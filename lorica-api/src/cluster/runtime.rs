@@ -10,6 +10,7 @@
 //! rebuilt" without parsing a message.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -38,15 +39,283 @@ pub enum ClusterRuntimeError {
     /// could not be rebuilt over it; the roster was still swapped.
     #[error("acceptor rebuild: {0}")]
     Acceptor(#[from] ClusterTlsError),
+    /// The coalesced refresh this call waited on failed. Shared, because
+    /// one refresh answers every caller whose signal it covered.
+    #[error("{0}")]
+    Refresh(Arc<ClusterRuntimeError>),
+    /// The detached task carrying a post-commit refresh or revocation
+    /// could not be joined (it panicked, or the runtime is stopping).
+    #[error("cluster enforcement task: {0}")]
+    EnforcementTask(String),
 }
 
 impl From<ClusterRuntimeError> for ApiError {
     fn from(err: ClusterRuntimeError) -> Self {
         match err {
             ClusterRuntimeError::Store(inner) => inner.into(),
+            ClusterRuntimeError::Refresh(shared) => shared_api_error(&shared),
             other => ApiError::Internal(other.to_string()),
         }
     }
+}
+
+/// The status a shared refresh error answers with: the same one the
+/// bare error would get.
+///
+/// The error sits behind an `Arc` every caller the refresh covered
+/// holds, so it cannot be moved into `From<ConfigError>`, which owns
+/// the variant-to-status mapping. The store error is re-materialised
+/// instead and handed to that mapping, rather than mapped a second time
+/// here. The match is exhaustive on purpose: a new `ConfigError` variant
+/// fails to compile here instead of silently answering 500.
+fn shared_api_error(err: &ClusterRuntimeError) -> ApiError {
+    let store = match err {
+        ClusterRuntimeError::Store(store) => store,
+        ClusterRuntimeError::Refresh(inner) => return shared_api_error(inner),
+        other => return ApiError::Internal(other.to_string()),
+    };
+    let rebuilt = match store {
+        ConfigError::NotFound(m) => ConfigError::NotFound(m.clone()),
+        ConfigError::Validation(m) => ConfigError::Validation(m.clone()),
+        ConfigError::Malformed(m) => ConfigError::Malformed(m.clone()),
+        ConfigError::Corrupt(m) => ConfigError::Corrupt(m.clone()),
+        ConfigError::Serialization(m) => ConfigError::Serialization(m.clone()),
+        // Neither payload can be cloned, and `From<ConfigError>` answers
+        // both with a 500 carrying the error's text.
+        ConfigError::Database(_) | ConfigError::Io(_) => {
+            return ApiError::Internal(store.to_string())
+        }
+    };
+    rebuilt.into()
+}
+
+/// Collapses a burst of control-plane refresh requests into as few
+/// refreshes as correctness allows (backlog #79).
+///
+/// Every caller takes a ticket, then queues for the right to run. The
+/// one that gets it reads the ticket counter BEFORE its refresh reads
+/// the store, so every ticket up to that value belongs to a caller
+/// whose registry write is already committed and is covered by this
+/// refresh. A caller that reaches the front and finds its ticket
+/// covered returns that refresh's outcome without running another. A
+/// burst of N therefore costs one refresh in flight plus one for
+/// everything that queued behind it, and no caller returns before a
+/// refresh that started after its signal has completed: a revocation
+/// still refuses the revoked serial by the time its caller returns.
+///
+/// Like the replication watch's counter, a signal is a number rather
+/// than a queue entry. Unlike it, the caller can wait, which is what
+/// the revoke, activate, enrol and renew paths need.
+#[derive(Default)]
+pub struct RefreshCoalescer {
+    requested: AtomicU64,
+    last: Mutex<RefreshCompletion>,
+}
+
+#[derive(Default)]
+struct RefreshCompletion {
+    /// The highest ticket the last completed refresh covered.
+    covers: u64,
+    error: Option<Arc<ClusterRuntimeError>>,
+}
+
+impl RefreshCoalescer {
+    /// Signal a refresh and wait until one that started after the
+    /// signal has completed, running `refresh` only when no such
+    /// refresh exists yet.
+    ///
+    /// A leader dropped mid-refresh (a cancelled handler) records
+    /// nothing, so the next caller in line runs its own refresh rather
+    /// than trusting one that may not have finished.
+    pub async fn run<F, Fut>(&self, refresh: F) -> Result<(), ClusterRuntimeError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), ClusterRuntimeError>>,
+    {
+        let ticket = self.requested.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut last = self.last.lock().await;
+        if last.covers < ticket {
+            let covers = self.requested.load(Ordering::SeqCst);
+            let outcome = refresh().await;
+            *last = RefreshCompletion {
+                covers,
+                error: outcome.err().map(Arc::new),
+            };
+        }
+        match &last.error {
+            None => Ok(()),
+            Some(e) => Err(ClusterRuntimeError::Refresh(Arc::clone(e))),
+        }
+    }
+}
+
+/// The most cluster units ([`detached`]) that run at once, counting
+/// only the outermost: a unit started inside another takes no slot, or
+/// a saturated bound would leave every outer unit waiting on an inner
+/// one that can never start.
+///
+/// The listener hooks are the reason for a bound of their own. A
+/// management request is already bounded by the management plane's
+/// units before it reaches one of these, but an enrolment, a renewal
+/// or a leave arrives from the fleet with nothing above it, and each
+/// unit outlives the connection that asked for it.
+pub const CLUSTER_DETACHED_UNITS_MAX: usize = 64;
+
+tokio::task_local! {
+    /// Set for the whole of a unit's task, so a nested [`detached`]
+    /// knows it is not the outermost.
+    static INSIDE_DETACHED_UNIT: ();
+}
+
+/// Where every cluster unit runs: one tracker the shutdown drains
+/// ([`drain_detached`]) and the slots of [`CLUSTER_DETACHED_UNITS_MAX`].
+struct DetachedRegistry {
+    tracker: tokio_util::task::TaskTracker,
+    slots: Arc<tokio::sync::Semaphore>,
+}
+
+fn detached_registry() -> &'static DetachedRegistry {
+    static REGISTRY: std::sync::OnceLock<DetachedRegistry> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| DetachedRegistry {
+        tracker: tokio_util::task::TaskTracker::new(),
+        slots: Arc::new(tokio::sync::Semaphore::new(CLUSTER_DETACHED_UNITS_MAX)),
+    })
+}
+
+/// The audit row a unit owes for its change, written as
+/// `<action>.incomplete` when the unit panics instead of finishing.
+///
+/// A panic can land after the commit and before the row the commit is
+/// owed, and the change then took effect with nothing in the
+/// tamper-evident trail. The unit cannot write that row itself once it
+/// has unwound, so it is described up front and written for it.
+pub struct OwedAudit {
+    /// Where the row goes; `None` when the audit log is not open.
+    pub log_store: Option<Arc<crate::log_store::LogStore>>,
+    /// Who asked for the change.
+    pub ctx: crate::audit::AuditContext,
+    /// The action the unit records when it finishes.
+    pub action: &'static str,
+    /// `(target_type, target_id)` as far as it is known before the
+    /// unit runs.
+    pub target: (&'static str, String),
+}
+
+/// Run `work` on its own task and await it, so dropping the caller
+/// cannot cut it short.
+///
+/// For a sequence that commits a registry or token write and owes the
+/// commit its enforcement, its audit row and its alert. A handler whose
+/// client disconnected is dropped at its next await point, and if that
+/// point sits between the commit and the rest, the store says one
+/// thing, the roster another, and the tamper-evident trail has no row
+/// for a change that took effect. Detached, the sequence either never
+/// starts or runs to its end. `what` names the sequence in the error a
+/// panicking or cancelled task produces.
+///
+/// The task runs on a tracker the shutdown drains ([`drain_detached`]),
+/// within [`CLUSTER_DETACHED_UNITS_MAX`]; the slot is taken before the
+/// task exists, so a caller dropped while it waits starts nothing. A
+/// panic is caught on the task and logged at ERROR. A unit that owes an
+/// audit row goes through [`detached_audited`] instead.
+pub async fn detached<T, Fut>(what: &'static str, work: Fut) -> Result<T, ClusterRuntimeError>
+where
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    run_detached(what, None, work).await
+}
+
+/// [`detached`] for a unit that commits a change and owes it an audit
+/// row: when the unit panics, `owed` is written as
+/// `<action>.incomplete` on the unit's own task, so the row does not
+/// depend on the caller still being there.
+pub async fn detached_audited<T, Fut>(
+    what: &'static str,
+    owed: OwedAudit,
+    work: Fut,
+) -> Result<T, ClusterRuntimeError>
+where
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    run_detached(what, Some(owed), work).await
+}
+
+async fn run_detached<T, Fut>(
+    what: &'static str,
+    owed: Option<OwedAudit>,
+    work: Fut,
+) -> Result<T, ClusterRuntimeError>
+where
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    use futures_util::FutureExt;
+    let registry = detached_registry();
+    let slot = if INSIDE_DETACHED_UNIT.try_with(|_| ()).is_ok() {
+        None
+    } else {
+        Some(
+            Arc::clone(&registry.slots)
+                .acquire_owned()
+                .await
+                .map_err(|e| ClusterRuntimeError::EnforcementTask(format!("{what}: {e}")))?,
+        )
+    };
+    let unit = INSIDE_DETACHED_UNIT.scope((), async move {
+        let _slot = slot;
+        match std::panic::AssertUnwindSafe(work).catch_unwind().await {
+            Ok(answer) => Some(answer),
+            Err(panic) => {
+                let reason = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                tracing::error!(
+                    task = what,
+                    panic = %reason,
+                    "a cluster unit panicked; a change it committed may lack its enforcement, and a unit that owes an audit row records it as incomplete"
+                );
+                if let Some(owed) = owed {
+                    crate::audit::record_with_store(
+                        owed.log_store,
+                        &owed.ctx,
+                        &format!("{}.incomplete", owed.action),
+                        (owed.target.0, &owed.target.1),
+                        None,
+                        Some(&serde_json::json!({ "task": what, "outcome": "panicked" })),
+                    )
+                    .await;
+                }
+                None
+            }
+        }
+    });
+    match registry.tracker.spawn(unit).await {
+        Ok(Some(answer)) => Ok(answer),
+        Ok(None) => Err(ClusterRuntimeError::EnforcementTask(format!(
+            "{what} task panicked"
+        ))),
+        Err(e) => Err(ClusterRuntimeError::EnforcementTask(format!(
+            "{what} task join failed: {e}"
+        ))),
+    }
+}
+
+/// Wait up to `grace` for every cluster unit in flight to end, for the
+/// shutdown path: a unit between its commit and its audit row is
+/// waited for rather than cut when the runtime drops. `false` when
+/// some were still running at the deadline.
+pub async fn drain_detached(grace: Duration) -> bool {
+    let tracker = &detached_registry().tracker;
+    tracker.close();
+    let drained = tokio::time::timeout(grace, tracker.wait()).await.is_ok();
+    // The tracker is process-wide: closing it only arms `wait`, and
+    // reopening keeps a later drain meaningful.
+    tracker.reopen();
+    drained
 }
 
 /// Run a pure-store closure and keep its error typed: `db_blocking`
@@ -92,9 +361,61 @@ pub struct ControlPlaneRuntime {
     /// the rows the fleet delivered. `None` when it could not be
     /// opened, which the fleet endpoints report rather than hide.
     pub telemetry: Option<Arc<crate::cluster_telemetry_store::ClusterTelemetryStore>>,
+    /// Every post-boot roster/CRL refresh goes through here (backlog
+    /// #79), through [`Self::refresh`] or [`Self::request_refresh`].
+    refresher: RefreshCoalescer,
 }
 
 impl ControlPlaneRuntime {
+    /// Refresh the roster, the fleet-size hint and the CRL-backed
+    /// acceptor after a registry write, coalesced with every other
+    /// caller signalling at the same time. Returns once a refresh that
+    /// started after this call has completed, with its outcome; see
+    /// [`RefreshCoalescer`].
+    ///
+    /// The refresh runs on its own task and this call awaits its
+    /// handle. Every caller has already committed a registry write, and
+    /// a caller dropped mid-wait (a handler whose client disconnected)
+    /// must not take with it the refresh that write is owed: the store
+    /// would say one thing and the roster and the acceptor another until
+    /// some unrelated write came along.
+    pub async fn refresh(
+        self: &Arc<Self>,
+        store: &Arc<Mutex<ConfigStore>>,
+    ) -> Result<(), ClusterRuntimeError> {
+        let runtime = Arc::clone(self);
+        let store = Arc::clone(store);
+        detached(
+            "refresh",
+            async move { runtime.refresh_in_place(&store).await },
+        )
+        .await?
+    }
+
+    /// The coalesced refresh on the caller's own task, for callers that
+    /// already run detached.
+    async fn refresh_in_place(
+        &self,
+        store: &Arc<Mutex<ConfigStore>>,
+    ) -> Result<(), ClusterRuntimeError> {
+        self.refresher
+            .run(|| refresh_control_plane(&self.control, store))
+            .await
+    }
+
+    /// The same without waiting, for a caller whose own answer does
+    /// not depend on the refresh. A failure is logged, which is all
+    /// such a caller did with it.
+    pub fn request_refresh(self: &Arc<Self>, store: &Arc<Mutex<ConfigStore>>) {
+        let runtime = Arc::clone(self);
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            if let Err(e) = runtime.refresh_in_place(&store).await {
+                tracing::error!(error = %e, "cluster plane: roster/CRL refresh failed");
+            }
+        });
+    }
+
     /// Claim the one [`DriftAlerter`] for this runtime.
     ///
     /// `Some` the first time, `None` afterwards: there is exactly one
@@ -102,7 +423,6 @@ impl ControlPlaneRuntime {
     /// asking for it is a bug worth failing on rather than a second
     /// consumer of the same budget (backlog #59).
     pub fn claim_drift_alerter(self: &Arc<Self>) -> Option<DriftAlerter> {
-        use std::sync::atomic::Ordering;
         if self.alerter_claimed.swap(true, Ordering::SeqCst) {
             return None;
         }
@@ -120,6 +440,7 @@ impl ControlPlaneRuntime {
             drift: DriftTracker::default(),
             alerter_claimed: std::sync::atomic::AtomicBool::new(false),
             telemetry: None,
+            refresher: RefreshCoalescer::default(),
         }
     }
 
@@ -133,6 +454,7 @@ impl ControlPlaneRuntime {
             drift: DriftTracker::default(),
             alerter_claimed: std::sync::atomic::AtomicBool::new(false),
             telemetry,
+            refresher: RefreshCoalescer::default(),
         }
     }
 }
@@ -607,7 +929,14 @@ pub fn roster_from_nodes(nodes: &[ClusterNode]) -> HashMap<String, NodeIdentity>
 }
 
 /// Reload the roster, the fleet-size hint and the CRL-backed acceptor
-/// from the store. Called after every registry mutation and at boot.
+/// from the store. Called once at boot, before any listener exists;
+/// every later caller goes through [`ControlPlaneRuntime::refresh`],
+/// which coalesces a burst of registry writes into one refresh.
+///
+/// The store lock covers the two list reads and nothing else: the CRL
+/// mint, the acceptor rebuild and the session reconciliation run after
+/// it is released, so an unrelated route or settings mutation never
+/// queues behind them.
 ///
 /// Serialized on the control plane's refresh guard across the read AND
 /// the swaps: two refreshes racing could otherwise land a pre-revocation
@@ -693,13 +1022,38 @@ pub struct RevokeOutcome {
 /// rebuilt. `Ok(None)` when the node does not exist; the refresh
 /// failure travels in the outcome so the caller audits what happened
 /// before surfacing it.
+///
+/// The refresh is coalesced with any other in flight but still awaited:
+/// when this returns without a `refresh_error`, the acceptor already
+/// refuses the revoked serials.
+///
+/// The whole sequence runs on its own task and this call awaits its
+/// handle, so dropping the caller cannot split it. A revoke handler
+/// whose client disconnected after the row flipped would otherwise
+/// leave a node the registry calls revoked with its session up and its
+/// certificate still admitted, until an unrelated refresh.
 pub async fn revoke_node(
-    control: &Arc<ControlPlane>,
+    runtime: &Arc<ControlPlaneRuntime>,
     store: &Arc<Mutex<ConfigStore>>,
     node_id: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<RevokeOutcome>, ClusterRuntimeError> {
-    let id = node_id.to_string();
+    let runtime = Arc::clone(runtime);
+    let store = Arc::clone(store);
+    let node_id = node_id.to_string();
+    detached("revocation", async move {
+        revoke_in_place(&runtime, &store, node_id, now).await
+    })
+    .await?
+}
+
+async fn revoke_in_place(
+    runtime: &ControlPlaneRuntime,
+    store: &Arc<Mutex<ConfigStore>>,
+    node_id: String,
+    now: DateTime<Utc>,
+) -> Result<Option<RevokeOutcome>, ClusterRuntimeError> {
+    let id = node_id.clone();
     let before = store_op(store, move |store| {
         let Some(existing) = store.get_cluster_node(&id)? else {
             return Ok(None);
@@ -712,8 +1066,8 @@ pub async fn revoke_node(
     let Some((node, newly_revoked, certificates_to_reissue)) = before else {
         return Ok(None);
     };
-    let refresh_error = refresh_control_plane(control, store).await.err();
-    let session_ended = control.sessions.kill(node_id);
+    let refresh_error = runtime.refresh_in_place(store).await.err();
+    let session_ended = runtime.control.sessions.kill(&node_id);
     Ok(Some(RevokeOutcome {
         node,
         newly_revoked,
@@ -892,20 +1246,294 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Backlog #79: refreshes coalesce, and none is lost.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_burst_of_refresh_signals_runs_fewer_refreshes_and_loses_none() {
+        const BURST: u64 = 32;
+        let coalescer = Arc::new(RefreshCoalescer::default());
+        // `written` stands in for the store: each caller commits a write,
+        // then signals. A refresh records the newest write it could see.
+        let written = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(AtomicU64::new(0));
+        let refreshes = Arc::new(AtomicU64::new(0));
+        let mut callers = Vec::new();
+        for _ in 0..BURST {
+            let (coalescer, written, seen, refreshes) = (
+                Arc::clone(&coalescer),
+                Arc::clone(&written),
+                Arc::clone(&seen),
+                Arc::clone(&refreshes),
+            );
+            callers.push(tokio::spawn(async move {
+                let mine = written.fetch_add(1, Ordering::SeqCst) + 1;
+                coalescer
+                    .run(|| async {
+                        refreshes.fetch_add(1, Ordering::SeqCst);
+                        seen.fetch_max(written.load(Ordering::SeqCst), Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Ok(())
+                    })
+                    .await
+                    .expect("refresh");
+                assert!(
+                    seen.load(Ordering::SeqCst) >= mine,
+                    "a caller returned before any refresh had read its write"
+                );
+            }));
+        }
+        for caller in callers {
+            caller.await.expect("caller");
+        }
+        let ran = refreshes.load(Ordering::SeqCst);
+        assert!(ran >= 1, "no refresh ran");
+        assert!(
+            ran < BURST,
+            "{ran} refreshes for {BURST} signals: nothing coalesced"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            BURST,
+            "the last write was never refreshed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_failure_reaches_every_caller_it_covered() {
+        let coalescer = Arc::new(RefreshCoalescer::default());
+        let mut callers = Vec::new();
+        for _ in 0..8 {
+            let coalescer = Arc::clone(&coalescer);
+            callers.push(tokio::spawn(async move {
+                coalescer
+                    .run(|| async {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        Err(ClusterRuntimeError::StoreTask("store gone".into()))
+                    })
+                    .await
+            }));
+        }
+        for caller in callers {
+            let outcome = caller.await.expect("caller");
+            assert!(
+                matches!(&outcome, Err(e) if e.to_string().contains("store gone")),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_leader_does_not_cover_the_callers_behind_it() {
+        let coalescer = Arc::new(RefreshCoalescer::default());
+        let leader = {
+            let coalescer = Arc::clone(&coalescer);
+            tokio::spawn(async move {
+                coalescer
+                    .run(|| async {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let ran = Arc::new(AtomicU64::new(0));
+        let follower = {
+            let (coalescer, ran) = (Arc::clone(&coalescer), Arc::clone(&ran));
+            tokio::spawn(async move {
+                coalescer
+                    .run(|| async {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        leader.abort();
+        follower.await.expect("follower").expect("refresh");
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "the follower trusted a refresh that never completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_revocation_in_a_burst_is_enforced_when_its_call_returns() {
+        let (runtime, _liveness) = crate::tests::test_control_plane();
+        let store = Arc::new(Mutex::new(ConfigStore::open_in_memory().expect("store")));
+        const NODES: usize = 6;
+        {
+            let store = store.lock().await;
+            for i in 0..NODES {
+                let mut row = node(
+                    &format!("n{i}"),
+                    &format!("fp-{i}"),
+                    None,
+                    NodeStatus::Active,
+                );
+                row.cert_serial = format!("0a{i:02x}");
+                row.cert_not_after = Utc::now() + chrono::Duration::days(30);
+                store.create_cluster_node(&row).expect("row");
+            }
+        }
+        runtime.refresh(&store).await.expect("initial refresh");
+        let before = runtime.control.acceptor.current();
+        let mut revocations = Vec::new();
+        for i in 0..NODES {
+            let (runtime, store) = (Arc::clone(&runtime), Arc::clone(&store));
+            revocations.push(tokio::spawn(async move {
+                let outcome = revoke_node(&runtime, &store, &format!("n{i}"), Utc::now())
+                    .await
+                    .expect("revoke")
+                    .expect("node exists");
+                assert!(
+                    outcome.refresh_error.is_none(),
+                    "{:?}",
+                    outcome.refresh_error
+                );
+                // Checked the moment the call returns, while other
+                // revocations of the burst may still be running.
+                let identity = runtime
+                    .control
+                    .roster
+                    .lookup(&format!("fp-{i}"))
+                    .expect("roster entry");
+                assert_eq!(identity.state, NodeState::Revoked, "n{i}");
+            }));
+        }
+        for revocation in revocations {
+            revocation.await.expect("revocation");
+        }
+        assert!(
+            !Arc::ptr_eq(&before, &runtime.control.acceptor.current()),
+            "the acceptor was never rebuilt over the new CRL"
+        );
+    }
+
     #[test]
     fn store_errors_keep_their_http_identity_through_the_runtime_error() {
+        use axum::http::StatusCode;
         use axum::response::IntoResponse;
-        let absent: ApiError =
-            ClusterRuntimeError::Store(ConfigError::NotFound("node".into())).into();
+        let status = |err: ClusterRuntimeError| ApiError::from(err).into_response().status();
+        let shared = |err: ClusterRuntimeError| ClusterRuntimeError::Refresh(Arc::new(err));
+        let absent = || ClusterRuntimeError::Store(ConfigError::NotFound("node".into()));
+        let refused = || ClusterRuntimeError::Store(ConfigError::Validation("cap".into()));
+        let unreadable = || ClusterRuntimeError::Store(ConfigError::Malformed("json".into()));
+        let acceptor = || ClusterRuntimeError::Acceptor(ClusterTlsError::Rustls("crl".into()));
+
+        assert_eq!(status(absent()), StatusCode::NOT_FOUND);
+        assert_eq!(status(acceptor()), StatusCode::INTERNAL_SERVER_ERROR);
+        // A refresh error reaches its callers wrapped and shared since
+        // the refreshes coalesce (backlog #79). The wrapper must not
+        // turn a store refusal into a 500.
+        for (bare, wrapped) in [
+            (absent(), shared(absent())),
+            (refused(), shared(refused())),
+            (unreadable(), shared(unreadable())),
+            (acceptor(), shared(acceptor())),
+        ] {
+            let message = bare.to_string();
+            assert_eq!(status(wrapped), status(bare), "{message}");
+        }
+        let held_by_two = Arc::new(absent());
+        let _other_caller = Arc::clone(&held_by_two);
         assert_eq!(
-            absent.into_response().status(),
-            axum::http::StatusCode::NOT_FOUND
+            status(ClusterRuntimeError::Refresh(held_by_two)),
+            StatusCode::NOT_FOUND
         );
-        let acceptor: ApiError =
-            ClusterRuntimeError::Acceptor(ClusterTlsError::Rustls("crl".into())).into();
+    }
+
+    // -----------------------------------------------------------------
+    // A caller dropped after its registry write does not cancel the
+    // enforcement that write is owed.
+    // -----------------------------------------------------------------
+
+    async fn eventually(what: &str, mut holds: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !holds() {
+            assert!(Instant::now() < deadline, "never happened: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn enrolled(id: &str, serial: &str) -> ClusterNode {
+        let mut row = node(id, &format!("fp-{id}"), None, NodeStatus::Active);
+        row.cert_serial = serial.to_string();
+        row.cert_not_after = Utc::now() + chrono::Duration::days(30);
+        row
+    }
+
+    #[tokio::test]
+    async fn a_refresh_whose_caller_is_dropped_still_lands() {
+        let (runtime, _liveness) = crate::tests::test_control_plane();
+        let store = Arc::new(Mutex::new(ConfigStore::open_in_memory().expect("store")));
+        store
+            .lock()
+            .await
+            .create_cluster_node(&enrolled("n0", "0a00"))
+            .expect("row");
+        // Held so the refresh is still waiting when its caller goes.
+        let guard = runtime.control.refresh_guard().await;
+        let dropped = tokio::time::timeout(Duration::from_millis(50), runtime.refresh(&store));
+        assert!(dropped.await.is_err(), "the refresh could not have run yet");
+        drop(guard);
+        eventually("the roster picks up the enrolled node", || {
+            runtime.control.roster.lookup("fp-n0").is_some()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_revocation_whose_caller_is_dropped_after_the_commit_is_still_enforced() {
+        let (runtime, _liveness) = crate::tests::test_control_plane();
+        let store = Arc::new(Mutex::new(ConfigStore::open_in_memory().expect("store")));
+        store
+            .lock()
+            .await
+            .create_cluster_node(&enrolled("n0", "0a00"))
+            .expect("row");
+        runtime.refresh(&store).await.expect("initial refresh");
+        let before = runtime.control.acceptor.current();
+
+        let guard = runtime.control.refresh_guard().await;
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(50),
+            revoke_node(&runtime, &store, "n0", Utc::now()),
+        );
+        assert!(
+            dropped.await.is_err(),
+            "the revocation could not finish yet"
+        );
+        eventually("the row flip commits", || {
+            store.try_lock().is_ok_and(|s| {
+                s.get_cluster_node("n0")
+                    .expect("read")
+                    .is_some_and(|n| n.status == NodeStatus::Revoked)
+            })
+        })
+        .await;
         assert_eq!(
-            acceptor.into_response().status(),
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            runtime.control.roster.lookup("fp-n0").expect("entry").state,
+            NodeState::Active,
+            "not enforced while the refresh is held"
         );
+        drop(guard);
+
+        eventually("the roster refuses the revoked node", || {
+            runtime
+                .control
+                .roster
+                .lookup("fp-n0")
+                .is_some_and(|n| n.state == NodeState::Revoked)
+        })
+        .await;
+        eventually("the acceptor is rebuilt over the new CRL", || {
+            !Arc::ptr_eq(&before, &runtime.control.acceptor.current())
+        })
+        .await;
     }
 }

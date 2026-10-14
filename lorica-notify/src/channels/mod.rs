@@ -97,9 +97,14 @@ enum ChannelType {
 }
 
 /// Rate limiter configuration.
+///
+/// The budget is per channel AND per alert type: a type that fires
+/// often spends its own budget, never the one a rare and critical type
+/// (`log_store_unavailable`, `ip_banned`) needs on the same channel.
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
-    /// Maximum number of notifications per channel within the window.
+    /// Maximum number of notifications of one alert type per channel
+    /// within the window.
     pub max_per_window: usize,
     /// Sliding window duration.
     pub window: Duration,
@@ -114,14 +119,33 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// What one [`NotifyDispatcher::dispatch`] achieved on the external
+/// channels (stdout always emits and is not counted).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DispatchOutcome {
+    /// Enabled channels subscribed to the event's type.
+    pub subscribed: usize,
+    /// Of those, the ones that accepted it: not rate limited and sent
+    /// without error.
+    pub delivered: usize,
+}
+
+impl DispatchOutcome {
+    /// Whether sending the event again could reach anyone it has not:
+    /// `true` once a channel took it, or when no channel subscribes.
+    pub fn settled(&self) -> bool {
+        self.subscribed == 0 || self.delivered > 0
+    }
+}
+
 /// Dispatches alert events to all configured notification channels.
 pub struct NotifyDispatcher {
     channels: Vec<RegisteredChannel>,
     history: Arc<Mutex<VecDeque<AlertEvent>>>,
     max_history: usize,
     rate_limit: RateLimitConfig,
-    /// Per-channel send timestamps for rate limiting.
-    send_times: Mutex<HashMap<String, VecDeque<Instant>>>,
+    /// Send timestamps per (channel id, alert type), for rate limiting.
+    send_times: Mutex<HashMap<(String, &'static str), VecDeque<Instant>>>,
     /// Counter of rate-limited (suppressed) notifications.
     suppressed_count: Mutex<usize>,
 }
@@ -242,10 +266,11 @@ impl NotifyDispatcher {
     /// their `alert_types` filter matches (empty list or `"*"` matches
     /// everything). Per-channel send failures are logged and do not
     /// interrupt delivery to other channels. Channels exceeding their
-    /// rate limit are skipped and counted in [`suppressed_count`].
+    /// rate limit for the event's type are skipped and counted in
+    /// [`suppressed_count`].
     ///
     /// [`suppressed_count`]: Self::suppressed_count
-    pub async fn dispatch(&self, event: &AlertEvent) {
+    pub async fn dispatch(&self, event: &AlertEvent) -> DispatchOutcome {
         // Always emit to stdout. This channel cannot fail, so its
         // dispatch outcome is always `ok`. Email / webhook / slack record
         // their own outcomes inside the respective `send` functions, where
@@ -263,6 +288,7 @@ impl NotifyDispatcher {
         }
 
         let alert_str = event.alert_type.as_str();
+        let mut outcome = DispatchOutcome::default();
 
         for ch in &self.channels {
             if !ch.enabled {
@@ -275,9 +301,9 @@ impl NotifyDispatcher {
             {
                 continue;
             }
+            outcome.subscribed += 1;
 
-            // Rate limiting check
-            if self.is_rate_limited(&ch.id) {
+            if self.is_rate_limited(&ch.id, alert_str) {
                 warn!(
                     channel_id = %ch.id,
                     alert_type = alert_str,
@@ -287,57 +313,29 @@ impl NotifyDispatcher {
                 continue;
             }
 
-            match &ch.channel_type {
-                ChannelType::Email(config) => {
-                    if let Err(e) = email::send(config, event).await {
-                        warn!(
-                            channel_id = %ch.id,
-                            error = %e,
-                            "failed to send email notification"
-                        );
-                    } else {
-                        self.record_send(&ch.id);
-                        info!(
-                            channel_id = %ch.id,
-                            alert_type = alert_str,
-                            "email notification sent"
-                        );
-                    }
+            let (kind, sent) = match &ch.channel_type {
+                ChannelType::Email(config) => ("email", email::send(config, event).await),
+                ChannelType::Webhook(config) => ("webhook", webhook::send(config, event).await),
+                ChannelType::Slack(config) => ("Slack", slack::send(config, event).await),
+            };
+            match sent {
+                Ok(()) => {
+                    self.record_send(&ch.id, alert_str);
+                    outcome.delivered += 1;
+                    info!(
+                        channel_id = %ch.id,
+                        alert_type = alert_str,
+                        "{kind} notification sent"
+                    );
                 }
-                ChannelType::Webhook(config) => {
-                    if let Err(e) = webhook::send(config, event).await {
-                        warn!(
-                            channel_id = %ch.id,
-                            error = %e,
-                            "failed to send webhook notification"
-                        );
-                    } else {
-                        self.record_send(&ch.id);
-                        info!(
-                            channel_id = %ch.id,
-                            alert_type = alert_str,
-                            "webhook notification sent"
-                        );
-                    }
-                }
-                ChannelType::Slack(config) => {
-                    if let Err(e) = slack::send(config, event).await {
-                        warn!(
-                            channel_id = %ch.id,
-                            error = %e,
-                            "failed to send Slack notification"
-                        );
-                    } else {
-                        self.record_send(&ch.id);
-                        info!(
-                            channel_id = %ch.id,
-                            alert_type = alert_str,
-                            "Slack notification sent"
-                        );
-                    }
-                }
+                Err(e) => warn!(
+                    channel_id = %ch.id,
+                    error = %e,
+                    "failed to send {kind} notification"
+                ),
             }
         }
+        outcome
     }
 
     /// Return the number of currently registered channels (enabled or not).
@@ -357,11 +355,13 @@ impl NotifyDispatcher {
         self.history.lock().len()
     }
 
-    /// Check if a channel has exceeded its rate limit.
-    fn is_rate_limited(&self, channel_id: &str) -> bool {
+    /// Check if a channel has spent its budget for `alert_type`.
+    fn is_rate_limited(&self, channel_id: &str, alert_type: &'static str) -> bool {
         let now = Instant::now();
         let mut times = self.send_times.lock();
-        let entry = times.entry(channel_id.to_string()).or_default();
+        let entry = times
+            .entry((channel_id.to_string(), alert_type))
+            .or_default();
 
         // Evict expired entries
         while entry
@@ -374,10 +374,12 @@ impl NotifyDispatcher {
         entry.len() >= self.rate_limit.max_per_window
     }
 
-    /// Record a successful send for rate limiting.
-    fn record_send(&self, channel_id: &str) {
+    /// Record a successful send of `alert_type` for rate limiting.
+    fn record_send(&self, channel_id: &str, alert_type: &'static str) {
         let mut times = self.send_times.lock();
-        let entry = times.entry(channel_id.to_string()).or_default();
+        let entry = times
+            .entry((channel_id.to_string(), alert_type))
+            .or_default();
         entry.push_back(Instant::now());
     }
 }
@@ -574,33 +576,108 @@ mod tests {
         assert_eq!(cfg.window, Duration::from_secs(60));
     }
 
+    const WAF: &str = "waf_alert";
+
+    fn budget() -> usize {
+        RateLimitConfig::default().max_per_window
+    }
+
     #[test]
     fn test_is_rate_limited_under_threshold() {
         let d = NotifyDispatcher::new();
-        // Record 5 sends (under default of 10)
-        for _ in 0..5 {
-            d.record_send("ch1");
+        for _ in 1..budget() {
+            d.record_send("ch1", WAF);
         }
-        assert!(!d.is_rate_limited("ch1"));
+        assert!(!d.is_rate_limited("ch1", WAF));
     }
 
     #[test]
     fn test_is_rate_limited_at_threshold() {
         let d = NotifyDispatcher::new();
-        for _ in 0..10 {
-            d.record_send("ch1");
+        for _ in 0..budget() {
+            d.record_send("ch1", WAF);
         }
-        assert!(d.is_rate_limited("ch1"));
+        assert!(d.is_rate_limited("ch1", WAF));
     }
 
     #[test]
     fn test_rate_limit_per_channel_isolation() {
         let d = NotifyDispatcher::new();
-        for _ in 0..10 {
-            d.record_send("ch1");
+        for _ in 0..budget() {
+            d.record_send("ch1", WAF);
         }
-        assert!(d.is_rate_limited("ch1"));
-        assert!(!d.is_rate_limited("ch2"));
+        assert!(d.is_rate_limited("ch1", WAF));
+        assert!(!d.is_rate_limited("ch2", WAF));
+    }
+
+    #[test]
+    fn one_alert_type_cannot_spend_another_types_budget() {
+        let d = NotifyDispatcher::new();
+        for _ in 0..budget() {
+            d.record_send("ch1", WAF);
+        }
+        assert!(d.is_rate_limited("ch1", WAF));
+        for critical in [AlertType::LogStoreUnavailable, AlertType::IpBanned] {
+            assert!(!d.is_rate_limited("ch1", critical.as_str()), "{critical:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_waf_flood_does_not_suppress_a_log_store_alert_on_the_same_channel() {
+        let mut d = NotifyDispatcher::new();
+        d.add_webhook_channel(
+            "w1".into(),
+            WebhookConfig {
+                url: "http://192.0.2.1:1/hook".into(),
+                auth_header: None,
+            },
+            vec![],
+            true,
+        );
+        for _ in 0..budget() {
+            d.record_send("w1", WAF);
+        }
+        let flood = d
+            .dispatch(&AlertEvent::new(AlertType::WafAlert, "xss"))
+            .await;
+        assert_eq!(
+            flood,
+            DispatchOutcome {
+                subscribed: 1,
+                delivered: 0
+            },
+            "the WAF budget is spent"
+        );
+        assert!(!flood.settled());
+        assert_eq!(d.suppressed_count(), 1);
+        assert!(
+            !d.is_rate_limited("w1", AlertType::LogStoreUnavailable.as_str()),
+            "the log-store alert still has its own budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_reports_who_subscribes() {
+        let mut d = NotifyDispatcher::new();
+        let unsubscribed = d
+            .dispatch(&AlertEvent::new(AlertType::BackendDown, "down"))
+            .await;
+        assert_eq!(unsubscribed, DispatchOutcome::default());
+        assert!(unsubscribed.settled());
+
+        d.add_webhook_channel(
+            "w1".into(),
+            WebhookConfig {
+                url: "http://192.0.2.1:1/hook".into(),
+                auth_header: None,
+            },
+            vec!["cert_expiring".into()],
+            true,
+        );
+        let other_type = d
+            .dispatch(&AlertEvent::new(AlertType::BackendDown, "down"))
+            .await;
+        assert_eq!(other_type.subscribed, 0);
     }
 
     #[test]
@@ -609,10 +686,10 @@ mod tests {
             max_per_window: 2,
             window: Duration::from_secs(60),
         });
-        d.record_send("ch1");
-        assert!(!d.is_rate_limited("ch1"));
-        d.record_send("ch1");
-        assert!(d.is_rate_limited("ch1"));
+        d.record_send("ch1", WAF);
+        assert!(!d.is_rate_limited("ch1", WAF));
+        d.record_send("ch1", WAF);
+        assert!(d.is_rate_limited("ch1", WAF));
     }
 
     #[test]

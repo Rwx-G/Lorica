@@ -964,9 +964,10 @@ pub const READS: &[ToolSpec] = &[
         name: "lorica_waf_stats",
         title: "WAF counters",
         summary: "Read the WAF's aggregate counters: the total matched, the count over the \
-                  last 24 hours, how many rules are loaded, and the count per rule category. \
-                  The counters may be a few seconds old: the node recomputes them at most \
-                  once per short window.",
+                  last hour and over the last 24 hours, how many rules are loaded, and the \
+                  count per rule category in total and over the last hour. The counters may \
+                  be a few seconds old: the node recomputes them at most once per short \
+                  window.",
         scope: AutomationScope::WafRead,
         path: "/automation/v1/waf/stats",
         resource: None,

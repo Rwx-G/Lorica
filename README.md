@@ -6,11 +6,11 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.9.1-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.9.2-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-3095-brightgreen.svg" alt="Lorica Tests">
-  <img src="https://img.shields.io/badge/Pingora%20Tests-779-blue.svg" alt="Inherited Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-3224-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Pingora%20Tests-782-blue.svg" alt="Inherited Tests">
 </p>
 
 ---
@@ -42,7 +42,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 
 - **WAF engine** - 49 OWASP CRS-inspired rules (SQLi, XSS, path traversal, command injection, SSRF, Log4Shell, XXE, CRLF). Request bodies are buffered only when the engine can actually parse them, decided on the declared `Content-Type` before the first chunk (v1.7.2), so a route fronting multi-gigabyte uploads keeps the WAF armed instead of choosing between the two. Since v1.8.0 the scan window is per route (`waf_body_scan_max_bytes`, 4 KiB to 64 MiB) under a node-wide in-flight budget that fails open, because a shared budget failing closed would be a 413 any client could hand to everyone else. Since v1.9.0, in Blocking mode, a body the WAF inspects is read and scanned in full before the backend is contacted and forwarded only once the scan passes, so a refused body reaches no backend, not a byte and not a connection (from 1.7.2 to 1.8.0 a refused chunked body still completed upstream); Detection mode and bodies the WAF does not inspect still stream. See `docs/security.md`
 - **AI / LLM crawler deny-list** (v1.6.0) - curated registry of AI crawler User-Agents with per-vendor verification (forward-confirmed rDNS, published IP ranges, or UA-only), per-route policy (off / deny / log), auto-served `/robots.txt` advertising the active deny-list, spoofed-UA fallback policy, custom crawler rules, `lorica_ai_bot_total` counter. See `docs/ai-crawlers.md`
-- **Tamper-evident audit log** (v1.6.0) - every state-mutating management call records operator, role, action, target, source IP, user agent and before/after payload hashes in a SHA-256 hash chain; `GET /api/v1/audit/verify` walks the chain and localises tampering to the earliest broken row; day-based retention is chain-safe. In a fleet (v1.7.0) every follower's trail fans in to the control plane as its own chain, verified separately
+- **Tamper-evident audit log** (v1.6.0) - every state-mutating management call records operator, role, action, target, source IP, user agent and before/after payload hashes in a SHA-256 hash chain; `GET /api/v1/audit/verify` walks the chain and localises tampering to the earliest broken row; day-based retention is chain-safe. In a fleet (v1.7.0) every follower's trail fans in to the control plane as its own chain, verified separately. Since v1.9.2 each follower's chain is capped at 500,000 rows, cut oldest first and sealed like day-based retention; the first rows cut go to a bounded, verified per-node backup so a flooding follower cannot erase its earlier history, every cut is recorded in the control plane's own chain, and verify walks a chain in chunks so it never stalls the access-log writer
 - **Per-recipient replication** (v1.8.0) - a follower receives only the routes it serves: the control plane resolves `node_selector` itself, against the node id the recipient's certificate proves, so a compromised edge no longer discloses the fleet's routing topology (every other node's upstream addresses, IP lists, mTLS configuration and Basic-auth hashes). Drift is judged against a per-node hash while the generation stays fleet-wide; the wire format did not move, so a mixed-version fleet upgrades in the documented order
 - **Management plane over TLS** (v1.6.0) - the loopback dashboard/API is served over HTTPS with a self-signed certificate generated on first boot (or an operator-supplied one), so the session cookie is `Secure`; `/metrics` requires a session or the bearer token in `prometheus_scrape_token` by default since v1.7.0
 - **Secrets never on argv** (v1.7.0) - every management CLI command (`unban`, `upgrade`, `cluster token|leave|status|break-glass`, `automation token create`, `mcp token create`) reads its password from `--password-file`, `--password-stdin` or `LORICA_ADMIN_PASSWORD`, and a join token only from a file, stdin or `LORICA_JOIN_TOKEN`. Since v1.9.0 they pin the exact certificate the management listener records as served (`<data-dir>/management/served-cert.pem`) before the password leaves, so a local process that grabs the unprivileged loopback port during a restart receives nothing
@@ -66,7 +66,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 
 - **Passive SLA** - per-route uptime, latency percentiles (p50/p95/p99), rolling windows (1h/24h/7d/30d)
 - **Active SLA** - synthetic HTTP probes at configurable intervals, detects outages during low-traffic periods
-- **Prometheus metrics** - `/metrics` endpoint with request counts, latency histograms, backend health, WAF events, cert expiry. Per-feature counters for cache-predictor bypass, header-rule matches, canary split selection, mirror outcomes (spawned / dropped / errored), forward-auth verdict cache hit rate - all bounded by route count. Under `--workers N` every scrape triggers a pull-on-scrape fan-out over the pipelined RPC channel so per-worker counters are sub-second fresh; concurrent scrapes dedup into a single fan-out and stuck workers fall back to cached state within a 500 ms per-worker timeout (WPAR-7)
+- **Prometheus metrics** - `/metrics` endpoint with request counts, latency histograms, backend health, WAF events, cert expiry. Per-feature counters for cache-predictor bypass, header-rule matches, canary split selection, mirror outcomes (spawned / dropped / errored), forward-auth verdict cache hit rate - all bounded by route count. `lorica_log_store_up{role,worker_id}` reads 0 for any process that cannot open `access-log.db` (since v1.9.2 the proxy keeps serving, alerts, shows a dashboard banner and retries the open every minute; see `docs/installation.md`). Under `--workers N` every scrape triggers a pull-on-scrape fan-out over the pipelined RPC channel so per-worker counters are sub-second fresh; concurrent scrapes dedup into a single fan-out and stuck workers fall back to cached state within a 500 ms per-worker timeout (WPAR-7)
 - **Request mirroring (shadow testing)** - duplicate every request to one or more secondary backends (deterministic per `X-Request-Id` sampling, 256-slot concurrency cap, body mirroring up to a configurable cap). Fire-and-forget: mirror failure can never impact the primary
 - **Real-time access logs** - WebSocket streaming to the dashboard with filtering
 - **Load testing** - built-in load test engine with SSE streaming, cron scheduling, CPU circuit breaker, and result comparison
@@ -337,11 +337,11 @@ The dashboard ships inside the binary and is served on the management port (defa
 
 ### Pages
 
-- **Overview** - cockpit dashboard with section helpers, setup checklist, system/route/security/performance cards
+- **Overview** - cockpit dashboard with section helpers, setup checklist, system/route/security/performance cards; the WAF card and its top category count the rolling last hour
 - **Routes** - create/edit routes with host matching, path prefixes, load balancing, WAF mode, rate limits, caching, timeouts, security headers, CORS, and 25 other per-route settings; a route the automation API owns carries an `automation` badge naming its environment and opens read-only, with a hint to update it through the pipeline
 - **Backends** - manage backend addresses, weights, health check type (TCP/HTTP), TLS upstream, active connections; automation-owned backends carry the same badge
 - **Certificates** - upload PEM certificates, view expiry dates, provision via ACME/Let's Encrypt (HTTP-01, DNS-01)
-- **Security** - WAF event table with category filtering, 49 rule toggles, IP ban list with unban button, admin audit log with chain verification; on a control plane every tab carries a node filter over the fleet's events, bans and audit chains
+- **Security** - WAF counters for the last hour, the last 24 hours and the events held (the retained table, bounded by `waf_event_retention`, or without a log store the in-memory events since start, labelled as such), refreshed periodically; WAF event table with category filtering, 49 rule toggles, IP ban list with unban button, admin audit log with chain verification; on a control plane every tab carries a node filter over the fleet's events, bans and audit chains
 - **SLA** - per-route passive/active SLA side-by-side, latency percentile tables, config editor, CSV/JSON export; on a control plane a node picker shows one follower's own figures (never a fleet aggregate: a fleet percentile is not a function of per-node percentiles)
 - **Load Tests** - test config management with clone, one-click execution, real-time SSE progress panel, historical results
 - **Active Probes** - CRUD for synthetic health probes with route selection, HTTP method/path/status/interval/timeout
@@ -542,7 +542,7 @@ All endpoints are served on the management port (default `9443`) over HTTPS (a s
 |--------|------|-------------|
 | `GET` | `/api/v1/waf/events` | Recent WAF events (with category filter) |
 | `DELETE` | `/api/v1/waf/events` | Clear WAF events |
-| `GET` | `/api/v1/waf/stats` | WAF statistics |
+| `GET` | `/api/v1/waf/stats` | WAF statistics: events held and where (`stored_in`), last-24h and last-hour counts, per-category counts over the events held and over the last hour |
 | `GET` | `/api/v1/waf/rules` | List WAF rules |
 | `PUT` | `/api/v1/waf/rules/{id}` | Enable/disable rule |
 | `GET` | `/api/v1/waf/rules/custom` | List custom rules |
@@ -719,7 +719,7 @@ cargo build --release
 # Every Rust test in the workspace
 cargo test --workspace
 
-# Product crates only (3095 tests, Lorica-native)
+# Product crates only (3224 tests, Lorica-native)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
            -p lorica-command -p lorica-shmem \
@@ -728,7 +728,7 @@ cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-mcp -p lorica-automation-policy \
            --features otel
 
-# Pingora-forked crates (779 tests)
+# Pingora-forked crates (782 tests)
 cargo test -p lorica-core -p lorica-proxy -p lorica-http \
            -p lorica-error -p lorica-tls -p lorica-cache \
            -p lorica-pool -p lorica-runtime -p lorica-timeout \
@@ -740,7 +740,7 @@ cargo test -p lorica-core -p lorica-proxy -p lorica-http \
 # wire corpus (every message's encoding, pinned)
 cargo test -p lorica-cluster --tests
 
-# Frontend (524 Vitest cases across 26 files) and its gates
+# Frontend (538 Vitest cases across 29 files) and its gates
 cd lorica-dashboard/frontend && npm run check && npm run lint && npx vitest run
 ```
 
@@ -767,6 +767,7 @@ runs them all in sequence; each `--skip-<profile>` flag drops one.
 | audit | 17 | the hash chain, tamper localisation, role floors |
 | hot-upgrade | 29 | signature verification, socket handover, rollback of a failing binary |
 | log-sinks | 23 | RFC 5424 syslog over TCP and OTLP logs, delivered to real collectors |
+| log-sinks-workers | 21 | the same sinks under `--workers 2`: frames from both worker PIDs reach the collector, and the supervisor's sent, truncated and dropped counters are the sum across workers |
 | acme | 15 | HTTP-01 and manual DNS-01 issuance against the Pebble fixture |
 | capture | 163 | two-phase matching from two source addresses, a 10 MiB body truncated at the cap while the upstream still receives all of it, credential headers and named query parameters redacted on every sink, a binary body round-tripping through base64, the per-rule budget and the TTL each self-disabling their rule, the recent-captures ring, and an `output.dir` that is read-only and then writable |
 | capture-workers | 160 + 50 | the same profile under `--workers 2`, sharing the 163 assertions above behind a flag rather than forking them (three become ranges, because a budget is spent per worker), plus what only worker mode can show: the per-rule budget overshooting its total by at most the worker count, the recent-captures ring answering 503 rather than an empty 200, all four sinks fed from inside a worker, and the counters aggregating across workers on `/metrics` |

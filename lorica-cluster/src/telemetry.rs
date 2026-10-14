@@ -82,8 +82,15 @@ pub const QUOTA_RETRY_AFTER_S: u32 = 30;
 /// after the database had become unmanageable.
 ///
 /// Bounding the database directly leaves the rest of the volume for
-/// the configuration store and the audit chain, which is what AC #8
+/// the configuration store and `access-log.db`, which is what AC #8
 /// actually asks for, and it needs no syscall beyond a file stat.
+///
+/// That second file is not fan-in free, and this cap does not see into
+/// it. Since Story 9.9 the audit rows followers push land there, beside
+/// the control plane's own chain, because verify walks one table. They
+/// are bounded by their own ceiling instead: a per-node row cap the
+/// hourly retention pass enforces (`FANNED_IN_AUDIT_ROWS_PER_NODE` in
+/// `lorica-api`'s log store, backlog #72).
 pub const DEFAULT_STORAGE_CAP_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// How much of one batch a node may store right now.

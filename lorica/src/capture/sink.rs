@@ -628,18 +628,20 @@ fn node_dir_writer() -> &'static CaptureDirWriter {
 mod tests {
     use super::*;
     use crate::capture::{BodyEncoding, CapturedRequest, CapturedResponse, CAPTURE_RECORD_KIND};
+    use crate::otel::log_sink_hub_test_lock as hub_lock;
     use lorica_api::metrics::capture_outcome_value;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    /// The hub is process-global; every test that emits takes this,
-    /// not only the ones that register a lane: a lane one test has
-    /// registered and let die is torn out by the NEXT publish, and a
-    /// sibling emitting in that window would inherit its `Gone` drop.
-    /// An async mutex because one of them holds it across an await.
-    fn hub_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    /// Every event waiting on `lane`, in order. A lane that wants a kind
+    /// other than captures can be handed one by a test outside the hub
+    /// lock (an audit line written by `capture::self_disable` reaches an
+    /// audit-wanting lane), so the assertions below look for the capture
+    /// among what arrived rather than at the first event.
+    fn drain(lane: &mut tokio::sync::mpsc::Receiver<log_sinks::SinkEvent>) -> Vec<SinkKind> {
+        std::iter::from_fn(|| lane.try_recv().ok())
+            .map(|event| event.kind())
+            .collect()
     }
 
     /// A fresh directory under the system temp dir, removed on drop.
@@ -740,8 +742,8 @@ mod tests {
             &ring(),
         );
         assert!(
-            off.try_recv().is_err(),
-            "a lane with capture off gets nothing"
+            !drain(&mut off).contains(&SinkKind::Capture),
+            "a lane with capture off gets no capture"
         );
         assert_eq!(
             dropped("cap-lane-off"),
@@ -1241,11 +1243,9 @@ mod tests {
             &ring(),
         );
 
-        assert_eq!(
-            lane.try_recv()
-                .expect("the lane received the record")
-                .kind(),
-            SinkKind::Capture
+        assert!(
+            drain(&mut lane).contains(&SinkKind::Capture),
+            "the lane received the record"
         );
         // The barrier proves every write enqueued before it has been
         // persisted; the count says none was.

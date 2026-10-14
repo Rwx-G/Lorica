@@ -38,6 +38,8 @@ pub async fn send(config: &WebhookConfig, event: &AlertEvent) -> Result<(), Noti
         crate::events::AlertType::ClusterNodeLeft => ":wave:",
         crate::events::AlertType::ClusterConfigRefused => ":no_entry_sign:",
         crate::events::AlertType::ClusterDrift => ":arrows_counterclockwise:",
+        crate::events::AlertType::LogStoreUnavailable => ":rotating_light:",
+        crate::events::AlertType::LogStoreRecovered => ":floppy_disk:",
     };
 
     let mut text = format!(

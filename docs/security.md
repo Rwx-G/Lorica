@@ -99,7 +99,16 @@ Every state-mutating management-API call is recorded in a dedicated
   `0` = keep forever) and chain-safe: before truncating, the earliest
   surviving row's `prev_chain_hash` is stored as a "retention seal" in
   `audit_log_meta`, which `verify` treats as the new genesis so the
-  surviving suffix still verifies.
+  surviving suffix still verifies. On a control plane it applies to
+  every follower's fanned-in chain too, by arrival time, and to the
+  per-node fan-in backup, so no audit row outlives the setting.
+- **Fan-in ceiling** (control plane, v1.9.2): each follower's chain is
+  capped per node, and the first rows ever cut from it are moved into
+  a per-node backup rather than deleted, up to the same ceiling, so a
+  compromised follower cannot evict its pre-compromise record by
+  flooding. Every cut is recorded in the control plane's own chain
+  (`cluster.audit.cap_cut`), and verify checks the backup. See
+  [cluster.md, "Audit rows are never shed"](cluster.md#audit-rows-are-never-shed).
 
 ### Resource-exhaustion caps (v1.6.0)
 

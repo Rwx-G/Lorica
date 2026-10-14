@@ -859,6 +859,86 @@ services:
     networks:
       - e2e
 
+  # ---- Log-sinks E2E, worker mode (backlog #53) -----------------------
+  # The log-sinks topology on its own volumes, with the node started by
+  # entrypoint-log-sinks-workers.sh (`--workers 2`). The access events
+  # reach the sinks from inside the workers, so the sink counters reach
+  # the supervisor's /metrics only through the per-worker counter
+  # aggregation, which the smoke asserts against the collector's count.
+  #
+  # Run with:
+  #   docker compose --profile log-sinks-workers up --build
+  #   docker compose --profile log-sinks-workers run --rm log-sinks-workers-smoke
+  lorica-log-sinks-workers:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+      args:
+        LORICA_FEATURES: "otel"
+    entrypoint: ["/entrypoint-log-sinks-workers.sh"]
+    profiles: ["log-sinks-workers"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-log-sinks-workers-data:/var/lib/lorica
+      - shared-log-sinks-workers:/shared
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  # Same socat collector as `syslog-collector`, except that each TCP
+  # connection gets its own file under /shared/syslog/. Every worker
+  # holds its own connection, and two of them appending to one file can
+  # interleave a frame mid-header, which would make the frame count the
+  # smoke compares against /metrics unreliable.
+  syslog-collector-log-sinks-workers:
+    build:
+      context: ./test-runner
+    profiles: ["log-sinks-workers"]
+    user: "0:0"
+    entrypoint:
+      - "sh"
+      - "-c"
+      - "mkdir -p /shared/syslog && rm -f /shared/syslog/*.log && exec socat -u TCP-LISTEN:6601,fork,reuseaddr SYSTEM:'cat >> /shared/syslog/conn-$${SOCAT_PEERPORT}.log'"
+    volumes:
+      - shared-log-sinks-workers:/shared
+    networks:
+      - e2e
+
+  otelcol-logs-log-sinks-workers:
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    profiles: ["log-sinks-workers"]
+    user: "0:0"
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./fixtures/otelcol-logs.yaml:/etc/otelcol/config.yaml:ro
+      - shared-log-sinks-workers:/shared
+    networks:
+      - e2e
+
+  log-sinks-workers-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["log-sinks-workers"]
+    entrypoint: ["bash", "run-log-sinks-workers-smoke.sh"]
+    depends_on:
+      - lorica-log-sinks-workers
+      - syslog-collector-log-sinks-workers
+      - otelcol-logs-log-sinks-workers
+    volumes:
+      - shared-log-sinks-workers:/shared:ro
+    environment:
+      - LORICA_API=https://lorica-log-sinks-workers:9443
+      - LORICA_PROXY=http://lorica-log-sinks-workers:8080
+      - BACKEND1_ADDR=backend1:80
+      - SYSLOG_DIR=/shared/syslog
+      - SYSLOG_ENDPOINT=syslog-collector-log-sinks-workers:6601
+      - OTLP_ENDPOINT=http://otelcol-logs-log-sinks-workers:4318
+      - LOG_SINKS_WORKERS=2
+    networks:
+      - e2e
+
   # ---- Capture E2E (v1.8.0 Stories 10.1 / 10.2) ----------------------
   # The log-sinks topology again (one `--features otel` node, the socat
   # syslog collector, the logs-only OTel collector), on its own volumes
@@ -1533,6 +1613,8 @@ volumes:
   shared-audit:
   lorica-log-sinks-data:
   shared-log-sinks:
+  lorica-log-sinks-workers-data:
+  shared-log-sinks-workers:
   lorica-capture-data:
   shared-capture:
   capture-ro:

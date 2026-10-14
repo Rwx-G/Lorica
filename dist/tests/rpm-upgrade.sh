@@ -2,21 +2,28 @@
 # Install tests for the .rpm, run as root on a host booted with systemd
 # (in CI and locally: a privileged Fedora container running /sbin/init).
 #
-#   rpm-upgrade.sh upgrade <released-1.8.0.rpm> <new.rpm>
+#   rpm-upgrade.sh upgrade <released-old.rpm> <new.rpm>
 #   rpm-upgrade.sh clean <new.rpm>
 #
-# `upgrade` installs 1.8.0, whose preun stops and disables the service on
-# every upgrade, and upgrades to the new package: its posttrans must bring
-# the service back, enabled, on the new binary. The new package is then
+# The old package is a released one, 1.8.0 or 1.6.0, called "the old
+# version" below. 1.6.0 is there for its access-log.db, whose schema
+# every release from 1.7.0 to 1.9.1 failed to open: the old node writes
+# audit rows before the upgrade, and every node the new package starts
+# must have persistence (persistence.sh).
+#
+# `upgrade` installs the old version, whose preun stops and disables the
+# service on every upgrade, and upgrades to the new package: its
+# posttrans must bring the service back, enabled, on the new binary,
+# with persistence. The new package is then
 # reinstalled over itself, which runs its own preun with $1 = 1 exactly
 # as an upgrade to the next version does: the service must stay enabled
 # and be restarted. Reinstalled again from each other state an operator
 # can leave the service in, that state must survive: stopped and
 # disabled, stopped and enabled, running and disabled. No reinstall may
 # change the owner of what the node's account owns below its data
-# directory. Erased, it must be stopped. Last, a 1.8.0 node the operator
+# directory. Erased, it must be stopped. Last, an old node the operator
 # stopped and disabled is upgraded: it must stay stopped and disabled,
-# although the 1.8.0 preun disables it on the way out whatever its state.
+# although the old preun disables it on the way out whatever its state.
 #
 # `clean` installs the new package on a host that never had lorica.
 set -uo pipefail
@@ -27,6 +34,9 @@ fail() {
     echo "FAIL: $*"
     exit 1
 }
+
+# shellcheck source=persistence.sh
+. "$(dirname "$0")/persistence.sh"
 
 wait_active() {
     for _ in $(seq 1 60); do
@@ -72,6 +82,7 @@ keeps_state() {
     install_quietly -Uvh --replacepkgs --nosignature "$new"
     if [ "$activity" = active ]; then
         wait_active || fail "$enablement and $activity: not running after the reinstall"
+        assert_persistence "$enablement and $activity"
     else
         sleep 2
         [ "$(systemctl is-active lorica.service)" != active ] \
@@ -88,16 +99,19 @@ keeps_state() {
 }
 
 upgrade() {
-    local old="$1" new="$2"
-    echo "=== install the released 1.8.0"
+    local old="$1" new="$2" OLD
+    OLD=$(rpm -qp --nosignature --qf '%{VERSION}' "$old")
+    echo "=== install the released $OLD"
     install_quietly -ivh --nosignature "$old"
-    wait_active without-record || fail "1.8.0 did not start"
+    wait_active without-record || fail "$OLD did not start"
+    record_old_audit_rows "$OLD"
 
     echo "=== upgrade to the new package"
     install_quietly -Uvh --nosignature "$new"
-    wait_active || fail "not active after the upgrade from 1.8.0, or no served certificate"
-    [ "$(systemctl is-enabled lorica.service)" = enabled ] || fail "not enabled after the upgrade from 1.8.0"
+    wait_active || fail "not active after the upgrade from $OLD, or no served certificate"
+    [ "$(systemctl is-enabled lorica.service)" = enabled ] || fail "not enabled after the upgrade from $OLD"
     echo "active and enabled, $SERVED_CERT written"
+    assert_persistence "upgrade from $OLD"
 
     echo "=== reinstall over itself (its own preun runs with \$1 = 1)"
     pid_before=$(systemctl show -p MainPID --value lorica.service)
@@ -107,6 +121,7 @@ upgrade() {
     pid_after=$(systemctl show -p MainPID --value lorica.service)
     [ "$pid_before" != "$pid_after" ] || fail "not restarted"
     echo "restarted ($pid_before -> $pid_after) and enabled"
+    assert_persistence "reinstall over itself"
 
     echo "=== an upgrade keeps the state the operator left"
     keeps_state disabled inactive "$new"
@@ -118,14 +133,14 @@ upgrade() {
     [ "$(systemctl is-active lorica.service)" != active ] || fail "still active after erase"
     echo "stopped"
 
-    echo "=== a 1.8.0 node stopped and disabled by the operator, upgraded"
+    echo "=== a $OLD node stopped and disabled by the operator, upgraded"
     install_quietly -ivh --nosignature "$old"
-    wait_active without-record || fail "1.8.0 did not start"
+    wait_active without-record || fail "$OLD did not start"
     systemctl disable --now lorica.service > /dev/null 2>&1
     install_quietly -Uvh --nosignature "$new"
     sleep 2
-    [ "$(systemctl is-active lorica.service)" != active ] || fail "the upgrade started a stopped 1.8.0 node"
-    [ "$(systemctl is-enabled lorica.service)" = disabled ] || fail "the upgrade enabled a disabled 1.8.0 node"
+    [ "$(systemctl is-active lorica.service)" != active ] || fail "the upgrade started a stopped $OLD node"
+    [ "$(systemctl is-enabled lorica.service)" = disabled ] || fail "the upgrade enabled a disabled $OLD node"
     echo "stopped and disabled, as left"
     rpm -e lorica > /dev/null 2>&1 || fail "erase"
 }

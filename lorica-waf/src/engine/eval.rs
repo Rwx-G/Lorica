@@ -176,20 +176,10 @@ impl WafEngine {
                 ev.client_ip = client_ip.to_string();
                 ev.timestamp = timestamp.clone();
             }
-            // Store events in the ring buffer. Backlog #41-c : clone
-            // outside the critical section (WafEvent clones allocate
-            // heap Strings) so the lock only covers the pop/push
-            // pointer work. Same capacity and drop-oldest order as
-            // the previous clone-under-lock loop.
-            let cloned: Vec<WafEvent> = events.clone();
-            let mut buf = self.event_buffer.lock();
-            for event in cloned {
-                if buf.len() >= self.max_events {
-                    buf.pop_front();
-                }
-                buf.push_back(event);
-            }
-            drop(buf);
+            // Backlog #41-c : clone outside the critical section
+            // (WafEvent clones allocate heap Strings) so the lock only
+            // covers the pop/push pointer work.
+            self.record_events(events.clone());
 
             let rule_ids: Vec<u32> = events.iter().map(|e| e.rule_id).collect();
             let categories: Vec<&str> = events.iter().map(|e| e.category.as_str()).collect();
@@ -297,17 +287,9 @@ impl WafEngine {
             ev.timestamp = timestamp.clone();
         }
 
-        // Store events in the ring buffer. Backlog #41-c : clone
-        // outside the critical section, same as `evaluate`.
-        let cloned: Vec<WafEvent> = events.clone();
-        let mut buf = self.event_buffer.lock();
-        for event in cloned {
-            if buf.len() >= self.max_events {
-                buf.pop_front();
-            }
-            buf.push_back(event);
-        }
-        drop(buf);
+        // Backlog #41-c : clone outside the critical section, same as
+        // `evaluate`.
+        self.record_events(events.clone());
 
         let rule_ids: Vec<u32> = events.iter().map(|e| e.rule_id).collect();
         let categories: Vec<&str> = events.iter().map(|e| e.category.as_str()).collect();

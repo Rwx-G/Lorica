@@ -29,6 +29,7 @@ use lorica::reload::reload_proxy_config;
 
 use crate::cli::Cli;
 use crate::startup;
+use crate::startup::log_store_health::LogStoreRole;
 use crate::startup::{
     persist_initial_password, restrict_key_permissions, shutdown_signal,
     try_init_otel_from_settings,
@@ -128,13 +129,11 @@ pub(crate) fn run_single_process(cli: Cli) {
             }
         }
 
-        let log_store = match lorica_api::log_store::LogStore::open(&data_dir) {
-            Ok(s) => Some(Arc::new(s)),
-            Err(e) => {
-                warn!(error = %e, "failed to open access log database, persistence disabled");
-                None
-            }
-        };
+        // A store that will not open is retried, alerted on and shown
+        // on every dashboard page, never fatal: see
+        // `startup::log_store_health`.
+        let log_store =
+            startup::log_store_health::open_log_store(&data_dir, LogStoreRole::Single);
 
         let store = Arc::new(Mutex::new(store));
         let log_buffer = Arc::new(LogBuffer::new(10_000));
@@ -185,10 +184,9 @@ pub(crate) fn run_single_process(cli: Cli) {
         // dispatcher + alert bridge + probe scheduler + SLA collector
         // cluster shared with supervisor mode (audit H-9, see
         // `startup::start_alerting_stack`). The dispatcher handle is
-        // kept: the config-reload listener below rebuilds it when
-        // notification channels change (Story 8.1 asymmetry, fixed in
-        // v1.5.11: edits used to be ignored until restart in
-        // single-process mode while supervisor mode hot-reloaded them).
+        // kept: the config-reload listener below reapplies its channels
+        // when notification settings change (Story 8.1 asymmetry, fixed
+        // in v1.5.11).
         let alert_sender = lorica_notify::AlertSender::new(256);
         let startup::AlertingStack {
             notify_dispatcher,
@@ -196,6 +194,16 @@ pub(crate) fn run_single_process(cli: Cli) {
             probe_scheduler,
             sla_collector,
         } = startup::start_alerting_stack(&store, &alert_sender, log_store.clone()).await;
+        let _log_store_retry = startup::log_store_health::spawn_log_store_retry(
+            log_store.clone(),
+            data_dir.clone(),
+            LogStoreRole::Single,
+            startup::log_store_health::LOG_STORE_RETRY_INTERVAL,
+        );
+        let _log_store_watch = startup::log_store_health::spawn_log_store_watch(
+            alert_sender.clone(),
+            startup::log_store_health::LOG_STORE_WATCH_INTERVAL,
+        );
 
         // Load-test engine + cron scheduler (shared helper, see
         // `startup::start_load_test_engine`)
@@ -215,15 +223,13 @@ pub(crate) fn run_single_process(cli: Cli) {
         lorica_proxy.waf_engine = Arc::clone(&waf_engine);
         lorica_proxy.acme_challenge_store = Some(acme_challenge_store.clone());
         lorica_proxy.alert_sender = Some(alert_sender.clone());
-        // Hand the proxy a producer handle for the background log
-        // writer (batched access-log + WAF-event persistence,
-        // backlog #24) instead of a direct LogStore reference. A
-        // clone also goes into AppState so the clear endpoints can
-        // flush in-flight writes before wiping.
-        let log_writer = log_store
-            .as_ref()
-            .map(|s| lorica_api::log_writer::spawn_log_writer(Arc::clone(s)));
-        lorica_proxy.log_writer = log_writer.clone();
+        // Hand the proxy the slot whose background log writer takes
+        // the access logs and WAF events (batched persistence, backlog
+        // #24) instead of a direct LogStore reference. The writer also
+        // goes into AppState so the clear endpoints can flush in-flight
+        // writes before wiping.
+        lorica_proxy.log_store = log_store.clone();
+        let api_log_writer = log_store.writer().cloned();
 
         // GeoIP: load the DB from `GlobalSettings.geoip_db_path` so
         // the request_filter can resolve client IPs. If auto-update is
@@ -378,7 +384,7 @@ pub(crate) fn run_single_process(cli: Cli) {
         let api_store = Arc::clone(&store);
         let api_log_buffer = Arc::clone(&log_buffer);
         let api_active_connections = Arc::clone(&active_connections);
-        let api_log_store = log_store.clone();
+        let api_log_store = log_store.store();
         let management_port = cli.management_port;
         let cluster_listen = cli.cluster_listen.clone();
         let cluster_enrollment_listen = cli.cluster_enrollment_listen.clone();
@@ -492,7 +498,7 @@ pub(crate) fn run_single_process(cli: Cli) {
                 load_test_engine: Some(Arc::clone(&load_test_engine)),
                 notification_history: Some(notification_history),
                 log_store: api_log_store,
-                log_writer: log_writer.clone(),
+                log_writer: api_log_writer,
                 task_tracker: api_task_tracker,
                 cluster: cluster_runtime,
                 oidc: oidc_verifier,
@@ -540,8 +546,8 @@ pub(crate) fn run_single_process(cli: Cli) {
 
         // Hourly retention loop (access logs, probe results, WAF
         // events, SLA buckets), shared across modes (audit H-9, see
-        // `startup::spawn_retention_loop`). No-op when the access-log
-        // store failed to open.
+        // `startup::spawn_retention_loop`). The access-log jobs wait
+        // for a store that failed to open.
         startup::spawn_retention_loop(
             log_store.clone(),
             Arc::clone(&store),
@@ -578,16 +584,8 @@ pub(crate) fn run_single_process(cli: Cli) {
                 }
                 lorica::reload::reload_cert_resolver(&reload_store, &reload_cert_resolver).await;
                 reload_probe_scheduler.reload().await;
-                {
-                    let s = reload_store.lock().await;
-                    reload_sla_collector.load_configs(&s);
-                    // Rebuild notification dispatcher with updated
-                    // channel configs, mirroring supervisor mode
-                    // (Story 8.1 asymmetry, fixed in v1.5.11).
-                    let new_dispatcher = startup::build_notify_dispatcher(&s);
-                    let mut d = reload_notify_dispatcher.lock().await;
-                    *d = new_dispatcher;
-                }
+                reload_sla_collector.load_configs(&*reload_store.lock().await);
+                startup::reload_notify_dispatcher(&reload_store, &reload_notify_dispatcher).await;
             }
         });
 
@@ -640,15 +638,10 @@ pub(crate) fn run_single_process(cli: Cli) {
             follower.shutdown();
         }
 
-        // Drain tracked background tasks before tearing down the API
-        // server. Bounded at 10 s so a hung task does not delay exit.
-        shutdown_task_tracker.close();
-        if tokio::time::timeout(Duration::from_secs(10), shutdown_task_tracker.wait())
-            .await
-            .is_err()
-        {
-            warn!("some background tasks did not finish within drain timeout; aborting");
-        }
+        // Drain tracked background tasks and cluster units in flight
+        // before tearing down the API server, each bounded so a hung
+        // task does not delay exit.
+        startup::drain_for_exit(&shutdown_task_tracker).await;
         api_handle.abort();
         health_handle.abort();
 

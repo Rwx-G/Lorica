@@ -25,7 +25,7 @@ info:
     reachable by no token, including a token carrying every scope in the
     enum: refusing outright is what keeps a path added without a
     declaration from silently inheriting the widest grant.
-  version: "1.9.1"
+  version: "1.9.2"
   license:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
@@ -614,8 +614,9 @@ paths:
       tags: [Reads]
       summary: WAF counters
       description: >-
-        Total events, events in the last 24 hours, the loaded rule
-        count and the count per category, the counters up to five
+        Total events, events in the last 24 hours and in the last hour,
+        the loaded rule count, and the count per category over all
+        events held and over the last hour, the counters up to five
         seconds old: they count the whole retained table under the log
         store's one connection, so the plane computes them at most once
         per five seconds however often it is asked, and a clear of the
@@ -623,8 +624,8 @@ paths:
         computed per call.
 
 
-        Not paginated, because it is not a row set: the only array it
-        carries is the count per rule category, a fixed vocabulary of
+        Not paginated, because it is not a row set: the only arrays it
+        carries are counts per rule category, a fixed vocabulary of
         rule families rather than something that grows with traffic.
 
 

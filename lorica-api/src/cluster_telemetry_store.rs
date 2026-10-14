@@ -225,11 +225,12 @@ impl ClusterTelemetryStore {
         // dashboard) does not block the writer (ingest), a busy
         // timeout so a slow retention chunk answers rather than
         // failing, and NORMAL sync because losing the last few
-        // telemetry rows on a crash costs nothing.
+        // telemetry rows on a crash costs nothing. The busy timeout goes
+        // first so it already covers the lock `journal_mode` may wait on.
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; \
-             PRAGMA synchronous=NORMAL; \
-             PRAGMA busy_timeout=5000;",
+            "PRAGMA busy_timeout=5000; \
+             PRAGMA journal_mode=WAL; \
+             PRAGMA synchronous=NORMAL;",
         )
         .map_err(|e| format!("failed to configure the cluster telemetry database: {e}"))?;
 
@@ -286,6 +287,17 @@ impl ClusterTelemetryStore {
                 ON fleet_waf_events(node_id, timestamp);
             CREATE INDEX IF NOT EXISTS idx_fleet_waf_ts
                 ON fleet_waf_events(timestamp);
+            -- The category filter (backlog #70). Without these the
+            -- planner walks id DESC testing every row, so a rare or
+            -- absent category scans the node's whole quota (or the
+            -- whole table) under the lock every ingest needs. One per
+            -- shape: the leading node_id cannot serve the fleet-wide
+            -- query. IF NOT EXISTS is also the migration: an existing
+            -- file gains them on its next open.
+            CREATE INDEX IF NOT EXISTS idx_fleet_waf_category
+                ON fleet_waf_events(node_id, category, id);
+            CREATE INDEX IF NOT EXISTS idx_fleet_waf_category_fleet
+                ON fleet_waf_events(category, id);
 
             -- Bans are a SNAPSHOT, not a stream (decision D3): a node
             -- holds them in memory and rebuilds from nothing on
@@ -527,19 +539,20 @@ impl ClusterTelemetryStore {
         node_id: &str,
         rows_per_node: u64,
     ) -> Result<u64, String> {
-        let table = table.as_str();
         let cut: Option<i64> = {
             let conn = self.conn.lock();
             conn.query_row(
-                &format!(
-                    "SELECT id FROM {table} WHERE node_id = ?1
-                     ORDER BY id DESC LIMIT 1 OFFSET ?2"
-                ),
+                &Self::quota_cut_sql(table),
                 rusqlite::params![node_id, i64::try_from(rows_per_node).unwrap_or(i64::MAX)],
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| format!("failed to find the retention cut for {table}: {e}"))?
+            .map_err(|e| {
+                format!(
+                    "failed to find the retention cut for {}: {e}",
+                    table.as_str()
+                )
+            })?
         };
         // No row at that offset: the node holds at most its quota.
         let Some(cut) = cut else {
@@ -551,19 +564,14 @@ impl ClusterTelemetryStore {
             let chunk = {
                 let conn = self.conn.lock();
                 conn.execute(
-                    &format!(
-                        "DELETE FROM {table} WHERE id IN (
-                             SELECT id FROM {table} WHERE node_id = ?1 AND id <= ?2
-                             ORDER BY id ASC LIMIT ?3
-                         )"
-                    ),
+                    &Self::quota_chunk_sql(table),
                     rusqlite::params![
                         node_id,
                         cut,
                         i64::try_from(RETENTION_CHUNK).unwrap_or(i64::MAX)
                     ],
                 )
-                .map_err(|e| format!("failed to prune {table}: {e}"))?
+                .map_err(|e| format!("failed to prune {}: {e}", table.as_str()))?
             };
             // The guard is dropped here, between chunks, on purpose:
             // ingest gets the lock back instead of waiting out the
@@ -573,6 +581,38 @@ impl ClusterTelemetryStore {
             }
             removed += chunk as u64;
         }
+    }
+
+    /// The statement that finds [`ClusterTelemetryStore::enforce_node_quota`]'s
+    /// cut. Separate, like the two below, so the query-plan tests
+    /// inspect the SQL the retention path issues rather than a copy.
+    fn quota_cut_sql(table: TelemetryTable) -> String {
+        format!(
+            "SELECT id FROM {} WHERE node_id = ?1
+             ORDER BY id DESC LIMIT 1 OFFSET ?2",
+            table.as_str()
+        )
+    }
+
+    /// One chunk of [`ClusterTelemetryStore::enforce_node_quota`]'s delete.
+    fn quota_chunk_sql(table: TelemetryTable) -> String {
+        let table = table.as_str();
+        format!(
+            "DELETE FROM {table} WHERE id IN (
+                 SELECT id FROM {table} WHERE node_id = ?1 AND id <= ?2
+                 ORDER BY id ASC LIMIT ?3
+             )"
+        )
+    }
+
+    /// One chunk of [`ClusterTelemetryStore::forget_node`]'s delete.
+    fn forget_chunk_sql(table: TelemetryTable) -> String {
+        let table = table.as_str();
+        format!(
+            "DELETE FROM {table} WHERE id IN (
+                 SELECT id FROM {table} WHERE node_id = ?1 LIMIT ?2
+             )"
+        )
     }
 
     /// Drop everything one node ever fanned in: both series and its
@@ -594,22 +634,22 @@ impl ClusterTelemetryStore {
     pub fn forget_node(&self, node_id: &str) -> Result<u64, String> {
         let mut removed = 0u64;
         for table in [TelemetryTable::Access, TelemetryTable::Waf] {
-            let table = table.as_str();
             loop {
                 let chunk = {
                     let conn = self.conn.lock();
                     conn.execute(
-                        &format!(
-                            "DELETE FROM {table} WHERE id IN (
-                                 SELECT id FROM {table} WHERE node_id = ?1 LIMIT ?2
-                             )"
-                        ),
+                        &Self::forget_chunk_sql(table),
                         rusqlite::params![
                             node_id,
                             i64::try_from(RETENTION_CHUNK).unwrap_or(i64::MAX)
                         ],
                     )
-                    .map_err(|e| format!("failed to reclaim {table} for a retired node: {e}"))?
+                    .map_err(|e| {
+                        format!(
+                            "failed to reclaim {} for a retired node: {e}",
+                            table.as_str()
+                        )
+                    })?
                 };
                 if chunk == 0 {
                     break;
@@ -732,14 +772,7 @@ impl ClusterTelemetryStore {
     ///
     /// Returns the SQLite error text on a read failure.
     pub fn query_waf(&self, params: &FleetQuery) -> Result<Vec<FleetWafRow>, String> {
-        let (where_clause, binds) = params.build_where("route_hostname", Some("category"));
-        let sql = format!(
-            "SELECT id, node_id, rule_id, description, category, severity, matched_field,
-                    matched_value, timestamp, client_ip, route_hostname, action
-             FROM fleet_waf_events {where_clause}
-             ORDER BY id DESC LIMIT {}",
-            params.page()
-        );
+        let (sql, binds) = Self::waf_query_sql(params);
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(&sql)
@@ -768,6 +801,21 @@ impl ClusterTelemetryStore {
             out.push(row.map_err(|e| format!("failed to read a fleet WAF row: {e}"))?);
         }
         Ok(out)
+    }
+
+    /// The statement [`ClusterTelemetryStore::query_waf`] runs, and its
+    /// binds. Separate so the query-plan tests inspect the exact SQL
+    /// the read path issues rather than a copy that could drift from it.
+    fn waf_query_sql(params: &FleetQuery) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+        let (where_clause, binds) = params.build_where("route_hostname", Some("category"));
+        let sql = format!(
+            "SELECT id, node_id, rule_id, description, category, severity, matched_field,
+                    matched_value, timestamp, client_ip, route_hostname, action
+             FROM fleet_waf_events {where_clause}
+             ORDER BY id DESC LIMIT {}",
+            params.page()
+        );
+        (sql, binds)
     }
 
     /// How many rows one node holds in one table. Test and diagnostic
@@ -834,16 +882,25 @@ impl FleetQuery {
             conditions.push(format!("{route_column} LIKE ?"));
             binds.push(Box::new(format!("%{route}%")));
         }
+        // With a category filter the time bounds are written `+timestamp`,
+        // which keeps them as filters but out of index selection. Without
+        // statistics the planner otherwise prefers `(node_id, timestamp)`
+        // or `(timestamp)` for a node plus a time bound, then reads every
+        // row of the window and sorts it for `id DESC`: on a rare category
+        // that is the whole-quota walk under the ingest lock the category
+        // indexes exist to remove (backlog #70).
+        let mut timestamp = "timestamp";
         if let (Some(column), Some(category)) = (category_column, &self.category) {
             conditions.push(format!("{column} = ?"));
             binds.push(Box::new(category.clone()));
+            timestamp = "+timestamp";
         }
         if let Some(from) = &self.from {
-            conditions.push("timestamp >= ?".to_string());
+            conditions.push(format!("{timestamp} >= ?"));
             binds.push(Box::new(from.clone()));
         }
         if let Some(to) = &self.to {
-            conditions.push("timestamp <= ?".to_string());
+            conditions.push(format!("{timestamp} <= ?"));
             binds.push(Box::new(to.clone()));
         }
         if let Some(before) = self.before_id {
@@ -1281,5 +1338,300 @@ mod tests {
             store.nodes_with_rows().expect("list"),
             vec!["node-a".to_string(), "node-b".to_string()]
         );
+    }
+
+    /// The `EXPLAIN QUERY PLAN` detail lines for the statement
+    /// [`ClusterTelemetryStore::query_waf`] runs with `params`.
+    fn waf_plan(store: &ClusterTelemetryStore, params: &FleetQuery) -> String {
+        let (sql, binds) = ClusterTelemetryStore::waf_query_sql(params);
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        plan_of(store, &sql, refs.as_slice())
+    }
+
+    /// The `EXPLAIN QUERY PLAN` detail lines for `sql`, joined.
+    fn plan_of(store: &ClusterTelemetryStore, sql: &str, binds: &[&dyn rusqlite::ToSql]) -> String {
+        let conn = store.conn.lock();
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("the statement plans");
+        let details = stmt
+            .query_map(binds, |row| row.get::<_, String>(3))
+            .expect("the plan runs");
+        details
+            .map(|d| d.expect("a plan row"))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// Every statement shape `query_waf` can issue: each filter of
+    /// [`FleetQuery`] present and absent, in every combination.
+    fn every_waf_shape() -> Vec<FleetQuery> {
+        // Exhaustive on purpose: a filter added to `FleetQuery` fails
+        // to compile here until it is given a place in the loops below.
+        let FleetQuery {
+            node_id: _,
+            route: _,
+            from: _,
+            to: _,
+            category: _,
+            before_id: _,
+            limit: _,
+        } = FleetQuery::default();
+        let window = [
+            (None, None),
+            (Some("2026-09-09T00:00:00Z"), None),
+            (None, Some("2026-09-10T00:00:00Z")),
+            (Some("2026-09-09T00:00:00Z"), Some("2026-09-10T00:00:00Z")),
+        ];
+        let mut shapes = Vec::new();
+        for node_id in [None, Some("node-1")] {
+            for category in [None, Some(RARE_CATEGORY)] {
+                for route in [None, Some("shop")] {
+                    for (from, to) in window {
+                        for before_id in [None, Some(300)] {
+                            shapes.push(FleetQuery {
+                                node_id: node_id.map(str::to_string),
+                                route: route.map(str::to_string),
+                                from: from.map(str::to_string),
+                                to: to.map(str::to_string),
+                                category: category.map(str::to_string),
+                                before_id,
+                                limit: 0,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        shapes
+    }
+
+    const DOMINANT_CATEGORY: &str = "sqli";
+    const RARE_CATEGORY: &str = "ssrf";
+    const ABSENT_CATEGORY: &str = "never-seen";
+
+    /// 0.1% rare, the rest split 70/20/10 between a dominant category
+    /// and two common ones: the shape of a WAF log where one rule
+    /// family fires on every scanner and another almost never.
+    fn waf_category_for(i: usize) -> &'static str {
+        if i % 1000 == 999 {
+            RARE_CATEGORY
+        } else {
+            match i % 10 {
+                0..=6 => DOMINANT_CATEGORY,
+                7 | 8 => "xss",
+                _ => "lfi",
+            }
+        }
+    }
+
+    /// Seed `per_node` WAF rows for each of `nodes` nodes, interleaved
+    /// row by row the way concurrent pushes interleave the shared id.
+    fn seed_waf_fleet(store: &ClusterTelemetryStore, nodes: usize, per_node: usize) {
+        let mut conn = store.conn.lock();
+        let tx = conn.transaction().expect("test setup: transaction");
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO fleet_waf_events
+                        (node_id, rule_id, description, category, severity, matched_field,
+                         matched_value, timestamp, client_ip, route_hostname, action)
+                     VALUES (?1, 942100, 'rule', ?2, 5, 'ARGS:id', '1 OR 1=1',
+                             '2026-09-09T10:00:00Z', '192.0.2.11', 'shop.example.com', 'block')",
+                )
+                .expect("test setup: prepare");
+            for i in 0..per_node {
+                for n in 0..nodes {
+                    stmt.execute(rusqlite::params![format!("node-{n}"), waf_category_for(i)])
+                        .expect("test setup: seed a WAF row");
+                }
+            }
+        }
+        tx.commit().expect("test setup: commit");
+    }
+
+    /// Put the file back in its pre-#70 shape, as a database written by
+    /// an earlier release would be.
+    fn drop_category_indexes(store: &ClusterTelemetryStore) {
+        store
+            .conn
+            .lock()
+            .execute_batch(
+                "DROP INDEX idx_fleet_waf_category;
+                 DROP INDEX idx_fleet_waf_category_fleet;",
+            )
+            .expect("test setup: drop the category indexes");
+    }
+
+    #[test]
+    fn the_category_filter_rides_an_index_in_every_shape() {
+        // A plan assertion rather than a timing one: on a small table a
+        // scan is as fast as a seek, and what regresses silently is the
+        // plan. Without these indexes a rare category walked the whole
+        // node quota, or the whole table, under the ingest lock. The
+        // time window matters most: it makes the timestamp indexes
+        // candidates too, and those cannot deliver id DESC unsorted.
+        let (store, _dir) = store();
+        seed_waf_fleet(&store, 3, 200);
+        for query in every_waf_shape()
+            .into_iter()
+            .filter(|q| q.category.is_some())
+        {
+            let plan = waf_plan(&store, &query);
+            let expected = if query.node_id.is_some() {
+                "USING INDEX idx_fleet_waf_category ("
+            } else {
+                "USING INDEX idx_fleet_waf_category_fleet ("
+            };
+            assert!(plan.contains(expected), "{query:?}: {plan}");
+            assert!(
+                !plan.contains("TEMP B-TREE"),
+                "the index must also deliver id DESC without a sort: {query:?}: {plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_category_indexes_change_no_plan_that_does_not_filter_on_category() {
+        // `idx_fleet_waf_category` leads with node_id like
+        // `idx_fleet_waf_node_id` does, so the planner could take it for
+        // a node-scoped read it cannot order. Every shape without a
+        // category must plan exactly as it did before the indexes.
+        let (baseline, _baseline_dir) = store();
+        let (store, _dir) = store();
+        drop_category_indexes(&baseline);
+        seed_waf_fleet(&store, 3, 200);
+        seed_waf_fleet(&baseline, 3, 200);
+        for query in every_waf_shape()
+            .into_iter()
+            .filter(|q| q.category.is_none())
+        {
+            let plan = waf_plan(&store, &query);
+            assert_eq!(plan, waf_plan(&baseline, &query), "{query:?}");
+            assert!(
+                !plan.contains("idx_fleet_waf_category"),
+                "{query:?}: {plan}"
+            );
+        }
+        let page = waf_plan(
+            &store,
+            &FleetQuery {
+                node_id: Some("node-1".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            page.contains("USING INDEX idx_fleet_waf_node_id (") && !page.contains("TEMP B-TREE"),
+            "a node's page walks (node_id, id) backwards: {page}"
+        );
+    }
+
+    #[test]
+    fn the_retention_statements_stay_on_the_node_id_index() {
+        let (store, _dir) = store();
+        seed_waf_fleet(&store, 3, 200);
+        let node: &dyn rusqlite::ToSql = &"node-1";
+        let cut = plan_of(
+            &store,
+            &ClusterTelemetryStore::quota_cut_sql(TelemetryTable::Waf),
+            &[node, &100i64],
+        );
+        let chunk = plan_of(
+            &store,
+            &ClusterTelemetryStore::quota_chunk_sql(TelemetryTable::Waf),
+            &[node, &300i64, &100i64],
+        );
+        let forget = plan_of(
+            &store,
+            &ClusterTelemetryStore::forget_chunk_sql(TelemetryTable::Waf),
+            &[node, &100i64],
+        );
+        for (name, plan) in [("quota cut", &cut), ("quota chunk", &chunk)] {
+            assert!(
+                plan.contains("idx_fleet_waf_node_id (") && !plan.contains("TEMP B-TREE"),
+                "the {name} walks (node_id, id) in order: {plan}"
+            );
+        }
+        assert!(
+            !forget.contains("SCAN fleet_waf_events"),
+            "reclaiming a node seeks its rows: {forget}"
+        );
+    }
+
+    #[test]
+    fn an_existing_database_gains_the_category_indexes_on_open() {
+        let (store, dir) = store();
+        drop_category_indexes(&store);
+        drop(store);
+        let store = ClusterTelemetryStore::open(dir.path()).expect("reopen");
+        let query = FleetQuery {
+            category: Some(RARE_CATEGORY.to_string()),
+            ..Default::default()
+        };
+        assert!(waf_plan(&store, &query).contains("idx_fleet_waf_category_fleet"));
+        // And a second open over a file that has them is a no-op.
+        drop(store);
+        ClusterTelemetryStore::open(dir.path()).expect("an idempotent reopen");
+    }
+
+    /// Backlog #70 measurement: plan and wall time of the category
+    /// filter on a fleet at its per-node row cap. Prints, asserts
+    /// nothing; the guard is the plan test below.
+    #[test]
+    #[ignore = "measurement (backlog #70): seeds five nodes at the per-node row cap"]
+    fn measure_waf_category_filter_at_the_row_cap() {
+        const NODES: usize = 5;
+        let per_node = DEFAULT_ROWS_PER_NODE as usize;
+        let dir = tempfile::tempdir().expect("test setup: temp dir");
+        {
+            let store = ClusterTelemetryStore::open(dir.path()).expect("test setup: open");
+            drop_category_indexes(&store);
+            let started = std::time::Instant::now();
+            seed_waf_fleet(&store, NODES, per_node);
+            eprintln!(
+                "[#70] seeded {} rows in {:?}",
+                NODES * per_node,
+                started.elapsed()
+            );
+        }
+        {
+            // The write-side price of the category indexes.
+            let (indexed, _indexed_dir) = store();
+            let started = std::time::Instant::now();
+            seed_waf_fleet(&indexed, NODES, per_node);
+            eprintln!(
+                "[#70] seeded {} rows with the category indexes in {:?}",
+                NODES * per_node,
+                started.elapsed()
+            );
+        }
+        // Reopening is what an upgraded control plane does: any index
+        // the schema gained since the file was written is built here.
+        let started = std::time::Instant::now();
+        let store = ClusterTelemetryStore::open(dir.path()).expect("reopen");
+        eprintln!("[#70] reopen (schema migration) {:?}", started.elapsed());
+
+        for (scope, node) in [("fleet-wide", None), ("one node", Some("node-2"))] {
+            for category in [DOMINANT_CATEGORY, RARE_CATEGORY, ABSENT_CATEGORY] {
+                let query = FleetQuery {
+                    node_id: node.map(str::to_string),
+                    category: Some(category.to_string()),
+                    ..Default::default()
+                };
+                let plan = waf_plan(&store, &query);
+                let mut times = Vec::new();
+                let mut rows = 0;
+                for _ in 0..5 {
+                    let started = std::time::Instant::now();
+                    rows = store.query_waf(&query).expect("query").len();
+                    times.push(started.elapsed());
+                }
+                times.sort();
+                eprintln!(
+                    "[#70] {scope:<10} category={category:<10} rows={rows:<3} median={:?} max={:?} plan: {plan}",
+                    times[2], times[4]
+                );
+            }
+        }
     }
 }

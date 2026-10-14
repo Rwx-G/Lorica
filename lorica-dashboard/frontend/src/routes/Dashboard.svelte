@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, type Component } from 'svelte';
 
-  import { api } from '../lib/api';
+  import { api, type LogStoreStatus } from '../lib/api';
   import {
     clusterStatus,
     breakGlassActive,
@@ -11,7 +11,10 @@
 
   /** How often the fleet state is refreshed while a tab is open. */
   const CLUSTER_POLL_MS = 10_000;
+  /** How often the log-store state behind the banner is re-read. */
+  const LOG_STORE_POLL_MS = 30_000;
   import Nav from '../components/Nav.svelte';
+  import LogStoreBanner from '../components/LogStoreBanner.svelte';
   import Placeholder from './Placeholder.svelte';
   import { currentPath } from '../lib/router';
   import { isDynamicImportError } from '../lib/chunk-reload';
@@ -93,11 +96,26 @@
     if (res.data) clusterStatus.set(res.data);
   }
 
+  // A node that cannot open its access-log store keeps serving, so
+  // nothing else on screen would say its audit trail, access logs and
+  // WAF events are being lost. Polled here so the banner is on every
+  // page, not only the one that happens to read the status.
+  let logStore: LogStoreStatus | null = $state(null);
+  async function refreshLogStore() {
+    const res = await api.getStatus();
+    if (res.data) logStore = res.data.log_store;
+  }
+
   onMount(() => {
     void loadRoute(path);
     void refreshCluster();
+    void refreshLogStore();
     const timer = setInterval(() => void refreshCluster(), CLUSTER_POLL_MS);
-    return () => clearInterval(timer);
+    const logStoreTimer = setInterval(() => void refreshLogStore(), LOG_STORE_POLL_MS);
+    return () => {
+      clearInterval(timer);
+      clearInterval(logStoreTimer);
+    };
   });
 
   $effect(() => {
@@ -107,6 +125,7 @@
 
 <Nav />
 <main class="content">
+  <LogStoreBanner status={logStore} />
   {#if $clusterStatus && isClustered($clusterStatus)}
     {@const badge = fleetBadge($clusterStatus)}
     <div class="fleet-bar">

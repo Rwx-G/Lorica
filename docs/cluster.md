@@ -413,7 +413,7 @@ rather than as an exception:
 |-------|---------|---------|-----------------|------------|----------------|--------------------|
 | Gauge | CPU, memory, disk | heartbeat | none, replaced each beat | its own fixed shape | superseded within one beat | no, session state by design |
 | Sheddable series | access rows, WAF events | fan-in, with cursors | rowid cursor, advanced per class on what was accepted | local retention, per-node quota, storage watermark | dropped and counted; the cursor holds | the cursor is persisted |
-| Durable series | audit rows | fan-in, with a cursor | rowid cursor, all-or-nothing per batch | charged to the quota but exempt from its verdict; a per-session push rate; retention by arrival time | never shed; a short count means storage failed | the cursor is persisted |
+| Durable series | audit rows | fan-in, with a cursor | rowid cursor, all-or-nothing per batch | charged to the quota but exempt from its verdict; a per-session push rate; retention by arrival time; a per-node row ceiling | never shed on the way in; past the ceiling the oldest stored rows are cut, sealed; a short count means storage failed | the cursor is persisted |
 | Live-state snapshot | bans | fan-in, no cursor | none, replaced wholesale | the storage watermark only | lossy by construction | no |
 
 Bans are the case the first sentence alone would have sent to the
@@ -742,9 +742,21 @@ because verify walks one table and a chain that lived elsewhere could
 not be reported beside the local one. What keeps that from re-creating
 the contention above is that audit rows are rare by nature, bounded per
 batch and per session (a push rate cap), charged to the per-node quota,
-and aged by the time they ARRIVED rather than by the timestamp the
-origin chose. Whether the shared connection shows under a large fleet
-is a measurement to take, not a fact to assert; backlog #75 holds it.
+aged by the time they ARRIVED rather than by the timestamp the origin
+chose, and capped per node (see "Audit rows are never shed"). That file
+is not the one the storage watermark measures, which is why the
+per-node ceiling exists.
+
+Whether the shared connection shows under a large fleet was measured
+rather than asserted (backlog #75, `lorica-api/tests/audit_fan_in_contention.rs`,
+which holds the scenarios and the numbers). At five followers pushing
+on the same tick, the control plane's access-log writer kept the
+latency it has with none, so the connection stays shared. What did show
+was anything holding it for a whole chain: verify walking a 200,000-row
+follower chain put the writer 25 seconds behind. Verify, the per-node
+ceiling and day-based retention therefore work in fixed-size chunks
+(`AUDIT_CHUNK` in `lorica-api/src/log_store.rs`), releasing the
+connection between them.
 
 ### The drain never touches the request path
 
@@ -1032,6 +1044,79 @@ Exempt from shedding is not unbounded: the batch is bounded on the
 wire like every other kind, so a peer cannot make the control plane
 allocate arbitrarily.
 
+Nor is it unbounded at rest. Day-based retention ages a fanned-in row
+by when it arrived, which bounds how long a row stays but not how many
+a node can send inside the window, and the rows land in
+`access-log.db`, which the fan-in storage watermark does not measure.
+So each follower's chain also has a row ceiling
+(`FANNED_IN_AUDIT_ROWS_PER_NODE` in `lorica-api/src/log_store.rs`, where
+its sizing is argued), enforced by the same hourly pass as day-based
+retention:
+
+- It is sized so an honest node never reaches it. A node that does is
+  one to look at: the pass logs it at WARN, and records every cut in
+  the control plane's OWN chain as a `cluster.audit.cap_cut` row naming
+  the node, the rows cut, their `origin_id` range and how many were
+  kept in the backup or deleted. That chain is one no peer can cap or
+  write, so the cut and the seal it moved stay on record whatever the
+  follower does next.
+- It cuts the node's OLDEST rows, as a prefix of that node's own order,
+  and seals the chain exactly as day-based retention does, so verify
+  still reports it whole. Nothing is cut out of the middle.
+- The first rows ever cut from a node are not deleted but moved, in the
+  cut's own transaction, into a per-node fan-in backup
+  (`audit_log_fanned_in_backup`), up to the same ceiling over the
+  node's lifetime; past that, cut rows are deleted. This answers the
+  case the ceiling would otherwise hand an attacker: a compromised
+  follower controls its own chain head and can push it past the
+  ceiling in minutes, which without the backup would evict, within the
+  hour and with a clean verify, everything it sent BEFORE the
+  compromise. The backup keeps those oldest rows, is filled once and
+  never overwritten (rows it ages out do not make room for later ones,
+  and a run that does not chain onto its last row closes it), and so
+  bounds one node at twice the ceiling in `access-log.db`.
+- The backup is a contiguous run of the chain with every row's
+  original hashes, and `GET /api/v1/audit/verify` checks it link by
+  link from its own first row, reported as a `backup` verdict beside
+  that node's chain verdict. The top-level `verified` covers it. It
+  ages out with day-based retention, by arrival time, like the chain
+  it came from.
+- It is per node: one node over its ceiling loses its own oldest rows
+  and nobody else's.
+- It never applies to the control plane's own chain, which is bounded
+  by the audit retention setting alone. The ceiling bounds what a peer
+  can make this store hold, not the local record.
+- Being enforced hourly, the bound actually held is twice the ceiling
+  (chain and backup) plus what one node can push in an hour at its
+  session's push cap.
+
+Rows the ceiling deletes, once the backup is full, are gone from the
+aggregated copy only: they are still on the origin node, still
+verifiable there, and still in that node's `lorica::audit` stream. On
+a compromised node only the last of those is out of the attacker's
+reach, and only where an operator ships it to a write-once sink.
+
+**Reading the backup.** No API lists its rows: verify establishes that
+it is intact, and reading it is a forensic step taken after a
+`cluster.audit.cap_cut` row, on the control plane host. Run verify
+first, so what you read is known to be unaltered, then open the file
+read-only as root or as the `lorica` user (the path assumes the default
+data directory):
+
+```bash
+sudo sqlite3 -readonly /var/lib/lorica/access-log.db \
+  "SELECT * FROM audit_log_fanned_in_backup
+   WHERE node_id = '<node-id>' ORDER BY origin_id;"
+```
+
+`access-log.db` runs in WAL mode, so a reader does not block Lorica's
+writer. Do not open it read-write: a row changed by hand is a break the
+next verify reports.
+
+A row a follower re-sends at or below the position of its chain's last
+cut is acknowledged and not stored: it was held once, and stored again
+it would sit before the seal and read as a break.
+
 A node that joins an existing fleet ships what it records from then on,
 not its whole pre-cluster history. Those rows are still on the node and
 still verifiable there.
@@ -1065,6 +1150,7 @@ identity, role and source address where there is an operator, and a
 | Fleet-wide ban | `cluster.ban.fleet` | control plane |
 | Configuration apply | `cluster.config.apply` | follower |
 | Refused identity, protocol violation | `cluster.identity.refused`, `cluster.protocol.violation` | control plane |
+| A follower's audit chain cut by the per-node ceiling | `cluster.audit.cap_cut` | control plane |
 
 `cluster.config.apply` records BOTH outcomes. A refusal is the more
 interesting one: it is the case where a node is knowingly serving

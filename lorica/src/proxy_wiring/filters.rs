@@ -138,7 +138,7 @@ pub(crate) fn build_redirect_location(
 impl LoricaProxy {
     /// Persist a `WafEvent` to the SQLite-backed `LogStore`.
     ///
-    /// No-op when no log writer is configured. The event is handed to
+    /// No-op while no log store is open in this process. The event is handed to
     /// the background log writer queue (backlog #24): the hot path
     /// never touches SQLite. Persistence failures surface from the
     /// writer thread as a `warn!` per batch plus
@@ -149,7 +149,7 @@ impl LoricaProxy {
     /// Prometheus category counters still surface the events, only
     /// the persistent forensics trail is shed.
     pub(super) fn persist_waf_event(&self, ev: &lorica_waf::WafEvent) {
-        if let Some(ref writer) = self.log_writer {
+        if let Some(writer) = self.log_store.writer() {
             writer.enqueue_waf(ev.clone());
         }
         // Story 9.8: offer the event to the log-export sinks. WAF

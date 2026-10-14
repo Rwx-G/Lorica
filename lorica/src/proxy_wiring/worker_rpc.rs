@@ -296,9 +296,12 @@ impl WorkerMetricsCtx {
         // `/metrics` at the supervisor sees the union across workers.
         // lorica-api exposes the snapshot as `(name, labels, value)`
         // tuples; translate into the lorica-command wire shape here -
-        // keeps lorica-api free of the lorica-command dep.
+        // keeps lorica-api free of the lorica-command dep. The worker's
+        // log-store state rides the same list, so the supervisor can
+        // report and alert on a worker that persists nothing.
         report.generic_counters = lorica_api::metrics::snapshot_per_worker_counters()
             .into_iter()
+            .chain(lorica_api::metrics::snapshot_log_store_up())
             .map(|(name, label_pairs, value)| {
                 // Flatten name=value pairs into alternating strings on
                 // the wire (`["route_id", "uuid", "mode", "cookie", ...]`).

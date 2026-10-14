@@ -255,6 +255,14 @@ export interface StatusResponse {
   backends_down: number;
   certificates_count: number;
   certificates_expiring_soon: number;
+  log_store: LogStoreStatus;
+}
+
+/** Whether the node persists its audit trail, access logs and WAF events. */
+export interface LogStoreStatus {
+  persisting: boolean;
+  /** Why not, while `persisting` is false. */
+  cause: string | null;
 }
 
 export interface PathRuleResponse {
@@ -826,6 +834,13 @@ export interface AuditVerifyResult {
 export interface NodeVerifyResult extends AuditVerifyResult {
   /** The chain's node; the empty string is this node's own. */
   node_id: string;
+  /**
+   * The rows the per-node fan-in cap moved out of this follower's chain
+   * instead of deleting them, verified from the backup's own first row.
+   * Absent when the cap has moved none. The fields above keep describing
+   * the live chain; the report's `verified` covers both.
+   */
+  backup?: AuditVerifyResult;
 }
 
 /**
@@ -2107,11 +2122,25 @@ export interface WafCategoryCount {
 }
 
 export interface WafStatsResponse {
+  /** Events held: the retained table, or the in-memory ring without a log store. */
   total_events: number;
   total_24h: number;
+  total_1h: number;
   rule_count: number;
+  /** Over the events `total_events` counts. */
   by_category: WafCategoryCount[];
+  /** Over the last hour, the window `total_1h` counts. */
+  by_category_1h: WafCategoryCount[];
+  /** Where the events `total_events` counts are held. */
+  stored_in: WafEventStorage;
 }
+
+/**
+ * `log_store`: the retained table, bounded by `waf_event_retention`.
+ * `memory`: no log store is open; the in-memory ring of the most recent
+ * events since the process started. `none`: nothing is wired.
+ */
+export type WafEventStorage = 'log_store' | 'memory' | 'none';
 
 export interface WafRuleSummary {
   id: number;

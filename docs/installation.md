@@ -104,6 +104,59 @@ the files are as shipped), then
 Upgrading it to 1.9.1 first does not start it: 1.9.0 recorded the
 service as stopped, and an upgrade from 1.9.0 keeps that state.
 
+## When the access-log database will not open
+
+`/var/lib/lorica/lorica.db` holds the configuration and Lorica does not
+start without it. `/var/lib/lorica/access-log.db` holds the audit trail,
+the access logs, the WAF events and the notification history, and a
+failure to open it is not fatal: the proxy keeps serving, because losing
+the forensics trail is better than losing the traffic. What it does
+instead, since 1.9.2, whatever the cause (a corrupt file, a full disk,
+wrong ownership or permissions):
+
+- Each process that cannot open it, the single process, the supervisor
+  or any worker, logs at ERROR `the access-log database could not be
+  opened` with the cause, and repeats it every quarter hour, or at once
+  when the cause changes, while the failure lasts.
+- `lorica_log_store_up` reads 0 for that process (labels `role` and
+  `worker_id`; a worker's value reaches the supervisor's `/metrics`).
+  Alert on `min(lorica_log_store_up) == 0`.
+- The process serving the dashboard raises `log_store_unavailable`
+  with the cause, re-sent until a channel accepts it and then as an
+  hourly reminder while the outage lasts, and one `log_store_recovered`
+  when it ends. A channel receives them when its alert types include
+  them (the "Log persistence lost / restored" box in Settings >
+  Notifications) or when it subscribes to every type. Channels saved
+  before 1.9.2 with an explicit list were subscribed on upgrade; untick
+  the box to opt out.
+- Every dashboard page shows a red banner, `Audit trail, access logs and
+  WAF events are not being persisted`, followed by the cause for
+  Operator and above, and a generic cause for Viewer.
+  `GET /api/v1/status` carries the same state in `log_store`.
+- Each failed process retries the open every 60 s. Once the cause is
+  fixed, persistence resumes without a restart, the gauge returns to 1
+  and the banner goes away within two minutes.
+
+A worker's cause is in that worker's log, not in the banner, which names
+the worker. To find it:
+
+```bash
+sudo journalctl -u lorica | grep 'access-log database'
+```
+
+Then check the usual causes: free space on the filesystem holding
+`/var/lib/lorica` (`df -h /var/lib/lorica`), ownership and mode
+(`ls -l /var/lib/lorica/access-log.db*`, owned by `lorica`), and the
+file's integrity (`sqlite3 /var/lib/lorica/access-log.db 'PRAGMA
+integrity_check'` with Lorica stopped). A file that is beyond repair can
+be moved aside together with its `-wal` and `-shm` companions; Lorica
+creates an empty one at the next retry, and the moved files keep the
+history they held.
+
+Rows produced while the store was down are not recovered: the audit
+trail has a gap for the duration of the outage, which the dashboard
+banner and the two notifications bound.
+
 ## systemd unit
 
 The packaged unit is hardened against the sandbox checklist in

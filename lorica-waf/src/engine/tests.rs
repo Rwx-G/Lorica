@@ -261,6 +261,219 @@ fn test_clean_request_no_events() {
     assert_eq!(e.event_count(), 0);
 }
 
+fn event_at(timestamp: String, category: RuleCategory) -> WafEvent {
+    WafEvent {
+        rule_id: 1,
+        description: "test".into(),
+        category,
+        severity: 3,
+        matched_field: "uri".into(),
+        matched_value: "x".into(),
+        timestamp,
+        client_ip: "192.0.2.10".into(),
+        route_hostname: "example.com".into(),
+        action: "blocked".into(),
+    }
+}
+
+#[test]
+fn windowed_counts_are_not_bounded_by_the_ring() {
+    let e = engine();
+    let now = chrono::Utc::now().to_rfc3339();
+    let recorded = e.max_events * 3 + 7;
+    e.record_events(
+        (0..recorded)
+            .map(|_| event_at(now.clone(), RuleCategory::Xss))
+            .collect(),
+    );
+    e.record_events(vec![event_at(now, RuleCategory::SqlInjection)]);
+
+    assert_eq!(e.event_count(), e.max_events);
+    let hour = e.event_counts_within(std::time::Duration::from_secs(3600));
+    assert_eq!(hour.total, recorded as u64 + 1);
+    assert_eq!(
+        hour.by_category,
+        vec![
+            ("xss".to_string(), recorded as u64),
+            ("sql_injection".to_string(), 1)
+        ]
+    );
+}
+
+fn numbered_event(rule_id: u32) -> WafEvent {
+    WafEvent {
+        rule_id,
+        ..event_at(chrono::Utc::now().to_rfc3339(), RuleCategory::Xss)
+    }
+}
+
+fn forwarding_engine() -> WafEngine {
+    let e = engine();
+    e.enable_forwarding();
+    e
+}
+
+#[test]
+fn events_after_is_empty_until_forwarding_is_enabled() {
+    let e = engine();
+    e.record_events(vec![numbered_event(1)]);
+    assert_eq!(e.events_after(0), EventsAfter::default());
+
+    e.enable_forwarding();
+    e.record_events(vec![numbered_event(2)]);
+    let after = e.events_after(0);
+    assert_eq!(
+        after.events.iter().map(|ev| ev.rule_id).collect::<Vec<_>>(),
+        vec![2],
+        "only events recorded once forwarding is on are numbered"
+    );
+}
+
+#[test]
+fn events_after_keeps_numbering_past_a_full_ring_and_outbox() {
+    let e = forwarding_engine();
+    let total = (FORWARD_OUTBOX_CAPACITY.max(e.max_events) * 2) as u32;
+    let mut cursor = 0;
+    let mut seen = Vec::new();
+    for rule_id in 1..=total {
+        e.record_events(vec![numbered_event(rule_id)]);
+        let after = e.events_after(cursor);
+        assert_eq!(after.lost, 0);
+        cursor = after.next;
+        seen.extend(after.events.into_iter().map(|ev| ev.rule_id));
+    }
+    assert_eq!(seen, (1..=total).collect::<Vec<_>>());
+    assert_eq!(
+        e.events_after(cursor),
+        EventsAfter {
+            events: vec![],
+            next: cursor,
+            lost: 0,
+            lost_by_source: vec![],
+        }
+    );
+    assert_eq!(e.event_count(), e.max_events, "the ring is unaffected");
+}
+
+#[test]
+fn events_after_counts_what_the_outbox_dropped_and_its_sources() {
+    let e = forwarding_engine();
+    let first = e.events_after(0);
+    let overflow = 37;
+    let recorded = FORWARD_OUTBOX_CAPACITY as u32 + overflow;
+    e.record_events((1..=recorded).map(numbered_event).collect());
+
+    let after = e.events_after(first.next);
+    assert_eq!(after.lost, u64::from(overflow));
+    assert_eq!(after.next, u64::from(recorded));
+    assert_eq!(
+        after.events.iter().map(|ev| ev.rule_id).collect::<Vec<_>>(),
+        ((overflow + 1)..=recorded).collect::<Vec<_>>()
+    );
+    let template = numbered_event(0);
+    assert_eq!(
+        after.lost_by_source,
+        vec![LostEvents {
+            client_ip: template.client_ip,
+            category: template.category,
+            count: u64::from(overflow),
+        }]
+    );
+
+    let next = e.events_after(after.next);
+    assert_eq!(next.lost, 0, "a loss is reported once");
+    assert!(next.lost_by_source.is_empty());
+}
+
+#[test]
+fn the_lost_sources_counted_are_bounded() {
+    let e = forwarding_engine();
+    let overflow = LOST_SOURCES_CAPACITY + 5;
+    let events = (0..FORWARD_OUTBOX_CAPACITY + overflow)
+        .map(|n| WafEvent {
+            client_ip: format!("2001:db8::{n:x}"),
+            ..numbered_event(1)
+        })
+        .collect();
+    e.record_events(events);
+
+    let after = e.events_after(0);
+    assert_eq!(after.lost, overflow as u64);
+    assert_eq!(after.lost_by_source.len(), LOST_SOURCES_CAPACITY);
+    assert!(after.lost_by_source.iter().all(|lost| lost.count == 1));
+}
+
+#[test]
+fn events_after_does_not_report_cleared_events_as_lost() {
+    let e = forwarding_engine();
+    e.record_events((1..=3).map(numbered_event).collect());
+    e.clear_events();
+    e.record_events(vec![numbered_event(4)]);
+
+    let after = e.events_after(0);
+    assert_eq!(after.lost, 0);
+    assert_eq!(after.next, 4);
+    assert_eq!(
+        after.events.iter().map(|ev| ev.rule_id).collect::<Vec<_>>(),
+        vec![4]
+    );
+}
+
+#[test]
+fn lost_events_join_the_windowed_counts_but_not_the_ring() {
+    let e = engine();
+    e.record_lost_events(&RuleCategory::Xss, 40);
+    let hour = e.event_counts_within(std::time::Duration::from_secs(3600));
+    assert_eq!(hour.total, 40);
+    assert_eq!(hour.by_category, vec![("xss".to_string(), 40)]);
+    assert_eq!(e.event_count(), 0);
+}
+
+#[test]
+fn windowed_counts_place_an_event_at_its_own_stamp() {
+    let e = engine();
+    let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    e.record_events(vec![event_at(two_hours_ago, RuleCategory::Xss)]);
+    assert_eq!(
+        e.event_counts_within(std::time::Duration::from_secs(3600))
+            .total,
+        0
+    );
+    assert_eq!(e.event_counts_within(LONGEST_EVENT_WINDOW).total, 1);
+}
+
+#[test]
+fn evaluated_and_blocklisted_events_are_counted_and_a_clear_forgets_them() {
+    let e = engine();
+    e.evaluate(
+        WafMode::Detection,
+        "/search",
+        Some("q=1'+OR+1=1--"),
+        &[],
+        "example.com",
+        "10.0.0.1",
+    );
+    e.record_blocklist_event("192.0.2.10", "example.com", "/");
+    let day = e.event_counts_within(LONGEST_EVENT_WINDOW);
+    assert!(e.event_count() >= 2, "the evaluation recorded its events");
+    assert_eq!(day.total, e.event_count() as u64);
+    assert!(day
+        .by_category
+        .iter()
+        .any(|(category, count)| category == "sql_injection" && *count >= 1));
+    assert!(day
+        .by_category
+        .iter()
+        .any(|(category, count)| category == "ip_blocklist" && *count == 1));
+
+    e.clear_events();
+    assert_eq!(e.event_count(), 0);
+    assert_eq!(
+        e.event_counts_within(LONGEST_EVENT_WINDOW),
+        WindowCounts::default()
+    );
+}
+
 // --- URL decoding ---
 
 #[test]

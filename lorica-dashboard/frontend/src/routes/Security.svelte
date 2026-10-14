@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary, type BlocklistStatus, type CustomWafRule, type BanEntry, type AuditRecord, type AuditVerifyReport, type AuditQuery } from '../lib/api';
+  import { api, type WafEvent, type WafStatsResponse, type WafRuleSummary, type BlocklistStatus, type CustomWafRule, type BanEntry, type AuditRecord, type AuditVerifyReport, type AuditQuery } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import NodeFilter from '../components/NodeFilter.svelte';
   import { showToast } from '../lib/toast';
@@ -14,12 +14,36 @@
    * exists only where it means something.
    */
   let events: (WafEvent & { node_id?: string })[] = $state([]);
-  let stats: { total_events: number; total_24h: number; rule_count: number; by_category: WafCategoryCount[] } = $state({
+  let stats: WafStatsResponse = $state({
     total_events: 0,
     total_24h: 0,
+    total_1h: 0,
     rule_count: 0,
     by_category: [],
+    by_category_1h: [],
+    stored_in: 'none',
   });
+  /** Re-reads the counters alone, so the rolling windows move without a click. */
+  let statsRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  const refreshedEvery = `refreshed every ${STATS_REFRESH_MS / 1000}s`;
+  /**
+   * The stored-events card. Without a log store the count is not the
+   * retained table but the in-memory ring of recent events, which is
+   * the degraded mode the log-store banner announces.
+   */
+  const storedCard = $derived(
+    stats.stored_in === 'memory'
+      ? {
+          label: 'Events in memory',
+          title:
+            'No log store is open: the most recent events this process has held in memory since it started, not a retained history; the category cards count the same events',
+        }
+      : {
+          label: 'Stored events',
+          title:
+            'Events kept in storage, bounded by the WAF event retention setting; the category cards count the same events',
+        },
+  );
   let rules: WafRuleSummary[] = $state([]);
   let rulesEnabled = $state(0);
   let blocklist: BlocklistStatus = $state({ enabled: false, ip_count: 0, source: '' });
@@ -138,11 +162,20 @@
     loading = false;
   }
 
+  async function loadStats() {
+    const res = await api.getWafStats();
+    if (res.data) {
+      stats = res.data;
+    }
+  }
+
   onMount(() => {
     loadData();
     loadBans();
+    statsRefreshTimer = setInterval(loadStats, STATS_REFRESH_MS);
     return () => {
       if (bansRefreshTimer) clearInterval(bansRefreshTimer);
+      if (statsRefreshTimer) clearInterval(statsRefreshTimer);
     };
   });
 
@@ -426,13 +459,17 @@
       <div class="stat-value">{rulesEnabled}/{stats.rule_count}</div>
       <div class="stat-label">Rules Enabled</div>
     </div>
-    <div class="stat-card">
+    <div class="stat-card" title="WAF events in the last hour, {refreshedEvery}">
+      <div class="stat-value">{stats.total_1h}</div>
+      <div class="stat-label">Events (1h)</div>
+    </div>
+    <div class="stat-card" title="WAF events in the last 24 hours, {refreshedEvery}">
       <div class="stat-value">{stats.total_24h}</div>
       <div class="stat-label">Events (24h)</div>
     </div>
-    <div class="stat-card">
+    <div class="stat-card" title={storedCard.title}>
       <div class="stat-value">{stats.total_events}</div>
-      <div class="stat-label">Total Events</div>
+      <div class="stat-label">{storedCard.label}</div>
     </div>
     {#each stats.by_category as cat (cat.category)}
       <div class="stat-card">
@@ -957,6 +994,23 @@
               {chain.first_break_id}: {chain.first_break_reason}
             </div>
           {/if}
+          <!--
+            The rows the per-node fan-in cap moved out of a follower's
+            chain rather than deleting them: its own verdict, beside the
+            chain's, since a broken backup is a different finding.
+          -->
+          {#if chain.backup}
+            {#if chain.backup.verified}
+              <div class="audit-verify audit-verify-ok" role="status">
+                {fleetNodeName(chain.node_id)}: fan-in backup verified, {chain.backup.total_rows} rows
+              </div>
+            {:else}
+              <div class="audit-verify audit-verify-broken" role="alert">
+                {fleetNodeName(chain.node_id)}: fan-in backup BROKEN at row
+                {chain.backup.first_break_id}: {chain.backup.first_break_reason}
+              </div>
+            {/if}
+          {/if}
         {/each}
       {/if}
 
@@ -1034,6 +1088,9 @@
 </div>
 
 <script lang="ts" module>
+  /** How often the page re-reads the WAF counters alone. */
+  export const STATS_REFRESH_MS = 30000;
+
   const trashIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
 </script>
 

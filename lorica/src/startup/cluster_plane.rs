@@ -57,12 +57,16 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use lorica_api::audit::{record_with_store, AuditContext};
 use lorica_api::cluster::runtime::MAX_BREAK_GLASS_SECS;
-use lorica_api::cluster::runtime::{publish_token_liveness, refresh_control_plane, revoke_node};
-use lorica_api::cluster::ControlPlaneRuntime;
+use lorica_api::cluster::runtime::{
+    detached, detached_audited, publish_token_liveness, refresh_control_plane, revoke_node,
+    OwedAudit,
+};
+use lorica_api::cluster::{ControlPlaneRuntime, BREAK_GLASS_OPEN_ACTION, LEAVE_ACTION};
 use lorica_api::cluster_telemetry_store::ClusterTelemetryStore;
 use lorica_api::db::db_blocking;
 use lorica_api::error::ApiError;
 use lorica_api::log_store::LogStore;
+use lorica_api::server::LogStoreSlot;
 use lorica_cluster::enroll::{
     BoxFuture, EnrollGrant, EnrollRefusal, EnrollRequest, EnrollmentHandler, RenewGrant,
     RenewRequest, SessionHandler,
@@ -129,6 +133,12 @@ const RENEWAL_COOLDOWN: Duration = Duration::from_secs(3600);
 /// refusal budget on the control plane.
 pub(crate) const RENEWAL_RETRY_AFTER_REFUSAL: Duration = Duration::from_secs(3600);
 
+/// The action of the row an enrolment records.
+const ENROL_ACTION: &str = "cluster.node.enroll";
+
+/// The action of the row a renewal records.
+const RENEW_ACTION: &str = "cluster.node.renew";
+
 /// Inputs for [`spawn_cluster_plane`], lifted from the CLI and the
 /// process.
 pub(crate) struct ClusterPlaneOptions {
@@ -150,9 +160,9 @@ pub(crate) struct ClusterPlaneOptions {
     /// of binding when `bind` equals the configured operational bind,
     /// closed otherwise.
     pub inherited_operational: Option<(String, RawFd)>,
-    /// The audit log the lifecycle hooks write to (`None` when the
-    /// access-log store failed to open; events still reach the sinks).
-    pub log_store: Option<Arc<LogStore>>,
+    /// The audit log the lifecycle hooks write to. Empty while the
+    /// access-log store is not open; events still reach the sinks.
+    pub log_store: LogStoreSlot,
     /// The alert dispatcher (`ClusterNodeLeft`, `ClusterDrift`).
     pub alert_sender: AlertSender,
     /// The proxy's configuration-reload signal. The control plane
@@ -471,9 +481,6 @@ pub(crate) async fn redeem_with_store(
     })
 }
 
-/// The binary's redemption and lifecycle hooks: the store, the CA
-/// (through the control-plane handle), the audit log and the alert
-/// dispatcher behind the transport crate's traits.
 /// Roughly what a batch will cost on disk, for the byte side of the
 /// ingest quota (Story 9.6 AC #8).
 ///
@@ -574,10 +581,36 @@ fn telemetry_db_bytes(data_dir: &std::path::Path) -> u64 {
         .sum()
 }
 
-struct FleetHandlers {
+/// The binary's redemption and lifecycle hooks: the store, the CA
+/// (through the control-plane handle), the audit log and the alert
+/// dispatcher behind the transport crate's traits.
+///
+/// A cloneable handle rather than the state itself, because the hooks
+/// that commit a registry write (enrolment, renewal, leave, retiring a
+/// superseded certificate) run on a task of their own that owns a
+/// clone. A hook's future is dropped when its listener stops waiting
+/// for it (the enrollment connection's time budget, a listener shutting
+/// down), and a hook dropped between the commit and the refresh, the
+/// alert or the audit row would leave the store, the acceptor and the
+/// trail disagreeing.
+#[derive(Clone)]
+struct FleetHandlers(Arc<FleetState>);
+
+impl std::ops::Deref for FleetHandlers {
+    type Target = FleetState;
+
+    fn deref(&self) -> &FleetState {
+        &self.0
+    }
+}
+
+struct FleetState {
     control: Arc<ControlPlane>,
+    /// The same control plane with its refresh coalescer: every roster
+    /// write below refreshes through it (backlog #79).
+    runtime: Arc<ControlPlaneRuntime>,
     store: Arc<Mutex<ConfigStore>>,
-    log_store: Option<Arc<LogStore>>,
+    log_store: LogStoreSlot,
     alert_sender: AlertSender,
     /// Last renewal grant per node, for [`RENEWAL_COOLDOWN`].
     renewals: StdMutex<HashMap<String, Instant>>,
@@ -597,9 +630,13 @@ struct FleetHandlers {
     config_reload: watch::Sender<u64>,
 }
 
-impl FleetHandlers {
+impl FleetState {
+    /// Refresh and wait. Enrolment and renewal hand the node a
+    /// certificate it dials with straight away, so its fingerprint must
+    /// be in the roster before the grant leaves; a fire-and-forget
+    /// refresh would let that first handshake be refused as unknown.
     async fn refresh(&self) {
-        if let Err(e) = refresh_control_plane(&self.control, &self.store).await {
+        if let Err(e) = self.runtime.refresh(&self.store).await {
             error!(error = %e, "cluster plane: roster/CRL refresh failed");
         }
     }
@@ -625,6 +662,21 @@ impl FleetHandlers {
         let _ = self.config_reload.send(next);
     }
 
+    /// The audit row a hook's unit owes if it panics; see [`OwedAudit`].
+    fn owed_audit(
+        &self,
+        peer: SocketAddr,
+        action: &'static str,
+        target: (&'static str, String),
+    ) -> OwedAudit {
+        OwedAudit {
+            log_store: self.log_store.store(),
+            ctx: plane_audit_ctx(peer),
+            action,
+            target,
+        }
+    }
+
     async fn audit(
         &self,
         peer: SocketAddr,
@@ -633,7 +685,7 @@ impl FleetHandlers {
         after: Option<serde_json::Value>,
     ) {
         record_with_store(
-            self.log_store.clone(),
+            self.log_store.store(),
             &plane_audit_ctx(peer),
             action,
             target,
@@ -664,35 +716,57 @@ impl FleetHandlers {
     }
 }
 
+impl FleetState {
+    /// The enrolment pipeline end to end: burn, sign, register, then
+    /// the refresh, the replication signal, the window recount and the
+    /// audit row the new node is owed.
+    async fn enrol(&self, request: EnrollRequest) -> Result<EnrollGrant, EnrollRefusal> {
+        let peer = request.peer;
+        let node_name = request.node_name.clone();
+        let public_id = request.public_id.clone();
+        let grant = redeem_with_store(&self.store, &self.control, request, Utc::now()).await?;
+        self.refresh().await;
+        // A new `(name, node_id)` row is a change to what every
+        // `node_selector` resolves to, which is half of what a
+        // per-recipient payload is a function of. Left unsignalled
+        // it would move every cut without moving the generation.
+        self.signal_fleet_change();
+        match publish_token_liveness(&self.control, &self.store).await {
+            Ok(live) => info!(live_tokens = live, "join token redeemed"),
+            Err(e) => error!(error = %e, "token liveness recount failed"),
+        }
+        self.audit(
+            peer,
+            ENROL_ACTION,
+            ("cluster_node", &grant.node_id),
+            Some(serde_json::json!({
+                "name": node_name,
+                "status": grant.status,
+                "token_public_id": public_id,
+            })),
+        )
+        .await;
+        Ok(grant)
+    }
+}
+
 impl EnrollmentHandler for FleetHandlers {
     fn redeem(&self, request: EnrollRequest) -> BoxFuture<'_, Result<EnrollGrant, EnrollRefusal>> {
+        let fleet = self.clone();
         Box::pin(async move {
-            let peer = request.peer;
-            let node_name = request.node_name.clone();
-            let public_id = request.public_id.clone();
-            let grant = redeem_with_store(&self.store, &self.control, request, Utc::now()).await?;
-            self.refresh().await;
-            // A new `(name, node_id)` row is a change to what every
-            // `node_selector` resolves to, which is half of what a
-            // per-recipient payload is a function of. Left unsignalled
-            // it would move every cut without moving the generation.
-            self.signal_fleet_change();
-            match publish_token_liveness(&self.control, &self.store).await {
-                Ok(live) => info!(live_tokens = live, "join token redeemed"),
-                Err(e) => error!(error = %e, "token liveness recount failed"),
-            }
-            self.audit(
-                peer,
-                "cluster.node.enroll",
-                ("cluster_node", &grant.node_id),
-                Some(serde_json::json!({
-                    "name": node_name,
-                    "status": grant.status,
-                    "token_public_id": public_id,
-                })),
-            )
-            .await;
-            Ok(grant)
+            // Detached from the burn on: a joiner that hangs up after its
+            // token burned must still leave a registered row the roster
+            // knows and an audit row naming the token.
+            // The node id is minted inside the unit, so a panicking
+            // one is recorded against the token it burned.
+            let owed = fleet.owed_audit(
+                request.peer,
+                ENROL_ACTION,
+                ("cluster_token", request.public_id.clone()),
+            );
+            detached_audited("enrolment", owed, async move { fleet.enrol(request).await })
+                .await
+                .map_err(|e| EnrollRefusal::Internal(e.to_string()))?
         })
     }
 }
@@ -707,6 +781,7 @@ impl SessionHandler for FleetHandlers {
         _schema_version: u32,
     ) -> BoxFuture<'_, ()> {
         let node_id = node_id.to_string();
+        let fleet = self.clone();
         Box::pin(async move {
             // The store is touched only when there is something to
             // retire: the first session on a renewed certificate closes
@@ -714,91 +789,54 @@ impl SessionHandler for FleetHandlers {
             // facts (address, version, last seen) reach the registry
             // through the periodic flush, so an ordinary session, or a
             // node reconnecting in a loop, never takes the store lock.
-            if via_previous_certificate || !self.control.roster.has_superseded_certificate(&node_id)
+            if via_previous_certificate
+                || !fleet.control.roster.has_superseded_certificate(&node_id)
             {
                 return;
             }
-            let id = node_id.clone();
-            let retired = db_blocking(&self.store, move |store| {
-                store
-                    .retire_previous_cluster_certificate(&id, Utc::now())
-                    .map_err(internal)
-            })
-            .await;
-            match retired {
-                Ok(Some(serial)) => {
-                    info!(
-                        node_id,
-                        serial, "superseded node certificate retired to the CRL"
-                    );
-                    self.refresh().await;
-                }
-                Ok(None) => {}
-                Err(e) => error!(node_id, error = %e, "retiring the superseded certificate failed"),
+            // Detached: a retirement whose refresh is skipped leaves the
+            // serial on the CRL in the store and admitted by the acceptor.
+            let retire = async move { fleet.retire_superseded_certificate(node_id).await };
+            if let Err(e) = detached("certificate retirement", retire).await {
+                error!(error = %e, "retiring the superseded certificate failed");
             }
         })
     }
 
     fn on_renew(&self, request: RenewRequest) -> BoxFuture<'_, Result<RenewGrant, String>> {
+        let fleet = self.clone();
         Box::pin(async move {
-            self.renew(request)
-                .await
-                .map_err(|refusal| refusal.to_string())
+            let owed = fleet.owed_audit(
+                request.peer,
+                RENEW_ACTION,
+                ("cluster_node", request.node_id.clone()),
+            );
+            detached_audited("renewal", owed, async move {
+                fleet
+                    .renew(request)
+                    .await
+                    .map_err(|refusal| refusal.to_string())
+            })
+            .await
+            .map_err(|e| e.to_string())?
         })
     }
 
     fn on_leave(&self, node_id: &str, peer: SocketAddr) -> BoxFuture<'_, Result<(), String>> {
         let node_id = node_id.to_string();
+        let fleet = self.clone();
         Box::pin(async move {
-            // A node id is a fresh UUID per enrolment, so a fleet
-            // with churn would otherwise accumulate one spend entry
-            // per historical node for the life of the process.
-            self.quota.forget(&node_id);
-            let outcome = revoke_node(&self.control, &self.store, &node_id, Utc::now())
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "node not registered".to_string())?;
-            // The row flipped and the session is gone: alert and audit
-            // that BEFORE surfacing a refresh failure (AC #13 says both
-            // sides audit, and a revocation with no trail is worse than
-            // a refused leave).
-            warn!(node_id, name = %outcome.node.name, %peer, "node left the fleet; revoked");
-            self.alert_sender.send(
-                AlertEvent::new(
-                    AlertType::ClusterNodeLeft,
-                    format!(
-                        "cluster node {} ({}) left the fleet",
-                        outcome.node.name, node_id
-                    ),
-                )
-                .with_detail("node_id", node_id.clone())
-                .with_detail("node_name", outcome.node.name.clone())
-                .with_detail("peer", peer.to_string())
-                // A cooperative leave wipes the node's copy of these
-                // keys (Story 9.3 AC #13), but the wipe is the node's
-                // word; the operator re-issues on the same evidence a
-                // revocation gives them.
-                .with_detail(
-                    "certificates_to_reissue",
-                    outcome.certificates_to_reissue.join(","),
-                ),
-            );
-            self.audit(
-                peer,
-                "cluster.node.leave",
-                ("cluster_node", &node_id),
-                Some(serde_json::json!({
-                    "name": outcome.node.name,
-                    "status": "revoked",
-                    "certificates_to_reissue": outcome.certificates_to_reissue,
-                    "refresh_error": outcome.refresh_error.as_ref().map(|e| e.to_string()),
-                })),
+            // Detached as a whole, like every hook here that commits:
+            // the alert and the audit row must not depend on the session
+            // task carrying this call outliving the revocation.
+            let owed = fleet.owed_audit(peer, LEAVE_ACTION, ("cluster_node", node_id.clone()));
+            detached_audited(
+                "leave",
+                owed,
+                async move { fleet.leave(node_id, peer).await },
             )
-            .await;
-            match outcome.refresh_error {
-                Some(e) => Err(e.to_string()),
-                None => Ok(()),
-            }
+            .await
+            .map_err(|e| e.to_string())?
         })
     }
 
@@ -877,7 +915,7 @@ impl SessionHandler for FleetHandlers {
             let accepted_audit = if audit_rows.is_empty() {
                 0
             } else {
-                let Some(log_store) = self.log_store.clone() else {
+                let Some(log_store) = self.log_store.store() else {
                     // Refused, not silently dropped, for the same
                     // reason the missing telemetry database is: a
                     // control plane that cannot store what its fleet
@@ -1134,7 +1172,87 @@ impl SessionHandler for FleetHandlers {
     }
 }
 
-impl FleetHandlers {
+impl FleetState {
+    /// Retire the superseded certificate a node's first session on its
+    /// renewed one closes the grace window on (AC #12).
+    async fn retire_superseded_certificate(&self, node_id: String) {
+        let id = node_id.clone();
+        let retired = db_blocking(&self.store, move |store| {
+            store
+                .retire_previous_cluster_certificate(&id, Utc::now())
+                .map_err(internal)
+        })
+        .await;
+        match retired {
+            Ok(Some(serial)) => {
+                info!(
+                    node_id,
+                    serial, "superseded node certificate retired to the CRL"
+                );
+                // Not awaited: nothing this hook does depends on it,
+                // and a fleet reconnecting after a renewal wave would
+                // otherwise hold each new session on a refresh.
+                self.runtime.request_refresh(&self.store);
+            }
+            Ok(None) => {}
+            Err(e) => error!(node_id, error = %e, "retiring the superseded certificate failed"),
+        }
+    }
+
+    /// A cooperative leave (AC #13): the revocation, then the alert and
+    /// the audit row it is owed.
+    async fn leave(&self, node_id: String, peer: SocketAddr) -> Result<(), String> {
+        // A node id is a fresh UUID per enrolment, so a fleet
+        // with churn would otherwise accumulate one spend entry
+        // per historical node for the life of the process.
+        self.quota.forget(&node_id);
+        let outcome = revoke_node(&self.runtime, &self.store, &node_id, Utc::now())
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "node not registered".to_string())?;
+        // The row flipped and the session is gone: alert and audit
+        // that BEFORE surfacing a refresh failure (AC #13 says both
+        // sides audit, and a revocation with no trail is worse than
+        // a refused leave).
+        warn!(node_id, name = %outcome.node.name, %peer, "node left the fleet; revoked");
+        self.alert_sender.send(
+            AlertEvent::new(
+                AlertType::ClusterNodeLeft,
+                format!(
+                    "cluster node {} ({}) left the fleet",
+                    outcome.node.name, node_id
+                ),
+            )
+            .with_detail("node_id", node_id.clone())
+            .with_detail("node_name", outcome.node.name.clone())
+            .with_detail("peer", peer.to_string())
+            // A cooperative leave wipes the node's copy of these
+            // keys (Story 9.3 AC #13), but the wipe is the node's
+            // word; the operator re-issues on the same evidence a
+            // revocation gives them.
+            .with_detail(
+                "certificates_to_reissue",
+                outcome.certificates_to_reissue.join(","),
+            ),
+        );
+        self.audit(
+            peer,
+            LEAVE_ACTION,
+            ("cluster_node", &node_id),
+            Some(serde_json::json!({
+                "name": outcome.node.name,
+                "status": "revoked",
+                "certificates_to_reissue": outcome.certificates_to_reissue,
+                "refresh_error": outcome.refresh_error.as_ref().map(|e| e.to_string()),
+            })),
+        )
+        .await;
+        match outcome.refresh_error {
+            Some(e) => Err(e.to_string()),
+            None => Ok(()),
+        }
+    }
+
     /// The renewal pipeline (AC #12): eligibility under a short lock,
     /// signing lock-free, persistence under a second short lock.
     ///
@@ -1199,7 +1317,7 @@ impl FleetHandlers {
         self.refresh().await;
         self.audit(
             peer,
-            "cluster.node.renew",
+            RENEW_ACTION,
             ("cluster_node", &node_id),
             Some(serde_json::json!({
                 "cert_fingerprint": issued.fingerprint_sha256,
@@ -1596,7 +1714,7 @@ async fn break_glass_is_corroborated(log_store: &Option<Arc<LogStore>>, node_id:
     .to_rfc3339();
     tokio::task::spawn_blocking(move || {
         let query = lorica_api::audit::AuditQuery {
-            action_prefix: Some("cluster.break_glass.open".to_string()),
+            action_prefix: Some(BREAK_GLASS_OPEN_ACTION.to_string()),
             from: Some(from),
             limit: 1,
             node_id: Some(node_id),
@@ -1611,7 +1729,7 @@ async fn break_glass_is_corroborated(log_store: &Option<Arc<LogStore>>, node_id:
 fn spawn_drift_watch(
     runtime: Arc<ControlPlaneRuntime>,
     store: Arc<Mutex<ConfigStore>>,
-    log_store: Option<Arc<LogStore>>,
+    log_store: LogStoreSlot,
     alert_sender: AlertSender,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1646,8 +1764,8 @@ fn spawn_drift_watch(
                 // node could otherwise keep itself out of every commit
                 // round and have the drift paged as operator action
                 // (backlog #78).
-                let corroborated =
-                    entry.break_glass && break_glass_is_corroborated(&log_store, &node_id).await;
+                let corroborated = entry.break_glass
+                    && break_glass_is_corroborated(&log_store.store(), &node_id).await;
                 let summary = if entry.break_glass && corroborated {
                     format!(
                         "cluster node {} ({}) is in break-glass and diverges from generation {}",
@@ -1729,13 +1847,14 @@ fn spawn_liveness_publisher(
 /// `schema_version`) and prune revoked serials whose certificate
 /// expired (the CRL stays bounded by the live certificates).
 fn spawn_session_flush(
-    control: Arc<ControlPlane>,
+    runtime: Arc<ControlPlaneRuntime>,
     store: Arc<Mutex<ConfigStore>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(FLUSH_INTERVAL).await;
-            let facts: Vec<LiveNodeFacts> = control
+            let facts: Vec<LiveNodeFacts> = runtime
+                .control
                 .sessions
                 .snapshot()
                 .into_iter()
@@ -1770,7 +1889,7 @@ fn spawn_session_flush(
             match flushed {
                 Ok(pruned) if pruned > 0 => {
                     info!(pruned, "expired revoked serials pruned from the CRL source");
-                    if let Err(e) = refresh_control_plane(&control, &store).await {
+                    if let Err(e) = runtime.refresh(&store).await {
                         error!(error = %e, "cluster plane: refresh after CRL prune failed");
                     }
                 }
@@ -1960,8 +2079,9 @@ pub(crate) async fn spawn_cluster_plane(
     let drift_alerts = opts.alert_sender.clone();
     let drift_log_store = opts.log_store.clone();
     let replication_reload = opts.config_reload.subscribe();
-    let handlers = Arc::new(FleetHandlers {
+    let handlers = Arc::new(FleetHandlers(Arc::new(FleetState {
         control: Arc::clone(&control),
+        runtime: Arc::clone(&runtime),
         store: Arc::clone(store),
         log_store: opts.log_store,
         alert_sender: opts.alert_sender,
@@ -1970,7 +2090,7 @@ pub(crate) async fn spawn_cluster_plane(
         quota: IngestQuota::new(),
         data_dir: opts.data_dir.clone(),
         config_reload: opts.config_reload.clone(),
-    });
+    })));
 
     let operational_stats = Arc::new(OperationalStats::default());
     let mut operational_config = OperationalConfig::new(
@@ -2006,7 +2126,7 @@ pub(crate) async fn spawn_cluster_plane(
 
     let tasks = vec![
         spawn_liveness_publisher(Arc::clone(&control), Arc::clone(store)),
-        spawn_session_flush(Arc::clone(&control), Arc::clone(store)),
+        spawn_session_flush(Arc::clone(&runtime), Arc::clone(store)),
         spawn_drift_watch(
             Arc::clone(&runtime),
             Arc::clone(store),
@@ -2389,7 +2509,7 @@ mod tests {
 
         // A different node's window says nothing about this one.
         log_store
-            .insert_fanned_in_audit("node-b", &[fanned_in_row("cluster.break_glass.open", 1)])
+            .insert_fanned_in_audit("node-b", &[fanned_in_row(BREAK_GLASS_OPEN_ACTION, 1)])
             .expect("insert node-b");
         assert!(!break_glass_is_corroborated(&Some(Arc::clone(&log_store)), "node-a").await);
 
@@ -2401,7 +2521,7 @@ mod tests {
 
         // This node's own open row corroborates it.
         log_store
-            .insert_fanned_in_audit("node-a", &[fanned_in_row("cluster.break_glass.open", 2)])
+            .insert_fanned_in_audit("node-a", &[fanned_in_row(BREAK_GLASS_OPEN_ACTION, 2)])
             .expect("insert node-a");
         assert!(break_glass_is_corroborated(&Some(Arc::clone(&log_store)), "node-a").await);
 
@@ -2636,6 +2756,149 @@ mod tests {
             "the fleet identity is not any recipient's cut"
         );
         drop((a, b));
+    }
+
+    /// The security half of the revocation contract under cancellation:
+    /// a revoke caller dropped after the row flipped (an operator whose
+    /// browser gave up, a leave whose peer hung up) still ends the
+    /// node's session and closes the roster to it.
+    #[tokio::test]
+    async fn a_revocation_whose_caller_is_dropped_after_the_commit_still_ends_the_session() {
+        let store = store_with_key();
+        let control = test_control(false);
+        let runtime = Arc::new(ControlPlaneRuntime::new(Arc::clone(&control)));
+        {
+            let mut row = roster_row("id-a", "edge-a");
+            row.cert_serial = "0a01".to_string();
+            store
+                .lock()
+                .await
+                .create_cluster_node(&row)
+                .expect("test setup: node");
+        }
+        runtime.refresh(&store).await.expect("initial refresh");
+        let (_session, _far) = spawn_scripted_follower(&control, "id-a");
+        assert!(control.sessions.is_connected("id-a"));
+
+        // Held so the enforcement is still pending when the caller goes.
+        let guard = control.refresh_guard().await;
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(50),
+            revoke_node(&runtime, &store, "id-a", Utc::now()),
+        );
+        assert!(
+            dropped.await.is_err(),
+            "the revocation could not finish yet"
+        );
+        assert!(
+            control.sessions.is_connected("id-a"),
+            "the session is ended after the refresh, not before"
+        );
+        drop(guard);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while control.sessions.is_connected("id-a") {
+            assert!(
+                Instant::now() < deadline,
+                "the dropped revocation never ended the session"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            control.roster.lookup("fp-id-a").expect("entry").state,
+            NodeState::Revoked
+        );
+        let row = store
+            .lock()
+            .await
+            .get_cluster_node("id-a")
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.status, NodeStatus::Revoked);
+    }
+
+    /// The trail half of the same contract: a leave whose hook future
+    /// is dropped after the row flipped still raises the alert and
+    /// writes the audit row the revocation is owed.
+    #[tokio::test]
+    async fn a_leave_whose_caller_is_dropped_after_the_commit_still_alerts_and_audits() {
+        let store = store_with_key();
+        let control = test_control(false);
+        let data_dir = tempfile::tempdir().expect("test setup: tempdir");
+        let log_store = Arc::new(LogStore::open(data_dir.path()).expect("test setup: log store"));
+        let alert_sender = AlertSender::new(16);
+        let mut alerts = alert_sender.subscribe();
+        let (config_reload, _reload) = watch::channel(0u64);
+        let fleet = FleetHandlers(Arc::new(FleetState {
+            control: Arc::clone(&control),
+            runtime: Arc::new(ControlPlaneRuntime::new(Arc::clone(&control))),
+            store: Arc::clone(&store),
+            log_store: LogStoreSlot::opened(Arc::clone(&log_store), None),
+            alert_sender,
+            renewals: StdMutex::new(HashMap::new()),
+            telemetry: None,
+            quota: IngestQuota::new(),
+            data_dir: data_dir.path().to_path_buf(),
+            config_reload,
+        }));
+        {
+            let mut row = roster_row("id-a", "edge-a");
+            row.cert_serial = "0a01".to_string();
+            store
+                .lock()
+                .await
+                .create_cluster_node(&row)
+                .expect("test setup: node");
+        }
+        fleet
+            .runtime
+            .refresh(&store)
+            .await
+            .expect("initial refresh");
+
+        let guard = control.refresh_guard().await;
+        let peer: SocketAddr = "192.0.2.10:9443".parse().expect("test setup: peer");
+        let dropped = tokio::time::timeout(Duration::from_millis(50), fleet.on_leave("id-a", peer));
+        assert!(dropped.await.is_err(), "the leave could not finish yet");
+        assert!(
+            alerts.try_recv().is_err(),
+            "alerted before the enforcement it reports"
+        );
+        drop(guard);
+
+        let alert = tokio::time::timeout(Duration::from_secs(5), alerts.recv())
+            .await
+            .expect("the dropped leave never alerted")
+            .expect("alert channel");
+        assert_eq!(alert.alert_type, AlertType::ClusterNodeLeft);
+        assert_eq!(
+            alert.details.get("node_id").map(String::as_str),
+            Some("id-a")
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            log_store
+                .flush_audit()
+                .await
+                .expect("the audit writer drains");
+            let (rows, _total) = log_store
+                .query_audit(&lorica_api::audit::AuditQuery {
+                    operator: None,
+                    action_prefix: Some(LEAVE_ACTION.to_string()),
+                    from: None,
+                    to: None,
+                    limit: 10,
+                    before_id: None,
+                    node_id: None,
+                })
+                .expect("audit query");
+            if rows.iter().any(|r| r.target_id == "id-a") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the dropped leave never audited");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// A follower that stages and applies whatever it is sent, over an

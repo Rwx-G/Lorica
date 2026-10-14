@@ -788,7 +788,7 @@ nothing else:
 |---|---|---|
 | `/automation/v1/logs` | `logs:read` | Access-log rows, newest first, with the filters the dashboard offers; `before_id` walks back by keyset. |
 | `/automation/v1/waf/events` | `waf:read` | Recent WAF matches, newest first, optionally one category. |
-| `/automation/v1/waf/stats` | `waf:read` | Totals, the 24 h count, the loaded rule count, the count per category, up to five seconds old. |
+| `/automation/v1/waf/stats` | `waf:read` | Totals, the 24 h and 1 h counts, the loaded rule count, the count per category over all events held and over the last hour, with `stored_in` saying where the events held are (the retained table, or without a log store the in-memory ring), up to `WAF_STATS_MAX_AGE` old. |
 | `/automation/v1/sla/overview` | `sla:read` | The 1 h and 24 h passive windows for every route. |
 | `/automation/v1/sla/routes/{id}` | `sla:read` | One route's passive windows (1 h, 24 h, 7 d, 30 d). |
 | `/automation/v1/cluster/status` | `cluster:read` | This node's role, build, applied generation and hash. |
@@ -850,15 +850,17 @@ also survives a log that is still growing, where an offset shifts by
 every row recorded between two calls; `after_id` bounds the other end,
 for a caller tailing new rows. `next_cursor` appears on `/logs` alone.
 
-**The WAF counters are up to five seconds old.** `/waf/stats` counts
-the whole retained table (three aggregate passes under the log store's
+**The WAF counters are not recomputed on every call.** `/waf/stats` counts
+the whole retained table (aggregate passes under the log store's
 one connection, which the access-log writer and the audit drain share),
 and a caller polling it paid that per call. The plane answers the
 counters it computed within the last `WAF_STATS_MAX_AGE`
 (`lorica-api/src/automation/read.rs`), so the table is scanned at most
 once per window however often it is asked; a clear of the WAF events
-drops them at once. The dashboard's own counters are computed per call,
-as before.
+drops them at once. The dashboard's endpoint reuses the same cached
+answer under its own, longer `DASHBOARD_WAF_STATS_MAX_AGE`
+(`lorica-api/src/waf.rs`), so an answer either plane computed serves the
+other while it is young enough for it.
 
 **A window this surface cannot reach is a refusal, never an empty
 page.** Two of the sources clamp their own row budget: the access log

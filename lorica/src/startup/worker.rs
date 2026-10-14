@@ -187,6 +187,9 @@ pub(crate) fn run_worker(
 
     // Create shared WAF engine for worker (must be before command channel setup)
     let waf_engine = Arc::new(lorica_waf::WafEngine::new());
+    // Every event must reach the supervisor, which alerts and bans:
+    // number them from the first request on.
+    waf_engine.enable_forwarding();
     worker_restore_waf_state(&store, &waf_engine);
 
     // Start the command channel listener in a background thread
@@ -473,41 +476,49 @@ pub(crate) fn run_worker(
                 &worker_blocklist_tracker,
             );
 
-            // Forward WAF events to supervisor
+            // Forward WAF events to supervisor. A write error reconnects:
+            // forwarding is what alerts and auto-bans run on, so it must
+            // not stop for the life of the worker. The batch being
+            // written when the socket broke is lost, and logged.
             tokio::spawn(async move {
-                let stream = loop {
-                    match tokio::net::UnixStream::connect(&waf_sock_path_worker).await {
-                        Ok(s) => break s,
-                        Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
-                    }
-                };
-                let mut writer = tokio::io::BufWriter::new(stream);
-                let mut interval = tokio::time::interval(Duration::from_secs(1));
-                let mut last_count = 0usize;
-                let event_buf = waf_fwd_engine.event_buffer();
+                let mut cursor = super::waf_forward::WafForwardCursor::new();
                 loop {
-                    interval.tick().await;
-                    let events: Vec<lorica_waf::WafEvent> = {
-                        let buf = event_buf.lock();
-                        if buf.len() == last_count {
+                    let stream = loop {
+                        match tokio::net::UnixStream::connect(&waf_sock_path_worker).await {
+                            Ok(s) => break s,
+                            Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+                        }
+                    };
+                    let mut writer = tokio::io::BufWriter::new(stream);
+                    let mut interval = tokio::time::interval(super::waf_forward::FORWARD_INTERVAL);
+                    'forward: loop {
+                        interval.tick().await;
+                        let batch = cursor.take_batch(&waf_fwd_engine);
+                        if batch.is_empty() {
                             continue;
                         }
-                        let new_events: Vec<_> = buf.iter().skip(last_count).cloned().collect();
-                        last_count = buf.len();
-                        new_events
-                    };
-                    for event in &events {
-                        if let Ok(json) = serde_json::to_string(event) {
-                            let line = format!("{json}\n");
-                            if tokio::io::AsyncWriteExt::write_all(&mut writer, line.as_bytes())
-                                .await
-                                .is_err()
+                        for line in batch.into_lines() {
+                            if let Err(e) =
+                                tokio::io::AsyncWriteExt::write_all(&mut writer, line.as_bytes())
+                                    .await
                             {
-                                return;
+                                tracing::error!(
+                                    error = %e,
+                                    "worker: WAF event stream to the supervisor broke; \
+                                     reconnecting, the batch in flight is lost"
+                                );
+                                break 'forward;
                             }
                         }
+                        if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut writer).await {
+                            tracing::error!(
+                                error = %e,
+                                "worker: WAF event stream to the supervisor broke; \
+                                 reconnecting, the batch in flight is lost"
+                            );
+                            break 'forward;
+                        }
                     }
-                    let _ = tokio::io::AsyncWriteExt::flush(&mut writer).await;
                 }
             });
 
@@ -624,7 +635,7 @@ pub(crate) fn run_worker(
     // because worker shutdown is orchestrated by the supervisor via
     // SIGTERM and the prune task exits with the runtime.
     let worker_auth_prune_tracker = tokio_util::task::TaskTracker::new();
-    // All four of the following `spawn_*` helpers call into
+    // The `spawn_*` helpers below call into
     // `tokio::spawn`, which requires a current runtime. We are
     // between two `rt.block_on(...)` blocks here, so use `rt.enter()`
     // to establish a runtime context for the duration of the setup.
@@ -720,21 +731,17 @@ pub(crate) fn run_worker(
         );
     }
     drop(_rt_guard);
-    // Open a LogStore so the worker can persist WAF events directly (with
-    // route_hostname and action stamped). SQLite WAL mode allows concurrent
-    // writes from multiple worker processes. Writes go through the
-    // per-worker background log writer (backlog #24).
-    let worker_log_store: Option<Arc<lorica_api::log_store::LogStore>> =
-        match lorica_api::log_store::LogStore::open(&data_dir) {
-            Ok(s) => Some(Arc::new(s)),
-            Err(e) => {
-                warn!(error = %e, "worker: failed to open log store, WAF event persistence disabled");
-                None
-            }
-        };
-    lorica_proxy.log_writer = worker_log_store
-        .as_ref()
-        .map(|store| lorica_api::log_writer::spawn_log_writer(Arc::clone(store)));
+    // Open a LogStore so the worker can persist access logs and WAF
+    // events directly (with route_hostname and action stamped). SQLite
+    // WAL mode allows concurrent writes from multiple worker processes.
+    // Writes go through the per-worker background log writer (backlog
+    // #24). A store that will not open is retried here and reported to
+    // the supervisor, which alerts: see `startup::log_store_health`.
+    let worker_log_store = crate::startup::log_store_health::open_log_store(
+        &data_dir,
+        crate::startup::log_store_health::LogStoreRole::Worker,
+    );
+    lorica_proxy.log_store = worker_log_store.clone();
     // The capture self-disable writer. Capture admission happens in
     // this process, so the queue it drains is this process's; without
     // the task a rule that spent its total keeps its stored `enabled`
@@ -742,14 +749,22 @@ pub(crate) fn run_worker(
     // Registered here rather than beside the prunes above because it
     // needs the log store opened just now, and `_rt_guard` is already
     // gone by this point.
-    let _capture_disable = {
+    let (_capture_disable, _log_store_retry) = {
         let _rt_guard = rt.enter();
-        lorica::capture::spawn_capture_disable_task(
-            Arc::clone(lorica::capture::node_budgets()),
-            Arc::clone(&store),
-            worker_log_store,
-            &worker_auth_prune_tracker,
-            lorica::capture::CAPTURE_DISABLE_INTERVAL,
+        (
+            lorica::capture::spawn_capture_disable_task(
+                Arc::clone(lorica::capture::node_budgets()),
+                Arc::clone(&store),
+                worker_log_store.clone(),
+                &worker_auth_prune_tracker,
+                lorica::capture::CAPTURE_DISABLE_INTERVAL,
+            ),
+            crate::startup::log_store_health::spawn_log_store_retry(
+                worker_log_store,
+                data_dir.clone(),
+                crate::startup::log_store_health::LogStoreRole::Worker,
+                crate::startup::log_store_health::LOG_STORE_RETRY_INTERVAL,
+            ),
         )
     };
     // ACME challenge store backed by SQLite - workers can read challenges set by supervisor

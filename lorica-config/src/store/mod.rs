@@ -187,6 +187,7 @@ const MIGRATIONS: &[Migration] = &[
     (60, migrate_oidc_issuer_ca_pem),
     (61, migrate_route_waf_body_scan_cap),
     (62, migrate_downstream_idle_timeout),
+    (63, migrate_subscribe_log_store_alerts),
 ];
 
 /// Which telemetry fan-in cursor a follower is reading or advancing
@@ -1166,6 +1167,57 @@ fn migrate_downstream_idle_timeout(_conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// The alert types 1.9.2 introduced, as this migration subscribes
+/// existing channels to them. Frozen here on purpose: the migration
+/// records what that release decided, and a type added later gets its
+/// own migration if it gets one at all.
+const LOG_STORE_ALERT_TYPES: [&str; 2] = ["log_store_unavailable", "log_store_recovered"];
+
+/// Subscribe every notification channel saved with an explicit
+/// alert-type list to the log-store alerts.
+///
+/// A channel whose list is empty or holds `*` already receives every
+/// type. One with an explicit list was saved before these types
+/// existed, so its operator never had the box to tick, and a node that
+/// stops persisting its audit trail would page nobody. Subscribed by
+/// default, they can untick it. A row whose list does not parse is left
+/// for `row_to_notification_config` to report, as every read does.
+fn migrate_subscribe_log_store_alerts(conn: &Connection) -> rusqlite::Result<()> {
+    // Absent only from the partial schemas some tests build; with no
+    // table there is no channel to subscribe.
+    if !column_exists(conn, "notification_configs", "alert_types")? {
+        return Ok(());
+    }
+    let rows: Vec<(String, String)> = conn
+        .prepare("SELECT id, alert_types FROM notification_configs")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, alert_types) in rows {
+        let Ok(mut types) = serde_json::from_str::<Vec<String>>(&alert_types) else {
+            continue;
+        };
+        if types.is_empty() || types.iter().any(|t| t == "*") {
+            continue;
+        }
+        let before = types.len();
+        for new_type in LOG_STORE_ALERT_TYPES {
+            if !types.iter().any(|t| t == new_type) {
+                types.push(new_type.to_string());
+            }
+        }
+        if types.len() == before {
+            continue;
+        }
+        let updated = serde_json::to_string(&types)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        conn.execute(
+            "UPDATE notification_configs SET alert_types = ?2 WHERE id = ?1",
+            params![id, updated],
+        )?;
+    }
+    Ok(())
+}
+
 fn migrate_acme_challenge_expiry(conn: &Connection) -> rusqlite::Result<()> {
     // Story 9.5 AC #6 / D11: `acme_challenges` carried no timestamp, no
     // index and no purge, so an order that died between the write and
@@ -1441,15 +1493,53 @@ impl ConfigStore {
 
         for &(version, migrate) in MIGRATIONS {
             if version > current_version {
-                tracing::info!("applying schema migration v{version}");
-                migrate(&self.conn)?;
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                    params![version],
-                )?;
+                self.apply_migration(version, migrate)?;
             }
         }
 
+        Ok(())
+    }
+
+    /// Apply one migration and record its version as a single unit.
+    ///
+    /// Many bodies are more than one statement. Run statement by
+    /// statement, a crash or a failing statement midway left the leading
+    /// statements applied and the version unrecorded. A batch gated on
+    /// its first column (6 to 9) was then skipped whole by the next
+    /// open, which recorded the version over a table missing the tail
+    /// of it; an ungated one (12) replayed its first `ALTER TABLE` and
+    /// failed every open after on the duplicate column. In one
+    /// transaction the body lands whole with its version or not at all.
+    ///
+    /// IMMEDIATE, and the version read again inside it, because the CLI
+    /// can open this file while the daemon is migrating it: the second
+    /// process waits on the write lock, then finds the version recorded
+    /// and applies nothing, where it used to replay a bare
+    /// `ALTER TABLE ADD COLUMN` and fail on the duplicate column.
+    fn apply_migration(
+        &self,
+        version: i64,
+        migrate: fn(&Connection) -> rusqlite::Result<()>,
+    ) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let recorded: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if recorded >= version {
+            return Ok(());
+        }
+        tracing::info!("applying schema migration v{version}");
+        migrate(&tx)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+            params![version],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 

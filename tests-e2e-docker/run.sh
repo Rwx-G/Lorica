@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Run the Lorica E2E test suite with Docker Compose.
-# Usage: ./run.sh [--build] [--keep] [--skip-workers] [--skip-cert-export] [--skip-ai-bot] [--skip-rbac] [--skip-hot-upgrade] [--skip-log-sinks] [--skip-acme] [--skip-mcp]
+# Usage: ./run.sh [--build] [--keep] [--skip-workers] [--skip-cert-export]
+#                 [--skip-ai-bot] [--skip-rbac] [--skip-audit] [--skip-hot-upgrade]
+#                 [--skip-log-sinks] [--skip-log-sinks-workers] [--skip-acme]
+#                 [--skip-cluster] [--skip-capture] [--skip-capture-workers]
+#                 [--skip-mcp]
 #   --build             Force rebuild all images
 #   --keep              Don't tear down containers after tests
 #   --skip-workers      Skip worker isolation tests (faster)
@@ -10,6 +14,7 @@
 #   --skip-audit        Skip the v1.6.0 Story 8.9 audit-log profile (faster)
 #   --skip-hot-upgrade  Skip the v1.6.0 Story 8.4 hot binary-upgrade profile (faster)
 #   --skip-log-sinks    Skip the v1.7.0 Story 9.8 log-sinks profile (faster)
+#   --skip-log-sinks-workers  Skip the worker-mode variant of the log-sinks profile
 #   --skip-acme         Skip the v1.7.0 Story 9.1 Pebble ACME profile (faster)
 #   --skip-cluster      Skip the v1.7.0 Epic 9 cluster profile (faster)
 #   --skip-capture      Skip the v1.8.0 Stories 10.1/10.2 capture profile (faster)
@@ -28,6 +33,7 @@ SKIP_RBAC=false
 SKIP_AUDIT=false
 SKIP_HOT_UPGRADE=false
 SKIP_LOG_SINKS=false
+SKIP_LOG_SINKS_WORKERS=false
 SKIP_ACME=false
 SKIP_CLUSTER=false
 SKIP_CAPTURE=false
@@ -45,6 +51,7 @@ for arg in "$@"; do
         --skip-audit)        SKIP_AUDIT=true ;;
         --skip-hot-upgrade)  SKIP_HOT_UPGRADE=true ;;
         --skip-log-sinks)    SKIP_LOG_SINKS=true ;;
+        --skip-log-sinks-workers) SKIP_LOG_SINKS_WORKERS=true ;;
         --skip-acme)         SKIP_ACME=true ;;
         --skip-cluster)      SKIP_CLUSTER=true ;;
         --skip-capture)      SKIP_CAPTURE=true ;;
@@ -79,7 +86,7 @@ dump_node_log() {
 # run boots against stale data - e.g. the cert-export smoke rotates the
 # admin password, and a stale volume 401s the next login), and on BUILD a
 # plain `docker compose build` (no profile flags) skips them entirely.
-ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile rbac --profile rbac-workers --profile audit --profile hot-upgrade --profile log-sinks --profile acme --profile cluster --profile capture --profile capture-workers --profile mcp"
+ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile rbac --profile rbac-workers --profile audit --profile hot-upgrade --profile log-sinks --profile log-sinks-workers --profile acme --profile cluster --profile capture --profile capture-workers --profile mcp"
 
 # `docker compose run` never rebuilds an existing image, so a stale runner
 # would silently run old assertions. With --build, build every service
@@ -353,6 +360,44 @@ if [ "$SKIP_LOG_SINKS" = false ] && [ "$EXIT_CODE" = "0" ]; then
     done
 
     docker compose --profile log-sinks run --rm log-sinks-smoke || EXIT_CODE=$?
+fi
+
+# ---- Phase 8b: Log-sinks profile, worker mode (backlog #53) ----------
+# The sink counters are incremented in the workers, where the access
+# events are published, and the supervisor's /metrics reports them only
+# through the per-worker counter aggregation. The smoke compares the
+# supervisor's sent and truncated counts with the frames the collector
+# received from at least two worker PIDs, and checks that the dropped
+# family carries every shed event. Opt-out via --skip-log-sinks-workers
+# (default ON); --skip-workers and --skip-log-sinks skip it too.
+if [ "$SKIP_LOG_SINKS_WORKERS" = false ] && [ "$SKIP_LOG_SINKS" = false ] \
+    && [ "$SKIP_WORKERS" = false ] && [ "$EXIT_CODE" = "0" ]; then
+    echo ""
+    echo "=== Lorica E2E Tests (log-sinks profile, worker mode) ==="
+    echo ""
+
+    docker compose --profile log-sinks-workers up $BUILD_FLAG -d \
+        backend1 syslog-collector-log-sinks-workers otelcol-logs-log-sinks-workers \
+        lorica-log-sinks-workers
+
+    echo "Waiting for Lorica (log-sinks workers) to initialize..."
+    for i in $(seq 1 60); do
+        if docker compose exec -T lorica-log-sinks-workers curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
+            echo "Lorica (log-sinks workers) is ready."
+            break
+        fi
+        if [ "$i" = "60" ]; then
+            echo "ERROR: Lorica (log-sinks workers) did not start within 120s"
+            docker compose logs lorica-log-sinks-workers | tail -20
+            break
+        fi
+        sleep 2
+    done
+
+    if ! docker compose --profile log-sinks-workers run --rm log-sinks-workers-smoke; then
+        EXIT_CODE=1
+        dump_node_log lorica-log-sinks-workers
+    fi
 fi
 
 # ---- Phase 9: ACME / Pebble profile (Story 9.1 AC #13) --------------

@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: Lorica API
   description: REST API for Lorica reverse proxy management
-  version: "1.9.1"
+  version: "1.9.2"
   license:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
@@ -2082,16 +2082,59 @@ paths:
                         type: integer
                         format: int64
                         description: >-
-                          Total persisted WAF events. Plateaus near
-                          waf_event_retention once the cap is reached.
+                          WAF events held, where `stored_in` says. With
+                          the log store, the persisted rows, which
+                          plateau near waf_event_retention once the cap
+                          is reached. The persistent counters, windowed
+                          ones included, are reused for a short while
+                          so that polling dashboards share one table
+                          scan, and dropped on a clear. Without it,
+                          the engine's in-memory ring of the most recent
+                          events since the process started.
+                      stored_in:
+                        type: string
+                        enum: [log_store, memory, none]
+                        description: >-
+                          Where the events `total_events` and
+                          `by_category` count are held: `log_store`, the
+                          retained table; `memory`, no log store is open
+                          and the in-memory ring is counted; `none`,
+                          nothing is wired.
                       total_24h:
                         type: integer
                         format: int64
-                        description: WAF events recorded in the last 24 hours.
+                        description: >-
+                          WAF events recorded in the last 24 hours, not
+                          bounded by retention or by the ring.
+                      total_1h:
+                        type: integer
+                        format: int64
+                        description: >-
+                          WAF events recorded in the last hour, not
+                          bounded by retention or by the ring. Without
+                          the log store the window starts on a whole
+                          minute, so it may include up to one minute
+                          more.
                       rule_count:
                         type: integer
                       by_category:
                         type: array
+                        description: >-
+                          Count per category over the events held, the
+                          same set `total_events` counts. Highest first.
+                        items:
+                          type: object
+                          properties:
+                            category:
+                              type: string
+                            count:
+                              type: integer
+                              format: int64
+                      by_category_1h:
+                        type: array
+                        description: >-
+                          Count per category over the last hour, the
+                          same window `total_1h` counts. Highest first.
                         items:
                           type: object
                           properties:
@@ -4217,7 +4260,9 @@ paths:
                     properties:
                       verified:
                         type: boolean
-                        description: True only when every chain verified.
+                        description: >-
+                          True only when every chain verified, and every fan-in
+                          backup a chain reports.
                       nodes:
                         type: array
                         items:
@@ -5002,6 +5047,27 @@ components:
         first_break_reason:
           type: string
           enum: [prev_hash_mismatch, chain_hash_mismatch]
+        backup:
+          type: object
+          description: >-
+            The rows the per-node fan-in cap moved out of this follower's
+            chain instead of deleting them, verified link by link from the
+            backup's own first row. Absent when the cap has moved none. The
+            fields beside it keep describing the live chain; the top-level
+            `verified` covers both.
+          properties:
+            verified:
+              type: boolean
+            total_rows:
+              type: integer
+            first_break_id:
+              type: integer
+              description: >-
+                The aggregated row id the broken row carried before the cap
+                moved it. Absent when verified.
+            first_break_reason:
+              type: string
+              enum: [prev_hash_mismatch, chain_hash_mismatch]
     NodeResources:
       type: object
       description: >-
@@ -6290,6 +6356,22 @@ components:
           type: integer
         certificates_expiring_soon:
           type: integer
+        log_store:
+          type: object
+          description: >-
+            Whether this node persists its audit trail, access logs and
+            WAF events to `access-log.db`. `persisting` is false while
+            the supervisor, the single process or any worker could not
+            open the store; the node keeps serving and retries every
+            60 s. The dashboard shows a banner on every page meanwhile.
+          required: [persisting, cause]
+          properties:
+            persisting:
+              type: boolean
+            cause:
+              type: string
+              nullable: true
+              description: Why the store is not open, while it is not.
 
     MessageResponse:
       type: object
@@ -6377,7 +6459,7 @@ components:
           type: array
           items:
             type: string
-          description: Alert categories this destination subscribes to (`cert_expiring`, `backend_down`, `waf_alert`, `config_changed`, `sla_breached`, `sla_recovered`, `ip_banned`, `cluster_node_left`, `cluster_config_refused`, `cluster_drift`).
+          description: Alert categories this destination subscribes to (`cert_expiring`, `backend_down`, `waf_alert`, `config_changed`, `sla_breached`, `sla_recovered`, `ip_banned`, `cluster_node_left`, `cluster_config_refused`, `cluster_drift`, `log_store_unavailable`, `log_store_recovered`).
 
     CreateNotificationRequest:
       type: object

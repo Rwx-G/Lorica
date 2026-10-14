@@ -181,9 +181,11 @@ pub struct LoricaProxy {
     pub acme_challenge_store: Option<lorica_api::acme::AcmeChallengeStore>,
     /// Non-blocking alert sender for notification dispatch.
     pub alert_sender: Option<lorica_notify::AlertSender>,
-    /// Producer handle for the background log writer (access logs +
-    /// WAF events, batched SQLite persistence; backlog #24).
-    pub log_writer: Option<lorica_api::log_writer::LogWriteHandle>,
+    /// This process's access-log store, whose background writer takes
+    /// the access logs and WAF events (batched SQLite persistence;
+    /// backlog #24). Read per request, so a store installed after a
+    /// failed boot open is written to without a restart.
+    pub log_store: lorica_api::server::LogStoreSlot,
     /// Per-backend circuit breaker engine. Single-process deployments
     /// hold the state machine in-process (`BreakerEngine::Local`);
     /// worker-mode deployments delegate admission and outcome
@@ -349,7 +351,7 @@ impl LoricaProxy {
             waf_counts: Arc::new(DashMap::new()),
             acme_challenge_store: None,
             alert_sender: None,
-            log_writer: None,
+            log_store: lorica_api::server::LogStoreSlot::default(),
             circuit_breaker_engine: BreakerEngine::local(5, 10),
             basic_auth_cache: Arc::new(DashMap::new()),
             shmem: None,
@@ -3074,7 +3076,7 @@ impl ProxyHttp for LoricaProxy {
                 // Non-blocking hand-off to the background log writer
                 // (backlog #24); the entry clone is far cheaper than
                 // the synchronous INSERT it replaces.
-                if let Some(ref writer) = self.log_writer {
+                if let Some(writer) = self.log_store.writer() {
                     writer.enqueue_access(entry.clone());
                 }
                 self.log_buffer.push(entry);

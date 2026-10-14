@@ -888,46 +888,79 @@ pub async fn apply_log_sinks_from_store(store: &Arc<Mutex<ConfigStore>>) {
     static LAST_APPLIED: OnceLock<parking_lot::Mutex<Option<LogSinksSnapshot>>> = OnceLock::new();
     let slot = LAST_APPLIED.get_or_init(|| parking_lot::Mutex::new(None));
 
-    let s = store.lock().await;
-    let settings = match s.get_global_settings() {
-        Ok(settings) => settings,
-        Err(e) => {
-            warn!(error = %e, "apply_log_sinks_from_store: store fetch failed, sinks pinned at last applied state");
-            lorica_api::metrics::inc_resolver_apply_failed("log_sinks");
-            return;
+    let stored = {
+        let s = store.lock().await;
+        match s.get_global_settings() {
+            Ok(settings) => Some(LogSinksSnapshot::from_settings(&settings)),
+            Err(e) => {
+                warn!(error = %e, "apply_log_sinks_from_store: store fetch failed, sinks pinned at last applied state");
+                lorica_api::metrics::inc_resolver_apply_failed("log_sinks");
+                None
+            }
         }
-    };
-    drop(s);
-
-    // The OTLP exporter fields feed the logs exporter, so they are
-    // part of the change detection alongside the sink fields carried
-    // by `LogSinksConfig` itself.
-    let next = LogSinksSnapshot {
-        sinks: lorica_api::log_sinks::LogSinksConfig::from_settings(
-            &settings,
-            cfg!(feature = "otel"),
-        ),
-        otlp_endpoint: settings
-            .otlp_endpoint
-            .as_ref()
-            .map(|e| e.trim().to_string())
-            .filter(|e| !e.is_empty()),
-        otlp_protocol: settings.otlp_protocol.clone(),
-        otlp_service_name: settings.otlp_service_name.clone(),
-        otlp_auth_header: settings.otlp_logs_auth_header.clone(),
     };
 
     let mut last = slot.lock();
-    if last.as_ref() == Some(&next) {
+    let transition = log_sinks_transition(&mut last, stored);
+    let Some(applied) = last.as_ref() else {
         return;
+    };
+    match transition {
+        LogSinksTransition::KeepLastApplied | LogSinksTransition::Unchanged => {}
+        LogSinksTransition::Start | LogSinksTransition::Replace => install_log_sinks(applied),
+        LogSinksTransition::Stop => {
+            install_log_sinks(applied);
+            info!("log-export sinks disabled by settings change");
+        }
     }
-    // Skip the initial no-op: nothing installed yet and nothing to
-    // install (the common standalone boot with sinks off).
-    if last.is_none() && next.sinks.is_empty() {
-        *last = Some(next);
-        return;
-    }
+}
 
+/// What [`apply_log_sinks_from_store`] does with one reading of the
+/// store, decided by [`log_sinks_transition`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogSinksTransition {
+    /// The store could not be read; the sinks already installed stay.
+    KeepLastApplied,
+    /// Nothing to (re)install: the stored configuration is the one in
+    /// place, or nothing was ever installed and nothing is configured.
+    Unchanged,
+    /// No sink was configured and one now is.
+    Start,
+    /// Sinks were configured and none now is.
+    Stop,
+    /// Any other change: the hub is torn down and rebuilt.
+    Replace,
+}
+
+/// Decide what a reading of the store (`None` when it could not be
+/// read) does to the sinks, and record it in `last_applied` unless it
+/// keeps them. Kept free of the hub and the process-wide slot so the
+/// transitions are testable without one test's install bleeding into
+/// the next.
+fn log_sinks_transition(
+    last_applied: &mut Option<LogSinksSnapshot>,
+    stored: Option<LogSinksSnapshot>,
+) -> LogSinksTransition {
+    let Some(next) = stored else {
+        return LogSinksTransition::KeepLastApplied;
+    };
+    let transition = match last_applied.as_ref() {
+        Some(last) if *last == next => LogSinksTransition::Unchanged,
+        // The common standalone boot with sinks off: nothing installed
+        // yet and nothing to install.
+        None if next.sinks.is_empty() => LogSinksTransition::Unchanged,
+        None => LogSinksTransition::Start,
+        Some(last) => match (last.sinks.is_empty(), next.sinks.is_empty()) {
+            (true, false) => LogSinksTransition::Start,
+            (false, true) => LogSinksTransition::Stop,
+            _ => LogSinksTransition::Replace,
+        },
+    };
+    *last_applied = Some(next);
+    transition
+}
+
+fn install_log_sinks(next: &LogSinksSnapshot) {
     // Installs the lanes whose consumer `log_sinks` owns (syslog). The
     // OTLP consumer lives here, so it registers its own lane below,
     // and only once it is running: a lane that exists before its
@@ -963,11 +996,6 @@ pub async fn apply_log_sinks_from_store(store: &Arc<Mutex<ConfigStore>>) {
             "syslog sink (re)installed from settings"
         );
     }
-    if next.sinks.is_empty() && last.as_ref().is_some_and(|l| !l.sinks.is_empty()) {
-        info!("log-export sinks disabled by settings change");
-    }
-
-    *last = Some(next);
 }
 
 #[derive(Clone, PartialEq)]
@@ -977,6 +1005,28 @@ struct LogSinksSnapshot {
     otlp_protocol: String,
     otlp_service_name: String,
     otlp_auth_header: Option<String>,
+}
+
+impl LogSinksSnapshot {
+    fn from_settings(settings: &lorica_config::models::GlobalSettings) -> Self {
+        // The OTLP exporter fields feed the logs exporter, so they are
+        // part of the change detection alongside the sink fields carried
+        // by `LogSinksConfig` itself.
+        LogSinksSnapshot {
+            sinks: lorica_api::log_sinks::LogSinksConfig::from_settings(
+                settings,
+                cfg!(feature = "otel"),
+            ),
+            otlp_endpoint: settings
+                .otlp_endpoint
+                .as_ref()
+                .map(|e| e.trim().to_string())
+                .filter(|e| !e.is_empty()),
+            otlp_protocol: settings.otlp_protocol.clone(),
+            otlp_service_name: settings.otlp_service_name.clone(),
+            otlp_auth_header: settings.otlp_logs_auth_header.clone(),
+        }
+    }
 }
 
 /// Story 8.10 AC #8. Emit a single operator-facing notice, once per
@@ -1416,6 +1466,122 @@ mod log_level_tests {
             Some(Err(_))
         ));
         assert_eq!(apply_log_level("debug", &mut last, &refuse), None);
+    }
+}
+
+#[cfg(test)]
+mod log_sinks_transition_tests {
+    //! Backlog #53 (b): the decision `apply_log_sinks_from_store` takes
+    //! on each reload, without the process-wide slot or the sink hub.
+
+    use lorica_config::models::GlobalSettings;
+
+    use super::{log_sinks_transition, LogSinksSnapshot, LogSinksTransition};
+
+    fn syslog_to(endpoint: &str) -> LogSinksSnapshot {
+        let settings = GlobalSettings {
+            syslog_endpoint: Some(endpoint.to_string()),
+            syslog_transport: "udp".to_string(),
+            ..GlobalSettings::default()
+        };
+        LogSinksSnapshot::from_settings(&settings)
+    }
+
+    fn sinks_off() -> LogSinksSnapshot {
+        LogSinksSnapshot::from_settings(&GlobalSettings::default())
+    }
+
+    #[test]
+    fn a_boot_with_sinks_off_installs_nothing_and_records_the_state() {
+        let mut last = None;
+        assert_eq!(
+            log_sinks_transition(&mut last, Some(sinks_off())),
+            LogSinksTransition::Unchanged
+        );
+        assert!(last.is_some_and(|l: LogSinksSnapshot| l.sinks.is_empty()));
+    }
+
+    #[test]
+    fn the_same_configuration_twice_is_a_no_op() {
+        let mut last = None;
+        assert_eq!(
+            log_sinks_transition(&mut last, Some(syslog_to("host01:514"))),
+            LogSinksTransition::Start
+        );
+        assert_eq!(
+            log_sinks_transition(&mut last, Some(syslog_to("host01:514"))),
+            LogSinksTransition::Unchanged
+        );
+    }
+
+    #[test]
+    fn enabling_a_sink_from_disabled_starts_it() {
+        let mut last = Some(sinks_off());
+        assert_eq!(
+            log_sinks_transition(&mut last, Some(syslog_to("host01:514"))),
+            LogSinksTransition::Start
+        );
+        assert!(last.is_some_and(|l| l.sinks.syslog.is_some()));
+    }
+
+    #[test]
+    fn disabling_every_sink_from_enabled_stops_them() {
+        let mut last = Some(syslog_to("host01:514"));
+        assert_eq!(
+            log_sinks_transition(&mut last, Some(sinks_off())),
+            LogSinksTransition::Stop
+        );
+        assert!(last.is_some_and(|l| l.sinks.is_empty()));
+    }
+
+    #[test]
+    fn a_changed_target_replaces_the_sinks() {
+        let mut last = Some(syslog_to("host01:514"));
+        assert_eq!(
+            log_sinks_transition(&mut last, Some(syslog_to("host02:514"))),
+            LogSinksTransition::Replace
+        );
+        assert!(last.is_some_and(|l| l.sinks.syslog.is_some_and(|s| s.endpoint == "host02:514")));
+    }
+
+    #[test]
+    fn a_changed_otlp_exporter_field_replaces_even_with_sinks_off() {
+        let mut last = Some(sinks_off());
+        let settings = GlobalSettings {
+            otlp_service_name: "edge-01".to_string(),
+            ..GlobalSettings::default()
+        };
+        assert_eq!(
+            log_sinks_transition(&mut last, Some(LogSinksSnapshot::from_settings(&settings))),
+            LogSinksTransition::Replace
+        );
+    }
+
+    #[test]
+    fn a_store_fetch_failure_keeps_the_last_applied_state() {
+        let mut last = Some(syslog_to("host01:514"));
+        assert_eq!(
+            log_sinks_transition(&mut last, None),
+            LogSinksTransition::KeepLastApplied
+        );
+        assert!(last.as_ref().is_some_and(|l| l
+            .sinks
+            .syslog
+            .as_ref()
+            .is_some_and(|s| s.endpoint == "host01:514")));
+        // The next good reading is compared against what is still
+        // installed, not against the failed one.
+        assert_eq!(
+            log_sinks_transition(&mut last, Some(syslog_to("host01:514"))),
+            LogSinksTransition::Unchanged
+        );
+
+        let mut never_applied = None;
+        assert_eq!(
+            log_sinks_transition(&mut never_applied, None),
+            LogSinksTransition::KeepLastApplied
+        );
+        assert!(never_applied.is_none());
     }
 }
 

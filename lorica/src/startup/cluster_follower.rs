@@ -177,10 +177,10 @@ pub(crate) struct FollowerOptions {
     /// fills up on a proxy is where its logs and databases live.
     pub data_dir: std::path::PathBuf,
     /// The audit log this node records its own applies in
-    /// (Story 9.9 AC #4). `None` on a node whose process does not
-    /// serve the management API, where `record_with_store` is a no-op
-    /// and the apply goes unrecorded rather than failing.
-    pub log_store: Option<Arc<lorica_api::log_store::LogStore>>,
+    /// (Story 9.9 AC #4). Empty while the access-log store is not
+    /// open, where `record_with_store` writes to the sinks only and the
+    /// apply goes unrecorded rather than failing.
+    pub log_store: lorica_api::server::LogStoreSlot,
 }
 
 /// Live handles for a running follower.
@@ -293,7 +293,7 @@ struct ReplicaHandler {
     /// than this map.
     alerted: StdMutex<HashSet<(u64, String)>>,
     /// Where this node's own audit entries go (Story 9.9 AC #4).
-    log_store: Option<Arc<lorica_api::log_store::LogStore>>,
+    log_store: lorica_api::server::LogStoreSlot,
     /// The last reading a background task published (Story 9.7 AC #3).
     ///
     /// Published rather than sampled on demand, because `resources()`
@@ -326,7 +326,7 @@ impl ReplicaHandler {
     /// per-node outcome (AC #6).
     async fn audit(&self, action: &str, after: serde_json::Value) {
         lorica_api::audit::record_with_store(
-            self.log_store.clone(),
+            self.log_store.store(),
             &lorica_api::audit::AuditContext::node("cluster"),
             action,
             ("cluster_node", &self.node_id),

@@ -69,7 +69,7 @@ use super::scope::{
     SLA_OVERVIEW_PATH, SLA_ROUTE_TEMPLATE, WAF_EVENTS_PATH, WAF_STATS_PATH, WHOAMI_PATH,
 };
 use crate::error::json_data;
-use crate::server::AppState;
+use crate::server::{AppState, LogStoreSlot};
 
 /// Body cap for the automation plane.
 ///
@@ -189,6 +189,29 @@ async fn hardened_response(req: axum::extract::Request, next: axum::middleware::
         http::HeaderValue::from_static("nosniff"),
     );
     response
+}
+
+/// Where a router finds this process's log-store slot.
+type SlotSource = fn() -> Option<&'static LogStoreSlot>;
+
+/// Give the request's `AppState` the log store the startup retry loop
+/// installed after the router was built.
+///
+/// The listener's router clones one `AppState` into every request, taken
+/// at boot, so a store that failed to open then and was installed later
+/// would otherwise stay invisible to the logs and WAF reads, and to the
+/// MCP tools that run them, until a restart. Runs inside the `AppState`
+/// extension so it patches the clone that layer inserts; the MCP endpoint
+/// hands that same patched state to [`in_process_router`].
+async fn adopt_late_log_store(
+    axum::extract::State(slot_source): axum::extract::State<SlotSource>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let (Some(state), Some(slot)) = (req.extensions_mut().get_mut::<AppState>(), slot_source()) {
+        crate::server::adopt_log_store(state, slot);
+    }
+    next.run(req).await
 }
 
 /// One `(verb, path)` the automation plane mounts, and the handler
@@ -467,11 +490,22 @@ pub(super) fn in_process_router() -> Router {
 /// 6. [`authorized`] - every authorization-class layer, the scope
 ///    gate and the write budget, shared with [`in_process_router`].
 ///
+/// Directly inside the `AppState` extension, [`adopt_late_log_store`]
+/// gives each request's state a log store installed after boot.
+///
 /// There is deliberately NO cookie layer, NO CSRF layer and NO session
 /// store here. The two management planes share no credential, and the
 /// cheapest way to keep that true is for this router to have no way to
 /// read one.
 pub fn build_automation_router(state: AppState) -> Router {
+    listener_router(state, crate::server::process_log_store)
+}
+
+/// [`build_automation_router`] with the log-store slot read from
+/// `slot_source`. Tests hand it a slot of their own: the process slot is
+/// one per test binary, and a store installed there would be adopted by
+/// every other test's state.
+fn listener_router(state: AppState, slot_source: SlotSource) -> Router {
     let routed = authorized(mounted(route_table()))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -479,6 +513,10 @@ pub fn build_automation_router(state: AppState) -> Router {
         ))
         .layer(axum::middleware::from_fn(hardened_response))
         .layer(axum::extract::DefaultBodyLimit::max(AUTOMATION_BODY_CAP))
+        .layer(axum::middleware::from_fn_with_state(
+            slot_source,
+            adopt_late_log_store,
+        ))
         .layer(axum::Extension(state.clone()));
     with_audit_and_panic_net(routed, state)
 }
@@ -667,6 +705,75 @@ mod tests {
             .await,
             http::StatusCode::NOT_FOUND
         );
+    }
+
+    static LATE_SLOT: OnceLock<LogStoreSlot> = OnceLock::new();
+
+    fn late_slot() -> Option<&'static LogStoreSlot> {
+        LATE_SLOT.get()
+    }
+
+    #[tokio::test]
+    async fn a_read_after_a_late_store_install_answers_from_the_store() {
+        let (state, token, _) =
+            crate::automation::test_support::a_node_with_something_to_read().await;
+        assert!(state.log_store.is_none(), "the store failed at boot");
+        let slot = LATE_SLOT.get_or_init(|| LogStoreSlot::failed("corrupt".to_string()));
+        let router = listener_router(state, late_slot);
+        let read = |path: &'static str| {
+            let router = router.clone();
+            let bearer = format!("Bearer {token}");
+            async move {
+                let response = router
+                    .oneshot(
+                        http::Request::builder()
+                            .uri(path)
+                            .header(http::header::AUTHORIZATION, bearer)
+                            .body(axum::body::Body::empty())
+                            .expect("test setup"),
+                    )
+                    .await
+                    .expect("infallible");
+                assert_eq!(response.status(), http::StatusCode::OK, "{path}");
+                crate::tests::body_json(response).await["data"].clone()
+            }
+        };
+        let rule_ids = |events: serde_json::Value| -> Vec<u64> {
+            events["items"]
+                .as_array()
+                .expect("a page of events")
+                .iter()
+                .map(|event| event["rule_id"].as_u64().expect("a rule id"))
+                .collect()
+        };
+
+        let from_the_ring = rule_ids(read(WAF_EVENTS_PATH).await);
+        assert_eq!(from_the_ring.len(), 5, "the in-memory fallback answers");
+
+        let dir = tempfile::tempdir().expect("test setup: tempdir");
+        let store = std::sync::Arc::new(
+            crate::log_store::LogStore::open(dir.path()).expect("test setup: log store"),
+        );
+        store
+            .insert_waf_event(&lorica_waf::WafEvent {
+                rule_id: 999_001,
+                description: "stored".to_string(),
+                category: lorica_waf::RuleCategory::Xss,
+                severity: 4,
+                matched_field: "query".to_string(),
+                matched_value: "<script>".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                client_ip: "192.0.2.10".to_string(),
+                route_hostname: "read.example.com".to_string(),
+                action: "blocked".to_string(),
+            })
+            .expect("test setup: stored event");
+        assert!(slot.install(store, None));
+
+        assert_eq!(rule_ids(read(WAF_EVENTS_PATH).await), vec![999_001]);
+        let stats = read(WAF_STATS_PATH).await;
+        assert_eq!(stats["total_events"], 1);
+        assert_eq!(stats["total_1h"], 1);
     }
 
     #[test]

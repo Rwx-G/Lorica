@@ -222,8 +222,8 @@
   let probesEnabled = $derived(probes.filter(p => p.enabled).length);
 
   let wafTopCategory = $derived.by(() => {
-    if (!wafStats || wafStats.by_category.length === 0) return null;
-    const sorted = [...wafStats.by_category].sort((a, b) => b.count - a.count);
+    if (!wafStats || wafStats.by_category_1h.length === 0) return null;
+    const sorted = [...wafStats.by_category_1h].sort((a, b) => b.count - a.count);
     return sorted[0];
   });
 
@@ -265,18 +265,25 @@
 
   onMount(() => {
     fetchAll();
-    refreshTimer = setInterval(fetchAll, 30000);
+    refreshTimer = setInterval(fetchAll, REFRESH_MS);
     return () => {
       if (refreshTimer) clearInterval(refreshTimer);
     };
   });
+
+  const refreshedEvery = `every ${REFRESH_MS / 1000}s`;
+</script>
+
+<script lang="ts" module>
+  /** How often the page re-reads everything it shows. */
+  export const REFRESH_MS = 30000;
 </script>
 
 <div class="overview">
   <div class="overview-header">
     <h1>Overview</h1>
     {#if lastRefresh}
-      <span class="refresh-indicator" title="Auto-refresh every 30s">
+      <span class="refresh-indicator" title="Auto-refresh {refreshedEvery}">
         <span class="refresh-dot"></span>
         Last update: {lastRefresh.toLocaleTimeString()}
       </span>
@@ -439,13 +446,14 @@
       </div>
       <div class="card-grid">
         <Card
-          title="WAF Events"
-          value={wafStats?.total_events ?? 0}
-          color={wafStats && wafStats.total_events > 0 ? 'orange' : 'green'}
+          title="WAF Events (1h)"
+          value={wafStats?.total_1h ?? 0}
+          color={wafStats && wafStats.total_1h > 0 ? 'orange' : 'green'}
+          tooltip="WAF events in the last hour, refreshed {refreshedEvery}"
         />
         {#if wafTopCategory}
           {@const shortCat = { sql_injection: 'SQLi', xss: 'XSS', path_traversal: 'Path Trav.', command_injection: 'Cmd Inj.', protocol_violation: 'Proto Viol.', SSRF: 'SSRF', log_injection: 'Log4Shell', XXE: 'XXE', ip_blocklist: 'IP Block', SSTI: 'SSTI', prototype_pollution: 'Proto Poll.' }[wafTopCategory.category] ?? wafTopCategory.category}
-          <Card title="Top Category" value="{shortCat} ({wafTopCategory.count})" tooltip="{wafTopCategory.category}: {wafTopCategory.count} events" />
+          <Card title="Top Category (1h)" value="{shortCat} ({wafTopCategory.count})" tooltip="{wafTopCategory.category}: {wafTopCategory.count} events in the last hour" />
         {/if}
         <Card
           title="Active Bans"
