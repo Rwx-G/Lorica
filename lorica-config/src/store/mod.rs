@@ -1441,15 +1441,53 @@ impl ConfigStore {
 
         for &(version, migrate) in MIGRATIONS {
             if version > current_version {
-                tracing::info!("applying schema migration v{version}");
-                migrate(&self.conn)?;
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-                    params![version],
-                )?;
+                self.apply_migration(version, migrate)?;
             }
         }
 
+        Ok(())
+    }
+
+    /// Apply one migration and record its version as a single unit.
+    ///
+    /// Many bodies are more than one statement. Run statement by
+    /// statement, a crash or a failing statement midway left the leading
+    /// statements applied and the version unrecorded. A batch gated on
+    /// its first column (6 to 9) was then skipped whole by the next
+    /// open, which recorded the version over a table missing the tail
+    /// of it; an ungated one (12) replayed its first `ALTER TABLE` and
+    /// failed every open after on the duplicate column. In one
+    /// transaction the body lands whole with its version or not at all.
+    ///
+    /// IMMEDIATE, and the version read again inside it, because the CLI
+    /// can open this file while the daemon is migrating it: the second
+    /// process waits on the write lock, then finds the version recorded
+    /// and applies nothing, where it used to replay a bare
+    /// `ALTER TABLE ADD COLUMN` and fail on the duplicate column.
+    fn apply_migration(
+        &self,
+        version: i64,
+        migrate: fn(&Connection) -> rusqlite::Result<()>,
+    ) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let recorded: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if recorded >= version {
+            return Ok(());
+        }
+        tracing::info!("applying schema migration v{version}");
+        migrate(&tx)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+            params![version],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
