@@ -6313,6 +6313,22 @@ components:
           type: integer
         certificates_expiring_soon:
           type: integer
+        log_store:
+          type: object
+          description: >-
+            Whether this node persists its audit trail, access logs and
+            WAF events to `access-log.db`. `persisting` is false while
+            the supervisor, the single process or any worker could not
+            open the store; the node keeps serving and retries every
+            60 s. The dashboard shows a banner on every page meanwhile.
+          required: [persisting, cause]
+          properties:
+            persisting:
+              type: boolean
+            cause:
+              type: string
+              nullable: true
+              description: Why the store is not open, while it is not.
 
     MessageResponse:
       type: object
@@ -6400,7 +6416,7 @@ components:
           type: array
           items:
             type: string
-          description: Alert categories this destination subscribes to (`cert_expiring`, `backend_down`, `waf_alert`, `config_changed`, `sla_breached`, `sla_recovered`, `ip_banned`, `cluster_node_left`, `cluster_config_refused`, `cluster_drift`).
+          description: Alert categories this destination subscribes to (`cert_expiring`, `backend_down`, `waf_alert`, `config_changed`, `sla_breached`, `sla_recovered`, `ip_banned`, `cluster_node_left`, `cluster_config_refused`, `cluster_drift`, `log_store_unavailable`, `log_store_recovered`).
 
     CreateNotificationRequest:
       type: object

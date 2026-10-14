@@ -54,7 +54,7 @@ pub const ENVIRONMENT_REAPER_INTERVAL: Duration = Duration::from_secs(60);
 pub fn spawn_environment_reaper(
     cluster: &ClusterRuntime,
     store: Arc<Mutex<ConfigStore>>,
-    log_store: Option<Arc<lorica_api::log_store::LogStore>>,
+    log_store: lorica_api::server::LogStoreSlot,
     config_reload: watch::Sender<u64>,
     tracker: &TaskTracker,
     interval: Duration,
@@ -73,7 +73,7 @@ pub fn spawn_environment_reaper(
             }
             let reaped = lorica_api::automation::reap_expired_environments(
                 &store,
-                log_store.clone(),
+                log_store.store(),
                 chrono::Utc::now(),
             )
             .await;
@@ -155,7 +155,7 @@ mod tests {
         let handle = spawn_environment_reaper(
             &ClusterRuntime::Standalone,
             store,
-            None,
+            lorica_api::server::LogStoreSlot::default(),
             tx,
             &tracker,
             Duration::from_secs(3600),

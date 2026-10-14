@@ -365,13 +365,13 @@ pub(crate) fn run_supervisor(cli: Cli) {
             }
         }
 
-        let log_store = match lorica_api::log_store::LogStore::open(&data_dir) {
-            Ok(s) => Some(Arc::new(s)),
-            Err(e) => {
-                warn!(error = %e, "failed to open access log database, persistence disabled");
-                None
-            }
-        };
+        // A store that will not open is retried, alerted on and shown
+        // on every dashboard page, never fatal: see
+        // `startup::log_store_health`. Each worker opens its own.
+        let log_store = startup::log_store_health::open_log_store(
+            &data_dir,
+            startup::log_store_health::LogStoreRole::Supervisor,
+        );
 
         let store = Arc::new(Mutex::new(store));
         let log_buffer = Arc::new(LogBuffer::new(10_000));
@@ -909,6 +909,18 @@ pub(crate) fn run_supervisor(cli: Cli) {
             probe_scheduler,
             sla_collector,
         } = startup::start_alerting_stack(&store, &alert_sender, log_store.clone()).await;
+        let _log_store_retry = startup::log_store_health::spawn_log_store_retry(
+            log_store.clone(),
+            data_dir.clone(),
+            startup::log_store_health::LogStoreRole::Supervisor,
+            startup::log_store_health::LOG_STORE_RETRY_INTERVAL,
+        );
+        // Watches the workers too: their state arrives with their
+        // metrics reports, and this is the process that can alert.
+        let _log_store_watch = startup::log_store_health::spawn_log_store_watch(
+            alert_sender.clone(),
+            startup::log_store_health::LOG_STORE_WATCH_INTERVAL,
+        );
 
         // Reload proxy config, probe scheduler, SLA configs, and notification dispatcher on config changes
         let reload_store = Arc::clone(&store);
@@ -938,7 +950,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
         let api_store = Arc::clone(&store);
         let api_log_buffer = Arc::clone(&log_buffer);
         let api_active_connections = Arc::clone(&active_connections);
-        let api_log_store = log_store.clone();
+        let api_log_store = log_store.store();
         let api_worker_metrics = Arc::clone(&worker_metrics);
         let api_aggregated_metrics = Arc::clone(&aggregated_metrics);
         // Pipelined metrics refresher (WPAR-7 pull-on-scrape). Captures
@@ -1184,8 +1196,8 @@ pub(crate) fn run_supervisor(cli: Cli) {
 
         // Hourly retention loop (access logs, probe results, WAF
         // events, SLA buckets), shared across modes (audit H-9, see
-        // `startup::spawn_retention_loop`). No-op when the access-log
-        // store failed to open.
+        // `startup::spawn_retention_loop`). The access-log jobs wait
+        // for a store that failed to open.
         startup::spawn_retention_loop(
             log_store.clone(),
             Arc::clone(&store),

@@ -36,6 +36,15 @@ pub enum AlertType {
     /// plane's current one (Story 9.4 AC #12); raised on the control
     /// plane, suppressed per node by an exponential backoff.
     ClusterDrift,
+    /// The access-log store (`access-log.db`) could not be opened, by
+    /// this process or one of its workers: the node keeps serving, but
+    /// its audit trail, access logs and WAF events are not persisted.
+    /// Raised once per outage by the process serving the management
+    /// API, however many retries fail.
+    LogStoreUnavailable,
+    /// Persistence resumed after a [`Self::LogStoreUnavailable`], without
+    /// a restart.
+    LogStoreRecovered,
 }
 
 impl AlertType {
@@ -56,8 +65,27 @@ impl AlertType {
             Self::ClusterNodeLeft => "cluster_node_left",
             Self::ClusterConfigRefused => "cluster_config_refused",
             Self::ClusterDrift => "cluster_drift",
+            Self::LogStoreUnavailable => "log_store_unavailable",
+            Self::LogStoreRecovered => "log_store_recovered",
         }
     }
+
+    /// Every alert type, in declaration order: the vocabulary a
+    /// notification channel can subscribe to.
+    pub const ALL: [AlertType; 12] = [
+        Self::CertExpiring,
+        Self::BackendDown,
+        Self::WafAlert,
+        Self::ConfigChanged,
+        Self::SlaBreached,
+        Self::SlaRecovered,
+        Self::IpBanned,
+        Self::ClusterNodeLeft,
+        Self::ClusterConfigRefused,
+        Self::ClusterDrift,
+        Self::LogStoreUnavailable,
+        Self::LogStoreRecovered,
+    ];
 }
 
 impl std::str::FromStr for AlertType {
@@ -74,6 +102,8 @@ impl std::str::FromStr for AlertType {
             "cluster_node_left" => Ok(Self::ClusterNodeLeft),
             "cluster_config_refused" => Ok(Self::ClusterConfigRefused),
             "cluster_drift" => Ok(Self::ClusterDrift),
+            "log_store_unavailable" => Ok(Self::LogStoreUnavailable),
+            "log_store_recovered" => Ok(Self::LogStoreRecovered),
             other => Err(format!("unknown alert type: {other}")),
         }
     }
@@ -114,25 +144,64 @@ impl AlertEvent {
 mod tests {
     use super::*;
 
+    /// The position of `alert_type` in [`AlertType::ALL`]. The match is
+    /// exhaustive, so a new variant does not compile until it is given
+    /// a position here, and the test below then fails until `ALL`
+    /// holds it there.
+    fn declared_position(alert_type: &AlertType) -> usize {
+        match alert_type {
+            AlertType::CertExpiring => 0,
+            AlertType::BackendDown => 1,
+            AlertType::WafAlert => 2,
+            AlertType::ConfigChanged => 3,
+            AlertType::SlaBreached => 4,
+            AlertType::SlaRecovered => 5,
+            AlertType::IpBanned => 6,
+            AlertType::ClusterNodeLeft => 7,
+            AlertType::ClusterConfigRefused => 8,
+            AlertType::ClusterDrift => 9,
+            AlertType::LogStoreUnavailable => 10,
+            AlertType::LogStoreRecovered => 11,
+        }
+    }
+
+    #[test]
+    fn all_holds_every_variant_once() {
+        for (index, alert_type) in AlertType::ALL.iter().enumerate() {
+            assert_eq!(declared_position(alert_type), index, "{alert_type:?}");
+        }
+    }
+
     #[test]
     fn test_alert_type_round_trip() {
-        for (s, variant) in [
-            ("cert_expiring", AlertType::CertExpiring),
-            ("backend_down", AlertType::BackendDown),
-            ("waf_alert", AlertType::WafAlert),
-            ("config_changed", AlertType::ConfigChanged),
-            ("sla_breached", AlertType::SlaBreached),
-            ("sla_recovered", AlertType::SlaRecovered),
-            ("ip_banned", AlertType::IpBanned),
-            ("cluster_node_left", AlertType::ClusterNodeLeft),
-            ("cluster_config_refused", AlertType::ClusterConfigRefused),
-            ("cluster_drift", AlertType::ClusterDrift),
-        ] {
+        for variant in AlertType::ALL {
+            let s = variant.as_str();
             assert_eq!(
                 s.parse::<AlertType>().expect("known AlertType variant"),
                 variant
             );
-            assert_eq!(variant.as_str(), s);
+            let json = serde_json::to_string(&variant).expect("an AlertType serializes");
+            assert_eq!(json, format!("\"{s}\""), "serde and as_str agree");
+        }
+    }
+
+    /// The management API reference lists the alert types a channel can
+    /// subscribe to; a type missing there is one an operator scripting
+    /// the API cannot know to ask for.
+    #[test]
+    fn the_api_reference_lists_every_alert_type() {
+        let reference = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../lorica-api/openapi.yaml"
+        ))
+        .expect("test setup: the OpenAPI document reads");
+        let line = reference
+            .lines()
+            .find(|line| line.contains("Alert categories this destination subscribes to"))
+            .expect("the alert_types description is present");
+        for alert_type in AlertType::ALL {
+            let quoted = format!("`{}`", alert_type.as_str());
+            assert!(line.contains(&quoted), "{quoted} is missing from: {line}");
         }
     }
 

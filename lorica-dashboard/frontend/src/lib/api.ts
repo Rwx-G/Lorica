@@ -255,6 +255,14 @@ export interface StatusResponse {
   backends_down: number;
   certificates_count: number;
   certificates_expiring_soon: number;
+  log_store: LogStoreStatus;
+}
+
+/** Whether the node persists its audit trail, access logs and WAF events. */
+export interface LogStoreStatus {
+  persisting: boolean;
+  /** Why not, while `persisting` is false. */
+  cause: string | null;
 }
 
 export interface PathRuleResponse {

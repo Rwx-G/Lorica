@@ -1438,16 +1438,32 @@ pub fn snapshot_per_worker_counters() -> Vec<GenericCounterTuple> {
 /// this crate's counter statics. Counters receive a POSITIVE delta
 /// only: a dropped worker's state stays at the last scrape until
 /// another report arrives or a `forget` call removes it.
+///
+/// The worker's [`snapshot_log_store_up`] entry is recorded here as the
+/// gauge it is; [`resolve_per_worker_counter`] knows no such counter, so
+/// the delta machinery skips it.
 pub fn apply_worker_generic_counters(worker_id: u32, entries: &[GenericCounterTuple]) {
+    if let Some((_, _, value)) = entries
+        .iter()
+        .rev()
+        .find(|(name, _, _)| name == LOG_STORE_UP_NAME)
+    {
+        record_worker_log_store_up(worker_id, *value > 0);
+    }
     lorica_metrics::apply_worker_generic_counters(worker_id, entries, resolve_per_worker_counter);
 }
 
 /// Drop a worker's snapshot on the supervisor side. Called when the
 /// supervisor detects a dead worker (RPC channel gone, crash
 /// signalled). Without this, the supervisor would keep the last-known
-/// counter values forever, skewing the aggregate.
+/// counter values forever, skewing the aggregate. The worker's
+/// log-store series goes with it: a dead worker persists nothing, and
+/// its replacement reports its own state on its first report.
 pub fn forget_worker_generic_counters(worker_id: u32) {
     lorica_metrics::forget_worker_generic_counters(worker_id);
+    if WORKER_LOG_STORE_UP.lock().remove(&worker_id).is_some() {
+        let _ = LOG_STORE_UP.remove_label_values(&["worker", &worker_id.to_string()]);
+    }
 }
 
 /// Test-only helper that wipes the supervisor's generic-counter
@@ -1490,6 +1506,82 @@ static LOG_WRITE_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// Bump the dropped-log-write counter for `kind` (`"access"` or `"waf"`).
 pub fn inc_log_write_dropped(kind: &str) {
     LOG_WRITE_DROPPED_TOTAL.with_label_values(&[kind]).inc();
+}
+
+/// Name of the log-store gauge as a scrape renders it, and as a worker
+/// ships its own value to the supervisor.
+const LOG_STORE_UP_NAME: &str = "lorica_log_store_up";
+
+/// Gauge: whether each process holds an open access-log store
+/// (`access-log.db`), 1 open, 0 not. Labels: `role`
+/// (`single`|`supervisor`|`worker`) and `worker_id` (empty except on
+/// `role="worker"`).
+///
+/// One series per process rather than a min across workers: the access
+/// logs and WAF events are written by the workers and the audit trail by
+/// the supervisor, so which process lost its store says which trail
+/// stopped. `min(lorica_log_store_up) == 0` is the node-level alert.
+/// Cardinality is bounded by the worker count.
+static LOG_STORE_UP: Lazy<IntGaugeVec> = Lazy::new(|| {
+    lorica_metrics::register_int_gauge_vec(
+        "log_store_up",
+        "Whether the process holds an open access-log store (1 open, 0 not)",
+        &["role", "worker_id"],
+    )
+});
+
+/// This process's own log-store state as last published: 0 never set,
+/// 1 down, 2 up. Read back by a worker building its metrics report.
+static LOCAL_LOG_STORE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The supervisor's view of each worker's log store, from the reports.
+static WORKER_LOG_STORE_UP: Lazy<parking_lot::Mutex<std::collections::BTreeMap<u32, bool>>> =
+    Lazy::new(|| parking_lot::Mutex::new(std::collections::BTreeMap::new()));
+
+/// Publish whether this process holds an open access-log store. `role`
+/// is `single`, `supervisor` or `worker`. In a worker the value only
+/// reaches a scrape through [`snapshot_log_store_up`] and the
+/// supervisor, since workers serve no `/metrics`.
+pub fn set_log_store_up(role: &str, up: bool) {
+    LOG_STORE_UP
+        .with_label_values(&[role, ""])
+        .set(i64::from(up));
+    LOCAL_LOG_STORE_STATE.store(if up { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// This worker's log-store state as one entry of its metrics report,
+/// `None` until [`set_log_store_up`] has run.
+///
+/// The value is a gauge, not a counter, and rides the generic-counter
+/// list only because the typed report has no field for it: the
+/// supervisor reads it by name in [`apply_worker_generic_counters`], and
+/// the counter machinery, like a supervisor that predates the gauge,
+/// skips a name it does not know.
+pub fn snapshot_log_store_up() -> Option<GenericCounterTuple> {
+    match LOCAL_LOG_STORE_STATE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some((LOG_STORE_UP_NAME.to_string(), Vec::new(), 0)),
+        2 => Some((LOG_STORE_UP_NAME.to_string(), Vec::new(), 1)),
+        _ => None,
+    }
+}
+
+/// Record a worker's reported log-store state on the supervisor.
+fn record_worker_log_store_up(worker_id: u32, up: bool) {
+    LOG_STORE_UP
+        .with_label_values(&["worker", &worker_id.to_string()])
+        .set(i64::from(up));
+    WORKER_LOG_STORE_UP.lock().insert(worker_id, up);
+}
+
+/// Workers whose last report said their log store is not open, in id
+/// order. Empty outside supervisor mode.
+pub fn workers_without_log_store() -> Vec<u32> {
+    WORKER_LOG_STORE_UP
+        .lock()
+        .iter()
+        .filter(|(_, up)| !**up)
+        .map(|(id, _)| *id)
+        .collect()
 }
 
 /// Counter: events dropped by a log-export sink (Story 9.8 AC #4),
@@ -3294,5 +3386,82 @@ mod tests {
             .collect();
         assert!(states.contains(&"active"), "states rendered: {states:?}");
         assert!(states.contains(&"expired"), "states rendered: {states:?}");
+    }
+
+    // ---- Log-store gauge (lorica_log_store_up) ----
+
+    /// The gauge, the local state and the per-worker map are process
+    /// globals the tests below all drive.
+    static LOG_STORE_GAUGE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The rendered value of the `lorica_log_store_up` series with these
+    /// labels, `None` when the series is absent.
+    fn rendered_log_store_up(role: &str, worker_id: &str) -> Option<f64> {
+        REGISTRY
+            .gather()
+            .iter()
+            .find(|family| family.name() == "lorica_log_store_up")
+            .and_then(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .find(|metric| {
+                        let labels = metric.get_label();
+                        labels
+                            .iter()
+                            .any(|pair| pair.name() == "role" && pair.value() == role)
+                            && labels
+                                .iter()
+                                .any(|pair| pair.name() == "worker_id" && pair.value() == worker_id)
+                    })
+                    .map(|metric| metric.get_gauge().value())
+            })
+    }
+
+    #[test]
+    fn the_log_store_gauge_follows_the_process_state() {
+        let _guard = LOG_STORE_GAUGE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_log_store_up("supervisor", false);
+        assert_eq!(rendered_log_store_up("supervisor", ""), Some(0.0));
+        assert_eq!(
+            snapshot_log_store_up(),
+            Some(("lorica_log_store_up".to_string(), Vec::new(), 0))
+        );
+
+        set_log_store_up("supervisor", true);
+        assert_eq!(rendered_log_store_up("supervisor", ""), Some(1.0));
+        assert_eq!(
+            snapshot_log_store_up(),
+            Some(("lorica_log_store_up".to_string(), Vec::new(), 1))
+        );
+    }
+
+    #[test]
+    fn a_worker_log_store_state_reaches_the_supervisor_scrape_and_leaves_with_the_worker() {
+        let _guard = LOG_STORE_GAUGE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        const WORKER: u32 = 9_101;
+        let down = ("lorica_log_store_up".to_string(), Vec::new(), 0);
+        apply_worker_generic_counters(WORKER, std::slice::from_ref(&down));
+        assert_eq!(rendered_log_store_up("worker", "9101"), Some(0.0));
+        assert!(workers_without_log_store().contains(&WORKER));
+
+        // A second report of the same state is the same gauge value,
+        // not an accumulation, which is what a counter delta would give.
+        apply_worker_generic_counters(WORKER, std::slice::from_ref(&down));
+        assert_eq!(rendered_log_store_up("worker", "9101"), Some(0.0));
+
+        let up = ("lorica_log_store_up".to_string(), Vec::new(), 1);
+        apply_worker_generic_counters(WORKER, std::slice::from_ref(&up));
+        assert_eq!(rendered_log_store_up("worker", "9101"), Some(1.0));
+        assert!(!workers_without_log_store().contains(&WORKER));
+
+        apply_worker_generic_counters(WORKER, &[down]);
+        forget_worker_generic_counters(WORKER);
+        assert_eq!(rendered_log_store_up("worker", "9101"), None);
+        assert!(!workers_without_log_store().contains(&WORKER));
     }
 }

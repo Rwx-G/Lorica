@@ -547,7 +547,10 @@ fn offer(
     // timestamp equality is the cheapest out-of-band join key).
     let timestamp = chrono::Utc::now().to_rfc3339();
 
-    let Some(log_store) = log_store else {
+    // A caller holding `None` may have captured it while the store was
+    // down; the store the retry loop installed since is this process's
+    // audit log all the same, and a row offered to nothing is a row lost.
+    let Some(log_store) = log_store.or_else(crate::server::recovered_log_store) else {
         emit_audit_event(ctx, action, target_type, target_id, "", &timestamp);
         return;
     };

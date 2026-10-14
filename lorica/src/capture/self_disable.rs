@@ -78,13 +78,14 @@ pub const CAPTURE_DISABLE_INTERVAL: Duration = Duration::from_secs(5);
 /// Spawn the task that persists the counters, the self-disables queued
 /// by the budgets, and the expiry sweep.
 ///
-/// `log_store` is this node's audit sink; `None` (single-process boot
-/// before the store exists, tests) still logs and still writes the
-/// flag, it simply records no audit row.
+/// `log_store` is this node's audit sink, read at every tick; while it
+/// holds no store (it failed to open and has not been installed since)
+/// the task still logs and still writes the flag, it simply records no
+/// audit row.
 pub fn spawn_capture_disable_task(
     budgets: Arc<CaptureBudgets>,
     store: Arc<Mutex<ConfigStore>>,
-    log_store: Option<Arc<lorica_api::log_store::LogStore>>,
+    log_store: lorica_api::server::LogStoreSlot,
     tracker: &TaskTracker,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
@@ -95,9 +96,9 @@ pub fn spawn_capture_disable_task(
             ticker.tick().await;
             flush_counters(&store, budgets.take_pending_counters()).await;
             for pending in budgets.take_pending_disables() {
-                disable_one(&store, log_store.clone(), &pending).await;
+                disable_one(&store, log_store.store(), &pending).await;
             }
-            disable_expired(&store, log_store.clone(), Utc::now()).await;
+            disable_expired(&store, log_store.store(), Utc::now()).await;
         }
     })
 }

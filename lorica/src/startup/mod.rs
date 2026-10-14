@@ -26,6 +26,7 @@ pub(crate) mod cluster_follower;
 pub(crate) mod cluster_plane;
 pub(crate) mod environment_reaper;
 pub(crate) mod hot_upgrade;
+pub(crate) mod log_store_health;
 pub(crate) mod single;
 pub(crate) mod supervisor;
 pub(crate) mod telemetry_drain;
@@ -90,7 +91,7 @@ pub(crate) struct AlertingStack {
 pub(crate) async fn start_alerting_stack(
     store: &Arc<Mutex<ConfigStore>>,
     alert_sender: &lorica_notify::AlertSender,
-    log_store: Option<Arc<lorica_api::log_store::LogStore>>,
+    log_store: lorica_api::server::LogStoreSlot,
 ) -> AlertingStack {
     // Create notification dispatcher from DB configs
     let notify_dispatcher = {
@@ -305,8 +306,9 @@ async fn purge_superseded_acme_orphans(store: &Arc<Mutex<ConfigStore>>) {
 /// expired ACME challenge purge (Story 9.5), and the daily SLA bucket
 /// purge.
 ///
-/// A `None` `log_store` (the access-log store failed to open) skips
-/// only the jobs that read it. The configuration-store jobs still run:
+/// While `log_store` holds no store (it failed to open and the retry
+/// loop has not installed one yet) only the jobs that read it are
+/// skipped, tick by tick. The configuration-store jobs still run:
 /// Story 9.5 iteration 1 found the challenge purge silently disabled
 /// on any node whose log store was missing, which is exactly the
 /// degraded node where stale rows accumulate unnoticed.
@@ -315,7 +317,7 @@ async fn purge_superseded_acme_orphans(store: &Arc<Mutex<ConfigStore>>) {
 /// is not returned. Must be called from within a tokio runtime
 /// context.
 pub(crate) fn spawn_retention_loop(
-    log_store: Option<Arc<lorica_api::log_store::LogStore>>,
+    log_store: lorica_api::server::LogStoreSlot,
     config_store: Arc<Mutex<ConfigStore>>,
     telemetry: Option<Arc<lorica_api::cluster_telemetry_store::ClusterTelemetryStore>>,
 ) {
@@ -323,13 +325,13 @@ pub(crate) fn spawn_retention_loop(
     // (expired ACME challenges, probe results, SLA windows) live in
     // the configuration store and must not be hostage to whether this
     // process happens to keep access logs.
-    let retention_log_store = log_store;
     let retention_config_store = config_store;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(3600));
         let mut last_sla_purge_day: u32 = 0;
         loop {
             interval.tick().await;
+            let retention_log_store = log_store.store();
             let (retention, waf_retention, audit_retention_days) = {
                 let s = retention_config_store.lock().await;
                 s.get_global_settings()
@@ -838,11 +840,12 @@ async fn run_sla_purge(store: &Arc<Mutex<ConfigStore>>, last_purge_day: u32) -> 
     today
 }
 
-/// Spawn alert dispatcher that also persists events to the log store (SQLite).
+/// Spawn alert dispatcher that also persists events to the log store
+/// (SQLite), once one is open.
 fn spawn_persisted_alert_dispatcher(
     alert_sender: &lorica_notify::AlertSender,
     dispatcher: Arc<Mutex<lorica_notify::NotifyDispatcher>>,
-    log_store: Option<Arc<lorica_api::log_store::LogStore>>,
+    log_store: lorica_api::server::LogStoreSlot,
 ) -> tokio::task::JoinHandle<()> {
     let mut rx = alert_sender.subscribe();
     tokio::spawn(async move {
@@ -863,8 +866,7 @@ fn spawn_persisted_alert_dispatcher(
                     // failures via the existing notifier-events-dropped metric
                     // (was a silent `let _ = ...` swallow that left the table
                     // unbounded if DELETE ever failed).
-                    if let Some(ref store) = log_store {
-                        let store = Arc::clone(store);
+                    if let Some(store) = log_store.store() {
                         let event_for_blocking = event.clone();
                         let blocking_outcome = tokio::task::spawn_blocking(move || {
                             let insert = store.insert_notification_event(&event_for_blocking);

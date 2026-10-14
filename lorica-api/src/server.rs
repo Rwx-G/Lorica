@@ -472,6 +472,158 @@ impl AppState {
     }
 }
 
+/// This process's access-log store (`access-log.db`), as it stands now.
+///
+/// The store is installed at most once: at boot when
+/// [`crate::log_store::LogStore::open`] succeeds, or later by the
+/// startup retry loop once a failure (corrupt file, full disk, wrong
+/// permissions) has been fixed. Until then [`Self::failure`] carries
+/// the cause, which the status endpoint, the dashboard banner and the
+/// log-store alerts all report. A clone shares the same slot, so a
+/// consumer handed one at boot sees a store installed afterwards on
+/// its next [`Self::store`] call, without a restart.
+///
+/// The writer handle rides along because the proxy persists access
+/// logs and WAF events through it, never through the store directly;
+/// it is `None` in a process that runs no proxy (the supervisor).
+#[derive(Clone, Default)]
+pub struct LogStoreSlot {
+    inner: Arc<LogStoreSlotInner>,
+}
+
+#[derive(Default)]
+struct LogStoreSlotInner {
+    store: std::sync::OnceLock<Arc<crate::log_store::LogStore>>,
+    writer: std::sync::OnceLock<crate::log_writer::LogWriteHandle>,
+    failure: parking_lot::Mutex<Option<String>>,
+}
+
+impl LogStoreSlot {
+    /// A slot holding a store that opened at boot.
+    pub fn opened(
+        store: Arc<crate::log_store::LogStore>,
+        writer: Option<crate::log_writer::LogWriteHandle>,
+    ) -> Self {
+        let slot = Self::default();
+        slot.install(store, writer);
+        slot
+    }
+
+    /// A slot whose store failed to open, with the cause.
+    pub fn failed(cause: String) -> Self {
+        let slot = Self::default();
+        *slot.inner.failure.lock() = Some(cause);
+        slot
+    }
+
+    /// The store, once one is installed.
+    pub fn store(&self) -> Option<Arc<crate::log_store::LogStore>> {
+        self.inner.store.get().cloned()
+    }
+
+    /// The proxy's writer handle, once a store is installed in a process
+    /// that runs the proxy.
+    pub fn writer(&self) -> Option<&crate::log_writer::LogWriteHandle> {
+        self.inner.writer.get()
+    }
+
+    /// Why the store is not open, while it is not.
+    pub fn failure(&self) -> Option<String> {
+        self.inner.failure.lock().clone()
+    }
+
+    /// Replace the recorded cause after another failed attempt. A no-op
+    /// once a store is installed, so a late retry cannot mark a working
+    /// store as down.
+    pub fn record_failure(&self, cause: String) {
+        let mut failure = self.inner.failure.lock();
+        if self.inner.store.get().is_none() {
+            *failure = Some(cause);
+        }
+    }
+
+    /// Install `store` (and the proxy's `writer`, if any) and clear the
+    /// failure. Returns `false`, leaving the slot untouched, when a store
+    /// is already installed.
+    ///
+    /// The writer goes in first: the proxy checks for a writer and the
+    /// API for a store, and a request path that sees the store must not
+    /// then miss the writer that feeds it.
+    pub fn install(
+        &self,
+        store: Arc<crate::log_store::LogStore>,
+        writer: Option<crate::log_writer::LogWriteHandle>,
+    ) -> bool {
+        let mut failure = self.inner.failure.lock();
+        if self.inner.store.get().is_some() {
+            return false;
+        }
+        if let Some(writer) = writer {
+            let _ = self.inner.writer.set(writer);
+        }
+        let _ = self.inner.store.set(store);
+        *failure = None;
+        true
+    }
+
+    /// Make this slot the one [`process_log_store`] returns. Called once
+    /// per process by the startup code; a second call is ignored, since
+    /// a process has one data directory and so one store.
+    pub fn register_for_process(&self) {
+        let _ = PROCESS_LOG_STORE.set(self.clone());
+    }
+}
+
+static PROCESS_LOG_STORE: std::sync::OnceLock<LogStoreSlot> = std::sync::OnceLock::new();
+
+/// The slot the startup code registered for this process, `None` in
+/// tests and one-shot CLI commands, which register nothing.
+pub fn process_log_store() -> Option<&'static LogStoreSlot> {
+    PROCESS_LOG_STORE.get()
+}
+
+/// The store installed in this process's slot after boot, if any.
+///
+/// For holders of a boot-time `Option<Arc<LogStore>>` that cannot be
+/// handed a [`LogStoreSlot`]: the `AppState` field, read by handlers in
+/// modules that predate the slot, and the automation plane's audit
+/// layer, which captured its `AppState` when the router was built.
+pub fn recovered_log_store() -> Option<Arc<crate::log_store::LogStore>> {
+    process_log_store().and_then(LogStoreSlot::store)
+}
+
+/// Give a request's `AppState` the store the retry loop installed
+/// after the router was built.
+///
+/// The router clones one `AppState` into every request, and that
+/// template was taken while the store was still down, so without this
+/// layer the logs, WAF events and audit pages would read nothing until
+/// a restart even though persistence had resumed. Only a `None` field
+/// is filled; a process whose store opened at boot pays one branch.
+async fn adopt_recovered_log_store(
+    mut req: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    if let (Some(state), Some(slot)) = (
+        req.extensions_mut().get_mut::<AppState>(),
+        process_log_store(),
+    ) {
+        adopt_log_store(state, slot);
+    }
+    next.run(req).await
+}
+
+/// Fill the empty log-store handles of `state` from `slot`.
+fn adopt_log_store(state: &mut AppState, slot: &LogStoreSlot) {
+    if state.log_store.is_some() {
+        return;
+    }
+    state.log_store = slot.store();
+    if state.log_writer.is_none() {
+        state.log_writer = slot.writer().cloned();
+    }
+}
+
 /// Build the axum router with all API routes.
 pub fn build_router(
     state: AppState,
@@ -1353,6 +1505,9 @@ pub fn build_router(
         // anything larger than this global default and without a per-
         // route override is rejected with 413 Payload Too Large.
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MiB
+        // Inside the `AppState` extension below, so it patches the
+        // clone that layer has just inserted.
+        .layer(middleware::from_fn(adopt_recovered_log_store))
         .layer(axum::Extension(state.clone()))
         .layer(axum::Extension(session_store))
         .layer(axum::Extension(rate_limiter))
@@ -1485,5 +1640,98 @@ pub async fn start_server(
                 tracing::debug!(peer = %remote_addr, error = %e, "management connection ended with error");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod log_store_slot_tests {
+    use super::*;
+
+    fn store_in(dir: &tempfile::TempDir) -> Arc<crate::log_store::LogStore> {
+        Arc::new(crate::log_store::LogStore::open(dir.path()).expect("test setup: log store"))
+    }
+
+    #[test]
+    fn a_failed_slot_reports_its_cause_until_a_store_is_installed() {
+        let dir = tempfile::tempdir().expect("test setup: tempdir");
+        let slot = LogStoreSlot::failed("disk full".to_string());
+        assert!(slot.store().is_none());
+        assert_eq!(slot.failure().as_deref(), Some("disk full"));
+
+        slot.record_failure("permission denied".to_string());
+        assert_eq!(slot.failure().as_deref(), Some("permission denied"));
+
+        assert!(slot.install(store_in(&dir), None));
+        assert!(slot.store().is_some());
+        assert!(
+            slot.failure().is_none(),
+            "an installed store clears the cause"
+        );
+
+        slot.record_failure("late retry".to_string());
+        assert!(
+            slot.failure().is_none(),
+            "a failure recorded after the install must not mark the store down"
+        );
+    }
+
+    #[test]
+    fn a_store_is_installed_once_and_every_clone_sees_it() {
+        let first = tempfile::tempdir().expect("test setup: tempdir");
+        let second = tempfile::tempdir().expect("test setup: tempdir");
+        let slot = LogStoreSlot::failed("corrupt".to_string());
+        let held_since_boot = slot.clone();
+
+        let store = store_in(&first);
+        assert!(slot.install(Arc::clone(&store), None));
+        assert!(
+            !slot.install(store_in(&second), None),
+            "a second install is refused"
+        );
+
+        let seen = held_since_boot
+            .store()
+            .expect("the clone sees the late store");
+        assert!(Arc::ptr_eq(&seen, &store));
+    }
+
+    #[tokio::test]
+    async fn a_request_state_taken_while_the_store_was_down_adopts_the_recovered_one() {
+        let dir = tempfile::tempdir().expect("test setup: tempdir");
+        let (mut state, _, _) = crate::tests::test_state().await;
+        let slot = LogStoreSlot::failed("corrupt".to_string());
+
+        adopt_log_store(&mut state, &slot);
+        assert!(
+            state.log_store.is_none(),
+            "nothing to adopt while the store is down"
+        );
+
+        let store = store_in(&dir);
+        let writer = crate::log_writer::spawn_log_writer(Arc::clone(&store));
+        slot.install(Arc::clone(&store), Some(writer));
+        adopt_log_store(&mut state, &slot);
+        let adopted = state
+            .log_store
+            .clone()
+            .expect("the recovered store is adopted");
+        assert!(Arc::ptr_eq(&adopted, &store));
+        assert!(state.log_writer.is_some(), "the writer comes with it");
+    }
+
+    #[tokio::test]
+    async fn a_store_opened_at_boot_is_never_replaced() {
+        let boot_dir = tempfile::tempdir().expect("test setup: tempdir");
+        let other_dir = tempfile::tempdir().expect("test setup: tempdir");
+        let (mut state, _, _) = crate::tests::test_state().await;
+        let boot = store_in(&boot_dir);
+        state.log_store = Some(Arc::clone(&boot));
+
+        adopt_log_store(
+            &mut state,
+            &LogStoreSlot::opened(store_in(&other_dir), None),
+        );
+        let kept = state.log_store.clone().expect("still set");
+        assert!(Arc::ptr_eq(&kept, &boot));
     }
 }

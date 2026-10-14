@@ -65,6 +65,7 @@ use lorica_api::cluster_telemetry_store::ClusterTelemetryStore;
 use lorica_api::db::db_blocking;
 use lorica_api::error::ApiError;
 use lorica_api::log_store::LogStore;
+use lorica_api::server::LogStoreSlot;
 use lorica_cluster::enroll::{
     BoxFuture, EnrollGrant, EnrollRefusal, EnrollRequest, EnrollmentHandler, RenewGrant,
     RenewRequest, SessionHandler,
@@ -152,9 +153,9 @@ pub(crate) struct ClusterPlaneOptions {
     /// of binding when `bind` equals the configured operational bind,
     /// closed otherwise.
     pub inherited_operational: Option<(String, RawFd)>,
-    /// The audit log the lifecycle hooks write to (`None` when the
-    /// access-log store failed to open; events still reach the sinks).
-    pub log_store: Option<Arc<LogStore>>,
+    /// The audit log the lifecycle hooks write to. Empty while the
+    /// access-log store is not open; events still reach the sinks.
+    pub log_store: LogStoreSlot,
     /// The alert dispatcher (`ClusterNodeLeft`, `ClusterDrift`).
     pub alert_sender: AlertSender,
     /// The proxy's configuration-reload signal. The control plane
@@ -602,7 +603,7 @@ struct FleetState {
     /// write below refreshes through it (backlog #79).
     runtime: Arc<ControlPlaneRuntime>,
     store: Arc<Mutex<ConfigStore>>,
-    log_store: Option<Arc<LogStore>>,
+    log_store: LogStoreSlot,
     alert_sender: AlertSender,
     /// Last renewal grant per node, for [`RENEWAL_COOLDOWN`].
     renewals: StdMutex<HashMap<String, Instant>>,
@@ -662,7 +663,7 @@ impl FleetState {
         after: Option<serde_json::Value>,
     ) {
         record_with_store(
-            self.log_store.clone(),
+            self.log_store.store(),
             &plane_audit_ctx(peer),
             action,
             target,
@@ -875,7 +876,7 @@ impl SessionHandler for FleetHandlers {
             let accepted_audit = if audit_rows.is_empty() {
                 0
             } else {
-                let Some(log_store) = self.log_store.clone() else {
+                let Some(log_store) = self.log_store.store() else {
                     // Refused, not silently dropped, for the same
                     // reason the missing telemetry database is: a
                     // control plane that cannot store what its fleet
@@ -1689,7 +1690,7 @@ async fn break_glass_is_corroborated(log_store: &Option<Arc<LogStore>>, node_id:
 fn spawn_drift_watch(
     runtime: Arc<ControlPlaneRuntime>,
     store: Arc<Mutex<ConfigStore>>,
-    log_store: Option<Arc<LogStore>>,
+    log_store: LogStoreSlot,
     alert_sender: AlertSender,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1724,8 +1725,8 @@ fn spawn_drift_watch(
                 // node could otherwise keep itself out of every commit
                 // round and have the drift paged as operator action
                 // (backlog #78).
-                let corroborated =
-                    entry.break_glass && break_glass_is_corroborated(&log_store, &node_id).await;
+                let corroborated = entry.break_glass
+                    && break_glass_is_corroborated(&log_store.store(), &node_id).await;
                 let summary = if entry.break_glass && corroborated {
                     format!(
                         "cluster node {} ({}) is in break-glass and diverges from generation {}",
@@ -2793,7 +2794,7 @@ mod tests {
             control: Arc::clone(&control),
             runtime: Arc::new(ControlPlaneRuntime::new(Arc::clone(&control))),
             store: Arc::clone(&store),
-            log_store: Some(Arc::clone(&log_store)),
+            log_store: LogStoreSlot::opened(Arc::clone(&log_store), None),
             alert_sender,
             renewals: StdMutex::new(HashMap::new()),
             telemetry: None,

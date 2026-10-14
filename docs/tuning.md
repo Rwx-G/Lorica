@@ -140,6 +140,9 @@ rather than stored in the settings:
 - `lorica_http_request_duration_seconds` - latency histogram
 - `lorica_backend_health{backend_id}` - backend health status
 - `lorica_active_connections` - current connection count
+- `lorica_log_store_up{role, worker_id}` - 0 while a process cannot
+  open `access-log.db` and persists no audit trail, access logs or WAF
+  events (see `docs/installation.md`); alert on `min(...) == 0`
 
 ### Dashboard
 

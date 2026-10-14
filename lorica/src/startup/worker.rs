@@ -720,21 +720,17 @@ pub(crate) fn run_worker(
         );
     }
     drop(_rt_guard);
-    // Open a LogStore so the worker can persist WAF events directly (with
-    // route_hostname and action stamped). SQLite WAL mode allows concurrent
-    // writes from multiple worker processes. Writes go through the
-    // per-worker background log writer (backlog #24).
-    let worker_log_store: Option<Arc<lorica_api::log_store::LogStore>> =
-        match lorica_api::log_store::LogStore::open(&data_dir) {
-            Ok(s) => Some(Arc::new(s)),
-            Err(e) => {
-                warn!(error = %e, "worker: failed to open log store, WAF event persistence disabled");
-                None
-            }
-        };
-    lorica_proxy.log_writer = worker_log_store
-        .as_ref()
-        .map(|store| lorica_api::log_writer::spawn_log_writer(Arc::clone(store)));
+    // Open a LogStore so the worker can persist access logs and WAF
+    // events directly (with route_hostname and action stamped). SQLite
+    // WAL mode allows concurrent writes from multiple worker processes.
+    // Writes go through the per-worker background log writer (backlog
+    // #24). A store that will not open is retried here and reported to
+    // the supervisor, which alerts: see `startup::log_store_health`.
+    let worker_log_store = crate::startup::log_store_health::open_log_store(
+        &data_dir,
+        crate::startup::log_store_health::LogStoreRole::Worker,
+    );
+    lorica_proxy.log_store = worker_log_store.clone();
     // The capture self-disable writer. Capture admission happens in
     // this process, so the queue it drains is this process's; without
     // the task a rule that spent its total keeps its stored `enabled`
@@ -742,14 +738,22 @@ pub(crate) fn run_worker(
     // Registered here rather than beside the prunes above because it
     // needs the log store opened just now, and `_rt_guard` is already
     // gone by this point.
-    let _capture_disable = {
+    let (_capture_disable, _log_store_retry) = {
         let _rt_guard = rt.enter();
-        lorica::capture::spawn_capture_disable_task(
-            Arc::clone(lorica::capture::node_budgets()),
-            Arc::clone(&store),
-            worker_log_store,
-            &worker_auth_prune_tracker,
-            lorica::capture::CAPTURE_DISABLE_INTERVAL,
+        (
+            lorica::capture::spawn_capture_disable_task(
+                Arc::clone(lorica::capture::node_budgets()),
+                Arc::clone(&store),
+                worker_log_store.clone(),
+                &worker_auth_prune_tracker,
+                lorica::capture::CAPTURE_DISABLE_INTERVAL,
+            ),
+            crate::startup::log_store_health::spawn_log_store_retry(
+                worker_log_store,
+                data_dir.clone(),
+                crate::startup::log_store_health::LogStoreRole::Worker,
+                crate::startup::log_store_health::LOG_STORE_RETRY_INTERVAL,
+            ),
         )
     };
     // ACME challenge store backed by SQLite - workers can read challenges set by supervisor

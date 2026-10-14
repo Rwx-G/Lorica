@@ -56,6 +56,7 @@ use std::time::Duration;
 
 use lorica_api::cluster::runtime::FollowerRuntime;
 use lorica_api::log_store::LogStore;
+use lorica_api::server::LogStoreSlot;
 use lorica_cluster::{
     ClusterRequest, TelemetryAccessRow, TelemetryAuditRow, TelemetryPush, TelemetryWafRow,
     MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_ROWS,
@@ -103,27 +104,32 @@ const PUSH_DEADLINE: Duration = Duration::from_secs(15);
 /// is.
 pub(crate) fn spawn_telemetry_drain(
     runtime: Arc<FollowerRuntime>,
-    log_store: Option<Arc<LogStore>>,
+    log_store: LogStoreSlot,
     config_store: Arc<Mutex<ConfigStore>>,
     bans: BanApplier,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // A node that has never drained starts at the PRESENT rather
-        // than replaying everything local retention holds. Up to
-        // 100 000 rows per kind arriving in one burst is not a useful
-        // first impression of a node, and the history it would carry
-        // predates the fleet knowing about this node at all.
-        if let Some(logs) = &log_store {
-            if let Err(reason) = seed_cursors(&config_store, Arc::clone(logs)).await {
-                warn!(%reason, "could not seed the telemetry cursors; the drain starts from zero");
-            }
-        }
+        let mut seeded = false;
         let mut interval = tokio::time::interval(DRAIN_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            let logs = log_store.store();
+            // A node that has never drained starts at the PRESENT rather
+            // than replaying everything local retention holds. Up to
+            // 100 000 rows per kind arriving in one burst is not a useful
+            // first impression of a node, and the history it would carry
+            // predates the fleet knowing about this node at all. Seeded
+            // on the first tick with a store rather than at spawn, so a
+            // store that opens late is seeded too.
+            if let (false, Some(logs)) = (seeded, &logs) {
+                seeded = true;
+                if let Err(reason) = seed_cursors(&config_store, Arc::clone(logs)).await {
+                    warn!(%reason, "could not seed the telemetry cursors; the drain starts from zero");
+                }
+            }
             for _ in 0..MAX_BATCHES_PER_TICK {
-                match drain_once(&runtime, log_store.as_ref(), &config_store, &bans).await {
+                match drain_once(&runtime, logs.as_ref(), &config_store, &bans).await {
                     // A short batch means the backlog is gone; wait
                     // for the next tick rather than spinning.
                     Ok(DrainOutcome::CaughtUp) => break,
