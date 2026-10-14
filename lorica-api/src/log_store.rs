@@ -148,6 +148,20 @@ impl ChainSegment {
     }
 }
 
+/// Why a chain's prefix is cut, which decides what the cut does beside
+/// removing the rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CutCause {
+    /// Day-based retention: the rows go and nothing else is written.
+    Retention,
+    /// The fan-in cap ([`LogStore::enforce_fanned_in_audit_cap`]): the
+    /// oldest rows cut fill the node's fan-in backup, up to
+    /// `backup_capacity` rows over its lifetime, and every chunk cut
+    /// writes its [`FANNED_IN_AUDIT_CAP_ACTION`] record into this
+    /// node's own chain.
+    FanInCap { backup_capacity: u64 },
+}
+
 /// What one or more prefix cuts of a chain took.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PrefixCut {
@@ -547,8 +561,7 @@ impl LogStore {
 
     /// Commit one row to this node's own chain and emit its
     /// `lorica::audit` event: what the audit writer does with each row
-    /// it receives, and what the fan-in cap does with the row recording
-    /// a cut, which it writes from the blocking pass that made the cut.
+    /// it receives.
     ///
     /// The writer's failure policy, unchanged by the queue: an insert
     /// failure is counted, logged and swallowed, and the event still
@@ -961,13 +974,25 @@ impl LogStore {
         Ok(entries)
     }
 
+    /// The `(MIN, MAX)` ids of `access_logs`, as two scalar subqueries:
+    /// SQLite answers a lone `MIN` or `MAX` of the rowid with one seek
+    /// at an end of the table, and both in one select with a scan of
+    /// every row.
+    const ACCESS_LOG_SPAN_SQL: &'static str =
+        "SELECT (SELECT MIN(id) FROM access_logs), (SELECT MAX(id) FROM access_logs)";
+
+    /// [`LogStore::ACCESS_LOG_SPAN_SQL`] for `waf_events`.
+    const WAF_EVENTS_SPAN_SQL: &'static str =
+        "SELECT (SELECT MIN(id) FROM waf_events), (SELECT MAX(id) FROM waf_events)";
+
     /// Delete entries older than the retention limit, keeping at most `max_entries` rows.
     /// Trim the access log table to the most recent `max_entries`. Returns the number deleted.
     ///
-    /// Uses `MIN(id)` / `MAX(id)` (both `O(log n)` index seeks on the
-    /// PRIMARY KEY rowid) instead of `SELECT COUNT(*)` (which scans
-    /// the whole table and could freeze the writer's `Mutex<Connection>`
-    /// for hundreds of milliseconds at millions of rows).
+    /// Sized from `MIN(id)` / `MAX(id)` (two `O(log n)` seeks on the
+    /// PRIMARY KEY rowid, see [`LogStore::ACCESS_LOG_SPAN_SQL`]) instead
+    /// of `SELECT COUNT(*)` (which scans the whole table and could
+    /// freeze the writer's `Mutex<Connection>` for hundreds of
+    /// milliseconds at millions of rows).
     /// `(MAX - MIN + 1)` over-estimates after deletes leave gaps in
     /// the id sequence, which is fine here: trimming slightly more
     /// aggressively than strictly needed cannot violate the retention
@@ -980,7 +1005,7 @@ impl LogStore {
     ) -> Result<RetentionOutcome, String> {
         let conn = self.conn.lock();
         let bounds: Option<(i64, i64)> = conn
-            .query_row("SELECT MIN(id), MAX(id) FROM access_logs", [], |row| {
+            .query_row(Self::ACCESS_LOG_SPAN_SQL, [], |row| {
                 let lo: Option<i64> = row.get(0)?;
                 let hi: Option<i64> = row.get(1)?;
                 Ok(lo.zip(hi))
@@ -1479,7 +1504,8 @@ impl LogStore {
     /// `max_entries`. Returns the number deleted.
     ///
     /// Sized from `MIN(id)` / `MAX(id)`, two `O(log n)` index seeks on
-    /// the rowid, for exactly the reason the access-log path already
+    /// the rowid ([`LogStore::WAF_EVENTS_SPAN_SQL`]), for exactly the
+    /// reason the access-log path already
     /// documents: `SELECT COUNT(*)` scans the whole table and can
     /// freeze this store's single `Mutex<Connection>` for hundreds of
     /// milliseconds at millions of rows. This path counted until
@@ -1510,7 +1536,7 @@ impl LogStore {
             let deleted = {
                 let conn = self.conn.lock();
                 let span: (Option<i64>, Option<i64>) = conn
-                    .query_row("SELECT MIN(id), MAX(id) FROM waf_events", [], |row| {
+                    .query_row(Self::WAF_EVENTS_SPAN_SQL, [], |row| {
                         Ok((row.get(0)?, row.get(1)?))
                     })
                     .map_err(|e| format!("failed to size WAF events: {e}"))?;
@@ -1900,7 +1926,7 @@ impl LogStore {
         conn: &Mutex<Connection>,
         entry: &crate::audit::NewAuditEntry,
     ) -> Result<(i64, String), String> {
-        use rusqlite::{OptionalExtension, TransactionBehavior};
+        use rusqlite::TransactionBehavior;
         let mut guard = conn.lock();
         // IMMEDIATE, so the tail read and the insert hold SQLite's
         // write lock together across PROCESSES (backlog #74): the
@@ -1909,10 +1935,25 @@ impl LogStore {
         // and used to be able to read the same tail as a concurrent
         // API write, producing two rows with one `prev_chain_hash`,
         // a fork the chain never recovers from.
-        let conn = guard
+        let tx = guard
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| format!("failed to open the audit transaction: {e}"))?;
+        let appended = Self::append_local_audit_in(&tx, entry)?;
+        tx.commit()
+            .map_err(|e| format!("failed to commit the audit row: {e}"))?;
+        Ok(appended)
+    }
 
+    /// Chain `entry` onto this node's own chain inside `tx`, an open
+    /// IMMEDIATE transaction the caller commits, and return its rowid
+    /// and `chain_hash`. The one place a local row is chained, so a row
+    /// written inside another statement's transaction (the fan-in cap's
+    /// record of its cut) links exactly as the audit writer's do.
+    fn append_local_audit_in(
+        conn: &Connection,
+        entry: &crate::audit::NewAuditEntry,
+    ) -> Result<(i64, String), String> {
+        use rusqlite::OptionalExtension;
         // The LOCAL tail, not the table's. Story 9.9 makes this table
         // hold N interleaved chains, and reading the global tail would
         // chain this node's next entry off whichever follower's row
@@ -1927,7 +1968,7 @@ impl LogStore {
         let prev_chain_hash: String = match last {
             Some(hash) => hash,
             None => {
-                Self::audit_seal(&conn)?.unwrap_or_else(|| crate::audit::GENESIS_HASH.to_string())
+                Self::audit_seal(conn)?.unwrap_or_else(|| crate::audit::GENESIS_HASH.to_string())
             }
         };
 
@@ -1961,10 +2002,7 @@ impl LogStore {
         )
         .map_err(|e| format!("failed to insert audit row: {e}"))?;
 
-        let id = conn.last_insert_rowid();
-        conn.commit()
-            .map_err(|e| format!("failed to commit the audit row: {e}"))?;
-        Ok((id, chain_hash))
+        Ok((conn.last_insert_rowid(), chain_hash))
     }
 
     /// Store audit rows fanned in from another node (Story 9.9 AC #2).
@@ -2608,7 +2646,7 @@ impl LogStore {
                 continue;
             };
             let mut totals = PrefixCut::default();
-            let outcome = self.cut_chain_in_chunks(&node_id, cut, 0, &mut totals);
+            let outcome = self.cut_chain_in_chunks(&node_id, cut, CutCause::Retention, &mut totals);
             removed += totals.removed;
             outcome?;
         }
@@ -2687,11 +2725,14 @@ impl LogStore {
     /// with day-based retention like the chain it came from, and
     /// [`LogStore::verify_fanned_in_backup`] checks it.
     ///
-    /// Every cut also writes a [`FANNED_IN_AUDIT_CAP_ACTION`] row into
-    /// this node's OWN chain, which no peer can cap: the node, the rows
-    /// cut, their `origin_id` range and how many were moved and how many
-    /// deleted, so the eviction and the seal it moved are on a record
-    /// the follower cannot touch.
+    /// Every chunk cut also writes a [`FANNED_IN_AUDIT_CAP_ACTION`] row
+    /// into this node's OWN chain, which no peer can cap: the node, the
+    /// rows cut, their `origin_id` range and how many were moved and how
+    /// many deleted, so the eviction and the seal it moved are on a
+    /// record the follower cannot touch. The row commits in the chunk's
+    /// own transaction, so no crash or failure can leave rows cut with
+    /// no record of the cut; a cut spanning several chunks therefore
+    /// leaves one record per chunk, their figures summing to the cut's.
     ///
     /// This node's own chain is never capped. The ceiling bounds what a
     /// PEER can make this store hold; local rows are written by this
@@ -2758,24 +2799,29 @@ impl LogStore {
             };
 
             let mut totals = PrefixCut::default();
-            let outcome = self.cut_chain_in_chunks(&node_id, cut, rows_per_node, &mut totals);
+            let outcome = self.cut_chain_in_chunks(
+                &node_id,
+                cut,
+                CutCause::FanInCap {
+                    backup_capacity: rows_per_node,
+                },
+                &mut totals,
+            );
             if let (Some(first), Some(last)) = (totals.first, totals.last) {
-                let record = FannedInAuditCapCut {
+                cuts.push(FannedInAuditCapCut {
                     node_id,
                     removed: totals.removed,
                     backed_up: totals.backed_up,
                     first_origin_id: first,
                     last_origin_id: last,
-                };
-                self.record_cap_cut(&record);
-                cuts.push(record);
+                });
             }
             outcome?;
         }
         Ok(cuts)
     }
 
-    /// Write the [`FANNED_IN_AUDIT_CAP_ACTION`] row for one cut into
+    /// The [`FANNED_IN_AUDIT_CAP_ACTION`] row recording one cut, for
     /// this node's own chain.
     ///
     /// The figures ride in the action, after the `:` where an action
@@ -2784,9 +2830,9 @@ impl LogStore {
     /// chain and on its `lorica::audit` stream alike. They are integers
     /// this store computed; the node id is the session-proved one the
     /// fan-in stamped, as in every other `cluster_node` target.
-    fn record_cap_cut(&self, cut: &FannedInAuditCapCut) {
+    fn cap_cut_entry(cut: &FannedInAuditCapCut) -> crate::audit::NewAuditEntry {
         let actor = crate::audit::AuditContext::node("cluster");
-        let entry = crate::audit::NewAuditEntry {
+        crate::audit::NewAuditEntry {
             timestamp: chrono::Utc::now().to_rfc3339(),
             operator_username: actor.username,
             operator_role: actor.role,
@@ -2804,8 +2850,7 @@ impl LogStore {
             after_payload_hash: String::new(),
             ip: actor.ip,
             user_agent: actor.user_agent,
-        };
-        Self::append_local_audit(&self.conn, &entry);
+        }
     }
 
     /// The column a chain's prefix cut is positioned on: the aggregated
@@ -2824,13 +2869,12 @@ impl LogStore {
     /// sealed prefix cuts of [`AUDIT_CHUNK`] rows with the connection
     /// released between them, adding what each took to `totals` as it
     /// goes so a caller still knows what was cut when a later chunk
-    /// fails. `backup_capacity` is passed to
-    /// [`LogStore::cut_chain_prefix`].
+    /// fails. `cause` is passed to [`LogStore::cut_chain_prefix`].
     fn cut_chain_in_chunks(
         &self,
         node_id: &str,
         cut: i64,
-        backup_capacity: u64,
+        cause: CutCause,
         totals: &mut PrefixCut,
     ) -> Result<(), String> {
         use rusqlite::OptionalExtension;
@@ -2846,7 +2890,7 @@ impl LogStore {
             // Fewer than a chunk left at or below the cut: the rest goes
             // in this one.
             let step = chunk_end.unwrap_or(cut);
-            let done = Self::cut_chain_prefix(&conn, node_id, step, backup_capacity)?;
+            let done = Self::cut_chain_prefix(&conn, node_id, step, cause)?;
             totals.absorb(done);
             if step >= cut || done.removed == 0 {
                 return Ok(());
@@ -2864,21 +2908,24 @@ impl LogStore {
     /// fanned-in chain also records the cut position, below which
     /// [`LogStore::insert_fanned_in_audit`] stores nothing again.
     ///
-    /// With a non-zero `backup_capacity` (the fan-in cap, never
-    /// retention, never the local chain), the oldest rows of the cut
-    /// are moved into the node's fan-in backup rather than deleted, as
-    /// [`LogStore::enforce_fanned_in_audit_cap`] describes; see
-    /// [`LogStore::move_to_fanned_in_backup`].
+    /// Cut by the fan-in cap (never retention, never the local chain),
+    /// the oldest rows of the cut are moved into the node's fan-in
+    /// backup rather than deleted, as
+    /// [`LogStore::enforce_fanned_in_audit_cap`] describes (see
+    /// [`LogStore::move_to_fanned_in_backup`]), and the cut is recorded
+    /// in this node's own chain, its `lorica::audit` event emitted once
+    /// the record is committed.
     ///
-    /// Seal, move and delete commit in ONE transaction. Written apart,
-    /// a failure between them would leave a seal naming a row that is
-    /// still the chain's first, and verify would report a break that
-    /// nothing tampered with, or rows deleted that the backup was owed.
+    /// Seal, move, delete and record commit in ONE transaction. Written
+    /// apart, a failure between them would leave a seal naming a row
+    /// that is still the chain's first, and verify would report a break
+    /// that nothing tampered with, or rows deleted that the backup was
+    /// owed, or a cut no record names.
     fn cut_chain_prefix(
         conn: &Connection,
         node_id: &str,
         cut: i64,
-        backup_capacity: u64,
+        cause: CutCause,
     ) -> Result<PrefixCut, String> {
         use rusqlite::{OptionalExtension, Transaction, TransactionBehavior};
         let (order, tail_order) = Self::chain_order(node_id);
@@ -2931,10 +2978,11 @@ impl LogStore {
                 .map_err(|e| format!("failed to read audit chain tail: {e}"))?,
         };
 
-        let backed_up = if backup_capacity > 0 && !node_id.is_empty() {
-            Self::move_to_fanned_in_backup(&tx, node_id, cut, backup_capacity, &first_prev)?
-        } else {
-            0
+        let backed_up = match cause {
+            CutCause::FanInCap { backup_capacity } if !node_id.is_empty() => {
+                Self::move_to_fanned_in_backup(&tx, node_id, cut, backup_capacity, &first_prev)?
+            }
+            _ => 0,
         };
 
         if let Some(seal) = seal {
@@ -2950,14 +2998,34 @@ impl LogStore {
                 params![node_id, cut],
             )
             .map_err(|e| format!("failed to enforce audit retention: {e}"))?;
-        tx.commit()
-            .map_err(|e| format!("failed to commit the audit cut: {e}"))?;
-        Ok(PrefixCut {
+        let done = PrefixCut {
             removed: deleted as u64,
             backed_up,
             first: Some(first_position),
             last: Some(cut),
-        })
+        };
+
+        let record = match cause {
+            CutCause::FanInCap { .. } if deleted > 0 => {
+                let entry = Self::cap_cut_entry(&FannedInAuditCapCut {
+                    node_id: node_id.to_string(),
+                    removed: done.removed,
+                    backed_up,
+                    first_origin_id: first_position,
+                    last_origin_id: cut,
+                });
+                let (_id, chain_hash) = Self::append_local_audit_in(&tx, &entry)?;
+                Some((entry, chain_hash))
+            }
+            _ => None,
+        };
+
+        tx.commit()
+            .map_err(|e| format!("failed to commit the audit cut: {e}"))?;
+        if let Some((entry, chain_hash)) = record {
+            crate::audit::emit_stored_event(&entry, &chain_hash);
+        }
+        Ok(done)
     }
 
     /// Inside a cut's transaction, copy the oldest rows of
@@ -4161,6 +4229,130 @@ mod fleet_audit_tests {
         );
     }
 
+    /// The actions of every cap record in this node's own chain, oldest
+    /// first.
+    fn cap_cut_records(store: &LogStore) -> Vec<String> {
+        let (rows, _) = store
+            .query_audit(&crate::audit::AuditQuery {
+                limit: 100,
+                node_id: Some(String::new()),
+                action_prefix: Some(FANNED_IN_AUDIT_CAP_ACTION.to_string()),
+                ..Default::default()
+            })
+            .expect("query the cap records");
+        rows.into_iter().rev().map(|row| row.action).collect()
+    }
+
+    #[test]
+    fn a_cap_cut_failing_before_its_commit_leaves_neither_the_cut_nor_its_record() {
+        // The record is the chunk's last statement before the commit, so
+        // a trigger refusing it is a failure after the seal, the move and
+        // the delete have run and before any of them is durable.
+        let (store, _dir) = store();
+        store
+            .insert_fanned_in_audit("node-a", &long_origin_chain(5))
+            .expect("fan-in");
+        let seal_before = LogStore::audit_seal_for(&store.conn.lock(), "node-a").expect("seal");
+        store
+            .conn
+            .lock()
+            .execute_batch(&format!(
+                "CREATE TEMP TRIGGER refuse_cap_record BEFORE INSERT ON audit_log
+                 WHEN NEW.action LIKE '{FANNED_IN_AUDIT_CAP_ACTION}%'
+                 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;"
+            ))
+            .expect("test setup: trigger");
+
+        let err = store
+            .enforce_fanned_in_audit_cap(3)
+            .expect_err("the record is refused, and the cut with it");
+        assert!(err.contains("injected failure"), "{err}");
+        assert_eq!(rows_held(&store, "node-a"), 5, "no row was cut");
+        assert!(
+            backup_origin_ids(&store, "node-a").is_empty(),
+            "no row was moved"
+        );
+        {
+            let conn = store.conn.lock();
+            assert_eq!(
+                LogStore::audit_seal_for(&conn, "node-a").expect("seal"),
+                seal_before,
+                "the seal did not move"
+            );
+            assert_eq!(
+                LogStore::audit_meta(&conn, &LogStore::cut_floor_key("node-a")).expect("floor"),
+                None
+            );
+        }
+        assert!(cap_cut_records(&store).is_empty(), "no record either");
+        for node_id in ["", "node-a"] {
+            assert!(
+                store
+                    .verify_audit_chain_for(node_id)
+                    .expect("verify")
+                    .verified,
+                "chain {node_id:?} after the rolled-back cut"
+            );
+        }
+
+        store
+            .conn
+            .lock()
+            .execute_batch("DROP TRIGGER refuse_cap_record")
+            .expect("test teardown: trigger");
+        let cut = store.enforce_fanned_in_audit_cap(3).expect("cap");
+        assert_eq!(
+            (cut[0].removed, cut[0].backed_up),
+            (2, 2),
+            "the retried cut is the whole cut, its backup room untouched"
+        );
+        assert_eq!(
+            cap_cut_records(&store),
+            vec![format!(
+                "{FANNED_IN_AUDIT_CAP_ACTION}:rows=2,origin_ids=1..=2,backed_up=2,deleted=0"
+            )]
+        );
+    }
+
+    #[test]
+    fn every_chunk_of_a_cap_cut_commits_with_its_own_record() {
+        let (store, _dir) = store();
+        let chunk = AUDIT_CHUNK;
+        let total = chunk * 2 + chunk / 2;
+        store
+            .insert_fanned_in_audit("node-a", &long_origin_chain(total as usize))
+            .expect("fan-in");
+        let keep = 100;
+
+        let cut = store.enforce_fanned_in_audit_cap(keep as u64).expect("cap");
+
+        let last = total - keep;
+        let record = |first: i64, end: i64, backed_up: i64| {
+            let rows = end - first + 1;
+            format!(
+                "{FANNED_IN_AUDIT_CAP_ACTION}:rows={rows},origin_ids={first}..={end},backed_up={backed_up},deleted={}",
+                rows - backed_up
+            )
+        };
+        assert_eq!(
+            cap_cut_records(&store),
+            vec![
+                record(1, chunk, keep),
+                record(chunk + 1, chunk * 2, 0),
+                record(chunk * 2 + 1, last, 0),
+            ]
+        );
+        assert_eq!(
+            (cut[0].removed, cut[0].backed_up),
+            (last as u64, keep as u64),
+            "the pass reports the sum of its chunks"
+        );
+        assert!(
+            store.verify_audit_chain_for("").expect("verify").verified,
+            "each record is a link of this node's own chain"
+        );
+    }
+
     #[test]
     fn retention_ages_the_backup_like_the_chain_it_came_from() {
         let (store, _dir) = store();
@@ -4513,6 +4705,30 @@ mod fleet_audit_tests {
             local_cut.contains("idx_audit_log_node_age"),
             "retention reads the expired range alone: {local_cut}"
         );
+    }
+
+    #[test]
+    fn the_retention_spans_seek_both_ends_of_the_table() {
+        // `SELECT MIN(id), MAX(id)` in one select is two aggregates, which
+        // SQLite's min/max optimisation does not serve: it read every
+        // entry of a covering index under the lock the writers wait on,
+        // on every pass.
+        let (store, _dir) = store();
+        for (table, sql) in [
+            ("access_logs", LogStore::ACCESS_LOG_SPAN_SQL),
+            ("waf_events", LogStore::WAF_EVENTS_SPAN_SQL),
+        ] {
+            let plan = plan_of(&store, sql, &[]);
+            assert!(
+                !plan.contains(&format!("SCAN {table}")),
+                "the {table} span scans: {plan}"
+            );
+            assert_eq!(
+                plan.matches(&format!("SEARCH {table}")).count(),
+                2,
+                "one seek per end of {table}: {plan}"
+            );
+        }
     }
 }
 
