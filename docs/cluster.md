@@ -1096,6 +1096,23 @@ verifiable there, and still in that node's `lorica::audit` stream. On
 a compromised node only the last of those is out of the attacker's
 reach, and only where an operator ships it to a write-once sink.
 
+**Reading the backup.** No API lists its rows: verify establishes that
+it is intact, and reading it is a forensic step taken after a
+`cluster.audit.cap_cut` row, on the control plane host. Run verify
+first, so what you read is known to be unaltered, then open the file
+read-only as root or as the `lorica` user (the path assumes the default
+data directory):
+
+```bash
+sudo sqlite3 -readonly /var/lib/lorica/access-log.db \
+  "SELECT * FROM audit_log_fanned_in_backup
+   WHERE node_id = '<node-id>' ORDER BY origin_id;"
+```
+
+`access-log.db` runs in WAL mode, so a reader does not block Lorica's
+writer. Do not open it read-write: a row changed by hand is a break the
+next verify reports.
+
 A row a follower re-sends at or below the position of its chain's last
 cut is acknowledged and not stored: it was held once, and stored again
 it would sit before the seal and read as a break.
