@@ -1611,15 +1611,16 @@ pub fn inc_log_sink_dropped(sink: &str, kind: &str) {
         .inc();
 }
 
-/// Counter: events successfully handed to a log-export sink's
-/// transport (written to the socket for syslog, emitted into the
-/// batch exporter for OTLP). Paired with the drop counter so an
-/// operator can tell "sink healthy, low traffic" apart from "sink
+/// Counter: events a log-export sink took: for syslog, after a
+/// successful socket write; for OTLP, once handed to the SDK's batch
+/// processor, so an export failure or a batch-queue drop is still
+/// counted here and never as dropped. Paired with the drop counter so
+/// an operator can tell "sink healthy, low traffic" apart from "sink
 /// dead" (QA finding, Story 9.8).
 static LOG_SINK_SENT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     lorica_metrics::register_int_counter_vec(
         "log_sink_sent_total",
-        "Events successfully handed to a log-export sink's transport (sink=syslog|otlp, kind=access|waf|audit)",
+        "Events a log-export sink took: syslog after a successful socket write, otlp once handed to the SDK batch exporter, delivery to the collector not confirmed (sink=syslog|otlp)",
         &["sink", "kind"],
     )
 });

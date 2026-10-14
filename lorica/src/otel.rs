@@ -560,6 +560,13 @@ mod imp {
     /// Convert one sink event into an OTel log record. The trace
     /// context captured at publish time on the hot path becomes the
     /// record's trace correlation (Story 9.8 AC #2).
+    ///
+    /// `lorica_log_sink_sent_total{sink="otlp"}` counts the record once
+    /// it is handed to the SDK's batch processor, not once the collector
+    /// has it: `emit` returns no outcome, so a batch the exporter fails
+    /// to deliver, or a record the processor's full queue drops, is
+    /// still counted as sent and never as dropped. The syslog lane, by
+    /// contrast, counts after its socket write succeeds.
     fn emit_sink_event(logger: &opentelemetry_sdk::logs::SdkLogger, event: &SinkEvent) {
         let kind = event.kind();
         let (severity, severity_text, raw_ts) = match &*event.payload {
@@ -607,9 +614,10 @@ mod imp {
                 .map_or(0, |(_, _, value)| value)
         }
 
-        /// The syslog lane counts every event it hands to its transport;
-        /// the OTLP lane must too, or `lorica_log_sink_sent_total{sink="otlp"}`
-        /// stays at zero on a healthy collector and reads as a dead sink.
+        /// An event handed to the OTLP exporter counts as sent, or
+        /// `lorica_log_sink_sent_total{sink="otlp"}` stays at zero on a
+        /// healthy collector and reads as a dead sink. What it counts is
+        /// the hand-off, not a delivery (see `emit_sink_event`).
         #[test]
         fn emitted_event_counts_as_sent_on_the_otlp_lane() {
             let provider = SdkLoggerProvider::builder().build();
