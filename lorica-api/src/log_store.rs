@@ -1944,6 +1944,12 @@ impl LogStore {
     /// origin's own `lorica::audit` stream shipped to a WORM sink is
     /// the anchor; see the module doc of [`crate::audit`].
     ///
+    /// The walk covers the chain as far as its head when the call
+    /// began, in chunks of
+    /// [`crate::cluster_telemetry_store::RETENTION_CHUNK`] rows, with
+    /// the connection released between chunks; see
+    /// [`LogStore::verify_audit_chain_chunked`].
+    ///
     /// # Errors
     ///
     /// Returns the SQLite error text on a read failure.
@@ -1951,43 +1957,141 @@ impl LogStore {
         &self,
         node_id: &str,
     ) -> Result<crate::audit::VerifyResult, String> {
-        let conn = self.conn.lock();
-        let mut expected: String = Self::audit_seal_for(&conn, node_id)?
-            .unwrap_or_else(|| crate::audit::GENESIS_HASH.to_string());
+        self.verify_audit_chain_chunked(
+            node_id,
+            crate::cluster_telemetry_store::RETENTION_CHUNK as i64,
+            &mut || {},
+        )
+    }
 
+    /// The walk behind [`LogStore::verify_audit_chain_for`], one chunk
+    /// per lock acquisition, calling `between_chunks` with the lock
+    /// released so a test can land a write exactly there.
+    ///
+    /// Chunked because every other user of `access-log.db` waits on the
+    /// same connection, the access-log writer first among them, and it
+    /// drops rows once its queue fills. A fanned-in chain may hold up to
+    /// [`FANNED_IN_AUDIT_ROWS_PER_NODE`] rows, and a walk holding the
+    /// lock throughout stalled that writer for the whole chain (backlog
+    /// #75). Hashing happens outside the lock as well; only the read of
+    /// each chunk is inside it.
+    ///
+    /// Releasing the lock mid-walk lets two kinds of write land between
+    /// chunks, and neither may read as a break:
+    ///
+    /// - Appends. The walk stops at the chain's head as it stood when
+    ///   the walk began, so a row written after that is left to the
+    ///   next verify rather than racing this one. An append that lands
+    ///   below that head, a fanned-in row filling a gap in origin
+    ///   order, is walked exactly as an unchunked verify starting at
+    ///   that moment would walk it.
+    /// - Prefix cuts ([`LogStore::cut_chain_prefix`], from retention or
+    ///   the fan-in cap). A cut deletes a prefix and reseals in one
+    ///   transaction. If the last row walked survived it, the cut
+    ///   stopped short of the cursor and everything ahead of it is
+    ///   untouched, so the walk goes on. If that row is gone, the cut
+    ///   reached the cursor or past it, and the first row ahead is now
+    ///   the chain's first: it is checked against the CURRENT seal,
+    ///   which is the anchor a verify started now would use for it.
+    ///
+    /// Neither rule loosens what a break is. Every row walked is
+    /// checked against its predecessor or the seal, as before. A row
+    /// deleted out from under the cursor by anything other than a cut
+    /// leaves the seal where it was, so the next row is checked against
+    /// a seal that does not name it and is reported. `total_rows`
+    /// counts rows walked, including any a cut removed after they were.
+    fn verify_audit_chain_chunked(
+        &self,
+        node_id: &str,
+        chunk: i64,
+        between_chunks: &mut dyn FnMut(),
+    ) -> Result<crate::audit::VerifyResult, String> {
+        use rusqlite::OptionalExtension;
         let (order, _) = Self::chain_order(node_id);
-        let sql = format!(
-            "SELECT {} FROM audit_log WHERE node_id = ?1 ORDER BY {order}",
-            Self::AUDIT_COLUMNS
-        );
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| format!("failed to prepare audit verify: {e}"))?;
-        let rows = stmt
-            .query_map(params![node_id], Self::row_to_audit)
-            .map_err(|e| format!("failed to run audit verify: {e}"))?;
+        let position = Self::chain_position(node_id);
+        let genesis = || crate::audit::GENESIS_HASH.to_string();
+
+        let (mut expected, head) = {
+            let conn = self.conn.lock();
+            let seal = Self::audit_seal_for(&conn, node_id)?.unwrap_or_else(genesis);
+            let head: Option<i64> = conn
+                .query_row(
+                    &format!("SELECT MAX({position}) FROM audit_log WHERE node_id = ?1"),
+                    params![node_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("failed to read the audit chain head: {e}"))?;
+            (seal, head)
+        };
 
         let mut total_rows: u64 = 0;
-        for row in rows {
-            let record = row.map_err(|e| format!("failed to read audit row: {e}"))?;
-            total_rows += 1;
-            if record.prev_chain_hash != expected {
-                return Ok(crate::audit::VerifyResult {
-                    verified: false,
-                    total_rows,
-                    first_break_id: Some(record.id),
-                    first_break_reason: Some("prev_hash_mismatch".into()),
-                });
+        let mut last_walked: Option<i64> = None;
+        if let Some(head) = head {
+            let chunk_sql = format!(
+                "SELECT {}, {position} FROM audit_log
+                 WHERE node_id = ?1 AND {position} >= ?2 AND {position} <= ?3
+                 ORDER BY {order} LIMIT ?4",
+                Self::AUDIT_COLUMNS
+            );
+            let survives_sql =
+                format!("SELECT 1 FROM audit_log WHERE node_id = ?1 AND {position} = ?2");
+            let mut from = i64::MIN;
+            loop {
+                let records: Vec<(crate::audit::AuditRecord, i64)> = {
+                    let conn = self.conn.lock();
+                    if let Some(last) = last_walked {
+                        let survived = conn
+                            .query_row(&survives_sql, params![node_id, last], |_| Ok(()))
+                            .optional()
+                            .map_err(|e| format!("failed to re-anchor the audit verify: {e}"))?
+                            .is_some();
+                        if !survived {
+                            expected =
+                                Self::audit_seal_for(&conn, node_id)?.unwrap_or_else(genesis);
+                        }
+                    }
+                    let mut stmt = conn
+                        .prepare_cached(&chunk_sql)
+                        .map_err(|e| format!("failed to prepare audit verify: {e}"))?;
+                    let rows = stmt
+                        .query_map(params![node_id, from, head, chunk], |row| {
+                            Ok((Self::row_to_audit(row)?, row.get(15)?))
+                        })
+                        .map_err(|e| format!("failed to run audit verify: {e}"))?;
+                    rows.collect::<rusqlite::Result<_>>()
+                        .map_err(|e| format!("failed to read audit row: {e}"))?
+                };
+
+                let fetched = records.len() as i64;
+                for (record, at) in records {
+                    total_rows += 1;
+                    if record.prev_chain_hash != expected {
+                        return Ok(crate::audit::VerifyResult {
+                            verified: false,
+                            total_rows,
+                            first_break_id: Some(record.id),
+                            first_break_reason: Some("prev_hash_mismatch".into()),
+                        });
+                    }
+                    if crate::audit::recompute_chain_hash(&record) != record.chain_hash {
+                        return Ok(crate::audit::VerifyResult {
+                            verified: false,
+                            total_rows,
+                            first_break_id: Some(record.id),
+                            first_break_reason: Some("chain_hash_mismatch".into()),
+                        });
+                    }
+                    expected = record.chain_hash;
+                    last_walked = Some(at);
+                }
+
+                let next = last_walked.and_then(|at| at.checked_add(1));
+                match next {
+                    Some(next) if fetched == chunk && next <= head => from = next,
+                    _ => break,
+                }
+                between_chunks();
             }
-            if crate::audit::recompute_chain_hash(&record) != record.chain_hash {
-                return Ok(crate::audit::VerifyResult {
-                    verified: false,
-                    total_rows,
-                    first_break_id: Some(record.id),
-                    first_break_reason: Some("chain_hash_mismatch".into()),
-                });
-            }
-            expected = record.chain_hash;
         }
 
         Ok(crate::audit::VerifyResult {
@@ -1998,8 +2102,6 @@ impl LogStore {
         })
     }
 
-    /// Every node id that has rows in the aggregate, `""` included.
-    ///
     /// Test-only: rewrite when a fanned-in row arrived, so retention
     /// tests can age rows without sleeping through a retention window.
     #[cfg(test)]
@@ -2013,6 +2115,8 @@ impl LogStore {
             .expect("test setup: backdate a fanned-in row");
     }
 
+    /// Every node id that has rows in the aggregate, `""` included.
+    ///
     /// The input to a verify that reports per node: an operator asking
     /// "is the fleet's audit trail intact" needs one answer per chain,
     /// and there is no other list of which chains exist.
@@ -3038,6 +3142,287 @@ mod fleet_audit_tests {
             oldest_origin_id(&store, "node-a"),
             (total - keep) as i64 + 1
         );
+    }
+
+    /// A chain of `n` rows as its origin would have published it.
+    fn long_origin_chain(n: usize) -> Vec<FannedInAuditRow> {
+        let actions: Vec<String> = (1..=n).map(|i| format!("a.{i}")).collect();
+        let actions: Vec<&str> = actions.iter().map(String::as_str).collect();
+        origin_chain(&actions)
+    }
+
+    /// Verify in one chunk: the walk as it was before it was chunked,
+    /// against which every chunked verdict below is compared.
+    fn verify_whole(store: &LogStore, node_id: &str) -> crate::audit::VerifyResult {
+        store
+            .verify_audit_chain_chunked(node_id, i64::MAX, &mut || {})
+            .expect("whole verify")
+    }
+
+    fn verdict(result: &crate::audit::VerifyResult) -> (bool, u64, Option<i64>, Option<&str>) {
+        (
+            result.verified,
+            result.total_rows,
+            result.first_break_id,
+            result.first_break_reason.as_deref(),
+        )
+    }
+
+    #[test]
+    fn a_chain_walked_in_several_chunks_verifies_in_full() {
+        let (store, _dir) = store();
+        for n in 0..10 {
+            store
+                .insert_audit(&local_entry(&format!("local.{n}")))
+                .expect("local");
+        }
+        store
+            .insert_fanned_in_audit("node-a", &long_origin_chain(10))
+            .expect("fan-in");
+        for node_id in ["", "node-a"] {
+            let mut pauses = 0;
+            let result = store
+                .verify_audit_chain_chunked(node_id, 3, &mut || pauses += 1)
+                .expect("verify");
+            assert_eq!(
+                verdict(&result),
+                (true, 10, None, None),
+                "chain {node_id:?}"
+            );
+            assert_eq!(pauses, 3, "four chunks, the lock released between each");
+        }
+    }
+
+    #[test]
+    fn a_break_in_a_later_chunk_is_reported_as_the_whole_walk_reports_it() {
+        let (store, _dir) = store();
+        for n in 0..10 {
+            store
+                .insert_audit(&local_entry(&format!("local.{n}")))
+                .expect("local");
+        }
+        let mut rows = long_origin_chain(10);
+        rows[7].action = "a.8.tampered".to_string();
+        store
+            .insert_fanned_in_audit("node-a", &rows)
+            .expect("fan-in");
+        // A rewritten row and a deleted one, both past the first chunk.
+        {
+            let conn = store.conn.lock();
+            conn.execute(
+                "UPDATE audit_log SET target_id = '999' WHERE node_id = '' AND id = 8",
+                [],
+            )
+            .expect("tamper");
+        }
+        let (store_deleted, _dir_deleted) = super::tests_support::store_with_local_rows(10);
+        store_deleted
+            .conn
+            .lock()
+            .execute("DELETE FROM audit_log WHERE id = 7", [])
+            .expect("delete");
+
+        for (store, node_id, reason) in [
+            (&store, "", "chain_hash_mismatch"),
+            (&store, "node-a", "chain_hash_mismatch"),
+            (&store_deleted, "", "prev_hash_mismatch"),
+        ] {
+            let whole = verify_whole(store, node_id);
+            let chunked = store
+                .verify_audit_chain_chunked(node_id, 3, &mut || {})
+                .expect("chunked verify");
+            assert!(!whole.verified);
+            assert_eq!(whole.first_break_reason.as_deref(), Some(reason));
+            assert_eq!(verdict(&chunked), verdict(&whole), "chain {node_id:?}");
+        }
+    }
+
+    #[test]
+    fn rows_appended_while_the_walk_is_paused_are_not_a_break() {
+        let (store, _dir) = store();
+        for n in 0..6 {
+            store
+                .insert_audit(&local_entry(&format!("local.{n}")))
+                .expect("local");
+        }
+        let chain = long_origin_chain(12);
+        store
+            .insert_fanned_in_audit("node-a", &chain[..6])
+            .expect("fan-in");
+
+        let mut appended = 0;
+        let mut append = || {
+            store
+                .insert_audit(&local_entry(&format!("local.late.{appended}")))
+                .expect("local append");
+            store
+                .insert_fanned_in_audit("node-a", &chain[6 + appended..7 + appended])
+                .expect("fan-in append");
+            appended += 1;
+        };
+        for node_id in ["", "node-a"] {
+            let at_start = super::tests_support::count_audit_rows(&store, node_id);
+            let result = store
+                .verify_audit_chain_chunked(node_id, 2, &mut append)
+                .expect("verify");
+            assert_eq!(
+                verdict(&result),
+                (true, at_start as u64, None, None),
+                "chain {node_id:?} is walked to the head it had when the walk began"
+            );
+            assert!(
+                super::tests_support::count_audit_rows(&store, node_id) > at_start,
+                "rows landed on chain {node_id:?} during its walk"
+            );
+        }
+        for node_id in ["", "node-a"] {
+            assert!(verify_whole(&store, node_id).verified, "chain {node_id:?}");
+        }
+    }
+
+    #[test]
+    fn a_prefix_cut_landing_mid_walk_is_not_a_break() {
+        // Ahead of the cursor: the cap takes rows the walk has not
+        // reached, and the next chunk starts at the new first row.
+        let (ahead, _ahead_dir) = store();
+        ahead
+            .insert_fanned_in_audit("node-a", &long_origin_chain(20))
+            .expect("fan-in");
+        let mut pauses = 0;
+        let result = ahead
+            .verify_audit_chain_chunked("node-a", 4, &mut || {
+                pauses += 1;
+                if pauses == 1 {
+                    ahead.enforce_fanned_in_audit_cap(5).expect("cap");
+                }
+            })
+            .expect("verify");
+        assert_eq!(oldest_origin_id(&ahead, "node-a"), 16, "the cut landed");
+        assert_eq!(verdict(&result), (true, 9, None, None));
+
+        // Behind the cursor: the cut takes only rows already walked.
+        let (behind, _behind_dir) = store();
+        behind
+            .insert_fanned_in_audit("node-a", &long_origin_chain(20))
+            .expect("fan-in");
+        let mut pauses = 0;
+        let result = behind
+            .verify_audit_chain_chunked("node-a", 4, &mut || {
+                pauses += 1;
+                if pauses == 2 {
+                    behind.enforce_fanned_in_audit_cap(15).expect("cap");
+                }
+            })
+            .expect("verify");
+        assert_eq!(oldest_origin_id(&behind, "node-a"), 6, "the cut landed");
+        assert_eq!(verdict(&result), (true, 20, None, None));
+
+        // Retention on the local chain, cutting through the cursor.
+        let (local, _local_dir) = super::tests_support::store_with_local_rows(10);
+        let mut pauses = 0;
+        let result = local
+            .verify_audit_chain_chunked("", 3, &mut || {
+                pauses += 1;
+                if pauses == 2 {
+                    local
+                        .enforce_audit_retention("2026-08-08T00:00:00+00:00")
+                        .expect("retention");
+                }
+            })
+            .expect("verify");
+        assert_eq!(
+            super::tests_support::count_audit_rows(&local, ""),
+            3,
+            "the cut landed"
+        );
+        assert_eq!(verdict(&result), (true, 9, None, None));
+    }
+
+    #[test]
+    fn a_row_deleted_under_the_cursor_without_a_cut_is_still_reported() {
+        // Re-anchoring on the seal is only sound because a cut moves
+        // the seal. A row deleted any other way leaves it where it was,
+        // and the next row, which names the deleted one, is a break.
+        let (store, _dir) = store();
+        store
+            .insert_fanned_in_audit("node-a", &long_origin_chain(12))
+            .expect("fan-in");
+        let mut pauses = 0;
+        let result = store
+            .verify_audit_chain_chunked("node-a", 4, &mut || {
+                pauses += 1;
+                if pauses == 1 {
+                    store
+                        .conn
+                        .lock()
+                        .execute(
+                            "DELETE FROM audit_log WHERE node_id = 'node-a' AND origin_id = 4",
+                            [],
+                        )
+                        .expect("tamper");
+                }
+            })
+            .expect("verify");
+        let fifth: i64 = store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT id FROM audit_log WHERE node_id = 'node-a' AND origin_id = 5",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fifth row");
+        assert_eq!(
+            verdict(&result),
+            (false, 5, Some(fifth), Some("prev_hash_mismatch"))
+        );
+        let whole = verify_whole(&store, "node-a");
+        assert_eq!(
+            (whole.first_break_id, whole.first_break_reason.as_deref()),
+            (Some(fifth), Some("prev_hash_mismatch")),
+            "a verify started after the deletion reports the same row"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_support {
+    use super::*;
+
+    /// A store holding `n` local audit rows stamped on consecutive days
+    /// from 2026-08-01, so a retention cutoff selects a known prefix.
+    pub(super) fn store_with_local_rows(n: u32) -> (LogStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("test setup: tempdir");
+        let store = LogStore::open(dir.path()).expect("test setup: log store opens");
+        for day in 1..=n {
+            store
+                .insert_audit(&crate::audit::NewAuditEntry {
+                    timestamp: format!("2026-08-{day:02}T12:00:00+00:00"),
+                    operator_username: "admin".to_string(),
+                    operator_role: "super_admin".to_string(),
+                    action: "route.update".to_string(),
+                    target_type: "route".to_string(),
+                    target_id: day.to_string(),
+                    before_payload_hash: String::new(),
+                    after_payload_hash: String::new(),
+                    ip: "192.0.2.10".to_string(),
+                    user_agent: "test".to_string(),
+                })
+                .expect("test setup: local audit row");
+        }
+        (store, dir)
+    }
+
+    pub(super) fn count_audit_rows(store: &LogStore, node_id: &str) -> i64 {
+        store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE node_id = ?1",
+                params![node_id],
+                |row| row.get(0),
+            )
+            .expect("count audit rows")
     }
 }
 

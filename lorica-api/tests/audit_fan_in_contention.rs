@@ -330,6 +330,103 @@ fn uncontended_push() -> Vec<Duration> {
         .collect()
 }
 
+/// Rows in the one follower chain of the long-chain scenario: well
+/// inside `FANNED_IN_AUDIT_ROWS_PER_NODE`, so a chain an honest node can
+/// legitimately leave on the control plane.
+const LONG_CHAIN: usize = 200_000;
+/// How long the long-chain scenario runs the writer against back-to-back
+/// verifies.
+const LONG_CHAIN_RUN: Duration = Duration::from_secs(10);
+
+/// The access-log writer against `verify` walking one long follower
+/// chain over and over, with nothing else on the connection: the lag
+/// a single chain walk can put on the writer, which a mutex held for
+/// the whole walk grows linearly with the chain.
+///
+/// Returns `(writer samples, writer max lag, verify samples)`.
+fn run_long_chain_phase() -> (Vec<Duration>, Duration, Vec<Duration>) {
+    let dir = tempfile::tempdir().expect("test setup: temp dir");
+    let store = Arc::new(LogStore::open(dir.path()).expect("test setup: open the log store"));
+    for batch in follower_chain(LONG_CHAIN).chunks(MAX_TELEMETRY_AUDIT) {
+        store
+            .insert_fanned_in_audit(&follower_name(0), batch)
+            .expect("test setup: long follower chain");
+    }
+    let start = Instant::now() + Duration::from_millis(200);
+    let end = start + LONG_CHAIN_RUN;
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let writer = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            let mut all = Vec::new();
+            let mut max_lag = Duration::ZERO;
+            let mut next = start;
+            let mut seq = 0u64;
+            while next < end {
+                let now = Instant::now();
+                if now < next {
+                    std::thread::sleep(next - now);
+                }
+                let began = Instant::now();
+                max_lag = max_lag.max(began.saturating_duration_since(next));
+                let batch: Vec<LogEntry> = (0..WRITER_BATCH)
+                    .map(|_| {
+                        seq += 1;
+                        access_entry(seq)
+                    })
+                    .collect();
+                store.insert_batch(&batch).expect("access batch");
+                all.push(began.elapsed());
+                next += WRITER_PERIOD;
+            }
+            (all, max_lag)
+        })
+    };
+
+    let verifier = {
+        let store = Arc::clone(&store);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut took = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                let began = Instant::now();
+                let result = store
+                    .verify_audit_chain_for(&follower_name(0))
+                    .expect("verify");
+                took.push(began.elapsed());
+                assert!(result.verified, "the long chain must verify: {result:?}");
+                assert_eq!(result.total_rows, LONG_CHAIN as u64);
+            }
+            took
+        })
+    };
+
+    let (writer, max_lag) = writer.join().expect("writer thread");
+    stop.store(true, Ordering::Relaxed);
+    let verify = verifier.join().expect("verify thread");
+    (writer, max_lag, verify)
+}
+
+#[test]
+#[ignore = "measurement (backlog #75): one long follower chain verified back to back"]
+fn measure_writer_lag_behind_a_long_chain_verify() {
+    let (mut writer, max_lag, mut verify) = run_long_chain_phase();
+    let w = summary(&mut writer);
+    let v = summary(&mut verify);
+    eprintln!(
+        "[#75] long chain {LONG_CHAIN} rows, {} verifies over {LONG_CHAIN_RUN:?}: \
+         writer p50/p99/max {:.2}/{:.2}/{:.2} ms, writer max lag {:.2} ms, verify p50/max {:.2}/{:.2} ms",
+        verify.len(),
+        w.0,
+        w.1,
+        w.2,
+        max_lag.as_secs_f64() * 1000.0,
+        v.0,
+        v.2
+    );
+}
+
 #[test]
 #[ignore = "measurement (backlog #75): about two minutes of synthetic load"]
 fn measure_audit_fan_in_contention_on_the_access_log_connection() {
