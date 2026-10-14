@@ -2082,12 +2082,24 @@ paths:
                         type: integer
                         format: int64
                         description: >-
-                          WAF events held. With the log store, the
-                          persisted rows, which plateau near
-                          waf_event_retention once the cap is reached.
-                          Without it, the engine's recent-event ring
-                          since the process started, a few hundred at
-                          most.
+                          WAF events held, where `stored_in` says. With
+                          the log store, the persisted rows, which
+                          plateau near waf_event_retention once the cap
+                          is reached. The persistent counters, windowed
+                          ones included, are reused for a short while
+                          so that polling dashboards share one table
+                          scan, and dropped on a clear. Without it,
+                          the engine's in-memory ring of the most recent
+                          events since the process started.
+                      stored_in:
+                        type: string
+                        enum: [log_store, memory, none]
+                        description: >-
+                          Where the events `total_events` and
+                          `by_category` count are held: `log_store`, the
+                          retained table; `memory`, no log store is open
+                          and the in-memory ring is counted; `none`,
+                          nothing is wired.
                       total_24h:
                         type: integer
                         format: int64

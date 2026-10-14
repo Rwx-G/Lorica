@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { auth } from '../lib/auth';
 import { api, type NodeVerifyResult } from '../lib/api';
 import { clusterStatus, type ClusterNodeResponse, type ClusterStatus } from '../lib/cluster';
-import Security from './Security.svelte';
+import Security, { STATS_REFRESH_MS } from './Security.svelte';
 
 function controlPlane(): ClusterStatus {
   return {
@@ -74,6 +74,7 @@ beforeEach(() => {
       rule_count: 0,
       by_category: [],
       by_category_1h: [],
+      stored_in: 'none',
     },
   });
   vi.spyOn(api, 'getWafRules').mockResolvedValue({ data: { rules: [], total: 0, enabled: 0 } });
@@ -106,6 +107,7 @@ describe('Security page, WAF counters', () => {
     rule_count: 40,
     by_category: [{ category: 'xss', count: 100000 }],
     by_category_1h: [{ category: 'xss', count: 640 }],
+    stored_in: 'log_store' as const,
   };
 
   it('shows the last hour, the last day and the stored total, labelled apart', async () => {
@@ -122,6 +124,19 @@ describe('Security page, WAF counters', () => {
     expect(screen.queryByText('Total Events')).toBeNull();
   });
 
+  it('labels the count as the in-memory events when no log store is open', async () => {
+    vi.spyOn(api, 'getWafStats').mockResolvedValue({
+      data: { ...counters, total_events: 480, stored_in: 'memory' },
+    });
+    render(Security);
+
+    await waitFor(() => expect(statValue('Events in memory')).toBe('480'));
+    expect(screen.queryByText('Stored events')).toBeNull();
+    const card = screen.getByText('Events in memory').closest('.stat-card');
+    expect(card).toHaveAttribute('title', expect.stringContaining('No log store'));
+    expect(card).not.toHaveAttribute('title', expect.stringContaining('retention'));
+  });
+
   it('re-reads the counters so the windows roll without a click', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const stats = vi
@@ -131,7 +146,7 @@ describe('Security page, WAF counters', () => {
     render(Security);
     await waitFor(() => expect(statValue('Events (1h)')).toBe('640'));
 
-    await vi.advanceTimersByTimeAsync(30000);
+    await vi.advanceTimersByTimeAsync(STATS_REFRESH_MS);
     await waitFor(() => expect(statValue('Events (1h)')).toBe('3'));
     expect(stats).toHaveBeenCalledTimes(2);
   });

@@ -341,7 +341,7 @@ The dashboard ships inside the binary and is served on the management port (defa
 - **Routes** - create/edit routes with host matching, path prefixes, load balancing, WAF mode, rate limits, caching, timeouts, security headers, CORS, and 25 other per-route settings; a route the automation API owns carries an `automation` badge naming its environment and opens read-only, with a hint to update it through the pipeline
 - **Backends** - manage backend addresses, weights, health check type (TCP/HTTP), TLS upstream, active connections; automation-owned backends carry the same badge
 - **Certificates** - upload PEM certificates, view expiry dates, provision via ACME/Let's Encrypt (HTTP-01, DNS-01)
-- **Security** - WAF counters for the last hour, the last 24 hours and the stored events (bounded by `waf_event_retention`), refreshed every 30 seconds; WAF event table with category filtering, 49 rule toggles, IP ban list with unban button, admin audit log with chain verification; on a control plane every tab carries a node filter over the fleet's events, bans and audit chains
+- **Security** - WAF counters for the last hour, the last 24 hours and the events held (the retained table, bounded by `waf_event_retention`, or without a log store the in-memory events since start, labelled as such), refreshed periodically; WAF event table with category filtering, 49 rule toggles, IP ban list with unban button, admin audit log with chain verification; on a control plane every tab carries a node filter over the fleet's events, bans and audit chains
 - **SLA** - per-route passive/active SLA side-by-side, latency percentile tables, config editor, CSV/JSON export; on a control plane a node picker shows one follower's own figures (never a fleet aggregate: a fleet percentile is not a function of per-node percentiles)
 - **Load Tests** - test config management with clone, one-click execution, real-time SSE progress panel, historical results
 - **Active Probes** - CRUD for synthetic health probes with route selection, HTTP method/path/status/interval/timeout
@@ -542,7 +542,7 @@ All endpoints are served on the management port (default `9443`) over HTTPS (a s
 |--------|------|-------------|
 | `GET` | `/api/v1/waf/events` | Recent WAF events (with category filter) |
 | `DELETE` | `/api/v1/waf/events` | Clear WAF events |
-| `GET` | `/api/v1/waf/stats` | WAF statistics: stored events, last-24h and last-hour counts, per-category counts over the stored events and over the last hour |
+| `GET` | `/api/v1/waf/stats` | WAF statistics: events held and where (`stored_in`), last-24h and last-hour counts, per-category counts over the events held and over the last hour |
 | `GET` | `/api/v1/waf/rules` | List WAF rules |
 | `PUT` | `/api/v1/waf/rules/{id}` | Enable/disable rule |
 | `GET` | `/api/v1/waf/rules/custom` | List custom rules |

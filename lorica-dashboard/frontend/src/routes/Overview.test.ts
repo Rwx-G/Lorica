@@ -2,7 +2,7 @@ import { render, screen, waitFor } from '@testing-library/svelte';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import { api, type WafStatsResponse } from '../lib/api';
-import Overview from './Overview.svelte';
+import Overview, { REFRESH_MS } from './Overview.svelte';
 
 function wafStats(overrides: Partial<WafStatsResponse> = {}): WafStatsResponse {
   return {
@@ -15,6 +15,7 @@ function wafStats(overrides: Partial<WafStatsResponse> = {}): WafStatsResponse {
       { category: 'xss', count: 600 },
       { category: 'sql_injection', count: 40 },
     ],
+    stored_in: 'log_store',
     ...overrides,
   };
 }
@@ -90,7 +91,7 @@ describe('Overview WAF cards', () => {
     render(Overview);
     await waitFor(() => expect(cardValue('WAF Events (1h)')).toBe('640'));
 
-    await vi.advanceTimersByTimeAsync(30000);
+    await vi.advanceTimersByTimeAsync(REFRESH_MS);
     await waitFor(() => expect(cardValue('WAF Events (1h)')).toBe('12'));
     expect(stats).toHaveBeenCalledTimes(2);
   });

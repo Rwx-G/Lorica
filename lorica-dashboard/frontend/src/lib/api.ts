@@ -2131,7 +2131,16 @@ export interface WafStatsResponse {
   by_category: WafCategoryCount[];
   /** Over the last hour, the window `total_1h` counts. */
   by_category_1h: WafCategoryCount[];
+  /** Where the events `total_events` counts are held. */
+  stored_in: WafEventStorage;
 }
+
+/**
+ * `log_store`: the retained table, bounded by `waf_event_retention`.
+ * `memory`: no log store is open; the in-memory ring of the most recent
+ * events since the process started. `none`: nothing is wired.
+ */
+export type WafEventStorage = 'log_store' | 'memory' | 'none';
 
 export interface WafRuleSummary {
   id: number;

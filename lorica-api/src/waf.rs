@@ -52,15 +52,38 @@ struct WafEventsResponse {
 /// The window `total_1h` and `by_category_1h` count over.
 const LAST_HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// The window `total_24h` counts over.
-const LAST_DAY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+/// The window `total_24h` counts over: the longest the engine's
+/// per-minute counters answer, so the no-log-store path never clamps it
+/// to a shorter one.
+const LAST_DAY: std::time::Duration = lorica_waf::engine::LONGEST_EVENT_WINDOW;
+
+/// How old the persistent counters `GET /api/v1/waf/stats` answers may
+/// be. The aggregates include whole-table passes under the log store's
+/// one connection, which the access-log writer and the audit drain wait
+/// on, and every open Security page polls them: within this age the
+/// answer already computed is reused, so the table is scanned at most
+/// once per this window however many dashboards are open. A clear
+/// drops the cached answer.
+pub const DASHBOARD_WAF_STATS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Where the events `total_events` and `by_category` count are held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StoredIn {
+    /// The `waf_events` table, capped by `waf_event_retention`.
+    LogStore,
+    /// No log store: the engine's ring of the most recent events this
+    /// process has seen since it started.
+    Memory,
+    /// Neither is wired: nothing is held.
+    None,
+}
 
 /// JSON body of `GET /api/v1/waf/stats`.
 ///
-/// `total_events` and `by_category` describe what is held: the retained
-/// `waf_events` table, or without a log store the engine's recent-event
-/// ring (a few hundred events since the process started). The windowed
-/// counts are exact over their window in both cases.
+/// `total_events` and `by_category` describe what is held, and
+/// `stored_in` says where. The windowed counts are exact over their
+/// window in every case.
 #[derive(Debug, Serialize)]
 struct WafStatsResponse {
     total_events: u64,
@@ -69,6 +92,7 @@ struct WafStatsResponse {
     rule_count: usize,
     by_category: Vec<CategoryCount>,
     by_category_1h: Vec<CategoryCount>,
+    stored_in: StoredIn,
 }
 
 #[derive(Debug, Serialize)]
@@ -134,17 +158,18 @@ pub async fn get_waf_events(
 /// implementation loaded up to 10 000 rows into memory and returned
 /// `events.len()`, capping the counter at 10 000 once the retention
 /// window exceeded that. `total_1h` and `by_category_1h` are the
-/// rolling last hour the dashboard leads with.
+/// rolling last hour the dashboard leads with. The persistent counters
+/// are up to [`DASHBOARD_WAF_STATS_MAX_AGE`] old.
 pub async fn get_waf_stats(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    waf_stats(&state, None).await
+    waf_stats(&state, Some(DASHBOARD_WAF_STATS_MAX_AGE)).await
 }
 
 /// The answer [`get_waf_stats`] gives, with the persistent aggregates
 /// reused while younger than `max_age` when one is given
 /// ([`crate::log_store::LogStore::waf_event_stats_within`]) and
-/// recomputed on every call otherwise, which is the dashboard's case.
+/// recomputed on every call otherwise.
 ///
 /// # Errors
 ///
@@ -157,10 +182,9 @@ pub(crate) async fn waf_stats(
     let rule_count = state.waf_rule_count.unwrap_or(0);
 
     // Read from persistent store if available, fall back to in-memory buffer
-    let stats = if let Some(ref store) = state.log_store {
-        // Off the tokio worker. COUNT(*) + GROUP BY can scan the
-        // whole waf_events table under retention (up to 100 000
-        // rows by default).
+    let (stats, stored_in) = if let Some(ref store) = state.log_store {
+        // Off the tokio worker. COUNT(*) + GROUP BY scan the whole
+        // waf_events table, which `waf_event_retention` caps.
         // The query Result is passed through untouched so a query
         // error still answers empty stats; only a join failure is a
         // hard error, as before.
@@ -171,7 +195,7 @@ pub(crate) async fn waf_stats(
             })
         })
         .await?;
-        stats.unwrap_or_default()
+        (stats.unwrap_or_default(), StoredIn::LogStore)
     } else if let Some(ref waf_buffer) = state.waf_event_buffer {
         let (total, by_category) = {
             let buf = waf_buffer.lock();
@@ -182,7 +206,7 @@ pub(crate) async fn waf_stats(
                     .or_insert(0u64) += 1;
             }
             let mut by_category: Vec<(String, u64)> = counts.into_iter().collect();
-            by_category.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+            by_category.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             (buf.len() as u64, by_category)
         };
         // The windows come from the engine's per-minute counters, not
@@ -196,15 +220,16 @@ pub(crate) async fn waf_stats(
             ),
             None => Default::default(),
         };
-        crate::log_store::WafEventStats {
+        let stats = crate::log_store::WafEventStats {
             total,
             total_24h: day.total,
             total_1h: hour.total,
             by_category,
             by_category_1h: hour.by_category,
-        }
+        };
+        (stats, StoredIn::Memory)
     } else {
-        crate::log_store::WafEventStats::default()
+        (crate::log_store::WafEventStats::default(), StoredIn::None)
     };
 
     Ok(json_data(WafStatsResponse {
@@ -214,6 +239,7 @@ pub(crate) async fn waf_stats(
         rule_count,
         by_category: category_counts(stats.by_category),
         by_category_1h: category_counts(stats.by_category_1h),
+        stored_in,
     }))
 }
 
@@ -723,6 +749,7 @@ mod tests {
         );
 
         let data = stats_of(&state).await;
+        assert_eq!(data["stored_in"], "memory");
         assert_eq!(data["total_events"], ring);
         assert_eq!(data["total_1h"], recent);
         assert_eq!(data["total_24h"], recent + 1);
@@ -751,6 +778,7 @@ mod tests {
         state.log_store = Some(store);
 
         let data = stats_of(&state).await;
+        assert_eq!(data["stored_in"], "log_store");
         assert_eq!(data["total_events"], 3);
         assert_eq!(data["total_24h"], 3);
         assert_eq!(data["total_1h"], 2);
@@ -774,7 +802,48 @@ mod tests {
                 "rule_count": 0,
                 "by_category": [],
                 "by_category_1h": [],
+                "stored_in": "none",
             })
         );
+    }
+
+    /// The dashboard's endpoint reuses the persistent aggregates within
+    /// [`DASHBOARD_WAF_STATS_MAX_AGE`], so a page polling it does not
+    /// scan the table on every call, and a clear is seen at once.
+    #[tokio::test]
+    async fn the_dashboard_stats_are_cached_and_a_clear_is_seen_at_once() {
+        let (mut state, _sessions, _limiter) = crate::tests::test_state().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(crate::log_store::LogStore::open(dir.path()).expect("open"));
+        let insert = |store: &crate::log_store::LogStore| {
+            store
+                .insert_waf_event(&event(
+                    lorica_waf::RuleCategory::Xss,
+                    chrono::Duration::zero(),
+                ))
+                .expect("insert");
+        };
+        insert(&store);
+        state.log_store = Some(Arc::clone(&store));
+        let dashboard_total = |state: AppState| async move {
+            let Json(body) = get_waf_stats(Extension(state)).await.expect("stats");
+            body["data"]["total_events"].clone()
+        };
+
+        assert_eq!(dashboard_total(state.clone()).await, 1);
+        insert(&store);
+        assert_eq!(
+            dashboard_total(state.clone()).await,
+            1,
+            "a second poll within the age reuses the first answer"
+        );
+        assert_eq!(
+            stats_of(&state).await["total_events"],
+            2,
+            "the table holds both"
+        );
+
+        store.clear_waf_events().expect("clear");
+        assert_eq!(dashboard_total(state).await, 0);
     }
 }

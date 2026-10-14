@@ -21,10 +21,29 @@
     rule_count: 0,
     by_category: [],
     by_category_1h: [],
+    stored_in: 'none',
   });
   /** Re-reads the counters alone, so the rolling windows move without a click. */
   let statsRefreshTimer: ReturnType<typeof setInterval> | null = null;
-  const STATS_REFRESH_MS = 30000;
+  const refreshedEvery = `refreshed every ${STATS_REFRESH_MS / 1000}s`;
+  /**
+   * The stored-events card. Without a log store the count is not the
+   * retained table but the in-memory ring of recent events, which is
+   * the degraded mode the log-store banner announces.
+   */
+  const storedCard = $derived(
+    stats.stored_in === 'memory'
+      ? {
+          label: 'Events in memory',
+          title:
+            'No log store is open: the most recent events this process has held in memory since it started, not a retained history; the category cards count the same events',
+        }
+      : {
+          label: 'Stored events',
+          title:
+            'Events kept in storage, bounded by the WAF event retention setting; the category cards count the same events',
+        },
+  );
   let rules: WafRuleSummary[] = $state([]);
   let rulesEnabled = $state(0);
   let blocklist: BlocklistStatus = $state({ enabled: false, ip_count: 0, source: '' });
@@ -440,17 +459,17 @@
       <div class="stat-value">{rulesEnabled}/{stats.rule_count}</div>
       <div class="stat-label">Rules Enabled</div>
     </div>
-    <div class="stat-card" title="WAF events in the last hour, refreshed every 30s">
+    <div class="stat-card" title="WAF events in the last hour, {refreshedEvery}">
       <div class="stat-value">{stats.total_1h}</div>
       <div class="stat-label">Events (1h)</div>
     </div>
-    <div class="stat-card" title="WAF events in the last 24 hours, refreshed every 30s">
+    <div class="stat-card" title="WAF events in the last 24 hours, {refreshedEvery}">
       <div class="stat-value">{stats.total_24h}</div>
       <div class="stat-label">Events (24h)</div>
     </div>
-    <div class="stat-card" title="Events kept in storage, bounded by the WAF event retention setting; the category cards count the same events">
+    <div class="stat-card" title={storedCard.title}>
       <div class="stat-value">{stats.total_events}</div>
-      <div class="stat-label">Stored events</div>
+      <div class="stat-label">{storedCard.label}</div>
     </div>
     {#each stats.by_category as cat (cat.category)}
       <div class="stat-card">
@@ -1069,6 +1088,9 @@
 </div>
 
 <script lang="ts" module>
+  /** How often the page re-reads the WAF counters alone. */
+  export const STATS_REFRESH_MS = 30000;
+
   const trashIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
 </script>
 

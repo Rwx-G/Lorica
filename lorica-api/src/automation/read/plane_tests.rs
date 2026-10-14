@@ -164,6 +164,7 @@ const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
     "stale_while_revalidate_s",
     "status",
     "sticky_session",
+    "stored_in",
     "strip_path_prefix",
     "successful_requests",
     "target_pct",
