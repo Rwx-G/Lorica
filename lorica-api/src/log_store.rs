@@ -409,8 +409,8 @@ impl LogStore {
         )
         .map_err(|e| format!("failed to initialize access log schema: {e}"))?;
 
-        // `request_id` arrived in 1.1.0; the other four predate 1.0.0 and
-        // are kept for files from before the first release.
+        // `request_id` arrived in 1.1.0; the rest predate 1.0.0 and are
+        // kept for files from before the first release.
         for (column, definition) in [
             ("client_ip", "TEXT NOT NULL DEFAULT ''"),
             ("is_xff", "INTEGER NOT NULL DEFAULT 0"),
@@ -439,8 +439,8 @@ impl LogStore {
             CREATE INDEX IF NOT EXISTS idx_waf_events_category ON waf_events(category);",
         )
         .map_err(|e| format!("failed to initialize waf events schema: {e}"))?;
-        // Every released file already has these three; kept for files
-        // from before the first release.
+        // Every released file already has these; kept for files from
+        // before the first release.
         for (column, definition) in [
             ("client_ip", "TEXT NOT NULL DEFAULT ''"),
             ("route_hostname", "TEXT NOT NULL DEFAULT ''"),
@@ -1914,6 +1914,30 @@ impl LogStore {
         "SELECT (SELECT MIN(origin_id) FROM audit_log WHERE node_id = ?1),
                 (SELECT MAX(origin_id) FROM audit_log WHERE node_id = ?1)";
 
+    /// The highest origin id a fanned-in chain holds; see
+    /// [`LogStore::insert_fanned_in_audit`].
+    const FANNED_IN_HEAD_SQL: &'static str =
+        "SELECT MAX(origin_id) FROM audit_log WHERE node_id = ?1";
+
+    /// Whether the chain holds `?2` with exactly the `chain_hash` `?3`.
+    const FANNED_IN_HOLDS_SQL: &'static str = "SELECT EXISTS(SELECT 1 FROM audit_log \
+        WHERE node_id = ?1 AND origin_id = ?2 AND chain_hash = ?3)";
+
+    /// Whether `node_id`'s chain already holds `row` as sent: a re-send,
+    /// not a row competing for a position this store has filled.
+    fn holds_fanned_in_row(
+        conn: &Connection,
+        node_id: &str,
+        row: &crate::audit::FannedInAuditRow,
+    ) -> Result<bool, String> {
+        conn.query_row(
+            Self::FANNED_IN_HOLDS_SQL,
+            params![node_id, row.origin_id, row.chain_hash],
+            |held| held.get(0),
+        )
+        .map_err(|e| format!("failed to look up a fanned-in audit row: {e}"))
+    }
+
     /// The `origin_id` of the newest row the cap must cut: the one just
     /// past the `?2` newest, exact through the index rather than
     /// estimated.
@@ -2120,13 +2144,22 @@ impl LogStore {
     /// batch after a lost acknowledgement must not duplicate rows, and
     /// a duplicate would break the partitioned verify's ordering.
     ///
-    /// Idempotent across a cut as well. A row at or below the highest
-    /// `origin_id` a prefix cut has removed from this chain is skipped:
-    /// the cut moved the seal past it, so stored again it would sit
-    /// before the seal in origin order, and verify would meet it first
-    /// and report a break nothing tampered with. Only a re-send of a
-    /// row this store already held can arrive there (origin ids only
-    /// grow on the node), so it is acknowledged like any duplicate.
+    /// Append-only in origin order. A row is stored only above the
+    /// highest `origin_id` this store has ever held for the node, its
+    /// live head or the floor of a prefix cut, whichever is higher; the
+    /// batch is taken in origin order, so each stored row raises that
+    /// mark for the next. Anything at or below it is acknowledged and
+    /// not stored. Below a cut floor it is a re-send of a row the cut
+    /// removed, which stored again would sit before the seal and read
+    /// as a break nothing tampered with. Above it, a re-send matches a
+    /// held row exactly, and a row that does not (a position never
+    /// filled, below the node's arrival or in a gap, or a held one
+    /// with another hash) is logged at WARN as refused. "Origin ids
+    /// only grow on the node" is the node's own claim, so it is
+    /// enforced here: otherwise a compromised node could push rows
+    /// below its arrival and have the fan-in cap move them into its
+    /// backup, which is filled once over the node's lifetime and must
+    /// only ever hold rows this store first accepted in order.
     ///
     /// Returns how many rows the store DURABLY HOLDS for this batch,
     /// which is all of them once the transaction commits, not how many
@@ -2197,13 +2230,23 @@ impl LogStore {
                 .map_err(|e| format!("failed to write the audit arrival seal: {e}"))?;
             }
         }
-        let cut_floor: Option<i64> = Self::audit_meta(&conn, &Self::cut_floor_key(node_id))?
-            .and_then(|floor| floor.parse().ok());
         let tx = conn
             .transaction()
             .map_err(|e| format!("failed to open the audit fan-in transaction: {e}"))?;
+        let cut_floor: Option<i64> = Self::audit_meta(&tx, &Self::cut_floor_key(node_id))?
+            .and_then(|floor| floor.parse().ok());
+        let stored_head: Option<i64> = tx
+            .query_row(Self::FANNED_IN_HEAD_SQL, params![node_id], |row| row.get(0))
+            .map_err(|e| format!("failed to read a fanned-in audit chain head: {e}"))?;
+        // Everything a cut removed sat at or below the floor, so the
+        // larger of the two is the highest origin id this store ever
+        // held for the node, cut or not.
+        let mut established = stored_head.max(cut_floor);
+        let mut ordered: Vec<&crate::audit::FannedInAuditRow> = rows.iter().collect();
+        ordered.sort_by_key(|row| row.origin_id);
         let received_at = chrono::Utc::now().to_rfc3339();
         let mut stored = 0u64;
+        let mut refused = 0u64;
         {
             let mut stmt = tx
                 .prepare_cached(
@@ -2214,10 +2257,16 @@ impl LogStore {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 )
                 .map_err(|e| format!("failed to prepare the audit fan-in insert: {e}"))?;
-            for row in rows {
-                if cut_floor.is_some_and(|floor| row.origin_id <= floor) {
+            for row in ordered {
+                if established.is_some_and(|head| row.origin_id <= head) {
+                    if cut_floor.is_none_or(|floor| row.origin_id > floor)
+                        && !Self::holds_fanned_in_row(&tx, node_id, row)?
+                    {
+                        refused += 1;
+                    }
                     continue;
                 }
+                established = Some(row.origin_id);
                 stored += stmt
                     .execute(params![
                         row.timestamp,
@@ -2242,7 +2291,17 @@ impl LogStore {
         }
         tx.commit()
             .map_err(|e| format!("failed to commit the audit fan-in: {e}"))?;
-        if stored != rows.len() as u64 {
+        if refused > 0 {
+            // No honest drain produces these: it sends in origin order
+            // and only ever re-sends rows this store already holds.
+            tracing::warn!(
+                node_id,
+                refused,
+                established_origin_id = established,
+                "fanned-in audit rows below the origin id this node already established were not stored; they are neither re-sends of held rows nor rows a cut removed"
+            );
+        }
+        if stored + refused != rows.len() as u64 {
             // Not an error: the drain re-offers a batch whenever a push
             // was not fully accepted, so a duplicate is the idempotency
             // working. Worth a line because a persistent gap means the
@@ -4633,6 +4692,76 @@ mod fleet_audit_tests {
     }
 
     #[test]
+    fn a_row_below_what_the_node_established_never_reaches_the_chain_or_its_backup() {
+        // The security audit's case: before any cut there is no floor,
+        // so a compromised follower could push rows below its arrival,
+        // let the cap move those into its once-only backup, and have
+        // later cuts delete its real history for lack of room.
+        let (store, _dir) = store();
+        let chain = long_origin_chain(12);
+        // Arrives mid-history at origin 5, then pushes up to 8 with a
+        // hole at 7 the honest drain never filled.
+        store
+            .insert_fanned_in_audit("node-a", &chain[4..6])
+            .expect("arrival");
+        store
+            .insert_fanned_in_audit("node-a", &chain[7..8])
+            .expect("next batch");
+
+        let mut forged = chain[5].clone();
+        forged.action = "a.forged".to_string();
+        let mut push: Vec<FannedInAuditRow> = chain[..4].to_vec();
+        push.push(chain[6].clone());
+        push.push(forged);
+        push.push(chain[4].clone());
+        assert_eq!(
+            store.insert_fanned_in_audit("node-a", &push).expect("push"),
+            push.len() as u64,
+            "acknowledged, so a drain is never wedged on it"
+        );
+        let ids = |store: &LogStore| -> Vec<(i64, String)> {
+            let conn = store.conn.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT origin_id, action FROM audit_log
+                     WHERE node_id = 'node-a' ORDER BY origin_id",
+                )
+                .expect("query");
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("rows")
+                .map(|row| row.expect("a row"))
+                .collect();
+            rows
+        };
+        assert_eq!(
+            ids(&store),
+            vec![
+                (5, "a.5".to_string()),
+                (6, "a.6".to_string()),
+                (8, "a.8".to_string())
+            ],
+            "nothing below the head was stored, the hole included, and the held row kept its content"
+        );
+
+        // A batch mixing a re-send with new rows stores the new ones,
+        // in origin order whatever order they were sent in.
+        let mut next: Vec<FannedInAuditRow> = chain[8..].iter().rev().cloned().collect();
+        next.push(chain[7].clone());
+        store
+            .insert_fanned_in_audit("node-a", &next)
+            .expect("continuation");
+        assert_eq!(rows_held(&store, "node-a"), 7);
+
+        store.enforce_fanned_in_audit_cap(3).expect("cap");
+        assert_eq!(
+            backup_origin_ids(&store, "node-a"),
+            vec![5, 6, 8],
+            "the backup holds only rows the store accepted in order"
+        );
+    }
+
+    #[test]
     fn a_prefix_cut_landing_before_the_first_chunk_is_not_a_break() {
         // The walk used to read the seal in one lock hold and the first
         // chunk in the next; a cut between the two moved the seal past
@@ -4802,6 +4931,16 @@ mod fleet_audit_tests {
                 "fanned-in span".into(),
                 LogStore::FANNED_IN_SPAN_SQL.into(),
                 vec![&"node-a" as &dyn rusqlite::ToSql],
+            ),
+            (
+                "fanned-in head".into(),
+                LogStore::FANNED_IN_HEAD_SQL.into(),
+                vec![&"node-a" as &dyn rusqlite::ToSql],
+            ),
+            (
+                "fanned-in row held".into(),
+                LogStore::FANNED_IN_HOLDS_SQL.into(),
+                vec![&"node-a" as &dyn rusqlite::ToSql, &3i64, &"hash"],
             ),
             (
                 "cap cut".into(),
