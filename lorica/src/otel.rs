@@ -663,6 +663,22 @@ mod imp {
 
 pub use imp::{init, init_logs, shutdown, shutdown_logs};
 
+/// Serialises every test in this crate that touches the process-global
+/// hub of `lorica_api::log_sinks`, which `lorica_api`'s own test lock
+/// cannot reach from here because it is `pub(crate)` to that crate.
+///
+/// Every test that emits takes it, not only the ones that register a
+/// lane: [`shutdown`] empties the hub, and a lane one test has registered
+/// and let die is torn out by the NEXT publish, so a test running in the
+/// window between another's `register_lane` and its assertion either
+/// removes that lane or inherits its `Gone` drop. An async mutex because
+/// some holders keep it across an await.
+#[cfg(test)]
+pub(crate) fn log_sink_hub_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 #[cfg(all(test, feature = "otel"))]
 mod shutdown_tests {
     //! Lifecycle coverage for the `imp::shutdown` path that the
@@ -683,8 +699,13 @@ mod shutdown_tests {
     //! module keeps the contract honest at unit-test time so a
     //! refactor of the shutdown path does not regress the flush
     //! guarantee unnoticed until the E2E profile runs.
+    //!
+    //! Every test here holds [`log_sink_hub_test_lock`]: `shutdown()`
+    //! empties the process-global log-sink hub, which used to remove a
+    //! lane a `capture::sink` test had just registered and failed its
+    //! drop count intermittently.
 
-    use super::{imp, OtelConfig, OtlpProtocol};
+    use super::{imp, log_sink_hub_test_lock, OtelConfig, OtlpProtocol};
 
     fn dummy_cfg(endpoint: &str) -> OtelConfig {
         OtelConfig {
@@ -697,12 +718,14 @@ mod shutdown_tests {
 
     #[test]
     fn shutdown_is_noop_before_init() {
+        let _guard = log_sink_hub_test_lock().blocking_lock();
         // Must not panic when PROVIDER has never held a value.
         imp::shutdown();
     }
 
     #[test]
     fn shutdown_is_idempotent() {
+        let _guard = log_sink_hub_test_lock().blocking_lock();
         // Calling shutdown twice in a row is legal: the drain hook
         // calls it unconditionally, and a reload may already have
         // torn the provider down. Idempotence is a hard requirement.
@@ -712,6 +735,7 @@ mod shutdown_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn init_then_shutdown_round_trips() {
+        let _guard = log_sink_hub_test_lock().lock().await;
         // Pointing at a nonexistent endpoint is fine - the batch
         // exporter build is lazy wrt connectivity, so init() succeeds
         // as long as the URL parses. shutdown() then flushes + drops
@@ -728,6 +752,7 @@ mod shutdown_tests {
 
     #[test]
     fn init_rejects_empty_endpoint_without_installing_provider() {
+        let _guard = log_sink_hub_test_lock().blocking_lock();
         // Design-doc contract: "Empty endpoint = disabled at runtime".
         // Must return Ok(()) so the caller's log line on failure
         // does not fire, and MUST NOT install a provider (a follow-up
