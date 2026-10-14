@@ -1439,20 +1439,28 @@ mod tests_stream {
     #[tokio::test]
     async fn non_origin_form_targets_do_not_reach_the_header() {
         init_log();
-        for target in [
-            &b"http://pingora.org/a"[..],
-            b"pingora.org:443",
-            b"foo/bar",
-            b"/a\xff",
-            b"/a\xff#/../admin",
+        // Authority-form is the CONNECT shape (RFC 9112 3.2.3), so it is
+        // sent both ways: the refusal must not depend on the method.
+        for (method, target) in [
+            ("GET", &b"http://pingora.org/a"[..]),
+            ("GET", b"pingora.org:443"),
+            ("CONNECT", b"pingora.org:443"),
+            ("GET", b"foo/bar"),
+            ("GET", b"/a\xff"),
+            ("GET", b"/a\xff#/../admin"),
         ] {
-            let mut input = b"GET ".to_vec();
+            let mut input = format!("{method} ").into_bytes();
             input.extend_from_slice(target);
             input.extend_from_slice(b" HTTP/1.1\r\nHost: pingora.org\r\n\r\n");
             let mock_io = Builder::new().read(&input).build();
             let mut http_stream = HttpSession::new(Box::new(mock_io));
             let err = http_stream.read_request().await.unwrap_err();
-            assert_eq!(&InvalidHTTPHeader, err.etype(), "{}", target.escape_ascii());
+            assert_eq!(
+                &InvalidHTTPHeader,
+                err.etype(),
+                "{method} {}",
+                target.escape_ascii()
+            );
         }
 
         for (target, raw) in [
