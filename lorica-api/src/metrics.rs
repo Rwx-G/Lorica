@@ -1456,12 +1456,17 @@ pub fn apply_worker_generic_counters(worker_id: u32, entries: &[GenericCounterTu
 /// Drop a worker's snapshot on the supervisor side. Called when the
 /// supervisor detects a dead worker (RPC channel gone, crash
 /// signalled). Without this, the supervisor would keep the last-known
-/// counter values forever, skewing the aggregate. The worker's
-/// log-store series goes with it: a dead worker persists nothing, and
-/// its replacement reports its own state on its first report.
+/// counter values forever, skewing the aggregate.
+///
+/// The worker's log-store series goes with it, since a dead process
+/// holds no store. Its last reported state does not: it stands until
+/// the replacement, which takes the same id, sends its first report.
+/// Forgetting it would read as "every worker is fine" for the length of
+/// a respawn, and the log-store alerts would announce a recovery that
+/// never happened, then the outage again.
 pub fn forget_worker_generic_counters(worker_id: u32) {
     lorica_metrics::forget_worker_generic_counters(worker_id);
-    if WORKER_LOG_STORE_UP.lock().remove(&worker_id).is_some() {
+    if WORKER_LOG_STORE_UP.lock().contains_key(&worker_id) {
         let _ = LOG_STORE_UP.remove_label_values(&["worker", &worker_id.to_string()]);
     }
 }
@@ -3439,7 +3444,7 @@ mod tests {
     }
 
     #[test]
-    fn a_worker_log_store_state_reaches_the_supervisor_scrape_and_leaves_with_the_worker() {
+    fn a_worker_log_store_state_reaches_the_supervisor_scrape_and_outlives_its_restart() {
         let _guard = LOG_STORE_GAUGE_TEST_GUARD
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3459,9 +3464,29 @@ mod tests {
         assert_eq!(rendered_log_store_up("worker", "9101"), Some(1.0));
         assert!(!workers_without_log_store().contains(&WORKER));
 
-        apply_worker_generic_counters(WORKER, &[down]);
+        apply_worker_generic_counters(WORKER, std::slice::from_ref(&down));
         forget_worker_generic_counters(WORKER);
         assert_eq!(rendered_log_store_up("worker", "9101"), None);
+        assert!(
+            workers_without_log_store().contains(&WORKER),
+            "a restart is not a recovery: the last report stands until the next one"
+        );
+
+        // The replacement reports, and only that decides.
+        apply_worker_generic_counters(WORKER, &[up]);
+        assert!(!workers_without_log_store().contains(&WORKER));
+        assert_eq!(rendered_log_store_up("worker", "9101"), Some(1.0));
+    }
+
+    #[test]
+    fn a_healthy_worker_restarting_is_not_an_outage() {
+        let _guard = LOG_STORE_GAUGE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        const WORKER: u32 = 9_102;
+        let up = ("lorica_log_store_up".to_string(), Vec::new(), 1);
+        apply_worker_generic_counters(WORKER, std::slice::from_ref(&up));
+        forget_worker_generic_counters(WORKER);
         assert!(!workers_without_log_store().contains(&WORKER));
     }
 }
