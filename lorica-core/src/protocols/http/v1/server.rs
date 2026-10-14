@@ -1430,6 +1430,46 @@ mod tests_stream {
         let _ = env_logger::builder().is_test(true).try_init();
     }
 
+    // Lorica: upstream `baf4fe5c` and `ee78ceb6` (not ported, see FORK.md)
+    // make absolute-form, authority-form and non-UTF-8 request-targets
+    // parse, then strip their fragment so it never reaches the upstream
+    // request-line. Here none of those shapes survive `read_request`, and an
+    // origin-form fragment is already dropped by the Uri. If this starts
+    // failing, those commits and the rest of `ffab8302` become applicable.
+    #[tokio::test]
+    async fn non_origin_form_targets_do_not_reach_the_header() {
+        init_log();
+        for target in [
+            &b"http://pingora.org/a"[..],
+            b"pingora.org:443",
+            b"foo/bar",
+            b"/a\xff",
+            b"/a\xff#/../admin",
+        ] {
+            let mut input = b"GET ".to_vec();
+            input.extend_from_slice(target);
+            input.extend_from_slice(b" HTTP/1.1\r\nHost: pingora.org\r\n\r\n");
+            let mock_io = Builder::new().read(&input).build();
+            let mut http_stream = HttpSession::new(Box::new(mock_io));
+            let err = http_stream.read_request().await.unwrap_err();
+            assert_eq!(&InvalidHTTPHeader, err.etype(), "{}", target.escape_ascii());
+        }
+
+        for (target, raw) in [
+            (&b"/a#/../admin"[..], &b"/a"[..]),
+            (b"/a?q=1#frag", b"/a?q=1"),
+            (b"#frag", b"/"),
+        ] {
+            let mut input = b"GET ".to_vec();
+            input.extend_from_slice(target);
+            input.extend_from_slice(b" HTTP/1.1\r\nHost: pingora.org\r\n\r\n");
+            let mock_io = Builder::new().read(&input).build();
+            let mut http_stream = HttpSession::new(Box::new(mock_io));
+            http_stream.read_request().await.unwrap();
+            assert_eq!(raw, http_stream.get_path(), "{}", target.escape_ascii());
+        }
+    }
+
     #[tokio::test]
     async fn read_basic() {
         init_log();
