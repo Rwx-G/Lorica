@@ -614,7 +614,11 @@ async fn adopt_recovered_log_store(
 }
 
 /// Fill the empty log-store handles of `state` from `slot`.
-fn adopt_log_store(state: &mut AppState, slot: &LogStoreSlot) {
+///
+/// The management router runs it from [`adopt_recovered_log_store`],
+/// the automation router from its own layer
+/// ([`crate::automation::build_automation_router`]).
+pub(crate) fn adopt_log_store(state: &mut AppState, slot: &LogStoreSlot) {
     if state.log_store.is_some() {
         return;
     }
