@@ -7,6 +7,10 @@ on:
   pull_request:
     branches: [main]
 
+# Read-only by default; the release job is the one that writes.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -549,16 +553,28 @@ jobs:
     env:
       OLD: ${{ matrix.old }}
     steps:
+      # The old package is installed as root on this runner: no job token
+      # left in .git/config for it to find.
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           name: lorica-deb
           path: pkg/
-      - name: Download the released ${{ matrix.old }} .deb
+      # Installed as root, so it must be the package the release job
+      # signed: its detached signature is checked against the published
+      # key alone, not against whatever keys the runner trusts.
+      - name: Download and verify the released ${{ matrix.old }} .deb
         run: |
           mkdir -p old
-          curl -fsSL --retry 3 -o "old/lorica_${OLD}_amd64.deb" \
-            "https://github.com/Rwx-G/Lorica/releases/download/v${OLD}/lorica_${OLD}_amd64.deb"
+          for asset in "lorica_${OLD}_amd64.deb" "lorica_${OLD}_amd64.deb.asc"; do
+            curl -fsSL --retry 3 -o "old/$asset" \
+              "https://github.com/Rwx-G/Lorica/releases/download/v${OLD}/$asset"
+          done
+          gpg --dearmor < docs/lorica-signing-key.asc > old/lorica-signing-key.gpg
+          gpgv --keyring "$PWD/old/lorica-signing-key.gpg" \
+            "old/lorica_${OLD}_amd64.deb.asc" "old/lorica_${OLD}_amd64.deb"
       - name: Upgrade ${{ matrix.old }} on a host with the uid-1001 account (held)
         run: |
           new=$(ls pkg/lorica_*_amd64.deb)
@@ -605,6 +621,8 @@ jobs:
       OLD: ${{ matrix.old }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           name: lorica-rpm
@@ -633,6 +651,21 @@ jobs:
           done
           echo "FAIL: systemd did not come up in the container"
           exit 1
+      # Installed as root, so it must be the package the release job
+      # signed. The keyring is a database of its own holding the
+      # published key alone, so a package signed by any key the image
+      # trusts does not pass, and an unsigned one fails the required
+      # signature level.
+      - name: Verify the released ${{ matrix.old }} .rpm signature
+        run: |
+          docker exec fedora bash -c '
+            set -e
+            keyring=$(mktemp -d)
+            rpmkeys --dbpath "$keyring" --define "_keyringpath $keyring/pubkeys" \
+              --import /w/docs/lorica-signing-key.asc
+            rpmkeys --dbpath "$keyring" --define "_keyringpath $keyring/pubkeys" \
+              --define "_pkgverify_level signature" --checksig "$1"' \
+            verify "/w/old/lorica-${OLD}-1.x86_64.rpm"
       - name: Upgrade ${{ matrix.old }}, then reinstall over itself
         run: |
           new=$(ls pkg/lorica-*.rpm)

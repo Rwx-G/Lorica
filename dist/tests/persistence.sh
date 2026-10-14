@@ -7,10 +7,15 @@
 # 1.6.0 node had written, logged one warning and ran on with no access
 # log, WAF event or audit persistence: the service was active and every
 # package-level check passed. So an upgrade is not done until the node
-# it started has persistence: its journal carries no line saying a
-# store failed to open, and an audited action it performs reads back
-# through its own API, above the rows the previous version left, on an
-# audit chain that still verifies.
+# it started has persistence: every one of its processes reports an
+# open store on `lorica_log_store_up`, and an audited action it performs
+# reads back through its own API, above the rows the previous version
+# left, on an audit chain that still verifies.
+#
+# The gauge, not the journal, is what says a store is open: a grep for
+# the failure's wording holds only until someone rewords it, and the
+# audit read-back exercises only the process serving the API, not the
+# workers that write the access logs and WAF events.
 #
 # The management API is spoken to through `openssl s_client`, without
 # pinning: this is the node under test on its own loopback, and the
@@ -22,8 +27,6 @@ MANAGEMENT_ADDRESS=127.0.0.1:9443
 ADMIN_PASSWORD_FILE=/var/lib/lorica/initial-admin-password
 # The audit row count the last check read; each later one must exceed it.
 AUDIT_FLOOR_FILE=/tmp/lorica-audit-floor
-# What a node says when a store did not open and it runs on without it.
-PERSISTENCE_LOST='persistence disabled|failed to open (access log|log store)|degrading to memory-only'
 
 rm -f "$AUDIT_FLOOR_FILE"
 
@@ -75,6 +78,40 @@ audit_rows_above() {
     return 1
 }
 
+# Wait for every process of the node to report an open log store on
+# `lorica_log_store_up`, and print the series read; fail at once on a
+# series reading 0. The process serving the API publishes its own
+# series (`single` or `supervisor`); in worker mode each worker the
+# supervisor lists publishes one through the metrics report a scrape
+# pulls, so a worker missing from the gauge is waited for, not passed.
+log_store_up_everywhere() {
+    local cookie="$1" metrics series workers id missing=
+    for _ in $(seq 1 30); do
+        metrics=$(management_get "$cookie" '/api/v1/metrics') || { echo "GET /api/v1/metrics: $metrics"; return 1; }
+        series=$(printf '%s\n' "$metrics" | tr -d '\r' | grep '^lorica_log_store_up{')
+        if printf '%s\n' "$series" | grep -q ' 0$'; then
+            printf '%s\n' "$series" | grep ' 0$' | tr '\n' ' '
+            return 1
+        fi
+        missing=
+        printf '%s\n' "$series" | grep -qE 'role="(single|supervisor)".* 1$' \
+            || missing="the process serving the API"
+        if printf '%s\n' "$series" | grep -q 'role="supervisor"'; then
+            workers=$(management_get "$cookie" '/api/v1/workers') || { echo "GET /api/v1/workers: $workers"; return 1; }
+            workers=$(printf '%s' "$workers" | grep -o '"worker_id":[0-9]*' | cut -d: -f2)
+            [ -n "$workers" ] || missing="$missing, any worker"
+            for id in $workers; do
+                printf '%s\n' "$series" | grep 'role="worker"' | grep -q "worker_id=\"$id\".* 1$" \
+                    || missing="$missing, worker $id"
+            done
+        fi
+        [ -z "$missing" ] && { printf '%s' "$series" | tr '\n' ' '; return 0; }
+        sleep 1
+    done
+    echo "no open log store reported by ${missing#, }; series: $(printf '%s' "$series" | tr '\n' ' ')"
+    return 1
+}
+
 # Before an upgrade: the old node must have written at least one audit
 # row to its access-log.db, which the upgraded node then has to read.
 record_old_audit_rows() {
@@ -87,16 +124,11 @@ record_old_audit_rows() {
 
 # After an upgrade, with the service active: the node has persistence.
 assert_persistence() {
-    local label="$1" floor rows persisted=yes invocation lost cookie verdict
+    local label="$1" floor rows persisted=yes stores cookie verdict
     floor=$(cat "$AUDIT_FLOOR_FILE" 2> /dev/null || echo 0)
     cookie=$(management_login) || fail "$label: login refused: $cookie"
     rows=$(audit_rows_above "$cookie" "$floor") || persisted=no
-
-    # Read once the API has answered, which takes a worker the time to
-    # fork and open its own store: every process of this start has tried.
-    invocation=$(systemctl show -p InvocationID --value lorica.service)
-    lost=$(journalctl --no-pager -o cat _SYSTEMD_INVOCATION_ID="$invocation" | grep -E "$PERSISTENCE_LOST")
-    [ -z "$lost" ] || fail "$label: $(printf '%s\n' "$lost" | wc -l) journal lines say a store did not open, the first: $(printf '%s\n' "$lost" | head -1)"
+    stores=$(log_store_up_everywhere "$cookie") || fail "$label: a process has no open log store: $stores"
     [ "$persisted" = yes ] || fail "$label: no audit row persisted: $rows"
     printf '%s' "$rows" > "$AUDIT_FLOOR_FILE"
 
@@ -106,5 +138,5 @@ assert_persistence() {
         printf '%s\n' "$verdict" | tail -1
         fail "$label: the audit chain does not verify"
     fi
-    echo "$label: persistence holds ($floor -> $rows audit rows, chain verified, no store failure in the journal)"
+    echo "$label: persistence holds ($floor -> $rows audit rows, chain verified, every store open: $stores)"
 }
