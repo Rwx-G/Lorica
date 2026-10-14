@@ -39,8 +39,9 @@ pub enum AlertType {
     /// The access-log store (`access-log.db`) could not be opened, by
     /// this process or one of its workers: the node keeps serving, but
     /// its audit trail, access logs and WAF events are not persisted.
-    /// Raised once per outage by the process serving the management
-    /// API, however many retries fail.
+    /// Raised by the process serving the management API when the
+    /// outage starts, sent again until a channel takes it, then as a
+    /// periodic reminder for as long as the outage lasts.
     LogStoreUnavailable,
     /// Persistence resumed after a [`Self::LogStoreUnavailable`], without
     /// a restart.
