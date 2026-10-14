@@ -4217,7 +4217,9 @@ paths:
                     properties:
                       verified:
                         type: boolean
-                        description: True only when every chain verified.
+                        description: >-
+                          True only when every chain verified, and every fan-in
+                          backup a chain reports.
                       nodes:
                         type: array
                         items:
@@ -5002,6 +5004,27 @@ components:
         first_break_reason:
           type: string
           enum: [prev_hash_mismatch, chain_hash_mismatch]
+        backup:
+          type: object
+          description: >-
+            The rows the per-node fan-in cap moved out of this follower's
+            chain instead of deleting them, verified link by link from the
+            backup's own first row. Absent when the cap has moved none. The
+            fields beside it keep describing the live chain; the top-level
+            `verified` covers both.
+          properties:
+            verified:
+              type: boolean
+            total_rows:
+              type: integer
+            first_break_id:
+              type: integer
+              description: >-
+                The aggregated row id the broken row carried before the cap
+                moved it. Absent when verified.
+            first_break_reason:
+              type: string
+              enum: [prev_hash_mismatch, chain_hash_mismatch]
     NodeResources:
       type: object
       description: >-

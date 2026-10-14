@@ -826,6 +826,13 @@ export interface AuditVerifyResult {
 export interface NodeVerifyResult extends AuditVerifyResult {
   /** The chain's node; the empty string is this node's own. */
   node_id: string;
+  /**
+   * The rows the per-node fan-in cap moved out of this follower's chain
+   * instead of deleting them, verified from the backup's own first row.
+   * Absent when the cap has moved none. The fields above keep describing
+   * the live chain; the report's `verified` covers both.
+   */
+  backup?: AuditVerifyResult;
 }
 
 /**

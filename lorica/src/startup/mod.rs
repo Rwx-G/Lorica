@@ -478,21 +478,31 @@ pub(crate) fn spawn_retention_loop(
             // Audit-log retention is day-based and chain-safe: the
             // store writes a retention seal before truncating so
             // /api/v1/audit/verify keeps passing (Story 8.9 AC #9).
+            // Off the runtime, like the cap below: on a control plane
+            // the pass walks every follower's chain, in chunks that
+            // each wait for the connection the writers share.
             if let Some(logs) = &retention_log_store {
                 if audit_retention_days > 0 {
                     let cutoff = (chrono::Utc::now()
                         - chrono::Duration::days(i64::from(audit_retention_days)))
                     .to_rfc3339();
-                    match logs.enforce_audit_retention(&cutoff) {
-                        Ok(0) => {}
-                        Ok(deleted) => {
+                    let logs = Arc::clone(logs);
+                    let aged =
+                        tokio::task::spawn_blocking(move || logs.enforce_audit_retention(&cutoff))
+                            .await;
+                    match aged {
+                        Ok(Ok(0)) => {}
+                        Ok(Ok(deleted)) => {
                             tracing::info!(
                                 deleted,
                                 "audit log retention: expired rows sealed and removed"
                             );
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::warn!(error = %e, "audit log retention cleanup failed");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "audit log retention task failed");
                         }
                     }
                 }
@@ -510,18 +520,26 @@ pub(crate) fn spawn_retention_loop(
                 })
                 .await;
                 match capped {
-                    Ok(Ok(cut_by_node)) => {
+                    Ok(Ok(cuts)) => {
                         // WARN, not INFO: an honest node never reaches
                         // the ceiling, so reaching it is a node to look
-                        // at, and the rows it lost here still exist on
-                        // that node and in its `lorica::audit` stream.
-                        for (node_id, rows) in cut_by_node {
+                        // at, possibly a compromised one evicting what
+                        // it sent before. The store has already moved
+                        // the first rows ever cut into the node's
+                        // backup and recorded the cut in this node's
+                        // own chain; this line is for whoever reads the
+                        // log first.
+                        for cut in cuts {
                             tracing::warn!(
-                                node_id,
-                                rows,
+                                node_id = %cut.node_id,
+                                rows = cut.removed,
+                                backed_up = cut.backed_up,
+                                deleted = cut.deleted(),
+                                first_origin_id = cut.first_origin_id,
+                                last_origin_id = cut.last_origin_id,
                                 cap = lorica_api::log_store::FANNED_IN_AUDIT_ROWS_PER_NODE,
                                 "fanned-in audit chain over its per-node cap: \
-                                 oldest rows sealed and removed"
+                                 oldest rows sealed and cut"
                             );
                         }
                     }

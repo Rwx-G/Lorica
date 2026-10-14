@@ -957,6 +957,23 @@
               {chain.first_break_id}: {chain.first_break_reason}
             </div>
           {/if}
+          <!--
+            The rows the per-node fan-in cap moved out of a follower's
+            chain rather than deleting them: its own verdict, beside the
+            chain's, since a broken backup is a different finding.
+          -->
+          {#if chain.backup}
+            {#if chain.backup.verified}
+              <div class="audit-verify audit-verify-ok" role="status">
+                {fleetNodeName(chain.node_id)}: fan-in backup verified, {chain.backup.total_rows} rows
+              </div>
+            {:else}
+              <div class="audit-verify audit-verify-broken" role="alert">
+                {fleetNodeName(chain.node_id)}: fan-in backup BROKEN at row
+                {chain.backup.first_break_id}: {chain.backup.first_break_reason}
+              </div>
+            {/if}
+          {/if}
         {/each}
       {/if}
 

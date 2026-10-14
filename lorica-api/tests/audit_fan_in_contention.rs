@@ -21,11 +21,25 @@
 //! `MAX_TELEMETRY_AUDIT` rows. This runs that mix with zero, two and
 //! five followers whose pushes land on the same tick boundary, with
 //! time compressed (a 1 s tick instead of the 10 s drain tick), and
-//! prints the latencies. It asserts nothing: it exists to inform a
-//! design decision, and the numbers depend on the machine.
+//! prints the latencies. Two more scenarios put the writer against
+//! `verify` walking one long follower chain back to back, and against
+//! the hourly reclaim (the per-node cap, then day-based retention)
+//! cutting long chains. Each asserts only that every chain it walks
+//! verifies: the numbers exist to inform a design decision, and they
+//! depend on the machine.
 //!
 //! Run in release mode:
 //! `cargo test --release -p lorica-api --test audit_fan_in_contention -- --ignored --nocapture`
+//!
+//! What it showed (backlog #75, decided in v1.9.2): at five followers
+//! the writer's p99 stays in the band it has with none, so fanned-in
+//! audit rows keep sharing the control plane's connection. The tail
+//! came from `verify` holding the lock for a whole chain: back to back
+//! on a 200,000-row chain it put the writer 25 s behind its schedule,
+//! and once verify read in chunks the same run measured 5 ms. Retention
+//! and the cap now cut in the same chunks: the reclaim scenario, the cap
+//! cutting 300,000 rows and retention then removing 200,000, kept the
+//! writer within 25 ms of its schedule on the run that added it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -149,6 +163,62 @@ struct PhaseResult {
     writer_max_lag: Duration,
 }
 
+/// What the paced access-log writer saw.
+struct WriterRun {
+    /// Every `insert_batch` call.
+    all: Vec<Duration>,
+    /// Calls that started within 100 ms after a [`TICK`] boundary, where
+    /// the follower pushes land.
+    on_tick: Vec<Duration>,
+    /// Longest the writer fell behind its own schedule.
+    max_lag: Duration,
+}
+
+/// The control plane's own access-log writer: a [`WRITER_BATCH`]-row
+/// batch every [`WRITER_PERIOD`] from `start`, until `end` or until
+/// `stop` is raised, timing each call and how far it ran behind.
+fn spawn_writer(
+    store: &Arc<LogStore>,
+    start: Instant,
+    end: Instant,
+    stop: &Arc<AtomicBool>,
+) -> std::thread::JoinHandle<WriterRun> {
+    let store = Arc::clone(store);
+    let stop = Arc::clone(stop);
+    std::thread::spawn(move || {
+        let mut run = WriterRun {
+            all: Vec::new(),
+            on_tick: Vec::new(),
+            max_lag: Duration::ZERO,
+        };
+        let mut next = start;
+        let mut seq = 0u64;
+        while next < end && !stop.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            if now < next {
+                std::thread::sleep(next - now);
+            }
+            let began = Instant::now();
+            run.max_lag = run.max_lag.max(began.saturating_duration_since(next));
+            let batch: Vec<LogEntry> = (0..WRITER_BATCH)
+                .map(|_| {
+                    seq += 1;
+                    access_entry(seq)
+                })
+                .collect();
+            store.insert_batch(&batch).expect("access batch");
+            let took = began.elapsed();
+            run.all.push(took);
+            let into_tick = began.saturating_duration_since(start).as_nanos() % TICK.as_nanos();
+            if into_tick < Duration::from_millis(100).as_nanos() {
+                run.on_tick.push(took);
+            }
+            next += WRITER_PERIOD;
+        }
+        run
+    })
+}
+
 /// Seed a fresh store: the local chain and every follower's history.
 /// Returns the store and, per follower, the rows still to be pushed.
 fn seeded_store(dir: &std::path::Path) -> (Arc<LogStore>, Vec<Vec<FannedInAuditRow>>) {
@@ -191,39 +261,7 @@ fn run_phase(followers: usize) -> PhaseResult {
     let end = start + TICK * TICKS;
     let stop = Arc::new(AtomicBool::new(false));
 
-    let writer = {
-        let store = Arc::clone(&store);
-        std::thread::spawn(move || {
-            let mut all = Vec::new();
-            let mut on_tick = Vec::new();
-            let mut max_lag = Duration::ZERO;
-            let mut next = start;
-            let mut seq = 0u64;
-            while next < end {
-                let now = Instant::now();
-                if now < next {
-                    std::thread::sleep(next - now);
-                }
-                let began = Instant::now();
-                max_lag = max_lag.max(began.saturating_duration_since(next));
-                let batch: Vec<LogEntry> = (0..WRITER_BATCH)
-                    .map(|_| {
-                        seq += 1;
-                        access_entry(seq)
-                    })
-                    .collect();
-                store.insert_batch(&batch).expect("access batch");
-                let took = began.elapsed();
-                all.push(took);
-                let into_tick = began.saturating_duration_since(start).as_nanos() % TICK.as_nanos();
-                if into_tick < Duration::from_millis(100).as_nanos() {
-                    on_tick.push(took);
-                }
-                next += WRITER_PERIOD;
-            }
-            (all, on_tick, max_lag)
-        })
-    };
+    let writer = spawn_writer(&store, start, end, &stop);
 
     let pushers: Vec<_> = pending
         .into_iter()
@@ -292,7 +330,11 @@ fn run_phase(followers: usize) -> PhaseResult {
         })
     };
 
-    let (writer, writer_on_tick, writer_max_lag) = writer.join().expect("writer thread");
+    let WriterRun {
+        all: writer,
+        on_tick: writer_on_tick,
+        max_lag: writer_max_lag,
+    } = writer.join().expect("writer thread");
     let push: Vec<Duration> = pushers
         .into_iter()
         .flat_map(|p| p.join().expect("pusher thread"))
@@ -356,33 +398,7 @@ fn run_long_chain_phase() -> (Vec<Duration>, Duration, Vec<Duration>) {
     let end = start + LONG_CHAIN_RUN;
     let stop = Arc::new(AtomicBool::new(false));
 
-    let writer = {
-        let store = Arc::clone(&store);
-        std::thread::spawn(move || {
-            let mut all = Vec::new();
-            let mut max_lag = Duration::ZERO;
-            let mut next = start;
-            let mut seq = 0u64;
-            while next < end {
-                let now = Instant::now();
-                if now < next {
-                    std::thread::sleep(next - now);
-                }
-                let began = Instant::now();
-                max_lag = max_lag.max(began.saturating_duration_since(next));
-                let batch: Vec<LogEntry> = (0..WRITER_BATCH)
-                    .map(|_| {
-                        seq += 1;
-                        access_entry(seq)
-                    })
-                    .collect();
-                store.insert_batch(&batch).expect("access batch");
-                all.push(began.elapsed());
-                next += WRITER_PERIOD;
-            }
-            (all, max_lag)
-        })
-    };
+    let writer = spawn_writer(&store, start, end, &stop);
 
     let verifier = {
         let store = Arc::clone(&store);
@@ -402,10 +418,67 @@ fn run_long_chain_phase() -> (Vec<Duration>, Duration, Vec<Duration>) {
         })
     };
 
-    let (writer, max_lag) = writer.join().expect("writer thread");
+    let writer = writer.join().expect("writer thread");
     stop.store(true, Ordering::Relaxed);
     let verify = verifier.join().expect("verify thread");
-    (writer, max_lag, verify)
+    (writer.all, writer.max_lag, verify)
+}
+
+/// Rows in each of the two follower chains the reclaim scenario holds.
+const RECLAIM_CHAIN: usize = 200_000;
+/// Rows the cap keeps of each chain it cuts.
+const RECLAIM_KEEP: u64 = 50_000;
+
+/// The access-log writer against the hourly audit reclaim at its
+/// worst: the per-node cap cutting two 200,000-row follower chains to
+/// 50,000 each (filling both backups), then day-based retention
+/// expiring every audit row the store holds, the backups included.
+///
+/// Returns `(writer run, cap duration, retention duration, rows the
+/// cap cut, rows retention removed)`.
+fn run_reclaim_phase() -> (WriterRun, Duration, Duration, u64, u64) {
+    let dir = tempfile::tempdir().expect("test setup: temp dir");
+    let store = Arc::new(LogStore::open(dir.path()).expect("test setup: open the log store"));
+    for n in 0..2 {
+        for batch in follower_chain(RECLAIM_CHAIN).chunks(MAX_TELEMETRY_AUDIT) {
+            store
+                .insert_fanned_in_audit(&follower_name(n), batch)
+                .expect("test setup: follower chain");
+        }
+    }
+    let start = Instant::now() + Duration::from_millis(200);
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = spawn_writer(&store, start, start + Duration::from_secs(600), &stop);
+
+    // Let the writer settle into its schedule before the reclaim begins.
+    std::thread::sleep(Duration::from_millis(1200));
+    let began = Instant::now();
+    let cuts = store
+        .enforce_fanned_in_audit_cap(RECLAIM_KEEP)
+        .expect("cap pass");
+    let cap_took = began.elapsed();
+    let cut: u64 = cuts.iter().map(|cut| cut.removed).sum();
+    for n in 0..2 {
+        let backup = store
+            .verify_fanned_in_backup(&follower_name(n))
+            .expect("verify backup")
+            .expect("the cap filled a backup");
+        assert!(backup.verified, "the backup must verify: {backup:?}");
+    }
+
+    // Every row arrived seconds ago, so a cutoff a minute ahead expires
+    // all of them.
+    let cutoff = (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+    let began = Instant::now();
+    let aged = store
+        .enforce_audit_retention(&cutoff)
+        .expect("retention pass");
+    let retention_took = began.elapsed();
+    std::thread::sleep(Duration::from_secs(1));
+
+    stop.store(true, Ordering::Relaxed);
+    let writer = writer.join().expect("writer thread");
+    (writer, cap_took, retention_took, cut, aged)
 }
 
 #[test]
@@ -424,6 +497,23 @@ fn measure_writer_lag_behind_a_long_chain_verify() {
         max_lag.as_secs_f64() * 1000.0,
         v.0,
         v.2
+    );
+}
+
+#[test]
+#[ignore = "measurement (backlog #75): the hourly audit reclaim against the writer"]
+fn measure_writer_lag_behind_the_audit_reclaim() {
+    let (mut writer, cap_took, retention_took, cut, aged) = run_reclaim_phase();
+    let w = summary(&mut writer.all);
+    eprintln!(
+        "[#75] reclaim: cap cut {cut} rows in {:.0} ms, retention removed {aged} rows in {:.0} ms: \
+         writer p50/p99/max {:.2}/{:.2}/{:.2} ms, writer max lag {:.2} ms",
+        cap_took.as_secs_f64() * 1000.0,
+        retention_took.as_secs_f64() * 1000.0,
+        w.0,
+        w.1,
+        w.2,
+        writer.max_lag.as_secs_f64() * 1000.0
     );
 }
 

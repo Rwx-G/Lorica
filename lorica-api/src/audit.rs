@@ -210,7 +210,7 @@ pub struct AuditQuery {
 }
 
 /// Outcome of `GET /api/v1/audit/verify`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VerifyResult {
     /// `true` when every row's chain recomputes.
     pub verified: bool,
@@ -769,6 +769,23 @@ pub struct NodeVerifyResult {
     /// That chain's verdict.
     #[serde(flatten)]
     pub result: VerifyResult,
+    /// The verdict on the rows the fan-in cap moved out of this chain
+    /// into its backup, absent when it moved none (see
+    /// [`crate::log_store::LogStore::verify_fanned_in_backup`]).
+    ///
+    /// Beside the chain's verdict rather than folded into it: the
+    /// fields above keep meaning the live chain, as they did before the
+    /// backup existed, and a broken backup is a different finding from
+    /// a broken chain. The report's top-level `verified` covers both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup: Option<VerifyResult>,
+}
+
+impl NodeVerifyResult {
+    /// Whether this chain and its backup, when it has one, both verify.
+    pub fn verified(&self) -> bool {
+        self.result.verified && self.backup.as_ref().is_none_or(|backup| backup.verified)
+    }
 }
 
 /// GET /api/v1/audit/verify - recompute the hash chain (SuperAdmin
@@ -777,8 +794,8 @@ pub struct NodeVerifyResult {
 /// Reports PER NODE. An aggregated table interleaves N chains, so one
 /// verdict over the whole table would be meaningless: it would chain
 /// one node's row to another's and break at the first interleave. The
-/// top-level `verified` is the conjunction, so a caller that only reads
-/// that field still gets a correct answer.
+/// top-level `verified` is the conjunction, fan-in backups included, so
+/// a caller that only reads that field still gets a correct answer.
 pub async fn verify_audit(
     Extension(state): Extension<AppState>,
     Query(params): Query<AuditVerifyParams>,
@@ -795,7 +812,12 @@ pub async fn verify_audit(
         let ids = match requested {
             Some(node_id) => vec![node_id],
             None => {
+                // A node whose live chain has aged out ahead of its
+                // backup is still a chain to report on.
                 let mut ids = log_store.audit_node_ids()?;
+                ids.extend(log_store.audit_backup_node_ids()?);
+                ids.sort();
+                ids.dedup();
                 // A table with no rows at all still has a local chain
                 // to report on, and reporting nothing reads as "not
                 // checked" rather than "nothing to check".
@@ -807,9 +829,13 @@ pub async fn verify_audit(
         };
         ids.into_iter()
             .map(|node_id| {
-                log_store
-                    .verify_audit_chain_for(&node_id)
-                    .map(|result| NodeVerifyResult { node_id, result })
+                let result = log_store.verify_audit_chain_for(&node_id)?;
+                let backup = log_store.verify_fanned_in_backup(&node_id)?;
+                Ok(NodeVerifyResult {
+                    node_id,
+                    result,
+                    backup,
+                })
             })
             .collect::<Result<Vec<_>, String>>()
     })
@@ -817,7 +843,7 @@ pub async fn verify_audit(
     .map_err(|e| ApiError::Internal(format!("audit verify task failed: {e}")))?
     .map_err(ApiError::Internal)?;
 
-    let verified = nodes.iter().all(|n| n.result.verified);
+    let verified = nodes.iter().all(NodeVerifyResult::verified);
     Ok(json_data(serde_json::json!({
         "verified": verified,
         "nodes": nodes,
@@ -894,6 +920,34 @@ mod tests {
             action_reason("automation.request.forbidden:environments:write"),
             "environments:write"
         );
+    }
+
+    #[test]
+    fn a_broken_backup_fails_its_node_and_reads_beside_the_chain_s_verdict() {
+        let verdict = |verified: bool| VerifyResult {
+            verified,
+            total_rows: 3,
+            first_break_id: (!verified).then_some(7),
+            first_break_reason: (!verified).then(|| "chain_hash_mismatch".to_string()),
+        };
+        let node = |backup: Option<VerifyResult>| NodeVerifyResult {
+            node_id: "node-a".to_string(),
+            result: verdict(true),
+            backup,
+        };
+        assert!(node(None).verified());
+        assert!(node(Some(verdict(true))).verified());
+        let broken = node(Some(verdict(false)));
+        assert!(!broken.verified());
+
+        // The chain's own fields keep meaning the live chain; the
+        // backup's verdict is a field of its own, and absent without one.
+        let json = serde_json::to_value(&broken).expect("serializes");
+        assert_eq!(json["verified"], true);
+        assert_eq!(json["backup"]["verified"], false);
+        assert_eq!(json["backup"]["first_break_id"], 7);
+        let json = serde_json::to_value(node(None)).expect("serializes");
+        assert!(json.get("backup").is_none());
     }
 
     #[test]
