@@ -149,6 +149,27 @@ impl RefreshCoalescer {
     }
 }
 
+/// Run `work` on its own task and await it, so dropping the caller
+/// cannot cut it short.
+///
+/// For a sequence that commits a registry or token write and owes the
+/// commit its enforcement, its audit row and its alert. A handler whose
+/// client disconnected is dropped at its next await point, and if that
+/// point sits between the commit and the rest, the store says one
+/// thing, the roster another, and the tamper-evident trail has no row
+/// for a change that took effect. Detached, the sequence either never
+/// starts or runs to its end. `what` names the sequence in the error a
+/// panicking or cancelled task produces.
+pub async fn detached<T, Fut>(what: &str, work: Fut) -> Result<T, ClusterRuntimeError>
+where
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(work)
+        .await
+        .map_err(|e| ClusterRuntimeError::EnforcementTask(format!("{what} task join failed: {e}")))
+}
+
 /// Run a pure-store closure and keep its error typed: `db_blocking`
 /// collapses everything into `ApiError`, which this layer must not
 /// name on its way out.
@@ -216,11 +237,11 @@ impl ControlPlaneRuntime {
     ) -> Result<(), ClusterRuntimeError> {
         let runtime = Arc::clone(self);
         let store = Arc::clone(store);
-        tokio::spawn(async move { runtime.refresh_in_place(&store).await })
-            .await
-            .map_err(|e| {
-                ClusterRuntimeError::EnforcementTask(format!("refresh task join failed: {e}"))
-            })?
+        detached(
+            "refresh",
+            async move { runtime.refresh_in_place(&store).await },
+        )
+        .await?
     }
 
     /// The coalesced refresh on the caller's own task, for callers that
@@ -872,11 +893,10 @@ pub async fn revoke_node(
     let runtime = Arc::clone(runtime);
     let store = Arc::clone(store);
     let node_id = node_id.to_string();
-    tokio::spawn(async move { revoke_in_place(&runtime, &store, node_id, now).await })
-        .await
-        .map_err(|e| {
-            ClusterRuntimeError::EnforcementTask(format!("revocation task join failed: {e}"))
-        })?
+    detached("revocation", async move {
+        revoke_in_place(&runtime, &store, node_id, now).await
+    })
+    .await?
 }
 
 async fn revoke_in_place(

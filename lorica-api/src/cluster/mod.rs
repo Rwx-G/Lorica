@@ -8,6 +8,8 @@
 //! every node mutation are SuperAdmin, reads are Viewer+.
 
 pub mod runtime;
+#[cfg(test)]
+mod tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -154,64 +156,76 @@ pub async fn mint_token(
     let now = Utc::now();
     let expires_at = now + chrono::Duration::seconds(i64::try_from(ttl).unwrap_or(i64::MAX));
     let created_by = session.username.clone();
-    let bound_node_name = body.node_name.clone();
-    let bound_source_cidr = body.source_cidr.clone();
-    let minted = db_blocking(&state.store, move |store| {
-        let key = store
-            .token_hmac_key()
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        let minted = token::mint(&key, &pin).map_err(|e| ApiError::Internal(e.to_string()))?;
-        store
-            .create_join_token(&JoinToken {
-                public_id: minted.public_id.clone(),
-                secret_hmac: minted.secret_hmac.clone(),
-                state: TokenState::Unused,
-                created_at: now,
-                expires_at,
-                created_by,
-                bound_node_name,
-                bound_source_cidr,
-                burned_at: None,
-                burned_by_node_id: None,
-            })
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        Ok::<_, ApiError>(minted)
-    })
-    .await?;
-
-    let live = runtime::publish_token_liveness(&control, &state.store).await?;
-    tracing::warn!(
-        public_id = %minted.public_id,
-        live_tokens = live,
-        expires_at = %expires_at.to_rfc3339(),
-        "join token minted; enrollment window open"
-    );
-
-    let response = MintedTokenResponse {
-        token: minted.token,
-        public_id: minted.public_id,
-        expires_at: expires_at.to_rfc3339(),
-        bound_node_name: body.node_name,
-        bound_source_cidr: body.source_cidr,
-    };
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    // The audit payload carries the public half and the bindings,
-    // never the token.
-    let after = serde_json::json!({
-        "public_id": response.public_id,
-        "expires_at": response.expires_at,
-        "bound_node_name": response.bound_node_name,
-        "bound_source_cidr": response.bound_source_cidr,
-    });
-    crate::audit::record(
-        &state,
-        &audit_ctx,
-        "cluster.token.mint",
-        ("cluster_token", &response.public_id),
-        None,
-        Some(&after),
-    )
-    .await;
+    // The write, the window it opens and its audit row as one unit: a
+    // token that exists with no row saying who minted it is the worst
+    // kind of hole, because it is a credential.
+    let response = runtime::detached("token mint", async move {
+        let bound_node_name = body.node_name.clone();
+        let bound_source_cidr = body.source_cidr.clone();
+        let minted = db_blocking(&state.store, move |store| {
+            let key = store
+                .token_hmac_key()
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            let minted = token::mint(&key, &pin).map_err(|e| ApiError::Internal(e.to_string()))?;
+            store
+                .create_join_token(&JoinToken {
+                    public_id: minted.public_id.clone(),
+                    secret_hmac: minted.secret_hmac.clone(),
+                    state: TokenState::Unused,
+                    created_at: now,
+                    expires_at,
+                    created_by,
+                    bound_node_name,
+                    bound_source_cidr,
+                    burned_at: None,
+                    burned_by_node_id: None,
+                })
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            Ok::<_, ApiError>(minted)
+        })
+        .await?;
+
+        let live = runtime::publish_token_liveness(&control, &state.store).await;
+        if let Ok(live) = &live {
+            tracing::warn!(
+                public_id = %minted.public_id,
+                live_tokens = live,
+                expires_at = %expires_at.to_rfc3339(),
+                "join token minted; enrollment window open"
+            );
+        }
+
+        let response = MintedTokenResponse {
+            token: minted.token,
+            public_id: minted.public_id,
+            expires_at: expires_at.to_rfc3339(),
+            bound_node_name: body.node_name,
+            bound_source_cidr: body.source_cidr,
+        };
+        // The audit payload carries the public half and the bindings,
+        // never the token.
+        let after = serde_json::json!({
+            "public_id": response.public_id,
+            "expires_at": response.expires_at,
+            "bound_node_name": response.bound_node_name,
+            "bound_source_cidr": response.bound_source_cidr,
+        });
+        // Recorded before a liveness failure is surfaced: the token
+        // row is committed either way.
+        crate::audit::record(
+            &state,
+            &audit_ctx,
+            "cluster.token.mint",
+            ("cluster_token", &response.public_id),
+            None,
+            Some(&after),
+        )
+        .await;
+        live?;
+        Ok::<_, ApiError>(response)
+    })
+    .await??;
     Ok(json_data_with_status(StatusCode::CREATED, response))
 }
 
@@ -240,29 +254,34 @@ pub async fn revoke_token(
     Path(public_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let control = control_plane(&state)?;
-    let id = public_id.clone();
-    let revoked = db_blocking(&state.store, move |store| {
-        store
-            .revoke_join_token(&id)
-            .map_err(|e| ApiError::Internal(e.to_string()))
-    })
-    .await?;
-    if !revoked {
-        return Err(ApiError::NotFound(
-            "no unused token with this public id".into(),
-        ));
-    }
-    runtime::publish_token_liveness(&control, &state.store).await?;
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    crate::audit::record(
-        &state,
-        &audit_ctx,
-        "cluster.token.revoke",
-        ("cluster_token", &public_id),
-        None,
-        None,
-    )
-    .await;
+    runtime::detached("token revocation", async move {
+        let id = public_id.clone();
+        let revoked = db_blocking(&state.store, move |store| {
+            store
+                .revoke_join_token(&id)
+                .map_err(|e| ApiError::Internal(e.to_string()))
+        })
+        .await?;
+        if !revoked {
+            return Err(ApiError::NotFound(
+                "no unused token with this public id".into(),
+            ));
+        }
+        let live = runtime::publish_token_liveness(&control, &state.store).await;
+        crate::audit::record(
+            &state,
+            &audit_ctx,
+            "cluster.token.revoke",
+            ("cluster_token", &public_id),
+            None,
+            None,
+        )
+        .await;
+        live?;
+        Ok(())
+    })
+    .await??;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -523,43 +542,54 @@ pub async fn activate_node(
 ) -> Result<impl IntoResponse, ApiError> {
     let runtime = control_plane_runtime(&state)?;
     let control = Arc::clone(&runtime.control);
-    let node_id = id.clone();
-    let (node, selected, certificates) = db_blocking(&state.store, move |store| {
-        let before = store
-            .get_cluster_node(&node_id)
-            .map_err(|e| ApiError::Internal(e.to_string()))?
-            .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
-        if before.status != NodeStatus::Pending {
-            return Err(ApiError::Conflict(format!(
-                "node is {}, only a pending node can be activated",
-                before.status.as_str()
-            )));
-        }
-        store
-            .activate_cluster_node(&node_id)
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        let node = store
-            .get_cluster_node(&node_id)
-            .map_err(|e| ApiError::Internal(e.to_string()))?
-            .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
-        let selected = selected_hostnames(store, std::slice::from_ref(&node));
-        let certificates = store.certificates_by_node().unwrap_or_default();
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    // The write, the refresh that admits the node and the audit row as
+    // one detached unit, so a client that disconnects cannot leave an
+    // activated row the acceptor does not know about, or one no audit
+    // row accounts for.
+    let (node, selected, certificates) = runtime::detached("activation", async move {
+        let node_id = id.clone();
+        let (node, selected, certificates) = db_blocking(&state.store, move |store| {
+            let before = store
+                .get_cluster_node(&node_id)
+                .map_err(|e| ApiError::Internal(e.to_string()))?
+                .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
+            if before.status != NodeStatus::Pending {
+                return Err(ApiError::Conflict(format!(
+                    "node is {}, only a pending node can be activated",
+                    before.status.as_str()
+                )));
+            }
+            store
+                .activate_cluster_node(&node_id)
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            let node = store
+                .get_cluster_node(&node_id)
+                .map_err(|e| ApiError::Internal(e.to_string()))?
+                .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
+            let selected = selected_hostnames(store, std::slice::from_ref(&node));
+            let certificates = store.certificates_by_node().unwrap_or_default();
+            Ok::<_, ApiError>((node, selected, certificates))
+        })
+        .await?;
+        // Awaited: the response says `active`, and a pending session must
+        // already be admitted as one when the operator reads it.
+        let refreshed = runtime.refresh(&state.store).await;
+        // Recorded before a refresh failure is surfaced: the row is
+        // active either way, and the next refresh admits the node.
+        crate::audit::record(
+            &state,
+            &audit_ctx,
+            "cluster.node.activate",
+            ("cluster_node", &id),
+            None,
+            Some(&serde_json::json!({ "status": "active", "name": node.name })),
+        )
+        .await;
+        refreshed?;
         Ok::<_, ApiError>((node, selected, certificates))
     })
-    .await?;
-    // Awaited: the response says `active`, and a pending session must
-    // already be admitted as one when the operator reads it.
-    runtime.refresh(&state.store).await?;
-    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    crate::audit::record(
-        &state,
-        &audit_ctx,
-        "cluster.node.activate",
-        ("cluster_node", &id),
-        None,
-        Some(&serde_json::json!({ "status": "active", "name": node.name })),
-    )
-    .await;
+    .await??;
     let mut responses =
         node_responses(&control, vec![node], &selected, &certificates, session.role);
     Ok(json_data(responses.remove(0)))
@@ -609,37 +639,50 @@ pub async fn revoke_node(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let runtime = control_plane_runtime(&state)?;
-    let outcome = runtime::revoke_node(&runtime, &state.store, &id, Utc::now())
-        .await?
-        .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
-    tracing::warn!(
-        node_id = %id,
-        name = %outcome.node.name,
-        newly_revoked = outcome.newly_revoked,
-        session_ended = outcome.session_ended,
-        certificates_to_reissue = ?outcome.certificates_to_reissue,
-        refresh_error = outcome.refresh_error.as_ref().map(|e| e.to_string()).as_deref().unwrap_or("-"),
-        "cluster node revoked"
-    );
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    crate::audit::record(
-        &state,
-        &audit_ctx,
-        "cluster.node.revoke",
-        ("cluster_node", &id),
-        Some(&serde_json::json!({
-            "status": outcome.node.status.as_str(),
-            "name": outcome.node.name,
-        })),
-        Some(&serde_json::json!({
-            "status": "revoked",
-            "newly_revoked": outcome.newly_revoked,
-            "session_ended": outcome.session_ended,
-            "certificates_to_reissue": outcome.certificates_to_reissue,
-            "refresh_error": outcome.refresh_error.as_ref().map(|e| e.to_string()),
-        })),
-    )
-    .await;
+    let node_id = id.clone();
+    // `runtime::revoke_node` already finishes the enforcement whatever
+    // happens to its caller. The journal line and the audit row ride in
+    // the same detached unit, or a client that disconnected after the
+    // row flipped would leave a revocation that took effect with no
+    // trace in the tamper-evident trail.
+    let outcome = runtime::detached("revocation record", async move {
+        let Some(outcome) =
+            runtime::revoke_node(&runtime, &state.store, &node_id, Utc::now()).await?
+        else {
+            return Ok::<_, ApiError>(None);
+        };
+        tracing::warn!(
+            node_id = %node_id,
+            name = %outcome.node.name,
+            newly_revoked = outcome.newly_revoked,
+            session_ended = outcome.session_ended,
+            certificates_to_reissue = ?outcome.certificates_to_reissue,
+            refresh_error = outcome.refresh_error.as_ref().map(|e| e.to_string()).as_deref().unwrap_or("-"),
+            "cluster node revoked"
+        );
+        crate::audit::record(
+            &state,
+            &audit_ctx,
+            "cluster.node.revoke",
+            ("cluster_node", &node_id),
+            Some(&serde_json::json!({
+                "status": outcome.node.status.as_str(),
+                "name": outcome.node.name,
+            })),
+            Some(&serde_json::json!({
+                "status": "revoked",
+                "newly_revoked": outcome.newly_revoked,
+                "session_ended": outcome.session_ended,
+                "certificates_to_reissue": outcome.certificates_to_reissue,
+                "refresh_error": outcome.refresh_error.as_ref().map(|e| e.to_string()),
+            })),
+        )
+        .await;
+        Ok(Some(outcome))
+    })
+    .await??
+    .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
     if let Some(refresh_error) = outcome.refresh_error {
         return Err(refresh_error.into());
     }
@@ -842,11 +885,25 @@ pub async fn leave(
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let ClusterRuntime::Follower(follower) = &state.cluster else {
-        return Err(ApiError::Conflict(
-            "this node is not a cluster follower".into(),
-        ));
-    };
+    let follower = follower_runtime(&state)?;
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    // Detached as a whole: once the control plane may
+    // have revoked this node, the wipe, the `left` flag and the audit
+    // row must follow whether or not the operator's client is still
+    // there to read the answer.
+    let response = runtime::detached("leave", async move {
+        leave_detached(&state, &follower, &audit_ctx).await
+    })
+    .await??;
+    Ok(json_data(response))
+}
+
+/// The body of [`leave`], run to its end on its own task.
+async fn leave_detached(
+    state: &AppState,
+    follower: &FollowerRuntime,
+    audit_ctx: &crate::audit::AuditContext,
+) -> Result<LeaveResponse, ApiError> {
     let notified = match follower.connection.current() {
         Some(live) => {
             match tokio::time::timeout(
@@ -888,10 +945,9 @@ pub async fn leave(
         identity_wiped = wiped,
         "this node left the fleet"
     );
-    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     crate::audit::record(
-        &state,
-        &audit_ctx,
+        state,
+        audit_ctx,
         "cluster.node.leave",
         ("cluster_node", &follower.node_id),
         None,
@@ -901,10 +957,10 @@ pub async fn leave(
         })),
     )
     .await;
-    Ok(json_data(LeaveResponse {
+    Ok(LeaveResponse {
         node_id: follower.node_id.clone(),
         control_plane_notified: notified,
-    }))
+    })
 }
 
 // ---- Configuration replication (Story 9.4) ----
@@ -1216,30 +1272,37 @@ pub async fn fleet_ban(
             "duration_s must be between 1 and {MAX_FLEET_BAN_DURATION_S}"
         )));
     }
-    let (applied, unreachable) = control
-        .push_ban(&body.client_ip, body.duration_s, "manual")
-        .await;
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    crate::audit::record(
-        &state,
-        &audit_ctx,
-        "cluster.ban.fleet",
-        ("cluster_ban", &body.client_ip),
-        None,
-        Some(&serde_json::json!({
-            "duration_s": body.duration_s,
-            "applied": applied,
-            "unreachable": unreachable,
-        })),
-    )
-    .await;
-    tracing::warn!(
-        client_ip = %body.client_ip,
-        duration_s = body.duration_s,
-        applied = applied.len(),
-        unreachable = unreachable.len(),
-        "fleet-wide ban issued"
-    );
+    // Nodes start enforcing as the push reaches them, so the push and
+    // its audit row run detached: a client that gives up mid-push must
+    // not leave a ban in force on part of the fleet with no record.
+    let (applied, unreachable) = runtime::detached("fleet ban", async move {
+        let (applied, unreachable) = control
+            .push_ban(&body.client_ip, body.duration_s, "manual")
+            .await;
+        crate::audit::record(
+            &state,
+            &audit_ctx,
+            "cluster.ban.fleet",
+            ("cluster_ban", &body.client_ip),
+            None,
+            Some(&serde_json::json!({
+                "duration_s": body.duration_s,
+                "applied": applied,
+                "unreachable": unreachable,
+            })),
+        )
+        .await;
+        tracing::warn!(
+            client_ip = %body.client_ip,
+            duration_s = body.duration_s,
+            applied = applied.len(),
+            unreachable = unreachable.len(),
+            "fleet-wide ban issued"
+        );
+        (applied, unreachable)
+    })
+    .await?;
     Ok(json_data(FleetBanResponse {
         applied,
         unreachable,
@@ -1319,45 +1382,55 @@ pub async fn open_break_glass(
     // unconditionally behind, so the first heartbeat after the window
     // closes pulls the fleet's configuration and reconciles the edits
     // away, which is what AC #11 promises.
-    db_blocking(&state.store, move |store| {
-        store
-            .set_cluster_break_glass_until(Some(until))
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        store
-            .set_cluster_applied_config(0, "")
-            .map_err(|e| ApiError::Internal(e.to_string()))
-    })
-    .await?;
-    {
-        let mut applied = follower
-            .applied
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        applied.generation = 0;
-        applied.hash = String::new();
-    }
-    follower.break_glass.send_replace(Some(until));
-    tracing::warn!(
-        node_id = %follower.node_id,
-        control_plane = %follower.control_plane,
-        until = %until.to_rfc3339(),
-        operator = %session.username,
-        "cluster break-glass OPEN: local configuration mutations are allowed on this follower \
-         until the window ends; the control plane reconciles them away afterwards"
-    );
+    //
+    // The write, the in-memory window and the audit row run detached:
+    // a window the store holds open while this process and the audit
+    // trail know nothing of it would let local edits through unrecorded.
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    crate::audit::record(
-        &state,
-        &audit_ctx,
-        "cluster.break_glass.open",
-        ("cluster_node", &follower.node_id),
-        None,
-        Some(&serde_json::json!({
-            "until": until.to_rfc3339(),
-            "duration_s": body.duration_s,
-        })),
-    )
-    .await;
+    let operator = session.username.clone();
+    let opened = Arc::clone(&follower);
+    runtime::detached("break-glass open", async move {
+        db_blocking(&state.store, move |store| {
+            store
+                .set_cluster_break_glass_until(Some(until))
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            store
+                .set_cluster_applied_config(0, "")
+                .map_err(|e| ApiError::Internal(e.to_string()))
+        })
+        .await?;
+        {
+            let mut applied = opened
+                .applied
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            applied.generation = 0;
+            applied.hash = String::new();
+        }
+        opened.break_glass.send_replace(Some(until));
+        tracing::warn!(
+            node_id = %opened.node_id,
+            control_plane = %opened.control_plane,
+            until = %until.to_rfc3339(),
+            operator = %operator,
+            "cluster break-glass OPEN: local configuration mutations are allowed on this follower \
+             until the window ends; the control plane reconciles them away afterwards"
+        );
+        crate::audit::record(
+            &state,
+            &audit_ctx,
+            "cluster.break_glass.open",
+            ("cluster_node", &opened.node_id),
+            None,
+            Some(&serde_json::json!({
+                "until": until.to_rfc3339(),
+                "duration_s": body.duration_s,
+            })),
+        )
+        .await;
+        Ok::<_, ApiError>(())
+    })
+    .await??;
     Ok(json_data(break_glass_response(&follower)))
 }
 
@@ -1371,27 +1444,35 @@ pub async fn close_break_glass(
     Extension(session): Extension<Session>,
 ) -> Result<impl IntoResponse, ApiError> {
     let follower = follower_runtime(&state)?;
-    db_blocking(&state.store, |store| {
-        store
-            .set_cluster_break_glass_until(None)
-            .map_err(|e| ApiError::Internal(e.to_string()))
-    })
-    .await?;
-    follower.break_glass.send_replace(None);
-    tracing::warn!(
-        node_id = %follower.node_id,
-        operator = %session.username,
-        "cluster break-glass CLOSED; reconciling with the control plane"
-    );
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    crate::audit::record(
-        &state,
-        &audit_ctx,
-        "cluster.break_glass.close",
-        ("cluster_node", &follower.node_id),
-        None,
-        None,
-    )
-    .await;
+    let operator = session.username.clone();
+    let closed = Arc::clone(&follower);
+    // Detached for the same reason as the open: the store, this
+    // process and the audit trail must agree on the window.
+    runtime::detached("break-glass close", async move {
+        db_blocking(&state.store, |store| {
+            store
+                .set_cluster_break_glass_until(None)
+                .map_err(|e| ApiError::Internal(e.to_string()))
+        })
+        .await?;
+        closed.break_glass.send_replace(None);
+        tracing::warn!(
+            node_id = %closed.node_id,
+            operator = %operator,
+            "cluster break-glass CLOSED; reconciling with the control plane"
+        );
+        crate::audit::record(
+            &state,
+            &audit_ctx,
+            "cluster.break_glass.close",
+            ("cluster_node", &closed.node_id),
+            None,
+            None,
+        )
+        .await;
+        Ok::<_, ApiError>(())
+    })
+    .await??;
     Ok(json_data(break_glass_response(&follower)))
 }
