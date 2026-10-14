@@ -748,7 +748,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&waf_sock_path, std::fs::Permissions::from_mode(0o660));
         }
-        let waf_event_sink = Arc::clone(&waf_event_buffer);
+        let waf_event_sink = Arc::clone(&waf_engine);
         let waf_alert_sender = alert_sender.clone();
         // Cross-worker WAF auto-ban counter lives in the shmem region
         // (see lorica-shmem::SharedRegion::waf_auto_ban). The supervisor
@@ -776,7 +776,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                                 match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
                                     Ok(0) => break,
                                     Ok(_) => {
-                                        if let Ok(event) = serde_json::from_str::<lorica_waf::WafEvent>(&line) {
+                                        if let Some(event) = super::waf_forward::record_forwarded_event(&sink, &line) {
                                             // Workers insert WAF events into the DB directly
                                             // (with route_hostname and action stamped), so we
                                             // skip the insert here to avoid duplicates.
@@ -862,12 +862,6 @@ pub(crate) fn run_supervisor(cli: Cli) {
                                                     }
                                                 }
                                             }
-
-                                            let mut buf = sink.lock();
-                                            if buf.len() >= 500 {
-                                                buf.pop_front();
-                                            }
-                                            buf.push_back(event);
                                         }
                                     }
                                     Err(_) => break,

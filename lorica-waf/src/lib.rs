@@ -39,6 +39,6 @@ pub mod prefilter;
 pub mod rules;
 
 pub use body_types::{body_is_inspectable, INSPECTABLE_BODY_CONTENT_TYPES};
-pub use engine::{RuleSummary, WafEngine, WafEvent, WafMode, WafVerdict};
+pub use engine::{EventsAfter, RuleSummary, WafEngine, WafEvent, WafMode, WafVerdict};
 pub use ip_blocklist::IpBlocklist;
 pub use rules::{HeaderScopedRule, RuleCategory, RuleSet, WafRule};

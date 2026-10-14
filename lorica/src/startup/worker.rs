@@ -482,23 +482,16 @@ pub(crate) fn run_worker(
                     }
                 };
                 let mut writer = tokio::io::BufWriter::new(stream);
-                let mut interval = tokio::time::interval(Duration::from_secs(1));
-                let mut last_count = 0usize;
-                let event_buf = waf_fwd_engine.event_buffer();
+                let mut interval = tokio::time::interval(super::waf_forward::FORWARD_INTERVAL);
+                let mut cursor = super::waf_forward::WafForwardCursor::new();
                 loop {
                     interval.tick().await;
-                    let events: Vec<lorica_waf::WafEvent> = {
-                        let buf = event_buf.lock();
-                        if buf.len() == last_count {
-                            continue;
-                        }
-                        let new_events: Vec<_> = buf.iter().skip(last_count).cloned().collect();
-                        last_count = buf.len();
-                        new_events
-                    };
+                    let events = cursor.take_batch(&waf_fwd_engine);
+                    if events.is_empty() {
+                        continue;
+                    }
                     for event in &events {
-                        if let Ok(json) = serde_json::to_string(event) {
-                            let line = format!("{json}\n");
+                        if let Some(line) = super::waf_forward::encode_forwarded_event(event) {
                             if tokio::io::AsyncWriteExt::write_all(&mut writer, line.as_bytes())
                                 .await
                                 .is_err()

@@ -39,6 +39,7 @@ mod url_decode;
 mod window;
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -49,6 +50,20 @@ use crate::rules::RuleSet;
 pub use types::{CustomRule, RuleSummary, WafEvent, WafMode, WafVerdict};
 pub use window::{WindowCounts, LONGEST_EVENT_WINDOW};
 
+/// What [`WafEngine::events_after`] answers for a sequence cursor.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EventsAfter {
+    /// Events recorded after the cursor that the ring still holds,
+    /// oldest first.
+    pub events: Vec<WafEvent>,
+    /// The cursor to pass next time: the sequence number of the last
+    /// event recorded so far.
+    pub next: u64,
+    /// Events recorded after the cursor that the ring dropped before
+    /// they were asked for.
+    pub lost: u64,
+}
+
 /// WAF engine with precompiled rules, IP blocklist, and event ring buffer.
 ///
 /// Cheap to share across worker threads behind an `Arc`: all mutable
@@ -56,13 +71,21 @@ pub use window::{WindowCounts, LONGEST_EVENT_WINDOW};
 /// behind interior locks. The recent-event buffer is bounded to 500
 /// entries; older events are dropped FIFO. Every recorded event is also
 /// counted per minute, so [`Self::event_counts_within`] is exact over
-/// its window however many events the ring has dropped.
+/// its window however many events the ring has dropped, and numbered,
+/// so [`Self::events_after`] can tell a reader which events are new.
 pub struct WafEngine {
     pub(super) ruleset: RuleSet,
     pub(super) disabled_rules: RwLock<HashSet<u32>>,
     pub(super) custom_rules: RwLock<Vec<(CustomRule, regex::Regex)>>,
     pub(super) event_buffer: Arc<Mutex<VecDeque<WafEvent>>>,
     pub(super) max_events: usize,
+    /// Events ever recorded, which makes it the sequence number of the
+    /// newest one. Written only under the `event_buffer` lock, so a
+    /// reader holding that lock sees it agree with the ring.
+    recorded: AtomicU64,
+    /// `recorded` at the last [`Self::clear_events`]: the events up to
+    /// it were forgotten on purpose, not dropped by the ring.
+    cleared_through: AtomicU64,
     event_window: Mutex<window::EventWindow>,
     /// IP address blocklist (e.g. Data-Shield IPv4 Blocklist).
     pub(super) ip_blocklist: IpBlocklist,
@@ -86,6 +109,8 @@ impl WafEngine {
             custom_rules: RwLock::new(Vec::new()),
             event_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(500))),
             max_events: 500,
+            recorded: AtomicU64::new(0),
+            cleared_through: AtomicU64::new(0),
             event_window: Mutex::new(window::EventWindow::new()),
             ip_blocklist: IpBlocklist::new(),
             prefilter: crate::prefilter::Prefilter::build(),
@@ -137,11 +162,43 @@ impl WafEngine {
             }
         }
         let mut buf = self.event_buffer.lock();
+        self.recorded
+            .fetch_add(events.len() as u64, Ordering::Relaxed);
         for event in events {
             if buf.len() >= self.max_events {
                 buf.pop_front();
             }
             buf.push_back(event);
+        }
+    }
+
+    /// Events recorded after the sequence number `cursor`, for a reader
+    /// that must see every event once, such as a worker forwarding its
+    /// events to the supervisor. Start from `0` and pass back
+    /// [`EventsAfter::next`].
+    ///
+    /// The ring length cannot serve as that cursor: once the ring is full
+    /// it stays at capacity while events keep arriving. Events recorded
+    /// after the cursor but already dropped by the ring are reported in
+    /// [`EventsAfter::lost`]; events forgotten by [`Self::clear_events`]
+    /// are not, since nobody lost them. The numbering assumes events
+    /// enter the ring only through [`Self::record_events`].
+    pub fn events_after(&self, cursor: u64) -> EventsAfter {
+        let buf = self.event_buffer.lock();
+        let recorded = self.recorded.load(Ordering::Relaxed);
+        let oldest_held = recorded.saturating_sub(buf.len() as u64);
+        let from = cursor
+            .max(self.cleared_through.load(Ordering::Relaxed))
+            .min(recorded);
+        let first_new = from.max(oldest_held);
+        EventsAfter {
+            events: buf
+                .iter()
+                .skip((first_new - oldest_held) as usize)
+                .cloned()
+                .collect(),
+            next: recorded,
+            lost: oldest_held.saturating_sub(from),
         }
     }
 
@@ -158,7 +215,10 @@ impl WafEngine {
     /// windowed counts alike.
     pub fn clear_events(&self) {
         self.event_window.lock().clear();
-        self.event_buffer.lock().clear();
+        let mut buf = self.event_buffer.lock();
+        buf.clear();
+        self.cleared_through
+            .store(self.recorded.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     /// Return a reference to the event buffer for dashboard consumption.

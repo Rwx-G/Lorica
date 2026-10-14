@@ -300,6 +300,69 @@ fn windowed_counts_are_not_bounded_by_the_ring() {
     );
 }
 
+fn numbered_event(rule_id: u32) -> WafEvent {
+    WafEvent {
+        rule_id,
+        ..event_at(chrono::Utc::now().to_rfc3339(), RuleCategory::Xss)
+    }
+}
+
+#[test]
+fn events_after_keeps_numbering_past_a_full_ring() {
+    let e = engine();
+    let mut cursor = 0;
+    let mut seen = Vec::new();
+    for rule_id in 1..=(e.max_events as u32 * 2) {
+        e.record_events(vec![numbered_event(rule_id)]);
+        let after = e.events_after(cursor);
+        assert_eq!(after.lost, 0);
+        cursor = after.next;
+        seen.extend(after.events.into_iter().map(|ev| ev.rule_id));
+    }
+    assert_eq!(seen, (1..=(e.max_events as u32 * 2)).collect::<Vec<_>>());
+    assert_eq!(
+        e.events_after(cursor),
+        EventsAfter {
+            events: vec![],
+            next: cursor,
+            lost: 0
+        }
+    );
+}
+
+#[test]
+fn events_after_counts_what_the_ring_dropped_before_it_was_read() {
+    let e = engine();
+    let first = e.events_after(0);
+    let overflow = 37;
+    let recorded = e.max_events as u32 + overflow;
+    e.record_events((1..=recorded).map(numbered_event).collect());
+
+    let after = e.events_after(first.next);
+    assert_eq!(after.lost, u64::from(overflow));
+    assert_eq!(after.next, u64::from(recorded));
+    assert_eq!(
+        after.events.iter().map(|ev| ev.rule_id).collect::<Vec<_>>(),
+        ((overflow + 1)..=recorded).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn events_after_does_not_report_cleared_events_as_lost() {
+    let e = engine();
+    e.record_events((1..=3).map(numbered_event).collect());
+    e.clear_events();
+    e.record_events(vec![numbered_event(4)]);
+
+    let after = e.events_after(0);
+    assert_eq!(after.lost, 0);
+    assert_eq!(after.next, 4);
+    assert_eq!(
+        after.events.iter().map(|ev| ev.rule_id).collect::<Vec<_>>(),
+        vec![4]
+    );
+}
+
 #[test]
 fn windowed_counts_place_an_event_at_its_own_stamp() {
     let e = engine();

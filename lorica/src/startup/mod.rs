@@ -30,6 +30,7 @@ pub(crate) mod log_store_health;
 pub(crate) mod single;
 pub(crate) mod supervisor;
 pub(crate) mod telemetry_drain;
+pub(crate) mod waf_forward;
 pub(crate) mod worker;
 
 use std::collections::VecDeque;
