@@ -576,6 +576,9 @@ fn telemetry_db_bytes(data_dir: &std::path::Path) -> u64 {
 
 struct FleetHandlers {
     control: Arc<ControlPlane>,
+    /// The same control plane with its refresh coalescer: every roster
+    /// write below refreshes through it (backlog #79).
+    runtime: Arc<ControlPlaneRuntime>,
     store: Arc<Mutex<ConfigStore>>,
     log_store: Option<Arc<LogStore>>,
     alert_sender: AlertSender,
@@ -598,8 +601,12 @@ struct FleetHandlers {
 }
 
 impl FleetHandlers {
+    /// Refresh and wait. Enrolment and renewal hand the node a
+    /// certificate it dials with straight away, so its fingerprint must
+    /// be in the roster before the grant leaves; a fire-and-forget
+    /// refresh would let that first handshake be refused as unknown.
     async fn refresh(&self) {
-        if let Err(e) = refresh_control_plane(&self.control, &self.store).await {
+        if let Err(e) = self.runtime.refresh(&self.store).await {
             error!(error = %e, "cluster plane: roster/CRL refresh failed");
         }
     }
@@ -731,7 +738,10 @@ impl SessionHandler for FleetHandlers {
                         node_id,
                         serial, "superseded node certificate retired to the CRL"
                     );
-                    self.refresh().await;
+                    // Not awaited: nothing this hook does depends on it,
+                    // and a fleet reconnecting after a renewal wave would
+                    // otherwise hold each new session on a refresh.
+                    self.runtime.request_refresh(&self.store);
                 }
                 Ok(None) => {}
                 Err(e) => error!(node_id, error = %e, "retiring the superseded certificate failed"),
@@ -754,7 +764,7 @@ impl SessionHandler for FleetHandlers {
             // with churn would otherwise accumulate one spend entry
             // per historical node for the life of the process.
             self.quota.forget(&node_id);
-            let outcome = revoke_node(&self.control, &self.store, &node_id, Utc::now())
+            let outcome = revoke_node(&self.runtime, &self.store, &node_id, Utc::now())
                 .await
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "node not registered".to_string())?;
@@ -1729,13 +1739,14 @@ fn spawn_liveness_publisher(
 /// `schema_version`) and prune revoked serials whose certificate
 /// expired (the CRL stays bounded by the live certificates).
 fn spawn_session_flush(
-    control: Arc<ControlPlane>,
+    runtime: Arc<ControlPlaneRuntime>,
     store: Arc<Mutex<ConfigStore>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(FLUSH_INTERVAL).await;
-            let facts: Vec<LiveNodeFacts> = control
+            let facts: Vec<LiveNodeFacts> = runtime
+                .control
                 .sessions
                 .snapshot()
                 .into_iter()
@@ -1770,7 +1781,7 @@ fn spawn_session_flush(
             match flushed {
                 Ok(pruned) if pruned > 0 => {
                     info!(pruned, "expired revoked serials pruned from the CRL source");
-                    if let Err(e) = refresh_control_plane(&control, &store).await {
+                    if let Err(e) = runtime.refresh(&store).await {
                         error!(error = %e, "cluster plane: refresh after CRL prune failed");
                     }
                 }
@@ -1962,6 +1973,7 @@ pub(crate) async fn spawn_cluster_plane(
     let replication_reload = opts.config_reload.subscribe();
     let handlers = Arc::new(FleetHandlers {
         control: Arc::clone(&control),
+        runtime: Arc::clone(&runtime),
         store: Arc::clone(store),
         log_store: opts.log_store,
         alert_sender: opts.alert_sender,
@@ -2006,7 +2018,7 @@ pub(crate) async fn spawn_cluster_plane(
 
     let tasks = vec![
         spawn_liveness_publisher(Arc::clone(&control), Arc::clone(store)),
-        spawn_session_flush(Arc::clone(&control), Arc::clone(store)),
+        spawn_session_flush(Arc::clone(&runtime), Arc::clone(store)),
         spawn_drift_watch(
             Arc::clone(&runtime),
             Arc::clone(store),

@@ -521,7 +521,8 @@ pub async fn activate_node(
     Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let control = control_plane(&state)?;
+    let runtime = control_plane_runtime(&state)?;
+    let control = Arc::clone(&runtime.control);
     let node_id = id.clone();
     let (node, selected, certificates) = db_blocking(&state.store, move |store| {
         let before = store
@@ -546,7 +547,9 @@ pub async fn activate_node(
         Ok::<_, ApiError>((node, selected, certificates))
     })
     .await?;
-    runtime::refresh_control_plane(&control, &state.store).await?;
+    // Awaited: the response says `active`, and a pending session must
+    // already be admitted as one when the operator reads it.
+    runtime.refresh(&state.store).await?;
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     crate::audit::record(
         &state,
@@ -605,8 +608,8 @@ pub async fn revoke_node(
     Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let control = control_plane(&state)?;
-    let outcome = runtime::revoke_node(&control, &state.store, &id, Utc::now())
+    let runtime = control_plane_runtime(&state)?;
+    let outcome = runtime::revoke_node(&runtime, &state.store, &id, Utc::now())
         .await?
         .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
     tracing::warn!(
