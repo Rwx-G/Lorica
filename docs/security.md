@@ -102,7 +102,7 @@ Every state-mutating management-API call is recorded in a dedicated
   surviving suffix still verifies. On a control plane it applies to
   every follower's fanned-in chain too, by arrival time, and to the
   per-node fan-in backup, so no audit row outlives the setting.
-- **Fan-in ceiling** (control plane, v1.9.2): each follower's chain is
+- **Fan-in ceiling** (control plane, v1.9.3): each follower's chain is
   capped per node, and the first rows ever cut from it are moved into
   a per-node backup rather than deleted, up to the same ceiling, so a
   compromised follower cannot evict its pre-compromise record by

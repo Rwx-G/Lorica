@@ -111,7 +111,7 @@ start without it. `/var/lib/lorica/access-log.db` holds the audit trail,
 the access logs, the WAF events and the notification history, and a
 failure to open it is not fatal: the proxy keeps serving, because losing
 the forensics trail is better than losing the traffic. What it does
-instead, since 1.9.2, whatever the cause (a corrupt file, a full disk,
+instead, since 1.9.3, whatever the cause (a corrupt file, a full disk,
 wrong ownership or permissions):
 
 - Each process that cannot open it, the single process, the supervisor
@@ -127,7 +127,7 @@ wrong ownership or permissions):
   when it ends. A channel receives them when its alert types include
   them (the "Log persistence lost / restored" box in Settings >
   Notifications) or when it subscribes to every type. Channels saved
-  before 1.9.2 with an explicit list were subscribed on upgrade; untick
+  before 1.9.3 with an explicit list were subscribed on upgrade; untick
   the box to opt out.
 - Every dashboard page shows a red banner, `Audit trail, access logs and
   WAF events are not being persisted`, followed by the cause for
