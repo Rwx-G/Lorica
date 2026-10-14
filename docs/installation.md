@@ -121,13 +121,17 @@ wrong ownership or permissions):
 - `lorica_log_store_up` reads 0 for that process (labels `role` and
   `worker_id`; a worker's value reaches the supervisor's `/metrics`).
   Alert on `min(lorica_log_store_up) == 0`.
-- The process serving the dashboard raises one `log_store_unavailable`
-  notification per outage, with the cause, and one `log_store_recovered`
+- The process serving the dashboard raises `log_store_unavailable`
+  with the cause, re-sent until a channel accepts it and then as an
+  hourly reminder while the outage lasts, and one `log_store_recovered`
   when it ends. A channel receives them when its alert types include
   them (the "Log persistence lost / restored" box in Settings >
-  Notifications) or when it subscribes to every type.
+  Notifications) or when it subscribes to every type. Channels saved
+  before 1.9.2 with an explicit list were subscribed on upgrade; untick
+  the box to opt out.
 - Every dashboard page shows a red banner, `Audit trail, access logs and
-  WAF events are not being persisted`, followed by the cause.
+  WAF events are not being persisted`, followed by the cause for
+  Operator and above, and a generic cause for Viewer.
   `GET /api/v1/status` carries the same state in `log_store`.
 - Each failed process retries the open every 60 s. Once the cause is
   fixed, persistence resumes without a restart, the gauge returns to 1
