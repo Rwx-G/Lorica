@@ -204,6 +204,18 @@ mod tests {
             let quoted = format!("`{}`", alert_type.as_str());
             assert!(line.contains(&quoted), "{quoted} is missing from: {line}");
         }
+        let named: Vec<&str> = line.split('`').skip(1).step_by(2).collect();
+        for name in &named {
+            assert!(
+                name.parse::<AlertType>().is_ok(),
+                "`{name}` is listed in the API reference but is not an alert type"
+            );
+        }
+        assert_eq!(
+            named.len(),
+            AlertType::ALL.len(),
+            "the API reference names an alert type twice: {line}"
+        );
     }
 
     #[test]
