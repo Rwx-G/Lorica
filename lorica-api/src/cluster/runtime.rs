@@ -43,15 +43,50 @@ pub enum ClusterRuntimeError {
     /// one refresh answers every caller whose signal it covered.
     #[error("{0}")]
     Refresh(Arc<ClusterRuntimeError>),
+    /// The detached task carrying a post-commit refresh or revocation
+    /// could not be joined (it panicked, or the runtime is stopping).
+    #[error("cluster enforcement task: {0}")]
+    EnforcementTask(String),
 }
 
 impl From<ClusterRuntimeError> for ApiError {
     fn from(err: ClusterRuntimeError) -> Self {
         match err {
             ClusterRuntimeError::Store(inner) => inner.into(),
+            ClusterRuntimeError::Refresh(shared) => shared_api_error(&shared),
             other => ApiError::Internal(other.to_string()),
         }
     }
+}
+
+/// The status a shared refresh error answers with: the same one the
+/// bare error would get.
+///
+/// The error sits behind an `Arc` every caller the refresh covered
+/// holds, so it cannot be moved into `From<ConfigError>`, which owns
+/// the variant-to-status mapping. The store error is re-materialised
+/// instead and handed to that mapping, rather than mapped a second time
+/// here. The match is exhaustive on purpose: a new `ConfigError` variant
+/// fails to compile here instead of silently answering 500.
+fn shared_api_error(err: &ClusterRuntimeError) -> ApiError {
+    let store = match err {
+        ClusterRuntimeError::Store(store) => store,
+        ClusterRuntimeError::Refresh(inner) => return shared_api_error(inner),
+        other => return ApiError::Internal(other.to_string()),
+    };
+    let rebuilt = match store {
+        ConfigError::NotFound(m) => ConfigError::NotFound(m.clone()),
+        ConfigError::Validation(m) => ConfigError::Validation(m.clone()),
+        ConfigError::Malformed(m) => ConfigError::Malformed(m.clone()),
+        ConfigError::Corrupt(m) => ConfigError::Corrupt(m.clone()),
+        ConfigError::Serialization(m) => ConfigError::Serialization(m.clone()),
+        // Neither payload can be cloned, and `From<ConfigError>` answers
+        // both with a 500 carrying the error's text.
+        ConfigError::Database(_) | ConfigError::Io(_) => {
+            return ApiError::Internal(store.to_string())
+        }
+    };
+    rebuilt.into()
 }
 
 /// Collapses a burst of control-plane refresh requests into as few
@@ -168,7 +203,29 @@ impl ControlPlaneRuntime {
     /// caller signalling at the same time. Returns once a refresh that
     /// started after this call has completed, with its outcome; see
     /// [`RefreshCoalescer`].
+    ///
+    /// The refresh runs on its own task and this call awaits its
+    /// handle. Every caller has already committed a registry write, and
+    /// a caller dropped mid-wait (a handler whose client disconnected)
+    /// must not take with it the refresh that write is owed: the store
+    /// would say one thing and the roster and the acceptor another until
+    /// some unrelated write came along.
     pub async fn refresh(
+        self: &Arc<Self>,
+        store: &Arc<Mutex<ConfigStore>>,
+    ) -> Result<(), ClusterRuntimeError> {
+        let runtime = Arc::clone(self);
+        let store = Arc::clone(store);
+        tokio::spawn(async move { runtime.refresh_in_place(&store).await })
+            .await
+            .map_err(|e| {
+                ClusterRuntimeError::EnforcementTask(format!("refresh task join failed: {e}"))
+            })?
+    }
+
+    /// The coalesced refresh on the caller's own task, for callers that
+    /// already run detached.
+    async fn refresh_in_place(
         &self,
         store: &Arc<Mutex<ConfigStore>>,
     ) -> Result<(), ClusterRuntimeError> {
@@ -184,7 +241,7 @@ impl ControlPlaneRuntime {
         let runtime = Arc::clone(self);
         let store = Arc::clone(store);
         tokio::spawn(async move {
-            if let Err(e) = runtime.refresh(&store).await {
+            if let Err(e) = runtime.refresh_in_place(&store).await {
                 tracing::error!(error = %e, "cluster plane: roster/CRL refresh failed");
             }
         });
@@ -800,13 +857,35 @@ pub struct RevokeOutcome {
 /// The refresh is coalesced with any other in flight but still awaited:
 /// when this returns without a `refresh_error`, the acceptor already
 /// refuses the revoked serials.
+///
+/// The whole sequence runs on its own task and this call awaits its
+/// handle, so dropping the caller cannot split it. A revoke handler
+/// whose client disconnected after the row flipped would otherwise
+/// leave a node the registry calls revoked with its session up and its
+/// certificate still admitted, until an unrelated refresh.
 pub async fn revoke_node(
-    runtime: &ControlPlaneRuntime,
+    runtime: &Arc<ControlPlaneRuntime>,
     store: &Arc<Mutex<ConfigStore>>,
     node_id: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<RevokeOutcome>, ClusterRuntimeError> {
-    let id = node_id.to_string();
+    let runtime = Arc::clone(runtime);
+    let store = Arc::clone(store);
+    let node_id = node_id.to_string();
+    tokio::spawn(async move { revoke_in_place(&runtime, &store, node_id, now).await })
+        .await
+        .map_err(|e| {
+            ClusterRuntimeError::EnforcementTask(format!("revocation task join failed: {e}"))
+        })?
+}
+
+async fn revoke_in_place(
+    runtime: &ControlPlaneRuntime,
+    store: &Arc<Mutex<ConfigStore>>,
+    node_id: String,
+    now: DateTime<Utc>,
+) -> Result<Option<RevokeOutcome>, ClusterRuntimeError> {
+    let id = node_id.clone();
     let before = store_op(store, move |store| {
         let Some(existing) = store.get_cluster_node(&id)? else {
             return Ok(None);
@@ -819,8 +898,8 @@ pub async fn revoke_node(
     let Some((node, newly_revoked, certificates_to_reissue)) = before else {
         return Ok(None);
     };
-    let refresh_error = runtime.refresh(store).await.err();
-    let session_ended = runtime.control.sessions.kill(node_id);
+    let refresh_error = runtime.refresh_in_place(store).await.err();
+    let session_ended = runtime.control.sessions.kill(&node_id);
     Ok(Some(RevokeOutcome {
         node,
         newly_revoked,
@@ -1169,18 +1248,124 @@ mod tests {
 
     #[test]
     fn store_errors_keep_their_http_identity_through_the_runtime_error() {
+        use axum::http::StatusCode;
         use axum::response::IntoResponse;
-        let absent: ApiError =
-            ClusterRuntimeError::Store(ConfigError::NotFound("node".into())).into();
+        let status = |err: ClusterRuntimeError| ApiError::from(err).into_response().status();
+        let shared = |err: ClusterRuntimeError| ClusterRuntimeError::Refresh(Arc::new(err));
+        let absent = || ClusterRuntimeError::Store(ConfigError::NotFound("node".into()));
+        let refused = || ClusterRuntimeError::Store(ConfigError::Validation("cap".into()));
+        let unreadable = || ClusterRuntimeError::Store(ConfigError::Malformed("json".into()));
+        let acceptor = || ClusterRuntimeError::Acceptor(ClusterTlsError::Rustls("crl".into()));
+
+        assert_eq!(status(absent()), StatusCode::NOT_FOUND);
+        assert_eq!(status(acceptor()), StatusCode::INTERNAL_SERVER_ERROR);
+        // A refresh error reaches its callers wrapped and shared since
+        // the refreshes coalesce (backlog #79). The wrapper must not
+        // turn a store refusal into a 500.
+        for (bare, wrapped) in [
+            (absent(), shared(absent())),
+            (refused(), shared(refused())),
+            (unreadable(), shared(unreadable())),
+            (acceptor(), shared(acceptor())),
+        ] {
+            let message = bare.to_string();
+            assert_eq!(status(wrapped), status(bare), "{message}");
+        }
+        let held_by_two = Arc::new(absent());
+        let _other_caller = Arc::clone(&held_by_two);
         assert_eq!(
-            absent.into_response().status(),
-            axum::http::StatusCode::NOT_FOUND
+            status(ClusterRuntimeError::Refresh(held_by_two)),
+            StatusCode::NOT_FOUND
         );
-        let acceptor: ApiError =
-            ClusterRuntimeError::Acceptor(ClusterTlsError::Rustls("crl".into())).into();
+    }
+
+    // -----------------------------------------------------------------
+    // A caller dropped after its registry write does not cancel the
+    // enforcement that write is owed.
+    // -----------------------------------------------------------------
+
+    async fn eventually(what: &str, mut holds: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !holds() {
+            assert!(Instant::now() < deadline, "never happened: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn enrolled(id: &str, serial: &str) -> ClusterNode {
+        let mut row = node(id, &format!("fp-{id}"), None, NodeStatus::Active);
+        row.cert_serial = serial.to_string();
+        row.cert_not_after = Utc::now() + chrono::Duration::days(30);
+        row
+    }
+
+    #[tokio::test]
+    async fn a_refresh_whose_caller_is_dropped_still_lands() {
+        let (runtime, _liveness) = crate::tests::test_control_plane();
+        let store = Arc::new(Mutex::new(ConfigStore::open_in_memory().expect("store")));
+        store
+            .lock()
+            .await
+            .create_cluster_node(&enrolled("n0", "0a00"))
+            .expect("row");
+        // Held so the refresh is still waiting when its caller goes.
+        let guard = runtime.control.refresh_guard().await;
+        let dropped = tokio::time::timeout(Duration::from_millis(50), runtime.refresh(&store));
+        assert!(dropped.await.is_err(), "the refresh could not have run yet");
+        drop(guard);
+        eventually("the roster picks up the enrolled node", || {
+            runtime.control.roster.lookup("fp-n0").is_some()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_revocation_whose_caller_is_dropped_after_the_commit_is_still_enforced() {
+        let (runtime, _liveness) = crate::tests::test_control_plane();
+        let store = Arc::new(Mutex::new(ConfigStore::open_in_memory().expect("store")));
+        store
+            .lock()
+            .await
+            .create_cluster_node(&enrolled("n0", "0a00"))
+            .expect("row");
+        runtime.refresh(&store).await.expect("initial refresh");
+        let before = runtime.control.acceptor.current();
+
+        let guard = runtime.control.refresh_guard().await;
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(50),
+            revoke_node(&runtime, &store, "n0", Utc::now()),
+        );
+        assert!(
+            dropped.await.is_err(),
+            "the revocation could not finish yet"
+        );
+        eventually("the row flip commits", || {
+            store.try_lock().is_ok_and(|s| {
+                s.get_cluster_node("n0")
+                    .expect("read")
+                    .is_some_and(|n| n.status == NodeStatus::Revoked)
+            })
+        })
+        .await;
         assert_eq!(
-            acceptor.into_response().status(),
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            runtime.control.roster.lookup("fp-n0").expect("entry").state,
+            NodeState::Active,
+            "not enforced while the refresh is held"
         );
+        drop(guard);
+
+        eventually("the roster refuses the revoked node", || {
+            runtime
+                .control
+                .roster
+                .lookup("fp-n0")
+                .is_some_and(|n| n.state == NodeState::Revoked)
+        })
+        .await;
+        eventually("the acceptor is rebuilt over the new CRL", || {
+            !Arc::ptr_eq(&before, &runtime.control.acceptor.current())
+        })
+        .await;
     }
 }

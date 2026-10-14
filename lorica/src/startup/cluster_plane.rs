@@ -2650,6 +2650,65 @@ mod tests {
         drop((a, b));
     }
 
+    /// The security half of the revocation contract under cancellation:
+    /// a revoke caller dropped after the row flipped (an operator whose
+    /// browser gave up, a leave whose peer hung up) still ends the
+    /// node's session and closes the roster to it.
+    #[tokio::test]
+    async fn a_revocation_whose_caller_is_dropped_after_the_commit_still_ends_the_session() {
+        let store = store_with_key();
+        let control = test_control(false);
+        let runtime = Arc::new(ControlPlaneRuntime::new(Arc::clone(&control)));
+        {
+            let mut row = roster_row("id-a", "edge-a");
+            row.cert_serial = "0a01".to_string();
+            store
+                .lock()
+                .await
+                .create_cluster_node(&row)
+                .expect("test setup: node");
+        }
+        runtime.refresh(&store).await.expect("initial refresh");
+        let (_session, _far) = spawn_scripted_follower(&control, "id-a");
+        assert!(control.sessions.is_connected("id-a"));
+
+        // Held so the enforcement is still pending when the caller goes.
+        let guard = control.refresh_guard().await;
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(50),
+            revoke_node(&runtime, &store, "id-a", Utc::now()),
+        );
+        assert!(
+            dropped.await.is_err(),
+            "the revocation could not finish yet"
+        );
+        assert!(
+            control.sessions.is_connected("id-a"),
+            "the session is ended after the refresh, not before"
+        );
+        drop(guard);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while control.sessions.is_connected("id-a") {
+            assert!(
+                Instant::now() < deadline,
+                "the dropped revocation never ended the session"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            control.roster.lookup("fp-id-a").expect("entry").state,
+            NodeState::Revoked
+        );
+        let row = store
+            .lock()
+            .await
+            .get_cluster_node("id-a")
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.status, NodeStatus::Revoked);
+    }
+
     /// A follower that stages and applies whatever it is sent, over an
     /// in-process duplex. Enough for a round to complete: what these
     /// assertions are about is what was OFFERED, not what a real node
