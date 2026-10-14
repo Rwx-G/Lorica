@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary, type BlocklistStatus, type CustomWafRule, type BanEntry, type AuditRecord, type AuditVerifyReport, type AuditQuery } from '../lib/api';
+  import { api, type WafEvent, type WafStatsResponse, type WafRuleSummary, type BlocklistStatus, type CustomWafRule, type BanEntry, type AuditRecord, type AuditVerifyReport, type AuditQuery } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import NodeFilter from '../components/NodeFilter.svelte';
   import { showToast } from '../lib/toast';
@@ -14,12 +14,17 @@
    * exists only where it means something.
    */
   let events: (WafEvent & { node_id?: string })[] = $state([]);
-  let stats: { total_events: number; total_24h: number; rule_count: number; by_category: WafCategoryCount[] } = $state({
+  let stats: WafStatsResponse = $state({
     total_events: 0,
     total_24h: 0,
+    total_1h: 0,
     rule_count: 0,
     by_category: [],
+    by_category_1h: [],
   });
+  /** Re-reads the counters alone, so the rolling windows move without a click. */
+  let statsRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  const STATS_REFRESH_MS = 30000;
   let rules: WafRuleSummary[] = $state([]);
   let rulesEnabled = $state(0);
   let blocklist: BlocklistStatus = $state({ enabled: false, ip_count: 0, source: '' });
@@ -138,11 +143,20 @@
     loading = false;
   }
 
+  async function loadStats() {
+    const res = await api.getWafStats();
+    if (res.data) {
+      stats = res.data;
+    }
+  }
+
   onMount(() => {
     loadData();
     loadBans();
+    statsRefreshTimer = setInterval(loadStats, STATS_REFRESH_MS);
     return () => {
       if (bansRefreshTimer) clearInterval(bansRefreshTimer);
+      if (statsRefreshTimer) clearInterval(statsRefreshTimer);
     };
   });
 
@@ -426,13 +440,17 @@
       <div class="stat-value">{rulesEnabled}/{stats.rule_count}</div>
       <div class="stat-label">Rules Enabled</div>
     </div>
-    <div class="stat-card">
+    <div class="stat-card" title="WAF events in the last hour, refreshed every 30s">
+      <div class="stat-value">{stats.total_1h}</div>
+      <div class="stat-label">Events (1h)</div>
+    </div>
+    <div class="stat-card" title="WAF events in the last 24 hours, refreshed every 30s">
       <div class="stat-value">{stats.total_24h}</div>
       <div class="stat-label">Events (24h)</div>
     </div>
-    <div class="stat-card">
+    <div class="stat-card" title="Events kept in storage, bounded by the WAF event retention setting; the category cards count the same events">
       <div class="stat-value">{stats.total_events}</div>
-      <div class="stat-label">Total Events</div>
+      <div class="stat-label">Stored events</div>
     </div>
     {#each stats.by_category as cat (cat.category)}
       <div class="stat-card">

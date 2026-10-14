@@ -49,18 +49,39 @@ struct WafEventsResponse {
     rule_count: usize,
 }
 
+/// The window `total_1h` and `by_category_1h` count over.
+const LAST_HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The window `total_24h` counts over.
+const LAST_DAY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// JSON body of `GET /api/v1/waf/stats`.
+///
+/// `total_events` and `by_category` describe what is held: the retained
+/// `waf_events` table, or without a log store the engine's recent-event
+/// ring (a few hundred events since the process started). The windowed
+/// counts are exact over their window in both cases.
 #[derive(Debug, Serialize)]
 struct WafStatsResponse {
     total_events: u64,
     total_24h: u64,
+    total_1h: u64,
     rule_count: usize,
     by_category: Vec<CategoryCount>,
+    by_category_1h: Vec<CategoryCount>,
 }
 
 #[derive(Debug, Serialize)]
 struct CategoryCount {
     category: String,
     count: u64,
+}
+
+fn category_counts(pairs: Vec<(String, u64)>) -> Vec<CategoryCount> {
+    pairs
+        .into_iter()
+        .map(|(category, count)| CategoryCount { category, count })
+        .collect()
 }
 
 /// GET /api/v1/waf/events - list recent WAF events
@@ -112,7 +133,8 @@ pub async fn get_waf_events(
 /// the configured `enforce_waf_retention` budget). The previous
 /// implementation loaded up to 10 000 rows into memory and returned
 /// `events.len()`, capping the counter at 10 000 once the retention
-/// window exceeded that.
+/// window exceeded that. `total_1h` and `by_category_1h` are the
+/// rolling last hour the dashboard leads with.
 pub async fn get_waf_stats(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -135,13 +157,13 @@ pub(crate) async fn waf_stats(
     let rule_count = state.waf_rule_count.unwrap_or(0);
 
     // Read from persistent store if available, fall back to in-memory buffer
-    let (total_events, total_24h, by_category) = if let Some(ref store) = state.log_store {
+    let stats = if let Some(ref store) = state.log_store {
         // Off the tokio worker. COUNT(*) + GROUP BY can scan the
         // whole waf_events table under retention (up to 100 000
         // rows by default).
         // The query Result is passed through untouched so a query
-        // error still falls back to empty stats below; only a join
-        // failure is a hard error, as before.
+        // error still answers empty stats; only a join failure is a
+        // hard error, as before.
         let stats = log_db_blocking(store, move |s| {
             Ok(match max_age {
                 Some(max_age) => s.waf_event_stats_within(max_age),
@@ -149,45 +171,49 @@ pub(crate) async fn waf_stats(
             })
         })
         .await?;
-        match stats {
-            Ok((total, total_24h, cats)) => {
-                let by_cat = cats
-                    .into_iter()
-                    .map(|(category, count)| CategoryCount { category, count })
-                    .collect();
-                (total, total_24h, by_cat)
-            }
-            Err(_) => (0u64, 0u64, vec![]),
-        }
+        stats.unwrap_or_default()
     } else if let Some(ref waf_buffer) = state.waf_event_buffer {
-        let buf = waf_buffer.lock();
-        let total = buf.len() as u64;
-        let cutoff_24h: String = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
-        let mut total_24h = 0u64;
-        let mut counts = std::collections::HashMap::new();
-        for event in buf.iter() {
-            if event.timestamp.as_str() >= cutoff_24h.as_str() {
-                total_24h += 1;
+        let (total, by_category) = {
+            let buf = waf_buffer.lock();
+            let mut counts = std::collections::HashMap::new();
+            for event in buf.iter() {
+                *counts
+                    .entry(event.category.as_str().to_string())
+                    .or_insert(0u64) += 1;
             }
-            *counts
-                .entry(event.category.as_str().to_string())
-                .or_insert(0u64) += 1;
+            let mut by_category: Vec<(String, u64)> = counts.into_iter().collect();
+            by_category.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+            (buf.len() as u64, by_category)
+        };
+        // The windows come from the engine's per-minute counters, not
+        // from the ring: the ring drops its oldest events past a few
+        // hundred, and a count taken from it reads as the ring's size
+        // during exactly the bursts an operator wants to see.
+        let (day, hour) = match state.waf_engine {
+            Some(ref engine) => (
+                engine.event_counts_within(LAST_DAY),
+                engine.event_counts_within(LAST_HOUR),
+            ),
+            None => Default::default(),
+        };
+        crate::log_store::WafEventStats {
+            total,
+            total_24h: day.total,
+            total_1h: hour.total,
+            by_category,
+            by_category_1h: hour.by_category,
         }
-        let mut by_cat: Vec<CategoryCount> = counts
-            .into_iter()
-            .map(|(category, count)| CategoryCount { category, count })
-            .collect();
-        by_cat.sort_by_key(|c| std::cmp::Reverse(c.count));
-        (total, total_24h, by_cat)
     } else {
-        (0u64, 0u64, vec![])
+        crate::log_store::WafEventStats::default()
     };
 
     Ok(json_data(WafStatsResponse {
-        total_events,
-        total_24h,
+        total_events: stats.total,
+        total_24h: stats.total_24h,
+        total_1h: stats.total_1h,
         rule_count,
-        by_category,
+        by_category: category_counts(stats.by_category),
+        by_category_1h: category_counts(stats.by_category_1h),
     }))
 }
 
@@ -277,6 +303,9 @@ pub async fn clear_waf_events(
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Some(ref engine) = state.waf_engine {
+        engine.clear_events();
+    }
     if let Some(ref waf_buffer) = state.waf_event_buffer {
         let mut buf = waf_buffer.lock();
         buf.clear();
@@ -642,4 +671,110 @@ pub fn spawn_blocklist_refresh(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn event(category: lorica_waf::RuleCategory, ago: chrono::Duration) -> WafEvent {
+        WafEvent {
+            rule_id: 942_100,
+            description: "test".into(),
+            category,
+            severity: 5,
+            matched_field: "query".into(),
+            matched_value: "x".into(),
+            timestamp: (chrono::Utc::now() - ago).to_rfc3339(),
+            client_ip: "192.0.2.10".into(),
+            route_hostname: "example.com".into(),
+            action: "blocked".into(),
+        }
+    }
+
+    async fn stats_of(state: &AppState) -> serde_json::Value {
+        let Json(body) = waf_stats(state, None).await.expect("stats");
+        body["data"].clone()
+    }
+
+    /// Without a log store the counts come from the engine: the stored
+    /// total is the ring's length, the windows are exact past it.
+    #[tokio::test]
+    async fn without_a_log_store_the_windows_are_not_bounded_by_the_ring() {
+        let (mut state, _sessions, _limiter) = crate::tests::test_state().await;
+        let engine = Arc::new(lorica_waf::WafEngine::new());
+        state.waf_event_buffer = Some(engine.event_buffer());
+        state.waf_engine = Some(Arc::clone(&engine));
+        let recent = 600;
+        engine.record_events(
+            (0..recent)
+                .map(|_| event(lorica_waf::RuleCategory::Xss, chrono::Duration::zero()))
+                .collect(),
+        );
+        engine.record_events(vec![event(
+            lorica_waf::RuleCategory::SqlInjection,
+            chrono::Duration::hours(2),
+        )]);
+        let ring = engine.event_count() as u64;
+        assert!(
+            ring < recent,
+            "the ring must overflow for this to mean anything"
+        );
+
+        let data = stats_of(&state).await;
+        assert_eq!(data["total_events"], ring);
+        assert_eq!(data["total_1h"], recent);
+        assert_eq!(data["total_24h"], recent + 1);
+        assert_eq!(
+            data["by_category_1h"],
+            serde_json::json!([{ "category": "xss", "count": recent }])
+        );
+    }
+
+    #[tokio::test]
+    async fn with_a_log_store_the_last_hour_is_counted_from_the_table() {
+        let (mut state, _sessions, _limiter) = crate::tests::test_state().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(crate::log_store::LogStore::open(dir.path()).expect("open"));
+        for ago in [chrono::Duration::minutes(10), chrono::Duration::minutes(50)] {
+            store
+                .insert_waf_event(&event(lorica_waf::RuleCategory::Xss, ago))
+                .expect("insert");
+        }
+        store
+            .insert_waf_event(&event(
+                lorica_waf::RuleCategory::PathTraversal,
+                chrono::Duration::hours(3),
+            ))
+            .expect("insert");
+        state.log_store = Some(store);
+
+        let data = stats_of(&state).await;
+        assert_eq!(data["total_events"], 3);
+        assert_eq!(data["total_24h"], 3);
+        assert_eq!(data["total_1h"], 2);
+        assert_eq!(
+            data["by_category_1h"],
+            serde_json::json!([{ "category": "xss", "count": 2 }])
+        );
+        assert_eq!(data["by_category"].as_array().expect("array").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_stats_answer_carries_every_field_when_nothing_is_wired() {
+        let (state, _sessions, _limiter) = crate::tests::test_state().await;
+        let data = stats_of(&state).await;
+        assert_eq!(
+            data,
+            serde_json::json!({
+                "total_events": 0,
+                "total_24h": 0,
+                "total_1h": 0,
+                "rule_count": 0,
+                "by_category": [],
+                "by_category_1h": [],
+            })
+        );
+    }
 }

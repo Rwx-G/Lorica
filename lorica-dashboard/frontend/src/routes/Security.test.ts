@@ -67,7 +67,14 @@ beforeEach(() => {
   auth.set({ status: 'authenticated', username: 'admin', role: 'super_admin' });
   clusterStatus.set(controlPlane());
   vi.spyOn(api, 'getWafStats').mockResolvedValue({
-    data: { total_events: 0, total_24h: 0, rule_count: 0, by_category: [] },
+    data: {
+      total_events: 0,
+      total_24h: 0,
+      total_1h: 0,
+      rule_count: 0,
+      by_category: [],
+      by_category_1h: [],
+    },
   });
   vi.spyOn(api, 'getWafRules').mockResolvedValue({ data: { rules: [], total: 0, enabled: 0 } });
   vi.spyOn(api, 'getBlocklistStatus').mockResolvedValue({
@@ -81,8 +88,53 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   clusterStatus.set(null);
   auth.set({ status: 'unauthenticated' });
+});
+
+/** The figure on the stat card labelled `label`. */
+function statValue(label: string): string | null | undefined {
+  return screen.getByText(label).closest('.stat-card')?.querySelector('.stat-value')?.textContent;
+}
+
+describe('Security page, WAF counters', () => {
+  const counters = {
+    total_events: 100000,
+    total_24h: 4200,
+    total_1h: 640,
+    rule_count: 40,
+    by_category: [{ category: 'xss', count: 100000 }],
+    by_category_1h: [{ category: 'xss', count: 640 }],
+  };
+
+  it('shows the last hour, the last day and the stored total, labelled apart', async () => {
+    vi.spyOn(api, 'getWafStats').mockResolvedValue({ data: counters });
+    render(Security);
+
+    await waitFor(() => expect(statValue('Events (1h)')).toBe('640'));
+    expect(statValue('Events (24h)')).toBe('4200');
+    expect(statValue('Stored events')).toBe('100000');
+    expect(screen.getByText('Stored events').closest('.stat-card')).toHaveAttribute(
+      'title',
+      expect.stringContaining('retention'),
+    );
+    expect(screen.queryByText('Total Events')).toBeNull();
+  });
+
+  it('re-reads the counters so the windows roll without a click', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const stats = vi
+      .spyOn(api, 'getWafStats')
+      .mockResolvedValueOnce({ data: counters })
+      .mockResolvedValue({ data: { ...counters, total_1h: 3 } });
+    render(Security);
+    await waitFor(() => expect(statValue('Events (1h)')).toBe('640'));
+
+    await vi.advanceTimersByTimeAsync(30000);
+    await waitFor(() => expect(statValue('Events (1h)')).toBe('3'));
+    expect(stats).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('Security page, fan-in backup verdict', () => {

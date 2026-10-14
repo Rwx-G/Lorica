@@ -195,9 +195,22 @@ enum AuditWrite {
 }
 
 /// Aggregated WAF-event statistics returned by
-/// [`LogStore::waf_event_stats`]: `(total, total_24h, by_category)`
-/// where `by_category` is `(category, count)` pairs sorted high-to-low.
-pub type WafEventStats = (u64, u64, Vec<(String, u64)>);
+/// [`LogStore::waf_event_stats`]. Every `by_category*` list is
+/// `(category, count)` pairs sorted high-to-low.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WafEventStats {
+    /// Rows in the table, which `waf_event_retention` caps: once the cap
+    /// is reached this plateaus near it and stops carrying signal.
+    pub total: u64,
+    /// Rows stamped within the last 24 hours.
+    pub total_24h: u64,
+    /// Rows stamped within the last hour.
+    pub total_1h: u64,
+    /// Per-category counts over the whole table.
+    pub by_category: Vec<(String, u64)>,
+    /// Per-category counts over the last hour.
+    pub by_category_1h: Vec<(String, u64)>,
+}
 
 /// What one retention pass removed, and how much of it the fan-in drain
 /// had not sent yet (backlog #76).
@@ -1237,41 +1250,78 @@ impl LogStore {
         Ok(events)
     }
 
-    /// Summarise WAF events via SQL aggregation : total count, rolling
-    /// 24h count, and per-category counts (sorted high-to-low). Used by
-    /// `/api/v1/waf/stats` so the stats are accurate regardless
-    /// of table size. The previous implementation loaded up to
-    /// 10 000 rows into memory to `.len()` them, which capped
-    /// the dashboard counter at 10 000 once the retention window
-    /// (100 000 rows) was in use.
+    /// Rows stamped at or after `?1`. RFC 3339 TEXT compares
+    /// lexicographically, so the bound rides `idx_waf_events_timestamp`
+    /// and the count reads the window's rows, not the table.
+    const WAF_EVENTS_SINCE_SQL: &'static str =
+        "SELECT COUNT(*) FROM waf_events WHERE timestamp >= ?1";
+
+    /// [`Self::WAF_EVENTS_SINCE_SQL`] per category.
     ///
-    /// Returns `(total, total_24h, by_category)`. Once
-    /// `waf_event_retention` caps the table, `total` plateaus near the
-    /// cap and stops carrying signal ; `total_24h` counts only rows
-    /// with a `timestamp` within the last 24 hours. RFC3339 TEXT
-    /// compares lexicographically, so the `timestamp >= ?` bound rides
-    /// the existing `idx_waf_events_timestamp` index.
+    /// `INDEXED BY` because left to itself the planner walks the whole
+    /// table through `idx_waf_events_category` to get the groups
+    /// presorted, which on a full retention table costs every row to
+    /// save sorting the few categories of one hour.
+    const WAF_CATEGORIES_SINCE_SQL: &'static str =
+        "SELECT category, COUNT(*) FROM waf_events INDEXED BY idx_waf_events_timestamp
+         WHERE timestamp >= ?1 GROUP BY category ORDER BY 2 DESC";
+
+    /// Summarise WAF events via SQL aggregation: the table's row count,
+    /// the rows of the last 24 hours and of the last hour, and the
+    /// per-category counts over the table and over the last hour. Used
+    /// by `/api/v1/waf/stats` so the stats are accurate regardless of
+    /// table size. The previous implementation loaded up to 10 000 rows
+    /// into memory to `.len()` them, which capped the dashboard counter
+    /// at 10 000 once the retention window (100 000 rows) was in use.
+    ///
+    /// The windowed figures are the ones that keep carrying signal once
+    /// `waf_event_retention` caps the table (see [`WafEventStats`]).
     pub fn waf_event_stats(&self) -> Result<WafEventStats, String> {
         let conn = self.conn.lock();
+        let now = chrono::Utc::now();
+        let cutoff_24h: String = (now - chrono::Duration::hours(24)).to_rfc3339();
+        let cutoff_1h: String = (now - chrono::Duration::hours(1)).to_rfc3339();
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM waf_events", [], |row| row.get(0))
             .map_err(|e| format!("failed to count WAF events: {e}"))?;
-        let cutoff_24h: String = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
         let total_24h: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM waf_events WHERE timestamp >= ?1",
-                params![cutoff_24h],
-                |row| row.get(0),
-            )
+            .query_row(Self::WAF_EVENTS_SINCE_SQL, params![cutoff_24h], |row| {
+                row.get(0)
+            })
             .map_err(|e| format!("failed to count 24h WAF events: {e}"))?;
+        let total_1h: i64 = conn
+            .query_row(Self::WAF_EVENTS_SINCE_SQL, params![cutoff_1h], |row| {
+                row.get(0)
+            })
+            .map_err(|e| format!("failed to count 1h WAF events: {e}"))?;
+        let by_category = Self::waf_categories(
+            &conn,
+            "SELECT category, COUNT(*) FROM waf_events
+             GROUP BY category ORDER BY 2 DESC",
+            &[],
+        )?;
+        let by_category_1h =
+            Self::waf_categories(&conn, Self::WAF_CATEGORIES_SINCE_SQL, &[&cutoff_1h])?;
+        Ok(WafEventStats {
+            total: total as u64,
+            total_24h: total_24h as u64,
+            total_1h: total_1h as u64,
+            by_category,
+            by_category_1h,
+        })
+    }
+
+    /// The `(category, count)` rows `sql` answers.
+    fn waf_categories(
+        conn: &Connection,
+        sql: &str,
+        binds: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<(String, u64)>, String> {
         let mut stmt = conn
-            .prepare(
-                "SELECT category, COUNT(*) FROM waf_events
-                 GROUP BY category ORDER BY 2 DESC",
-            )
+            .prepare(sql)
             .map_err(|e| format!("failed to prepare WAF stats query: {e}"))?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(binds, |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
             })
             .map_err(|e| format!("failed to query WAF stats: {e}"))?;
@@ -1279,13 +1329,13 @@ impl LogStore {
         for r in rows {
             by_category.push(r.map_err(|e| format!("failed to read WAF stats row: {e}"))?);
         }
-        Ok((total as u64, total_24h as u64, by_category))
+        Ok(by_category)
     }
 
     /// [`LogStore::waf_event_stats`], answered from the last
     /// computation while it is younger than `max_age`.
     ///
-    /// The aggregates are two `COUNT(*)` passes and a `GROUP BY` over
+    /// The aggregates include a `COUNT(*)` and a `GROUP BY` over
     /// the whole retained table under the connection mutex the access
     /// log writer and the audit drain share, and a caller polling them
     /// (a model asking the automation plane in a loop) paid that per
@@ -3213,7 +3263,8 @@ mod waf_stats_tests {
             };
             store.insert_waf_event(&mk_event(i, cat)).expect("insert");
         }
-        let (total, _total_24h, by_cat) = store.waf_event_stats().expect("stats");
+        let stats = store.waf_event_stats().expect("stats");
+        let (total, by_cat) = (stats.total, stats.by_category);
         assert_eq!(total, n as u64, "total must reflect the full table");
         let sum: u64 = by_cat.iter().map(|(_, c)| c).sum();
         assert_eq!(sum, n as u64, "per-category counts must sum to total");
@@ -3234,7 +3285,8 @@ mod waf_stats_tests {
         store
             .insert_waf_event(&mk_event(2, lorica_waf::RuleCategory::SqlInjection))
             .expect("insert");
-        let (total, _total_24h, by_cat) = store.waf_event_stats().expect("stats");
+        let stats = store.waf_event_stats().expect("stats");
+        let (total, by_cat) = (stats.total, stats.by_category);
         assert_eq!(total, 4);
         assert_eq!(by_cat.len(), 2);
         // XSS first (3 > 1).
@@ -3249,7 +3301,10 @@ mod waf_stats_tests {
         store
             .insert_waf_event(&mk_event(1, lorica_waf::RuleCategory::Xss))
             .expect("insert");
-        assert_eq!(store.waf_event_stats_within(an_hour).expect("stats").0, 1);
+        assert_eq!(
+            store.waf_event_stats_within(an_hour).expect("stats").total,
+            1
+        );
 
         // A row recorded inside the window does not move the cached
         // answer: the table is not scanned again.
@@ -3257,8 +3312,8 @@ mod waf_stats_tests {
             .insert_waf_event(&mk_event(2, lorica_waf::RuleCategory::SqlInjection))
             .expect("insert");
         let cached = store.waf_event_stats_within(an_hour).expect("stats");
-        assert_eq!(cached.0, 1);
-        assert_eq!(cached.2.len(), 1);
+        assert_eq!(cached.total, 1);
+        assert_eq!(cached.by_category.len(), 1);
 
         // An answer older than the age asked for is recomputed, and is
         // what the uncached aggregate says.
@@ -3266,23 +3321,23 @@ mod waf_stats_tests {
             .waf_event_stats_within(std::time::Duration::ZERO)
             .expect("stats");
         assert_eq!(fresh, store.waf_event_stats().expect("stats"));
-        assert_eq!(fresh.0, 2);
+        assert_eq!(fresh.total, 2);
 
         // A clear never reads as the counts it emptied.
         store.clear_waf_events().expect("clear");
         assert_eq!(
             store.waf_event_stats_within(an_hour).expect("stats"),
-            (0, 0, Vec::new())
+            WafEventStats::default()
         );
     }
 
     #[test]
     fn waf_event_stats_on_empty_table() {
         let (store, _dir) = tmp_store();
-        let (total, total_24h, by_cat) = store.waf_event_stats().expect("stats");
-        assert_eq!(total, 0);
-        assert_eq!(total_24h, 0);
-        assert!(by_cat.is_empty());
+        assert_eq!(
+            store.waf_event_stats().expect("stats"),
+            WafEventStats::default()
+        );
     }
 
     /// Backlog #44 : with `waf_event_retention` capping the table,
@@ -3308,9 +3363,84 @@ mod waf_stats_tests {
             store.insert_waf_event(&ev).expect("insert recent");
         }
 
-        let (total, total_24h, _by_cat) = store.waf_event_stats().expect("stats");
-        assert_eq!(total, 7, "total must reflect the whole table");
-        assert_eq!(total_24h, 3, "total_24h must count only rows within 24h");
+        let stats = store.waf_event_stats().expect("stats");
+        assert_eq!(stats.total, 7, "total must reflect the whole table");
+        assert_eq!(
+            stats.total_24h, 3,
+            "total_24h must count only rows within 24h"
+        );
+    }
+
+    /// The dashboard's headline figure is the last hour: rows just
+    /// inside it count, rows just outside it do not, and the
+    /// per-category breakdown covers the same rows while `by_category`
+    /// keeps covering the whole table.
+    #[test]
+    fn waf_event_stats_counts_the_last_hour() {
+        let (store, _dir) = tmp_store();
+        let now = chrono::Utc::now();
+        let insert = |ago: chrono::Duration, category: lorica_waf::RuleCategory| {
+            let mut ev = mk_event(1, category);
+            ev.timestamp = (now - ago).to_rfc3339();
+            store.insert_waf_event(&ev).expect("insert");
+        };
+        for _ in 0..2 {
+            insert(chrono::Duration::minutes(59), lorica_waf::RuleCategory::Xss);
+        }
+        insert(
+            chrono::Duration::seconds(5),
+            lorica_waf::RuleCategory::SqlInjection,
+        );
+        for _ in 0..4 {
+            insert(
+                chrono::Duration::minutes(61),
+                lorica_waf::RuleCategory::PathTraversal,
+            );
+        }
+        insert(chrono::Duration::days(2), lorica_waf::RuleCategory::Xss);
+
+        let stats = store.waf_event_stats().expect("stats");
+        assert_eq!(stats.total, 8);
+        assert_eq!(stats.total_24h, 7);
+        assert_eq!(stats.total_1h, 3);
+        assert_eq!(
+            stats.by_category_1h,
+            vec![("xss".to_string(), 2), ("sql_injection".to_string(), 1)]
+        );
+        assert_eq!(stats.by_category[0], ("path_traversal".to_string(), 4));
+        assert_eq!(stats.by_category.iter().map(|(_, n)| n).sum::<u64>(), 8);
+    }
+
+    /// The windowed reads are what keep the dashboard cheap on a full
+    /// retention table: they must seek the timestamp index to the
+    /// window's first row and read only the window, never the table.
+    #[test]
+    fn the_windowed_waf_counts_ride_the_timestamp_index() {
+        let (store, _dir) = tmp_store();
+        let cutoff = "2026-10-14T11:00:00+00:00";
+        for sql in [
+            LogStore::WAF_EVENTS_SINCE_SQL,
+            LogStore::WAF_CATEGORIES_SINCE_SQL,
+        ] {
+            let conn = store.conn.lock();
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("the statement plans");
+            let plan = stmt
+                .query_map([cutoff], |row| row.get::<_, String>(3))
+                .expect("the plan runs")
+                .map(|d| d.expect("a plan row"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            assert!(
+                plan.contains("idx_waf_events_timestamp (timestamp>?)"),
+                "{sql} does not seek the timestamp index: {plan}"
+            );
+            assert!(
+                !plan.contains("SCAN waf_events"),
+                "{sql} scans the table: {plan}"
+            );
+        }
     }
 }
 

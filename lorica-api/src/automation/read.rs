@@ -557,7 +557,7 @@ pub const WAF_STATS_MAX_AGE: std::time::Duration = std::time::Duration::from_sec
 ///
 /// One summary object, the dashboard's, with its persistent counters
 /// up to [`WAF_STATS_MAX_AGE`] old. Not paginated and not a collection:
-/// its only array is the count per rule category, a fixed vocabulary of
+/// its only arrays are counts per rule category, a fixed vocabulary of
 /// rule families rather than a row set that grows with traffic.
 ///
 /// # Errors

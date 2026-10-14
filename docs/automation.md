@@ -788,7 +788,7 @@ nothing else:
 |---|---|---|
 | `/automation/v1/logs` | `logs:read` | Access-log rows, newest first, with the filters the dashboard offers; `before_id` walks back by keyset. |
 | `/automation/v1/waf/events` | `waf:read` | Recent WAF matches, newest first, optionally one category. |
-| `/automation/v1/waf/stats` | `waf:read` | Totals, the 24 h count, the loaded rule count, the count per category, up to five seconds old. |
+| `/automation/v1/waf/stats` | `waf:read` | Totals, the 24 h and 1 h counts, the loaded rule count, the count per category over all events held and over the last hour, up to five seconds old. |
 | `/automation/v1/sla/overview` | `sla:read` | The 1 h and 24 h passive windows for every route. |
 | `/automation/v1/sla/routes/{id}` | `sla:read` | One route's passive windows (1 h, 24 h, 7 d, 30 d). |
 | `/automation/v1/cluster/status` | `cluster:read` | This node's role, build, applied generation and hash. |
@@ -851,7 +851,7 @@ every row recorded between two calls; `after_id` bounds the other end,
 for a caller tailing new rows. `next_cursor` appears on `/logs` alone.
 
 **The WAF counters are up to five seconds old.** `/waf/stats` counts
-the whole retained table (three aggregate passes under the log store's
+the whole retained table (aggregate passes under the log store's
 one connection, which the access-log writer and the audit drain share),
 and a caller polling it paid that per call. The plane answers the
 counters it computed within the last `WAF_STATS_MAX_AGE`

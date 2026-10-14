@@ -11,8 +11,10 @@ Author: Rwx-G
 
 ### Added
 
+- **`GET /api/v1/waf/stats` and `/automation/v1/waf/stats` report `total_1h` and `by_category_1h`**, the WAF events and their categories over the last hour.
 ### Changed
 
+- **The dashboard's WAF counts are rolling windows.** The Overview's WAF card and its top category count the last hour instead of every stored event. The Security page shows the last hour, the last 24 hours and the stored events, labelled as bounded by `waf_event_retention`, and refreshes them every 30 seconds instead of only on load. Without a log store, the hour and day counts come from per-minute counters and are no longer bounded by the engine's 500-event ring, which is what made a node whose store failed to open show 500.
 - **A node that cannot open `access-log.db` keeps serving, and says so everywhere.** Whatever the cause (a corrupt file, a full disk, permissions, or the 1.6.0 schema defect under Fixed), the failure is logged at ERROR in every process instead of one WARN line at start; `lorica_log_store_up{role,worker_id}` reads 0 for each process without a store, so `min(lorica_log_store_up) == 0` is a node-level alert; the notification channels receive `log_store_unavailable` when an outage starts and `log_store_recovered` when it ends, once each (a "Log persistence lost / restored" toggle in Settings > Notifications); every dashboard page shows a red banner naming the cause; and `GET /api/v1/status` gains `log_store {persisting, cause}`. Every process retries the open every 60 s and resumes persisting audit rows, access logs and WAF events without a restart. Rows produced during an outage are not recovered.
 ### Fixed
 

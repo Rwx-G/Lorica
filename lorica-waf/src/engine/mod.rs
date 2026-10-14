@@ -29,11 +29,14 @@
 //!   the associated pattern/size caps.
 //! - [`url_decode`] - recursive URL decoding helpers used by the hot
 //!   path.
+//! - [`window`] - per-minute event counts over the last day, beside
+//!   the bounded recent-event ring.
 
 mod custom_rules;
 mod eval;
 mod types;
 mod url_decode;
+mod window;
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -44,19 +47,23 @@ use crate::ip_blocklist::IpBlocklist;
 use crate::rules::RuleSet;
 
 pub use types::{CustomRule, RuleSummary, WafEvent, WafMode, WafVerdict};
+pub use window::{WindowCounts, LONGEST_EVENT_WINDOW};
 
 /// WAF engine with precompiled rules, IP blocklist, and event ring buffer.
 ///
 /// Cheap to share across worker threads behind an `Arc`: all mutable
 /// state (disabled rule set, custom rules, event buffer, blocklist) is
 /// behind interior locks. The recent-event buffer is bounded to 500
-/// entries; older events are dropped FIFO.
+/// entries; older events are dropped FIFO. Every recorded event is also
+/// counted per minute, so [`Self::event_counts_within`] is exact over
+/// its window however many events the ring has dropped.
 pub struct WafEngine {
     pub(super) ruleset: RuleSet,
     pub(super) disabled_rules: RwLock<HashSet<u32>>,
     pub(super) custom_rules: RwLock<Vec<(CustomRule, regex::Regex)>>,
     pub(super) event_buffer: Arc<Mutex<VecDeque<WafEvent>>>,
     pub(super) max_events: usize,
+    event_window: Mutex<window::EventWindow>,
     /// IP address blocklist (e.g. Data-Shield IPv4 Blocklist).
     pub(super) ip_blocklist: IpBlocklist,
     /// Two-phase prefilter (PERF-9): an Aho-Corasick automaton over a
@@ -79,6 +86,7 @@ impl WafEngine {
             custom_rules: RwLock::new(Vec::new()),
             event_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(500))),
             max_events: 500,
+            event_window: Mutex::new(window::EventWindow::new()),
             ip_blocklist: IpBlocklist::new(),
             prefilter: crate::prefilter::Prefilter::build(),
         }
@@ -109,11 +117,48 @@ impl WafEngine {
             route_hostname: String::new(),
             action: String::new(),
         };
-        let mut buf = self.event_buffer.lock();
-        if buf.len() >= self.max_events {
-            buf.pop_front();
+        self.record_events(vec![event]);
+    }
+
+    /// Record `events`: count each in the per-minute window, then append
+    /// them to the recent-event ring, dropping its oldest entries past
+    /// capacity.
+    ///
+    /// Every event the engine produces goes through here. A process
+    /// that receives events another engine produced (the supervisor,
+    /// from its workers) records them here too, so its windowed counts
+    /// cover them.
+    pub fn record_events(&self, events: Vec<WafEvent>) {
+        let now = chrono::Utc::now();
+        {
+            let mut window = self.event_window.lock();
+            for event in &events {
+                window.record(&event.timestamp, event.category.as_str(), now);
+            }
         }
-        buf.push_back(event);
+        let mut buf = self.event_buffer.lock();
+        for event in events {
+            if buf.len() >= self.max_events {
+                buf.pop_front();
+            }
+            buf.push_back(event);
+        }
+    }
+
+    /// Events recorded over the last `window` (at most
+    /// [`LONGEST_EVENT_WINDOW`]), in total and per category, at minute
+    /// resolution and unbounded by the recent-event ring.
+    pub fn event_counts_within(&self, window: std::time::Duration) -> WindowCounts {
+        self.event_window
+            .lock()
+            .counts_within(window, chrono::Utc::now())
+    }
+
+    /// Forget every recorded event: the recent-event ring and the
+    /// windowed counts alike.
+    pub fn clear_events(&self) {
+        self.event_window.lock().clear();
+        self.event_buffer.lock().clear();
     }
 
     /// Return a reference to the event buffer for dashboard consumption.

@@ -212,7 +212,7 @@ mod tests {
         // are populated (bounded to keep a regression from hanging).
         for _ in 0..100 {
             let accesses = store.count().unwrap_or(0);
-            let (waf_total, _, _) = store.waf_event_stats().unwrap_or((0, 0, vec![]));
+            let waf_total = store.waf_event_stats().map_or(0, |stats| stats.total);
             if accesses == 10 && waf_total == 1 {
                 return;
             }

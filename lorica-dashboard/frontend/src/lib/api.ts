@@ -2122,10 +2122,15 @@ export interface WafCategoryCount {
 }
 
 export interface WafStatsResponse {
+  /** Events held: the retained table, or the in-memory ring without a log store. */
   total_events: number;
   total_24h: number;
+  total_1h: number;
   rule_count: number;
+  /** Over the events `total_events` counts. */
   by_category: WafCategoryCount[];
+  /** Over the last hour, the window `total_1h` counts. */
+  by_category_1h: WafCategoryCount[];
 }
 
 export interface WafRuleSummary {

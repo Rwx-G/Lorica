@@ -2082,16 +2082,47 @@ paths:
                         type: integer
                         format: int64
                         description: >-
-                          Total persisted WAF events. Plateaus near
+                          WAF events held. With the log store, the
+                          persisted rows, which plateau near
                           waf_event_retention once the cap is reached.
+                          Without it, the engine's recent-event ring
+                          since the process started, a few hundred at
+                          most.
                       total_24h:
                         type: integer
                         format: int64
-                        description: WAF events recorded in the last 24 hours.
+                        description: >-
+                          WAF events recorded in the last 24 hours, not
+                          bounded by retention or by the ring.
+                      total_1h:
+                        type: integer
+                        format: int64
+                        description: >-
+                          WAF events recorded in the last hour, not
+                          bounded by retention or by the ring. Without
+                          the log store the window starts on a whole
+                          minute, so it may include up to one minute
+                          more.
                       rule_count:
                         type: integer
                       by_category:
                         type: array
+                        description: >-
+                          Count per category over the events held, the
+                          same set `total_events` counts. Highest first.
+                        items:
+                          type: object
+                          properties:
+                            category:
+                              type: string
+                            count:
+                              type: integer
+                              format: int64
+                      by_category_1h:
+                        type: array
+                        description: >-
+                          Count per category over the last hour, the
+                          same window `total_1h` counts. Highest first.
                         items:
                           type: object
                           properties:

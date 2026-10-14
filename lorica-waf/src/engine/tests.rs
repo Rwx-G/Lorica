@@ -261,6 +261,85 @@ fn test_clean_request_no_events() {
     assert_eq!(e.event_count(), 0);
 }
 
+fn event_at(timestamp: String, category: RuleCategory) -> WafEvent {
+    WafEvent {
+        rule_id: 1,
+        description: "test".into(),
+        category,
+        severity: 3,
+        matched_field: "uri".into(),
+        matched_value: "x".into(),
+        timestamp,
+        client_ip: "192.0.2.10".into(),
+        route_hostname: "example.com".into(),
+        action: "blocked".into(),
+    }
+}
+
+#[test]
+fn windowed_counts_are_not_bounded_by_the_ring() {
+    let e = engine();
+    let now = chrono::Utc::now().to_rfc3339();
+    let recorded = e.max_events * 3 + 7;
+    e.record_events(
+        (0..recorded)
+            .map(|_| event_at(now.clone(), RuleCategory::Xss))
+            .collect(),
+    );
+    e.record_events(vec![event_at(now, RuleCategory::SqlInjection)]);
+
+    assert_eq!(e.event_count(), e.max_events);
+    let hour = e.event_counts_within(std::time::Duration::from_secs(3600));
+    assert_eq!(hour.total, recorded as u64 + 1);
+    assert_eq!(
+        hour.by_category,
+        vec![
+            ("xss".to_string(), recorded as u64),
+            ("sql_injection".to_string(), 1)
+        ]
+    );
+}
+
+#[test]
+fn windowed_counts_place_an_event_at_its_own_stamp() {
+    let e = engine();
+    let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    e.record_events(vec![event_at(two_hours_ago, RuleCategory::Xss)]);
+    assert_eq!(
+        e.event_counts_within(std::time::Duration::from_secs(3600))
+            .total,
+        0
+    );
+    assert_eq!(e.event_counts_within(LONGEST_EVENT_WINDOW).total, 1);
+}
+
+#[test]
+fn evaluated_and_blocklisted_events_are_counted_and_a_clear_forgets_them() {
+    let e = engine();
+    e.evaluate(
+        WafMode::Detection,
+        "/search",
+        Some("q=1'+OR+1=1--"),
+        &[],
+        "example.com",
+        "10.0.0.1",
+    );
+    e.record_blocklist_event("192.0.2.10", "example.com", "/");
+    let day = e.event_counts_within(LONGEST_EVENT_WINDOW);
+    assert_eq!(day.total, e.event_count() as u64);
+    assert!(day
+        .by_category
+        .iter()
+        .any(|(category, count)| category == "ip_blocklist" && *count == 1));
+
+    e.clear_events();
+    assert_eq!(e.event_count(), 0);
+    assert_eq!(
+        e.event_counts_within(LONGEST_EVENT_WINDOW),
+        WindowCounts::default()
+    );
+}
+
 // --- URL decoding ---
 
 #[test]
