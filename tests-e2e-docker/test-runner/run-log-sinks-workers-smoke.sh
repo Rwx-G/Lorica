@@ -18,16 +18,28 @@
 # The supervisor proxies nothing, so it has no access event of its own:
 # every `kind="access"` sample it reports came from a worker report.
 #
+# Every request carries its phase as its first path segment
+# (`/warmup/1`, `/burst/1`, `/pad/1aaa...`), which the frame body repeats
+# in its `path` (the query string is not logged), so each phase's frames
+# are counted on their own and per worker PID.
+#
 #   sent       lorica_log_sink_sent_total{sink="syslog",kind="access"}
 #              equals the number of access frames the collector received,
-#              and those frames carry at least two distinct worker PIDs:
-#              the supervisor reports the SUM, not one worker's share.
-#              The OTLP lane's series reads the same request count.
-#   truncated  lorica_log_sink_truncated_total{sink="syslog"} counts the
-#              one access message cut to the stream size ceiling.
-#   dropped    with the collector re-pointed at a dead port, the access
-#              events the workers shed reach
-#              lorica_log_sink_dropped_total{sink="syslog",kind="access"}.
+#              those frames carry at least two distinct worker PIDs, and
+#              the count exceeds the largest single PID's share: the
+#              supervisor reports the SUM, not one worker's share. The
+#              OTLP lane's series grows by the request count.
+#   truncated  lorica_log_sink_truncated_total{sink="syslog"} equals the
+#              number of oversized access frames, which carry at least
+#              two PIDs and exceed the largest PID's share: the sum again.
+#   dropped    with the collector re-pointed at a dead port,
+#              lorica_log_sink_dropped_total{sink="syslog",kind="access"}
+#              grows by exactly the number of shed access events. Nothing
+#              reaches the collector in that phase, so the per-worker
+#              split is not observable: this proves the family propagates
+#              every worker's drops, not that a max-style aggregation
+#              would be caught on it. Summation is proven on the two
+#              families above, which share the aggregation path.
 # =============================================================================
 
 set -eu
@@ -49,11 +61,16 @@ HOST="log-sinks-workers.local"
 # concurrency is what spreads the connections over them.
 FIRE=40
 DEAD_FIRE=20
-# The stream transport cuts a message body at 7168 bytes; a query string
-# past that guarantees one truncated access message.
+# Requests per probe round: the warm-up, the oversized rounds and the
+# dead-endpoint probe each repeat a round until the property they wait
+# for shows, instead of sleeping a fixed time.
+ROUND=8
+MAX_ROUNDS=30
+# The stream transport cuts a message body at 7168 bytes; a path past
+# that guarantees a truncated access message. It has to be the path: the
+# access event logs `uri.path()`, so a long query string never reaches
+# the body.
 OVERSIZE_PAD=7500
-# A configuration write reaches the workers over the supervisor RPC.
-SETTLE=5
 
 # Sum of one counter family's samples on the supervisor's /metrics,
 # keeping only the samples that carry every label given after the name.
@@ -69,23 +86,60 @@ metric_sum() {
     printf '%s\n' "$lines" | awk 'NF {sum += $NF} END {printf "%d", sum}'
 }
 
-# The PID field of every access frame the collector holds, one per line.
-# RFC 5424 header: <PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID.
-access_frame_pids() {
-    cat "$SYSLOG_DIR"/*.log 2>/dev/null \
-        | grep -aoE '<[0-9]+>1 [^ ]+ [^ ]+ lorica [0-9]+ access \[lorica@32473' \
-        | awk '{print $5}' || true
+# metric_sum, read every 2s until two reads agree: the value once the
+# workers have stopped moving it, used as a baseline.
+settled_metric_sum() {
+    local prev cur i
+    prev=$(metric_sum "$@")
+    cur="$prev"
+    for i in $(seq 1 15); do
+        sleep 2
+        cur=$(metric_sum "$@")
+        [ "$cur" = "$prev" ] && break
+        prev="$cur"
+    done
+    printf '%s' "$cur"
 }
 
-# Fire N requests at once and print how many did not answer 200.
+# One line per access frame the collector holds: "<pid> <tag> <status>".
+# RFC 5424 header: <PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID. The
+# JSON body holds no `<`, so a frame runs up to the next header. The tag
+# is the request path's first segment; the status is "-" where the body was cut
+# before it (the oversized frames). The patterns are strings, not
+# /regex/ literals: busybox awk ends a literal at the `/` inside `[/]`.
+access_frames() {
+    cat "$SYSLOG_DIR"/*.log 2>/dev/null \
+        | grep -aoE '<[0-9]+>1 [^ ]+ [^ ]+ lorica [0-9]+ access [^<]*' \
+        | awk '{
+            tag = "-"
+            if (match($0, "\"path\":\"/[a-z]+/")) tag = substr($0, RSTART + 9, RLENGTH - 10)
+            status = "-"
+            if (match($0, "\"status\":[0-9]+")) status = substr($0, RSTART + 9, RLENGTH - 9)
+            print $5, tag, status
+        }' || true
+}
+
+# The frames of one tag, or of every tag when the argument is empty.
+frames_tagged() {
+    access_frames | awk -v tag="$1" 'tag == "" || $2 == tag'
+}
+
+# Filters over frame lines on stdin.
+count_lines() { wc -l | tr -d ' '; }
+distinct_pids() { awk '{print $1}' | sort -u | wc -l | tr -d ' '; }
+largest_share() { awk '{n[$1]++} END {m = 0; for (p in n) if (n[p] > m) m = n[p]; print m}'; }
+per_pid() { awk '{n[$1]++} END {for (p in n) printf "%s from pid %s; ", n[p], p}'; }
+
+# Fire N requests at once, each to `/<tag>/<i><suffix>`, and print
+# how many did not answer 200.
 fire_parallel() {
-    local count="$1"
+    local count="$1" tag="$2" suffix="${3:-}"
     local codes
     codes=$(mktemp)
     local n
     for n in $(seq 1 "$count"); do
         curl -s -o /dev/null --max-time 30 -w '%{http_code}\n' \
-            -H "Host: $HOST" "${PROXY}/?n=$n" >> "$codes" 2>/dev/null &
+            -H "Host: $HOST" "${PROXY}/${tag}/${n}${suffix}" >> "$codes" 2>/dev/null &
     done
     wait || true
     grep -cv '^200$' "$codes" || true
@@ -166,7 +220,6 @@ SINKS_UPDATE=$(api_put /api/v1/settings "{
 assert_json "$SINKS_UPDATE" '.data.syslog_endpoint' "$SYSLOG_ENDPOINT" 'syslog sink configured'
 assert_json "$SINKS_UPDATE" '.data.syslog_transport' 'tcp' 'syslog transport is tcp'
 assert_json "$SINKS_UPDATE" '.data.otlp_logs_enabled' 'true' 'OTLP logs sink configured'
-sleep "$SETTLE"
 
 # --- Backend and route, WAF off: every request is one access event ---
 log "=== Log-sinks workers smoke: create route ==="
@@ -190,55 +243,80 @@ ROUTE=$(api_post /api/v1/routes "{
 ROUTE_ID=$(echo "$ROUTE" | jq -r '.data.id // empty')
 [ -n "$ROUTE_ID" ] || { fail "route create: $ROUTE"; exit 1; }
 ok "route created (id=$ROUTE_ID)"
-sleep "$SETTLE"
 
-# --- Drive traffic through the workers ---
-log "=== Log-sinks workers smoke: drive traffic ==="
-# One sequential request first, so a route that does not answer fails
-# here with its status rather than as a short frame count later.
-PROBE_CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $HOST" "${PROXY}/" 2>/dev/null || true)
-if [ "$PROBE_CODE" = "200" ]; then
-    ok "the route answers 200"
+# --- Warm-up: the route and the syslog sink on every worker ---
+log "=== Log-sinks workers smoke: wait for every worker ==="
+# The sink settings and the route reach each worker over the supervisor
+# RPC, each on its own schedule. A worker writes a frame with status 200
+# only once it holds both, so rounds go on until every worker has: from
+# then on no request is served without its frame, and the frames below
+# carry each worker's PID whatever way the burst spreads.
+READY=0
+for round in $(seq 1 "$MAX_ROUNDS"); do
+    fire_parallel "$ROUND" warmup >/dev/null
+    sleep 1
+    READY=$(frames_tagged warmup | awk '$3 == "200"' | distinct_pids)
+    [ "$READY" -ge "$WORKERS" ] && break
+done
+if [ "$READY" -ge "$WORKERS" ]; then
+    ok "$READY worker processes serve the route and feed the syslog sink"
 else
-    fail "the route answered '$PROBE_CODE'"
+    fail "$READY of $WORKERS worker processes wrote a 200 access frame after $MAX_ROUNDS rounds ($(frames_tagged warmup | per_pid))"
     print_results
 fi
 
-NON_200=$(fire_parallel "$FIRE")
+# The OTLP lane is observable only through the counter, so it is read
+# as a delta from a baseline taken once the warm-up has been counted.
+OTLP_BEFORE=$(settled_metric_sum lorica_log_sink_sent_total 'sink="otlp"' 'kind="access"')
+
+# --- Drive traffic through the workers ---
+log "=== Log-sinks workers smoke: drive traffic ==="
+NON_200=$(fire_parallel "$FIRE" burst)
 [ "$NON_200" = "0" ] && ok "$FIRE concurrent requests answered 200" \
     || fail "$NON_200/$FIRE concurrent requests did not answer 200"
 
+# Oversized requests, in rounds until their frames carry two PIDs, so
+# the truncated count is a sum over workers too.
 PAD=$(head -c "$OVERSIZE_PAD" /dev/zero | tr '\0' 'a')
-OVERSIZE_CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $HOST" \
-    "${PROXY}/?pad=${PAD}" 2>/dev/null || true)
-if [ -n "$OVERSIZE_CODE" ] && [ "$OVERSIZE_CODE" != "000" ]; then
-    ok "the oversized request was answered ($OVERSIZE_CODE)"
-else
-    fail "the oversized request got no answer"
-fi
-EXPECTED=$(( FIRE + 2 ))
+PAD_FIRED=0
+PAD_PIDS=0
+for round in $(seq 1 "$MAX_ROUNDS"); do
+    fire_parallel "$ROUND" pad "$PAD" >/dev/null
+    PAD_FIRED=$(( PAD_FIRED + ROUND ))
+    sleep 1
+    PAD_PIDS=$(frames_tagged pad | distinct_pids)
+    [ "$PAD_PIDS" -ge 2 ] && break
+done
 
 # --- sent: the supervisor reports the sum of every worker's share ---
 log "=== Log-sinks workers smoke: lorica_log_sink_sent_total aggregates ==="
-FRAMES=0
+BURST_FRAMES=0
+PAD_FRAMES=0
 for i in $(seq 1 30); do
-    FRAMES=$(access_frame_pids | wc -l | tr -d ' ')
-    [ "$FRAMES" -ge "$EXPECTED" ] && break
+    BURST_FRAMES=$(frames_tagged burst | count_lines)
+    PAD_FRAMES=$(frames_tagged pad | count_lines)
+    [ "$BURST_FRAMES" -ge "$FIRE" ] && [ "$PAD_FRAMES" -ge "$PAD_FIRED" ] && break
     sleep 1
 done
-if [ "$FRAMES" = "$EXPECTED" ]; then
-    ok "the syslog collector holds $FRAMES access frames, one per request"
+if [ "$BURST_FRAMES" = "$FIRE" ]; then
+    ok "the syslog collector holds $BURST_FRAMES burst access frames, one per request"
 else
-    fail "the syslog collector holds $FRAMES access frames, expected $EXPECTED"
+    fail "the syslog collector holds $BURST_FRAMES burst access frames, expected $FIRE"
+fi
+if [ "$PAD_FRAMES" = "$PAD_FIRED" ]; then
+    ok "the syslog collector holds $PAD_FRAMES oversized access frames, one per request"
+else
+    fail "the syslog collector holds $PAD_FRAMES oversized access frames, expected $PAD_FIRED"
 fi
 
-PER_PID=$(access_frame_pids | sort | uniq -c | awk '{printf "%s pid %s; ", $1, $2}')
-PIDS=$(access_frame_pids | sort -u | wc -l | tr -d ' ')
-LARGEST_SHARE=$(access_frame_pids | sort | uniq -c | awk 'BEGIN {m = 0} $1 > m {m = $1} END {print m}')
+FRAMES=$(frames_tagged "" | count_lines)
+PIDS=$(frames_tagged "" | distinct_pids)
+LARGEST_SHARE=$(frames_tagged "" | largest_share)
+PER_PID=$(frames_tagged "" | per_pid)
 if [ "$PIDS" -ge 2 ] && [ "$PIDS" -le "$WORKERS" ]; then
     ok "access frames came from $PIDS worker processes: ${PER_PID}"
 else
-    fail "access frames came from $PIDS process(es), expected 2 to $WORKERS (${PER_PID}); unless all $FIRE connections landed on one worker, the sum below proves nothing"
+    fail "access frames came from $PIDS process(es), expected 2 to $WORKERS (${PER_PID})"
 fi
 
 SENT=0
@@ -253,40 +331,68 @@ else
     fail "lorica_log_sink_sent_total{sink=\"syslog\",kind=\"access\"} reads $SENT, the collector holds $FRAMES (largest single worker share $LARGEST_SHARE)"
 fi
 
+OTLP_EXPECTED=$(( FIRE + PAD_FIRED ))
 OTLP_SENT=0
 for i in $(seq 1 30); do
-    OTLP_SENT=$(metric_sum lorica_log_sink_sent_total 'sink="otlp"' 'kind="access"')
-    [ "$OTLP_SENT" -ge "$EXPECTED" ] && break
+    OTLP_SENT=$(( $(metric_sum lorica_log_sink_sent_total 'sink="otlp"' 'kind="access"') - OTLP_BEFORE ))
+    [ "$OTLP_SENT" -ge "$OTLP_EXPECTED" ] && break
     sleep 1
 done
-if [ "$OTLP_SENT" = "$EXPECTED" ]; then
-    ok "lorica_log_sink_sent_total{sink=\"otlp\",kind=\"access\"} reads $OTLP_SENT on the supervisor, one per request"
+if [ "$OTLP_SENT" = "$OTLP_EXPECTED" ]; then
+    ok "lorica_log_sink_sent_total{sink=\"otlp\",kind=\"access\"} grew by $OTLP_SENT on the supervisor, one per request"
 else
-    fail "lorica_log_sink_sent_total{sink=\"otlp\",kind=\"access\"} reads $OTLP_SENT, expected $EXPECTED"
+    fail "lorica_log_sink_sent_total{sink=\"otlp\",kind=\"access\"} grew by $OTLP_SENT, expected $OTLP_EXPECTED"
 fi
 
-# --- truncated ---
+# --- truncated: the oversized frames, summed over workers ---
 log "=== Log-sinks workers smoke: lorica_log_sink_truncated_total aggregates ==="
+PAD_LARGEST_SHARE=$(frames_tagged pad | largest_share)
+PAD_PER_PID=$(frames_tagged pad | per_pid)
+if [ "$PAD_PIDS" -ge 2 ]; then
+    ok "oversized access frames came from $PAD_PIDS worker processes: ${PAD_PER_PID}"
+else
+    fail "oversized access frames came from $PAD_PIDS process(es) after $PAD_FIRED requests (${PAD_PER_PID})"
+fi
 TRUNCATED=0
 for i in $(seq 1 30); do
     TRUNCATED=$(metric_sum lorica_log_sink_truncated_total 'sink="syslog"')
-    [ "$TRUNCATED" -ge 1 ] && break
+    [ "$TRUNCATED" -ge "$PAD_FRAMES" ] && break
     sleep 1
 done
-if [ "$TRUNCATED" = "1" ]; then
-    ok "lorica_log_sink_truncated_total{sink=\"syslog\"} reads 1 on the supervisor, the oversized access message"
+if [ "$TRUNCATED" = "$PAD_FRAMES" ] && [ "$TRUNCATED" -gt "$PAD_LARGEST_SHARE" ]; then
+    ok "lorica_log_sink_truncated_total{sink=\"syslog\"} reads $TRUNCATED on the supervisor: the sum across workers, not one worker's $PAD_LARGEST_SHARE"
 else
-    fail "lorica_log_sink_truncated_total{sink=\"syslog\"} reads $TRUNCATED, expected 1"
+    fail "lorica_log_sink_truncated_total{sink=\"syslog\"} reads $TRUNCATED, the collector holds $PAD_FRAMES oversized frames (largest single worker share $PAD_LARGEST_SHARE)"
 fi
 
 # --- dropped: a dead collector, and the workers' sheds reach /metrics ---
 log "=== Log-sinks workers smoke: lorica_log_sink_dropped_total aggregates ==="
 DEAD_UPDATE=$(api_put /api/v1/settings "{\"syslog_endpoint\": \"${SYSLOG_HOST}:1\"}")
 assert_json "$DEAD_UPDATE" '.data.syslog_endpoint' "${SYSLOG_HOST}:1" 'syslog re-pointed at a dead port'
-sleep "$SETTLE"
-DROPPED_BEFORE=$(metric_sum lorica_log_sink_dropped_total 'sink="syslog"' 'kind="access"')
 
-NON_200=$(fire_parallel "$DEAD_FIRE")
+# A worker still on the live collector writes a frame for every request
+# it serves; probe rounds go on until two in a row leave none.
+CLEAN=0
+for round in $(seq 1 "$MAX_ROUNDS"); do
+    PROBE_BEFORE=$(frames_tagged deadprobe | count_lines)
+    fire_parallel "$ROUND" deadprobe >/dev/null
+    sleep 2
+    PROBE_AFTER=$(frames_tagged deadprobe | count_lines)
+    if [ "$PROBE_AFTER" = "$PROBE_BEFORE" ]; then
+        CLEAN=$(( CLEAN + 1 ))
+    else
+        CLEAN=0
+    fi
+    [ "$CLEAN" -ge 2 ] && break
+done
+if [ "$CLEAN" -ge 2 ]; then
+    ok "two probe rounds left no frame: the workers write to the dead port"
+else
+    fail "probe requests still reach the live collector after $MAX_ROUNDS rounds ($(frames_tagged deadprobe | per_pid))"
+fi
+DROPPED_BEFORE=$(settled_metric_sum lorica_log_sink_dropped_total 'sink="syslog"' 'kind="access"')
+
+NON_200=$(fire_parallel "$DEAD_FIRE" dead)
 [ "$NON_200" = "0" ] && ok "$DEAD_FIRE concurrent requests answered 200 with the collector dead" \
     || fail "$NON_200/$DEAD_FIRE concurrent requests failed with the collector dead"
 
@@ -296,10 +402,11 @@ for i in $(seq 1 30); do
     [ "$DROPPED" -ge "$DEAD_FIRE" ] && break
     sleep 1
 done
-if [ "$DROPPED" -ge "$DEAD_FIRE" ]; then
-    ok "lorica_log_sink_dropped_total{sink=\"syslog\",kind=\"access\"} grew by $DROPPED on the supervisor for $DEAD_FIRE shed access events"
+DEAD_FRAMES=$(frames_tagged dead | count_lines)
+if [ "$DROPPED" = "$DEAD_FIRE" ] && [ "$DEAD_FRAMES" = "0" ]; then
+    ok "lorica_log_sink_dropped_total{sink=\"syslog\",kind=\"access\"} grew by $DROPPED on the supervisor, one per shed access event"
 else
-    fail "lorica_log_sink_dropped_total{sink=\"syslog\",kind=\"access\"} grew by $DROPPED, expected at least $DEAD_FIRE"
+    fail "lorica_log_sink_dropped_total{sink=\"syslog\",kind=\"access\"} grew by $DROPPED for $DEAD_FIRE requests, $DEAD_FRAMES of which reached the collector"
 fi
 
 # --- Summary ---

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Run the Lorica E2E test suite with Docker Compose.
-# Usage: ./run.sh [--build] [--keep] [--skip-workers] [--skip-cert-export] [--skip-ai-bot] [--skip-rbac] [--skip-hot-upgrade] [--skip-log-sinks] [--skip-acme] [--skip-mcp]
+# Usage: ./run.sh [--build] [--keep] [--skip-workers] [--skip-cert-export]
+#                 [--skip-ai-bot] [--skip-rbac] [--skip-audit] [--skip-hot-upgrade]
+#                 [--skip-log-sinks] [--skip-log-sinks-workers] [--skip-acme]
+#                 [--skip-cluster] [--skip-capture] [--skip-capture-workers]
+#                 [--skip-mcp]
 #   --build             Force rebuild all images
 #   --keep              Don't tear down containers after tests
 #   --skip-workers      Skip worker isolation tests (faster)
@@ -362,16 +366,19 @@ fi
 # The sink counters are incremented in the workers, where the access
 # events are published, and the supervisor's /metrics reports them only
 # through the per-worker counter aggregation. The smoke compares the
-# supervisor's sent count with the frames the collector received from
-# at least two worker PIDs, then checks the truncated and dropped
-# families the same way. Opt-out via --skip-log-sinks-workers (default
-# ON); --skip-workers and --skip-log-sinks skip it too.
-if [ "$SKIP_LOG_SINKS_WORKERS" = false ] && [ "$SKIP_LOG_SINKS" = false ]     && [ "$SKIP_WORKERS" = false ] && [ "$EXIT_CODE" = "0" ]; then
+# supervisor's sent and truncated counts with the frames the collector
+# received from at least two worker PIDs, and checks that the dropped
+# family carries every shed event. Opt-out via --skip-log-sinks-workers
+# (default ON); --skip-workers and --skip-log-sinks skip it too.
+if [ "$SKIP_LOG_SINKS_WORKERS" = false ] && [ "$SKIP_LOG_SINKS" = false ] \
+    && [ "$SKIP_WORKERS" = false ] && [ "$EXIT_CODE" = "0" ]; then
     echo ""
     echo "=== Lorica E2E Tests (log-sinks profile, worker mode) ==="
     echo ""
 
-    docker compose --profile log-sinks-workers up $BUILD_FLAG -d         backend1 syslog-collector-log-sinks-workers otelcol-logs-log-sinks-workers         lorica-log-sinks-workers
+    docker compose --profile log-sinks-workers up $BUILD_FLAG -d \
+        backend1 syslog-collector-log-sinks-workers otelcol-logs-log-sinks-workers \
+        lorica-log-sinks-workers
 
     echo "Waiting for Lorica (log-sinks workers) to initialize..."
     for i in $(seq 1 60); do
