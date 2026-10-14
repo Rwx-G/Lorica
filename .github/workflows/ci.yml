@@ -527,32 +527,42 @@ jobs:
           echo "OK: chown fails soft under the shipped filter (no SIGSYS)"
 
   # The ownership repair in the postinst only acts on a host upgraded from
-  # a package built before 1.9.0, so it is tested on one: the released
-  # 1.8.0. 1.8.0 is pinned because it is the last affected release; a
-  # later one would not exercise the repair, and the script fails if the
-  # precondition does not hold. Whether the upgrade holds the service
-  # depends on whether an account has the uid those packages recorded as
-  # owner, so both cases run: on this runner, whose `runner` account is
-  # uid 1001, and in an Ubuntu container booted under systemd, which has
-  # no such account, as most upgraded hosts do not.
+  # a package built before 1.9.0, so it is tested on released ones, and
+  # the script fails if the precondition does not hold. 1.8.0 is the last
+  # affected release. 1.6.0 wrote the access-log.db schema every release
+  # from 1.7.0 to 1.9.1 failed to open, leaving the node running with no
+  # persistence: the 1.6.0 node writes audit rows before the upgrade, and
+  # every upgraded node must read them back and persist new ones.
+  # Whether the upgrade holds the service depends on whether an account
+  # has the uid those packages recorded as owner, so both cases run: on
+  # this runner, whose `runner` account is uid 1001, and in an Ubuntu
+  # container booted under systemd, which has no such account, as most
+  # upgraded hosts do not.
   test-deb-upgrade:
-    name: Test .deb upgrade from 1.8.0
+    name: Test .deb upgrade from ${{ matrix.old }}
     needs: build-and-package
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        old: ['1.6.0', '1.8.0']
+    env:
+      OLD: ${{ matrix.old }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: lorica-deb
           path: pkg/
-      - name: Download the released 1.8.0 .deb
+      - name: Download the released ${{ matrix.old }} .deb
         run: |
-          curl -fsSL --retry 3 -o pkg/lorica_1.8.0_amd64.deb \
-            https://github.com/Rwx-G/Lorica/releases/download/v1.8.0/lorica_1.8.0_amd64.deb
-      - name: Upgrade 1.8.0 on a host with the uid-1001 account (held)
+          mkdir -p old
+          curl -fsSL --retry 3 -o "old/lorica_${OLD}_amd64.deb" \
+            "https://github.com/Rwx-G/Lorica/releases/download/v${OLD}/lorica_${OLD}_amd64.deb"
+      - name: Upgrade ${{ matrix.old }} on a host with the uid-1001 account (held)
         run: |
-          new=$(ls pkg/lorica_*_amd64.deb | grep -v 'lorica_1\.8\.0_')
-          sudo bash dist/tests/deb-upgrade.sh upgrade-held pkg/lorica_1.8.0_amd64.deb "$new"
+          new=$(ls pkg/lorica_*_amd64.deb)
+          sudo bash dist/tests/deb-upgrade.sh upgrade-held "old/lorica_${OLD}_amd64.deb" "$new"
       - name: Boot Ubuntu under systemd, without a uid-1001 account
         run: |
           printf '%s\n' \
@@ -572,30 +582,38 @@ jobs:
           done
           echo "FAIL: systemd did not come up in the container"
           exit 1
-      - name: Upgrade 1.8.0 on a host without it (not held)
+      - name: Upgrade ${{ matrix.old }} on a host without it (not held)
         run: |
-          new=$(ls pkg/lorica_*_amd64.deb | grep -v 'lorica_1\.8\.0_')
+          new=$(ls pkg/lorica_*_amd64.deb)
           docker exec ubuntu bash /w/dist/tests/deb-upgrade.sh upgrade \
-            /w/pkg/lorica_1.8.0_amd64.deb "/w/$new"
+            "/w/old/lorica_${OLD}_amd64.deb" "/w/$new"
 
-  # 1.8.0's preun stops and disables the service on every upgrade, so the
-  # new package must start it from posttrans. That needs systemd, which a
-  # `container:` job does not boot: Fedora runs here under its own init,
-  # in a privileged container on the runner.
+  # The released packages' preun stops and disables the service on every
+  # upgrade, so the new package must start it from posttrans. That needs
+  # systemd, which a `container:` job does not boot: Fedora runs here
+  # under its own init, in a privileged container on the runner. The old
+  # versions are the deb job's, for the same reasons.
   test-rpm-upgrade:
-    name: Test .rpm upgrade from 1.8.0
+    name: Test .rpm upgrade from ${{ matrix.old }}
     needs: build-and-package
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        old: ['1.6.0', '1.8.0']
+    env:
+      OLD: ${{ matrix.old }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: lorica-rpm
           path: pkg/
-      - name: Download the released 1.8.0 .rpm
+      - name: Download the released ${{ matrix.old }} .rpm
         run: |
-          curl -fsSL --retry 3 -o pkg/lorica-1.8.0-1.x86_64.rpm \
-            https://github.com/Rwx-G/Lorica/releases/download/v1.8.0/lorica-1.8.0-1.x86_64.rpm
+          mkdir -p old
+          curl -fsSL --retry 3 -o "old/lorica-${OLD}-1.x86_64.rpm" \
+            "https://github.com/Rwx-G/Lorica/releases/download/v${OLD}/lorica-${OLD}-1.x86_64.rpm"
       - name: Boot Fedora under systemd
         run: |
           printf '%s\n' \
@@ -615,14 +633,16 @@ jobs:
           done
           echo "FAIL: systemd did not come up in the container"
           exit 1
-      - name: Upgrade 1.8.0, then reinstall over itself
+      - name: Upgrade ${{ matrix.old }}, then reinstall over itself
         run: |
-          new=$(ls pkg/lorica-*.rpm | grep -v 'lorica-1\.8\.0-')
+          new=$(ls pkg/lorica-*.rpm)
           docker exec fedora bash /w/dist/tests/rpm-upgrade.sh upgrade \
-            /w/pkg/lorica-1.8.0-1.x86_64.rpm "/w/$new"
+            "/w/old/lorica-${OLD}-1.x86_64.rpm" "/w/$new"
+      # Nothing in it depends on the old version: one matrix leg is enough.
       - name: Install on a clean host
+        if: matrix.old == '1.8.0'
         run: |
-          new=$(ls pkg/lorica-*.rpm | grep -v 'lorica-1\.8\.0-')
+          new=$(ls pkg/lorica-*.rpm)
           docker rm -f fedora
           docker run -d --name fedora --privileged --cgroupns=host \
             -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock \
