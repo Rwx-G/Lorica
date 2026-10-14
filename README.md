@@ -6,11 +6,11 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.9.1-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.9.2-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-3095-brightgreen.svg" alt="Lorica Tests">
-  <img src="https://img.shields.io/badge/Pingora%20Tests-779-blue.svg" alt="Inherited Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-3224-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Pingora%20Tests-782-blue.svg" alt="Inherited Tests">
 </p>
 
 ---
@@ -719,7 +719,7 @@ cargo build --release
 # Every Rust test in the workspace
 cargo test --workspace
 
-# Product crates only (3095 tests, Lorica-native)
+# Product crates only (3224 tests, Lorica-native)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
            -p lorica-command -p lorica-shmem \
@@ -728,7 +728,7 @@ cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-mcp -p lorica-automation-policy \
            --features otel
 
-# Pingora-forked crates (779 tests)
+# Pingora-forked crates (782 tests)
 cargo test -p lorica-core -p lorica-proxy -p lorica-http \
            -p lorica-error -p lorica-tls -p lorica-cache \
            -p lorica-pool -p lorica-runtime -p lorica-timeout \
@@ -740,7 +740,7 @@ cargo test -p lorica-core -p lorica-proxy -p lorica-http \
 # wire corpus (every message's encoding, pinned)
 cargo test -p lorica-cluster --tests
 
-# Frontend (524 Vitest cases across 26 files) and its gates
+# Frontend (538 Vitest cases across 29 files) and its gates
 cd lorica-dashboard/frontend && npm run check && npm run lint && npx vitest run
 ```
 
@@ -767,6 +767,7 @@ runs them all in sequence; each `--skip-<profile>` flag drops one.
 | audit | 17 | the hash chain, tamper localisation, role floors |
 | hot-upgrade | 29 | signature verification, socket handover, rollback of a failing binary |
 | log-sinks | 23 | RFC 5424 syslog over TCP and OTLP logs, delivered to real collectors |
+| log-sinks-workers | 21 | the same sinks under `--workers 2`: frames from both worker PIDs reach the collector, and the supervisor's sent, truncated and dropped counters are the sum across workers |
 | acme | 15 | HTTP-01 and manual DNS-01 issuance against the Pebble fixture |
 | capture | 163 | two-phase matching from two source addresses, a 10 MiB body truncated at the cap while the upstream still receives all of it, credential headers and named query parameters redacted on every sink, a binary body round-tripping through base64, the per-rule budget and the TTL each self-disabling their rule, the recent-captures ring, and an `output.dir` that is read-only and then writable |
 | capture-workers | 160 + 50 | the same profile under `--workers 2`, sharing the 163 assertions above behind a flag rather than forking them (three become ranges, because a budget is spent per worker), plus what only worker mode can show: the per-rule budget overshooting its total by at most the worker count, the recent-captures ring answering 503 rather than an empty 200, all four sinks fed from inside a worker, and the counters aggregating across workers on `/metrics` |

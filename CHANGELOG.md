@@ -11,6 +11,18 @@ Author: Rwx-G
 
 ### Added
 
+### Changed
+
+### Fixed
+
+### Removed
+
+### Security
+
+## [1.9.2] - 2026-10-14
+
+### Added
+
 - **`GET /api/v1/waf/stats` and `/automation/v1/waf/stats` report `total_1h` and `by_category_1h`**, the WAF events and their categories over the last hour.
 
 ### Changed
@@ -38,8 +50,6 @@ Author: Rwx-G
 - **Cluster units that commit a change are tracked, bounded and panic-safe.** Enrolment, renewal, leave, node and token mutations, break-glass and fleet bans run on a bounded tracker; a panic is logged at ERROR and recorded as an `<action>.incomplete` audit row instead of leaving the change unaudited, and shutdown waits for units in flight.
 - **In worker mode, notification channel, active probe and SLA edits apply when saved.** Since 1.3.0 the supervisor refreshed its own state only when a reload fell back to the legacy broadcast, which a successful two-phase reload never does, so alerts kept going to the old channels and probes and SLA thresholds stayed stale until a restart or an unrelated backend health flip. The supervisor now refreshes on every reload. Reloading notification channels also no longer drops the in-memory notification history or resets per-channel rate limits.
 - **Shutdown and the hot-upgrade drain wait for in-flight cluster changes,** up to a bounded grace, so they finish and write their audit rows.
-
-### Removed
 
 ### Security
 
