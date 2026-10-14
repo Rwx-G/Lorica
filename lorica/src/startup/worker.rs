@@ -187,6 +187,9 @@ pub(crate) fn run_worker(
 
     // Create shared WAF engine for worker (must be before command channel setup)
     let waf_engine = Arc::new(lorica_waf::WafEngine::new());
+    // Every event must reach the supervisor, which alerts and bans:
+    // number them from the first request on.
+    waf_engine.enable_forwarding();
     worker_restore_waf_state(&store, &waf_engine);
 
     // Start the command channel listener in a background thread
@@ -473,34 +476,49 @@ pub(crate) fn run_worker(
                 &worker_blocklist_tracker,
             );
 
-            // Forward WAF events to supervisor
+            // Forward WAF events to supervisor. A write error reconnects:
+            // forwarding is what alerts and auto-bans run on, so it must
+            // not stop for the life of the worker. The batch being
+            // written when the socket broke is lost, and logged.
             tokio::spawn(async move {
-                let stream = loop {
-                    match tokio::net::UnixStream::connect(&waf_sock_path_worker).await {
-                        Ok(s) => break s,
-                        Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
-                    }
-                };
-                let mut writer = tokio::io::BufWriter::new(stream);
-                let mut interval = tokio::time::interval(super::waf_forward::FORWARD_INTERVAL);
                 let mut cursor = super::waf_forward::WafForwardCursor::new();
                 loop {
-                    interval.tick().await;
-                    let events = cursor.take_batch(&waf_fwd_engine);
-                    if events.is_empty() {
-                        continue;
-                    }
-                    for event in &events {
-                        if let Some(line) = super::waf_forward::encode_forwarded_event(event) {
-                            if tokio::io::AsyncWriteExt::write_all(&mut writer, line.as_bytes())
-                                .await
-                                .is_err()
+                    let stream = loop {
+                        match tokio::net::UnixStream::connect(&waf_sock_path_worker).await {
+                            Ok(s) => break s,
+                            Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+                        }
+                    };
+                    let mut writer = tokio::io::BufWriter::new(stream);
+                    let mut interval = tokio::time::interval(super::waf_forward::FORWARD_INTERVAL);
+                    'forward: loop {
+                        interval.tick().await;
+                        let batch = cursor.take_batch(&waf_fwd_engine);
+                        if batch.is_empty() {
+                            continue;
+                        }
+                        for line in batch.into_lines() {
+                            if let Err(e) =
+                                tokio::io::AsyncWriteExt::write_all(&mut writer, line.as_bytes())
+                                    .await
                             {
-                                return;
+                                tracing::error!(
+                                    error = %e,
+                                    "worker: WAF event stream to the supervisor broke; \
+                                     reconnecting, the batch in flight is lost"
+                                );
+                                break 'forward;
                             }
                         }
+                        if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut writer).await {
+                            tracing::error!(
+                                error = %e,
+                                "worker: WAF event stream to the supervisor broke; \
+                                 reconnecting, the batch in flight is lost"
+                            );
+                            break 'forward;
+                        }
                     }
-                    let _ = tokio::io::AsyncWriteExt::flush(&mut writer).await;
                 }
             });
 
@@ -617,7 +635,7 @@ pub(crate) fn run_worker(
     // because worker shutdown is orchestrated by the supervisor via
     // SIGTERM and the prune task exits with the runtime.
     let worker_auth_prune_tracker = tokio_util::task::TaskTracker::new();
-    // All four of the following `spawn_*` helpers call into
+    // The `spawn_*` helpers below call into
     // `tokio::spawn`, which requires a current runtime. We are
     // between two `rt.block_on(...)` blocks here, so use `rt.enter()`
     // to establish a runtime context for the duration of the setup.

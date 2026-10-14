@@ -31,61 +31,61 @@
 //!   path.
 //! - [`window`] - per-minute event counts over the last day, beside
 //!   the bounded recent-event ring.
+//! - [`forward`] - the outbox a worker drains to forward its events.
 
 mod custom_rules;
 mod eval;
+mod forward;
 mod types;
 mod url_decode;
 mod window;
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Mutex, RwLock};
 
 use crate::ip_blocklist::IpBlocklist;
-use crate::rules::RuleSet;
+use crate::rules::{RuleCategory, RuleSet};
 
+pub use forward::{LostEvents, FORWARD_OUTBOX_CAPACITY, LOST_SOURCES_CAPACITY};
 pub use types::{CustomRule, RuleSummary, WafEvent, WafMode, WafVerdict};
 pub use window::{WindowCounts, LONGEST_EVENT_WINDOW};
 
 /// What [`WafEngine::events_after`] answers for a sequence cursor.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EventsAfter {
-    /// Events recorded after the cursor that the ring still holds,
+    /// Events recorded after the cursor that the outbox still held,
     /// oldest first.
     pub events: Vec<WafEvent>,
     /// The cursor to pass next time: the sequence number of the last
     /// event recorded so far.
     pub next: u64,
-    /// Events recorded after the cursor that the ring dropped before
+    /// Events recorded after the cursor that the outbox dropped before
     /// they were asked for.
     pub lost: u64,
+    /// The sources of those dropped events, as far as the outbox could
+    /// count them (see [`LOST_SOURCES_CAPACITY`]).
+    pub lost_by_source: Vec<LostEvents>,
 }
 
 /// WAF engine with precompiled rules, IP blocklist, and event ring buffer.
 ///
 /// Cheap to share across worker threads behind an `Arc`: all mutable
 /// state (disabled rule set, custom rules, event buffer, blocklist) is
-/// behind interior locks. The recent-event buffer is bounded to 500
-/// entries; older events are dropped FIFO. Every recorded event is also
-/// counted per minute, so [`Self::event_counts_within`] is exact over
-/// its window however many events the ring has dropped, and numbered,
-/// so [`Self::events_after`] can tell a reader which events are new.
+/// behind interior locks. The recent-event buffer is bounded
+/// (`max_events`); older events are dropped FIFO. Every recorded event is
+/// also counted per minute, so [`Self::event_counts_within`] is exact
+/// over its window however many events the ring has dropped. An engine
+/// whose events are forwarded elsewhere also numbers them in an outbox,
+/// see [`Self::enable_forwarding`].
 pub struct WafEngine {
     pub(super) ruleset: RuleSet,
     pub(super) disabled_rules: RwLock<HashSet<u32>>,
     pub(super) custom_rules: RwLock<Vec<(CustomRule, regex::Regex)>>,
     pub(super) event_buffer: Arc<Mutex<VecDeque<WafEvent>>>,
     pub(super) max_events: usize,
-    /// Events ever recorded, which makes it the sequence number of the
-    /// newest one. Written only under the `event_buffer` lock, so a
-    /// reader holding that lock sees it agree with the ring.
-    recorded: AtomicU64,
-    /// `recorded` at the last [`Self::clear_events`]: the events up to
-    /// it were forgotten on purpose, not dropped by the ring.
-    cleared_through: AtomicU64,
+    forward_outbox: OnceLock<Mutex<forward::ForwardOutbox>>,
     event_window: Mutex<window::EventWindow>,
     /// IP address blocklist (e.g. Data-Shield IPv4 Blocklist).
     pub(super) ip_blocklist: IpBlocklist,
@@ -109,8 +109,7 @@ impl WafEngine {
             custom_rules: RwLock::new(Vec::new()),
             event_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(500))),
             max_events: 500,
-            recorded: AtomicU64::new(0),
-            cleared_through: AtomicU64::new(0),
+            forward_outbox: OnceLock::new(),
             event_window: Mutex::new(window::EventWindow::new()),
             ip_blocklist: IpBlocklist::new(),
             prefilter: crate::prefilter::Prefilter::build(),
@@ -130,6 +129,7 @@ impl WafEngine {
     /// `path` are accepted for symmetry with [`Self::evaluate`] but
     /// currently only the IP is stored.
     pub fn record_blocklist_event(&self, ip: &str, _host: &str, _path: &str) {
+        let now = chrono::Utc::now();
         let event = WafEvent {
             rule_id: 0,
             description: format!("IP {ip} blocked by IP blocklist"),
@@ -137,17 +137,18 @@ impl WafEngine {
             severity: 5,
             matched_field: "client_ip".to_string(),
             matched_value: ip.to_string(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: now.to_rfc3339(),
             client_ip: ip.to_string(),
             route_hostname: String::new(),
             action: String::new(),
         };
-        self.record_events(vec![event]);
+        // Stamped now, so the minute is known without parsing it back.
+        self.record_at_minutes(vec![event], vec![Some(window::minute_of(now))]);
     }
 
-    /// Record `events`: count each in the per-minute window, then append
-    /// them to the recent-event ring, dropping its oldest entries past
-    /// capacity.
+    /// Record `events`: count each in the per-minute window, hand a copy
+    /// to the forwarding outbox when there is one, then append them to
+    /// the recent-event ring, dropping its oldest entries past capacity.
     ///
     /// Every event the engine produces goes through here. A process
     /// that receives events another engine produced (the supervisor,
@@ -155,15 +156,30 @@ impl WafEngine {
     /// cover them.
     pub fn record_events(&self, events: Vec<WafEvent>) {
         let now = chrono::Utc::now();
+        let minutes = events
+            .iter()
+            .map(|event| window::minute_for(&event.timestamp, now))
+            .collect();
+        self.record_at_minutes(events, minutes);
+    }
+
+    /// [`Self::record_events`] with each event's minute already placed,
+    /// so the locks below cover counter and pointer work only: parsing
+    /// and cloning happen before each is taken.
+    fn record_at_minutes(&self, events: Vec<WafEvent>, minutes: Vec<Option<i64>>) {
         {
             let mut window = self.event_window.lock();
-            for event in &events {
-                window.record(&event.timestamp, event.category.as_str(), now);
+            for (event, minute) in events.iter().zip(minutes) {
+                if let Some(minute) = minute {
+                    window.count_at(minute, event.category.as_str(), 1);
+                }
             }
         }
+        if let Some(outbox) = self.forward_outbox.get() {
+            let copies = events.clone();
+            outbox.lock().push(copies);
+        }
         let mut buf = self.event_buffer.lock();
-        self.recorded
-            .fetch_add(events.len() as u64, Ordering::Relaxed);
         for event in events {
             if buf.len() >= self.max_events {
                 buf.pop_front();
@@ -172,34 +188,52 @@ impl WafEngine {
         }
     }
 
-    /// Events recorded after the sequence number `cursor`, for a reader
-    /// that must see every event once, such as a worker forwarding its
-    /// events to the supervisor. Start from `0` and pass back
-    /// [`EventsAfter::next`].
+    /// Number every event recorded from now on in an outbox that
+    /// [`Self::events_after`] drains, for a process whose events must
+    /// all reach another one (a worker forwarding to its supervisor).
+    /// Idempotent.
     ///
-    /// The ring length cannot serve as that cursor: once the ring is full
-    /// it stays at capacity while events keep arriving. Events recorded
-    /// after the cursor but already dropped by the ring are reported in
-    /// [`EventsAfter::lost`]; events forgotten by [`Self::clear_events`]
-    /// are not, since nobody lost them. The numbering assumes events
-    /// enter the ring only through [`Self::record_events`].
+    /// Off by default because each recorded event then costs one more
+    /// copy, which a process nobody reads the outbox of should not pay.
+    pub fn enable_forwarding(&self) {
+        self.forward_outbox.get_or_init(|| {
+            Mutex::new(forward::ForwardOutbox::new(
+                FORWARD_OUTBOX_CAPACITY,
+                LOST_SOURCES_CAPACITY,
+            ))
+        });
+    }
+
+    /// Events recorded after the sequence number `cursor`, for the one
+    /// reader that must see every event once, such as a worker
+    /// forwarding its events to the supervisor. Start from `0` and pass
+    /// back [`EventsAfter::next`]. Empty until
+    /// [`Self::enable_forwarding`] has run.
+    ///
+    /// The events are moved out of the outbox, so a second reader would
+    /// find them gone. Events recorded after the cursor but already
+    /// dropped by the outbox are reported in [`EventsAfter::lost`], with
+    /// their sources in [`EventsAfter::lost_by_source`]; events forgotten
+    /// by [`Self::clear_events`] are not, since nobody lost them. The
+    /// numbering assumes events enter only through
+    /// [`Self::record_events`].
     pub fn events_after(&self, cursor: u64) -> EventsAfter {
-        let buf = self.event_buffer.lock();
-        let recorded = self.recorded.load(Ordering::Relaxed);
-        let oldest_held = recorded.saturating_sub(buf.len() as u64);
-        let from = cursor
-            .max(self.cleared_through.load(Ordering::Relaxed))
-            .min(recorded);
-        let first_new = from.max(oldest_held);
-        EventsAfter {
-            events: buf
-                .iter()
-                .skip((first_new - oldest_held) as usize)
-                .cloned()
-                .collect(),
-            next: recorded,
-            lost: oldest_held.saturating_sub(from),
-        }
+        let Some(outbox) = self.forward_outbox.get() else {
+            return EventsAfter::default();
+        };
+        let taken = outbox.lock().take_after(cursor);
+        taken.into()
+    }
+
+    /// Count `count` events of `category` that happened in the last
+    /// moments but were never recorded here one by one: events a worker
+    /// had to drop before it could forward them. They join the windowed
+    /// counts, not the recent-event ring.
+    pub fn record_lost_events(&self, category: &RuleCategory, count: u64) {
+        let minute = window::minute_of(chrono::Utc::now());
+        self.event_window
+            .lock()
+            .count_at(minute, category.as_str(), count);
     }
 
     /// Events recorded over the last `window` (at most
@@ -211,14 +245,14 @@ impl WafEngine {
             .counts_within(window, chrono::Utc::now())
     }
 
-    /// Forget every recorded event: the recent-event ring and the
-    /// windowed counts alike.
+    /// Forget every recorded event: the recent-event ring, the
+    /// forwarding outbox and the windowed counts alike.
     pub fn clear_events(&self) {
         self.event_window.lock().clear();
-        let mut buf = self.event_buffer.lock();
-        buf.clear();
-        self.cleared_through
-            .store(self.recorded.load(Ordering::Relaxed), Ordering::Relaxed);
+        if let Some(outbox) = self.forward_outbox.get() {
+            outbox.lock().clear();
+        }
+        self.event_buffer.lock().clear();
     }
 
     /// Return a reference to the event buffer for dashboard consumption.

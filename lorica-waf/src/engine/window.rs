@@ -59,8 +59,26 @@ pub(super) struct EventWindow {
     slots: Vec<MinuteSlot>,
 }
 
-fn minute_of(at: DateTime<Utc>) -> i64 {
+pub(super) fn minute_of(at: DateTime<Utc>) -> i64 {
     at.timestamp().div_euclid(60)
+}
+
+/// The minute an event stamped `timestamp` (RFC 3339) counts in, or
+/// `None` when it is older than the longest window and is not counted.
+///
+/// The event's own stamp decides its minute, not `now`: an event a
+/// worker forwarded arrives up to a second after it fired. A stamp that
+/// does not parse counts at `now`, and one ahead of `now` (a worker
+/// clock running ahead) counts at `now`.
+///
+/// Pure, so a caller parses before it takes the window's lock.
+pub(super) fn minute_for(timestamp: &str, now: DateTime<Utc>) -> Option<i64> {
+    let now_minute = minute_of(now);
+    let minute = DateTime::parse_from_rfc3339(timestamp)
+        .map(|at| minute_of(at.with_timezone(&Utc)))
+        .unwrap_or(now_minute)
+        .min(now_minute);
+    (now_minute - minute < SLOTS as i64).then_some(minute)
 }
 
 impl EventWindow {
@@ -76,30 +94,32 @@ impl EventWindow {
         }
     }
 
-    /// Count one event of `category` stamped `timestamp` (RFC 3339).
-    ///
-    /// The event's own stamp decides its minute, not `now`: an event a
-    /// worker forwarded arrives up to a second after it fired. A stamp
-    /// that does not parse counts at `now`, one ahead of `now` (a worker
-    /// clock running ahead) counts at `now`, and one older than the
-    /// longest window is not counted at all.
+    /// Count one event of `category` stamped `timestamp` (RFC 3339), at
+    /// the minute [`minute_for`] places it in.
+    #[cfg(test)]
     pub(super) fn record(&mut self, timestamp: &str, category: &'static str, now: DateTime<Utc>) {
-        let now_minute = minute_of(now);
-        let minute = DateTime::parse_from_rfc3339(timestamp)
-            .map(|at| minute_of(at.with_timezone(&Utc)))
-            .unwrap_or(now_minute)
-            .min(now_minute);
-        if now_minute - minute >= SLOTS as i64 {
+        if let Some(minute) = minute_for(timestamp, now) {
+            self.count_at(minute, category, 1);
+        }
+    }
+
+    /// Add `count` events of `category` to `minute`, a value
+    /// [`minute_for`] or [`minute_of`] produced.
+    pub(super) fn count_at(&mut self, minute: i64, category: &'static str, count: u64) {
+        let slot = &mut self.slots[minute.rem_euclid(SLOTS as i64) as usize];
+        // The minute was placed before the lock was taken; if the clock
+        // crossed into the minute that reuses this slot meanwhile, the
+        // event has aged out and must not wipe the newer minute.
+        if slot.minute > minute {
             return;
         }
-        let slot = &mut self.slots[minute.rem_euclid(SLOTS as i64) as usize];
         if slot.minute != minute {
             slot.minute = minute;
             slot.by_category.clear();
         }
         match slot.by_category.iter_mut().find(|(c, _)| *c == category) {
-            Some((_, count)) => *count += 1,
-            None => slot.by_category.push((category, 1)),
+            Some((_, total)) => *total += count,
+            None => slot.by_category.push((category, count)),
         }
     }
 
@@ -221,6 +241,23 @@ mod tests {
         window.record(&wrapped.to_rfc3339(), "sql_injection", wrapped);
         let day = window.counts_within(LONGEST_EVENT_WINDOW, wrapped);
         assert_eq!(day.by_category, vec![("sql_injection".to_string(), 1)]);
+    }
+
+    #[test]
+    fn a_minute_placed_before_its_slot_was_reused_does_not_wipe_the_newer_minute() {
+        let now = at("2026-10-14T12:00:00Z");
+        let mut window = EventWindow::new();
+        let aged = minute_for(
+            &stamp(now, chrono::Duration::minutes(SLOTS as i64 - 1)),
+            now,
+        )
+        .expect("still inside the longest window");
+        window.record(&now.to_rfc3339(), "xss", now);
+        let reused = now + chrono::Duration::minutes(1);
+        window.record(&reused.to_rfc3339(), "xss", reused);
+        window.count_at(aged, "sql_injection", 1);
+        let day = window.counts_within(LONGEST_EVENT_WINDOW, reused);
+        assert_eq!(day.by_category, vec![("xss".to_string(), 2)]);
     }
 
     #[test]

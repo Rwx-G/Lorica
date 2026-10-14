@@ -842,77 +842,85 @@ async fn run_sla_purge(store: &Arc<Mutex<ConfigStore>>, last_purge_day: u32) -> 
 }
 
 /// Spawn alert dispatcher that also persists events to the log store
-/// (SQLite), once one is open.
+/// (SQLite), once one is open. Each dispatch outcome is recorded on the
+/// sender's ledger, and the coalesced `waf_alert` summaries it owes are
+/// dispatched every [`lorica_notify::COALESCE_FLUSH_INTERVAL`].
 fn spawn_persisted_alert_dispatcher(
     alert_sender: &lorica_notify::AlertSender,
     dispatcher: Arc<Mutex<lorica_notify::NotifyDispatcher>>,
     log_store: lorica_api::server::LogStoreSlot,
 ) -> tokio::task::JoinHandle<()> {
     let mut rx = alert_sender.subscribe();
+    let ledger = alert_sender.ledger().clone();
     tokio::spawn(async move {
+        let mut flush = tokio::time::interval(lorica_notify::COALESCE_FLUSH_INTERVAL);
+        flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    // Dispatch via channels (email, webhook, etc.)
-                    let d = dispatcher.lock().await;
-                    d.dispatch(&event).await;
-                    drop(d);
-
-                    // Persist to log store. Both calls are sync rusqlite under
-                    // `parking_lot::Mutex<Connection>` ; running them inline
-                    // would block the alert dispatcher's async reactor (audit
-                    // H-7). Off-load both to one `spawn_blocking` so the
-                    // mutex acquisition + the SELECT COUNT(*) + DELETE pair
-                    // happen on the blocking pool, and surface retention
-                    // failures via the existing notifier-events-dropped metric
-                    // (was a silent `let _ = ...` swallow that left the table
-                    // unbounded if DELETE ever failed).
-                    if let Some(store) = log_store.store() {
-                        let event_for_blocking = event.clone();
-                        let blocking_outcome = tokio::task::spawn_blocking(move || {
-                            let insert = store.insert_notification_event(&event_for_blocking);
-                            let retention = store.enforce_notification_retention(500);
-                            (insert, retention)
-                        })
-                        .await;
-                        match blocking_outcome {
-                            Ok((insert, retention)) => {
-                                if let Err(e) = insert {
-                                    tracing::warn!(error = %e, "failed to persist notification event");
-                                    lorica_api::metrics::inc_notifier_events_dropped(
-                                        "persist_failed",
-                                        1,
-                                    );
-                                }
-                                if let Err(e) = retention {
-                                    tracing::warn!(error = %e, "notification retention enforcement failed");
-                                    lorica_api::metrics::inc_notifier_events_dropped(
-                                        "retention_failed",
-                                        1,
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "notification persistence task join failed");
-                                lorica_api::metrics::inc_notifier_events_dropped("join_failed", 1);
-                            }
-                        }
+            let events = tokio::select! {
+                received = rx.recv() => match received {
+                    Ok(event) => vec![event],
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            dropped = n,
+                            "alert dispatcher lagged, some notifications were dropped"
+                        );
+                        lorica_api::metrics::inc_notifier_events_dropped("lag", n);
+                        continue;
                     }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(
-                        dropped = n,
-                        "alert dispatcher lagged, some notifications were dropped"
-                    );
-                    lorica_api::metrics::inc_notifier_events_dropped("lag", n);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    lorica_api::metrics::inc_notifier_events_dropped("closed", 1);
-                    break;
-                }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        lorica_api::metrics::inc_notifier_events_dropped("closed", 1);
+                        break;
+                    }
+                },
+                _ = flush.tick() => ledger.due_summaries(),
+            };
+            for event in events {
+                let outcome = dispatcher.lock().await.dispatch(&event).await;
+                ledger.record_delivery(&event.alert_type, outcome);
+                persist_notification(&log_store, event).await;
             }
         }
     })
+}
+
+/// Persist one dispatched alert to the log store, when one is open.
+///
+/// Both calls are sync rusqlite under `parking_lot::Mutex<Connection>`;
+/// running them inline would block the alert dispatcher's async reactor
+/// (audit H-7). Off-load both to one `spawn_blocking` so the mutex
+/// acquisition + the SELECT COUNT(*) + DELETE pair happen on the
+/// blocking pool, and surface retention failures via the
+/// notifier-events-dropped metric rather than leaving the table
+/// unbounded if DELETE ever failed.
+async fn persist_notification(
+    log_store: &lorica_api::server::LogStoreSlot,
+    event: lorica_notify::AlertEvent,
+) {
+    let Some(store) = log_store.store() else {
+        return;
+    };
+    let blocking_outcome = tokio::task::spawn_blocking(move || {
+        let insert = store.insert_notification_event(&event);
+        let retention = store.enforce_notification_retention(500);
+        (insert, retention)
+    })
+    .await;
+    match blocking_outcome {
+        Ok((insert, retention)) => {
+            if let Err(e) = insert {
+                tracing::warn!(error = %e, "failed to persist notification event");
+                lorica_api::metrics::inc_notifier_events_dropped("persist_failed", 1);
+            }
+            if let Err(e) = retention {
+                tracing::warn!(error = %e, "notification retention enforcement failed");
+                lorica_api::metrics::inc_notifier_events_dropped("retention_failed", 1);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "notification persistence task join failed");
+            lorica_api::metrics::inc_notifier_events_dropped("join_failed", 1);
+        }
+    }
 }
 
 /// Build a NotifyDispatcher from database notification configs.
@@ -1207,6 +1215,8 @@ pub(crate) async fn shutdown_signal() {
             warn!("Received SIGINT");
         }
     }
+    // Here rather than at each caller, so no mode can forget it.
+    log_store_health::begin_shutdown();
 }
 
 #[cfg(test)]
