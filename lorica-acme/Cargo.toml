@@ -26,13 +26,16 @@ parking_lot = "0.12"
 async-trait = { workspace = true }
 thiserror = "2"
 tokio = { workspace = true, features = ["time"] }
-# Route53 is opt-in because its dep graph drags `aws-smithy-http-client`
-# which depends on the security-maintenance-only `rustls 0.21` + `hyper 0.14`
-# stack. Deployments that don't use ACME DNS-01 via Route53 (the great
-# majority of today's users) should not pay the compile cost nor ship that
-# older TLS surface. Enable via `lorica-api`'s `route53` feature.
+# Route53 is opt-in: the AWS SDK is a large dep graph that deployments not
+# using ACME DNS-01 via Route53 (the great majority) should not compile.
+# Enable via `lorica-api`'s `route53` feature.
+#
+# Both crates must stay on the SDK's default HTTPS client (rustls 0.23).
+# `aws-sdk-route53`'s default `rustls` feature selects the legacy client
+# instead, which drags in the rustls 0.21 / webpki 0.101 / hyper 0.14
+# stack; that is why its default features are off.
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"], optional = true }
-aws-sdk-route53 = { version = "1", optional = true }
+aws-sdk-route53 = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"], optional = true }
 
 [features]
 default = []
