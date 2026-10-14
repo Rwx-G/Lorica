@@ -496,6 +496,42 @@ pub(crate) fn spawn_retention_loop(
                         }
                     }
                 }
+                // The per-node ceiling on fanned-in audit rows (backlog
+                // #72). Independent of the day-based setting above, and
+                // runs when that is 0: a retention that keeps forever is
+                // exactly when a peer's push rate is the only other
+                // bound. Off the runtime, because a node that has been
+                // flooding for an hour leaves a reclaim worth chunking.
+                let logs = Arc::clone(logs);
+                let capped = tokio::task::spawn_blocking(move || {
+                    logs.enforce_fanned_in_audit_cap(
+                        lorica_api::log_store::FANNED_IN_AUDIT_ROWS_PER_NODE,
+                    )
+                })
+                .await;
+                match capped {
+                    Ok(Ok(cut_by_node)) => {
+                        // WARN, not INFO: an honest node never reaches
+                        // the ceiling, so reaching it is a node to look
+                        // at, and the rows it lost here still exist on
+                        // that node and in its `lorica::audit` stream.
+                        for (node_id, rows) in cut_by_node {
+                            tracing::warn!(
+                                node_id,
+                                rows,
+                                cap = lorica_api::log_store::FANNED_IN_AUDIT_ROWS_PER_NODE,
+                                "fanned-in audit chain over its per-node cap: \
+                                 oldest rows sealed and removed"
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "fanned-in audit cap enforcement failed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "fanned-in audit cap task failed");
+                    }
+                }
             }
             {
                 let s = retention_config_store.lock().await;

@@ -413,7 +413,7 @@ rather than as an exception:
 |-------|---------|---------|-----------------|------------|----------------|--------------------|
 | Gauge | CPU, memory, disk | heartbeat | none, replaced each beat | its own fixed shape | superseded within one beat | no, session state by design |
 | Sheddable series | access rows, WAF events | fan-in, with cursors | rowid cursor, advanced per class on what was accepted | local retention, per-node quota, storage watermark | dropped and counted; the cursor holds | the cursor is persisted |
-| Durable series | audit rows | fan-in, with a cursor | rowid cursor, all-or-nothing per batch | charged to the quota but exempt from its verdict; a per-session push rate; retention by arrival time | never shed; a short count means storage failed | the cursor is persisted |
+| Durable series | audit rows | fan-in, with a cursor | rowid cursor, all-or-nothing per batch | charged to the quota but exempt from its verdict; a per-session push rate; retention by arrival time; a per-node row ceiling | never shed on the way in; past the ceiling the oldest stored rows are cut, sealed; a short count means storage failed | the cursor is persisted |
 | Live-state snapshot | bans | fan-in, no cursor | none, replaced wholesale | the storage watermark only | lossy by construction | no |
 
 Bans are the case the first sentence alone would have sent to the
@@ -742,9 +742,11 @@ because verify walks one table and a chain that lived elsewhere could
 not be reported beside the local one. What keeps that from re-creating
 the contention above is that audit rows are rare by nature, bounded per
 batch and per session (a push rate cap), charged to the per-node quota,
-and aged by the time they ARRIVED rather than by the timestamp the
-origin chose. Whether the shared connection shows under a large fleet
-is a measurement to take, not a fact to assert; backlog #75 holds it.
+aged by the time they ARRIVED rather than by the timestamp the origin
+chose, and capped per node (see "Audit rows are never shed"). That file
+is not the one the storage watermark measures, which is why the
+per-node ceiling exists. Whether the shared connection shows under a
+large fleet is a measurement to take, not a fact to assert; backlog #75 holds it.
 
 ### The drain never touches the request path
 
@@ -1031,6 +1033,33 @@ exist, because it is believed.
 Exempt from shedding is not unbounded: the batch is bounded on the
 wire like every other kind, so a peer cannot make the control plane
 allocate arbitrarily.
+
+Nor is it unbounded at rest. Day-based retention ages a fanned-in row
+by when it arrived, which bounds how long a row stays but not how many
+a node can send inside the window, and the rows land in
+`access-log.db`, which the fan-in storage watermark does not measure.
+So each follower's chain also has a row ceiling
+(`FANNED_IN_AUDIT_ROWS_PER_NODE` in `lorica-api/src/log_store.rs`, where
+its sizing is argued), enforced by the same hourly pass as day-based
+retention:
+
+- It is sized so an honest node never reaches it. A node that does is
+  one to look at, and the pass logs it at WARN with the node id and
+  the rows it removed.
+- It cuts the node's OLDEST rows, as a prefix of that node's own order,
+  and seals the chain exactly as day-based retention does, so verify
+  still reports it whole. Nothing is cut out of the middle.
+- It is per node: one node over its ceiling loses its own oldest rows
+  and nobody else's.
+- It never applies to the control plane's own chain, which is bounded
+  by the audit retention setting alone. The ceiling bounds what a peer
+  can make this store hold, not the local record.
+- Being enforced hourly, the bound actually held is the ceiling plus
+  what one node can push in an hour at its session's push cap.
+
+Rows the ceiling removes are gone from the aggregated copy only: they
+are still on the origin node, still verifiable there, and still in that
+node's `lorica::audit` stream.
 
 A node that joins an existing fleet ships what it records from then on,
 not its whole pre-cluster history. Those rows are still on the node and
