@@ -585,6 +585,51 @@ mod imp {
             }
         }
         logger.emit(record);
+        lorica_api::metrics::inc_log_sink_sent("otlp", kind.as_str());
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::Arc;
+
+        use lorica_api::log_sinks::{CaptureSinkRecord, SinkEvent, SinkPayload};
+        use opentelemetry::logs::LoggerProvider as _;
+        use opentelemetry_sdk::logs::SdkLoggerProvider;
+
+        fn otlp_capture_sent() -> u64 {
+            lorica_api::metrics::snapshot_per_worker_counters()
+                .into_iter()
+                .find(|(name, labels, _)| {
+                    name == "lorica_log_sink_sent_total"
+                        && labels.iter().any(|(k, v)| k == "sink" && v == "otlp")
+                        && labels.iter().any(|(k, v)| k == "kind" && v == "capture")
+                })
+                .map_or(0, |(_, _, value)| value)
+        }
+
+        /// The syslog lane counts every event it hands to its transport;
+        /// the OTLP lane must too, or `lorica_log_sink_sent_total{sink="otlp"}`
+        /// stays at zero on a healthy collector and reads as a dead sink.
+        #[test]
+        fn emitted_event_counts_as_sent_on_the_otlp_lane() {
+            let provider = SdkLoggerProvider::builder().build();
+            let logger = provider.logger("lorica-unit-test");
+            let event = SinkEvent {
+                payload: Arc::new(SinkPayload::Capture(CaptureSinkRecord {
+                    rule_id: "otlp-sent-test".to_string(),
+                    request_id: "req-otlp-sent-test".to_string(),
+                    timestamp: "2026-01-01T00:00:00Z".to_string(),
+                    document: serde_json::json!({ "request_id": "req-otlp-sent-test" }),
+                })),
+                trace_id: None,
+                span_id: None,
+            };
+
+            let before = otlp_capture_sent();
+            super::emit_sink_event(&logger, &event);
+            assert_eq!(otlp_capture_sent(), before + 1);
+            let _ = provider.shutdown();
+        }
     }
 }
 
