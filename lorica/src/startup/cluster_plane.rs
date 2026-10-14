@@ -58,9 +58,10 @@ use chrono::{DateTime, Utc};
 use lorica_api::audit::{record_with_store, AuditContext};
 use lorica_api::cluster::runtime::MAX_BREAK_GLASS_SECS;
 use lorica_api::cluster::runtime::{
-    detached, publish_token_liveness, refresh_control_plane, revoke_node,
+    detached, detached_audited, publish_token_liveness, refresh_control_plane, revoke_node,
+    OwedAudit,
 };
-use lorica_api::cluster::ControlPlaneRuntime;
+use lorica_api::cluster::{ControlPlaneRuntime, BREAK_GLASS_OPEN_ACTION, LEAVE_ACTION};
 use lorica_api::cluster_telemetry_store::ClusterTelemetryStore;
 use lorica_api::db::db_blocking;
 use lorica_api::error::ApiError;
@@ -131,6 +132,12 @@ const RENEWAL_COOLDOWN: Duration = Duration::from_secs(3600);
 /// again, so a node behind the cooldown does not burn its per-session
 /// refusal budget on the control plane.
 pub(crate) const RENEWAL_RETRY_AFTER_REFUSAL: Duration = Duration::from_secs(3600);
+
+/// The action of the row an enrolment records.
+const ENROL_ACTION: &str = "cluster.node.enroll";
+
+/// The action of the row a renewal records.
+const RENEW_ACTION: &str = "cluster.node.renew";
 
 /// Inputs for [`spawn_cluster_plane`], lifted from the CLI and the
 /// process.
@@ -655,6 +662,21 @@ impl FleetState {
         let _ = self.config_reload.send(next);
     }
 
+    /// The audit row a hook's unit owes if it panics; see [`OwedAudit`].
+    fn owed_audit(
+        &self,
+        peer: SocketAddr,
+        action: &'static str,
+        target: (&'static str, String),
+    ) -> OwedAudit {
+        OwedAudit {
+            log_store: self.log_store.store(),
+            ctx: plane_audit_ctx(peer),
+            action,
+            target,
+        }
+    }
+
     async fn audit(
         &self,
         peer: SocketAddr,
@@ -715,7 +737,7 @@ impl FleetState {
         }
         self.audit(
             peer,
-            "cluster.node.enroll",
+            ENROL_ACTION,
             ("cluster_node", &grant.node_id),
             Some(serde_json::json!({
                 "name": node_name,
@@ -735,7 +757,14 @@ impl EnrollmentHandler for FleetHandlers {
             // Detached from the burn on: a joiner that hangs up after its
             // token burned must still leave a registered row the roster
             // knows and an audit row naming the token.
-            detached("enrolment", async move { fleet.enrol(request).await })
+            // The node id is minted inside the unit, so a panicking
+            // one is recorded against the token it burned.
+            let owed = fleet.owed_audit(
+                request.peer,
+                ENROL_ACTION,
+                ("cluster_token", request.public_id.clone()),
+            );
+            detached_audited("enrolment", owed, async move { fleet.enrol(request).await })
                 .await
                 .map_err(|e| EnrollRefusal::Internal(e.to_string()))?
         })
@@ -777,7 +806,12 @@ impl SessionHandler for FleetHandlers {
     fn on_renew(&self, request: RenewRequest) -> BoxFuture<'_, Result<RenewGrant, String>> {
         let fleet = self.clone();
         Box::pin(async move {
-            detached("renewal", async move {
+            let owed = fleet.owed_audit(
+                request.peer,
+                RENEW_ACTION,
+                ("cluster_node", request.node_id.clone()),
+            );
+            detached_audited("renewal", owed, async move {
                 fleet
                     .renew(request)
                     .await
@@ -795,9 +829,14 @@ impl SessionHandler for FleetHandlers {
             // Detached as a whole, like every hook here that commits:
             // the alert and the audit row must not depend on the session
             // task carrying this call outliving the revocation.
-            detached("leave", async move { fleet.leave(node_id, peer).await })
-                .await
-                .map_err(|e| e.to_string())?
+            let owed = fleet.owed_audit(peer, LEAVE_ACTION, ("cluster_node", node_id.clone()));
+            detached_audited(
+                "leave",
+                owed,
+                async move { fleet.leave(node_id, peer).await },
+            )
+            .await
+            .map_err(|e| e.to_string())?
         })
     }
 
@@ -1198,7 +1237,7 @@ impl FleetState {
         );
         self.audit(
             peer,
-            "cluster.node.leave",
+            LEAVE_ACTION,
             ("cluster_node", &node_id),
             Some(serde_json::json!({
                 "name": outcome.node.name,
@@ -1278,7 +1317,7 @@ impl FleetState {
         self.refresh().await;
         self.audit(
             peer,
-            "cluster.node.renew",
+            RENEW_ACTION,
             ("cluster_node", &node_id),
             Some(serde_json::json!({
                 "cert_fingerprint": issued.fingerprint_sha256,
@@ -1675,7 +1714,7 @@ async fn break_glass_is_corroborated(log_store: &Option<Arc<LogStore>>, node_id:
     .to_rfc3339();
     tokio::task::spawn_blocking(move || {
         let query = lorica_api::audit::AuditQuery {
-            action_prefix: Some("cluster.break_glass.open".to_string()),
+            action_prefix: Some(BREAK_GLASS_OPEN_ACTION.to_string()),
             from: Some(from),
             limit: 1,
             node_id: Some(node_id),
@@ -2470,7 +2509,7 @@ mod tests {
 
         // A different node's window says nothing about this one.
         log_store
-            .insert_fanned_in_audit("node-b", &[fanned_in_row("cluster.break_glass.open", 1)])
+            .insert_fanned_in_audit("node-b", &[fanned_in_row(BREAK_GLASS_OPEN_ACTION, 1)])
             .expect("insert node-b");
         assert!(!break_glass_is_corroborated(&Some(Arc::clone(&log_store)), "node-a").await);
 
@@ -2482,7 +2521,7 @@ mod tests {
 
         // This node's own open row corroborates it.
         log_store
-            .insert_fanned_in_audit("node-a", &[fanned_in_row("cluster.break_glass.open", 2)])
+            .insert_fanned_in_audit("node-a", &[fanned_in_row(BREAK_GLASS_OPEN_ACTION, 2)])
             .expect("insert node-a");
         assert!(break_glass_is_corroborated(&Some(Arc::clone(&log_store)), "node-a").await);
 
@@ -2846,7 +2885,7 @@ mod tests {
             let (rows, _total) = log_store
                 .query_audit(&lorica_api::audit::AuditQuery {
                     operator: None,
-                    action_prefix: Some("cluster.node.leave".to_string()),
+                    action_prefix: Some(LEAVE_ACTION.to_string()),
                     from: None,
                     to: None,
                     limit: 10,

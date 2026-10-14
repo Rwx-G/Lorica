@@ -65,6 +65,22 @@ fn control_plane(state: &AppState) -> Result<Arc<ControlPlane>, ApiError> {
     Ok(Arc::clone(&control_plane_runtime(state)?.control))
 }
 
+/// The audit row a detached unit owes its change if it panics; see
+/// [`runtime::OwedAudit`].
+fn owed_audit(
+    state: &AppState,
+    ctx: &crate::audit::AuditContext,
+    action: &'static str,
+    target: (&'static str, String),
+) -> runtime::OwedAudit {
+    runtime::OwedAudit {
+        log_store: state.log_store.clone(),
+        ctx: ctx.clone(),
+        action,
+        target,
+    }
+}
+
 /// The follower's runtime handle, or 409 on any other role.
 fn follower_runtime(state: &AppState) -> Result<Arc<FollowerRuntime>, ApiError> {
     match &state.cluster {
@@ -160,7 +176,9 @@ pub async fn mint_token(
     // The write, the window it opens and its audit row as one unit: a
     // token that exists with no row saying who minted it is the worst
     // kind of hole, because it is a credential.
-    let response = runtime::detached("token mint", async move {
+    const ACTION: &str = "cluster.token.mint";
+    let owed = owed_audit(&state, &audit_ctx, ACTION, ("cluster_token", String::new()));
+    let response = runtime::detached_audited("token mint", owed, async move {
         let bound_node_name = body.node_name.clone();
         let bound_source_cidr = body.source_cidr.clone();
         let minted = db_blocking(&state.store, move |store| {
@@ -216,7 +234,7 @@ pub async fn mint_token(
         crate::audit::record(
             &state,
             &audit_ctx,
-            "cluster.token.mint",
+            ACTION,
             ("cluster_token", &response.public_id),
             None,
             Some(&after),
@@ -255,7 +273,14 @@ pub async fn revoke_token(
 ) -> Result<impl IntoResponse, ApiError> {
     let control = control_plane(&state)?;
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
-    runtime::detached("token revocation", async move {
+    const ACTION: &str = "cluster.token.revoke";
+    let owed = owed_audit(
+        &state,
+        &audit_ctx,
+        ACTION,
+        ("cluster_token", public_id.clone()),
+    );
+    runtime::detached_audited("token revocation", owed, async move {
         let id = public_id.clone();
         let revoked = db_blocking(&state.store, move |store| {
             store
@@ -272,7 +297,7 @@ pub async fn revoke_token(
         crate::audit::record(
             &state,
             &audit_ctx,
-            "cluster.token.revoke",
+            ACTION,
             ("cluster_token", &public_id),
             None,
             None,
@@ -547,49 +572,52 @@ pub async fn activate_node(
     // one detached unit, so a client that disconnects cannot leave an
     // activated row the acceptor does not know about, or one no audit
     // row accounts for.
-    let (node, selected, certificates) = runtime::detached("activation", async move {
-        let node_id = id.clone();
-        let (node, selected, certificates) = db_blocking(&state.store, move |store| {
-            let before = store
-                .get_cluster_node(&node_id)
-                .map_err(|e| ApiError::Internal(e.to_string()))?
-                .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
-            if before.status != NodeStatus::Pending {
-                return Err(ApiError::Conflict(format!(
-                    "node is {}, only a pending node can be activated",
-                    before.status.as_str()
-                )));
-            }
-            store
-                .activate_cluster_node(&node_id)
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-            let node = store
-                .get_cluster_node(&node_id)
-                .map_err(|e| ApiError::Internal(e.to_string()))?
-                .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
-            let selected = selected_hostnames(store, std::slice::from_ref(&node));
-            let certificates = store.certificates_by_node().unwrap_or_default();
+    const ACTION: &str = "cluster.node.activate";
+    let owed = owed_audit(&state, &audit_ctx, ACTION, ("cluster_node", id.clone()));
+    let (node, selected, certificates) =
+        runtime::detached_audited("activation", owed, async move {
+            let node_id = id.clone();
+            let (node, selected, certificates) = db_blocking(&state.store, move |store| {
+                let before = store
+                    .get_cluster_node(&node_id)
+                    .map_err(|e| ApiError::Internal(e.to_string()))?
+                    .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
+                if before.status != NodeStatus::Pending {
+                    return Err(ApiError::Conflict(format!(
+                        "node is {}, only a pending node can be activated",
+                        before.status.as_str()
+                    )));
+                }
+                store
+                    .activate_cluster_node(&node_id)
+                    .map_err(|e| ApiError::Internal(e.to_string()))?;
+                let node = store
+                    .get_cluster_node(&node_id)
+                    .map_err(|e| ApiError::Internal(e.to_string()))?
+                    .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
+                let selected = selected_hostnames(store, std::slice::from_ref(&node));
+                let certificates = store.certificates_by_node().unwrap_or_default();
+                Ok::<_, ApiError>((node, selected, certificates))
+            })
+            .await?;
+            // Awaited: the response says `active`, and a pending session must
+            // already be admitted as one when the operator reads it.
+            let refreshed = runtime.refresh(&state.store).await;
+            // Recorded before a refresh failure is surfaced: the row is
+            // active either way, and the next refresh admits the node.
+            crate::audit::record(
+                &state,
+                &audit_ctx,
+                ACTION,
+                ("cluster_node", &id),
+                None,
+                Some(&serde_json::json!({ "status": "active", "name": node.name })),
+            )
+            .await;
+            refreshed?;
             Ok::<_, ApiError>((node, selected, certificates))
         })
-        .await?;
-        // Awaited: the response says `active`, and a pending session must
-        // already be admitted as one when the operator reads it.
-        let refreshed = runtime.refresh(&state.store).await;
-        // Recorded before a refresh failure is surfaced: the row is
-        // active either way, and the next refresh admits the node.
-        crate::audit::record(
-            &state,
-            &audit_ctx,
-            "cluster.node.activate",
-            ("cluster_node", &id),
-            None,
-            Some(&serde_json::json!({ "status": "active", "name": node.name })),
-        )
-        .await;
-        refreshed?;
-        Ok::<_, ApiError>((node, selected, certificates))
-    })
-    .await??;
+        .await??;
     let mut responses =
         node_responses(&control, vec![node], &selected, &certificates, session.role);
     Ok(json_data(responses.remove(0)))
@@ -646,7 +674,9 @@ pub async fn revoke_node(
     // the same detached unit, or a client that disconnected after the
     // row flipped would leave a revocation that took effect with no
     // trace in the tamper-evident trail.
-    let outcome = runtime::detached("revocation record", async move {
+    const ACTION: &str = "cluster.node.revoke";
+    let owed = owed_audit(&state, &audit_ctx, ACTION, ("cluster_node", id.clone()));
+    let outcome = runtime::detached_audited("revocation record", owed, async move {
         let Some(outcome) =
             runtime::revoke_node(&runtime, &state.store, &node_id, Utc::now()).await?
         else {
@@ -664,7 +694,7 @@ pub async fn revoke_node(
         crate::audit::record(
             &state,
             &audit_ctx,
-            "cluster.node.revoke",
+            ACTION,
             ("cluster_node", &node_id),
             Some(&serde_json::json!({
                 "status": outcome.node.status.as_str(),
@@ -891,12 +921,22 @@ pub async fn leave(
     // have revoked this node, the wipe, the `left` flag and the audit
     // row must follow whether or not the operator's client is still
     // there to read the answer.
-    let response = runtime::detached("leave", async move {
+    let owed = owed_audit(
+        &state,
+        &audit_ctx,
+        LEAVE_ACTION,
+        ("cluster_node", follower.node_id.clone()),
+    );
+    let response = runtime::detached_audited("leave", owed, async move {
         leave_detached(&state, &follower, &audit_ctx).await
     })
     .await??;
     Ok(json_data(response))
 }
+
+/// The action of a leave row, the one the follower writes on its own
+/// chain and the one the control plane writes for the node that left.
+pub const LEAVE_ACTION: &str = "cluster.node.leave";
 
 /// The body of [`leave`], run to its end on its own task.
 async fn leave_detached(
@@ -948,7 +988,7 @@ async fn leave_detached(
     crate::audit::record(
         state,
         audit_ctx,
-        "cluster.node.leave",
+        LEAVE_ACTION,
         ("cluster_node", &follower.node_id),
         None,
         Some(&serde_json::json!({
@@ -1276,14 +1316,21 @@ pub async fn fleet_ban(
     // Nodes start enforcing as the push reaches them, so the push and
     // its audit row run detached: a client that gives up mid-push must
     // not leave a ban in force on part of the fleet with no record.
-    let (applied, unreachable) = runtime::detached("fleet ban", async move {
+    const ACTION: &str = "cluster.ban.fleet";
+    let owed = owed_audit(
+        &state,
+        &audit_ctx,
+        ACTION,
+        ("cluster_ban", body.client_ip.clone()),
+    );
+    let (applied, unreachable) = runtime::detached_audited("fleet ban", owed, async move {
         let (applied, unreachable) = control
             .push_ban(&body.client_ip, body.duration_s, "manual")
             .await;
         crate::audit::record(
             &state,
             &audit_ctx,
-            "cluster.ban.fleet",
+            ACTION,
             ("cluster_ban", &body.client_ip),
             None,
             Some(&serde_json::json!({
@@ -1342,6 +1389,10 @@ fn break_glass_response(follower: &FollowerRuntime) -> BreakGlassResponse {
     }
 }
 
+/// The action of the row a break-glass open records. The control plane
+/// reads it back from the fan-in to corroborate a follower's drift.
+pub const BREAK_GLASS_OPEN_ACTION: &str = "cluster.break_glass.open";
+
 /// GET /api/v1/cluster/break-glass - the current window (SuperAdmin,
 /// follower only).
 pub async fn get_break_glass(
@@ -1383,30 +1434,46 @@ pub async fn open_break_glass(
     // closes pulls the fleet's configuration and reconciles the edits
     // away, which is what AC #11 promises.
     //
-    // The write, the in-memory window and the audit row run detached:
+    // The writes, the in-memory window and the audit row run detached:
     // a window the store holds open while this process and the audit
     // trail know nothing of it would let local edits through unrecorded.
+    //
+    // The marker is cleared first and the window written last, each in
+    // its own commit (`set_cluster_applied_config` opens its own
+    // transaction, so the two cannot share one). The window is then the
+    // single write that opens anything: a failure or a crash before it
+    // leaves a node that is merely behind and re-pulls the fleet's
+    // configuration, never a window with no audit row and no
+    // reconciliation owed. Both under one store lock hold, so a replica
+    // apply cannot record a generation between them.
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     let operator = session.username.clone();
     let opened = Arc::clone(&follower);
-    runtime::detached("break-glass open", async move {
+    let owed = owed_audit(
+        &state,
+        &audit_ctx,
+        BREAK_GLASS_OPEN_ACTION,
+        ("cluster_node", follower.node_id.clone()),
+    );
+    runtime::detached_audited("break-glass open", owed, async move {
+        let cleared = Arc::clone(&opened);
         db_blocking(&state.store, move |store| {
             store
-                .set_cluster_break_glass_until(Some(until))
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-            store
                 .set_cluster_applied_config(0, "")
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            {
+                let mut applied = cleared
+                    .applied
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                applied.generation = 0;
+                applied.hash = String::new();
+            }
+            store
+                .set_cluster_break_glass_until(Some(until))
                 .map_err(|e| ApiError::Internal(e.to_string()))
         })
         .await?;
-        {
-            let mut applied = opened
-                .applied
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            applied.generation = 0;
-            applied.hash = String::new();
-        }
         opened.break_glass.send_replace(Some(until));
         tracing::warn!(
             node_id = %opened.node_id,
@@ -1419,7 +1486,7 @@ pub async fn open_break_glass(
         crate::audit::record(
             &state,
             &audit_ctx,
-            "cluster.break_glass.open",
+            BREAK_GLASS_OPEN_ACTION,
             ("cluster_node", &opened.node_id),
             None,
             Some(&serde_json::json!({
@@ -1449,7 +1516,14 @@ pub async fn close_break_glass(
     let closed = Arc::clone(&follower);
     // Detached for the same reason as the open: the store, this
     // process and the audit trail must agree on the window.
-    runtime::detached("break-glass close", async move {
+    const ACTION: &str = "cluster.break_glass.close";
+    let owed = owed_audit(
+        &state,
+        &audit_ctx,
+        ACTION,
+        ("cluster_node", follower.node_id.clone()),
+    );
+    runtime::detached_audited("break-glass close", owed, async move {
         db_blocking(&state.store, |store| {
             store
                 .set_cluster_break_glass_until(None)
@@ -1465,7 +1539,7 @@ pub async fn close_break_glass(
         crate::audit::record(
             &state,
             &audit_ctx,
-            "cluster.break_glass.close",
+            ACTION,
             ("cluster_node", &closed.node_id),
             None,
             None,

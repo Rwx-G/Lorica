@@ -291,3 +291,193 @@ async fn an_activation_dropped_before_its_write_still_writes_and_refreshes() {
     .await;
     eventually_audited(&fixture, "cluster.node.activate").await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_panicking_unit_is_logged_and_its_owed_audit_row_is_written_as_incomplete() {
+    let fixture = Fixture::new().await;
+    let journal = Arc::new(Journal::default());
+    let _installed = tracing::subscriber::set_default(Recording(Arc::clone(&journal)));
+    const ACTION: &str = "cluster.test.probe";
+
+    let owed = crate::cluster::runtime::OwedAudit {
+        log_store: fixture.state.log_store.clone(),
+        ctx: crate::audit::AuditContext::node("cluster"),
+        action: ACTION,
+        target: ("cluster_node", "n0".to_string()),
+    };
+    let outcome = crate::cluster::runtime::detached_audited("probe", owed, async {
+        panic!("injected after the commit");
+    })
+    .await;
+
+    assert!(
+        matches!(
+            outcome,
+            Err(crate::cluster::runtime::ClusterRuntimeError::EnforcementTask(_))
+        ),
+        "the caller is told the unit failed"
+    );
+    eventually_audited(&fixture, &format!("{ACTION}.incomplete")).await;
+    assert!(
+        journal
+            .0
+            .lock()
+            .expect("journal")
+            .iter()
+            .any(|m| m.starts_with("a cluster unit panicked")),
+        "the panic reached the journal"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_unit_nested_in_another_runs_and_the_drain_waits_for_units_in_flight() {
+    let (started, running) = tokio::sync::oneshot::channel::<()>();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let unit = tokio::spawn(crate::cluster::runtime::detached("outer", async move {
+        // Nested: takes no slot of its own, so it can never wait on the
+        // one its parent holds.
+        let inner = crate::cluster::runtime::detached("inner", async { 7 }).await;
+        let _ = started.send(());
+        let _ = released.await;
+        inner
+    }));
+    running.await.expect("the unit started");
+
+    assert!(
+        !crate::cluster::runtime::drain_detached(Duration::from_millis(50)).await,
+        "a unit still in flight is not drained"
+    );
+    release.send(()).expect("the unit is waiting");
+    assert!(crate::cluster::runtime::drain_detached(Duration::from_secs(5)).await);
+    let inner = unit
+        .await
+        .expect("the caller task")
+        .expect("the outer unit");
+    assert_eq!(inner.expect("the inner unit"), 7);
+}
+
+/// A follower whose `lorica.db` is a file, so a second connection can
+/// install a trigger that fails one write.
+async fn follower_fixture() -> (
+    crate::server::AppState,
+    Arc<crate::cluster::FollowerRuntime>,
+    tempfile::TempDir,
+) {
+    let data_dir = tempfile::tempdir().expect("test setup: tempdir");
+    let (mut state, _sessions, _limiter) = crate::tests::test_state().await;
+    state.store = Arc::new(tokio::sync::Mutex::new(
+        lorica_config::ConfigStore::open(&data_dir.path().join("lorica.db"), None)
+            .expect("test setup: config store"),
+    ));
+    state.log_store = Some(Arc::new(
+        crate::log_store::LogStore::open(data_dir.path()).expect("test setup: log store"),
+    ));
+    let follower = Arc::new(crate::cluster::FollowerRuntime {
+        node_id: "node-01".to_string(),
+        node_name: "edge-01".to_string(),
+        control_plane: "cp.example.com:7443".to_string(),
+        connection: lorica_cluster::ClusterConnection::disconnected(),
+        left: tokio::sync::watch::channel(false).0,
+        applied: Arc::new(StdMutex::new(lorica_cluster::AppliedConfig {
+            generation: 5,
+            hash: "abc".to_string(),
+            break_glass: false,
+        })),
+        break_glass: tokio::sync::watch::channel(None).0,
+    });
+    state.cluster = ClusterRuntime::Follower(Arc::clone(&follower));
+    state
+        .store
+        .lock()
+        .await
+        .set_cluster_applied_config(5, "abc")
+        .expect("test setup: applied marker");
+    (state, follower, data_dir)
+}
+
+async fn open_window(state: &crate::server::AppState) -> bool {
+    super::open_break_glass(
+        crate::audit::ClientConnectInfo(None),
+        http::HeaderMap::new(),
+        Extension(state.clone()),
+        Extension(super_admin()),
+        axum::Json(super::BreakGlassRequest { duration_s: 600 }),
+    )
+    .await
+    .is_ok()
+}
+
+async fn break_glass_audited(state: &crate::server::AppState) -> bool {
+    let log_store = state.log_store.clone().expect("log store");
+    log_store
+        .flush_audit()
+        .await
+        .expect("the audit writer drains");
+    let (rows, _total) = log_store
+        .query_audit(&crate::audit::AuditQuery {
+            action_prefix: Some(super::BREAK_GLASS_OPEN_ACTION.to_string()),
+            limit: 10,
+            ..Default::default()
+        })
+        .expect("audit query");
+    !rows.is_empty()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_break_glass_window_that_fails_to_persist_opens_nothing_and_leaves_the_node_behind() {
+    let (state, follower, data_dir) = follower_fixture().await;
+    let saboteur =
+        rusqlite::Connection::open(data_dir.path().join("lorica.db")).expect("second connection");
+    saboteur
+        .execute_batch(
+            "CREATE TRIGGER refuse_window_update BEFORE UPDATE ON cluster_replica
+                 WHEN NEW.key = 'break_glass_until'
+                 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;
+             CREATE TRIGGER refuse_window_insert BEFORE INSERT ON cluster_replica
+                 WHEN NEW.key = 'break_glass_until'
+                 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .expect("test setup: triggers");
+
+    assert!(!open_window(&state).await, "the window write failed");
+    {
+        let store = state.store.lock().await;
+        assert_eq!(
+            store.cluster_break_glass_until().expect("window"),
+            None,
+            "no window persisted for a restart to reload"
+        );
+        assert_eq!(
+            store.cluster_applied_config().expect("marker"),
+            (0, String::new()),
+            "the marker is cleared, so the node is behind and re-pulls"
+        );
+    }
+    assert!(
+        follower.break_glass_until().is_none(),
+        "no window in memory"
+    );
+    assert_eq!(
+        follower.applied().generation,
+        0,
+        "memory agrees with the store"
+    );
+    assert!(
+        !break_glass_audited(&state).await,
+        "no row for a window that never opened"
+    );
+
+    saboteur
+        .execute_batch("DROP TRIGGER refuse_window_update; DROP TRIGGER refuse_window_insert;")
+        .expect("test teardown: triggers");
+    assert!(open_window(&state).await, "the retry opens the window");
+    assert!(state
+        .store
+        .lock()
+        .await
+        .cluster_break_glass_until()
+        .expect("window")
+        .is_some());
+    assert!(follower.break_glass_until().is_some());
+    assert!(break_glass_audited(&state).await);
+}

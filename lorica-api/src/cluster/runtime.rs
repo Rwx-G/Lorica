@@ -149,6 +149,58 @@ impl RefreshCoalescer {
     }
 }
 
+/// The most cluster units ([`detached`]) that run at once, counting
+/// only the outermost: a unit started inside another takes no slot, or
+/// a saturated bound would leave every outer unit waiting on an inner
+/// one that can never start.
+///
+/// The listener hooks are the reason for a bound of their own. A
+/// management request is already bounded by the management plane's
+/// units before it reaches one of these, but an enrolment, a renewal
+/// or a leave arrives from the fleet with nothing above it, and each
+/// unit outlives the connection that asked for it.
+pub const CLUSTER_DETACHED_UNITS_MAX: usize = 64;
+
+tokio::task_local! {
+    /// Set for the whole of a unit's task, so a nested [`detached`]
+    /// knows it is not the outermost.
+    static INSIDE_DETACHED_UNIT: ();
+}
+
+/// Where every cluster unit runs: one tracker the shutdown drains
+/// ([`drain_detached`]) and the slots of [`CLUSTER_DETACHED_UNITS_MAX`].
+struct DetachedRegistry {
+    tracker: tokio_util::task::TaskTracker,
+    slots: Arc<tokio::sync::Semaphore>,
+}
+
+fn detached_registry() -> &'static DetachedRegistry {
+    static REGISTRY: std::sync::OnceLock<DetachedRegistry> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| DetachedRegistry {
+        tracker: tokio_util::task::TaskTracker::new(),
+        slots: Arc::new(tokio::sync::Semaphore::new(CLUSTER_DETACHED_UNITS_MAX)),
+    })
+}
+
+/// The audit row a unit owes for its change, written as
+/// `<action>.incomplete` when the unit panics instead of finishing.
+///
+/// A panic can land after the commit and before the row the commit is
+/// owed, and the change then took effect with nothing in the
+/// tamper-evident trail. The unit cannot write that row itself once it
+/// has unwound, so it is described up front and written for it.
+pub struct OwedAudit {
+    /// Where the row goes; `None` when the audit log is not open.
+    pub log_store: Option<Arc<crate::log_store::LogStore>>,
+    /// Who asked for the change.
+    pub ctx: crate::audit::AuditContext,
+    /// The action the unit records when it finishes.
+    pub action: &'static str,
+    /// `(target_type, target_id)` as far as it is known before the
+    /// unit runs.
+    pub target: (&'static str, String),
+}
+
 /// Run `work` on its own task and await it, so dropping the caller
 /// cannot cut it short.
 ///
@@ -160,14 +212,110 @@ impl RefreshCoalescer {
 /// for a change that took effect. Detached, the sequence either never
 /// starts or runs to its end. `what` names the sequence in the error a
 /// panicking or cancelled task produces.
-pub async fn detached<T, Fut>(what: &str, work: Fut) -> Result<T, ClusterRuntimeError>
+///
+/// The task runs on a tracker the shutdown drains ([`drain_detached`]),
+/// within [`CLUSTER_DETACHED_UNITS_MAX`]; the slot is taken before the
+/// task exists, so a caller dropped while it waits starts nothing. A
+/// panic is caught on the task and logged at ERROR. A unit that owes an
+/// audit row goes through [`detached_audited`] instead.
+pub async fn detached<T, Fut>(what: &'static str, work: Fut) -> Result<T, ClusterRuntimeError>
 where
     Fut: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::spawn(work)
-        .await
-        .map_err(|e| ClusterRuntimeError::EnforcementTask(format!("{what} task join failed: {e}")))
+    run_detached(what, None, work).await
+}
+
+/// [`detached`] for a unit that commits a change and owes it an audit
+/// row: when the unit panics, `owed` is written as
+/// `<action>.incomplete` on the unit's own task, so the row does not
+/// depend on the caller still being there.
+pub async fn detached_audited<T, Fut>(
+    what: &'static str,
+    owed: OwedAudit,
+    work: Fut,
+) -> Result<T, ClusterRuntimeError>
+where
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    run_detached(what, Some(owed), work).await
+}
+
+async fn run_detached<T, Fut>(
+    what: &'static str,
+    owed: Option<OwedAudit>,
+    work: Fut,
+) -> Result<T, ClusterRuntimeError>
+where
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    use futures_util::FutureExt;
+    let registry = detached_registry();
+    let slot = if INSIDE_DETACHED_UNIT.try_with(|_| ()).is_ok() {
+        None
+    } else {
+        Some(
+            Arc::clone(&registry.slots)
+                .acquire_owned()
+                .await
+                .map_err(|e| ClusterRuntimeError::EnforcementTask(format!("{what}: {e}")))?,
+        )
+    };
+    let unit = INSIDE_DETACHED_UNIT.scope((), async move {
+        let _slot = slot;
+        match std::panic::AssertUnwindSafe(work).catch_unwind().await {
+            Ok(answer) => Some(answer),
+            Err(panic) => {
+                let reason = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                tracing::error!(
+                    task = what,
+                    panic = %reason,
+                    "a cluster unit panicked; a change it committed may lack its enforcement, and a unit that owes an audit row records it as incomplete"
+                );
+                if let Some(owed) = owed {
+                    crate::audit::record_with_store(
+                        owed.log_store,
+                        &owed.ctx,
+                        &format!("{}.incomplete", owed.action),
+                        (owed.target.0, &owed.target.1),
+                        None,
+                        Some(&serde_json::json!({ "task": what, "outcome": "panicked" })),
+                    )
+                    .await;
+                }
+                None
+            }
+        }
+    });
+    match registry.tracker.spawn(unit).await {
+        Ok(Some(answer)) => Ok(answer),
+        Ok(None) => Err(ClusterRuntimeError::EnforcementTask(format!(
+            "{what} task panicked"
+        ))),
+        Err(e) => Err(ClusterRuntimeError::EnforcementTask(format!(
+            "{what} task join failed: {e}"
+        ))),
+    }
+}
+
+/// Wait up to `grace` for every cluster unit in flight to end, for the
+/// shutdown path: a unit between its commit and its audit row is
+/// waited for rather than cut when the runtime drops. `false` when
+/// some were still running at the deadline.
+pub async fn drain_detached(grace: Duration) -> bool {
+    let tracker = &detached_registry().tracker;
+    tracker.close();
+    let drained = tokio::time::timeout(grace, tracker.wait()).await.is_ok();
+    // The tracker is process-wide: closing it only arms `wait`, and
+    // reopening keeps a later drain meaningful.
+    tracker.reopen();
+    drained
 }
 
 /// Run a pure-store closure and keep its error typed: `db_blocking`
