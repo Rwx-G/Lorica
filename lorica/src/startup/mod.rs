@@ -929,39 +929,69 @@ pub(crate) fn build_notify_dispatcher(
 ) -> lorica_notify::NotifyDispatcher {
     let mut dispatcher = lorica_notify::NotifyDispatcher::new();
     if let Ok(configs) = store.list_notification_configs() {
-        for nc in configs {
-            let config_json = &nc.config;
-            match nc.channel {
-                lorica_config::models::NotificationChannel::Email => {
-                    if let Ok(email_cfg) =
-                        serde_json::from_str::<lorica_notify::channels::EmailConfig>(config_json)
-                    {
-                        dispatcher.add_email_channel(nc.id, email_cfg, nc.alert_types, nc.enabled);
-                    }
+        register_notify_channels(&mut dispatcher, configs);
+    }
+    dispatcher
+}
+
+/// Apply the stored notification channels to the live dispatcher, in
+/// place, on a configuration change.
+///
+/// In place rather than by swapping in a new dispatcher: the history
+/// ring is aliased by `AppState` (the in-memory fallback of the
+/// notification history endpoint) and the per-channel rate-limit
+/// budgets live in the dispatcher, so a fresh one would orphan the
+/// first and reset the second on every save. The store lock is
+/// released before the dispatcher lock is taken, because the alert
+/// bridge holds the dispatcher lock across network sends. A store
+/// that cannot be read keeps the current channels.
+pub(crate) async fn reload_notify_dispatcher(
+    store: &Arc<Mutex<ConfigStore>>,
+    dispatcher: &Mutex<lorica_notify::NotifyDispatcher>,
+) {
+    let listed = store.lock().await.list_notification_configs();
+    let configs = match listed {
+        Ok(configs) => configs,
+        Err(e) => {
+            warn!(error = %e, "failed to read notification channels; the current ones stay");
+            return;
+        }
+    };
+    let mut dispatcher = dispatcher.lock().await;
+    dispatcher.clear_channels();
+    register_notify_channels(&mut dispatcher, configs);
+}
+
+fn register_notify_channels(
+    dispatcher: &mut lorica_notify::NotifyDispatcher,
+    configs: Vec<lorica_config::models::NotificationConfig>,
+) {
+    for nc in configs {
+        let config_json = &nc.config;
+        match nc.channel {
+            lorica_config::models::NotificationChannel::Email => {
+                if let Ok(email_cfg) =
+                    serde_json::from_str::<lorica_notify::channels::EmailConfig>(config_json)
+                {
+                    dispatcher.add_email_channel(nc.id, email_cfg, nc.alert_types, nc.enabled);
                 }
-                lorica_config::models::NotificationChannel::Webhook => {
-                    if let Ok(webhook_cfg) =
-                        serde_json::from_str::<lorica_notify::channels::WebhookConfig>(config_json)
-                    {
-                        dispatcher.add_webhook_channel(
-                            nc.id,
-                            webhook_cfg,
-                            nc.alert_types,
-                            nc.enabled,
-                        );
-                    }
+            }
+            lorica_config::models::NotificationChannel::Webhook => {
+                if let Ok(webhook_cfg) =
+                    serde_json::from_str::<lorica_notify::channels::WebhookConfig>(config_json)
+                {
+                    dispatcher.add_webhook_channel(nc.id, webhook_cfg, nc.alert_types, nc.enabled);
                 }
-                lorica_config::models::NotificationChannel::Slack => {
-                    if let Ok(slack_cfg) =
-                        serde_json::from_str::<lorica_notify::channels::WebhookConfig>(config_json)
-                    {
-                        dispatcher.add_slack_channel(nc.id, slack_cfg, nc.alert_types, nc.enabled);
-                    }
+            }
+            lorica_config::models::NotificationChannel::Slack => {
+                if let Ok(slack_cfg) =
+                    serde_json::from_str::<lorica_notify::channels::WebhookConfig>(config_json)
+                {
+                    dispatcher.add_slack_channel(nc.id, slack_cfg, nc.alert_types, nc.enabled);
                 }
             }
         }
     }
-    dispatcher
 }
 
 /// Try to initialise the OpenTelemetry exporter from persisted
@@ -1219,6 +1249,53 @@ pub(crate) async fn shutdown_signal() {
     log_store_health::begin_shutdown();
 }
 
+/// How long the exit path waits for the tracked background tasks.
+pub(crate) const BACKGROUND_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the exit path waits for cluster units in flight
+/// (`lorica_api::cluster::runtime::detached`): a unit between its
+/// commit and its audit row finishes instead of being cut when the
+/// runtime drops.
+pub(crate) const CLUSTER_UNIT_DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// What [`drain_for_exit`] managed to wait out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExitDrain {
+    /// Every tracked background task ended in time.
+    pub(crate) background_tasks: bool,
+    /// Every cluster unit in flight ended in time.
+    pub(crate) cluster_units: bool,
+}
+
+/// Wait out the tracked background tasks and the cluster units in
+/// flight, concurrently and each within its own bound, before the
+/// process exits. Called once the cluster plane is shut down, so no
+/// fleet session can start a new unit while this waits.
+pub(crate) async fn drain_for_exit(tracker: &tokio_util::task::TaskTracker) -> ExitDrain {
+    tracker.close();
+    let (background_tasks, cluster_units) = tokio::join!(
+        async {
+            tokio::time::timeout(BACKGROUND_TASK_DRAIN_TIMEOUT, tracker.wait())
+                .await
+                .is_ok()
+        },
+        lorica_api::cluster::runtime::drain_detached(CLUSTER_UNIT_DRAIN_GRACE),
+    );
+    if !background_tasks {
+        warn!("some background tasks did not finish within drain timeout; aborting");
+    }
+    if !cluster_units {
+        warn!(
+            "some cluster units did not finish within the shutdown grace; their changes may \
+             lack an audit row"
+        );
+    }
+    ExitDrain {
+        background_tasks,
+        cluster_units,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Story 9.5 AC #4 / D7 drift gate.
@@ -1278,5 +1355,106 @@ mod tests {
         }
 
         assert_eq!(call_sites, vec!["single.rs", "worker.rs"]);
+    }
+
+    fn webhook_config(id: &str, enabled: bool) -> lorica_config::models::NotificationConfig {
+        lorica_config::models::NotificationConfig {
+            id: id.to_string(),
+            channel: lorica_config::models::NotificationChannel::Webhook,
+            enabled,
+            config: r#"{"url":"https://hooks.example.com/alerts","auth_header":null}"#.to_string(),
+            alert_types: vec!["backend_down".to_string()],
+        }
+    }
+
+    /// The history ring is aliased by `AppState` at boot; a reload that
+    /// swapped in a new dispatcher would leave that alias reading a ring
+    /// nothing writes to any more.
+    #[tokio::test]
+    async fn reloading_the_dispatcher_replaces_channels_and_keeps_its_history_ring() {
+        use std::sync::Arc;
+        let store = Arc::new(tokio::sync::Mutex::new(
+            lorica_config::ConfigStore::open_in_memory().expect("test setup: config store"),
+        ));
+        store
+            .lock()
+            .await
+            .create_notification_config(&webhook_config("nc-old", true))
+            .expect("test setup: notification config");
+        let dispatcher = {
+            let s = store.lock().await;
+            tokio::sync::Mutex::new(super::build_notify_dispatcher(&s))
+        };
+        let history_at_boot = dispatcher.lock().await.history();
+        assert_eq!(dispatcher.lock().await.channel_count(), 1);
+
+        {
+            let s = store.lock().await;
+            s.delete_notification_config("nc-old")
+                .expect("test setup: delete");
+            s.create_notification_config(&webhook_config("nc-a", true))
+                .expect("test setup: notification config");
+            s.create_notification_config(&webhook_config("nc-b", false))
+                .expect("test setup: notification config");
+        }
+        super::reload_notify_dispatcher(&store, &dispatcher).await;
+
+        let d = dispatcher.lock().await;
+        assert_eq!(
+            d.channel_count(),
+            2,
+            "removed channel gone, both new ones in"
+        );
+        assert!(
+            Arc::ptr_eq(&history_at_boot, &d.history()),
+            "the boot-time history alias still points at the live ring"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_exit_drain_waits_for_a_cluster_unit_in_flight() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let finished = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let unit_finished = Arc::clone(&finished);
+        let caller = tokio::spawn(lorica_api::cluster::runtime::detached(
+            "exit drain test",
+            async move {
+                let _ = started_tx.send(());
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                unit_finished.store(true, Ordering::Release);
+            },
+        ));
+        started_rx.await.expect("the unit started");
+        // The caller is gone, as a disconnected management client
+        // would be; the unit still runs to its end on its own task.
+        caller.abort();
+
+        let drained = super::drain_for_exit(&tokio_util::task::TaskTracker::new()).await;
+
+        assert!(drained.cluster_units);
+        assert!(drained.background_tasks);
+        assert!(
+            finished.load(Ordering::Acquire),
+            "shutdown returned only after the unit finished"
+        );
+    }
+
+    /// Every exit path goes through the drain: `drain_detached` shipped
+    /// in 724fa6ec with no caller at all.
+    #[test]
+    fn every_exit_path_drains_cluster_units() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/startup");
+        // Supervisor: the shutdown signal and the hot-upgrade drain.
+        for (file, expected) in [("supervisor.rs", 2), ("single.rs", 1)] {
+            let src = std::fs::read_to_string(root.join(file))
+                .unwrap_or_else(|e| panic!("test setup: {file} reads: {e}"));
+            let calls = src
+                .lines()
+                .filter(|l| l.contains("drain_for_exit(") && !l.trim_start().starts_with("//"))
+                .count();
+            assert_eq!(calls, expected, "{file}: exit paths calling drain_for_exit");
+        }
     }
 }

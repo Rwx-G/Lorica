@@ -184,10 +184,9 @@ pub(crate) fn run_single_process(cli: Cli) {
         // dispatcher + alert bridge + probe scheduler + SLA collector
         // cluster shared with supervisor mode (audit H-9, see
         // `startup::start_alerting_stack`). The dispatcher handle is
-        // kept: the config-reload listener below rebuilds it when
-        // notification channels change (Story 8.1 asymmetry, fixed in
-        // v1.5.11: edits used to be ignored until restart in
-        // single-process mode while supervisor mode hot-reloaded them).
+        // kept: the config-reload listener below reapplies its channels
+        // when notification settings change (Story 8.1 asymmetry, fixed
+        // in v1.5.11).
         let alert_sender = lorica_notify::AlertSender::new(256);
         let startup::AlertingStack {
             notify_dispatcher,
@@ -585,16 +584,8 @@ pub(crate) fn run_single_process(cli: Cli) {
                 }
                 lorica::reload::reload_cert_resolver(&reload_store, &reload_cert_resolver).await;
                 reload_probe_scheduler.reload().await;
-                {
-                    let s = reload_store.lock().await;
-                    reload_sla_collector.load_configs(&s);
-                    // Rebuild notification dispatcher with updated
-                    // channel configs, mirroring supervisor mode
-                    // (Story 8.1 asymmetry, fixed in v1.5.11).
-                    let new_dispatcher = startup::build_notify_dispatcher(&s);
-                    let mut d = reload_notify_dispatcher.lock().await;
-                    *d = new_dispatcher;
-                }
+                reload_sla_collector.load_configs(&*reload_store.lock().await);
+                startup::reload_notify_dispatcher(&reload_store, &reload_notify_dispatcher).await;
             }
         });
 
@@ -647,15 +638,10 @@ pub(crate) fn run_single_process(cli: Cli) {
             follower.shutdown();
         }
 
-        // Drain tracked background tasks before tearing down the API
-        // server. Bounded at 10 s so a hung task does not delay exit.
-        shutdown_task_tracker.close();
-        if tokio::time::timeout(Duration::from_secs(10), shutdown_task_tracker.wait())
-            .await
-            .is_err()
-        {
-            warn!("some background tasks did not finish within drain timeout; aborting");
-        }
+        // Drain tracked background tasks and cluster units in flight
+        // before tearing down the API server, each bounded so a hung
+        // task does not delay exit.
+        startup::drain_for_exit(&shutdown_task_tracker).await;
         api_handle.abort();
         health_handle.abort();
 

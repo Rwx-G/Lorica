@@ -85,7 +85,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
     use lorica_command::CommandChannel;
     use lorica_worker::manager::{WorkerConfig, WorkerEvent, WorkerManager};
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
     use tokio::sync::broadcast;
 
@@ -489,8 +489,6 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // an auto-ban would make the two indistinguishable in
         // `GET /api/v1/bans` and in the fleet view.
         let (ban_bc_tx, _) = broadcast::channel::<(String, u64, i32)>(1024);
-        // Clone for the API's watch-based reload signal
-        let reload_bc_tx_clone = reload_bc_tx.clone();
         let (config_reload_tx, mut config_reload_rx) = tokio::sync::watch::channel(0u64);
 
         // Register the watch sender with the reload module so the
@@ -531,87 +529,10 @@ pub(crate) fn run_supervisor(cli: Cli) {
             dashmap::DashMap<String, Option<lorica_config::models::RateLimit>>,
         > = Arc::new(dashmap::DashMap::new());
 
-        // Bridge: watch channel (from API) -> broadcast (to per-worker tasks)
-        //
-        // In worker mode we also drive the pipelined-RPC two-phase
-        // coordinator off the same signal (see `coordinate_config_reload`
-        // below). The coordinator and the legacy broadcast both end up
-        // reloading the same config; when both succeed the later one is
-        // a no-op (new_config == current_config). We keep the legacy
-        // path for the rare case where a worker's RPC channel is not
-        // yet registered (race at worker spawn).
+        // Shared by the config-reload bridge (spawned once the
+        // alerting stack exists, below) and the per-worker heartbeat
+        // tasks.
         let sequence = Arc::new(AtomicU64::new(1));
-        let bridge_seq = Arc::clone(&sequence);
-        let endpoints_for_reload = Arc::clone(&worker_rpc_endpoints);
-        let reload_generation_clone = Arc::clone(&reload_generation);
-        let rl_policy_for_reload = Arc::clone(&rl_policy_cache);
-        let supervisor_reload_store = Arc::clone(&store);
-        tokio::spawn(async move {
-            while config_reload_rx.changed().await.is_ok() {
-                // Apply the per-process hot-reload hooks (GeoIP / ASN
-                // updater task lifecycle, OTel exporter, bot HMAC
-                // secret) on the SUPERVISOR side. Worker reload runs
-                // independently via the RPC two-phase coordinator
-                // below. Without this call, supervisor-side state
-                // (auto-update task spawn / abort, OTel exporter)
-                // would only refresh at boot time.
-                lorica::reload::apply_supervisor_settings_from_store(
-                    &supervisor_reload_store,
-                )
-                .await;
-                let seq = bridge_seq.fetch_add(1, Ordering::Relaxed);
-                // Two-phase RPC reload (WPAR-8) when any worker has a
-                // registered endpoint.
-                if !endpoints_for_reload.is_empty() {
-                    let gen = reload_generation_clone
-                        .fetch_add(1, Ordering::Relaxed)
-                        + 1;
-                    let report = coordinate_config_reload(&endpoints_for_reload, gen).await;
-                    if !report.prepare_failed.is_empty() || !report.commit_failed.is_empty() {
-                        // Audit M-17 : when commit_failed is non-empty
-                        // AND committed is non-empty, the fleet is
-                        // transiently split (some workers serve the
-                        // new config, others still on the old) until
-                        // the legacy fallback below brings the
-                        // stragglers in line. Surface as a Prometheus
-                        // counter so operators can alert on
-                        // fleet-coherence gaps even though the system
-                        // self-heals on the next reload.
-                        if !report.commit_failed.is_empty() && !report.committed.is_empty() {
-                            warn!(
-                                seq,
-                                generation = report.generation,
-                                committed = report.committed.len(),
-                                commit_failed = report.commit_failed.len(),
-                                "two-phase config reload split fleet : some workers committed, others did not - legacy broadcast fallback will reconcile"
-                            );
-                            lorica_api::metrics::inc_config_reload_split_fleet();
-                        }
-                        warn!(
-                            seq,
-                            generation = report.generation,
-                            prepare_failed = report.prepare_failed.len(),
-                            commit_failed = report.commit_failed.len(),
-                            "two-phase config reload had failures; falling back to legacy broadcast"
-                        );
-                        let _ = reload_bc_tx_clone.send(seq);
-                    }
-                    // Whether the two-phase path fully committed or fell
-                    // back to the legacy broadcast, the route policies
-                    // may have changed - drop the supervisor-side
-                    // rate-limit policy cache so the next RateLimitDelta
-                    // re-reads them from the store (audit M-4).
-                    rl_policy_for_reload.clear();
-                } else {
-                    // No workers with RPC (e.g. --workers 0 or before
-                    // any worker registered). Fall back to legacy
-                    // per-worker broadcast which also fires the SIGHUP
-                    // path for single-process mode.
-                    let _ = reload_bc_tx_clone.send(seq);
-                    rl_policy_for_reload.clear();
-                }
-            }
-        });
 
         // Aggregated metrics from all workers (shared with API)
         let aggregated_metrics = Arc::new(lorica_api::workers::AggregatedMetrics::new());
@@ -840,27 +761,36 @@ pub(crate) fn run_supervisor(cli: Cli) {
             startup::log_store_health::LOG_STORE_WATCH_INTERVAL,
         );
 
-        // Reload proxy config, probe scheduler, SLA configs, and notification dispatcher on config changes
-        let reload_store = Arc::clone(&store);
-        let reload_config = Arc::clone(&proxy_config);
-        let reload_probe_scheduler = Arc::clone(&probe_scheduler);
-        let reload_sla_collector = Arc::clone(&sla_collector);
-        let reload_notify_dispatcher = Arc::clone(&notify_dispatcher);
-        let mut reload_rx = reload_bc_tx.subscribe();
+        // Config-change bridge: every change signalled on the watch
+        // channel (API, environment reaper, GeoIP updater, cluster
+        // replication) reaches the workers and the supervisor's own
+        // state through `ConfigReloadBridge::apply_config_change`. A
+        // change already pending when this spawns is not lost: the
+        // watch receiver still reports it.
+        let reload_bridge = ConfigReloadBridge::new(
+            Arc::clone(&worker_rpc_endpoints),
+            Arc::clone(&reload_generation),
+            Arc::clone(&sequence),
+            Arc::clone(&rl_policy_cache),
+            reload_bc_tx.clone(),
+            SupervisorReloadTargets {
+                store: Arc::clone(&store),
+                proxy_config: Arc::clone(&proxy_config),
+                probe_scheduler: Arc::clone(&probe_scheduler),
+                sla_collector: Arc::clone(&sla_collector),
+                notify_dispatcher: Arc::clone(&notify_dispatcher),
+            },
+        );
+        let supervisor_reload_store = Arc::clone(&store);
         tokio::spawn(async move {
-            while reload_rx.recv().await.is_ok() {
-                if let Err(e) = reload_proxy_config(&reload_store, &reload_config, None).await {
-                    tracing::error!(error = %e, "supervisor: failed to reload proxy config");
-                }
-                reload_probe_scheduler.reload().await;
-                {
-                    let s = reload_store.lock().await;
-                    reload_sla_collector.load_configs(&s);
-                    // Rebuild notification dispatcher with updated channel configs
-                    let new_dispatcher = startup::build_notify_dispatcher(&s);
-                    let mut d = reload_notify_dispatcher.lock().await;
-                    *d = new_dispatcher;
-                }
+            while config_reload_rx.changed().await.is_ok() {
+                // Per-process hot-reload hooks (GeoIP / ASN updater
+                // lifecycle, OTel exporter, log sinks, bot HMAC secret)
+                // on the SUPERVISOR side; without this they would only
+                // refresh at boot.
+                lorica::reload::apply_supervisor_settings_from_store(&supervisor_reload_store)
+                    .await;
+                reload_bridge.apply_config_change().await;
             }
         });
 
@@ -1422,14 +1352,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                             e.into_inner()
                         })
                         .shutdown_all();
-                    // Drain tracked background tasks, bounded to 10 s.
-                    shutdown_task_tracker.close();
-                    if tokio::time::timeout(Duration::from_secs(10), shutdown_task_tracker.wait())
-                        .await
-                        .is_err()
-                    {
-                        warn!("some background tasks did not finish within drain timeout; aborting");
-                    }
+                    startup::drain_for_exit(&shutdown_task_tracker).await;
                     api_handle.abort();
                     health_handle.abort();
                     lorica::otel::shutdown();
@@ -1548,12 +1471,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                                     "hot upgrade: drain exceeded the window, stragglers were force-killed"
                                 );
                             }
-                            shutdown_task_tracker.close();
-                            let _ = tokio::time::timeout(
-                                Duration::from_secs(10),
-                                shutdown_task_tracker.wait(),
-                            )
-                            .await;
+                            startup::drain_for_exit(&shutdown_task_tracker).await;
                             api_handle.abort();
                             health_handle.abort();
                             lorica::otel::shutdown();
@@ -2493,6 +2411,118 @@ async fn handle_breaker_report(
 }
 
 // ---------------------------------------------------------------------------
+// Config-change bridge: one change signal, applied to the workers and to
+// the supervisor's own copies of the configuration.
+// ---------------------------------------------------------------------------
+
+/// The configuration the supervisor itself acts on, as opposed to what
+/// its workers serve: the proxy view its health checks resolve, the
+/// active probes and SLA thresholds it evaluates, and the notification
+/// channels every alert leaves through.
+struct SupervisorReloadTargets {
+    store: Arc<Mutex<ConfigStore>>,
+    proxy_config: Arc<ArcSwap<ProxyConfig>>,
+    probe_scheduler: Arc<lorica_bench::ProbeScheduler>,
+    sla_collector: Arc<lorica_bench::SlaCollector>,
+    notify_dispatcher: Arc<Mutex<lorica_notify::NotifyDispatcher>>,
+}
+
+impl SupervisorReloadTargets {
+    async fn refresh(&self) {
+        if let Err(e) = reload_proxy_config(&self.store, &self.proxy_config, None).await {
+            error!(error = %e, "supervisor: failed to reload proxy config");
+        }
+        self.probe_scheduler.reload().await;
+        self.sla_collector.load_configs(&*self.store.lock().await);
+        startup::reload_notify_dispatcher(&self.store, &self.notify_dispatcher).await;
+    }
+}
+
+type RateLimitPolicyCache = dashmap::DashMap<String, Option<lorica_config::models::RateLimit>>;
+
+/// Everything one configuration change drives from the supervisor.
+///
+/// The supervisor's own state is refreshed here, on every change,
+/// rather than by a listener on the legacy broadcast: that broadcast
+/// only fires when the two-phase reload fails or no worker has
+/// registered, so from v1.3.0 to v1.9.1 a reload that the workers
+/// committed left the supervisor's notification channels, probes, SLA
+/// thresholds and health-check view as they were until a restart.
+struct ConfigReloadBridge {
+    worker_endpoints: Arc<dashmap::DashMap<u32, lorica_command::RpcEndpoint>>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    sequence: Arc<std::sync::atomic::AtomicU64>,
+    rl_policy_cache: Arc<RateLimitPolicyCache>,
+    legacy_broadcast: tokio::sync::broadcast::Sender<u64>,
+    supervisor_state: SupervisorReloadTargets,
+}
+
+impl ConfigReloadBridge {
+    fn new(
+        worker_endpoints: Arc<dashmap::DashMap<u32, lorica_command::RpcEndpoint>>,
+        generation: Arc<std::sync::atomic::AtomicU64>,
+        sequence: Arc<std::sync::atomic::AtomicU64>,
+        rl_policy_cache: Arc<RateLimitPolicyCache>,
+        legacy_broadcast: tokio::sync::broadcast::Sender<u64>,
+        supervisor_state: SupervisorReloadTargets,
+    ) -> Self {
+        Self {
+            worker_endpoints,
+            generation,
+            sequence,
+            rl_policy_cache,
+            legacy_broadcast,
+            supervisor_state,
+        }
+    }
+
+    async fn apply_config_change(&self) {
+        self.reload_workers().await;
+        // Route policies may have changed whichever way the workers
+        // reloaded: the next RateLimitDelta re-reads them (audit M-4).
+        self.rl_policy_cache.clear();
+        self.supervisor_state.refresh().await;
+    }
+
+    /// Two-phase RPC reload (WPAR-8) when any worker has registered an
+    /// endpoint, the legacy per-worker broadcast otherwise or when the
+    /// two-phase round fails.
+    async fn reload_workers(&self) {
+        use std::sync::atomic::Ordering;
+        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+        if !self.worker_endpoints.is_empty() {
+            let gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+            let report = coordinate_config_reload(&self.worker_endpoints, gen).await;
+            if !report.prepare_failed.is_empty() || !report.commit_failed.is_empty() {
+                // Audit M-17: some workers serve the new config and
+                // others the old one until the fallback below reconciles
+                // them. Counted so operators can alert on the gap.
+                if !report.commit_failed.is_empty() && !report.committed.is_empty() {
+                    warn!(
+                        seq,
+                        generation = report.generation,
+                        committed = report.committed.len(),
+                        commit_failed = report.commit_failed.len(),
+                        "two-phase config reload split fleet : some workers committed, others did not - legacy broadcast fallback will reconcile"
+                    );
+                    lorica_api::metrics::inc_config_reload_split_fleet();
+                }
+                warn!(
+                    seq,
+                    generation = report.generation,
+                    prepare_failed = report.prepare_failed.len(),
+                    commit_failed = report.commit_failed.len(),
+                    "two-phase config reload had failures; falling back to legacy broadcast"
+                );
+                let _ = self.legacy_broadcast.send(seq);
+            }
+        } else {
+            let _ = self.legacy_broadcast.send(seq);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Supervisor-side two-phase config reload coordinator (WPAR-8).
 //
 // Replaces the legacy one-shot `CommandType::ConfigReload` with a
@@ -3067,5 +3097,143 @@ mod supervisor_tests {
             r.query("route-b", "b"),
             lorica_command::BreakerDecision::Allow
         );
+    }
+
+    /// A worker on the far end of a real RPC socketpair that answers
+    /// the two-phase reload, accepting it or refusing the Prepare.
+    fn fake_worker(accept_prepare: bool) -> lorica_command::RpcEndpoint {
+        let (supervisor_end, worker_end) =
+            tokio::net::UnixStream::pair().expect("test setup: UnixStream::pair");
+        let (supervisor_ep, _supervisor_incoming) =
+            lorica_command::RpcEndpoint::new(supervisor_end);
+        let (worker_ep, mut worker_incoming) = lorica_command::RpcEndpoint::new(worker_end);
+        tokio::spawn(async move {
+            let _keep_open = worker_ep;
+            while let Some(inc) = worker_incoming.recv().await {
+                let refuse = !accept_prepare
+                    && inc.command_type() == lorica_command::CommandType::ConfigReloadPrepare;
+                if refuse {
+                    let _ = inc.reply_error("injected Prepare failure").await;
+                } else {
+                    let _ = inc.reply(lorica_command::Response::ok(0)).await;
+                }
+            }
+        });
+        supervisor_ep
+    }
+
+    struct BridgeFixture {
+        bridge: ConfigReloadBridge,
+        store: Arc<Mutex<ConfigStore>>,
+        dispatcher: Arc<Mutex<lorica_notify::NotifyDispatcher>>,
+        legacy_rx: tokio::sync::broadcast::Receiver<u64>,
+    }
+
+    fn bridge_fixture(workers: &[bool]) -> BridgeFixture {
+        let store = Arc::new(Mutex::new(
+            ConfigStore::open_in_memory().expect("test setup: config store"),
+        ));
+        let dispatcher = Arc::new(Mutex::new(lorica_notify::NotifyDispatcher::new()));
+        let endpoints = Arc::new(dashmap::DashMap::new());
+        for (id, accept) in workers.iter().enumerate() {
+            endpoints.insert(id as u32, fake_worker(*accept));
+        }
+        let (legacy_tx, legacy_rx) = tokio::sync::broadcast::channel(16);
+        let bridge = ConfigReloadBridge::new(
+            endpoints,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            Arc::new(dashmap::DashMap::new()),
+            legacy_tx,
+            SupervisorReloadTargets {
+                store: Arc::clone(&store),
+                proxy_config: Arc::new(ArcSwap::from_pointee(ProxyConfig::default())),
+                probe_scheduler: Arc::new(lorica_bench::ProbeScheduler::new(
+                    Arc::clone(&store),
+                    Some(Arc::clone(&dispatcher)),
+                )),
+                sla_collector: Arc::new(lorica_bench::SlaCollector::new()),
+                notify_dispatcher: Arc::clone(&dispatcher),
+            },
+        );
+        BridgeFixture {
+            bridge,
+            store,
+            dispatcher,
+            legacy_rx,
+        }
+    }
+
+    async fn add_webhook_channel(store: &Mutex<ConfigStore>) {
+        store
+            .lock()
+            .await
+            .create_notification_config(&lorica_config::models::NotificationConfig {
+                id: "nc-1".to_string(),
+                channel: lorica_config::models::NotificationChannel::Webhook,
+                enabled: true,
+                config: r#"{"url":"https://hooks.example.com/alerts","auth_header":null}"#
+                    .to_string(),
+                alert_types: vec!["backend_down".to_string()],
+            })
+            .expect("test setup: notification config");
+    }
+
+    /// Long enough for the slowest path to land; a correct bridge has
+    /// applied the change before `apply_config_change` returns.
+    async fn channel_count_after_settling(
+        dispatcher: &Mutex<lorica_notify::NotifyDispatcher>,
+    ) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let count = dispatcher.lock().await.channel_count();
+            if count > 0 || Instant::now() >= deadline {
+                return count;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_committed_two_phase_reload_applies_the_new_notification_channels() {
+        let mut f = bridge_fixture(&[true, true]);
+        add_webhook_channel(&f.store).await;
+
+        f.bridge.apply_config_change().await;
+
+        assert_eq!(
+            channel_count_after_settling(&f.dispatcher).await,
+            1,
+            "the supervisor alerts through the channel the operator just added"
+        );
+        assert!(
+            f.legacy_rx.try_recv().is_err(),
+            "a fully committed reload does not also fire the legacy per-worker broadcast"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_two_phase_reload_falls_back_and_still_applies_the_channels() {
+        let mut f = bridge_fixture(&[true, false]);
+        add_webhook_channel(&f.store).await;
+
+        f.bridge.apply_config_change().await;
+
+        assert_eq!(channel_count_after_settling(&f.dispatcher).await, 1);
+        assert!(
+            f.legacy_rx.try_recv().is_ok(),
+            "a refused Prepare falls back to the legacy per-worker broadcast"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reload_with_no_registered_worker_applies_the_channels() {
+        let mut f = bridge_fixture(&[]);
+        add_webhook_channel(&f.store).await;
+
+        f.bridge.apply_config_change().await;
+
+        assert_eq!(channel_count_after_settling(&f.dispatcher).await, 1);
+        assert!(f.legacy_rx.try_recv().is_ok());
     }
 }

@@ -36,6 +36,8 @@ Author: Rwx-G
 - **The automation plane and the MCP server read from a log store installed by the 60 s retry** instead of answering from the empty in-memory fallback until a restart.
 - **Opening a break-glass window can no longer leave it open with no audit row.** The applied-config marker is cleared before the window is persisted, under one store lock, so a failed write leaves the node behind and it re-pulls its configuration.
 - **Cluster units that commit a change are tracked, bounded and panic-safe.** Enrolment, renewal, leave, node and token mutations, break-glass and fleet bans run on a bounded tracker; a panic is logged at ERROR and recorded as an `<action>.incomplete` audit row instead of leaving the change unaudited, and shutdown waits for units in flight.
+- **In worker mode, notification channel, active probe and SLA edits apply when saved.** Since 1.3.0 the supervisor refreshed its own state only when a reload fell back to the legacy broadcast, which a successful two-phase reload never does, so alerts kept going to the old channels and probes and SLA thresholds stayed stale until a restart or an unrelated backend health flip. The supervisor now refreshes on every reload. Reloading notification channels also no longer drops the in-memory notification history or resets per-channel rate limits.
+- **Shutdown and the hot-upgrade drain wait for in-flight cluster changes,** up to a bounded grace, so they finish and write their audit rows.
 
 ### Removed
 
