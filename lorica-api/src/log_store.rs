@@ -282,6 +282,53 @@ pub struct WafRowForFanIn {
     pub action: String,
 }
 
+/// Whether `table` has a column named `column`. `false` when the table
+/// itself is absent.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        params![table, column],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count > 0)
+}
+
+/// Add `column` to `table` unless it is already there, and fail on
+/// anything else.
+///
+/// Replaces an `ALTER TABLE` whose result was discarded, which hid every
+/// failure behind the one it meant to tolerate (the column already
+/// existing). An ALTER that fails while the column is now present lost
+/// a race with another process opening the same file (the supervisor
+/// and every worker open it), and that is the only failure taken as
+/// success. A local twin of the helper in `lorica-config`'s store
+/// rather than a call into it: that one is private to the config
+/// schema. `table`, `column` and `definition` are constants of
+/// [`LogStore::open`], never input, which is what makes the
+/// interpolation safe.
+fn add_column_if_absent(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), String> {
+    let failed = |e: rusqlite::Error| format!("failed to add column {table}.{column}: {e}");
+    if column_exists(conn, table, column).map_err(failed)? {
+        return Ok(());
+    }
+    match conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    ) {
+        Ok(_) => Ok(()),
+        Err(e) if column_exists(conn, table, column).map_err(failed)? => {
+            tracing::debug!(error = %e, table, column, "column added concurrently by another process");
+            Ok(())
+        }
+        Err(e) => Err(failed(e)),
+    }
+}
+
 /// Persistent log database wrapper. Cheaply cloneable through `Arc<LogStore>`.
 pub struct LogStore {
     /// Shared with the audit consumer thread, which therefore cannot
@@ -309,6 +356,23 @@ impl LogStore {
         let conn = Connection::open(&db_path)
             .map_err(|e| format!("failed to open access log database: {e}"))?;
 
+        // Before any DDL, not after it: the supervisor and every worker
+        // open this file, possibly together, and without a busy timeout
+        // a schema write that meets another process's lock fails on the
+        // spot with "database is locked" instead of waiting its turn.
+        conn.execute_batch(
+            "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
+        )
+        .map_err(|e| format!("failed to set access log pragmas: {e}"))?;
+
+        // Schema rule for every table below. On a file an older release
+        // created, `CREATE TABLE IF NOT EXISTS` does nothing, so the table
+        // keeps the columns that release gave it whatever the CREATE says.
+        // A column some released file lacks is therefore added by
+        // `add_column_if_absent`, and every statement naming it, an index
+        // above all, runs after that call and never in the CREATE batch.
+        // The 1.7.0 audit indexes broke that rule and failed the whole
+        // open on every file 1.6.0 had written (`log_store_upgrade.rs`).
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS access_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -332,42 +396,17 @@ impl LogStore {
         )
         .map_err(|e| format!("failed to initialize access log schema: {e}"))?;
 
-        // Migrate: add columns if missing (existing databases).
-        // Each ALTER is separate because execute_batch stops at first error.
-        let _ = conn.execute(
-            "ALTER TABLE access_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE access_logs ADD COLUMN is_xff INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE access_logs ADD COLUMN xff_proxy_ip TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE access_logs ADD COLUMN source TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE access_logs ADD COLUMN request_id TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-
-        // Migrate: add columns to waf_events if missing
-        let _ = conn.execute(
-            "ALTER TABLE waf_events ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE waf_events ADD COLUMN route_hostname TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE waf_events ADD COLUMN action TEXT NOT NULL DEFAULT ''",
-            [],
-        );
+        // `request_id` arrived in 1.1.0; the other four predate 1.0.0 and
+        // are kept for files from before the first release.
+        for (column, definition) in [
+            ("client_ip", "TEXT NOT NULL DEFAULT ''"),
+            ("is_xff", "INTEGER NOT NULL DEFAULT 0"),
+            ("xff_proxy_ip", "TEXT NOT NULL DEFAULT ''"),
+            ("source", "TEXT NOT NULL DEFAULT ''"),
+            ("request_id", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            add_column_if_absent(&conn, "access_logs", column, definition)?;
+        }
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS waf_events (
@@ -387,6 +426,15 @@ impl LogStore {
             CREATE INDEX IF NOT EXISTS idx_waf_events_category ON waf_events(category);",
         )
         .map_err(|e| format!("failed to initialize waf events schema: {e}"))?;
+        // Every released file already has these three; kept for files
+        // from before the first release.
+        for (column, definition) in [
+            ("client_ip", "TEXT NOT NULL DEFAULT ''"),
+            ("route_hostname", "TEXT NOT NULL DEFAULT ''"),
+            ("action", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            add_column_if_absent(&conn, "waf_events", column, definition)?;
+        }
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS notification_history (
@@ -421,9 +469,6 @@ impl LogStore {
             CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
             CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action);
             CREATE INDEX IF NOT EXISTS idx_audit_log_operator ON audit_log(operator_username);
-            CREATE INDEX IF NOT EXISTS idx_audit_log_node ON audit_log(node_id, origin_id);
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_log_origin
-                ON audit_log(node_id, origin_id) WHERE node_id != '';
             CREATE TABLE IF NOT EXISTS audit_log_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -431,17 +476,17 @@ impl LogStore {
         )
         .map_err(|e| format!("failed to initialize audit log schema: {e}"))?;
 
-        // Migrate: the fan-in columns (Story 9.9 AC #2). Both default
-        // to the local-row value, so an existing single-node database
-        // needs no backfill and reads exactly as it did.
-        let _ = conn.execute(
-            "ALTER TABLE audit_log ADD COLUMN node_id TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audit_log ADD COLUMN origin_id INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
+        // Migrate: the fan-in columns (Story 9.9 AC #2), absent from
+        // every file 1.6.0 wrote. Both default to the local-row value,
+        // so the rows already there join this node's own chain with no
+        // backfill and read exactly as they did.
+        add_column_if_absent(&conn, "audit_log", "node_id", "TEXT NOT NULL DEFAULT ''")?;
+        add_column_if_absent(
+            &conn,
+            "audit_log",
+            "origin_id",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         // When a fanned-in row ARRIVED, set by this store, never by the
         // origin. Retention cuts fanned-in chains on it rather than on
         // `timestamp`, which is a string the origin node chose: a
@@ -449,32 +494,34 @@ impl LogStore {
         // hold them here forever (Epic 9 close, security audit). Empty
         // on local rows and on rows written before the column existed;
         // retention falls back to `timestamp` for those.
-        let _ = conn.execute(
-            "ALTER TABLE audit_log ADD COLUMN received_at TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_audit_log_node ON audit_log(node_id, origin_id)",
-            [],
-        );
-        // PARTIAL on purpose. Every local row is `('', 0)`, so a plain
-        // unique index would refuse the second local audit entry ever
-        // written. Restricted to fanned-in rows it is what makes the
-        // fan-in insert idempotent, so a batch re-sent after a lost
-        // acknowledgement stores nothing twice.
-        let _ = conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_log_origin ON audit_log(node_id, origin_id) WHERE node_id != ''",
-            [],
-        );
-        // After the `received_at` migration, which the age expression
-        // reads. Day-based retention finds each chain's last expired row
-        // through it, in the expired range alone: without it every
+        add_column_if_absent(
+            &conn,
+            "audit_log",
+            "received_at",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+
+        // Every index naming a fan-in column, after the migrations that
+        // add them.
+        //
+        // `uq_audit_log_origin` is PARTIAL on purpose. Every local row is
+        // `('', 0)`, so a plain unique index would refuse the second
+        // local audit entry ever written. Restricted to fanned-in rows it
+        // is what makes the fan-in insert idempotent, so a batch re-sent
+        // after a lost acknowledgement stores nothing twice.
+        //
+        // `idx_audit_log_node_age` reads `received_at` through the age
+        // expression. Day-based retention finds each chain's last expired
+        // row through it, in the expired range alone: without it every
         // hourly pass read every row of every chain under the lock.
         //
         // The fan-in backup keeps every column of a row the cap moved,
         // under the same unique `(node_id, origin_id)` its chain had.
         conn.execute_batch(&format!(
-            "CREATE INDEX IF NOT EXISTS idx_audit_log_node_age
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_node ON audit_log(node_id, origin_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_log_origin
+                ON audit_log(node_id, origin_id) WHERE node_id != '';
+            CREATE INDEX IF NOT EXISTS idx_audit_log_node_age
                 ON audit_log(node_id, {AUDIT_AGE}, origin_id);
             CREATE TABLE IF NOT EXISTS {FANNED_IN_BACKUP_TABLE} (
                 id INTEGER PRIMARY KEY,
@@ -499,12 +546,7 @@ impl LogStore {
             CREATE INDEX IF NOT EXISTS idx_audit_backup_age
                 ON {FANNED_IN_BACKUP_TABLE}(node_id, {AUDIT_AGE}, origin_id);"
         ))
-        .map_err(|e| format!("failed to initialize the audit fan-in backup schema: {e}"))?;
-
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
-        )
-        .map_err(|e| format!("failed to set access log pragmas: {e}"))?;
+        .map_err(|e| format!("failed to initialize the audit fan-in schema: {e}"))?;
 
         let conn = Arc::new(Mutex::new(conn));
         let (audit_tx, audit_rx) = tokio::sync::mpsc::channel(AUDIT_QUEUE_CAPACITY);

@@ -110,11 +110,23 @@ impl AcmeChallengeStore {
         // hitting SQLITE_BUSY at the timeout boundary.
         let conn = match rusqlite::Connection::open(&path) {
             Ok(c) => {
-                let _ = c.execute_batch(
-                    "PRAGMA journal_mode=WAL; \
-                     PRAGMA busy_timeout=5000; \
+                // busy_timeout first: `journal_mode` needs a lock and can
+                // fail while another process holds one, and a batch stops
+                // at its first error, so behind it the timeout was the
+                // pragma lost. Logged rather than fatal: the file is
+                // already WAL after `ConfigStore::open`, and a store that
+                // cannot set a pragma still serves.
+                if let Err(e) = c.execute_batch(
+                    "PRAGMA busy_timeout=5000; \
+                     PRAGMA journal_mode=WAL; \
                      PRAGMA synchronous=NORMAL;",
-                );
+                ) {
+                    tracing::warn!(
+                        error = %e,
+                        db = %path.display(),
+                        "failed to set the ACME challenge store pragmas"
+                    );
+                }
                 // Schema ownership note (Story 9.1 AC #10): the
                 // `acme_challenges` table is created by lorica-config
                 // migration v47, which every process runs on

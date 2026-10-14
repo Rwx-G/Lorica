@@ -225,11 +225,12 @@ impl ClusterTelemetryStore {
         // dashboard) does not block the writer (ingest), a busy
         // timeout so a slow retention chunk answers rather than
         // failing, and NORMAL sync because losing the last few
-        // telemetry rows on a crash costs nothing.
+        // telemetry rows on a crash costs nothing. The busy timeout goes
+        // first so it already covers the lock `journal_mode` may wait on.
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; \
-             PRAGMA synchronous=NORMAL; \
-             PRAGMA busy_timeout=5000;",
+            "PRAGMA busy_timeout=5000; \
+             PRAGMA journal_mode=WAL; \
+             PRAGMA synchronous=NORMAL;",
         )
         .map_err(|e| format!("failed to configure the cluster telemetry database: {e}"))?;
 
