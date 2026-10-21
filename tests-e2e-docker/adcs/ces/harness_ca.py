@@ -162,6 +162,19 @@ class HarnessPki:
         )
         return chain_path, key_path, leaf.public_bytes(serialization.Encoding.DER)
 
+    def write_issuing_key(self, directory):
+        """The issuing CA's private key, for the e2e profile's adoption
+        step: it needs a certificate this authority signed outside
+        Lorica, as one issued by hand before the upgrade was. Written
+        before the public files, so a healthy fixture always has it."""
+        (Path(directory) / "issuing.key.pem").write_bytes(
+            self.issuing_key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            )
+        )
+
     def write_public(self, directory):
         """The CA certificates clients and tests read. Written under
         temporary names and renamed: the healthcheck keys on root.pem."""

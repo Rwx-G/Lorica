@@ -388,6 +388,7 @@ def main():
     for thread in threads:
         thread.start()
     CA_DIR.mkdir(parents=True, exist_ok=True)
+    pki.write_issuing_key(CA_DIR)
     pki.write_public(CA_DIR)
     for thread in threads:
         thread.join()

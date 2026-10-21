@@ -714,9 +714,17 @@ jobs:
         with:
           name: lorica-rpm
           path: dist/
+      # dnf, not rpm -i: the package requires krb5-libs, which dnf
+      # resolves from the repositories as an operator's install does.
+      # The signature is the release job's business, not this job's.
       - name: Install and verify
         run: |
-          rpm -ivh dist/*.rpm
+          dnf install -y --nogpgcheck ./dist/*.rpm
+          if ldd /usr/bin/lorica /usr/bin/lorica-mcp | grep -q 'not found'; then
+            ldd /usr/bin/lorica /usr/bin/lorica-mcp
+            echo "FAIL: an unresolved library"
+            exit 1
+          fi
           test -x /usr/bin/lorica
           test -x /usr/bin/lorica-mcp
           test -f /usr/lib/systemd/system/lorica.service

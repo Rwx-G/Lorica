@@ -1580,6 +1580,72 @@ services:
     environment:
       - SHARED_DIR=/shared
 
+  # ---------------------------------------------------------------
+  # AD CS profile (Story 13.6 AC #2, IV1).
+  #
+  # The KDC and the CES fixture are the Story 13.1 harness services,
+  # extended from adcs/docker-compose.yml so the realm, the fixture and
+  # their healthchecks have one definition. They keep their aliases on
+  # the `adcs` network, which is why the node and its runner join it
+  # rather than `e2e`. The harness volume is renamed here: it carries
+  # the fixture's CA certificates, the issuing CA key the adoption step
+  # signs with, and the KDC log the breaker step counts AS-REQs in.
+  #
+  # Run with:
+  #   docker compose --profile adcs up --build -d lorica-adcs
+  #   docker compose --profile adcs run --rm adcs-smoke
+  # ---------------------------------------------------------------
+  # Their service names are the harness's own: `extends` carries the
+  # fixture's `depends_on: kdc` along, which must resolve here too.
+  kdc:
+    extends:
+      file: ./adcs/docker-compose.yml
+      service: kdc
+    profiles: ["adcs"]
+    volumes:
+      - adcs-harness:/harness
+
+  ces:
+    extends:
+      file: ./adcs/docker-compose.yml
+      service: ces
+    profiles: ["adcs"]
+    volumes:
+      - adcs-harness:/harness
+
+  lorica-adcs:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    profiles: ["adcs"]
+    volumes:
+      - lorica-adcs-data:/var/lib/lorica
+      - shared-adcs:/shared
+    depends_on:
+      ces:
+        condition: service_healthy
+    networks:
+      - adcs
+
+  adcs-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["adcs"]
+    # Root, as the harness's own Rust tests run: krb5kdc writes its log
+    # 0640, and the breaker step counts AS-REQs in it.
+    user: "0:0"
+    entrypoint: ["bash", "run-adcs-smoke.sh"]
+    depends_on:
+      - lorica-adcs
+    volumes:
+      - shared-adcs:/shared:ro
+      - adcs-harness:/harness:ro
+    environment:
+      - LORICA_API=https://lorica-adcs:9443
+      - LORICA_TLS=lorica-adcs:8443
+    networks:
+      - adcs
+
 volumes:
   lorica-data:
   lorica-workers-data:
@@ -1628,9 +1694,15 @@ volumes:
   shared-acme:
   lorica-mcp-data:
   shared-mcp:
+  lorica-adcs-data:
+  shared-adcs:
+  adcs-harness:
 
 networks:
   e2e:
+  # The AD CS profile's network: the harness services carry their
+  # corp.example.org aliases on it.
+  adcs:
   # A second network for the automation smoke's "outside" connection
   # (Story 10.3 IV1): only lorica-cp and automation-smoke join it, and
   # its addresses are in no allowlist.
