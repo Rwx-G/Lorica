@@ -50,12 +50,11 @@ const BLACKHOLE_REALM: &str = "BLACKHOLE.EXAMPLE.ORG";
 const BLACKHOLE_KDC: &str = "blackhole.corp.example.org";
 const TEMPLATE: &str = "LoricaWebServer";
 
-/// The generated files' per-KDC timeout and retry count, which the
-/// renderer requires. MIT krb5 1.20 and 1.21 know neither relation: the
-/// black-hole test measured MIT giving up on one silent KDC after about
-/// 27 s whatever these say, which is why the outer guard matters.
-const KDC_TIMEOUT_SECS: u32 = 2;
-const KDC_MAX_RETRIES: u32 = 2;
+/// The generated files' `request_timeout`, which the renderer requires.
+/// MIT krb5 before 1.22 ignores it: the black-hole test measured MIT
+/// giving up on one silent KDC after about 27 s, which is why the outer
+/// guard matters.
+const KDC_REQUEST_TIMEOUT_SECS: u32 = 2;
 
 /// The black-hole test's outer guard. Short enough that the test proves
 /// the operation ends, long enough that MIT's own give-up, when it comes
@@ -82,7 +81,7 @@ fn harness_dir() -> PathBuf {
 fn configure_kerberos() {
     let dir: PathBuf =
         std::env::temp_dir().join(format!("lorica-adcs-harness-{}", std::process::id()));
-    let timing: KdcTiming = KdcTiming::new(KDC_TIMEOUT_SECS, KDC_MAX_RETRIES).expect("timing");
+    let timing: KdcTiming = KdcTiming::new(KDC_REQUEST_TIMEOUT_SECS).expect("timing");
     let harness: PathBuf = krb5_config_path(&dir);
     Krb5Config {
         realm: Realm::new(REALM).expect("realm"),

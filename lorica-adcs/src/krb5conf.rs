@@ -174,52 +174,43 @@ impl fmt::Display for KdcAddress {
     }
 }
 
-/// How long MIT krb5 waits for each KDC and how many times it asks.
-/// Their product bounds a Kerberos leg, which must fit inside the
-/// operation timeout of Epic 13 D8.
+/// The total time MIT krb5 may spend on one KDC exchange, rendered as
+/// `request_timeout` in `[libdefaults]`.
+///
+/// MIT honours that relation from release 1.22 only. Earlier releases
+/// (1.20 on Debian 13, 1.21 on RHEL 9) ignore it, as they ignore any
+/// unknown relation, and no profile relation bounds the exchange there:
+/// the Heimdal names `kdc_timeout` and `max_retries` do nothing on MIT.
+/// On those releases the operation timeout of Epic 13 D8 is the only
+/// bound the caller sees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KdcTiming {
-    timeout_secs: u32,
-    max_retries: u32,
+    request_timeout_secs: u32,
 }
 
 impl KdcTiming {
-    /// Upper bound of the per-KDC timeout, in seconds.
-    pub const MAX_TIMEOUT_SECS: u32 = 60;
-    /// Upper bound of the retry count.
-    pub const MAX_RETRIES: u32 = 10;
+    /// Upper bound of the request timeout, in seconds.
+    pub const MAX_REQUEST_TIMEOUT_SECS: u32 = 60;
 
-    /// Validates a per-KDC timeout of `timeout_secs` (1 to
-    /// [`Self::MAX_TIMEOUT_SECS`]) and a retry count of `max_retries`
-    /// (1 to [`Self::MAX_RETRIES`]).
-    pub fn new(timeout_secs: u32, max_retries: u32) -> Result<KdcTiming, AdcsError> {
-        if timeout_secs == 0 || timeout_secs > Self::MAX_TIMEOUT_SECS {
+    /// Validates a request timeout of `request_timeout_secs` (1 to
+    /// [`Self::MAX_REQUEST_TIMEOUT_SECS`]).
+    pub fn new(request_timeout_secs: u32) -> Result<KdcTiming, AdcsError> {
+        if request_timeout_secs == 0 || request_timeout_secs > Self::MAX_REQUEST_TIMEOUT_SECS {
             return Err(AdcsError::InvalidKdcTiming {
                 reason: format!(
-                    "kdc_timeout must be within 1..={} seconds",
-                    Self::MAX_TIMEOUT_SECS
+                    "request_timeout must be within 1..={} seconds",
+                    Self::MAX_REQUEST_TIMEOUT_SECS
                 ),
             });
         }
-        if max_retries == 0 || max_retries > Self::MAX_RETRIES {
-            return Err(AdcsError::InvalidKdcTiming {
-                reason: format!("max_retries must be within 1..={}", Self::MAX_RETRIES),
-            });
-        }
         Ok(KdcTiming {
-            timeout_secs,
-            max_retries,
+            request_timeout_secs,
         })
     }
 
-    /// The per-KDC timeout, in seconds.
-    pub fn timeout_secs(&self) -> u32 {
-        self.timeout_secs
-    }
-
-    /// The retry count.
-    pub fn max_retries(&self) -> u32 {
-        self.max_retries
+    /// The request timeout, in seconds.
+    pub fn request_timeout_secs(&self) -> u32 {
+        self.request_timeout_secs
     }
 }
 
@@ -230,7 +221,7 @@ pub struct Krb5Config {
     pub realm: Realm,
     /// Explicit KDCs of the realm; empty means DNS SRV discovery.
     pub kdcs: Vec<KdcAddress>,
-    /// The per-KDC timeout and retry count.
+    /// The bound of one KDC exchange, on MIT krb5 1.22 and later.
     pub timing: KdcTiming,
 }
 
@@ -253,10 +244,9 @@ impl Krb5Config {
         out.push_str(&format!("    default_tgs_enctypes = {enctypes}\n"));
         out.push_str("    allow_weak_crypto = false\n");
         out.push_str(&format!(
-            "    kdc_timeout = {}s\n",
-            self.timing.timeout_secs
+            "    request_timeout = {}s\n",
+            self.timing.request_timeout_secs
         ));
-        out.push_str(&format!("    max_retries = {}\n", self.timing.max_retries));
         if self.kdcs.is_empty() {
             out.push_str("    dns_lookup_kdc = true\n");
         } else {
@@ -384,7 +374,7 @@ mod tests {
     const INJECTIONS: &[&str] = &["\n", "\r", "[", "]", "{", "}", "=", " ", "\t", "#", ";"];
 
     fn timing() -> KdcTiming {
-        KdcTiming::new(3, 2).expect("timing")
+        KdcTiming::new(3).expect("timing")
     }
 
     #[test]
@@ -465,12 +455,17 @@ mod tests {
 
     #[test]
     fn timing_bounds() {
-        assert!(KdcTiming::new(1, 1).is_ok());
-        assert!(KdcTiming::new(KdcTiming::MAX_TIMEOUT_SECS, KdcTiming::MAX_RETRIES).is_ok());
-        assert!(KdcTiming::new(0, 1).is_err());
-        assert!(KdcTiming::new(KdcTiming::MAX_TIMEOUT_SECS + 1, 1).is_err());
-        assert!(KdcTiming::new(1, 0).is_err());
-        assert!(KdcTiming::new(1, KdcTiming::MAX_RETRIES + 1).is_err());
+        assert!(KdcTiming::new(1).is_ok());
+        assert!(KdcTiming::new(KdcTiming::MAX_REQUEST_TIMEOUT_SECS).is_ok());
+        for out_of_bounds in [0, KdcTiming::MAX_REQUEST_TIMEOUT_SECS + 1] {
+            assert!(
+                matches!(
+                    KdcTiming::new(out_of_bounds),
+                    Err(AdcsError::InvalidKdcTiming { .. })
+                ),
+                "{out_of_bounds}"
+            );
+        }
     }
 
     #[test]
@@ -489,8 +484,7 @@ mod tests {
     default_tkt_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96 aes256-cts-hmac-sha384-192 aes128-cts-hmac-sha256-128
     default_tgs_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96 aes256-cts-hmac-sha384-192 aes128-cts-hmac-sha256-128
     allow_weak_crypto = false
-    kdc_timeout = 3s
-    max_retries = 2
+    request_timeout = 3s
     dns_lookup_kdc = true
 ";
         assert_eq!(config.render(), expected);

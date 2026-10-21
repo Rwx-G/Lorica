@@ -72,7 +72,7 @@ pub enum AdcsError {
         reason: &'static str,
     },
 
-    /// The KDC timeout or retry count is outside its bounds.
+    /// The KDC request timeout is outside its bounds.
     #[error("krb5.conf: invalid KDC timing: {reason}")]
     InvalidKdcTiming {
         /// Which bound it broke.

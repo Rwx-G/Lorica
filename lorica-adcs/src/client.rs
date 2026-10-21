@@ -64,10 +64,19 @@ pub struct CesTimeouts {
     pub connect: Duration,
     /// The longest wait for the next bytes of a response.
     pub read: Duration,
-    /// The whole operation, ticket acquisition included. It is the outer
-    /// guard: a GSS-API call already running on a blocking thread is not
-    /// stopped by it, which is why the `krb5.conf` `kdc_timeout` and
-    /// `max_retries` must fit inside it.
+    /// The whole operation, ticket acquisition included.
+    ///
+    /// It stops the caller waiting, not the GSS-API call: that call runs
+    /// on a blocking thread, which finishes on MIT krb5's own schedule
+    /// after this fires. On MIT before 1.22 nothing in the generated
+    /// `krb5.conf` bounds a KDC exchange (a silent KDC was measured to
+    /// hold one for about 27 s); from 1.22 its `request_timeout` does
+    /// (see [`crate::KdcTiming`]). Keeping abandoned threads from piling
+    /// up is the caller's job, by never starting a second operation for
+    /// an authority while one is still running.
+    ///
+    /// The default sits well above one silent-KDC cycle, so a single
+    /// unreachable KDC is reported as such rather than as a timeout.
     pub operation: Duration,
 }
 
