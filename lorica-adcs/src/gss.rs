@@ -22,7 +22,7 @@
 use libgssapi::context::{ClientCtx, CtxFlags, SecurityContext as _};
 use libgssapi::credential::{Cred, CredUsage};
 use libgssapi::name::Name;
-use libgssapi::oid::{OidSet, GSS_MECH_KRB5, GSS_MECH_SPNEGO, GSS_NT_KRB5_PRINCIPAL};
+use libgssapi::oid::{OidSet, GSS_MECH_SPNEGO, GSS_NT_KRB5_PRINCIPAL};
 
 use crate::secret::Secret;
 use crate::AdcsError;
@@ -33,7 +33,9 @@ use crate::AdcsError;
 /// The classification reads the GSS-API minor status, which MIT's
 /// mechanism glue passes through unchanged for the Kerberos mechanism
 /// when no other mechanism produced the same value, and falls back to
-/// MIT's message text when the number is not one it knows. Anything not
+/// MIT's message text when the number is not one it knows, which is the
+/// usual case: the credential is acquired through SPNEGO, whose glue
+/// renumbers the Kerberos status. Anything not
 /// recognised either way is [`TicketFailure::Other`]: an unknown failure
 /// is never promoted to a credential rejection, and never hides one
 /// either, since the message is kept in the error.
@@ -74,11 +76,16 @@ const KDC_ERR_CLIENT_REVOKED: u32 = 18;
 const KDC_ERR_KEY_EXPIRED: u32 = 23;
 const KDC_ERR_PREAUTH_FAILED: u32 = 24;
 const KRB_AP_ERR_BAD_INTEGRITY: u32 = 31;
-const CREDENTIAL_REJECTED_CODES: [u32; 4] = [
-    KDC_ERR_CLIENT_REVOKED,
-    KDC_ERR_KEY_EXPIRED,
-    KDC_ERR_PREAUTH_FAILED,
-    KRB_AP_ERR_BAD_INTEGRITY,
+/// The codes that mean the KDC refused the credential, each with the
+/// lower-case fragment of MIT's message for it. The text is what is left
+/// when the mechanism glue renumbered the minor status, which is always
+/// the case for a credential acquired through SPNEGO, so the code is
+/// recovered from it.
+const CREDENTIAL_REJECTED: [(u32, &str); 4] = [
+    (KDC_ERR_CLIENT_REVOKED, "credentials have been revoked"),
+    (KDC_ERR_KEY_EXPIRED, "password has expired"),
+    (KDC_ERR_PREAUTH_FAILED, "preauthentication failed"),
+    (KRB_AP_ERR_BAD_INTEGRITY, "decrypt integrity check failed"),
 ];
 
 /// `KRB5_REALM_UNKNOWN` ("Cannot find KDC for requested realm"),
@@ -89,12 +96,6 @@ const KDC_UNREACHABLE_CODES: [i64; 3] = [-1_765_328_230, -1_765_328_228, -1_765_
 
 /// Lower-case fragments of MIT's messages for the codes above, for a
 /// minor status the mechanism glue renumbered.
-const CREDENTIAL_REJECTED_TEXT: [&str; 4] = [
-    "preauthentication failed",
-    "credentials have been revoked",
-    "password has expired",
-    "decrypt integrity check failed",
-];
 const KDC_UNREACHABLE_TEXT: [&str; 3] = [
     "cannot find kdc",
     "cannot contact any kdc",
@@ -119,7 +120,11 @@ pub(crate) fn classify_ticket_failure(
     message: &str,
 ) -> (TicketFailure, Option<u32>) {
     let kdc_code: Option<u32> = kdc_error_code(minor_status);
-    if kdc_code.is_some_and(|code: u32| CREDENTIAL_REJECTED_CODES.contains(&code)) {
+    if kdc_code.is_some_and(|code: u32| {
+        CREDENTIAL_REJECTED
+            .iter()
+            .any(|(rejected, _): &(u32, &str)| *rejected == code)
+    }) {
         return (TicketFailure::CredentialRejected, kdc_code);
     }
     let signed: i64 = i64::from(i32::from_ne_bytes(minor_status.to_ne_bytes()));
@@ -127,11 +132,11 @@ pub(crate) fn classify_ticket_failure(
         return (TicketFailure::KdcUnreachable, kdc_code);
     }
     let lower: String = message.to_ascii_lowercase();
-    if CREDENTIAL_REJECTED_TEXT
+    if let Some((code, _)) = CREDENTIAL_REJECTED
         .iter()
-        .any(|fragment: &&str| lower.contains(fragment))
+        .find(|(_, fragment): &&(u32, &str)| lower.contains(fragment))
     {
-        return (TicketFailure::CredentialRejected, kdc_code);
+        return (TicketFailure::CredentialRejected, Some(*code));
     }
     if KDC_UNREACHABLE_TEXT
         .iter()
@@ -218,14 +223,19 @@ impl GssBackend for LibGssapi {
                 reason: format!("the principal {principal:?} is not a Kerberos name: {err}"),
             },
         )?;
+        // SPNEGO alone: MIT's SPNEGO acquires the krb5 element itself, and
+        // naming krb5 beside it makes the mechanism glue acquire a second
+        // time, one more AS exchange per operation and, with a wrong
+        // password, two failed pre-authentications against the account
+        // lockout instead of one (Epic 13 D15). Measured against the
+        // harness KDC on MIT 1.20 and 1.21, and pinned by
+        // `tests/harness.rs`.
         let mut mechanisms: OidSet = OidSet::new();
-        for mechanism in [GSS_MECH_SPNEGO, GSS_MECH_KRB5] {
-            mechanisms
-                .add(mechanism)
-                .map_err(|err: libgssapi::error::Error| {
-                    ticket_error(principal, err.minor, err.to_string())
-                })?;
-        }
+        mechanisms
+            .add(GSS_MECH_SPNEGO)
+            .map_err(|err: libgssapi::error::Error| {
+                ticket_error(principal, err.minor, err.to_string())
+            })?;
         // MIT acquires into a fresh `MEMORY:` cache of its own (Epic 13
         // D3): no default ccache is read or written.
         password
@@ -284,7 +294,7 @@ mod tests {
 
     #[test]
     fn credential_rejections_are_classified_from_the_minor_status() {
-        for code in CREDENTIAL_REJECTED_CODES {
+        for (code, _) in CREDENTIAL_REJECTED {
             let status: u32 = minor(KRB5_ERROR_TABLE_BASE + i64::from(code));
             assert_eq!(kdc_error_code(status), Some(code));
             assert_eq!(
@@ -308,14 +318,28 @@ mod tests {
     // know; MIT's text still names the cause.
     #[test]
     fn a_renumbered_status_falls_back_to_the_message() {
-        let renumbered: u32 = 100_000;
+        // The minor status and message a wrong password produced through
+        // SPNEGO against the harness KDC (MIT 1.20).
+        let renumbered: u32 = 100_001;
         assert_eq!(
             classify_ticket_failure(
                 renumbered,
-                "Unspecified GSS failure.  Minor code may provide more information (Preauthentication failed)"
+                "No credentials were supplied, or the credentials were unavailable or \
+                 inaccessible (Preauthentication failed)"
             ),
-            (TicketFailure::CredentialRejected, None)
+            (
+                TicketFailure::CredentialRejected,
+                Some(KDC_ERR_PREAUTH_FAILED)
+            )
         );
+        for (code, fragment) in CREDENTIAL_REJECTED {
+            let message: String = format!("Unspecified GSS failure ({})", fragment.to_uppercase());
+            assert_eq!(
+                classify_ticket_failure(renumbered, &message),
+                (TicketFailure::CredentialRejected, Some(code)),
+                "{message}"
+            );
+        }
         assert_eq!(
             classify_ticket_failure(
                 renumbered,

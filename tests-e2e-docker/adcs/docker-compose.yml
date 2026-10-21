@@ -1,0 +1,90 @@
+# The Kerberos harness of Story 13.1 (AC #12): an MIT KDC, a CES fixture
+# that enforces the TLS channel binding, and a KDC that never answers.
+# Driven by run.sh; Story 13.6's adcs profile builds on it.
+#
+# Its own network and project, apart from the main e2e suite, and every
+# volume but the two shared cargo caches is ephemeral: `down -v` removes
+# it, and the external ones are never touched by compose.
+services:
+  kdc:
+    build: ./kdc
+    volumes:
+      - harness:/harness
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /harness/ces.keytab && bash -c 'echo > /dev/tcp/127.0.0.1/88'"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks:
+      adcs:
+        aliases:
+          - kdc.corp.example.org
+
+  kdc-blackhole:
+    build: ./ces
+    command: ["python3", "/app/blackhole.py"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 88), 2).close()"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks:
+      adcs:
+        aliases:
+          - blackhole.corp.example.org
+
+  ces:
+    build: ./ces
+    depends_on:
+      kdc:
+        condition: service_healthy
+    volumes:
+      - harness:/harness
+    healthcheck:
+      # A full handshake against the published root, both listeners: a
+      # bare TCP connect would only log a failed handshake each time.
+      test: ["CMD", "python3", "-c", "import socket, ssl; c = ssl.create_default_context(cafile='/harness/ca/root.pem'); [c.wrap_socket(socket.create_connection(('ces.corp.example.org', p), 2), server_hostname='ces.corp.example.org').close() for p in (443, 8443)]"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    networks:
+      adcs:
+        aliases:
+          - ces.corp.example.org
+
+  # The Rust side, started by run.sh with `docker compose run`. The same
+  # image and cache volumes as the standard gate container, so the build
+  # is shared with it.
+  tests:
+    image: rust:1-bookworm
+    profiles: ["tests"]
+    working_dir: /workspace
+    environment:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: /target
+      RUSTFLAGS: "-D warnings"
+      ADCS_HARNESS_DIR: /harness
+    volumes:
+      - ../..:/workspace
+      - lorica-target:/target
+      - lorica-cargo-registry:/usr/local/cargo/registry
+      - harness:/harness:ro
+    command:
+      - bash
+      - -c
+      - >-
+        apt-get update -qq
+        && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cmake libclang-dev libkrb5-dev >/dev/null
+        && cargo test -p lorica-adcs --test harness -- --ignored --nocapture
+    networks:
+      - adcs
+
+networks:
+  adcs: {}
+
+volumes:
+  harness: {}
+  lorica-target:
+    external: true
+  lorica-cargo-registry:
+    external: true
