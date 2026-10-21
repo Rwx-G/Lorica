@@ -1518,6 +1518,9 @@ pub async fn delete_backend(
 /// the row is said. A certificate that was uploaded rather than issued
 /// is refused (400) exactly as on the management plane, since there is
 /// nothing to renew it against, and no path here takes the replacement.
+/// An AD CS certificate is refused (403
+/// `adcs_renewal_not_on_automation_plane`, Epic 13 D6): it is renewed
+/// by the background loop and the dashboard only.
 /// A token renews one certificate at a time (409) and not within
 /// [`crate::acme::MIN_TOKEN_RENEWAL_INTERVAL_HOURS`] of its last
 /// issuance or during a CA cooldown (429). With `?dry_run=true`, which
@@ -1536,14 +1539,14 @@ pub async fn renew_certificate(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
     Query(dry_run): Query<DryRunQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<(StatusCode, Json<Value>), crate::adcs::AdcsHandlerError> {
     ensure_preview_readable(
         &principal,
         dry_run.mode(),
         AutomationScope::CertificatesRead,
     )?;
     let actor = audit_context(&principal, &connect_info, &headers);
-    crate::acme::renew_certificate_as(
+    let (status, answer) = crate::acme::renew_certificate_as(
         &state,
         &actor,
         id,
@@ -1551,7 +1554,11 @@ pub async fn renew_certificate(
         certificate_guard(&principal),
         crate::acme::RenewalBudget::PerCertificate,
     )
-    .await
+    .await?;
+    Ok((
+        status,
+        redact::write_answer(answer, redact::certificate_row),
+    ))
 }
 
 /// The longest key a settings refusal repeats back.

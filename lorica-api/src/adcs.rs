@@ -78,8 +78,11 @@ use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 mod issue;
+mod renew;
 
 pub use issue::{issue_certificate, AdcsIssueRequest, PendingIssuance, MAX_SANS};
+pub(crate) use renew::{renew_due, renew_manually, AdcsRenewalMemory};
+pub use renew::{ADCS_RENEWAL_ACTOR, ADCS_RENEWAL_BACKOFF_HOURS};
 
 /// The target type of every audit row this module writes.
 const AUDIT_TARGET: &str = "adcs_authority";
@@ -208,9 +211,10 @@ pub(crate) enum NotRun {
     Lost(String),
 }
 
-/// The error of an AD CS handler: an [`ApiError`], the 504 of an
-/// operation that is still finishing, or a refusal with a code of its
-/// own, neither of which `ApiError` has a variant for.
+/// The error of an AD CS handler, and of the certificate renewal
+/// handlers, which renew AD CS certificates too: an [`ApiError`], the
+/// 504 of an operation that is still finishing, or a refusal with a
+/// code of its own, neither of which `ApiError` has a variant for.
 #[derive(Debug)]
 pub enum AdcsHandlerError {
     /// Any other refusal or failure.
@@ -284,14 +288,16 @@ impl axum::response::IntoResponse for AdcsHandlerError {
 }
 
 /// The process's AD CS runtime: the [`AdcsGuard`], the client the
-/// handlers call, where `adcs_authority_failed` alerts go, and how long
-/// a handler waits for its operation.
+/// handlers call, where `adcs_authority_failed` alerts go, how long a
+/// handler waits for its operation, and what the renewal paths
+/// remember about each certificate's failures.
 #[derive(Clone)]
 pub struct AdcsRuntime {
     guard: AdcsGuard,
     client: Arc<dyn AdcsClient>,
     alerts: Option<lorica_notify::AlertSender>,
     handler_deadline: Duration,
+    pub(crate) renewals: Arc<AdcsRenewalMemory>,
 }
 
 impl AdcsRuntime {
@@ -303,6 +309,7 @@ impl AdcsRuntime {
             client: Arc::new(LibAdcsClient),
             alerts,
             handler_deadline: handler_deadline(),
+            renewals: Arc::default(),
         }
     }
 
@@ -317,6 +324,7 @@ impl AdcsRuntime {
             client,
             alerts,
             handler_deadline: handler_deadline(),
+            renewals: Arc::default(),
         }
     }
 

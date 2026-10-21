@@ -46,6 +46,14 @@
 //!   every field the environment resource derives from that name
 //!   ([`ENVIRONMENT_NAMED_FIELDS`]).
 //!
+//! One thing is withheld whole, key and value: a certificate's
+//! [`ADCS_INTERNAL_FIELDS`], the authority id, the template and the
+//! authority's request identifier (Epic 13). They are internal PKI
+//! detail no token caller needs: a token cannot issue or renew an AD
+//! CS certificate, and `source` and `subject`, which stay, say what a
+//! certificate is. A field that answers no caller's need is not
+//! published (the Epic 10 and 11 rule).
+//!
 //! The mask applies wherever the automation plane or the MCP server
 //! answers such a row: the read listings, and every write answer and
 //! preview. A preview's list of changed fields is computed on the
@@ -301,6 +309,24 @@ pub fn environment_outside(row: &mut Value, visible: &std::collections::BTreeSet
     for field in ENVIRONMENT_NAMED_FIELDS {
         if let Some(Value::String(text)) = row.get_mut(*field) {
             *text = REDACTED.to_string();
+        }
+    }
+}
+
+/// The certificate view's fields the automation plane does not answer.
+pub const ADCS_INTERNAL_FIELDS: &[&str] = &[
+    "adcs_authority_id",
+    "adcs_template",
+    "adcs_template_oid",
+    "adcs_request_id",
+];
+
+/// A certificate row as the automation plane may answer it: without
+/// [`ADCS_INTERNAL_FIELDS`].
+pub fn certificate_row(row: &mut Value) {
+    if let Some(fields) = row.as_object_mut() {
+        for field in ADCS_INTERNAL_FIELDS {
+            fields.remove(*field);
         }
     }
 }

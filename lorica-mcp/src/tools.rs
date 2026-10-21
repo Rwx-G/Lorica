@@ -1571,7 +1571,8 @@ pub const MUTATIONS: &[Mutation] = &[
                   for a row it already holds, keeping the id and every route bound to it. \
                   Every name the certificate carries must be inside the token's \
                   allowed_hostnames. A certificate that was uploaded rather than issued is \
-                  refused, and nothing here takes its replacement.",
+                  refused, and nothing here takes its replacement. An AD CS certificate is \
+                  refused too: only the node and the dashboard renew it.",
         scope: AutomationScope::CertificatesWrite,
         verb: Verb::Post,
         path: "/automation/v1/certificates",

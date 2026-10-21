@@ -129,9 +129,6 @@ pub(crate) enum IssueSubject {
     OverDefaults(AdcsSubjectDefaults),
     /// Exactly these fields, the authority's defaults ignored: a
     /// renewal reuses the current certificate's subject.
-    // Constructed by Story 13.4's renewal, which is not wired yet; the
-    // tests here exercise it so the path it will take is proven now.
-    #[cfg_attr(not(test), allow(dead_code))]
     Exact(AdcsSubjectDefaults),
 }
 
@@ -593,6 +590,39 @@ fn alert_issuance_failed(
     message: &str,
     request_id: Option<&str>,
 ) {
+    send_issuance_failed(
+        state,
+        authority_id,
+        &attempt.sans,
+        attempt.replace.as_deref(),
+        step,
+        message,
+        request_id,
+    );
+}
+
+/// Raise `cert_issuance_failed` for an attempt on `sans`.
+///
+/// For a replacement, a renewal, the alert is sent once per failure
+/// state of the certificate (Story 13.4 AC #5): a failure at the step
+/// last alerted for `cert_id` is silent, so a certificate failing the
+/// same way on every loop tick alerts once, and a different step or a
+/// renewal in between re-arms it. A new certificate has no state to
+/// repeat and always alerts.
+pub(super) fn send_issuance_failed(
+    state: &AppState,
+    authority_id: &str,
+    sans: &[String],
+    cert_id: Option<&str>,
+    step: &str,
+    message: &str,
+    request_id: Option<&str>,
+) {
+    if let Some(cert_id) = cert_id {
+        if !state.adcs.renewals.is_new_failure_state(cert_id, step) {
+            return;
+        }
+    }
     let Some(alerts) = &state.adcs.alerts else {
         return;
     };
@@ -600,15 +630,15 @@ fn alert_issuance_failed(
         lorica_notify::events::AlertType::CertIssuanceFailed,
         format!(
             "AD CS issuance for {} produced no certificate ({step})",
-            attempt.sans.first().map_or("", String::as_str)
+            sans.first().map_or("", String::as_str)
         ),
     )
     .with_detail("authority_id", authority_id)
     .with_detail("step", step)
     .with_detail("message", message)
-    .with_detail("sans", attempt.sans.join(","));
-    if let Some(cert_id) = &attempt.replace {
-        event = event.with_detail("cert_id", cert_id.clone());
+    .with_detail("sans", sans.join(","));
+    if let Some(cert_id) = cert_id {
+        event = event.with_detail("cert_id", cert_id);
     }
     if let Some(request_id) = request_id {
         event = event.with_detail("request_id", request_id);
@@ -1127,6 +1157,9 @@ async fn store_issued(
     if let Some((settings, acls)) = stored.export_snapshot {
         crate::cert_export::export_after_release(settings, acls, stored.cert.clone()).await;
     }
+    if replacing {
+        state.adcs.renewals.forget_failures(&stored.cert.id);
+    }
     crate::acme::after_certificate_issued(state, &stored.cert.id).await;
 
     let response = serde_json::to_value(cert_to_response(&stored.cert)).ok();
@@ -1206,4 +1239,4 @@ fn write_issued(
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::adcs) mod tests;

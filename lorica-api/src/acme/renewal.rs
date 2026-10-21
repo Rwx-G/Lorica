@@ -17,11 +17,14 @@
 use std::collections::{HashMap, HashSet};
 
 use axum::extract::{Extension, Path};
+use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
+use lorica_config::models::CertificateSource;
 use parking_lot::Mutex;
 use tracing::{error, info, warn};
 
+use crate::adcs::AdcsHandlerError;
 use crate::db::db_blocking;
 use crate::error::ApiError;
 use crate::middleware::auth::Session;
@@ -56,7 +59,8 @@ pub const MIN_TOKEN_RENEWAL_INTERVAL_HOURS: i64 = 48;
 /// was the loop's local variable and the manual path could not see it.
 #[derive(Debug, Default)]
 pub struct RenewalLedger {
-    /// Certificate ids with an ACME order open right now.
+    /// Certificate ids with an ACME order or an AD CS renewal open
+    /// right now.
     in_flight: Mutex<HashSet<String>>,
     /// Per-certificate instant before which the CA's rate limit makes
     /// another order pointless, keyed by certificate id.
@@ -125,6 +129,9 @@ impl Drop for InFlightRenewal<'_> {
     }
 }
 
+/// The error code a token gets for an AD CS certificate (Epic 13 D6).
+pub const ADCS_NOT_ON_AUTOMATION_PLANE: &str = "adcs_renewal_not_on_automation_plane";
+
 /// How often the actor may renew one certificate by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenewalBudget {
@@ -167,6 +174,30 @@ pub(super) fn should_auto_renew(
     }
     let days_remaining = (cert.not_after - now).num_days();
     days_remaining <= threshold_days
+}
+
+/// Pure predicate : does this AD CS certificate qualify for automated
+/// renewal at `now` (Story 13.4 AC #1) ? Beside [`should_auto_renew`],
+/// not inside it, so the ACME predicate and its tests stay as they
+/// are. Returns `true` when ALL of the following are true :
+///
+/// - its derived source is AD CS (`is_acme` wins over
+///   `adcs_authority_id`, see `Certificate::source`)
+/// - `cert.acme_auto_renew == true`, the opt-in both sources share
+///   (Epic 13 D14)
+/// - `(cert.not_after - now).num_days() <= threshold_days`, the same
+///   window as ACME
+///
+/// The loop applies [`is_bound`] to both sources before either
+/// predicate.
+pub(super) fn should_auto_renew_adcs(
+    cert: &lorica_config::models::Certificate,
+    now: chrono::DateTime<chrono::Utc>,
+    threshold_days: i64,
+) -> bool {
+    cert.source() == CertificateSource::Adcs
+        && cert.acme_auto_renew
+        && (cert.not_after - now).num_days() <= threshold_days
 }
 
 /// Pure predicate : is `cert_id` referenced by at least one route ?
@@ -285,17 +316,8 @@ use lorica_acme::{build_dns_challenger, AcmeConfig, DnsChallengeConfig};
 use super::dns01::provision_with_acme_dns;
 use super::http01::provision_with_acme;
 
-/// Spawn a background task that checks ACME certificates for renewal.
-///
-/// Runs every `check_interval` and renews certificates where:
-/// - `is_acme == true` and `acme_auto_renew == true`
-/// - The cert is referenced by at least one route (unbound certs are
-///   never auto-renewed, see [`is_bound`])
-/// - Days until expiry <= `renewal_threshold_days`
-///
-/// On a Let's Encrypt rate-limit error the cert is put on a per-process
-/// cooldown (see [`cooldown_from_error`]) so the loop stops hammering
-/// the ACME endpoint until the quota window reopens.
+/// Spawn a background task that checks ACME and AD CS certificates
+/// for renewal, every `check_interval`; see [`renewal_tick`].
 pub fn spawn_renewal_task(
     state: AppState,
     check_interval: std::time::Duration,
@@ -310,181 +332,216 @@ pub fn spawn_renewal_task(
         // CA has refused is told so. Not persisted across restarts.
         loop {
             tokio::time::sleep(check_interval).await;
-
-            let certs = match db_blocking(&state.store, |store| store.list_certificates()).await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(error = %e, "ACME renewal: failed to list certificates");
-                    continue;
-                }
-            };
-
-            // Build the set of cert ids referenced by at least one
-            // route, using the same derivation as the resolver
-            // reload, so we never auto-renew an unbound cert.
-            let bound_ids: HashSet<String> =
-                match db_blocking(&state.store, |store| store.list_routes()).await {
-                    Ok(routes) => routes
-                        .iter()
-                        .filter_map(|r| r.certificate_id.clone())
-                        .collect(),
-                    Err(e) => {
-                        warn!(error = %e, "ACME renewal: failed to list routes");
-                        continue;
-                    }
-                };
-
-            let now = chrono::Utc::now();
-            // Drop expired cooldown entries so the map stays bounded by
-            // the count of currently rate-limited certs (a cert that is
-            // decommissioned mid-cooldown is swept once its window ends).
-            state.renewals.sweep_cooldowns(now);
-
-            for cert in &certs {
-                // Skip certs not bound to any route. An unbound cert
-                // is never served, so renewing it is pure quota waste
-                // and, before in-place renewal, spawned orphans.
-                if !is_bound(&cert.id, &bound_ids) {
-                    continue;
-                }
-
-                // Pre-filter via the pure `should_auto_renew` helper so
-                // the branching stays unit-testable. The helper already
-                // rules out non-ACME, opt-out, dns01-manual, and out-of-
-                // window certs ; we add a separate notification arm
-                // below for the "inside window but not eligible for
-                // auto" case (dns01-manual), which the helper collapses
-                // to `false` but the operator still wants to be alerted
-                // about.
-                if !cert.is_acme || !cert.acme_auto_renew {
-                    continue;
-                }
-                let days_remaining = (cert.not_after - now).num_days();
-                if days_remaining > renewal_threshold_days {
-                    continue;
-                }
-
-                // Honour an active rate-limit cooldown before doing any
-                // work for this cert (expired entries were swept above,
-                // so a present entry is still active).
-                if let Some(until) = state.renewals.cooldown_until(&cert.id, now) {
-                    info!(
-                        domain = %cert.domain,
-                        cert_id = %cert.id,
-                        retry_after = %until,
-                        "skipping ACME renewal: rate-limit cooldown active"
-                    );
-                    continue;
-                }
-
-                info!(
-                    domain = %cert.domain,
-                    days_remaining = days_remaining,
-                    threshold = renewal_threshold_days,
-                    "ACME certificate approaching expiry, attempting renewal"
-                );
-
-                // Dispatch cert_expiring notification (fires for both
-                // auto-renewable and dns01-manual certs, since the
-                // operator wants to know about the upcoming expiry in
-                // both cases).
-                if let Some(ref sender) = alert_sender {
-                    sender.send(
-                        lorica_notify::AlertEvent::new(
-                            lorica_notify::events::AlertType::CertExpiring,
-                            format!(
-                                "Certificate for {} expires in {} days",
-                                cert.domain, days_remaining
-                            ),
-                        )
-                        .with_detail("domain", cert.domain.clone())
-                        .with_detail("days_remaining", days_remaining.to_string())
-                        .with_detail("cert_id", cert.id.clone()),
-                    );
-                }
-
-                // Skip dns01-manual certs from the ACME renewal call
-                // itself - the operator must confirm the new TXT.
-                if !should_auto_renew(cert, now, renewal_threshold_days) {
-                    info!(
-                        domain = %cert.domain,
-                        "skipping auto-renewal for manual DNS-01 certificate"
-                    );
-                    continue;
-                }
-
-                let config = AcmeConfig {
-                    staging: cert.issuer.contains("STAGING"),
-                    contact_email: None,
-                };
-
-                // Renew with all domains (primary + SANs), deduplicated
-                let mut all_domains = vec![cert.domain.clone()];
-                for d in &cert.san_domains {
-                    if !all_domains.contains(d) {
-                        all_domains.push(d.clone());
-                    }
-                }
-                // One order per certificate at a time, across this loop
-                // and the manual path: a manual renewal of this id that
-                // is still open is left to finish.
-                let Some(_in_flight) = state.renewals.begin(&cert.id) else {
-                    info!(
-                        domain = %cert.domain,
-                        cert_id = %cert.id,
-                        "skipping ACME renewal: an order for this certificate is in flight"
-                    );
-                    continue;
-                };
-
-                // In-place renewal : the leaf is written back onto the
-                // same row (`Some(cert.id)`), so the id and every route
-                // binding survive. No reassign, no delete, no orphan.
-                match renew_with_method(&state, cert, &config, &all_domains, Some(&cert.id)).await {
-                    Ok(_) => {
-                        state.renewals.clear_cooldown(&cert.id);
-                        state.rotate_bot_hmac_on_cert_event().await;
-                        state.notify_config_changed();
-                        info!(
-                            domain = %cert.domain,
-                            cert_id = %cert.id,
-                            acme_method = ?cert.acme_method,
-                            "ACME certificate renewed successfully"
-                        );
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if let Some(until) = cooldown_from_error(&msg, now) {
-                            state.renewals.record_cooldown(&cert.id, until);
-                            info!(
-                                domain = %cert.domain,
-                                cert_id = %cert.id,
-                                retry_after = %until,
-                                "ACME renewal rate-limited; cooldown recorded"
-                            );
-                        }
-                        error!(
-                            domain = %cert.domain,
-                            error = %e,
-                            days_remaining = days_remaining,
-                            acme_method = ?cert.acme_method,
-                            "ACME renewal failed - existing cert still active"
-                        );
-                    }
-                }
-            }
+            renewal_tick(&state, renewal_threshold_days, alert_sender.as_ref()).await;
         }
     })
 }
 
-/// POST /api/v1/certificates/:id/renew - manually trigger ACME renewal for a certificate
+/// One pass of the renewal loop, dispatched by derived source (Epic 13
+/// D14).
+///
+/// Both sources renew the certificates bound to at least one route
+/// (unbound certs are never auto-renewed, see [`is_bound`]), opted in
+/// with `acme_auto_renew`, with at most `renewal_threshold_days` left.
+///
+/// - AD CS ([`should_auto_renew_adcs`]): handed to
+///   `crate::adcs::renew_due`, which renews them in place one at a
+///   time under the D15 guard and breaker, and sends no
+///   `CertExpiring`: `check_cert_expiry` speaks for them (Story 13.4
+///   AC #6, decided in the `adcs::renew` module docs).
+/// - ACME: on a Let's Encrypt rate-limit error the cert is put on a
+///   per-process cooldown (see [`cooldown_from_error`]) so the loop
+///   stops hammering the ACME endpoint until the quota window reopens.
+pub(crate) async fn renewal_tick(
+    state: &AppState,
+    renewal_threshold_days: i64,
+    alert_sender: Option<&lorica_notify::AlertSender>,
+) {
+    let certs = match db_blocking(&state.store, |store| store.list_certificates()).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "certificate renewal: failed to list certificates");
+            return;
+        }
+    };
+
+    // Build the set of cert ids referenced by at least one
+    // route, using the same derivation as the resolver
+    // reload, so we never auto-renew an unbound cert.
+    let bound_ids: HashSet<String> =
+        match db_blocking(&state.store, |store| store.list_routes()).await {
+            Ok(routes) => routes
+                .iter()
+                .filter_map(|r| r.certificate_id.clone())
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "certificate renewal: failed to list routes");
+                return;
+            }
+        };
+
+    let now = chrono::Utc::now();
+    // Drop expired cooldown entries so the map stays bounded by
+    // the count of currently rate-limited certs (a cert that is
+    // decommissioned mid-cooldown is swept once its window ends).
+    state.renewals.sweep_cooldowns(now);
+
+    let live: HashSet<&str> = certs.iter().map(|cert| cert.id.as_str()).collect();
+    state.adcs.renewals.retain(&live, now);
+    let adcs_due: Vec<&lorica_config::models::Certificate> = certs
+        .iter()
+        .filter(|cert| {
+            is_bound(&cert.id, &bound_ids)
+                && should_auto_renew_adcs(cert, now, renewal_threshold_days)
+        })
+        .collect();
+    crate::adcs::renew_due(state, &adcs_due, now).await;
+
+    for cert in &certs {
+        // Skip certs not bound to any route. An unbound cert
+        // is never served, so renewing it is pure quota waste
+        // and, before in-place renewal, spawned orphans.
+        if !is_bound(&cert.id, &bound_ids) {
+            continue;
+        }
+
+        // Pre-filter via the pure `should_auto_renew` helper so
+        // the branching stays unit-testable. The helper already
+        // rules out non-ACME, opt-out, dns01-manual, and out-of-
+        // window certs ; we add a separate notification arm
+        // below for the "inside window but not eligible for
+        // auto" case (dns01-manual), which the helper collapses
+        // to `false` but the operator still wants to be alerted
+        // about. Only the ACME source from here on: the AD CS
+        // certificates were dispatched above.
+        if cert.source() != CertificateSource::Acme || !cert.acme_auto_renew {
+            continue;
+        }
+        let days_remaining = (cert.not_after - now).num_days();
+        if days_remaining > renewal_threshold_days {
+            continue;
+        }
+
+        // Honour an active rate-limit cooldown before doing any
+        // work for this cert (expired entries were swept above,
+        // so a present entry is still active).
+        if let Some(until) = state.renewals.cooldown_until(&cert.id, now) {
+            info!(
+                domain = %cert.domain,
+                cert_id = %cert.id,
+                retry_after = %until,
+                "skipping ACME renewal: rate-limit cooldown active"
+            );
+            continue;
+        }
+
+        info!(
+            domain = %cert.domain,
+            days_remaining = days_remaining,
+            threshold = renewal_threshold_days,
+            "ACME certificate approaching expiry, attempting renewal"
+        );
+
+        // Dispatch cert_expiring notification (fires for both
+        // auto-renewable and dns01-manual certs, since the
+        // operator wants to know about the upcoming expiry in
+        // both cases).
+        if let Some(sender) = alert_sender {
+            sender.send(
+                lorica_notify::AlertEvent::new(
+                    lorica_notify::events::AlertType::CertExpiring,
+                    format!(
+                        "Certificate for {} expires in {} days",
+                        cert.domain, days_remaining
+                    ),
+                )
+                .with_detail("domain", cert.domain.clone())
+                .with_detail("days_remaining", days_remaining.to_string())
+                .with_detail("cert_id", cert.id.clone()),
+            );
+        }
+
+        // Skip dns01-manual certs from the ACME renewal call
+        // itself - the operator must confirm the new TXT.
+        if !should_auto_renew(cert, now, renewal_threshold_days) {
+            info!(
+                domain = %cert.domain,
+                "skipping auto-renewal for manual DNS-01 certificate"
+            );
+            continue;
+        }
+
+        let config = AcmeConfig {
+            staging: cert.issuer.contains("STAGING"),
+            contact_email: None,
+        };
+
+        // Renew with all domains (primary + SANs), deduplicated
+        let mut all_domains = vec![cert.domain.clone()];
+        for d in &cert.san_domains {
+            if !all_domains.contains(d) {
+                all_domains.push(d.clone());
+            }
+        }
+        // One order per certificate at a time, across this loop
+        // and the manual path: a manual renewal of this id that
+        // is still open is left to finish.
+        let Some(_in_flight) = state.renewals.begin(&cert.id) else {
+            info!(
+                domain = %cert.domain,
+                cert_id = %cert.id,
+                "skipping ACME renewal: an order for this certificate is in flight"
+            );
+            continue;
+        };
+
+        // In-place renewal : the leaf is written back onto the
+        // same row (`Some(cert.id)`), so the id and every route
+        // binding survive. No reassign, no delete, no orphan.
+        match renew_with_method(state, cert, &config, &all_domains, Some(&cert.id)).await {
+            Ok(_) => {
+                state.renewals.clear_cooldown(&cert.id);
+                state.rotate_bot_hmac_on_cert_event().await;
+                state.notify_config_changed();
+                info!(
+                    domain = %cert.domain,
+                    cert_id = %cert.id,
+                    acme_method = ?cert.acme_method,
+                    "ACME certificate renewed successfully"
+                );
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if let Some(until) = cooldown_from_error(&msg, now) {
+                    state.renewals.record_cooldown(&cert.id, until);
+                    info!(
+                        domain = %cert.domain,
+                        cert_id = %cert.id,
+                        retry_after = %until,
+                        "ACME renewal rate-limited; cooldown recorded"
+                    );
+                }
+                error!(
+                    domain = %cert.domain,
+                    error = %e,
+                    days_remaining = days_remaining,
+                    acme_method = ?cert.acme_method,
+                    "ACME renewal failed - existing cert still active"
+                );
+            }
+        }
+    }
+}
+
+/// POST /api/v1/certificates/:id/renew - manually renew an ACME or an
+/// AD CS certificate
 pub async fn renew_certificate(
     connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), AdcsHandlerError> {
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     renew_certificate_as(
         &state,
@@ -497,9 +554,21 @@ pub async fn renew_certificate(
     .await
 }
 
-/// The whole of [`renew_certificate`] as `actor`: the ACME-only
-/// refusal, the in-place renewal, the reload signal and the
-/// `certificate.renew` audit row.
+/// The whole of [`renew_certificate`] as `actor`: the refusal of a
+/// certificate nothing renews, the in-place renewal, the reload signal
+/// and the `certificate.renew` audit row.
+///
+/// An AD CS certificate (Story 13.4, Epic 13 D6) is renewed for an
+/// operator's session ([`RenewalBudget::Unbounded`]) by
+/// `crate::adcs::renew_manually`, and refused for any token
+/// ([`RenewalBudget::PerCertificate`]) with 403
+/// `adcs_renewal_not_on_automation_plane`, after `guard.check` so a
+/// token outside its grant learns nothing about the row. 403 rather
+/// than 409: the refusal is a property of the caller's plane, the way
+/// a grant or a scope refusal is on this plane, not a state of the
+/// certificate that a later call could find changed. The token
+/// renewal budget below is reasoned for Let's Encrypt, not for a
+/// domain authority, which is why it does not stand in for this.
 ///
 /// Split from the handler so the automation plane (Story 11.2) can run
 /// exactly this with a token as the actor rather than a session; see
@@ -533,7 +602,7 @@ pub(crate) async fn renew_certificate_as(
     mode: crate::preview::WriteMode,
     guard: crate::target::CertificateGuard,
     budget: RenewalBudget,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), AdcsHandlerError> {
     let (cert, provider) = db_blocking(&state.store, move |store| {
         let cert = store
             .get_certificate(&id)?
@@ -547,26 +616,49 @@ pub(crate) async fn renew_certificate_as(
     })
     .await?;
 
-    if !cert.is_acme {
-        return Err(ApiError::BadRequest(
-            "only ACME certificates can be renewed (use upload for manual certs)".into(),
-        ));
+    match (cert.source(), budget) {
+        (CertificateSource::Acme, _) => {}
+        (CertificateSource::Adcs, RenewalBudget::Unbounded) => {
+            return crate::adcs::renew_manually(state, actor, &cert, mode).await;
+        }
+        (CertificateSource::Adcs, RenewalBudget::PerCertificate) => {
+            return Err(AdcsHandlerError::Coded {
+                status: StatusCode::FORBIDDEN,
+                code: ADCS_NOT_ON_AUTOMATION_PLANE,
+                message: format!(
+                    "certificate `{}` is issued by the AD CS authority; it is renewed by the \
+                     background loop and the dashboard only, never by a token",
+                    cert.id
+                ),
+                step: None,
+            });
+        }
+        (CertificateSource::Manual, _) => {
+            return Err(ApiError::BadRequest(
+                "only ACME and AD CS certificates can be renewed (use upload for manual certs)"
+                    .into(),
+            )
+            .into());
+        }
     }
     if budget == RenewalBudget::PerCertificate {
         ensure_token_renewal_budget(&state.renewals, &cert, Utc::now())?;
     }
     let plan = plan_renewal(&cert, provider.as_ref()).map_err(ApiError::BadRequest)?;
     if mode.previews() {
-        return Ok(crate::preview::previewed(
-            "renew",
-            serde_json::to_value(crate::certificates::cert_to_response(&cert)).ok(),
-            None,
+        return Ok((
+            StatusCode::OK,
+            crate::preview::previewed(
+                "renew",
+                serde_json::to_value(crate::certificates::cert_to_response(&cert)).ok(),
+                None,
+            ),
         ));
     }
     let _in_flight = match (state.renewals.begin(&cert.id), budget) {
         (Some(mark), _) => Some(mark),
         (None, RenewalBudget::PerCertificate) => {
-            return Err(in_flight_refusal(&cert.id));
+            return Err(in_flight_refusal(&cert.id).into());
         }
         (None, RenewalBudget::Unbounded) => None,
     };
@@ -592,7 +684,7 @@ pub(crate) async fn renew_certificate_as(
         if let Some(until) = cooldown_from_error(&e.to_string(), Utc::now()) {
             state.renewals.record_cooldown(&cert.id, until);
         }
-        return Err(ApiError::Internal(format!("ACME renewal failed: {e}")));
+        return Err(ApiError::Internal(format!("ACME renewal failed: {e}")).into());
     }
     state.renewals.clear_cooldown(&cert.id);
 
@@ -624,7 +716,7 @@ pub(crate) async fn renew_certificate_as(
     // In-place renewal keeps the id, so `old_cert_id == new_cert_id`.
     // Both fields are retained for response-shape compatibility with
     // existing API clients (the dashboard types this exact shape).
-    Ok(crate::error::json_data(payload))
+    Ok((StatusCode::OK, crate::error::json_data(payload)))
 }
 
 /// The 409 a token gets for a certificate whose order is open.

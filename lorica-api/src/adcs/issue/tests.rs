@@ -40,7 +40,7 @@ const V2_TEMPLATE_OID: &str = "1.3.6.1.4.1.311.21.8.1234567.7654321.42";
 
 /// The template extension the stand-in puts in what it issues.
 #[derive(Clone, Copy)]
-enum TemplateExtension {
+pub(in crate::adcs) enum TemplateExtension {
     None,
     V2,
     V1Bmp,
@@ -49,7 +49,7 @@ enum TemplateExtension {
 
 /// What the stand-in answers to the next enrollment.
 #[derive(Clone)]
-enum Answer {
+pub(in crate::adcs) enum Answer {
     /// Sign the CSR; with `sans`, issue those names instead of the
     /// requested ones.
     Issue {
@@ -62,7 +62,7 @@ enum Answer {
     Fail(fn() -> AdcsError),
 }
 
-fn issue_v2() -> Answer {
+pub(in crate::adcs) fn issue_v2() -> Answer {
     Answer::Issue {
         template: TemplateExtension::V2,
         sans: None,
@@ -71,7 +71,7 @@ fn issue_v2() -> Answer {
 
 /// A stand-in authority: an issuing CA under a root, answering each
 /// enrollment with `answer`, recording every CSR it is sent.
-struct StubAuthority {
+pub(in crate::adcs) struct StubAuthority {
     answer: Mutex<Answer>,
     calls: AtomicUsize,
     csrs: Mutex<Vec<Vec<u8>>>,
@@ -81,7 +81,7 @@ struct StubAuthority {
 }
 
 impl StubAuthority {
-    fn new(answer: Answer) -> Arc<StubAuthority> {
+    pub(in crate::adcs) fn new(answer: Answer) -> Arc<StubAuthority> {
         StubAuthority::slow(answer, Duration::ZERO)
     }
 
@@ -104,15 +104,15 @@ impl StubAuthority {
         })
     }
 
-    fn calls(&self) -> usize {
+    pub(in crate::adcs) fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
 
-    fn set_answer(&self, answer: Answer) {
+    pub(in crate::adcs) fn set_answer(&self, answer: Answer) {
         *self.answer.lock().expect("answer") = answer;
     }
 
-    fn last_csr(&self) -> Vec<u8> {
+    pub(in crate::adcs) fn last_csr(&self) -> Vec<u8> {
         self.csrs
             .lock()
             .expect("csrs")
@@ -272,7 +272,10 @@ fn template_extension(template: TemplateExtension) -> Option<rcgen::CustomExtens
 }
 
 /// A fixture whose authority exists, with the stand-in answering.
-async fn issuing(stub: &Arc<StubAuthority>, alerts: Option<lorica_notify::AlertSender>) -> Fixture {
+pub(in crate::adcs) async fn issuing(
+    stub: &Arc<StubAuthority>,
+    alerts: Option<lorica_notify::AlertSender>,
+) -> Fixture {
     let f = fixture(Arc::clone(stub), alerts).await;
     f.create_authority().await;
     f
@@ -281,7 +284,10 @@ async fn issuing(stub: &Arc<StubAuthority>, alerts: Option<lorica_notify::AlertS
 impl Fixture {
     /// An issuance on a limiter of its own, for tests that issue more
     /// than the `adcs_issue` bucket admits.
-    async fn issue(&self, request: serde_json::Value) -> axum::response::Response {
+    pub(in crate::adcs) async fn issue(
+        &self,
+        request: serde_json::Value,
+    ) -> axum::response::Response {
         crate::tests::send(
             &self.state,
             &self.session_store,
@@ -294,7 +300,7 @@ impl Fixture {
         .await
     }
 
-    async fn certificates(&self) -> Vec<Certificate> {
+    pub(in crate::adcs) async fn certificates(&self) -> Vec<Certificate> {
         self.state
             .store
             .lock()
@@ -315,7 +321,7 @@ impl Fixture {
     }
 }
 
-fn web01() -> serde_json::Value {
+pub(in crate::adcs) fn web01() -> serde_json::Value {
     serde_json::json!({ "sans": ["web01.corp.example.org"], "key_type": "ecdsa_p256" })
 }
 
@@ -324,7 +330,7 @@ async fn error_of(resp: axum::response::Response) -> (StatusCode, serde_json::Va
     (status, body_json(resp).await["error"].clone())
 }
 
-fn alerts_of(
+pub(in crate::adcs) fn alerts_of(
     received: &mut tokio::sync::broadcast::Receiver<lorica_notify::AlertEvent>,
 ) -> Vec<lorica_notify::AlertEvent> {
     let mut alerts = Vec::new();
@@ -608,7 +614,7 @@ async fn a_fault_or_a_client_failure_is_a_bad_gateway_naming_the_step() {
     }
 }
 
-fn rejected_credential() -> AdcsError {
+pub(in crate::adcs) fn rejected_credential() -> AdcsError {
     AdcsError::Ticket {
         principal: "svc-lorica@CORP.EXAMPLE.ORG".to_string(),
         failure: TicketFailure::CredentialRejected,

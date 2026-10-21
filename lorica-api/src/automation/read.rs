@@ -717,8 +717,9 @@ pub async fn list_routes(
 
 /// `GET /automation/v1/certificates` (scope `certificates:read`).
 ///
-/// Certificate metadata: domain, SANs, fingerprint, issuer, validity
-/// window and ACME settings. Never a PEM body and never key material,
+/// Certificate metadata: domain, SANs, fingerprint, issuer, subject,
+/// validity window, derived source and renewal settings, without the
+/// AD CS internals ([`redact::certificate_row`]). Never a PEM body and never key material,
 /// because this is the management plane's list view, which carries
 /// neither. The single-certificate path, which does return the public
 /// PEM, is deliberately not mounted here. A principal carrying grants
@@ -739,7 +740,7 @@ pub async fn list_certificates(
         !text(row, "domain").is_empty()
             && certificate_names_granted(&principal, text(row, "domain"), texts(row, "san_domains"))
     });
-    page.of(rows)
+    page.of(masked(rows, redact::certificate_row))
 }
 
 #[cfg(test)]

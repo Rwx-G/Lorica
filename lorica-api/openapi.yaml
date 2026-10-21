@@ -4415,32 +4415,124 @@ paths:
       - $ref: "#/components/parameters/ResourceId"
     post:
       tags: [Certificates]
-      summary: Force an ACME renewal for one certificate
+      summary: Renew one ACME or AD CS certificate now
       description: |
-        Triggers an immediate ACME renewal for the named cert
-        regardless of its remaining validity. Honours the cert's
-        recorded ACME method (HTTP-01 / DNS-01) and provider id.
-        Returns the new cert id on success ; the old row is
-        replaced atomically.
+        Renews the named certificate immediately, regardless of its
+        remaining validity, in place: the id and every route bound to it
+        are kept. Operator and above.
+
+        An ACME certificate is ordered with its recorded ACME method
+        (HTTP-01 / DNS-01) and provider id, and answers the ACME shape
+        below.
+
+        An AD CS certificate (Story 13.4) is requested from the AD CS
+        authority with a new key, its current names and subject and its
+        recorded template, under the single-flight guard and the failed
+        state of every AD CS operation. It answers 200 with the renewed
+        certificate, or 202 when the authority holds the request
+        pending: nothing is stored and the current certificate stays in
+        service. Only the dashboard renews an AD CS certificate by hand;
+        the automation plane and MCP refuse it
+        (`adcs_renewal_not_on_automation_plane`).
+
+        An uploaded certificate is refused (400): nothing renews it.
       security:
         - sessionCookie: []
       responses:
         "200":
-          description: Renewal succeeded
+          description: >-
+            Renewed in place. An ACME certificate answers
+            `{renewed, old_cert_id, new_cert_id, domain}` (the two ids are
+            equal); an AD CS certificate answers the renewed certificate.
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  cert_id:
-                    type: string
-                    format: uuid
+                  data:
+                    oneOf:
+                      - type: object
+                        description: ACME certificate
+                        properties:
+                          renewed:
+                            type: boolean
+                          old_cert_id:
+                            type: string
+                          new_cert_id:
+                            type: string
+                          domain:
+                            type: string
+                      - $ref: "#/components/schemas/Certificate"
+        "202":
+          description: >-
+            AD CS only: the authority holds the request for approval.
+            Nothing was stored, the current certificate stays in service,
+            and the attempt raised `cert_issuance_failed` naming the
+            request identifier.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/AdcsPendingIssuance"
+        "400":
+          description: The certificate is neither ACME nor AD CS, or its ACME method cannot be renewed here
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: >-
+            AD CS: a renewal of this certificate is in flight, from the
+            background loop or another request (`conflict`); no authority
+            or no password is configured (`adcs_not_configured`); the
+            authority is in the failed state (`adcs_failed_state`); another
+            AD CS operation is running (`adcs_busy`); or this node is a
+            follower (`conflict`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: >-
+            AD CS: the certificate's names are no longer under an allowed
+            suffix (`adcs_san_refused`), the authority denied the request
+            (`adcs_denied`, with its message), or the stored certificate
+            cannot be read back into a request (`unprocessable_entity`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "500":
-          description: Renewal failed (ACME server error, DNS, etc.)
+          description: ACME renewal failed (ACME server error, DNS, etc.); the stored certificate is untouched
+        "502":
+          description: >-
+            AD CS: the authority answered with a fault, a client step
+            failed, or the issued certificate does not cover the names
+            (`adcs_error`, with `error.step`). The current certificate
+            stays in service.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdcsErrorResponse"
+        "504":
+          description: >-
+            AD CS: the renewal outlived the handler's deadline
+            (`gateway_timeout`); it is still finishing and stores and
+            audits its outcome when it ends
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   # ---------------------------------------------------------------------------
   # Admin audit log (Story 8.9)
