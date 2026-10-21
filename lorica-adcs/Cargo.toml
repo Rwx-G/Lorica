@@ -1,0 +1,24 @@
+[package]
+name = "lorica-adcs"
+version = "1.9.3"
+authors = ["Rwx-G"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+description = "AD CS certificate enrollment client for Lorica: Kerberos SPNEGO with TLS channel binding, WS-Trust over CES"
+
+# A leaf crate (Epic 13 decision D8): it depends on no first-party crate
+# and knows nothing about the store, routes or the dashboard. Keeping the
+# GSS-API FFI surface here keeps it in one place, although every crate
+# that depends on this one still links the system library.
+[dependencies]
+# Approved 2026-10-21 (Epic 13 decision D7) and pinned exactly: it is an
+# FFI binding, so a minor release can change what the generated bindings
+# expect of the system library. `libgssapi-sys` runs `bindgen` at build
+# time, which is why `libclang-dev` and `libkrb5-dev` are build
+# requirements of every job that compiles the workspace, and
+# `libgssapi-krb5-2` / `krb5-libs` a runtime requirement of the packages.
+libgssapi = "=0.11.0"
+# The error type's `Display` and `source`, at the version every other
+# product crate pins.
+thiserror = "2"

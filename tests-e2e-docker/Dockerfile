@@ -13,7 +13,7 @@ RUN pnpm run build
 
 # Stage 2: Build Rust binary
 FROM rust:1-bookworm AS builder
-RUN apt-get update && apt-get install -y cmake pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y cmake pkg-config libssl-dev libkrb5-dev libclang-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY lorica/ lorica/
@@ -48,6 +48,7 @@ COPY lorica-geoip/ lorica-geoip/
 COPY lorica-challenge/ lorica-challenge/
 COPY lorica-mcp/ lorica-mcp/
 COPY lorica-automation-policy/ lorica-automation-policy/
+COPY lorica-adcs/ lorica-adcs/
 COPY tinyufo/ tinyufo/
 
 # Copy pre-built frontend into the dashboard crate
@@ -71,7 +72,7 @@ RUN cargo build --release -p lorica-mcp
 
 # Stage 3: Runtime
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates socat curl sqlite3 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates libgssapi-krb5-2 socat curl sqlite3 && rm -rf /var/lib/apt/lists/*
 RUN useradd -r -s /bin/false lorica
 RUN mkdir -p /var/lib/lorica && chown lorica:lorica /var/lib/lorica
 

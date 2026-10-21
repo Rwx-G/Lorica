@@ -7,6 +7,7 @@ URL:            https://github.com/Rwx-G/Lorica
 BuildArch:      x86_64
 
 Requires:       ca-certificates
+Requires:       krb5-libs
 
 %description
 A dashboard-first reverse proxy built in Rust. Single binary,
