@@ -325,7 +325,7 @@ All table-stakes features (forward auth, basic auth, mTLS, retry with backoff, c
 | Gap | Plan |
 |---|---|
 | HTTP/3 (QUIC) | Planned for v2.0.0. Blocked on [Pingora PR #524](https://github.com/cloudflare/pingora/pull/524) (tokio-quiche integration) |
-| TCP/L4 proxying | Planned for v1.10.0 ([Epic 12](docs/prd/epic-12-v1.10.0.md)): TCP and UDP stream proxying at parity with nginx `stream {}`, then beyond parity in v1.11.0 |
+| TCP/L4 proxying | Planned for v1.11.0 ([Epic 12](docs/prd/epic-12-v1.11.0.md)): TCP and UDP stream proxying at parity with nginx `stream {}`, then beyond parity in v1.12.0 |
 | Service discovery (Docker labels, K8s Ingress) | Out of scope by design. Lorica targets standalone edge / bastion, not in-cluster deployment |
 | Config providers (etcd, Consul) | Out of scope by design. Same rationale as service discovery |
 | ACME TLS-ALPN-01 | Low priority. HTTP-01 and DNS-01 cover all real-world scenarios |
