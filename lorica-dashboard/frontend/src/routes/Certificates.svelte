@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import {
     api,
+    type AdcsAuthorityState,
     type CertificateResponse,
     type CertificateDetailResponse,
     type RouteResponse,
@@ -18,7 +19,9 @@
   import CertificateSelfSignedPrefPrompt from '../components/certificates/CertificateSelfSignedPrefPrompt.svelte';
   import CertificateThresholdsForm from '../components/certificates/CertificateThresholdsForm.svelte';
   import { showToast } from '../lib/toast';
-  import { canWrite, isSuperAdmin } from '../lib/auth';
+  import { canWrite, canWriteRole, isSuperAdmin } from '../lib/auth';
+  import { nodeRole } from '../lib/cluster';
+  import { adcsRenewalOffered, adcsRenewOutcome, type AdcsRenewOutcome } from '../lib/adcs-issuance';
 
   let certificates: CertificateResponse[] = $state([]);
   let routes: RouteResponse[] = $state([]);
@@ -49,6 +52,28 @@
 
   // Renew state
   let renewingId = $state('');
+
+  // AD CS renewal (Story 13.4). `canWriteRole`, not `canWrite`: a
+  // follower in a break-glass window regains `canWrite`, but the API
+  // refuses every AD CS operation on a follower.
+  let adcsState = $state<AdcsAuthorityState | null>(null);
+  let adcsRenewable = $derived(
+    adcsRenewalOffered({
+      canIssue: $canWriteRole,
+      follower: $nodeRole === 'follower',
+      state: adcsState,
+    }),
+  );
+  let adcsRenewConfirm: CertificateResponse | null = $state(null);
+  let adcsRenewResult: { domain: string; outcome: AdcsRenewOutcome } | null = $state(null);
+
+  async function loadAdcsState() {
+    // Renewal is never offered to a Viewer or on a follower, so the
+    // read is skipped rather than made for nothing.
+    if (!$canWriteRole || $nodeRole === 'follower') return;
+    const res = await api.getAdcsAuthority();
+    if (res.data) adcsState = res.data;
+  }
 
   // Self-signed generation state
   let showSelfSigned = $state(false);
@@ -105,7 +130,10 @@
     loading = false;
   }
 
-  onMount(loadData);
+  onMount(() => {
+    void loadData();
+    void loadAdcsState();
+  });
 
   function getRoutesForCert(certId: string): RouteResponse[] {
     return routes.filter((r) => r.certificate_id === certId);
@@ -149,6 +177,10 @@
   }
 
   async function handleRenew(cert: CertificateResponse) {
+    if (cert.source === 'adcs') {
+      adcsRenewConfirm = cert;
+      return;
+    }
     renewingId = cert.id;
     const res = await api.renewCertificate(cert.id);
     if (res.error) {
@@ -158,6 +190,25 @@
     }
     renewingId = '';
     await loadData();
+  }
+
+  async function renewFromAdcs() {
+    const cert = adcsRenewConfirm;
+    if (!cert) return;
+    adcsRenewConfirm = null;
+    adcsRenewResult = null;
+    renewingId = cert.id;
+    const res = await api.renewCertificate(cert.id);
+    renewingId = '';
+    adcsRenewResult = { domain: cert.domain, outcome: adcsRenewOutcome(res) };
+    // A credential rejection puts the authority in the failed state;
+    // re-reading it hides "Renew now" until a SuperAdmin fixes it.
+    await Promise.all([loadData(), loadAdcsState()]);
+  }
+
+  function adcsRenewMessage(cert: CertificateResponse): string {
+    const template = cert.adcs_template ? `template ${cert.adcs_template}` : 'its recorded template';
+    return `Renew ${cert.domain} from the AD CS authority? The authority records a new issuance under ${template}, for the same names and subject, with a new key. Only its administrators can revoke it. The current certificate stays in service until the new one is stored.`;
   }
 
   // Two-stage download for private keys: the `key` and `bundle` parts
@@ -264,6 +315,35 @@
     <div class="error-banner">{error}</div>
   {/if}
 
+  {#if adcsRenewResult}
+    {@const outcome = adcsRenewResult.outcome}
+    {@const domain = adcsRenewResult.domain}
+    <div
+      class="adcs-renew-result"
+      class:ok={outcome.kind === 'renewed'}
+      role={outcome.kind === 'renewed' ? 'status' : 'alert'}
+      data-testid="adcs-renew-outcome"
+    >
+      <span>
+        {#if outcome.kind === 'renewed'}
+          Renewed {domain} from AD CS.
+          {#if outcome.certificate}
+            Subject as issued by the authority:
+            <code>{outcome.certificate.subject || 'not readable'}</code>. Valid until
+            {new Date(outcome.certificate.not_after).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}.
+          {/if}
+        {:else if outcome.kind === 'pending'}
+          The authority answered that the renewal of {domain} is pending, under request id
+          <code>{outcome.requestId}</code>: {outcome.message}
+          Nothing was stored and the current certificate stays in service.
+        {:else}
+          Renewing {domain} from AD CS did not complete: {outcome.message}
+        {/if}
+      </span>
+      <button class="btn-dismiss" aria-label="Dismiss" onclick={() => (adcsRenewResult = null)}>&times;</button>
+    </div>
+  {/if}
+
   {#if loading}
     <p class="loading">Loading...</p>
   {:else if certificates.length === 0}
@@ -281,6 +361,7 @@
       {warningDays}
       {criticalDays}
       {renewingId}
+      {adcsRenewable}
       onView={openDetail}
       onEdit={openEditForm}
       onRenew={handleRenew}
@@ -320,6 +401,17 @@
     message={deleteMessage()}
     onconfirm={handleDelete}
     oncancel={() => { deletingCert = null; deleteRoutes = []; }}
+  />
+{/if}
+
+{#if adcsRenewConfirm}
+  <ConfirmDialog
+    title="Renew from AD CS"
+    message={adcsRenewMessage(adcsRenewConfirm)}
+    confirmLabel="Renew now"
+    confirmStyle="primary"
+    onconfirm={renewFromAdcs}
+    oncancel={() => (adcsRenewConfirm = null)}
   />
 {/if}
 
@@ -410,6 +502,39 @@
 
   .text-muted {
     color: var(--color-text-muted);
+  }
+
+  .adcs-renew-result {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.625rem 0.75rem;
+    margin-bottom: 1rem;
+    border: 1px solid var(--color-red);
+    border-radius: 0.375rem;
+    color: var(--color-red);
+    font-size: 0.875rem;
+    line-height: 1.5;
+  }
+
+  .adcs-renew-result.ok {
+    border-color: var(--color-green);
+    color: var(--color-green);
+    background: var(--color-green-subtle);
+  }
+
+  .adcs-renew-result code {
+    word-break: break-all;
+  }
+
+  .btn-dismiss {
+    background: none;
+    border: none;
+    color: inherit;
+    font-size: 1.125rem;
+    line-height: 1;
+    padding: 0;
   }
 
   .btn {

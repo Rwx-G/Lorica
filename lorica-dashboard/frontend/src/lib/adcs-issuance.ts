@@ -2,7 +2,8 @@
  * Pure helpers behind AD CS issuance in the dashboard (Story 13.3):
  * the names a route still needs a certificate for, the advisory SAN
  * hints, the request summary the operator confirms, when issuance is
- * offered at all, and how an answer reads.
+ * offered at all, and how an answer reads. Renewal (Story 13.4) is an
+ * issuance at the authority, so it shares the same rules.
  *
  * Everything here is advisory. The API checks the allowlist, refuses
  * wildcards and every other condition itself, and its messages are
@@ -17,7 +18,9 @@ import type {
   AdcsKeyType,
   AdcsSubjectDefaults,
   AdcsSubjectOverrides,
+  ApiError,
   ApiResponse,
+  CertificateRenewResult,
   CertificateResponse,
 } from './api';
 import { findUncoveredHostnames } from './cert-san-match';
@@ -44,6 +47,9 @@ export const ADCS_SUBJECT_FIELDS = Object.keys(ADCS_SUBJECT_LABELS) as (keyof Ad
 
 export const ADCS_STILL_FINISHING =
   'The issuance is still finishing on the server. Check the certificate list before retrying shortly: it may have completed.';
+
+export const ADCS_RENEWAL_STILL_FINISHING =
+  'The renewal is still finishing on the server. Reload the certificate list before retrying shortly: it may have completed.';
 
 function normalize(name: string): string {
   let n = name.trim().toLowerCase();
@@ -183,6 +189,23 @@ export function adcsIssuanceBlocker(input: {
   return null;
 }
 
+/**
+ * Whether "Renew now" is offered on an AD CS certificate: a renewal is
+ * an issuance at the authority, refused by the API under exactly the
+ * same conditions.
+ */
+export function adcsRenewalOffered(input: Parameters<typeof adcsIssuanceBlocker>[0]): boolean {
+  return adcsIssuanceBlocker(input) === null;
+}
+
+/** The API's message, plus the failing step of an `adcs_error` when the message does not name it. */
+export function adcsErrorMessage(error: ApiError): string {
+  if (error.step && !error.message.includes(error.step)) {
+    return `${error.message} (failing step: ${error.step})`;
+  }
+  return error.message;
+}
+
 export type AdcsIssueOutcome =
   | { kind: 'issued'; certificate: CertificateResponse }
   | { kind: 'pending'; requestId: string; message: string }
@@ -193,12 +216,36 @@ export function adcsIssueOutcome(res: ApiResponse<AdcsIssueResult>): AdcsIssueOu
     // A 504 can come from a reverse proxy with no envelope, so the
     // status alone decides, whatever the body says.
     if (res.error.status === 504) return { kind: 'refused', message: ADCS_STILL_FINISHING };
-    return { kind: 'refused', message: res.error.message };
+    return { kind: 'refused', message: adcsErrorMessage(res.error) };
   }
   const data = res.data;
   if (data && 'outcome' in data) {
     return { kind: 'pending', requestId: data.request_id, message: data.message };
   }
   if (data) return { kind: 'issued', certificate: data };
+  return { kind: 'refused', message: 'The server returned an empty answer.' };
+}
+
+/**
+ * `certificate` is null only if the server answered the ACME shape,
+ * which carries no certificate to show.
+ */
+export type AdcsRenewOutcome =
+  | { kind: 'renewed'; certificate: CertificateResponse | null }
+  | { kind: 'pending'; requestId: string; message: string }
+  | { kind: 'refused'; message: string };
+
+export function adcsRenewOutcome(res: ApiResponse<CertificateRenewResult>): AdcsRenewOutcome {
+  if (res.error) {
+    // Same reason as for issuance: a proxy's 504 has no envelope.
+    if (res.error.status === 504) return { kind: 'refused', message: ADCS_RENEWAL_STILL_FINISHING };
+    return { kind: 'refused', message: adcsErrorMessage(res.error) };
+  }
+  const data = res.data;
+  if (data && 'outcome' in data) {
+    return { kind: 'pending', requestId: data.request_id, message: data.message };
+  }
+  if (data && 'renewed' in data) return { kind: 'renewed', certificate: null };
+  if (data) return { kind: 'renewed', certificate: data };
   return { kind: 'refused', message: 'The server returned an empty answer.' };
 }

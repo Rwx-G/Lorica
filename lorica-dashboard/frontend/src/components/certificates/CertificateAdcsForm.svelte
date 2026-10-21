@@ -148,16 +148,12 @@
         Certificate issued and stored.
       </div>
       <dl class="issued">
-        <dt>Domain</dt>
-        <dd>{outcome.certificate.domain}</dd>
-        <dt>Names</dt>
-        <dd>{outcome.certificate.san_domains.length > 0 ? outcome.certificate.san_domains.join(', ') : outcome.certificate.domain}</dd>
-        <dt>Issuer</dt>
-        <dd>{outcome.certificate.issuer}</dd>
+        <dt>Subject as issued</dt>
+        <dd data-testid="adcs-issued-subject">{outcome.certificate.subject || 'not readable from the returned certificate'}</dd>
       </dl>
       <p class="hint">
-        These are the names of the certificate the authority returned, which
-        may differ from the request.
+        This is the subject of the certificate the authority returned. Its
+        template may have rewritten the subject that was requested.
       </p>
       <div class="form-actions">
         <button class="btn btn-cancel" onclick={onClose}>Close</button>

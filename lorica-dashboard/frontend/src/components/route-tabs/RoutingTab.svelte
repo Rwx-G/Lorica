@@ -239,6 +239,9 @@
           <div class="adcs-result ok" role="status" data-testid="adcs-route-outcome">
             Issued a certificate for {adcsOutcome.certificate.domain} from AD CS and
             selected it. The route uses it once saved.
+            {#if adcsOutcome.certificate.subject}
+              Subject as issued by the authority: <code>{adcsOutcome.certificate.subject}</code>.
+            {/if}
           </div>
         {:else if adcsOutcome?.kind === 'pending'}
           <div class="adcs-result failed" role="alert" data-testid="adcs-route-outcome">

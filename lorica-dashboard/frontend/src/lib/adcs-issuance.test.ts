@@ -3,11 +3,14 @@ import type { AdcsAuthorityState } from './api';
 import { testAuthority, testCertificate as cert } from '../test-adcs-fixtures';
 import {
   ADCS_KEY_TYPE_LABELS,
+  ADCS_RENEWAL_STILL_FINISHING,
   ADCS_STILL_FINISHING,
   ADCS_SUBJECT_FIELDS,
   ADCS_SUBJECT_LABELS,
   adcsIssuanceBlocker,
   adcsIssueOutcome,
+  adcsRenewalOffered,
+  adcsRenewOutcome,
   adcsRequestSummary,
   adcsSanHints,
   hostnamesWithoutCertificate,
@@ -195,5 +198,77 @@ describe('adcsIssueOutcome', () => {
     expect(
       adcsIssueOutcome({ error: { code: 'parse_error', message: 'Server returned invalid response (504)', status: 504 } }),
     ).toEqual({ kind: 'refused', message: ADCS_STILL_FINISHING });
+  });
+});
+
+describe('adcsIssueOutcome failing step', () => {
+  it('adds the failing step of an adcs_error the message does not name', () => {
+    expect(
+      adcsIssueOutcome({ error: { code: 'adcs_error', message: 'the CA closed the connection', step: 'enroll', status: 502 } }),
+    ).toEqual({ kind: 'refused', message: 'the CA closed the connection (failing step: enroll)' });
+  });
+
+  it('does not repeat a step the message already names', () => {
+    expect(
+      adcsIssueOutcome({ error: { code: 'adcs_error', message: 'kerberos: ticket refused', step: 'kerberos', status: 502 } }),
+    ).toEqual({ kind: 'refused', message: 'kerberos: ticket refused' });
+  });
+});
+
+describe('adcsRenewalOffered', () => {
+  const ready: AdcsAuthorityState = { authority: testAuthority(), managed_on_control_plane: false };
+
+  it('follows the issuance rules exactly, case by case', () => {
+    const cases: Parameters<typeof adcsIssuanceBlocker>[0][] = [
+      { canIssue: true, follower: false, state: ready },
+      { canIssue: false, follower: false, state: ready },
+      { canIssue: true, follower: true, state: ready },
+      { canIssue: true, follower: false, state: { authority: null, managed_on_control_plane: true } },
+      { canIssue: true, follower: false, state: { authority: null, managed_on_control_plane: false } },
+      { canIssue: true, follower: false, state: null },
+      {
+        canIssue: true,
+        follower: false,
+        state: { authority: testAuthority({ failed_since: '2026-10-20T08:00:00Z' }), managed_on_control_plane: false },
+      },
+    ];
+    for (const input of cases) {
+      expect(adcsRenewalOffered(input)).toBe(adcsIssuanceBlocker(input) === null);
+    }
+    expect(cases.filter(adcsRenewalOffered)).toEqual([cases[0]]);
+  });
+});
+
+describe('adcsRenewOutcome', () => {
+  it('reads the renewed certificate', () => {
+    const renewed = cert('app.corp.example.org', [], { source: 'adcs' });
+    expect(adcsRenewOutcome({ data: renewed })).toEqual({ kind: 'renewed', certificate: renewed });
+  });
+
+  it('reads the ACME shape as renewed with no certificate to show', () => {
+    expect(
+      adcsRenewOutcome({ data: { renewed: true, old_cert_id: 'c', new_cert_id: 'c', domain: 'app.corp.example.org' } }),
+    ).toEqual({ kind: 'renewed', certificate: null });
+  });
+
+  it('reads the 202 body as pending', () => {
+    expect(
+      adcsRenewOutcome({ data: { outcome: 'pending', request_id: '4712', message: 'Taken under submission' } }),
+    ).toEqual({ kind: 'pending', requestId: '4712', message: 'Taken under submission' });
+  });
+
+  it('keeps every refusal message verbatim and adds the failing step', () => {
+    expect(
+      adcsRenewOutcome({ error: { code: 'adcs_busy', message: 'an AD CS operation is already running', status: 409 } }),
+    ).toEqual({ kind: 'refused', message: 'an AD CS operation is already running' });
+    expect(
+      adcsRenewOutcome({ error: { code: 'adcs_error', message: 'the CA closed the connection', step: 'enroll', status: 502 } }),
+    ).toEqual({ kind: 'refused', message: 'the CA closed the connection (failing step: enroll)' });
+  });
+
+  it('reads a 504 as still finishing, whatever the body says', () => {
+    expect(
+      adcsRenewOutcome({ error: { code: 'parse_error', message: 'Server returned invalid response (504)', status: 504 } }),
+    ).toEqual({ kind: 'refused', message: ADCS_RENEWAL_STILL_FINISHING });
   });
 });

@@ -124,6 +124,9 @@ describe('RoutingTab AD CS issuance', () => {
       expect((document.getElementById('certificate') as HTMLSelectElement).value).toBe('cert-issued'),
     );
     expect(screen.getByTestId('adcs-route-outcome')).toHaveTextContent('once saved');
+    expect(screen.getByTestId('adcs-route-outcome')).toHaveTextContent(
+      'Subject as issued by the authority: CN=app.corp.example.org,O=Example Corp,C=FR',
+    );
     expect(screen.queryByTestId('adcs-route-offer')).not.toBeInTheDocument();
   });
 

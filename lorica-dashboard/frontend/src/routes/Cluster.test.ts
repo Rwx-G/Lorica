@@ -80,6 +80,7 @@ function certificate(id: string, domain: string) {
     san_domains: [],
     fingerprint: 'ab',
     issuer: 'Test CA',
+    subject: `CN=${domain}`,
     not_before: '2026-01-01T00:00:00Z',
     not_after: '2027-01-01T00:00:00Z',
     is_acme: false,

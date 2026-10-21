@@ -117,6 +117,7 @@ const mockCert = {
   san_domains: [],
   fingerprint: 'AA:BB:CC',
   issuer: 'Test CA',
+  subject: 'CN=example.com',
   not_before: '2026-01-01T00:00:00Z',
   not_after: '2027-01-01T00:00:00Z',
   is_acme: false,

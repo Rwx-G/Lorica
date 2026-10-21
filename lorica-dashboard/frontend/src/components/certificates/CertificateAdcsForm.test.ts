@@ -137,19 +137,30 @@ describe('CertificateAdcsForm hints and request', () => {
 });
 
 describe('CertificateAdcsForm outcomes', () => {
-  it('201: shows the issued certificate, reloads, and links to it', async () => {
+  it('201: shows the subject as issued, reloads, and links to it', async () => {
     served();
     const issued = testCertificate('app.corp.example.org', ['app.corp.example.org', 'www.app.corp.example.org'], {
       source: 'adcs',
+      subject: 'CN=app.corp.example.org,OU=IT,O=Example Corp,C=FR',
     });
     vi.spyOn(api, 'issueAdcsCertificate').mockResolvedValue({ data: issued });
     const props = await rendered();
     await reviewAndIssue('app.corp.example.org\nwww.app.corp.example.org');
     await waitFor(() => expect(screen.getByTestId('adcs-issue-outcome')).toHaveTextContent('issued'));
-    expect(screen.getByText('app.corp.example.org, www.app.corp.example.org')).toBeInTheDocument();
+    expect(screen.getByTestId('adcs-issued-subject')).toHaveTextContent(issued.subject);
     expect(props.onReload).toHaveBeenCalledOnce();
     await fireEvent.click(screen.getByRole('button', { name: 'View certificate' }));
     expect(props.onView).toHaveBeenCalledWith(issued);
+  });
+
+  it('201: says so when the returned subject is unreadable', async () => {
+    served();
+    vi.spyOn(api, 'issueAdcsCertificate').mockResolvedValue({
+      data: testCertificate('app.corp.example.org', [], { source: 'adcs', subject: '' }),
+    });
+    await rendered();
+    await reviewAndIssue('app.corp.example.org');
+    await waitFor(() => expect(screen.getByTestId('adcs-issued-subject')).toHaveTextContent('not readable'));
   });
 
   it('202: shows the request id and message, and reloads nothing', async () => {

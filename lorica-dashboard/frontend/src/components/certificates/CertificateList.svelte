@@ -9,6 +9,11 @@
     warningDays: number;
     criticalDays: number;
     renewingId: string;
+    /**
+     * Whether "Renew now" is offered on AD CS certificates, decided by
+     * the page from the role, the node and the authority state.
+     */
+    adcsRenewable: boolean;
     onView: (cert: CertificateResponse) => void;
     onEdit: (cert: CertificateResponse) => void;
     onRenew: (cert: CertificateResponse) => void;
@@ -22,6 +27,7 @@
     warningDays,
     criticalDays,
     renewingId,
+    adcsRenewable,
     onView,
     onEdit,
     onRenew,
@@ -115,6 +121,11 @@
               </button>
               {#if cert.is_acme}
                 <button class="btn-icon" title="Renew" aria-label="Renew certificate" onclick={() => onRenew(cert)} disabled={renewingId === cert.id}>
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                  {@html renewIcon}
+                </button>
+              {:else if cert.source === 'adcs' && adcsRenewable}
+                <button class="btn-icon" title="Renew now from AD CS" aria-label="Renew certificate from AD CS" onclick={() => onRenew(cert)} disabled={renewingId === cert.id}>
                   <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html renewIcon}
                 </button>

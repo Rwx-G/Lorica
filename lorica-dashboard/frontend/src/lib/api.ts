@@ -59,6 +59,8 @@ export interface ApiError {
    * no `code` the node chose.
    */
   status?: number;
+  /** The failing step's closed name, on an AD CS `adcs_error` (Epic 13). */
+  step?: string;
 }
 
 /** Body of `POST /api/v1/cluster/tokens` (Story 9.3, 9.5 D15). */
@@ -725,6 +727,12 @@ export interface CertificateResponse {
   san_domains: string[];
   fingerprint: string;
   issuer: string;
+  /**
+   * The subject as the certificate carries it, RFC 4514 (`CN=...,O=...`),
+   * empty when the API could not read it. For an AD CS certificate it is
+   * what the authority issued, which its template may have rewritten.
+   */
+  subject: string;
   not_before: string;
   not_after: string;
   is_acme: boolean;
@@ -1359,6 +1367,21 @@ export interface AdcsIssuePending {
 /** 201 carries the stored certificate, 202 the pending answer. */
 export type AdcsIssueResult = CertificateResponse | AdcsIssuePending;
 
+/** The ACME answer of `POST /api/v1/certificates/:id/renew`: in place, so both ids are equal. */
+export interface AcmeRenewResult {
+  renewed: boolean;
+  old_cert_id: string;
+  new_cert_id: string;
+  domain: string;
+}
+
+/**
+ * `POST /api/v1/certificates/:id/renew`: the ACME shape, or for an AD CS
+ * certificate (Story 13.4) the renewed certificate under the same id,
+ * or the 202 pending body.
+ */
+export type CertificateRenewResult = AcmeRenewResult | CertificateResponse | AdcsIssuePending;
+
 export interface UserPreferenceResponse {
   id: string;
   preference_key: string;
@@ -1608,8 +1631,12 @@ export const api = {
   deleteCertificate: (id: string) =>
     request<{ message: string }>('DELETE', `/certificates/${id}`),
 
+  /**
+   * Renew a certificate in place, ACME or AD CS. An AD CS renewal is an
+   * issuance at the authority, so callers confirm it with the operator.
+   */
   renewCertificate: (id: string) =>
-    request<{ renewed: boolean; old_cert_id: string; new_cert_id: string; domain: string }>('POST', `/certificates/${id}/renew`),
+    request<CertificateRenewResult>('POST', `/certificates/${id}/renew`),
 
   /**
    * Trigger a browser download of the PEM payload for one certificate.

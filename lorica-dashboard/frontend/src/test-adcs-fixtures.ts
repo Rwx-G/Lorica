@@ -1,5 +1,5 @@
 /**
- * Shared AD CS fixtures for the Vitest suites of Story 13.3. A plain
+ * Shared AD CS fixtures for the Vitest suites of Stories 13.3 and 13.4. A plain
  * module rather than an export of a test file, which would register
  * that file's suites a second time in every importer.
  */
@@ -51,6 +51,7 @@ export function testCertificate(
     san_domains,
     fingerprint: 'ab',
     issuer: 'CN=Example Issuing CA',
+    subject: `CN=${domain},O=Example Corp,C=FR`,
     not_before: '2026-01-01T00:00:00Z',
     not_after: '2027-01-01T00:00:00Z',
     is_acme: false,
