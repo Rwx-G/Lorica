@@ -52,6 +52,13 @@ import type {
 export interface ApiError {
   code: string;
   message: string;
+  /**
+   * The HTTP status of a refused request, absent on a network failure.
+   * Some answers are told apart by status alone: a 504 can come from a
+   * reverse proxy in front of the node, with no JSON envelope and so
+   * no `code` the node chose.
+   */
+  status?: number;
 }
 
 /** Body of `POST /api/v1/cluster/tokens` (Story 9.3, 9.5 D15). */
@@ -192,14 +199,20 @@ async function request<T>(
     json = await res.json();
   } catch {
     // Non-JSON response (e.g., backend returned HTML error page)
-    return { error: { code: 'parse_error', message: `Server returned invalid response (${res.status})` } };
+    return {
+      error: {
+        code: 'parse_error',
+        message: `Server returned invalid response (${res.status})`,
+        status: res.status,
+      },
+    };
   }
 
   if (!res.ok) {
     const err = json.error && typeof json.error === 'object' && 'code' in json.error
       ? (json.error as ApiError)
       : { code: 'unknown', message: res.statusText };
-    return { error: err };
+    return { error: { ...err, status: res.status } };
   }
   return { data: json.data as T };
 }
@@ -1217,6 +1230,87 @@ export interface CreateDnsProviderRequest {
   config: DnsProviderConfig;
 }
 
+// ---- AD CS authority (Story 13.2) ----
+
+/** `AdcsKeyType` in `lorica-config`, as serialised. */
+export type AdcsKeyType = 'rsa2048' | 'rsa3072' | 'ecdsa_p256';
+
+/** The fixed part of every CSR subject; blank fields are `null`. */
+export interface AdcsSubjectDefaults {
+  country: string | null;
+  state: string | null;
+  locality: string | null;
+  organization: string | null;
+  organizational_unit: string | null;
+  email: string | null;
+}
+
+/**
+ * The authority as a read returns it. There is no password field: the
+ * password is write-only and only `password_set` says whether one is
+ * stored.
+ */
+export interface AdcsAuthority {
+  id: string;
+  endpoint: string;
+  realm: string;
+  kdcs: string[];
+  principal: string;
+  endpoint_ca_pem: string | null;
+  issuing_ca_pem: string | null;
+  default_template: string;
+  default_key_type: AdcsKeyType;
+  subject: AdcsSubjectDefaults;
+  allowed_suffixes: string[];
+  auto_renew_default: boolean;
+  /** Set while the authority is in the failed state (Epic 13 D15). */
+  failed_since: string | null;
+  failed_step: string | null;
+  failed_kdc_code: number | null;
+  created_at: string;
+  updated_at: string;
+  password_set: boolean;
+}
+
+/** Body of `GET /api/v1/adcs/authority`. */
+export interface AdcsAuthorityState {
+  /** `null` when none is configured, and always on a follower. */
+  authority: AdcsAuthority | null;
+  /** `true` on a follower: the authority lives on the control plane only. */
+  managed_on_control_plane: boolean;
+}
+
+/** Body of `PUT /api/v1/adcs/authority`. */
+export interface AdcsAuthorityRequest {
+  endpoint: string;
+  realm: string;
+  kdcs: string[];
+  principal: string;
+  /**
+   * Required on creation and with any change of `endpoint`, `realm`,
+   * `kdcs` or `principal`; omitted otherwise to keep the stored one.
+   */
+  password?: string;
+  endpoint_ca_pem: string | null;
+  issuing_ca_pem: string | null;
+  default_template: string;
+  default_key_type: AdcsKeyType;
+  subject: AdcsSubjectDefaults;
+  allowed_suffixes: string[];
+  auto_renew_default: boolean;
+}
+
+/** Body of a completed `POST /api/v1/adcs/authority/test`. */
+export interface AdcsConnectionTestResult {
+  ok: boolean;
+  /** The failing step's closed name, `null` on success. */
+  step: string | null;
+  /** The client's error text, `null` on success. */
+  message: string | null;
+  /** Whether this test put the authority in the failed state. */
+  authority_failed: boolean;
+}
+
 export interface UserPreferenceResponse {
   id: string;
   preference_key: string;
@@ -1680,6 +1774,22 @@ export const api = {
 
   testDnsProvider: (id: string) =>
     request<{ message: string; provider_type: string }>('POST', `/dns-providers/${id}/test`),
+
+  // AD CS authority (Story 13.2). Reads are Viewer, writes SuperAdmin,
+  // the connection test Operator; `required_role` is the enforcement.
+  getAdcsAuthority: () =>
+    request<AdcsAuthorityState>('GET', '/adcs/authority'),
+
+  /** Create (201) or update (200) the one authority. */
+  putAdcsAuthority: (body: AdcsAuthorityRequest) =>
+    request<AdcsAuthority>('PUT', '/adcs/authority', body),
+
+  /** Refused with 409, naming them, while certificates reference it. */
+  deleteAdcsAuthority: () =>
+    request<{ message: string }>('DELETE', '/adcs/authority'),
+
+  testAdcsAuthority: () =>
+    request<AdcsConnectionTestResult>('POST', '/adcs/authority/test'),
 
   // Cert export ACLs (v1.4.1)
   listCertExportAcls: () =>
