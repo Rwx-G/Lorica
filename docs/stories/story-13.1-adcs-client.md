@@ -1,7 +1,7 @@
 # Story 13.1: The `lorica-adcs` Client
 
 **Epic:** [Epic 13 - AD CS Certificate Enrollment over CES (v1.10.0)](../prd/epic-13-v1.10.0.md)
-**Status:** Draft
+**Status:** Approved
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** nothing in this epic. It builds on `main` at `0245ab20`
@@ -51,15 +51,18 @@ re-exported by `x509-parser` 0.18; the WS-Addressing `MessageID` uses
 `uuid` v4 as `lorica-api` does. `libgssapi` and `quick-xml` are the
 only additions (PRD D7).
 
-**One open dependency question, for the maintainer before Lot 3:
-`zeroize`.** AC #2 asks that the buffer holding the password be zeroed
-after use. A hand-written loop of zero writes is removed by the
-optimiser, which is the reason `zeroize` exists. It is already in
-`Cargo.lock` (1.9.0, through rustls), so taking it as a direct
-dependency downloads nothing new, but it is a new direct dependency and
-the project rule says to ask. The recommendation is to accept it; the
-fallback is to drop the zeroing clause and rely on the password living
-only for the duration of one call.
+**The password buffer is wiped without `zeroize`.** AC #2 asks that
+the buffer holding the password be zeroed after use. A plain loop of
+zero writes can be removed by the optimiser; `zeroize` exists for that
+reason but would be a new direct dependency, which the maintainer did
+not approve. Decided 2026-10-21: the crate holds the password in a
+`Secret` type whose `Drop` overwrites its bytes with
+`core::ptr::write_volatile` followed by a `compiler_fence(SeqCst)`,
+the same technique `zeroize` uses, in one function carrying
+`#[allow(unsafe_code)]` and a `// SAFETY:` comment (the writes stay
+inside a slice the type owns). Copies made by `libgssapi` and MIT krb5
+during acquisition are outside Lorica's reach and are not claimed to be
+wiped.
 
 **The CES fixture of the harness is Python, not Rust.** The fixture
 must refuse a context whose returned flags lack
@@ -171,8 +174,9 @@ chain (`cargo fmt --all -- --check`, the three clippy invocations of
 
 ### Lot 3: Kerberos, HTTP, and the one public call
 
-- [ ] Maintainer answer on `zeroize` recorded in the Change Log before
-      this lot starts.
+- [ ] `Secret` type per the decision above: volatile wipe on `Drop`,
+      no `Debug`/`Display` that prints the value, a test that the
+      buffer reads zero after the wipe.
 - [ ] `GssBackend` trait (acquire with password, init step with
       binding, verify response token) with the `libgssapi`
       implementation and a test double. `Cred::acquire_with_password`
@@ -363,3 +367,4 @@ cannot regress silently.
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
 | 2026-10-21 | 0.1 | Story drafted from the Epic 13 PRD after the specification check. Status Draft. | Romain G. |
+| 2026-10-21 | 0.2 | Password wipe decided without `zeroize` (volatile writes). Status Approved. | Romain G. |
