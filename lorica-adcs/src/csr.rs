@@ -20,8 +20,8 @@ use std::fmt;
 
 use rcgen::string::{Ia5String, PrintableString};
 use rcgen::{
-    Attribute, CertificateParams, DistinguishedName, DnType, DnValue, KeyPair, SanType,
-    PKCS_ECDSA_P256_SHA256,
+    Attribute, CertificateParams, DistinguishedName, DnType, DnValue, KeyPair, RsaKeySize, SanType,
+    PKCS_ECDSA_P256_SHA256, PKCS_RSA_SHA256,
 };
 
 use crate::der::{tlv, TAG_BMP_STRING, TAG_SEQUENCE, TAG_SET};
@@ -42,14 +42,19 @@ const EMAIL_ADDRESS_OID: &[u64] = &[1, 2, 840, 113549, 1, 9, 1];
 /// The key generated for a request. A new key every issuance and every
 /// renewal (D4).
 ///
-/// RSA 2048 and 3072, which D4 makes selectable, are absent: `rcgen`
-/// generates RSA keys only with its `aws_lc_rs` backend, and the
-/// workspace builds it with `ring`.
+/// RSA 2048 is the default because a template duplicated from *Web
+/// Server* at schema version 2 uses a legacy cryptographic provider that
+/// handles RSA only; ECDSA needs a version 3 or later template with a
+/// key storage provider. Every request is signed with SHA-256.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KeyType {
-    /// ECDSA on P-256, signed with SHA-256. The default of D4.
+    /// RSA, 2048-bit modulus. The default of D4.
     #[default]
+    Rsa2048,
+    /// RSA, 3072-bit modulus.
+    Rsa3072,
+    /// ECDSA on P-256.
     EcdsaP256,
 }
 
@@ -149,6 +154,8 @@ pub fn build_csr(
     params.subject_alt_names = san_entries;
 
     let key: KeyPair = match key_type {
+        KeyType::Rsa2048 => KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048),
+        KeyType::Rsa3072 => KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_3072),
         KeyType::EcdsaP256 => KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256),
     }
     .map_err(|err| csr_error(format!("key generation failed: {err}")))?;
@@ -278,6 +285,7 @@ mod tests {
     use x509_parser::certification_request::X509CertificationRequest;
     use x509_parser::der_parser::asn1_rs::{Any, FromDer, Oid};
     use x509_parser::extensions::{GeneralName, ParsedExtension};
+    use x509_parser::public_key::PublicKey;
 
     const EXTENSION_REQUEST_OID: &str = "1.2.840.113549.1.9.14";
     const TEMPLATE_OID: &str = "1.3.6.1.4.1.311.13.2.1";
@@ -540,6 +548,77 @@ mod tests {
             &non_ascii_email,
             "WebServer"
         ));
+    }
+
+    #[test]
+    fn rsa_2048_is_the_default_key_type() {
+        assert_eq!(KeyType::default(), KeyType::Rsa2048);
+    }
+
+    #[test]
+    fn each_key_type_yields_its_algorithm_and_size() {
+        // (key type, SPKI algorithm, key size in bits, signature algorithm)
+        let cases: [(KeyType, &str, usize, &str); 3] = [
+            (
+                KeyType::Rsa2048,
+                "1.2.840.113549.1.1.1",
+                2048,
+                "1.2.840.113549.1.1.11",
+            ),
+            (
+                KeyType::Rsa3072,
+                "1.2.840.113549.1.1.1",
+                3072,
+                "1.2.840.113549.1.1.11",
+            ),
+            (
+                KeyType::EcdsaP256,
+                "1.2.840.10045.2.1",
+                256,
+                "1.2.840.10045.4.3.2",
+            ),
+        ];
+        for (key_type, spki_oid, bits, signature_oid) in cases {
+            let csr: GeneratedCsr = build_csr(
+                &sans(&["web01.corp.example.org"]),
+                &SubjectFields::default(),
+                "LoricaWebServer",
+                key_type,
+            )
+            .expect("csr");
+            let (_, request): (&[u8], X509CertificationRequest<'_>) =
+                X509CertificationRequest::from_der(&csr.csr_der).expect("parse csr");
+            let spki = &request.certification_request_info.subject_pki;
+            assert_eq!(
+                spki.algorithm.algorithm.to_id_string(),
+                spki_oid,
+                "{key_type:?}"
+            );
+            let parsed: PublicKey<'_> = spki.parsed().expect("public key");
+            let size: usize = match &parsed {
+                PublicKey::RSA(rsa) => rsa.key_size(),
+                PublicKey::EC(ec) => ec.key_size(),
+                other => panic!("{key_type:?}: unexpected key {other:?}"),
+            };
+            assert_eq!(size, bits, "{key_type:?}");
+            if key_type == KeyType::EcdsaP256 {
+                let curve: String = spki
+                    .algorithm
+                    .parameters
+                    .as_ref()
+                    .expect("curve parameter")
+                    .as_oid()
+                    .expect("curve oid")
+                    .to_id_string();
+                assert_eq!(curve, "1.2.840.10045.3.1.7");
+            }
+            assert_eq!(
+                request.signature_algorithm.algorithm.to_id_string(),
+                signature_oid,
+                "{key_type:?}"
+            );
+            KeyPair::from_pem(&csr.private_key_pem).expect("the private key parses back");
+        }
     }
 
     #[test]

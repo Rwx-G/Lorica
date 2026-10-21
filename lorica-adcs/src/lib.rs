@@ -27,22 +27,35 @@
 //! construction and the `krb5.conf` renderer. It depends on no
 //! first-party crate and knows nothing about the store, routes or the
 //! dashboard; when to issue, renew and store is `lorica-api`'s business.
+//!
+//! The calls the rest of Lorica makes are [`enroll`], which turns a CSR
+//! from [`build_csr`] into an [`EnrollOutcome`], and [`test_connection`],
+//! which authenticates without requesting anything. Both read the
+//! Kerberos configuration from the file `KRB5_CONFIG` names, which the
+//! `lorica` binary sets to [`krb5_config_path`] at startup and Story
+//! 13.2 writes with [`Krb5Config::write_to`].
 
 mod binding;
 mod chain;
+mod client;
 mod csr;
 mod der;
 mod error;
+mod gss;
 mod krb5conf;
+mod secret;
 #[cfg(test)]
 mod test_support;
 mod wstep;
 
 pub use binding::channel_binding;
 pub use chain::chain_from_cmc;
+pub use client::{enroll, test_connection, CesParams, CesTimeouts, EnrollOutcome};
 pub use csr::{build_csr, GeneratedCsr, KeyType, SubjectFields};
 pub use error::AdcsError;
-pub use krb5conf::{write_atomically, KdcAddress, KdcTiming, Krb5Config, Realm};
+pub use gss::TicketFailure;
+pub use krb5conf::{krb5_config_path, write_atomically, KdcAddress, KdcTiming, Krb5Config, Realm};
+pub use secret::Secret;
 pub use wstep::request::{build_request, new_message_id, SOAP_CONTENT_TYPE};
 pub use wstep::response::{parse_response, EnrollmentResponse, FaultKind};
 

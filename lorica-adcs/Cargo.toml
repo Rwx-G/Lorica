@@ -25,10 +25,13 @@ thiserror = "2"
 # Channel-binding digests (RFC 5929). The workspace's crypto already, at
 # the version every product crate uses; no `sha2` beside it.
 ring = "0.17"
-# CSR and key generation, at the version `lorica-api` uses. With the
-# workspace's `ring` backend it cannot generate RSA keys, which is why
-# `KeyType` offers ECDSA only (see `csr.rs`).
-rcgen = "0.14"
+# CSR and key generation, at the version `lorica-api` uses. RSA key
+# generation, the default key type of Epic 13 D4, exists only under the
+# `aws_lc_rs` backend (decided 2026-10-21). `aws-lc-rs` and `aws-lc-sys`
+# were already in the lockfile through `jsonwebtoken`, so no crate is
+# added; feature unification makes every rcgen user in the workspace
+# run on that backend.
+rcgen = { version = "0.14", features = ["aws_lc_rs"] }
 # Certificate parsing for the channel binding and the chain; its
 # re-exported `der_parser` / `asn1_rs` read the CMC response, so neither
 # is a direct dependency.
@@ -40,3 +43,19 @@ uuid = { version = "1", features = ["v4"] }
 # Approved 2026-10-21 (Epic 13 decision D7): the SOAP envelope writer and
 # the namespace-aware response reader. No SOAP framework.
 quick-xml = "0.42"
+# The CES exchange over HTTPS, at the version and TLS features
+# `lorica-api` uses, so no second TLS stack enters the binary.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+# GSS-API calls go to `spawn_blocking` and the whole operation sits
+# under an outer `tokio::time::timeout` (Epic 13 D8).
+tokio = { workspace = true, features = ["rt", "time"] }
+
+[dev-dependencies]
+# A local HTTPS server standing in for CES in the exchange tests. Every
+# crate below is already in the workspace lockfile through `lorica-api`.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"

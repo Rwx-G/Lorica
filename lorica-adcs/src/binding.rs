@@ -116,11 +116,10 @@ mod tests {
     }
 
     /// A copy of `cert_der` whose outer `signatureAlgorithm` names
-    /// `oid`, with NULL parameters when `null_params`. rcgen with the
-    /// workspace's ring backend cannot generate RSA keys nor sign with
-    /// SHA-1, MD5 or ECDSA-SHA512, and the binding reads the OID only,
-    /// so these families are exercised on a certificate re-labelled
-    /// this way rather than truly signed.
+    /// `oid`, with NULL parameters when `null_params`. rcgen cannot sign
+    /// with MD5 or SHA-1, and the binding reads the OID only, so those
+    /// families (and unknown OIDs) are exercised on a certificate
+    /// re-labelled this way rather than truly signed.
     fn relabelled(cert_der: &[u8], oid: &str, null_params: bool) -> Vec<u8> {
         let outer: Vec<&[u8]> = der_split(cert_der);
         let tbs: &[u8] = outer[0];
@@ -196,6 +195,30 @@ mod tests {
             &relabelled(&base, "1.2.840.113549.1.1.13", true),
             &digest::SHA512,
         );
+    }
+
+    // The spike's CES certificate was RSA with SHA-512; IV2 asks for
+    // SHA-512 and SHA-256 server certificates to bind.
+    #[test]
+    fn truly_signed_rsa_and_p521_certificates_bind_with_their_signature_hash() {
+        let rsa = |alg: &'static rcgen::SignatureAlgorithm| {
+            KeyPair::generate_rsa_for(alg, rcgen::RsaKeySize::_2048).expect("generate rsa key")
+        };
+        let cases: [(KeyPair, &'static digest::Algorithm); 4] = [
+            (rsa(&rcgen::PKCS_RSA_SHA256), &digest::SHA256),
+            (rsa(&rcgen::PKCS_RSA_SHA384), &digest::SHA384),
+            (rsa(&rcgen::PKCS_RSA_SHA512), &digest::SHA512),
+            (
+                KeyPair::generate_for(&rcgen::PKCS_ECDSA_P521_SHA512).expect("generate p521 key"),
+                &digest::SHA512,
+            ),
+        ];
+        for (key, hash) in cases {
+            let params: CertificateParams =
+                CertificateParams::new(vec!["ces.corp.example.org".to_owned()]).expect("params");
+            let cert: Vec<u8> = params.self_signed(&key).expect("self-sign").der().to_vec();
+            assert_binding(&cert, hash);
+        }
     }
 
     #[test]

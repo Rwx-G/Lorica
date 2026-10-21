@@ -35,6 +35,25 @@ fn main() {
 
     let cli = Cli::parse();
 
+    // Every Kerberos context MIT krb5 creates in this process reads the
+    // `krb5.conf` Lorica generates, never the host's (Epic 13 D3). It is
+    // set once, here, because MIT reads the variable at each context
+    // creation and processes started from this one (workers, hot-upgrade
+    // successors) inherit it. A `worker` invocation passes here too, with
+    // the top-level default data directory rather than its own; workers
+    // never run the API nor acquire a ticket, so that value is unused.
+    //
+    // SAFETY: no other thread exists yet, so nothing can read the
+    // environment concurrently: `Cli::parse` spawns none, and the first
+    // thread is the log appender `init_logging` may start, or a runtime
+    // built after it. `set_var` is safe in edition 2021 and becomes
+    // `unsafe` in edition 2024; this comment is the justification that
+    // migration will need.
+    std::env::set_var(
+        "KRB5_CONFIG",
+        lorica_adcs::krb5_config_path(std::path::Path::new(&cli.data_dir)),
+    );
+
     match cli.command {
         Some(Commands::Worker {
             id,
@@ -272,6 +291,66 @@ fn main() {
 
             // Single-process mode (--workers 0)
             startup::single::run_single_process(cli);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Story 13.1 AC #3. `set_var` is only sound while the process has a
+    /// single thread, and nothing at runtime can observe the order in
+    /// which `main` did things, so the order is checked in the source:
+    /// the assignment comes after `Cli::parse` and before the first
+    /// `init_logging` (which may start the log appender thread) and
+    /// before anything in `main.rs` that builds a runtime or a thread.
+    #[test]
+    fn krb5_config_is_set_before_logging_and_before_any_thread() {
+        let source: &str = include_str!("main.rs");
+        let production: &str = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("test setup: main.rs has a body");
+        let lines: Vec<(usize, &str)> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .collect();
+        let first = |needle: &str| -> Option<usize> {
+            lines
+                .iter()
+                .find(|(_, line)| line.contains(needle))
+                .map(|(index, _)| *index)
+        };
+        let parse: usize = first("Cli::parse()").expect("main parses the command line");
+        let assignment: usize =
+            first("\"KRB5_CONFIG\"").expect("main sets KRB5_CONFIG (Story 13.1 AC #3)");
+        let logging: usize = first("init_logging(").expect("main initialises logging");
+        assert!(
+            parse < assignment,
+            "KRB5_CONFIG is set before Cli::parse, which is where data_dir comes from"
+        );
+        assert!(
+            assignment < logging,
+            "KRB5_CONFIG must be set before the first init_logging, which may spawn a thread"
+        );
+        for marker in [
+            "Runtime::new",
+            "runtime::Builder",
+            "new_multi_thread",
+            "new_current_thread",
+            "tokio::main",
+            "thread::spawn",
+            "thread::Builder",
+        ] {
+            for (index, line) in &lines {
+                if line.contains(marker) {
+                    assert!(
+                        assignment < *index,
+                        "main.rs:{}: `{marker}` runs before KRB5_CONFIG is set",
+                        index + 1
+                    );
+                }
+            }
         }
     }
 }

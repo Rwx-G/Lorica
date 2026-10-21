@@ -2972,6 +2972,7 @@ dependencies = [
  "ipnet",
  "itoa",
  "log",
+ "lorica-adcs",
  "lorica-api",
  "lorica-automation-policy",
  "lorica-bench",
@@ -3049,11 +3050,18 @@ name = "lorica-adcs"
 version = "1.9.3"
 dependencies = [
  "base64 0.23.1",
+ "bytes",
+ "http-body-util",
+ "hyper 1.11.1",
+ "hyper-util",
  "libgssapi",
  "quick-xml",
  "rcgen",
+ "reqwest 0.12.28",
  "ring",
  "thiserror 2.0.20",
+ "tokio",
+ "tokio-rustls",
  "uuid",
  "x509-parser 0.18.1",
 ]
@@ -4794,6 +4802,7 @@ version = "0.14.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8774e05a7d0de114588e6a28fe7e71694b82614ed569d86d8b389dfbc98b8ad8"
 dependencies = [
+ "aws-lc-rs",
  "pem",
  "ring",
  "rustls-pki-types",
@@ -6885,6 +6894,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d43b0f71ce057da06bc0851b23ee24f3f86190b07203dd8f567d0b706a185202"
 dependencies = [
  "asn1-rs 0.7.2",
+ "aws-lc-rs",
  "data-encoding",
  "der-parser 10.0.0",
  "lazy_static",

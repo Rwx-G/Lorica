@@ -278,6 +278,15 @@ impl Krb5Config {
     }
 }
 
+/// Where the generated `krb5.conf` lives under the data directory
+/// (Epic 13 D3): `<data-dir>/adcs/krb5.conf`. The `lorica` binary points
+/// `KRB5_CONFIG` here at startup, before any thread exists, and MIT
+/// krb5 reads it at every context creation, so the file can be written
+/// later and rewritten when the authority changes.
+pub fn krb5_config_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("adcs").join("krb5.conf")
+}
+
 /// Replaces `path` with `contents` so that a reader sees either the old
 /// file or the new one, never a partial write: the bytes go to a sibling
 /// temporary file in the same directory, which is flushed to disk and
@@ -376,6 +385,14 @@ mod tests {
 
     fn timing() -> KdcTiming {
         KdcTiming::new(3, 2).expect("timing")
+    }
+
+    #[test]
+    fn the_file_lives_under_the_data_directory() {
+        assert_eq!(
+            krb5_config_path(Path::new("/var/lib/lorica")),
+            Path::new("/var/lib/lorica/adcs/krb5.conf")
+        );
     }
 
     #[test]
