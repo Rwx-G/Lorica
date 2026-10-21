@@ -529,9 +529,10 @@ describe('api.importPreview', () => {
 
 describe('api.importConfig', () => {
   it('calls POST /api/v1/config/import with toml_content', async () => {
-    mockFetch({ message: 'configuration imported successfully' });
+    mockFetch({ message: 'configuration imported successfully', warnings: ['made manual'] });
     const res = await api.importConfig('version = 1\n');
     expect(res.data?.message).toBe('configuration imported successfully');
+    expect(res.data?.warnings).toEqual(['made manual']);
     expect(fetch).toHaveBeenCalledWith(
       '/api/v1/config/import',
       expect.objectContaining({

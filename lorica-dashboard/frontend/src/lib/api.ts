@@ -1445,6 +1445,15 @@ export interface ImportDiffResponse {
   global_settings: { changes: SettingChange[] };
 }
 
+/// Result of an applied import. `warnings` lists what the import
+/// changed on its own initiative, such as an AD CS certificate made
+/// manual because its authority is absent on this node; the response
+/// is the only place the operator learns it.
+export interface ImportConfigResponse {
+  message: string;
+  warnings: string[];
+}
+
 // --- AI crawler management (Story 8.2) ---
 
 /// Verification strategy attached to a crawler entry. A discriminated
@@ -1973,7 +1982,7 @@ export const api = {
     request<ImportDiffResponse>('POST', '/config/import/preview', { toml_content }),
 
   importConfig: (toml_content: string) =>
-    request<{ message: string }>('POST', '/config/import', { toml_content }),
+    request<ImportConfigResponse>('POST', '/config/import', { toml_content }),
 
   getWorkers: () =>
     request<{ workers: WorkerStatus[]; total: number }>('GET', '/workers'),

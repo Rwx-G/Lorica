@@ -19,6 +19,7 @@
   let importPreviewing = $state(false);
   let importApplying = $state(false);
   let importSuccess = $state('');
+  let importWarnings: string[] = $state([]);
 
   async function handleExport() {
     exporting = true;
@@ -47,6 +48,7 @@
     importDiff = null;
     importError = '';
     importSuccess = '';
+    importWarnings = [];
   }
 
   async function previewImport() {
@@ -70,11 +72,13 @@
     importApplying = true;
     importError = '';
     importSuccess = '';
+    importWarnings = [];
     const res = await api.importConfig(importToml);
     if (res.error) {
       importError = res.error.message;
     } else {
       importSuccess = 'Configuration imported successfully.';
+      importWarnings = res.data?.warnings ?? [];
       importDiff = null;
       importToml = '';
       importFile = null;
@@ -152,6 +156,16 @@
             {/if}
             {#if importSuccess}
               <div class="form-success">{importSuccess}</div>
+            {/if}
+            {#if importWarnings.length > 0}
+              <div class="import-warnings" role="alert">
+                <h4>The import changed the following on its own:</h4>
+                <ul>
+                  {#each importWarnings as warning, i (i)}
+                    <li>{warning}</li>
+                  {/each}
+                </ul>
+              </div>
             {/if}
             <div class="actions-center">
               <button class="btn btn-primary" onclick={previewImport} disabled={!importToml || importPreviewing}>
@@ -239,6 +253,26 @@
     color: var(--color-green);
     font-size: 0.8125rem;
     margin: 0.5rem 0;
+  }
+
+  .import-warnings {
+    background: var(--color-orange-subtle);
+    border: 1px solid var(--color-orange);
+    border-radius: var(--radius-md);
+    color: var(--color-orange);
+    font-size: 0.8125rem;
+    margin: 0.5rem 0;
+    padding: 0.75rem 1rem;
+  }
+
+  .import-warnings h4 {
+    font-size: 0.8125rem;
+    margin: 0 0 0.5rem;
+  }
+
+  .import-warnings ul {
+    margin: 0;
+    padding-left: 1.25rem;
   }
 
   .file-info {
