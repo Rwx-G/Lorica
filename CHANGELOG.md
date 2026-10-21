@@ -19,6 +19,9 @@ Author: Rwx-G
 
 ### Security
 
+- **`rustls-webpki` 0.103.16, `webpki-roots` 1.0.10 and `webpki-root-certs` 1.0.10** (RUSTSEC-2026-0382, RUSTSEC-2026-0381, RUSTSEC-2026-0383): certificate verification on Lorica's outbound TLS clients (ACME, DNS providers, notifications, GeoIP downloads, OTLP export) could accept intermediates that are now distrusted.
+- **`ammonia` 4.1.8** (RUSTSEC-2026-0373): a mixed-case CSS `url()` could pass the sanitizer. Lorica's error-page sanitizer does not allow `style` attributes or elements, so it was not reachable.
+
 ## [1.9.3] - 2026-10-14
 
 The release of 1.9.2. Its tag was cut on the merge of the 1.9.2 changes, before the fix for the `rustls` advisories below landed, and the release pipeline never ran on it, so no 1.9.2 package exists. A release tag is never moved, so the same changes ship as 1.9.3: everything listed under `[1.9.2]` is in this release.
