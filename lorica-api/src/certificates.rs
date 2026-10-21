@@ -327,6 +327,10 @@ pub async fn create_certificate(
         acme_method: None,
 
         acme_dns_provider_id: None,
+        adcs_authority_id: None,
+        adcs_template: None,
+        adcs_template_oid: None,
+        adcs_request_id: None,
     };
 
     let (cert, export_snapshot) = db_blocking(&state.store, move |store| {
@@ -576,6 +580,10 @@ pub async fn generate_self_signed(
         acme_method: None,
 
         acme_dns_provider_id: None,
+        adcs_authority_id: None,
+        adcs_template: None,
+        adcs_template_oid: None,
+        adcs_request_id: None,
     };
 
     let (certificate, export_snapshot) = db_blocking(&state.store, move |store| {

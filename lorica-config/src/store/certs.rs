@@ -20,8 +20,10 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT INTO certificates (id, domain, san_domains, fingerprint, cert_pem, key_pem,
              issuer, not_before, not_after, is_acme, acme_auto_renew, created_at,
-             acme_method, acme_dns_provider_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             acme_method, acme_dns_provider_id, adcs_authority_id, adcs_template,
+             adcs_template_oid, adcs_request_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+             ?17, ?18)",
             params![
                 cert.id,
                 cert.domain,
@@ -37,6 +39,10 @@ impl ConfigStore {
                 cert.created_at.to_rfc3339(),
                 cert.acme_method,
                 cert.acme_dns_provider_id,
+                cert.adcs_authority_id,
+                cert.adcs_template,
+                cert.adcs_template_oid,
+                cert.adcs_request_id,
             ],
         )?;
         Ok(())
@@ -48,7 +54,8 @@ impl ConfigStore {
             .query_row(
                 "SELECT id, domain, san_domains, fingerprint, cert_pem, key_pem,
                  issuer, not_before, not_after, is_acme, acme_auto_renew, created_at,
-                 acme_method, acme_dns_provider_id
+                 acme_method, acme_dns_provider_id, adcs_authority_id, adcs_template,
+                 adcs_template_oid, adcs_request_id
                  FROM certificates WHERE id = ?1",
                 params![id],
                 |row| Ok(self.row_to_certificate(row)),
@@ -62,7 +69,8 @@ impl ConfigStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, domain, san_domains, fingerprint, cert_pem, key_pem,
              issuer, not_before, not_after, is_acme, acme_auto_renew, created_at,
-             acme_method, acme_dns_provider_id
+             acme_method, acme_dns_provider_id, adcs_authority_id, adcs_template,
+             adcs_template_oid, adcs_request_id
              FROM certificates ORDER BY domain",
         )?;
         let rows = stmt.query_map([], |row| Ok(self.row_to_certificate(row)))?;
@@ -85,7 +93,8 @@ impl ConfigStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, domain, san_domains, fingerprint, cert_pem,
              issuer, not_before, not_after, is_acme, acme_auto_renew, created_at,
-             acme_method, acme_dns_provider_id
+             acme_method, acme_dns_provider_id, adcs_authority_id, adcs_template,
+             adcs_template_oid, adcs_request_id
              FROM certificates ORDER BY domain",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -108,6 +117,10 @@ impl ConfigStore {
                     created_at: parse_datetime(&row.get::<_, String>(10)?)?,
                     acme_method: row.get(11)?,
                     acme_dns_provider_id: row.get(12)?,
+                    adcs_authority_id: row.get(13)?,
+                    adcs_template: row.get(14)?,
+                    adcs_template_oid: row.get(15)?,
+                    adcs_request_id: row.get(16)?,
                 })
             })())
         })?;
@@ -127,7 +140,8 @@ impl ConfigStore {
             "UPDATE certificates SET domain=?2, san_domains=?3, fingerprint=?4,
              cert_pem=?5, key_pem=?6, issuer=?7, not_before=?8, not_after=?9,
              is_acme=?10, acme_auto_renew=?11, acme_method=?12,
-             acme_dns_provider_id=?13
+             acme_dns_provider_id=?13, adcs_authority_id=?14, adcs_template=?15,
+             adcs_template_oid=?16, adcs_request_id=?17
              WHERE id=?1",
             params![
                 cert.id,
@@ -143,6 +157,10 @@ impl ConfigStore {
                 cert.acme_auto_renew,
                 cert.acme_method,
                 cert.acme_dns_provider_id,
+                cert.adcs_authority_id,
+                cert.adcs_template,
+                cert.adcs_template_oid,
+                cert.adcs_request_id,
             ],
         )?;
         if changed == 0 {
@@ -207,6 +225,10 @@ impl ConfigStore {
             created_at: parse_datetime(&row.get::<_, String>(11)?)?,
             acme_method,
             acme_dns_provider_id,
+            adcs_authority_id: row.get(14)?,
+            adcs_template: row.get(15)?,
+            adcs_template_oid: row.get(16)?,
+            adcs_request_id: row.get(17)?,
         })
     }
 }

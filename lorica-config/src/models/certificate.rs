@@ -6,7 +6,8 @@ use super::hostname_pattern::matches_one_label;
 /// X.509 certificate + private key used to terminate TLS for one or
 /// more routes. `key_pem` is encrypted at rest by the store when an
 /// [`EncryptionKey`](crate::EncryptionKey) is configured. `is_acme` /
-/// `acme_*` fields drive the ACME renewal loop.
+/// `acme_*` fields drive the ACME renewal loop, `adcs_*` the AD CS one;
+/// [`Certificate::source`] says which applies.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Certificate {
@@ -31,8 +32,11 @@ pub struct Certificate {
     pub not_after: DateTime<Utc>,
     /// Whether the cert was issued by Lorica's ACME flow.
     pub is_acme: bool,
-    /// Whether the ACME renewal loop is allowed to renew this cert
-    /// without operator confirmation.
+    /// Whether the renewal loop may renew this cert without operator
+    /// confirmation. Despite the name it governs both automated
+    /// sources, ACME and AD CS (Epic 13 PRD D14); [`Certificate::source`]
+    /// says which one it applies to, and it means nothing for a manual
+    /// certificate.
     pub acme_auto_renew: bool,
     /// Insert timestamp.
     pub created_at: DateTime<Utc>,
@@ -43,6 +47,63 @@ pub struct Certificate {
     /// Reference to a global DNS provider (dns_providers.id).
     #[serde(default)]
     pub acme_dns_provider_id: Option<String>,
+    /// The AD CS authority this certificate is issued and renewed by
+    /// (`adcs_authority.id`); `None` for every other source. Plain
+    /// nullable TEXT with no foreign key, like `acme_dns_provider_id`:
+    /// followers hold these certificates without the authority row
+    /// (PRD D13, D14).
+    #[serde(default)]
+    pub adcs_authority_id: Option<String>,
+    /// The template common name the certificate was requested with;
+    /// renewal reuses it.
+    #[serde(default)]
+    pub adcs_template: Option<String>,
+    /// The template OID observed in the issued certificate.
+    #[serde(default)]
+    pub adcs_template_oid: Option<String>,
+    /// The request identifier the authority assigned.
+    #[serde(default)]
+    pub adcs_request_id: Option<String>,
+}
+
+/// Where a certificate comes from and what renews it (PRD D14).
+///
+/// Derived by [`Certificate::source`], never stored: a stored source
+/// beside `is_acme` would be two truths that can disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CertificateSource {
+    /// Issued and renewed by Lorica's ACME flow.
+    Acme,
+    /// Issued and renewed through the AD CS authority.
+    Adcs,
+    /// Uploaded or generated; nothing renews it.
+    Manual,
+}
+
+impl Certificate {
+    /// The derived source: ACME when `is_acme`, AD CS when
+    /// `adcs_authority_id` is set, manual otherwise. `is_acme` wins
+    /// because the ACME loop selects on it alone, so a row carrying
+    /// both is renewed as ACME whatever this says.
+    ///
+    /// ```
+    /// use lorica_config::models::{Certificate, CertificateSource};
+    /// # fn demo(cert: &Certificate) {
+    /// if cert.source() == CertificateSource::Adcs {
+    ///     assert!(cert.adcs_authority_id.is_some());
+    /// }
+    /// # }
+    /// ```
+    pub fn source(&self) -> CertificateSource {
+        if self.is_acme {
+            CertificateSource::Acme
+        } else if self.adcs_authority_id.is_some() {
+            CertificateSource::Adcs
+        } else {
+            CertificateSource::Manual
+        }
+    }
 }
 
 /// How closely a certificate name matched a hostname. Ordered so that
@@ -183,6 +244,51 @@ mod tests {
             created_at: at("2026-01-01T00:00:00Z"),
             acme_method: None,
             acme_dns_provider_id: None,
+            adcs_authority_id: None,
+            adcs_template: None,
+            adcs_template_oid: None,
+            adcs_request_id: None,
+        }
+    }
+
+    #[test]
+    fn the_source_is_derived_from_is_acme_then_the_authority_reference() {
+        let manual = cert("m", "a.example.com", &[], "2027-01-01T00:00:00Z");
+        assert_eq!(manual.source(), CertificateSource::Manual);
+
+        let mut adcs = manual.clone();
+        adcs.adcs_authority_id = Some("adcs-1".to_string());
+        assert_eq!(adcs.source(), CertificateSource::Adcs);
+
+        let mut acme = manual.clone();
+        acme.is_acme = true;
+        assert_eq!(acme.source(), CertificateSource::Acme);
+
+        // The ACME loop selects on `is_acme` alone, so that is what a
+        // row carrying both is.
+        let mut both = adcs.clone();
+        both.is_acme = true;
+        assert_eq!(both.source(), CertificateSource::Acme);
+
+        // The template fields alone do not make a certificate AD CS:
+        // reverting to manual clears the authority reference only.
+        let mut reverted = adcs;
+        reverted.adcs_authority_id = None;
+        reverted.adcs_template = Some("LoricaWebServer".to_string());
+        assert_eq!(reverted.source(), CertificateSource::Manual);
+    }
+
+    #[test]
+    fn the_source_serialises_lowercase() {
+        for (source, text) in [
+            (CertificateSource::Acme, "\"acme\""),
+            (CertificateSource::Adcs, "\"adcs\""),
+            (CertificateSource::Manual, "\"manual\""),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&source).expect("test setup: serialise"),
+                text
+            );
         }
     }
 

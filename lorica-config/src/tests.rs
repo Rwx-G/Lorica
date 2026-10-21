@@ -132,6 +132,10 @@ mod tests {
             acme_method: None,
 
             acme_dns_provider_id: None,
+            adcs_authority_id: None,
+            adcs_template: None,
+            adcs_template_oid: None,
+            adcs_request_id: None,
         }
     }
 
@@ -961,9 +965,9 @@ mod tests {
         let db_path = dir.path().join("legacy.db");
         {
             let conn = rusqlite::Connection::open(&db_path).expect("test setup: raw open");
-            // A real pre-v22 database also has the `routes`, `backends`
-            // and `sessions` tables (created at v1 / v1 / v21); the
-            // v22+ tail adds columns to them. The old runner swallowed
+            // A real pre-v22 database also has the `routes`, `backends`,
+            // `certificates` and `sessions` tables (created at v1 / v1 /
+            // v1 / v21); the v22+ tail adds columns to them. The old runner swallowed
             // the ALTER errors when they were missing, the tracked
             // runner does not, so the synthetic fixture must include
             // them.
@@ -980,6 +984,9 @@ mod tests {
                  CREATE TABLE backends (
                     id TEXT PRIMARY KEY,
                     address TEXT NOT NULL DEFAULT ''
+                 );
+                 CREATE TABLE certificates (
+                    id TEXT PRIMARY KEY
                  );
                  CREATE TABLE sessions (
                     id TEXT PRIMARY KEY,
@@ -1308,14 +1315,14 @@ created_at = "2026-01-01T00:00:00Z"
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        // 63 is the current head of the tracked MIGRATIONS table (every
+        // 64 is the current head of the tracked MIGRATIONS table (every
         // schema change now carries a distinct version, including the
         // former post-v22 unconditional ALTER blocks).
         assert_eq!(
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            63
+            64
         );
     }
 
@@ -1333,7 +1340,7 @@ created_at = "2026-01-01T00:00:00Z"
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                63
+                64
             );
         }
     }

@@ -1359,6 +1359,48 @@ mod tests {
     }
 
     #[test]
+    fn a_1_9_blob_without_the_adcs_certificate_fields_decodes_to_manual_certificates() {
+        // Story 13.2: the four `adcs_*` certificate fields joined the
+        // blob under version 2. A 1.10.0 follower is upgraded before its
+        // control plane, so it must accept the blob a 1.9.x control
+        // plane still sends, which has none of them.
+        const ADCS_FIELDS: [&str; 4] = [
+            "adcs_authority_id",
+            "adcs_template",
+            "adcs_template_oid",
+            "adcs_request_id",
+        ];
+        let mut cfg = fleet_config();
+        cfg.certificates[0].adcs_authority_id = Some("adcs-1".to_string());
+        cfg.certificates[0].adcs_template = Some("LoricaWebServer".to_string());
+        cfg.certificates[0].adcs_template_oid = Some("1.3.6.1.4.1.311.21.8.1.2".to_string());
+        cfg.certificates[0].adcs_request_id = Some("4242".to_string());
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
+        for cert in root["certificates"]
+            .as_array_mut()
+            .expect("test setup: certificates is an array")
+        {
+            let object = cert
+                .as_object_mut()
+                .expect("test setup: a certificate is an object");
+            for field in ADCS_FIELDS {
+                assert!(object.remove(field).is_some(), "{field} is on the wire");
+            }
+        }
+        let older = serde_json::to_vec(&root).expect("test setup: re-encode");
+        let decoded = decode_canonical(&older).expect("a 1.9-shaped blob still decodes");
+        assert_eq!(decoded.certificates.len(), cfg.certificates.len());
+        for cert in &decoded.certificates {
+            assert_eq!(cert.source(), crate::models::CertificateSource::Manual);
+            assert!(cert.adcs_template.is_none());
+            assert!(cert.adcs_template_oid.is_none());
+            assert!(cert.adcs_request_id.is_none());
+        }
+    }
+
+    #[test]
     fn the_canonical_format_version_is_two() {
         let bytes = encode_canonical(&fleet_config()).expect("test setup: encode");
         let peek: serde_json::Value =
@@ -1391,8 +1433,19 @@ mod tests {
     /// it first. A version bump would break the first case and protect
     /// nothing in the second. Pinned by
     /// `a_1_8_0_blob_without_the_idle_timeout_decodes_to_the_default`.
+    ///
+    /// Story 13.2 (1.10.0) moved it again, on the same argument:
+    /// `Certificate` gained `adcs_authority_id`, `adcs_template`,
+    /// `adcs_template_oid` and `adcs_request_id`, each `Option` with a
+    /// serde default. A 1.10.0 follower decodes the 1.9.x blob its
+    /// control plane sends until that control plane is upgraded last
+    /// (`docs/cluster.md`); a 1.9.x follower never receives the new
+    /// shape, because migration 64 puts it behind on schema and the
+    /// handshake refuses it first. The version stays at 2. Pinned by
+    /// `a_1_9_blob_without_the_adcs_certificate_fields_decodes_to_manual_certificates`.
+    /// The AD CS authority itself is not in the blob at all (PRD D13).
     const CANONICAL_SHAPE_DIGEST: &str =
-        "5b850d870f04320d6636d3655f48f1a05258e5934a34c7b90c02d5599b00c8fc";
+        "8e3bb7aa1c7070ca67b2af5fe10dce2736be3c2b2e81f2429124f26498b257ed";
 
     /// Every field name `T` accepts, read from the type itself rather
     /// than from the JSON of some fixture.
@@ -1866,6 +1919,10 @@ fleet_bytes={fleet_bytes} per_recipient_mean_bytes={mean_bytes}",
             created_at: now,
             acme_method: None,
             acme_dns_provider_id: None,
+            adcs_authority_id: None,
+            adcs_template: None,
+            adcs_template_oid: None,
+            adcs_request_id: None,
         }
     }
 

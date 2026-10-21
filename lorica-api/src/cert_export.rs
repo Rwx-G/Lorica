@@ -791,6 +791,10 @@ mod tests {
             acme_auto_renew: false,
             acme_method: None,
             acme_dns_provider_id: None,
+            adcs_authority_id: None,
+            adcs_template: None,
+            adcs_template_oid: None,
+            adcs_request_id: None,
             created_at: Utc::now(),
         }
     }

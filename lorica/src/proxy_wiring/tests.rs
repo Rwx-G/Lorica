@@ -122,6 +122,10 @@ fn make_certificate(id: &str, domain: &str) -> Certificate {
         acme_method: None,
 
         acme_dns_provider_id: None,
+        adcs_authority_id: None,
+        adcs_template: None,
+        adcs_template_oid: None,
+        adcs_request_id: None,
     }
 }
 

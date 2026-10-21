@@ -194,13 +194,39 @@ fn validate(data: &ImportData) -> Result<()> {
 }
 
 /// Import data into the store, replacing all existing data.
-pub fn import_to_store(store: &ConfigStore, data: &ImportData) -> Result<()> {
+///
+/// Returns the warnings the operator should see: the import succeeded,
+/// but something in it was not taken as written.
+///
+/// The AD CS authority is not part of the export (Epic 13 PRD D14) and
+/// survives the import. A certificate naming an authority this node
+/// does not hold is imported as a manual certificate, with its
+/// `adcs_authority_id` cleared and a warning: kept as written, it would
+/// be an AD CS certificate whose renewals no authority can serve.
+pub fn import_to_store(store: &ConfigStore, data: &ImportData) -> Result<Vec<String>> {
+    let local_authority_id = store.get_adcs_authority()?.map(|authority| authority.id);
+    let mut warnings = Vec::new();
+
     store.clear_all()?;
 
     store.update_global_settings(&data.global_settings)?;
 
     for cert in &data.certificates {
-        store.create_certificate(cert)?;
+        match cert.adcs_authority_id.as_deref() {
+            Some(authority_id) if Some(authority_id) != local_authority_id.as_deref() => {
+                let warning = format!(
+                    "certificate {} ({}) references AD CS authority {authority_id}, which this \
+                     node does not hold; imported as a manual certificate",
+                    cert.id, cert.domain
+                );
+                tracing::warn!("{warning}");
+                warnings.push(warning);
+                let mut manual = cert.clone();
+                manual.adcs_authority_id = None;
+                store.create_certificate(&manual)?;
+            }
+            _ => store.create_certificate(cert)?,
+        }
     }
     for backend in &data.backends {
         store.create_backend(backend)?;
@@ -221,11 +247,12 @@ pub fn import_to_store(store: &ConfigStore, data: &ImportData) -> Result<()> {
         store.create_user(user)?;
     }
 
-    Ok(())
+    Ok(warnings)
 }
 
-/// Import from a TOML file into the store.
-pub fn import_from_file(store: &ConfigStore, path: &Path) -> Result<()> {
+/// Import from a TOML file into the store. Returns the warnings of
+/// [`import_to_store`].
+pub fn import_from_file(store: &ConfigStore, path: &Path) -> Result<Vec<String>> {
     let content = std::fs::read_to_string(path)?;
     let data = parse_toml(&content)?;
     import_to_store(store, &data)

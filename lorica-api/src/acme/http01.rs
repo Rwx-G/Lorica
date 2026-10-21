@@ -227,6 +227,10 @@ pub(super) async fn provision_with_acme(
         acme_method: Some("http01".into()),
 
         acme_dns_provider_id: None,
+        adcs_authority_id: None,
+        adcs_template: None,
+        adcs_template_oid: None,
+        adcs_request_id: None,
     };
 
     let (cert, export_snapshot) = db_blocking(&state.store, move |store| {
