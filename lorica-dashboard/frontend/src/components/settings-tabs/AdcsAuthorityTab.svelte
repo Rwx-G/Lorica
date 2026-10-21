@@ -12,6 +12,7 @@
   import { showToast } from '../../lib/toast';
   import { canWriteRole, isSuperAdminRole } from '../../lib/auth';
   import { nodeRole } from '../../lib/cluster';
+  import { ADCS_KEY_TYPE_LABELS, ADCS_KEY_TYPES } from '../../lib/adcs-issuance';
 
   interface Props {
     expanded: boolean;
@@ -19,15 +20,6 @@
   }
 
   let { expanded, toggleSection }: Props = $props();
-
-  // A Record rather than a list, so the compiler refuses a key type
-  // added to `AdcsKeyType` without a label here.
-  const KEY_TYPE_LABELS: Record<AdcsKeyType, string> = {
-    rsa2048: 'RSA 2048',
-    rsa3072: 'RSA 3072',
-    ecdsa_p256: 'ECDSA P-256',
-  };
-  const KEY_TYPES = Object.keys(KEY_TYPE_LABELS) as AdcsKeyType[];
 
   // The pre-authentication failures that open the breaker (Epic 13
   // D15), named so the operator knows which directory fix to ask for.
@@ -440,8 +432,8 @@
             <div class="settings-form-row">
               <label for="adcs-key-type">Default key type</label>
               <select id="adcs-key-type" bind:value={defaultKeyType}>
-                {#each KEY_TYPES as keyType (keyType)}
-                  <option value={keyType}>{KEY_TYPE_LABELS[keyType]}</option>
+                {#each ADCS_KEY_TYPES as keyType (keyType)}
+                  <option value={keyType}>{ADCS_KEY_TYPE_LABELS[keyType]}</option>
                 {/each}
               </select>
               <span class="settings-hint">

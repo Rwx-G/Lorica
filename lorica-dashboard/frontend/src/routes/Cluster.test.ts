@@ -85,6 +85,11 @@ function certificate(id: string, domain: string) {
     is_acme: false,
     acme_auto_renew: false,
     created_at: '2026-01-01T00:00:00Z',
+    source: 'manual' as const,
+    adcs_authority_id: null,
+    adcs_template: null,
+    adcs_template_oid: null,
+    adcs_request_id: null,
   };
 }
 

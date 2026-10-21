@@ -9,6 +9,7 @@
   } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import CertificateAcmeForm from '../components/certificates/CertificateAcmeForm.svelte';
+  import CertificateAdcsForm from '../components/certificates/CertificateAdcsForm.svelte';
   import CertificateEditForm from '../components/certificates/CertificateEditForm.svelte';
   import CertificateList from '../components/certificates/CertificateList.svelte';
   import CertificateUploadForm from '../components/certificates/CertificateUploadForm.svelte';
@@ -66,6 +67,14 @@
 
   function openAcmeForm() {
     showAcmeForm = true;
+  }
+
+  // AD CS issuance state (Story 13.3)
+  let showAdcsForm = $state(false);
+
+  function viewIssuedCertificate(cert: CertificateResponse) {
+    showAdcsForm = false;
+    void openDetail(cert);
   }
 
   async function loadData() {
@@ -245,6 +254,7 @@
       {#if $canWrite}
         <button class="btn btn-secondary" onclick={openSelfSigned}>Self-signed</button>
         <button class="btn btn-acme" onclick={openAcmeForm}>Let's Encrypt</button>
+        <button class="btn btn-secondary" onclick={() => showAdcsForm = true}>AD CS</button>
         <button class="btn btn-primary" onclick={() => showUploadForm = true}>+ Upload Certificate</button>
       {/if}
     </div>
@@ -362,6 +372,14 @@
 
 {#if showAcmeForm}
   <CertificateAcmeForm {dnsProviders} onClose={() => showAcmeForm = false} onReload={loadData} />
+{/if}
+
+{#if showAdcsForm}
+  <CertificateAdcsForm
+    onClose={() => showAdcsForm = false}
+    onReload={loadData}
+    onView={viewIssuedCertificate}
+  />
 {/if}
 
 <script lang="ts" module>

@@ -77,8 +77,10 @@
             {#if cert.san_domains.length > 0}
               <span class="san-count" title={cert.san_domains.join(', ')}>+{cert.san_domains.length} SAN</span>
             {/if}
-            {#if cert.is_acme}
+            {#if cert.source === 'acme'}
               <span class="cert-source-badge acme" title={cert.acme_method || 'http01'}>ACME{#if cert.acme_method && cert.acme_method !== 'http01'} ({cert.acme_method.replace('dns01-', '')}){/if}{#if cert.acme_auto_renew} &#x21bb;{/if}</span>
+            {:else if cert.source === 'adcs'}
+              <span class="cert-source-badge adcs" title={cert.adcs_template ? `Template ${cert.adcs_template}` : 'AD CS'}>AD CS{#if cert.acme_auto_renew} &#x21bb;{/if}</span>
             {:else}
               <span class="cert-source-badge manual">Manual</span>
             {/if}
@@ -184,6 +186,11 @@
   .cert-source-badge.acme {
     background: rgba(34, 197, 94, 0.15);
     color: var(--color-green);
+  }
+
+  .cert-source-badge.adcs {
+    background: rgba(59, 130, 246, 0.15);
+    color: var(--color-primary);
   }
 
   .cert-source-badge.manual {

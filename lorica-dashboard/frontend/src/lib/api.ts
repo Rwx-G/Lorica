@@ -712,6 +712,13 @@ export interface BackendResponse {
   updated_at: string;
 }
 
+/**
+ * Where a certificate comes from, derived by the API (Epic 13 D14):
+ * ACME when `is_acme`, AD CS when `adcs_authority_id` is set, manual
+ * otherwise. The dashboard reads it and never re-derives it.
+ */
+export type CertificateSource = 'acme' | 'adcs' | 'manual';
+
 export interface CertificateResponse {
   id: string;
   domain: string;
@@ -721,10 +728,18 @@ export interface CertificateResponse {
   not_before: string;
   not_after: string;
   is_acme: boolean;
+  /** Auto-renew for both ACME and AD CS certificates; `source` says which. */
   acme_auto_renew: boolean;
   created_at: string;
   acme_method?: string;
   acme_dns_provider_id?: string;
+  source: CertificateSource;
+  adcs_authority_id: string | null;
+  /** The template name requested at issuance. */
+  adcs_template: string | null;
+  /** The template OID observed in the issued certificate. */
+  adcs_template_oid: string | null;
+  adcs_request_id: string | null;
 }
 
 export interface CertificateDetailResponse extends CertificateResponse {
@@ -1311,6 +1326,39 @@ export interface AdcsConnectionTestResult {
   authority_failed: boolean;
 }
 
+/** Subject overrides of an issuance; an absent field takes the authority's default. */
+export interface AdcsSubjectOverrides {
+  country?: string;
+  state?: string;
+  locality?: string;
+  organization?: string;
+  organizational_unit?: string;
+  email?: string;
+}
+
+/** Body of `POST /api/v1/certificates/adcs` (Story 13.3). */
+export interface AdcsIssueRequest {
+  /** The first one is the subject's `CN`. */
+  sans: string[];
+  template?: string;
+  key_type?: AdcsKeyType;
+  subject?: AdcsSubjectOverrides;
+  auto_renew?: boolean;
+}
+
+/**
+ * The 202 body: the template needs CA manager approval, which v1.10.0
+ * does not support, so nothing was stored.
+ */
+export interface AdcsIssuePending {
+  outcome: 'pending';
+  request_id: string;
+  message: string;
+}
+
+/** 201 carries the stored certificate, 202 the pending answer. */
+export type AdcsIssueResult = CertificateResponse | AdcsIssuePending;
+
 export interface UserPreferenceResponse {
   id: string;
   preference_key: string;
@@ -1790,6 +1838,15 @@ export const api = {
 
   testAdcsAuthority: () =>
     request<AdcsConnectionTestResult>('POST', '/adcs/authority/test'),
+
+  /**
+   * Issue a certificate from the AD CS authority (Story 13.3), Operator
+   * and above. The authority records the issuance and only its
+   * administrators can revoke it, so callers confirm the full request
+   * with the operator first.
+   */
+  issueAdcsCertificate: (body: AdcsIssueRequest) =>
+    request<AdcsIssueResult>('POST', '/certificates/adcs', body),
 
   // Cert export ACLs (v1.4.1)
   listCertExportAcls: () =>

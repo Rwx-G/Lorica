@@ -122,7 +122,35 @@ const mockCert = {
   is_acme: false,
   acme_auto_renew: false,
   created_at: '2026-01-01T00:00:00Z',
+  source: 'manual',
+  adcs_authority_id: null,
+  adcs_template: null,
+  adcs_template_oid: null,
+  adcs_request_id: null,
 };
+
+describe('api.issueAdcsCertificate', () => {
+  it('calls POST /api/v1/certificates/adcs with the request as body', async () => {
+    mockFetch({ ...mockCert, source: 'adcs', adcs_authority_id: 'adcs-1' }, true, 201);
+    const body = { sans: ['app.corp.example.org'], auto_renew: true };
+    const res = await api.issueAdcsCertificate(body);
+    expect(res.data).toMatchObject({ source: 'adcs' });
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/certificates/adcs',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify(body) }),
+    );
+  });
+
+  it('carries the status of a refusal', async () => {
+    mockFetch({ code: 'adcs_san_refused', message: 'outside the allowed suffixes: a.example.com' }, false, 422);
+    const res = await api.issueAdcsCertificate({ sans: ['a.example.com'] });
+    expect(res.error).toEqual({
+      code: 'adcs_san_refused',
+      message: 'outside the allowed suffixes: a.example.com',
+      status: 422,
+    });
+  });
+});
 
 describe('api.getCertificate', () => {
   it('calls GET /api/v1/certificates/:id and returns detail', async () => {
