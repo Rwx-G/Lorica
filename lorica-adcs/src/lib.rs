@@ -28,24 +28,26 @@
 //! first-party crate and knows nothing about the store, routes or the
 //! dashboard; when to issue, renew and store is `lorica-api`'s business.
 
+mod binding;
+mod chain;
+mod csr;
+mod der;
+mod error;
+mod krb5conf;
+#[cfg(test)]
+mod test_support;
+mod wstep;
+
+pub use binding::channel_binding;
+pub use chain::chain_from_cmc;
+pub use csr::{build_csr, GeneratedCsr, KeyType, SubjectFields};
+pub use error::AdcsError;
+pub use krb5conf::{write_atomically, KdcAddress, KdcTiming, Krb5Config, Realm};
+pub use wstep::request::{build_request, new_message_id, SOAP_CONTENT_TYPE};
+pub use wstep::response::{parse_response, EnrollmentResponse, FaultKind};
+
 use libgssapi::name::Name;
 use libgssapi::oid::GSS_NT_HOSTBASED_SERVICE;
-
-/// Why an AD CS operation failed. Every variant names the step that
-/// failed, so a connection test can show it as it is.
-#[derive(Debug, thiserror::Error)]
-pub enum AdcsError {
-    /// The GSS-API library refused the CES service name, before any
-    /// network exchange.
-    #[error("SPNEGO: cannot import the service name HTTP@{host}: {source}")]
-    ServiceName {
-        /// The CES host the name was built from.
-        host: String,
-        /// What the GSS-API library reported.
-        #[source]
-        source: libgssapi::error::Error,
-    },
-}
 
 /// The GSS-API name of the CES web service on `host`, `HTTP@<host>` as a
 /// host-based service name: the Kerberos target a client asks a ticket

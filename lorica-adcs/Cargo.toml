@@ -22,3 +22,21 @@ libgssapi = "=0.11.0"
 # The error type's `Display` and `source`, at the version every other
 # product crate pins.
 thiserror = "2"
+# Channel-binding digests (RFC 5929). The workspace's crypto already, at
+# the version every product crate uses; no `sha2` beside it.
+ring = "0.17"
+# CSR and key generation, at the version `lorica-api` uses. With the
+# workspace's `ring` backend it cannot generate RSA keys, which is why
+# `KeyType` offers ECDSA only (see `csr.rs`).
+rcgen = "0.14"
+# Certificate parsing for the channel binding and the chain; its
+# re-exported `der_parser` / `asn1_rs` read the CMC response, so neither
+# is a direct dependency.
+x509-parser = "0.18"
+# Base64 of the WS-Trust tokens, at the workspace's version.
+base64 = "0.23"
+# The WS-Addressing MessageID, v4 as `lorica-api` generates its ids.
+uuid = { version = "1", features = ["v4"] }
+# Approved 2026-10-21 (Epic 13 decision D7): the SOAP envelope writer and
+# the namespace-aware response reader. No SOAP framework.
+quick-xml = "0.42"
