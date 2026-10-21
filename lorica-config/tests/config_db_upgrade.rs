@@ -258,7 +258,7 @@ fn an_upgrade_subscribes_explicit_channels_to_the_adcs_alerts() {
         .expect("test setup: raw open")
         .execute_batch(
             r#"
-            DELETE FROM schema_migrations WHERE version = 65;
+            DELETE FROM schema_migrations WHERE version >= 65;
             INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
             VALUES ('explicit', 'webhook', 1, '{"url":"https://hooks.example.com/a"}',
                     '["backend_down","log_store_unavailable"]');

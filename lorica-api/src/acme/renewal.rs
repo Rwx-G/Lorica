@@ -344,9 +344,9 @@ pub fn spawn_renewal_task(
 /// (unbound certs are never auto-renewed, see [`is_bound`]), opted in
 /// with `acme_auto_renew`, with at most `renewal_threshold_days` left.
 ///
-/// - AD CS ([`should_auto_renew_adcs`]): handed to
-///   `crate::adcs::renew_due`, which renews them in place one at a
-///   time under the D15 guard and breaker, and sends no
+/// - AD CS ([`should_auto_renew_adcs`]): handed, after the ACME arm,
+///   to `crate::adcs::renew_due`, which renews them in place one at a
+///   time on one session under the D15 guard and breaker, and sends no
 ///   `CertExpiring`: `check_cert_expiry` speaks for them (Story 13.4
 ///   AC #6, decided in the `adcs::renew` module docs).
 /// - ACME: on a Let's Encrypt rate-limit error the cert is put on a
@@ -385,17 +385,6 @@ pub(crate) async fn renewal_tick(
     // the count of currently rate-limited certs (a cert that is
     // decommissioned mid-cooldown is swept once its window ends).
     state.renewals.sweep_cooldowns(now);
-
-    let live: HashSet<&str> = certs.iter().map(|cert| cert.id.as_str()).collect();
-    state.adcs.renewals.retain(&live, now);
-    let adcs_due: Vec<&lorica_config::models::Certificate> = certs
-        .iter()
-        .filter(|cert| {
-            is_bound(&cert.id, &bound_ids)
-                && should_auto_renew_adcs(cert, now, renewal_threshold_days)
-        })
-        .collect();
-    crate::adcs::renew_due(state, &adcs_due, now).await;
 
     for cert in &certs {
         // Skip certs not bound to any route. An unbound cert
@@ -531,6 +520,19 @@ pub(crate) async fn renewal_tick(
             }
         }
     }
+
+    // After the ACME arm: the AD CS batch holds its guard for as long as
+    // the authority takes, which must never delay a public certificate.
+    let live: HashSet<&str> = certs.iter().map(|cert| cert.id.as_str()).collect();
+    state.adcs.renewals.retain(&live, now);
+    let adcs_due: Vec<&lorica_config::models::Certificate> = certs
+        .iter()
+        .filter(|cert| {
+            is_bound(&cert.id, &bound_ids)
+                && should_auto_renew_adcs(cert, now, renewal_threshold_days)
+        })
+        .collect();
+    crate::adcs::renew_due(state, &adcs_due, now).await;
 }
 
 /// POST /api/v1/certificates/:id/renew - manually renew an ACME or an

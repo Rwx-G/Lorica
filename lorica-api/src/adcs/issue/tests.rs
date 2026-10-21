@@ -47,6 +47,9 @@ pub(in crate::adcs) enum TemplateExtension {
     V1Utf8,
 }
 
+/// A change to what the stand-in signs.
+pub(in crate::adcs) type Tweak = fn(&mut rcgen::CertificateParams);
+
 /// What the stand-in answers to the next enrollment.
 #[derive(Clone)]
 pub(in crate::adcs) enum Answer {
@@ -56,6 +59,12 @@ pub(in crate::adcs) enum Answer {
         template: TemplateExtension,
         sans: Option<Vec<&'static str>>,
     },
+    /// Sign the CSR as `Issue` with the v2 template does, then let
+    /// `tweak` change what the certificate says before it is signed.
+    Tweaked(Tweak),
+    /// Sign the CSR, and answer with a chain whose first certificate is
+    /// a CA of the same name that did not sign it.
+    ForeignChain,
     Pending,
     Denied,
     Fault(FaultKind),
@@ -74,6 +83,7 @@ pub(in crate::adcs) fn issue_v2() -> Answer {
 pub(in crate::adcs) struct StubAuthority {
     answer: Mutex<Answer>,
     calls: AtomicUsize,
+    opens: AtomicUsize,
     csrs: Mutex<Vec<Vec<u8>>>,
     delay: Duration,
     issuing_ca: rcgen::Issuer<'static, rcgen::KeyPair>,
@@ -97,6 +107,7 @@ impl StubAuthority {
         Arc::new(StubAuthority {
             answer: Mutex::new(answer),
             calls: AtomicUsize::new(0),
+            opens: AtomicUsize::new(0),
             csrs: Mutex::new(Vec::new()),
             delay,
             issuing_ca: rcgen::Issuer::new(issuing_params, issuing_key),
@@ -106,6 +117,11 @@ impl StubAuthority {
 
     pub(in crate::adcs) fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    /// How many sessions were opened, each one ticket in production.
+    pub(in crate::adcs) fn opens(&self) -> usize {
+        self.opens.load(Ordering::SeqCst)
     }
 
     pub(in crate::adcs) fn set_answer(&self, answer: Answer) {
@@ -126,8 +142,21 @@ impl StubAuthority {
     }
 
     fn sign(&self, csr_der: &[u8], template: TemplateExtension, sans: Option<&[&str]>) -> Vec<u8> {
+        self.sign_tweaked(csr_der, template, sans, |_| {})
+    }
+
+    /// What a dedicated *Server Authentication* template issues, as
+    /// changed by `tweak`.
+    fn sign_tweaked(
+        &self,
+        csr_der: &[u8],
+        template: TemplateExtension,
+        sans: Option<&[&str]>,
+        tweak: impl FnOnce(&mut rcgen::CertificateParams),
+    ) -> Vec<u8> {
         let mut request = rcgen::CertificateSigningRequestParams::from_der(&csr_der.into())
             .expect("the CSR parses and its signature verifies");
+        request.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
         if let Some(sans) = sans {
             request.params.subject_alt_names = sans
                 .iter()
@@ -139,6 +168,7 @@ impl StubAuthority {
         if let Some(extension) = template_extension(template) {
             request.params.custom_extensions.push(extension);
         }
+        tweak(&mut request.params);
         request
             .signed_by(&self.issuing_ca)
             .expect("the issuing CA signs")
@@ -186,6 +216,24 @@ impl AdcsClient for StubAuthority {
                 request_id: Some("4242".to_string()),
                 disposition_message: Some("Issued".to_string()),
             }),
+            Answer::Tweaked(tweak) => Ok(EnrollOutcome::Issued {
+                leaf_der: self.sign_tweaked(csr_der, TemplateExtension::V2, None, tweak),
+                chain_der: vec![self.issuing_ca_der.clone()],
+                request_id: Some("4242".to_string()),
+                disposition_message: Some("Issued".to_string()),
+            }),
+            Answer::ForeignChain => {
+                let impostor_key = rcgen::KeyPair::generate().expect("test setup: impostor key");
+                let impostor = ca_params("Example Issuing CA")
+                    .self_signed(&impostor_key)
+                    .expect("test setup: impostor CA");
+                Ok(EnrollOutcome::Issued {
+                    leaf_der: self.sign(csr_der, TemplateExtension::V2, None),
+                    chain_der: vec![impostor.der().to_vec()],
+                    request_id: Some("4243".to_string()),
+                    disposition_message: Some("Issued".to_string()),
+                })
+            }
             Answer::Pending => Ok(EnrollOutcome::Pending {
                 request_id: "77".to_string(),
             }),
@@ -201,6 +249,15 @@ impl AdcsClient for StubAuthority {
             }),
             Answer::Fail(make) => Err(make()),
         }
+    }
+
+    async fn open<'a>(
+        &'a self,
+        params: &CesParams,
+        password: Secret,
+    ) -> Result<Box<dyn crate::adcs::AdcsSession + 'a>, AdcsError> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        Ok(crate::adcs::per_request_session(self, params, password))
     }
 }
 
@@ -274,12 +331,26 @@ pub(in crate::adcs) fn template_extension(
 }
 
 /// A fixture whose authority exists, with the stand-in answering.
+/// The templates the fixture's authority allows besides its default,
+/// the ones the renewal tests record on a certificate.
+pub(in crate::adcs) const EXTRA_TEMPLATES: [&str; 2] = ["RenewalTemplate", "RecordedTemplate"];
+
 pub(in crate::adcs) async fn issuing(
     stub: &Arc<StubAuthority>,
     alerts: Option<lorica_notify::AlertSender>,
 ) -> Fixture {
     let f = fixture(Arc::clone(stub), alerts).await;
-    f.create_authority().await;
+    let mut with_templates = body(Some(super::super::tests::PASSWORD));
+    with_templates["allowed_templates"] = serde_json::json!(EXTRA_TEMPLATES);
+    let resp = f
+        .send(
+            "PUT",
+            super::super::tests::AUTHORITY,
+            &f.admin,
+            Some(with_templates),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
     f
 }
 
@@ -1082,4 +1153,222 @@ async fn no_automation_route_reaches_the_issuance_endpoint() {
         );
     }
     assert_eq!(stub.calls(), 0);
+}
+
+/// D17: a template the authority does not list is refused before the
+/// authority is contacted; a listed one is accepted whatever its case.
+#[tokio::test]
+async fn a_template_outside_the_allowlist_is_refused_before_the_authority() {
+    let stub = StubAuthority::new(issue_v2());
+    let f = issuing(&stub, None).await;
+    let operator = f.user("operator-template", Role::Operator).await;
+
+    let mut request = web01();
+    request["template"] = serde_json::json!("User");
+    let (status, error) = error_of(f.send("POST", ISSUE, &operator, Some(request)).await).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error["code"], "adcs_template_refused");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("User"),
+        "{error}"
+    );
+    assert_eq!(stub.calls(), 0);
+    assert_eq!(
+        f.audit_actions().await.last().map(String::as_str),
+        Some("adcs.certificate.issue.refused:template")
+    );
+
+    let mut control = web01();
+    control["template"] = serde_json::json!("Web\u{7}Server");
+    let resp = f.issue(control).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(stub.calls(), 0);
+
+    let mut listed = web01();
+    listed["template"] = serde_json::json!(EXTRA_TEMPLATES[0].to_ascii_lowercase());
+    let resp = f.issue(listed).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(stub.calls(), 1);
+}
+
+fn no_eku(params: &mut rcgen::CertificateParams) {
+    params.extended_key_usages.clear();
+}
+
+fn client_auth_only(params: &mut rcgen::CertificateParams) {
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+}
+
+fn any_purpose(params: &mut rcgen::CertificateParams) {
+    params.extended_key_usages = vec![
+        rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+        rcgen::ExtendedKeyUsagePurpose::Any,
+    ];
+}
+
+fn a_ca(params: &mut rcgen::CertificateParams) {
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+}
+
+fn an_extra_dns_name(params: &mut rcgen::CertificateParams) {
+    params.subject_alt_names.push(rcgen::SanType::DnsName(
+        "dc01.corp.example.org"
+            .try_into()
+            .expect("test setup: DNS name"),
+    ));
+}
+
+fn an_ip_address(params: &mut rcgen::CertificateParams) {
+    params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::new(192, 0, 2, 10),
+        )));
+}
+
+fn upper_case_names(params: &mut rcgen::CertificateParams) {
+    params.subject_alt_names = vec![rcgen::SanType::DnsName(
+        "WEB01.Corp.Example.ORG"
+            .try_into()
+            .expect("test setup: DNS name"),
+    )];
+}
+
+/// D17 and the request id on every post-issuance rejection: a leaf that
+/// is not a server certificate, or whose names are not exactly the
+/// requested ones, is not stored, and the error, the audit action and
+/// the alert all carry the authority's request identifier.
+#[tokio::test]
+async fn an_issued_certificate_that_is_not_what_was_requested_is_not_stored() {
+    let cases: [(Tweak, &str, &str); 6] = [
+        (no_eku, "certificate_profile", "Server Authentication"),
+        (
+            client_auth_only,
+            "certificate_profile",
+            "Server Authentication",
+        ),
+        (any_purpose, "certificate_profile", "Any Purpose"),
+        (a_ca, "certificate_profile", "CA certificate"),
+        (an_extra_dns_name, "san_coverage", "dc01.corp.example.org"),
+        (an_ip_address, "san_coverage", "IP address"),
+    ];
+    for (tweak, step, names) in cases {
+        let stub = StubAuthority::new(Answer::Tweaked(tweak));
+        let alerts = lorica_notify::AlertSender::new(16);
+        let mut received = alerts.subscribe();
+        let f = issuing(&stub, Some(alerts)).await;
+
+        let (status, error) = error_of(f.issue(web01()).await).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{step} {names}");
+        assert_eq!(error["code"], "adcs_error", "{step} {names}");
+        assert_eq!(error["step"], step, "{names}");
+        let message = error["message"].as_str().unwrap_or_default();
+        assert!(message.contains(names), "{message}");
+        assert!(message.contains("request 4242"), "{message}");
+        assert!(message.contains("revoked"), "{message}");
+        assert!(f.certificates().await.is_empty(), "{step} {names}");
+        assert_eq!(f.authority_issuing_ca().await, None, "{step} {names}");
+
+        let raised = alerts_of(&mut received);
+        assert_eq!(raised.len(), 1, "{step} {names}");
+        assert_eq!(
+            raised[0].details.get("request_id").map(String::as_str),
+            Some("4242")
+        );
+        assert_eq!(
+            raised[0].details.get("step").map(String::as_str),
+            Some(step)
+        );
+        assert_eq!(
+            f.audit_actions().await.last().map(String::as_str),
+            Some(format!("adcs.certificate.issue.error:{step}:4242").as_str())
+        );
+    }
+}
+
+/// The names are compared without regard to case, as DNS does.
+#[tokio::test]
+async fn names_issued_in_another_case_are_the_requested_names() {
+    let stub = StubAuthority::new(Answer::Tweaked(upper_case_names));
+    let f = issuing(&stub, None).await;
+    assert_eq!(f.issue(web01()).await.status(), StatusCode::CREATED);
+}
+
+/// D12, pen L1: the issuing CA is learned only from a chain whose first
+/// certificate signed the leaf; a look-alike of the same name is not.
+#[tokio::test]
+async fn an_issuing_ca_that_did_not_sign_the_leaf_is_not_learned() {
+    let stub = StubAuthority::new(Answer::ForeignChain);
+    let f = issuing(&stub, None).await;
+    assert_eq!(f.issue(web01()).await.status(), StatusCode::CREATED);
+    assert_eq!(f.authority_issuing_ca().await, None);
+    assert!(!f
+        .audit_actions()
+        .await
+        .iter()
+        .any(|action| action.contains("issuing_ca")));
+
+    stub.set_answer(issue_v2());
+    assert_eq!(f.issue(web01()).await.status(), StatusCode::CREATED);
+    assert_eq!(f.authority_issuing_ca().await, Some(stub.issuing_ca_pem()));
+}
+
+/// Arch M1: a renewal whose certificate was reverted to manual while it
+/// was at the authority writes nothing over that decision, and says
+/// which request to revoke.
+#[tokio::test]
+async fn a_replacement_of_a_certificate_reverted_meanwhile_is_not_written() {
+    let stub = StubAuthority::new(issue_v2());
+    let alerts = lorica_notify::AlertSender::new(16);
+    let mut received = alerts.subscribe();
+    let f = issuing(&stub, Some(alerts)).await;
+    let id = body_json(f.issue(web01()).await).await["data"]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let reverted: Certificate = {
+        let store = f.state.store.lock().await;
+        let mut cert = store.get_certificate(&id).expect("read").expect("row");
+        cert.adcs_authority_id = None;
+        store.update_certificate(&cert).expect("reverted");
+        cert
+    };
+    alerts_of(&mut received);
+
+    let request = IssueRequest {
+        sans: vec!["web01.corp.example.org".to_string()],
+        template: None,
+        key_type: None,
+        subject: IssueSubject::Exact(AdcsSubjectDefaults::default()),
+        auto_renew: None,
+        replace: Some(id.clone()),
+    };
+    let ctx = AuditContext::node("adcs-renewal");
+    match issue(&f.state, &ctx, request).await {
+        Err(IssueError::Api(crate::error::ApiError::Conflict(_))) => {}
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+    let after: Certificate = f
+        .state
+        .store
+        .lock()
+        .await
+        .get_certificate(&id)
+        .expect("read")
+        .expect("row");
+    assert_eq!(after.fingerprint, reverted.fingerprint);
+    assert_eq!(after.adcs_authority_id, None, "still manual");
+    let raised = alerts_of(&mut received);
+    assert_eq!(raised.len(), 1);
+    assert_eq!(
+        raised[0].details.get("request_id").map(String::as_str),
+        Some("4242")
+    );
+    assert_eq!(
+        f.audit_actions().await.last().map(String::as_str),
+        Some("adcs.certificate.issue.error:store:4242")
+    );
 }

@@ -19,6 +19,12 @@
 #      one pre-authentication, a second test is refused with no KDC
 #      exchange, and saving the right password closes it.
 #
+# Woven through them, the decisions the epic audit added: a Viewer reads
+# that the authority exists but not how it is reached (D18); a template
+# the authority does not list is refused before any Kerberos exchange
+# (D17); the private key of an AD CS certificate, issued or adopted, is
+# downloadable by nobody and its PEM is not replaceable (D16).
+#
 # The probe client without a channel binding (IV1's third leg) runs from
 # run.sh inside the fixture container, which has python-gssapi.
 # =============================================================================
@@ -42,6 +48,7 @@ WRONG_PASSWORD="harness-only-wrong-password"
 KDC_PRINCIPAL=" svc-lorica@CORP.EXAMPLE.ORG for "
 
 WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
 
 # --- preflight ----------------------------------------------------------------
 log "=== AD CS smoke: preflight ==="
@@ -96,6 +103,25 @@ fi
 ok "logged in as the SuperAdmin"
 
 # --- helpers --------------------------------------------------------------------
+
+# The session cookie of a fresh login as $1 with password $2, or nothing.
+login_user() {
+    local headers="$WORK/user.headers"
+    local http
+    http=$(curl -s -o /dev/null -D "$headers" -w '%{http_code}' \
+        "$API/api/v1/auth/login" -X POST -H "Content-Type: application/json" \
+        -d "$(jq -nc --arg u "$1" --arg p "$2" '{username:$u,password:$p}')")
+    [ "$http" = "200" ] && session_from "$headers"
+}
+
+# `call` with the session cookie $1 instead of the SuperAdmin's.
+call_as() {
+    local saved="$SESSION"
+    SESSION="$1"
+    shift
+    call "$@"
+    SESSION="$saved"
+}
 
 # Sets CODE and BODY. Usage: call <method> <path> [json body]
 call() {
@@ -152,8 +178,8 @@ authority_update() {
     call GET /api/v1/adcs/authority
     echo "$BODY" | jq -c --arg pw "$1" '.data.authority
         | {endpoint, realm, kdcs, principal, endpoint_ca_pem, issuing_ca_pem,
-           default_template, default_key_type, subject, allowed_suffixes,
-           auto_renew_default}
+           default_template, allowed_templates, default_key_type, subject,
+           allowed_suffixes, auto_renew_default}
         + {password: $pw}'
 }
 
@@ -168,6 +194,7 @@ AUTHORITY=$(jq -nc --arg endpoint "$ENDPOINT" --arg pw "$HARNESS_PASSWORD" \
         password: $pw,
         endpoint_ca_pem: $ca,
         default_template: "LoricaWebServer",
+        allowed_templates: ["LoricaWebServerAlt"],
         allowed_suffixes: ["corp.example.org"],
         auto_renew_default: true
     }')
@@ -175,6 +202,35 @@ call PUT /api/v1/adcs/authority "$AUTHORITY"
 expect_code 201 "authority created"
 assert_json "$BODY" '.data.password_set' "true" "the password is reported set, never returned"
 assert_json "$BODY" '.data | has("password")' "false" "no password field in the answer"
+assert_json "$BODY" '.data.allowed_templates | join(",")' "LoricaWebServer,LoricaWebServerAlt" \
+    "the allowed templates are stored with the default first (D17)"
+
+# D18: every role learns that the authority exists; only Operators and
+# above learn how it is reached.
+VIEWER_PW="AdcsSmokeViewer!4242"
+OPERATOR_PW="AdcsSmokeOperator!4242"
+call POST /api/v1/users "$(jq -nc --arg p "$VIEWER_PW" '{username:"adcs-viewer",password:$p,role:"viewer"}')"
+expect_code 201 "viewer account created"
+call POST /api/v1/users "$(jq -nc --arg p "$OPERATOR_PW" '{username:"adcs-operator",password:$p,role:"operator"}')"
+expect_code 201 "operator account created"
+VIEWER_SESSION=$(login_user adcs-viewer "$VIEWER_PW" || true)
+OPERATOR_SESSION=$(login_user adcs-operator "$OPERATOR_PW" || true)
+[ -n "$VIEWER_SESSION" ] && [ -n "$OPERATOR_SESSION" ] \
+    || { fail "viewer or operator login failed"; exit 1; }
+
+call_as "$VIEWER_SESSION" GET /api/v1/adcs/authority
+expect_code 200 "a viewer reads the authority"
+assert_json "$BODY" '.data.configured' "true" "the viewer learns an authority is configured"
+assert_json "$BODY" '.data.summary.allowed_suffixes[0]' "corp.example.org" "and its allowed suffixes"
+assert_json "$BODY" '.data.authority' "null" "but not the authority itself"
+case "$BODY" in
+    *ces.corp.example.org*|*svc-lorica*|*CORP.EXAMPLE.ORG*|*LoricaWebServer*)
+        fail "the viewer's answer names the endpoint, principal, realm or template: $BODY" ;;
+    *) ok "the viewer's answer names no endpoint, principal, realm or template" ;;
+esac
+call_as "$OPERATOR_SESSION" GET /api/v1/adcs/authority
+assert_json "$BODY" '.data.authority.endpoint' "$ENDPOINT" "an operator reads the endpoint"
+assert_json "$BODY" '.data.authority.principal' "svc-lorica" "and the principal"
 
 BEFORE=$(as_reqs)
 connection_test
@@ -197,6 +253,20 @@ call POST /api/v1/routes "{\"hostname\":\"${HOSTNAME_UNDER_TEST}\",\"path_prefix
 ROUTE_ID=$(echo "$BODY" | jq -r '.data.id // empty')
 [ -n "$ROUTE_ID" ] || { fail "route create: HTTP $CODE $BODY"; exit 1; }
 ok "route for ${HOSTNAME_UNDER_TEST} created"
+
+# D17: a template the authority does not list is refused before any
+# Kerberos exchange.
+BEFORE=$(as_reqs)
+call POST /api/v1/certificates/adcs "{\"sans\":[\"${HOSTNAME_UNDER_TEST}\"],\"template\":\"User\"}"
+expect_code 422 "a template outside the allowlist is refused"
+assert_json "$BODY" '.error.code' "adcs_template_refused" "refused as adcs_template_refused"
+sleep 1
+AFTER=$(as_reqs)
+if [ "$AFTER" = "$BEFORE" ]; then
+    ok "the refused template reached no KDC"
+else
+    fail "the refused template reached the KDC: $BEFORE AS-REQ lines before, $AFTER after"
+fi
 
 call POST /api/v1/certificates/adcs "{\"sans\":[\"${HOSTNAME_UNDER_TEST}\"]}"
 expect_code 201 "issued from AD CS for the route's hostname"
@@ -228,6 +298,25 @@ esac
 call GET /api/v1/adcs/authority
 assert_json "$BODY" '.data.authority.issuing_ca_pem != null' "true" \
     "the authority learned its issuing CA from the first issuance"
+
+# D16: the private key of an AD CS certificate is downloadable by no
+# role; its certificate is. The download bucket admits five a minute,
+# and this smoke makes five.
+for part in "?part=key" "?part=bundle" ""; do
+    call GET "/api/v1/certificates/$CERT_ID/download$part"
+    expect_code 403 "the key is not downloadable (download$part)"
+    assert_json "$BODY" '.error.code' "adcs_key_not_exportable" "refused as adcs_key_not_exportable"
+done
+call GET "/api/v1/certificates/$CERT_ID/download?part=cert"
+expect_code 200 "the certificate itself is downloadable"
+case "$BODY" in
+    *"PRIVATE KEY"*) fail "the certificate download carries a private key" ;;
+    *"BEGIN CERTIFICATE"*) ok "the download is the certificate, without a key" ;;
+    *) fail "the certificate download carries no certificate: $(echo "$BODY" | head -c 200)" ;;
+esac
+call PUT "/api/v1/certificates/$CERT_ID" "$(jq -nc --arg d "other.corp.example.org" '{domain:$d}')"
+expect_code 409 "the domain of an AD CS certificate is not replaceable"
+assert_json "$BODY" '.error.code' "adcs_certificate_managed" "refused as adcs_certificate_managed"
 
 # --- 3. renew now -----------------------------------------------------------------
 log "=== 3. renew now ==="
@@ -320,6 +409,8 @@ call POST "/api/v1/certificates/$ADOPTED_ID/adcs/adopt"
 expect_code 200 "adopted"
 assert_json "$BODY" '.data.source' "adcs" "the adopted certificate is AD CS-managed"
 assert_json "$BODY" '.data.adcs_template' "LoricaWebServer" "it renews with the authority's template"
+call GET "/api/v1/certificates/$ADOPTED_ID/download?part=key"
+expect_code 403 "the key of an adopted certificate is no longer downloadable"
 call GET /api/v1/adcs/adoption-candidates
 assert_json "$BODY" '.data.candidates | length' "0" "an adopted certificate is no longer a candidate"
 
@@ -355,6 +446,9 @@ fi
 call GET /api/v1/adcs/authority
 assert_json "$BODY" '.data.authority.failed_since != null' "true" "the authority reports the failed state"
 assert_json "$BODY" '.data.authority.failed_kdc_code' "24" "with KDC_ERR_PREAUTH_FAILED"
+call_as "$VIEWER_SESSION" GET /api/v1/adcs/authority
+assert_json "$BODY" '.data.summary.failed_kdc_code' "24" "a viewer sees the failed state too"
+assert_json "$BODY" '.data.summary.failed_reason != null' "true" "with what the code means"
 
 BEFORE=$(as_reqs)
 connection_test
@@ -381,5 +475,4 @@ connection_test
 expect_code 200 "connection test after the fix answered"
 assert_json "$BODY" '.data.ok' "true" "connection test ok again"
 
-rm -rf "$WORK"
 print_results

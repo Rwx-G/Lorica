@@ -30,7 +30,7 @@ use lorica_config::models::{Certificate, Role};
 use lorica_config::{ConfigStore, EncryptionKey};
 use tokio::sync::Mutex;
 
-use super::{failure_step, AdcsClient, AdcsRuntime};
+use super::{AdcsClient, AdcsRuntime};
 use crate::middleware::auth::SessionStore;
 use crate::middleware::rate_limit::RateLimiter;
 use crate::server::AppState;
@@ -328,8 +328,8 @@ async fn creation_needs_a_password_which_is_stored_and_never_returned() {
     assert_eq!(created["data"]["subject"]["country"], "FR");
     assert_eq!(f.stored_password().await.as_deref(), Some(PASSWORD));
 
-    let viewer = f.user("viewer-adcs", Role::Viewer).await;
-    let resp = f.send("GET", AUTHORITY, &viewer, None).await;
+    let operator = f.user("operator-adcs", Role::Operator).await;
+    let resp = f.send("GET", AUTHORITY, &operator, None).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let read = body_json(resp).await;
     let text = read.to_string();
@@ -356,7 +356,7 @@ async fn an_identity_change_without_a_password_is_refused_and_keeps_the_stored_o
     let f = fixture(always_ok(), None).await;
     f.create_authority().await;
 
-    let changes: [(&str, serde_json::Value); 4] = [
+    let changes: [(&str, serde_json::Value); 5] = [
         (
             "endpoint",
             serde_json::json!("https://ces2.corp.example.org/CA_CES_Kerberos/service.svc/CES"),
@@ -364,6 +364,11 @@ async fn an_identity_change_without_a_password_is_refused_and_keeps_the_stored_o
         ("realm", serde_json::json!("LAB.EXAMPLE.ORG")),
         ("kdcs", serde_json::json!(["kdc9.corp.example.org"])),
         ("principal", serde_json::json!("svc-other")),
+        // The trust bundle decides which endpoint the tokens go to.
+        (
+            "endpoint_ca_pem",
+            serde_json::json!(crate::tests::TEST_CERT_RSA_PEM),
+        ),
     ];
     for (field, value) in &changes {
         let mut changed = body(None);
@@ -387,6 +392,7 @@ async fn an_identity_change_without_a_password_is_refused_and_keeps_the_stored_o
             .expect("row");
         assert_eq!(stored.realm, "CORP.EXAMPLE.ORG", "{field}");
         assert_eq!(stored.principal, "svc-lorica", "{field}");
+        assert_eq!(stored.endpoint_ca_pem, None, "{field}");
     }
 
     let mut changed = body(Some(NEW_PASSWORD));
@@ -430,8 +436,8 @@ async fn a_change_outside_the_identity_keeps_the_password_and_names_the_fields()
         f.audit_actions().await,
         vec![
             "adcs.authority.create",
-            "adcs.authority.update:allowed_suffixes,default_template",
-            "adcs.authority.update:allowed_suffixes,default_template",
+            "adcs.authority.update:allowed_suffixes,allowed_templates,default_template",
+            "adcs.authority.update:allowed_suffixes,allowed_templates,default_template",
         ]
     );
 }
@@ -439,7 +445,13 @@ async fn a_change_outside_the_identity_keeps_the_password_and_names_the_fields()
 #[tokio::test]
 async fn every_invalid_field_is_refused_and_nothing_is_stored() {
     let f = fixture(always_ok(), None).await;
-    let cases: [(&str, serde_json::Value); 12] = [
+    let too_many_kdcs: Vec<String> = (0..=super::MAX_KDCS)
+        .map(|n| format!("kdc{n}.corp.example.org"))
+        .collect();
+    let too_many_templates: Vec<String> = (0..lorica_config::models::ADCS_ALLOWED_TEMPLATES_MAX)
+        .map(|n| format!("Template{n}"))
+        .collect();
+    let cases: [(&str, serde_json::Value); 17] = [
         (
             "endpoint",
             serde_json::json!("http://ces.corp.example.org/CES"),
@@ -470,6 +482,11 @@ async fn every_invalid_field_is_refused_and_nothing_is_stored() {
         ),
         ("allowed_suffixes", serde_json::json!([])),
         ("endpoint_ca_pem", serde_json::json!("not a certificate")),
+        ("kdcs", serde_json::json!(too_many_kdcs)),
+        ("allowed_templates", serde_json::json!(["Web\nServer"])),
+        ("allowed_templates", serde_json::json!(["  "])),
+        ("allowed_templates", serde_json::json!(too_many_templates)),
+        ("default_template", serde_json::json!("Web\u{7}Server")),
     ];
     for (field, value) in &cases {
         let mut invalid = body(Some(PASSWORD));
@@ -866,8 +883,8 @@ async fn a_rejected_credential_opens_the_breaker_once_and_a_password_write_close
             "adcs.authority.failed_state.enter:ticket_acquisition",
             "adcs.authority.test.refused:failed_state",
             "adcs.authority.test.refused:failed_state",
-            "adcs.authority.update:default_template",
-            "adcs.authority.update:default_template,password",
+            "adcs.authority.update:allowed_templates,default_template",
+            "adcs.authority.update:allowed_templates,default_template,password",
             "adcs.authority.failed_state.exit",
         ]
     );
@@ -941,11 +958,11 @@ async fn the_failing_step_and_text_reach_the_caller_verbatim() {
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp).await;
         let expected = make();
-        assert_eq!(json["data"]["step"], failure_step(&expected));
+        assert_eq!(json["data"]["step"], expected.step().as_str());
         assert_eq!(json["data"]["message"], expected.to_string());
         assert_eq!(
             f.audit_actions().await.last().map(String::as_str),
-            Some(format!("adcs.authority.test.failed:{}", failure_step(&expected)).as_str())
+            Some(format!("adcs.authority.test.failed:{}", expected.step().as_str()).as_str())
         );
     }
 }
@@ -1053,5 +1070,150 @@ async fn the_import_response_carries_the_import_warnings() {
             .unwrap_or_default()
             .contains("adcs-elsewhere"),
         "{json}"
+    );
+}
+
+/// D18: every role learns that an authority exists, its suffixes and
+/// its failed state; only Operators and SuperAdmins learn how it is
+/// reached.
+#[tokio::test]
+async fn viewers_see_the_summary_and_operators_the_connection_details() {
+    let f = fixture(always_ok(), None).await;
+    let mut with_ca = body(Some(PASSWORD));
+    with_ca["issuing_ca_pem"] = serde_json::json!(crate::tests::TEST_CERT_RSA_PEM);
+    with_ca["allowed_templates"] = serde_json::json!(["LoricaWebServerEcdsa"]);
+    let resp = f.send("PUT", AUTHORITY, &f.admin, Some(with_ca)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    f.state
+        .store
+        .lock()
+        .await
+        .set_adcs_failed("ticket_acquisition", Some(24))
+        .expect("test setup: failed state");
+
+    let viewer = f.user("viewer-d18", Role::Viewer).await;
+    let operator = f.user("operator-d18", Role::Operator).await;
+    let readers: [(&str, &str, bool); 3] = [
+        ("viewer", viewer.as_str(), false),
+        ("operator", operator.as_str(), true),
+        ("superadmin", f.admin.as_str(), true),
+    ];
+    for (role, cookie, sees_details) in readers {
+        let resp = f.send("GET", AUTHORITY, cookie, None).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{role}");
+        let json = body_json(resp).await;
+        let data = &json["data"];
+        assert_eq!(data["configured"], true, "{role}");
+        assert_eq!(data["managed_on_control_plane"], false, "{role}");
+        let summary = &data["summary"];
+        assert_eq!(summary["allowed_suffixes"][0], "corp.example.org", "{role}");
+        assert_eq!(summary["failed_step"], "ticket_acquisition", "{role}");
+        assert_eq!(summary["failed_kdc_code"], 24, "{role}");
+        assert_eq!(
+            summary["failed_reason"],
+            lorica_adcs::kdc_error_meaning(24).expect("code 24 has a meaning"),
+            "{role}"
+        );
+        assert!(summary["failed_since"].is_string(), "{role}");
+        let text = json.to_string();
+        for detail in [
+            "ces.corp.example.org",
+            "CORP.EXAMPLE.ORG",
+            "kdc1.corp.example.org",
+            "svc-lorica",
+            "LoricaWebServer",
+            "BEGIN CERTIFICATE",
+        ] {
+            assert_eq!(text.contains(detail), sees_details, "{role}: {detail}");
+        }
+        assert_eq!(data["authority"].is_null(), !sees_details, "{role}");
+        assert!(!text.contains(PASSWORD), "{role}");
+    }
+}
+
+/// D17: the allowed templates are stored with the default first, each
+/// once whatever its case, and returned to Operators.
+#[tokio::test]
+async fn the_allowed_templates_are_stored_with_the_default_first() {
+    let f = fixture(always_ok(), None).await;
+    let mut with_templates = body(Some(PASSWORD));
+    with_templates["allowed_templates"] = serde_json::json!([
+        " LoricaWebServerEcdsa ",
+        "loricawebserver",
+        "LORICAWEBSERVERECDSA"
+    ]);
+    let resp = f
+        .send("PUT", AUTHORITY, &f.admin, Some(with_templates))
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = body_json(resp).await;
+    assert_eq!(
+        json["data"]["allowed_templates"],
+        serde_json::json!(["LoricaWebServer", "LoricaWebServerEcdsa"])
+    );
+    let stored = f
+        .state
+        .store
+        .lock()
+        .await
+        .get_adcs_authority()
+        .expect("read")
+        .expect("row");
+    assert!(stored.permits_template("LoricaWebServerEcdsa"));
+    assert!(!stored.permits_template("User"));
+}
+
+/// The store's own endpoint check is coarser than `CesEndpoint` (the
+/// config crate does not link `lorica-adcs`), and must never refuse an
+/// endpoint the API accepted: every endpoint of these vectors that
+/// `CesEndpoint` accepts, the model accepts too.
+#[test]
+fn the_store_never_refuses_an_endpoint_the_api_accepts() {
+    let vectors: [&str; 8] = [
+        "https://ces.corp.example.org/CA_CES_Kerberos/service.svc/CES",
+        "https://ces.corp.example.org:8443/CES",
+        "https://ces.corp.example.org",
+        "HTTPS://ces.corp.example.org/CES",
+        "https://xn--bcher-kva.corp.example.org/CES",
+        "http://ces.corp.example.org/CES",
+        "https://192.0.2.10/CES",
+        "https://user:pw@ces.corp.example.org/CES",
+    ];
+    let mut accepted: usize = 0;
+    for endpoint in vectors {
+        if lorica_adcs::CesEndpoint::new(endpoint).is_err() {
+            continue;
+        }
+        accepted += 1;
+        let mut authority = lorica_config::models::AdcsAuthority {
+            id: "adcs-1".to_string(),
+            endpoint: endpoint.to_string(),
+            realm: "CORP.EXAMPLE.ORG".to_string(),
+            kdcs: Vec::new(),
+            principal: "svc-lorica".to_string(),
+            endpoint_ca_pem: None,
+            issuing_ca_pem: None,
+            default_template: "LoricaWebServer".to_string(),
+            allowed_templates: Vec::new(),
+            default_key_type: lorica_config::models::AdcsKeyType::Rsa2048,
+            subject: lorica_config::models::AdcsSubjectDefaults::default(),
+            allowed_suffixes: vec![
+                lorica_config::models::AllowedSuffix::new("corp.example.org")
+                    .expect("test setup: suffix"),
+            ],
+            auto_renew_default: true,
+            failed_since: None,
+            failed_step: None,
+            failed_kdc_code: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        assert!(authority.validate().is_ok(), "{endpoint}");
+        authority.allowed_templates = vec!["LoricaWebServer".to_string()];
+        assert!(authority.validate().is_ok(), "{endpoint}");
+    }
+    assert!(
+        accepted >= 4,
+        "the vectors must exercise accepted endpoints"
     );
 }

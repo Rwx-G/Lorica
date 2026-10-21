@@ -6,6 +6,8 @@
 //! `<cert_export_dir>/<sanitised-hostname>/{cert,chain,fullchain,privkey}.pem`
 //! so external tooling (Ansible, a HAProxy sidecar, a backup job) can
 //! read the live bundle straight off disk without hitting the HTTP API.
+//! A certificate issued by the AD CS authority is exported without its
+//! private key (Epic 13 D16).
 //!
 //! Design notes:
 //!
@@ -35,7 +37,12 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use lorica_config::models::{resolve_cert_export_acl, CertExportAcl, Certificate, GlobalSettings};
+use lorica_config::models::{
+    resolve_cert_export_acl, CertExportAcl, Certificate, CertificateSource, GlobalSettings,
+};
+
+/// The file a certificate's private key is exported to.
+const PRIVKEY_FILE: &str = "privkey.pem";
 
 #[cfg(unix)]
 use nix::unistd::{chown, Gid, Uid};
@@ -304,12 +311,28 @@ pub fn export_certificate(
     let fullchain = cert.cert_pem.clone();
     let privkey = cert.key_pem.clone();
 
-    for (name, content) in [
+    // The private key of an AD CS certificate never leaves Lorica (Epic
+    // 13 D16). A key file left from before the certificate was adopted
+    // is removed: it would pair a key Lorica no longer serves with the
+    // renewed certificate beside it.
+    let exports_key: bool = cert.source() != CertificateSource::Adcs;
+    if !exports_key {
+        match fs::remove_file(host_dir.join(PRIVKEY_FILE)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let mut files: Vec<(&str, &String)> = vec![
         ("cert.pem", &leaf),
         ("chain.pem", &chain_only),
         ("fullchain.pem", &fullchain),
-        ("privkey.pem", &privkey),
-    ] {
+    ];
+    if exports_key {
+        files.push((PRIVKEY_FILE, &privkey));
+    }
+
+    for (name, content) in files {
         let target = host_dir.join(name);
         write_atomic(&target, content.as_bytes())?;
         match apply_permissions(
@@ -903,6 +926,48 @@ mod tests {
         assert!(!chain.contains("leaf"));
         let privkey = fs::read_to_string(host_dir.join("privkey.pem")).unwrap();
         assert_eq!(privkey, "privkey-bytes");
+    }
+
+    /// Epic 13 D16: an AD CS certificate exports its certificate and
+    /// chain, never its key, and a key file left from before its
+    /// adoption is removed.
+    #[test]
+    fn an_adcs_certificate_is_exported_without_its_key() {
+        let tmp = tempfile::tempdir().expect("test setup");
+        let settings = GlobalSettings {
+            cert_export_enabled: true,
+            cert_export_dir: Some(tmp.path().to_string_lossy().into_owned()),
+            ..GlobalSettings::default()
+        };
+        let acls = vec![catchall_acl("acl-all")];
+        let pem = "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nchain\n-----END CERTIFICATE-----\n";
+        let manual = dummy_cert("web.corp.example.org", pem, "manual-key-bytes");
+        export_certificate(&settings, &acls, &manual).expect("manual export");
+        let host_dir = tmp.path().join("web.corp.example.org");
+        assert!(
+            host_dir.join(PRIVKEY_FILE).exists(),
+            "test setup: a key file"
+        );
+
+        let mut adopted = dummy_cert("web.corp.example.org", pem, "adcs-key-bytes");
+        adopted.adcs_authority_id = Some("adcs-1".into());
+        assert_eq!(adopted.source(), CertificateSource::Adcs);
+        let outcome = export_certificate(&settings, &acls, &adopted).expect("AD CS export");
+        assert!(matches!(
+            outcome,
+            ExportOutcome::Ok | ExportOutcome::PermissionsSkipped
+        ));
+        for name in ["cert.pem", "chain.pem", "fullchain.pem"] {
+            assert!(host_dir.join(name).exists(), "missing file {name}");
+        }
+        assert!(
+            !host_dir.join(PRIVKEY_FILE).exists(),
+            "no key file for an AD CS certificate, not even a stale one"
+        );
+        for entry in fs::read_dir(&host_dir).expect("list") {
+            let content = fs::read_to_string(entry.expect("entry").path()).expect("read");
+            assert!(!content.contains("key-bytes"), "{content}");
+        }
     }
 
     #[test]

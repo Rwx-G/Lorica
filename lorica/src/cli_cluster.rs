@@ -261,6 +261,18 @@ pub(crate) fn run_cluster_join(
                 "enrolled, but failed to persist the fleet identity: {e}"
             ))
         });
+    let log_store = open_log_store(&data_dir);
+    match runtime().block_on(forget_adcs_authority(&store, &data_dir, log_store)) {
+        Ok(true) => println!(
+            "Removed this node's AD CS authority and its service account password: a follower \
+             holds neither (the authority is managed on the control plane)."
+        ),
+        Ok(false) => {}
+        Err(e) => fail(format!(
+            "enrolled, but failed to remove this node's AD CS authority: {e}. Delete it before \
+             starting the node (it must not keep the service account password)"
+        )),
+    }
     println!(
         "Enrolled as node {} ({}) with status {}; certificate valid until {}.",
         grant.node_id,
@@ -276,6 +288,74 @@ pub(crate) fn run_cluster_join(
         );
     }
     println!("Restart lorica to start the cluster session (this node dials {control_plane}).");
+}
+
+/// The node's audit log, for the rows a CLI command writes itself.
+fn open_log_store(data_dir: &Path) -> Option<Arc<lorica_api::log_store::LogStore>> {
+    match lorica_api::log_store::LogStore::open(data_dir) {
+        Ok(log_store) => Some(Arc::new(log_store)),
+        Err(e) => {
+            eprintln!("warning: the local audit log could not be opened: {e}");
+            None
+        }
+    }
+}
+
+/// The audit identity of a row a CLI command writes itself.
+fn cli_audit_context() -> AuditContext {
+    AuditContext {
+        username: "cli".to_string(),
+        role: "local".to_string(),
+        ip: String::new(),
+        user_agent: "lorica-cli".to_string(),
+    }
+}
+
+/// Remove the AD CS authority, its encrypted service account password
+/// and its generated `krb5.conf` from a node that has just become a
+/// follower, and audit it (Epic 13 D13). Returns whether there was an
+/// authority.
+///
+/// A follower never uses the authority and never holds its password; a
+/// former standalone node or control plane that joins a fleet would
+/// otherwise keep both at rest beside the master key. The certificates
+/// that reference it stay: followers serve AD CS certificates without
+/// the authority, and the control plane's configuration replaces them.
+async fn forget_adcs_authority(
+    store: &ConfigStore,
+    data_dir: &Path,
+    log_store: Option<Arc<lorica_api::log_store::LogStore>>,
+) -> Result<bool, String> {
+    let purged: bool = store
+        .purge_adcs_authority()
+        .map_err(|e| format!("failed to delete the AD CS authority: {e}"))?;
+    let krb5_conf: PathBuf = lorica_adcs::krb5_config_path(data_dir);
+    match std::fs::remove_file(&krb5_conf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("failed to delete {}: {e}", krb5_conf.display())),
+    }
+    if purged {
+        let after = serde_json::json!({
+            "reason": "this node joined a fleet as a follower",
+            "password_deleted": true,
+        });
+        record_with_store(
+            log_store.clone(),
+            &cli_audit_context(),
+            "adcs.authority.delete.on_join",
+            ("adcs_authority", ""),
+            None,
+            Some(&after),
+        )
+        .await;
+        // The process exits right after; an unflushed row would die
+        // with the writer thread.
+        if let Some(log_store) = &log_store {
+            let _ = log_store.flush_audit().await;
+        }
+    }
+    Ok(purged)
 }
 
 /// Outcome of the credential-less deregistration probe.
@@ -442,19 +522,8 @@ pub(crate) fn run_cluster_leave(
             // the same path every other cluster audit takes so the
             // sink copy and the failure metric apply. The control
             // plane audited its revocation already.
-            let log_store = match lorica_api::log_store::LogStore::open(&data_dir) {
-                Ok(log_store) => Some(Arc::new(log_store)),
-                Err(e) => {
-                    eprintln!("warning: the local audit log could not be opened: {e}");
-                    None
-                }
-            };
-            let ctx = AuditContext {
-                username: "cli".to_string(),
-                role: "local".to_string(),
-                ip: String::new(),
-                user_agent: "lorica-cli".to_string(),
-            };
+            let log_store = open_log_store(&data_dir);
+            let ctx = cli_audit_context();
             let after = serde_json::json!({
                 "identity_wiped": wiped,
                 "reason": "control plane deregistered this node",
@@ -664,4 +733,79 @@ pub(crate) fn run_cluster_token(
             "The enrollment window stays open until this token is redeemed, revoked or expires."
         );
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lorica_config::models::{AdcsAuthority, AdcsKeyType, AdcsSubjectDefaults, AllowedSuffix};
+
+    fn authority() -> AdcsAuthority {
+        let now: DateTime<Utc> = Utc::now();
+        AdcsAuthority {
+            id: "adcs-1".to_string(),
+            endpoint: "https://ces.corp.example.org/CA_CES_Kerberos/service.svc/CES".to_string(),
+            realm: "CORP.EXAMPLE.ORG".to_string(),
+            kdcs: Vec::new(),
+            principal: "svc-lorica".to_string(),
+            endpoint_ca_pem: None,
+            issuing_ca_pem: None,
+            default_template: "LoricaWebServer".to_string(),
+            allowed_templates: vec!["LoricaWebServer".to_string()],
+            default_key_type: AdcsKeyType::Rsa2048,
+            subject: AdcsSubjectDefaults::default(),
+            allowed_suffixes: vec![AllowedSuffix::new("corp.example.org").expect("suffix")],
+            auto_renew_default: true,
+            failed_since: None,
+            failed_step: None,
+            failed_kdc_code: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Epic 13 D13: a node that joins a fleet keeps neither the
+    /// authority, nor its encrypted password, nor its `krb5.conf`, and
+    /// the removal is audited.
+    #[tokio::test]
+    async fn joining_a_fleet_removes_the_adcs_authority_and_its_password() {
+        let dir = tempfile::tempdir().expect("test setup: tempdir");
+        let store = open_store(dir.path());
+        store
+            .upsert_adcs_authority(&authority())
+            .expect("authority");
+        store
+            .set_adcs_password(Some("example-only-password"))
+            .expect("password");
+        let krb5_conf = lorica_adcs::krb5_config_path(dir.path());
+        std::fs::create_dir_all(krb5_conf.parent().expect("parent")).expect("adcs dir");
+        std::fs::write(&krb5_conf, "[libdefaults]\n").expect("krb5.conf");
+        let log_store = open_log_store(dir.path());
+
+        let purged = forget_adcs_authority(&store, dir.path(), log_store.clone())
+            .await
+            .expect("purge");
+
+        assert!(purged);
+        assert!(store.get_adcs_authority().expect("read").is_none());
+        assert!(!store.has_adcs_password().expect("presence"));
+        assert!(!krb5_conf.exists());
+        let (rows, _) = log_store
+            .expect("log store")
+            .query_audit(&lorica_api::audit::AuditQuery {
+                action_prefix: Some("adcs.authority.delete.on_join".to_string()),
+                limit: 10,
+                ..Default::default()
+            })
+            .expect("audit query");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].operator_username, "cli");
+
+        assert!(
+            !forget_adcs_authority(&store, dir.path(), None)
+                .await
+                .expect("nothing left"),
+            "a node with no authority has nothing to remove"
+        );
+    }
 }

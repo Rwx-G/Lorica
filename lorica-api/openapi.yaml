@@ -1468,6 +1468,12 @@ paths:
     put:
       tags: [Certificates]
       summary: Update certificate
+      description: >-
+        On a certificate whose `source` is `adcs`, `cert_pem`, `key_pem`
+        and `domain` are refused with 409 `adcs_certificate_managed`: the
+        authority issues and renews it, and adoption only takes over a
+        certificate its issuing CA signed. Revert it to manual first; its
+        `acme_auto_renew` stays editable.
       security:
         - sessionCookie: []
       requestBody:
@@ -1477,10 +1483,18 @@ paths:
             schema:
               type: object
               properties:
+                domain:
+                  type: string
                 cert_pem:
                   type: string
                 key_pem:
                   type: string
+                acme_method:
+                  type: string
+                acme_dns_provider_id:
+                  type: string
+                acme_auto_renew:
+                  type: boolean
       responses:
         "200":
           description: Certificate updated
@@ -1495,6 +1509,14 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: >-
+            The PEM, key or domain of an AD CS certificate
+            (`adcs_certificate_managed`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdcsErrorResponse"
     delete:
       tags: [Certificates]
       summary: Delete certificate
@@ -1526,6 +1548,13 @@ paths:
         Returns a PEM file with the requested part(s) of a stored
         certificate. Audit-logged (tracing::warn with client IP +
         cert id) and rate-limited at 5 downloads per 60s per IP.
+        Operator and above.
+
+        The private key of a certificate whose `source` is `adcs` never
+        leaves Lorica (Epic 13 D16): `key` and `bundle`, the default, are
+        refused with 403 `adcs_key_not_exportable` for every role, the
+        certificate adopted from manual included. Its `cert` and `chain`
+        download as any other certificate's.
       security:
         - sessionCookie: []
       parameters:
@@ -1552,6 +1581,14 @@ paths:
             application/x-pem-file:
               schema:
                 type: string
+        "403":
+          description: >-
+            Below Operator, or the private key of an AD CS certificate
+            (`adcs_key_not_exportable`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdcsErrorResponse"
         "404":
           $ref: "#/components/responses/NotFound"
         "429":
@@ -1601,12 +1638,22 @@ paths:
         them, a wildcard, an empty list or more than 100 names is refused
         with 422 `adcs_san_refused` naming the offending names. The subject
         is the authority's defaults with the request's set fields over
-        them; the template and key type default to the authority's. Lorica
-        generates the key and the CSR; the key never leaves Lorica and is
-        stored encrypted. An issued certificate is stored with its chain
-        and the template observed in it, the issuing CA certificate is
-        recorded on the authority if it has none, and the certificate is
-        served through the hot-swap path. A certificate issued here is
+        them; the template and key type default to the authority's. The
+        template must be the authority's default or one of its
+        `allowed_templates` (Epic 13 D17), checked before anything is sent:
+        422 `adcs_template_refused` otherwise. Lorica generates the key and
+        the CSR; the key never leaves Lorica (it is not downloadable, D16)
+        and is stored encrypted. The issued leaf must carry the Server
+        Authentication extended key usage and not Any Purpose, must not be
+        a CA, and its subject alternative names must be exactly the
+        requested DNS names; otherwise nothing is stored and the 502, the
+        `adcs.certificate.issue.error:<step>:<request id>` audit action and
+        the `cert_issuance_failed` alert name the authority's request
+        identifier, for its administrators to revoke the certificate. An
+        issued certificate is stored with its chain and the template
+        observed in it, the issuing CA certificate is recorded on the
+        authority if it has none and the leaf verifies under it, and the
+        certificate is served through the hot-swap path. A certificate issued here is
         bound to no route; the renewal loop renews bound certificates only.
         Pending, denied and failed outcomes store nothing, raise
         `cert_issuance_failed` and are audited. Rate limited to 3 a minute
@@ -1661,9 +1708,10 @@ paths:
         "422":
           description: >-
             A SAN refused before the authority was contacted
-            (`adcs_san_refused`, naming the names), the authority denied the
-            request (`adcs_denied`, with its message), or a field is invalid
-            (`unprocessable_entity`)
+            (`adcs_san_refused`, naming the names), a template the authority
+            does not allow (`adcs_template_refused`), the authority denied
+            the request (`adcs_denied`, with its message), or a field is
+            invalid (`unprocessable_entity`)
           content:
             application/json:
               schema:
@@ -1673,12 +1721,13 @@ paths:
         "502":
           description: >-
             The authority answered with a fault, a client step failed, or the
-            issued certificate does not cover the requested names
-            (`adcs_error`). `error.step` names the failing step
-            (`ticket_acquisition`, `kdc_discovery`, `tls`, `channel_binding`,
-            `spnego`, `mutual_authentication`, `fault_permission`,
-            `fault_template`, `fault_other`, `san_coverage`, ...) and the
-            message says it in words.
+            issued certificate is not what was requested (`adcs_error`).
+            `error.step` names the failing step (`ticket_acquisition`,
+            `kdc_discovery`, `tls`, `channel_binding`, `spnego`,
+            `mutual_authentication`, `fault_permission`, `fault_template`,
+            `fault_other`, `certificate_profile`, `san_coverage`, ...) and
+            the message says it in words, with the request identifier when
+            the authority issued a certificate Lorica did not store.
           content:
             application/json:
               schema:
@@ -4136,14 +4185,17 @@ paths:
   /api/v1/adcs/authority:
     get:
       tags: [AdcsAuthority]
-      summary: The AD CS authority, without its password (Viewer+)
+      summary: The AD CS authority, without its password (Viewer+, details Operator+)
       description: >-
-        The password is write-only and reported as `password_set`. The
-        failed state (Epic 13 D15) is part of the authority:
-        `failed_since`, `failed_step` and `failed_kdc_code` are set while
-        every AD CS operation is suspended. On a follower the authority is
-        never present, since it lives on the control plane only (D13):
-        `authority` is `null` and `managed_on_control_plane` is `true`.
+        Every role reads `configured` and the `summary`: the allowed DNS
+        suffixes and the failed state (Epic 13 D15), set while every AD
+        CS operation is suspended. Only Operators and SuperAdmins read
+        `authority`, the endpoint, realm, KDCs, principal, CA certificates
+        and templates (D18); a Viewer gets `null` there. The password is
+        write-only and reported as `password_set`. On a follower the
+        authority is never present, since it lives on the control plane
+        only (D13): `configured` is `false`, `summary` and `authority` are
+        `null`, and `managed_on_control_plane` is `true`.
       security:
         - sessionCookie: []
       responses:
@@ -4163,10 +4215,12 @@ paths:
       summary: Create or update the AD CS authority (SuperAdmin, control plane only)
       description: >-
         One authority per installation. `password` is required on creation
-        and whenever `endpoint`, `realm`, `kdcs` or `principal` changes:
-        such a change clears the stored password, so a request that changes
-        one of them without a new password is refused with 422 and leaves
-        the stored one in place. Any password written replaces the stored
+        and whenever `endpoint`, `realm`, `kdcs`, `principal` or
+        `endpoint_ca_pem` changes: such a change clears the stored
+        password, so a request that changes one of them without a new
+        password is refused with 422 and leaves the stored one in place.
+        `allowed_templates` is stored with `default_template` first and
+        each name once (Epic 13 D17). Any password written replaces the stored
         one and closes the failed state. The generated `krb5.conf` is
         rewritten in the same transaction. Refused with 409 while another AD
         CS operation runs, and on a follower.
@@ -4649,9 +4703,11 @@ paths:
         "422":
           description: >-
             AD CS: the certificate's names are no longer under an allowed
-            suffix (`adcs_san_refused`), the authority denied the request
-            (`adcs_denied`, with its message), or the stored certificate
-            cannot be read back into a request (`unprocessable_entity`)
+            suffix (`adcs_san_refused`), its recorded template is no longer
+            one the authority allows (`adcs_template_refused`), the
+            authority denied the request (`adcs_denied`, with its message),
+            or the stored certificate cannot be read back into a request
+            (`unprocessable_entity`)
           content:
             application/json:
               schema:
@@ -4663,9 +4719,10 @@ paths:
         "502":
           description: >-
             AD CS: the authority answered with a fault, a client step
-            failed, or the issued certificate does not cover the names
-            (`adcs_error`, with `error.step`). The current certificate
-            stays in service.
+            failed, or the issued certificate is not what was requested
+            (`adcs_error`, with `error.step` and, when the authority issued
+            one, its request identifier). The current certificate stays in
+            service.
           content:
             application/json:
               schema:
@@ -6898,7 +6955,9 @@ components:
           description: DNS names, no wildcard; the first is the `CN`.
         template:
           type: string
-          description: The template's common name; the authority's default when absent.
+          description: >-
+            The template's common name, the authority's default or one of
+            its `allowed_templates`; the default when absent.
         key_type:
           type: string
           enum: [rsa2048, rsa3072, ecdsa_p256]
@@ -7136,6 +7195,14 @@ components:
         default_template:
           type: string
           description: The common name of the template, not its display name
+        allowed_templates:
+          type: array
+          items:
+            type: string
+          description: >-
+            The template common names an issuance may request, the default
+            first (Epic 13 D17). Edited by SuperAdmins with the rest of the
+            authority.
         default_key_type:
           $ref: "#/components/schemas/AdcsKeyType"
         subject:
@@ -7157,7 +7224,7 @@ components:
         failed_kdc_code:
           type: integer
           nullable: true
-          description: The KDC error code (24 wrong password, 18 account disabled or locked, 23 password expired)
+          description: The KDC error code that opened the failed state; `summary.failed_reason` says what it means
         created_at:
           type: string
           format: date-time
@@ -7167,16 +7234,48 @@ components:
         password_set:
           type: boolean
           description: Whether a service account password is stored; the password itself is never returned
+    AdcsAuthoritySummary:
+      type: object
+      description: >-
+        What every role reads of the authority (Epic 13 D18): that it
+        exists, which names it may issue, and its failed state.
+      properties:
+        allowed_suffixes:
+          type: array
+          items:
+            type: string
+        failed_since:
+          type: string
+          format: date-time
+          nullable: true
+        failed_step:
+          type: string
+          nullable: true
+        failed_kdc_code:
+          type: integer
+          nullable: true
+        failed_reason:
+          type: string
+          nullable: true
+          description: What the KDC code means for the service account, when it rejects the credential
     AdcsAuthorityState:
       type: object
       properties:
+        configured:
+          type: boolean
+          description: Whether an authority is configured on this node; false on a follower
+        managed_on_control_plane:
+          type: boolean
+          description: True on a follower, which holds no authority
+        summary:
+          allOf:
+            - $ref: "#/components/schemas/AdcsAuthoritySummary"
+          nullable: true
         authority:
           allOf:
             - $ref: "#/components/schemas/AdcsAuthority"
           nullable: true
-        managed_on_control_plane:
-          type: boolean
-          description: True on a follower, which holds no authority
+          description: The whole authority, for Operators and SuperAdmins only; null for a Viewer
     AdcsAuthorityRequest:
       type: object
       additionalProperties: false
@@ -7189,6 +7288,7 @@ components:
           pattern: "^[A-Z0-9][A-Z0-9.-]*$"
         kdcs:
           type: array
+          maxItems: 10
           items:
             type: string
         principal:
@@ -7199,7 +7299,8 @@ components:
           writeOnly: true
           description: >-
             Required on creation and with any change of endpoint, realm,
-            kdcs or principal. Never returned, never logged.
+            kdcs, principal or endpoint_ca_pem. Never returned, never
+            logged.
         endpoint_ca_pem:
           type: string
           nullable: true
@@ -7208,6 +7309,15 @@ components:
           nullable: true
         default_template:
           type: string
+        allowed_templates:
+          type: array
+          maxItems: 31
+          items:
+            type: string
+          description: >-
+            Other template common names an issuance may request; the
+            default is always permitted. Each non-empty, at most 256
+            characters, no control character; at most 32 with the default.
         default_key_type:
           $ref: "#/components/schemas/AdcsKeyType"
         subject:
@@ -7229,9 +7339,10 @@ components:
           type: string
           nullable: true
           description: >-
-            The failing step: ticket_acquisition, kdc_discovery, tls,
-            channel_binding, spnego, mutual_authentication, http,
-            configuration, krb5_conf, timeout, gss_task, or other
+            The failing step, a word of the client's closed list
+            (ticket_acquisition, kdc_discovery, tls, channel_binding,
+            spnego, mutual_authentication, http, configuration, krb5_conf,
+            timeout, gss_task, ...)
         message:
           type: string
           nullable: true

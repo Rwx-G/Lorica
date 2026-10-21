@@ -42,7 +42,14 @@ It does:
   upgrading Lorica ends the manual process instead of running a second
   one beside it; and **revert** any AD CS certificate to manual.
 - **Bound the names it may request** with an allowlist of DNS suffixes,
-  enforced by the API before anything reaches the authority.
+  and **the templates it may request** with an allowlist of template
+  names, both enforced by the API before anything reaches the authority
+  and both edited by SuperAdmins only.
+- **Check what the authority issued** before storing it: a server
+  certificate (Server Authentication, not a CA) for exactly the names
+  requested.
+- **Keep the private key.** The key of an AD CS certificate is never
+  downloadable and never exported, for any role.
 - **Stop at once** when the service account's credential is rejected,
   so a stale password costs one failed pre-authentication, not one per
   certificate per tick.
@@ -92,6 +99,13 @@ Server*:
   its side, but the template is the authority's own bound, and a
   template anyone may enroll in with *Supply in the request* is ESC1 on
   its own.
+- **The service account enrolls in this template and no other.** A
+  service account is a domain user, so it inherits every template
+  opened to *Domain Users* or *Authenticated Users*. Lorica only
+  requests the templates its SuperAdmin lists and refuses a certificate
+  that is not a server certificate, but the authority should not depend
+  on that: take `svc-lorica` out of every group that grants enrollment
+  elsewhere.
 - **No CA certificate manager approval**, and no authorised signature
   requirement: Lorica supports templates that issue immediately.
 - **Published on the authority.** A template that exists in the
@@ -228,12 +242,13 @@ dashboard, on the control plane. One authority per installation.
 |---|---|
 | CES endpoint | `https://` only, with a DNS host name (the service ticket is for `HTTP/<host>`), no credentials in the URL |
 | Kerberos realm | Upper case letters, digits, dots and hyphens: `CORP.EXAMPLE.ORG` |
-| KDCs | Optional, one `host[:port]` per line (`dc01.corp.example.org`, `dc02.corp.example.org:88`). Empty: discovered through DNS SRV records |
+| KDCs | Optional, at most 10, one `host[:port]` per line (`dc01.corp.example.org`, `dc02.corp.example.org:88`). Empty: discovered through DNS SRV records |
 | Service principal | `svc-lorica` or `svc-lorica@CORP.EXAMPLE.ORG`, in the realm above |
 | Service account password | Write-only (see below) |
 | Endpoint CA bundle | Optional PEM. When set, these certificates alone are trusted for the CES endpoint's TLS certificate, instead of the system and webpki roots |
 | Issuing CA certificate | Optional PEM: the CA that signs Lorica's certificates. Learned from the first issuance when left empty; needed for adoption |
 | Default template | The template's common name |
+| Allowed templates | Other template common names an issuance may request; the default template is always allowed. An authority saved before v1.10.0 final starts with its default template alone |
 | Default key type | RSA 2048 (default), RSA 3072, ECDSA P-256 |
 | Subject defaults | `C`, `ST`, `L`, `O`, `OU`, email: the fixed part of every subject. The `CN` is always the certificate's first name |
 | Allowed DNS suffixes | At least one; see [The allowlist](#the-allowlist) |
@@ -246,27 +261,33 @@ read reports only whether one is set. Leaving the field empty on an
 update keeps the stored password.
 
 **Changing where the credential goes clears it.** Any change to the
-endpoint, the realm, the KDC list or the principal clears the stored
-password, and the same save must supply it again; a save that changes
+endpoint, the realm, the KDC list, the principal or the endpoint CA
+bundle clears the stored password, and the same save must supply it
+again; a save that changes
 one of them without a password is refused and leaves everything as it
 was. Whoever can redirect where the credential is sent could otherwise
 harvest material derived from it: a connection test against a KDC of
-their choosing sends pre-authentication derived from the password.
+their choosing sends pre-authentication derived from the password, and
+a bundle trusting a CA of their choosing would send the Kerberos tokens
+to a server presenting a certificate from it.
 
 ### Who may do what
 
 | Action | Role |
 |---|---|
-| Read the authority (password reported as set or not) | Viewer |
-| Create, change or delete the authority, including the allowed suffixes | SuperAdmin |
+| Read that an authority is configured, its allowed suffixes and its failed state | Viewer |
+| Read the authority's endpoint, realm, KDCs, principal, CA certificates and templates (password reported as set or not) | Operator |
+| Create, change or delete the authority, including the allowed suffixes and templates | SuperAdmin |
 | Run the connection test | Operator |
 | Issue a certificate, "Renew now", adopt, revert to manual | Operator |
 
 The split is deliberate. An Operator has full control over certificates;
-if the same role could edit the allowlist, the allowlist would bound
-nothing against the people it exists to bound, and if it could edit the
-realm or the KDC list, it could aim the service account's
-pre-authentication at a server of its choosing. The limit of that
+if the same role could edit the allowlists, they would bound nothing
+against the people they exist to bound, and if it could edit the realm
+or the KDC list, it could aim the service account's pre-authentication
+at a server of its choosing. A Viewer does not see how the authority is
+reached: the endpoint, realm, KDCs and principal map the domain's PKI
+and name the account a password spray or a lockout would aim at. The limit of that
 protection is stated in the threat model: the allowlist bounds callers
 of the API, not someone who can read the data directory, where the
 master key sits beside the database.
@@ -315,9 +336,10 @@ type, the complete subject and every name, and the API documents
 ### From the certificate page
 
 **Certificates > AD CS** opens a form: the DNS names (the first one is
-the `CN` and the certificate's domain), and optionally a template, a
-key type and subject fields that replace the authority's defaults for
-this certificate, plus its auto-renew setting.
+the `CN` and the certificate's domain), and optionally a template among
+the authority's allowed ones, a key type and subject fields that replace
+the authority's defaults for this certificate, plus its auto-renew
+setting.
 
 A certificate issued here is **not bound to any route**. The renewal
 loop only renews certificates a route uses, so it is renewed once a
@@ -361,20 +383,68 @@ With `corp.example.org` allowed:
 A request may carry at most 100 names. A refusal answers 422
 `adcs_san_refused` and names the offending names.
 
+**The allowlist bounds the suffix, not the host.** With
+`corp.example.org` allowed, an Operator may request a certificate for
+any name under it, a domain controller's or the CES host's included.
+That is why the key never leaves Lorica (see
+[The private key stays in Lorica](#the-private-key-stays-in-lorica)):
+such a certificate can only be served by Lorica, on a route an Operator
+could configure anyway. Allow the narrowest suffixes that cover the
+services Lorica fronts (`apps.corp.example.org` rather than the AD
+domain itself).
+
+### The templates
+
+The template decides what the authority signs: the extended key usage,
+the validity, whether the certificate is a CA. An issuance may request
+the authority's default template or one of its **allowed templates**,
+both set by a SuperAdmin; any other answers 422 `adcs_template_refused`
+before the authority is contacted, and is audited as
+`adcs.certificate.issue.refused:template`. Names are compared without
+regard to case, as the authority does. A renewal requests the template
+recorded on the certificate, so removing a template from the list stops
+the renewal of the certificates issued with it (alerted with the step
+`template_refused`).
+
 ### What happens on each outcome
 
 | Outcome | HTTP | What Lorica does |
 |---|---|---|
-| Issued | 201 | Checks that the certificate covers every requested name and matches the generated key, stores it with its chain and the encrypted key, records the template observed in it, records the issuing CA certificate on the authority if it had none, and serves it through the hot-swap path. The page shows the subject **as issued**: the authority may rewrite or drop subject fields, and Lorica shows what it received, not what it asked for |
+| Issued | 201 | Checks that the certificate is a server certificate (Server Authentication extended key usage, not Any Purpose, not a CA), that its names are exactly the requested ones, and that it matches the generated key; stores it with its chain and the encrypted key, records the template observed in it, records the issuing CA certificate on the authority if it had none and the certificate's signature verifies under it, and serves it through the hot-swap path. The page shows the subject **as issued**: the authority may rewrite or drop subject fields, and Lorica shows what it received, not what it asked for |
 | Pending | 202 | The template needs approval. Nothing is stored, the generated key is discarded, the authority's request identifier is shown, audited and alerted (`cert_issuance_failed`) |
 | Denied | 422 `adcs_denied` | Nothing is stored; the authority's message is shown; alerted |
 | Fault or client failure | 502 `adcs_error` | Nothing is stored; `error.step` names the failing step and the message says it in words; alerted |
-| Refused before contact | 409 or 422 | No authority or no password (`adcs_not_configured`), the failed state (`adcs_failed_state`), another AD CS operation running (`adcs_busy`), a follower; or a refused name or field |
+| Refused before contact | 409 or 422 | No authority or no password (`adcs_not_configured`), the failed state (`adcs_failed_state`), another AD CS operation running (`adcs_busy`), a follower; or a refused name (`adcs_san_refused`), template (`adcs_template_refused`) or field |
 | Still running | 504 | See [Timeouts](#timeouts-and-the-single-flight-guard) |
 
-An issued certificate that does not cover the requested names (step
-`san_coverage`) is not stored, and remains valid at the authority until
-revoked there: tell its administrators.
+An issued certificate that is not a server certificate (step
+`certificate_profile`), whose names are not exactly the requested ones,
+missing or extra, of any type (step `san_coverage`), or that cannot be
+served with its key (step `certificate`) is not stored, and remains
+valid at the authority until revoked there: tell its administrators.
+The error, the `cert_issuance_failed` alert (`request_id` detail) and
+the audit action (`adcs.certificate.issue.error:<step>:<request id>`)
+all carry the authority's request identifier they revoke it by.
+
+### The private key stays in Lorica
+
+The key of an AD CS certificate, issued by Lorica or adopted, is never
+handed out:
+
+- the certificate download refuses `key` and `bundle`, the default, with
+  403 `adcs_key_not_exportable`, whatever the role; `cert` and `chain`
+  download as for any certificate;
+- the filesystem export writes `cert.pem`, `chain.pem` and
+  `fullchain.pem` and no `privkey.pem` (a key file left from before the
+  certificate was adopted is removed);
+- its PEM, key and domain cannot be replaced through the certificate
+  update (409 `adcs_certificate_managed`): revert it to manual first.
+
+A follower that serves the certificate still receives its key through
+the cluster's need-to-know path, as for any certificate, and exposes it
+no more than the control plane does. What this gives up: Lorica cannot
+be used to hand AD CS certificates to other servers, which was never
+its purpose.
 
 Issuance is rate-limited to 3 a minute in its own bucket, and every
 attempt is audited under `adcs.certificate.issue` with its names and
@@ -399,7 +469,19 @@ replaces it when it is stored. Each renewal generates a **new key and a
 new CSR** (keys are never reused), requests the current certificate's
 names and subject again, and uses **the template recorded on the
 certificate**, not the authority's current default, which only applies
-to new issuance. The key type is the authority's current default.
+to new issuance. The key keeps the current certificate's type and size
+(the template accepted it), or the authority's default when Lorica
+cannot generate that type.
+
+**One session per tick.** The loop renews the AD CS certificates due in
+one tick as one AD CS operation: one hold of the single-flight guard, one
+Kerberos ticket for them all. Each certificate is read again right
+before its renewal, and left alone if it changed since the tick picked
+it: reverted to manual, auto-renew turned off, no longer bound, or
+already renewed. The loop runs its ACME renewals first, so a slow or
+unreachable authority never delays them. When another AD CS operation
+holds the guard as the tick starts, the loop waits 30 seconds and tries
+again, up to 10 times, rather than leaving its renewals for 12 hours.
 
 **"Renew now"** on the certificate page renews an AD CS certificate at
 once (Operator and above), after a confirmation, under the same rules
@@ -408,12 +490,16 @@ flight, from the loop or another click, answers 409. A pending answer is
 reported with its request identifier, and the current certificate stays.
 
 **When a renewal fails**, the current certificate stays in service.
-Any failure other than a rejected credential, a pending answer included,
-leaves that certificate alone for 24 hours before the loop tries again,
-and raises `cert_issuance_failed` once per failure state, not on every
-tick. A rejected credential opens the [failed state](#the-failed-state)
-and ends the tick: the other certificates due are not attempted, so the
-tick costs one pre-authentication attempt in all.
+A failure of that certificate's request (a CA fault or denial, a
+pending answer, an issued certificate Lorica refused, a template no
+longer allowed) leaves it alone for 24 hours before the loop tries
+again, and raises `cert_issuance_failed` once per failure state, not on
+every tick. A failure of the authority itself (a KDC that cannot be
+reached, a rejected credential, the endpoint's TLS or authentication, a
+timeout) ends the tick: the other certificates due are not attempted,
+so an authority that is down or refusing costs one attempt per tick in
+all. A rejected credential also opens the
+[failed state](#the-failed-state).
 
 **Expiry alerts.** `cert_expiring` comes from the regular expiry check
 with the thresholds you set, as for an uploaded certificate; the loop
@@ -578,6 +664,12 @@ certificate renewal runs.
   detection the fleet uses. A follower's settings tab shows "managed on
   the control plane", with no test button, and its API refuses every AD
   CS operation.
+- **A node that joins a fleet loses its authority.** `lorica cluster
+  join` deletes the node's authority, its encrypted password and its
+  `krb5.conf` once the node is enrolled, and audits it
+  (`adcs.authority.delete.on_join`, actor `cli`). A standalone node that
+  had an authority keeps neither as a follower; configure the authority
+  on the control plane.
 - **Issued certificates replicate like any other certificate**, keys
   through the same need-to-know path; see `docs/cluster.md`.
 - **Upgrade followers first, the control plane last.** v1.10.0 adds
@@ -618,8 +710,9 @@ instead.
   AD CS certificate issued from the certificate page and never bound, or
   left behind by a cancelled route, stays on the certificate page until
   you bind or delete it; remember that deleting it does not revoke it.
-- **Certificate export** applies to AD CS certificates as to any other:
-  when it is enabled, an issuance or renewal writes the PEM files.
+- **Certificate export** applies to AD CS certificates without their
+  key: when it is enabled, an issuance or renewal writes the certificate
+  and chain files, never `privkey.pem`.
 
 ## Troubleshooting
 
@@ -643,8 +736,10 @@ message; the message carries the detail.
 | `fault_permission` | CA fault `0x80094012` | Enroll permission (next table) |
 | `fault_template` | CA fault `0x80094800` or `0x80094802` | Template name and publication (next table) |
 | `fault_other` | Any other CA fault | The message carries the CA's text and code |
-| `san_coverage` | The issued certificate does not cover the requested names | The template must use *Supply in the request*; the issued certificate was not stored and must be revoked at the authority |
-| `certificate` | The issued certificate cannot be served with the generated key | Report it |
+| `certificate_profile` | The issued certificate is not a server certificate: no Server Authentication extended key usage, Any Purpose, or a CA | The template's extensions; the issued certificate was not stored and must be revoked at the authority (the message names the request) |
+| `san_coverage` | The issued certificate's names are not exactly the requested ones: one is missing, or one was added, of any type | The template must use *Supply in the request* and add no name; the issued certificate was not stored and must be revoked at the authority (the message names the request) |
+| `certificate` | The issued certificate cannot be read or cannot be served with the generated key | Report it; revoke the request the message names |
+| `store` | The issued certificate could not be stored, or the certificate being renewed stopped being AD CS managed meanwhile | Revoke the request the message names |
 | `timeout` | The operation passed its bound | Silent KDCs or a slow CES; see [Timeouts](#timeouts-and-the-single-flight-guard) |
 | `krb5_conf` | The generated `krb5.conf` could not be written | Permissions on `<data-dir>/adcs/` |
 | `configuration`, `csr` | A parameter or the CSR was refused before anything was sent | The message names the field |
@@ -726,11 +821,50 @@ the KDC list empty: with an explicit list, the generated `krb5.conf`
 turns DNS discovery off and names KDCs for the service account's realm
 only, so the other realm's KDCs cannot be located.
 
+## Accepted residual risks
+
+What the code does not close, stated so it is decided rather than
+discovered. `docs/security/threat-model.md` carries the same list.
+
+- **An Operator can issue for any host under an allowed suffix.** The
+  key stays in Lorica, so the certificate can only be served by Lorica,
+  on a route the Operator could configure anyway. Keep the suffixes
+  narrow.
+- **Issued certificates cannot be revoked from Lorica.** An Operator can
+  issue up to 3 a minute per address, each one logged by the authority
+  and audited by Lorica, each valid until the authority's administrators
+  revoke it. Alert on `adcs.certificate.issue.ok` volume if that
+  matters.
+- **Renewal can be delayed** by someone keeping the single-flight guard
+  busy (connection tests, issuances, "Renew now"). The loop waits and
+  retries for about five minutes per tick, every attempt that holds the
+  guard is audited, and the 30-day window leaves many ticks before
+  expiry.
+- **A network position trips the breaker.** A forged KDC error, or a
+  reply that does not decrypt, puts the authority in the failed state
+  until a SuperAdmin saves the password again. List the KDCs explicitly
+  rather than relying on DNS SRV discovery, which an attacker who
+  controls DNS can redirect.
+- **Pre-authentication is observable.** Whoever is on the path to the
+  KDCs sees the AES pre-authentication of every operation and can guess
+  the password offline. Give `svc-lorica` a long random password and
+  require pre-authentication on the account; FAST armoring is not used.
+- **A token can make the loop renew an AD CS certificate** by binding it
+  to a route within its grant (a bound certificate is renewed). The
+  names do not change and the loop is the sanctioned renewer, so the
+  token issues nothing it could choose; the renewal is audited under
+  `adcs-renewal`.
+- **Bodiless AD CS requests rely on `SameSite=Strict`**, as every
+  bodiless request of the management API does (the connection test,
+  "Renew now", revert): a script on a sibling host of the same site
+  could send them as a logged-in Operator. Do not host other
+  applications under the dashboard's registrable domain.
+
 ## API reference
 
 | Method and path | Role | What it does |
 |---|---|---|
-| `GET /api/v1/adcs/authority` | Viewer | The authority without its password (`password_set`), with its failed state; `managed_on_control_plane` on a follower |
+| `GET /api/v1/adcs/authority` | Viewer | `configured` and the `summary` (suffixes, failed state) for every role; the `authority` itself, without its password (`password_set`), for Operators and above; `managed_on_control_plane` on a follower |
 | `PUT /api/v1/adcs/authority` | SuperAdmin | Create or update; `password` required on creation and on an identity change |
 | `DELETE /api/v1/adcs/authority` | SuperAdmin | Refused while certificates reference it |
 | `POST /api/v1/adcs/authority/test` | Operator | The connection test |

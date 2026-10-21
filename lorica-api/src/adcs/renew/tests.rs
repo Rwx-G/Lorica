@@ -689,3 +689,186 @@ fn only_the_key_types_lorica_generates_are_kept() {
     let ed25519 = key_type(&spki_of(&rcgen::PKCS_ED25519));
     assert_eq!(ed25519, Err("a key of algorithm 1.3.101.112".to_string()));
 }
+
+fn unreachable_kdc() -> lorica_adcs::AdcsError {
+    lorica_adcs::AdcsError::Ticket {
+        principal: "svc-lorica@CORP.EXAMPLE.ORG".to_string(),
+        failure: lorica_adcs::TicketFailure::KdcUnreachable,
+        kdc_error_code: None,
+        minor_status: 0,
+        message: "Cannot find KDC for realm \"CORP.EXAMPLE.ORG\"".to_string(),
+    }
+}
+
+/// D3, D15: a tick renews every due certificate on one session, one
+/// ticket in production.
+#[tokio::test]
+async fn a_tick_renews_every_due_certificate_on_one_session() {
+    let stub = StubAuthority::new(issue_v2());
+    let f = issuing(&stub, None).await;
+    for name in ["web01", "web02", "web03"] {
+        f.bound_in_window(&format!("{name}.corp.example.org")).await;
+    }
+    let (calls, opens) = (stub.calls(), stub.opens());
+
+    f.tick().await;
+
+    assert_eq!(stub.calls(), calls + 3, "three renewals");
+    assert_eq!(stub.opens(), opens + 1, "one session for the tick");
+}
+
+/// Perf H, arch M2: a failure of the authority rather than of one
+/// certificate ends the tick after one attempt, without opening the
+/// breaker and without backing any certificate off.
+#[tokio::test]
+async fn a_failure_of_the_authority_ends_the_tick_after_one_attempt() {
+    let stub = StubAuthority::new(issue_v2());
+    let alerts = lorica_notify::AlertSender::new(64);
+    let mut received = alerts.subscribe();
+    let f = issuing(&stub, Some(alerts)).await;
+    let mut ids = Vec::new();
+    for name in ["web01", "web02", "web03"] {
+        ids.push(f.bound_in_window(&format!("{name}.corp.example.org")).await);
+    }
+    alerts_of(&mut received);
+    let calls = stub.calls();
+    stub.set_answer(Answer::Fail(unreachable_kdc));
+
+    f.tick().await;
+
+    assert_eq!(stub.calls(), calls + 1, "the first attempt ends the tick");
+    let raised = alerts_of(&mut received);
+    assert_eq!(of_type(&raised, AlertType::CertIssuanceFailed), 1);
+    assert_eq!(of_type(&raised, AlertType::AdcsAuthorityFailed), 0);
+    let now = Utc::now();
+    for id in &ids {
+        assert_eq!(f.state.adcs.renewals.backoff_until(id, now), None, "{id}");
+    }
+    assert!(!f
+        .state
+        .store
+        .lock()
+        .await
+        .get_adcs_authority()
+        .expect("read")
+        .expect("row")
+        .is_failed());
+
+    stub.set_answer(issue_v2());
+    f.tick().await;
+    assert_eq!(stub.calls(), calls + 4, "the next tick renews them all");
+}
+
+/// Arch M on renew.rs: each certificate is read again right before its
+/// renewal; one reverted, opted out, unbound or already renewed since
+/// the tick selected it is left alone.
+#[tokio::test]
+async fn a_certificate_changed_since_selection_is_not_renewed() {
+    let stub = StubAuthority::new(issue_v2());
+    let f = issuing(&stub, None).await;
+    let reverted = f.bound_in_window("web01.corp.example.org").await;
+    let opted_out = f.bound_in_window("web02.corp.example.org").await;
+    let unbound = f.bound_in_window("web03.corp.example.org").await;
+    let renewed = f.bound_in_window("web04.corp.example.org").await;
+    let selected: Vec<Certificate> = {
+        let mut selected = Vec::new();
+        for id in [&reverted, &opted_out, &unbound, &renewed] {
+            selected.push(f.cert(id).await);
+        }
+        selected
+    };
+    {
+        let store = f.state.store.lock().await;
+        let mut cert = store
+            .get_certificate(&reverted)
+            .expect("read")
+            .expect("row");
+        cert.adcs_authority_id = None;
+        store.update_certificate(&cert).expect("reverted");
+        let mut cert = store
+            .get_certificate(&opted_out)
+            .expect("read")
+            .expect("row");
+        cert.acme_auto_renew = false;
+        store.update_certificate(&cert).expect("opted out");
+        for mut route in store.list_routes().expect("routes") {
+            if route.certificate_id.as_deref() == Some(unbound.as_str()) {
+                route.certificate_id = None;
+                store.update_route(&route).expect("unbound");
+            }
+        }
+        let mut cert = store.get_certificate(&renewed).expect("read").expect("row");
+        cert.fingerprint = "sha256:renewed-meanwhile".to_string();
+        store.update_certificate(&cert).expect("renewed");
+    }
+    let calls = stub.calls();
+
+    let refs: Vec<&Certificate> = selected.iter().collect();
+    crate::adcs::renew_due(&f.state, &refs, Utc::now()).await;
+
+    assert_eq!(stub.calls(), calls, "nothing was still due");
+    assert_eq!(f.cert(&reverted).await.adcs_authority_id, None);
+}
+
+/// Pen L5: a tick that finds another AD CS operation running waits and
+/// tries again instead of leaving its renewals to the next tick.
+#[tokio::test]
+async fn a_tick_waits_for_a_busy_guard_instead_of_giving_up() {
+    let stub = StubAuthority::new(issue_v2());
+    let mut f = issuing(&stub, None).await;
+    f.state.adcs = f
+        .state
+        .adcs
+        .clone()
+        .with_busy_retry_delay(std::time::Duration::from_millis(50));
+    let id = f.bound_in_window("web01.corp.example.org").await;
+    let cert = f.cert(&id).await;
+    let calls = stub.calls();
+
+    let permit = f.state.adcs.guard().try_acquire().expect("nothing runs");
+    let state = f.state.clone();
+    let tick = tokio::spawn(async move {
+        crate::adcs::renew_due(&state, &[&cert], Utc::now()).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(stub.calls(), calls, "nothing while the guard is held");
+    drop(permit);
+    tick.await.expect("the tick ends");
+
+    assert_eq!(stub.calls(), calls + 1, "renewed once the guard was free");
+}
+
+/// D17 at renewal: a recorded template the authority no longer lists is
+/// refused before the authority is contacted, alerted, and backed off.
+#[tokio::test]
+async fn a_renewal_with_a_template_no_longer_allowed_is_refused() {
+    let stub = StubAuthority::new(issue_v2());
+    let alerts = lorica_notify::AlertSender::new(64);
+    let mut received = alerts.subscribe();
+    let f = issuing(&stub, Some(alerts)).await;
+    let id = f.bound_in_window("web01.corp.example.org").await;
+    {
+        let store = f.state.store.lock().await;
+        let mut cert = store.get_certificate(&id).expect("read").expect("row");
+        cert.adcs_template = Some("RetiredTemplate".to_string());
+        store.update_certificate(&cert).expect("template recorded");
+    }
+    alerts_of(&mut received);
+    let calls = stub.calls();
+
+    f.tick().await;
+
+    assert_eq!(stub.calls(), calls, "nothing reached the authority");
+    let raised = alerts_of(&mut received);
+    assert_eq!(raised.len(), 1);
+    assert_eq!(
+        raised[0].details.get("step").map(String::as_str),
+        Some("template_refused")
+    );
+    assert!(f
+        .state
+        .adcs
+        .renewals
+        .backoff_until(&id, Utc::now())
+        .is_some());
+}

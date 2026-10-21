@@ -27,7 +27,10 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) use adcs_authority::{sample_adcs_authority, ADCS_FIXTURE_SENTINEL};
-pub use adcs_authority::{AdcsAuthority, AdcsKeyType, AdcsSubjectDefaults, AllowedSuffix};
+pub use adcs_authority::{
+    validate_template_name, AdcsAuthority, AdcsKeyType, AdcsSubjectDefaults, AllowedSuffix,
+    ADCS_ALLOWED_TEMPLATES_MAX, ADCS_TEMPLATE_NAME_MAX_LEN,
+};
 pub use ai_crawler::{
     CustomCrawler, CustomVerification, CUSTOM_CRAWLER_MAX_CIDRS, CUSTOM_CRAWLER_MAX_COUNT,
 };

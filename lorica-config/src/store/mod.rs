@@ -191,6 +191,7 @@ const MIGRATIONS: &[Migration] = &[
     (63, migrate_subscribe_log_store_alerts),
     (64, migrate_adcs_authority),
     (65, migrate_subscribe_adcs_alerts),
+    (66, migrate_adcs_allowed_templates),
 ];
 
 /// Which telemetry fan-in cursor a follower is reading or advancing
@@ -1306,6 +1307,36 @@ fn migrate_adcs_authority(conn: &Connection) -> rusqlite::Result<()> {
         "TEXT DEFAULT NULL",
     )?;
     add_column_if_absent(conn, "certificates", "adcs_request_id", "TEXT DEFAULT NULL")
+}
+
+/// Epic 13 D17: the templates an issuance may request become a list on
+/// the authority. An authority saved before the list existed gets its
+/// default template as the whole list, which is exactly what it
+/// permitted in practice once the override is bounded; anything wider is
+/// a SuperAdmin's decision to make afterwards, not the migration's.
+fn migrate_adcs_allowed_templates(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "adcs_authority",
+        "allowed_templates_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    let unlisted: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, default_template FROM adcs_authority              WHERE allowed_templates_json = '[]'",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<(String, String)>>>()?
+    };
+    for (id, default_template) in unlisted {
+        let list: String = serde_json::to_string(&[default_template])
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+        conn.execute(
+            "UPDATE adcs_authority SET allowed_templates_json = ?1 WHERE id = ?2",
+            params![list, id],
+        )?;
+    }
+    Ok(())
 }
 
 fn migrate_acme_challenge_expiry(conn: &Connection) -> rusqlite::Result<()> {

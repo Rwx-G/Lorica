@@ -42,7 +42,7 @@ const ADCS_AUTHORITY_COLUMNS: &str = "id, endpoint, realm, kdcs_json, principal,
      endpoint_ca_pem, issuing_ca_pem, default_template, default_key_type, subject_country, \
      subject_state, subject_locality, subject_organization, subject_organizational_unit, \
      subject_email, allowed_suffixes_json, auto_renew_default, failed_since, failed_step, \
-     failed_kdc_code, created_at, updated_at";
+     failed_kdc_code, created_at, updated_at, allowed_templates_json";
 
 /// Decode one `adcs_authority` row.
 fn row_to_adcs_authority(row: &rusqlite::Row<'_>) -> Result<AdcsAuthority> {
@@ -58,6 +58,7 @@ fn row_to_adcs_authority(row: &rusqlite::Row<'_>) -> Result<AdcsAuthority> {
         endpoint_ca_pem: row.get(5)?,
         issuing_ca_pem: row.get(6)?,
         default_template: row.get(7)?,
+        allowed_templates: json_column(row, 22, "adcs authority", "allowed_templates")?,
         default_key_type: AdcsKeyType::from_str(&key_type).map_err(|e| {
             ConfigError::Corrupt(format!("stored adcs authority key type is invalid: {e}"))
         })?,
@@ -130,9 +131,9 @@ impl ConfigStore {
              endpoint_ca_pem, issuing_ca_pem, default_template, default_key_type,
              subject_country, subject_state, subject_locality, subject_organization,
              subject_organizational_unit, subject_email, allowed_suffixes_json,
-             auto_renew_default, created_at, updated_at)
+             auto_renew_default, created_at, updated_at, allowed_templates_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-             ?17, ?18, ?19)
+             ?17, ?18, ?19, ?20)
              ON CONFLICT(id) DO UPDATE SET endpoint = excluded.endpoint,
              realm = excluded.realm, kdcs_json = excluded.kdcs_json,
              principal = excluded.principal, endpoint_ca_pem = excluded.endpoint_ca_pem,
@@ -147,7 +148,8 @@ impl ConfigStore {
              subject_email = excluded.subject_email,
              allowed_suffixes_json = excluded.allowed_suffixes_json,
              auto_renew_default = excluded.auto_renew_default,
-             updated_at = excluded.updated_at",
+             updated_at = excluded.updated_at,
+             allowed_templates_json = excluded.allowed_templates_json",
             params![
                 authority.id,
                 authority.endpoint,
@@ -171,6 +173,10 @@ impl ConfigStore {
                 authority.auto_renew_default,
                 authority.created_at.to_rfc3339(),
                 authority.updated_at.to_rfc3339(),
+                serialize_field(
+                    "adcs authority allowed_templates",
+                    &authority.allowed_templates
+                )?,
             ],
         )?;
         Ok(())
@@ -203,6 +209,35 @@ impl ConfigStore {
             ));
         }
         self.decrypt_config(&ciphertext).map(Some)
+    }
+
+    /// Whether a service account password is stored, read without
+    /// decrypting it: a presence check has no reason to put the
+    /// cleartext in memory.
+    pub fn has_adcs_password(&self) -> Result<bool> {
+        let stored: Option<bool> = self
+            .conn
+            .query_row(
+                "SELECT password_enc IS NOT NULL FROM adcs_authority \
+                 ORDER BY created_at, id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stored.unwrap_or(false))
+    }
+
+    /// Delete every authority row, password included, whatever
+    /// certificates reference it. Returns whether a row existed.
+    ///
+    /// For a node that becomes a follower (Epic 13 D13): a follower holds
+    /// AD CS certificates without the authority by design, so the
+    /// reference guard of [`ConfigStore::delete_adcs_authority`] does not
+    /// apply, and the row and its encrypted password must not stay on a
+    /// node that will never use them.
+    pub fn purge_adcs_authority(&self) -> Result<bool> {
+        let deleted = self.conn.execute("DELETE FROM adcs_authority", [])?;
+        Ok(deleted > 0)
     }
 
     /// Set (`Some`) or clear (`None`) the service account password.
@@ -600,6 +635,100 @@ mod tests {
         assert!(matches!(
             store.set_adcs_password(Some(PASSWORD)),
             Err(ConfigError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn password_presence_is_read_without_decrypting() {
+        let store = keyed_store();
+        assert!(!store.has_adcs_password().expect("no authority"));
+        store
+            .upsert_adcs_authority(&sample_adcs_authority("adcs-1"))
+            .expect("upsert");
+        assert!(!store.has_adcs_password().expect("no password"));
+        store.set_adcs_password(Some(PASSWORD)).expect("password");
+        assert!(store.has_adcs_password().expect("a password"));
+
+        // A store that could not decrypt it still answers.
+        let dir = tempfile::tempdir().expect("test setup: tempdir");
+        let path = dir.path().join("adcs.db");
+        {
+            let key = EncryptionKey::generate().expect("test setup: key generates");
+            let keyed = ConfigStore::open(&path, Some(key)).expect("test setup: open");
+            keyed
+                .upsert_adcs_authority(&sample_adcs_authority("adcs-1"))
+                .expect("upsert");
+            keyed.set_adcs_password(Some(PASSWORD)).expect("password");
+        }
+        let keyless = ConfigStore::open(&path, None).expect("test setup: reopen");
+        assert!(keyless.has_adcs_password().expect("presence"));
+    }
+
+    #[test]
+    fn a_purge_removes_the_authority_and_its_password_whatever_references_it() {
+        let store = keyed_store();
+        assert!(!store.purge_adcs_authority().expect("nothing to purge"));
+        store
+            .upsert_adcs_authority(&sample_adcs_authority("adcs-1"))
+            .expect("upsert");
+        store.set_adcs_password(Some(PASSWORD)).expect("password");
+        store
+            .create_certificate(&certificate("web", Some("adcs-1")))
+            .expect("test setup: cert");
+
+        assert!(store.purge_adcs_authority().expect("purge"));
+        assert!(store.get_adcs_authority().expect("read").is_none());
+        assert!(!store.has_adcs_password().expect("presence"));
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM adcs_authority", [], |row| row.get(0))
+            .expect("test setup: count");
+        assert_eq!(rows, 0, "no ciphertext left behind");
+        let web = store.get_certificate("web").expect("read").expect("row");
+        assert_eq!(
+            web.adcs_authority_id.as_deref(),
+            Some("adcs-1"),
+            "a follower keeps the certificates the control plane issued"
+        );
+    }
+
+    #[test]
+    fn migration_66_lists_the_default_template_of_an_existing_authority() {
+        let store = keyed_store();
+        let mut authority = sample_adcs_authority("adcs-1");
+        authority.allowed_templates = Vec::new();
+        store.upsert_adcs_authority(&authority).expect("upsert");
+        // As a row written before the list existed reads after the column
+        // was added with its default.
+        store
+            .conn
+            .execute(
+                "UPDATE adcs_authority SET allowed_templates_json = '[]'",
+                [],
+            )
+            .expect("test setup: reset the list");
+
+        super::super::migrate_adcs_allowed_templates(&store.conn).expect("migration 66");
+        super::super::migrate_adcs_allowed_templates(&store.conn)
+            .expect("migration 66 is idempotent");
+
+        let read = store.get_adcs_authority().expect("read").expect("row");
+        assert_eq!(read.allowed_templates, vec![read.default_template.clone()]);
+    }
+
+    #[test]
+    fn the_allowed_templates_round_trip_and_are_validated() {
+        let store = keyed_store();
+        let mut authority = sample_adcs_authority("adcs-1");
+        authority.allowed_templates = vec!["LoricaWebServer".into(), "LoricaEcdsa".into()];
+        store.upsert_adcs_authority(&authority).expect("upsert");
+        let read = store.get_adcs_authority().expect("read").expect("row");
+        assert_eq!(read.allowed_templates, authority.allowed_templates);
+
+        authority.allowed_templates.push("Bad\ttemplate".into());
+        assert!(matches!(
+            store.upsert_adcs_authority(&authority),
+            Err(ConfigError::Validation(_))
         ));
     }
 

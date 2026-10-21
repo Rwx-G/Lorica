@@ -368,7 +368,7 @@ async fn iv1_only_a_certificate_the_issuing_ca_signed_is_offered() {
         (&sibling, "not signed by the authority's issuing CA"),
         (&forged, "not signed by the authority's issuing CA"),
         (&foreign_key_id, "not signed by the authority's issuing CA"),
-        (&outside, "not under an allowed DNS suffix"),
+        (&outside, "under an allowed suffix"),
         (&wildcard, "wildcard"),
     ] {
         let (status, json) = post(&f, &adopt_path(id), &f.admin, None).await;
@@ -858,4 +858,165 @@ async fn iv2_an_adopted_bound_certificate_is_renewed_in_place_by_the_loop() {
     let subject = csr.certification_request_info.subject.to_string();
     assert!(subject.contains("O=Example Corp"), "{subject}");
     assert!(subject.contains(&format!("CN={name}")), "{subject}");
+}
+
+/// A request on a limiter of its own: the download bucket admits five
+/// per window, fewer than this test makes.
+async fn unlimited(
+    f: &Fixture,
+    method: &str,
+    uri: &str,
+    cookie: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, String) {
+    let resp = crate::tests::send(
+        &f.state,
+        &f.session_store,
+        &RateLimiter::new(),
+        method,
+        uri,
+        cookie,
+        body,
+    )
+    .await;
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Epic 13 D16: once a certificate is AD CS (adopted here), its private
+/// key is downloadable by no role, through `key`, `bundle` or the
+/// default part; its certificate and chain stay downloadable at the
+/// usual floor.
+#[tokio::test]
+async fn the_key_of_an_adcs_certificate_is_downloaded_by_no_role() {
+    let pki = pki();
+    let stub = StubAuthority::new(issue_v2());
+    let f = with_authority(&stub, &pki.issuing.pem).await;
+    let id = upload(
+        &f,
+        "web01.corp.example.org",
+        leaf(
+            &pki.issuing.issuer,
+            &["web01.corp.example.org"],
+            TemplateExtension::V2,
+        ),
+        &pki.issuing.pem,
+    )
+    .await;
+    let operator = f.user("operator-d16", Role::Operator).await;
+    let viewer = f.user("viewer-d16", Role::Viewer).await;
+    let download = |part: &str| format!("/api/v1/certificates/{id}/download{part}");
+
+    let (status, text) = unlimited(&f, "GET", &download("?part=key"), &operator, None).await;
+    assert_eq!(status, StatusCode::OK, "a manual key: {text}");
+    assert!(text.contains("PRIVATE KEY"));
+
+    let (status, _) = post(&f, &adopt_path(&id), &operator, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stored(&f, &id).await.source(), CertificateSource::Adcs);
+
+    for (role, cookie) in [
+        ("viewer", viewer.as_str()),
+        ("operator", operator.as_str()),
+        ("superadmin", f.admin.as_str()),
+    ] {
+        for part in ["?part=key", "?part=bundle", ""] {
+            let (status, text) = unlimited(&f, "GET", &download(part), cookie, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{role} {part}: {text}");
+            assert!(!text.contains("PRIVATE KEY"), "{role} {part}");
+            if role != "viewer" {
+                let json: serde_json::Value = serde_json::from_str(&text).expect("JSON error");
+                assert_eq!(
+                    json["error"]["code"],
+                    crate::certificates::ADCS_KEY_NOT_EXPORTABLE,
+                    "{role} {part}"
+                );
+            }
+        }
+        for part in ["?part=cert", "?part=chain"] {
+            let (status, text) = unlimited(&f, "GET", &download(part), cookie, None).await;
+            if role == "viewer" {
+                assert_eq!(status, StatusCode::FORBIDDEN, "{role} {part}");
+            } else {
+                assert_eq!(status, StatusCode::OK, "{role} {part}: {text}");
+                assert!(text.contains("BEGIN CERTIFICATE"), "{role} {part}");
+                assert!(!text.contains("PRIVATE KEY"), "{role} {part}");
+            }
+        }
+    }
+}
+
+/// Pen L2: the PEM, key and domain of an AD CS certificate cannot be
+/// replaced through the generic update, which would bypass the
+/// signature check adoption makes; its auto-renew setting can be
+/// changed, and reverting it makes the replacement an ordinary update.
+#[tokio::test]
+async fn the_pem_of_an_adcs_certificate_is_not_replaced_through_the_update() {
+    let pki = pki();
+    let stub = StubAuthority::new(issue_v2());
+    let f = with_authority(&stub, &pki.issuing.pem).await;
+    let id = upload(
+        &f,
+        "web01.corp.example.org",
+        leaf(
+            &pki.issuing.issuer,
+            &["web01.corp.example.org"],
+            TemplateExtension::V2,
+        ),
+        &pki.issuing.pem,
+    )
+    .await;
+    let (status, _) = post(&f, &adopt_path(&id), &f.admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let before: Certificate = stored(&f, &id).await;
+    let (foreign_pem, foreign_key) = leaf(
+        &pki.forged.issuer,
+        &["web01.corp.example.org"],
+        TemplateExtension::V2,
+    );
+    let path = format!("/api/v1/certificates/{id}");
+
+    for change in [
+        serde_json::json!({ "cert_pem": foreign_pem, "key_pem": foreign_key }),
+        serde_json::json!({ "domain": "dc01.corp.example.org" }),
+        serde_json::json!({ "key_pem": crate::tests::TEST_KEY_RSA_PEM }),
+    ] {
+        let (status, text) = unlimited(&f, "PUT", &path, &f.admin, Some(change.clone())).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{change}: {text}");
+        let json: serde_json::Value = serde_json::from_str(&text).expect("JSON error");
+        assert_eq!(
+            json["error"]["code"],
+            crate::certificates::ADCS_CERTIFICATE_MANAGED
+        );
+    }
+    let after: Certificate = stored(&f, &id).await;
+    assert_eq!(after.fingerprint, before.fingerprint);
+    assert_eq!(after.domain, before.domain);
+    assert_eq!(after.source(), CertificateSource::Adcs);
+
+    let (status, text) = unlimited(
+        &f,
+        "PUT",
+        &path,
+        &f.admin,
+        Some(serde_json::json!({ "acme_auto_renew": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(!stored(&f, &id).await.acme_auto_renew);
+
+    let (status, _) = post(&f, &revert_path(&id), &f.admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, text) = unlimited(
+        &f,
+        "PUT",
+        &path,
+        &f.admin,
+        Some(serde_json::json!({ "cert_pem": foreign_pem, "key_pem": foreign_key })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a manual certificate: {text}");
 }

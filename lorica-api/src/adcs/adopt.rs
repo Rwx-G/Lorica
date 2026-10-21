@@ -20,11 +20,12 @@
 //! A candidate is a manual certificate whose leaf the authority's
 //! issuing CA certificate signed, and whose names a renewal could
 //! request: every one of them under an allowed suffix, none a wildcard
-//! (the rule issuance applies, [`check_sans`]). "Signed" means the
-//! leaf's signature verifies against the issuing CA certificate's
-//! public key, the leaf's issuer name is that certificate's subject,
-//! and, when the leaf carries an authority key identifier and the CA a
-//! subject key identifier, the two are equal. The issuer name alone
+//! (the rule issuance applies, [`check_sans`]). "Signed" is
+//! [`lorica_adcs::issued_by`], the rule the client applies to an issued
+//! chain: the leaf's signature verifies against the issuing CA
+//! certificate's public key, the leaf's issuer name is that
+//! certificate's subject, and, when the leaf carries an authority key
+//! identifier and the CA a subject key identifier, the two are equal. The issuer name alone
 //! proves nothing (anyone can mint a CA with the same name), and a root
 //! would match every issuing CA under it, so only the first certificate
 //! of the authority's `issuing_ca_pem` is ever used.
@@ -51,7 +52,6 @@ use lorica_config::models::{AdcsAuthority, Certificate, CertificateSource};
 use lorica_config::ConfigStore;
 use serde::{Deserialize, Serialize};
 use x509_parser::certificate::X509Certificate;
-use x509_parser::extensions::ParsedExtension;
 
 use super::issue::{check_sans, normalize_sans, template_oid_of, IssueError};
 use super::renew::{renewal_names, stored_leaf_der};
@@ -179,40 +179,6 @@ fn parse_issuing_ca(der: &[u8]) -> Result<X509Certificate<'_>, ApiError> {
         .map_err(|err| ApiError::Internal(format!("stored AD CS issuing CA certificate: {err}")))
 }
 
-fn authority_key_id<'c>(cert: &'c X509Certificate<'_>) -> Option<&'c [u8]> {
-    cert.extensions()
-        .iter()
-        .find_map(|extension| match extension.parsed_extension() {
-            ParsedExtension::AuthorityKeyIdentifier(aki) => {
-                aki.key_identifier.as_ref().map(|id| id.0)
-            }
-            _ => None,
-        })
-}
-
-fn subject_key_id<'c>(cert: &'c X509Certificate<'_>) -> Option<&'c [u8]> {
-    cert.extensions()
-        .iter()
-        .find_map(|extension| match extension.parsed_extension() {
-            ParsedExtension::SubjectKeyIdentifier(id) => Some(id.0),
-            _ => None,
-        })
-}
-
-/// Whether `ca` signed `leaf` (see the module documentation).
-pub(crate) fn signed_by(leaf: &X509Certificate<'_>, ca: &X509Certificate<'_>) -> bool {
-    if leaf.issuer().as_raw() != ca.subject().as_raw() {
-        return false;
-    }
-    if leaf.verify_signature(Some(ca.public_key())).is_err() {
-        return false;
-    }
-    match (authority_key_id(leaf), subject_key_id(ca)) {
-        (Some(authority_key), Some(subject_key)) => authority_key == subject_key,
-        _ => true,
-    }
-}
-
 /// The template `cert`'s leaf names, when `cert` is a candidate for
 /// `authority`, whose issuing CA certificate is `ca`.
 pub(crate) fn assess(
@@ -228,7 +194,7 @@ pub(crate) fn assess(
     let (_, leaf) = x509_parser::parse_x509_certificate(&leaf_der).map_err(|err| {
         NotCandidate::Unreadable(format!("the stored certificate does not parse: {err}"))
     })?;
-    if !signed_by(&leaf, ca) {
+    if !lorica_adcs::issued_by(&leaf, ca) {
         return Err(NotCandidate::NotSignedByIssuingCa);
     }
     let names: Vec<String> = normalize_sans(&renewal_names(cert));

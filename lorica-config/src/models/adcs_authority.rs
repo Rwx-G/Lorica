@@ -29,6 +29,46 @@ const DNS_NAME_MAX_LEN: usize = 253;
 /// RFC 1035 section 2.3.4: one label is at most 63 octets.
 const DNS_LABEL_MAX_LEN: usize = 63;
 
+/// The longest template name accepted. A bound on what an audit row and
+/// a CSR attribute carry, not a rule of the authority's.
+pub const ADCS_TEMPLATE_NAME_MAX_LEN: usize = 256;
+
+/// The most templates [`AdcsAuthority::allowed_templates`] may list.
+pub const ADCS_ALLOWED_TEMPLATES_MAX: usize = 32;
+
+/// Check one template common name (Epic 13 D17): non-empty, at most
+/// [`ADCS_TEMPLATE_NAME_MAX_LEN`] characters, no control character. The
+/// value is taken as given; callers trim before calling. `field` names
+/// the field in the error.
+///
+/// The one rule for every template name Lorica stores or sends: the
+/// authority's default, its allowed list and an issuance request's
+/// override all go through it.
+///
+/// # Errors
+///
+/// [`ConfigError::Validation`] naming `field`.
+///
+/// ```
+/// use lorica_config::models::validate_template_name;
+/// assert!(validate_template_name("template", "LoricaWebServer").is_ok());
+/// assert!(validate_template_name("template", "").is_err());
+/// assert!(validate_template_name("template", "Web\nServer").is_err());
+/// ```
+pub fn validate_template_name(field: &str, name: &str) -> Result<()> {
+    if name.is_empty() || name.chars().any(char::is_control) {
+        return Err(ConfigError::Validation(format!(
+            "{field}: a template's common name is required, without control characters"
+        )));
+    }
+    if name.chars().count() > ADCS_TEMPLATE_NAME_MAX_LEN {
+        return Err(ConfigError::Validation(format!(
+            "{field}: a template name is at most {ADCS_TEMPLATE_NAME_MAX_LEN} characters"
+        )));
+    }
+    Ok(())
+}
+
 /// The key the CSR is generated with (PRD D4).
 ///
 /// RSA 2048 is the default because a template duplicated from *Web
@@ -273,6 +313,13 @@ pub struct AdcsAuthority {
     pub issuing_ca_pem: Option<String>,
     /// The template's common name (`cn`), never its display name.
     pub default_template: String,
+    /// The template common names an issuance may request besides
+    /// [`AdcsAuthority::default_template`], which is always permitted
+    /// (D17). The template decides what the authority signs (EKU,
+    /// validity, CA or not), so it is bounded by the role that does not
+    /// issue, like the suffixes.
+    #[serde(default)]
+    pub allowed_templates: Vec<String>,
     /// The key type a new certificate gets unless the request says
     /// otherwise.
     #[serde(default)]
@@ -313,10 +360,36 @@ impl AdcsAuthority {
         self.allowed_suffixes.iter().any(|s| s.permits(name))
     }
 
+    /// Whether an issuance may request `template` (D17): the default
+    /// template or one of the allowed ones. Compared without regard to
+    /// ASCII case, as the authority looks a template up by its common
+    /// name.
+    ///
+    /// ```
+    /// use lorica_config::models::AdcsAuthority;
+    /// # fn demo(mut authority: AdcsAuthority) {
+    /// authority.default_template = "LoricaWebServer".to_string();
+    /// authority.allowed_templates = vec!["LoricaWebServerEcdsa".to_string()];
+    /// assert!(authority.permits_template("LoricaWebServer"));
+    /// assert!(authority.permits_template("loricawebserverecdsa"));
+    /// assert!(!authority.permits_template("User"));
+    /// # }
+    /// ```
+    pub fn permits_template(&self, template: &str) -> bool {
+        std::iter::once(&self.default_template)
+            .chain(&self.allowed_templates)
+            .any(|allowed: &String| allowed.eq_ignore_ascii_case(template))
+    }
+
     /// The invariants the store refuses to persist without: an
-    /// `https://` endpoint with a host, a principal, a template, and at
-    /// least one allowed suffix. The realm and KDC grammar is the API's
-    /// (see the module doc).
+    /// `https://` endpoint with a host, a principal, valid template
+    /// names, and at least one allowed suffix.
+    ///
+    /// The endpoint check is coarse on purpose: this crate does not link
+    /// `lorica-adcs` (see the module doc), whose `CesEndpoint` the API
+    /// validates with. A test in `lorica-api` replays `CesEndpoint`'s
+    /// accepted vectors here, so this check never refuses what the API
+    /// accepted. The realm and KDC grammar is the API's alone.
     ///
     /// # Errors
     ///
@@ -341,10 +414,14 @@ impl AdcsAuthority {
                 "AD CS principal is required".to_string(),
             ));
         }
-        if self.default_template.trim().is_empty() {
-            return Err(ConfigError::Validation(
-                "AD CS default template is required".to_string(),
-            ));
+        validate_template_name("default_template", &self.default_template)?;
+        if self.allowed_templates.len() > ADCS_ALLOWED_TEMPLATES_MAX {
+            return Err(ConfigError::Validation(format!(
+                "allowed_templates: at most {ADCS_ALLOWED_TEMPLATES_MAX} templates"
+            )));
+        }
+        for template in &self.allowed_templates {
+            validate_template_name("allowed_templates", template)?;
         }
         if self.allowed_suffixes.is_empty() {
             return Err(ConfigError::Validation(
@@ -381,6 +458,7 @@ pub(crate) fn sample_adcs_authority(id: &str) -> AdcsAuthority {
             "-----BEGIN CERTIFICATE-----\nissuing-ca-{s}\n-----END CERTIFICATE-----"
         )),
         default_template: format!("Template{s}"),
+        allowed_templates: vec![format!("Template{s}"), format!("Other{s}")],
         default_key_type: AdcsKeyType::Rsa3072,
         subject: AdcsSubjectDefaults {
             country: Some("FR".to_string()),
@@ -532,6 +610,18 @@ mod tests {
         no_template.default_template = String::new();
         let mut no_suffix = authority();
         no_suffix.allowed_suffixes.clear();
+        let mut control_template = authority();
+        control_template.default_template = "Web\u{7}Server".to_string();
+        let mut empty_allowed = authority();
+        empty_allowed.allowed_templates.push(String::new());
+        let mut too_many_allowed = authority();
+        too_many_allowed.allowed_templates = (0..=ADCS_ALLOWED_TEMPLATES_MAX)
+            .map(|n| format!("Template{n}"))
+            .collect();
+        let mut too_long_allowed = authority();
+        too_long_allowed
+            .allowed_templates
+            .push("T".repeat(ADCS_TEMPLATE_NAME_MAX_LEN + 1));
         for broken in [
             plain_http,
             no_host,
@@ -539,6 +629,10 @@ mod tests {
             no_principal,
             no_template,
             no_suffix,
+            control_template,
+            empty_allowed,
+            too_many_allowed,
+            too_long_allowed,
         ] {
             assert!(broken.validate().is_err(), "{broken:?}");
         }
@@ -555,6 +649,33 @@ mod tests {
         assert!(two.permits("web.corp.example.org"));
         assert!(two.permits("x.lab.example.net"));
         assert!(!two.permits("example.net"));
+    }
+
+    #[test]
+    fn the_default_template_is_always_permitted_and_nothing_else_is_unless_listed() {
+        let mut authority = authority();
+        authority.default_template = "LoricaWebServer".to_string();
+        authority.allowed_templates = Vec::new();
+        assert!(authority.permits_template("LoricaWebServer"));
+        assert!(authority.permits_template("LORICAWEBSERVER"));
+        assert!(!authority.permits_template("User"));
+        assert!(!authority.permits_template("LoricaWebServer2"));
+        assert!(!authority.permits_template(""));
+        authority.allowed_templates = vec!["LoricaWebServerEcdsa".to_string()];
+        assert!(authority.permits_template("LoricaWebServerEcdsa"));
+        assert!(authority.permits_template("LoricaWebServer"));
+        assert!(!authority.permits_template("SubCA"));
+    }
+
+    #[test]
+    fn a_stored_authority_without_the_field_reads_with_no_extra_template() {
+        let mut json = serde_json::to_value(authority()).expect("test setup: serialise");
+        json.as_object_mut()
+            .expect("an object")
+            .remove("allowed_templates");
+        let read: AdcsAuthority = serde_json::from_value(json).expect("deserialise");
+        assert!(read.allowed_templates.is_empty());
+        assert!(read.permits_template(&read.default_template));
     }
 
     #[test]

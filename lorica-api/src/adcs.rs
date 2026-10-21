@@ -24,16 +24,20 @@
 //! [`crate::middleware::authorize::required_role`] (D11): whoever can
 //! edit the realm or the KDC list decides where pre-authentication
 //! derived from the service account's password is sent, and whoever can
-//! edit the suffixes decides which names Lorica may request.
+//! edit the suffixes and the templates decides which names Lorica may
+//! request and what the authority signs for them (D17). A read is open
+//! to every role, but only Operators and above see how the authority is
+//! reached (D18).
 //!
 //! # The password
 //!
 //! Write-only. It arrives as [`WritePassword`], which wraps a
 //! [`lorica_adcs::Secret`] and prints as redacted, goes straight into
 //! the store's encrypted column, and is never returned: a read reports
-//! `password_set` only. A change to the endpoint, realm, KDC list or
-//! principal is refused unless the same request carries a new password,
-//! because the stored one was given for the old identity (D11). The
+//! `password_set` only. A change to the endpoint, realm, KDC list,
+//! principal or endpoint trust bundle is refused unless the same request
+//! carries a new password, because the stored one was given for the old
+//! identity (D11). The
 //! check, the row, the password and the generated `krb5.conf` are
 //! written inside one store transaction, so a refusal or a failure at
 //! any step leaves the stored password as it was.
@@ -64,10 +68,13 @@ use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
 use lorica_adcs::{
-    AdcsError, CesParams, CesTimeouts, EnrollOutcome, KdcAddress, KdcTiming, Krb5Config, Realm,
-    Secret, TicketFailure,
+    kdc_error_meaning, AdcsError, CesEndpoint, CesParams, CesTimeouts, EnrollOutcome, KdcAddress,
+    KdcTiming, Krb5Config, Principal, Realm, Secret, TicketFailure,
 };
-use lorica_config::models::{AdcsAuthority, AdcsKeyType, AdcsSubjectDefaults, AllowedSuffix};
+use lorica_config::models::{
+    validate_template_name, AdcsAuthority, AdcsKeyType, AdcsSubjectDefaults, AllowedSuffix, Role,
+    ADCS_ALLOWED_TEMPLATES_MAX,
+};
 use lorica_config::ConfigStore;
 use serde::{Deserialize, Serialize};
 
@@ -100,6 +107,12 @@ const AUDIT_TARGET: &str = "adcs_authority";
 /// outer guard fires, and leaves room for MIT to try a second KDC.
 pub const KDC_REQUEST_TIMEOUT_SECS: u32 = 30;
 
+/// How long the renewal loop waits for a busy guard before trying its
+/// AD CS batch again. A tick that gave up at the first refusal could be
+/// skipped, for 12 hours, by anyone keeping the guard busy with
+/// connection tests or issuances at the right moment.
+const BUSY_RETRY_DELAY: Duration = Duration::from_secs(30);
+
 /// The message of every refusal by [`AdcsGuard`].
 const BUSY_MESSAGE: &str = "an AD CS operation is already running; try again once it has finished";
 
@@ -123,28 +136,102 @@ const STILL_RUNNING_MESSAGE: &str = "the AD CS operation is still finishing: a K
      outlived the operation timeout. Its outcome is recorded in the audit log when it ends, and \
      every other AD CS operation is refused until then";
 
-/// The calls into the authority the API makes, behind a seam so tests
-/// drive the handlers without a KDC. Production uses
-/// [`lorica_adcs::test_connection`] and [`lorica_adcs::enroll`].
+/// One authenticated conversation with the authority: one ticket for
+/// every request of one API operation or one renewal tick (Epic 13 D3,
+/// D15). It holds the service account's ticket, so it never outlives
+/// the operation or the tick that opened it.
 #[async_trait::async_trait]
-pub(crate) trait AdcsClient: Send + Sync {
-    /// Authenticate to the CES described by `params` without
-    /// requesting anything.
-    async fn test_connection(&self, params: &CesParams, password: &Secret)
-        -> Result<(), AdcsError>;
+pub(crate) trait AdcsSession: Send {
+    /// Authenticate without requesting anything.
+    async fn test(&mut self) -> Result<(), AdcsError>;
 
     /// Request a certificate for the DER PKCS#10 `csr_der`: an issuance
     /// at the authority.
+    async fn enroll(&mut self, csr_der: &[u8]) -> Result<EnrollOutcome, AdcsError>;
+}
+
+/// The calls into the authority the API makes, behind a seam so tests
+/// drive the handlers without a KDC. Production opens a
+/// [`lorica_adcs::CesSession`].
+#[async_trait::async_trait]
+pub(crate) trait AdcsClient: Send + Sync {
+    /// Authenticate to the CES described by `params` without
+    /// requesting anything, on a session of its own.
+    async fn test_connection(&self, params: &CesParams, password: &Secret)
+        -> Result<(), AdcsError>;
+
+    /// Request a certificate for `csr_der` on a session of its own.
     async fn enroll(
         &self,
         params: &CesParams,
         password: &Secret,
         csr_der: &[u8],
     ) -> Result<EnrollOutcome, AdcsError>;
+
+    /// Open a session. The default makes every request of it a call of
+    /// its own, which is what a stand-in authority needs; the real
+    /// client acquires one ticket for the whole session.
+    async fn open<'a>(
+        &'a self,
+        params: &CesParams,
+        password: Secret,
+    ) -> Result<Box<dyn AdcsSession + 'a>, AdcsError> {
+        Ok(per_request_session(self, params, password))
+    }
+}
+
+/// A session on `client` whose requests each go through its one-shot
+/// calls.
+pub(crate) fn per_request_session<'a, C: AdcsClient + ?Sized>(
+    client: &'a C,
+    params: &CesParams,
+    password: Secret,
+) -> Box<dyn AdcsSession + 'a> {
+    Box::new(PerRequest {
+        client,
+        params: params.clone(),
+        password,
+    })
+}
+
+/// See [`per_request_session`].
+struct PerRequest<'a, C: ?Sized> {
+    client: &'a C,
+    params: CesParams,
+    password: Secret,
+}
+
+#[async_trait::async_trait]
+impl<C: AdcsClient + ?Sized> AdcsSession for PerRequest<'_, C> {
+    async fn test(&mut self) -> Result<(), AdcsError> {
+        self.client
+            .test_connection(&self.params, &self.password)
+            .await
+    }
+
+    async fn enroll(&mut self, csr_der: &[u8]) -> Result<EnrollOutcome, AdcsError> {
+        self.client
+            .enroll(&self.params, &self.password, csr_der)
+            .await
+    }
 }
 
 /// The real client: the `lorica-adcs` crate.
 struct LibAdcsClient;
+
+/// A [`lorica_adcs::CesSession`] behind the seam.
+struct LibSession(lorica_adcs::CesSession);
+
+#[async_trait::async_trait]
+impl AdcsSession for LibSession {
+    async fn test(&mut self) -> Result<(), AdcsError> {
+        self.0.test().await
+    }
+
+    async fn enroll(&mut self, csr_der: &[u8]) -> Result<EnrollOutcome, AdcsError> {
+        self.0.enroll(csr_der).await
+    }
+}
 
 #[async_trait::async_trait]
 impl AdcsClient for LibAdcsClient {
@@ -163,6 +250,63 @@ impl AdcsClient for LibAdcsClient {
         csr_der: &[u8],
     ) -> Result<EnrollOutcome, AdcsError> {
         lorica_adcs::enroll(params, password, csr_der).await
+    }
+
+    async fn open<'a>(
+        &'a self,
+        params: &CesParams,
+        password: Secret,
+    ) -> Result<Box<dyn AdcsSession + 'a>, AdcsError> {
+        let session = lorica_adcs::CesSession::open(params, &password).await?;
+        Ok(Box::new(LibSession(session)))
+    }
+}
+
+/// A session opened on its first request, so an operation refused
+/// before it reaches the authority (a name, a template) builds nothing,
+/// and a renewal tick shares one session across its certificates.
+///
+/// Opening contacts nothing (see [`lorica_adcs::CesSession::open`]), so
+/// a failed open is retried on the next request at no cost to the
+/// account.
+pub(crate) struct LazySession<'a> {
+    client: &'a dyn AdcsClient,
+    params: CesParams,
+    password: Secret,
+    session: Option<Box<dyn AdcsSession + 'a>>,
+}
+
+impl<'a> LazySession<'a> {
+    /// A session on `client` for the authority `params` describes.
+    pub(crate) fn new(client: &'a dyn AdcsClient, params: CesParams, password: Secret) -> Self {
+        LazySession {
+            client,
+            params,
+            password,
+            session: None,
+        }
+    }
+
+    async fn opened(&mut self) -> Result<&mut Box<dyn AdcsSession + 'a>, AdcsError> {
+        let session: Box<dyn AdcsSession + 'a> = match self.session.take() {
+            Some(session) => session,
+            None => {
+                self.client
+                    .open(&self.params, self.password.clone())
+                    .await?
+            }
+        };
+        Ok(self.session.insert(session))
+    }
+
+    /// See [`AdcsSession::test`].
+    pub(crate) async fn test(&mut self) -> Result<(), AdcsError> {
+        self.opened().await?.test().await
+    }
+
+    /// See [`AdcsSession::enroll`].
+    pub(crate) async fn enroll(&mut self, csr_der: &[u8]) -> Result<EnrollOutcome, AdcsError> {
+        self.opened().await?.enroll(csr_der).await
     }
 }
 
@@ -303,6 +447,9 @@ pub struct AdcsRuntime {
     client: Arc<dyn AdcsClient>,
     alerts: Option<lorica_notify::AlertSender>,
     handler_deadline: Duration,
+    /// How long the renewal loop waits before trying again when another
+    /// AD CS operation holds the guard.
+    busy_retry_delay: Duration,
     pub(crate) renewals: Arc<AdcsRenewalMemory>,
 }
 
@@ -315,6 +462,7 @@ impl AdcsRuntime {
             client: Arc::new(LibAdcsClient),
             alerts,
             handler_deadline: handler_deadline(),
+            busy_retry_delay: BUSY_RETRY_DELAY,
             renewals: Arc::default(),
         }
     }
@@ -330,6 +478,7 @@ impl AdcsRuntime {
             client,
             alerts,
             handler_deadline: handler_deadline(),
+            busy_retry_delay: BUSY_RETRY_DELAY,
             renewals: Arc::default(),
         }
     }
@@ -339,6 +488,19 @@ impl AdcsRuntime {
     pub(crate) fn with_handler_deadline(mut self, deadline: Duration) -> AdcsRuntime {
         self.handler_deadline = deadline;
         self
+    }
+
+    /// The same runtime with a renewal-loop busy retry short enough for
+    /// a test.
+    #[cfg(test)]
+    pub(crate) fn with_busy_retry_delay(mut self, delay: Duration) -> AdcsRuntime {
+        self.busy_retry_delay = delay;
+        self
+    }
+
+    /// How long the renewal loop waits before retrying a busy guard.
+    pub(crate) fn busy_retry_delay(&self) -> Duration {
+        self.busy_retry_delay
     }
 
     /// The single-flight guard, for a test to hold it.
@@ -373,6 +535,28 @@ where
         Ok(Err(err)) => Err(NotRun::Lost(err.to_string())),
         Err(_) => Err(NotRun::StillRunning),
     }
+}
+
+/// Run `operation` as the one AD CS operation of the process and wait
+/// for its end, or return [`NotRun::Busy`] at once when another one is
+/// running. For the renewal loop, which has no client to answer: the
+/// operation is a whole tick's batch, bounded per request by the
+/// client's operation timeout rather than by a handler's deadline.
+pub(crate) async fn run_exclusive_to_end<T, F>(
+    runtime: &AdcsRuntime,
+    operation: F,
+) -> Result<T, NotRun>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let permit: AdcsPermit = runtime.guard.try_acquire().ok_or(NotRun::Busy)?;
+    tokio::spawn(async move {
+        let _permit: AdcsPermit = permit;
+        operation.await
+    })
+    .await
+    .map_err(|err| NotRun::Lost(err.to_string()))
 }
 
 /// Why no AD CS operation may start now.
@@ -538,36 +722,6 @@ pub async fn write_krb5_conf_at_startup(state: &AppState) {
     }
 }
 
-/// The closed step word an AD CS error is audited and persisted under.
-/// The operator reads the error's own text, which names the step in
-/// words (Story 13.1 AC #8); this is the field a filter matches on.
-pub(crate) fn failure_step(err: &AdcsError) -> &'static str {
-    match err {
-        AdcsError::Ticket { failure, .. } => match failure {
-            TicketFailure::KdcUnreachable => "kdc_discovery",
-            TicketFailure::CredentialRejected => "ticket_acquisition",
-        },
-        AdcsError::ServiceName { .. } | AdcsError::Spnego { .. } => "spnego",
-        AdcsError::MutualAuth { .. } => "mutual_authentication",
-        AdcsError::ChannelBindingCertificate { .. } | AdcsError::ChannelBindingAlgorithm { .. } => {
-            "channel_binding"
-        }
-        AdcsError::Tls { .. } => "tls",
-        AdcsError::Http { .. } => "http",
-        AdcsError::InvalidRealm { .. }
-        | AdcsError::InvalidKdc { .. }
-        | AdcsError::InvalidKdcTiming { .. }
-        | AdcsError::Krb5ConfWrite { .. } => "krb5_conf",
-        AdcsError::InvalidParams { .. } => "configuration",
-        AdcsError::Csr { .. } => "csr",
-        AdcsError::SoapEnvelope { .. } | AdcsError::SoapResponse { .. } => "soap",
-        AdcsError::Chain { .. } => "chain",
-        AdcsError::Timeout { .. } => "timeout",
-        AdcsError::GssTask { .. } => "gss_task",
-        _ => "other",
-    }
-}
-
 /// Open the D15 breaker when `err` is a credential the KDC rejected.
 ///
 /// Returns `true` when this call is the entry into the failed state; it
@@ -588,7 +742,7 @@ pub(crate) async fn record_credential_rejection(
     else {
         return Ok(false);
     };
-    let step: &'static str = failure_step(err);
+    let step: &'static str = err.step().as_str();
     let kdc_code: Option<i32> = kdc_error_code.and_then(|code: u32| i32::try_from(code).ok());
     let entered: bool = db_blocking(&state.store, move |store| {
         store.set_adcs_failed(step, kdc_code)
@@ -659,14 +813,16 @@ pub struct AdcsAuthorityRequest {
     pub endpoint: String,
     /// The Kerberos realm, `^[A-Z0-9][A-Z0-9.-]*$`.
     pub realm: String,
-    /// Explicit KDCs as `host[:port]`; empty means DNS SRV discovery.
+    /// Explicit KDCs as `host[:port]`, at most [`MAX_KDCS`]; empty means
+    /// DNS SRV discovery.
     #[serde(default)]
     pub kdcs: Vec<String>,
     /// The service account, `user` or `user@REALM`.
     pub principal: String,
     /// The service account password. Required on creation and with any
-    /// change of `endpoint`, `realm`, `kdcs` or `principal`; optional
-    /// otherwise, where it replaces the stored one. Never returned.
+    /// change of `endpoint`, `realm`, `kdcs`, `principal` or
+    /// `endpoint_ca_pem`; optional otherwise, where it replaces the
+    /// stored one. Never returned.
     #[serde(default)]
     pub password: Option<WritePassword>,
     /// PEM certificates trusted, alone, for the endpoint's TLS
@@ -678,6 +834,10 @@ pub struct AdcsAuthorityRequest {
     pub issuing_ca_pem: Option<String>,
     /// The template's common name.
     pub default_template: String,
+    /// The other template common names an issuance may request (D17);
+    /// the default template is always permitted.
+    #[serde(default)]
+    pub allowed_templates: Vec<String>,
     /// The key type of a new certificate.
     #[serde(default)]
     pub default_key_type: AdcsKeyType,
@@ -690,6 +850,11 @@ pub struct AdcsAuthorityRequest {
     pub auto_renew_default: bool,
 }
 
+/// The most explicit KDCs an authority may list. MIT tries them in
+/// turn, each silent one costing its own retry schedule while the
+/// operation holds the single-flight guard, so the list is bounded.
+pub const MAX_KDCS: usize = 10;
+
 /// The configuration part of a request once every field is valid.
 struct ValidatedRequest {
     endpoint: String,
@@ -699,6 +864,7 @@ struct ValidatedRequest {
     endpoint_ca_pem: Option<String>,
     issuing_ca_pem: Option<String>,
     default_template: String,
+    allowed_templates: Vec<String>,
     default_key_type: AdcsKeyType,
     subject: AdcsSubjectDefaults,
     allowed_suffixes: Vec<AllowedSuffix>,
@@ -711,54 +877,6 @@ fn refuse(reason: String) -> ApiError {
 
 fn has_control_characters(value: &str) -> bool {
     value.chars().any(char::is_control)
-}
-
-/// The endpoint's rules, those `lorica_adcs` applies before connecting:
-/// `https://`, no credentials in the URL, and a DNS host name, since the
-/// service ticket is for `HTTP/<host>`.
-fn validate_endpoint(raw: &str) -> Result<String, ApiError> {
-    let endpoint: &str = raw.trim();
-    let url: reqwest::Url = reqwest::Url::parse(endpoint)
-        .map_err(|err| refuse(format!("endpoint: not a URL ({err})")))?;
-    if url.scheme() != "https" {
-        return Err(refuse("endpoint: must be an https:// URL".to_string()));
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(refuse(
-            "endpoint: must not carry credentials in the URL".to_string(),
-        ));
-    }
-    if url.domain().is_none() {
-        return Err(refuse(
-            "endpoint: the host must be a DNS name, the service ticket is for HTTP/<host>"
-                .to_string(),
-        ));
-    }
-    Ok(endpoint.to_string())
-}
-
-/// `user` or `user@REALM` with the authority's realm, as the client
-/// builds the principal name.
-fn validate_principal(raw: &str, realm: &Realm) -> Result<String, ApiError> {
-    let principal: &str = raw.trim();
-    if principal.is_empty()
-        || principal
-            .chars()
-            .any(|c: char| c.is_control() || c.is_whitespace())
-    {
-        return Err(refuse(
-            "principal: required, with no spaces or control characters".to_string(),
-        ));
-    }
-    match principal.split_once('@') {
-        None => Ok(principal.to_string()),
-        Some((user, principal_realm)) if !user.is_empty() && principal_realm == realm.as_str() => {
-            Ok(principal.to_string())
-        }
-        Some(_) => Err(refuse(format!(
-            "principal: must be a user name or user@{realm}"
-        ))),
-    }
 }
 
 /// A PEM bundle of at least one certificate, every block a certificate
@@ -820,12 +938,49 @@ fn validate_subject(subject: AdcsSubjectDefaults) -> Result<AdcsSubjectDefaults,
     })
 }
 
+/// The allowed template list as stored: each name trimmed and checked,
+/// the default first, no name twice (ignoring ASCII case, as the
+/// authority does).
+fn allowed_template_list(
+    default_template: &str,
+    requested: &[String],
+) -> Result<Vec<String>, ApiError> {
+    let mut list: Vec<String> = vec![default_template.to_string()];
+    for raw in requested {
+        let name: &str = raw.trim();
+        validate_template_name("allowed_templates", name)?;
+        if !list
+            .iter()
+            .any(|kept: &String| kept.eq_ignore_ascii_case(name))
+        {
+            list.push(name.to_string());
+        }
+    }
+    if list.len() > ADCS_ALLOWED_TEMPLATES_MAX {
+        return Err(refuse(format!(
+            "allowed_templates: at most {ADCS_ALLOWED_TEMPLATES_MAX} templates, the default \
+             included"
+        )));
+    }
+    Ok(list)
+}
+
 impl AdcsAuthorityRequest {
-    /// Validate every field, splitting the password off.
+    /// Validate every field, splitting the password off. The endpoint,
+    /// realm, KDC and principal rules are `lorica_adcs`'s own, the ones
+    /// the client applies before it connects, so a value refused at the
+    /// first operation is refused here instead.
     fn validate(self) -> Result<(ValidatedRequest, Option<Secret>), ApiError> {
-        let endpoint: String = validate_endpoint(&self.endpoint)?;
+        let endpoint: &str = self.endpoint.trim();
+        CesEndpoint::new(endpoint).map_err(|err: AdcsError| refuse(format!("endpoint: {err}")))?;
         let realm: Realm =
             Realm::new(self.realm.trim()).map_err(|err: AdcsError| refuse(err.to_string()))?;
+        if self.kdcs.len() > MAX_KDCS {
+            return Err(refuse(format!(
+                "kdcs: at most {MAX_KDCS} KDCs, {} given",
+                self.kdcs.len()
+            )));
+        }
         let kdcs: Vec<String> = self
             .kdcs
             .iter()
@@ -835,13 +990,13 @@ impl AdcsAuthorityRequest {
                     .map_err(|err: AdcsError| refuse(err.to_string()))
             })
             .collect::<Result<Vec<String>, ApiError>>()?;
-        let principal: String = validate_principal(&self.principal, &realm)?;
+        let principal: &str = self.principal.trim();
+        Principal::new(principal, &realm)
+            .map_err(|err: AdcsError| refuse(format!("principal: {err}")))?;
         let default_template: String = self.default_template.trim().to_string();
-        if default_template.is_empty() || has_control_characters(&default_template) {
-            return Err(refuse(
-                "default_template: the template's common name is required".to_string(),
-            ));
-        }
+        validate_template_name("default_template", &default_template)?;
+        let allowed_templates: Vec<String> =
+            allowed_template_list(&default_template, &self.allowed_templates)?;
         if self.allowed_suffixes.is_empty() {
             return Err(refuse(
                 "allowed_suffixes: at least one DNS suffix is required".to_string(),
@@ -853,13 +1008,14 @@ impl AdcsAuthorityRequest {
             .map(|suffix: &String| AllowedSuffix::new(suffix.trim()))
             .collect::<Result<Vec<AllowedSuffix>, lorica_config::ConfigError>>()?;
         let validated: ValidatedRequest = ValidatedRequest {
-            endpoint,
+            endpoint: endpoint.to_string(),
             realm: realm.as_str().to_string(),
             kdcs,
-            principal,
+            principal: principal.to_string(),
             endpoint_ca_pem: validate_pem_bundle("endpoint_ca_pem", self.endpoint_ca_pem)?,
             issuing_ca_pem: validate_pem_bundle("issuing_ca_pem", self.issuing_ca_pem)?,
             default_template,
+            allowed_templates,
             default_key_type: self.default_key_type,
             subject: validate_subject(self.subject)?,
             allowed_suffixes,
@@ -872,8 +1028,8 @@ impl AdcsAuthorityRequest {
     }
 }
 
-/// The authority as a read returns it: every stored field except the
-/// password, which is reported as set or not.
+/// The authority as Operators and SuperAdmins read it: every stored
+/// field except the password, which is reported as set or not.
 #[derive(Debug, Serialize)]
 pub struct AdcsAuthorityView {
     /// The stored authority.
@@ -883,45 +1039,89 @@ pub struct AdcsAuthorityView {
     pub password_set: bool,
 }
 
+/// What every role may read of the authority (D18): that it exists,
+/// which names it may issue, and whether it is in the failed state. The
+/// endpoint, realm, KDCs, principal, CA certificates and templates map
+/// the domain's PKI, so they are in [`AdcsAuthorityView`] only.
+#[derive(Debug, Serialize)]
+pub struct AdcsAuthoritySummary {
+    /// DNS suffixes Lorica may request names under.
+    pub allowed_suffixes: Vec<AllowedSuffix>,
+    /// When the authority entered the D15 failed state, `null` when it
+    /// is not failed.
+    pub failed_since: Option<chrono::DateTime<Utc>>,
+    /// The step that opened the breaker.
+    pub failed_step: Option<String>,
+    /// The KDC error code that opened it.
+    pub failed_kdc_code: Option<i32>,
+    /// What that code means for the service account, when it is one
+    /// that rejects the credential.
+    pub failed_reason: Option<&'static str>,
+}
+
+impl AdcsAuthoritySummary {
+    fn of(authority: &AdcsAuthority) -> AdcsAuthoritySummary {
+        AdcsAuthoritySummary {
+            allowed_suffixes: authority.allowed_suffixes.clone(),
+            failed_since: authority.failed_since,
+            failed_step: authority.failed_step.clone(),
+            failed_kdc_code: authority.failed_kdc_code,
+            failed_reason: authority
+                .failed_kdc_code
+                .and_then(|code: i32| u32::try_from(code).ok())
+                .and_then(kdc_error_meaning),
+        }
+    }
+}
+
 /// Body of `GET /api/v1/adcs/authority`.
 #[derive(Debug, Serialize)]
 pub struct AdcsAuthorityState {
-    /// The authority, `null` when none is configured or on a follower.
-    pub authority: Option<AdcsAuthorityView>,
+    /// Whether an authority is configured on this node; `false` on a
+    /// follower.
+    pub configured: bool,
     /// `true` on a follower: the authority lives on the control plane
     /// only (D13), so this node has none to show.
     pub managed_on_control_plane: bool,
+    /// What every role may read, `null` when no authority is
+    /// configured.
+    pub summary: Option<AdcsAuthoritySummary>,
+    /// The whole authority, for Operators and SuperAdmins only (D18);
+    /// `null` for a Viewer, when none is configured, or on a follower.
+    pub authority: Option<AdcsAuthorityView>,
 }
 
-/// Whether a password is stored. The decrypted text goes into a
-/// [`Secret`] at once so its buffer is wiped.
-fn password_is_set(store: &ConfigStore) -> Result<bool, lorica_config::ConfigError> {
-    Ok(store.get_adcs_password()?.map(Secret::new).is_some())
-}
-
-/// GET /api/v1/adcs/authority - the authority without its password.
+/// GET /api/v1/adcs/authority - the authority without its password; its
+/// connection details only to Operators and above (D18).
 pub async fn get_adcs_authority(
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if matches!(state.cluster, ClusterRuntime::Follower(_)) {
         return Ok(json_data(AdcsAuthorityState {
-            authority: None,
+            configured: false,
             managed_on_control_plane: true,
+            summary: None,
+            authority: None,
         }));
     }
-    let authority: Option<AdcsAuthorityView> = db_blocking(&state.store, |store| {
-        let Some(authority) = store.get_adcs_authority()? else {
-            return Ok::<_, lorica_config::ConfigError>(None);
-        };
-        Ok(Some(AdcsAuthorityView {
-            authority,
-            password_set: password_is_set(store)?,
-        }))
+    let (authority, password_set) = db_blocking(&state.store, |store| {
+        let authority: Option<AdcsAuthority> = store.get_adcs_authority()?;
+        let password_set: bool = store.has_adcs_password()?;
+        Ok::<_, lorica_config::ConfigError>((authority, password_set))
     })
     .await?;
+    let sees_details: bool = session.role >= Role::Operator;
     Ok(json_data(AdcsAuthorityState {
-        authority,
+        configured: authority.is_some(),
         managed_on_control_plane: false,
+        summary: authority.as_ref().map(AdcsAuthoritySummary::of),
+        authority: authority
+            .filter(|_| sees_details)
+            .map(|authority: AdcsAuthority| AdcsAuthorityView {
+                authority,
+                password_set,
+            }),
     }))
 }
 
@@ -1046,6 +1246,7 @@ fn write_authority(
         endpoint_ca_pem: request.endpoint_ca_pem,
         issuing_ca_pem: request.issuing_ca_pem,
         default_template: request.default_template,
+        allowed_templates: request.allowed_templates,
         default_key_type: request.default_key_type,
         subject: request.subject,
         allowed_suffixes: request.allowed_suffixes,
@@ -1060,19 +1261,22 @@ fn write_authority(
     };
 
     // A creation is an identity change from nothing: an authority with
-    // no credential could only fail its first test.
+    // no credential could only fail its first test. The trust bundle is
+    // part of the identity: it decides which TLS endpoint the
+    // credential's tokens are sent to.
     let identity_changed: bool = existing.as_ref().is_none_or(|stored: &AdcsAuthority| {
         stored.endpoint != authority.endpoint
             || stored.realm != authority.realm
             || stored.kdcs != authority.kdcs
             || stored.principal != authority.principal
+            || stored.endpoint_ca_pem != authority.endpoint_ca_pem
     });
     if identity_changed && password.is_none() {
         return Err(ApiError::Unprocessable(if existing.is_none() {
             "password: required when creating the AD CS authority".to_string()
         } else {
-            "password: changing the endpoint, realm, KDC list or principal clears the stored \
-             password, so the same request must supply a new one"
+            "password: changing the endpoint, realm, KDC list, principal or endpoint trust \
+             bundle clears the stored password, so the same request must supply a new one"
                 .to_string()
         }));
     }
@@ -1100,7 +1304,7 @@ fn write_authority(
     Ok(WriteOutcome {
         view: AdcsAuthorityView {
             authority: stored,
-            password_set: password_is_set(store)?,
+            password_set: store.has_adcs_password()?,
         },
         created: existing.is_none(),
         changed,
@@ -1236,13 +1440,16 @@ async fn run_connection_test(
             return Err(unavailable.into());
         }
     };
-    let authority_id: &str = operation.authority.id.as_str();
-    let result: Result<(), AdcsError> = state
-        .adcs
-        .client
-        .test_connection(&operation.params, &operation.password)
-        .await;
-    drop(operation.password);
+    let AdcsOperation {
+        authority,
+        params,
+        password,
+    } = operation;
+    let authority_id: &str = authority.id.as_str();
+    let mut session: LazySession<'_> =
+        LazySession::new(state.adcs.client.as_ref(), params, password);
+    let result: Result<(), AdcsError> = session.test().await;
+    drop(session);
 
     let err: AdcsError = match result {
         Ok(()) => {
@@ -1264,7 +1471,7 @@ async fn run_connection_test(
         }
         Err(err) => err,
     };
-    let step: &'static str = failure_step(&err);
+    let step: &'static str = err.step().as_str();
     crate::audit::record(
         state,
         ctx,

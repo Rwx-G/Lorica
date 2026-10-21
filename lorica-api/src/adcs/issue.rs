@@ -13,27 +13,35 @@
 // limitations under the License.
 
 //! Issuing a certificate from the AD CS authority (Story 13.3, Epic 13
-//! PRD D4, D5, D6, D12, D14, D15).
+//! PRD D4, D5, D6, D12, D14, D15, D17).
 //!
-//! One function, [`issue`], builds the CSR, calls the authority and
-//! stores the result; the endpoint and Story 13.4's renewal both call
-//! it, so there is one code path from a request to a stored row.
+//! One function, [`issue_with`], builds the CSR, calls the authority and
+//! stores the result; the endpoint, "Renew now" and the renewal loop all
+//! reach it, so there is one code path from a request to a stored row.
+//! [`issue`] runs it as one operation of its own; the loop runs it for
+//! every certificate of a tick on one session.
 //!
 //! # What is checked before the authority is contacted
 //!
 //! Every SAN, against the authority's allowlist with
 //! [`lorica_config::models::AllowedSuffix::permits`] (D5): names are
 //! trimmed, lowercased and deduplicated, a wildcard is refused, an empty
-//! list and a list over [`MAX_SANS`] are refused. A refusal names the
-//! offending names and costs no Kerberos attempt.
+//! list and a list over [`MAX_SANS`] are refused. Then the template,
+//! against the authority's allowed templates (D17). A refusal names what
+//! it refused and costs no Kerberos attempt.
 //!
-//! # What an issued certificate must be
+//! # What an issued certificate must be (D17)
 //!
-//! The leaf must cover every requested name: an authority that issued
-//! something else is an error, alerted, and nothing is stored. The leaf
-//! and the generated key must match, the check every upload goes
-//! through. The row is then stored as an upload is: leaf then chain in
-//! `cert_pem`, the key in the store's encrypted column.
+//! A server certificate: it carries the Server Authentication extended
+//! key usage and not Any Purpose, and it is not a CA. Its subject
+//! alternative names are exactly the requested DNS names, none missing
+//! and none added, of any type. The leaf and the generated key must
+//! match, the check every upload goes through. A certificate failing
+//! any of this is not stored; it exists at the authority all the same,
+//! so the audit row and the alert carry the authority's request
+//! identifier for its administrators to revoke it. A stored row holds
+//! leaf then chain in `cert_pem`, the key in the store's encrypted
+//! column.
 //!
 //! # Outcomes that store nothing
 //!
@@ -42,12 +50,18 @@
 //! audited. A credential the KDC rejects also opens the D15 breaker,
 //! through the same path as the connection test.
 
+use std::collections::BTreeSet;
+
 use axum::extract::Extension;
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
-use lorica_adcs::{AdcsError, EnrollOutcome, FaultKind, GeneratedCsr, KeyType, SubjectFields};
-use lorica_config::models::{AdcsAuthority, AdcsKeyType, AdcsSubjectDefaults, Certificate};
+use lorica_adcs::{
+    AdcsError, EnrollOutcome, FailureScope, FaultKind, GeneratedCsr, KeyType, SubjectFields,
+};
+use lorica_config::models::{
+    validate_template_name, AdcsAuthority, AdcsKeyType, AdcsSubjectDefaults, Certificate,
+};
 use lorica_config::ConfigStore;
 use serde::{Deserialize, Serialize};
 use x509_parser::certificate::X509Certificate;
@@ -55,8 +69,8 @@ use x509_parser::der_parser::asn1_rs::{Any, FromDer, Oid, Tag};
 use x509_parser::extensions::GeneralName;
 
 use super::{
-    failure_step, prepare_operation, record_credential_rejection, refuse_on_follower,
-    run_exclusive, validate_subject, AdcsHandlerError, AdcsOperation, AdcsUnavailable, NotRun,
+    prepare_operation, record_credential_rejection, refuse_on_follower, run_exclusive,
+    validate_subject, AdcsHandlerError, AdcsOperation, AdcsUnavailable, LazySession, NotRun,
     BUSY_MESSAGE,
 };
 use crate::audit::{AuditContext, ClientConnectInfo};
@@ -94,7 +108,8 @@ const REQUEST_ID_AUDIT_MAX: usize = 64;
 pub struct AdcsIssueRequest {
     /// The names to request; the first is the `CN`.
     pub sans: Vec<String>,
-    /// The template's common name; the authority's default when unset.
+    /// The template's common name, one the authority allows (D17); the
+    /// authority's default when unset.
     #[serde(default)]
     pub template: Option<String>,
     /// The key type; the authority's default when unset.
@@ -174,7 +189,7 @@ pub(crate) enum SanRefusal {
     TooMany,
     /// At least one wildcard name (D5).
     Wildcard,
-    /// At least one name under no allowed suffix.
+    /// At least one name under no allowed suffix, or not a DNS name.
     OutsideAllowlist,
 }
 
@@ -201,6 +216,12 @@ pub(crate) enum IssueError {
         /// The refusal in words, naming them.
         message: String,
     },
+    /// The template is not one the authority allows (D17); nothing was
+    /// sent.
+    TemplateRefused {
+        /// The refusal in words, naming the template.
+        message: String,
+    },
     /// No AD CS operation may run now.
     Unavailable(AdcsUnavailable),
     /// Another AD CS operation is running.
@@ -221,6 +242,9 @@ pub(crate) enum IssueError {
         message: String,
         /// Whether this failure opened the D15 breaker.
         authority_failed: bool,
+        /// Whether the next request to the authority would fail the same
+        /// way, which ends a renewal tick (D15).
+        scope: FailureScope,
     },
     /// A request field refused, or a store failure.
     Api(ApiError),
@@ -239,6 +263,11 @@ impl From<IssueError> for AdcsHandlerError {
             IssueError::SanRefused { message, .. } => coded(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "adcs_san_refused",
+                message,
+            ),
+            IssueError::TemplateRefused { message } => coded(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "adcs_template_refused",
                 message,
             ),
             IssueError::Unavailable(unavailable) => match unavailable {
@@ -269,6 +298,7 @@ impl From<IssueError> for AdcsHandlerError {
                 step,
                 message,
                 authority_failed,
+                ..
             } => AdcsHandlerError::Coded {
                 status: StatusCode::BAD_GATEWAY,
                 code: "adcs_error",
@@ -332,12 +362,13 @@ pub async fn issue_certificate(
 /// Issue a certificate as the one AD CS operation of the process.
 ///
 /// Refusals before the authority is contacted (an invalid field, the
-/// SANs, no authority, the failed state, another operation running)
-/// are audited as `adcs.certificate.issue.refused:<reason>`; every
-/// answer of the authority and every client failure is audited, and
-/// every one that stores nothing raises `cert_issuance_failed` with the
-/// step, the message and, when `request.replace` is set, the
-/// certificate id. A credential the KDC rejects opens the D15 breaker.
+/// SANs, the template, no authority, the failed state, another
+/// operation running) are audited as
+/// `adcs.certificate.issue.refused:<reason>`; every answer of the
+/// authority and every client failure is audited, and every one that
+/// stores nothing raises `cert_issuance_failed` with the step, the
+/// message and, when `request.replace` is set, the certificate id. A
+/// credential the KDC rejects opens the D15 breaker.
 ///
 /// The operation runs under [`run_exclusive`], so it is single-flight
 /// with the connection test and every authority write, and an
@@ -375,16 +406,10 @@ pub(crate) async fn issue(
 
 /// The request's own fields, checked before the guard is taken: the
 /// template's common name and the subject overrides.
-fn validate_request(mut request: IssueRequest) -> Result<IssueRequest, ApiError> {
+pub(super) fn validate_request(mut request: IssueRequest) -> Result<IssueRequest, ApiError> {
     if let Some(template) = &request.template {
         let template: String = template.trim().to_string();
-        if template.is_empty() || template.chars().any(char::is_control) {
-            return Err(ApiError::Unprocessable(
-                "template: the template's common name must be non-empty, without control \
-                 characters"
-                    .to_string(),
-            ));
-        }
+        validate_template_name("template", &template)?;
         request.template = Some(template);
     }
     request.subject = match request.subject {
@@ -449,9 +474,12 @@ pub(crate) fn check_sans(authority: &AdcsAuthority, sans: &[String]) -> Result<(
             format!("sans: wildcard names are refused: {}", quoted(&wildcards)),
         ));
     }
+    // A name still ending in a dot had two root dots: `permits` would
+    // drop the second one and accept it, and the CSR builder would then
+    // refuse it under the guard, reported as a CSR failure.
     let outside: Vec<String> = sans
         .iter()
-        .filter(|name: &&String| !authority.permits(name))
+        .filter(|name: &&String| name.ends_with('.') || !authority.permits(name))
         .cloned()
         .collect();
     if !outside.is_empty() {
@@ -464,7 +492,7 @@ pub(crate) fn check_sans(authority: &AdcsAuthority, sans: &[String]) -> Result<(
             SanRefusal::OutsideAllowlist,
             outside.clone(),
             format!(
-                "sans: not under an allowed DNS suffix of the authority ({}): {}",
+                "sans: not a DNS name under an allowed suffix of the authority ({}): {}",
                 suffixes.join(", "),
                 quoted(&outside)
             ),
@@ -572,6 +600,28 @@ async fn audit(
     .await;
 }
 
+/// Audit a renewal refused before an issuance could be attempted (the
+/// stored certificate cannot be read back into a request), as
+/// `adcs.certificate.issue.refused:<reason>` on `cert_id`: every
+/// renewal attempt leaves a row (Story 13.4 AC #7).
+pub(super) async fn audit_refusal(
+    state: &AppState,
+    ctx: &AuditContext,
+    reason: &str,
+    cert_id: &str,
+    message: &str,
+) {
+    let payload = serde_json::json!({ "message": message });
+    audit(
+        state,
+        ctx,
+        &format!("refused:{reason}"),
+        cert_id,
+        Some(&payload),
+    )
+    .await;
+}
+
 /// A request identifier as an audit action may carry it: the
 /// authority's text, reduced to the characters an identifier has.
 fn request_id_for_audit(request_id: &str) -> String {
@@ -646,7 +696,35 @@ pub(super) fn send_issuance_failed(
     alerts.send(event);
 }
 
-/// Audit, alert and build the error of an attempt that stores nothing.
+/// Audit and alert an attempt that stores nothing, as
+/// `adcs.certificate.issue.error:<step>`, or
+/// `adcs.certificate.issue.error:<step>:<request id>` when the authority
+/// issued a certificate Lorica refused: the action is the part of an
+/// audit row that is kept readable (payloads are kept as hashes), and
+/// the identifier is what the authority's administrators revoke by.
+async fn record_failure(
+    state: &AppState,
+    ctx: &AuditContext,
+    authority_id: &str,
+    attempt: &Attempt,
+    step: &str,
+    message: &str,
+    request_id: Option<&str>,
+) {
+    let payload = attempt.payload(
+        "error",
+        serde_json::json!({ "step": step, "message": message, "request_id": request_id }),
+    );
+    let action: String = match request_id {
+        Some(id) => format!("error:{step}:{}", request_id_for_audit(id)),
+        None => format!("error:{step}"),
+    };
+    audit(state, ctx, &action, attempt.target_id(), Some(&payload)).await;
+    alert_issuance_failed(state, authority_id, attempt, step, message, request_id);
+}
+
+/// [`record_failure`], and the error of a failure that concerns this
+/// request only.
 async fn fail(
     state: &AppState,
     ctx: &AuditContext,
@@ -654,26 +732,38 @@ async fn fail(
     attempt: &Attempt,
     step: &str,
     message: String,
-    authority_failed: bool,
+    request_id: Option<&str>,
 ) -> IssueError {
-    let payload = attempt.payload(
-        "error",
-        serde_json::json!({ "step": step, "message": message }),
-    );
-    audit(
+    record_failure(
         state,
         ctx,
-        &format!("error:{step}"),
-        attempt.target_id(),
-        Some(&payload),
+        authority_id,
+        attempt,
+        step,
+        &message,
+        request_id,
     )
     .await;
-    alert_issuance_failed(state, authority_id, attempt, step, &message, None);
     IssueError::Failed {
         step: step.to_string(),
         message,
-        authority_failed,
+        authority_failed: false,
+        scope: FailureScope::Request,
     }
+}
+
+/// The message of a certificate the authority issued and Lorica did not
+/// store: it is valid until the authority's administrators revoke it,
+/// which the request identifier lets them do.
+fn not_stored(reason: &str, request_id: Option<&str>) -> String {
+    let request: String = request_id.map_or_else(
+        || "its request identifier was not returned".to_string(),
+        |id: &str| format!("request {id}"),
+    );
+    format!(
+        "{reason}; it was not stored, and it remains valid at the authority until revoked there \
+         ({request})"
+    )
 }
 
 /// The closed step word of an authority fault that is not a denial.
@@ -689,7 +779,8 @@ fn hresult(code: Option<u32>) -> String {
     code.map_or_else(String::new, |code: u32| format!(" (0x{code:08X})"))
 }
 
-/// The body of [`issue`], under the guard.
+/// The body of [`issue`], under the guard: read the authority, then
+/// [`issue_with`] on a session of its own.
 async fn issue_exclusive(
     state: &AppState,
     ctx: &AuditContext,
@@ -714,6 +805,22 @@ async fn issue_exclusive(
             return Err(IssueError::Unavailable(unavailable));
         }
     };
+    let mut session: LazySession<'_> =
+        LazySession::new(state.adcs.client.as_ref(), params, password);
+    issue_with(state, ctx, &authority, &mut session, request).await
+}
+
+/// One issuance against `authority` on `session`, under the guard: the
+/// checks that need no authority, the CSR, the enrollment, and the
+/// stored row. `request` went through [`validate_request`].
+pub(super) async fn issue_with(
+    state: &AppState,
+    ctx: &AuditContext,
+    authority: &AdcsAuthority,
+    session: &mut LazySession<'_>,
+    request: IssueRequest,
+) -> Result<IssueOutcome, IssueError> {
+    let target_id: String = request.replace.clone().unwrap_or_default();
 
     // A replacement names a row that must still exist, checked before
     // the authority issues anything that would then have nowhere to go.
@@ -725,7 +832,6 @@ async fn issue_exclusive(
         match exists {
             Ok(true) => {}
             Ok(false) => {
-                drop(password);
                 audit(state, ctx, "refused:not_found", &target_id, None).await;
                 return Err(IssueError::Api(ApiError::NotFound(format!(
                     "certificate {target_id}"
@@ -736,8 +842,7 @@ async fn issue_exclusive(
     }
 
     let sans: Vec<String> = normalize_sans(&request.sans);
-    if let Err(refusal) = check_sans(&authority, &sans) {
-        drop(password);
+    if let Err(refusal) = check_sans(authority, &sans) {
         if let IssueError::SanRefused { reason, names, .. } = &refusal {
             let payload = serde_json::json!({ "sans": sans, "refused": names });
             audit(
@@ -752,16 +857,28 @@ async fn issue_exclusive(
         return Err(refusal);
     }
 
+    let template: String = request
+        .template
+        .clone()
+        .unwrap_or_else(|| authority.default_template.clone());
+    if !authority.permits_template(&template) {
+        let payload = serde_json::json!({ "sans": sans, "template": template });
+        audit(state, ctx, "refused:template", &target_id, Some(&payload)).await;
+        return Err(IssueError::TemplateRefused {
+            message: format!(
+                "template: {template:?} is not one the AD CS authority allows; a SuperAdmin \
+                 lists the templates an issuance may request"
+            ),
+        });
+    }
+
     let attempt: Attempt = Attempt {
         sans,
-        template: request
-            .template
-            .clone()
-            .unwrap_or_else(|| authority.default_template.clone()),
+        template,
         key_type: request.key_type.unwrap_or(authority.default_key_type),
         replace: request.replace.clone(),
     };
-    let subject: AdcsSubjectDefaults = assemble_subject(&authority, &request.subject);
+    let subject: AdcsSubjectDefaults = assemble_subject(authority, &request.subject);
 
     // Key generation is CPU work (RSA 3072 takes a noticeable fraction
     // of a second), kept off the async workers.
@@ -776,52 +893,38 @@ async fn issue_exclusive(
     let csr: GeneratedCsr = match built {
         Ok(Ok(csr)) => csr,
         Ok(Err(err)) => {
-            drop(password);
-            let step: &'static str = failure_step(&err);
             return Err(fail(
                 state,
                 ctx,
                 &authority.id,
                 &attempt,
-                step,
+                err.step().as_str(),
                 err.to_string(),
-                false,
+                None,
             )
             .await);
         }
         Err(join) => {
-            drop(password);
             return Err(fail(
                 state,
                 ctx,
                 &authority.id,
                 &attempt,
-                "csr",
+                lorica_adcs::FailureStep::Csr.as_str(),
                 format!("CSR: the key generation task failed: {join}"),
-                false,
+                None,
             )
             .await);
         }
     };
 
-    let result: Result<EnrollOutcome, AdcsError> = state
-        .adcs
-        .client
-        .enroll(&params, &password, &csr.csr_der)
-        .await;
-    drop(password);
+    let result: Result<EnrollOutcome, AdcsError> = session.enroll(&csr.csr_der).await;
 
     match result {
         Err(err) => {
-            let step: &'static str = failure_step(&err);
+            let step: &'static str = err.step().as_str();
             let message: String = err.to_string();
-            let target: &str = attempt.target_id();
-            let payload = attempt.payload(
-                "error",
-                serde_json::json!({ "step": step, "message": message }),
-            );
-            audit(state, ctx, &format!("error:{step}"), target, Some(&payload)).await;
-            alert_issuance_failed(state, &authority.id, &attempt, step, &message, None);
+            record_failure(state, ctx, &authority.id, &attempt, step, &message, None).await;
             let authority_failed: bool =
                 record_credential_rejection(state, ctx, &authority.id, &err)
                     .await
@@ -830,6 +933,7 @@ async fn issue_exclusive(
                 step: step.to_string(),
                 message,
                 authority_failed,
+                scope: err.scope(),
             })
         }
         Ok(EnrollOutcome::Pending { request_id }) => {
@@ -897,7 +1001,7 @@ async fn issue_exclusive(
                 "SOAP fault: the authority refused the request{}: {message}",
                 hresult(error_code)
             );
-            Err(fail(state, ctx, &authority.id, &attempt, step, message, false).await)
+            Err(fail(state, ctx, &authority.id, &attempt, step, message, None).await)
         }
         Ok(EnrollOutcome::Issued {
             leaf_der,
@@ -911,7 +1015,7 @@ async fn issue_exclusive(
                 request_id,
                 private_key_pem: csr.private_key_pem,
             };
-            store_issued(state, ctx, &authority, &attempt, &request, issued).await
+            store_issued(state, ctx, authority, &attempt, &request, issued).await
         }
     }
 }
@@ -926,25 +1030,125 @@ struct Issued {
 
 /// What the leaf says, read once.
 struct LeafFacts {
+    /// Its `dNSName` entries, lowercased.
     dns_names: Vec<String>,
+    /// Every other subject alternative name, described.
+    other_names: Vec<String>,
+    /// Whether its extended key usage includes Server Authentication.
+    server_auth: bool,
+    /// Whether its extended key usage includes Any Purpose.
+    any_purpose: bool,
+    /// Whether `basicConstraints` makes it a CA.
+    is_ca: bool,
     template_oid: Option<String>,
 }
 
+impl LeafFacts {
+    /// Why the leaf is not a server certificate (D17), or `None`.
+    fn profile_problem(&self) -> Option<&'static str> {
+        if self.is_ca {
+            Some("the authority issued a CA certificate (basicConstraints cA true)")
+        } else if !self.server_auth {
+            Some(
+                "the authority issued a certificate without the Server Authentication extended \
+                 key usage",
+            )
+        } else if self.any_purpose {
+            Some("the authority issued a certificate with the Any Purpose extended key usage")
+        } else {
+            None
+        }
+    }
+
+    /// Why the leaf's names are not exactly `requested`, or `None`.
+    /// Both sides are lowercase DNS names here, so the comparison is
+    /// case-insensitive.
+    fn names_problem(&self, requested: &[String]) -> Option<String> {
+        let issued: BTreeSet<&str> = self.dns_names.iter().map(String::as_str).collect();
+        let asked: BTreeSet<&str> = requested.iter().map(String::as_str).collect();
+        let missing: Vec<String> = asked
+            .difference(&issued)
+            .map(|name: &&str| (*name).to_string())
+            .collect();
+        let mut extra: Vec<String> = issued
+            .difference(&asked)
+            .map(|name: &&str| (*name).to_string())
+            .collect();
+        extra.extend(self.other_names.iter().cloned());
+        if missing.is_empty() && extra.is_empty() {
+            return None;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if !missing.is_empty() {
+            parts.push(format!("does not cover {}", quoted(&missing)));
+        }
+        if !extra.is_empty() {
+            parts.push(format!("names what was not requested: {}", quoted(&extra)));
+        }
+        Some(format!(
+            "the authority issued a certificate that {}",
+            parts.join(" and ")
+        ))
+    }
+}
+
+/// A subject alternative name that is not a DNS name, in words.
+fn describe_other_name(name: &GeneralName<'_>) -> String {
+    match name {
+        GeneralName::RFC822Name(address) => format!("email {address}"),
+        GeneralName::URI(uri) => format!("URI {uri}"),
+        GeneralName::IPAddress(_) => "an IP address".to_string(),
+        GeneralName::OtherName(oid, _) => format!("other name {}", oid.to_id_string()),
+        GeneralName::RegisteredID(oid) => format!("registered ID {}", oid.to_id_string()),
+        _ => "a name that is not a DNS name".to_string(),
+    }
+}
+
+/// The leaf's facts. An extension present twice, which x509-parser
+/// refuses to choose between, fails the read: what the certificate may
+/// do must not be guessed.
 fn leaf_facts(leaf_der: &[u8]) -> Result<LeafFacts, String> {
     let (_, leaf): (&[u8], X509Certificate<'_>) = x509_parser::parse_x509_certificate(leaf_der)
         .map_err(|err| format!("the issued certificate does not parse: {err}"))?;
     let mut dns_names: Vec<String> = Vec::new();
-    if let Ok(Some(san)) = leaf.subject_alternative_name() {
+    let mut other_names: Vec<String> = Vec::new();
+    let san = leaf.subject_alternative_name().map_err(|err| {
+        format!("the issued certificate's subject alternative names cannot be read: {err}")
+    })?;
+    if let Some(san) = san {
         for name in &san.value.general_names {
-            if let GeneralName::DNSName(dns) = name {
-                dns_names.push(dns.to_ascii_lowercase());
+            match name {
+                GeneralName::DNSName(dns) => dns_names.push(dns.to_ascii_lowercase()),
+                other => other_names.push(describe_other_name(other)),
             }
         }
     }
+    let eku = leaf.extended_key_usage().map_err(|err| {
+        format!("the issued certificate's extended key usage cannot be read: {err}")
+    })?;
+    let is_ca: bool = leaf
+        .basic_constraints()
+        .map_err(|err| format!("the issued certificate's basic constraints cannot be read: {err}"))?
+        .is_some_and(|constraints| constraints.value.ca);
     Ok(LeafFacts {
         dns_names,
+        other_names,
+        server_auth: eku.as_ref().is_some_and(|usage| usage.value.server_auth),
+        any_purpose: eku.as_ref().is_some_and(|usage| usage.value.any),
+        is_ca,
         template_oid: template_oid_of(&leaf),
     })
+}
+
+/// The first certificate of the issued chain, as PEM, when the leaf's
+/// signature verifies under its key: the only issuing CA the authority
+/// may learn from an issuance (D12). Names and key identifiers are
+/// copied at will, so they alone prove nothing.
+fn verified_issuing_ca(leaf_der: &[u8], chain_der: &[Vec<u8>]) -> Option<String> {
+    let issuer_der: &Vec<u8> = chain_der.first()?;
+    let (_, leaf) = x509_parser::parse_x509_certificate(leaf_der).ok()?;
+    let (_, issuer) = x509_parser::parse_x509_certificate(issuer_der).ok()?;
+    lorica_adcs::issued_by(&leaf, &issuer).then(|| pem_certificate(issuer_der))
 }
 
 /// The template an issued certificate names: the OID of extension
@@ -1021,48 +1225,29 @@ async fn store_issued(
     request: &IssueRequest,
     issued: Issued,
 ) -> Result<IssueOutcome, IssueError> {
-    let facts: LeafFacts = match leaf_facts(&issued.leaf_der) {
-        Ok(facts) => facts,
-        Err(message) => {
-            return Err(fail(
-                state,
-                ctx,
-                &authority.id,
-                attempt,
-                "certificate",
-                message,
-                false,
-            )
-            .await)
-        }
-    };
-    let uncovered: Vec<String> = attempt
-        .sans
-        .iter()
-        .filter(|name: &&String| !facts.dns_names.contains(name))
-        .cloned()
-        .collect();
-    if !uncovered.is_empty() {
-        let message: String = format!(
-            "the authority issued a certificate that does not cover {} (it names {}); it was \
-             not stored, and it remains valid at the authority until revoked there",
-            quoted(&uncovered),
-            if facts.dns_names.is_empty() {
-                "no DNS name".to_string()
-            } else {
-                quoted(&facts.dns_names)
-            }
-        );
-        return Err(fail(
+    let request_id: Option<&str> = issued.request_id.as_deref();
+    let rejected = |step: &'static str, reason: String| async move {
+        fail(
             state,
             ctx,
             &authority.id,
             attempt,
-            "san_coverage",
-            message,
-            false,
+            step,
+            not_stored(&reason, request_id),
+            request_id,
         )
-        .await);
+        .await
+    };
+
+    let facts: LeafFacts = match leaf_facts(&issued.leaf_der) {
+        Ok(facts) => facts,
+        Err(reason) => return Err(rejected("certificate", reason).await),
+    };
+    if let Some(reason) = facts.profile_problem() {
+        return Err(rejected("certificate_profile", reason.to_string()).await);
+    }
+    if let Some(reason) = facts.names_problem(&attempt.sans) {
+        return Err(rejected("san_coverage", reason).await);
     }
 
     let mut cert_pem: String = pem_certificate(&issued.leaf_der);
@@ -1070,18 +1255,13 @@ async fn store_issued(
         cert_pem.push_str(&pem_certificate(der));
     }
     if let Err(err) = lorica_tls::validate_certificate_bundle(&cert_pem, &issued.private_key_pem) {
-        return Err(fail(
-            state,
-            ctx,
-            &authority.id,
-            attempt,
+        return Err(rejected(
             "certificate",
             format!("the issued certificate cannot be served with its key: {err}"),
-            false,
         )
         .await);
     }
-    let issuing_ca_pem: Option<String> = issued.chain_der.first().map(|der| pem_certificate(der));
+    let issuing_ca_pem: Option<String> = verified_issuing_ca(&issued.leaf_der, &issued.chain_der);
     let parsed = parse_cert_pem(&cert_pem);
     let now = Utc::now();
     let cert: Certificate = Certificate {
@@ -1129,27 +1309,20 @@ async fn store_issued(
     let stored: Stored = match written {
         Ok(stored) => stored,
         Err(err) => {
-            let message: String = format!("the issued certificate could not be stored: {err}");
-            let payload = attempt.payload(
-                "error",
-                serde_json::json!({ "step": "store", "message": message }),
+            let message: String = not_stored(
+                &format!("the issued certificate could not be stored: {err}"),
+                request_id,
             );
-            audit(
+            record_failure(
                 state,
                 ctx,
-                "error:store",
-                attempt.target_id(),
-                Some(&payload),
-            )
-            .await;
-            alert_issuance_failed(
-                state,
                 &authority.id,
                 attempt,
                 "store",
                 &message,
-                issued.request_id.as_deref(),
-            );
+                request_id,
+            )
+            .await;
             return Err(IssueError::Api(err));
         }
     };
@@ -1201,7 +1374,13 @@ struct WriteMode {
 
 /// The store side of an issued certificate, inside one transaction:
 /// the row, created or replaced in place, and the issuing CA
-/// certificate on the authority when it has none yet (D12).
+/// certificate on the authority when it has none yet and the leaf
+/// verifies under it (D12).
+///
+/// A replacement is written only while the row is still managed by
+/// this authority: a reversion, or a PEM replaced through the generic
+/// update, that landed while the renewal was at the authority is the
+/// operator's decision, and the renewal must not undo it.
 fn write_issued(
     store: &ConfigStore,
     mut cert: Certificate,
@@ -1213,6 +1392,13 @@ fn write_issued(
         let current: Certificate = store
             .get_certificate(&cert.id)?
             .ok_or_else(|| ApiError::NotFound(format!("certificate {}", cert.id)))?;
+        if current.is_acme || current.adcs_authority_id.as_deref() != Some(authority_id) {
+            return Err(ApiError::Conflict(format!(
+                "certificate {} stopped being managed by the AD CS authority while it was being \
+                 renewed",
+                cert.id
+            )));
+        }
         cert.created_at = current.created_at;
         if !mode.auto_renew_given {
             cert.acme_auto_renew = current.acme_auto_renew;

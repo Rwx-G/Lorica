@@ -9,6 +9,7 @@ use chrono::Utc;
 use lorica_config::models::CertificateSource;
 use serde::{Deserialize, Serialize};
 
+use crate::adcs::AdcsHandlerError;
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
@@ -575,7 +576,21 @@ pub async fn get_certificate(
     Ok(json_data(response))
 }
 
+/// The code of a refused PEM or domain change on an AD CS certificate.
+pub const ADCS_CERTIFICATE_MANAGED: &str = "adcs_certificate_managed";
+
+/// The code of a refused private-key download (Epic 13 D16).
+pub const ADCS_KEY_NOT_EXPORTABLE: &str = "adcs_key_not_exportable";
+
 /// PUT /api/v1/certificates/:id - replace the PEM body, domain, or ACME settings.
+///
+/// An AD CS certificate's PEM, key and domain are refused with 409
+/// `adcs_certificate_managed`: the row is the authority's (its next
+/// renewal requests the stored names and subject under the system
+/// actor), and adoption admits only a certificate the issuing CA signed
+/// (D9), which a replacement would bypass. Reverting it to manual first
+/// makes the replacement an ordinary upload. Its auto-renew setting
+/// stays editable.
 pub async fn update_certificate(
     connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
@@ -583,11 +598,16 @@ pub async fn update_certificate(
     Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Json(body): Json<UpdateCertificateRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let (before_cert, cert) = db_blocking(&state.store, move |store| {
+) -> Result<Json<serde_json::Value>, AdcsHandlerError> {
+    let replaces_material: bool =
+        body.domain.is_some() || body.cert_pem.is_some() || body.key_pem.is_some();
+    let updated = db_blocking(&state.store, move |store| {
         let mut cert = store
             .get_certificate(&id)?
             .ok_or_else(|| ApiError::NotFound(format!("certificate {id}")))?;
+        if replaces_material && cert.source() == CertificateSource::Adcs {
+            return Ok(None);
+        }
         let before_cert = cert.clone();
 
         if let Some(domain) = body.domain {
@@ -633,9 +653,18 @@ pub async fn update_certificate(
         }
 
         store.update_certificate(&cert)?;
-        Ok::<_, ApiError>((before_cert, cert))
+        Ok::<_, ApiError>(Some((before_cert, cert)))
     })
     .await?;
+    let Some((before_cert, cert)) = updated else {
+        return Err(AdcsHandlerError::Coded {
+            status: StatusCode::CONFLICT,
+            code: ADCS_CERTIFICATE_MANAGED,
+            message: "this certificate is issued and renewed by the AD CS authority: its PEM,                       key and domain cannot be replaced. Revert it to manual first, then upload                       the replacement"
+                .to_string(),
+            step: None,
+        });
+    };
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
 
@@ -804,7 +833,14 @@ pub struct DownloadCertificateQuery {
 }
 
 /// GET /api/v1/certificates/:id/download - emit the PEM payload as a
-/// file download. Auth-gated (this endpoint lives under
+/// file download.
+///
+/// The private key of an AD CS certificate is never served (Epic 13
+/// D16): `key` and `bundle`, the default, answer 403
+/// `adcs_key_not_exportable` for every role. Its `cert` and `chain`
+/// download as any other certificate's. The key is a domain-trusted
+/// identity for any name under the authority's suffixes; Lorica holds
+/// it to serve the certificate and for nothing else. Auth-gated (this endpoint lives under
 /// `protected_routes`), rate-limited per client IP (5 downloads / 60 s,
 /// same bucket shape used for login), audited via `tracing::warn!` with
 /// the operator username + user_id, client IP, cert id, domain and
@@ -821,7 +857,7 @@ pub async fn download_certificate(
     Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Query(q): Query<DownloadCertificateQuery>,
-) -> Result<Response, ApiError> {
+) -> Result<Response, AdcsHandlerError> {
     let client_ip = connect_info
         .0
         .map(|ci| ci.0.ip().to_string())
@@ -837,7 +873,7 @@ pub async fn download_certificate(
         .check_bucket("cert_download", &client_ip, 5, 60)
         .await
     {
-        return Err(ApiError::RateLimited(retry_after));
+        return Err(ApiError::RateLimited(retry_after).into());
     }
 
     let cert = db_blocking(&state.store, move |store| {
@@ -848,6 +884,23 @@ pub async fn download_certificate(
     .await?;
 
     let part = q.part.as_deref().unwrap_or("bundle");
+    if cert.source() == CertificateSource::Adcs && matches!(part, "key" | "bundle") {
+        tracing::warn!(
+            username = %session.username,
+            user_id = %session.user_id,
+            client_ip = %client_ip,
+            cert_id = %cert.id,
+            part = %part,
+            "certificate download refused: the private key of an AD CS certificate never leaves              Lorica",
+        );
+        return Err(AdcsHandlerError::Coded {
+            status: StatusCode::FORBIDDEN,
+            code: ADCS_KEY_NOT_EXPORTABLE,
+            message: "the private key of a certificate issued by the AD CS authority never                       leaves Lorica; download `cert` or `chain` instead"
+                .to_string(),
+            step: None,
+        });
+    }
     let (body, suffix) = match part {
         "cert" => (cert.cert_pem.clone(), "cert"),
         "key" => (cert.key_pem.clone(), "key"),
@@ -863,7 +916,8 @@ pub async fn download_certificate(
         other => {
             return Err(ApiError::BadRequest(format!(
                 "unknown `part` value {other:?}; expected cert | key | chain | bundle"
-            )));
+            ))
+            .into());
         }
     };
 
