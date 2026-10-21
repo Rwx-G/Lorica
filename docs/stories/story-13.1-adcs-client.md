@@ -1,7 +1,7 @@
 # Story 13.1: The `lorica-adcs` Client
 
 **Epic:** [Epic 13 - AD CS Certificate Enrollment over CES (v1.10.0)](../prd/epic-13-v1.10.0.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** nothing in this epic. It builds on `main` at `0245ab20`
@@ -135,7 +135,7 @@ chain (`cargo fmt --all -- --check`, the three clippy invocations of
       an explicit `libgssapi-krb5-2` in the runtime stage of
       `Dockerfile` and `tests-e2e-docker/Dockerfile` (not inherited
       through `curl`).
-- [ ] IV4 checked by hand: the production image builds, starts, and
+- [x] IV4 checked by hand: the production image builds, starts, and
       `ldd /usr/bin/lorica` inside it resolves.
 
 ### Lot 2: the pure logic, tested without a network
@@ -422,3 +422,4 @@ cannot regress silently.
 | 2026-10-21 | 0.1 | Story drafted from the Epic 13 PRD after the specification check. Status Draft. | Romain G. |
 | 2026-10-21 | 0.2 | Password wipe decided without `zeroize` (volatile writes). Status Approved. | Romain G. |
 | 2026-10-21 | 0.3 | Lots 1 to 4 implemented; SPNEGO-only acquisition and request_timeout after the harness findings; IV4 carried to Story 13.2. Status Review. | Romain G. |
+| 2026-10-21 | 0.4 | IV4 verified after Story 13.2 Lot 3: `lorica` links `libgssapi_krb5.so.2`, resolved on `debian:bookworm-slim` with the production runtime packages. Status Done. | Romain G. |

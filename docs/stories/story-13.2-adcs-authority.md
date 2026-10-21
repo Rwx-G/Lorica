@@ -1,7 +1,7 @@
 # Story 13.2: The AD CS Authority
 
 **Epic:** [Epic 13 - AD CS Certificate Enrollment over CES (v1.10.0)](../prd/epic-13-v1.10.0.md)
-**Status:** Approved
+**Status:** Review
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** Story 13.1 (the `lorica-adcs` client: `test_connection`,
@@ -74,41 +74,41 @@ of `.claude/rules/lorica-frontend.md`).
 
 ### Lot 1: schema, model, store
 
-- [ ] `AdcsAuthority` model in `lorica-config/src/models/` (new file),
+- [x] `AdcsAuthority` model in `lorica-config/src/models/` (new file),
       with `AllowedSuffix` (D5 label matching, wildcards refused) and
       the subject defaults; realm and KDC values validated with
       `lorica_adcs::Realm` / `KdcAddress` (so the grammar lives in one
       place) or, if `lorica-config` must not depend on `lorica-adcs`,
       a validator in `lorica-config` pinned to the same vectors by a
       test on each side (`.claude/rules/derived-not-transcribed.md`).
-- [ ] Migration (next free number): `adcs_authority` table (stable
+- [x] Migration (next free number): `adcs_authority` table (stable
       `id`, the fields of AC #1, `password_enc`, the failed-state
       columns) and the certificate columns `adcs_authority_id` (plain
       nullable TEXT, no foreign key, D14), `adcs_template`,
       `adcs_template_oid`, `adcs_request_id`.
-- [ ] `store/adcs_authority.rs` (get, upsert with the at-most-one-row
+- [x] `store/adcs_authority.rs` (get, upsert with the at-most-one-row
       rule, delete with the certificate guard, failed-state set/clear),
       `password_enc` registered in `ENCRYPTED_COLUMNS`, and
       `ConfigStore::has_encryption_key()` with a test on
       `open_in_memory`.
-- [ ] `Certificate` gains the `adcs_*` fields with `#[serde(default)]`;
+- [x] `Certificate` gains the `adcs_*` fields with `#[serde(default)]`;
       `CANONICAL_SHAPE_DIGEST` updated with the backlog #82
       compatibility argument in its comment; a test decodes a blob
       produced without the fields. `acme_auto_renew`'s doc comment says
       it now governs both sources (D14).
-- [ ] The authority absent from `CanonicalConfig`, `ExportData` and
+- [x] The authority absent from `CanonicalConfig`, `ExportData` and
       every replica path; tests assert it (AC #6, #7).
 
 ### Lot 2: alert types
 
-- [ ] `AlertType::AdcsAuthorityFailed` and `CertIssuanceFailed` with
+- [x] `AlertType::AdcsAuthorityFailed` and `CertIssuanceFailed` with
       their `as_str` values, the subscription migration, and the
       `openapi.yaml` enum. Dashboard: the notification settings
       checkboxes and history labels.
 
 ### Lot 3: API, breaker, audit
 
-- [ ] Handlers in `lorica-api/src/adcs.rs` (new), routes in
+- [x] Handlers in `lorica-api/src/adcs.rs` (new), routes in
       `server.rs` with `rl(...)` layers (`adcs_test` at
       `RL_ACME_PROVISION`), `required_role` rules in
       `middleware/authorize.rs`: the SuperAdmin overlay for
@@ -116,23 +116,23 @@ of `.claude/rules/lorica-frontend.md`).
       for `POST /api/v1/adcs/authority/test` ahead of it, reads at the
       Viewer default, the follower read-only list unchanged. Table
       test per path.
-- [ ] Identity-field change clears the password and requires a new
+- [x] Identity-field change clears the password and requires a new
       one in the same request; password write-only; delete guard.
-- [ ] The breaker: one `AdcsGuard` on the API state (single-flight
+- [x] The breaker: one `AdcsGuard` on the API state (single-flight
       per authority, a `tokio::sync::Mutex` or semaphore), the
       persisted failed state, `TicketFailure::CredentialRejected` as
       the only trigger, `AdcsAuthorityFailed` raised once on entry,
       cleared by a password write.
-- [ ] The `krb5.conf` regenerated atomically at
+- [x] The `krb5.conf` regenerated atomically at
       `lorica_adcs::krb5_config_path(data_dir)` on every authority
       write and at startup when an authority exists.
-- [ ] Audit rows for create, update (field names only), delete,
+- [x] Audit rows for create, update (field names only), delete,
       connection test, failed-state entry and exit.
-- [ ] `openapi.yaml` for every path, contract test green.
+- [x] `openapi.yaml` for every path, contract test green.
 
 ### Lot 4: dashboard
 
-- [ ] `api.ts` types and calls; `AdcsAuthorityTab.svelte` under
+- [x] `api.ts` types and calls; `AdcsAuthorityTab.svelte` under
       `components/settings-tabs/`, registered in the settings page,
       SuperAdmin-editable, read-only otherwise, follower message, the
       connection test button with the named failure displayed as
@@ -182,12 +182,49 @@ of `.claude/rules/lorica-frontend.md`).
 
 ### Debug Log
 
+- 2026-10-21, Lot 1: `lorica-config` does not depend on `lorica-adcs`
+  (it links the system GSS-API library); realm and KDC grammar is
+  validated at the API with `lorica_adcs::Realm` / `KdcAddress`, the
+  suffix policy (`AllowedSuffix`) lives in `lorica-config`. Key
+  rotation now skips NULL text columns, or an authority without a
+  password would have failed the whole rotation. Config import returns
+  warnings; an AD CS certificate whose authority is absent is imported
+  as manual.
+- 2026-10-21, Lot 2: migration 65 shares a helper with migration 63.
+  The dashboard keeps a hand-typed list of alert types (pre-existing);
+  its derivation is scheduled in the epic audit.
+- 2026-10-21, Lot 3: refusals (failed state, busy, follower) answer 409;
+  the password is required on create. A review found the guard was
+  released when the outer timeout fired while a blocking KDC exchange
+  kept running; fixed in `200ced18`: every blocking step is awaited,
+  the operation runs in a task that owns the guard, the handler answers
+  504 when the operation outlives it, and the audit and breaker outcome
+  are written when it ends.
+
 ### Completion Notes
 
+- AC #1 to #9 met. IV1 covered by the RBAC table and handler tests,
+  IV2 by the handler tests plus the Story 13.1 harness.
+- `lorica` now links `libgssapi_krb5`, which closed Story 13.1 IV4.
+
 ## File List
+
+- `lorica-config/src/models/adcs_authority.rs`, `lorica-config/src/store/adcs_authority.rs`,
+  `lorica-config/src/{canonical,export,import,tests}.rs`, `lorica-config/src/store/{mod,certs,replica,cluster_nodes}.rs`,
+  `lorica-config/src/models/{mod,certificate}.rs`, `lorica-config/tests/config_db_upgrade.rs`
+- `lorica-notify/src/events.rs`, `lorica-notify/src/channels/slack.rs`
+- `lorica-api/src/adcs.rs`, `lorica-api/src/adcs/tests.rs`, `lorica-api/src/{server,lib,config,tests}.rs`,
+  `lorica-api/src/middleware/authorize.rs`, `lorica-api/openapi.yaml`, `lorica-api/Cargo.toml`,
+  certificate literal sites in `lorica-api` and `lorica`
+- `lorica/src/startup/{mod,single,supervisor}.rs`
+- `lorica-adcs/src/{client,error}.rs`, `lorica-adcs/src/client/tests.rs`, `lorica-adcs/tests/harness.rs`
+- `lorica-dashboard/frontend/src/lib/api.ts`, `components/settings-tabs/AdcsAuthorityTab.{svelte,test.ts}`,
+  `routes/Settings.svelte`, `components/settings/SettingsNotifications.{svelte,test.ts}`,
+  `components/settings-tabs/NotificationHistoryTab.{svelte,test.ts}`
 
 ## Change Log
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
 | 2026-10-21 | 0.1 | Story drafted from the Epic 13 PRD. Status Approved (maintainer delegated the epic). | Romain G. |
+| 2026-10-21 | 0.2 | Lots 1 to 4 implemented, guard fix applied. Status Review. | Romain G. |
