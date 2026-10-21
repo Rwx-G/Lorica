@@ -61,7 +61,7 @@ pub use chain::issued_by;
 pub use client::{enroll, test_connection, CesParams, CesSession, CesTimeouts, EnrollOutcome};
 pub use csr::{build_csr, GeneratedCsr, KeyType, SubjectFields};
 pub use error::{AdcsError, FailureScope, FailureStep};
-pub use gss::{kdc_error_meaning, TicketFailure};
+pub use gss::{kdc_error_meaning, kdc_rejection_codes, TicketFailure};
 pub use krb5conf::{krb5_config_path, KdcAddress, KdcTiming, Krb5Config, Realm};
 pub use secret::Secret;
 pub use target::{CesEndpoint, Principal};

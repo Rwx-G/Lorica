@@ -136,6 +136,21 @@ pub fn kdc_error_meaning(code: u32) -> Option<&'static str> {
         .map(|known: &KnownRejection| known.meaning)
 }
 
+/// The KDC protocol error codes [`kdc_error_meaning`] knows, in
+/// ascending order: the ones that reject the service account's
+/// credential and open the failed state.
+///
+/// ```
+/// for code in lorica_adcs::kdc_rejection_codes() {
+///     assert!(lorica_adcs::kdc_error_meaning(code).is_some());
+/// }
+/// ```
+pub fn kdc_rejection_codes() -> impl Iterator<Item = u32> {
+    CREDENTIAL_REJECTED
+        .iter()
+        .map(|known: &KnownRejection| known.code)
+}
+
 /// The MIT codes that mean no KDC could be reached, each with the
 /// lower-case fragment of MIT's message for it, for a minor status the
 /// mechanism glue renumbered.
@@ -396,6 +411,16 @@ mod tests {
 
     /// A minor status the mechanism glue renumbered: no number we know.
     const RENUMBERED: u32 = 100_001;
+
+    #[test]
+    fn the_rejection_codes_are_the_known_ones_in_ascending_order() {
+        let codes: Vec<u32> = kdc_rejection_codes().collect();
+        let mut sorted: Vec<u32> = codes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(codes, sorted);
+        assert_eq!(codes.len(), CREDENTIAL_REJECTED.len());
+    }
 
     #[test]
     fn credential_rejections_are_classified_from_the_minor_status() {

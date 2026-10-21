@@ -246,7 +246,7 @@ dashboard, on the control plane. One authority per installation.
 | Service principal | `svc-lorica` or `svc-lorica@CORP.EXAMPLE.ORG`, in the realm above |
 | Service account password | Write-only (see below) |
 | Endpoint CA bundle | Optional PEM. When set, these certificates alone are trusted for the CES endpoint's TLS certificate, instead of the system and webpki roots |
-| Issuing CA certificate | Optional PEM: the CA that signs Lorica's certificates. Learned from the first issuance when left empty; needed for adoption |
+| Issuing CA certificate | Optional PEM: the CA that signs Lorica's certificates. Learned from the first issuance when left empty; needed for adoption. A save that leaves the field out keeps the stored certificate, so a form loaded before the first issuance does not erase what it learned; a blank value clears it |
 | Default template | The template's common name |
 | Allowed templates | Other template common names an issuance may request; the default template is always allowed. An authority saved before v1.10.0 final starts with its default template alone |
 | Default key type | RSA 2048 (default), RSA 3072, ECDSA P-256 |
@@ -312,7 +312,11 @@ reaches the CA's database.
 
 The answer is either "Connection OK" or the failing step and the
 client's message, as they are; see
-[Troubleshooting](#troubleshooting). Every test is audited
+[Troubleshooting](#troubleshooting). A test that cannot start is
+refused with the answers every AD CS operation gives (see
+[Error codes](#error-codes)): 409 `adcs_not_configured` without an
+authority or a password, `adcs_failed_state` in the failed state,
+`adcs_busy` while another operation runs. Every test is audited
 (`adcs.authority.test.ok`, `adcs.authority.test.failed:<step>`,
 `adcs.authority.test.refused:<reason>`). The test is rate-limited to 3
 a minute, and runs under the same single-flight guard as every other AD
@@ -414,8 +418,9 @@ the renewal of the certificates issued with it (alerted with the step
 | Pending | 202 | The template needs approval. Nothing is stored, the generated key is discarded, the authority's request identifier is shown, audited and alerted (`cert_issuance_failed`) |
 | Denied | 422 `adcs_denied` | Nothing is stored; the authority's message is shown; alerted |
 | Fault or client failure | 502 `adcs_error` | Nothing is stored; `error.step` names the failing step and the message says it in words; alerted |
-| Refused before contact | 409 or 422 | No authority or no password (`adcs_not_configured`), the failed state (`adcs_failed_state`), another AD CS operation running (`adcs_busy`), a follower; or a refused name (`adcs_san_refused`), template (`adcs_template_refused`) or field |
-| Still running | 504 | See [Timeouts](#timeouts-and-the-single-flight-guard) |
+| Refused before contact | 409 or 422 | No authority or no password (`adcs_not_configured`), the failed state (`adcs_failed_state`), another AD CS operation running (`adcs_busy`), a follower (`conflict`); or a refused name (`adcs_san_refused`), template (`adcs_template_refused`) or field |
+| Local failure | 500 `adcs_krb5_conf` | The generated `krb5.conf` could not be written (`error.step` is `krb5_conf`); nothing was sent, and the log names the path and the cause |
+| Still running | 504 `gateway_timeout` | See [Timeouts](#timeouts-and-the-single-flight-guard) |
 
 An issued certificate that is not a server certificate (step
 `certificate_profile`), whose names are not exactly the requested ones,
@@ -533,7 +538,17 @@ satisfy the allowlist. When the authority's issuing CA field holds more
 than one certificate, only the first is used, so paste the issuing CA
 first. Detection needs that issuing CA certificate:
 issue one certificate through Lorica, which records it, or paste it in
-the authority settings. Until then the certificate page says so.
+the authority settings. Until then the certificate page says so, and
+an adoption is refused with 409 `adcs_no_issuing_ca`. A certificate
+that is not a candidate is refused with 422 `adcs_not_candidate`, and
+the message says why. On a follower the listing is empty with the
+reason `managed_on_control_plane`, as the authority read is.
+
+Listing candidates verifies signatures, and each verdict is kept in
+memory per pair of certificates (the stored PEM and the issuing CA
+certificate): a listing verifies only a certificate it has not seen
+under that issuing CA, and a replaced certificate or a new issuing CA
+certificate is verified again. Adoption itself always verifies afresh.
 
 When candidates exist, the certificate page shows a banner; **Review**
 opens the adoption panel, which shows for each certificate:
@@ -622,10 +637,15 @@ operation opens the state again, after one attempt.
 
 **One AD CS operation at a time.** Connection tests, issuance, "Renew
 now", loop renewals and authority writes share one guard per process. A
-second operation is refused at once with 409 rather than queued: the
+second operation is refused at once with 409 `adcs_busy` rather than
+queued: the
 Kerberos calls are blocking, and a queue behind a silent KDC would pile
 up blocked threads, each about to spend another attempt against the
-account.
+account. The guard belongs to the process: while a hot upgrade runs the
+old and the new process side by side, each could run one operation. The
+new process's renewal loop waits before its first tick and the failed
+state is stored on the authority, so the overlap costs at most one
+extra attempt.
 
 **The bounds.** An operation has 10 seconds per connection to the CES
 host, 30 seconds per read, and 120 seconds in all. The generated
@@ -663,7 +683,9 @@ certificate renewal runs.
   offline-crackable digest of a password a person chose, for no drift
   detection the fleet uses. A follower's settings tab shows "managed on
   the control plane", with no test button, and its API refuses every AD
-  CS operation.
+  CS operation with 409 `conflict`, the answer of the follower gate that
+  refuses every configuration write; its adoption listing is empty with
+  the reason `managed_on_control_plane`.
 - **A node that joins a fleet loses its authority.** `lorica cluster
   join` deletes the node's authority, its encrypted password and its
   `krb5.conf` once the node is enrolled, and audits it
@@ -741,8 +763,15 @@ message; the message carries the detail.
 | `certificate` | The issued certificate cannot be read or cannot be served with the generated key | Report it; revoke the request the message names |
 | `store` | The issued certificate could not be stored, or the certificate being renewed stopped being AD CS managed meanwhile | Revoke the request the message names |
 | `timeout` | The operation passed its bound | Silent KDCs or a slow CES; see [Timeouts](#timeouts-and-the-single-flight-guard) |
-| `krb5_conf` | The generated `krb5.conf` could not be written | Permissions on `<data-dir>/adcs/` |
-| `configuration`, `csr` | A parameter or the CSR was refused before anything was sent | The message names the field |
+| `gss_task` | A Kerberos call's task did not return | The log; the process may be shutting down |
+| `krb5_conf` | The generated `krb5.conf` could not be written (500 `adcs_krb5_conf`) | Permissions on `<data-dir>/adcs/`; the log names the path |
+| `configuration` | A connection parameter was refused before anything was sent | The message names the parameter |
+| `csr` | The CSR was refused before anything was sent | The message names the field |
+| `denied` | The authority denied the request (422 `adcs_denied`) | The authority's message, below |
+| `pending` | The template needs approval; nothing was stored | Remove the approval requirement, see [Supported templates](#supported-templates) |
+| `subject` | A renewal could not read its certificate back into a request | The stored certificate; replace it after reverting to manual |
+| `san_refused` | A renewal's names are no longer under an allowed suffix | The allowed suffixes |
+| `template_refused` | A renewal's recorded template is no longer allowed | The allowed templates |
 
 A denial (422 `adcs_denied`) is the CA refusing this request under its
 policy; the message is the CA's.
@@ -876,6 +905,34 @@ discovered. `docs/security/threat-model.md` carries the same list.
 
 On a follower, the authority read answers `managed_on_control_plane`
 and every operation is refused. `lorica-api/openapi.yaml` has the
-request and response shapes. The alert types are
+request and response shapes.
+
+### Error codes
+
+A condition answers the same status and code on every AD CS endpoint
+that meets it: the connection test, issuance, "Renew now", adoption,
+reversion and the authority writes. The codes are held by
+`ADCS_CODES` in `lorica-api/src/adcs/error.rs`; a test fails when this
+table or `openapi.yaml` misses one.
+
+| Code | Status | Meaning |
+|---|---|---|
+| `adcs_not_configured` | 409 | No authority is configured, or it has no password |
+| `adcs_no_issuing_ca` | 409 | The authority does not know its issuing CA certificate (adoption) |
+| `adcs_failed_state` | 409 | The authority is in the [failed state](#the-failed-state) |
+| `adcs_busy` | 409 | Another AD CS operation is running |
+| `adcs_san_refused` | 422 | A requested name is refused by the allowlist |
+| `adcs_template_refused` | 422 | The requested template is not allowed |
+| `adcs_denied` | 422 | The authority denied the request |
+| `adcs_not_candidate` | 422 | The certificate cannot be adopted |
+| `adcs_error` | 502 | A fault, a client step, or an issued certificate Lorica refused; `error.step` names the step |
+| `adcs_krb5_conf` | 500 | The generated `krb5.conf` could not be written |
+| `adcs_certificate_managed` | 409 | An AD CS certificate's PEM, key or domain cannot be replaced |
+| `adcs_key_not_exportable` | 403 | The private key of an AD CS certificate is never downloaded |
+| `adcs_renewal_not_on_automation_plane` | 403 | A token asked to renew an AD CS certificate |
+| `gateway_timeout` | 504 | The operation outlived the request and is still finishing |
+
+A follower answers 409 `conflict`, the code of the gate that refuses
+every configuration write there. The alert types are
 `adcs_authority_failed` and `cert_issuance_failed`; channels saved with
 an explicit alert list are subscribed to both on upgrade.

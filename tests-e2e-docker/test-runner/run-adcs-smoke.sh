@@ -84,7 +84,7 @@ LOGIN_HEADERS="$WORK/login.headers"
 LOGIN_BODY="$WORK/login.body"
 LOGIN_HTTP=$(curl -s -o "$LOGIN_BODY" -D "$LOGIN_HEADERS" -w '%{http_code}' \
     "$API/api/v1/auth/login" -X POST -H "Content-Type: application/json" \
-    -d "{\"username\":\"admin\",\"password\":\"${ADMIN_PW}\"}")
+    -d "$(jq -nc --arg u admin --arg p "$ADMIN_PW" '{username:$u,password:$p}')")
 [ "$LOGIN_HTTP" = "200" ] || { fail "login HTTP $LOGIN_HTTP: $(cat "$LOGIN_BODY")"; exit 1; }
 SESSION=$(session_from "$LOGIN_HEADERS")
 [ -n "$SESSION" ] || { fail "no session cookie returned"; exit 1; }
@@ -96,7 +96,7 @@ if [ "$(jq -r '.data.must_change_password // false' "$LOGIN_BODY")" = "true" ]; 
     [ "$CHANGE_HTTP" = "200" ] || { fail "password change HTTP $CHANGE_HTTP"; exit 1; }
     curl -s -o /dev/null -D "$LOGIN_HEADERS" "$API/api/v1/auth/login" -X POST \
         -H "Content-Type: application/json" \
-        -d "{\"username\":\"admin\",\"password\":\"${NEW_PW}\"}"
+        -d "$(jq -nc --arg u admin --arg p "$NEW_PW" '{username:$u,password:$p}')"
     SESSION=$(session_from "$LOGIN_HEADERS")
     [ -n "$SESSION" ] || { fail "no session cookie after re-login"; exit 1; }
 fi
@@ -146,15 +146,24 @@ expect_code() {
     fi
 }
 
-# The connection test shares a 3-a-minute bucket, and this smoke runs it
-# four times: a 429 is waited out, never counted as the answer.
-connection_test() {
-    for _ in $(seq 1 12); do
-        call POST /api/v1/adcs/authority/test
-        [ "$CODE" = "429" ] || return 0
-        sleep 10
+# `call`, with a 429 waited out rather than counted as the answer. The
+# connection test, and issuance with "Renew now", each have a rate-limit
+# bucket smaller than the calls this smoke makes in a minute; the wait is
+# logged so it shows in the run's timings.
+call_past_rate_limit() {
+    local waited=0
+    for _ in $(seq 1 60); do
+        call "$@"
+        if [ "$CODE" != "429" ]; then
+            [ "$waited" = "0" ] || log "$1 $2: waited ${waited}s for the rate limit"
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
     done
 }
+
+connection_test() { call_past_rate_limit POST /api/v1/adcs/authority/test; }
 
 as_reqs() { grep "AS_REQ" "$HARNESS/kdc.log" | grep -c -- "$KDC_PRINCIPAL" || true; }
 preauth_failures() {
@@ -339,10 +348,10 @@ call GET /api/v1/routes/"$ROUTE_ID"
 assert_json "$BODY" '.data.certificate_id' "$CERT_ID" "the route still references the renewed certificate"
 
 # --- 4. renewal by the loop -------------------------------------------------------
-# The loop ticks every 12 hours and renews a bound certificate with 30
-# days or less left. Driving it here would mean waiting a tick out; its
-# selection, its breaker and its 24-hour backoff are covered by the unit
-# tests in lorica-api/src/adcs/renew/tests.rs. Not asserted here.
+# The loop renews on its own tick, inside its renewal window. Driving it
+# here would mean waiting a tick out; its selection, its breaker and its
+# back-off are covered by the unit tests in
+# lorica-api/src/adcs/renew/tests.rs. Not asserted here.
 log "=== 4. renewal by the loop: time-based, covered by unit tests, not driven ==="
 
 # --- 5. adoption and reversion -----------------------------------------------------
@@ -367,12 +376,15 @@ sign_leaf() {
         -extfile "$WORK/$name.ext" -out "$WORK/$name.crt" 2>/dev/null
 }
 
+# Uploads the leaf of $1 with the chain in $2 and sets UPLOADED_ID, empty
+# on failure. Called directly, not through $(...): CODE and BODY must
+# survive for the failure message.
 upload() {
     local name="$1" chain="$2"
     call POST /api/v1/certificates "$(jq -nc --arg d "$name" \
         --arg c "$(cat "$WORK/$name.crt" "$chain")" --rawfile k "$WORK/$name.key" \
         '{domain:$d, cert_pem:$c, key_pem:$k}')"
-    echo "$BODY" | jq -r '.data.id // empty'
+    UPLOADED_ID=$(echo "$BODY" | jq -r '.data.id // empty')
 }
 
 sign_leaf "$ADOPTED_NAME" "$HARNESS/ca/issuing.pem" "$HARNESS/ca/issuing.key.pem"
@@ -383,9 +395,11 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 30 -keyout "$WORK/foreign-ca.key
     -out "$WORK/foreign-ca.pem" 2>/dev/null
 sign_leaf "$FOREIGN_NAME" "$WORK/foreign-ca.pem" "$WORK/foreign-ca.key"
 
-ADOPTED_ID=$(upload "$ADOPTED_NAME" "$HARNESS/ca/issuing.pem")
+upload "$ADOPTED_NAME" "$HARNESS/ca/issuing.pem"
+ADOPTED_ID="$UPLOADED_ID"
 [ -n "$ADOPTED_ID" ] || { fail "upload of the harness-signed certificate: HTTP $CODE $BODY"; exit 1; }
-FOREIGN_ID=$(upload "$FOREIGN_NAME" "$WORK/foreign-ca.pem")
+upload "$FOREIGN_NAME" "$WORK/foreign-ca.pem"
+FOREIGN_ID="$UPLOADED_ID"
 [ -n "$FOREIGN_ID" ] || { fail "upload of the foreign certificate: HTTP $CODE $BODY"; exit 1; }
 ok "uploaded a manual certificate from the harness CA and one from another CA"
 
@@ -453,6 +467,8 @@ assert_json "$BODY" '.data.summary.failed_reason != null' "true" "with what the 
 BEFORE=$(as_reqs)
 connection_test
 expect_code 409 "a second test is refused in the failed state"
+assert_json "$BODY" '.error.code' "adcs_failed_state" \
+    "refused as adcs_failed_state, the code issuance answers too"
 case "$(echo "$BODY" | jq -r '.error.message // empty')" in
     *"failed state"*) ok "the refusal names the failed state" ;;
     *) fail "the refusal does not name the failed state: $BODY" ;;
@@ -464,7 +480,7 @@ if [ "$AFTER" = "$BEFORE" ]; then
 else
     fail "the refused test reached the KDC: $BEFORE AS-REQ lines before, $AFTER after"
 fi
-call POST /api/v1/certificates/adcs "{\"sans\":[\"other.corp.example.org\"]}"
+call_past_rate_limit POST /api/v1/certificates/adcs "{\"sans\":[\"other.corp.example.org\"]}"
 expect_code 409 "issuance is refused in the failed state too"
 assert_json "$BODY" '.error.code' "adcs_failed_state" "refused as adcs_failed_state"
 

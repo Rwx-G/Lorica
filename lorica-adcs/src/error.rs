@@ -24,7 +24,7 @@ use crate::gss::TicketFailure;
 /// Declares [`FailureStep`] with its closed words, so the list of steps,
 /// their words and [`FailureStep::ALL`] are one declaration.
 macro_rules! failure_steps {
-    ($($(#[doc = $doc:literal])* $variant:ident => $word:literal,)*) => {
+    ($($(#[doc = $doc:literal])* $variant:ident => $word:literal, $label:literal,)*) => {
         /// The step an AD CS operation failed at, as a closed word that
         /// audit rows, persisted state and alert filters match on.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -43,41 +43,48 @@ macro_rules! failure_steps {
                     $(FailureStep::$variant => $word,)*
                 }
             }
+
+            /// The step in words, for an operator reading a failure.
+            pub fn label(self) -> &'static str {
+                match self {
+                    $(FailureStep::$variant => $label,)*
+                }
+            }
         }
     };
 }
 
 failure_steps! {
     /// No KDC of the realm could be found or reached.
-    KdcDiscovery => "kdc_discovery",
+    KdcDiscovery => "kdc_discovery", "KDC discovery",
     /// The KDC answered and no ticket was obtained.
-    TicketAcquisition => "ticket_acquisition",
+    TicketAcquisition => "ticket_acquisition", "Ticket acquisition",
     /// The SPNEGO exchange failed before mutual authentication.
-    Spnego => "spnego",
+    Spnego => "spnego", "SPNEGO",
     /// The endpoint did not prove it holds the service key.
-    MutualAuthentication => "mutual_authentication",
+    MutualAuthentication => "mutual_authentication", "Mutual authentication",
     /// The channel binding could not be computed, or the endpoint's
     /// certificate changed under it.
-    ChannelBinding => "channel_binding",
+    ChannelBinding => "channel_binding", "Channel binding",
     /// The TLS connection to the endpoint failed.
-    Tls => "tls",
+    Tls => "tls", "TLS connection",
     /// An HTTP leg failed below the authentication.
-    Http => "http",
+    Http => "http", "HTTP exchange",
     /// The generated `krb5.conf` or one of its values was refused or
     /// could not be written.
-    Krb5Conf => "krb5_conf",
+    Krb5Conf => "krb5_conf", "Kerberos configuration",
     /// The connection parameters are unusable.
-    Configuration => "configuration",
+    Configuration => "configuration", "Connection parameters",
     /// The CSR could not be built.
-    Csr => "csr",
+    Csr => "csr", "Certificate request",
     /// The SOAP envelope could not be written or the answer read.
-    Soap => "soap",
+    Soap => "soap", "SOAP message",
     /// The issuing chain of an issued certificate could not be built.
-    Chain => "chain",
+    Chain => "chain", "Certificate chain",
     /// The operation timeout passed.
-    Timeout => "timeout",
+    Timeout => "timeout", "Timeout",
     /// A blocking task of the operation did not return.
-    GssTask => "gss_task",
+    GssTask => "gss_task", "Kerberos task",
 }
 
 impl fmt::Display for FailureStep {
@@ -367,6 +374,13 @@ mod tests {
         words.sort_unstable();
         words.dedup();
         assert_eq!(words.len(), count, "{words:?}");
+        let mut labels: Vec<&str> = FailureStep::ALL
+            .iter()
+            .map(|step: &FailureStep| step.label())
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), count, "{labels:?}");
         for step in FailureStep::ALL {
             assert_eq!(step.to_string(), step.as_str());
             assert!(

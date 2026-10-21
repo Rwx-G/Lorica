@@ -30,11 +30,20 @@
 //! would match every issuing CA under it, so only the first certificate
 //! of the authority's `issuing_ca_pem` is ever used.
 //!
-//! Detection is a pure read, computed on every request: nothing about a
-//! candidate is stored, so there is nothing to keep in sync when the
-//! certificates or the issuing CA change. Adoption re-checks the
-//! candidacy of the one certificate it is asked about, inside the store
-//! transaction that writes it.
+//! Detection is a pure read: nothing about a candidate is stored, so
+//! there is nothing to keep in sync when the certificates or the issuing
+//! CA change. The costly part of it, parsing a leaf and verifying its
+//! signature, depends on the two certificates' bytes alone, so its
+//! verdict is kept in memory per pair of digests ([`AdoptionVerdicts`]):
+//! a replaced PEM or a new issuing CA is a pair not seen yet, and a
+//! listing costs a signature only for what changed since the last one.
+//! Adoption re-checks the candidacy of the one certificate it is asked
+//! about, without that memory, inside the store transaction that writes
+//! it.
+//!
+//! A follower has no authority (D13): its listing answers
+//! `managed_on_control_plane` without reading anything, as its authority
+//! read does.
 //!
 //! # What adoption and reversion change
 //!
@@ -44,20 +53,25 @@
 //! `adcs_authority_id` only: the certificate becomes manual, stays in
 //! service, and keeps the other `adcs_*` fields as history.
 
+use std::collections::{HashMap, HashSet};
+
 use axum::extract::{Extension, Path};
-use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use lorica_config::models::{AdcsAuthority, Certificate, CertificateSource};
 use lorica_config::ConfigStore;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use x509_parser::certificate::X509Certificate;
 
-use super::issue::{check_sans, normalize_sans, template_oid_of, IssueError};
+use super::error::{NOT_CANDIDATE, NO_ISSUING_CA};
+use super::issue::{check_sans, normalize_sans, IssueError};
+use super::leaf::template_oid_of;
 use super::renew::{renewal_names, stored_leaf_der};
-use super::{refuse_on_follower, AdcsHandlerError};
+use super::{refuse_on_follower, AdcsUnavailable};
 use crate::audit::{AuditContext, ClientConnectInfo};
 use crate::certificates::{cert_to_response, subject_of, CertificateResponse};
+use crate::cluster::ClusterRuntime;
 use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
 use crate::middleware::auth::Session;
@@ -75,6 +89,18 @@ pub enum AdoptionUnavailable {
     /// The authority does not know its issuing CA certificate, so no
     /// signature can be verified.
     NoIssuingCa,
+    /// This node is a follower: the authority, and so its candidates,
+    /// live on the control plane (D13).
+    ManagedOnControlPlane,
+}
+
+impl AdoptionUnavailable {
+    /// Every reason, in declaration order.
+    pub const ALL: [AdoptionUnavailable; 3] = [
+        AdoptionUnavailable::NotConfigured,
+        AdoptionUnavailable::NoIssuingCa,
+        AdoptionUnavailable::ManagedOnControlPlane,
+    ];
 }
 
 /// A manual certificate the authority's issuing CA signed.
@@ -123,7 +149,7 @@ pub struct AdcsAdoptRequest {
 }
 
 /// Why a certificate is not a candidate.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum NotCandidate {
     /// It is not a manual certificate.
     NotManual(CertificateSource),
@@ -186,10 +212,27 @@ pub(crate) fn assess(
     ca: &X509Certificate<'_>,
     cert: &Certificate,
 ) -> Result<Option<String>, NotCandidate> {
+    must_be_manual(cert)?;
+    let template: Option<String> = signature_verdict(ca, cert)?;
+    names_must_be_requestable(authority, cert)?;
+    Ok(template)
+}
+
+fn must_be_manual(cert: &Certificate) -> Result<(), NotCandidate> {
     let source: CertificateSource = cert.source();
     if source != CertificateSource::Manual {
         return Err(NotCandidate::NotManual(source));
     }
+    Ok(())
+}
+
+/// Whether `ca` signed `cert`'s leaf, and the template the leaf names:
+/// the part of [`assess`] that depends on the two certificates' bytes
+/// alone, and the only costly one.
+fn signature_verdict(
+    ca: &X509Certificate<'_>,
+    cert: &Certificate,
+) -> Result<Option<String>, NotCandidate> {
     let leaf_der: Vec<u8> = stored_leaf_der(cert).map_err(NotCandidate::Unreadable)?;
     let (_, leaf) = x509_parser::parse_x509_certificate(&leaf_der).map_err(|err| {
         NotCandidate::Unreadable(format!("the stored certificate does not parse: {err}"))
@@ -197,11 +240,68 @@ pub(crate) fn assess(
     if !lorica_adcs::issued_by(&leaf, ca) {
         return Err(NotCandidate::NotSignedByIssuingCa);
     }
+    Ok(template_oid_of(&leaf))
+}
+
+fn names_must_be_requestable(
+    authority: &AdcsAuthority,
+    cert: &Certificate,
+) -> Result<(), NotCandidate> {
     let names: Vec<String> = normalize_sans(&renewal_names(cert));
     if let Err(IssueError::SanRefused { message, .. }) = check_sans(authority, &names) {
         return Err(NotCandidate::Names(message));
     }
-    Ok(template_oid_of(&leaf))
+    Ok(())
+}
+
+/// The SHA-256 of `bytes`.
+fn digest(bytes: &[u8]) -> [u8; 32] {
+    let mut out: [u8; 32] = [0; 32];
+    out.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref());
+    out
+}
+
+/// A stored certificate's PEM digest and an issuing CA certificate's
+/// DER digest.
+type VerdictKey = ([u8; 32], [u8; 32]);
+
+/// The [`signature_verdict`] of every certificate the last listings
+/// looked at, per (certificate PEM digest, issuing CA DER digest).
+///
+/// A verdict is a function of those bytes, so it never goes stale: a
+/// changed PEM or a new issuing CA certificate is another key. Each
+/// listing keeps only the keys it used, so the map is bounded by the
+/// number of stored certificates. Adoption never reads it.
+#[derive(Debug, Default)]
+pub(crate) struct AdoptionVerdicts {
+    by_key: Mutex<HashMap<VerdictKey, Result<Option<String>, NotCandidate>>>,
+}
+
+impl AdoptionVerdicts {
+    /// The verdict for `key`, computed by `compute` when unknown.
+    fn get_or_compute(
+        &self,
+        key: VerdictKey,
+        compute: impl FnOnce() -> Result<Option<String>, NotCandidate>,
+    ) -> Result<Option<String>, NotCandidate> {
+        if let Some(known) = self.by_key.lock().get(&key) {
+            return known.clone();
+        }
+        let verdict = compute();
+        self.by_key.lock().insert(key, verdict.clone());
+        verdict
+    }
+
+    /// Forget every verdict but those of `used`.
+    fn retain(&self, used: &HashSet<VerdictKey>) {
+        self.by_key.lock().retain(|key, _| used.contains(key));
+    }
+
+    /// How many verdicts are kept, for a test.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.by_key.lock().len()
+    }
 }
 
 /// The template observed on the most recent certificate Lorica issued
@@ -233,6 +333,7 @@ fn observed_template(authority: &AdcsAuthority, certs: &[Certificate]) -> Option
 fn list_candidates(
     authority: Option<&AdcsAuthority>,
     certs: &[Certificate],
+    verdicts: &AdoptionVerdicts,
 ) -> Result<AdoptionCandidates, ApiError> {
     let unavailable = |reason: AdoptionUnavailable| AdoptionCandidates {
         reason: Some(reason),
@@ -245,11 +346,19 @@ fn list_candidates(
         return Ok(unavailable(AdoptionUnavailable::NoIssuingCa));
     };
     let ca: X509Certificate<'_> = parse_issuing_ca(&ca_der)?;
+    let ca_digest: [u8; 32] = digest(&ca_der);
     let observed: Option<String> = observed_template(authority, certs);
+    let mut used: HashSet<VerdictKey> = HashSet::with_capacity(certs.len());
     let candidates: Vec<AdoptionCandidate> = certs
         .iter()
         .filter_map(|cert| {
-            let issued: Option<String> = assess(authority, &ca, cert).ok()?;
+            must_be_manual(cert).ok()?;
+            let key: VerdictKey = (digest(cert.cert_pem.as_bytes()), ca_digest);
+            used.insert(key);
+            let issued: Option<String> = verdicts
+                .get_or_compute(key, || signature_verdict(&ca, cert))
+                .ok()?;
+            names_must_be_requestable(authority, cert).ok()?;
             let template_mismatch: bool = matches!(
                 (&issued, &observed),
                 (Some(issued), Some(observed)) if issued != observed
@@ -266,6 +375,7 @@ fn list_candidates(
             })
         })
         .collect();
+    verdicts.retain(&used);
     Ok(AdoptionCandidates {
         reason: None,
         candidates,
@@ -277,6 +387,12 @@ fn list_candidates(
 pub async fn list_adoption_candidates(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if matches!(state.cluster, ClusterRuntime::Follower(_)) {
+        return Ok(json_data(AdoptionCandidates {
+            reason: Some(AdoptionUnavailable::ManagedOnControlPlane),
+            candidates: Vec::new(),
+        }));
+    }
     let (authority, certs) = db_blocking(&state.store, |store| {
         Ok::<_, ApiError>((
             store.get_adcs_authority()?,
@@ -286,17 +402,19 @@ pub async fn list_adoption_candidates(
     .await?;
     // Parsing and verifying every certificate is CPU work, done after
     // the store lock is released.
+    let verdicts = std::sync::Arc::clone(&state.adcs.adoption);
     let listing: AdoptionCandidates =
-        tokio::task::spawn_blocking(move || list_candidates(authority.as_ref(), &certs))
+        tokio::task::spawn_blocking(move || list_candidates(authority.as_ref(), &certs, &verdicts))
             .await
             .map_err(|err| ApiError::Internal(format!("adoption listing task failed: {err}")))??;
     Ok(json_data(listing))
 }
 
-/// What a refused adoption or reversion answers.
+/// What a refused adoption answers.
 #[derive(Debug)]
 enum Refusal {
-    NotConfigured(String),
+    NotConfigured,
+    NoIssuingCa,
     NotCandidate(String),
     Api(ApiError),
 }
@@ -313,25 +431,17 @@ impl From<lorica_config::ConfigError> for Refusal {
     }
 }
 
-impl From<Refusal> for AdcsHandlerError {
-    fn from(refusal: Refusal) -> AdcsHandlerError {
-        let coded =
-            |status: StatusCode, code: &'static str, message: String| AdcsHandlerError::Coded {
-                status,
-                code,
-                message,
-                step: None,
-            };
+impl From<Refusal> for ApiError {
+    fn from(refusal: Refusal) -> ApiError {
         match refusal {
-            Refusal::NotConfigured(message) => {
-                coded(StatusCode::CONFLICT, "adcs_not_configured", message)
-            }
-            Refusal::NotCandidate(message) => coded(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "adcs_not_candidate",
-                message,
+            Refusal::NotConfigured => AdcsUnavailable::NotConfigured.into(),
+            Refusal::NoIssuingCa => NO_ISSUING_CA.error(
+                "the AD CS authority does not know its issuing CA certificate, so no certificate \
+                 can be verified as its own; issue one certificate through Lorica, or have a \
+                 SuperAdmin paste the issuing CA certificate in the authority settings",
             ),
-            Refusal::Api(err) => AdcsHandlerError::Api(err),
+            Refusal::NotCandidate(message) => NOT_CANDIDATE.error(message),
+            Refusal::Api(err) => err,
         }
     }
 }
@@ -350,22 +460,11 @@ fn write_adoption(
     id: &str,
     auto_renew: Option<bool>,
 ) -> Result<Written, Refusal> {
-    let authority: AdcsAuthority = store.get_adcs_authority()?.ok_or_else(|| {
-        Refusal::NotConfigured(
-            "no AD CS authority is configured; a SuperAdmin must declare one".to_string(),
-        )
-    })?;
+    let authority: AdcsAuthority = store.get_adcs_authority()?.ok_or(Refusal::NotConfigured)?;
     let before: Certificate = store
         .get_certificate(id)?
         .ok_or_else(|| ApiError::NotFound(format!("certificate {id}")))?;
-    let ca_der: Vec<u8> = issuing_ca_der(&authority)?.ok_or_else(|| {
-        Refusal::NotConfigured(
-            "the AD CS authority does not know its issuing CA certificate, so no certificate \
-             can be verified as its own; issue one certificate through Lorica, or have a \
-             SuperAdmin paste the issuing CA certificate in the authority settings"
-                .to_string(),
-        )
-    })?;
+    let ca_der: Vec<u8> = issuing_ca_der(&authority)?.ok_or(Refusal::NoIssuingCa)?;
     let ca: X509Certificate<'_> = parse_issuing_ca(&ca_der)?;
     let issued_template: Option<String> = assess(&authority, &ca, &before)
         .map_err(|not_candidate| Refusal::NotCandidate(not_candidate.message(id)))?;
@@ -435,7 +534,7 @@ pub async fn adopt_certificate(
     Extension(session): Extension<Session>,
     Path(id): Path<String>,
     body: Option<Json<AdcsAdoptRequest>>,
-) -> Result<Json<serde_json::Value>, AdcsHandlerError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     refuse_on_follower(&state)?;
     let auto_renew: Option<bool> = body.and_then(|Json(request)| request.auto_renew);
     let written: Written = db_blocking(&state.store, move |store| {
@@ -457,15 +556,14 @@ pub async fn revert_certificate(
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, AdcsHandlerError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     refuse_on_follower(&state)?;
     // A renewal in flight would write the row back with the authority
     // set when it completes, undoing the reversion.
     let Some(_in_flight) = state.renewals.begin(&id) else {
         return Err(ApiError::Conflict(format!(
             "certificate `{id}`: a renewal is in flight; revert it once the renewal ends"
-        ))
-        .into());
+        )));
     };
     let reverted_id: String = id.clone();
     let written: Written = db_blocking(&state.store, move |store| {

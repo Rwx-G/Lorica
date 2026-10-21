@@ -98,6 +98,15 @@ impl AdcsKeyType {
             Self::EcdsaP256 => "ecdsa_p256",
         }
     }
+
+    /// The key type in words, as the dashboard offers it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rsa2048 => "RSA 2048",
+            Self::Rsa3072 => "RSA 3072",
+            Self::EcdsaP256 => "ECDSA P-256",
+        }
+    }
 }
 
 impl fmt::Display for AdcsKeyType {
@@ -140,6 +149,20 @@ pub struct AdcsSubjectDefaults {
     /// The optional `emailAddress` attribute.
     #[serde(default)]
     pub email: Option<String>,
+}
+
+impl AdcsSubjectDefaults {
+    /// Every field as it is serialised, in declaration order, with its
+    /// label for an operator. A test holds it to the serialised fields,
+    /// so a field added to the struct without an entry here fails.
+    pub const FIELDS: [(&'static str, &'static str); 6] = [
+        ("country", "Country (C)"),
+        ("state", "State or province (ST)"),
+        ("locality", "Locality (L)"),
+        ("organization", "Organization (O)"),
+        ("organizational_unit", "Organizational unit (OU)"),
+        ("email", "Email"),
+    ];
 }
 
 /// One entry of the authority's DNS-suffix allowlist (PRD D5).
@@ -259,13 +282,30 @@ impl fmt::Display for AllowedSuffix {
     }
 }
 
-/// `raw` lowercased with one root dot dropped, when every label is an
-/// RFC 1123 LDH label and the whole fits RFC 1035's length; `None`
-/// otherwise. Non-ASCII input is refused: an internationalised name is
-/// written in its punycode (`xn--`) form, which is LDH.
+/// `raw` as the allowlist compares names: ASCII-lowercased, one trailing
+/// root dot dropped. Nothing is validated; [`AllowedSuffix::permits`]
+/// refuses what is not a DNS name. Issuance requests names in this form,
+/// so what is checked and what is requested are one spelling.
+///
+/// ```
+/// use lorica_config::models::canonical_dns_name;
+/// assert_eq!(canonical_dns_name("App.Corp.Example.ORG."), "app.corp.example.org");
+/// ```
+pub fn canonical_dns_name(raw: &str) -> String {
+    let lowered: String = raw.to_ascii_lowercase();
+    match lowered.strip_suffix('.') {
+        Some(name) => name.to_string(),
+        None => lowered,
+    }
+}
+
+/// [`canonical_dns_name`] of `raw`, when every label is an RFC 1123 LDH
+/// label and the whole fits RFC 1035's length; `None` otherwise.
+/// Non-ASCII input is refused: an internationalised name is written in
+/// its punycode (`xn--`) form, which is LDH.
 fn normalize_dns_name(raw: &str) -> Option<String> {
-    let lowered = raw.to_ascii_lowercase();
-    let name = lowered.strip_suffix('.').unwrap_or(&lowered);
+    let canonical: String = canonical_dns_name(raw);
+    let name: &str = canonical.as_str();
     if name.is_empty() || name.len() > DNS_NAME_MAX_LEN {
         return None;
     }
@@ -586,6 +626,47 @@ mod tests {
         }
         assert_eq!(AdcsKeyType::default(), AdcsKeyType::Rsa2048);
         assert!("rsa4096".parse::<AdcsKeyType>().is_err());
+    }
+
+    #[test]
+    fn the_subject_field_table_is_the_serialised_fields() {
+        let every_field_set: AdcsSubjectDefaults = AdcsSubjectDefaults {
+            country: Some(String::new()),
+            state: Some(String::new()),
+            locality: Some(String::new()),
+            organization: Some(String::new()),
+            organizational_unit: Some(String::new()),
+            email: Some(String::new()),
+        };
+        let serialised: serde_json::Value =
+            serde_json::to_value(&every_field_set).expect("test setup: serialise");
+        let mut keys: Vec<&str> = serialised
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut table: Vec<&str> = AdcsSubjectDefaults::FIELDS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        keys.sort_unstable();
+        table.sort_unstable();
+        assert_eq!(keys, table);
+    }
+
+    #[test]
+    fn the_canonical_name_is_the_one_permits_compares() {
+        let suffix: AllowedSuffix = suffix("corp.example.org");
+        for raw in [
+            "App.Corp.Example.Org.",
+            "corp.example.org",
+            "a.CORP.example.org",
+        ] {
+            assert!(suffix.permits(raw));
+            assert!(suffix.permits(&canonical_dns_name(raw)));
+            assert_eq!(normalize_dns_name(raw), Some(canonical_dns_name(raw)));
+        }
     }
 
     fn authority() -> AdcsAuthority {

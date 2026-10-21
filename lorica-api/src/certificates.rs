@@ -1,15 +1,18 @@
 //! TLS certificate CRUD plus self-signed generation. ACME-issued certs are
 //! created via the [`crate::acme`] module but managed here once stored.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
+
 use axum::extract::{Extension, Path, Query};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::Utc;
 use lorica_config::models::CertificateSource;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::adcs::AdcsHandlerError;
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
@@ -178,6 +181,30 @@ pub(crate) fn cert_to_response(c: &lorica_config::models::Certificate) -> Certif
     }
 }
 
+/// The most subjects [`SUBJECTS`] keeps before it starts again empty: a
+/// bound for a process whose views are built only one row at a time,
+/// far above any certificate count a listing prunes it to.
+const SUBJECT_CACHE_MAX: usize = 65_536;
+
+/// The subject of every certificate PEM a view was built from, per
+/// SHA-256 of that PEM.
+///
+/// A subject is a function of the PEM bytes alone, so an entry is never
+/// stale: a renewed or replaced certificate is another key. Parsing
+/// every stored chain on every list request is what this saves; hashing
+/// the PEM is an order of magnitude cheaper than decoding and parsing
+/// it. In memory rather than a stored column, because a column would
+/// change the certificate row every follower replicates, for a value
+/// only the management API reads. [`list_certificates`] keeps only the
+/// entries of the rows it listed.
+static SUBJECTS: LazyLock<Mutex<HashMap<[u8; 32], String>>> = LazyLock::new(Mutex::default);
+
+fn pem_digest(cert_pem: &str) -> [u8; 32] {
+    let mut out: [u8; 32] = [0; 32];
+    out.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, cert_pem.as_bytes()).as_ref());
+    out
+}
+
 /// The subject of the leaf in `cert_pem` (its first PEM block) as an
 /// RFC 4514 string: RDNs last-to-first, joined by `,`, multi-valued
 /// RDNs by `+`, the RFC's descriptors for the attributes it names and
@@ -187,8 +214,29 @@ pub(crate) fn cert_to_response(c: &lorica_config::models::Certificate) -> Certif
 ///
 /// Computed from the stored certificate rather than stored: an AD CS
 /// authority may rewrite the subject it was asked for, and the operator
-/// is shown what was issued (Epic 13 D5).
+/// is shown what was issued (Epic 13 D5). Computed once per PEM (see
+/// [`SUBJECTS`]).
 pub(crate) fn subject_of(cert_pem: &str) -> String {
+    let key: [u8; 32] = pem_digest(cert_pem);
+    if let Some(known) = SUBJECTS.lock().get(&key) {
+        return known.clone();
+    }
+    let subject: String = parse_subject(cert_pem);
+    let mut subjects = SUBJECTS.lock();
+    if subjects.len() >= SUBJECT_CACHE_MAX {
+        subjects.clear();
+    }
+    subjects.insert(key, subject.clone());
+    subject
+}
+
+/// Forget every cached subject but those of `live`.
+fn retain_subjects(live: &HashSet<[u8; 32]>) {
+    SUBJECTS.lock().retain(|key, _| live.contains(key));
+}
+
+/// [`subject_of`] without the cache.
+fn parse_subject(cert_pem: &str) -> String {
     let Some(block) = pem::parse_many(cert_pem)
         .ok()
         .and_then(|blocks: Vec<pem::Pem>| blocks.into_iter().next())
@@ -454,7 +502,19 @@ pub async fn list_certificates(
         store.list_certificates_without_private_keys()
     })
     .await?;
-    let responses: Vec<_> = certs.iter().map(cert_to_response).collect();
+    // A certificate not seen yet is parsed for its subject: CPU work,
+    // kept off the async workers.
+    let responses: Vec<CertificateResponse> = tokio::task::spawn_blocking(move || {
+        let responses: Vec<CertificateResponse> = certs.iter().map(cert_to_response).collect();
+        let live: HashSet<[u8; 32]> = certs
+            .iter()
+            .map(|cert| pem_digest(&cert.cert_pem))
+            .collect();
+        retain_subjects(&live);
+        responses
+    })
+    .await
+    .map_err(|err| ApiError::Internal(format!("certificate listing task failed: {err}")))?;
     Ok(json_data(serde_json::json!({ "certificates": responses })))
 }
 
@@ -577,10 +637,10 @@ pub async fn get_certificate(
 }
 
 /// The code of a refused PEM or domain change on an AD CS certificate.
-pub const ADCS_CERTIFICATE_MANAGED: &str = "adcs_certificate_managed";
+pub const ADCS_CERTIFICATE_MANAGED: &str = crate::adcs::CERTIFICATE_MANAGED.code;
 
 /// The code of a refused private-key download (Epic 13 D16).
-pub const ADCS_KEY_NOT_EXPORTABLE: &str = "adcs_key_not_exportable";
+pub const ADCS_KEY_NOT_EXPORTABLE: &str = crate::adcs::KEY_NOT_EXPORTABLE.code;
 
 /// PUT /api/v1/certificates/:id - replace the PEM body, domain, or ACME settings.
 ///
@@ -598,7 +658,7 @@ pub async fn update_certificate(
     Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Json(body): Json<UpdateCertificateRequest>,
-) -> Result<Json<serde_json::Value>, AdcsHandlerError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let replaces_material: bool =
         body.domain.is_some() || body.cert_pem.is_some() || body.key_pem.is_some();
     let updated = db_blocking(&state.store, move |store| {
@@ -657,13 +717,10 @@ pub async fn update_certificate(
     })
     .await?;
     let Some((before_cert, cert)) = updated else {
-        return Err(AdcsHandlerError::Coded {
-            status: StatusCode::CONFLICT,
-            code: ADCS_CERTIFICATE_MANAGED,
-            message: "this certificate is issued and renewed by the AD CS authority: its PEM,                       key and domain cannot be replaced. Revert it to manual first, then upload                       the replacement"
-                .to_string(),
-            step: None,
-        });
+        return Err(crate::adcs::CERTIFICATE_MANAGED.error(
+            "this certificate is issued and renewed by the AD CS authority: its PEM, key and \
+             domain cannot be replaced. Revert it to manual first, then upload the replacement",
+        ));
     };
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
@@ -857,7 +914,7 @@ pub async fn download_certificate(
     Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Query(q): Query<DownloadCertificateQuery>,
-) -> Result<Response, AdcsHandlerError> {
+) -> Result<Response, ApiError> {
     let client_ip = connect_info
         .0
         .map(|ci| ci.0.ip().to_string())
@@ -873,7 +930,7 @@ pub async fn download_certificate(
         .check_bucket("cert_download", &client_ip, 5, 60)
         .await
     {
-        return Err(ApiError::RateLimited(retry_after).into());
+        return Err(ApiError::RateLimited(retry_after));
     }
 
     let cert = db_blocking(&state.store, move |store| {
@@ -891,15 +948,13 @@ pub async fn download_certificate(
             client_ip = %client_ip,
             cert_id = %cert.id,
             part = %part,
-            "certificate download refused: the private key of an AD CS certificate never leaves              Lorica",
+            "certificate download refused: the private key of an AD CS certificate never leaves \
+             Lorica",
         );
-        return Err(AdcsHandlerError::Coded {
-            status: StatusCode::FORBIDDEN,
-            code: ADCS_KEY_NOT_EXPORTABLE,
-            message: "the private key of a certificate issued by the AD CS authority never                       leaves Lorica; download `cert` or `chain` instead"
-                .to_string(),
-            step: None,
-        });
+        return Err(crate::adcs::KEY_NOT_EXPORTABLE.error(
+            "the private key of a certificate issued by the AD CS authority never leaves Lorica; \
+             download `cert` or `chain` instead",
+        ));
     }
     let (body, suffix) = match part {
         "cert" => (cert.cert_pem.clone(), "cert"),
@@ -916,8 +971,7 @@ pub async fn download_certificate(
         other => {
             return Err(ApiError::BadRequest(format!(
                 "unknown `part` value {other:?}; expected cert | key | chain | bundle"
-            ))
-            .into());
+            )));
         }
     };
 
@@ -1020,6 +1074,11 @@ mod download_tests {
             r"CN=\ #web.corp.example.org,O=Example\, Corp,C=FR"
         );
         assert_eq!(subject_of("not a certificate"), "");
+        assert_eq!(
+            subject_of(&cert.pem()),
+            parse_subject(&cert.pem()),
+            "the cached subject is the parsed one"
+        );
     }
 
     #[test]

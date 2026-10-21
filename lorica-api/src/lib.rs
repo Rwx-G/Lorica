@@ -60,6 +60,7 @@ pub mod target;
 /// Hot binary-upgrade verification + staging (Story 8.4).
 pub mod upgrade;
 pub mod users;
+pub mod vocabulary;
 pub mod waf;
 pub mod workers;
 

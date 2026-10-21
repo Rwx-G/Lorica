@@ -470,6 +470,47 @@ async fn renew_now_on_the_dashboard_renews_in_place() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
+/// "Renew now" of an AD CS certificate spends the bucket issuance
+/// spends, not ACME provisioning's: the two sources no longer throttle
+/// each other.
+#[tokio::test]
+async fn renew_now_of_an_adcs_certificate_spends_the_issuance_bucket() {
+    use crate::server::{
+        RL_ACME_PROVISION, RL_BUCKET_ACME_PROVISION, RL_BUCKET_ADCS_ISSUE, RL_WINDOW_S,
+    };
+    let stub = StubAuthority::new(issue_v2());
+    let f = issuing(&stub, None).await;
+    let resp = f.issue(web01()).await;
+    let id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let spend = |bucket: &'static str| {
+        let limiter = f.rate_limiter.clone();
+        async move {
+            let _ = limiter
+                .check_bucket(bucket, "127.0.0.1", RL_ACME_PROVISION, RL_WINDOW_S)
+                .await;
+        }
+    };
+    for _ in 0..RL_ACME_PROVISION {
+        spend(RL_BUCKET_ACME_PROVISION).await;
+    }
+    let resp = f.send("POST", &renew_path(&id), &f.admin, None).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an exhausted ACME bucket does not stop an AD CS renewal"
+    );
+    for _ in 1..RL_ACME_PROVISION {
+        spend(RL_BUCKET_ADCS_ISSUE).await;
+    }
+    let calls = stub.calls();
+    let resp = f.send("POST", &renew_path(&id), &f.admin, None).await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(stub.calls(), calls, "refused before the authority");
+}
+
 /// AC #8 and D6, the three planes: for an in-grant AD CS certificate
 /// the automation route and the MCP tool are refused with
 /// `adcs_renewal_not_on_automation_plane` and reach no authority, a

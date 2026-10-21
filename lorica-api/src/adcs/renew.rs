@@ -74,13 +74,12 @@ use x509_parser::oid_registry::{OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY, OID_PKC
 use x509_parser::public_key::PublicKey;
 use x509_parser::x509::{AttributeTypeAndValue, SubjectPublicKeyInfo, X509Name};
 
+use super::error::IssuanceStep;
 use super::issue::{
     audit_refusal, issue, issue_with, send_issuance_failed, validate_request, IssueError,
     IssueOutcome, IssueRequest, IssueSubject, PendingIssuance,
 };
-use super::{
-    prepare_operation, refuse_on_follower, AdcsHandlerError, AdcsOperation, LazySession, NotRun,
-};
+use super::{prepare_operation, refuse_on_follower, AdcsOperation, LazySession, NotRun};
 use crate::audit::AuditContext;
 use crate::certificates::cert_to_response;
 use crate::db::db_blocking;
@@ -88,11 +87,11 @@ use crate::error::{json_data_with_status, ApiError};
 use crate::server::AppState;
 
 /// How long a certificate whose AD CS renewal failed for a reason of its
-/// own, not the authority's, is left alone by the loop. Longer than
-/// the loop's 12 hour tick, so a certificate the authority refuses is
-/// asked about once a day rather than on every tick, and short enough
-/// against a 30 day window that a transient failure leaves many
-/// attempts before expiry.
+/// own, not the authority's, is left alone by the loop. Longer than the
+/// loop's tick (`crate::acme::renewal`), so a certificate the authority
+/// refuses is not asked about on every tick, and short against the
+/// renewal window, so a transient failure leaves many attempts before
+/// expiry.
 pub const ADCS_RENEWAL_BACKOFF_HOURS: i64 = 24;
 
 /// The actor of every loop renewal's audit rows.
@@ -502,8 +501,9 @@ async fn renew_one(
         Ok(request) => request,
         Err(message) => {
             warn!(cert_id = %cert.id, error = %message, "AD CS renewal: no request to send");
-            audit_refusal(state, ctx, "subject", &cert.id, &message).await;
-            alert_unsent_failure(state, cert, "subject", &message);
+            let step: &str = IssuanceStep::Subject.as_str();
+            audit_refusal(state, ctx, step, &cert.id, &message).await;
+            alert_unsent_failure(state, cert, step, &message);
             memory.back_off(&cert.id, now);
             return Next::Continue;
         }
@@ -548,13 +548,18 @@ async fn renew_one(
         Err(IssueError::Api(ApiError::NotFound(_))) => Next::Continue,
         Err(IssueError::SanRefused { message, .. }) => {
             warn!(cert_id = %cert.id, error = %message, "AD CS renewal refused its names");
-            alert_unsent_failure(state, cert, "san_refused", &message);
+            alert_unsent_failure(state, cert, IssuanceStep::SanRefused.as_str(), &message);
             memory.back_off(&cert.id, now);
             Next::Continue
         }
         Err(IssueError::TemplateRefused { message }) => {
             warn!(cert_id = %cert.id, error = %message, "AD CS renewal refused its template");
-            alert_unsent_failure(state, cert, "template_refused", &message);
+            alert_unsent_failure(
+                state,
+                cert,
+                IssuanceStep::TemplateRefused.as_str(),
+                &message,
+            );
             memory.back_off(&cert.id, now);
             Next::Continue
         }
@@ -591,7 +596,7 @@ pub(crate) async fn renew_manually(
     actor: &AuditContext,
     cert: &Certificate,
     mode: crate::preview::WriteMode,
-) -> Result<(StatusCode, Json<serde_json::Value>), AdcsHandlerError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     refuse_on_follower(state)?;
     if mode.previews() {
         return Ok((
@@ -607,17 +612,23 @@ pub(crate) async fn renew_manually(
         return Err(ApiError::Conflict(format!(
             "certificate `{}`: a renewal is in flight; one renewal per certificate at a time",
             cert.id
-        ))
-        .into());
+        )));
     };
     let request: IssueRequest = match renewal_request(cert) {
         Ok(request) => request,
         Err(message) => {
-            audit_refusal(state, actor, "subject", &cert.id, &message).await;
-            return Err(AdcsHandlerError::Api(ApiError::Unprocessable(format!(
+            audit_refusal(
+                state,
+                actor,
+                IssuanceStep::Subject.as_str(),
+                &cert.id,
+                &message,
+            )
+            .await;
+            return Err(ApiError::Unprocessable(format!(
                 "certificate `{}` cannot be renewed: {message}",
                 cert.id
-            ))));
+            )));
         }
     };
     match issue(state, actor, request).await? {

@@ -92,6 +92,36 @@ pub enum ApiError {
     /// supervisor, which holds an empty one.
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
+
+    /// A refusal or failure with a code of its own, so a client tells
+    /// one condition from another without reading the message: the AD
+    /// CS conditions (`adcs_busy`, `adcs_failed_state`, ...), the 504 of
+    /// an operation still finishing, a plane refusal. The message is
+    /// the envelope's as given, with no prefix, and `step` names the
+    /// failing step of a failure that has one.
+    #[error("{message}")]
+    Coded {
+        /// The HTTP status.
+        status: StatusCode,
+        /// The envelope's `code`.
+        code: &'static str,
+        /// The envelope's `message`.
+        message: String,
+        /// The failing step's closed name, carried as `error.step`.
+        step: Option<String>,
+    },
+}
+
+impl ApiError {
+    /// A [`ApiError::Coded`] without a step.
+    pub fn coded(status: StatusCode, code: &'static str, message: impl Into<String>) -> ApiError {
+        ApiError::Coded {
+            status,
+            code,
+            message: message.into(),
+            step: None,
+        }
+    }
 }
 
 impl From<lorica_config::ConfigError> for ApiError {
@@ -136,6 +166,8 @@ impl From<lorica_acme::AcmeError> for ApiError {
 struct ErrorBody {
     code: String,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -157,6 +189,7 @@ impl ApiError {
             }
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::Coded { status, .. } => *status,
         }
     }
 
@@ -171,6 +204,7 @@ impl ApiError {
             ApiError::RateLimited(_) | ApiError::RateLimitedBecause { .. } => "rate_limited",
             ApiError::Internal(_) => "internal_error",
             ApiError::ServiceUnavailable(_) => "service_unavailable",
+            ApiError::Coded { code, .. } => code,
         }
     }
 }
@@ -216,10 +250,15 @@ impl IntoResponse for ApiError {
             }
             _ => self.to_string(),
         };
+        let step: Option<String> = match &self {
+            ApiError::Coded { step, .. } => step.clone(),
+            _ => None,
+        };
         let body = ErrorEnvelope {
             error: ErrorBody {
                 code: self.code().to_string(),
                 message: user_message,
+                step,
             },
         };
         let mut response = (status, axum::Json(body)).into_response();
@@ -435,6 +474,36 @@ mod tests {
                 "non-Internal variant message must round-trip verbatim"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_coded_error_answers_its_status_code_message_and_step() {
+        let err = ApiError::Coded {
+            status: StatusCode::BAD_GATEWAY,
+            code: "adcs_error",
+            message: "TLS: handshake failed".into(),
+            step: Some("tls".into()),
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(json["error"]["code"], "adcs_error");
+        assert_eq!(json["error"]["message"], "TLS: handshake failed");
+        assert_eq!(json["error"]["step"], "tls");
+
+        let response = ApiError::coded(StatusCode::CONFLICT, "adcs_busy", "busy").into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(json["error"]["message"], "busy");
+        assert!(
+            json["error"].get("step").is_none(),
+            "no step key without a step: {json}"
+        );
     }
 
     #[test]

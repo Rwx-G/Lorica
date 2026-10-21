@@ -319,8 +319,8 @@ jobs:
     needs: lint
     runs-on: ubuntu-latest
     # The tests-e2e-docker/ suite drives Lorica against real backend
-    # containers across every profile (base, workers, cert-export, AI-bot,
-    # RBAC, audit, hot-upgrade). It exercises the full network stack
+    # containers across every profile run.sh enables by default (its usage
+    # header lists them, adcs included). It exercises the full network stack
     # deterministically on Linux, which Docker Desktop on Windows does not -
     # so it belongs in CI rather than as a Windows-local-only gate. It is
     # heavy (each profile builds a release image, with Docker layer reuse);
@@ -334,6 +334,31 @@ jobs:
         run: |
           cd tests-e2e-docker
           ./run.sh --build
+
+  adcs-harness:
+    name: AD CS Kerberos harness
+    needs: lint
+    runs-on: ubuntu-latest
+    # What Epic 13 exists to guarantee is proven only against a real MIT
+    # KDC and a CES fixture: a token without the TLS channel binding is
+    # refused, a forged or missing mutual-authentication token is
+    # refused, a wrong password costs one AS-REQ, a KDC that never
+    # answers is bounded. Those are the #[ignore]d tests of
+    # lorica-adcs/tests/harness.rs and the fixture's probe client, which
+    # tests-e2e-docker/adcs/run.sh builds, runs and tears down; unit
+    # tests cannot see an AS-REQ, so without this job a regression there
+    # would leave CI green. The E2E (Docker) job runs the adcs profile,
+    # the management API end to end, on top of the same fixtures.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      # The harness's test container shares the cargo caches of the
+      # local gate container through two external volumes, which a
+      # fresh runner does not have.
+      - name: Create the cargo cache volumes the harness mounts
+        run: docker volume create lorica-target && docker volume create lorica-cargo-registry
+      - name: Run the AD CS Kerberos harness
+        run: tests-e2e-docker/adcs/run.sh
 
   build-and-package:
     name: Build & Package

@@ -1539,7 +1539,7 @@ pub async fn renew_certificate(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
     Query(dry_run): Query<DryRunQuery>,
-) -> Result<(StatusCode, Json<Value>), crate::adcs::AdcsHandlerError> {
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     ensure_preview_readable(
         &principal,
         dry_run.mode(),

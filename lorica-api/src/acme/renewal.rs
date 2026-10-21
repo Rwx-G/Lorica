@@ -24,7 +24,6 @@ use lorica_config::models::CertificateSource;
 use parking_lot::Mutex;
 use tracing::{error, info, warn};
 
-use crate::adcs::AdcsHandlerError;
 use crate::db::db_blocking;
 use crate::error::ApiError;
 use crate::middleware::auth::Session;
@@ -130,7 +129,7 @@ impl Drop for InFlightRenewal<'_> {
 }
 
 /// The error code a token gets for an AD CS certificate (Epic 13 D6).
-pub const ADCS_NOT_ON_AUTOMATION_PLANE: &str = "adcs_renewal_not_on_automation_plane";
+pub const ADCS_NOT_ON_AUTOMATION_PLANE: &str = crate::adcs::NOT_ON_AUTOMATION_PLANE.code;
 
 /// How often the actor may renew one certificate by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -537,13 +536,41 @@ pub(crate) async fn renewal_tick(
 
 /// POST /api/v1/certificates/:id/renew - manually renew an ACME or an
 /// AD CS certificate
+///
+/// Rate limited here rather than on the route, by the certificate's
+/// source: an ACME renewal spends the `acme_provision` bucket, an AD CS
+/// one the `adcs_issue` bucket issuance spends, since both are an
+/// issuance at the authority. One route-level bucket made the two
+/// sources throttle each other and gave AD CS two budgets.
 pub async fn renew_certificate(
     connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
+    Extension(rate_limiter): Extension<crate::middleware::rate_limit::RateLimiter>,
     Path(id): Path<String>,
-) -> Result<(StatusCode, Json<serde_json::Value>), AdcsHandlerError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let client_ip: String = connect_info
+        .0
+        .map_or_else(|| "127.0.0.1".to_string(), |ci| ci.0.ip().to_string());
+    let looked_up: String = id.clone();
+    let source: Option<CertificateSource> = db_blocking(&state.store, move |store| {
+        Ok::<_, ApiError>(store.get_certificate(&looked_up)?.map(|cert| cert.source()))
+    })
+    .await?;
+    let bucket: &'static str = match source {
+        Some(CertificateSource::Adcs) => crate::server::RL_BUCKET_ADCS_ISSUE,
+        _ => crate::server::RL_BUCKET_ACME_PROVISION,
+    };
+    rate_limiter
+        .check_bucket(
+            bucket,
+            &client_ip,
+            crate::server::RL_ACME_PROVISION,
+            crate::server::RL_WINDOW_S,
+        )
+        .await
+        .map_err(ApiError::RateLimited)?;
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     renew_certificate_as(
         &state,
@@ -604,7 +631,7 @@ pub(crate) async fn renew_certificate_as(
     mode: crate::preview::WriteMode,
     guard: crate::target::CertificateGuard,
     budget: RenewalBudget,
-) -> Result<(StatusCode, Json<serde_json::Value>), AdcsHandlerError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let (cert, provider) = db_blocking(&state.store, move |store| {
         let cert = store
             .get_certificate(&id)?
@@ -624,23 +651,17 @@ pub(crate) async fn renew_certificate_as(
             return crate::adcs::renew_manually(state, actor, &cert, mode).await;
         }
         (CertificateSource::Adcs, RenewalBudget::PerCertificate) => {
-            return Err(AdcsHandlerError::Coded {
-                status: StatusCode::FORBIDDEN,
-                code: ADCS_NOT_ON_AUTOMATION_PLANE,
-                message: format!(
-                    "certificate `{}` is issued by the AD CS authority; it is renewed by the \
-                     background loop and the dashboard only, never by a token",
-                    cert.id
-                ),
-                step: None,
-            });
+            return Err(crate::adcs::NOT_ON_AUTOMATION_PLANE.error(format!(
+                "certificate `{}` is issued by the AD CS authority; it is renewed by the \
+                 background loop and the dashboard only, never by a token",
+                cert.id
+            )));
         }
         (CertificateSource::Manual, _) => {
             return Err(ApiError::BadRequest(
                 "only ACME and AD CS certificates can be renewed (use upload for manual certs)"
                     .into(),
-            )
-            .into());
+            ));
         }
     }
     if budget == RenewalBudget::PerCertificate {
@@ -660,7 +681,7 @@ pub(crate) async fn renew_certificate_as(
     let _in_flight = match (state.renewals.begin(&cert.id), budget) {
         (Some(mark), _) => Some(mark),
         (None, RenewalBudget::PerCertificate) => {
-            return Err(in_flight_refusal(&cert.id).into());
+            return Err(in_flight_refusal(&cert.id));
         }
         (None, RenewalBudget::Unbounded) => None,
     };
@@ -686,7 +707,7 @@ pub(crate) async fn renew_certificate_as(
         if let Some(until) = cooldown_from_error(&e.to_string(), Utc::now()) {
             state.renewals.record_cooldown(&cert.id, until);
         }
-        return Err(ApiError::Internal(format!("ACME renewal failed: {e}")).into());
+        return Err(ApiError::Internal(format!("ACME renewal failed: {e}")));
     }
     state.renewals.clear_cooldown(&cert.id);
 

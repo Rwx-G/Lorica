@@ -587,7 +587,12 @@ async fn delete_is_refused_with_the_certificates_that_use_the_authority() {
         "the krb5.conf goes with the authority"
     );
     let resp = f.send("DELETE", AUTHORITY, &f.admin, None).await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(resp).await["error"]["code"],
+        super::error::NOT_CONFIGURED.code,
+        "the same answer as every other endpoint without an authority"
+    );
     assert_eq!(
         f.audit_actions().await,
         vec!["adcs.authority.create", "adcs.authority.delete"]
@@ -682,7 +687,9 @@ async fn a_second_operation_is_refused_while_one_runs() {
     ] {
         let resp = f.send(method, uri, &f.admin, payload).await;
         assert_eq!(resp.status(), StatusCode::CONFLICT, "{method} {uri}");
-        let message = body_json(resp).await["error"]["message"].to_string();
+        let error = body_json(resp).await["error"].clone();
+        assert_eq!(error["code"], super::error::BUSY.code, "{method} {uri}");
+        let message = error["message"].to_string();
         assert!(message.contains("already running"), "{message}");
     }
     assert_eq!(client.calls(), 0);
@@ -830,8 +837,14 @@ async fn a_rejected_credential_opens_the_breaker_once_and_a_password_write_close
     for _ in 0..2 {
         let resp = f.test_unlimited().await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
-        let message = body_json(resp).await["error"]["message"].to_string();
+        let error = body_json(resp).await["error"].clone();
+        assert_eq!(error["code"], super::error::FAILED_STATE.code);
+        let message = error["message"].as_str().unwrap_or_default().to_string();
         assert!(message.contains("failed state"), "{message}");
+        assert!(
+            !message.starts_with("conflict"),
+            "the message is built from the condition, not another error's text: {message}"
+        );
     }
     assert_eq!(client.calls(), 1, "the breaker spends no further attempt");
 
@@ -967,12 +980,18 @@ async fn the_failing_step_and_text_reach_the_caller_verbatim() {
     }
 }
 
+/// The connection test refuses a missing authority with the code every
+/// AD CS endpoint answers it with.
 #[tokio::test]
-async fn a_test_without_an_authority_is_not_found_and_audited() {
+async fn a_test_without_an_authority_is_refused_as_not_configured_and_audited() {
     let client = always_ok();
     let f = fixture(Arc::clone(&client), None).await;
     let resp = f.send("POST", TEST, &f.admin, None).await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(resp).await["error"]["code"],
+        super::error::NOT_CONFIGURED.code
+    );
     assert_eq!(client.calls(), 0);
     assert_eq!(
         f.audit_actions().await,
@@ -1070,6 +1089,73 @@ async fn the_import_response_carries_the_import_warnings() {
             .unwrap_or_default()
             .contains("adcs-elsewhere"),
         "{json}"
+    );
+}
+
+/// A write that leaves `issuing_ca_pem` out keeps the stored one, which
+/// an issuance may have learned since the form was loaded; a blank one
+/// clears it.
+#[tokio::test]
+async fn a_write_without_the_issuing_ca_keeps_it_and_a_blank_one_clears_it() {
+    let f = fixture(always_ok(), None).await;
+    let mut with_ca = body(Some(PASSWORD));
+    with_ca["issuing_ca_pem"] = serde_json::json!(crate::tests::TEST_CERT_RSA_PEM);
+    let resp = f.send("PUT", AUTHORITY, &f.admin, Some(with_ca)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(stored_issuing_ca(&f).await.is_some());
+
+    let resp = f.send("PUT", AUTHORITY, &f.admin, Some(body(None))).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        stored_issuing_ca(&f).await.is_some(),
+        "an absent field keeps it"
+    );
+
+    let mut blank = body(None);
+    blank["issuing_ca_pem"] = serde_json::json!("");
+    let resp = f.send("PUT", AUTHORITY, &f.admin, Some(blank)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        stored_issuing_ca(&f).await.is_none(),
+        "a blank field clears it"
+    );
+}
+
+async fn stored_issuing_ca(f: &Fixture) -> Option<String> {
+    f.state
+        .store
+        .lock()
+        .await
+        .get_adcs_authority()
+        .expect("read")
+        .expect("row")
+        .issuing_ca_pem
+}
+
+/// The `krb5.conf` an operation needs is written when it differs from
+/// the rendering, and only then.
+#[tokio::test]
+async fn an_operation_rewrites_the_krb5_conf_only_when_it_changed() {
+    let f = fixture(always_ok(), None).await;
+    f.create_authority().await;
+    let path = f.krb5_conf();
+    std::fs::write(&path, b"stale").expect("test setup: stale file");
+    let resp = f.test_unlimited().await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rendered = std::fs::read(&path).expect("read");
+    assert_ne!(rendered, b"stale".to_vec(), "a stale file is rewritten");
+    let modified = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .expect("mtime");
+    std::thread::sleep(Duration::from_millis(20));
+    let resp = f.test_unlimited().await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .expect("mtime"),
+        modified,
+        "an unchanged file is not written again"
     );
 }
 

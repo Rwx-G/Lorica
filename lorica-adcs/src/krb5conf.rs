@@ -269,6 +269,20 @@ impl Krb5Config {
     pub fn write_to(&self, path: &Path) -> Result<(), AdcsError> {
         write_atomically(path, self.render().as_bytes())
     }
+
+    /// [`Krb5Config::write_to`], unless the file at `path` already holds
+    /// exactly this rendering: then nothing is written and the answer is
+    /// `false`. The file changes only with the authority, while every AD
+    /// CS operation makes sure of it, so the usual cost is reading a few
+    /// hundred bytes rather than a write and two fsyncs.
+    pub fn write_if_changed(&self, path: &Path) -> Result<bool, AdcsError> {
+        let rendered: String = self.render();
+        if fs::read(path).is_ok_and(|current: Vec<u8>| current == rendered.as_bytes()) {
+            return Ok(false);
+        }
+        write_atomically(path, rendered.as_bytes())?;
+        Ok(true)
+    }
 }
 
 /// Where the generated `krb5.conf` lives under the data directory
@@ -642,6 +656,22 @@ mod tests {
             timing: timing(),
         };
         config.write_to(&path).expect("write");
+        assert_eq!(fs::read_to_string(&path).expect("read"), config.render());
+    }
+
+    #[test]
+    fn write_if_changed_writes_only_a_different_rendering() {
+        let root: ScratchDir = ScratchDir::new();
+        let path: PathBuf = root.join("adcs").join("krb5.conf");
+        let config: Krb5Config = Krb5Config {
+            realm: Realm::new("CORP.EXAMPLE.ORG").expect("realm"),
+            kdcs: Vec::new(),
+            timing: timing(),
+        };
+        assert!(config.write_if_changed(&path).expect("first write"));
+        assert!(!config.write_if_changed(&path).expect("unchanged"));
+        fs::write(&path, b"stale").expect("setup: a stale file");
+        assert!(config.write_if_changed(&path).expect("rewrite"));
         assert_eq!(fs::read_to_string(&path).expect("read"), config.render());
     }
 }

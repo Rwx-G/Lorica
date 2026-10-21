@@ -76,6 +76,22 @@ pub struct SubjectFields {
     pub email: Option<String>,
 }
 
+impl SubjectFields {
+    /// Refuse the fields [`build_csr`] would refuse, without generating
+    /// a key: for a caller that stores subject fields and wants them
+    /// refused when they are saved rather than at the first request.
+    ///
+    /// ```
+    /// use lorica_adcs::SubjectFields;
+    /// let mut subject = SubjectFields::default();
+    /// subject.country = Some("FRA".to_owned());
+    /// assert!(subject.check().is_err());
+    /// ```
+    pub fn check(&self) -> Result<(), AdcsError> {
+        distinguished_name("check.invalid", self).map(|_| ())
+    }
+}
+
 /// A CSR and the private key it was made for.
 pub struct GeneratedCsr {
     /// The PKCS#10 request, DER.

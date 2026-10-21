@@ -81,6 +81,29 @@ pub enum CertificateSource {
     Manual,
 }
 
+impl CertificateSource {
+    /// Every source, in declaration order.
+    pub const ALL: [CertificateSource; 3] = [Self::Acme, Self::Adcs, Self::Manual];
+
+    /// The serialised spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Acme => "acme",
+            Self::Adcs => "adcs",
+            Self::Manual => "manual",
+        }
+    }
+
+    /// The source in words, as the dashboard shows it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Acme => "ACME",
+            Self::Adcs => "AD CS",
+            Self::Manual => "Manual",
+        }
+    }
+}
+
 impl Certificate {
     /// The derived source: ACME when `is_acme`, AD CS when
     /// `adcs_authority_id` is set, manual otherwise. `is_acme` wins
@@ -278,18 +301,28 @@ mod tests {
         assert_eq!(reverted.source(), CertificateSource::Manual);
     }
 
+    /// The position of `source` in [`CertificateSource::ALL`]: the
+    /// match is exhaustive, so a new variant does not compile until it
+    /// has one, and the test below fails until `ALL` holds it there.
+    fn declared_position(source: CertificateSource) -> usize {
+        match source {
+            CertificateSource::Acme => 0,
+            CertificateSource::Adcs => 1,
+            CertificateSource::Manual => 2,
+        }
+    }
+
     #[test]
-    fn the_source_serialises_lowercase() {
-        for (source, text) in [
-            (CertificateSource::Acme, "\"acme\""),
-            (CertificateSource::Adcs, "\"adcs\""),
-            (CertificateSource::Manual, "\"manual\""),
-        ] {
+    fn the_source_serialises_as_its_spelling_and_all_holds_every_variant() {
+        for (index, source) in CertificateSource::ALL.into_iter().enumerate() {
+            assert_eq!(declared_position(source), index, "{source:?}");
             assert_eq!(
                 serde_json::to_string(&source).expect("test setup: serialise"),
-                text
+                format!("\"{}\"", source.as_str())
             );
+            assert!(!source.label().is_empty());
         }
+        assert_eq!(CertificateSource::Adcs.as_str(), "adcs");
     }
 
     fn picked_id(certs: &[Certificate], hostname: &str) -> Option<String> {

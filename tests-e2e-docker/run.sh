@@ -562,17 +562,19 @@ if [ "$SKIP_ADCS" = false ] && [ "$EXIT_CODE" = "0" ]; then
     docker compose --profile adcs up $BUILD_FLAG -d lorica-adcs
 
     echo "Waiting for Lorica (adcs) to initialize..."
-    for i in $(seq 1 60); do
+    ADCS_READY_TRIES=60
+    ADCS_READY_INTERVAL_S=2
+    for i in $(seq 1 "$ADCS_READY_TRIES"); do
         if docker compose --profile adcs exec -T lorica-adcs curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
             echo "Lorica (adcs) is ready."
             break
         fi
-        if [ "$i" = "60" ]; then
-            echo "ERROR: Lorica (adcs) did not start within 120s"
+        if [ "$i" = "$ADCS_READY_TRIES" ]; then
+            echo "ERROR: Lorica (adcs) did not start after $ADCS_READY_TRIES tries ${ADCS_READY_INTERVAL_S}s apart"
             docker compose logs lorica-adcs | tail -20
             break
         fi
-        sleep 2
+        sleep "$ADCS_READY_INTERVAL_S"
     done
 
     if ! docker compose --profile adcs run --rm adcs-smoke; then

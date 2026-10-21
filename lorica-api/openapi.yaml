@@ -1700,7 +1700,8 @@ paths:
             No authority or no password is configured (`adcs_not_configured`),
             the authority is in the failed state (`adcs_failed_state`),
             another AD CS operation is running (`adcs_busy`), or this node is
-            a follower (`conflict`)
+            a follower (`conflict`, the follower gate's answer). Every AD CS
+            endpoint answers these conditions with the same status and code.
           content:
             application/json:
               schema:
@@ -1718,6 +1719,15 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "500":
+          description: >-
+            The generated krb5.conf could not be written (`adcs_krb5_conf`,
+            `error.step` is `krb5_conf`); the log names the path and the
+            cause. Nothing was sent to the authority.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdcsErrorResponse"
         "502":
           description: >-
             The authority answered with a fault, a client step failed, or the
@@ -1794,9 +1804,9 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: >-
-            No authority is configured, or it does not know its issuing CA
-            certificate (`adcs_not_configured`), or this node is a follower
-            (`conflict`)
+            No authority is configured (`adcs_not_configured`), it does not
+            know its issuing CA certificate (`adcs_no_issuing_ca`), or this
+            node is a follower (`conflict`)
           content:
             application/json:
               schema:
@@ -4220,10 +4230,14 @@ paths:
         password, so a request that changes one of them without a new
         password is refused with 422 and leaves the stored one in place.
         `allowed_templates` is stored with `default_template` first and
-        each name once (Epic 13 D17). Any password written replaces the stored
-        one and closes the failed state. The generated `krb5.conf` is
-        rewritten in the same transaction. Refused with 409 while another AD
-        CS operation runs, and on a follower.
+        each name once (Epic 13 D17). `issuing_ca_pem` left out (or `null`)
+        keeps the stored certificate, which an issuance may have learned
+        since the caller read the authority; a blank one clears it. Any
+        password written replaces the stored one and closes the failed
+        state. The generated `krb5.conf` is rewritten in the same
+        transaction; a write failure answers 500 `adcs_krb5_conf` and
+        stores nothing. Refused with 409 `adcs_busy` while another AD CS
+        operation runs, and with 409 `conflict` on a follower.
       security:
         - sessionCookie: []
       requestBody:
@@ -4258,7 +4272,9 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "409":
-          description: Another AD CS operation is running, or this node is a follower
+          description: >-
+            Another AD CS operation is running (`adcs_busy`), or this node is
+            a follower (`conflict`)
           content:
             application/json:
               schema:
@@ -4267,6 +4283,12 @@ paths:
           $ref: "#/components/responses/Unprocessable"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "500":
+          description: The generated krb5.conf could not be written (`adcs_krb5_conf`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdcsErrorResponse"
     delete:
       tags: [AdcsAuthority]
       summary: Delete the AD CS authority (SuperAdmin, control plane only)
@@ -4286,13 +4308,12 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
-        "404":
-          $ref: "#/components/responses/NotFound"
         "409":
           description: >-
-            Certificates still reference the authority (the message lists
-            them), another AD CS operation is running, or this node is a
-            follower
+            No authority is configured (`adcs_not_configured`), certificates
+            still reference it (`conflict`, the message lists them), another
+            AD CS operation is running (`adcs_busy`), or this node is a
+            follower (`conflict`)
           content:
             application/json:
               schema:
@@ -4335,20 +4356,24 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
-        "404":
-          $ref: "#/components/responses/NotFound"
         "409":
           description: >-
-            The authority is in the failed state, another AD CS operation is
-            running, or this node is a follower
+            No authority or no password is configured (`adcs_not_configured`),
+            the authority is in the failed state (`adcs_failed_state`),
+            another AD CS operation is running (`adcs_busy`), or this node is
+            a follower (`conflict`): the answers issuance gives
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
-        "422":
-          $ref: "#/components/responses/Unprocessable"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "500":
+          description: The generated krb5.conf could not be written (`adcs_krb5_conf`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdcsErrorResponse"
         "504":
           description: >-
             The test outlived the handler's deadline (`gateway_timeout`);
@@ -4364,15 +4389,17 @@ paths:
       tags: [AdcsAuthority]
       summary: Manual certificates the authority's issuing CA signed (Viewer+)
       description: >-
-        Computed on every request from the stored certificates and the
-        authority's issuing CA certificate (the first certificate of its
-        `issuing_ca_pem`); nothing about a candidate is stored. A candidate
+        Computed from the stored certificates and the authority's issuing
+        CA certificate (the first certificate of its `issuing_ca_pem`);
+        nothing about a candidate is stored. The signature verdict of a
+        certificate is kept in memory per pair of certificates, so a
+        listing verifies only what changed since the last one. A candidate
         is a manual certificate whose leaf that certificate signed, checked
         by signature, issuer name and key identifiers, never by issuer name
         alone, and whose domain and SANs are all under an allowed DNS
-        suffix, none a wildcard. With no authority, or no issuing CA
-        certificate to verify against, the list is empty and `reason` says
-        why.
+        suffix, none a wildcard. With no authority, no issuing CA
+        certificate to verify against, or on a follower, the list is empty
+        and `reason` says why.
       security:
         - sessionCookie: []
       responses:
@@ -4715,7 +4742,10 @@ paths:
         "429":
           $ref: "#/components/responses/RateLimited"
         "500":
-          description: ACME renewal failed (ACME server error, DNS, etc.); the stored certificate is untouched
+          description: >-
+            ACME renewal failed (ACME server error, DNS, etc.); the stored
+            certificate is untouched. AD CS: the generated krb5.conf could
+            not be written (`adcs_krb5_conf`).
         "502":
           description: >-
             AD CS: the authority answered with a fault, a client step
@@ -7010,7 +7040,10 @@ components:
               type: string
             step:
               type: string
-              description: The failing step's closed name.
+              description: >-
+                The failing step's closed name: a client step
+                (`FailureStep` of lorica-adcs) or an issuance step
+                (`IssuanceStep` of lorica-api); docs/adcs.md lists both.
 
     AdcsAdoptRequest:
       type: object
@@ -7071,10 +7104,11 @@ components:
         reason:
           type: string
           nullable: true
-          enum: [not_configured, no_issuing_ca, null]
+          enum: [not_configured, no_issuing_ca, managed_on_control_plane, null]
           description: >-
-            Why the list is empty without looking: no authority, or no
-            issuing CA certificate. `null` when the list is real.
+            Why the list is empty without looking: no authority, no issuing
+            CA certificate, or a follower, whose authority lives on the
+            control plane. `null` when the list is real.
         candidates:
           type: array
           items:
@@ -7307,6 +7341,9 @@ components:
         issuing_ca_pem:
           type: string
           nullable: true
+          description: >-
+            Left out or null keeps the stored certificate, which an issuance
+            may have learned since the authority was read; blank clears it.
         default_template:
           type: string
         allowed_templates:
@@ -7340,9 +7377,7 @@ components:
           nullable: true
           description: >-
             The failing step, a word of the client's closed list
-            (ticket_acquisition, kdc_discovery, tls, channel_binding,
-            spnego, mutual_authentication, http, configuration, krb5_conf,
-            timeout, gss_task, ...)
+            (`FailureStep` of lorica-adcs; docs/adcs.md lists them)
         message:
           type: string
           nullable: true

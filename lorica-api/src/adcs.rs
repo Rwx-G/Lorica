@@ -48,8 +48,9 @@
 //! puts the authority in the persisted failed state, raises one
 //! `adcs_authority_failed` alert on entry, and every later operation is
 //! refused until a password write clears it. Every operation, and every
-//! write of the authority, runs under [`AdcsGuard`]; see there for why a
-//! second one is refused rather than queued.
+//! write of the authority, runs under [`runtime::AdcsGuard`]; see there
+//! for why a second one is refused rather than queued. What each refusal
+//! answers is in [`error`].
 //!
 //! # Control plane only (D13)
 //!
@@ -58,25 +59,20 @@
 //! break-glass window does not make a follower an AD CS client), and
 //! its read answers `managed_on_control_plane`.
 
-use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::extract::Extension;
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
 use lorica_adcs::{
-    kdc_error_meaning, AdcsError, CesEndpoint, CesParams, CesTimeouts, EnrollOutcome, KdcAddress,
-    KdcTiming, Krb5Config, Principal, Realm, Secret, TicketFailure,
+    kdc_error_meaning, AdcsError, CesParams, CesTimeouts, KdcAddress, KdcTiming, Krb5Config, Realm,
+    Secret, TicketFailure,
 };
-use lorica_config::models::{
-    validate_template_name, AdcsAuthority, AdcsKeyType, AdcsSubjectDefaults, AllowedSuffix, Role,
-    ADCS_ALLOWED_TEMPLATES_MAX,
-};
+use lorica_config::models::{AdcsAuthority, AllowedSuffix, Role};
 use lorica_config::ConfigStore;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::audit::{AuditContext, ClientConnectInfo};
 use crate::cluster::ClusterRuntime;
@@ -86,16 +82,33 @@ use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 mod adopt;
+mod error;
 mod issue;
+mod leaf;
 mod renew;
+mod runtime;
+mod validate;
 
+pub(crate) use adopt::AdoptionVerdicts;
 pub use adopt::{
     adopt_certificate, list_adoption_candidates, revert_certificate, AdcsAdoptRequest,
     AdoptionCandidate, AdoptionCandidates, AdoptionUnavailable,
 };
+pub(crate) use error::{
+    refuse_on_follower, AdcsUnavailable, CERTIFICATE_MANAGED, KEY_NOT_EXPORTABLE,
+    NOT_ON_AUTOMATION_PLANE,
+};
+pub use error::{AdcsCode, IssuanceStep, ADCS_CODES};
 pub use issue::{issue_certificate, AdcsIssueRequest, PendingIssuance, MAX_SANS};
 pub(crate) use renew::{renew_due, renew_manually, AdcsRenewalMemory};
 pub use renew::{ADCS_RENEWAL_ACTOR, ADCS_RENEWAL_BACKOFF_HOURS};
+pub use runtime::AdcsRuntime;
+#[cfg(test)]
+pub(crate) use runtime::{per_request_session, AdcsClient, AdcsSession};
+pub(crate) use runtime::{run_exclusive, run_exclusive_to_end, LazySession, NotRun};
+use validate::ValidatedRequest;
+pub(crate) use validate::{subject_fields, validate_subject};
+pub use validate::{AdcsAuthorityRequest, WritePassword, MAX_KDCS};
 
 /// The target type of every audit row this module writes.
 const AUDIT_TARGET: &str = "adcs_authority";
@@ -106,517 +119,6 @@ const AUDIT_TARGET: &str = "adcs_authority";
 /// D3, D8), so a silent KDC is reported as unreachable before the
 /// outer guard fires, and leaves room for MIT to try a second KDC.
 pub const KDC_REQUEST_TIMEOUT_SECS: u32 = 30;
-
-/// How long the renewal loop waits for a busy guard before trying its
-/// AD CS batch again. A tick that gave up at the first refusal could be
-/// skipped, for 12 hours, by anyone keeping the guard busy with
-/// connection tests or issuances at the right moment.
-const BUSY_RETRY_DELAY: Duration = Duration::from_secs(30);
-
-/// The message of every refusal by [`AdcsGuard`].
-const BUSY_MESSAGE: &str = "an AD CS operation is already running; try again once it has finished";
-
-/// What a handler waits for its operation beyond the client's own
-/// operation timeout, for the audit and breaker writes that follow it.
-/// An operation that ends on that timeout is then reported by the
-/// handler as it ended; only one whose GSS-API step outlived it (MIT's
-/// own schedule, see [`CesTimeouts::operation`]) is answered 504.
-const HANDLER_GRACE: Duration = Duration::from_secs(15);
-
-/// How long a handler waits for its AD CS operation before answering
-/// 504: [`CesTimeouts::default`]'s operation timeout, the one every
-/// operation runs with, plus [`HANDLER_GRACE`].
-fn handler_deadline() -> Duration {
-    CesTimeouts::default().operation + HANDLER_GRACE
-}
-
-/// The message of the 504 a handler answers when its operation outlives
-/// [`handler_deadline`].
-const STILL_RUNNING_MESSAGE: &str = "the AD CS operation is still finishing: a Kerberos exchange \
-     outlived the operation timeout. Its outcome is recorded in the audit log when it ends, and \
-     every other AD CS operation is refused until then";
-
-/// One authenticated conversation with the authority: one ticket for
-/// every request of one API operation or one renewal tick (Epic 13 D3,
-/// D15). It holds the service account's ticket, so it never outlives
-/// the operation or the tick that opened it.
-#[async_trait::async_trait]
-pub(crate) trait AdcsSession: Send {
-    /// Authenticate without requesting anything.
-    async fn test(&mut self) -> Result<(), AdcsError>;
-
-    /// Request a certificate for the DER PKCS#10 `csr_der`: an issuance
-    /// at the authority.
-    async fn enroll(&mut self, csr_der: &[u8]) -> Result<EnrollOutcome, AdcsError>;
-}
-
-/// The calls into the authority the API makes, behind a seam so tests
-/// drive the handlers without a KDC. Production opens a
-/// [`lorica_adcs::CesSession`].
-#[async_trait::async_trait]
-pub(crate) trait AdcsClient: Send + Sync {
-    /// Authenticate to the CES described by `params` without
-    /// requesting anything, on a session of its own.
-    async fn test_connection(&self, params: &CesParams, password: &Secret)
-        -> Result<(), AdcsError>;
-
-    /// Request a certificate for `csr_der` on a session of its own.
-    async fn enroll(
-        &self,
-        params: &CesParams,
-        password: &Secret,
-        csr_der: &[u8],
-    ) -> Result<EnrollOutcome, AdcsError>;
-
-    /// Open a session. The default makes every request of it a call of
-    /// its own, which is what a stand-in authority needs; the real
-    /// client acquires one ticket for the whole session.
-    async fn open<'a>(
-        &'a self,
-        params: &CesParams,
-        password: Secret,
-    ) -> Result<Box<dyn AdcsSession + 'a>, AdcsError> {
-        Ok(per_request_session(self, params, password))
-    }
-}
-
-/// A session on `client` whose requests each go through its one-shot
-/// calls.
-pub(crate) fn per_request_session<'a, C: AdcsClient + ?Sized>(
-    client: &'a C,
-    params: &CesParams,
-    password: Secret,
-) -> Box<dyn AdcsSession + 'a> {
-    Box::new(PerRequest {
-        client,
-        params: params.clone(),
-        password,
-    })
-}
-
-/// See [`per_request_session`].
-struct PerRequest<'a, C: ?Sized> {
-    client: &'a C,
-    params: CesParams,
-    password: Secret,
-}
-
-#[async_trait::async_trait]
-impl<C: AdcsClient + ?Sized> AdcsSession for PerRequest<'_, C> {
-    async fn test(&mut self) -> Result<(), AdcsError> {
-        self.client
-            .test_connection(&self.params, &self.password)
-            .await
-    }
-
-    async fn enroll(&mut self, csr_der: &[u8]) -> Result<EnrollOutcome, AdcsError> {
-        self.client
-            .enroll(&self.params, &self.password, csr_der)
-            .await
-    }
-}
-
-/// The real client: the `lorica-adcs` crate.
-struct LibAdcsClient;
-
-/// A [`lorica_adcs::CesSession`] behind the seam.
-struct LibSession(lorica_adcs::CesSession);
-
-#[async_trait::async_trait]
-impl AdcsSession for LibSession {
-    async fn test(&mut self) -> Result<(), AdcsError> {
-        self.0.test().await
-    }
-
-    async fn enroll(&mut self, csr_der: &[u8]) -> Result<EnrollOutcome, AdcsError> {
-        self.0.enroll(csr_der).await
-    }
-}
-
-#[async_trait::async_trait]
-impl AdcsClient for LibAdcsClient {
-    async fn test_connection(
-        &self,
-        params: &CesParams,
-        password: &Secret,
-    ) -> Result<(), AdcsError> {
-        lorica_adcs::test_connection(params, password).await
-    }
-
-    async fn enroll(
-        &self,
-        params: &CesParams,
-        password: &Secret,
-        csr_der: &[u8],
-    ) -> Result<EnrollOutcome, AdcsError> {
-        lorica_adcs::enroll(params, password, csr_der).await
-    }
-
-    async fn open<'a>(
-        &'a self,
-        params: &CesParams,
-        password: Secret,
-    ) -> Result<Box<dyn AdcsSession + 'a>, AdcsError> {
-        let session = lorica_adcs::CesSession::open(params, &password).await?;
-        Ok(Box::new(LibSession(session)))
-    }
-}
-
-/// A session opened on its first request, so an operation refused
-/// before it reaches the authority (a name, a template) builds nothing,
-/// and a renewal tick shares one session across its certificates.
-///
-/// Opening contacts nothing (see [`lorica_adcs::CesSession::open`]), so
-/// a failed open is retried on the next request at no cost to the
-/// account.
-pub(crate) struct LazySession<'a> {
-    client: &'a dyn AdcsClient,
-    params: CesParams,
-    password: Secret,
-    session: Option<Box<dyn AdcsSession + 'a>>,
-}
-
-impl<'a> LazySession<'a> {
-    /// A session on `client` for the authority `params` describes.
-    pub(crate) fn new(client: &'a dyn AdcsClient, params: CesParams, password: Secret) -> Self {
-        LazySession {
-            client,
-            params,
-            password,
-            session: None,
-        }
-    }
-
-    async fn opened(&mut self) -> Result<&mut Box<dyn AdcsSession + 'a>, AdcsError> {
-        let session: Box<dyn AdcsSession + 'a> = match self.session.take() {
-            Some(session) => session,
-            None => {
-                self.client
-                    .open(&self.params, self.password.clone())
-                    .await?
-            }
-        };
-        Ok(self.session.insert(session))
-    }
-
-    /// See [`AdcsSession::test`].
-    pub(crate) async fn test(&mut self) -> Result<(), AdcsError> {
-        self.opened().await?.test().await
-    }
-
-    /// See [`AdcsSession::enroll`].
-    pub(crate) async fn enroll(&mut self, csr_der: &[u8]) -> Result<EnrollOutcome, AdcsError> {
-        self.opened().await?.enroll(csr_der).await
-    }
-}
-
-/// The single-flight guard of every AD CS operation (Epic 13 D15).
-///
-/// One per process, shared by every clone of [`AppState`]. A second
-/// operation is refused at once instead of waiting its turn: the
-/// GSS-API calls behind an operation are blocking FFI on the blocking
-/// pool, and an operation blocked on a silent KDC holds its thread
-/// until MIT krb5 gives up, so a queue of callers would turn one silent
-/// KDC into a pile of blocked threads, each about to spend another
-/// pre-authentication attempt against the service account.
-///
-/// The permit lives in the task [`run_exclusive`] spawns, not in the
-/// handler, and `lorica-adcs` resolves an operation only once its
-/// blocking GSS-API calls have returned: so the guard is held until no
-/// thread of the operation is left, even when the handler has already
-/// answered 504 or its client has gone.
-///
-/// Authority writes take it too, so a password saved while a test is
-/// in flight cannot be followed by that test's verdict on the old one.
-#[derive(Clone, Default)]
-pub(crate) struct AdcsGuard {
-    slot: Arc<tokio::sync::Mutex<()>>,
-}
-
-/// Proof that the holder is the one AD CS operation running; the guard
-/// is released when it is dropped.
-pub(crate) struct AdcsPermit {
-    _held: tokio::sync::OwnedMutexGuard<()>,
-}
-
-impl AdcsGuard {
-    /// The permit, or `None` while another operation holds it.
-    pub(crate) fn try_acquire(&self) -> Option<AdcsPermit> {
-        Arc::clone(&self.slot)
-            .try_lock_owned()
-            .ok()
-            .map(|held| AdcsPermit { _held: held })
-    }
-}
-
-/// Why [`run_exclusive`] returned no output.
-#[derive(Debug)]
-pub(crate) enum NotRun {
-    /// Another AD CS operation is running; this one never started.
-    Busy,
-    /// The operation started and outlived the handler's deadline. It
-    /// keeps running, and the guard, until it ends.
-    StillRunning,
-    /// The operation's task panicked or was cancelled by the runtime.
-    Lost(String),
-}
-
-/// The error of an AD CS handler, and of the certificate renewal
-/// handlers, which renew AD CS certificates too: an [`ApiError`], the
-/// 504 of an operation that is still finishing, or a refusal with a
-/// code of its own, neither of which `ApiError` has a variant for.
-#[derive(Debug)]
-pub enum AdcsHandlerError {
-    /// Any other refusal or failure.
-    Api(ApiError),
-    /// 504: the operation outlived the handler's deadline and keeps the
-    /// single-flight guard until it ends.
-    StillRunning,
-    /// A refusal or failure the issuance endpoint names with its own
-    /// code (`adcs_san_refused`, `adcs_error`, ...), so a client can
-    /// tell the cases apart without reading the message.
-    Coded {
-        /// The HTTP status.
-        status: StatusCode,
-        /// The envelope's `code`.
-        code: &'static str,
-        /// The envelope's `message`.
-        message: String,
-        /// The failing step's closed name, for a failure that has one.
-        step: Option<String>,
-    },
-}
-
-impl From<ApiError> for AdcsHandlerError {
-    fn from(err: ApiError) -> AdcsHandlerError {
-        AdcsHandlerError::Api(err)
-    }
-}
-
-impl From<NotRun> for AdcsHandlerError {
-    fn from(not_run: NotRun) -> AdcsHandlerError {
-        match not_run {
-            NotRun::Busy => AdcsHandlerError::Api(ApiError::Conflict(BUSY_MESSAGE.to_string())),
-            NotRun::StillRunning => AdcsHandlerError::StillRunning,
-            NotRun::Lost(reason) => AdcsHandlerError::Api(ApiError::Internal(format!(
-                "the AD CS operation task failed: {reason}"
-            ))),
-        }
-    }
-}
-
-impl axum::response::IntoResponse for AdcsHandlerError {
-    fn into_response(self) -> axum::response::Response {
-        match self {
-            AdcsHandlerError::Api(err) => err.into_response(),
-            // The envelope of every other error, so a client reads it
-            // the same way.
-            AdcsHandlerError::StillRunning => (
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "gateway_timeout",
-                        "message": STILL_RUNNING_MESSAGE,
-                    }
-                })),
-            )
-                .into_response(),
-            AdcsHandlerError::Coded {
-                status,
-                code,
-                message,
-                step,
-            } => {
-                let mut error = serde_json::json!({ "code": code, "message": message });
-                if let Some(step) = step {
-                    error["step"] = serde_json::Value::String(step);
-                }
-                (status, Json(serde_json::json!({ "error": error }))).into_response()
-            }
-        }
-    }
-}
-
-/// The process's AD CS runtime: the [`AdcsGuard`], the client the
-/// handlers call, where `adcs_authority_failed` alerts go, how long a
-/// handler waits for its operation, and what the renewal paths
-/// remember about each certificate's failures.
-#[derive(Clone)]
-pub struct AdcsRuntime {
-    guard: AdcsGuard,
-    client: Arc<dyn AdcsClient>,
-    alerts: Option<lorica_notify::AlertSender>,
-    handler_deadline: Duration,
-    /// How long the renewal loop waits before trying again when another
-    /// AD CS operation holds the guard.
-    busy_retry_delay: Duration,
-    pub(crate) renewals: Arc<AdcsRenewalMemory>,
-}
-
-impl AdcsRuntime {
-    /// The production runtime. `alerts` is the process's alert channel;
-    /// `None` raises nothing (tests and one-shot commands).
-    pub fn new(alerts: Option<lorica_notify::AlertSender>) -> AdcsRuntime {
-        AdcsRuntime {
-            guard: AdcsGuard::default(),
-            client: Arc::new(LibAdcsClient),
-            alerts,
-            handler_deadline: handler_deadline(),
-            busy_retry_delay: BUSY_RETRY_DELAY,
-            renewals: Arc::default(),
-        }
-    }
-
-    /// A runtime calling `client` instead of the authority.
-    #[cfg(test)]
-    pub(crate) fn with_client(
-        client: Arc<dyn AdcsClient>,
-        alerts: Option<lorica_notify::AlertSender>,
-    ) -> AdcsRuntime {
-        AdcsRuntime {
-            guard: AdcsGuard::default(),
-            client,
-            alerts,
-            handler_deadline: handler_deadline(),
-            busy_retry_delay: BUSY_RETRY_DELAY,
-            renewals: Arc::default(),
-        }
-    }
-
-    /// The same runtime with a handler deadline short enough for a test.
-    #[cfg(test)]
-    pub(crate) fn with_handler_deadline(mut self, deadline: Duration) -> AdcsRuntime {
-        self.handler_deadline = deadline;
-        self
-    }
-
-    /// The same runtime with a renewal-loop busy retry short enough for
-    /// a test.
-    #[cfg(test)]
-    pub(crate) fn with_busy_retry_delay(mut self, delay: Duration) -> AdcsRuntime {
-        self.busy_retry_delay = delay;
-        self
-    }
-
-    /// How long the renewal loop waits before retrying a busy guard.
-    pub(crate) fn busy_retry_delay(&self) -> Duration {
-        self.busy_retry_delay
-    }
-
-    /// The single-flight guard, for a test to hold it.
-    #[cfg(test)]
-    pub(crate) fn guard(&self) -> &AdcsGuard {
-        &self.guard
-    }
-}
-
-/// Run `operation` as the one AD CS operation of the process, or return
-/// [`NotRun::Busy`] at once when another one is running (see
-/// [`AdcsGuard`]).
-///
-/// The operation runs in a task of its own that holds the permit for
-/// its whole life, so neither the handler's deadline nor a client that
-/// disconnects can release the guard while it runs. When the deadline
-/// passes first the handler gets [`NotRun::StillRunning`] and the task
-/// carries on: whatever the operation records on completion (its audit
-/// row, the D15 breaker) is therefore written by the task, never lost.
-pub(crate) async fn run_exclusive<T, F>(runtime: &AdcsRuntime, operation: F) -> Result<T, NotRun>
-where
-    F: Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    let permit: AdcsPermit = runtime.guard.try_acquire().ok_or(NotRun::Busy)?;
-    let task: tokio::task::JoinHandle<T> = tokio::spawn(async move {
-        let _permit: AdcsPermit = permit;
-        operation.await
-    });
-    match tokio::time::timeout(runtime.handler_deadline, task).await {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(err)) => Err(NotRun::Lost(err.to_string())),
-        Err(_) => Err(NotRun::StillRunning),
-    }
-}
-
-/// Run `operation` as the one AD CS operation of the process and wait
-/// for its end, or return [`NotRun::Busy`] at once when another one is
-/// running. For the renewal loop, which has no client to answer: the
-/// operation is a whole tick's batch, bounded per request by the
-/// client's operation timeout rather than by a handler's deadline.
-pub(crate) async fn run_exclusive_to_end<T, F>(
-    runtime: &AdcsRuntime,
-    operation: F,
-) -> Result<T, NotRun>
-where
-    F: Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    let permit: AdcsPermit = runtime.guard.try_acquire().ok_or(NotRun::Busy)?;
-    tokio::spawn(async move {
-        let _permit: AdcsPermit = permit;
-        operation.await
-    })
-    .await
-    .map_err(|err| NotRun::Lost(err.to_string()))
-}
-
-/// Why no AD CS operation may start now.
-#[derive(Debug)]
-pub(crate) enum AdcsUnavailable {
-    /// No authority is configured.
-    NotConfigured,
-    /// The authority is in the D15 failed state.
-    Failed {
-        /// The step that opened the breaker.
-        step: String,
-    },
-    /// The authority has no password stored.
-    NoPassword,
-    /// The store, or the `krb5.conf` write, failed.
-    Error(ApiError),
-}
-
-impl AdcsUnavailable {
-    /// The closed word an audit reason spells this refusal with.
-    pub(crate) fn audit_reason(&self) -> &'static str {
-        match self {
-            AdcsUnavailable::NotConfigured => "not_configured",
-            AdcsUnavailable::Failed { .. } => "failed_state",
-            AdcsUnavailable::NoPassword => "no_password",
-            AdcsUnavailable::Error(_) => "error",
-        }
-    }
-}
-
-impl From<ApiError> for AdcsUnavailable {
-    fn from(err: ApiError) -> AdcsUnavailable {
-        AdcsUnavailable::Error(err)
-    }
-}
-
-impl From<lorica_config::ConfigError> for AdcsUnavailable {
-    fn from(err: lorica_config::ConfigError) -> AdcsUnavailable {
-        AdcsUnavailable::Error(err.into())
-    }
-}
-
-impl From<AdcsUnavailable> for ApiError {
-    fn from(unavailable: AdcsUnavailable) -> ApiError {
-        match unavailable {
-            AdcsUnavailable::NotConfigured => {
-                ApiError::NotFound("no AD CS authority is configured".to_string())
-            }
-            AdcsUnavailable::Failed { step } => ApiError::Conflict(format!(
-                "the AD CS authority is in the failed state (the KDC rejected its credential \
-                 at {step}); every AD CS operation is suspended until a SuperAdmin saves a new \
-                 password"
-            )),
-            AdcsUnavailable::NoPassword => ApiError::Unprocessable(
-                "the AD CS authority has no password set; a SuperAdmin must save one".to_string(),
-            ),
-            AdcsUnavailable::Error(err) => err,
-        }
-    }
-}
 
 /// Everything one AD CS operation needs, read from the store.
 pub(crate) struct AdcsOperation {
@@ -629,21 +131,31 @@ pub(crate) struct AdcsOperation {
 }
 
 /// Read the authority and its password, refuse when no operation may
-/// run against it, and rewrite the `krb5.conf` from the stored row so
-/// the file the library reads is the one this operation's parameters
-/// came from. Call it under the [`AdcsGuard`].
+/// run against it, and make the `krb5.conf` the one the stored row
+/// renders, so the file the library reads is the one this operation's
+/// parameters came from. Call it under the single-flight guard, which
+/// every writer of the file holds.
+///
+/// The file is compared and written after the store lock is released:
+/// every other store-bound request waits on that lock, and the file
+/// changes only with the authority, so an operation usually writes
+/// nothing at all.
 pub(crate) async fn prepare_operation(state: &AppState) -> Result<AdcsOperation, AdcsUnavailable> {
-    let data_dir: std::path::PathBuf = state.data_dir.clone();
-    db_blocking(&state.store, move |store| {
-        Ok::<_, ApiError>(prepare_operation_in(store, &data_dir))
+    let (operation, config): (AdcsOperation, Krb5Config) = db_blocking(&state.store, |store| {
+        Ok::<_, ApiError>(read_operation(store))
     })
-    .await?
+    .await??;
+    let path: std::path::PathBuf = lorica_adcs::krb5_config_path(&state.data_dir);
+    tokio::task::spawn_blocking(move || config.write_if_changed(&path))
+        .await
+        .map_err(|err| AdcsUnavailable::Krb5Conf(format!("the krb5.conf task failed: {err}")))?
+        .map_err(|err: AdcsError| AdcsUnavailable::Krb5Conf(err.to_string()))?;
+    Ok(operation)
 }
 
-fn prepare_operation_in(
-    store: &ConfigStore,
-    data_dir: &Path,
-) -> Result<AdcsOperation, AdcsUnavailable> {
+/// The store side of [`prepare_operation`]: the operation and the
+/// `krb5.conf` it needs.
+fn read_operation(store: &ConfigStore) -> Result<(AdcsOperation, Krb5Config), AdcsUnavailable> {
     let authority: AdcsAuthority = store
         .get_adcs_authority()?
         .ok_or(AdcsUnavailable::NotConfigured)?;
@@ -657,19 +169,21 @@ fn prepare_operation_in(
         .map(Secret::new)
         .ok_or(AdcsUnavailable::NoPassword)?;
     let config: Krb5Config = krb5_config_of(&authority)?;
-    write_krb5_conf(data_dir, &config)?;
     let params: CesParams = CesParams {
         endpoint: authority.endpoint.clone(),
-        realm: config.realm,
+        realm: config.realm.clone(),
         principal: authority.principal.clone(),
         trust_bundle_pem: authority.endpoint_ca_pem.clone(),
         timeouts: CesTimeouts::default(),
     };
-    Ok(AdcsOperation {
-        authority,
-        params,
-        password,
-    })
+    Ok((
+        AdcsOperation {
+            authority,
+            params,
+            password,
+        },
+        config,
+    ))
 }
 
 /// The `krb5.conf` of a stored authority. The values were validated by
@@ -692,7 +206,7 @@ fn krb5_config_of(authority: &AdcsAuthority) -> Result<Krb5Config, ApiError> {
 fn write_krb5_conf(data_dir: &Path, config: &Krb5Config) -> Result<(), ApiError> {
     config
         .write_to(&lorica_adcs::krb5_config_path(data_dir))
-        .map_err(|err: AdcsError| ApiError::Internal(err.to_string()))
+        .map_err(|err: AdcsError| ApiError::from(AdcsUnavailable::Krb5Conf(err.to_string())))
 }
 
 /// Regenerate the `krb5.conf` from the stored authority, once, when the
@@ -775,257 +289,6 @@ pub(crate) async fn record_credential_rejection(
         alerts.send(event);
     }
     Ok(true)
-}
-
-/// A follower holds no authority and runs no AD CS operation (D13),
-/// break-glass window or not.
-fn refuse_on_follower(state: &AppState) -> Result<(), ApiError> {
-    if let ClusterRuntime::Follower(follower) = &state.cluster {
-        return Err(ApiError::Conflict(format!(
-            "this node is a follower of {}: the AD CS authority is managed on the control plane",
-            follower.control_plane
-        )));
-    }
-    Ok(())
-}
-
-/// The service account password of a write, accepted and never shown:
-/// its `Debug` is redacted and it has no `Serialize`.
-pub struct WritePassword(Secret);
-
-impl<'de> Deserialize<'de> for WritePassword {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        String::deserialize(deserializer).map(|text: String| WritePassword(Secret::new(text)))
-    }
-}
-
-impl std::fmt::Debug for WritePassword {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("WritePassword(<redacted>)")
-    }
-}
-
-/// Body of `PUT /api/v1/adcs/authority`.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AdcsAuthorityRequest {
-    /// The CES endpoint, `https://` with a DNS host name.
-    pub endpoint: String,
-    /// The Kerberos realm, `^[A-Z0-9][A-Z0-9.-]*$`.
-    pub realm: String,
-    /// Explicit KDCs as `host[:port]`, at most [`MAX_KDCS`]; empty means
-    /// DNS SRV discovery.
-    #[serde(default)]
-    pub kdcs: Vec<String>,
-    /// The service account, `user` or `user@REALM`.
-    pub principal: String,
-    /// The service account password. Required on creation and with any
-    /// change of `endpoint`, `realm`, `kdcs`, `principal` or
-    /// `endpoint_ca_pem`; optional otherwise, where it replaces the
-    /// stored one. Never returned.
-    #[serde(default)]
-    pub password: Option<WritePassword>,
-    /// PEM certificates trusted, alone, for the endpoint's TLS
-    /// certificate.
-    #[serde(default)]
-    pub endpoint_ca_pem: Option<String>,
-    /// The issuing CA certificate, PEM.
-    #[serde(default)]
-    pub issuing_ca_pem: Option<String>,
-    /// The template's common name.
-    pub default_template: String,
-    /// The other template common names an issuance may request (D17);
-    /// the default template is always permitted.
-    #[serde(default)]
-    pub allowed_templates: Vec<String>,
-    /// The key type of a new certificate.
-    #[serde(default)]
-    pub default_key_type: AdcsKeyType,
-    /// The fixed part of every subject.
-    #[serde(default)]
-    pub subject: AdcsSubjectDefaults,
-    /// DNS suffixes Lorica may request names under; at least one.
-    pub allowed_suffixes: Vec<String>,
-    /// The auto-renew setting a newly issued certificate starts with.
-    pub auto_renew_default: bool,
-}
-
-/// The most explicit KDCs an authority may list. MIT tries them in
-/// turn, each silent one costing its own retry schedule while the
-/// operation holds the single-flight guard, so the list is bounded.
-pub const MAX_KDCS: usize = 10;
-
-/// The configuration part of a request once every field is valid.
-struct ValidatedRequest {
-    endpoint: String,
-    realm: String,
-    kdcs: Vec<String>,
-    principal: String,
-    endpoint_ca_pem: Option<String>,
-    issuing_ca_pem: Option<String>,
-    default_template: String,
-    allowed_templates: Vec<String>,
-    default_key_type: AdcsKeyType,
-    subject: AdcsSubjectDefaults,
-    allowed_suffixes: Vec<AllowedSuffix>,
-    auto_renew_default: bool,
-}
-
-fn refuse(reason: String) -> ApiError {
-    ApiError::Unprocessable(reason)
-}
-
-fn has_control_characters(value: &str) -> bool {
-    value.chars().any(char::is_control)
-}
-
-/// A PEM bundle of at least one certificate, every block a certificate
-/// x509-parser reads. `None` and blank stay unset.
-fn validate_pem_bundle(field: &str, raw: Option<String>) -> Result<Option<String>, ApiError> {
-    let Some(text) = raw.map(|text: String| text.trim().to_string()) else {
-        return Ok(None);
-    };
-    if text.is_empty() {
-        return Ok(None);
-    }
-    let blocks: Vec<pem::Pem> =
-        pem::parse_many(&text).map_err(|err| refuse(format!("{field}: not PEM ({err})")))?;
-    if blocks.is_empty() {
-        return Err(refuse(format!("{field}: no PEM certificate found")));
-    }
-    for block in &blocks {
-        if block.tag() != "CERTIFICATE" {
-            return Err(refuse(format!(
-                "{field}: every PEM block must be a CERTIFICATE, found {}",
-                block.tag()
-            )));
-        }
-        x509_parser::parse_x509_certificate(block.contents())
-            .map_err(|err| refuse(format!("{field}: unreadable certificate ({err})")))?;
-    }
-    Ok(Some(text))
-}
-
-/// Trimmed, blank as unset, and free of control characters: every
-/// subject field is written into a CSR's distinguished name.
-fn validate_subject(subject: AdcsSubjectDefaults) -> Result<AdcsSubjectDefaults, ApiError> {
-    let clean = |field: &str, value: Option<String>| -> Result<Option<String>, ApiError> {
-        let value: Option<String> = value
-            .map(|text: String| text.trim().to_string())
-            .filter(|text: &String| !text.is_empty());
-        if value.as_deref().is_some_and(has_control_characters) {
-            return Err(refuse(format!(
-                "subject.{field}: control characters are refused"
-            )));
-        }
-        Ok(value)
-    };
-    let country: Option<String> = clean("country", subject.country)?;
-    if let Some(code) = &country {
-        if code.len() != 2 || !code.chars().all(|c: char| c.is_ascii_alphabetic()) {
-            return Err(refuse(
-                "subject.country: must be a two-letter ISO 3166 code".to_string(),
-            ));
-        }
-    }
-    Ok(AdcsSubjectDefaults {
-        country: country.map(|code: String| code.to_ascii_uppercase()),
-        state: clean("state", subject.state)?,
-        locality: clean("locality", subject.locality)?,
-        organization: clean("organization", subject.organization)?,
-        organizational_unit: clean("organizational_unit", subject.organizational_unit)?,
-        email: clean("email", subject.email)?,
-    })
-}
-
-/// The allowed template list as stored: each name trimmed and checked,
-/// the default first, no name twice (ignoring ASCII case, as the
-/// authority does).
-fn allowed_template_list(
-    default_template: &str,
-    requested: &[String],
-) -> Result<Vec<String>, ApiError> {
-    let mut list: Vec<String> = vec![default_template.to_string()];
-    for raw in requested {
-        let name: &str = raw.trim();
-        validate_template_name("allowed_templates", name)?;
-        if !list
-            .iter()
-            .any(|kept: &String| kept.eq_ignore_ascii_case(name))
-        {
-            list.push(name.to_string());
-        }
-    }
-    if list.len() > ADCS_ALLOWED_TEMPLATES_MAX {
-        return Err(refuse(format!(
-            "allowed_templates: at most {ADCS_ALLOWED_TEMPLATES_MAX} templates, the default \
-             included"
-        )));
-    }
-    Ok(list)
-}
-
-impl AdcsAuthorityRequest {
-    /// Validate every field, splitting the password off. The endpoint,
-    /// realm, KDC and principal rules are `lorica_adcs`'s own, the ones
-    /// the client applies before it connects, so a value refused at the
-    /// first operation is refused here instead.
-    fn validate(self) -> Result<(ValidatedRequest, Option<Secret>), ApiError> {
-        let endpoint: &str = self.endpoint.trim();
-        CesEndpoint::new(endpoint).map_err(|err: AdcsError| refuse(format!("endpoint: {err}")))?;
-        let realm: Realm =
-            Realm::new(self.realm.trim()).map_err(|err: AdcsError| refuse(err.to_string()))?;
-        if self.kdcs.len() > MAX_KDCS {
-            return Err(refuse(format!(
-                "kdcs: at most {MAX_KDCS} KDCs, {} given",
-                self.kdcs.len()
-            )));
-        }
-        let kdcs: Vec<String> = self
-            .kdcs
-            .iter()
-            .map(|kdc: &String| {
-                KdcAddress::new(kdc.trim())
-                    .map(|address: KdcAddress| address.to_string())
-                    .map_err(|err: AdcsError| refuse(err.to_string()))
-            })
-            .collect::<Result<Vec<String>, ApiError>>()?;
-        let principal: &str = self.principal.trim();
-        Principal::new(principal, &realm)
-            .map_err(|err: AdcsError| refuse(format!("principal: {err}")))?;
-        let default_template: String = self.default_template.trim().to_string();
-        validate_template_name("default_template", &default_template)?;
-        let allowed_templates: Vec<String> =
-            allowed_template_list(&default_template, &self.allowed_templates)?;
-        if self.allowed_suffixes.is_empty() {
-            return Err(refuse(
-                "allowed_suffixes: at least one DNS suffix is required".to_string(),
-            ));
-        }
-        let allowed_suffixes: Vec<AllowedSuffix> = self
-            .allowed_suffixes
-            .iter()
-            .map(|suffix: &String| AllowedSuffix::new(suffix.trim()))
-            .collect::<Result<Vec<AllowedSuffix>, lorica_config::ConfigError>>()?;
-        let validated: ValidatedRequest = ValidatedRequest {
-            endpoint: endpoint.to_string(),
-            realm: realm.as_str().to_string(),
-            kdcs,
-            principal: principal.to_string(),
-            endpoint_ca_pem: validate_pem_bundle("endpoint_ca_pem", self.endpoint_ca_pem)?,
-            issuing_ca_pem: validate_pem_bundle("issuing_ca_pem", self.issuing_ca_pem)?,
-            default_template,
-            allowed_templates,
-            default_key_type: self.default_key_type,
-            subject: validate_subject(self.subject)?,
-            allowed_suffixes,
-            auto_renew_default: self.auto_renew_default,
-        };
-        Ok((
-            validated,
-            self.password.map(|password: WritePassword| password.0),
-        ))
-    }
 }
 
 /// The authority as Operators and SuperAdmins read it: every stored
@@ -1177,7 +440,7 @@ pub async fn put_adcs_authority(
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
     Json(body): Json<AdcsAuthorityRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), AdcsHandlerError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     refuse_on_follower(&state)?;
     let (request, password): (ValidatedRequest, Option<Secret>) = body.validate()?;
     let data_dir: std::path::PathBuf = state.data_dir.clone();
@@ -1244,7 +507,12 @@ fn write_authority(
         kdcs: request.kdcs,
         principal: request.principal,
         endpoint_ca_pem: request.endpoint_ca_pem,
-        issuing_ca_pem: request.issuing_ca_pem,
+        issuing_ca_pem: match request.issuing_ca_pem {
+            Some(given) => given,
+            None => existing
+                .as_ref()
+                .and_then(|a: &AdcsAuthority| a.issuing_ca_pem.clone()),
+        },
         default_template: request.default_template,
         allowed_templates: request.allowed_templates,
         default_key_type: request.default_key_type,
@@ -1319,14 +587,14 @@ pub async fn delete_adcs_authority(
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
-) -> Result<Json<serde_json::Value>, AdcsHandlerError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     refuse_on_follower(&state)?;
     let store = Arc::clone(&state.store);
     let id: String = run_exclusive(&state.adcs, async move {
         db_blocking(&store, |store| {
-            let authority: AdcsAuthority = store.get_adcs_authority()?.ok_or_else(|| {
-                ApiError::NotFound("no AD CS authority is configured".to_string())
-            })?;
+            let authority: AdcsAuthority = store
+                .get_adcs_authority()?
+                .ok_or_else(|| ApiError::from(AdcsUnavailable::NotConfigured))?;
             let referencing: Vec<String> = store.adcs_authority_certificate_ids(&authority.id)?;
             if !referencing.is_empty() {
                 return Err(ApiError::Conflict(format!(
@@ -1375,9 +643,8 @@ pub struct ConnectionTestResult {
     /// Whether Lorica authenticated to the endpoint, mutual
     /// authentication included.
     pub ok: bool,
-    /// The failing step's closed name (`ticket_acquisition`,
-    /// `kdc_discovery`, `tls`, `channel_binding`, `spnego`,
-    /// `mutual_authentication`, ...), `null` on success.
+    /// The failing step's closed name, one of
+    /// [`lorica_adcs::FailureStep`]'s, `null` on success.
     pub step: Option<&'static str>,
     /// The client's error text, which names the step in words, `null`
     /// on success.
@@ -1397,7 +664,7 @@ pub async fn test_adcs_authority(
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
-) -> Result<Json<serde_json::Value>, AdcsHandlerError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     refuse_on_follower(&state)?;
     let ctx: AuditContext = AuditContext::new(&session, connect_info.as_ref(), &headers);
     let task_state: AppState = state.clone();

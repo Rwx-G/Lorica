@@ -28,7 +28,8 @@ use lorica_notify::events::AlertType;
 use x509_parser::certification_request::X509CertificationRequest;
 use x509_parser::prelude::FromDer;
 
-use super::{issue, template_oid_of, IssueError, IssueOutcome, IssueRequest, IssueSubject};
+use super::{issue, IssueError, IssueOutcome, IssueRequest, IssueSubject};
+use crate::adcs::leaf::template_oid_of;
 use crate::adcs::tests::{body, fixture, Fixture};
 use crate::adcs::AdcsClient;
 use crate::audit::AuditContext;

@@ -414,7 +414,10 @@ async fn the_listing_says_why_nothing_can_be_offered() {
     assert_eq!(listing["candidates"], serde_json::json!([]));
     let (status, json) = post(&f, &adopt_path(&id), &f.admin, None).await;
     assert_eq!(status, StatusCode::CONFLICT, "{json}");
-    assert_eq!(json["error"]["code"], "adcs_not_configured");
+    assert_eq!(
+        json["error"]["code"],
+        crate::adcs::error::NO_ISSUING_CA.code
+    );
     assert!(
         json["error"]["message"]
             .as_str()
@@ -425,6 +428,108 @@ async fn the_listing_says_why_nothing_can_be_offered() {
 
     let (status, _) = post(&f, &adopt_path("no-such-certificate"), &f.admin, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A follower holds no authority (D13): its listing says so without
+/// reading anything, as its authority read does.
+#[tokio::test]
+async fn a_follower_lists_no_candidate_and_says_why() {
+    let stub = StubAuthority::new(issue_v2());
+    let pki = pki();
+    let mut f = with_authority(&stub, &pki.issuing.pem).await;
+    upload(
+        &f,
+        "web01.corp.example.org",
+        leaf(
+            &pki.issuing.issuer,
+            &["web01.corp.example.org"],
+            TemplateExtension::V2,
+        ),
+        &pki.issuing.pem,
+    )
+    .await;
+    f.state.cluster =
+        crate::cluster::ClusterRuntime::Follower(crate::tests::test_follower_runtime());
+    let listing = candidates(&f, &f.admin).await;
+    assert_eq!(listing["reason"], "managed_on_control_plane");
+    assert_eq!(listing["candidates"], serde_json::json!([]));
+    assert_eq!(f.state.adcs.adoption.len(), 0, "nothing was verified");
+}
+
+/// The signature verdict of a certificate is computed once per pair of
+/// certificates: a second listing verifies nothing new, a deleted
+/// certificate's verdict is forgotten, and a new issuing CA certificate
+/// is a pair not seen yet, never a stale verdict.
+#[tokio::test]
+async fn the_listing_remembers_each_verdict_by_the_certificates_bytes() {
+    let stub = StubAuthority::new(issue_v2());
+    let pki = pki();
+    let f = with_authority(&stub, &pki.issuing.pem).await;
+    let offered = upload(
+        &f,
+        "web01.corp.example.org",
+        leaf(
+            &pki.issuing.issuer,
+            &["web01.corp.example.org"],
+            TemplateExtension::V2,
+        ),
+        &pki.issuing.pem,
+    )
+    .await;
+    let foreign = upload(
+        &f,
+        "sibling.corp.example.org",
+        leaf(
+            &pki.sibling.issuer,
+            &["sibling.corp.example.org"],
+            TemplateExtension::V2,
+        ),
+        &pki.sibling.pem,
+    )
+    .await;
+
+    let first = candidates(&f, &f.admin).await;
+    assert_eq!(candidate_ids(&first), vec![offered.clone()]);
+    assert_eq!(
+        f.state.adcs.adoption.len(),
+        2,
+        "one verdict per manual certificate"
+    );
+    let second = candidates(&f, &f.admin).await;
+    assert_eq!(second, first, "a remembered verdict answers the same");
+    assert_eq!(f.state.adcs.adoption.len(), 2);
+
+    f.state
+        .store
+        .lock()
+        .await
+        .delete_certificate(&foreign)
+        .expect("test setup: delete");
+    candidates(&f, &f.admin).await;
+    assert_eq!(
+        f.state.adcs.adoption.len(),
+        1,
+        "the deleted one is forgotten"
+    );
+
+    let mut request = body(None);
+    request["issuing_ca_pem"] = serde_json::json!(pki.sibling.pem);
+    let resp = f
+        .send(
+            "PUT",
+            crate::adcs::tests::AUTHORITY,
+            &f.admin,
+            Some(request),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let listing = candidates(&f, &f.admin).await;
+    assert_eq!(
+        candidate_ids(&listing),
+        Vec::<String>::new(),
+        "under another issuing CA the certificate is verified again, and refused"
+    );
+    assert_eq!(f.state.adcs.adoption.len(), 1);
 }
 
 /// AC #3: the template a candidate was issued with is compared with the

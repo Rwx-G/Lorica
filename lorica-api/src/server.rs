@@ -92,6 +92,12 @@ pub const RL_PASSWORD_CHANGE: u32 = 3;
 /// shares the size in its own bucket (Epic 13 D15): each one spends a
 /// pre-authentication attempt against the service account.
 pub const RL_ACME_PROVISION: u32 = 3;
+
+/// The bucket ACME provisioning and an ACME renewal spend.
+pub(crate) const RL_BUCKET_ACME_PROVISION: &str = "acme_provision";
+
+/// The bucket AD CS issuance and an AD CS renewal spend.
+pub(crate) const RL_BUCKET_ADCS_ISSUE: &str = "adcs_issue";
 /// Generic destructive CUD on small endpoints (bans, backends,
 /// cache purge, dns providers, notifications, preferences,
 /// probes, loadtest, sla, waf rule toggles).
@@ -989,7 +995,7 @@ pub fn build_router(
             "/api/v1/certificates/adcs",
             post(crate::adcs::issue_certificate)
                 .layer(bl(BODY_CAP_DEFAULT))
-                .layer(rl("adcs_issue", RL_ACME_PROVISION, RL_WINDOW_S)),
+                .layer(rl(RL_BUCKET_ADCS_ISSUE, RL_ACME_PROVISION, RL_WINDOW_S)),
         )
         // Adoption and reversion (Story 13.5). Operator, the
         // certificate default; neither contacts the authority, so the
@@ -1356,37 +1362,37 @@ pub fn build_router(
             "/api/v1/acme/provision",
             post(crate::acme::provision_certificate)
                 .layer(bl(BODY_CAP_ACME))
-                .layer(rl("acme_provision", RL_ACME_PROVISION, RL_WINDOW_S)),
+                .layer(rl(RL_BUCKET_ACME_PROVISION, RL_ACME_PROVISION, RL_WINDOW_S)),
         )
         .route(
             "/api/v1/acme/provision-dns",
             post(crate::acme::provision_certificate_dns)
                 .layer(bl(BODY_CAP_ACME))
-                .layer(rl("acme_provision", RL_ACME_PROVISION, RL_WINDOW_S)),
+                .layer(rl(RL_BUCKET_ACME_PROVISION, RL_ACME_PROVISION, RL_WINDOW_S)),
         )
         .route(
             "/api/v1/acme/provision-dns-manual",
             post(crate::acme::provision_dns_manual)
                 .layer(bl(BODY_CAP_ACME))
-                .layer(rl("acme_provision", RL_ACME_PROVISION, RL_WINDOW_S)),
+                .layer(rl(RL_BUCKET_ACME_PROVISION, RL_ACME_PROVISION, RL_WINDOW_S)),
         )
         .route(
             "/api/v1/acme/provision-dns-manual/check",
             post(crate::acme::check_dns_manual)
                 .layer(bl(BODY_CAP_ACME))
-                .layer(rl("acme_provision", RL_ACME_PROVISION, RL_WINDOW_S)),
+                .layer(rl(RL_BUCKET_ACME_PROVISION, RL_ACME_PROVISION, RL_WINDOW_S)),
         )
         .route(
             "/api/v1/acme/provision-dns-manual/confirm",
             post(crate::acme::provision_dns_manual_confirm)
                 .layer(bl(BODY_CAP_ACME))
-                .layer(rl("acme_provision", RL_ACME_PROVISION, RL_WINDOW_S)),
+                .layer(rl(RL_BUCKET_ACME_PROVISION, RL_ACME_PROVISION, RL_WINDOW_S)),
         )
         .route(
             "/api/v1/certificates/{id}/renew",
-            post(crate::acme::renew_certificate)
-                .layer(bl(BODY_CAP_ACME))
-                .layer(rl("acme_provision", RL_ACME_PROVISION, RL_WINDOW_S)),
+            // Rate limited inside the handler, by the certificate's
+            // source (`crate::acme::renew_certificate`).
+            post(crate::acme::renew_certificate).layer(bl(BODY_CAP_ACME)),
         )
         .route("/api/v1/waf/rules", get(crate::waf::get_waf_rules))
         .route(
