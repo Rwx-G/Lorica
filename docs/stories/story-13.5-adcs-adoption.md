@@ -1,7 +1,7 @@
 # Story 13.5: Adopting Certificates Issued Before Lorica Could
 
 **Epic:** [Epic 13 - AD CS Certificate Enrollment over CES (v1.10.0)](../prd/epic-13-v1.10.0.md)
-**Status:** Approved
+**Status:** Review
 **Priority:** P1
 **Author:** Romain G.
 **Depends on:** Story 13.2 (the issuing CA certificate on the
@@ -58,25 +58,25 @@ These are the PRD's, unchanged. They are the contract.
 
 ### Lot 1: the API
 
-- [ ] `GET /api/v1/adcs/adoption-candidates` (Viewer): candidates with
+- [x] `GET /api/v1/adcs/adoption-candidates` (Viewer): candidates with
       SANs, subject, template identifier and comparison, auto-renew
       default; empty with a reason when no issuing CA certificate is
       known.
-- [ ] `POST /api/v1/certificates/{id}/adcs/adopt` (Operator):
+- [x] `POST /api/v1/certificates/{id}/adcs/adopt` (Operator):
       re-checks candidacy server-side, sets `adcs_authority_id`,
       `adcs_template` (the authority's template; the observed one is
       kept in `adcs_template_oid`), `acme_auto_renew` from the request
       or the authority default. Bulk adoption is the dashboard calling
       it per certificate.
-- [ ] `POST /api/v1/certificates/{id}/adcs/revert` (Operator): clears
+- [x] `POST /api/v1/certificates/{id}/adcs/revert` (Operator): clears
       `adcs_authority_id`.
-- [ ] RBAC table, follower refusal, audit, `openapi.yaml`, tests
+- [x] RBAC table, follower refusal, audit, `openapi.yaml`, tests
       including IV1's three certificates (generated: issuing CA, sibling
       CA under the same root, forged issuer name).
 
 ### Lot 2: the dashboard
 
-- [ ] The candidates banner and list on the certificate page, the
+- [x] The candidates banner and list on the certificate page, the
       adoption summary with the template warning, individual and bulk
       adopt, revert on AD CS certificates. Vitest.
 
@@ -84,7 +84,12 @@ These are the PRD's, unchanged. They are the contract.
 
 ### Debug Log
 
+- 2026-10-21, Lot 1 (`2041aee4`): candidacy requires the issuer bytes, the signature (x509-parser `verify_signature`) and the key identifier to match the first certificate of the authority's issuing CA field. Adoption clears `adcs_request_id` so an adopted certificate does not count as observed issuance; 409 `adcs_not_configured` when no issuing CA is known; revert refused while a renewal of the certificate is in flight.
+- 2026-10-21, Lot 2 (`90ba802d`): banner, adoption panel with per-certificate summary and bulk adoption, revert on the list.
+
 ### Completion Notes
+
+- AC #1 to #6 met; IV1 and IV2 covered by `adcs/adopt/tests.rs`.
 
 ## File List
 
@@ -93,3 +98,4 @@ These are the PRD's, unchanged. They are the contract.
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
 | 2026-10-21 | 0.1 | Story drafted from the Epic 13 PRD. Status Approved (maintainer delegated the epic). | Romain G. |
+| 2026-10-21 | 0.2 | Lots implemented. Status Review. | Romain G. |

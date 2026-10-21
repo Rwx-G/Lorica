@@ -1,7 +1,7 @@
 # Story 13.3: Issuing a New Certificate
 
 **Epic:** [Epic 13 - AD CS Certificate Enrollment over CES (v1.10.0)](../prd/epic-13-v1.10.0.md)
-**Status:** Approved
+**Status:** Review
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** Story 13.1 (`lorica-adcs`: `build_csr`, `enroll`,
@@ -64,9 +64,9 @@ These are the PRD's, unchanged. They are the contract.
 
 ### Lot 1: the API
 
-- [ ] `CertificateResponse` gains `source` and the `adcs_*` fields
+- [x] `CertificateResponse` gains `source` and the `adcs_*` fields
       (`lorica-api/src/certificates.rs`), `openapi.yaml` updated.
-- [ ] An internal `issue(store, authority, request) -> IssueOutcome`
+- [x] An internal `issue(store, authority, request) -> IssueOutcome`
       in the AD CS module that Story 13.4 reuses: SAN checks, subject
       assembly (authority defaults, request overrides, `CN` = first
       SAN), `build_csr` with the template's common name, `enroll`
@@ -78,27 +78,27 @@ These are the PRD's, unchanged. They are the contract.
       the authority's default; record the issuing CA certificate on
       the authority if absent; `notify_config_changed` so the resolver
       reloads.
-- [ ] `POST /api/v1/certificates/adcs`, Operator default role, `rl`
+- [x] `POST /api/v1/certificates/adcs`, Operator default role, `rl`
       bucket `adcs_issue` at `RL_ACME_PROVISION`, the failed-state
       refusal, the D15 credential classification on a ticket failure
       (same path as the connection test), audit, `cert_issuance_failed`
       on pending, denied and error outcomes.
-- [ ] Test: the automation route table does not reach the endpoint.
-- [ ] Tests with the client seam from Story 13.2: each outcome, the
+- [x] Test: the automation route table does not reach the endpoint.
+- [x] Tests with the client seam from Story 13.2: each outcome, the
       three IV2 refusals with no client call recorded, template OID
       extraction, issuing-CA recording.
 
 ### Lot 2: the dashboard
 
-- [ ] `api.ts`: types and call; `source` shown on the certificate list
+- [x] `api.ts`: types and call; `source` shown on the certificate list
       and detail.
-- [ ] `CertificateAdcsForm.svelte` beside the ACME form, with the
+- [x] `CertificateAdcsForm.svelte` beside the ACME form, with the
       confirmation summary and the unbound-certificate note.
-- [ ] `RoutingTab.svelte`: the "covered by no stored certificate"
+- [x] `RoutingTab.svelte`: the "covered by no stored certificate"
       derived value, the "Issue from AD CS" action (hidden when no
       authority is configured or on a follower), the same confirmation
       component, setting `form.certificate_id` on success.
-- [ ] Vitest for the derived value (domain plus SANs, wildcards
+- [x] Vitest for the derived value (domain plus SANs, wildcards
       dropped), the confirmation summary, and the follower/no-authority
       hiding.
 
@@ -116,7 +116,12 @@ These are the PRD's, unchanged. They are the contract.
 
 ### Debug Log
 
+- 2026-10-21, Lot 1 (`b4c4d992`): `issue()` in `lorica-api/src/adcs/issue.rs`, reused by renewal; certificate responses gained `source` and an RFC 4514 `subject` (computed from the stored leaf). The automation certificate read exposes `source` and `subject` but not the internal `adcs_*` fields (orchestrator decision, applied in `b521711b`).
+- 2026-10-21, Lot 2 (`cd03c7e1`, `061dbb8f`): the issuance form, the route-form action and the confirmation; the issued subject displayed once the API returned it.
+
 ### Completion Notes
+
+- AC #1 to #8 met; IV1 covered by the RoutingTab test, IV2 by the issuance tests (zero client calls on each refusal).
 
 ## File List
 
@@ -125,3 +130,4 @@ These are the PRD's, unchanged. They are the contract.
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
 | 2026-10-21 | 0.1 | Story drafted from the Epic 13 PRD. Status Approved (maintainer delegated the epic). | Romain G. |
+| 2026-10-21 | 0.2 | Lots implemented. Status Review. | Romain G. |

@@ -1,7 +1,7 @@
 # Story 13.4: Renewal
 
 **Epic:** [Epic 13 - AD CS Certificate Enrollment over CES (v1.10.0)](../prd/epic-13-v1.10.0.md)
-**Status:** Approved
+**Status:** Review
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** Story 13.3 (the internal `issue()` with its in-place
@@ -66,26 +66,26 @@ These are the PRD's, unchanged. They are the contract.
 
 ### Lot 1: the loop and the manual path
 
-- [ ] AD CS eligibility (source AD CS, `acme_auto_renew`, inside the
+- [x] AD CS eligibility (source AD CS, `acme_auto_renew`, inside the
       window, bound) beside `should_auto_renew`; dispatch in the loop;
       the AD CS arm calls `issue()` in-place mode with the current
       SANs, subject and `adcs_template`.
-- [ ] `RenewalLedger` in-flight mark around the AD CS arm and the
+- [x] `RenewalLedger` in-flight mark around the AD CS arm and the
       manual path; 409 on overlap.
-- [ ] Breaker short-circuit inside a tick; per-certificate cooldown for
+- [x] Breaker short-circuit inside a tick; per-certificate cooldown for
       non-credential failures, kept apart from the ACME rate-limit
       cooldown; one `cert_issuance_failed` per failure state.
-- [ ] `renew_certificate_as`: AD CS accepted for the dashboard caller,
+- [x] `renew_certificate_as`: AD CS accepted for the dashboard caller,
       refused for any token caller (`RenewalBudget::PerCertificate`)
       after `guard.check`, error `adcs_renewal_not_on_automation_plane`;
       tests on the dashboard route, the automation route and the MCP
       tool.
-- [ ] Expiry alert decision (AC #6) and its test.
-- [ ] Audit rows for loop and manual renewals.
+- [x] Expiry alert decision (AC #6) and its test.
+- [x] Audit rows for loop and manual renewals.
 
 ### Lot 2: the dashboard
 
-- [ ] "Renew now" offered for AD CS certificates (Operator and above,
+- [x] "Renew now" offered for AD CS certificates (Operator and above,
       not on a follower, not while the authority is failed), outcomes
       and 409/504 shown as returned. Vitest.
 
@@ -102,7 +102,13 @@ These are the PRD's, unchanged. They are the contract.
 
 ### Debug Log
 
+- 2026-10-21, Lot 1 (`b521711b`): `renewal_tick` with an AD CS arm (`adcs/renew.rs`); the breaker ends the tick on a credential rejection or the failed state; other failures back the certificate off 24 h and alert once per failure state. `check_cert_expiry` speaks for AD CS expiry; the loop's `CertExpiring` stays ACME-only. Token callers get 403 `adcs_renewal_not_on_automation_plane`.
+- 2026-10-21 (`2041aee4`): renewal keeps the current key type and size instead of the authority default, so a default change cannot turn an RSA certificate into ECDSA that a version 2 template rejects.
+- 2026-10-21, Lot 2 (`061dbb8f`): Renew now for AD CS on the certificate list, behind a confirmation since a renewal is an issuance.
+
 ### Completion Notes
+
+- AC #1 to #8 met; IV1 and IV2 covered by `adcs/renew/tests.rs`.
 
 ## File List
 
@@ -111,3 +117,4 @@ These are the PRD's, unchanged. They are the contract.
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
 | 2026-10-21 | 0.1 | Story drafted from the Epic 13 PRD. Status Approved (maintainer delegated the epic). | Romain G. |
+| 2026-10-21 | 0.2 | Lots implemented. Status Review. | Romain G. |
