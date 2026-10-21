@@ -46,6 +46,18 @@ pub enum AlertType {
     /// Persistence resumed after a [`Self::LogStoreUnavailable`], without
     /// a restart.
     LogStoreRecovered,
+    /// The AD CS authority entered the failed state of Epic 13 PRD D15:
+    /// the KDC rejected its credential, so every further Kerberos
+    /// exchange is suspended until an operator writes a new password.
+    /// Raised once per entry into that state, not on each refused
+    /// attempt while it lasts.
+    AdcsAuthorityFailed,
+    /// An AD CS issuance or renewal did not produce a certificate: the
+    /// CA denied it, answered with an error fault, left it pending, or a
+    /// step before that failed. The event carries the certificate id
+    /// when there is one (a renewal, or an issuance that got that far),
+    /// the failing step, and the authority's message.
+    CertIssuanceFailed,
 }
 
 impl AlertType {
@@ -68,12 +80,14 @@ impl AlertType {
             Self::ClusterDrift => "cluster_drift",
             Self::LogStoreUnavailable => "log_store_unavailable",
             Self::LogStoreRecovered => "log_store_recovered",
+            Self::AdcsAuthorityFailed => "adcs_authority_failed",
+            Self::CertIssuanceFailed => "cert_issuance_failed",
         }
     }
 
     /// Every alert type, in declaration order: the vocabulary a
     /// notification channel can subscribe to.
-    pub const ALL: [AlertType; 12] = [
+    pub const ALL: [AlertType; 14] = [
         Self::CertExpiring,
         Self::BackendDown,
         Self::WafAlert,
@@ -86,6 +100,8 @@ impl AlertType {
         Self::ClusterDrift,
         Self::LogStoreUnavailable,
         Self::LogStoreRecovered,
+        Self::AdcsAuthorityFailed,
+        Self::CertIssuanceFailed,
     ];
 }
 
@@ -105,6 +121,8 @@ impl std::str::FromStr for AlertType {
             "cluster_drift" => Ok(Self::ClusterDrift),
             "log_store_unavailable" => Ok(Self::LogStoreUnavailable),
             "log_store_recovered" => Ok(Self::LogStoreRecovered),
+            "adcs_authority_failed" => Ok(Self::AdcsAuthorityFailed),
+            "cert_issuance_failed" => Ok(Self::CertIssuanceFailed),
             other => Err(format!("unknown alert type: {other}")),
         }
     }
@@ -163,6 +181,8 @@ mod tests {
             AlertType::ClusterDrift => 9,
             AlertType::LogStoreUnavailable => 10,
             AlertType::LogStoreRecovered => 11,
+            AlertType::AdcsAuthorityFailed => 12,
+            AlertType::CertIssuanceFailed => 13,
         }
     }
 

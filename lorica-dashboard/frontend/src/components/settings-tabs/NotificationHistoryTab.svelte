@@ -40,7 +40,7 @@
               {#each notifHistory as ev, i (i)}
                 <tr>
                   <td class="mono">{new Date(ev.timestamp).toLocaleString()}</td>
-                  <td><span class="badge badge-{ev.alert_type === 'sla_breached' || ev.alert_type === 'backend_down' || ev.alert_type === 'log_store_unavailable' ? 'red' : ev.alert_type === 'sla_recovered' || ev.alert_type === 'log_store_recovered' ? 'green' : ev.alert_type === 'cert_expiring' ? 'orange' : 'blue'}">{ev.alert_type}</span></td>
+                  <td><span class="badge badge-{ev.alert_type === 'sla_breached' || ev.alert_type === 'backend_down' || ev.alert_type === 'log_store_unavailable' || ev.alert_type === 'adcs_authority_failed' || ev.alert_type === 'cert_issuance_failed' ? 'red' : ev.alert_type === 'sla_recovered' || ev.alert_type === 'log_store_recovered' ? 'green' : ev.alert_type === 'cert_expiring' ? 'orange' : 'blue'}">{ev.alert_type}</span></td>
                   <td>{ev.summary}</td>
                 </tr>
               {/each}

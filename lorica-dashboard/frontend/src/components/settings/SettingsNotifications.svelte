@@ -67,6 +67,8 @@
   let notifAlertSlaBreached = $state(false);
   let notifAlertIpBanned = $state(false);
   let notifAlertLogStore = $state(false);
+  let notifAlertAdcsAuthorityFailed = $state(false);
+  let notifAlertCertIssuanceFailed = $state(false);
   let notifError = $state('');
   let notifSaving = $state(false);
   let deletingNotif: NotificationConfigResponse | null = $state(null);
@@ -93,6 +95,8 @@
     notifAlertSlaBreached = false;
     notifAlertIpBanned = false;
     notifAlertLogStore = false;
+    notifAlertAdcsAuthorityFailed = false;
+    notifAlertCertIssuanceFailed = false;
     notifError = '';
     showNotifForm = true;
   }
@@ -148,6 +152,8 @@
     notifAlertSlaBreached = types.includes('sla_breached');
     notifAlertIpBanned = types.includes('ip_banned');
     notifAlertLogStore = types.includes('log_store_unavailable');
+    notifAlertAdcsAuthorityFailed = types.includes('adcs_authority_failed');
+    notifAlertCertIssuanceFailed = types.includes('cert_issuance_failed');
 
     notifError = '';
     showNotifForm = true;
@@ -191,6 +197,8 @@
     if (notifAlertSlaBreached) { alertArr.push('sla_breached'); alertArr.push('sla_recovered'); }
     if (notifAlertIpBanned) alertArr.push('ip_banned');
     if (notifAlertLogStore) { alertArr.push('log_store_unavailable'); alertArr.push('log_store_recovered'); }
+    if (notifAlertAdcsAuthorityFailed) alertArr.push('adcs_authority_failed');
+    if (notifAlertCertIssuanceFailed) alertArr.push('cert_issuance_failed');
 
     const body = { channel: notifChannel, enabled: notifEnabled, config: configStr, alert_types: alertArr };
 
@@ -367,9 +375,9 @@
       <fieldset class="settings-fieldset">
         <legend>Alert Types</legend>
         <div class="settings-alert-select-all">
-          <button type="button" class="settings-btn-link" onclick={() => { notifAlertBackendDown = notifAlertCertExpiring = notifAlertWafAlert = notifAlertConfigChanged = notifAlertSlaBreached = notifAlertIpBanned = notifAlertLogStore = true; }}>Select all</button>
+          <button type="button" class="settings-btn-link" onclick={() => { notifAlertBackendDown = notifAlertCertExpiring = notifAlertWafAlert = notifAlertConfigChanged = notifAlertSlaBreached = notifAlertIpBanned = notifAlertLogStore = notifAlertAdcsAuthorityFailed = notifAlertCertIssuanceFailed = true; }}>Select all</button>
           <span class="settings-separator">|</span>
-          <button type="button" class="settings-btn-link" onclick={() => { notifAlertBackendDown = notifAlertCertExpiring = notifAlertWafAlert = notifAlertConfigChanged = notifAlertSlaBreached = notifAlertIpBanned = notifAlertLogStore = false; }}>None</button>
+          <button type="button" class="settings-btn-link" onclick={() => { notifAlertBackendDown = notifAlertCertExpiring = notifAlertWafAlert = notifAlertConfigChanged = notifAlertSlaBreached = notifAlertIpBanned = notifAlertLogStore = notifAlertAdcsAuthorityFailed = notifAlertCertIssuanceFailed = false; }}>None</button>
         </div>
         <div class="settings-alert-checkboxes">
           <label><input type="checkbox" bind:checked={notifAlertBackendDown} /> Backend down</label>
@@ -379,6 +387,8 @@
           <label><input type="checkbox" bind:checked={notifAlertSlaBreached} /> SLA breached</label>
           <label><input type="checkbox" bind:checked={notifAlertIpBanned} /> IP banned</label>
           <label><input type="checkbox" bind:checked={notifAlertLogStore} /> Log persistence lost / restored</label>
+          <label><input type="checkbox" bind:checked={notifAlertAdcsAuthorityFailed} /> AD CS authority failed</label>
+          <label><input type="checkbox" bind:checked={notifAlertCertIssuanceFailed} /> Certificate issuance failed</label>
         </div>
       </fieldset>
       {#if notifError}

@@ -190,6 +190,7 @@ const MIGRATIONS: &[Migration] = &[
     (62, migrate_downstream_idle_timeout),
     (63, migrate_subscribe_log_store_alerts),
     (64, migrate_adcs_authority),
+    (65, migrate_subscribe_adcs_alerts),
 ];
 
 /// Which telemetry fan-in cursor a follower is reading or advancing
@@ -1185,6 +1186,28 @@ const LOG_STORE_ALERT_TYPES: [&str; 2] = ["log_store_unavailable", "log_store_re
 /// default, they can untick it. A row whose list does not parse is left
 /// for `row_to_notification_config` to report, as every read does.
 fn migrate_subscribe_log_store_alerts(conn: &Connection) -> rusqlite::Result<()> {
+    subscribe_explicit_channels(conn, &LOG_STORE_ALERT_TYPES)
+}
+
+/// The alert types Story 13.2 introduced, as migration 65 subscribes
+/// existing channels to them. Frozen for the reason given on
+/// `LOG_STORE_ALERT_TYPES`.
+const ADCS_ALERT_TYPES: [&str; 2] = ["adcs_authority_failed", "cert_issuance_failed"];
+
+/// Subscribe every notification channel saved with an explicit
+/// alert-type list to the AD CS alerts, for the reason migration 63
+/// gave: a channel saved before these types existed never had the box
+/// to tick, and an authority whose account is locked out, or a
+/// certificate that silently failed to renew, would page nobody.
+fn migrate_subscribe_adcs_alerts(conn: &Connection) -> rusqlite::Result<()> {
+    subscribe_explicit_channels(conn, &ADCS_ALERT_TYPES)
+}
+
+/// Append `new_types` to every channel whose stored list is explicit.
+/// An empty list or one holding `*` already receives every type, and a
+/// row whose list does not parse is left for
+/// `row_to_notification_config` to report.
+fn subscribe_explicit_channels(conn: &Connection, new_types: &[&str]) -> rusqlite::Result<()> {
     // Absent only from the partial schemas some tests build; with no
     // table there is no channel to subscribe.
     if !column_exists(conn, "notification_configs", "alert_types")? {
@@ -1202,7 +1225,7 @@ fn migrate_subscribe_log_store_alerts(conn: &Connection) -> rusqlite::Result<()>
             continue;
         }
         let before = types.len();
-        for new_type in LOG_STORE_ALERT_TYPES {
+        for &new_type in new_types {
             if !types.iter().any(|t| t == new_type) {
                 types.push(new_type.to_string());
             }

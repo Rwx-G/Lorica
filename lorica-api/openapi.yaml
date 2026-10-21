@@ -6459,7 +6459,7 @@ components:
           type: array
           items:
             type: string
-          description: Alert categories this destination subscribes to (`cert_expiring`, `backend_down`, `waf_alert`, `config_changed`, `sla_breached`, `sla_recovered`, `ip_banned`, `cluster_node_left`, `cluster_config_refused`, `cluster_drift`, `log_store_unavailable`, `log_store_recovered`).
+          description: Alert categories this destination subscribes to (`cert_expiring`, `backend_down`, `waf_alert`, `config_changed`, `sla_breached`, `sla_recovered`, `ip_banned`, `cluster_node_left`, `cluster_config_refused`, `cluster_drift`, `log_store_unavailable`, `log_store_recovered`, `adcs_authority_failed`, `cert_issuance_failed`).
 
     CreateNotificationRequest:
       type: object
