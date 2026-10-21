@@ -20,6 +20,8 @@ Author: Rwx-G
 
 ### Fixed
 
+- **Editing a notification channel no longer drops its cluster alert subscriptions.** The dashboard's form only knew a hand-typed subset of the alert types, so saving a channel removed every type it did not list, including the three cluster alerts. Stored types are now kept and the cluster types have their checkboxes.
+
 ### Removed
 
 ### Security
