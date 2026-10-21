@@ -3086,6 +3086,7 @@ dependencies = [
  "itoa",
  "jsonwebtoken",
  "lorica-acme",
+ "lorica-adcs",
  "lorica-automation-policy",
  "lorica-bench",
  "lorica-cache",

@@ -105,7 +105,10 @@ pub async fn import_config(
         )?;
     }
 
-    db_blocking(&state.store, move |store| {
+    // What the import changed on its own initiative, such as an AD CS
+    // certificate made manual because its authority is not on this
+    // node (Epic 13 D14). The caller learns it here or not at all.
+    let warnings: Vec<String> = db_blocking(&state.store, move |store| {
         lorica_config::import::import_to_store(&*store, &import_data)
             .map_err(|e| ApiError::Internal(e.to_string()))
     })
@@ -125,9 +128,10 @@ pub async fn import_config(
     )
     .await;
 
-    Ok(json_data(
-        serde_json::json!({"message": "configuration imported successfully"}),
-    ))
+    Ok(json_data(serde_json::json!({
+        "message": "configuration imported successfully",
+        "warnings": warnings,
+    })))
 }
 
 /// POST /api/v1/config/import/preview - parse a TOML payload and return its diff without applying it.

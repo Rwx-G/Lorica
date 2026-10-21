@@ -48,6 +48,10 @@ tags:
     description: User preferences
   - name: DnsProviders
     description: DNS provider credentials for ACME DNS-01 challenges
+  - name: AdcsAuthority
+    description: >-
+      The AD CS authority certificates are issued from (Epic 13): SuperAdmin
+      writes, an Operator connection test, control plane only.
   - name: Validation
     description: Pre-flight validation helpers (mTLS PEM, forward-auth health check)
   - name: Audit
@@ -3312,7 +3316,21 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/MessageResponse"
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      message:
+                        type: string
+                      warnings:
+                        type: array
+                        items:
+                          type: string
+                        description: >-
+                          What the import changed on its own, such as an AD CS
+                          certificate made manual because its authority is not
+                          on this node. Empty when nothing was.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -3889,6 +3907,168 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # AD CS authority (Story 13.2, Epic 13)
+  # ---------------------------------------------------------------------------
+  /api/v1/adcs/authority:
+    get:
+      tags: [AdcsAuthority]
+      summary: The AD CS authority, without its password (Viewer+)
+      description: >-
+        The password is write-only and reported as `password_set`. The
+        failed state (Epic 13 D15) is part of the authority:
+        `failed_since`, `failed_step` and `failed_kdc_code` are set while
+        every AD CS operation is suspended. On a follower the authority is
+        never present, since it lives on the control plane only (D13):
+        `authority` is `null` and `managed_on_control_plane` is `true`.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The authority, or `null` when none is configured
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/AdcsAuthorityState"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    put:
+      tags: [AdcsAuthority]
+      summary: Create or update the AD CS authority (SuperAdmin, control plane only)
+      description: >-
+        One authority per installation. `password` is required on creation
+        and whenever `endpoint`, `realm`, `kdcs` or `principal` changes:
+        such a change clears the stored password, so a request that changes
+        one of them without a new password is refused with 422 and leaves
+        the stored one in place. Any password written replaces the stored
+        one and closes the failed state. The generated `krb5.conf` is
+        rewritten in the same transaction. Refused with 409 while another AD
+        CS operation runs, and on a follower.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdcsAuthorityRequest"
+      responses:
+        "200":
+          description: The authority, updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/AdcsAuthority"
+        "201":
+          description: The authority, created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/AdcsAuthority"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: Another AD CS operation is running, or this node is a follower
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+    delete:
+      tags: [AdcsAuthority]
+      summary: Delete the AD CS authority (SuperAdmin, control plane only)
+      description: >-
+        Refused with 409 naming every certificate that still references the
+        authority; revert them to manual or delete them first.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Authority deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: >-
+            Certificates still reference the authority (the message lists
+            them), another AD CS operation is running, or this node is a
+            follower
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/adcs/authority/test:
+    post:
+      tags: [AdcsAuthority]
+      summary: Test that Lorica can authenticate to the authority (Operator+, control plane only)
+      description: >-
+        Acquires a Kerberos ticket for the service account and
+        authenticates to the CES endpoint with the TLS channel binding and
+        mutual authentication. No certificate is requested and nothing
+        reaches the CA database. A completed test answers 200 with `ok`,
+        or with the failing step and the client message. A rejected
+        credential puts the authority in the failed state (Epic 13 D15),
+        raises one `adcs_authority_failed` alert, and every later test is
+        refused with 409 until a SuperAdmin saves a new password. Rate
+        limited to 3 a minute in its own bucket; single-flight with every
+        other AD CS operation.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The test ran; see `ok`
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/AdcsConnectionTestResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: >-
+            The authority is in the failed state, another AD CS operation is
+            running, or this node is a follower
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "429":
+          $ref: "#/components/responses/RateLimited"
 
   # ---------------------------------------------------------------------------
   # Notification history
@@ -6373,6 +6553,166 @@ components:
               nullable: true
               description: Why the store is not open, while it is not.
 
+    AdcsSubjectDefaults:
+      type: object
+      description: The fixed part of every CSR subject; the CN is the first SAN of the certificate.
+      additionalProperties: false
+      properties:
+        country:
+          type: string
+          nullable: true
+          description: Two-letter ISO 3166 code, stored upper case
+        state:
+          type: string
+          nullable: true
+        locality:
+          type: string
+          nullable: true
+        organization:
+          type: string
+          nullable: true
+        organizational_unit:
+          type: string
+          nullable: true
+        email:
+          type: string
+          nullable: true
+    AdcsKeyType:
+      type: string
+      enum: [rsa2048, rsa3072, ecdsa_p256]
+    AdcsAuthority:
+      type: object
+      description: >-
+        The AD CS authority as stored, without its password. Never
+        replicated to followers and never exported (Epic 13 D13, D14).
+      properties:
+        id:
+          type: string
+        endpoint:
+          type: string
+          description: The CES endpoint, https:// with a DNS host name
+        realm:
+          type: string
+        kdcs:
+          type: array
+          items:
+            type: string
+          description: Explicit KDCs as host[:port]; empty means DNS SRV discovery
+        principal:
+          type: string
+        endpoint_ca_pem:
+          type: string
+          nullable: true
+          description: PEM certificates trusted, alone, for the TLS certificate of the endpoint
+        issuing_ca_pem:
+          type: string
+          nullable: true
+        default_template:
+          type: string
+          description: The common name of the template, not its display name
+        default_key_type:
+          $ref: "#/components/schemas/AdcsKeyType"
+        subject:
+          $ref: "#/components/schemas/AdcsSubjectDefaults"
+        allowed_suffixes:
+          type: array
+          items:
+            type: string
+        auto_renew_default:
+          type: boolean
+        failed_since:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the KDC rejected the credential; null when not failed
+        failed_step:
+          type: string
+          nullable: true
+        failed_kdc_code:
+          type: integer
+          nullable: true
+          description: The KDC error code (24 wrong password, 18 account disabled or locked, 23 password expired)
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        password_set:
+          type: boolean
+          description: Whether a service account password is stored; the password itself is never returned
+    AdcsAuthorityState:
+      type: object
+      properties:
+        authority:
+          allOf:
+            - $ref: "#/components/schemas/AdcsAuthority"
+          nullable: true
+        managed_on_control_plane:
+          type: boolean
+          description: True on a follower, which holds no authority
+    AdcsAuthorityRequest:
+      type: object
+      additionalProperties: false
+      required: [endpoint, realm, principal, default_template, allowed_suffixes, auto_renew_default]
+      properties:
+        endpoint:
+          type: string
+        realm:
+          type: string
+          pattern: "^[A-Z0-9][A-Z0-9.-]*$"
+        kdcs:
+          type: array
+          items:
+            type: string
+        principal:
+          type: string
+          description: user, or user@REALM with the realm of the authority
+        password:
+          type: string
+          writeOnly: true
+          description: >-
+            Required on creation and with any change of endpoint, realm,
+            kdcs or principal. Never returned, never logged.
+        endpoint_ca_pem:
+          type: string
+          nullable: true
+        issuing_ca_pem:
+          type: string
+          nullable: true
+        default_template:
+          type: string
+        default_key_type:
+          $ref: "#/components/schemas/AdcsKeyType"
+        subject:
+          $ref: "#/components/schemas/AdcsSubjectDefaults"
+        allowed_suffixes:
+          type: array
+          minItems: 1
+          items:
+            type: string
+          description: DNS suffixes Lorica may request names under; wildcards are refused
+        auto_renew_default:
+          type: boolean
+    AdcsConnectionTestResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        step:
+          type: string
+          nullable: true
+          description: >-
+            The failing step: ticket_acquisition, kdc_discovery, tls,
+            channel_binding, spnego, mutual_authentication, http,
+            configuration, krb5_conf, timeout, gss_task, or other
+        message:
+          type: string
+          nullable: true
+          description: The error text of the client, which names the step in words
+        authority_failed:
+          type: boolean
+          description: Whether this test put the authority in the failed state
     MessageResponse:
       type: object
       properties:

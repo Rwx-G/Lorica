@@ -35,9 +35,10 @@ use crate::server::AppState;
 ///    key depending on `format`) which need Operator.
 /// 3. Every other method defaults to Operator (fail-closed), with a
 ///    SuperAdmin overlay for settings writes, DNS providers,
-///    notification configs, cert-export ACLs, config import, and
-///    the hot binary upgrade; and a Viewer floor for the self
-///    password change.
+///    notification configs, cert-export ACLs, config import, the
+///    hot binary upgrade and the AD CS authority (whose connection
+///    test is carved out at Operator ahead of it); and a Viewer floor
+///    for the self password change.
 pub fn required_role(method: &http::Method, path: &str) -> Role {
     if path == "/api/v1/users" || path.starts_with("/api/v1/users/") {
         return Role::SuperAdmin;
@@ -171,10 +172,22 @@ pub fn required_role(method: &http::Method, path: &str) -> Role {
         return Role::Viewer;
     }
 
+    // The AD CS connection test (Story 13.2, Epic 13 D11) is Operator:
+    // it tells an operator whether issuance will work and changes no
+    // configuration. It must precede the overlay below, whose
+    // `/api/v1/adcs/` prefix would otherwise capture it.
+    if method == http::Method::POST && path == "/api/v1/adcs/authority/test" {
+        return Role::Operator;
+    }
+
     // SuperAdmin overlay (AC #6): settings / DNS providers /
     // notification configs / cert-export ACL editing / config
-    // import / binary upgrade.
+    // import / binary upgrade / the AD CS authority (Epic 13 D11:
+    // whoever edits its realm, KDCs or suffixes decides where the
+    // service account authenticates and which names Lorica may
+    // request, which must not be the role that issues).
     if path == "/api/v1/settings"
+        || path.starts_with("/api/v1/adcs/")
         || path.starts_with("/api/v1/settings/")
         || path == "/api/v1/dns-providers"
         || path.starts_with("/api/v1/dns-providers/")
@@ -336,8 +349,32 @@ mod tests {
             (Method::POST, "/api/v1/cluster/nodes/n1/activate"),
             (Method::DELETE, "/api/v1/cluster/nodes/n1"),
             (Method::POST, "/api/v1/cluster/bans"),
+            // The AD CS authority lives on the control plane only
+            // (Epic 13 D13), its connection test included: a follower
+            // holds no authority to test.
+            (Method::PUT, "/api/v1/adcs/authority"),
+            (Method::DELETE, "/api/v1/adcs/authority"),
+            (Method::POST, "/api/v1/adcs/authority/test"),
         ] {
             assert!(!follower_local_request(&method, path), "{method} {path}");
+        }
+    }
+
+    /// Story 13.2 AC #2: one row per AD CS path and method. The test
+    /// carve-out is listed beside the writes it is carved out of, so a
+    /// reordering of the rules that lets the overlay capture it fails
+    /// here.
+    #[test]
+    fn adcs_authority_paths_follow_d11() {
+        for (method, path, expected) in [
+            (Method::GET, "/api/v1/adcs/authority", Role::Viewer),
+            (Method::PUT, "/api/v1/adcs/authority", Role::SuperAdmin),
+            (Method::DELETE, "/api/v1/adcs/authority", Role::SuperAdmin),
+            (Method::POST, "/api/v1/adcs/authority", Role::SuperAdmin),
+            (Method::POST, "/api/v1/adcs/authority/test", Role::Operator),
+            (Method::PUT, "/api/v1/adcs/authority/test", Role::SuperAdmin),
+        ] {
+            assert_eq!(required_role(&method, path), expected, "{method} {path}");
         }
     }
 

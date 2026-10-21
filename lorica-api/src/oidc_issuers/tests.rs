@@ -78,6 +78,7 @@ async fn test_state(issuer: Arc<MockIssuer>) -> (AppState, SessionStore, RateLim
         mcp_invocations: Arc::new(crate::automation::InvocationLimiter::new()),
         renewals: Arc::new(crate::acme::RenewalLedger::new()),
         automation_writes: crate::middleware::rate_limit::RateLimiter::new(),
+        adcs: crate::adcs::AdcsRuntime::new(None),
     };
     let session_store = SessionStore::new(store).await;
     (state, session_store, RateLimiter::new())

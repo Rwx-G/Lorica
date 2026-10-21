@@ -212,6 +212,10 @@ pub(crate) async fn run_api_server(
         // below.
         purge_superseded_acme_orphans(&state.store).await;
 
+        // AD CS operations run here and only here (Epic 13 D13), and
+        // `KRB5_CONFIG` already points at this file (set in `main`).
+        lorica_api::adcs::write_krb5_conf_at_startup(&state).await;
+
         let _acme_renewal = lorica_api::acme::spawn_renewal_task(
             state.clone(),
             std::time::Duration::from_secs(12 * 3600),
