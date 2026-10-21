@@ -1,7 +1,8 @@
 <script lang="ts">
-  import type { CertificateResponse, RouteResponse } from '../../lib/api';
+  import type { CertificateDownloadPart, CertificateResponse, RouteResponse } from '../../lib/api';
   import CertExpiryBadge from '../CertExpiryBadge.svelte';
   import { canWrite } from '../../lib/auth';
+  import { downloadPartRefusal } from '../../lib/adcs-issuance';
 
   interface Props {
     certificates: CertificateResponse[];
@@ -24,7 +25,7 @@
     onRenew: (cert: CertificateResponse) => void;
     onRevert: (cert: CertificateResponse) => void;
     onDelete: (cert: CertificateResponse) => void;
-    onDownload: (cert: CertificateResponse, part: 'cert' | 'key' | 'chain' | 'bundle') => void;
+    onDownload: (cert: CertificateResponse, part: CertificateDownloadPart) => void;
   }
 
   let {
@@ -49,6 +50,21 @@
   let openMenuId: string | null = $state(null);
   function toggleMenu(id: string) {
     openMenuId = openMenuId === id ? null : id;
+  }
+
+  const DOWNLOAD_CHOICES: { part: CertificateDownloadPart; label: string; sensitive: boolean }[] = [
+    { part: 'bundle', label: 'Bundle (cert + key)', sensitive: false },
+    { part: 'cert', label: 'Certificate only', sensitive: false },
+    { part: 'chain', label: 'Certificate + chain', sensitive: false },
+    { part: 'key', label: 'Private key (sensitive)', sensitive: true },
+  ];
+
+  function downloadRefusal(cert: CertificateResponse): string | null {
+    for (const choice of DOWNLOAD_CHOICES) {
+      const refusal = downloadPartRefusal(cert, choice.part);
+      if (refusal) return refusal;
+    }
+    return null;
   }
 
   function formatDate(iso: string): string {
@@ -158,11 +174,21 @@
                   {@html downloadIcon}
                 </button>
                 {#if openMenuId === cert.id}
+                  {@const refusal = downloadRefusal(cert)}
                   <div class="download-menu" role="menu">
-                    <button role="menuitem" onclick={() => { onDownload(cert, 'bundle'); openMenuId = null; }}>Bundle (cert + key)</button>
-                    <button role="menuitem" onclick={() => { onDownload(cert, 'cert'); openMenuId = null; }}>Certificate only</button>
-                    <button role="menuitem" onclick={() => { onDownload(cert, 'chain'); openMenuId = null; }}>Certificate + chain</button>
-                    <button role="menuitem" class="danger" onclick={() => { onDownload(cert, 'key'); openMenuId = null; }}>Private key (sensitive)</button>
+                    {#each DOWNLOAD_CHOICES as choice (choice.part)}
+                      {@const refused = downloadPartRefusal(cert, choice.part) !== null}
+                      <button
+                        role="menuitem"
+                        class:danger={choice.sensitive}
+                        disabled={refused}
+                        aria-describedby={refused ? `download-refusal-${cert.id}` : undefined}
+                        onclick={() => { onDownload(cert, choice.part); openMenuId = null; }}
+                      >{choice.label}</button>
+                    {/each}
+                    {#if refusal}
+                      <p class="download-refusal" id="download-refusal-{cert.id}" role="none" data-testid="download-refusal">{refusal}</p>
+                    {/if}
                   </div>
                 {/if}
               </div>
@@ -278,5 +304,23 @@
   .download-menu button.danger {
     color: var(--color-red);
     border-top: 1px solid var(--color-border);
+  }
+  .download-menu button:disabled {
+    cursor: not-allowed;
+    color: var(--color-text-muted);
+    text-decoration: line-through;
+  }
+  .download-menu button:disabled:hover {
+    background: none;
+  }
+  .download-refusal {
+    margin: 0;
+    padding: 0.5rem 0.75rem;
+    max-width: 16rem;
+    border-top: 1px solid var(--color-border);
+    font-size: 0.75rem;
+    line-height: 1.4;
+    white-space: normal;
+    color: var(--color-text-muted);
   }
 </style>

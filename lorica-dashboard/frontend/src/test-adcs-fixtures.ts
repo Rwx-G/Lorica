@@ -3,7 +3,13 @@
  * module rather than an export of a test file, which would register
  * that file's suites a second time in every importer.
  */
-import type { AdcsAdoptionCandidate, AdcsAuthority, AdcsAuthorityState, CertificateResponse } from './lib/api';
+import type {
+  AdcsAdoptionCandidate,
+  AdcsAuthority,
+  AdcsAuthorityState,
+  AdcsAuthoritySummary,
+  CertificateResponse,
+} from './lib/api';
 
 export function testAuthority(overrides: Partial<AdcsAuthority> = {}): AdcsAuthority {
   return {
@@ -15,6 +21,7 @@ export function testAuthority(overrides: Partial<AdcsAuthority> = {}): AdcsAutho
     endpoint_ca_pem: null,
     issuing_ca_pem: null,
     default_template: 'LoricaWebServer',
+    allowed_templates: ['LoricaWebServer'],
     default_key_type: 'rsa2048',
     subject: {
       country: 'FR',
@@ -36,8 +43,44 @@ export function testAuthority(overrides: Partial<AdcsAuthority> = {}): AdcsAutho
   };
 }
 
-export function testAuthorityState(overrides: Partial<AdcsAuthorityState> = {}): AdcsAuthorityState {
-  return { authority: testAuthority(), managed_on_control_plane: false, ...overrides };
+/** The summary the API derives from `authority` for every role. */
+export function testSummary(
+  authority: AdcsAuthority,
+  failedReason: string | null = null,
+): AdcsAuthoritySummary {
+  return {
+    allowed_suffixes: authority.allowed_suffixes,
+    failed_since: authority.failed_since,
+    failed_step: authority.failed_step,
+    failed_kdc_code: authority.failed_kdc_code,
+    failed_reason: failedReason,
+  };
+}
+
+/**
+ * A `GET /api/v1/adcs/authority` body shaped as the API builds it:
+ * `authority: null` for none configured, `follower` for a follower
+ * (which reports none), `viewer` for a Viewer (summary only, D18).
+ */
+export function testAuthorityState({
+  authority = testAuthority(),
+  follower = false,
+  viewer = false,
+  failedReason = null,
+}: {
+  authority?: AdcsAuthority | null;
+  follower?: boolean;
+  viewer?: boolean;
+  failedReason?: string | null;
+} = {}): AdcsAuthorityState {
+  if (follower) return { configured: false, managed_on_control_plane: true, summary: null, authority: null };
+  if (authority === null) return { configured: false, managed_on_control_plane: false, summary: null, authority: null };
+  return {
+    configured: true,
+    managed_on_control_plane: false,
+    summary: testSummary(authority, failedReason),
+    authority: viewer ? null : authority,
+  };
 }
 
 export function testCertificate(

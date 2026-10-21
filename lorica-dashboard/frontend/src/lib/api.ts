@@ -761,6 +761,13 @@ export interface CreateCertificateRequest {
   key_pem: string;
 }
 
+/**
+ * A part of `GET /api/v1/certificates/{id}/download`. `key` and
+ * `bundle` carry the private key, which an AD CS certificate never
+ * releases (Epic 13 D16).
+ */
+export type CertificateDownloadPart = 'cert' | 'key' | 'chain' | 'bundle';
+
 export interface UpdateCertificateRequest {
   domain?: string;
   cert_pem?: string;
@@ -1282,6 +1289,8 @@ export interface AdcsAuthority {
   endpoint_ca_pem: string | null;
   issuing_ca_pem: string | null;
   default_template: string;
+  /** The templates an issuance may request, the default first (Epic 13 D17). */
+  allowed_templates: string[];
   default_key_type: AdcsKeyType;
   subject: AdcsSubjectDefaults;
   allowed_suffixes: string[];
@@ -1295,12 +1304,30 @@ export interface AdcsAuthority {
   password_set: boolean;
 }
 
+/** What every role reads of the authority (Epic 13 D18). */
+export interface AdcsAuthoritySummary {
+  allowed_suffixes: string[];
+  /** Set while the authority is in the failed state (Epic 13 D15). */
+  failed_since: string | null;
+  failed_step: string | null;
+  failed_kdc_code: number | null;
+  /** What the KDC code means for the service account, worded by the API. */
+  failed_reason: string | null;
+}
+
 /** Body of `GET /api/v1/adcs/authority`. */
 export interface AdcsAuthorityState {
-  /** `null` when none is configured, and always on a follower. */
-  authority: AdcsAuthority | null;
+  /** Whether an authority is configured on this node; `false` on a follower. */
+  configured: boolean;
   /** `true` on a follower: the authority lives on the control plane only. */
   managed_on_control_plane: boolean;
+  /** `null` when none is configured, and always on a follower. */
+  summary: AdcsAuthoritySummary | null;
+  /**
+   * The connection details, for Operators and SuperAdmins only (D18):
+   * `null` for a Viewer as well as when `summary` is.
+   */
+  authority: AdcsAuthority | null;
 }
 
 /** Body of `PUT /api/v1/adcs/authority`. */
@@ -1311,12 +1338,15 @@ export interface AdcsAuthorityRequest {
   principal: string;
   /**
    * Required on creation and with any change of `endpoint`, `realm`,
-   * `kdcs` or `principal`; omitted otherwise to keep the stored one.
+   * `kdcs`, `principal` or `endpoint_ca_pem`; omitted otherwise to keep
+   * the stored one.
    */
   password?: string;
   endpoint_ca_pem: string | null;
   issuing_ca_pem: string | null;
   default_template: string;
+  /** The other templates an issuance may request; the default always may. */
+  allowed_templates: string[];
   default_key_type: AdcsKeyType;
   subject: AdcsSubjectDefaults;
   allowed_suffixes: string[];
@@ -1348,6 +1378,7 @@ export interface AdcsSubjectOverrides {
 export interface AdcsIssueRequest {
   /** The first one is the subject's `CN`. */
   sans: string[];
+  /** One of the authority's `allowed_templates`; its default when absent. */
   template?: string;
   key_type?: AdcsKeyType;
   subject?: AdcsSubjectOverrides;
@@ -1684,12 +1715,14 @@ export const api = {
    * Bypasses the `request()` wrapper (which expects a JSON envelope) and
    * talks directly to the endpoint via fetch + Blob so the browser's
    * native download flow picks up the `Content-Disposition` filename.
-   * `part` selects `cert` / `key` / `chain` / `bundle` (default).
+   * `part` selects `cert` / `key` / `chain` / `bundle` (default); the
+   * API refuses `key` and `bundle` of an AD CS certificate with 403
+   * `adcs_key_not_exportable`, whose message comes back as returned.
    * Returns `{ ok }` on success, or `{ ok: false, message }` on error;
    * callers surface a toast and never auto-retry (rate-limit is 5 per
    * 60 s).
    */
-  downloadCertificate: async (id: string, part: 'cert' | 'key' | 'chain' | 'bundle' = 'bundle'): Promise<{ ok: true } | { ok: false; message: string }> => {
+  downloadCertificate: async (id: string, part: CertificateDownloadPart = 'bundle'): Promise<{ ok: true } | { ok: false; message: string }> => {
     const qs = new URLSearchParams({ part }).toString();
     const res = await fetch(`/api/v1/certificates/${id}/download?${qs}`, {
       method: 'GET',

@@ -62,7 +62,7 @@ describe('RoutingTab AD CS offer', () => {
   });
 
   it('is not offered when no authority is configured', async () => {
-    served({ authority: null, managed_on_control_plane: false });
+    served(testAuthorityState({ authority: null }));
     await rendered(routeForm());
     expect(screen.queryByTestId('adcs-route-offer')).not.toBeInTheDocument();
   });
@@ -74,7 +74,7 @@ describe('RoutingTab AD CS offer', () => {
   });
 
   it('is not offered on a follower, by the API flag', async () => {
-    served({ authority: null, managed_on_control_plane: true });
+    served(testAuthorityState({ follower: true }));
     await rendered(routeForm());
     expect(screen.queryByTestId('adcs-route-offer')).not.toBeInTheDocument();
   });
@@ -169,5 +169,30 @@ describe('RoutingTab AD CS issuance', () => {
     await fireEvent.click(await screen.findByRole('button', { name: 'Issue from AD CS' }));
     await fireEvent.click(screen.getByRole('button', { name: 'Issue' }));
     await waitFor(() => expect(screen.getByTestId('adcs-route-outcome')).toHaveTextContent(message));
+  });
+});
+
+describe('RoutingTab AD CS template (D17)', () => {
+  it('offers the allowed templates, the default preselected, and sends the one chosen', async () => {
+    served(
+      testAuthorityState({
+        authority: testAuthority({ allowed_templates: ['LoricaWebServer', 'LoricaEcdsa'] }),
+      }),
+    );
+    const issue = vi.spyOn(api, 'issueAdcsCertificate').mockResolvedValue({
+      data: { outcome: 'pending', request_id: '4711', message: 'Taken under submission' },
+    });
+    await rendered(routeForm());
+    await screen.findByRole('button', { name: 'Issue from AD CS' });
+    const select = screen.getByLabelText('Template') as HTMLSelectElement;
+    expect(Array.from(select.options).map((option) => option.value)).toEqual(['LoricaWebServer', 'LoricaEcdsa']);
+    expect(select.value).toBe('LoricaWebServer');
+
+    await fireEvent.change(select, { target: { value: 'LoricaEcdsa' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Issue from AD CS' }));
+    expect(screen.getByTestId('adcs-confirm-template')).toHaveTextContent('LoricaEcdsa');
+    await fireEvent.click(screen.getByRole('button', { name: 'Issue' }));
+    await waitFor(() => expect(issue).toHaveBeenCalledOnce());
+    expect(issue.mock.calls[0][0].template).toBe('LoricaEcdsa');
   });
 });

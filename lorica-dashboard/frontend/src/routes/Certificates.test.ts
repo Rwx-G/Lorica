@@ -10,9 +10,11 @@ import {
   type ApiError,
   type CertificateResponse,
 } from '../lib/api';
-import { ADCS_RENEWAL_STILL_FINISHING } from '../lib/adcs-issuance';
+import { ADCS_KEY_NOT_EXPORTABLE_HINT, ADCS_RENEWAL_STILL_FINISHING } from '../lib/adcs-issuance';
 import { ADCS_NO_ISSUING_CA_HINT } from '../lib/adcs-adoption';
 import { testAuthority, testAuthorityState, testCandidate, testCertificate } from '../test-adcs-fixtures';
+import { get } from 'svelte/store';
+import { toasts } from '../lib/toast';
 import Certificates from './Certificates.svelte';
 
 const adcsCert = testCertificate('app.corp.example.org', [], {
@@ -80,13 +82,13 @@ describe('Certificates AD CS "Renew now" gating', () => {
   });
 
   it('hides it when no authority is configured', async () => {
-    served({ authority: null, managed_on_control_plane: false });
+    served(testAuthorityState({ authority: null }));
     await rendered();
     expect(renewButton()).not.toBeInTheDocument();
   });
 
   it('hides it on a follower, by the API flag', async () => {
-    served({ authority: testAuthority(), managed_on_control_plane: true });
+    served(testAuthorityState({ follower: true }));
     await rendered();
     expect(renewButton()).not.toBeInTheDocument();
   });
@@ -247,7 +249,7 @@ describe('Certificates AD CS adoption banner', () => {
   });
 
   it('hides it on a follower, by the API flag', async () => {
-    served({ authority: testAuthority(), managed_on_control_plane: true });
+    served(testAuthorityState({ follower: true }));
     offered(twoCandidates);
     await rendered([manualCert]);
     expect(banner()).not.toBeInTheDocument();
@@ -262,7 +264,7 @@ describe('Certificates AD CS adoption banner', () => {
   });
 
   it('says nothing when no authority is configured', async () => {
-    served({ authority: null, managed_on_control_plane: false });
+    served(testAuthorityState({ authority: null }));
     offered({ reason: 'not_configured', candidates: [] });
     await rendered([manualCert]);
     expect(banner()).not.toBeInTheDocument();
@@ -307,7 +309,7 @@ describe('Certificates AD CS "Revert to manual"', () => {
   });
 
   it('is hidden on a follower', async () => {
-    served({ authority: testAuthority(), managed_on_control_plane: true });
+    served(testAuthorityState({ follower: true }));
     await rendered();
     expect(revertButton()).not.toBeInTheDocument();
   });
@@ -337,5 +339,84 @@ describe('Certificates AD CS "Revert to manual"', () => {
     expect(revert).toHaveBeenCalledWith(adcsCert.id);
     await waitFor(() => expect(revertButton()).not.toBeInTheDocument());
     expect(list).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('Certificates download of an AD CS certificate (D16)', () => {
+  async function openMenu(): Promise<HTMLElement> {
+    await fireEvent.click(screen.getByRole('button', { name: 'Download certificate' }));
+    return screen.getByRole('menu');
+  }
+
+  it('disables the key and the bundle with the reason, and keeps cert and chain', async () => {
+    served();
+    await rendered();
+    const menu = await openMenu();
+    expect(within(menu).getByRole('menuitem', { name: 'Bundle (cert + key)' })).toBeDisabled();
+    expect(within(menu).getByRole('menuitem', { name: 'Private key (sensitive)' })).toBeDisabled();
+    expect(within(menu).getByRole('menuitem', { name: 'Certificate only' })).toBeEnabled();
+    expect(within(menu).getByRole('menuitem', { name: 'Certificate + chain' })).toBeEnabled();
+    expect(within(menu).getByTestId('download-refusal')).toHaveTextContent(ADCS_KEY_NOT_EXPORTABLE_HINT);
+  });
+
+  it('downloads the chain of an AD CS certificate', async () => {
+    served();
+    const download = vi.spyOn(api, 'downloadCertificate').mockResolvedValue({ ok: true });
+    await rendered();
+    const menu = await openMenu();
+    await fireEvent.click(within(menu).getByRole('menuitem', { name: 'Certificate + chain' }));
+    expect(download).toHaveBeenCalledWith(adcsCert.id, 'chain');
+  });
+
+  it('offers every part of a manual certificate', async () => {
+    served();
+    await rendered([manualCert]);
+    const menu = await openMenu();
+    for (const item of within(menu).getAllByRole('menuitem')) expect(item).toBeEnabled();
+    expect(within(menu).queryByTestId('download-refusal')).not.toBeInTheDocument();
+  });
+
+  it('shows the refusal of the API as returned', async () => {
+    served();
+    const message = 'the private key of an AD CS certificate never leaves Lorica';
+    vi.spyOn(api, 'downloadCertificate').mockResolvedValue({ ok: false, message });
+    await rendered([manualCert]);
+    const menu = await openMenu();
+    await fireEvent.click(within(menu).getByRole('menuitem', { name: 'Certificate only' }));
+    await waitFor(() =>
+      expect(get(toasts).map((toast) => toast.message)).toContain(`Download failed: ${message}`),
+    );
+  });
+});
+
+describe('Certificates delete dialog', () => {
+  it('says that deleting an AD CS certificate does not revoke it', async () => {
+    served();
+    await rendered();
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    expect(screen.getByRole('dialog')).toHaveTextContent('does not revoke it');
+  });
+
+  it('says nothing about revocation for a manual certificate', async () => {
+    served();
+    await rendered([manualCert]);
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    expect(screen.getByRole('dialog')).not.toHaveTextContent('revoke');
+  });
+});
+
+describe('Certificates reloads after a renewal', () => {
+  it('re-reads the list but not the adoption candidates, which a renewal cannot change', async () => {
+    served();
+    const candidates = vi.mocked(api.listAdcsAdoptionCandidates);
+    vi.spyOn(api, 'renewCertificate').mockResolvedValue({ data: adcsCert });
+    await rendered();
+    await waitFor(() => expect(renewButton()).toBeInTheDocument());
+    const before = candidates.mock.calls.length;
+    const list = vi.mocked(api.listCertificates);
+    const listed = list.mock.calls.length;
+    await confirmRenewal();
+    await waitFor(() => expect(list.mock.calls.length).toBe(listed + 1));
+    expect(candidates.mock.calls.length).toBe(before);
   });
 });

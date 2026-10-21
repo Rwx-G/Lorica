@@ -3,7 +3,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import { auth, type Role } from '../../lib/auth';
 import { clusterStatus, type ClusterStatus } from '../../lib/cluster';
-import { api, type AdcsAuthority, type AdcsAuthorityState } from '../../lib/api';
+import { api, type AdcsAuthority } from '../../lib/api';
+import { testAuthorityState } from '../../test-adcs-fixtures';
 import AdcsAuthorityTab from './AdcsAuthorityTab.svelte';
 
 function authority(overrides: Partial<AdcsAuthority> = {}): AdcsAuthority {
@@ -16,6 +17,7 @@ function authority(overrides: Partial<AdcsAuthority> = {}): AdcsAuthority {
     endpoint_ca_pem: null,
     issuing_ca_pem: null,
     default_template: 'LoricaWebServer',
+    allowed_templates: ['LoricaWebServer', 'LoricaWebServerEcdsa'],
     default_key_type: 'rsa2048',
     subject: {
       country: 'FR',
@@ -37,13 +39,21 @@ function authority(overrides: Partial<AdcsAuthority> = {}): AdcsAuthority {
   };
 }
 
-function served(state: Partial<AdcsAuthorityState> = {}) {
-  return vi.spyOn(api, 'getAdcsAuthority').mockResolvedValue({
-    data: { authority: authority(), managed_on_control_plane: false, ...state },
-  });
+let currentRole: Role = 'super_admin';
+
+type Served = { authority?: AdcsAuthority | null; follower?: boolean; failedReason?: string | null };
+
+/** The authority read as the API answers the current role: a Viewer gets the summary only (D18). */
+function state({ authority: stored = authority(), follower = false, failedReason = null }: Served = {}) {
+  return testAuthorityState({ authority: stored, follower, failedReason, viewer: currentRole === 'viewer' });
+}
+
+function served(options: Served = {}) {
+  return vi.spyOn(api, 'getAdcsAuthority').mockResolvedValue({ data: state(options) });
 }
 
 function as(role: Role): void {
+  currentRole = role;
   auth.set({ status: 'authenticated', username: role, role });
 }
 
@@ -93,11 +103,19 @@ describe('AdcsAuthorityTab roles', () => {
     expect(screen.getByRole('button', { name: 'Test connection' })).toBeInTheDocument();
   });
 
-  it('gives a Viewer the read-only view without the test', async () => {
+  it('gives a Viewer the summary only: configured and the suffixes, no connection details (D18)', async () => {
     as('viewer');
     served();
     await rendered();
-    expect(screen.getByLabelText(/^Allowed DNS suffixes/)).toBeDisabled();
+    const summary = screen.getByTestId('adcs-summary');
+    expect(summary).toHaveTextContent('An AD CS authority is configured');
+    expect(summary).toHaveTextContent('corp.example.org');
+    expect(screen.queryByLabelText(/^CES endpoint/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^Kerberos realm/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^KDCs/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^Service principal/)).not.toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent('CORP-CA_CES_Kerberos');
+    expect(document.body).not.toHaveTextContent('svc-lorica');
     expect(screen.queryByRole('button', { name: 'Test connection' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Save AD CS authority' })).not.toBeInTheDocument();
   });
@@ -112,7 +130,7 @@ describe('AdcsAuthorityTab roles', () => {
 
 describe('AdcsAuthorityTab on a follower', () => {
   it('shows the control-plane notice and nothing to write or test, on the API flag', async () => {
-    served({ authority: null, managed_on_control_plane: true });
+    served({ follower: true });
     await rendered();
     expect(screen.getByTestId('adcs-follower-notice')).toHaveTextContent(
       'managed on the control plane',
@@ -146,7 +164,7 @@ describe('AdcsAuthorityTab password', () => {
   });
 
   it('says not set when no password is stored', async () => {
-    as('viewer');
+    as('operator');
     served({ authority: authority({ password_set: false }) });
     await rendered();
     expect(screen.getByTestId('adcs-password-state')).toHaveTextContent('not set');
@@ -286,14 +304,13 @@ describe('AdcsAuthorityTab connection test', () => {
     });
     await rendered();
     get.mockResolvedValue({
-      data: {
+      data: state({
         authority: authority({
           failed_since: '2026-10-20T08:00:00Z',
           failed_step: 'ticket_acquisition',
           failed_kdc_code: 24,
         }),
-        managed_on_control_plane: false,
-      },
+      }),
     });
     await fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
     await waitFor(() => expect(screen.getByTestId('adcs-failed-state')).toBeInTheDocument());
@@ -302,21 +319,36 @@ describe('AdcsAuthorityTab connection test', () => {
 });
 
 describe('AdcsAuthorityTab failed state', () => {
-  it('shows since, step and KDC code to every role, with how to clear it', async () => {
+  it('shows since, step, KDC code and the reason the API gives to every role, with how to clear it', async () => {
     as('viewer');
     served({
       authority: authority({
         failed_since: '2026-10-20T08:00:00Z',
         failed_step: 'ticket_acquisition',
-        failed_kdc_code: 24,
+        failed_kdc_code: 31,
       }),
+      failedReason: 'integrity check on the decrypted field failed',
     });
     await rendered();
     const banner = screen.getByTestId('adcs-failed-state');
     expect(banner).toHaveTextContent(new Date('2026-10-20T08:00:00Z').toLocaleString());
     expect(banner).toHaveTextContent('ticket_acquisition');
-    expect(banner).toHaveTextContent('24 (wrong password)');
+    expect(banner).toHaveTextContent('31 (integrity check on the decrypted field failed)');
     expect(banner).toHaveTextContent('Saving a new password clears this state');
+  });
+
+  it('shows the code alone when the API gives no reason', async () => {
+    served({
+      authority: authority({
+        failed_since: '2026-10-20T08:00:00Z',
+        failed_step: 'ticket_acquisition',
+        failed_kdc_code: 99,
+      }),
+    });
+    await rendered();
+    const banner = screen.getByTestId('adcs-failed-state');
+    expect(banner).toHaveTextContent('99');
+    expect(banner.textContent).not.toMatch(/99\s*\(/);
   });
 
   it('shows no banner while the authority is healthy', async () => {
@@ -337,5 +369,93 @@ describe('AdcsAuthorityTab prerequisites', () => {
     expect(section).toHaveTextContent('EDITF_ATTRIBUTESUBJECTALTNAME2');
     expect(section).toHaveTextContent('Extended Protection');
     expect(section).toHaveTextContent('docs/adcs.md');
+  });
+});
+
+describe('AdcsAuthorityTab endpoint trust bundle', () => {
+  it('asks for the password again when the endpoint CA bundle changes', async () => {
+    served();
+    const put = vi.spyOn(api, 'putAdcsAuthority');
+    await rendered();
+    await fireEvent.input(screen.getByLabelText(/^Endpoint CA bundle/), {
+      target: { value: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----' },
+    });
+    expect(screen.getByTestId('adcs-identity-warning')).toHaveTextContent('endpoint CA bundle');
+    await fireEvent.click(screen.getByRole('button', { name: 'Save AD CS authority' }));
+    expect(screen.getByTestId('adcs-form-error')).toHaveTextContent('password must be entered again');
+    expect(put).not.toHaveBeenCalled();
+  });
+});
+
+describe('AdcsAuthorityTab allowed templates (D17)', () => {
+  const list = () => screen.getByTestId('adcs-allowed-templates');
+
+  it('lists the default as always allowed, with no way to remove it', async () => {
+    served();
+    await rendered();
+    expect(list()).toHaveTextContent('LoricaWebServer');
+    expect(list()).toHaveTextContent('default, always allowed');
+    expect(screen.queryByRole('button', { name: 'Remove template LoricaWebServer' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Remove template LoricaWebServerEcdsa' })).toBeInTheDocument();
+  });
+
+  it('saves the templates added and removed, never the default twice', async () => {
+    served();
+    const put = vi.spyOn(api, 'putAdcsAuthority').mockResolvedValue({ data: authority() });
+    await rendered();
+    await fireEvent.click(screen.getByRole('button', { name: 'Remove template LoricaWebServerEcdsa' }));
+    await fireEvent.input(screen.getByLabelText('Template to allow'), { target: { value: 'LoricaInternal' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Allow template' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Save AD CS authority' }));
+    await waitFor(() => expect(put).toHaveBeenCalled());
+    expect(put.mock.calls[0][0].allowed_templates).toEqual(['LoricaInternal']);
+    expect(put.mock.calls[0][0].default_template).toBe('LoricaWebServer');
+  });
+
+  it('refuses to add a template already allowed, ignoring case', async () => {
+    served();
+    await rendered();
+    await fireEvent.input(screen.getByLabelText('Template to allow'), { target: { value: 'loricawebserver' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Allow template' }));
+    expect(screen.getByRole('alert')).toHaveTextContent('loricawebserver is already allowed.');
+    expect(screen.queryByRole('button', { name: 'Remove template loricawebserver' })).not.toBeInTheDocument();
+  });
+
+  it('shows the list read-only to an Operator', async () => {
+    as('operator');
+    served();
+    await rendered();
+    expect(list()).toHaveTextContent('LoricaWebServerEcdsa');
+    expect(screen.queryByRole('button', { name: /^Remove template/ })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Template to allow')).not.toBeInTheDocument();
+  });
+});
+
+describe('AdcsAuthorityTab subject defaults', () => {
+  it('fills and sends every subject field the shared label table names', async () => {
+    served();
+    const put = vi.spyOn(api, 'putAdcsAuthority').mockResolvedValue({ data: authority() });
+    await rendered();
+    expect((screen.getByLabelText('Organization (O)') as HTMLInputElement).value).toBe('Example Corp');
+    expect(screen.getByLabelText('Country (C)')).toHaveAttribute('maxlength', '2');
+    await fireEvent.input(screen.getByLabelText('Locality (L)'), { target: { value: 'Paris' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Save AD CS authority' }));
+    await waitFor(() => expect(put).toHaveBeenCalled());
+    expect(put.mock.calls[0][0].subject).toEqual({
+      country: 'FR',
+      state: null,
+      locality: 'Paris',
+      organization: 'Example Corp',
+      organizational_unit: null,
+      email: null,
+    });
+  });
+});
+
+describe('AdcsAuthorityTab section header', () => {
+  it('says whether the section is expanded', async () => {
+    served();
+    await rendered();
+    expect(screen.getByRole('button', { name: 'AD CS authority' })).toHaveAttribute('aria-expanded', 'true');
   });
 });

@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { AdcsAuthority, AdcsIssueRequest } from '../../lib/api';
   import { adcsRequestSummary } from '../../lib/adcs-issuance';
+  import { modalFocus } from '../../lib/modal-focus';
 
   interface Props {
     authority: AdcsAuthority;
@@ -29,6 +30,7 @@
   tabindex="-1"
   onclick={(e) => { if (e.target === e.currentTarget && !submitting) oncancel(); }}
   onkeydown={handleKeydown}
+  {@attach modalFocus}
 >
   <div class="modal" role="document" data-testid="adcs-issue-confirm">
     <h2 id="adcs-confirm-title">Confirm AD CS issuance</h2>
@@ -68,7 +70,7 @@
     </p>
 
     <div class="form-actions">
-      <button class="btn btn-cancel" onclick={oncancel} disabled={submitting}>Cancel</button>
+      <button class="btn btn-cancel" onclick={oncancel} disabled={submitting} data-autofocus>Cancel</button>
       <button class="btn btn-primary" onclick={onconfirm} disabled={submitting}>
         {submitting ? 'Issuing...' : 'Issue'}
       </button>

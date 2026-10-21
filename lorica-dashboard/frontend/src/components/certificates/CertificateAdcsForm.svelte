@@ -16,13 +16,16 @@
     adcsIssuanceBlocker,
     adcsIssueOutcome,
     adcsSanHints,
+    adcsTemplateOptions,
     parseSanList,
     subjectOverrides,
     type AdcsIssueOutcome,
   } from '../../lib/adcs-issuance';
   import { canWriteRole } from '../../lib/auth';
   import { nodeRole } from '../../lib/cluster';
+  import { modalFocus } from '../../lib/modal-focus';
   import AdcsIssueConfirm from './AdcsIssueConfirm.svelte';
+  import AdcsOutcomeMessage from './AdcsOutcomeMessage.svelte';
 
   interface Props {
     onClose: () => void;
@@ -67,6 +70,7 @@
         }),
   );
   const authority = $derived(authorityState?.authority ?? null);
+  const templates = $derived(authority ? adcsTemplateOptions(authority) : []);
   const sans = $derived(parseSanList(sansText));
   const hints = $derived(adcsSanHints(sans, authority?.allowed_suffixes ?? []));
 
@@ -95,13 +99,10 @@
       formError = 'Enter at least one DNS name.';
       return;
     }
-    const trimmedTemplate = template.trim();
     const overrides = subjectOverrides(authority.subject, subject);
     pendingRequest = {
       sans,
-      ...(trimmedTemplate !== '' && trimmedTemplate !== authority.default_template
-        ? { template: trimmedTemplate }
-        : {}),
+      ...(template !== authority.default_template ? { template } : {}),
       ...(keyType !== authority.default_key_type ? { key_type: keyType } : {}),
       ...(overrides ? { subject: overrides } : {}),
       auto_renew: autoRenew,
@@ -127,6 +128,7 @@
   tabindex="-1"
   onclick={(e) => { if (e.target === e.currentTarget) onClose(); }}
   onkeydown={(e) => { if (e.key === 'Escape' && !pendingRequest) onClose(); }}
+  {@attach modalFocus}
 >
   <div class="modal" role="document">
     <h2 id="adcs-form-title">AD CS Certificate</h2>
@@ -165,15 +167,8 @@
         </button>
       </div>
     {:else}
-      {#if outcome?.kind === 'pending'}
-        <div class="form-error" role="alert" data-testid="adcs-issue-outcome">
-          The authority answered that the request is pending, under request id
-          <code>{outcome.requestId}</code>: {outcome.message}
-          Nothing was stored. Templates that need CA manager approval are not
-          supported; ask the authority's administrators about this request.
-        </div>
-      {:else if outcome?.kind === 'refused'}
-        <div class="form-error" role="alert" data-testid="adcs-issue-outcome">{outcome.message}</div>
+      {#if outcome}
+        <AdcsOutcomeMessage {outcome} testId="adcs-issue-outcome" />
       {/if}
       {#if formError}
         <div class="form-error" role="alert">{formError}</div>
@@ -210,8 +205,15 @@
         <summary>Template, key type and subject</summary>
         <div class="form-group">
           <label for="adcs-issue-template">Template</label>
-          <input id="adcs-issue-template" type="text" bind:value={template} autocomplete="off" spellcheck="false" />
-          <span class="hint">The template's common name. Prefilled with the authority's default.</span>
+          <select id="adcs-issue-template" bind:value={template}>
+            {#each templates as name (name)}
+              <option value={name}>{name}{name === authority?.default_template ? ' (default)' : ''}</option>
+            {/each}
+          </select>
+          <span class="hint">
+            The templates a SuperAdmin allowed on the authority, under Settings.
+            Any other is refused before the authority is contacted.
+          </span>
         </div>
         <div class="form-group">
           <label for="adcs-issue-key-type">Key type</label>

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { AdcsAuthorityState } from './api';
-import { testAuthority, testCertificate as cert } from '../test-adcs-fixtures';
+import { testAuthority, testAuthorityState, testCertificate as cert } from '../test-adcs-fixtures';
 import {
   ADCS_KEY_TYPE_LABELS,
   ADCS_RENEWAL_STILL_FINISHING,
@@ -12,8 +12,13 @@ import {
   adcsRenewalOffered,
   adcsRenewOutcome,
   adcsRequestSummary,
+  adcsManagedCertificateNotice,
   adcsSanHints,
+  adcsTemplateOptions,
+  ADCS_KEY_NOT_EXPORTABLE_HINT,
+  downloadPartRefusal,
   hostnamesWithoutCertificate,
+  isAdcsFollower,
   nameUnderSuffix,
   parseSanList,
   subjectOverrides,
@@ -138,7 +143,7 @@ describe('adcsRequestSummary', () => {
 });
 
 describe('adcsIssuanceBlocker', () => {
-  const ready: AdcsAuthorityState = { authority: testAuthority(), managed_on_control_plane: false };
+  const ready: AdcsAuthorityState = testAuthorityState();
 
   it('offers issuance to an Operator on the control plane with a healthy authority', () => {
     expect(adcsIssuanceBlocker({ canIssue: true, follower: false, state: ready })).toBeNull();
@@ -154,14 +159,14 @@ describe('adcsIssuanceBlocker', () => {
       adcsIssuanceBlocker({
         canIssue: true,
         follower: false,
-        state: { authority: null, managed_on_control_plane: true },
+        state: testAuthorityState({ follower: true }),
       }),
     ).toMatch(/follower/);
   });
 
   it('refuses when no authority is configured', () => {
     expect(
-      adcsIssuanceBlocker({ canIssue: true, follower: false, state: { authority: null, managed_on_control_plane: false } }),
+      adcsIssuanceBlocker({ canIssue: true, follower: false, state: testAuthorityState({ authority: null }) }),
     ).toMatch(/No AD CS authority is configured/);
   });
 
@@ -170,9 +175,83 @@ describe('adcsIssuanceBlocker', () => {
       adcsIssuanceBlocker({
         canIssue: true,
         follower: false,
-        state: { authority: testAuthority({ failed_since: '2026-10-20T08:00:00Z' }), managed_on_control_plane: false },
+        state: testAuthorityState({ authority: testAuthority({ failed_since: '2026-10-20T08:00:00Z' }) }),
       }),
     ).toMatch(/failed state/);
+  });
+
+  it('reads configured and failed from the summary, which a Viewer also gets (D18)', () => {
+    const failed = testAuthorityState({
+      authority: testAuthority({ failed_since: '2026-10-20T08:00:00Z' }),
+      viewer: true,
+    });
+    expect(failed.authority).toBeNull();
+    expect(adcsIssuanceBlocker({ canIssue: true, follower: false, state: failed })).toMatch(/failed state/);
+    expect(
+      adcsIssuanceBlocker({ canIssue: true, follower: false, state: testAuthorityState({ viewer: true }) }),
+    ).toBeNull();
+  });
+});
+
+describe('adcsTemplateOptions', () => {
+  it('puts the default first, then the other allowed templates', () => {
+    expect(
+      adcsTemplateOptions({ default_template: 'LoricaWebServer', allowed_templates: ['LoricaWebServer', 'LoricaEcdsa'] }),
+    ).toEqual(['LoricaWebServer', 'LoricaEcdsa']);
+  });
+
+  it('offers the default even when the list omits it', () => {
+    expect(adcsTemplateOptions({ default_template: 'LoricaWebServer', allowed_templates: [] })).toEqual([
+      'LoricaWebServer',
+    ]);
+  });
+
+  it('lists a name once, ignoring case as the API does', () => {
+    expect(
+      adcsTemplateOptions({
+        default_template: 'LoricaWebServer',
+        allowed_templates: ['loricawebserver', 'LoricaEcdsa', 'LORICAECDSA'],
+      }),
+    ).toEqual(['LoricaWebServer', 'LoricaEcdsa']);
+  });
+});
+
+describe('isAdcsFollower', () => {
+  it('is true by the cluster role before the read lands, or by the API flag', () => {
+    expect(isAdcsFollower('follower', null)).toBe(true);
+    expect(isAdcsFollower(null, testAuthorityState({ follower: true }))).toBe(true);
+    expect(isAdcsFollower('control_plane', testAuthorityState())).toBe(false);
+    expect(isAdcsFollower(null, null)).toBe(false);
+  });
+});
+
+describe('downloadPartRefusal', () => {
+  const adcs = cert('app.corp.example.org', [], { source: 'adcs' });
+
+  it('refuses the key and the bundle of an AD CS certificate (D16)', () => {
+    expect(downloadPartRefusal(adcs, 'key')).toBe(ADCS_KEY_NOT_EXPORTABLE_HINT);
+    expect(downloadPartRefusal(adcs, 'bundle')).toBe(ADCS_KEY_NOT_EXPORTABLE_HINT);
+  });
+
+  it('keeps its certificate and chain downloadable', () => {
+    expect(downloadPartRefusal(adcs, 'cert')).toBeNull();
+    expect(downloadPartRefusal(adcs, 'chain')).toBeNull();
+  });
+
+  it('refuses nothing on a manual or ACME certificate', () => {
+    for (const source of ['manual', 'acme'] as const) {
+      for (const part of ['cert', 'key', 'chain', 'bundle'] as const) {
+        expect(downloadPartRefusal(cert('a.example.com', [], { source }), part)).toBeNull();
+      }
+    }
+  });
+});
+
+describe('adcsManagedCertificateNotice', () => {
+  it('explains the lock on an AD CS certificate only', () => {
+    expect(adcsManagedCertificateNotice({ source: 'adcs' })).toMatch(/Revert it to manual first/);
+    expect(adcsManagedCertificateNotice({ source: 'manual' })).toBeNull();
+    expect(adcsManagedCertificateNotice({ source: 'acme' })).toBeNull();
   });
 });
 
@@ -216,20 +295,20 @@ describe('adcsIssueOutcome failing step', () => {
 });
 
 describe('adcsRenewalOffered', () => {
-  const ready: AdcsAuthorityState = { authority: testAuthority(), managed_on_control_plane: false };
+  const ready: AdcsAuthorityState = testAuthorityState();
 
   it('follows the issuance rules exactly, case by case', () => {
     const cases: Parameters<typeof adcsIssuanceBlocker>[0][] = [
       { canIssue: true, follower: false, state: ready },
       { canIssue: false, follower: false, state: ready },
       { canIssue: true, follower: true, state: ready },
-      { canIssue: true, follower: false, state: { authority: null, managed_on_control_plane: true } },
-      { canIssue: true, follower: false, state: { authority: null, managed_on_control_plane: false } },
+      { canIssue: true, follower: false, state: testAuthorityState({ follower: true }) },
+      { canIssue: true, follower: false, state: testAuthorityState({ authority: null }) },
       { canIssue: true, follower: false, state: null },
       {
         canIssue: true,
         follower: false,
-        state: { authority: testAuthority({ failed_since: '2026-10-20T08:00:00Z' }), managed_on_control_plane: false },
+        state: testAuthorityState({ authority: testAuthority({ failed_since: '2026-10-20T08:00:00Z' }) }),
       },
     ];
     for (const input of cases) {

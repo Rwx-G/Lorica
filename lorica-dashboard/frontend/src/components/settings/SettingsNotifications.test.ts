@@ -90,3 +90,39 @@ describe('SettingsNotifications AD CS alert types', () => {
     expect(update.mock.calls[0][1].alert_types).toEqual(['backend_down']);
   });
 });
+
+describe('SettingsNotifications keeps every subscription on edit', () => {
+  it('saves the cluster and unknown types a channel holds, after an unrelated change', async () => {
+    const update = vi
+      .spyOn(api, 'updateNotification')
+      .mockResolvedValue({ data: channel([]) });
+    render(SettingsNotifications, {
+      props: props([channel(['backend_down', 'cluster_drift', 'cluster_node_left', 'future_alert'])]),
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    expect(screen.getByRole('checkbox', { name: 'Cluster drift' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Cluster node left' })).toBeChecked();
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'WAF alert' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    const saved = update.mock.calls[0][1].alert_types;
+    expect(saved).toEqual(expect.arrayContaining(['backend_down', 'waf_alert', 'cluster_drift', 'cluster_node_left', 'future_alert']));
+    expect(saved).toHaveLength(5);
+  });
+
+  it('unsubscribes a cluster type the operator unticks', async () => {
+    const update = vi
+      .spyOn(api, 'updateNotification')
+      .mockResolvedValue({ data: channel([]) });
+    render(SettingsNotifications, { props: props([channel(['cluster_config_refused'])]) });
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'Cluster configuration refused' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    expect(update.mock.calls[0][1].alert_types).toEqual([]);
+  });
+});

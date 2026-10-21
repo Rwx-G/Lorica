@@ -69,4 +69,9 @@ describe('AdcsIssueConfirm', () => {
     expect(screen.getByRole('button', { name: 'Issuing...' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
   });
+
+  it('moves focus to Cancel, never to Issue', () => {
+    renderConfirm();
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Cancel' }));
+  });
 });

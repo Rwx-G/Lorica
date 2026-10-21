@@ -4,6 +4,7 @@
     api,
     type AdcsAdoptionCandidates,
     type AdcsAuthorityState,
+    type CertificateDownloadPart,
     type CertificateResponse,
     type CertificateDetailResponse,
     type RouteResponse,
@@ -23,7 +24,14 @@
   import { showToast } from '../lib/toast';
   import { canWrite, canWriteRole, isSuperAdmin } from '../lib/auth';
   import { nodeRole } from '../lib/cluster';
-  import { adcsErrorMessage, adcsRenewalOffered, adcsRenewOutcome, type AdcsRenewOutcome } from '../lib/adcs-issuance';
+  import {
+    adcsErrorMessage,
+    adcsRenewalOffered,
+    adcsRenewOutcome,
+    downloadPartRefusal,
+    isAdcsFollower,
+    type AdcsRenewOutcome,
+  } from '../lib/adcs-issuance';
   import { ADCS_NO_ISSUING_CA_HINT, adcsAdoptionBanner } from '../lib/adcs-adoption';
 
   let certificates: CertificateResponse[] = $state([]);
@@ -82,7 +90,7 @@
   // adopting and reverting are refused on a follower in every window.
   // Neither issues anything, so the authority's failed state does not
   // gate them.
-  const onFollower = $derived($nodeRole === 'follower' || Boolean(adcsState?.managed_on_control_plane));
+  const onFollower = $derived(isAdcsFollower($nodeRole, adcsState));
   const adcsOperable = $derived($canWriteRole && !onFollower);
   let adoption = $state<AdcsAdoptionCandidates | null>(null);
   let showAdoption = $state(false);
@@ -141,12 +149,17 @@
     void openDetail(cert);
   }
 
-  async function loadData() {
+  /**
+   * `candidates: false` after a renewal: renewing keeps a certificate's
+   * source, so it cannot add or remove an adoption candidate, and the
+   * listing verifies a signature per stored certificate on the server.
+   */
+  async function loadData({ candidates = true }: { candidates?: boolean } = {}) {
     loading = true;
     error = '';
-    // Any certificate change can add or remove a candidate, so the
-    // candidates are re-read with the list, in parallel with it.
-    const adoptionRead = loadAdoptionCandidates();
+    // Any other certificate change can add or remove a candidate, so
+    // the candidates are re-read with the list, in parallel with it.
+    const adoptionRead = candidates ? loadAdoptionCandidates() : Promise.resolve();
     const [certsRes, routesRes, settingsRes, , dnsRes] = await Promise.all([
       api.listCertificates(),
       api.listRoutes(),
@@ -232,7 +245,7 @@
       showToast(`Certificate for ${cert.domain} renewed successfully`, 'success');
     }
     renewingId = '';
-    await loadData();
+    await loadData({ candidates: false });
   }
 
   async function renewFromAdcs() {
@@ -246,7 +259,7 @@
     adcsRenewResult = { domain: cert.domain, outcome: adcsRenewOutcome(res) };
     // A credential rejection puts the authority in the failed state;
     // re-reading it hides "Renew now" until a SuperAdmin fixes it.
-    await Promise.all([loadData(), loadAdcsState()]);
+    await Promise.all([loadData({ candidates: false }), loadAdcsState()]);
   }
 
   function adcsRenewMessage(cert: CertificateResponse): string {
@@ -259,9 +272,14 @@
   // modal so one click never silently drops a private key onto the
   // operator's filesystem. `cert` and `chain` bypass the confirm -
   // they carry no secret material.
-  let pendingDownload: { cert: CertificateResponse; part: 'cert' | 'key' | 'chain' | 'bundle' } | null = $state(null);
+  let pendingDownload: { cert: CertificateResponse; part: CertificateDownloadPart } | null = $state(null);
 
-  function requestDownload(cert: CertificateResponse, part: 'cert' | 'key' | 'chain' | 'bundle') {
+  function requestDownload(cert: CertificateResponse, part: CertificateDownloadPart) {
+    const refusal = downloadPartRefusal(cert, part);
+    if (refusal) {
+      showToast(refusal, 'error');
+      return;
+    }
     if (part === 'key' || part === 'bundle') {
       pendingDownload = { cert, part };
       return;
@@ -276,7 +294,7 @@
     await performDownload(cert, part);
   }
 
-  async function performDownload(cert: CertificateResponse, part: 'cert' | 'key' | 'chain' | 'bundle') {
+  async function performDownload(cert: CertificateResponse, part: CertificateDownloadPart) {
     const res = await api.downloadCertificate(cert.id, part);
     if (res.ok) {
       showToast(`Downloaded ${cert.domain} (${part})`, 'success');
@@ -287,7 +305,13 @@
 
   function deleteMessage(): string {
     if (!deletingCert) return '';
-    const base = `Are you sure you want to delete the certificate for "${deletingCert.domain}"?`;
+    const question = `Are you sure you want to delete the certificate for "${deletingCert.domain}"?`;
+    // PRD out of scope: Lorica cannot revoke, so a deletion must not
+    // read as one.
+    const base =
+      deletingCert.source === 'adcs'
+        ? `${question} Deleting it in Lorica does not revoke it: the AD CS authority still holds it as issued, and only its administrators can revoke it.`
+        : question;
     if (deleteRoutes.length === 0) {
       return `${base} No routes are using this certificate.`;
     }

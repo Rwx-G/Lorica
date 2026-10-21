@@ -55,4 +55,41 @@ describe('ConfirmDialog', () => {
     await fireEvent.keyDown(overlay, { key: 'Enter' });
     expect(onconfirm).toHaveBeenCalledOnce();
   });
+
+  it('is named by its title', () => {
+    render(ConfirmDialog, { props: defaultProps });
+    expect(screen.getByRole('dialog', { name: 'Delete Item' })).toBeInTheDocument();
+  });
+
+  it('moves focus to Cancel, so Escape works and Enter there cancels', async () => {
+    const onconfirm = vi.fn();
+    const oncancel = vi.fn();
+    render(ConfirmDialog, { props: { ...defaultProps, onconfirm, oncancel } });
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    expect(document.activeElement).toBe(cancel);
+    await fireEvent.keyDown(cancel, { key: 'Enter' });
+    expect(onconfirm).not.toHaveBeenCalled();
+  });
+
+  it('keeps Tab inside the dialog', async () => {
+    render(ConfirmDialog, { props: defaultProps });
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    const confirm = screen.getByRole('button', { name: 'Delete' });
+    confirm.focus();
+    await fireEvent.keyDown(confirm, { key: 'Tab' });
+    expect(document.activeElement).toBe(cancel);
+    await fireEvent.keyDown(cancel, { key: 'Tab', shiftKey: true });
+    expect(document.activeElement).toBe(confirm);
+  });
+
+  it('gives focus back to the element that opened it', () => {
+    const opener = document.createElement('button');
+    document.body.appendChild(opener);
+    opener.focus();
+    const { unmount } = render(ConfirmDialog, { props: defaultProps });
+    expect(document.activeElement).not.toBe(opener);
+    unmount();
+    expect(document.activeElement).toBe(opener);
+    opener.remove();
+  });
 });

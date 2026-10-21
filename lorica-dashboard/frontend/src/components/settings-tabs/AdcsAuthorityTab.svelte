@@ -4,15 +4,23 @@
     api,
     type AdcsAuthority,
     type AdcsAuthorityRequest,
+    type AdcsAuthoritySummary,
     type AdcsConnectionTestResult,
     type AdcsKeyType,
+    type AdcsSubjectDefaults,
     type ApiError,
   } from '../../lib/api';
   import ConfirmDialog from '../ConfirmDialog.svelte';
   import { showToast } from '../../lib/toast';
   import { canWriteRole, isSuperAdminRole } from '../../lib/auth';
   import { nodeRole } from '../../lib/cluster';
-  import { ADCS_KEY_TYPE_LABELS, ADCS_KEY_TYPES } from '../../lib/adcs-issuance';
+  import {
+    ADCS_KEY_TYPE_LABELS,
+    ADCS_KEY_TYPES,
+    ADCS_SUBJECT_FIELDS,
+    ADCS_SUBJECT_LABELS,
+    isAdcsFollower,
+  } from '../../lib/adcs-issuance';
 
   interface Props {
     expanded: boolean;
@@ -21,28 +29,32 @@
 
   let { expanded, toggleSection }: Props = $props();
 
-  // The pre-authentication failures that open the breaker (Epic 13
-  // D15), named so the operator knows which directory fix to ask for.
-  const KDC_CODE_MEANINGS: Record<number, string> = {
-    18: 'account disabled or locked',
-    23: 'password expired',
-    24: 'wrong password',
+  const IDENTITY_CHANGE_MESSAGE =
+    'Changing the endpoint, realm, KDC list, principal or endpoint CA bundle clears the stored password, so the service account password must be entered again before saving.';
+
+  type SubjectForm = Record<keyof AdcsSubjectDefaults, string>;
+
+  // Only the fields whose input differs from a plain text box.
+  const SUBJECT_INPUT: Partial<
+    Record<keyof AdcsSubjectDefaults, { type?: string; maxlength?: number; placeholder?: string }>
+  > = {
+    country: { maxlength: 2, placeholder: 'FR' },
+    organization: { placeholder: 'Example Corp' },
+    email: { type: 'email', placeholder: 'pki@corp.example.org' },
   };
 
-  const IDENTITY_CHANGE_MESSAGE =
-    'Changing the endpoint, realm, KDC list or principal clears the stored password, so the service account password must be entered again before saving.';
-
+  let configured = $state(false);
+  let summary = $state<AdcsAuthoritySummary | null>(null);
+  // `null` for a Viewer even when `configured` (Epic 13 D18).
   let authority = $state<AdcsAuthority | null>(null);
   let managedOnControlPlane = $state(false);
   let loading = $state(false);
   let loadError = $state('');
 
-  // The server answers `managed_on_control_plane` on a follower, but
-  // the cluster store knows the role before that read lands. Either is
-  // enough: a follower refuses every AD CS write and test, break-glass
-  // window or not, so `isSuperAdmin` / `canWrite` (which reopen during
-  // break-glass) are the wrong gates here.
-  const follower = $derived(managedOnControlPlane || $nodeRole === 'follower');
+  // `isSuperAdmin` / `canWrite` reopen during break-glass, but a
+  // follower refuses every AD CS write and test regardless, so the
+  // role-only stores are the gates here.
+  const follower = $derived(isAdcsFollower($nodeRole, { managed_on_control_plane: managedOnControlPlane }));
   const canEdit = $derived($isSuperAdminRole && !follower);
   const canTest = $derived($canWriteRole && !follower && authority !== null);
 
@@ -54,13 +66,12 @@
   let endpointCaPem = $state('');
   let issuingCaPem = $state('');
   let defaultTemplate = $state('');
+  // The templates allowed besides the default, which always is.
+  let otherTemplates = $state<string[]>([]);
+  let templateDraft = $state('');
+  let templateError = $state('');
   let defaultKeyType = $state<AdcsKeyType>('rsa2048');
-  let country = $state('');
-  let stateOrProvince = $state('');
-  let locality = $state('');
-  let organization = $state('');
-  let organizationalUnit = $state('');
-  let email = $state('');
+  let subject = $state<SubjectForm>(emptySubject());
   let suffixes = $state('');
   let autoRenewDefault = $state(true);
 
@@ -71,6 +82,16 @@
   let testing = $state(false);
   let testResult = $state<AdcsConnectionTestResult | null>(null);
   let testError = $state('');
+
+  function emptySubject(): SubjectForm {
+    return Object.fromEntries(ADCS_SUBJECT_FIELDS.map((field) => [field, ''])) as SubjectForm;
+  }
+
+  function subjectBody(): AdcsSubjectDefaults {
+    const out: Partial<AdcsSubjectDefaults> = {};
+    for (const field of ADCS_SUBJECT_FIELDS) out[field] = optional(subject[field]);
+    return out as AdcsSubjectDefaults;
+  }
 
   function lines(value: string): string[] {
     return value
@@ -86,6 +107,11 @@
 
   function sameList(a: string[], b: string[]): boolean {
     return a.length === b.length && a.every((value, index) => value === b[index]);
+  }
+
+  // The API compares template names without regard to ASCII case.
+  function sameTemplate(a: string, b: string): boolean {
+    return a.trim().toLowerCase() === b.trim().toLowerCase();
   }
 
   /** The words an operator reads for a refused request. */
@@ -105,13 +131,15 @@
     endpointCaPem = from?.endpoint_ca_pem ?? '';
     issuingCaPem = from?.issuing_ca_pem ?? '';
     defaultTemplate = from?.default_template ?? '';
+    otherTemplates = (from?.allowed_templates ?? []).filter(
+      (name) => !sameTemplate(name, defaultTemplate),
+    );
+    templateDraft = '';
+    templateError = '';
     defaultKeyType = from?.default_key_type ?? 'rsa2048';
-    country = from?.subject.country ?? '';
-    stateOrProvince = from?.subject.state ?? '';
-    locality = from?.subject.locality ?? '';
-    organization = from?.subject.organization ?? '';
-    organizationalUnit = from?.subject.organizational_unit ?? '';
-    email = from?.subject.email ?? '';
+    const filled = emptySubject();
+    for (const field of ADCS_SUBJECT_FIELDS) filled[field] = from?.subject[field] ?? '';
+    subject = filled;
     suffixes = (from?.allowed_suffixes ?? []).join('\n');
     autoRenewDefault = from?.auto_renew_default ?? true;
   }
@@ -123,6 +151,8 @@
     if (res.error) {
       loadError = describe(res.error);
     } else if (res.data) {
+      configured = res.data.configured;
+      summary = res.data.summary;
       authority = res.data.authority;
       managedOnControlPlane = res.data.managed_on_control_plane;
       fillForm(authority);
@@ -132,6 +162,22 @@
 
   onMount(load);
 
+  function addTemplate(): void {
+    templateError = '';
+    const name = templateDraft.trim();
+    if (name === '') return;
+    if (sameTemplate(name, defaultTemplate) || otherTemplates.some((kept) => sameTemplate(kept, name))) {
+      templateError = `${name} is already allowed.`;
+      return;
+    }
+    otherTemplates = [...otherTemplates, name];
+    templateDraft = '';
+  }
+
+  function removeTemplate(name: string): void {
+    otherTemplates = otherTemplates.filter((kept) => kept !== name);
+  }
+
   // Advisory only: the API normalises what it stores and is the one
   // that refuses, with a 422 this form then shows verbatim.
   const identityChanged = $derived(
@@ -139,7 +185,8 @@
       (endpoint.trim() !== authority.endpoint ||
         realm.trim() !== authority.realm ||
         principal.trim() !== authority.principal ||
-        !sameList(lines(kdcs), authority.kdcs)),
+        !sameList(lines(kdcs), authority.kdcs) ||
+        optional(endpointCaPem) !== authority.endpoint_ca_pem),
   );
   const passwordRequired = $derived(authority === null || identityChanged);
 
@@ -160,15 +207,10 @@
       endpoint_ca_pem: optional(endpointCaPem),
       issuing_ca_pem: optional(issuingCaPem),
       default_template: defaultTemplate.trim(),
+      // The default may have been retyped to one of these since.
+      allowed_templates: otherTemplates.filter((name) => !sameTemplate(name, defaultTemplate)),
       default_key_type: defaultKeyType,
-      subject: {
-        country: optional(country),
-        state: optional(stateOrProvince),
-        locality: optional(locality),
-        organization: optional(organization),
-        organizational_unit: optional(organizationalUnit),
-        email: optional(email),
-      },
+      subject: subjectBody(),
       allowed_suffixes: lines(suffixes),
       auto_renew_default: autoRenewDefault,
       // Omitted, never sent empty: an absent password keeps the stored one.
@@ -182,11 +224,12 @@
       return;
     }
     if (res.data) {
-      authority = res.data;
-      fillForm(authority);
       testResult = null;
       testError = '';
       showToast('AD CS authority saved.', 'success');
+      // Read back rather than patch locally: the summary (failed state
+      // and its reason) is the API's to derive.
+      await load();
     }
   }
 
@@ -198,6 +241,8 @@
       deleteError = describe(res.error);
       return;
     }
+    configured = false;
+    summary = null;
     authority = null;
     fillForm(null);
     testResult = null;
@@ -229,7 +274,7 @@
 </script>
 
 <section class="settings-section">
-  <button class="settings-collapsible-header" class:open={expanded} onclick={toggleSection}>
+  <button class="settings-collapsible-header" class:open={expanded} aria-expanded={expanded} onclick={toggleSection}>
     <h2>AD CS authority</h2>
     <span class="settings-chevron" class:expanded></span>
   </button>
@@ -256,23 +301,21 @@
           page on the control plane to view or change it.
         </p>
       {:else if !loading && !loadError}
-        {#if authority?.failed_since}
+        {#if summary?.failed_since}
           <div class="failed-state" role="alert" data-testid="adcs-failed-state">
             <strong>The authority is in the failed state.</strong>
             The KDC rejected the service account's credential, and every AD CS
             operation is suspended so that no further attempt locks the account.
             <dl>
               <dt>Since</dt>
-              <dd>{when(authority.failed_since)}</dd>
+              <dd>{when(summary.failed_since)}</dd>
               <dt>Step</dt>
-              <dd><code>{authority.failed_step ?? 'unknown'}</code></dd>
+              <dd><code>{summary.failed_step ?? 'unknown'}</code></dd>
               <dt>KDC code</dt>
               <dd>
-                {#if authority.failed_kdc_code !== null}
-                  {authority.failed_kdc_code}
-                  {#if KDC_CODE_MEANINGS[authority.failed_kdc_code]}
-                    ({KDC_CODE_MEANINGS[authority.failed_kdc_code]})
-                  {/if}
+                {#if summary.failed_kdc_code !== null}
+                  {summary.failed_kdc_code}
+                  {#if summary.failed_reason}({summary.failed_reason}){/if}
                 {:else}
                   not reported
                 {/if}
@@ -283,8 +326,21 @@
           </div>
         {/if}
 
-        {#if authority === null && !canEdit}
+        {#if !configured && !canEdit}
           <p class="settings-empty-text">No AD CS authority is configured.</p>
+        {:else if authority === null && !canEdit}
+          <div class="summary-view" data-testid="adcs-summary">
+            <p class="settings-hint">
+              An AD CS authority is configured. Its connection details are shown
+              to Operators and SuperAdmins only.
+            </p>
+            <h3>Allowed DNS suffixes</h3>
+            <ul class="suffix-list">
+              {#each summary?.allowed_suffixes ?? [] as suffix (suffix)}
+                <li><code>{suffix}</code></li>
+              {/each}
+            </ul>
+          </div>
         {:else}
           <fieldset class="adcs-form" disabled={!canEdit}>
             <legend class="sr-only">AD CS authority settings</legend>
@@ -392,7 +448,8 @@
               ></textarea>
               <span class="settings-hint">
                 Certificates trusted, alone, for the CES endpoint's TLS
-                certificate. Empty uses the system trust store.
+                certificate. Empty uses the system trust store. Changing it
+                clears the stored password, like the fields above.
               </span>
             </div>
 
@@ -430,6 +487,52 @@
             </div>
 
             <div class="settings-form-row">
+              <span class="field-label" id="adcs-allowed-templates-label">Allowed templates</span>
+              <ul class="template-list" aria-labelledby="adcs-allowed-templates-label" data-testid="adcs-allowed-templates">
+                <li>
+                  <code>{defaultTemplate.trim() || 'the default template'}</code>
+                  <span class="template-fixed">default, always allowed</span>
+                </li>
+                {#each otherTemplates as name (name)}
+                  <li>
+                    <code>{name}</code>
+                    {#if canEdit}
+                      <button
+                        type="button"
+                        class="template-remove"
+                        aria-label="Remove template {name}"
+                        onclick={() => removeTemplate(name)}
+                      >Remove</button>
+                    {/if}
+                  </li>
+                {/each}
+              </ul>
+              {#if canEdit}
+                <div class="template-add">
+                  <label for="adcs-template-add" class="sr-only">Template to allow</label>
+                  <input
+                    id="adcs-template-add"
+                    type="text"
+                    bind:value={templateDraft}
+                    placeholder="LoricaWebServerEcdsa"
+                    autocomplete="off"
+                    spellcheck="false"
+                    onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addTemplate(); } }}
+                  />
+                  <button type="button" class="btn btn-cancel" onclick={addTemplate}>Allow template</button>
+                </div>
+                {#if templateError}
+                  <span class="field-error" role="alert">{templateError}</span>
+                {/if}
+              {/if}
+              <span class="settings-hint">
+                The templates an issuance may request, by common name. The
+                template decides what the authority signs, so any other is
+                refused before the authority is contacted.
+              </span>
+            </div>
+
+            <div class="settings-form-row">
               <label for="adcs-key-type">Default key type</label>
               <select id="adcs-key-type" bind:value={defaultKeyType}>
                 {#each ADCS_KEY_TYPES as keyType (keyType)}
@@ -444,30 +547,19 @@
             </div>
 
             <div class="subject-grid">
-              <div class="settings-form-row">
-                <label for="adcs-subject-c">Country (C)</label>
-                <input id="adcs-subject-c" type="text" maxlength="2" bind:value={country} placeholder="FR" autocomplete="off" />
-              </div>
-              <div class="settings-form-row">
-                <label for="adcs-subject-st">State or province (ST)</label>
-                <input id="adcs-subject-st" type="text" bind:value={stateOrProvince} autocomplete="off" />
-              </div>
-              <div class="settings-form-row">
-                <label for="adcs-subject-l">Locality (L)</label>
-                <input id="adcs-subject-l" type="text" bind:value={locality} autocomplete="off" />
-              </div>
-              <div class="settings-form-row">
-                <label for="adcs-subject-o">Organization (O)</label>
-                <input id="adcs-subject-o" type="text" bind:value={organization} placeholder="Example Corp" autocomplete="off" />
-              </div>
-              <div class="settings-form-row">
-                <label for="adcs-subject-ou">Organizational unit (OU)</label>
-                <input id="adcs-subject-ou" type="text" bind:value={organizationalUnit} autocomplete="off" />
-              </div>
-              <div class="settings-form-row">
-                <label for="adcs-subject-email">Email</label>
-                <input id="adcs-subject-email" type="email" bind:value={email} placeholder="pki@corp.example.org" autocomplete="off" />
-              </div>
+              {#each ADCS_SUBJECT_FIELDS as field (field)}
+                <div class="settings-form-row">
+                  <label for="adcs-subject-{field}">{ADCS_SUBJECT_LABELS[field]}</label>
+                  <input
+                    id="adcs-subject-{field}"
+                    type={SUBJECT_INPUT[field]?.type ?? 'text'}
+                    maxlength={SUBJECT_INPUT[field]?.maxlength}
+                    placeholder={SUBJECT_INPUT[field]?.placeholder}
+                    bind:value={subject[field]}
+                    autocomplete="off"
+                  />
+                </div>
+              {/each}
             </div>
             <span class="settings-hint">
               The fixed part of every certificate's subject. The common name is
@@ -654,6 +746,58 @@
   .identity-warning {
     display: block;
     color: var(--color-orange);
+    font-size: var(--text-xs);
+    margin-top: 0.25rem;
+  }
+  .summary-view h3 {
+    border-top: none;
+    padding-top: 0;
+  }
+  .suffix-list {
+    margin: 0;
+    padding-left: 1.25rem;
+    font-size: 0.875rem;
+    line-height: 1.6;
+  }
+  .field-label {
+    display: block;
+    font-size: var(--text-sm);
+    font-weight: 500;
+    margin-bottom: 0.25rem;
+  }
+  .template-list {
+    list-style: none;
+    margin: 0 0 0.5rem;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: 0.875rem;
+  }
+  .template-list li {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+  .template-fixed {
+    font-size: var(--text-xs);
+    color: var(--color-text-muted);
+  }
+  .template-remove {
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: var(--text-xs);
+    color: var(--color-red);
+    cursor: pointer;
+  }
+  .template-add {
+    display: flex;
+    gap: var(--space-2);
+  }
+  .field-error {
+    display: block;
+    color: var(--color-red);
     font-size: var(--text-xs);
     margin-top: 0.25rem;
   }

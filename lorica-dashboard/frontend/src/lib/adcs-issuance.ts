@@ -11,8 +11,10 @@
  */
 
 import type {
+  AcmeRenewResult,
   AdcsAuthority,
   AdcsAuthorityState,
+  AdcsIssuePending,
   AdcsIssueRequest,
   AdcsIssueResult,
   AdcsKeyType,
@@ -20,6 +22,7 @@ import type {
   AdcsSubjectOverrides,
   ApiError,
   ApiResponse,
+  CertificateDownloadPart,
   CertificateRenewResult,
   CertificateResponse,
 } from './api';
@@ -80,6 +83,10 @@ export function parseSanList(text: string): string[] {
  * Whether `name` is `suffix` or under it, compared label by label
  * (Epic 13 D5): `corp.example.org` permits `www.corp.example.org` and
  * never `evilcorp.example.org`.
+ *
+ * Deliberately coarse: it only drives a hint. `AllowedSuffix::permits`
+ * in `lorica-config` is the rule the API applies, and a name the two
+ * read differently is refused by the API with its own message.
  */
 export function nameUnderSuffix(name: string, suffix: string): boolean {
   const n = normalize(name);
@@ -166,9 +173,39 @@ export function adcsRequestSummary(authority: AdcsAuthority, request: AdcsIssueR
 }
 
 /**
+ * The templates an issuance may request (Epic 13 D17): the default
+ * first, then the others, each name once. The API compares template
+ * names without regard to ASCII case, so the list does too.
+ */
+export function adcsTemplateOptions(
+  authority: Pick<AdcsAuthority, 'default_template' | 'allowed_templates'>,
+): string[] {
+  const out: string[] = [];
+  for (const name of [authority.default_template, ...authority.allowed_templates]) {
+    if (!out.some((kept) => kept.toLowerCase() === name.toLowerCase())) out.push(name);
+  }
+  return out;
+}
+
+/**
+ * Whether this node is a follower for AD CS: the cluster role says so
+ * before the authority read lands, the API's `managed_on_control_plane`
+ * after. A follower refuses every AD CS operation, break-glass window
+ * or not, so the role-based write gates (which reopen during
+ * break-glass) are not enough on their own.
+ */
+export function isAdcsFollower(
+  role: string | null,
+  state: Pick<AdcsAuthorityState, 'managed_on_control_plane'> | null,
+): boolean {
+  return role === 'follower' || Boolean(state?.managed_on_control_plane);
+}
+
+/**
  * Why issuance is not offered, or `null` when it is. `follower` is the
- * API's `managed_on_control_plane` or the cluster role: a follower
- * refuses every AD CS operation, break-glass window or not.
+ * cluster role; the API's `managed_on_control_plane` is read from
+ * `state`. Configured and failed come from the summary every role
+ * reads (D18), so the answer never depends on the connection details.
  */
 export function adcsIssuanceBlocker(input: {
   canIssue: boolean;
@@ -179,11 +216,11 @@ export function adcsIssuanceBlocker(input: {
   if (input.follower || input.state?.managed_on_control_plane) {
     return 'AD CS issuance runs on the control plane. This node is a follower: open the dashboard of the control plane to issue a certificate.';
   }
-  const authority = input.state?.authority ?? null;
-  if (authority === null) {
+  const summary = input.state?.summary ?? null;
+  if (!input.state?.configured || summary === null) {
     return 'No AD CS authority is configured. A SuperAdmin configures it under Settings.';
   }
-  if (authority.failed_since) {
+  if (summary.failed_since) {
     return 'The AD CS authority is in the failed state: its credential was rejected, and every AD CS operation is suspended until a SuperAdmin saves a new password under Settings.';
   }
   return null;
@@ -206,25 +243,12 @@ export function adcsErrorMessage(error: ApiError): string {
   return error.message;
 }
 
-export type AdcsIssueOutcome =
-  | { kind: 'issued'; certificate: CertificateResponse }
+/** An answer that stored nothing: pending at the authority, or refused. */
+export type AdcsUnsettledOutcome =
   | { kind: 'pending'; requestId: string; message: string }
   | { kind: 'refused'; message: string };
 
-export function adcsIssueOutcome(res: ApiResponse<AdcsIssueResult>): AdcsIssueOutcome {
-  if (res.error) {
-    // A 504 can come from a reverse proxy with no envelope, so the
-    // status alone decides, whatever the body says.
-    if (res.error.status === 504) return { kind: 'refused', message: ADCS_STILL_FINISHING };
-    return { kind: 'refused', message: adcsErrorMessage(res.error) };
-  }
-  const data = res.data;
-  if (data && 'outcome' in data) {
-    return { kind: 'pending', requestId: data.request_id, message: data.message };
-  }
-  if (data) return { kind: 'issued', certificate: data };
-  return { kind: 'refused', message: 'The server returned an empty answer.' };
-}
+export type AdcsIssueOutcome = { kind: 'issued'; certificate: CertificateResponse } | AdcsUnsettledOutcome;
 
 /**
  * `certificate` is null only if the server answered the ACME shape,
@@ -232,20 +256,63 @@ export function adcsIssueOutcome(res: ApiResponse<AdcsIssueResult>): AdcsIssueOu
  */
 export type AdcsRenewOutcome =
   | { kind: 'renewed'; certificate: CertificateResponse | null }
-  | { kind: 'pending'; requestId: string; message: string }
-  | { kind: 'refused'; message: string };
+  | AdcsUnsettledOutcome;
 
-export function adcsRenewOutcome(res: ApiResponse<CertificateRenewResult>): AdcsRenewOutcome {
+/**
+ * The reading issuance and renewal share: a refusal or a 202 pending
+ * body, or the success body for the caller to read.
+ */
+function readAdcsAnswer<T extends object>(
+  res: ApiResponse<T | AdcsIssuePending>,
+  stillFinishing: string,
+): AdcsUnsettledOutcome | { kind: 'success'; data: T } {
   if (res.error) {
-    // Same reason as for issuance: a proxy's 504 has no envelope.
-    if (res.error.status === 504) return { kind: 'refused', message: ADCS_RENEWAL_STILL_FINISHING };
+    // A 504 can come from a reverse proxy with no envelope, so the
+    // status alone decides, whatever the body says.
+    if (res.error.status === 504) return { kind: 'refused', message: stillFinishing };
     return { kind: 'refused', message: adcsErrorMessage(res.error) };
   }
   const data = res.data;
-  if (data && 'outcome' in data) {
-    return { kind: 'pending', requestId: data.request_id, message: data.message };
-  }
-  if (data && 'renewed' in data) return { kind: 'renewed', certificate: null };
-  if (data) return { kind: 'renewed', certificate: data };
-  return { kind: 'refused', message: 'The server returned an empty answer.' };
+  if (!data) return { kind: 'refused', message: 'The server returned an empty answer.' };
+  if ('outcome' in data) return { kind: 'pending', requestId: data.request_id, message: data.message };
+  return { kind: 'success', data };
+}
+
+export function adcsIssueOutcome(res: ApiResponse<AdcsIssueResult>): AdcsIssueOutcome {
+  const read = readAdcsAnswer<CertificateResponse>(res, ADCS_STILL_FINISHING);
+  return read.kind === 'success' ? { kind: 'issued', certificate: read.data } : read;
+}
+
+export function adcsRenewOutcome(res: ApiResponse<CertificateRenewResult>): AdcsRenewOutcome {
+  const read = readAdcsAnswer<AcmeRenewResult | CertificateResponse>(res, ADCS_RENEWAL_STILL_FINISHING);
+  if (read.kind !== 'success') return read;
+  return { kind: 'renewed', certificate: 'renewed' in read.data ? null : read.data };
+}
+
+export const ADCS_KEY_NOT_EXPORTABLE_HINT =
+  'The private key of an AD CS certificate never leaves Lorica, so neither the key nor the bundle can be downloaded. The certificate and its chain can.';
+
+/**
+ * Why a part of this certificate is not offered for download, or `null`
+ * when it is: the key of an AD CS certificate never leaves Lorica
+ * (Epic 13 D16), and the API refuses it for every role with 403
+ * `adcs_key_not_exportable`.
+ */
+export function downloadPartRefusal(
+  cert: Pick<CertificateResponse, 'source'>,
+  part: CertificateDownloadPart,
+): string | null {
+  if (cert.source === 'adcs' && (part === 'key' || part === 'bundle')) return ADCS_KEY_NOT_EXPORTABLE_HINT;
+  return null;
+}
+
+/**
+ * Why the domain, certificate and key of this certificate cannot be
+ * replaced, or `null` when they can: the authority issues and renews
+ * an AD CS certificate, and the API refuses a replacement with 409
+ * `adcs_certificate_managed`. Auto-renew stays editable.
+ */
+export function adcsManagedCertificateNotice(cert: Pick<CertificateResponse, 'source'>): string | null {
+  if (cert.source !== 'adcs') return null;
+  return 'The AD CS authority issues and renews this certificate, so its domain, certificate and key cannot be replaced here. Revert it to manual first to replace them. Auto-renew stays editable.';
 }

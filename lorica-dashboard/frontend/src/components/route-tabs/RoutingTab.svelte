@@ -13,12 +13,14 @@
   import {
     adcsIssuanceBlocker,
     adcsIssueOutcome,
+    adcsTemplateOptions,
     hostnamesWithoutCertificate,
     type AdcsIssueOutcome,
   } from '../../lib/adcs-issuance';
   import { canWriteRole } from '../../lib/auth';
   import { nodeRole } from '../../lib/cluster';
   import AdcsIssueConfirm from '../certificates/AdcsIssueConfirm.svelte';
+  import AdcsOutcomeMessage from '../certificates/AdcsOutcomeMessage.svelte';
   import SubsectionHeader from '../SubsectionHeader.svelte';
   import FieldHelpButton from '../FieldHelpButton.svelte';
   import HelpModal from '../HelpModal.svelte';
@@ -121,6 +123,8 @@
         state: adcsState,
       }) === null,
   );
+  let adcsTemplates = $derived(adcsState?.authority ? adcsTemplateOptions(adcsState.authority) : []);
+  let adcsTemplate = $state('');
   let adcsRequest = $state<AdcsIssueRequest | null>(null);
   let adcsSubmitting = $state(false);
   let adcsOutcome = $state<AdcsIssueOutcome | null>(null);
@@ -130,14 +134,21 @@
     // skipped rather than made for nothing.
     if (!$canWriteRole || $nodeRole === 'follower') return;
     const res = await api.getAdcsAuthority();
-    if (res.data) adcsState = res.data;
+    if (res.data) {
+      adcsState = res.data;
+      adcsTemplate = res.data.authority?.default_template ?? '';
+    }
   });
 
   function openAdcsConfirm(): void {
     const authority = adcsState?.authority;
     if (!authority) return;
     adcsOutcome = null;
-    adcsRequest = { sans: [...hostnamesNeedingCert], auto_renew: authority.auto_renew_default };
+    adcsRequest = {
+      sans: [...hostnamesNeedingCert],
+      ...(adcsTemplate !== authority.default_template ? { template: adcsTemplate } : {}),
+      auto_renew: authority.auto_renew_default,
+    };
   }
 
   async function issueFromAdcs(): Promise<void> {
@@ -232,7 +243,15 @@
               {hostnamesNeedingCert.length === 1 ? 'this hostname' : 'these hostnames'}:
               {hostnamesNeedingCert.join(', ')}.
             </span>
-            <button type="button" class="btn-adcs" onclick={openAdcsConfirm}>Issue from AD CS</button>
+            <span class="adcs-offer-actions">
+              <label for="adcs-route-template">Template</label>
+              <select id="adcs-route-template" bind:value={adcsTemplate}>
+                {#each adcsTemplates as name (name)}
+                  <option value={name}>{name}{name === adcsState?.authority?.default_template ? ' (default)' : ''}</option>
+                {/each}
+              </select>
+              <button type="button" class="btn-adcs" onclick={openAdcsConfirm}>Issue from AD CS</button>
+            </span>
           </div>
         {/if}
         {#if adcsOutcome?.kind === 'issued'}
@@ -243,17 +262,8 @@
               Subject as issued by the authority: <code>{adcsOutcome.certificate.subject}</code>.
             {/if}
           </div>
-        {:else if adcsOutcome?.kind === 'pending'}
-          <div class="adcs-result failed" role="alert" data-testid="adcs-route-outcome">
-            The authority answered that the request is pending, under request id
-            <code>{adcsOutcome.requestId}</code>: {adcsOutcome.message}
-            Nothing was stored. Templates that need CA manager approval are not
-            supported.
-          </div>
-        {:else if adcsOutcome?.kind === 'refused'}
-          <div class="adcs-result failed" role="alert" data-testid="adcs-route-outcome">
-            {adcsOutcome.message}
-          </div>
+        {:else if adcsOutcome}
+          <AdcsOutcomeMessage outcome={adcsOutcome} testId="adcs-route-outcome" />
         {/if}
       </div>
 
@@ -637,7 +647,16 @@
     line-height: 1.45;
   }
   .adcs-result.ok { color: var(--color-green); }
-  .adcs-result.failed { color: var(--color-red); }
+  .adcs-offer-actions {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .adcs-offer-actions select {
+    width: auto;
+    max-width: 14rem;
+  }
 
   .eval-order-banner {
     font-size: 0.8125rem;
