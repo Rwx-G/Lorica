@@ -3059,10 +3059,13 @@ dependencies = [
  "rcgen",
  "reqwest 0.12.28",
  "ring",
+ "rustls",
+ "rustls-native-certs 0.8.4",
  "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
  "uuid",
+ "webpki-roots",
  "x509-parser 0.18.1",
 ]
 

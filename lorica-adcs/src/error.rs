@@ -12,12 +12,92 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The crate's error type.
+//! The crate's error type, and the two classifications every caller keys
+//! on: the step that failed and how far the failure reaches.
 
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::gss::TicketFailure;
+
+/// Declares [`FailureStep`] with its closed words, so the list of steps,
+/// their words and [`FailureStep::ALL`] are one declaration.
+macro_rules! failure_steps {
+    ($($(#[doc = $doc:literal])* $variant:ident => $word:literal,)*) => {
+        /// The step an AD CS operation failed at, as a closed word that
+        /// audit rows, persisted state and alert filters match on.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub enum FailureStep {
+            $($(#[doc = $doc])* $variant,)*
+        }
+
+        impl FailureStep {
+            /// Every step, in declaration order.
+            pub const ALL: &'static [FailureStep] = &[$(FailureStep::$variant,)*];
+
+            /// The closed word of the step. Stable: it is stored and
+            /// matched on outside the process.
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(FailureStep::$variant => $word,)*
+                }
+            }
+        }
+    };
+}
+
+failure_steps! {
+    /// No KDC of the realm could be found or reached.
+    KdcDiscovery => "kdc_discovery",
+    /// The KDC answered and no ticket was obtained.
+    TicketAcquisition => "ticket_acquisition",
+    /// The SPNEGO exchange failed before mutual authentication.
+    Spnego => "spnego",
+    /// The endpoint did not prove it holds the service key.
+    MutualAuthentication => "mutual_authentication",
+    /// The channel binding could not be computed, or the endpoint's
+    /// certificate changed under it.
+    ChannelBinding => "channel_binding",
+    /// The TLS connection to the endpoint failed.
+    Tls => "tls",
+    /// An HTTP leg failed below the authentication.
+    Http => "http",
+    /// The generated `krb5.conf` or one of its values was refused or
+    /// could not be written.
+    Krb5Conf => "krb5_conf",
+    /// The connection parameters are unusable.
+    Configuration => "configuration",
+    /// The CSR could not be built.
+    Csr => "csr",
+    /// The SOAP envelope could not be written or the answer read.
+    Soap => "soap",
+    /// The issuing chain of an issued certificate could not be built.
+    Chain => "chain",
+    /// The operation timeout passed.
+    Timeout => "timeout",
+    /// A blocking task of the operation did not return.
+    GssTask => "gss_task",
+}
+
+impl fmt::Display for FailureStep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How far a failure reaches, for a caller running several requests
+/// against one authority (a renewal tick, Epic 13 D15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureScope {
+    /// The authority as a whole is unusable: its KDC, its credential, its
+    /// endpoint's TLS or authentication, its configuration. The next
+    /// request would fail the same way, so a batch stops here.
+    Authority,
+    /// Only this request failed (its CSR, the answer to it); the next
+    /// request may succeed.
+    Request,
+}
 
 /// Why an AD CS operation failed. Every variant names the step that
 /// failed, so a connection test can show it as it is.
@@ -26,13 +106,12 @@ use crate::gss::TicketFailure;
 pub enum AdcsError {
     /// The GSS-API library refused the CES service name, before any
     /// network exchange.
-    #[error("SPNEGO: cannot import the service name HTTP@{host}: {source}")]
+    #[error("SPNEGO: cannot import the service name HTTP@{host}: {reason}")]
     ServiceName {
         /// The CES host the name was built from.
         host: String,
         /// What the GSS-API library reported.
-        #[source]
-        source: libgssapi::error::Error,
+        reason: String,
     },
 
     /// The server certificate the channel binding is computed from could
@@ -53,6 +132,16 @@ pub enum AdcsError {
         /// The signature algorithm OID, in dotted form.
         oid: String,
     },
+
+    /// A connection of the operation presented a certificate other than
+    /// the one the token is bound to. The handshake was refused before
+    /// anything was sent on it: the token never left (Epic 13 D2).
+    #[error(
+        "channel binding: the endpoint presented a different certificate on a later connection \
+         than the one the token is bound to; the connection was refused before the token was \
+         sent (a TLS interception, or the endpoint's certificate changed mid-operation)"
+    )]
+    ServerCertificateChanged,
 
     /// A Kerberos realm failed validation; nothing was written.
     #[error("krb5.conf: invalid realm {value:?}: {reason}")]
@@ -130,7 +219,7 @@ pub enum AdcsError {
     /// No Kerberos ticket could be obtained for the service account.
     /// The display names the step as KDC discovery when no KDC could be
     /// reached, ticket acquisition otherwise.
-    #[error("{}: no ticket for {principal}: {message}", failure.step())]
+    #[error("{}: no ticket for {principal}: {message}", failure.label())]
     Ticket {
         /// The principal the ticket was asked for.
         principal: String,
@@ -138,8 +227,8 @@ pub enum AdcsError {
         /// again (Epic 13 D15).
         failure: TicketFailure,
         /// The KDC's protocol error code (RFC 4120 7.5.9), when the
-        /// failure carries one: 24 for a wrong password, 18 for a
-        /// disabled or locked account, 23 for an expired password.
+        /// failure carries one; [`crate::kdc_error_meaning`] says what
+        /// the codes that reject the credential mean.
         kdc_error_code: Option<u32>,
         /// The GSS-API minor status as the library returned it.
         minor_status: u32,
@@ -168,7 +257,8 @@ pub enum AdcsError {
 
     /// The SPNEGO exchange failed before mutual authentication: the
     /// endpoint does not offer Negotiate, the initial token could not be
-    /// built, or the endpoint refused the token.
+    /// built, the endpoint refused the token, or the mechanism SPNEGO
+    /// settled on is not Kerberos.
     #[error("SPNEGO: {reason}")]
     Spnego {
         /// What failed.
@@ -177,7 +267,8 @@ pub enum AdcsError {
 
     /// The endpoint did not prove it holds the service key: no response
     /// token, a token the GSS-API library rejected, or a context left
-    /// incomplete (Epic 13 D2, Story 13.1 AC #5).
+    /// incomplete or without mutual authentication (Epic 13 D2, Story
+    /// 13.1 AC #5).
     #[error("SPNEGO mutual authentication: {reason}")]
     MutualAuth {
         /// What was missing or wrong.
@@ -193,9 +284,9 @@ pub enum AdcsError {
         after: Duration,
     },
 
-    /// A blocking GSS-API task did not return (it panicked or the
-    /// runtime is shutting down).
-    #[error("{step}: the blocking GSS-API task failed: {reason}")]
+    /// A blocking task did not return (it panicked or the runtime is
+    /// shutting down).
+    #[error("{step}: the blocking task failed: {reason}")]
     GssTask {
         /// The step the task ran.
         step: &'static str,
@@ -213,5 +304,129 @@ impl AdcsError {
             AdcsError::Ticket { failure, .. } => Some(*failure),
             _ => None,
         }
+    }
+
+    /// The step that failed.
+    pub fn step(&self) -> FailureStep {
+        match self {
+            AdcsError::Ticket { failure, .. } => failure.step(),
+            AdcsError::ServiceName { .. } | AdcsError::Spnego { .. } => FailureStep::Spnego,
+            AdcsError::MutualAuth { .. } => FailureStep::MutualAuthentication,
+            AdcsError::ChannelBindingCertificate { .. }
+            | AdcsError::ChannelBindingAlgorithm { .. }
+            | AdcsError::ServerCertificateChanged => FailureStep::ChannelBinding,
+            AdcsError::Tls { .. } => FailureStep::Tls,
+            AdcsError::Http { .. } => FailureStep::Http,
+            AdcsError::InvalidRealm { .. }
+            | AdcsError::InvalidKdc { .. }
+            | AdcsError::InvalidKdcTiming { .. }
+            | AdcsError::Krb5ConfWrite { .. } => FailureStep::Krb5Conf,
+            AdcsError::InvalidParams { .. } => FailureStep::Configuration,
+            AdcsError::Csr { .. } => FailureStep::Csr,
+            AdcsError::SoapEnvelope { .. } | AdcsError::SoapResponse { .. } => FailureStep::Soap,
+            AdcsError::Chain { .. } => FailureStep::Chain,
+            AdcsError::Timeout { .. } => FailureStep::Timeout,
+            AdcsError::GssTask { .. } => FailureStep::GssTask,
+        }
+    }
+
+    /// How far the failure reaches. Everything up to and including
+    /// mutual authentication, plus the timeout and the configuration,
+    /// is the authority's; what concerns one request's CSR or the answer
+    /// to it is the request's. A CA denial or fault is not an error at
+    /// all but an [`crate::EnrollOutcome`].
+    pub fn scope(&self) -> FailureScope {
+        match self.step() {
+            FailureStep::Csr | FailureStep::Soap | FailureStep::Chain => FailureScope::Request,
+            FailureStep::KdcDiscovery
+            | FailureStep::TicketAcquisition
+            | FailureStep::Spnego
+            | FailureStep::MutualAuthentication
+            | FailureStep::ChannelBinding
+            | FailureStep::Tls
+            | FailureStep::Http
+            | FailureStep::Krb5Conf
+            | FailureStep::Configuration
+            | FailureStep::Timeout
+            | FailureStep::GssTask => FailureScope::Authority,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_step_has_a_distinct_word() {
+        let mut words: Vec<&str> = FailureStep::ALL
+            .iter()
+            .map(|step: &FailureStep| step.as_str())
+            .collect();
+        let count: usize = words.len();
+        words.sort_unstable();
+        words.dedup();
+        assert_eq!(words.len(), count, "{words:?}");
+        for step in FailureStep::ALL {
+            assert_eq!(step.to_string(), step.as_str());
+            assert!(
+                step.as_str()
+                    .bytes()
+                    .all(|b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{step:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_scoped_failures_are_the_csr_and_the_answer() {
+        let request: Vec<AdcsError> = vec![
+            AdcsError::Csr {
+                reason: String::new(),
+            },
+            AdcsError::SoapResponse {
+                reason: String::new(),
+            },
+            AdcsError::Chain {
+                reason: String::new(),
+            },
+        ];
+        for err in &request {
+            assert_eq!(err.scope(), FailureScope::Request, "{err}");
+        }
+        let authority: Vec<AdcsError> = vec![
+            AdcsError::Ticket {
+                principal: String::new(),
+                failure: TicketFailure::KdcUnreachable,
+                kdc_error_code: None,
+                minor_status: 0,
+                message: String::new(),
+            },
+            AdcsError::Ticket {
+                principal: String::new(),
+                failure: TicketFailure::CredentialRejected,
+                kdc_error_code: Some(24),
+                minor_status: 0,
+                message: String::new(),
+            },
+            AdcsError::Tls {
+                reason: String::new(),
+            },
+            AdcsError::Spnego {
+                reason: String::new(),
+            },
+            AdcsError::MutualAuth {
+                reason: String::new(),
+            },
+            AdcsError::ServerCertificateChanged,
+            AdcsError::Timeout {
+                after: Duration::from_secs(1),
+            },
+        ];
+        for err in &authority {
+            assert_eq!(err.scope(), FailureScope::Authority, "{err}");
+        }
+        assert_eq!(authority[0].step(), FailureStep::KdcDiscovery);
+        assert_eq!(authority[1].step(), FailureStep::TicketAcquisition);
     }
 }

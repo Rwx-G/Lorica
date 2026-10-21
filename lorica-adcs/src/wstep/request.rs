@@ -26,11 +26,11 @@ use super::{
 use crate::AdcsError;
 
 /// The `Content-Type` of the POST that carries the envelope.
-pub const SOAP_CONTENT_TYPE: &str = "application/soap+xml; charset=utf-8";
+pub(crate) const SOAP_CONTENT_TYPE: &str = "application/soap+xml; charset=utf-8";
 
 /// A fresh WS-Addressing `MessageID`, `urn:uuid:` and a random (v4)
 /// UUID.
-pub fn new_message_id() -> String {
+pub(crate) fn new_message_id() -> String {
     format!("urn:uuid:{}", uuid::Uuid::new_v4())
 }
 
@@ -42,17 +42,7 @@ pub fn new_message_id() -> String {
 /// authenticates at the transport (MS-WSTEP 3.1.1.1.1). The template is
 /// not here either; it travels inside the CSR. `a:To` is not in the
 /// specification's example; other clients send it and it is harmless.
-///
-/// ```
-/// let xml: String = lorica_adcs::build_request(
-///     "https://ces.corp.example.org/CES",
-///     &lorica_adcs::new_message_id(),
-///     &[0x30, 0x00],
-/// )?;
-/// assert!(xml.starts_with("<s:Envelope"));
-/// # Ok::<(), lorica_adcs::AdcsError>(())
-/// ```
-pub fn build_request(
+pub(crate) fn build_request(
     endpoint_url: &str,
     message_id: &str,
     csr_der: &[u8],

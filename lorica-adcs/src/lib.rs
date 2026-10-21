@@ -28,12 +28,19 @@
 //! first-party crate and knows nothing about the store, routes or the
 //! dashboard; when to issue, renew and store is `lorica-api`'s business.
 //!
-//! The calls the rest of Lorica makes are [`enroll`], which turns a CSR
-//! from [`build_csr`] into an [`EnrollOutcome`], and [`test_connection`],
-//! which authenticates without requesting anything. Both read the
-//! Kerberos configuration from the file `KRB5_CONFIG` names, which the
-//! `lorica` binary sets to [`krb5_config_path`] at startup and Story
-//! 13.2 writes with [`Krb5Config::write_to`].
+//! The calls the rest of Lorica makes go through a [`CesSession`], which
+//! acquires one ticket and turns CSRs from [`build_csr`] into
+//! [`EnrollOutcome`]s, or authenticates without requesting anything, for
+//! as long as one API operation or one renewal tick lasts; [`enroll`]
+//! and [`test_connection`] are the one-request forms. Every request
+//! reads the Kerberos configuration from the file `KRB5_CONFIG` names,
+//! which the `lorica` binary sets to [`krb5_config_path`] at startup and
+//! Story 13.2 writes with [`Krb5Config::write_to`].
+//!
+//! The rules an authority's values must meet are exported for the API to
+//! apply when the authority is saved: [`CesEndpoint`], [`Principal`],
+//! [`Realm`], [`KdcAddress`]. An error names its [`FailureStep`] and
+//! its [`FailureScope`].
 
 mod binding;
 mod chain;
@@ -44,20 +51,21 @@ mod error;
 mod gss;
 mod krb5conf;
 mod secret;
+mod target;
 #[cfg(test)]
 mod test_support;
+mod tls;
 mod wstep;
 
-pub use binding::channel_binding;
-pub use chain::chain_from_cmc;
-pub use client::{enroll, test_connection, CesParams, CesTimeouts, EnrollOutcome};
+pub use chain::issued_by;
+pub use client::{enroll, test_connection, CesParams, CesSession, CesTimeouts, EnrollOutcome};
 pub use csr::{build_csr, GeneratedCsr, KeyType, SubjectFields};
-pub use error::AdcsError;
-pub use gss::TicketFailure;
-pub use krb5conf::{krb5_config_path, write_atomically, KdcAddress, KdcTiming, Krb5Config, Realm};
+pub use error::{AdcsError, FailureScope, FailureStep};
+pub use gss::{kdc_error_meaning, TicketFailure};
+pub use krb5conf::{krb5_config_path, KdcAddress, KdcTiming, Krb5Config, Realm};
 pub use secret::Secret;
-pub use wstep::request::{build_request, new_message_id, SOAP_CONTENT_TYPE};
-pub use wstep::response::{parse_response, EnrollmentResponse, FaultKind};
+pub use target::{CesEndpoint, Principal};
+pub use wstep::response::{EnrollmentResponse, FaultKind};
 
 use libgssapi::name::Name;
 use libgssapi::oid::GSS_NT_HOSTBASED_SERVICE;
@@ -68,12 +76,12 @@ use libgssapi::oid::GSS_NT_HOSTBASED_SERVICE;
 ///
 /// Importing the name is local to the library: it contacts no KDC and
 /// resolves nothing.
-pub fn service_name(host: &str) -> Result<Name, AdcsError> {
+pub(crate) fn service_name(host: &str) -> Result<Name, AdcsError> {
     let service: String = format!("HTTP@{host}");
     Name::new(service.as_bytes(), Some(GSS_NT_HOSTBASED_SERVICE)).map_err(
-        |source: libgssapi::error::Error| AdcsError::ServiceName {
+        |err: libgssapi::error::Error| AdcsError::ServiceName {
             host: host.to_owned(),
-            source,
+            reason: err.to_string(),
         },
     )
 }

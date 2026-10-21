@@ -34,8 +34,9 @@ ring = "0.17"
 rcgen = { version = "0.14", features = ["aws_lc_rs"] }
 # Certificate parsing for the channel binding and the chain; its
 # re-exported `der_parser` / `asn1_rs` read the CMC response, so neither
-# is a direct dependency.
-x509-parser = "0.18"
+# is a direct dependency. `verify` checks each link of the issuing chain
+# by signature, on the `ring` already listed above.
+x509-parser = { version = "0.18", features = ["verify"] }
 # Base64 of the WS-Trust tokens, at the workspace's version.
 base64 = "0.23"
 # The WS-Addressing MessageID, v4 as `lorica-api` generates its ids.
@@ -46,6 +47,16 @@ quick-xml = "0.42"
 # The CES exchange over HTTPS, at the version and TLS features
 # `lorica-api` uses, so no second TLS stack enters the binary.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+# The TLS configuration handed to reqwest with `use_preconfigured_tls`:
+# a certificate verifier that keeps the token on the certificate its
+# channel binding was computed from (Epic 13 D2). reqwest downcasts the
+# configuration to its own rustls type, so this must be the rustls
+# reqwest links; the three crates are those reqwest already pulls in,
+# at the versions the lockfile holds, and the roots are the ones reqwest
+# loaded itself before (system store plus the webpki bundle).
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
+rustls-native-certs = "0.8"
+webpki-roots = "1"
 # GSS-API calls go to `spawn_blocking` and the whole operation sits
 # under an outer `tokio::time::timeout` (Epic 13 D8).
 tokio = { workspace = true, features = ["rt", "time"] }

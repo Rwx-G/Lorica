@@ -44,6 +44,11 @@ const CERTSRV_E_TEMPLATE_CONFLICT: u32 = 0x8009_4802;
 /// not an answer from CES and is refused before it costs anything.
 const MAX_DEPTH: usize = 64;
 
+/// A CES answer holds a few dozen elements. Every element costs several
+/// allocations in the tree, so a body of empty elements, cheap to send,
+/// is refused once it holds far more than an answer could.
+const MAX_ELEMENTS: usize = 10_000;
+
 /// What a fault that is not a denial is about, from its `ErrorCode`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaultKind {
@@ -110,7 +115,7 @@ fn malformed(reason: impl Into<String>) -> AdcsError {
 /// A body that is neither a `RequestSecurityTokenResponseCollection`
 /// nor a SOAP fault is refused, as is an issued answer whose chain does
 /// not lead to its certificate.
-pub fn parse_response(body: &str) -> Result<EnrollmentResponse, AdcsError> {
+pub(crate) fn parse_response(body: &str) -> Result<EnrollmentResponse, AdcsError> {
     let envelope: Element = parse_tree(body)?;
     if !envelope.is(SOAP_ENVELOPE_NS, "Envelope") {
         return Err(malformed(format!(
@@ -376,12 +381,21 @@ fn parse_tree(body: &str) -> Result<Element, AdcsError> {
     let mut reader: NsReader<&[u8]> = NsReader::from_str(body);
     let mut stack: Vec<Element> = Vec::new();
     let mut root: Option<Element> = None;
+    let mut elements: usize = 0;
     loop {
         let (resolved, event) = reader
             .read_resolved_event()
             .map_err(|err| malformed(format!("not well-formed XML: {err}")))?;
         let ns: Option<String> = match &event {
-            Event::Start(_) | Event::Empty(_) => Some(namespace_of(&resolved)?),
+            Event::Start(_) | Event::Empty(_) => {
+                elements += 1;
+                if elements > MAX_ELEMENTS {
+                    return Err(malformed(format!(
+                        "the document holds more than {MAX_ELEMENTS} elements"
+                    )));
+                }
+                Some(namespace_of(&resolved)?)
+            }
             _ => None,
         };
         match event {
@@ -668,6 +682,18 @@ mod tests {
         assert!(matches!(
             parse_response(&body),
             Err(AdcsError::Chain { .. })
+        ));
+    }
+
+    #[test]
+    fn a_flood_of_elements_is_refused() {
+        let body: String = format!(
+            r#"<s:Envelope xmlns:s="{SOAP_ENVELOPE_NS}"><s:Body>{}</s:Body></s:Envelope>"#,
+            "<a/>".repeat(MAX_ELEMENTS)
+        );
+        assert!(matches!(
+            parse_response(&body),
+            Err(AdcsError::SoapResponse { reason }) if reason.contains("elements")
         ));
     }
 

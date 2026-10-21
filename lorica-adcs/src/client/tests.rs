@@ -30,10 +30,12 @@ use tokio_rustls::rustls;
 use tokio_rustls::TlsAcceptor;
 
 use super::*;
-use crate::gss::{ticket_error, TicketFailure};
+use crate::error::FailureStep;
+use crate::gss::ticket_error;
 use crate::test_support::{
     b64, fault_response, issued_response, pending_response, signed_data, TestPki,
 };
+use libgssapi::oid::GSS_MECH_KRB5;
 
 const CLIENT_TOKEN: &[u8] = b"client-token";
 const SERVER_TOKEN: &[u8] = b"server-token";
@@ -61,7 +63,16 @@ enum Acquisition {
 enum Mutual {
     Completes,
     StaysIncomplete,
+    /// Completes, yet has a token left for the server.
+    CompletesWithToken,
+    /// Completes on a mechanism other than Kerberos (NTLMSSP).
+    NotKerberos,
+    /// Completes without the mutual flag.
+    NoMutualFlag,
 }
+
+/// NTLMSSP, 1.3.6.1.4.1.311.2.2.10.
+const NTLMSSP: &[u8] = b"\x2b\x06\x01\x04\x01\x82\x37\x02\x02\x0a";
 
 /// Hands out [`CLIENT_TOKEN`], accepts only [`SERVER_TOKEN`] back, and
 /// records what it was given.
@@ -159,11 +170,15 @@ impl GssContext for FakeContext {
         match input_token {
             None => Ok(Some(CLIENT_TOKEN.to_vec())),
             Some(token) if token == SERVER_TOKEN => match self.mutual {
-                Mutual::Completes => {
+                Mutual::StaysIncomplete => Ok(Some(b"another leg".to_vec())),
+                Mutual::CompletesWithToken => {
+                    self.complete = true;
+                    Ok(Some(b"a final token".to_vec()))
+                }
+                Mutual::Completes | Mutual::NotKerberos | Mutual::NoMutualFlag => {
                     self.complete = true;
                     Ok(None)
                 }
-                Mutual::StaysIncomplete => Ok(Some(b"another leg".to_vec())),
             },
             Some(_) => Err(GssFailure {
                 message: "A token was invalid".to_owned(),
@@ -173,6 +188,17 @@ impl GssContext for FakeContext {
 
     fn is_complete(&self) -> bool {
         self.complete
+    }
+
+    fn negotiated(&self) -> Result<Negotiated, GssFailure> {
+        let mechanism: Vec<u8> = match self.mutual {
+            Mutual::NotKerberos => NTLMSSP.to_vec(),
+            _ => GSS_MECH_KRB5.to_vec(),
+        };
+        Ok(Negotiated {
+            mechanism,
+            mutual: !matches!(self.mutual, Mutual::NoMutualFlag),
+        })
     }
 }
 
@@ -240,8 +266,10 @@ fn iis(authenticated: impl Fn(&Seen) -> Reply + Send + Sync + 'static) -> Handle
 
 struct TestCes {
     endpoint: String,
+    /// The certificate of the first connection.
     certificate_der: Vec<u8>,
-    certificate_pem: String,
+    /// Every certificate the server may present, all trusted.
+    trust_bundle_pem: String,
     seen: Arc<Mutex<Vec<Seen>>>,
 }
 
@@ -254,34 +282,65 @@ fn self_signed_localhost() -> (Vec<u8>, String, KeyPair) {
     (certificate.der().to_vec(), certificate.pem(), key)
 }
 
+fn acceptor_for(certificate_der: &[u8], key: &KeyPair) -> TlsAcceptor {
+    let config: rustls::ServerConfig = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("protocol versions")
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![rustls::pki_types::CertificateDer::from(
+            certificate_der.to_vec(),
+        )],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+            key.serialize_der(),
+        )),
+    )
+    .expect("server config");
+    TlsAcceptor::from(Arc::new(config))
+}
+
 impl TestCes {
+    /// One certificate, connections kept alive.
     async fn start(handler: Handler) -> TestCes {
-        let (certificate_der, certificate_pem, key): (Vec<u8>, String, KeyPair) =
-            self_signed_localhost();
-        let config: rustls::ServerConfig = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("protocol versions")
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![rustls::pki_types::CertificateDer::from(
-                certificate_der.clone(),
-            )],
-            rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
-                key.serialize_der(),
-            )),
-        )
-        .expect("server config");
-        let acceptor: TlsAcceptor = TlsAcceptor::from(Arc::new(config));
+        TestCes::start_rotating(handler, &[0], true).await
+    }
+
+    /// Connection `i` presents certificate `schedule[i]`, the last entry
+    /// for every later connection; every certificate is self-signed for
+    /// `localhost` and in the trust bundle, so each passes the normal
+    /// verification. Without keep-alive, every request opens its own
+    /// connection, as a relay forcing a reconnect would make it.
+    async fn start_rotating(handler: Handler, schedule: &[usize], keep_alive: bool) -> TestCes {
+        let count: usize = schedule.iter().max().map_or(1, |last: &usize| last + 1);
+        let identities: Vec<(Vec<u8>, String, KeyPair)> =
+            (0..count).map(|_| self_signed_localhost()).collect();
+        let acceptors: Vec<TlsAcceptor> = identities
+            .iter()
+            .map(|(der, _, key)| acceptor_for(der, key))
+            .collect();
+        let per_connection: Vec<TlsAcceptor> = schedule
+            .iter()
+            .map(|index: &usize| acceptors[*index].clone())
+            .collect();
         let listener: TcpListener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port: u16 = listener.local_addr().expect("local addr").port();
         let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
-        tokio::spawn(serve(listener, acceptor, handler, Arc::clone(&seen)));
+        tokio::spawn(serve(
+            listener,
+            per_connection,
+            keep_alive,
+            handler,
+            Arc::clone(&seen),
+        ));
         TestCes {
             endpoint: format!("https://localhost:{port}/CES"),
-            certificate_der,
-            certificate_pem,
+            certificate_der: identities[schedule[0]].0.clone(),
+            trust_bundle_pem: identities
+                .iter()
+                .map(|(_, pem, _)| pem.as_str())
+                .collect::<String>(),
             seen,
         }
     }
@@ -295,7 +354,7 @@ impl TestCes {
             endpoint: self.endpoint.clone(),
             realm: Realm::new("CORP.EXAMPLE.ORG").expect("realm"),
             principal: "svc-lorica".to_owned(),
-            trust_bundle_pem: Some(self.certificate_pem.clone()),
+            trust_bundle_pem: Some(self.trust_bundle_pem.clone()),
             timeouts: CesTimeouts {
                 connect: Duration::from_secs(5),
                 read: Duration::from_secs(5),
@@ -307,12 +366,16 @@ impl TestCes {
 
 async fn serve(
     listener: TcpListener,
-    acceptor: TlsAcceptor,
+    per_connection: Vec<TlsAcceptor>,
+    keep_alive: bool,
     handler: Handler,
     seen: Arc<Mutex<Vec<Seen>>>,
 ) {
+    let mut connections: usize = 0;
     while let Ok((tcp, _)) = listener.accept().await {
-        let acceptor: TlsAcceptor = acceptor.clone();
+        let acceptor: TlsAcceptor =
+            per_connection[connections.min(per_connection.len() - 1)].clone();
+        connections += 1;
         let handler: Handler = Arc::clone(&handler);
         let seen: Arc<Mutex<Vec<Seen>>> = Arc::clone(&seen);
         tokio::spawn(async move {
@@ -349,6 +412,7 @@ async fn serve(
                 }
             });
             let _ = hyper::server::conn::http1::Builder::new()
+                .keep_alive(keep_alive)
                 .serve_connection(TokioIo::new(tls), service)
                 .await;
         });
@@ -394,14 +458,16 @@ async fn an_issued_certificate_after_a_bound_and_mutually_authenticated_exchange
     // presented.
     let binding: Vec<u8> = channel_binding(&ces.certificate_der).expect("binding");
     assert_eq!(log.bindings, vec![binding.clone(), binding]);
+    // The probe is a bodiless GET: nothing reaches an endpoint before it
+    // authenticated, not even the CSR.
     let seen: Vec<Seen> = ces.seen();
     assert_eq!(seen.len(), 2);
     assert_eq!(seen[0].authorization, None);
-    for request in &seen {
-        assert_eq!(request.method, "POST");
-        assert!(request.body.contains(&b64(b"csr")), "{}", request.body);
-        assert!(request.body.contains("RequestSecurityToken"));
-    }
+    assert_eq!(seen[0].method, "GET");
+    assert!(seen[0].body.is_empty());
+    assert_eq!(seen[1].method, "POST");
+    assert!(seen[1].body.contains(&b64(b"csr")), "{}", seen[1].body);
+    assert!(seen[1].body.contains("RequestSecurityToken"));
 }
 
 #[tokio::test]
@@ -756,19 +822,6 @@ async fn unusable_parameters_are_refused_before_anything_is_sent() {
     assert!(ces.seen().is_empty());
 }
 
-#[test]
-fn a_principal_with_its_realm_is_kept() {
-    let realm: Realm = Realm::new("CORP.EXAMPLE.ORG").expect("realm");
-    assert_eq!(
-        principal_name("svc-lorica@CORP.EXAMPLE.ORG", &realm).expect("principal"),
-        "svc-lorica@CORP.EXAMPLE.ORG"
-    );
-    assert_eq!(
-        principal_name("svc-lorica", &realm).expect("principal"),
-        "svc-lorica@CORP.EXAMPLE.ORG"
-    );
-}
-
 // ---------------------------------------------------------------- test_connection
 
 #[tokio::test]
@@ -794,6 +847,169 @@ async fn the_connection_test_requires_mutual_authentication() {
         .await
         .expect_err("no token");
     assert!(matches!(err, AdcsError::MutualAuth { .. }), "{err}");
+}
+
+// ---------------------------------------------------------------- the pinned channel (security High)
+
+/// A relay lets the probe reach the real endpoint, then terminates the
+/// reconnect with another certificate the client also trusts. The token,
+/// already built, must never be written to that connection.
+#[tokio::test]
+async fn a_reconnect_to_another_certificate_never_carries_the_token() {
+    let ces: TestCes =
+        TestCes::start_rotating(iis(|_| Reply::new(200).proven()), &[0, 1], false).await;
+    let gss: Arc<FakeGss> = FakeGss::working();
+    let err: AdcsError = enroll_with(Arc::clone(&gss), &ces.params(), &password(), b"csr")
+        .await
+        .expect_err("relayed");
+    assert!(matches!(err, AdcsError::ServerCertificateChanged), "{err}");
+    assert_eq!(err.step(), FailureStep::ChannelBinding);
+    assert_eq!(gss.log().bindings.len(), 1, "the token was built");
+    let seen: Vec<Seen> = ces.seen();
+    assert_eq!(seen.len(), 1, "only the probe reached a server: {seen:?}");
+    assert_eq!(seen[0].authorization, None);
+}
+
+/// A reconnect is not an attack in itself: the same certificate on a
+/// new connection authenticates, as against a server that closes after
+/// every answer.
+#[tokio::test]
+async fn a_reconnect_to_the_same_certificate_authenticates() {
+    let pending: String = pending_response("7");
+    let ces: TestCes = TestCes::start_rotating(
+        iis(move |_| Reply::new(200).body(&pending).proven()),
+        &[0],
+        false,
+    )
+    .await;
+    let outcome: EnrollOutcome =
+        enroll_with(FakeGss::working(), &ces.params(), &password(), b"csr")
+            .await
+            .expect("pending");
+    assert!(
+        matches!(outcome, EnrollOutcome::Pending { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(ces.seen().len(), 2);
+}
+
+// ---------------------------------------------------------------- sessions (performance Medium, D15)
+
+async fn session(gss: &Arc<FakeGss>, ces: &TestCes) -> Session<FakeGss> {
+    Session::open(Arc::clone(gss), &ces.params(), &password())
+        .await
+        .expect("session")
+}
+
+#[tokio::test]
+async fn a_session_acquires_one_ticket_for_every_request() {
+    let pending: String = pending_response("8");
+    let ces: TestCes = TestCes::start(iis(move |seen: &Seen| match seen.method.as_str() {
+        "POST" => Reply::new(200).body(&pending).proven(),
+        _ => Reply::new(405).proven(),
+    }))
+    .await;
+    let gss: Arc<FakeGss> = FakeGss::working();
+    let mut session: Session<FakeGss> = session(&gss, &ces).await;
+    assert!(ces.seen().is_empty(), "opening sends nothing");
+    session.enroll(b"csr").await.expect("first");
+    session.enroll(b"csr").await.expect("second");
+    session.test().await.expect("test");
+    drop(session);
+
+    let log: MutexGuard<'_, FakeLog> = gss.log();
+    assert_eq!(log.principals.len(), 1, "one ticket for the session");
+    assert_eq!(log.hosts.len(), 3, "one context per request");
+    let binding: Vec<u8> = channel_binding(&ces.certificate_der).expect("binding");
+    assert!(log.bindings.iter().all(|seen: &Vec<u8>| *seen == binding));
+    let seen: Vec<Seen> = ces.seen();
+    let methods: Vec<&str> = seen
+        .iter()
+        .map(|request: &Seen| request.method.as_str())
+        .collect();
+    assert_eq!(
+        methods,
+        ["GET", "POST", "POST", "GET"],
+        "one probe for the session"
+    );
+    assert_eq!(seen[0].authorization, None);
+    assert!(seen[1..]
+        .iter()
+        .all(|request: &Seen| request.authorization.is_some()));
+}
+
+#[tokio::test]
+async fn a_session_refuses_a_certificate_change_on_a_later_request() {
+    let pending: String = pending_response("9");
+    let ces: TestCes = TestCes::start_rotating(
+        iis(move |_| Reply::new(200).body(&pending).proven()),
+        &[0, 0, 1],
+        false,
+    )
+    .await;
+    let gss: Arc<FakeGss> = FakeGss::working();
+    let mut session: Session<FakeGss> = session(&gss, &ces).await;
+    session.enroll(b"csr").await.expect("first request");
+    let err: AdcsError = session.enroll(b"csr").await.expect_err("changed");
+    assert!(matches!(err, AdcsError::ServerCertificateChanged), "{err}");
+    assert_eq!(ces.seen().len(), 2, "nothing reached the third connection");
+}
+
+/// D15: a session spends at most one failed pre-authentication.
+#[tokio::test]
+async fn a_rejected_credential_is_never_retried_within_a_session() {
+    let ces: TestCes = TestCes::start(iis(|_| Reply::new(405).proven())).await;
+    let gss: Arc<FakeGss> = FakeGss::new(
+        Acquisition::Fails(PREAUTH_FAILED_MINOR, "Preauthentication failed"),
+        Mutual::Completes,
+    );
+    let mut session: Session<FakeGss> = session(&gss, &ces).await;
+    for attempt in 0..3 {
+        let err: AdcsError = session.test().await.expect_err("rejected");
+        assert_eq!(
+            err.ticket_failure(),
+            Some(TicketFailure::CredentialRejected),
+            "attempt {attempt}: {err}"
+        );
+        assert!(
+            matches!(
+                err,
+                AdcsError::Ticket {
+                    kdc_error_code: Some(24),
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+    assert_eq!(gss.log().principals.len(), 1, "one acquisition only");
+    assert_eq!(ces.seen().len(), 1, "one probe, no token");
+}
+
+// ---------------------------------------------------------------- SPNEGO pinned to Kerberos (pen L6)
+
+#[tokio::test]
+async fn an_established_context_must_be_kerberos_mutual_and_final() {
+    let cases: [(Mutual, &str); 3] = [
+        (Mutual::CompletesWithToken, "further token"),
+        (Mutual::NotKerberos, "1.3.6.1.4.1.311.2.2.10, not Kerberos"),
+        (Mutual::NoMutualFlag, "does not carry mutual authentication"),
+    ];
+    for (mutual, expected) in cases {
+        let pending: String = pending_response("1");
+        let ces: TestCes =
+            TestCes::start(iis(move |_| Reply::new(200).body(&pending).proven())).await;
+        let gss: Arc<FakeGss> = FakeGss::new(Acquisition::Succeeds, mutual);
+        let err: AdcsError = enroll_with(gss, &ces.params(), &password(), b"csr")
+            .await
+            .expect_err("refused");
+        assert!(err.to_string().contains(expected), "{err}");
+        let step: FailureStep = match mutual {
+            Mutual::NotKerberos => FailureStep::Spnego,
+            _ => FailureStep::MutualAuthentication,
+        };
+        assert_eq!(err.step(), step, "{err}");
+    }
 }
 
 #[test]

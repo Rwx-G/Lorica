@@ -159,7 +159,8 @@ impl KdcAddress {
         &self.host
     }
 
-    /// The port, or 88 when none was given.
+    /// The port, or the Kerberos port of RFC 4120 7.2 when none was
+    /// given.
     pub fn port(&self) -> u16 {
         self.port.unwrap_or(DEFAULT_KDC_PORT)
     }
@@ -261,8 +262,10 @@ impl Krb5Config {
         out
     }
 
-    /// Renders the file and writes it to `path` with
-    /// [`write_atomically`].
+    /// Renders the file and writes it to `path` atomically, mode 0600 on
+    /// Unix, making its parent directory private (0700) whether or not
+    /// it already existed: point it at a directory of its own, such as
+    /// [`krb5_config_path`] gives.
     pub fn write_to(&self, path: &Path) -> Result<(), AdcsError> {
         write_atomically(path, self.render().as_bytes())
     }
@@ -281,8 +284,9 @@ pub fn krb5_config_path(data_dir: &Path) -> PathBuf {
 /// file or the new one, never a partial write: the bytes go to a sibling
 /// temporary file in the same directory, which is flushed to disk and
 /// then renamed over `path`. The parent directory is created when
-/// absent, with mode 0700 on Unix, and the file gets mode 0600.
-pub fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), AdcsError> {
+/// absent and set to mode 0700 on Unix even when it already existed, and
+/// the file gets mode 0600.
+pub(crate) fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), AdcsError> {
     let write_error = |at: &Path| {
         let at: PathBuf = at.to_path_buf();
         move |source: std::io::Error| AdcsError::Krb5ConfWrite { path: at, source }
@@ -321,13 +325,16 @@ pub fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), AdcsError> {
     sync_dir(parent).map_err(write_error(parent))
 }
 
+// `DirBuilder::mode` applies only to a directory it creates; one left
+// by an older release or made by hand keeps its mode unless it is set.
 #[cfg(unix)]
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt as _;
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(dir)
+        .create(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(not(unix))]
@@ -541,16 +548,34 @@ mod tests {
         }
     }
 
-    fn scratch_dir() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "lorica-adcs-test-{}",
-            uuid::Uuid::new_v4().simple()
-        ))
+    /// A directory under the system temporary directory, removed when
+    /// the test ends, a failed assertion included.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new() -> ScratchDir {
+            ScratchDir(std::env::temp_dir().join(format!(
+                "lorica-adcs-test-{}",
+                uuid::Uuid::new_v4().simple()
+            )))
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            // Nothing to report from a test's teardown: a leftover
+            // directory under the temporary directory harms nothing.
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
     fn atomic_write_creates_the_directory_and_replaces_the_file() {
-        let root: PathBuf = scratch_dir();
+        let root: ScratchDir = ScratchDir::new();
         let path: PathBuf = root.join("adcs").join("krb5.conf");
         write_atomically(&path, b"first\n").expect("first write");
         write_atomically(&path, b"second\n").expect("second write");
@@ -571,12 +596,27 @@ mod tests {
             let file_mode: u32 = fs::metadata(&path).expect("metadata").permissions().mode();
             assert_eq!(file_mode & 0o777, 0o600);
         }
-        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_directory_is_made_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root: ScratchDir = ScratchDir::new();
+        let dir: PathBuf = root.join("adcs");
+        fs::create_dir_all(&dir).expect("setup");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("loosen");
+        write_atomically(&dir.join("krb5.conf"), b"x").expect("write");
+        let dir_mode: u32 = fs::metadata(&dir)
+            .expect("dir metadata")
+            .permissions()
+            .mode();
+        assert_eq!(dir_mode & 0o777, 0o700);
     }
 
     #[test]
     fn atomic_write_failure_names_the_path_and_leaves_no_temp_file() {
-        let root: PathBuf = scratch_dir();
+        let root: ScratchDir = ScratchDir::new();
         // The target is an existing directory, so the rename fails.
         let path: PathBuf = root.join("krb5.conf");
         fs::create_dir_all(path.join("occupied")).expect("setup");
@@ -585,17 +625,16 @@ mod tests {
             matches!(&err, AdcsError::Krb5ConfWrite { path: p, .. } if *p == path),
             "{err}"
         );
-        let entries: Vec<std::ffi::OsString> = fs::read_dir(&root)
+        let entries: Vec<std::ffi::OsString> = fs::read_dir(&root.0)
             .expect("list")
             .map(|entry| entry.expect("entry").file_name())
             .collect();
         assert_eq!(entries, vec![std::ffi::OsString::from("krb5.conf")]);
-        fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[test]
     fn write_to_writes_the_rendering() {
-        let root: PathBuf = scratch_dir();
+        let root: ScratchDir = ScratchDir::new();
         let path: PathBuf = root.join("krb5.conf");
         let config: Krb5Config = Krb5Config {
             realm: Realm::new("CORP.EXAMPLE.ORG").expect("realm"),
@@ -604,6 +643,5 @@ mod tests {
         };
         config.write_to(&path).expect("write");
         assert_eq!(fs::read_to_string(&path).expect("read"), config.render());
-        fs::remove_dir_all(&root).expect("cleanup");
     }
 }

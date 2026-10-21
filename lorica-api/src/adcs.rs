@@ -545,7 +545,7 @@ pub(crate) fn failure_step(err: &AdcsError) -> &'static str {
     match err {
         AdcsError::Ticket { failure, .. } => match failure {
             TicketFailure::KdcUnreachable => "kdc_discovery",
-            TicketFailure::CredentialRejected | TicketFailure::Other => "ticket_acquisition",
+            TicketFailure::CredentialRejected => "ticket_acquisition",
         },
         AdcsError::ServiceName { .. } | AdcsError::Spnego { .. } => "spnego",
         AdcsError::MutualAuth { .. } => "mutual_authentication",

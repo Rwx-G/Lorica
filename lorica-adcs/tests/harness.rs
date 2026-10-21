@@ -26,9 +26,9 @@ use std::sync::{Mutex, Once, PoisonError};
 use std::time::{Duration, Instant};
 
 use lorica_adcs::{
-    build_csr, enroll, krb5_config_path, test_connection, AdcsError, CesParams, CesTimeouts,
-    EnrollOutcome, FaultKind, GeneratedCsr, KdcAddress, KdcTiming, KeyType, Krb5Config, Realm,
-    Secret, SubjectFields, TicketFailure,
+    build_csr, enroll, krb5_config_path, test_connection, AdcsError, CesParams, CesSession,
+    CesTimeouts, EnrollOutcome, FailureScope, FaultKind, GeneratedCsr, KdcAddress, KdcTiming,
+    KeyType, Krb5Config, Realm, Secret, SubjectFields, TicketFailure,
 };
 use x509_parser::certificate::X509Certificate;
 use x509_parser::certification_request::X509CertificationRequest;
@@ -306,6 +306,41 @@ fn iv1_a_bound_token_authenticates_with_one_ticket_request() {
     });
 }
 
+// D15, performance Medium: a session, as one renewal tick uses it,
+// acquires one ticket for all its requests. The fixture closes every
+// connection after its answer, so each authenticated request also
+// reconnects under the certificate pin (security High) against a real
+// MIT acceptor, and the mechanism and flag checks of the final step
+// run against a real SPNEGO context (pen L6).
+#[test]
+#[ignore = "needs the tests-e2e-docker/adcs harness"]
+fn a_session_enrolls_twice_and_tests_with_one_ticket_request() {
+    run(async {
+        let before: Vec<String> = as_reqs();
+        let mut session: CesSession =
+            CesSession::open(&params(SHA256_PORT, "issued", "valid"), &password())
+                .await
+                .expect("open");
+        for name in ["web05.corp.example.org", "web06.corp.example.org"] {
+            let outcome: EnrollOutcome = session
+                .enroll(&csr(&[name]).csr_der)
+                .await
+                .expect("enroll in the session");
+            assert!(
+                matches!(outcome, EnrollOutcome::Issued { .. }),
+                "{name}: {outcome:?}"
+            );
+        }
+        session.test().await.expect("test in the session");
+        drop(session);
+        let after: Vec<String> = as_reqs();
+        let new: &[String] = &after[before.len()..];
+        println!("AS-REQs of one three-request session:\n{}", new.join("\n"));
+        assert_eq!(count(new, "ISSUE:"), 1, "one ticket for the session");
+        assert_eq!(count(new, "PREAUTH_FAILED"), 0);
+    });
+}
+
 // IV2: the binding hash follows the certificate's signature hash
 // (RFC 5929 4.1), so SHA-256 and SHA-512 server certificates both
 // authenticate. The fixture's certificates are checked first, so the
@@ -509,6 +544,7 @@ fn a_wrong_password_is_rejected_after_one_failed_preauthentication() {
             Some(TicketFailure::CredentialRejected),
             "{err}"
         );
+        assert_eq!(err.scope(), FailureScope::Authority);
         assert!(
             matches!(
                 err,
@@ -519,6 +555,34 @@ fn a_wrong_password_is_rejected_after_one_failed_preauthentication() {
             ),
             "{err:?}"
         );
+        assert_eq!(count(new, "PREAUTH_FAILED"), 1);
+        assert_eq!(count(new, "ISSUE:"), 0);
+    });
+}
+
+// D15: a session that met a wrong password never asks the KDC again,
+// however many requests it is given.
+#[test]
+#[ignore = "needs the tests-e2e-docker/adcs harness"]
+fn a_session_spends_one_failed_preauthentication_at_most() {
+    run(async {
+        let before: Vec<String> = as_reqs();
+        let mut session: CesSession = CesSession::open(
+            &params(SHA256_PORT, "issued", "valid"),
+            &Secret::new("harness-only-wrong-password".to_owned()),
+        )
+        .await
+        .expect("open");
+        for _ in 0..3 {
+            let err: AdcsError = session.test().await.expect_err("a wrong password");
+            assert_eq!(
+                err.ticket_failure(),
+                Some(TicketFailure::CredentialRejected),
+                "{err}"
+            );
+        }
+        let after: Vec<String> = as_reqs();
+        let new: &[String] = &after[before.len()..];
         assert_eq!(count(new, "PREAUTH_FAILED"), 1);
         assert_eq!(count(new, "ISSUE:"), 0);
     });

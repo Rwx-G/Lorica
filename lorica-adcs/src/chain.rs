@@ -18,9 +18,11 @@
 //!
 //! Only the `certificates` set of the CMS `SignedData` is read. Its
 //! order means nothing and it includes the root, so the path is rebuilt
-//! from the leaf. The CMC signature, the encapsulated `PKIResponse` and
-//! the signer infos are ignored: the chain Lorica keeps is verified as a
-//! certificate path where it is used, not here.
+//! from the leaf, each link verified by signature: the first link is the
+//! certificate Lorica learns as the issuing CA, the anchor of adoption
+//! (Epic 13 D9), so a certificate that merely carries the right name and
+//! key identifier must not pass for it. The CMC signature, the
+//! encapsulated `PKIResponse` and the signer infos are ignored.
 
 use x509_parser::certificate::X509Certificate;
 use x509_parser::der_parser::asn1_rs::{Any, Class, FromDer, Oid, Tag};
@@ -30,6 +32,11 @@ use crate::AdcsError;
 
 /// `id-signedData` (RFC 5652 5.1).
 const SIGNED_DATA_OID: &str = "1.2.840.113549.1.7.2";
+
+/// A CMC response carries the issuing path and the root, a handful of
+/// certificates; a set past this is not one, and the path walk, which
+/// compares every candidate at every link, is refused it.
+const MAX_CMC_CERTIFICATES: usize = 32;
 
 fn chain_error(reason: impl Into<String>) -> AdcsError {
     AdcsError::Chain {
@@ -42,17 +49,22 @@ fn chain_error(reason: impl Into<String>) -> AdcsError {
 /// order, DER, without the self-signed root. The leaf itself, if the set
 /// carries it, is not repeated.
 ///
-/// Each link is the certificate whose subject is the current
-/// certificate's issuer, and when both carry key identifiers, whose
-/// subject key identifier equals the current authority key identifier;
-/// two CAs with the same name are told apart that way. The walk stops
-/// at a self-signed certificate, which is dropped, or where the set has
-/// no issuer, which keeps the chain up to there. A set holding no issuer
-/// of the leaf at all is refused.
-pub fn chain_from_cmc(leaf_der: &[u8], cmc_der: &[u8]) -> Result<Vec<Vec<u8>>, AdcsError> {
+/// Each link is the certificate that [`issued_by`] says issued the
+/// current one. The walk stops at a self-issued certificate, which is
+/// dropped, or where the set has no issuer, which keeps the chain up to
+/// there. A set holding no issuer of the leaf at all is refused, as is a
+/// set larger than a CMC response carries.
+pub(crate) fn chain_from_cmc(leaf_der: &[u8], cmc_der: &[u8]) -> Result<Vec<Vec<u8>>, AdcsError> {
     let (_, leaf): (&[u8], X509Certificate<'_>) = x509_parser::parse_x509_certificate(leaf_der)
         .map_err(|err| chain_error(format!("the issued certificate does not parse: {err}")))?;
     let set: Vec<&[u8]> = signed_data_certificates(cmc_der)?;
+    if set.len() > MAX_CMC_CERTIFICATES {
+        return Err(chain_error(format!(
+            "the CMC set holds {} certificates, more than the {MAX_CMC_CERTIFICATES} a response \
+             carries",
+            set.len()
+        )));
+    }
     let mut candidates: Vec<(&[u8], X509Certificate<'_>)> = Vec::with_capacity(set.len());
     for der in set {
         if der == leaf_der {
@@ -75,7 +87,7 @@ pub fn chain_from_cmc(leaf_der: &[u8], cmc_der: &[u8]) -> Result<Vec<Vec<u8>>, A
             break;
         }
         let next: Option<usize> = (0..candidates.len())
-            .find(|index: &usize| !used[*index] && issues(&candidates[*index].1, current));
+            .find(|index: &usize| !used[*index] && issued_by(current, &candidates[*index].1));
         let Some(index) = next else {
             break;
         };
@@ -115,9 +127,11 @@ fn subject_key_id<'a>(cert: &'a X509Certificate<'_>) -> Option<&'a [u8]> {
         })
 }
 
-/// Whether `issuer` is a plausible issuer of `subject`: names first,
-/// key identifiers when both sides have them.
-fn issues(issuer: &X509Certificate<'_>, subject: &X509Certificate<'_>) -> bool {
+/// Whether the names and key identifiers say `issuer` issued `subject`:
+/// the issuer's subject is the subject's issuer, byte for byte, and when
+/// both carry key identifiers, the authority key identifier equals the
+/// subject key identifier.
+fn names_link(subject: &X509Certificate<'_>, issuer: &X509Certificate<'_>) -> bool {
     if issuer.subject().as_raw() != subject.issuer().as_raw() {
         return false;
     }
@@ -127,8 +141,25 @@ fn issues(issuer: &X509Certificate<'_>, subject: &X509Certificate<'_>) -> bool {
     }
 }
 
+/// Whether `issuer` issued `subject`: [`names_link`], and `subject`'s
+/// signature verifies under `issuer`'s key. Names and key identifiers
+/// are copied at will; only the signature tells the real issuer from a
+/// certificate made to look like it.
+///
+/// ```
+/// # fn demo(leaf: &x509_parser::certificate::X509Certificate<'_>,
+/// #         ca: &x509_parser::certificate::X509Certificate<'_>) {
+/// if lorica_adcs::issued_by(leaf, ca) {
+///     // `ca`'s key signed `leaf`.
+/// }
+/// # }
+/// ```
+pub fn issued_by(subject: &X509Certificate<'_>, issuer: &X509Certificate<'_>) -> bool {
+    names_link(subject, issuer) && subject.verify_signature(Some(issuer.public_key())).is_ok()
+}
+
 fn is_self_issued(cert: &X509Certificate<'_>) -> bool {
-    issues(cert, cert)
+    names_link(cert, cert)
 }
 
 /// The DER of each certificate in the `certificates` field of the CMS
@@ -260,6 +291,57 @@ mod tests {
         let cmc: Vec<u8> = signed_data(&[impostor.der(), &pki.root, &pki.intermediate]);
         let chain: Vec<Vec<u8>> = chain_from_cmc(&pki.leaf, &cmc).expect("chain");
         assert_eq!(chain, vec![pki.intermediate.clone()]);
+    }
+
+    // Security audit Low / pen L1: a CA forged with the real issuing
+    // CA's name and subject key identifier, under the real root's name,
+    // must not become the chain's first link (the learned issuing CA).
+    #[test]
+    fn a_lookalike_issuer_is_refused_by_signature() {
+        let pki: TestPki = TestPki::generate();
+        let (_, intermediate): (&[u8], X509Certificate<'_>) =
+            x509_parser::parse_x509_certificate(&pki.intermediate).expect("intermediate");
+        let copied_ski: Vec<u8> = subject_key_id(&intermediate).expect("ski").to_vec();
+        let fake_root_key: KeyPair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("key");
+        let fake_root: CertifiedIssuer<'static, KeyPair> =
+            CertifiedIssuer::self_signed(ca_params("Test Root CA"), fake_root_key)
+                .expect("fake root");
+        let mut lookalike_params = ca_params("Test Issuing CA");
+        lookalike_params.key_identifier_method = rcgen::KeyIdMethod::PreSpecified(copied_ski);
+        let lookalike_key: KeyPair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("key");
+        let lookalike: CertifiedIssuer<'static, KeyPair> =
+            CertifiedIssuer::signed_by(lookalike_params, lookalike_key, &fake_root)
+                .expect("lookalike");
+        let (_, parsed): (&[u8], X509Certificate<'_>) =
+            x509_parser::parse_x509_certificate(lookalike.der()).expect("lookalike parses");
+        let (_, leaf): (&[u8], X509Certificate<'_>) =
+            x509_parser::parse_x509_certificate(&pki.leaf).expect("leaf");
+        assert!(names_link(&leaf, &parsed), "the lookalike matches by name");
+        assert!(!issued_by(&leaf, &parsed));
+        assert!(issued_by(&leaf, &intermediate));
+
+        let chain: Vec<Vec<u8>> = chain_from_cmc(
+            &pki.leaf,
+            &signed_data(&[lookalike.der(), &pki.root, &pki.intermediate]),
+        )
+        .expect("chain");
+        assert_eq!(chain, vec![pki.intermediate.clone()]);
+        assert!(matches!(
+            chain_from_cmc(&pki.leaf, &signed_data(&[lookalike.der(), &pki.root])),
+            Err(AdcsError::Chain { .. })
+        ));
+    }
+
+    #[test]
+    fn an_oversized_set_is_refused() {
+        let pki: TestPki = TestPki::generate();
+        let set: Vec<&[u8]> = std::iter::repeat_n(pki.root.as_slice(), MAX_CMC_CERTIFICATES)
+            .chain([pki.intermediate.as_slice()])
+            .collect();
+        assert!(matches!(
+            chain_from_cmc(&pki.leaf, &signed_data(&set)),
+            Err(AdcsError::Chain { reason }) if reason.contains("more than")
+        ));
     }
 
     #[test]

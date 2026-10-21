@@ -75,15 +75,7 @@ fn binding_hash_for(signature_oid: &str) -> Option<BindingHash> {
 /// no such hash (RSASSA-PSS, EdDSA, an unknown OID) is refused with its
 /// OID in the error, never bound with a guessed hash: a wrong binding is
 /// a 401 that would look like a Kerberos failure.
-///
-/// ```
-/// # fn demo(server_cert_der: &[u8]) -> Result<(), lorica_adcs::AdcsError> {
-/// let binding: Vec<u8> = lorica_adcs::channel_binding(server_cert_der)?;
-/// assert!(binding.starts_with(b"tls-server-end-point:"));
-/// # Ok(())
-/// # }
-/// ```
-pub fn channel_binding(cert_der: &[u8]) -> Result<Vec<u8>, AdcsError> {
+pub(crate) fn channel_binding(cert_der: &[u8]) -> Result<Vec<u8>, AdcsError> {
     let (_, cert): (&[u8], X509Certificate<'_>) = x509_parser::parse_x509_certificate(cert_der)
         .map_err(|err| AdcsError::ChannelBindingCertificate {
             reason: err.to_string(),
