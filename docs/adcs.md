@@ -443,7 +443,9 @@ stays manual. Lorica offers to take over the ones your authority issued.
 authority's **issuing CA certificate**, checked by signature and
 authority key identifier, never by issuer name and never against a root
 (every issuing CA under the same root would match), and whose names all
-satisfy the allowlist. Detection needs that issuing CA certificate:
+satisfy the allowlist. When the authority's issuing CA field holds more
+than one certificate, only the first is used, so paste the issuing CA
+first. Detection needs that issuing CA certificate:
 issue one certificate through Lorica, which records it, or paste it in
 the authority settings. Until then the certificate page says so.
 
@@ -479,7 +481,12 @@ off, which keeps the certificate AD CS-managed. Reverting is also how a
 certificate stops referencing the authority before the authority is
 deleted.
 
-Adoption and reversion are audited, naming the certificates.
+Reverting is refused while a renewal of the certificate is in flight,
+since the renewal would set the authority again when it completes.
+
+Adoption and reversion are audited, naming the certificates:
+`adcs.certificate.adopt:<id>` and `adcs.certificate.revert:<id>`, each
+with the certificate's view before and after.
 
 ## The failed state
 

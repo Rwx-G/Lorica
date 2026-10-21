@@ -356,6 +356,8 @@ mod tests {
             (Method::DELETE, "/api/v1/adcs/authority"),
             (Method::POST, "/api/v1/adcs/authority/test"),
             (Method::POST, "/api/v1/certificates/adcs"),
+            (Method::POST, "/api/v1/certificates/c1/adcs/adopt"),
+            (Method::POST, "/api/v1/certificates/c1/adcs/revert"),
         ] {
             assert!(!follower_local_request(&method, path), "{method} {path}");
         }
@@ -377,6 +379,30 @@ mod tests {
             // Issuance is the certificate default (D11): the role that
             // issues is not the one that edits the allowlist bounding it.
             (Method::POST, "/api/v1/certificates/adcs", Role::Operator),
+            // Adoption (Story 13.5): the candidate listing is a read,
+            // admitted by the GET rule ahead of the `/api/v1/adcs/`
+            // overlay, which keeps every other method SuperAdmin;
+            // adopting and reverting are the certificate default.
+            (
+                Method::GET,
+                "/api/v1/adcs/adoption-candidates",
+                Role::Viewer,
+            ),
+            (
+                Method::POST,
+                "/api/v1/adcs/adoption-candidates",
+                Role::SuperAdmin,
+            ),
+            (
+                Method::POST,
+                "/api/v1/certificates/c1/adcs/adopt",
+                Role::Operator,
+            ),
+            (
+                Method::POST,
+                "/api/v1/certificates/c1/adcs/revert",
+                Role::Operator,
+            ),
         ] {
             assert_eq!(required_role(&method, path), expected, "{method} {path}");
         }

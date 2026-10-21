@@ -623,3 +623,69 @@ fn the_failure_memory_alerts_on_a_new_state_and_forgets_on_success() {
         "c-2 was forgotten"
     );
 }
+
+/// The key type of the CSR the stand-in received last.
+fn last_csr_key_type(stub: &StubAuthority) -> Result<lorica_config::models::AdcsKeyType, String> {
+    let csr_der = stub.last_csr();
+    let (_, csr) = X509CertificationRequest::from_der(&csr_der).expect("csr");
+    super::generated_key_type(&csr.certification_request_info.subject_pki)
+}
+
+/// Story 13.4 fix: a renewal keeps the current certificate's key type
+/// and size, whatever the authority's default (RSA 2048 here) says, so
+/// a changed default cannot turn a certificate into one its template
+/// refuses.
+#[tokio::test]
+async fn a_renewal_keeps_the_current_key_type_and_size() {
+    use lorica_config::models::AdcsKeyType;
+    let stub = StubAuthority::new(issue_v2());
+    let f = issuing(&stub, None).await;
+    for (key_type, expected) in [
+        ("ecdsa_p256", AdcsKeyType::EcdsaP256),
+        ("rsa3072", AdcsKeyType::Rsa3072),
+    ] {
+        let name = format!("{key_type}.corp.example.org").replace('_', "-");
+        let resp = f
+            .issue(serde_json::json!({ "sans": [name], "key_type": key_type }))
+            .await;
+        assert_eq!(resp.status(), StatusCode::CREATED, "{key_type}");
+        let id = body_json(resp).await["data"]["id"]
+            .as_str()
+            .expect("id")
+            .to_string();
+        assert_eq!(last_csr_key_type(&stub), Ok(expected), "{key_type} issued");
+
+        let resp = f.send("POST", &renew_path(&id), &f.admin, None).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{key_type}");
+        assert_eq!(last_csr_key_type(&stub), Ok(expected), "{key_type} renewed");
+    }
+}
+
+/// A key Lorica cannot generate is named, so the renewal falls back to
+/// the authority's default and says why.
+#[test]
+fn only_the_key_types_lorica_generates_are_kept() {
+    use lorica_config::models::AdcsKeyType;
+    let spki_of = |algorithm: &'static rcgen::SignatureAlgorithm| -> Vec<u8> {
+        let key = rcgen::KeyPair::generate_for(algorithm).expect("test setup: key");
+        let params = rcgen::CertificateParams::new(vec!["web01.corp.example.org".to_string()])
+            .expect("test setup: params");
+        params
+            .self_signed(&key)
+            .expect("test setup: certificate")
+            .der()
+            .to_vec()
+    };
+    let key_type = |der: &[u8]| {
+        let (_, cert) = x509_parser::parse_x509_certificate(der).expect("certificate");
+        super::generated_key_type(cert.public_key())
+    };
+    assert_eq!(
+        key_type(&spki_of(&rcgen::PKCS_ECDSA_P256_SHA256)),
+        Ok(AdcsKeyType::EcdsaP256)
+    );
+    let p384 = key_type(&spki_of(&rcgen::PKCS_ECDSA_P384_SHA384));
+    assert_eq!(p384, Err("an ECDSA key on curve 1.3.132.0.34".to_string()));
+    let ed25519 = key_type(&spki_of(&rcgen::PKCS_ED25519));
+    assert_eq!(ed25519, Err("a key of algorithm 1.3.101.112".to_string()));
+}

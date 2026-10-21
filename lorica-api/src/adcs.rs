@@ -15,7 +15,8 @@
 //! The AD CS authority on the management API (Story 13.2, Epic 13 PRD
 //! D3, D11, D13, D15): read it, write it, delete it, and test that
 //! Lorica can authenticate to it. Issuing a certificate from it (Story
-//! 13.3) lives in the `issue` submodule.
+//! 13.3) lives in the `issue` submodule, renewing one (Story 13.4) in
+//! `renew`, and adopting or reverting one (Story 13.5) in `adopt`.
 //!
 //! # Who may do what
 //!
@@ -77,9 +78,14 @@ use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
 use crate::server::AppState;
 
+mod adopt;
 mod issue;
 mod renew;
 
+pub use adopt::{
+    adopt_certificate, list_adoption_candidates, revert_certificate, AdcsAdoptRequest,
+    AdoptionCandidate, AdoptionCandidates, AdoptionUnavailable,
+};
 pub use issue::{issue_certificate, AdcsIssueRequest, PendingIssuance, MAX_SANS};
 pub(crate) use renew::{renew_due, renew_manually, AdcsRenewalMemory};
 pub use renew::{ADCS_RENEWAL_ACTOR, ADCS_RENEWAL_BACKOFF_HOURS};

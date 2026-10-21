@@ -991,6 +991,24 @@ pub fn build_router(
                 .layer(bl(BODY_CAP_DEFAULT))
                 .layer(rl("adcs_issue", RL_ACME_PROVISION, RL_WINDOW_S)),
         )
+        // Adoption and reversion (Story 13.5). Operator, the
+        // certificate default; neither contacts the authority, so the
+        // bucket is sized for a bulk adoption the dashboard sends one
+        // certificate at a time, not for issuance.
+        .route(
+            "/api/v1/certificates/{id}/adcs/adopt",
+            post(crate::adcs::adopt_certificate)
+                .layer(bl(BODY_CAP_DEFAULT))
+                .layer(rl("adcs_adopt", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/certificates/{id}/adcs/revert",
+            post(crate::adcs::revert_certificate).layer(rl(
+                "adcs_adopt",
+                RL_DESTRUCTIVE_CUD,
+                RL_WINDOW_S,
+            )),
+        )
         .route(
             "/api/v1/certificates/{id}",
             get(crate::certificates::get_certificate),
@@ -1228,6 +1246,11 @@ pub fn build_router(
                 .delete(crate::adcs::delete_adcs_authority)
                 .layer(bl(BODY_CAP_PEM))
                 .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+        )
+        // Adoption candidates (Story 13.5): a read, Viewer.
+        .route(
+            "/api/v1/adcs/adoption-candidates",
+            get(crate::adcs::list_adoption_candidates),
         )
         .route(
             "/api/v1/adcs/authority/test",

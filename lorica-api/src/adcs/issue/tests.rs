@@ -36,7 +36,7 @@ use crate::middleware::rate_limit::RateLimiter;
 use crate::tests::body_json;
 
 const ISSUE: &str = "/api/v1/certificates/adcs";
-const V2_TEMPLATE_OID: &str = "1.3.6.1.4.1.311.21.8.1234567.7654321.42";
+pub(in crate::adcs) const V2_TEMPLATE_OID: &str = "1.3.6.1.4.1.311.21.8.1234567.7654321.42";
 
 /// The template extension the stand-in puts in what it issues.
 #[derive(Clone, Copy)]
@@ -241,7 +241,9 @@ fn oid_content(dotted: &str) -> Vec<u8> {
     out
 }
 
-fn template_extension(template: TemplateExtension) -> Option<rcgen::CustomExtension> {
+pub(in crate::adcs) fn template_extension(
+    template: TemplateExtension,
+) -> Option<rcgen::CustomExtension> {
     let (oid, value): (&[u64], Vec<u8>) = match template {
         TemplateExtension::None => return None,
         TemplateExtension::V2 => (

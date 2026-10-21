@@ -18,9 +18,9 @@
 //! certificates due for renewal and hands them to [`renew_due`]; the
 //! dashboard's "Renew now" reaches [`renew_manually`] through
 //! `renew_certificate_as`. Both renew in place through
-//! [`super::issue::issue`], with the certificate's current names and
-//! subject and its recorded template, under the `RenewalLedger`
-//! in-flight mark the ACME renewals share.
+//! [`super::issue::issue`], with the certificate's current names,
+//! subject and key type and its recorded template, under the
+//! `RenewalLedger` in-flight mark the ACME renewals share.
 //!
 //! # Failures
 //!
@@ -54,11 +54,13 @@ use std::collections::{HashMap, HashSet};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
-use lorica_config::models::{AdcsSubjectDefaults, Certificate};
+use lorica_config::models::{AdcsKeyType, AdcsSubjectDefaults, Certificate};
 use parking_lot::Mutex;
 use tracing::{info, warn};
 use x509_parser::certificate::X509Certificate;
-use x509_parser::x509::{AttributeTypeAndValue, X509Name};
+use x509_parser::oid_registry::{OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY, OID_PKCS1_RSAENCRYPTION};
+use x509_parser::public_key::PublicKey;
+use x509_parser::x509::{AttributeTypeAndValue, SubjectPublicKeyInfo, X509Name};
 
 use super::issue::{
     issue, send_issuance_failed, IssueError, IssueOutcome, IssueRequest, IssueSubject,
@@ -141,28 +143,30 @@ impl AdcsRenewalMemory {
     }
 }
 
-/// The subject fields of `cert`'s leaf, the first certificate of its
-/// `cert_pem`, as a renewal requests them again. The `CN` is not one of
-/// them: it is the first SAN, the certificate's domain.
-fn current_subject(cert: &Certificate) -> Result<AdcsSubjectDefaults, String> {
+/// The DER of `cert`'s leaf, the first certificate of its `cert_pem`.
+pub(super) fn stored_leaf_der(cert: &Certificate) -> Result<Vec<u8>, String> {
     let blocks: Vec<pem::Pem> = pem::parse_many(&cert.cert_pem)
         .map_err(|err| format!("the stored certificate is not PEM: {err}"))?;
-    let leaf_der: &[u8] = blocks
+    blocks
         .iter()
         .find(|block| block.tag() == "CERTIFICATE")
-        .map(|block| block.contents())
-        .ok_or_else(|| "the stored certificate holds no CERTIFICATE block".to_string())?;
-    let (_, leaf): (&[u8], X509Certificate<'_>) = x509_parser::parse_x509_certificate(leaf_der)
-        .map_err(|err| format!("the stored certificate does not parse: {err}"))?;
+        .map(|block| block.contents().to_vec())
+        .ok_or_else(|| "the stored certificate holds no CERTIFICATE block".to_string())
+}
+
+/// The subject fields of `leaf` as a renewal requests them again. The
+/// `CN` is not one of them: it is the first SAN, the certificate's
+/// domain.
+fn current_subject(leaf: &X509Certificate<'_>) -> AdcsSubjectDefaults {
     let subject: &X509Name<'_> = leaf.subject();
-    Ok(AdcsSubjectDefaults {
+    AdcsSubjectDefaults {
         country: first_value(subject.iter_country()),
         state: first_value(subject.iter_state_or_province()),
         locality: first_value(subject.iter_locality()),
         organization: first_value(subject.iter_organization()),
         organizational_unit: first_value(subject.iter_organizational_unit()),
         email: first_value(subject.iter_email()),
-    })
+    }
 }
 
 fn first_value<'a, 'b: 'a>(
@@ -174,22 +178,90 @@ fn first_value<'a, 'b: 'a>(
         .map(str::to_string)
 }
 
-/// The in-place issuance that renews `cert`: its names with the domain
-/// first, its current subject, its recorded template (the authority's
-/// default only when none is recorded), the authority's key type, and
-/// its auto-renew setting kept.
-fn renewal_request(cert: &Certificate) -> Result<IssueRequest, String> {
+/// The key type of `spki` when it is one Lorica generates, or why not.
+///
+/// A renewal keeps the current key's type and size rather than taking
+/// the authority's default: the template the certificate was issued
+/// under accepted that key, and a default changed since (RSA to ECDSA,
+/// say) would be refused by a version 2 template, whose legacy
+/// provider handles RSA only.
+pub(super) fn generated_key_type(spki: &SubjectPublicKeyInfo<'_>) -> Result<AdcsKeyType, String> {
+    let algorithm = &spki.algorithm.algorithm;
+    if *algorithm == OID_PKCS1_RSAENCRYPTION {
+        let bits: usize = match spki.parsed() {
+            Ok(PublicKey::RSA(rsa)) => modulus_bits(rsa.modulus),
+            _ => return Err("an RSA key whose modulus does not parse".to_string()),
+        };
+        return match bits {
+            2048 => Ok(AdcsKeyType::Rsa2048),
+            3072 => Ok(AdcsKeyType::Rsa3072),
+            other => Err(format!("an RSA {other} key")),
+        };
+    }
+    if *algorithm == OID_KEY_TYPE_EC_PUBLIC_KEY {
+        let curve = spki
+            .algorithm
+            .parameters
+            .as_ref()
+            .and_then(|parameters| parameters.as_oid().ok());
+        return match curve {
+            Some(curve) if curve == OID_EC_P256 => Ok(AdcsKeyType::EcdsaP256),
+            Some(curve) => Err(format!("an ECDSA key on curve {}", curve.to_id_string())),
+            None => Err("an ECDSA key with no named curve".to_string()),
+        };
+    }
+    Err(format!("a key of algorithm {}", algorithm.to_id_string()))
+}
+
+/// The bit length of a DER INTEGER's content, leading zero bytes and
+/// bits not counted: x509-parser's own `key_size` assumes the sign byte
+/// is there.
+fn modulus_bits(modulus: &[u8]) -> usize {
+    let significant: &[u8] = match modulus.iter().position(|byte: &u8| *byte != 0) {
+        Some(first) => &modulus[first..],
+        None => return 0,
+    };
+    let leading_zeros: usize = significant[0].leading_zeros() as usize;
+    significant.len() * 8 - leading_zeros
+}
+
+/// The names a renewal of `cert` requests: its domain first, then its
+/// SANs, each once.
+pub(super) fn renewal_names(cert: &Certificate) -> Vec<String> {
     let mut sans: Vec<String> = vec![cert.domain.clone()];
     for name in &cert.san_domains {
         if !sans.contains(name) {
             sans.push(name.clone());
         }
     }
+    sans
+}
+
+/// The in-place issuance that renews `cert`: its names with the domain
+/// first, its current subject, its recorded template (the authority's
+/// default only when none is recorded), its current key type (the
+/// authority's default only when Lorica cannot generate that one), and
+/// its auto-renew setting kept.
+fn renewal_request(cert: &Certificate) -> Result<IssueRequest, String> {
+    let leaf_der: Vec<u8> = stored_leaf_der(cert)?;
+    let (_, leaf): (&[u8], X509Certificate<'_>) = x509_parser::parse_x509_certificate(&leaf_der)
+        .map_err(|err| format!("the stored certificate does not parse: {err}"))?;
+    let key_type: Option<AdcsKeyType> = match generated_key_type(leaf.public_key()) {
+        Ok(key_type) => Some(key_type),
+        Err(current) => {
+            warn!(
+                cert_id = %cert.id,
+                current_key = %current,
+                "AD CS renewal: Lorica cannot generate the current key's type, so the                  renewal uses the authority's default key type"
+            );
+            None
+        }
+    };
     Ok(IssueRequest {
-        sans,
+        sans: renewal_names(cert),
         template: cert.adcs_template.clone(),
-        key_type: None,
-        subject: IssueSubject::Exact(current_subject(cert)?),
+        key_type,
+        subject: IssueSubject::Exact(current_subject(&leaf)),
         auto_renew: None,
         replace: Some(cert.id.clone()),
     })
@@ -211,13 +283,10 @@ async fn authority_ready(state: &AppState) -> Result<bool, ApiError> {
 /// A failure the issuance did not alert itself (a refusal before the
 /// authority was contacted), alerted through the same per-state memory.
 fn alert_unsent_failure(state: &AppState, cert: &Certificate, step: &str, message: &str) {
-    let sans: Vec<String> = std::iter::once(cert.domain.clone())
-        .chain(cert.san_domains.iter().cloned())
-        .collect();
     send_issuance_failed(
         state,
         cert.adcs_authority_id.as_deref().unwrap_or_default(),
-        &sans,
+        &renewal_names(cert),
         Some(&cert.id),
         step,
         message,
