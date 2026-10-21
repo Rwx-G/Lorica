@@ -14,9 +14,15 @@
      * the page from the role, the node and the authority state.
      */
     adcsRenewable: boolean;
+    /**
+     * Whether "Revert to manual" is offered on AD CS certificates. It
+     * does not depend on the authority's health, unlike renewal.
+     */
+    adcsRevertable: boolean;
     onView: (cert: CertificateResponse) => void;
     onEdit: (cert: CertificateResponse) => void;
     onRenew: (cert: CertificateResponse) => void;
+    onRevert: (cert: CertificateResponse) => void;
     onDelete: (cert: CertificateResponse) => void;
     onDownload: (cert: CertificateResponse, part: 'cert' | 'key' | 'chain' | 'bundle') => void;
   }
@@ -28,9 +34,11 @@
     criticalDays,
     renewingId,
     adcsRenewable,
+    adcsRevertable,
     onView,
     onEdit,
     onRenew,
+    onRevert,
     onDelete,
     onDownload,
   }: Props = $props();
@@ -59,6 +67,7 @@
   const editIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
   const trashIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
   const renewIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
+  const revertIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg>';
   const downloadIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
 </script>
 
@@ -128,6 +137,12 @@
                 <button class="btn-icon" title="Renew now from AD CS" aria-label="Renew certificate from AD CS" onclick={() => onRenew(cert)} disabled={renewingId === cert.id}>
                   <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html renewIcon}
+                </button>
+              {/if}
+              {#if cert.source === 'adcs' && adcsRevertable}
+                <button class="btn-icon" title="Revert to manual" aria-label="Revert to manual" onclick={() => onRevert(cert)}>
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                  {@html revertIcon}
                 </button>
               {/if}
               <div class="download-menu-wrap">

@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import {
     api,
+    type AdcsAdoptionCandidates,
     type AdcsAuthorityState,
     type CertificateResponse,
     type CertificateDetailResponse,
@@ -10,6 +11,7 @@
   } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import CertificateAcmeForm from '../components/certificates/CertificateAcmeForm.svelte';
+  import AdcsAdoptionPanel from '../components/certificates/AdcsAdoptionPanel.svelte';
   import CertificateAdcsForm from '../components/certificates/CertificateAdcsForm.svelte';
   import CertificateEditForm from '../components/certificates/CertificateEditForm.svelte';
   import CertificateList from '../components/certificates/CertificateList.svelte';
@@ -21,7 +23,8 @@
   import { showToast } from '../lib/toast';
   import { canWrite, canWriteRole, isSuperAdmin } from '../lib/auth';
   import { nodeRole } from '../lib/cluster';
-  import { adcsRenewalOffered, adcsRenewOutcome, type AdcsRenewOutcome } from '../lib/adcs-issuance';
+  import { adcsErrorMessage, adcsRenewalOffered, adcsRenewOutcome, type AdcsRenewOutcome } from '../lib/adcs-issuance';
+  import { ADCS_NO_ISSUING_CA_HINT, adcsAdoptionBanner } from '../lib/adcs-adoption';
 
   let certificates: CertificateResponse[] = $state([]);
   let routes: RouteResponse[] = $state([]);
@@ -75,6 +78,42 @@
     if (res.data) adcsState = res.data;
   }
 
+  // AD CS adoption (Story 13.5). Same `canWriteRole` reason as renewal:
+  // adopting and reverting are refused on a follower in every window.
+  // Neither issues anything, so the authority's failed state does not
+  // gate them.
+  const onFollower = $derived($nodeRole === 'follower' || Boolean(adcsState?.managed_on_control_plane));
+  const adcsOperable = $derived($canWriteRole && !onFollower);
+  let adoption = $state<AdcsAdoptionCandidates | null>(null);
+  let showAdoption = $state(false);
+  let adoptionBanner = $derived(
+    adcsAdoptionBanner({ canAdopt: $canWriteRole, follower: onFollower, candidates: adoption }),
+  );
+  let revertConfirm: CertificateResponse | null = $state(null);
+
+  async function loadAdoptionCandidates() {
+    if (!$canWriteRole || $nodeRole === 'follower') return;
+    const res = await api.listAdcsAdoptionCandidates();
+    if (res.data) adoption = res.data;
+  }
+
+  async function revertToManual() {
+    const cert = revertConfirm;
+    if (!cert) return;
+    revertConfirm = null;
+    const res = await api.revertAdcsCertificate(cert.id);
+    if (res.error) {
+      showToast(adcsErrorMessage(res.error), 'error');
+    } else {
+      showToast(`${cert.domain} is a manual certificate again`, 'success');
+    }
+    await loadData();
+  }
+
+  function revertMessage(cert: CertificateResponse): string {
+    return `Revert ${cert.domain} to manual? Lorica stops renewing it from the AD CS authority and keeps the current certificate in service until you replace it. To pause renewal and keep it AD CS managed, turn auto-renew off in Edit instead.`;
+  }
+
   // Self-signed generation state
   let showSelfSigned = $state(false);
   const SS_PREF_KEY = 'lorica_self_signed_pref';
@@ -105,6 +144,9 @@
   async function loadData() {
     loading = true;
     error = '';
+    // Any certificate change can add or remove a candidate, so the
+    // candidates are re-read with the list, in parallel with it.
+    const adoptionRead = loadAdoptionCandidates();
     const [certsRes, routesRes, settingsRes, , dnsRes] = await Promise.all([
       api.listCertificates(),
       api.listRoutes(),
@@ -127,6 +169,7 @@
     if (dnsRes.data) {
       dnsProviders = dnsRes.data.dns_providers;
     }
+    await adoptionRead;
     loading = false;
   }
 
@@ -315,6 +358,30 @@
     <div class="error-banner">{error}</div>
   {/if}
 
+  {#if adoptionBanner?.kind === 'candidates' && !showAdoption}
+    <div class="adcs-adoption-banner" role="status" data-testid="adcs-adoption-banner">
+      <span>
+        {adoptionBanner.count === 1
+          ? '1 certificate can be managed by the AD CS authority.'
+          : `${adoptionBanner.count} certificates can be managed by the AD CS authority.`}
+      </span>
+      <button class="btn btn-secondary" onclick={() => (showAdoption = true)}>Review</button>
+    </div>
+  {:else if adoptionBanner?.kind === 'no_issuing_ca'}
+    <div class="adcs-adoption-banner" role="status" data-testid="adcs-adoption-banner">
+      <span>{ADCS_NO_ISSUING_CA_HINT}</span>
+    </div>
+  {/if}
+
+  {#if showAdoption && adoption && adcsOperable}
+    <AdcsAdoptionPanel
+      candidates={adoption.candidates}
+      autoRenewDefault={adcsState?.authority?.auto_renew_default ?? true}
+      onReload={loadData}
+      onClose={() => (showAdoption = false)}
+    />
+  {/if}
+
   {#if adcsRenewResult}
     {@const outcome = adcsRenewResult.outcome}
     {@const domain = adcsRenewResult.domain}
@@ -362,9 +429,11 @@
       {criticalDays}
       {renewingId}
       {adcsRenewable}
+      adcsRevertable={adcsOperable}
       onView={openDetail}
       onEdit={openEditForm}
       onRenew={handleRenew}
+      onRevert={(cert) => (revertConfirm = cert)}
       onDelete={openDelete}
       onDownload={requestDownload}
     />
@@ -412,6 +481,17 @@
     confirmStyle="primary"
     onconfirm={renewFromAdcs}
     oncancel={() => (adcsRenewConfirm = null)}
+  />
+{/if}
+
+{#if revertConfirm}
+  <ConfirmDialog
+    title="Revert to manual"
+    message={revertMessage(revertConfirm)}
+    confirmLabel="Revert to manual"
+    confirmStyle="warning"
+    onconfirm={revertToManual}
+    oncancel={() => (revertConfirm = null)}
   />
 {/if}
 
@@ -502,6 +582,21 @@
 
   .text-muted {
     color: var(--color-text-muted);
+  }
+
+  .adcs-adoption-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.625rem 0.75rem;
+    margin-bottom: 1rem;
+    border: 1px solid var(--color-primary);
+    border-radius: 0.375rem;
+    background: var(--color-primary-subtle);
+    color: var(--color-text);
+    font-size: 0.875rem;
+    line-height: 1.5;
   }
 
   .adcs-renew-result {

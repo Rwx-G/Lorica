@@ -21,11 +21,13 @@ describe('certificate source on the list', () => {
         criticalDays: 7,
         renewingId: '',
         adcsRenewable: false,
+        adcsRevertable: false,
         onView: vi.fn(),
         onEdit: vi.fn(),
         onRenew: vi.fn(),
         onDelete: vi.fn(),
         onDownload: vi.fn(),
+        onRevert: vi.fn(),
       },
     });
     const row = (domain: string) => screen.getByRole('button', { name: domain }).closest('td');
@@ -48,11 +50,13 @@ describe('AD CS renew action on the list', () => {
         criticalDays: 7,
         renewingId: '',
         adcsRenewable,
+        adcsRevertable: false,
         onView: vi.fn(),
         onEdit: vi.fn(),
         onRenew,
         onDelete: vi.fn(),
         onDownload: vi.fn(),
+        onRevert: vi.fn(),
       },
     });
     return onRenew;

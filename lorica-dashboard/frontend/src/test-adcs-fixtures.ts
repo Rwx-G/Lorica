@@ -1,9 +1,9 @@
 /**
- * Shared AD CS fixtures for the Vitest suites of Stories 13.3 and 13.4. A plain
+ * Shared AD CS fixtures for the Vitest suites of Stories 13.3 to 13.5. A plain
  * module rather than an export of a test file, which would register
  * that file's suites a second time in every importer.
  */
-import type { AdcsAuthority, AdcsAuthorityState, CertificateResponse } from './lib/api';
+import type { AdcsAdoptionCandidate, AdcsAuthority, AdcsAuthorityState, CertificateResponse } from './lib/api';
 
 export function testAuthority(overrides: Partial<AdcsAuthority> = {}): AdcsAuthority {
   return {
@@ -62,6 +62,20 @@ export function testCertificate(
     adcs_template: null,
     adcs_template_oid: null,
     adcs_request_id: null,
+    ...overrides,
+  };
+}
+
+export function testCandidate(domain: string, overrides: Partial<AdcsAdoptionCandidate> = {}): AdcsAdoptionCandidate {
+  return {
+    certificate_id: `cert-${domain}`,
+    domain,
+    san_domains: [domain],
+    subject: `CN=${domain},O=Example Corp,C=FR`,
+    not_after: '2027-01-01T00:00:00Z',
+    issued_template: '1.3.6.1.4.1.311.21.8.1.2',
+    observed_template: '1.3.6.1.4.1.311.21.8.1.2',
+    template_mismatch: false,
     ...overrides,
   };
 }

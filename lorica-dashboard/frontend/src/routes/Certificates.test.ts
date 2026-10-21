@@ -1,11 +1,18 @@
-import { render, screen, waitFor, fireEvent } from '@testing-library/svelte';
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/svelte';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import { auth, type Role } from '../lib/auth';
 import { clusterStatus, type ClusterStatus } from '../lib/cluster';
-import { api, type AdcsAuthorityState, type ApiError, type CertificateResponse } from '../lib/api';
+import {
+  api,
+  type AdcsAdoptionCandidates,
+  type AdcsAuthorityState,
+  type ApiError,
+  type CertificateResponse,
+} from '../lib/api';
 import { ADCS_RENEWAL_STILL_FINISHING } from '../lib/adcs-issuance';
-import { testAuthority, testAuthorityState, testCertificate } from '../test-adcs-fixtures';
+import { ADCS_NO_ISSUING_CA_HINT } from '../lib/adcs-adoption';
+import { testAuthority, testAuthorityState, testCandidate, testCertificate } from '../test-adcs-fixtures';
 import Certificates from './Certificates.svelte';
 
 const adcsCert = testCertificate('app.corp.example.org', [], {
@@ -47,7 +54,12 @@ beforeEach(() => {
   vi.spyOn(api, 'listDnsProviders').mockResolvedValue({ data: { dns_providers: [] } });
   vi.spyOn(api, 'getSettings').mockResolvedValue({ error: { code: 'unknown', message: 'not under test' } });
   vi.spyOn(api, 'listPreferences').mockResolvedValue({ error: { code: 'unknown', message: 'not under test' } });
+  offered({ reason: null, candidates: [] });
 });
+
+function offered(candidates: AdcsAdoptionCandidates) {
+  return vi.spyOn(api, 'listAdcsAdoptionCandidates').mockResolvedValue({ data: candidates });
+}
 
 afterEach(() => {
   auth.set({ status: 'unauthenticated' });
@@ -182,5 +194,148 @@ describe('Certificates AD CS "Renew now" outcomes', () => {
     await confirmRenewal();
     await waitFor(() => expect(renewButton()).not.toBeInTheDocument());
     expect(get).toHaveBeenCalledTimes(2);
+  });
+});
+
+const manualCert = testCertificate('legacy.corp.example.org');
+const twoCandidates: AdcsAdoptionCandidates = {
+  reason: null,
+  candidates: [testCandidate('legacy.corp.example.org'), testCandidate('old.corp.example.org')],
+};
+const banner = () => screen.queryByTestId('adcs-adoption-banner');
+
+describe('Certificates AD CS adoption banner', () => {
+  it('announces the candidates to an Operator and opens the panel', async () => {
+    served();
+    offered(twoCandidates);
+    await rendered([manualCert]);
+    await waitFor(() =>
+      expect(banner()).toHaveTextContent('2 certificates can be managed by the AD CS authority.'),
+    );
+    await fireEvent.click(screen.getByRole('button', { name: 'Review' }));
+    expect(screen.getByTestId('adcs-adoption-panel')).toBeInTheDocument();
+    expect(screen.getAllByTestId('adcs-adoption-candidate')).toHaveLength(2);
+  });
+
+  it('announces them to a SuperAdmin', async () => {
+    as('super_admin');
+    served();
+    offered(twoCandidates);
+    await rendered([manualCert]);
+    await waitFor(() => expect(banner()).toBeInTheDocument());
+  });
+
+  it('hides it from a Viewer, without reading the candidates', async () => {
+    as('viewer');
+    served();
+    const list = offered(twoCandidates);
+    await rendered([manualCert]);
+    expect(banner()).not.toBeInTheDocument();
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it('hides it on a follower in break-glass, without reading the candidates', async () => {
+    clusterStatus.set({
+      role: 'follower',
+      break_glass_until: new Date(Date.now() + 3_600_000).toISOString(),
+    } as ClusterStatus);
+    served();
+    const list = offered(twoCandidates);
+    await rendered([manualCert]);
+    expect(banner()).not.toBeInTheDocument();
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it('hides it on a follower, by the API flag', async () => {
+    served({ authority: testAuthority(), managed_on_control_plane: true });
+    offered(twoCandidates);
+    await rendered([manualCert]);
+    expect(banner()).not.toBeInTheDocument();
+  });
+
+  it('says how to provide the issuing CA when none is known', async () => {
+    served();
+    offered({ reason: 'no_issuing_ca', candidates: [] });
+    await rendered([manualCert]);
+    await waitFor(() => expect(banner()).toHaveTextContent(ADCS_NO_ISSUING_CA_HINT));
+    expect(screen.queryByRole('button', { name: 'Review' })).not.toBeInTheDocument();
+  });
+
+  it('says nothing when no authority is configured', async () => {
+    served({ authority: null, managed_on_control_plane: false });
+    offered({ reason: 'not_configured', candidates: [] });
+    await rendered([manualCert]);
+    expect(banner()).not.toBeInTheDocument();
+  });
+
+  it('re-reads the candidates after an adoption', async () => {
+    served();
+    const list = offered(twoCandidates);
+    vi.spyOn(api, 'adoptAdcsCertificate').mockResolvedValue({ data: { ...manualCert, source: 'adcs' } });
+    await rendered([manualCert]);
+    await waitFor(() => expect(banner()).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Review' }));
+    list.mockResolvedValue({ data: { reason: null, candidates: [twoCandidates.candidates[1]] } });
+    await fireEvent.click(screen.getByLabelText('Select legacy.corp.example.org'));
+    await fireEvent.click(screen.getByRole('button', { name: 'Adopt selected (1)' }));
+    await waitFor(() => expect(screen.getAllByTestId('adcs-adoption-candidate')).toHaveLength(1));
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId('adcs-adoption-results')).toHaveTextContent('legacy.corp.example.org: Adopted');
+  });
+});
+
+const revertButton = () => screen.queryByRole('button', { name: 'Revert to manual' });
+
+describe('Certificates AD CS "Revert to manual"', () => {
+  it('is offered on AD CS certificates only', async () => {
+    served();
+    await rendered([adcsCert, manualCert]);
+    await waitFor(() => expect(screen.getAllByRole('button', { name: 'Revert to manual' })).toHaveLength(1));
+  });
+
+  it('stays offered while the authority is in the failed state', async () => {
+    served(testAuthorityState({ authority: testAuthority({ failed_since: '2026-10-20T08:00:00Z' }) }));
+    await rendered();
+    await waitFor(() => expect(revertButton()).toBeInTheDocument());
+  });
+
+  it('is hidden from a Viewer', async () => {
+    as('viewer');
+    served();
+    await rendered();
+    expect(revertButton()).not.toBeInTheDocument();
+  });
+
+  it('is hidden on a follower', async () => {
+    served({ authority: testAuthority(), managed_on_control_plane: true });
+    await rendered();
+    expect(revertButton()).not.toBeInTheDocument();
+  });
+
+  it('explains the consequence and sends nothing on cancel', async () => {
+    served();
+    const revert = vi.spyOn(api, 'revertAdcsCertificate');
+    await rendered();
+    await waitFor(() => expect(revertButton()).toBeInTheDocument());
+    await fireEvent.click(revertButton() as HTMLElement);
+    expect(screen.getByText(/stops renewing it/)).toHaveTextContent('keeps the current certificate in service');
+    await fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(revert).not.toHaveBeenCalled();
+  });
+
+  it('reverts on confirmation and reloads the list', async () => {
+    const reverted = { ...adcsCert, source: 'manual' as const, adcs_authority_id: null };
+    served();
+    const revert = vi.spyOn(api, 'revertAdcsCertificate').mockResolvedValue({ data: reverted });
+    await rendered();
+    await waitFor(() => expect(revertButton()).toBeInTheDocument());
+    const list = vi.mocked(api.listCertificates);
+    list.mockResolvedValue({ data: { certificates: [reverted] } });
+    await fireEvent.click(revertButton() as HTMLElement);
+    const dialog = screen.getByText(/stops renewing it/).closest('[role="document"]') as HTMLElement;
+    await fireEvent.click(within(dialog).getByRole('button', { name: 'Revert to manual' }));
+    expect(revert).toHaveBeenCalledWith(adcsCert.id);
+    await waitFor(() => expect(revertButton()).not.toBeInTheDocument());
+    expect(list).toHaveBeenCalledTimes(2);
   });
 });

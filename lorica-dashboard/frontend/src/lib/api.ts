@@ -1382,6 +1382,38 @@ export interface AcmeRenewResult {
  */
 export type CertificateRenewResult = AcmeRenewResult | CertificateResponse | AdcsIssuePending;
 
+/**
+ * Why `GET /api/v1/adcs/adoption-candidates` lists nothing without
+ * looking (Story 13.5): no authority, or no issuing CA certificate to
+ * verify signatures against.
+ */
+export type AdcsAdoptionUnavailableReason = 'not_configured' | 'no_issuing_ca';
+
+/** A manual certificate the authority's issuing CA signed (Story 13.5). */
+export interface AdcsAdoptionCandidate {
+  certificate_id: string;
+  domain: string;
+  san_domains: string[];
+  subject: string;
+  not_after: string;
+  /** The template read from the certificate: an OID, or a version 1 template name. */
+  issued_template: string | null;
+  /** The template seen on certificates Lorica issued; null when it has issued none. */
+  observed_template: string | null;
+  template_mismatch: boolean;
+}
+
+/** Body of `GET /api/v1/adcs/adoption-candidates`. */
+export interface AdcsAdoptionCandidates {
+  reason: AdcsAdoptionUnavailableReason | null;
+  candidates: AdcsAdoptionCandidate[];
+}
+
+/** Body of `POST /api/v1/certificates/{id}/adcs/adopt`; absent, the authority's default applies. */
+export interface AdcsAdoptRequest {
+  auto_renew?: boolean;
+}
+
 export interface UserPreferenceResponse {
   id: string;
   preference_key: string;
@@ -1874,6 +1906,21 @@ export const api = {
    */
   issueAdcsCertificate: (body: AdcsIssueRequest) =>
     request<AdcsIssueResult>('POST', '/certificates/adcs', body),
+
+  // AD CS adoption (Story 13.5). Detection is computed on every read.
+  listAdcsAdoptionCandidates: () =>
+    request<AdcsAdoptionCandidates>('GET', '/adcs/adoption-candidates'),
+
+  /**
+   * Hand a manual certificate to the AD CS authority, Operator and
+   * above. It issues nothing: renewal takes over at the next window.
+   */
+  adoptAdcsCertificate: (id: string, body: AdcsAdoptRequest) =>
+    request<CertificateResponse>('POST', `/certificates/${id}/adcs/adopt`, body),
+
+  /** Make an AD CS certificate manual again; the current certificate stays in service. */
+  revertAdcsCertificate: (id: string) =>
+    request<CertificateResponse>('POST', `/certificates/${id}/adcs/revert`),
 
   // Cert export ACLs (v1.4.1)
   listCertExportAcls: () =>
