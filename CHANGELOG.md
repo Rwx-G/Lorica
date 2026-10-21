@@ -11,13 +11,20 @@ Author: Rwx-G
 
 ### Added
 
+- **Certificate enrollment from an Active Directory Certificate Services authority** (`lorica-adcs`, Epic 13). A SuperAdmin declares the authority once under Settings > AD CS authority (its Certificate Enrollment Web Service endpoint, Kerberos realm, optional KDC list, service account, default template and key type, subject defaults, allowed DNS suffixes), and an Operator checks it with a connection test that requests nothing. Operators then issue a certificate from the certificate page or, for a route's hostnames that no certificate covers, from the route form, after a confirmation showing the full request; Lorica generates the key and the CSR, and only the CSR leaves the node. AD CS certificates bound to a route are renewed in place by the existing loop in the same 30-day window as ACME ones, with a new key and the template they were issued with, or at once with "Renew now". Certificates the authority issued before Lorica could are detected by signature against its issuing CA certificate and offered for adoption, which issues nothing; any AD CS certificate can be reverted to manual. Two alert types, `adcs_authority_failed` and `cert_issuance_failed`; channels saved with an explicit alert list are subscribed to both on upgrade. Templates that need a certificate manager's approval are not supported. Control plane only: upgrade followers first. See `docs/adcs.md`, which also lists the authority-side prerequisites Lorica cannot check.
+
 ### Changed
+
+- **Every install now requires the GSS-API runtime library**, `libgssapi-krb5-2` on Debian and Ubuntu and `krb5-libs` on Fedora and RHEL, declared by the packages and installed with them, whether or not an AD CS authority is ever configured. No Kerberos client tools are needed, and the host's `/etc/krb5.conf` is not read. The Docker images install it.
+- **Configuration import returns warnings.** `POST /api/v1/config/import` answers a `warnings` list with what the import changed on its own initiative, such as an AD CS certificate imported as manual because its authority is not on the target node (the authority is never exported).
 
 ### Fixed
 
 ### Removed
 
 ### Security
+
+- **The AD CS service account credential and the authority are protected by design.** The password is stored encrypted under the master key, covered by key rotation, write-only, never logged or audited, and never replicated: the authority, its password and its state are absent from the canonical blob, every follower payload and the configuration export, and followers run no AD CS operation. Changing the endpoint, realm, KDC list or principal clears the stored password, so the credential is never sent where it was not entered for, and only a SuperAdmin may change them or the allowed DNS suffixes; issuing is Operator. Every name is checked against the suffixes on whole labels before the authority is contacted, wildcards and the `san:` attribute are refused, and automation tokens and MCP can neither issue nor renew. Authentication is Kerberos only, with a mandatory TLS channel binding and verified mutual authentication; NTLM, HTTP Basic and the `/certsrv` pages are not supported. Lorica generates its own AES-only `krb5.conf` from validated fields. One rejected pre-authentication puts the authority in a persisted failed state that stops every AD CS operation until a new password is saved, so a stale password cannot lock the account. Never give the `lorica` binary file capabilities or setuid: MIT Kerberos then ignores the generated configuration (`docs/adcs.md`).
 
 - **`rustls-webpki` 0.103.16, `webpki-roots` 1.0.10 and `webpki-root-certs` 1.0.10** (RUSTSEC-2026-0382, RUSTSEC-2026-0381, RUSTSEC-2026-0383): certificate verification on Lorica's outbound TLS clients (ACME, DNS providers, notifications, GeoIP downloads, OTLP export) could accept intermediates that are now distrusted.
 - **`ammonia` 4.1.8** (RUSTSEC-2026-0373): a mixed-case CSS `url()` could pass the sanitizer. Lorica's error-page sanitizer does not allow `style` attributes or elements, so it was not reachable.

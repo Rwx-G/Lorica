@@ -132,6 +132,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **TOML config export/import** - with diff preview before applying changes
 - **Nginx config import** - paste an `nginx.conf` to auto-create routes, backends, certificates, and path rules with cert import support
 - **ACME / Let's Encrypt** - automatic TLS provisioning via HTTP-01 and DNS-01 challenges (Cloudflare, Route53, OVH providers), multi-domain SAN and wildcard support, smart auto-renewal, OCSP stapling
+- **AD CS enrollment** (v1.10.0) - issue, renew and adopt internal certificates from an Active Directory Certificate Services authority through its enrollment web service, with Kerberos bound to the TLS channel and no Kerberos setup on the host; one confirmed click from the route form or the certificate page, names bounded by a SuperAdmin-owned DNS suffix allowlist, renewal in place with a new key, control plane only. See [docs/adcs.md](docs/adcs.md)
 - **DNS providers** - global DNS credentials configured once in Settings and referenced by ID for certificate provisioning (Cloudflare, Route53, OVH)
 - **Notification channels** - stdout, SMTP email, HTTP webhook, Slack with per-channel rate limiting
 - **Ban list management** - view and unban auto-banned IPs from the dashboard
@@ -878,6 +879,7 @@ trail, failure modes and how to replace a control plane.
 
 - [docs/installation.md](docs/installation.md) - packages, first boot, the management plane's TLS certificate
 - [docs/cluster.md](docs/cluster.md) - multi-node operation, end to end
+- [docs/adcs.md](docs/adcs.md) - AD CS certificate enrollment: authority-side prerequisites, network and time, issuance, renewal, adoption, the failed state, troubleshooting by failing step
 - [docs/capture.md](docs/capture.md) - traffic capture: rules, budgets, the record, redaction, sinks
 - [docs/automation.md](docs/automation.md) - the CI automation API: the listener, tokens and scopes, the environment resource, GitLab pipelines and OIDC
 - [docs/mcp.md](docs/mcp.md) - the management MCP server: the three tiers, minting a token, configuring a client over stdio or Streamable HTTP, what each tier cannot see or change, the audit

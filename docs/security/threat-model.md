@@ -1,12 +1,12 @@
 # Lorica Threat Model
 
 **Author:** Romain G.
-**Version:** 1.2
-**Date:** 2026-09-30
+**Version:** 1.3
+**Date:** 2026-10-21
 
 ## Overview
 
-Lorica is a reverse proxy that sits between the Internet and backend services. It terminates TLS, routes HTTP traffic, provides WAF protection, and exposes a management dashboard on localhost. Since v1.7.0 a node can additionally participate in a multi-node cluster over a dedicated, mutually authenticated cluster plane. Since v1.8.0 it can additionally serve a CI automation API on a listener of its own. Since v1.9.0 a management MCP server lets a language model drive that automation API, in three tiers. This document identifies threat categories and mitigations.
+Lorica is a reverse proxy that sits between the Internet and backend services. It terminates TLS, routes HTTP traffic, provides WAF protection, and exposes a management dashboard on localhost. Since v1.7.0 a node can additionally participate in a multi-node cluster over a dedicated, mutually authenticated cluster plane. Since v1.8.0 it can additionally serve a CI automation API on a listener of its own. Since v1.9.0 a management MCP server lets a language model drive that automation API, in three tiers. Since v1.10.0 the control plane can request certificates from an Active Directory Certificate Services authority, with a credential it holds for it. This document identifies threat categories and mitigations.
 
 ## Trust Boundaries
 
@@ -28,6 +28,9 @@ CI runners  -->  [ Automation plane (--automation-listen, opt-in) ]
 MCP client (a language model)      |
    stdio: launches lorica-mcp -----+  (an automation client, one tier)
    Streamable HTTP: POST /automation/v1/mcp on the same listener
+
+Control plane  -->  [ AD CS authority: CES over HTTPS, KDCs on 88 ]
+   (outbound only)         Kerberos SPNEGO bound to the TLS channel
 ```
 
 1. **Internet to Proxy** - Untrusted. All inbound traffic is potentially malicious.
@@ -39,6 +42,7 @@ MCP client (a language model)      |
 7. **CI runner to Automation plane** - Remote, and authenticated per request by a scoped bearer token or a GitLab ID token; no session, no cookie, no CSRF pairing. Disabled by default; only exists when the operator passes `--automation-listen`, and refuses to open without a source allowlist or on a node holding a follower identity. What a credential may reach is bounded by its own grant (scopes, hostname patterns, backend CIDRs), not by a role.
 8. **Capture records** - A capture record holds request and response bodies taken after TLS termination, so it carries whatever the traffic carried. It crosses whatever boundary its sink does: the process log, a syslog or OTLP collector, or a directory on the node.
 9. **MCP client to Automation plane** - Not a new listener: the stdio server is a subprocess the client launches, which reaches the automation listener as any automation client does, and the Streamable HTTP binding is one path on that listener. What is new is the caller. It is a language model, and the text it reads through the read tier was largely written by the people attacking the node, so everything that caller does is treated as possibly steered by that text. It also crosses a second boundary: whatever the model reads leaves the node for wherever the model runs.
+10. **Control plane to the AD CS authority** - Outbound only, from the control plane, and opt-in: no authority configured, no traffic. Lorica authenticates to the authority's enrollment service (CES) as a service account, with Kerberos SPNEGO bound to the TLS channel, and verifies the server's mutual-authentication token. The authority is trusted to sign what it is asked within its template; what crosses to it is a CSR, never a private key.
 
 ## Threat Categories
 
@@ -230,6 +234,31 @@ An OIDC issuer entry may carry the config tier's write scopes and may not carry 
 
 The concern was that access-log rows carry request paths with their query strings, and a query string routinely carries somebody else's credential (a password-reset token, an OAuth `code`, a signed-URL signature, an API key). Checked on the code while deciding: the proxy records `uri.path()`, so an access-log row carries no query string at all, and never has. The decision stands anyway as a guard on the automation plane's log read path only: every query-parameter value in a row's `path` is replaced by `[redacted]`, names kept, and a fragment is replaced whole, without decoding, so an encoded `&` or `=` stays inside the value it belongs to and malformed encoding cannot defeat it. The dashboard and the log sinks are unchanged. A WAF event carries no URI and no query string, only the span a signature matched, which is the attack the event exists to show and is left as recorded; a span can include part of a query or header value a user sent, and pointing a hosted model at the read tier remains the operator's decision that WAF spans and log rows leave the node.
 
+### T10: The AD CS Authority (v1.10.0+)
+
+AD CS enrollment is opt-in: none of it runs until a SuperAdmin declares an authority, and it runs on the control plane only. See `docs/adcs.md` for the operator model. D5, D11, D13 and D15 below are the decisions of the Epic 13 PRD (`docs/prd/epic-13-v1.10.0.md`).
+
+**The asset: the authority.** An AD CS authority is a domain-wide trust anchor: a certificate it issues is trusted by every machine in the forest, and its common misconfigurations are documented attack paths (ESC1 to ESC8). Lorica becomes one of its clients, so the asset at stake is the authority's integrity, not Lorica's own data: Lorica must not become a way to mint arbitrary names from it, nor the weak link that makes it relayable.
+
+**The secret: the service account credential.** The password of the account Lorica authenticates as, entered by a SuperAdmin. Whoever holds it can request certificates within the rights the template gives the account, and a derivative of it (pre-authentication sent to a KDC of an attacker's choosing, an unsalted digest) can be attacked offline. The Kerberos tickets acquired from it are a second, short-lived secret.
+
+| Threat | Mitigation | Status |
+|--------|-----------|--------|
+| Minting names outside the operator's estate through the authority | D5: an allowlist of DNS suffixes on the authority, matched on whole DNS labels and case-insensitive (`evilcorp.example.org` does not match `corp.example.org`), checked by the API on every name before the authority is contacted; wildcards refused; at most 100 names per request. The `CN` is the first name, and the fixed part of the subject comes from the authority. Lorica never sends the `san:` request attribute, so it never needs `EDITF_ATTRIBUTESUBJECTALTNAME2` (ESC6) | Implemented |
+| An Operator widening the allowlist, or aiming the credential at a server of its choosing | D11: authority writes (suffixes, endpoint, realm, KDC list, principal, CA certificates, subject defaults) are SuperAdmin; the connection test, issuance, renewal, adoption and reversion are Operator. Any change to the endpoint, realm, KDC list or principal clears the stored password, and the same request must supply a new one, so the stored credential is never sent to a destination it was not entered for | Implemented |
+| The allowlist read as a host-level control | D11's stated limit: the allowlist bounds callers of the API, not someone who can read the data directory, where the master key sits beside the database and decrypts the password. See Residual Risks | Accepted, documented |
+| The password leaking from the store, the API, the logs or the audit trail | Stored encrypted in its own column under the master key and covered by `lorica rotate-key`; write-only (a read reports `password_set`); redacted in debug output and never logged; an update's audit row names the fields changed, never their values. In memory the client holds it in a buffer wiped with volatile writes when dropped; copies made inside the GSS-API library are outside that claim | Implemented |
+| The password or a derivative reaching followers | D13: the authority, its failed state and its issuing CA certificate are absent from the replicated configuration, from every follower-facing payload and from the configuration export, which a test asserts; replicating them would hand every follower an unsalted, offline-crackable digest of a password a person chose. Followers run no AD CS operation and their API refuses every one. Issued certificates replicate like any other | Implemented |
+| A ticket outliving its operation | Acquired in-process into a fresh, per-call in-memory credential cache for one operation and discarded after it: no child process, no `kinit`, no ticket on disk | Implemented |
+| Relaying or reusing Lorica's authentication | Kerberos only: no NTLM, no HTTP Basic, no password-mode CES. Every token carries an RFC 5929 `tls-server-end-point` channel binding, with no setting or build feature that removes it, and the server's mutual-authentication token is verified: an exchange that does not complete it fails. Extended Protection set to Required on CES, which protects the authority from every other client too, is an authority-side prerequisite Lorica cannot check | Implemented, authority-side prerequisite documented |
+| A host Kerberos configuration weakening the exchange, or a realm or KDC value injecting one | Lorica generates its own `krb5.conf` (AES encryption types only, no reverse-DNS canonicalisation of the service name, an explicit KDC list or SRV discovery) from typed, validated fields that refuse every profile delimiter and control character; the host's `/etc/krb5.conf` is not read. `KRB5_CONFIG` is set before any thread starts. MIT ignores it in a setuid or file-capability process, so `docs/adcs.md` forbids both, and the shipped unit grants its capability as ambient | Implemented, documented |
+| A stale password locking the service account | D15: one rejected pre-authentication (KDC codes 24, 18, 23, or 31) puts the authority in a failed state persisted on its row, which refuses every later AD CS operation, the renewal loop included, until a SuperAdmin saves a password; one `adcs_authority_failed` alert per entry. Every AD CS operation is single-flight per process and refused rather than queued while another runs, so a silent KDC cannot pile up blocked attempts; the connection test and issuance are rate-limited | Implemented |
+| Issuance without a human decision | No issuance path on the automation plane or MCP, and renewal refused to every token (`adcs_renewal_not_on_automation_plane`); the dashboard confirms the full request before every issuance; every attempt is audited with its names and outcome | Implemented |
+| A private key exposed in transit | The key is generated in Lorica, signs the CSR and is stored encrypted with the certificate; only the CSR crosses the wire. A pending, denied or failed request discards it. Every issuance and renewal gets a new key | Implemented |
+| Adopting a certificate the authority did not sign | Candidates are verified by signature and authority key identifier against the authority's issuing CA certificate, never by issuer name and never against a root | Implemented |
+| Storing a certificate with names Lorica did not ask for | The issued leaf must cover every requested name and match the generated key, or nothing is stored and `cert_issuance_failed` is raised | Implemented |
+| A certificate valid at the authority that Lorica no longer holds | Lorica cannot revoke, and CES offers no revocation. A certificate issued and then not kept (names not covered, a pending request approved after its key was discarded, a certificate deleted in Lorica) stays valid until the authority's administrators revoke it; `docs/adcs.md` says so at each of those points | Accepted, documented |
+
 ## Residual Risks
 
 1. **Management API on localhost** - If an attacker gains local shell access, they can access the API. Mitigation: this is inherent to the deployment model (single-binary, self-hosted). Note that "localhost only" describes the management API specifically; a clustered control plane additionally exposes the cluster plane, whose own boundary is described in T6.
@@ -240,6 +269,7 @@ The concern was that access-log rows carry request paths with their query string
 6. **Tier wiring is the operator's** - Three tier tokens given to one client, a config token given to a client meant to read, or an admin tier left configured, all defeat the isolation without the node being able to tell. Mitigation: the hardening guide's MCP tier guidance and the audit rows.
 7. **User-sent text reaches a hosted model** - Access-log rows carry no query string, and the automation plane withholds any query value a row's path would carry (T9, decided 2026-09-30). WAF events carry the span a signature matched, verbatim, which can include part of a value a user sent. Mitigation: the operator's choice of where the model runs, stated in `docs/mcp.md`.
 8. **A browser that accepts a certificate warning on the management port** - The CLI pins the certificate the management listener served and sends nothing to anything else; a browser has no such pin, and a local user who holds the unprivileged port while Lorica is down presents a self-signed certificate that raises the same warning as the node's own. Mitigation: compare the fingerprint of `<data-dir>/management/served-cert.pem` before accepting (hardening guide), reach the dashboard through the operator's own TLS front where one exists.
+9. **The AD CS allowlist bounds API callers, not the host** - Someone who can read the control plane's data directory holds the master key beside the database, so they can decrypt the service account's password and request any certificate the template allows that account, under any name, without going through Lorica's allowlist. In that case the template's own restrictions (Server Authentication EKU only, enrollment limited to the service account) are the authority's bound. Mitigation: filesystem permissions, the systemd sandbox, and the authority-side prerequisites in `docs/adcs.md`.
 
 ## Review Schedule
 
