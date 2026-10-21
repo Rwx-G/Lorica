@@ -981,6 +981,16 @@ pub fn build_router(
                 RL_WINDOW_S,
             )),
         )
+        // Issuance from the AD CS authority (Story 13.3). Operator, the
+        // certificate default; the bucket is its own so an issuance
+        // burst does not starve uploads, and its size is ACME's because
+        // each call is an issuance logged at the authority.
+        .route(
+            "/api/v1/certificates/adcs",
+            post(crate::adcs::issue_certificate)
+                .layer(bl(BODY_CAP_DEFAULT))
+                .layer(rl("adcs_issue", RL_ACME_PROVISION, RL_WINDOW_S)),
+        )
         .route(
             "/api/v1/certificates/{id}",
             get(crate::certificates::get_certificate),

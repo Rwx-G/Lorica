@@ -14,7 +14,8 @@
 
 //! The AD CS authority on the management API (Story 13.2, Epic 13 PRD
 //! D3, D11, D13, D15): read it, write it, delete it, and test that
-//! Lorica can authenticate to it.
+//! Lorica can authenticate to it. Issuing a certificate from it (Story
+//! 13.3) lives in the `issue` submodule.
 //!
 //! # Who may do what
 //!
@@ -62,8 +63,8 @@ use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
 use lorica_adcs::{
-    AdcsError, CesParams, CesTimeouts, KdcAddress, KdcTiming, Krb5Config, Realm, Secret,
-    TicketFailure,
+    AdcsError, CesParams, CesTimeouts, EnrollOutcome, KdcAddress, KdcTiming, Krb5Config, Realm,
+    Secret, TicketFailure,
 };
 use lorica_config::models::{AdcsAuthority, AdcsKeyType, AdcsSubjectDefaults, AllowedSuffix};
 use lorica_config::ConfigStore;
@@ -75,6 +76,10 @@ use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
 use crate::server::AppState;
+
+mod issue;
+
+pub use issue::{issue_certificate, AdcsIssueRequest, PendingIssuance, MAX_SANS};
 
 /// The target type of every audit row this module writes.
 const AUDIT_TARGET: &str = "adcs_authority";
@@ -111,13 +116,22 @@ const STILL_RUNNING_MESSAGE: &str = "the AD CS operation is still finishing: a K
 
 /// The calls into the authority the API makes, behind a seam so tests
 /// drive the handlers without a KDC. Production uses
-/// [`lorica_adcs::test_connection`].
+/// [`lorica_adcs::test_connection`] and [`lorica_adcs::enroll`].
 #[async_trait::async_trait]
 pub(crate) trait AdcsClient: Send + Sync {
     /// Authenticate to the CES described by `params` without
     /// requesting anything.
     async fn test_connection(&self, params: &CesParams, password: &Secret)
         -> Result<(), AdcsError>;
+
+    /// Request a certificate for the DER PKCS#10 `csr_der`: an issuance
+    /// at the authority.
+    async fn enroll(
+        &self,
+        params: &CesParams,
+        password: &Secret,
+        csr_der: &[u8],
+    ) -> Result<EnrollOutcome, AdcsError>;
 }
 
 /// The real client: the `lorica-adcs` crate.
@@ -131,6 +145,15 @@ impl AdcsClient for LibAdcsClient {
         password: &Secret,
     ) -> Result<(), AdcsError> {
         lorica_adcs::test_connection(params, password).await
+    }
+
+    async fn enroll(
+        &self,
+        params: &CesParams,
+        password: &Secret,
+        csr_der: &[u8],
+    ) -> Result<EnrollOutcome, AdcsError> {
+        lorica_adcs::enroll(params, password, csr_der).await
     }
 }
 
@@ -185,9 +208,9 @@ pub(crate) enum NotRun {
     Lost(String),
 }
 
-/// The error of an AD CS handler: an [`ApiError`], or the 504 of an
-/// operation that is still finishing, which `ApiError` has no variant
-/// for.
+/// The error of an AD CS handler: an [`ApiError`], the 504 of an
+/// operation that is still finishing, or a refusal with a code of its
+/// own, neither of which `ApiError` has a variant for.
 #[derive(Debug)]
 pub enum AdcsHandlerError {
     /// Any other refusal or failure.
@@ -195,6 +218,19 @@ pub enum AdcsHandlerError {
     /// 504: the operation outlived the handler's deadline and keeps the
     /// single-flight guard until it ends.
     StillRunning,
+    /// A refusal or failure the issuance endpoint names with its own
+    /// code (`adcs_san_refused`, `adcs_error`, ...), so a client can
+    /// tell the cases apart without reading the message.
+    Coded {
+        /// The HTTP status.
+        status: StatusCode,
+        /// The envelope's `code`.
+        code: &'static str,
+        /// The envelope's `message`.
+        message: String,
+        /// The failing step's closed name, for a failure that has one.
+        step: Option<String>,
+    },
 }
 
 impl From<ApiError> for AdcsHandlerError {
@@ -231,6 +267,18 @@ impl axum::response::IntoResponse for AdcsHandlerError {
                 })),
             )
                 .into_response(),
+            AdcsHandlerError::Coded {
+                status,
+                code,
+                message,
+                step,
+            } => {
+                let mut error = serde_json::json!({ "code": code, "message": message });
+                if let Some(step) = step {
+                    error["step"] = serde_json::Value::String(step);
+                }
+                (status, Json(serde_json::json!({ "error": error }))).into_response()
+            }
         }
     }
 }

@@ -39,9 +39,9 @@ use crate::tests::{
     test_state,
 };
 
-const AUTHORITY: &str = "/api/v1/adcs/authority";
-const TEST: &str = "/api/v1/adcs/authority/test";
-const PASSWORD: &str = "example-only-password-1";
+pub(in crate::adcs) const AUTHORITY: &str = "/api/v1/adcs/authority";
+pub(in crate::adcs) const TEST: &str = "/api/v1/adcs/authority/test";
+pub(in crate::adcs) const PASSWORD: &str = "example-only-password-1";
 const NEW_PASSWORD: &str = "example-only-password-2";
 
 /// A stand-in for the authority: answers every connection test with
@@ -92,6 +92,15 @@ impl AdcsClient for StubClient {
         }
         (self.answer)()
     }
+
+    async fn enroll(
+        &self,
+        _params: &CesParams,
+        _password: &Secret,
+        _csr_der: &[u8],
+    ) -> Result<lorica_adcs::EnrollOutcome, AdcsError> {
+        panic!("the connection-test stub is never asked to enroll");
+    }
 }
 
 fn rejected_credential() -> AdcsError {
@@ -114,11 +123,11 @@ fn unreachable_kdc() -> AdcsError {
     }
 }
 
-struct Fixture {
-    state: AppState,
-    session_store: SessionStore,
-    rate_limiter: RateLimiter,
-    admin: String,
+pub(in crate::adcs) struct Fixture {
+    pub(in crate::adcs) state: AppState,
+    pub(in crate::adcs) session_store: SessionStore,
+    pub(in crate::adcs) rate_limiter: RateLimiter,
+    pub(in crate::adcs) admin: String,
     // Held for the data directory's lifetime.
     _data_dir: tempfile::TempDir,
 }
@@ -127,7 +136,10 @@ struct Fixture {
 /// the shared test state's does not, and the store refuses to keep the
 /// password in clear), with an audit log and a data directory of its
 /// own.
-async fn fixture(client: Arc<StubClient>, alerts: Option<lorica_notify::AlertSender>) -> Fixture {
+pub(in crate::adcs) async fn fixture(
+    client: Arc<impl AdcsClient + 'static>,
+    alerts: Option<lorica_notify::AlertSender>,
+) -> Fixture {
     let (mut state, _, rate_limiter) = test_state().await;
     let key: EncryptionKey = EncryptionKey::generate().expect("test setup: key");
     let store = Arc::new(Mutex::new(
@@ -152,7 +164,7 @@ async fn fixture(client: Arc<StubClient>, alerts: Option<lorica_notify::AlertSen
 }
 
 impl Fixture {
-    async fn send(
+    pub(in crate::adcs) async fn send(
         &self,
         method: &str,
         uri: &str,
@@ -186,7 +198,7 @@ impl Fixture {
         .await
     }
 
-    async fn user(&self, name: &str, role: Role) -> String {
+    pub(in crate::adcs) async fn user(&self, name: &str, role: Role) -> String {
         create_user_and_login(
             &self.state,
             &self.session_store,
@@ -197,7 +209,7 @@ impl Fixture {
         .await
     }
 
-    async fn create_authority(&self) -> serde_json::Value {
+    pub(in crate::adcs) async fn create_authority(&self) -> serde_json::Value {
         let resp = self
             .send("PUT", AUTHORITY, &self.admin, Some(body(Some(PASSWORD))))
             .await;
@@ -205,7 +217,7 @@ impl Fixture {
         body_json(resp).await
     }
 
-    async fn stored_password(&self) -> Option<String> {
+    pub(in crate::adcs) async fn stored_password(&self) -> Option<String> {
         self.state
             .store
             .lock()
@@ -214,7 +226,7 @@ impl Fixture {
             .expect("read the password")
     }
 
-    async fn audit_actions(&self) -> Vec<String> {
+    pub(in crate::adcs) async fn audit_actions(&self) -> Vec<String> {
         let log_store = self.state.log_store.clone().expect("log store");
         log_store
             .flush_audit()
@@ -242,13 +254,13 @@ impl Fixture {
 
     /// Handlers answer 504 after `deadline` instead of the production
     /// one.
-    fn with_handler_deadline(mut self, deadline: Duration) -> Fixture {
+    pub(in crate::adcs) fn with_handler_deadline(mut self, deadline: Duration) -> Fixture {
         self.state.adcs = self.state.adcs.clone().with_handler_deadline(deadline);
         self
     }
 
     /// Waits until no AD CS operation holds the guard.
-    async fn wait_until_idle(&self) {
+    pub(in crate::adcs) async fn wait_until_idle(&self) {
         tokio::time::timeout(Duration::from_secs(10), async {
             while self.state.adcs.guard().try_acquire().is_none() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -259,7 +271,7 @@ impl Fixture {
     }
 }
 
-fn body(password: Option<&str>) -> serde_json::Value {
+pub(in crate::adcs) fn body(password: Option<&str>) -> serde_json::Value {
     let mut body = serde_json::json!({
         "endpoint": "https://ces.corp.example.org/CA_CES_Kerberos/service.svc/CES",
         "realm": "CORP.EXAMPLE.ORG",

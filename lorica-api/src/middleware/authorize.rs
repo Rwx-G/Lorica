@@ -355,6 +355,7 @@ mod tests {
             (Method::PUT, "/api/v1/adcs/authority"),
             (Method::DELETE, "/api/v1/adcs/authority"),
             (Method::POST, "/api/v1/adcs/authority/test"),
+            (Method::POST, "/api/v1/certificates/adcs"),
         ] {
             assert!(!follower_local_request(&method, path), "{method} {path}");
         }
@@ -373,6 +374,9 @@ mod tests {
             (Method::POST, "/api/v1/adcs/authority", Role::SuperAdmin),
             (Method::POST, "/api/v1/adcs/authority/test", Role::Operator),
             (Method::PUT, "/api/v1/adcs/authority/test", Role::SuperAdmin),
+            // Issuance is the certificate default (D11): the role that
+            // issues is not the one that edits the allowlist bounding it.
+            (Method::POST, "/api/v1/certificates/adcs", Role::Operator),
         ] {
             assert_eq!(required_role(&method, path), expected, "{method} {path}");
         }
