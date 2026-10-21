@@ -55,6 +55,7 @@
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::Extension;
 use axum::http::StatusCode;
@@ -88,6 +89,26 @@ pub const KDC_REQUEST_TIMEOUT_SECS: u32 = 30;
 /// The message of every refusal by [`AdcsGuard`].
 const BUSY_MESSAGE: &str = "an AD CS operation is already running; try again once it has finished";
 
+/// What a handler waits for its operation beyond the client's own
+/// operation timeout, for the audit and breaker writes that follow it.
+/// An operation that ends on that timeout is then reported by the
+/// handler as it ended; only one whose GSS-API step outlived it (MIT's
+/// own schedule, see [`CesTimeouts::operation`]) is answered 504.
+const HANDLER_GRACE: Duration = Duration::from_secs(15);
+
+/// How long a handler waits for its AD CS operation before answering
+/// 504: [`CesTimeouts::default`]'s operation timeout, the one every
+/// operation runs with, plus [`HANDLER_GRACE`].
+fn handler_deadline() -> Duration {
+    CesTimeouts::default().operation + HANDLER_GRACE
+}
+
+/// The message of the 504 a handler answers when its operation outlives
+/// [`handler_deadline`].
+const STILL_RUNNING_MESSAGE: &str = "the AD CS operation is still finishing: a Kerberos exchange \
+     outlived the operation timeout. Its outcome is recorded in the audit log when it ends, and \
+     every other AD CS operation is refused until then";
+
 /// The calls into the authority the API makes, behind a seam so tests
 /// drive the handlers without a KDC. Production uses
 /// [`lorica_adcs::test_connection`].
@@ -118,10 +139,16 @@ impl AdcsClient for LibAdcsClient {
 /// One per process, shared by every clone of [`AppState`]. A second
 /// operation is refused at once instead of waiting its turn: the
 /// GSS-API calls behind an operation are blocking FFI on the blocking
-/// pool, and an operation that times out leaves its thread running
+/// pool, and an operation blocked on a silent KDC holds its thread
 /// until MIT krb5 gives up, so a queue of callers would turn one silent
 /// KDC into a pile of blocked threads, each about to spend another
 /// pre-authentication attempt against the service account.
+///
+/// The permit lives in the task [`run_exclusive`] spawns, not in the
+/// handler, and `lorica-adcs` resolves an operation only once its
+/// blocking GSS-API calls have returned: so the guard is held until no
+/// thread of the operation is left, even when the handler has already
+/// answered 504 or its client has gone.
 ///
 /// Authority writes take it too, so a password saved while a test is
 /// in flight cannot be followed by that test's verdict on the old one.
@@ -146,23 +173,77 @@ impl AdcsGuard {
     }
 }
 
-/// [`run_exclusive`] found another AD CS operation running.
+/// Why [`run_exclusive`] returned no output.
 #[derive(Debug)]
-pub(crate) struct AdcsBusy;
+pub(crate) enum NotRun {
+    /// Another AD CS operation is running; this one never started.
+    Busy,
+    /// The operation started and outlived the handler's deadline. It
+    /// keeps running, and the guard, until it ends.
+    StillRunning,
+    /// The operation's task panicked or was cancelled by the runtime.
+    Lost(String),
+}
 
-impl From<AdcsBusy> for ApiError {
-    fn from(_: AdcsBusy) -> ApiError {
-        ApiError::Conflict(BUSY_MESSAGE.to_string())
+/// The error of an AD CS handler: an [`ApiError`], or the 504 of an
+/// operation that is still finishing, which `ApiError` has no variant
+/// for.
+#[derive(Debug)]
+pub enum AdcsHandlerError {
+    /// Any other refusal or failure.
+    Api(ApiError),
+    /// 504: the operation outlived the handler's deadline and keeps the
+    /// single-flight guard until it ends.
+    StillRunning,
+}
+
+impl From<ApiError> for AdcsHandlerError {
+    fn from(err: ApiError) -> AdcsHandlerError {
+        AdcsHandlerError::Api(err)
+    }
+}
+
+impl From<NotRun> for AdcsHandlerError {
+    fn from(not_run: NotRun) -> AdcsHandlerError {
+        match not_run {
+            NotRun::Busy => AdcsHandlerError::Api(ApiError::Conflict(BUSY_MESSAGE.to_string())),
+            NotRun::StillRunning => AdcsHandlerError::StillRunning,
+            NotRun::Lost(reason) => AdcsHandlerError::Api(ApiError::Internal(format!(
+                "the AD CS operation task failed: {reason}"
+            ))),
+        }
+    }
+}
+
+impl axum::response::IntoResponse for AdcsHandlerError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            AdcsHandlerError::Api(err) => err.into_response(),
+            // The envelope of every other error, so a client reads it
+            // the same way.
+            AdcsHandlerError::StillRunning => (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "gateway_timeout",
+                        "message": STILL_RUNNING_MESSAGE,
+                    }
+                })),
+            )
+                .into_response(),
+        }
     }
 }
 
 /// The process's AD CS runtime: the [`AdcsGuard`], the client the
-/// handlers call, and where `adcs_authority_failed` alerts go.
+/// handlers call, where `adcs_authority_failed` alerts go, and how long
+/// a handler waits for its operation.
 #[derive(Clone)]
 pub struct AdcsRuntime {
     guard: AdcsGuard,
     client: Arc<dyn AdcsClient>,
     alerts: Option<lorica_notify::AlertSender>,
+    handler_deadline: Duration,
 }
 
 impl AdcsRuntime {
@@ -173,6 +254,7 @@ impl AdcsRuntime {
             guard: AdcsGuard::default(),
             client: Arc::new(LibAdcsClient),
             alerts,
+            handler_deadline: handler_deadline(),
         }
     }
 
@@ -186,7 +268,15 @@ impl AdcsRuntime {
             guard: AdcsGuard::default(),
             client,
             alerts,
+            handler_deadline: handler_deadline(),
         }
+    }
+
+    /// The same runtime with a handler deadline short enough for a test.
+    #[cfg(test)]
+    pub(crate) fn with_handler_deadline(mut self, deadline: Duration) -> AdcsRuntime {
+        self.handler_deadline = deadline;
+        self
     }
 
     /// The single-flight guard, for a test to hold it.
@@ -197,13 +287,30 @@ impl AdcsRuntime {
 }
 
 /// Run `operation` as the one AD CS operation of the process, or return
-/// [`AdcsBusy`] at once when another one is running (see [`AdcsGuard`]).
-pub(crate) async fn run_exclusive<T>(
-    runtime: &AdcsRuntime,
-    operation: impl Future<Output = T>,
-) -> Result<T, AdcsBusy> {
-    let _permit: AdcsPermit = runtime.guard.try_acquire().ok_or(AdcsBusy)?;
-    Ok(operation.await)
+/// [`NotRun::Busy`] at once when another one is running (see
+/// [`AdcsGuard`]).
+///
+/// The operation runs in a task of its own that holds the permit for
+/// its whole life, so neither the handler's deadline nor a client that
+/// disconnects can release the guard while it runs. When the deadline
+/// passes first the handler gets [`NotRun::StillRunning`] and the task
+/// carries on: whatever the operation records on completion (its audit
+/// row, the D15 breaker) is therefore written by the task, never lost.
+pub(crate) async fn run_exclusive<T, F>(runtime: &AdcsRuntime, operation: F) -> Result<T, NotRun>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let permit: AdcsPermit = runtime.guard.try_acquire().ok_or(NotRun::Busy)?;
+    let task: tokio::task::JoinHandle<T> = tokio::spawn(async move {
+        let _permit: AdcsPermit = permit;
+        operation.await
+    });
+    match tokio::time::timeout(runtime.handler_deadline, task).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(err)) => Err(NotRun::Lost(err.to_string())),
+        Err(_) => Err(NotRun::StillRunning),
+    }
 }
 
 /// Why no AD CS operation may start now.
@@ -808,18 +915,19 @@ pub async fn put_adcs_authority(
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
     Json(body): Json<AdcsAuthorityRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), AdcsHandlerError> {
     refuse_on_follower(&state)?;
     let (request, password): (ValidatedRequest, Option<Secret>) = body.validate()?;
     let data_dir: std::path::PathBuf = state.data_dir.clone();
-    let outcome: WriteOutcome = run_exclusive(
-        &state.adcs,
-        db_blocking(&state.store, move |store| {
+    let store = Arc::clone(&state.store);
+    let outcome: WriteOutcome = run_exclusive(&state.adcs, async move {
+        db_blocking(&store, move |store| {
             store.in_transaction(|store: &ConfigStore| {
                 write_authority(store, &data_dir, request, password)
             })
-        }),
-    )
+        })
+        .await
+    })
     .await??;
 
     let ctx: AuditContext = AuditContext::new(&session, connect_info.as_ref(), &headers);
@@ -945,11 +1053,11 @@ pub async fn delete_adcs_authority(
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<serde_json::Value>, AdcsHandlerError> {
     refuse_on_follower(&state)?;
-    let id: String = run_exclusive(
-        &state.adcs,
-        db_blocking(&state.store, |store| {
+    let store = Arc::clone(&state.store);
+    let id: String = run_exclusive(&state.adcs, async move {
+        db_blocking(&store, |store| {
             let authority: AdcsAuthority = store.get_adcs_authority()?.ok_or_else(|| {
                 ApiError::NotFound("no AD CS authority is configured".to_string())
             })?;
@@ -963,8 +1071,9 @@ pub async fn delete_adcs_authority(
             }
             store.delete_adcs_authority(&authority.id)?;
             Ok::<String, ApiError>(authority.id)
-        }),
-    )
+        })
+        .await
+    })
     .await??;
 
     // A file left behind would describe a realm nothing uses any more.
@@ -1013,17 +1122,24 @@ pub struct ConnectionTestResult {
 
 /// POST /api/v1/adcs/authority/test - authenticate to the authority
 /// without requesting a certificate (Operator).
+///
+/// A test that outlives the handler's deadline is answered 504 and
+/// finishes in its own task, which writes its audit row and, for a
+/// rejected credential, opens the breaker when it ends.
 pub async fn test_adcs_authority(
     connect_info: ClientConnectInfo,
     headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<serde_json::Value>, AdcsHandlerError> {
     refuse_on_follower(&state)?;
     let ctx: AuditContext = AuditContext::new(&session, connect_info.as_ref(), &headers);
-    match run_exclusive(&state.adcs, run_connection_test(&state, &ctx)).await {
-        Ok(outcome) => outcome.map(json_data),
-        Err(busy) => {
+    let task_state: AppState = state.clone();
+    let task_ctx: AuditContext = ctx.clone();
+    let test = async move { run_connection_test(&task_state, &task_ctx).await };
+    match run_exclusive(&state.adcs, test).await {
+        Ok(outcome) => Ok(json_data(outcome?)),
+        Err(NotRun::Busy) => {
             crate::audit::record(
                 &state,
                 &ctx,
@@ -1033,8 +1149,9 @@ pub async fn test_adcs_authority(
                 None,
             )
             .await;
-            Err(busy.into())
+            Err(NotRun::Busy.into())
         }
+        Err(not_run) => Err(not_run.into()),
     }
 }
 

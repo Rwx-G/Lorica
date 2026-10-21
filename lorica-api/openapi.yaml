@@ -4038,7 +4038,11 @@ paths:
         raises one `adcs_authority_failed` alert, and every later test is
         refused with 409 until a SuperAdmin saves a new password. Rate
         limited to 3 a minute in its own bucket; single-flight with every
-        other AD CS operation.
+        other AD CS operation. A test whose Kerberos exchange outlives the
+        operation timeout is answered 504 and keeps running: it holds the
+        single-flight guard, so every AD CS operation is refused with 409
+        until it ends, and its outcome (audit row, failed state) is
+        recorded when it does.
       security:
         - sessionCookie: []
       responses:
@@ -4069,6 +4073,15 @@ paths:
           $ref: "#/components/responses/Unprocessable"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "504":
+          description: >-
+            The test outlived the handler's deadline (`gateway_timeout`);
+            it is still finishing and keeps every other AD CS operation
+            refused until it ends
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   # ---------------------------------------------------------------------------
   # Notification history

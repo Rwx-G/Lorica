@@ -116,8 +116,9 @@ fn run<F: Future<Output = ()>>(test: F) {
         .build()
         .expect("runtime");
     runtime.block_on(test);
-    // A GSS-API call the outer timeout abandoned may still be blocked on
-    // the black-hole KDC; dropping the runtime would wait for it.
+    // The client now awaits every blocking GSS-API step, so nothing is
+    // left running when a test returns; shutting down in the background
+    // only keeps a test that fails mid-exchange from hanging the binary.
     runtime.shutdown_background();
 }
 

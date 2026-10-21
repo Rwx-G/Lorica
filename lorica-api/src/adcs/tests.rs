@@ -48,13 +48,24 @@ const NEW_PASSWORD: &str = "example-only-password-2";
 /// what `answer` builds, and counts the calls.
 struct StubClient {
     calls: AtomicUsize,
+    /// How long the first call takes, as a KDC exchange outliving the
+    /// operation timeout would; later calls answer at once.
+    first_call_delay: Duration,
     answer: Box<dyn Fn() -> Result<(), AdcsError> + Send + Sync>,
 }
 
 impl StubClient {
     fn new(answer: impl Fn() -> Result<(), AdcsError> + Send + Sync + 'static) -> Arc<StubClient> {
+        StubClient::slow_once(Duration::ZERO, answer)
+    }
+
+    fn slow_once(
+        first_call_delay: Duration,
+        answer: impl Fn() -> Result<(), AdcsError> + Send + Sync + 'static,
+    ) -> Arc<StubClient> {
         Arc::new(StubClient {
             calls: AtomicUsize::new(0),
+            first_call_delay,
             answer: Box::new(answer),
         })
     }
@@ -76,7 +87,9 @@ impl AdcsClient for StubClient {
             password.expose(|text: &str| !text.is_empty()),
             "the stored password reaches the client"
         );
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            tokio::time::sleep(self.first_call_delay).await;
+        }
         (self.answer)()
     }
 }
@@ -225,6 +238,24 @@ impl Fixture {
 
     fn krb5_conf(&self) -> std::path::PathBuf {
         lorica_adcs::krb5_config_path(&self.state.data_dir)
+    }
+
+    /// Handlers answer 504 after `deadline` instead of the production
+    /// one.
+    fn with_handler_deadline(mut self, deadline: Duration) -> Fixture {
+        self.state.adcs = self.state.adcs.clone().with_handler_deadline(deadline);
+        self
+    }
+
+    /// Waits until no AD CS operation holds the guard.
+    async fn wait_until_idle(&self) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while self.state.adcs.guard().try_acquire().is_none() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the operation ends");
     }
 }
 
@@ -640,6 +671,100 @@ async fn a_second_operation_is_refused_while_one_runs() {
             "adcs.authority.test.ok",
         ]
     );
+}
+
+const SLOW_OPERATION: Duration = Duration::from_millis(1500);
+const SHORT_HANDLER_DEADLINE: Duration = Duration::from_millis(200);
+
+/// D15: an operation that outlives the handler's deadline is answered
+/// 504 and keeps the guard until it ends, so a request in the meantime
+/// is refused rather than started beside it; its outcome is audited by
+/// the task when it ends, and the next request runs normally.
+#[tokio::test]
+async fn an_operation_past_the_handler_deadline_keeps_the_guard_until_it_ends() {
+    let client = StubClient::slow_once(SLOW_OPERATION, || Ok(()));
+    let f = fixture(Arc::clone(&client), None)
+        .await
+        .with_handler_deadline(SHORT_HANDLER_DEADLINE);
+    f.create_authority().await;
+
+    let resp = f.test_unlimited().await;
+    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], "gateway_timeout", "{json}");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("still finishing"),
+        "{json}"
+    );
+
+    let resp = f.test_unlimited().await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let message = body_json(resp).await["error"]["message"].to_string();
+    assert!(message.contains("already running"), "{message}");
+    assert_eq!(client.calls(), 1, "the refused request reached no KDC");
+
+    f.wait_until_idle().await;
+    assert_eq!(
+        f.audit_actions().await,
+        vec![
+            "adcs.authority.create",
+            "adcs.authority.test.refused:busy",
+            "adcs.authority.test.ok",
+        ],
+        "the slow test's outcome is audited once it ends"
+    );
+
+    let resp = f.test_unlimited().await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["ok"], true);
+    assert_eq!(client.calls(), 2);
+}
+
+/// The breaker is not lost with the 504: a slow operation that ends on
+/// a rejected credential opens it from its own task.
+#[tokio::test]
+async fn a_rejected_credential_past_the_handler_deadline_still_opens_the_breaker() {
+    let client = StubClient::slow_once(SLOW_OPERATION, || Err(rejected_credential()));
+    let alerts = lorica_notify::AlertSender::new(16);
+    let mut received = alerts.subscribe();
+    let f = fixture(Arc::clone(&client), Some(alerts))
+        .await
+        .with_handler_deadline(SHORT_HANDLER_DEADLINE);
+    f.create_authority().await;
+
+    let resp = f.test_unlimited().await;
+    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    f.wait_until_idle().await;
+
+    let stored = f
+        .state
+        .store
+        .lock()
+        .await
+        .get_adcs_authority()
+        .expect("read")
+        .expect("row");
+    assert!(stored.is_failed());
+    assert_eq!(stored.failed_kdc_code, Some(24));
+    let alert = received.try_recv().expect("the entry alert");
+    assert_eq!(
+        alert.alert_type,
+        lorica_notify::events::AlertType::AdcsAuthorityFailed
+    );
+    assert_eq!(
+        f.audit_actions().await,
+        vec![
+            "adcs.authority.create",
+            "adcs.authority.test.failed:ticket_acquisition",
+            "adcs.authority.failed_state.enter:ticket_acquisition",
+        ]
+    );
+    let resp = f.test_unlimited().await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(client.calls(), 1);
 }
 
 /// IV2's breaker half and AC #4: one rejected credential opens the

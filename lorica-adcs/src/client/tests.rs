@@ -17,6 +17,7 @@
 //! path is the harness's (Story 13.1 Lot 4).
 
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use bytes::Bytes;
@@ -67,6 +68,10 @@ enum Mutual {
 struct FakeGss {
     acquisition: Acquisition,
     mutual: Mutual,
+    /// How long acquisition blocks its thread, as a silent KDC would.
+    acquire_delay: Duration,
+    /// Set when acquisition returns, after its delay.
+    acquired: AtomicBool,
     log: Arc<Mutex<FakeLog>>,
 }
 
@@ -75,12 +80,28 @@ impl FakeGss {
         Arc::new(FakeGss {
             acquisition,
             mutual,
+            acquire_delay: Duration::ZERO,
+            acquired: AtomicBool::new(false),
             log: Arc::new(Mutex::new(FakeLog::default())),
         })
     }
 
     fn working() -> Arc<FakeGss> {
         FakeGss::new(Acquisition::Succeeds, Mutual::Completes)
+    }
+
+    fn slow(acquire_delay: Duration) -> Arc<FakeGss> {
+        Arc::new(FakeGss {
+            acquisition: Acquisition::Succeeds,
+            mutual: Mutual::Completes,
+            acquire_delay,
+            acquired: AtomicBool::new(false),
+            log: Arc::new(Mutex::new(FakeLog::default())),
+        })
+    }
+
+    fn has_acquired(&self) -> bool {
+        self.acquired.load(Ordering::SeqCst)
     }
 
     fn log(&self) -> MutexGuard<'_, FakeLog> {
@@ -99,9 +120,13 @@ impl GssBackend for FakeGss {
     type Context = FakeContext;
 
     fn acquire_credential(&self, principal: &str, password: &Secret) -> Result<String, AdcsError> {
-        let mut log: MutexGuard<'_, FakeLog> = self.log();
-        log.principals.push(principal.to_owned());
-        log.passwords.push(password.expose(str::to_owned));
+        {
+            let mut log: MutexGuard<'_, FakeLog> = self.log();
+            log.principals.push(principal.to_owned());
+            log.passwords.push(password.expose(str::to_owned));
+        }
+        std::thread::sleep(self.acquire_delay);
+        self.acquired.store(true, Ordering::SeqCst);
         match self.acquisition {
             Acquisition::Succeeds => Ok(principal.to_owned()),
             Acquisition::Fails(minor, message) => {
@@ -590,7 +615,7 @@ async fn a_bundle_without_certificates_is_refused() {
 // ---------------------------------------------------------------- bounds (AC #9)
 
 #[tokio::test]
-async fn the_outer_guard_bounds_the_whole_operation() {
+async fn the_operation_timeout_cuts_an_http_leg_short() {
     let ces: TestCes = TestCes::start(Arc::new(|_: &Seen| {
         Reply::new(401)
             .header("www-authenticate", "Negotiate")
@@ -603,6 +628,72 @@ async fn the_outer_guard_bounds_the_whole_operation() {
         .await
         .expect_err("timeout");
     assert!(matches!(err, AdcsError::Timeout { .. }), "{err}");
+}
+
+/// D15: a GSS-API step that outlives the operation timeout is waited
+/// for, never abandoned, so the caller's single-flight guard is not
+/// released while its thread still talks to a KDC.
+#[tokio::test]
+async fn a_blocking_step_past_the_deadline_is_awaited_before_the_timeout() {
+    let acquire_delay: Duration = Duration::from_millis(800);
+    let operation: Duration = Duration::from_millis(300);
+    let pending: String = pending_response("1");
+    let ces: TestCes = TestCes::start(iis(move |_| Reply::new(200).body(&pending).proven())).await;
+    let mut params: CesParams = ces.params();
+    params.timeouts.operation = operation;
+
+    let gss: Arc<FakeGss> = FakeGss::slow(acquire_delay);
+    let started: tokio::time::Instant = tokio::time::Instant::now();
+    let err: AdcsError = enroll_with(Arc::clone(&gss), &params, &password(), b"csr")
+        .await
+        .expect_err("timeout");
+    assert!(
+        matches!(err, AdcsError::Timeout { after } if after == operation),
+        "{err}"
+    );
+    assert!(gss.has_acquired(), "the step ran to its end first");
+    assert!(
+        started.elapsed() >= acquire_delay,
+        "{:?}",
+        started.elapsed()
+    );
+
+    let gss: Arc<FakeGss> = FakeGss::slow(acquire_delay);
+    let err: AdcsError = test_connection_with(Arc::clone(&gss), &params, &password())
+        .await
+        .expect_err("timeout");
+    assert!(matches!(err, AdcsError::Timeout { .. }), "{err}");
+    assert!(gss.has_acquired(), "the step ran to its end first");
+
+    assert_eq!(
+        ces.seen().len(),
+        2,
+        "one unauthenticated request per operation, nothing sent after the deadline"
+    );
+}
+
+/// A credential the KDC rejects is reported as such even when the
+/// rejection arrives after the deadline: the breaker keys on it.
+#[tokio::test]
+async fn a_step_error_past_the_deadline_wins_over_the_timeout() {
+    let ces: TestCes = TestCes::start(iis(|_| Reply::new(405).proven())).await;
+    let mut params: CesParams = ces.params();
+    params.timeouts.operation = Duration::from_millis(100);
+    let gss: Arc<FakeGss> = Arc::new(FakeGss {
+        acquisition: Acquisition::Fails(PREAUTH_FAILED_MINOR, "Preauthentication failed"),
+        mutual: Mutual::Completes,
+        acquire_delay: Duration::from_millis(400),
+        acquired: AtomicBool::new(false),
+        log: Arc::new(Mutex::new(FakeLog::default())),
+    });
+    let err: AdcsError = test_connection_with(gss, &params, &password())
+        .await
+        .expect_err("rejected");
+    assert_eq!(
+        err.ticket_failure(),
+        Some(TicketFailure::CredentialRejected),
+        "{err}"
+    );
 }
 
 #[tokio::test]

@@ -184,8 +184,9 @@ pub enum AdcsError {
         reason: String,
     },
 
-    /// The outer guard of the whole operation fired. A blocking GSS-API
-    /// call may still be running; the `krb5.conf` timeouts bound it.
+    /// The operation timeout passed. Reported only once no GSS-API call
+    /// of the operation is running any more (see
+    /// [`crate::CesTimeouts::operation`]).
     #[error("timed out after {} s", after.as_secs())]
     Timeout {
         /// The operation timeout that elapsed.

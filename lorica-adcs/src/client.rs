@@ -66,14 +66,18 @@ pub struct CesTimeouts {
     pub read: Duration,
     /// The whole operation, ticket acquisition included.
     ///
-    /// It stops the caller waiting, not the GSS-API call: that call runs
-    /// on a blocking thread, which finishes on MIT krb5's own schedule
-    /// after this fires. On MIT before 1.22 nothing in the generated
-    /// `krb5.conf` bounds a KDC exchange (a silent KDC was measured to
-    /// hold one for about 27 s); from 1.22 its `request_timeout` does
-    /// (see [`crate::KdcTiming`]). Keeping abandoned threads from piling
-    /// up is the caller's job, by never starting a second operation for
-    /// an authority while one is still running.
+    /// It bounds the HTTP legs, and it is checked after each GSS-API
+    /// step, but it never interrupts one: a step is synchronous FFI on a
+    /// blocking thread, which tokio cannot stop, and abandoning its task
+    /// would leave the thread spending KDC attempts after the operation
+    /// had returned, beside the next one (Epic 13 D8, D15). So an
+    /// operation whose deadline passes during a step returns
+    /// [`AdcsError::Timeout`] only once that step has returned, and may
+    /// therefore outlast this bound by one step. What bounds a step is
+    /// MIT krb5's own schedule: on MIT before 1.22 nothing in the
+    /// generated `krb5.conf` bounds a KDC exchange (a silent KDC was
+    /// measured to hold one for about 27 s); from 1.22 its
+    /// `request_timeout` does (see [`crate::KdcTiming`]).
     ///
     /// The default sits well above one silent-KDC cycle, so a single
     /// unreachable KDC is reported as such rather than as a timeout.
@@ -124,6 +128,13 @@ pub struct CesParams {
 /// undone only by revocation. Errors name the step that failed;
 /// a pending, denied or failed request is an [`EnrollOutcome`], not an
 /// error.
+///
+/// When the future resolves, no GSS-API call of the operation is still
+/// running, a timeout included (see [`CesTimeouts::operation`]). That
+/// holds only for a future driven to completion: dropping it while a
+/// step runs detaches the step's thread, so a caller that must not
+/// start another operation beside it runs this in a task it never
+/// cancels.
 pub async fn enroll(
     params: &CesParams,
     password: &Secret,
@@ -145,6 +156,9 @@ pub async fn enroll(
 /// only acts on a `POST`ed `RequestSecurityToken`, never is. Posting an
 /// envelope with an empty or invalid CSR would reach the authority and
 /// leave a failed request in its database.
+///
+/// Like [`enroll`], the future resolves only once no GSS-API call of the
+/// operation is still running, and dropping it early detaches the call.
 pub async fn test_connection(params: &CesParams, password: &Secret) -> Result<(), AdcsError> {
     test_connection_with(Arc::new(LibGssapi), params, password).await
 }
@@ -158,24 +172,22 @@ pub(crate) async fn enroll_with<B: GssBackend>(
     let target: Target = Target::from_params(params)?;
     let envelope: String = build_request(target.url.as_str(), &new_message_id(), csr_der)?;
     let request: Request = Request::Enroll(envelope);
-    bounded(params.timeouts.operation, async {
-        let answer: Answer = exchange(backend, params, &target, password, &request).await?;
-        if answer.status != StatusCode::OK && answer.status != StatusCode::INTERNAL_SERVER_ERROR {
-            return Err(AdcsError::Http {
-                stage: AUTHENTICATED,
-                reason: format!(
-                    "unexpected status {}; a CES answers 200 or a SOAP fault with 500",
-                    answer.status
-                ),
-            });
-        }
-        let body: String = String::from_utf8(answer.body).map_err(|_| AdcsError::Http {
+    let deadline: Deadline = Deadline::after(params.timeouts.operation);
+    let answer: Answer = exchange(backend, params, &target, password, &request, &deadline).await?;
+    if answer.status != StatusCode::OK && answer.status != StatusCode::INTERNAL_SERVER_ERROR {
+        return Err(AdcsError::Http {
             stage: AUTHENTICATED,
-            reason: "the response body is not UTF-8".to_owned(),
-        })?;
-        parse_response(&body)
-    })
-    .await
+            reason: format!(
+                "unexpected status {}; a CES answers 200 or a SOAP fault with 500",
+                answer.status
+            ),
+        });
+    }
+    let body: String = String::from_utf8(answer.body).map_err(|_| AdcsError::Http {
+        stage: AUTHENTICATED,
+        reason: "the response body is not UTF-8".to_owned(),
+    })?;
+    parse_response(&body)
 }
 
 pub(crate) async fn test_connection_with<B: GssBackend>(
@@ -184,20 +196,71 @@ pub(crate) async fn test_connection_with<B: GssBackend>(
     password: &Secret,
 ) -> Result<(), AdcsError> {
     let target: Target = Target::from_params(params)?;
-    bounded(params.timeouts.operation, async {
-        exchange(backend, params, &target, password, &Request::Probe).await?;
-        Ok(())
-    })
-    .await
+    let deadline: Deadline = Deadline::after(params.timeouts.operation);
+    exchange(
+        backend,
+        params,
+        &target,
+        password,
+        &Request::Probe,
+        &deadline,
+    )
+    .await?;
+    Ok(())
 }
 
-async fn bounded<T>(
+/// The operation timeout, as the instant every leg is measured against
+/// (see [`CesTimeouts::operation`] for why a GSS-API step is checked
+/// after it returns instead of being cut short).
+struct Deadline {
+    at: tokio::time::Instant,
     after: Duration,
-    operation: impl Future<Output = Result<T, AdcsError>>,
-) -> Result<T, AdcsError> {
-    tokio::time::timeout(after, operation)
-        .await
-        .map_err(|_| AdcsError::Timeout { after })?
+}
+
+impl Deadline {
+    fn after(after: Duration) -> Deadline {
+        Deadline {
+            at: tokio::time::Instant::now() + after,
+            after,
+        }
+    }
+
+    fn expired(&self) -> AdcsError {
+        AdcsError::Timeout { after: self.after }
+    }
+
+    /// An async leg, cancelled when the deadline passes. Only legs that
+    /// own no blocking thread may go through here.
+    async fn bound<T>(
+        &self,
+        leg: impl Future<Output = Result<T, AdcsError>>,
+    ) -> Result<T, AdcsError> {
+        tokio::time::timeout_at(self.at, leg)
+            .await
+            .map_err(|_| self.expired())?
+    }
+
+    /// A GSS-API step on a blocking thread, always awaited to its end.
+    /// The step's own error wins over the deadline: a credential the KDC
+    /// rejected must reach the breaker as such, not as a timeout, or the
+    /// next operation would spend another attempt against the account.
+    async fn blocking<T: Send + 'static>(
+        &self,
+        step: &'static str,
+        task: impl FnOnce() -> Result<T, AdcsError> + Send + 'static,
+    ) -> Result<T, AdcsError> {
+        let value: T =
+            tokio::task::spawn_blocking(task)
+                .await
+                .map_err(|err: tokio::task::JoinError| AdcsError::GssTask {
+                    step,
+                    reason: err.to_string(),
+                })??;
+        if tokio::time::Instant::now() >= self.at {
+            return Err(self.expired());
+        }
+        Ok(value)
+    }
 }
 
 /// The validated endpoint and principal.
@@ -436,28 +499,19 @@ fn offered_schemes(headers: &HeaderMap) -> String {
     }
 }
 
-async fn blocking<T: Send + 'static>(
-    step: &'static str,
-    task: impl FnOnce() -> Result<T, AdcsError> + Send + 'static,
-) -> Result<T, AdcsError> {
-    tokio::task::spawn_blocking(task)
-        .await
-        .map_err(|err: tokio::task::JoinError| AdcsError::GssTask {
-            step,
-            reason: err.to_string(),
-        })?
-}
-
 async fn exchange<B: GssBackend>(
     backend: Arc<B>,
     params: &CesParams,
     target: &Target,
     password: &Secret,
     request: &Request,
+    deadline: &Deadline,
 ) -> Result<Answer, AdcsError> {
     let client: Client = http_client(params)?;
 
-    let probe: Response = send(&client, &target.url, request, None, PROBE).await?;
+    let probe: Response = deadline
+        .bound(send(&client, &target.url, request, None, PROBE))
+        .await?;
     let server_certificate: Vec<u8> = probe
         .extensions()
         .get::<reqwest::tls::TlsInfo>()
@@ -469,7 +523,7 @@ async fn exchange<B: GssBackend>(
     let probe_status: StatusCode = probe.status();
     let offers_negotiate: bool = !negotiate_challenges(probe.headers()).is_empty();
     let offered: String = offered_schemes(probe.headers());
-    read_body(PROBE, probe).await?;
+    deadline.bound(read_body(PROBE, probe)).await?;
     if probe_status != StatusCode::UNAUTHORIZED {
         return Err(AdcsError::Spnego {
             reason: format!(
@@ -489,33 +543,41 @@ async fn exchange<B: GssBackend>(
     let host: String = target.host.clone();
     let password: Secret = password.clone();
     let initial_binding: Vec<u8> = binding.clone();
-    let (context, token): (B::Context, Vec<u8>) = blocking("SPNEGO initial token", move || {
-        let credential: B::Credential = backend.acquire_credential(&principal, &password)?;
-        drop(password);
-        let mut context: B::Context = backend.client_context(credential, &host)?;
-        let token: Vec<u8> = context
-            .step(None, &initial_binding)
-            .map_err(|failure: GssFailure| AdcsError::Spnego {
-                reason: format!(
-                    "cannot build the initial token for HTTP/{host}: {}",
-                    failure.message
-                ),
-            })?
-            .ok_or_else(|| AdcsError::Spnego {
-                reason: "the GSS-API library produced no initial token".to_owned(),
-            })?;
-        Ok((context, token))
-    })
-    .await?;
+    let (context, token): (B::Context, Vec<u8>) = deadline
+        .blocking("SPNEGO initial token", move || {
+            let credential: B::Credential = backend.acquire_credential(&principal, &password)?;
+            drop(password);
+            let mut context: B::Context = backend.client_context(credential, &host)?;
+            let token: Vec<u8> = context
+                .step(None, &initial_binding)
+                .map_err(|failure: GssFailure| AdcsError::Spnego {
+                    reason: format!(
+                        "cannot build the initial token for HTTP/{host}: {}",
+                        failure.message
+                    ),
+                })?
+                .ok_or_else(|| AdcsError::Spnego {
+                    reason: "the GSS-API library produced no initial token".to_owned(),
+                })?;
+            Ok((context, token))
+        })
+        .await?;
 
-    let response: Response =
-        send(&client, &target.url, request, Some(&token), AUTHENTICATED).await?;
+    let response: Response = deadline
+        .bound(send(
+            &client,
+            &target.url,
+            request,
+            Some(&token),
+            AUTHENTICATED,
+        ))
+        .await?;
     let status: StatusCode = response.status();
     let server_token: Option<String> = negotiate_challenges(response.headers())
         .into_iter()
         .flatten()
         .next();
-    let body: Vec<u8> = read_body(AUTHENTICATED, response).await?;
+    let body: Vec<u8> = deadline.bound(read_body(AUTHENTICATED, response)).await?;
     if status == StatusCode::UNAUTHORIZED {
         return Err(AdcsError::Spnego {
             reason: "the endpoint refused the token with 401 (check the channel binding / \
@@ -534,23 +596,24 @@ async fn exchange<B: GssBackend>(
                     reason: format!("the response token is not base64: {err}"),
                 })
         })?;
-    blocking("SPNEGO mutual authentication", move || {
-        let mut context: B::Context = context;
-        context
-            .step(Some(&server_token), &binding)
-            .map_err(|failure: GssFailure| AdcsError::MutualAuth {
-                reason: format!("the response token was rejected: {}", failure.message),
-            })?;
-        if context.is_complete() {
-            Ok(())
-        } else {
-            Err(AdcsError::MutualAuth {
-                reason: "the security context is still incomplete after the response token"
-                    .to_owned(),
-            })
-        }
-    })
-    .await?;
+    deadline
+        .blocking("SPNEGO mutual authentication", move || {
+            let mut context: B::Context = context;
+            context
+                .step(Some(&server_token), &binding)
+                .map_err(|failure: GssFailure| AdcsError::MutualAuth {
+                    reason: format!("the response token was rejected: {}", failure.message),
+                })?;
+            if context.is_complete() {
+                Ok(())
+            } else {
+                Err(AdcsError::MutualAuth {
+                    reason: "the security context is still incomplete after the response token"
+                        .to_owned(),
+                })
+            }
+        })
+        .await?;
     Ok(Answer { status, body })
 }
 
