@@ -538,8 +538,8 @@ impl Stream {
         // Since the buffers can't be resized in place,
         // we take the raw stream out of them and put it in new buffers with the size we want
         let stream = mem::take(&mut self.stream);
-        let stream =
-            stream.map(|s| BufferedStream::with_capacity(BUF_READ_SIZE, BUF_WRITE_SIZE, s.into_inner()));
+        let stream = stream
+            .map(|s| BufferedStream::with_capacity(BUF_READ_SIZE, BUF_WRITE_SIZE, s.into_inner()));
         let _ = mem::replace(&mut self.stream, stream);
     }
 }

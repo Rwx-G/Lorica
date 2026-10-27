@@ -72,11 +72,7 @@ impl ProxyHttp for CustomProxy {
 
     fn new_ctx(&self) {}
 
-    async fn upstream_peer(
-        &self,
-        _: &mut Session,
-        _: &mut (),
-    ) -> Result<Box<HttpPeer>> {
+    async fn upstream_peer(&self, _: &mut Session, _: &mut ()) -> Result<Box<HttpPeer>> {
         unreachable!("test supplies its own body writer")
     }
 }
