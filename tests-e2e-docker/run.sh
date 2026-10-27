@@ -587,7 +587,9 @@ if [ "$SKIP_ADCS" = false ] && [ "$EXIT_CODE" = "0" ]; then
     if [ "$EXIT_CODE" = "0" ]; then
         echo ""
         echo "=== AD CS harness probe: a token without a channel binding is refused ==="
-        docker compose --profile adcs exec -T ces python3 /app/probe.py || EXIT_CODE=$?
+        # `sh -c` for the same MSYS path-conversion reason as the cluster
+        # readiness probe below.
+        docker compose --profile adcs exec -T ces sh -c 'python3 /app/probe.py' || EXIT_CODE=$?
     fi
 fi
 
