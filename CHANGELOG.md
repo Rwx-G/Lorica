@@ -15,6 +15,8 @@ Author: Rwx-G
 
 ### Fixed
 
+- **Upstream Pingora sync into the forked crates (see `FORK.md`).** An empty write on a chunked HTTP/1.x body no longer ends the body early: it was encoded as a zero-length chunk, which is the chunked terminator, so the peer stopped reading there and took the real terminator for the start of the next message, desyncing the connection. With `trace` logging enabled, an upstream response header carrying a non-UTF-8 byte no longer panics the request task while the raw header is logged. Upgraded sessions on the forked proxy's custom-protocol path no longer fail when the client half-closes a finished upgrade request while the response is still draining, and still see a reset that arrives afterwards; Lorica does not wire that path today, so this changes nothing for a running node. The rate estimator in `lorica-limits` wraps on overflow instead of panicking in debug builds, and the L4 socket buffers no longer construct a zero-capacity `BufReader`, which panics from tokio 1.54.0 on every accept and connect (the workspace pins 1.53.1, so this removes a trap on the next bump rather than a live crash).
+
 ### Removed
 
 ### Security
