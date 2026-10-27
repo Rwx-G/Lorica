@@ -1,7 +1,7 @@
 # Story 13.6: Packaging, End-to-End and the Operator Guide
 
 **Epic:** [Epic 13 - AD CS Certificate Enrollment over CES (v1.10.0)](../prd/epic-13-v1.10.0.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** Stories 13.1 to 13.5.
@@ -72,7 +72,7 @@ These are the PRD's, unchanged. They are the contract.
 
 ### Lot 4: release check (maintainer)
 
-- [ ] AC #5, recorded here with placeholders.
+- [x] AC #5, recorded here with placeholders.
 
 ## Dev Agent Record
 
@@ -85,7 +85,7 @@ These are the PRD's, unchanged. They are the contract.
 ### Completion Notes
 
 - AC #1 to #4 met; IV1 and IV2 covered by the `adcs` profile and the deb and rpm install jobs.
-- AC #5 and IV3 are pending: the release check against a real authority is the maintainer's, run from the release candidate's `.deb` before the PR to `main`, and has not been run. The status stays Review until its outcome is recorded here with placeholders.
+- AC #5 and IV3 passed on 2026-10-27. The maintainer ran the release check against a production AD CS authority (CES in Kerberos mode, Extended Protection Required, NTLM refused, service account in a child domain of the authority's forest) from a `.deb` built at `1472df25` before the version bump, on a Debian 13 host with nothing Kerberos configured by hand. Connection test ok; a certificate issued for a test name under the allowed suffix, bound to a route and served correctly; "Renew now" replaced it in place and the new certificate was served; the maintainer reported the remaining steps (adoption) working. This confirms against a real authority what the specifications left unconfirmed: the request envelope and `To` header, the template carried as a CSR attribute, the response and CMC chain shapes, the RFC 5929 binding with the authority's certificate, and `KRB5_CONFIG` honoured under the shipped unit. The test certificates are to be revoked by the authority's administrators. Names of the deployment are deliberately not recorded.
 - The PRD records the epic-wide deviations in "Delivery notes (v1.10.0)".
 
 ## File List
@@ -101,3 +101,4 @@ These are the PRD's, unchanged. They are the contract.
 |------|---------|-------------|--------|
 | 2026-10-21 | 0.1 | Story drafted from the Epic 13 PRD. Status Approved (maintainer delegated the epic). | Romain G. |
 | 2026-10-27 | 0.2 | Lots 1 to 3 delivered and recorded; AC #5 (release check) pending with the maintainer. Status Review. | Romain G. |
+| 2026-10-27 | 0.3 | Release check against a real authority passed (AC #5, IV3). Status Done. | Romain G. |
