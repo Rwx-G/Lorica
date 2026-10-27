@@ -1050,6 +1050,15 @@ impl BodyWriter {
             BM::ChunkedEncoding(written) => {
                 let chunk_size = buf.len();
 
+                // A zero-length chunk encodes as "0\r\n\r\n", which is the
+                // chunked terminator: the peer would treat it as end of body
+                // and parse whatever follows (including the terminator that
+                // finish() writes) as the start of the next message. Skip it;
+                // finish() is the only place that ends the body.
+                if chunk_size == 0 {
+                    return Ok(Some(0));
+                }
+
                 let chuck_size_buf = format!("{:X}\r\n", chunk_size);
                 let mut output_buf = Bytes::from(chuck_size_buf).chain(buf).chain(&b"\r\n"[..]);
                 stream
@@ -2376,6 +2385,38 @@ mod tests {
         let res = body_writer.finish(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, data.len() * 2);
         assert_eq!(body_writer.body_mode, BodyMode::Complete(data.len() * 2));
+    }
+
+    #[tokio::test]
+    async fn write_body_chunked_ignores_empty_chunk() {
+        init_log();
+        let data = b"abcdefghij";
+        let output = b"A\r\nabcdefghij\r\n";
+        // The mock expects no write between the data chunk and finish():
+        // an empty chunk would encode as "0\r\n\r\n" - the terminator -
+        // ending the body early and desyncing the peer's parser.
+        let mut mock_io = Builder::new()
+            .write(&output[..])
+            .write(&LAST_CHUNK[..])
+            .build();
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_chunked();
+        let res = body_writer
+            .write_body(&mut mock_io, &data[..])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(res, data.len());
+        let res = body_writer
+            .write_body(&mut mock_io, b"")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(res, 0);
+        assert_eq!(body_writer.body_mode, BodyMode::ChunkedEncoding(data.len()));
+        let res = body_writer.finish(&mut mock_io).await.unwrap().unwrap();
+        assert_eq!(res, data.len());
+        assert_eq!(body_writer.body_mode, BodyMode::Complete(data.len()));
     }
 
     #[tokio::test]
