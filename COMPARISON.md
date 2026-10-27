@@ -1,6 +1,6 @@
 # Lorica - Competitive Feature Comparison
 
-> Last updated: 2026-10-14 | Lorica v1.9.3
+> Last updated: 2026-10-27 | Lorica v1.10.0
 >
 > **Legend:** Y = Yes | N = No | P = Partial | Paid = Paid/Enterprise only | Plug = Plugin/Module (not built-in)
 >
@@ -147,6 +147,7 @@
 | ACME HTTP-01 | Y | N | Y | Y | Y | Y | Y | Y |
 | ACME DNS-01 | Y | N | N | N | Y | Y | Y | Y |
 | ACME TLS-ALPN-01 | N | N | N | Plug | Y | N | Y | N |
+| AD CS enrollment (CES, Kerberos) | Y | N | N | N | N | N | N | N |
 | Auto-renewal | Y | N | P | Y | Y | Y | Y | Y |
 | Multi-domain SAN | Y | N | N | N | Y | N | Y | N |
 | Wildcard via DNS-01 | Y | N | N | N | Y | Y | Y | Y |
@@ -158,6 +159,7 @@
 ### Lorica Strengths
 
 - **ACME DNS-01 with 3 providers** (Cloudflare, Route53, OVH) + manual mode. Traefik and Caddy ship many more DNS providers; Lorica's spread covers the common European-centric set. Route 53 is an opt-in Cargo feature (not in the default `.deb` / `.rpm` build) to keep the AWS SDK dep graph out of the default binary.
+- **Internal certificates from Active Directory Certificate Services** (v1.10.0) - Lorica enrolls, renews and adopts certificates from an AD CS authority through its Certificate Enrollment Web Service, with Kerberos and a TLS channel binding, so an internal PKI is served the way Let's Encrypt is. The others serve public names through ACME and leave an AD CS estate to a separate enrollment tool or a manual CSR workflow.
 - **SNI hot-swap** via arc-swap - zero-downtime cert rotation.
 - **CRL support** - Rare feature, only Nginx and HAProxy match.
 - **Per-route mTLS policy** - chain verification at the TLS listener plus per-route enforcement knobs (`required`, org allowlist) that hot-reload without restart. Most competitors only expose a single listener-wide client-cert setting.
@@ -320,7 +322,7 @@ These features are either unique to Lorica or extremely rare among competitors:
 
 ## Summary: Remaining Gaps
 
-All table-stakes features (forward auth, basic auth, mTLS, retry with backoff, custom error pages, etc.) are shipped. All major differentiators planned through v1.9.0 are shipped: v1.6.0 added the hot binary upgrade, multi-user RBAC and the AI/LLM crawler deny-list; v1.7.0 added the multi-node cluster and the syslog / OTLP log export; v1.8.0 added conditional request capture and the CI automation API with GitLab OIDC; v1.9.0 added the management MCP server in three tiers. Remaining gaps are by design or planned for future versions.
+All table-stakes features (forward auth, basic auth, mTLS, retry with backoff, custom error pages, etc.) are shipped. All major differentiators planned through v1.10.0 are shipped: v1.6.0 added the hot binary upgrade, multi-user RBAC and the AI/LLM crawler deny-list; v1.7.0 added the multi-node cluster and the syslog / OTLP log export; v1.8.0 added conditional request capture and the CI automation API with GitLab OIDC; v1.9.0 added the management MCP server in three tiers; v1.10.0 added certificate enrollment from Active Directory Certificate Services. Remaining gaps are by design or planned for future versions.
 
 | Gap | Plan |
 |---|---|

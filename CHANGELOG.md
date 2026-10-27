@@ -11,6 +11,18 @@ Author: Rwx-G
 
 ### Added
 
+### Changed
+
+### Fixed
+
+### Removed
+
+### Security
+
+## [1.10.0] - 2026-10-27
+
+### Added
+
 - **Certificate enrollment from an Active Directory Certificate Services authority** (`lorica-adcs`, Epic 13). A SuperAdmin declares the authority once under Settings > AD CS authority (its Certificate Enrollment Web Service endpoint, Kerberos realm, optional KDC list, service account, default template and key type, subject defaults, allowed DNS suffixes), and an Operator checks it with a connection test that requests nothing. Operators then issue a certificate from the certificate page or, for a route's hostnames that no certificate covers, from the route form, after a confirmation showing the full request; Lorica generates the key and the CSR, and only the CSR leaves the node. AD CS certificates bound to a route are renewed in place by the existing loop in the same 30-day window as ACME ones, with a new key and the template they were issued with, or at once with "Renew now". Certificates the authority issued before Lorica could are detected by signature against its issuing CA certificate and offered for adoption, which issues nothing; any AD CS certificate can be reverted to manual. Two alert types, `adcs_authority_failed` and `cert_issuance_failed`; channels saved with an explicit alert list are subscribed to both on upgrade. Templates that need a certificate manager's approval are not supported. Control plane only: upgrade followers first. See `docs/adcs.md`, which also lists the authority-side prerequisites Lorica cannot check.
 
 ### Changed
@@ -21,8 +33,6 @@ Author: Rwx-G
 ### Fixed
 
 - **Editing a notification channel no longer drops its cluster alert subscriptions.** The dashboard's form only knew a hand-typed subset of the alert types, so saving a channel removed every type it did not list, including the three cluster alerts. Stored types are now kept and the cluster types have their checkboxes.
-
-### Removed
 
 ### Security
 
