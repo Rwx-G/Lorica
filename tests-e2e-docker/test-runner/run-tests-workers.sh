@@ -582,8 +582,8 @@ else
         STALE_HITS=0
         MAINT_HITS=0
         OTHER_HITS=0
-        TOTAL=30
-        for i in $(seq 1 $TOTAL); do
+        FANOUT=30
+        for i in $(seq 1 $FANOUT); do
             CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
                 -H "Host: app1.test" "$PROXY/" 2>/dev/null || echo "000")
             if [ "$CODE" = "503" ]; then
