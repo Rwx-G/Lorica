@@ -1,7 +1,7 @@
 # Story 13.3: Issuing a New Certificate
 
 **Epic:** [Epic 13 - AD CS Certificate Enrollment over CES (v1.10.0)](../prd/epic-13-v1.10.0.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** Story 13.1 (`lorica-adcs`: `build_csr`, `enroll`,
@@ -123,7 +123,25 @@ These are the PRD's, unchanged. They are the contract.
 
 - AC #1 to #8 met; IV1 covered by the RoutingTab test, IV2 by the issuance tests (zero client calls on each refusal).
 
+### After the epic audit
+
+- AC #1: the RFC 4514 subject is computed from the stored PEM and cached in memory by PEM digest, not stored, so the replicated row is unchanged. The automation certificate read exposes `source` and `subject` and none of the `adcs_*` fields.
+- AC #2, D17: the optional template must be one of the authority's allowed templates (422 `adcs_template_refused`), and the dashboard offers only those. AC #6, D17: an issued leaf is stored only with the Server Authentication EKU, no CA flag and exactly the requested names; otherwise nothing is stored and the alert and audit row keep the authority's request id. The issuing CA is learned only when it verifies the leaf.
+- AC #2 refusals answer the codes of `ADCS_CODES` (Story 13.2). An issuance past the handler's deadline answers 504 and still stores its certificate when it ends.
+- D16: no role may download the private key of an AD CS certificate (403 `adcs_key_not_exportable`), and the filesystem export writes its certificate and chain only. The PEM, key and domain of an AD CS certificate cannot be replaced (409 `adcs_certificate_managed`).
+- The PRD records the epic-wide deviations in "Delivery notes (v1.10.0)".
+
 ## File List
+
+- `lorica-api/src/adcs/issue.rs`, `lorica-api/src/adcs/issue/tests.rs`, `lorica-api/src/adcs/{leaf,validate}.rs`,
+  `lorica-api/src/adcs.rs`, `lorica-api/src/adcs/tests.rs`, `lorica-api/src/certificates.rs`,
+  `lorica-api/src/middleware/authorize.rs`, `lorica-api/src/server.rs`,
+  `lorica-api/src/automation/read/plane_tests.rs`, `lorica-api/openapi.yaml`
+- `lorica-dashboard/frontend/src/components/certificates/{AdcsIssueConfirm,CertificateAdcsForm}.{svelte,test.ts}`,
+  `components/certificates/{CertificateDetail,CertificateList}.svelte`, `components/certificates/CertificateSource.test.ts`,
+  `components/route-tabs/RoutingTab.{svelte,test.ts}`, `components/RouteDrawer.svelte`,
+  `lib/adcs-issuance.{ts,test.ts}`, `lib/api.{ts,test.ts}`, `routes/{Certificates,Routes}.svelte`,
+  `routes/Certificates.test.ts`, `test-adcs-fixtures.ts`
 
 ## Change Log
 
@@ -131,3 +149,4 @@ These are the PRD's, unchanged. They are the contract.
 |------|---------|-------------|--------|
 | 2026-10-21 | 0.1 | Story drafted from the Epic 13 PRD. Status Approved (maintainer delegated the epic). | Romain G. |
 | 2026-10-21 | 0.2 | Lots implemented. Status Review. | Romain G. |
+| 2026-10-27 | 0.3 | Audit changes recorded (D16, D17, subject cache, automation read), File List filled. Status Done. | Romain G. |

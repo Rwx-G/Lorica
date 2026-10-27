@@ -294,6 +294,38 @@ pub fn krb5_config_path(data_dir: &Path) -> PathBuf {
     data_dir.join("adcs").join("krb5.conf")
 }
 
+/// Whether MIT krb5 honours `KRB5_CONFIG` in this process, and so reads
+/// the file at [`krb5_config_path`] rather than the host's
+/// `/etc/krb5.conf` (Epic 13 D3).
+///
+/// MIT reads the variable with `secure_getenv`, which ignores the
+/// environment of a process the kernel started in secure mode
+/// (`AT_SECURE`): a setuid or setgid binary, or one carrying file
+/// capabilities. Capabilities granted as ambient by the service manager
+/// do not set it. The answer is fixed at exec, so a caller may read it
+/// once.
+pub fn krb5_config_is_honoured() -> bool {
+    !started_in_secure_mode()
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // The crate's FFI read of the auxiliary vector; see SAFETY below.
+fn started_in_secure_mode() -> bool {
+    // SAFETY: `getauxval` takes a plain integer and only reads the
+    // auxiliary vector the kernel placed in the process at exec, which
+    // nothing writes afterwards; an absent entry answers 0. It has no
+    // precondition to uphold.
+    let at_secure: libc::c_ulong = unsafe { libc::getauxval(libc::AT_SECURE) };
+    at_secure != 0
+}
+
+/// Lorica runs on Linux only; elsewhere there is no auxiliary vector to
+/// read, and the workspace is merely compiled.
+#[cfg(not(target_os = "linux"))]
+fn started_in_secure_mode() -> bool {
+    false
+}
+
 /// Replaces `path` with `contents` so that a reader sees either the old
 /// file or the new one, never a partial write: the bytes go to a sibling
 /// temporary file in the same directory, which is flushed to disk and
@@ -396,6 +428,14 @@ mod tests {
 
     fn timing() -> KdcTiming {
         KdcTiming::new(3).expect("timing")
+    }
+
+    /// The test binary is neither setuid nor capability-carrying, so
+    /// the auxiliary vector reads as an ordinary start: the FFI call
+    /// answers, and answers what MIT would conclude.
+    #[test]
+    fn an_ordinary_process_honours_krb5_config() {
+        assert!(krb5_config_is_honoured());
     }
 
     #[test]

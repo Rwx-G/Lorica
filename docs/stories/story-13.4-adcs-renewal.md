@@ -1,7 +1,7 @@
 # Story 13.4: Renewal
 
 **Epic:** [Epic 13 - AD CS Certificate Enrollment over CES (v1.10.0)](../prd/epic-13-v1.10.0.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** Story 13.3 (the internal `issue()` with its in-place
@@ -110,7 +110,24 @@ These are the PRD's, unchanged. They are the contract.
 
 - AC #1 to #8 met; IV1 and IV2 covered by `adcs/renew/tests.rs`.
 
+### After the epic audit
+
+- AC #3: the decision above ("one ticket per tick is a property of the guard", one AS-REQ per successful renewal) is superseded. A `CesSession` acquires one ticket and one HTTPS client for the whole tick, so a tick acquires at most one ticket on the success path too; the ticket stays in a per-call memory cache dropped with the session, so it does not outlive the tick (D3).
+- AC #1: the loop runs the ACME arm first, re-reads each AD CS certificate before renewing it (one deleted, reverted, switched to auto-renew off, unbound or already renewed since selection is skipped), and ends the tick on any authority-wide failure (ticket, KDC, TLS, SPNEGO, mutual authentication, timeout); per-certificate back-off is kept for outcomes that concern one request. A busy guard makes the tick wait and retry instead of giving up.
+- AC #2: renewal keeps the current key type and size; a template no longer in the authority's allowlist (D17) is refused before the authority is contacted.
+- AC #7: a renewal that fails before reaching the authority still writes its audit row.
+- Every renewal path is refused at the `krb5_conf` step when the process runs with `AT_SECURE` set (Story 13.2).
+- The PRD records the epic-wide deviations in "Delivery notes (v1.10.0)".
+
 ## File List
+
+- `lorica-api/src/adcs/renew.rs`, `lorica-api/src/adcs/renew/tests.rs`, `lorica-api/src/adcs/{issue,runtime}.rs`,
+  `lorica-api/src/adcs/issue/tests.rs`, `lorica-api/src/adcs.rs`
+- `lorica-api/src/acme/{mod,renewal}.rs`, `lorica-api/src/automation/{read,redact,write}.rs`,
+  `lorica-api/src/automation/read/plane_tests.rs`, `lorica-mcp/src/tools.rs`
+- `lorica-api/openapi.yaml`, `lorica-api/openapi-automation.yaml`
+- `lorica-dashboard/frontend/src/components/certificates/{CertificateList,CertificateDetail}.svelte`,
+  `lib/adcs-issuance.{ts,test.ts}`, `lib/api.ts`, `routes/Certificates.{svelte,test.ts}`
 
 ## Change Log
 
@@ -118,3 +135,4 @@ These are the PRD's, unchanged. They are the contract.
 |------|---------|-------------|--------|
 | 2026-10-21 | 0.1 | Story drafted from the Epic 13 PRD. Status Approved (maintainer delegated the epic). | Romain G. |
 | 2026-10-21 | 0.2 | Lots implemented. Status Review. | Romain G. |
+| 2026-10-27 | 0.3 | Audit changes recorded (session per tick, re-read before renewing, tick ends on authority-wide failures), File List filled. Status Done. | Romain G. |

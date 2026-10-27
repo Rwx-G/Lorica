@@ -96,7 +96,7 @@ pub use adopt::{
 };
 pub(crate) use error::{
     refuse_on_follower, AdcsUnavailable, CERTIFICATE_MANAGED, KEY_NOT_EXPORTABLE,
-    NOT_ON_AUTOMATION_PLANE,
+    KRB5_CONFIG_IGNORED_MESSAGE, NOT_ON_AUTOMATION_PLANE,
 };
 pub use error::{AdcsCode, IssuanceStep, ADCS_CODES};
 pub use issue::{issue_certificate, AdcsIssueRequest, PendingIssuance, MAX_SANS};
@@ -136,6 +136,11 @@ pub(crate) struct AdcsOperation {
 /// parameters came from. Call it under the single-flight guard, which
 /// every writer of the file holds.
 ///
+/// In a process MIT krb5 would not let read that file (setuid, file
+/// capabilities), the operation is refused instead: it would otherwise
+/// authenticate under the host's `/etc/krb5.conf`, whatever KDCs and
+/// encryption types it names.
+///
 /// The file is compared and written after the store lock is released:
 /// every other store-bound request waits on that lock, and the file
 /// changes only with the authority, so an operation usually writes
@@ -145,6 +150,9 @@ pub(crate) async fn prepare_operation(state: &AppState) -> Result<AdcsOperation,
         Ok::<_, ApiError>(read_operation(store))
     })
     .await??;
+    if !state.adcs.krb5_config_honoured {
+        return Err(AdcsUnavailable::Krb5ConfigIgnored);
+    }
     let path: std::path::PathBuf = lorica_adcs::krb5_config_path(&state.data_dir);
     tokio::task::spawn_blocking(move || config.write_if_changed(&path))
         .await
@@ -210,7 +218,9 @@ fn write_krb5_conf(data_dir: &Path, config: &Krb5Config) -> Result<(), ApiError>
 }
 
 /// Regenerate the `krb5.conf` from the stored authority, once, when the
-/// management API starts on a node that runs AD CS operations. The file
+/// management API starts on a node that runs AD CS operations, and say
+/// so as an error when the process is one MIT krb5 would not let read
+/// it. The file
 /// is rewritten on every authority write and before every operation;
 /// this covers a data directory restored without it, or an upgrade that
 /// changed what the renderer writes. A failure is logged, not fatal:
@@ -226,6 +236,9 @@ pub async fn write_krb5_conf_at_startup(state: &AppState) {
     })
     .await;
     match written {
+        Ok(true) if !state.adcs.krb5_config_honoured => {
+            tracing::error!("{KRB5_CONFIG_IGNORED_MESSAGE}; every AD CS operation is refused")
+        }
         Ok(true) => tracing::info!("AD CS krb5.conf regenerated from the stored authority"),
         Ok(false) => {}
         Err(err) => tracing::warn!(

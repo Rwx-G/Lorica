@@ -285,6 +285,9 @@ pub struct AdcsRuntime {
     busy_retry_delay: Duration,
     pub(crate) renewals: Arc<AdcsRenewalMemory>,
     pub(crate) adoption: Arc<AdoptionVerdicts>,
+    /// [`lorica_adcs::krb5_config_is_honoured`], read once: it is fixed
+    /// at exec.
+    pub(crate) krb5_config_honoured: bool,
 }
 
 impl AdcsRuntime {
@@ -299,6 +302,7 @@ impl AdcsRuntime {
             busy_retry_delay: BUSY_RETRY_DELAY,
             renewals: Arc::default(),
             adoption: Arc::default(),
+            krb5_config_honoured: lorica_adcs::krb5_config_is_honoured(),
         }
     }
 
@@ -316,6 +320,7 @@ impl AdcsRuntime {
             busy_retry_delay: BUSY_RETRY_DELAY,
             renewals: Arc::default(),
             adoption: Arc::default(),
+            krb5_config_honoured: lorica_adcs::krb5_config_is_honoured(),
         }
     }
 
@@ -323,6 +328,14 @@ impl AdcsRuntime {
     #[cfg(test)]
     pub(crate) fn with_handler_deadline(mut self, deadline: Duration) -> AdcsRuntime {
         self.handler_deadline = deadline;
+        self
+    }
+
+    /// The same runtime as in a process started setuid or with file
+    /// capabilities, where MIT krb5 ignores `KRB5_CONFIG`.
+    #[cfg(test)]
+    pub(crate) fn with_krb5_config_ignored(mut self) -> AdcsRuntime {
+        self.krb5_config_honoured = false;
         self
     }
 

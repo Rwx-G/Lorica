@@ -1721,9 +1721,11 @@ paths:
           $ref: "#/components/responses/RateLimited"
         "500":
           description: >-
-            The generated krb5.conf could not be written (`adcs_krb5_conf`,
-            `error.step` is `krb5_conf`); the log names the path and the
-            cause. Nothing was sent to the authority.
+            The generated krb5.conf could not be written, or the process
+            runs with elevated privileges (`AT_SECURE`) so MIT Kerberos
+            would ignore it (`adcs_krb5_conf`, `error.step` is
+            `krb5_conf`); the message or the log names the cause. Nothing
+            was sent to the authority.
           content:
             application/json:
               schema:
@@ -4369,7 +4371,7 @@ paths:
         "429":
           $ref: "#/components/responses/RateLimited"
         "500":
-          description: The generated krb5.conf could not be written (`adcs_krb5_conf`)
+          description: The generated krb5.conf could not be written, or the process runs with elevated privileges (`AT_SECURE`) so MIT Kerberos would ignore it (`adcs_krb5_conf`)
           content:
             application/json:
               schema:
@@ -4745,7 +4747,9 @@ paths:
           description: >-
             ACME renewal failed (ACME server error, DNS, etc.); the stored
             certificate is untouched. AD CS: the generated krb5.conf could
-            not be written (`adcs_krb5_conf`).
+            not be written, or the process runs with elevated privileges
+            (`AT_SECURE`) so MIT Kerberos would ignore it
+            (`adcs_krb5_conf`).
         "502":
           description: >-
             AD CS: the authority answered with a fault, a client step

@@ -1,7 +1,7 @@
 # Story 13.5: Adopting Certificates Issued Before Lorica Could
 
 **Epic:** [Epic 13 - AD CS Certificate Enrollment over CES (v1.10.0)](../prd/epic-13-v1.10.0.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P1
 **Author:** Romain G.
 **Depends on:** Story 13.2 (the issuing CA certificate on the
@@ -91,7 +91,22 @@ These are the PRD's, unchanged. They are the contract.
 
 - AC #1 to #6 met; IV1 and IV2 covered by `adcs/adopt/tests.rs`.
 
+### After the epic audit
+
+- AC #1: with no issuing CA known the listing and adoption answer `adcs_no_issuing_ca`, not `adcs_not_configured` (the Debug Log above records the first behaviour). Verdicts are cached per pair of digests (certificate PEM, issuing CA DER), and the listing does nothing on a follower.
+- AC #5: a loop renewal already past selection re-reads the certificate before renewing it, so a reversion during the tick is honoured (Story 13.4).
+- The PEM, key and domain of an AD CS certificate cannot be replaced through `PUT /api/v1/certificates/{id}` (409 `adcs_certificate_managed`), which would otherwise have put an unverified certificate under the authority without the adoption signature check; revert to manual first. Adopted certificates fall under D16 (key not downloadable).
+- The PRD records the epic-wide deviations in "Delivery notes (v1.10.0)".
+
 ## File List
+
+- `lorica-api/src/adcs/adopt.rs`, `lorica-api/src/adcs/adopt/tests.rs`, `lorica-api/src/adcs.rs`,
+  `lorica-api/src/adcs/{renew,issue}.rs`, `lorica-api/src/adcs/renew/tests.rs`, `lorica-api/src/adcs/issue/tests.rs`,
+  `lorica-api/src/certificates.rs`, `lorica-api/src/middleware/authorize.rs`, `lorica-api/src/server.rs`,
+  `lorica-api/openapi.yaml`, `docs/adcs.md`
+- `lorica-dashboard/frontend/src/components/certificates/AdcsAdoptionPanel.{svelte,test.ts}`,
+  `components/certificates/CertificateList.svelte`, `components/certificates/CertificateSource.test.ts`,
+  `lib/adcs-adoption.{ts,test.ts}`, `lib/api.ts`, `routes/Certificates.{svelte,test.ts}`, `test-adcs-fixtures.ts`
 
 ## Change Log
 
@@ -99,3 +114,4 @@ These are the PRD's, unchanged. They are the contract.
 |------|---------|-------------|--------|
 | 2026-10-21 | 0.1 | Story drafted from the Epic 13 PRD. Status Approved (maintainer delegated the epic). | Romain G. |
 | 2026-10-21 | 0.2 | Lots implemented. Status Review. | Romain G. |
+| 2026-10-27 | 0.3 | Audit changes recorded (own code for an unknown issuing CA, verdict cache, managed PEM refusal), File List filled. Status Done. | Romain G. |

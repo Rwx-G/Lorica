@@ -61,6 +61,13 @@ webpki-roots = "1"
 # under an outer `tokio::time::timeout` (Epic 13 D8).
 tokio = { workspace = true, features = ["rt", "time"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# `getauxval(AT_SECURE)`: MIT krb5 ignores `KRB5_CONFIG` in a process
+# started in secure mode, and only the auxiliary vector says whether
+# this one was. Already in the lockfile through `lorica-core` and most
+# of the async stack; `nix` does not wrap `getauxval`.
+libc = "0.2"
+
 [dev-dependencies]
 # A local HTTPS server standing in for CES in the exchange tests. Every
 # crate below is already in the workspace lockfile through `lorica-api`.

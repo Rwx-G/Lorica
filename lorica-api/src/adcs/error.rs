@@ -212,6 +212,12 @@ pub(crate) const STILL_RUNNING_MESSAGE: &str = "the AD CS operation is still fin
      Kerberos exchange outlived the operation timeout. Its outcome is recorded in the audit log \
      when it ends, and every other AD CS operation is refused until then";
 
+/// The message of [`AdcsUnavailable::Krb5ConfigIgnored`], also logged
+/// at startup when an authority is configured.
+pub(crate) const KRB5_CONFIG_IGNORED_MESSAGE: &str = "Lorica runs with elevated privileges \
+     (AT_SECURE), so MIT Kerberos ignores KRB5_CONFIG; remove file capabilities or setuid from \
+     the binary, see docs/adcs.md";
+
 /// The message of [`AdcsUnavailable::NotConfigured`].
 const NOT_CONFIGURED_MESSAGE: &str =
     "no AD CS authority is configured; a SuperAdmin must declare one";
@@ -231,6 +237,9 @@ pub(crate) enum AdcsUnavailable {
     /// The generated `krb5.conf` could not be written; the detail names
     /// a path under the data directory, so it is logged, not answered.
     Krb5Conf(String),
+    /// The process started in secure mode, so MIT krb5 would read the
+    /// host's `krb5.conf` instead of the generated one (D3).
+    Krb5ConfigIgnored,
     /// The store failed.
     Error(ApiError),
 }
@@ -242,7 +251,9 @@ impl AdcsUnavailable {
             AdcsUnavailable::NotConfigured => "not_configured",
             AdcsUnavailable::Failed { .. } => "failed_state",
             AdcsUnavailable::NoPassword => "no_password",
-            AdcsUnavailable::Krb5Conf(_) => lorica_adcs::FailureStep::Krb5Conf.as_str(),
+            AdcsUnavailable::Krb5Conf(_) | AdcsUnavailable::Krb5ConfigIgnored => {
+                lorica_adcs::FailureStep::Krb5Conf.as_str()
+            }
             AdcsUnavailable::Error(_) => "error",
         }
     }
@@ -279,6 +290,10 @@ impl From<AdcsUnavailable> for ApiError {
                      the cause",
                 )
             }
+            AdcsUnavailable::Krb5ConfigIgnored => KRB5_CONF.error_at(
+                lorica_adcs::FailureStep::Krb5Conf.as_str(),
+                KRB5_CONFIG_IGNORED_MESSAGE,
+            ),
             AdcsUnavailable::Error(err) => err,
         }
     }

@@ -1,7 +1,7 @@
 # Story 13.2: The AD CS Authority
 
 **Epic:** [Epic 13 - AD CS Certificate Enrollment over CES (v1.10.0)](../prd/epic-13-v1.10.0.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** Story 13.1 (the `lorica-adcs` client: `test_connection`,
@@ -207,6 +207,40 @@ of `.claude/rules/lorica-frontend.md`).
   IV2 by the handler tests plus the Story 13.1 harness.
 - `lorica` now links `libgssapi_krb5`, which closed Story 13.1 IV4.
 
+### After the epic audit
+
+- AC #1: the schema landed in three migrations, not one: 64 (authority,
+  password column, `adcs_*` certificate columns), 65 (alert
+  subscriptions, AC #9) and 66 (`allowed_templates_json` for D17,
+  seeded with the authority's default template).
+- AC #2 and AC #3, refusals: the same condition first answered
+  different codes on different endpoints. Every AD CS refusal now comes
+  from `ADCS_CODES` (`lorica-api/src/adcs/error.rs`): one status and one
+  code per condition on every endpoint (`adcs_not_configured`,
+  `adcs_failed_state`, `adcs_busy`, ...), checked against `docs/adcs.md`
+  and `openapi.yaml` by tests. An operation that outlives its handler
+  answers 504 `gateway_timeout`, and every other AD CS request 409
+  `adcs_busy` until it ends.
+- AC #2, D11 extended: a change of the endpoint trust bundle clears the
+  password, like the four identity fields. D18: Viewers read a summary
+  (configured, suffixes, failed state); the connection details go to
+  Operators and SuperAdmins only.
+- AC #4 / D15: the breaker opens on four KDC codes (31 added: a wrong
+  password on an account without pre-authentication), and on any ticket
+  failure not identified as an unreachable KDC (Story 13.1).
+- AC #5 and AC #9: the dashboard reads the alert types and the AD CS
+  vocabulary from `adcs.generated.ts`, rendered from Rust and pinned by
+  `lorica-api/tests/adcs_vocabulary_fixture.rs`. Editing a notification
+  channel no longer drops the cluster alert types it held.
+- AC #6 / D13: `lorica cluster join` deletes the node's authority, its
+  password and its `krb5.conf`, audited `adcs.authority.delete.on_join`.
+- `krb5.conf` is written only when what the stored authority renders
+  differs, outside the store lock. Every operation is refused at the
+  `krb5_conf` step (500 `adcs_krb5_conf`) when the process runs with
+  `AT_SECURE` set, and the condition is logged as an error at startup
+  when an authority is configured.
+- The PRD records the epic-wide deviations in "Delivery notes (v1.10.0)".
+
 ## File List
 
 - `lorica-config/src/models/adcs_authority.rs`, `lorica-config/src/store/adcs_authority.rs`,
@@ -216,7 +250,10 @@ of `.claude/rules/lorica-frontend.md`).
 - `lorica-api/src/adcs.rs`, `lorica-api/src/adcs/tests.rs`, `lorica-api/src/{server,lib,config,tests}.rs`,
   `lorica-api/src/middleware/authorize.rs`, `lorica-api/openapi.yaml`, `lorica-api/Cargo.toml`,
   certificate literal sites in `lorica-api` and `lorica`
-- `lorica/src/startup/{mod,single,supervisor}.rs`
+- `lorica/src/startup/{mod,single,supervisor}.rs`, `lorica/src/cli_cluster.rs`
+- After the audit: `lorica-api/src/adcs/{error,runtime,validate}.rs`,
+  `lorica-api/tests/adcs_vocabulary_fixture.rs`,
+  `lorica-dashboard/frontend/src/lib/adcs.generated.ts`
 - `lorica-adcs/src/{client,error}.rs`, `lorica-adcs/src/client/tests.rs`, `lorica-adcs/tests/harness.rs`
 - `lorica-dashboard/frontend/src/lib/api.ts`, `components/settings-tabs/AdcsAuthorityTab.{svelte,test.ts}`,
   `routes/Settings.svelte`, `components/settings/SettingsNotifications.{svelte,test.ts}`,
@@ -228,3 +265,4 @@ of `.claude/rules/lorica-frontend.md`).
 |------|---------|-------------|--------|
 | 2026-10-21 | 0.1 | Story drafted from the Epic 13 PRD. Status Approved (maintainer delegated the epic). | Romain G. |
 | 2026-10-21 | 0.2 | Lots 1 to 4 implemented, guard fix applied. Status Review. | Romain G. |
+| 2026-10-27 | 0.3 | Audit changes recorded (error table, migration 66, D18 summary, join, generated vocabulary, `AT_SECURE`). Status Done. | Romain G. |

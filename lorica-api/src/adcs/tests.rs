@@ -259,6 +259,13 @@ impl Fixture {
         self
     }
 
+    /// The process MIT krb5 sees from here on started setuid or with
+    /// file capabilities.
+    pub(in crate::adcs) fn with_krb5_config_ignored(mut self) -> Fixture {
+        self.state.adcs = self.state.adcs.clone().with_krb5_config_ignored();
+        self
+    }
+
     /// Waits until no AD CS operation holds the guard.
     pub(in crate::adcs) async fn wait_until_idle(&self) {
         tokio::time::timeout(Duration::from_secs(10), async {

@@ -913,3 +913,48 @@ async fn a_renewal_with_a_template_no_longer_allowed_is_refused() {
         .backoff_until(&id, Utc::now())
         .is_some());
 }
+
+/// Audit I1, D3: in a process started in secure mode MIT krb5 would
+/// read the host's `krb5.conf`, so the connection test, an issuance,
+/// "Renew now" and the loop all stop at the `krb5_conf` step, and none
+/// reaches the authority.
+#[tokio::test]
+async fn every_operation_is_refused_when_krb5_config_would_be_ignored() {
+    let stub = StubAuthority::new(issue_v2());
+    let f = issuing(&stub, None).await;
+    let id = f.bound_in_window("web01.corp.example.org").await;
+    let not_after = f.cert(&id).await.not_after;
+    let calls = stub.calls();
+    let f = f.with_krb5_config_ignored();
+
+    let requests: [(&str, String, Option<serde_json::Value>); 3] = [
+        ("POST", "/api/v1/adcs/authority/test".to_string(), None),
+        (
+            "POST",
+            "/api/v1/certificates/adcs".to_string(),
+            Some(web01()),
+        ),
+        ("POST", renew_path(&id), None),
+    ];
+    for (method, uri, request) in requests {
+        let resp = f.send(method, &uri, &f.admin, request).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "{uri}");
+        let error = body_json(resp).await["error"].clone();
+        assert_eq!(error["code"], "adcs_krb5_conf", "{uri}");
+        assert_eq!(error["step"], "krb5_conf", "{uri}");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("AT_SECURE")),
+            "{uri}: {error}"
+        );
+    }
+    f.tick().await;
+
+    assert_eq!(stub.calls(), calls, "nothing reached the authority");
+    assert_eq!(
+        f.cert(&id).await.not_after,
+        not_after,
+        "nothing was renewed"
+    );
+}

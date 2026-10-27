@@ -402,6 +402,28 @@ cannot regress silently.
   whole allocation on drop; copies inside `libgssapi` and MIT are out of
   reach and not claimed.
 
+### After the epic audit
+
+- `344b1602`: every connection of an operation must present the
+  certificate the probe met (a rustls verifier that accepts only that
+  leaf after normal validation), so the token never leaves on a
+  connection whose certificate it is not bound to; the probe is a
+  bodiless `GET`. The context must end on Kerberos with mutual
+  authentication. Any ticket failure not positively identified as an
+  unreachable KDC counts as a rejected credential (fail closed), and
+  KDC code 31 joins the three of D15. A `CesSession` acquires one ticket
+  and one HTTPS client for an operation or a renewal tick. Each chain
+  link is verified by signature, responses are capped, and the failure
+  steps (`FailureStep`, with their scope), the KDC code meanings and
+  the endpoint and principal validation are owned by this crate.
+- AC #3 / D3: the crate exposes `krb5_config_is_honoured`, which reads
+  `getauxval(AT_SECURE)`: in a setuid or file-capability process MIT
+  ignores `KRB5_CONFIG`, and the API then refuses every AD CS
+  operation at the `krb5_conf` step instead of letting MIT read the
+  host's file. `libc` became a Linux-only direct dependency of the
+  crate (already in the lockfile); it is the crate's second scoped
+  `unsafe` call.
+
 ## File List
 
 - `lorica-adcs/Cargo.toml`, `lorica-adcs/src/{lib,error,binding,krb5conf,csr,der,chain,secret,gss,client,test_support}.rs`,
@@ -423,3 +445,4 @@ cannot regress silently.
 | 2026-10-21 | 0.2 | Password wipe decided without `zeroize` (volatile writes). Status Approved. | Romain G. |
 | 2026-10-21 | 0.3 | Lots 1 to 4 implemented; SPNEGO-only acquisition and request_timeout after the harness findings; IV4 carried to Story 13.2. Status Review. | Romain G. |
 | 2026-10-21 | 0.4 | IV4 verified after Story 13.2 Lot 3: `lorica` links `libgssapi_krb5.so.2`, resolved on `debian:bookworm-slim` with the production runtime packages. Status Done. | Romain G. |
+| 2026-10-27 | 0.5 | Post-audit changes recorded (certificate pinning, Kerberos-only context, fail-closed classification, session, `AT_SECURE` detection). | Romain G. |

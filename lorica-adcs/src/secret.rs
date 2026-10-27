@@ -88,7 +88,7 @@ impl Drop for Secret {
 
 /// Overwrites every byte of `buffer` with zero in a way the compiler
 /// keeps even though the buffer is about to be freed.
-#[allow(unsafe_code)] // The one unsafe call of the crate; see SAFETY below.
+#[allow(unsafe_code)] // A volatile write the optimiser cannot drop; see SAFETY below.
 pub(crate) fn wipe(buffer: &mut [u8]) {
     for byte in buffer.iter_mut() {
         // SAFETY: `byte` comes from a live `&mut [u8]`, so it is non-null,

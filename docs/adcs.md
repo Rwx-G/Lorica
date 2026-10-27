@@ -222,9 +222,19 @@ Lorica points MIT Kerberos at its generated file through the
 process. MIT reads that variable with `secure_getenv`, which **ignores
 it in a process started with elevated privileges**: a binary that is
 setuid, or that carries file capabilities (`setcap
-cap_net_bind_service+ep /usr/bin/lorica`). Lorica would then silently
-fall back to the host's `/etc/krb5.conf`, or to none, with whatever
-encryption types and KDCs that file names.
+cap_net_bind_service+ep /usr/bin/lorica`). MIT would then fall back to
+the host's `/etc/krb5.conf`, or to none, with whatever encryption types
+and KDCs that file names.
+
+Lorica detects it: it reads the kernel's `AT_SECURE` flag, which is
+what `secure_getenv` obeys, and when the flag is set it refuses every
+AD CS operation (the connection test, issuance, "Renew now" and the
+renewal loop) at the `krb5_conf` step with 500 `adcs_krb5_conf` and the
+message "Lorica runs with elevated privileges (AT_SECURE), so MIT
+Kerberos ignores KRB5_CONFIG". Nothing is sent to a KDC. With an
+authority configured, the same message is logged as an error at
+startup. The fix is to remove the file capabilities (`setcap -r
+/usr/bin/lorica`) or the setuid bit, and restart.
 
 The supported way to bind ports below 1024 is the shipped systemd
 unit's `AmbientCapabilities=CAP_NET_BIND_SERVICE`, which does not set
@@ -419,7 +429,7 @@ the renewal of the certificates issued with it (alerted with the step
 | Denied | 422 `adcs_denied` | Nothing is stored; the authority's message is shown; alerted |
 | Fault or client failure | 502 `adcs_error` | Nothing is stored; `error.step` names the failing step and the message says it in words; alerted |
 | Refused before contact | 409 or 422 | No authority or no password (`adcs_not_configured`), the failed state (`adcs_failed_state`), another AD CS operation running (`adcs_busy`), a follower (`conflict`); or a refused name (`adcs_san_refused`), template (`adcs_template_refused`) or field |
-| Local failure | 500 `adcs_krb5_conf` | The generated `krb5.conf` could not be written (`error.step` is `krb5_conf`); nothing was sent, and the log names the path and the cause |
+| Local failure | 500 `adcs_krb5_conf` | The generated `krb5.conf` could not be written, or the process runs with elevated privileges so MIT Kerberos would ignore it (`error.step` is `krb5_conf`); nothing was sent, and the message or the log names the cause |
 | Still running | 504 `gateway_timeout` | See [Timeouts](#timeouts-and-the-single-flight-guard) |
 
 An issued certificate that is not a server certificate (step
@@ -764,7 +774,7 @@ message; the message carries the detail.
 | `store` | The issued certificate could not be stored, or the certificate being renewed stopped being AD CS managed meanwhile | Revoke the request the message names |
 | `timeout` | The operation passed its bound | Silent KDCs or a slow CES; see [Timeouts](#timeouts-and-the-single-flight-guard) |
 | `gss_task` | A Kerberos call's task did not return | The log; the process may be shutting down |
-| `krb5_conf` | The generated `krb5.conf` could not be written (500 `adcs_krb5_conf`) | Permissions on `<data-dir>/adcs/`; the log names the path |
+| `krb5_conf` | The generated `krb5.conf` could not be written, or Lorica runs setuid or with file capabilities, where MIT ignores it (500 `adcs_krb5_conf`) | Permissions on `<data-dir>/adcs/`, the log names the path; or, when the message names `AT_SECURE`, see [Never give the binary file capabilities or setuid](#never-give-the-binary-file-capabilities-or-setuid) |
 | `configuration` | A connection parameter was refused before anything was sent | The message names the parameter |
 | `csr` | The CSR was refused before anything was sent | The message names the field |
 | `denied` | The authority denied the request (422 `adcs_denied`) | The authority's message, below |
@@ -926,7 +936,7 @@ table or `openapi.yaml` misses one.
 | `adcs_denied` | 422 | The authority denied the request |
 | `adcs_not_candidate` | 422 | The certificate cannot be adopted |
 | `adcs_error` | 502 | A fault, a client step, or an issued certificate Lorica refused; `error.step` names the step |
-| `adcs_krb5_conf` | 500 | The generated `krb5.conf` could not be written |
+| `adcs_krb5_conf` | 500 | The generated `krb5.conf` could not be written, or the process runs with elevated privileges (`AT_SECURE`) so MIT Kerberos would ignore it |
 | `adcs_certificate_managed` | 409 | An AD CS certificate's PEM, key or domain cannot be replaced |
 | `adcs_key_not_exportable` | 403 | The private key of an AD CS certificate is never downloaded |
 | `adcs_renewal_not_on_automation_plane` | 403 | A token asked to renew an AD CS certificate |

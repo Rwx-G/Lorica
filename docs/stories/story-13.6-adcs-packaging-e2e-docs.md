@@ -1,7 +1,7 @@
 # Story 13.6: Packaging, End-to-End and the Operator Guide
 
 **Epic:** [Epic 13 - AD CS Certificate Enrollment over CES (v1.10.0)](../prd/epic-13-v1.10.0.md)
-**Status:** Approved
+**Status:** Review
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** Stories 13.1 to 13.5.
@@ -43,7 +43,7 @@ These are the PRD's, unchanged. They are the contract.
 
 ### Lot 1: documentation
 
-- [ ] `docs/adcs.md`: what it does, prerequisites on the authority side,
+- [x] `docs/adcs.md`: what it does, prerequisites on the authority side,
       Lorica-side setup (the settings tab), network and time,
       issuance, renewal, adoption, revert, the breaker and how to clear
       it, troubleshooting by failing step, supported and refused
@@ -51,22 +51,22 @@ These are the PRD's, unchanged. They are the contract.
       capabilities caveat, the bot-protection cookie rotation on every
       certificate event, unbound certificates neither renewed nor
       purged, the mixed-version fleet upgrade order (followers first).
-- [ ] `docs/security/threat-model.md`: the authority as an asset, the
+- [x] `docs/security/threat-model.md`: the authority as an asset, the
       service account credential as a secret, mitigations (D5, D11,
       D13, D15) and D11's stated limit.
-- [ ] `CHANGELOG.md` `[Unreleased]`: Added (AD CS enrollment), Security
+- [x] `CHANGELOG.md` `[Unreleased]`: Added (AD CS enrollment), Security
       (what protects the credential and the authority), the new runtime
       library requirement.
-- [ ] Links: README feature list, `docs/` index if one exists, the
+- [x] Links: README feature list, `docs/` index if one exists, the
       settings tab prerequisites section pointing at the guide.
 
 ### Lot 2: packaging and install checks
 
-- [ ] AC #1 in the scripts and CI jobs.
+- [x] AC #1 in the scripts and CI jobs.
 
 ### Lot 3: the `adcs` e2e profile
 
-- [ ] A Lorica container joined to the harness network, driven through
+- [x] A Lorica container joined to the harness network, driven through
       the management API: authority, test, issuance from a route,
       renewal, adoption, revert, breaker.
 
@@ -78,12 +78,26 @@ These are the PRD's, unchanged. They are the contract.
 
 ### Debug Log
 
+- 2026-10-21, Lot 1 (`8d548195`): `docs/adcs.md`, the threat model section, the changelog and the README feature list.
+- 2026-10-21, Lots 2 and 3 (`95e02a03`): the install and upgrade checks install the new package through `apt-get install` and `dnf install` and fail on an unresolved library of `lorica` or `lorica-mcp`; the upgrade scripts install the new package's dependencies before running its CLI from the extracted copy. The `adcs` e2e profile (`tests-e2e-docker/test-runner/run-adcs-smoke.sh`) drives a real Lorica against the Story 13.1 harness through authority, connection test, issuance from a route served over TLS, renewal, adoption and revert, the breaker, and the unbound probe.
+- After the epic audit (`a541f687`): CI runs the Kerberos harness in its own job. `docs/adcs.md` gained D16 to D18, the error-code table tested against `ADCS_CODES`, and the accepted residual risks; the `KRB5_CONFIG` caveat now says Lorica detects `AT_SECURE` and refuses every AD CS operation rather than relying on the documentation alone.
+
 ### Completion Notes
 
+- AC #1 to #4 met; IV1 and IV2 covered by the `adcs` profile and the deb and rpm install jobs.
+- AC #5 and IV3 are pending: the release check against a real authority is the maintainer's, run from the release candidate's `.deb` before the PR to `main`, and has not been run. The status stays Review until its outcome is recorded here with placeholders.
+- The PRD records the epic-wide deviations in "Delivery notes (v1.10.0)".
+
 ## File List
+
+- `docs/adcs.md`, `docs/security/threat-model.md`, `CHANGELOG.md`, `README.md`
+- `.github/workflows/ci.yml`, `dist/tests/deb-upgrade.sh`, `dist/tests/rpm-upgrade.sh`
+- `tests-e2e-docker/adcs/ces/{harness_ca,server}.py`, `tests-e2e-docker/docker-compose.yml`, `tests-e2e-docker/run.sh`,
+  `tests-e2e-docker/test-runner/Dockerfile`, `tests-e2e-docker/test-runner/run-adcs-smoke.sh`
 
 ## Change Log
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
 | 2026-10-21 | 0.1 | Story drafted from the Epic 13 PRD. Status Approved (maintainer delegated the epic). | Romain G. |
+| 2026-10-27 | 0.2 | Lots 1 to 3 delivered and recorded; AC #5 (release check) pending with the maintainer. Status Review. | Romain G. |
