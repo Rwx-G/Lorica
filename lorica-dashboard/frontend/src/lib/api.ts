@@ -48,6 +48,14 @@ import type {
   FleetWafRow,
   RevokeNodeResponse,
 } from './cluster';
+import type {
+  AdcsKeyType,
+  AdcsSubjectField,
+  AdoptionUnavailableReason,
+  CertificateSource,
+} from './adcs.generated';
+
+export type { AdcsKeyType, AdcsSubjectField, CertificateSource };
 
 export interface ApiError {
   code: string;
@@ -714,13 +722,6 @@ export interface BackendResponse {
   updated_at: string;
 }
 
-/**
- * Where a certificate comes from, derived by the API (Epic 13 D14):
- * ACME when `is_acme`, AD CS when `adcs_authority_id` is set, manual
- * otherwise. The dashboard reads it and never re-derives it.
- */
-export type CertificateSource = 'acme' | 'adcs' | 'manual';
-
 export interface CertificateResponse {
   id: string;
   domain: string;
@@ -741,6 +742,10 @@ export interface CertificateResponse {
   created_at: string;
   acme_method?: string;
   acme_dns_provider_id?: string;
+  /**
+   * Where the certificate comes from, derived by the API (Epic 13 D14);
+   * the dashboard reads it and never re-derives it.
+   */
   source: CertificateSource;
   adcs_authority_id: string | null;
   /** The template name requested at issuance. */
@@ -1262,18 +1267,8 @@ export interface CreateDnsProviderRequest {
 
 // ---- AD CS authority (Story 13.2) ----
 
-/** `AdcsKeyType` in `lorica-config`, as serialised. */
-export type AdcsKeyType = 'rsa2048' | 'rsa3072' | 'ecdsa_p256';
-
 /** The fixed part of every CSR subject; blank fields are `null`. */
-export interface AdcsSubjectDefaults {
-  country: string | null;
-  state: string | null;
-  locality: string | null;
-  organization: string | null;
-  organizational_unit: string | null;
-  email: string | null;
-}
+export type AdcsSubjectDefaults = Record<AdcsSubjectField, string | null>;
 
 /**
  * The authority as a read returns it. There is no password field: the
@@ -1343,7 +1338,11 @@ export interface AdcsAuthorityRequest {
    */
   password?: string;
   endpoint_ca_pem: string | null;
-  issuing_ca_pem: string | null;
+  /**
+   * Omitted (or `null`) to keep the stored certificate, which an
+   * issuance may have learned since the form was loaded; blank clears it.
+   */
+  issuing_ca_pem?: string;
   default_template: string;
   /** The other templates an issuance may request; the default always may. */
   allowed_templates: string[];
@@ -1365,14 +1364,7 @@ export interface AdcsConnectionTestResult {
 }
 
 /** Subject overrides of an issuance; an absent field takes the authority's default. */
-export interface AdcsSubjectOverrides {
-  country?: string;
-  state?: string;
-  locality?: string;
-  organization?: string;
-  organizational_unit?: string;
-  email?: string;
-}
+export type AdcsSubjectOverrides = Partial<Record<AdcsSubjectField, string>>;
 
 /** Body of `POST /api/v1/certificates/adcs` (Story 13.3). */
 export interface AdcsIssueRequest {
@@ -1413,12 +1405,8 @@ export interface AcmeRenewResult {
  */
 export type CertificateRenewResult = AcmeRenewResult | CertificateResponse | AdcsIssuePending;
 
-/**
- * Why `GET /api/v1/adcs/adoption-candidates` lists nothing without
- * looking (Story 13.5): no authority, or no issuing CA certificate to
- * verify signatures against.
- */
-export type AdcsAdoptionUnavailableReason = 'not_configured' | 'no_issuing_ca';
+/** Why `GET /api/v1/adcs/adoption-candidates` lists nothing without looking (Story 13.5). */
+export type AdcsAdoptionUnavailableReason = AdoptionUnavailableReason;
 
 /** A manual certificate the authority's issuing CA signed (Story 13.5). */
 export interface AdcsAdoptionCandidate {

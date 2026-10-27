@@ -1,12 +1,7 @@
 <script lang="ts">
-  import type { CertificateDetailResponse, CertificateSource, RouteResponse } from '../../lib/api';
+  import type { CertificateDetailResponse, RouteResponse } from '../../lib/api';
+  import { CERTIFICATE_SOURCE_LABELS } from '../../lib/adcs.generated';
   import CertExpiryBadge from '../CertExpiryBadge.svelte';
-
-  const SOURCE_LABELS: Record<CertificateSource, string> = {
-    acme: 'ACME',
-    adcs: 'AD CS',
-    manual: 'Manual',
-  };
 
   interface Props {
     detailCert: CertificateDetailResponse | null;
@@ -81,7 +76,7 @@
         <div class="detail-row">
           <span class="detail-label">Source</span>
           <span class="detail-value" data-testid="cert-detail-source">
-            {SOURCE_LABELS[detailCert.source]}{detailCert.source !== 'manual' && detailCert.acme_auto_renew ? ' (auto-renew)' : ''}
+            {CERTIFICATE_SOURCE_LABELS[detailCert.source]}{detailCert.source !== 'manual' && detailCert.acme_auto_renew ? ' (auto-renew)' : ''}
           </span>
         </div>
         {#if detailCert.source === 'adcs'}

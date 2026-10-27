@@ -26,27 +26,19 @@ import type {
   CertificateRenewResult,
   CertificateResponse,
 } from './api';
+import {
+  ADCS_ERROR_CODES,
+  ADCS_FAILURE_STEP_LABELS,
+  ADCS_KEY_TYPE_LABELS,
+  ADCS_SUBJECT_FIELD_LABELS,
+  type AdcsSubjectField,
+} from './adcs.generated';
 import { findUncoveredHostnames } from './cert-san-match';
 
-// A Record rather than a list, so the compiler refuses a key type
-// added to `AdcsKeyType` without a label here.
-export const ADCS_KEY_TYPE_LABELS: Record<AdcsKeyType, string> = {
-  rsa2048: 'RSA 2048',
-  rsa3072: 'RSA 3072',
-  ecdsa_p256: 'ECDSA P-256',
-};
 export const ADCS_KEY_TYPES = Object.keys(ADCS_KEY_TYPE_LABELS) as AdcsKeyType[];
+export const ADCS_SUBJECT_FIELDS = Object.keys(ADCS_SUBJECT_FIELD_LABELS) as AdcsSubjectField[];
 
-// Same reason: a subject field added to the authority must get a label.
-export const ADCS_SUBJECT_LABELS: Record<keyof AdcsSubjectDefaults, string> = {
-  country: 'Country (C)',
-  state: 'State or province (ST)',
-  locality: 'Locality (L)',
-  organization: 'Organization (O)',
-  organizational_unit: 'Organizational unit (OU)',
-  email: 'Email',
-};
-export const ADCS_SUBJECT_FIELDS = Object.keys(ADCS_SUBJECT_LABELS) as (keyof AdcsSubjectDefaults)[];
+export const ADCS_RATE_LIMITED = 'Rate limited: too many AD CS requests in a short time. Retry later.';
 
 export const ADCS_STILL_FINISHING =
   'The issuance is still finishing on the server. Check the certificate list before retrying shortly: it may have completed.';
@@ -128,7 +120,7 @@ export function hostnamesWithoutCertificate(
 /** Only the fields the operator changed from the authority's defaults, and never a blank one. */
 export function subjectOverrides(
   defaults: AdcsSubjectDefaults,
-  edited: Record<keyof AdcsSubjectDefaults, string>,
+  edited: Record<AdcsSubjectField, string>,
 ): AdcsSubjectOverrides | undefined {
   const out: AdcsSubjectOverrides = {};
   for (const field of ADCS_SUBJECT_FIELDS) {
@@ -161,7 +153,7 @@ export function adcsRequestSummary(authority: AdcsAuthority, request: AdcsIssueR
   if (request.sans.length > 0) subject.push({ label: 'Common name (CN)', value: request.sans[0] });
   for (const field of ADCS_SUBJECT_FIELDS) {
     const value = request.subject?.[field]?.trim() || authority.subject[field];
-    if (value) subject.push({ label: ADCS_SUBJECT_LABELS[field], value });
+    if (value) subject.push({ label: ADCS_SUBJECT_FIELD_LABELS[field], value });
   }
   return {
     template: request.template ?? authority.default_template,
@@ -235,12 +227,25 @@ export function adcsRenewalOffered(input: Parameters<typeof adcsIssuanceBlocker>
   return adcsIssuanceBlocker(input) === null;
 }
 
-/** The API's message, plus the failing step of an `adcs_error` when the message does not name it. */
+/** A step the dashboard does not know shows as its raw name. */
+export function adcsStepLabel(step: string): string {
+  return (ADCS_FAILURE_STEP_LABELS as Readonly<Record<string, string>>)[step] ?? step;
+}
+
+/**
+ * The API's message, plus the failing step when the message names it
+ * neither by its name nor its label. The generated meaning of the code
+ * stands in only for an envelope without a message. A 429 reads the
+ * same whoever answered it: the node's bucket or a proxy in front.
+ */
 export function adcsErrorMessage(error: ApiError): string {
-  if (error.step && !error.message.includes(error.step)) {
-    return `${error.message} (failing step: ${error.step})`;
-  }
-  return error.message;
+  if (error.status === 429) return ADCS_RATE_LIMITED;
+  const message =
+    error.message.trim() || ADCS_ERROR_CODES.find((entry) => entry.code === error.code)?.meaning || error.message;
+  if (!error.step) return message;
+  const label = adcsStepLabel(error.step);
+  if (message.includes(error.step) || message.includes(label)) return message;
+  return `${message} (failing step: ${label})`;
 }
 
 /** An answer that stored nothing: pending at the authority, or refused. */

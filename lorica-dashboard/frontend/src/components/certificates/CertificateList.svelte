@@ -3,6 +3,7 @@
   import CertExpiryBadge from '../CertExpiryBadge.svelte';
   import { canWrite } from '../../lib/auth';
   import { downloadPartRefusal } from '../../lib/adcs-issuance';
+  import { CERTIFICATE_SOURCE_LABELS } from '../../lib/adcs.generated';
 
   interface Props {
     certificates: CertificateResponse[];
@@ -109,11 +110,11 @@
               <span class="san-count" title={cert.san_domains.join(', ')}>+{cert.san_domains.length} SAN</span>
             {/if}
             {#if cert.source === 'acme'}
-              <span class="cert-source-badge acme" title={cert.acme_method || 'http01'}>ACME{#if cert.acme_method && cert.acme_method !== 'http01'} ({cert.acme_method.replace('dns01-', '')}){/if}{#if cert.acme_auto_renew} &#x21bb;{/if}</span>
+              <span class="cert-source-badge acme" title={cert.acme_method || 'http01'}>{CERTIFICATE_SOURCE_LABELS.acme}{#if cert.acme_method && cert.acme_method !== 'http01'} ({cert.acme_method.replace('dns01-', '')}){/if}{#if cert.acme_auto_renew} &#x21bb;{/if}</span>
             {:else if cert.source === 'adcs'}
-              <span class="cert-source-badge adcs" title={cert.adcs_template ? `Template ${cert.adcs_template}` : 'AD CS'}>AD CS{#if cert.acme_auto_renew} &#x21bb;{/if}</span>
+              <span class="cert-source-badge adcs" title={cert.adcs_template ? `Template ${cert.adcs_template}` : CERTIFICATE_SOURCE_LABELS.adcs}>{CERTIFICATE_SOURCE_LABELS.adcs}{#if cert.acme_auto_renew} &#x21bb;{/if}</span>
             {:else}
-              <span class="cert-source-badge manual">Manual</span>
+              <span class="cert-source-badge manual">{CERTIFICATE_SOURCE_LABELS.manual}</span>
             {/if}
           </td>
           <td class="issuer">{cert.issuer}</td>

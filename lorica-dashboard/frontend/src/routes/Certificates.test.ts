@@ -10,7 +10,7 @@ import {
   type ApiError,
   type CertificateResponse,
 } from '../lib/api';
-import { ADCS_KEY_NOT_EXPORTABLE_HINT, ADCS_RENEWAL_STILL_FINISHING } from '../lib/adcs-issuance';
+import { ADCS_KEY_NOT_EXPORTABLE_HINT, ADCS_RATE_LIMITED, ADCS_RENEWAL_STILL_FINISHING } from '../lib/adcs-issuance';
 import { ADCS_NO_ISSUING_CA_HINT } from '../lib/adcs-adoption';
 import { testAuthority, testAuthorityState, testCandidate, testCertificate } from '../test-adcs-fixtures';
 import { get } from 'svelte/store';
@@ -163,6 +163,11 @@ describe('Certificates AD CS "Renew now" outcomes', () => {
       '502 error',
       { code: 'adcs_error', message: 'the CA closed the connection', step: 'enroll', status: 502 },
       'the CA closed the connection (failing step: enroll)',
+    ],
+    [
+      '429 rate limited',
+      { code: 'rate_limited', message: 'rate limited (retry after 30s)', status: 429 },
+      ADCS_RATE_LIMITED,
     ],
     [
       '504 still finishing',

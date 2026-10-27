@@ -1,12 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import type { AdcsAuthorityState } from './api';
 import { testAuthority, testAuthorityState, testCertificate as cert } from '../test-adcs-fixtures';
+import { ADCS_ERROR_CODES, ADCS_FAILURE_STEP_LABELS, ADCS_KEY_TYPE_LABELS, ADCS_SUBJECT_FIELD_LABELS } from './adcs.generated';
 import {
-  ADCS_KEY_TYPE_LABELS,
+  ADCS_RATE_LIMITED,
   ADCS_RENEWAL_STILL_FINISHING,
   ADCS_STILL_FINISHING,
   ADCS_SUBJECT_FIELDS,
-  ADCS_SUBJECT_LABELS,
+  adcsErrorMessage,
   adcsIssuanceBlocker,
   adcsIssueOutcome,
   adcsRenewalOffered,
@@ -119,9 +120,9 @@ describe('adcsRequestSummary', () => {
     expect(summary.autoRenew).toBe(true);
     expect(summary.subject).toEqual([
       { label: 'Common name (CN)', value: 'app.corp.example.org' },
-      { label: ADCS_SUBJECT_LABELS.country, value: 'FR' },
-      { label: ADCS_SUBJECT_LABELS.locality, value: 'Paris' },
-      { label: ADCS_SUBJECT_LABELS.organization, value: 'Example Corp' },
+      { label: ADCS_SUBJECT_FIELD_LABELS.country, value: 'FR' },
+      { label: ADCS_SUBJECT_FIELD_LABELS.locality, value: 'Paris' },
+      { label: ADCS_SUBJECT_FIELD_LABELS.organization, value: 'Example Corp' },
     ]);
   });
 
@@ -136,9 +137,9 @@ describe('adcsRequestSummary', () => {
     expect(summary.template).toBe('LoricaEcdsa');
     expect(summary.keyType).toBe(ADCS_KEY_TYPE_LABELS.ecdsa_p256);
     expect(summary.autoRenew).toBe(false);
-    expect(summary.subject).toContainEqual({ label: ADCS_SUBJECT_LABELS.organization, value: 'Other Corp' });
-    expect(summary.subject).toContainEqual({ label: ADCS_SUBJECT_LABELS.organizational_unit, value: 'Web' });
-    expect(summary.subject).toContainEqual({ label: ADCS_SUBJECT_LABELS.country, value: 'FR' });
+    expect(summary.subject).toContainEqual({ label: ADCS_SUBJECT_FIELD_LABELS.organization, value: 'Other Corp' });
+    expect(summary.subject).toContainEqual({ label: ADCS_SUBJECT_FIELD_LABELS.organizational_unit, value: 'Web' });
+    expect(summary.subject).toContainEqual({ label: ADCS_SUBJECT_FIELD_LABELS.country, value: 'FR' });
   });
 });
 
@@ -287,6 +288,35 @@ describe('adcsIssueOutcome failing step', () => {
     ).toEqual({ kind: 'refused', message: 'the CA closed the connection (failing step: enroll)' });
   });
 
+  it('names a known step by its generated label', () => {
+    expect(
+      adcsIssueOutcome({ error: { code: 'adcs_error', message: 'the CA closed the connection', step: 'soap', status: 502 } }),
+    ).toEqual({
+      kind: 'refused',
+      message: `the CA closed the connection (failing step: ${ADCS_FAILURE_STEP_LABELS.soap})`,
+    });
+  });
+
+  it('does not repeat a step the message names by its label', () => {
+    const message = `${ADCS_FAILURE_STEP_LABELS.spnego} failed`;
+    expect(adcsIssueOutcome({ error: { code: 'adcs_error', message, step: 'spnego', status: 502 } })).toEqual({
+      kind: 'refused',
+      message,
+    });
+  });
+
+  it('falls back on the generated meaning of a code that came without a message', () => {
+    for (const entry of ADCS_ERROR_CODES) {
+      expect(adcsErrorMessage({ code: entry.code, message: '', status: entry.status })).toBe(entry.meaning);
+    }
+  });
+
+  it('reads a 429 as rate limited, whatever the body says', () => {
+    expect(
+      adcsIssueOutcome({ error: { code: 'rate_limited', message: 'rate limited (retry after 30s)', status: 429 } }),
+    ).toEqual({ kind: 'refused', message: ADCS_RATE_LIMITED });
+  });
+
   it('does not repeat a step the message already names', () => {
     expect(
       adcsIssueOutcome({ error: { code: 'adcs_error', message: 'kerberos: ticket refused', step: 'kerberos', status: 502 } }),
@@ -343,6 +373,12 @@ describe('adcsRenewOutcome', () => {
     expect(
       adcsRenewOutcome({ error: { code: 'adcs_error', message: 'the CA closed the connection', step: 'enroll', status: 502 } }),
     ).toEqual({ kind: 'refused', message: 'the CA closed the connection (failing step: enroll)' });
+  });
+
+  it('reads a 429 as rate limited: a renewal spends the issuance bucket', () => {
+    expect(
+      adcsRenewOutcome({ error: { code: 'rate_limited', message: 'rate limited (retry after 30s)', status: 429 } }),
+    ).toEqual({ kind: 'refused', message: ADCS_RATE_LIMITED });
   });
 
   it('reads a 504 as still finishing, whatever the body says', () => {

@@ -4,6 +4,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { auth, type Role } from '../../lib/auth';
 import { clusterStatus, type ClusterStatus } from '../../lib/cluster';
 import { api, type AdcsAuthority } from '../../lib/api';
+import { ADCS_FAILURE_STEP_LABELS, ADCS_KDC_CODE_MEANINGS } from '../../lib/adcs.generated';
 import { testAuthorityState } from '../../test-adcs-fixtures';
 import AdcsAuthorityTab from './AdcsAuthorityTab.svelte';
 
@@ -178,7 +179,6 @@ describe('AdcsAuthorityTab password', () => {
     await waitFor(() => expect(put).toHaveBeenCalled());
     expect(put.mock.calls[0][0]).not.toHaveProperty('password');
   });
-
   it('warns that an identity change needs the password again, and does not send without it', async () => {
     served();
     const put = vi.spyOn(api, 'putAdcsAuthority');
@@ -216,6 +216,38 @@ describe('AdcsAuthorityTab password', () => {
   });
 });
 
+describe('AdcsAuthorityTab issuing CA', () => {
+  const PEM = ['-----BEGIN CERTIFICATE-----', 'MIIB', '-----END CERTIFICATE-----'].join('\n');
+
+  async function saved(stored: string | null, typed?: string): Promise<Record<string, unknown>> {
+    served({ authority: authority({ issuing_ca_pem: stored }) });
+    const put = vi.spyOn(api, 'putAdcsAuthority').mockResolvedValue({ data: authority() });
+    await rendered();
+    if (typed !== undefined) {
+      await fireEvent.input(screen.getByLabelText('Issuing CA certificate (PEM)'), { target: { value: typed } });
+    }
+    await fireEvent.click(screen.getByRole('button', { name: 'Save AD CS authority' }));
+    await waitFor(() => expect(put).toHaveBeenCalled());
+    return put.mock.calls[0][0] as unknown as Record<string, unknown>;
+  }
+
+  it('omits it when left empty, so a form loaded before the first issuance keeps what it learned', async () => {
+    expect(await saved(null)).not.toHaveProperty('issuing_ca_pem');
+  });
+
+  it('omits it when left as loaded', async () => {
+    expect(await saved(PEM)).not.toHaveProperty('issuing_ca_pem');
+  });
+
+  it('sends a pasted one', async () => {
+    expect(await saved(null, PEM)).toHaveProperty('issuing_ca_pem', PEM);
+  });
+
+  it('sends a blank one when the operator clears it', async () => {
+    expect(await saved(PEM, '  ')).toHaveProperty('issuing_ca_pem', '');
+  });
+});
+
 describe('AdcsAuthorityTab refusals', () => {
   it('shows a 422 from the API verbatim', async () => {
     served();
@@ -226,6 +258,58 @@ describe('AdcsAuthorityTab refusals', () => {
     await rendered();
     await fireEvent.click(screen.getByRole('button', { name: 'Save AD CS authority' }));
     await waitFor(() => expect(screen.getByTestId('adcs-form-error')).toHaveTextContent(message));
+  });
+
+  it('shows a refused delete without an authority as the API words it', async () => {
+    served();
+    const message = 'no AD CS authority is configured';
+    vi.spyOn(api, 'deleteAdcsAuthority').mockResolvedValue({
+      error: { code: 'adcs_not_configured', message, status: 409 },
+    });
+    await rendered();
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete authority' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(screen.getByTestId('adcs-delete-error')).toHaveTextContent(message));
+  });
+
+  it('shows a busy save as the API words it', async () => {
+    served();
+    const message = 'an AD CS operation is already running; try again once it has finished';
+    vi.spyOn(api, 'putAdcsAuthority').mockResolvedValue({
+      error: { code: 'adcs_busy', message, status: 409 },
+    });
+    await rendered();
+    await fireEvent.click(screen.getByRole('button', { name: 'Save AD CS authority' }));
+    await waitFor(() => expect(screen.getByTestId('adcs-form-error')).toHaveTextContent(message));
+  });
+
+  it('names the step of a krb5.conf that could not be written', async () => {
+    served();
+    vi.spyOn(api, 'putAdcsAuthority').mockResolvedValue({
+      error: {
+        code: 'adcs_krb5_conf',
+        message: 'the generated krb5.conf could not be written; the log names the path and the cause',
+        step: 'krb5_conf',
+        status: 500,
+      },
+    });
+    await rendered();
+    await fireEvent.click(screen.getByRole('button', { name: 'Save AD CS authority' }));
+    await waitFor(() =>
+      expect(screen.getByTestId('adcs-form-error')).toHaveTextContent(
+        `(failing step: ${ADCS_FAILURE_STEP_LABELS.krb5_conf})`,
+      ),
+    );
+  });
+
+  it('shows a rate-limited test as such', async () => {
+    served();
+    vi.spyOn(api, 'testAdcsAuthority').mockResolvedValue({
+      error: { code: 'rate_limited', message: 'rate limited (retry after 20s)', status: 429 },
+    });
+    await rendered();
+    await fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+    await waitFor(() => expect(screen.getByTestId('adcs-test-error')).toHaveTextContent('Retry later'));
   });
 
   it('shows the 409 certificate list of a refused delete', async () => {
@@ -241,11 +325,11 @@ describe('AdcsAuthorityTab refusals', () => {
     await waitFor(() => expect(screen.getByTestId('adcs-delete-error')).toHaveTextContent(message));
   });
 
-  it('shows a 409 from the test verbatim', async () => {
+  it('shows a busy test verbatim', async () => {
     served();
     const message = 'an AD CS operation is already running; try again once it has finished';
     vi.spyOn(api, 'testAdcsAuthority').mockResolvedValue({
-      error: { code: 'conflict', message, status: 409 },
+      error: { code: 'adcs_busy', message, status: 409 },
     });
     await rendered();
     await fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
@@ -288,7 +372,10 @@ describe('AdcsAuthorityTab connection test', () => {
     });
     await rendered();
     await fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
-    await waitFor(() => expect(screen.getByTestId('adcs-test-result')).toHaveTextContent('tls'));
+    await waitFor(() =>
+      expect(screen.getByTestId('adcs-test-result')).toHaveTextContent(ADCS_FAILURE_STEP_LABELS.tls),
+    );
+    expect(screen.getByTestId('adcs-test-result')).toHaveTextContent('tls');
     expect(screen.getByTestId('adcs-test-result')).toHaveTextContent(message);
   });
 
@@ -332,9 +419,22 @@ describe('AdcsAuthorityTab failed state', () => {
     await rendered();
     const banner = screen.getByTestId('adcs-failed-state');
     expect(banner).toHaveTextContent(new Date('2026-10-20T08:00:00Z').toLocaleString());
+    expect(banner).toHaveTextContent(ADCS_FAILURE_STEP_LABELS.ticket_acquisition);
     expect(banner).toHaveTextContent('ticket_acquisition');
     expect(banner).toHaveTextContent('31 (integrity check on the decrypted field failed)');
     expect(banner).toHaveTextContent('Saving a new password clears this state');
+  });
+
+  it('falls back on the generated meaning of a known code when the API gives no reason', async () => {
+    served({
+      authority: authority({
+        failed_since: '2026-10-20T08:00:00Z',
+        failed_step: 'ticket_acquisition',
+        failed_kdc_code: 24,
+      }),
+    });
+    await rendered();
+    expect(screen.getByTestId('adcs-failed-state')).toHaveTextContent(`24 (${ADCS_KDC_CODE_MEANINGS[24]})`);
   });
 
   it('shows the code alone when the API gives no reason', async () => {

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 
-import { ALERT_TYPE_CHOICES, alertTone, choiceSelected, mergeAlertTypes } from './alert-types';
+import { ALERT_TYPES } from './adcs.generated';
+import { ALERT_TYPE_CHOICES, alertLabel, alertTone, choiceSelected, mergeAlertTypes } from './alert-types';
 
 function choice(label: string) {
   const found = ALERT_TYPE_CHOICES.find((candidate) => candidate.label === label);
@@ -18,10 +19,12 @@ describe('ALERT_TYPE_CHOICES', () => {
     expect(new Set(types).size).toBe(types.length);
   });
 
-  it('offers the cluster alerts, whose subscriptions an edit used to drop', () => {
-    const types = ALERT_TYPE_CHOICES.flatMap((c) => c.types);
-    for (const type of ['cluster_node_left', 'cluster_config_refused', 'cluster_drift']) {
-      expect(types).toContain(type);
+  it('offers every generated type, each recovery beside the alert it closes', () => {
+    const offered = ALERT_TYPE_CHOICES.flatMap((c) => c.types);
+    expect([...offered].sort()).toEqual(ALERT_TYPES.map((d) => d.value).sort());
+    for (const definition of ALERT_TYPES.filter((d) => d.recovers !== null)) {
+      const owner = ALERT_TYPE_CHOICES.find((c) => c.types.includes(definition.value));
+      expect(owner?.types[0]).toBe(definition.recovers);
     }
   });
 });
@@ -59,11 +62,23 @@ describe('mergeAlertTypes', () => {
 });
 
 describe('alertTone', () => {
-  it('reads failures red, recoveries green, warnings orange, anything else blue', () => {
-    expect(alertTone('adcs_authority_failed')).toBe('red');
-    expect(alertTone('sla_recovered')).toBe('green');
-    expect(alertTone('cert_expiring')).toBe('orange');
-    expect(alertTone('config_changed')).toBe('blue');
+  it('colours every generated type by its tone', () => {
+    const colours = { problem: 'red', recovery: 'green', warning: 'orange', info: 'blue' };
+    for (const definition of ALERT_TYPES) {
+      expect(alertTone(definition.value)).toBe(colours[definition.tone]);
+    }
+  });
+
+  it('reads a type it does not know as information', () => {
     expect(alertTone('future_alert')).toBe('blue');
+  });
+});
+
+describe('alertLabel', () => {
+  it('labels a known type and shows an unknown one raw', () => {
+    for (const definition of ALERT_TYPES) {
+      expect(alertLabel(definition.value)).toBe(definition.label);
+    }
+    expect(alertLabel('future_alert')).toBe('future_alert');
   });
 });

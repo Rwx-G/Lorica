@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { auth, type Role } from '../../lib/auth';
 import { clusterStatus, type ClusterStatus } from '../../lib/cluster';
 import { api, type AdcsAuthorityState, type ApiError } from '../../lib/api';
-import { ADCS_STILL_FINISHING } from '../../lib/adcs-issuance';
+import { ADCS_STILL_FINISHING, adcsStepLabel } from '../../lib/adcs-issuance';
 import { testAuthority, testAuthorityState, testCertificate } from '../../test-adcs-fixtures';
 import CertificateAdcsForm from './CertificateAdcsForm.svelte';
 
@@ -227,7 +227,7 @@ describe('CertificateAdcsForm outcomes', () => {
       await rendered();
       await reviewAndIssue('app.corp.example.org');
       await waitFor(() => expect(screen.getByTestId('adcs-issue-outcome')).toHaveTextContent(error.message));
-      if (error.step) expect(screen.getByTestId('adcs-issue-outcome')).toHaveTextContent(error.step);
+      if (error.step) expect(screen.getByTestId('adcs-issue-outcome')).toHaveTextContent(adcsStepLabel(error.step));
       expect(screen.getByRole('button', { name: 'Review request' })).toBeInTheDocument();
     });
   }

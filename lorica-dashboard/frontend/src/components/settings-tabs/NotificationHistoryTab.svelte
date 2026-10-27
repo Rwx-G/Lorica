@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { alertTone } from '../../lib/alert-types';
+  import { alertLabel, alertTone } from '../../lib/alert-types';
 
   interface NotifEvent {
     alert_type: string;
@@ -42,7 +42,7 @@
               {#each notifHistory as ev, i (i)}
                 <tr>
                   <td class="mono">{new Date(ev.timestamp).toLocaleString()}</td>
-                  <td><span class="badge badge-{alertTone(ev.alert_type)}">{ev.alert_type}</span></td>
+                  <td><span class="badge badge-{alertTone(ev.alert_type)}" title={ev.alert_type}>{alertLabel(ev.alert_type)}</span></td>
                   <td>{ev.summary}</td>
                 </tr>
               {/each}

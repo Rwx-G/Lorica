@@ -36,6 +36,16 @@ describe('adcsAdoptionBanner', () => {
     expect(adcsAdoptionBanner({ canAdopt: false, follower: false, candidates })).toBeNull();
   });
 
+  it('says nothing on a follower, whose listing names the control plane', () => {
+    expect(
+      adcsAdoptionBanner({
+        canAdopt: true,
+        follower: false,
+        candidates: { reason: 'managed_on_control_plane', candidates: [] },
+      }),
+    ).toBeNull();
+  });
+
   it('says nothing when no authority is configured', () => {
     expect(
       adcsAdoptionBanner({ canAdopt: true, follower: false, candidates: { reason: 'not_configured', candidates: [] } }),
@@ -76,5 +86,13 @@ describe('adoptInSequence', () => {
       ['b.corp.example.org', true],
     ]);
     expect(results[0].message).toBe('not signed by the issuing CA');
+  });
+
+  it('shows a refusal for an unknown issuing CA as the API words it', async () => {
+    const message = 'the AD CS authority does not know its issuing CA certificate';
+    const results = await adoptInSequence(two.candidates.slice(0, 1), () => true, async () => ({
+      error: { code: 'adcs_no_issuing_ca', message, status: 409 },
+    }));
+    expect(results).toEqual([expect.objectContaining({ ok: false, message })]);
   });
 });

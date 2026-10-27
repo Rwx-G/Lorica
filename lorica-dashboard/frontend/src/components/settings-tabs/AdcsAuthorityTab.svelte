@@ -8,6 +8,7 @@
     type AdcsConnectionTestResult,
     type AdcsKeyType,
     type AdcsSubjectDefaults,
+    type AdcsSubjectField,
     type ApiError,
   } from '../../lib/api';
   import ConfirmDialog from '../ConfirmDialog.svelte';
@@ -15,12 +16,17 @@
   import { canWriteRole, isSuperAdminRole } from '../../lib/auth';
   import { nodeRole } from '../../lib/cluster';
   import {
-    ADCS_KEY_TYPE_LABELS,
     ADCS_KEY_TYPES,
     ADCS_SUBJECT_FIELDS,
-    ADCS_SUBJECT_LABELS,
+    adcsErrorMessage,
+    adcsStepLabel,
     isAdcsFollower,
   } from '../../lib/adcs-issuance';
+  import {
+    ADCS_KDC_CODE_MEANINGS,
+    ADCS_KEY_TYPE_LABELS,
+    ADCS_SUBJECT_FIELD_LABELS,
+  } from '../../lib/adcs.generated';
 
   interface Props {
     expanded: boolean;
@@ -32,11 +38,11 @@
   const IDENTITY_CHANGE_MESSAGE =
     'Changing the endpoint, realm, KDC list, principal or endpoint CA bundle clears the stored password, so the service account password must be entered again before saving.';
 
-  type SubjectForm = Record<keyof AdcsSubjectDefaults, string>;
+  type SubjectForm = Record<AdcsSubjectField, string>;
 
   // Only the fields whose input differs from a plain text box.
   const SUBJECT_INPUT: Partial<
-    Record<keyof AdcsSubjectDefaults, { type?: string; maxlength?: number; placeholder?: string }>
+    Record<AdcsSubjectField, { type?: string; maxlength?: number; placeholder?: string }>
   > = {
     country: { maxlength: 2, placeholder: 'FR' },
     organization: { placeholder: 'Example Corp' },
@@ -119,7 +125,7 @@
     if (error.status === 504) {
       return 'The operation is still finishing on the server. Retry shortly.';
     }
-    return error.message;
+    return adcsErrorMessage(error);
   }
 
   function fillForm(from: AdcsAuthority | null): void {
@@ -190,6 +196,15 @@
   );
   const passwordRequired = $derived(authority === null || identityChanged);
 
+  // Sent only when the operator changed it: an issuance may have learned
+  // the issuing CA since this form loaded, and an omitted field keeps
+  // what is stored where a blank one would clear it.
+  function issuingCaChange(): { issuing_ca_pem?: string } {
+    const edited = optional(issuingCaPem);
+    if (edited === (authority?.issuing_ca_pem ?? null)) return {};
+    return { issuing_ca_pem: edited ?? '' };
+  }
+
   async function save(): Promise<void> {
     formError = '';
     if (passwordRequired && password === '') {
@@ -205,7 +220,7 @@
       kdcs: lines(kdcs),
       principal: principal.trim(),
       endpoint_ca_pem: optional(endpointCaPem),
-      issuing_ca_pem: optional(issuingCaPem),
+      ...issuingCaChange(),
       default_template: defaultTemplate.trim(),
       // The default may have been retyped to one of these since.
       allowed_templates: otherTemplates.filter((name) => !sameTemplate(name, defaultTemplate)),
@@ -310,12 +325,19 @@
               <dt>Since</dt>
               <dd>{when(summary.failed_since)}</dd>
               <dt>Step</dt>
-              <dd><code>{summary.failed_step ?? 'unknown'}</code></dd>
+              <dd>
+                {#if summary.failed_step}
+                  {adcsStepLabel(summary.failed_step)} (<code>{summary.failed_step}</code>)
+                {:else}
+                  unknown
+                {/if}
+              </dd>
               <dt>KDC code</dt>
               <dd>
                 {#if summary.failed_kdc_code !== null}
+                  {@const meaning = summary.failed_reason ?? ADCS_KDC_CODE_MEANINGS[summary.failed_kdc_code]}
                   {summary.failed_kdc_code}
-                  {#if summary.failed_reason}({summary.failed_reason}){/if}
+                  {#if meaning}({meaning}){/if}
                 {:else}
                   not reported
                 {/if}
@@ -549,7 +571,7 @@
             <div class="subject-grid">
               {#each ADCS_SUBJECT_FIELDS as field (field)}
                 <div class="settings-form-row">
-                  <label for="adcs-subject-{field}">{ADCS_SUBJECT_LABELS[field]}</label>
+                  <label for="adcs-subject-{field}">{ADCS_SUBJECT_FIELD_LABELS[field]}</label>
                   <input
                     id="adcs-subject-{field}"
                     type={SUBJECT_INPUT[field]?.type ?? 'text'}
@@ -637,7 +659,8 @@
               </p>
             {:else}
               <div class="test-failed" role="status" data-testid="adcs-test-result">
-                Failed at step <code>{testResult.step}</code>: {testResult.message}
+                Failed at step {testResult.step ? adcsStepLabel(testResult.step) : 'unknown'}
+                {#if testResult.step}(<code>{testResult.step}</code>){/if}: {testResult.message}
                 {#if testResult.authority_failed}
                   <br />The KDC rejected the credential: the authority is now in the
                   failed state.

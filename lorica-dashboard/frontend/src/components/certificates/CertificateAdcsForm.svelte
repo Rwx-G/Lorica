@@ -5,14 +5,12 @@
     type AdcsAuthorityState,
     type AdcsIssueRequest,
     type AdcsKeyType,
-    type AdcsSubjectDefaults,
+    type AdcsSubjectField,
     type CertificateResponse,
   } from '../../lib/api';
   import {
     ADCS_KEY_TYPES,
-    ADCS_KEY_TYPE_LABELS,
     ADCS_SUBJECT_FIELDS,
-    ADCS_SUBJECT_LABELS,
     adcsIssuanceBlocker,
     adcsIssueOutcome,
     adcsSanHints,
@@ -21,6 +19,7 @@
     subjectOverrides,
     type AdcsIssueOutcome,
   } from '../../lib/adcs-issuance';
+  import { ADCS_KEY_TYPE_LABELS, ADCS_SUBJECT_FIELD_LABELS } from '../../lib/adcs.generated';
   import { canWriteRole } from '../../lib/auth';
   import { nodeRole } from '../../lib/cluster';
   import { modalFocus } from '../../lib/modal-focus';
@@ -42,14 +41,9 @@
   let sansText = $state('');
   let template = $state('');
   let keyType = $state<AdcsKeyType>('rsa2048');
-  let subject = $state<Record<keyof AdcsSubjectDefaults, string>>({
-    country: '',
-    state: '',
-    locality: '',
-    organization: '',
-    organizational_unit: '',
-    email: '',
-  });
+  let subject = $state(
+    Object.fromEntries(ADCS_SUBJECT_FIELDS.map((field) => [field, ''])) as Record<AdcsSubjectField, string>,
+  );
   let autoRenew = $state(true);
 
   let formError = $state('');
@@ -226,7 +220,7 @@
         <div class="form-row">
           {#each ADCS_SUBJECT_FIELDS as field (field)}
             <div class="form-group">
-              <label for="adcs-issue-subject-{field}">{ADCS_SUBJECT_LABELS[field]}</label>
+              <label for="adcs-issue-subject-{field}">{ADCS_SUBJECT_FIELD_LABELS[field]}</label>
               <input id="adcs-issue-subject-{field}" type="text" bind:value={subject[field]} autocomplete="off" />
             </div>
           {/each}

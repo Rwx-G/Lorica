@@ -22,8 +22,22 @@ describe('NotificationHistoryTab', () => {
       },
     });
 
-    for (const alertType of ['adcs_authority_failed', 'cert_issuance_failed']) {
-      expect(screen.getByText(alertType)).toHaveClass('badge-red');
+    for (const label of ['AD CS authority failed', 'Certificate issuance failed']) {
+      expect(screen.getByText(label)).toHaveClass('badge-red');
     }
+  });
+
+  it('follows the generated tone and shows an unknown type raw, in blue', () => {
+    render(NotificationHistoryTab, {
+      props: {
+        notifHistory: [event('cluster_config_refused'), event('cluster_drift'), event('future_alert')],
+        expanded: true,
+        toggleSection: vi.fn(),
+      },
+    });
+
+    expect(screen.getByText('Cluster configuration refused')).toHaveClass('badge-red');
+    expect(screen.getByText('Cluster drift')).toHaveClass('badge-orange');
+    expect(screen.getByText('future_alert')).toHaveClass('badge-blue');
   });
 });

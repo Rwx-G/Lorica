@@ -2,7 +2,7 @@ import { render, screen, fireEvent } from '@testing-library/svelte';
 import { describe, it, expect, vi } from 'vitest';
 
 import { testAuthority } from '../../test-adcs-fixtures';
-import { ADCS_KEY_TYPE_LABELS } from '../../lib/adcs-issuance';
+import { ADCS_KEY_TYPE_LABELS } from '../../lib/adcs.generated';
 import AdcsIssueConfirm from './AdcsIssueConfirm.svelte';
 
 function renderConfirm(overrides: Partial<{ submitting: boolean }> = {}) {

@@ -2,13 +2,15 @@
  * The alert types a notification channel subscribes to, as the
  * dashboard offers them, and how an edit is saved.
  *
- * The vocabulary is `AlertType::ALL` in `lorica-notify`. This list is
- * still typed by hand until a generated module replaces it, so saving
- * never trusts it to be complete: a type the channel already holds and
- * no choice covers is kept as it is (`mergeAlertTypes`). Dropping it
- * would silently unsubscribe the channel from an alert the dashboard
- * merely does not display.
+ * The vocabulary is `ALERT_TYPES`, rendered from `AlertType::ALL` in
+ * `lorica-notify`. Saving still never trusts it to be complete: a
+ * dashboard served next to a newer API meets types it does not know,
+ * and a type the channel already holds that no choice covers is kept
+ * as it is (`mergeAlertTypes`). Dropping it would silently unsubscribe
+ * the channel from an alert the dashboard merely does not display.
  */
+
+import { ALERT_TYPES, type AlertTone, type AlertType } from './adcs.generated';
 
 export interface AlertTypeChoice {
   label: string;
@@ -16,23 +18,19 @@ export interface AlertTypeChoice {
    * The types one checkbox stands for: an alert and its recovery
    * travel together. The first one decides whether the box is ticked.
    */
-  types: readonly string[];
+  types: readonly AlertType[];
 }
 
-export const ALERT_TYPE_CHOICES: readonly AlertTypeChoice[] = [
-  { label: 'Backend down', types: ['backend_down'] },
-  { label: 'Certificate expiring', types: ['cert_expiring'] },
-  { label: 'WAF alert', types: ['waf_alert'] },
-  { label: 'Configuration changed', types: ['config_changed'] },
-  { label: 'SLA breached', types: ['sla_breached', 'sla_recovered'] },
-  { label: 'IP banned', types: ['ip_banned'] },
-  { label: 'Cluster node left', types: ['cluster_node_left'] },
-  { label: 'Cluster configuration refused', types: ['cluster_config_refused'] },
-  { label: 'Cluster drift', types: ['cluster_drift'] },
-  { label: 'Log persistence lost / restored', types: ['log_store_unavailable', 'log_store_recovered'] },
-  { label: 'AD CS authority failed', types: ['adcs_authority_failed'] },
-  { label: 'Certificate issuance failed', types: ['cert_issuance_failed'] },
-];
+/** One checkbox per alert that is not a recovery, carrying the recoveries that close it. */
+export const ALERT_TYPE_CHOICES: readonly AlertTypeChoice[] = ALERT_TYPES.filter(
+  (definition) => definition.recovers === null,
+).map((definition) => ({
+  label: definition.label,
+  types: [
+    definition.value,
+    ...ALERT_TYPES.filter((other) => other.recovers === definition.value).map((other) => other.value),
+  ],
+}));
 
 /** Whether a channel holding `stored` shows `choice` as ticked. */
 export function choiceSelected(choice: AlertTypeChoice, stored: readonly string[]): boolean {
@@ -57,31 +55,33 @@ export function mergeAlertTypes(stored: readonly string[], selected: ReadonlySet
       out.push(...choice.types);
     }
   }
-  const offered = new Set(ALERT_TYPE_CHOICES.flatMap((choice) => choice.types));
+  const offered = new Set<string>(ALERT_TYPE_CHOICES.flatMap((choice) => choice.types));
   for (const type of stored) {
     if (!offered.has(type) && !out.includes(type)) out.push(type);
   }
   return out;
 }
 
-/**
- * The badge colour of an alert type in the notification history: red
- * for a failure, green for a recovery, orange for a warning ahead of
- * one, blue otherwise (including types this module does not know).
- */
-export type AlertTone = 'red' | 'green' | 'orange' | 'blue';
+/** The badge colour of an alert in the notification history. */
+export type AlertBadgeColour = 'red' | 'green' | 'orange' | 'blue';
 
-const ALERT_TONES: Readonly<Record<string, AlertTone>> = {
-  backend_down: 'red',
-  sla_breached: 'red',
-  log_store_unavailable: 'red',
-  adcs_authority_failed: 'red',
-  cert_issuance_failed: 'red',
-  sla_recovered: 'green',
-  log_store_recovered: 'green',
-  cert_expiring: 'orange',
+const BADGE_COLOURS: Readonly<Record<AlertTone, AlertBadgeColour>> = {
+  problem: 'red',
+  recovery: 'green',
+  warning: 'orange',
+  info: 'blue',
 };
 
-export function alertTone(type: string): AlertTone {
-  return ALERT_TONES[type] ?? 'blue';
+function definitionOf(type: string) {
+  return ALERT_TYPES.find((definition) => definition.value === type);
+}
+
+/** A type this dashboard does not know reads as information. */
+export function alertTone(type: string): AlertBadgeColour {
+  return BADGE_COLOURS[definitionOf(type)?.tone ?? 'info'];
+}
+
+/** A type this dashboard does not know shows as its raw value. */
+export function alertLabel(type: string): string {
+  return definitionOf(type)?.label ?? type;
 }
