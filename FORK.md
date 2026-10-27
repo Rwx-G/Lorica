@@ -190,6 +190,24 @@ after any upstream sync that touches the function it lives in.
   behaves as upstream does. The `408` also covers upstream's own read
   timeout on a header (`KeepaliveStatus::Off`), which RFC 9110 15.5.9
   describes as well as the new bound.
+- **`lorica-core`, two HTTP/2 server tests rewritten for h2 0.4.20
+  (v1.10.0, tests only).** Sites:
+  `lorica-core/src/protocols/http/v2/server.rs`,
+  `test_req_conflicting_content_length_rejected` (same name upstream) and
+  `test_req_malformed_stream_budget_exhausted`. h2 0.4.20 resets a request
+  carrying conflicting `Content-Length` values in its own codec, before
+  `accept` yields it, so `validate_content_length_without_transfer_encoding`
+  never sees it and the stream never counts against
+  `MAX_MALFORMED_STREAMS_PER_CONN`. Upstream's version expects
+  `H2Accept::Rejected` from the acceptance check; Lorica's accepts either
+  layer and asserts the property instead: the request never surfaces as a
+  session, the client sees `PROTOCOL_ERROR`, and a client repeating it gets
+  the connection torn down after a bounded number of streams (h2's own
+  limit on locally reset streams, `max_local_error_reset_streams`, left at
+  h2's default by `default_h2_options`). The malformed-stream
+  budget stays exercised by `test_authority_mismatch_exhausts_malformed_stream_budget`.
+  Take upstream's version of these two tests only once upstream runs on
+  h2 0.4.20 or later.
 
 ## Upstream sync record
 

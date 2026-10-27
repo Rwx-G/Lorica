@@ -1677,7 +1677,7 @@ mod test {
         let mut connection = handshake(Box::new(server), None).await.unwrap();
         let digest = Arc::new(Digest::default());
 
-        // h2 >= 0.4.20 resets a stream carrying conflicting Content-Length
+        // Lorica: h2 >= 0.4.20 resets a stream carrying conflicting Content-Length
         // values in its own codec, before `accept` yields it, so the stream
         // never reaches `validate_content_length_without_transfer_encoding`
         // and the loop sees the connection close. An older h2 hands it over
@@ -1751,7 +1751,7 @@ mod test {
         let digest = Arc::new(Digest::default());
         let mut malformed_streams = 0usize;
 
-        // h2 >= 0.4.20 rejects conflicting Content-Length values itself (see
+        // Lorica: h2 >= 0.4.20 rejects conflicting Content-Length values itself (see
         // test_req_conflicting_content_length_rejected), and counts each such
         // reset toward its limit on locally reset streams, so it is h2's
         // GOAWAY that ends the connection here; with an older h2 it is this
