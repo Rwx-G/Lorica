@@ -1662,9 +1662,8 @@ mod test {
                 .unwrap();
 
             let (response, mut req_body) = h2.send_request(request, false).unwrap();
-            // Send a body matching the first Content-Length value so the h2
-            // codec accepts the stream and Pingora's duplicate-CL validation is
-            // what rejects the request.
+            // A body matching the first Content-Length value, so the only
+            // defect of the stream is the conflicting framing.
             req_body.reserve_capacity(5);
             req_body.send_data("abcde".into(), true).unwrap();
 
@@ -1678,30 +1677,39 @@ mod test {
         let mut connection = handshake(Box::new(server), None).await.unwrap();
         let digest = Arc::new(Digest::default());
 
-        // The malformed stream is reset during acceptance, so it is reported as
-        // rejected rather than surfaced to the application as a session.
-        let accepted = HttpSession::from_h2_conn(&mut connection, digest.clone())
+        // h2 >= 0.4.20 resets a stream carrying conflicting Content-Length
+        // values in its own codec, before `accept` yields it, so the stream
+        // never reaches `validate_content_length_without_transfer_encoding`
+        // and the loop sees the connection close. An older h2 hands it over
+        // and the acceptance check resets it as `Rejected`. Either way, the
+        // request must never surface as a session.
+        loop {
+            let accepted = timeout(
+                Duration::from_secs(1),
+                HttpSession::from_h2_conn(&mut connection, digest.clone()),
+            )
             .await
-            .unwrap();
-        assert!(
-            matches!(accepted, Some(H2Accept::Rejected)),
-            "malformed request must not surface as a session"
-        );
-
-        let done = timeout(
-            Duration::from_secs(1),
-            HttpSession::from_h2_conn(&mut connection, digest),
-        )
-        .await
-        .expect("from_h2_conn hung after rejecting malformed request")
-        .expect("from_h2_conn returned an error after rejecting malformed request");
-        assert!(done.is_none(), "connection should close after rejection");
+            .expect("from_h2_conn hung after a malformed request")
+            .expect("from_h2_conn returned an error after a malformed request");
+            match accepted {
+                Some(H2Accept::Session(_)) => {
+                    panic!("malformed request must not surface as a session")
+                }
+                Some(H2Accept::Rejected) => continue,
+                None => break,
+            }
+        }
 
         client_task.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_req_malformed_stream_budget_exhausted() {
+        // Far above both bounds that can end the connection: this module's
+        // MAX_MALFORMED_STREAMS_PER_CONN and h2's default limit on locally
+        // reset streams. Reaching it means nothing bounded the connection.
+        const STREAM_CAP: usize = 4096;
+
         let (client, server) = duplex(65536);
 
         let client_task = tokio::spawn(async move {
@@ -1709,46 +1717,73 @@ mod test {
             tokio::spawn(async move {
                 let _ = connection.await;
             });
-            let mut h2 = h2.ready().await.unwrap();
+            let mut h2 = h2;
 
-            let request = Request::builder()
-                .method(Method::GET)
-                .uri("https://www.example.com/")
-                .header("content-length", "5")
-                .header("content-length", "6")
-                .body(())
-                .unwrap();
-
-            let (response, mut req_body) = h2.send_request(request, false).unwrap();
-            req_body.reserve_capacity(5);
-            req_body.send_data("abcde".into(), true).unwrap();
-            let err = response.await.unwrap_err();
-            if let Some(reason) = err.reason() {
-                assert_eq!(reason, h2::Reason::PROTOCOL_ERROR);
+            let mut sent = 0usize;
+            while sent < STREAM_CAP {
+                let Ok(ready) = h2.ready().await else {
+                    break;
+                };
+                h2 = ready;
+                let request = Request::builder()
+                    .method(Method::GET)
+                    .uri("https://www.example.com/")
+                    .header("content-length", "5")
+                    .header("content-length", "6")
+                    .body(())
+                    .unwrap();
+                let Ok((response, mut req_body)) = h2.send_request(request, false) else {
+                    break;
+                };
+                sent += 1;
+                req_body.reserve_capacity(5);
+                let _ = req_body.send_data("abcde".into(), true);
+                if let Err(err) = response.await {
+                    if err.is_go_away() {
+                        break;
+                    }
+                }
             }
+            sent
         });
 
         let mut connection = handshake(Box::new(server), None).await.unwrap();
         let digest = Arc::new(Digest::default());
-        let mut malformed_streams = MAX_MALFORMED_STREAMS_PER_CONN - 1;
+        let mut malformed_streams = 0usize;
 
-        let err = match HttpSession::from_h2_conn_with_malformed_budget(
-            &mut connection,
-            digest,
-            &mut malformed_streams,
-        )
-        .await
-        {
-            Ok(Some(_)) => panic!("malformed request must not surface as a session"),
-            Ok(None) => panic!("connection ended before malformed budget was exhausted"),
-            Err(err) => err,
+        // h2 >= 0.4.20 rejects conflicting Content-Length values itself (see
+        // test_req_conflicting_content_length_rejected), and counts each such
+        // reset toward its limit on locally reset streams, so it is h2's
+        // GOAWAY that ends the connection here; with an older h2 it is this
+        // module's malformed-stream budget. The property under test holds for
+        // both: a client repeating the request cannot keep the connection
+        // alive, and no stream ever reaches the application.
+        // test_authority_mismatch_exhausts_malformed_stream_budget is what
+        // exercises this module's own budget.
+        let err = loop {
+            match HttpSession::from_h2_conn_with_malformed_budget(
+                &mut connection,
+                digest.clone(),
+                &mut malformed_streams,
+            )
+            .await
+            {
+                Ok(Some(H2Accept::Session(_))) => {
+                    panic!("malformed request must not surface as a session")
+                }
+                Ok(Some(H2Accept::Rejected)) => continue,
+                Ok(None) => panic!("connection ended without being torn down"),
+                Err(err) => break err,
+            }
         };
-
         assert_eq!(err.etype(), &ErrorType::H2Error);
-        assert_eq!(malformed_streams, MAX_MALFORMED_STREAMS_PER_CONN);
 
         drop(connection);
-        client_task.await.unwrap();
+        let sent = client_task.await.unwrap();
+        assert!(
+            sent < STREAM_CAP,
+            "the connection accepted {sent} malformed streams without being torn down"
+        );
     }
 
     #[tokio::test]
