@@ -228,7 +228,9 @@ impl RateLimitEngine {
     }
 
     /// Attempt to consume `cost` tokens for the bucket keyed by `key`,
-    /// creating a fresh bucket on first-seen (seeded from `rl`). The
+    /// creating a fresh bucket on first-seen (seeded from `rl`, which
+    /// must be the limit `key` was built for: see
+    /// [`super::rate_limit::bucket_key`]). The
     /// hot path is lock-free for the `Local` variant (CAS loop on a
     /// single atomic); `Authoritative` takes the per-bucket mutex for
     /// refill + drain.
@@ -268,11 +270,28 @@ impl RateLimitEngine {
                 } else {
                     map.entry(key.to_string())
                         .or_insert_with(|| {
-                            Arc::new(lorica_limits::token_bucket::LocalBucket::new(rl.capacity))
+                            Arc::new(lorica_limits::token_bucket::LocalBucket::new(
+                                rl.capacity,
+                                now_ns,
+                            ))
                         })
                         .clone()
                 };
-                bucket.try_consume(cost)
+                bucket.try_consume(cost, now_ns)
+            }
+        }
+    }
+
+    /// Drop every bucket untouched for `idle_ttl_ns`. Worker buckets
+    /// count refused requests as activity too, so a client hammering a
+    /// drained bucket cannot earn a fresh one by waiting for eviction.
+    pub fn prune_idle(&self, now_ns: u64, idle_ttl_ns: u64) {
+        match self {
+            RateLimitEngine::Authoritative(map) => {
+                map.retain(|_, b| now_ns.saturating_sub(b.last_activity_ns()) < idle_ttl_ns);
+            }
+            RateLimitEngine::Local(map) => {
+                map.retain(|_, b| now_ns.saturating_sub(b.last_activity_ns()) < idle_ttl_ns);
             }
         }
     }
@@ -289,5 +308,56 @@ impl RateLimitEngine {
             }
             RateLimitEngine::Local(map) => map.get(key).map(|b| b.value().tokens()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lorica_config::models::{RateLimit, RateLimitScope};
+
+    const TTL_NS: u64 = 300_000_000_000;
+
+    fn limit() -> RateLimit {
+        RateLimit {
+            capacity: 2,
+            refill_per_sec: 1,
+            scope: RateLimitScope::PerIp,
+        }
+    }
+
+    fn assert_prunes_idle_buckets_only(engine: &RateLimitEngine) {
+        assert!(engine.try_consume("idle", &limit(), 1, 0));
+        assert!(engine.try_consume("busy", &limit(), 1, 0));
+        assert!(engine.try_consume("busy", &limit(), 1, TTL_NS));
+        engine.prune_idle(TTL_NS + 1, TTL_NS);
+        assert!(engine.remaining_tokens("idle", TTL_NS + 1).is_none());
+        assert!(engine.remaining_tokens("busy", TTL_NS + 1).is_some());
+    }
+
+    #[test]
+    fn worker_engine_prunes_idle_buckets() {
+        // Worker mode used to keep one bucket per client address forever.
+        assert_prunes_idle_buckets_only(&RateLimitEngine::local());
+    }
+
+    #[test]
+    fn single_process_engine_prunes_idle_buckets() {
+        assert_prunes_idle_buckets_only(&RateLimitEngine::authoritative());
+    }
+
+    #[test]
+    fn worker_engine_counts_refused_requests_as_activity() {
+        let engine = RateLimitEngine::local();
+        for _ in 0..2 {
+            assert!(engine.try_consume("k", &limit(), 1, 0));
+        }
+        assert!(!engine.try_consume("k", &limit(), 1, TTL_NS));
+        engine.prune_idle(TTL_NS + 1, TTL_NS);
+        assert_eq!(
+            engine.remaining_tokens("k", TTL_NS + 1),
+            Some(0),
+            "a drained bucket still being hit must not be evicted into a full one"
+        );
     }
 }

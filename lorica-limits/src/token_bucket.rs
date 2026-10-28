@@ -22,10 +22,11 @@
 //!   the cached token count. Successful consumption is recorded in a
 //!   separate `delta` counter.
 //! - A background task on the worker calls [`LocalBucket::take_delta`]
-//!   every ~100 ms, pushes the accumulated consumption to the
-//!   supervisor via the pipelined RPC framework, and calls
-//!   [`LocalBucket::refresh`] with the authoritative token count from
-//!   the reply.
+//!   every ~100 ms on each bucket that [`LocalBucket::needs_sync`],
+//!   pushes the accumulated consumption (possibly zero, for a bucket
+//!   waiting on its refill) to the supervisor via the pipelined RPC
+//!   framework, and calls [`LocalBucket::refresh`] with the
+//!   authoritative token count from the reply.
 //! - [`AuthoritativeBucket`] lives in the supervisor. It applies the
 //!   time-based refill, subtracts the batched consumption pushed by
 //!   each worker, and returns the current token count.
@@ -62,14 +63,25 @@ pub struct LocalBucket {
     tokens: AtomicI64,
     /// Accumulated successful consumption since the last `take_delta`.
     delta: AtomicU64,
+    /// Configured burst size. A bucket holding fewer tokens than this
+    /// still owes the supervisor a sync even with nothing consumed:
+    /// refused requests consume nothing, so a drained bucket would
+    /// otherwise never learn about the refill.
+    capacity: u32,
+    /// Monotonic timestamp of the last `try_consume`, admitted or not.
+    /// Read by the worker's idle-eviction task.
+    last_activity_ns: AtomicU64,
 }
 
 impl LocalBucket {
-    /// Construct a bucket with an initial token count.
-    pub fn new(initial_tokens: u32) -> Self {
+    /// Construct a full bucket of `capacity` tokens. `now_ns` seeds the
+    /// activity clock; pass `lorica_shmem::now_ns()` on Linux.
+    pub fn new(capacity: u32, now_ns: u64) -> Self {
         Self {
-            tokens: AtomicI64::new(initial_tokens as i64),
+            tokens: AtomicI64::new(capacity as i64),
             delta: AtomicU64::new(0),
+            capacity,
+            last_activity_ns: AtomicU64::new(now_ns),
         }
     }
 
@@ -77,8 +89,11 @@ impl LocalBucket {
     /// `false` if there were not enough tokens in the local cache.
     ///
     /// Lock-free: uses a CAS loop on `tokens`. Successful consumption
-    /// increments `delta`; rejection does not.
-    pub fn try_consume(&self, cost: u32) -> bool {
+    /// increments `delta`; rejection does not. Both count as activity,
+    /// so a client hammering a drained bucket keeps it alive rather than
+    /// earning a fresh one from the idle eviction.
+    pub fn try_consume(&self, cost: u32, now_ns: u64) -> bool {
+        self.last_activity_ns.store(now_ns, Ordering::Relaxed);
         let c = cost as i64;
         loop {
             let cur = self.tokens.load(Ordering::Acquire);
@@ -137,6 +152,23 @@ impl LocalBucket {
     /// Current accumulated delta without draining. For observability.
     pub fn peek_delta(&self) -> u64 {
         self.delta.load(Ordering::Acquire)
+    }
+
+    /// Configured burst size this bucket was created with.
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    /// Monotonic timestamp of the last `try_consume`.
+    pub fn last_activity_ns(&self) -> u64 {
+        self.last_activity_ns.load(Ordering::Relaxed)
+    }
+
+    /// Whether the next sync tick must include this bucket: it carries
+    /// unpushed consumption, or it is below capacity and only the
+    /// supervisor knows how much has refilled since.
+    pub fn needs_sync(&self) -> bool {
+        self.peek_delta() > 0 || self.tokens() < i64::from(self.capacity)
     }
 }
 
@@ -277,20 +309,20 @@ mod tests {
 
     #[test]
     fn local_try_consume_success_and_rejection() {
-        let b = LocalBucket::new(10);
-        assert!(b.try_consume(3));
-        assert!(b.try_consume(5));
+        let b = LocalBucket::new(10, 0);
+        assert!(b.try_consume(3, 0));
+        assert!(b.try_consume(5, 0));
         assert_eq!(b.peek_delta(), 8);
-        assert!(!b.try_consume(3)); // only 2 left
-        assert!(b.try_consume(2));
-        assert!(!b.try_consume(1));
+        assert!(!b.try_consume(3, 0)); // only 2 left
+        assert!(b.try_consume(2, 0));
+        assert!(!b.try_consume(1, 0));
     }
 
     #[test]
     fn local_take_delta_resets() {
-        let b = LocalBucket::new(100);
+        let b = LocalBucket::new(100, 0);
         for _ in 0..10 {
-            assert!(b.try_consume(1));
+            assert!(b.try_consume(1, 0));
         }
         assert_eq!(b.take_delta(), 10);
         assert_eq!(b.peek_delta(), 0);
@@ -298,8 +330,8 @@ mod tests {
 
     #[test]
     fn local_refresh_overwrites_tokens_not_delta() {
-        let b = LocalBucket::new(100);
-        assert!(b.try_consume(10));
+        let b = LocalBucket::new(100, 0);
+        assert!(b.try_consume(10, 0));
         assert_eq!(b.tokens(), 90);
         assert_eq!(b.peek_delta(), 10);
         b.refresh(50);
@@ -309,17 +341,65 @@ mod tests {
     }
 
     #[test]
+    fn local_starts_full_and_remembers_capacity() {
+        let b = LocalBucket::new(5, 7);
+        assert_eq!(b.capacity(), 5);
+        assert_eq!(b.tokens(), 5);
+        assert_eq!(b.last_activity_ns(), 7);
+        assert!(
+            !b.needs_sync(),
+            "a full bucket with no consumption is in sync"
+        );
+    }
+
+    #[test]
+    fn local_activity_tracks_admitted_and_refused_requests() {
+        let b = LocalBucket::new(1, 0);
+        assert!(b.try_consume(1, 10));
+        assert_eq!(b.last_activity_ns(), 10);
+        assert!(!b.try_consume(1, 20));
+        assert_eq!(
+            b.last_activity_ns(),
+            20,
+            "a refused request is activity too"
+        );
+    }
+
+    #[test]
+    fn local_drained_bucket_needs_sync_without_pending_delta() {
+        // Issue #45: refused requests consume nothing, so once the delta
+        // of the draining requests has been pushed, a drained bucket has
+        // nothing to push and still has to be refreshed.
+        let b = LocalBucket::new(3, 0);
+        for _ in 0..3 {
+            assert!(b.try_consume(1, 0));
+        }
+        assert!(!b.try_consume(1, 0));
+        assert_eq!(b.take_delta(), 3);
+        b.refresh(0);
+        assert_eq!(b.peek_delta(), 0);
+        assert!(b.needs_sync(), "drained bucket must keep asking for refill");
+        b.refresh(2);
+        assert!(
+            b.needs_sync(),
+            "partially refilled bucket still below capacity"
+        );
+        b.refresh(3);
+        assert!(!b.needs_sync(), "full again: nothing left to learn");
+    }
+
+    #[test]
     fn local_try_consume_under_concurrent_threads() {
         use std::sync::Arc;
         use std::thread;
-        let b = Arc::new(LocalBucket::new(1000));
+        let b = Arc::new(LocalBucket::new(1000, 0));
         let mut handles = Vec::new();
         for _ in 0..8 {
             let b = b.clone();
             handles.push(thread::spawn(move || {
                 let mut ok = 0u32;
                 for _ in 0..500 {
-                    if b.try_consume(1) {
+                    if b.try_consume(1, 0) {
                         ok += 1;
                     }
                 }

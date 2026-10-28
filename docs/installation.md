@@ -13,11 +13,16 @@ over stdio for one session (`docs/mcp.md`). They install the unit at
 
 ```bash
 # Debian / Ubuntu
-sudo dpkg -i lorica_<version>_amd64.deb
+sudo apt install ./lorica_<version>_amd64.deb
 
 # Fedora / RHEL
-sudo rpm -i lorica-<version>-1.x86_64.rpm
+sudo dnf install ./lorica-<version>-1.x86_64.rpm
 ```
+
+Since 1.10.1 the packages require the GSS-API runtime library
+(`libgssapi-krb5-2`, `krb5-libs`), which `apt` and `dnf` install with
+them. `dpkg -i` and `rpm -i` do not resolve dependencies and refuse the
+package on a host that lacks it.
 
 On a first install the post-install hook enables and starts the service.
 An upgrade keeps the state you left it in: it never enables the

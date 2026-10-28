@@ -64,6 +64,14 @@ impl PathRule {
             PathMatchType::Exact => request_path == self.path,
         }
     }
+
+    /// Whether this rule sets either rate-limit field. A rule that does
+    /// gets a token bucket of its own instead of drawing from the
+    /// route-level one; see [`Route::effective_rate_limit_with`] for the
+    /// limit it resolves to.
+    pub fn overrides_rate_limit(&self) -> bool {
+        self.rate_limit_rps.is_some() || self.rate_limit_burst.is_some()
+    }
 }
 
 /// Route a request to a specific backend group based on one of its HTTP
@@ -399,7 +407,7 @@ fn default_forward_auth_timeout_ms() -> u32 {
 /// `scope = PerRoute`, a single shared bucket caps aggregate route
 /// traffic regardless of client - useful to protect an origin that
 /// cannot handle more than X rps total.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimit {
     /// Burst / token-bucket capacity. Must be `> 0`; the API rejects 0.
@@ -1189,23 +1197,10 @@ impl Route {
         if let Some(v) = rule.cache_ttl_s {
             r.cache_ttl_s = v;
         }
-        if let Some(v) = rule.rate_limit_rps {
-            r.rate_limit_rps = Some(v);
-        }
-        if let Some(v) = rule.rate_limit_burst {
-            r.rate_limit_burst = Some(v);
-        }
-        // Story 8.10 AC #5. The unified limiter reads `rate_limit`, so a
-        // path rule that overrides the legacy `rate_limit_rps` must also
-        // re-synthesise the structured limit; otherwise a route carrying a
-        // `rate_limit` struct would keep enforcing the route-level bucket
-        // and silently ignore the per-path override.
-        if rule.rate_limit_rps.is_some() {
-            r.rate_limit = r
-                .rate_limit_rps
-                .filter(|&rps| rps > 0)
-                .map(|rps| RateLimit::from_legacy(rps, r.rate_limit_burst));
-        }
+        let (rps, burst, structured) = self.rate_limit_fields_with(rule);
+        r.rate_limit_rps = rps;
+        r.rate_limit_burst = burst;
+        r.rate_limit = structured;
         if rule.redirect_to.is_some() {
             r.redirect_to = rule.redirect_to.clone();
         }
@@ -1222,12 +1217,67 @@ impl Route {
     /// `rate_limit_rps` of `0` (or absent) means "no limit" and yields
     /// `None`, so both engines now share a single admission path.
     pub fn effective_rate_limit(&self) -> Option<RateLimit> {
-        self.rate_limit.clone().or_else(|| {
-            self.rate_limit_rps
-                .filter(|&rps| rps > 0)
-                .map(|rps| RateLimit::from_legacy(rps, self.rate_limit_burst))
-        })
+        resolve_rate_limit(
+            self.rate_limit.clone(),
+            self.rate_limit_rps,
+            self.rate_limit_burst,
+        )
     }
+
+    /// The effective rate limit of a request that matched `rule`: the
+    /// same answer as `self.with_path_rule_overrides(rule)
+    /// .effective_rate_limit()`, without cloning the whole route on the
+    /// request path. Both go through one private merge, so the limiter
+    /// and the route snapshot later stages read cannot disagree.
+    pub fn effective_rate_limit_with(&self, rule: &PathRule) -> Option<RateLimit> {
+        let (rps, burst, structured) = self.rate_limit_fields_with(rule);
+        resolve_rate_limit(structured, rps, burst)
+    }
+
+    /// The first path rule matching `request_path`, with its position in
+    /// [`Route::path_rules`]. First match wins, as everywhere rules are
+    /// evaluated.
+    pub fn matching_path_rule(&self, request_path: &str) -> Option<(usize, &PathRule)> {
+        self.path_rules
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| rule.matches(request_path))
+    }
+
+    /// `(rate_limit_rps, rate_limit_burst, rate_limit)` once `rule` is
+    /// layered on top of this route.
+    fn rate_limit_fields_with(
+        &self,
+        rule: &PathRule,
+    ) -> (Option<u32>, Option<u32>, Option<RateLimit>) {
+        let rps = rule.rate_limit_rps.or(self.rate_limit_rps);
+        let burst = rule.rate_limit_burst.or(self.rate_limit_burst);
+        // Story 8.10 AC #5. The structured `rate_limit` wins over the
+        // legacy pair, so a rule overriding `rate_limit_rps` must replace
+        // it too; otherwise a route carrying a `rate_limit` struct would
+        // keep enforcing the route-level bucket and silently ignore the
+        // per-path override.
+        let structured = if rule.rate_limit_rps.is_some() {
+            rps.filter(|&r| r > 0)
+                .map(|r| RateLimit::from_legacy(r, burst))
+        } else {
+            self.rate_limit.clone()
+        };
+        (rps, burst, structured)
+    }
+}
+
+/// Structured limit first, then the legacy pair, where an `rps` of `0`
+/// means no limit.
+fn resolve_rate_limit(
+    structured: Option<RateLimit>,
+    rps: Option<u32>,
+    burst: Option<u32>,
+) -> Option<RateLimit> {
+    structured.or_else(|| {
+        rps.filter(|&r| r > 0)
+            .map(|r| RateLimit::from_legacy(r, burst))
+    })
 }
 
 fn default_security_headers() -> String {

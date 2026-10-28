@@ -519,15 +519,30 @@ pub(crate) fn run_supervisor(cli: Cli) {
         let reload_generation: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        // Per-route rate-limit policy cache (audit M-4). Without this
-        // cache, N concurrent `RateLimitDelta` RPCs on a first-seen
-        // `{route|scope}` key serialise on the single `store`
-        // tokio::Mutex for N SQLite reads. Cache populated on miss,
-        // invalidated on every successful two-phase Commit (see the
-        // reload coordinator below).
-        let rl_policy_cache: Arc<
-            dashmap::DashMap<String, Option<lorica_config::models::RateLimit>>,
-        > = Arc::new(dashmap::DashMap::new());
+        // Cross-worker authoritative token buckets and the per-route
+        // policy cache that sizes them. Every `RateLimitDelta` RPC from
+        // a worker drains its consumption into the bucket for each key
+        // and replies with the current token count, or `untracked` for
+        // a key with no limit behind it. Policies are dropped on every
+        // config change (see the reload bridge below), buckets by the
+        // idle prune spawned here. See docs/architecture/worker-shared-state.md § 6.
+        let rate_limits: Arc<lorica::proxy_wiring::SupervisorRateLimits> =
+            Arc::new(lorica::proxy_wiring::SupervisorRateLimits::new());
+        {
+            let rate_limits = Arc::clone(&rate_limits);
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(lorica::proxy_wiring::rate_limit::BUCKET_PRUNE_INTERVAL);
+                ticker.tick().await; // skip the immediate tick
+                loop {
+                    ticker.tick().await;
+                    rate_limits.prune_idle(
+                        lorica_shmem::now_ns(),
+                        lorica::proxy_wiring::rate_limit::BUCKET_IDLE_TTL,
+                    );
+                }
+            });
+        }
 
         // Shared by the config-reload bridge (spawned once the
         // alerting stack exists, below) and the per-worker heartbeat
@@ -540,15 +555,6 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // Track per-worker task handles so we can abort stale tasks on restart
         let worker_task_handles: Arc<parking_lot::Mutex<std::collections::HashMap<u32, tokio::task::JoinHandle<()>>>> =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-
-        // Cross-worker authoritative token-bucket registry. Every
-        // `RateLimitDelta` RPC from a worker drains its consumption into
-        // the `AuthoritativeBucket` keyed here, then replies with the
-        // current token count for each key so the worker can refresh its
-        // local cache. See docs/architecture/worker-shared-state.md § 6.
-        let rl_registry: Arc<
-            dashmap::DashMap<String, Arc<lorica_limits::token_bucket::AuthoritativeBucket>>,
-        > = Arc::new(dashmap::DashMap::new());
 
         // Cross-worker forward-auth verdict cache. Workers issue
         // `VerdictLookup` before calling the auth upstream and
@@ -606,8 +612,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
             spawn_supervisor_rpc_handler(
                 worker_id,
                 rpc_raw_fd,
-                Arc::clone(&rl_registry),
-                Arc::clone(&rl_policy_cache),
+                Arc::clone(&rate_limits),
                 Arc::clone(&store),
                 Arc::clone(&verdict_cache),
                 Arc::clone(&breaker_registry),
@@ -771,7 +776,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
             Arc::clone(&worker_rpc_endpoints),
             Arc::clone(&reload_generation),
             Arc::clone(&sequence),
-            Arc::clone(&rl_policy_cache),
+            Arc::clone(&rate_limits),
             reload_bc_tx.clone(),
             SupervisorReloadTargets {
                 store: Arc::clone(&store),
@@ -1072,8 +1077,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // the deps the helper needs once at monitor scope so the
         // crash branch can move them into `spawn_supervisor_rpc_handler`.
         let monitor_rpc_endpoints = Arc::clone(&worker_rpc_endpoints);
-        let monitor_rl_registry = Arc::clone(&rl_registry);
-        let monitor_rl_policy = Arc::clone(&rl_policy_cache);
+        let monitor_rate_limits = Arc::clone(&rate_limits);
         let monitor_store = Arc::clone(&store);
         let monitor_verdict_cache = Arc::clone(&verdict_cache);
         let monitor_breaker_registry = Arc::clone(&breaker_registry);
@@ -1217,8 +1221,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                             spawn_supervisor_rpc_handler(
                                 id,
                                 new_rpc_fd.into_raw_fd(),
-                                Arc::clone(&monitor_rl_registry),
-                                Arc::clone(&monitor_rl_policy),
+                                Arc::clone(&monitor_rate_limits),
                                 Arc::clone(&monitor_store),
                                 Arc::clone(&monitor_verdict_cache),
                                 Arc::clone(&monitor_breaker_registry),
@@ -1850,10 +1853,7 @@ fn spawn_worker_channel_task(
 fn spawn_supervisor_rpc_handler(
     worker_id: u32,
     rpc_fd: std::os::fd::RawFd,
-    rl_registry: Arc<
-        dashmap::DashMap<String, Arc<lorica_limits::token_bucket::AuthoritativeBucket>>,
-    >,
-    rl_policy_cache: Arc<dashmap::DashMap<String, Option<lorica_config::models::RateLimit>>>,
+    rate_limits: Arc<lorica::proxy_wiring::SupervisorRateLimits>,
     store: Arc<Mutex<lorica_config::ConfigStore>>,
     verdict_cache: Arc<SupervisorVerdictCache>,
     breaker_registry: Arc<SupervisorBreakerRegistry>,
@@ -1881,8 +1881,12 @@ fn spawn_supervisor_rpc_handler(
         while let Some(inc) = incoming.recv().await {
             match inc.command_type() {
                 lorica_command::CommandType::RateLimitDelta => {
-                    handle_rate_limit_delta(inc, &rl_registry, &rl_policy_cache, &store, worker_id)
-                        .await;
+                    lorica::proxy_wiring::rate_limit::handle_rate_limit_delta(
+                        inc,
+                        &rate_limits,
+                        &store,
+                    )
+                    .await;
                 }
                 lorica_command::CommandType::VerdictLookup => {
                     handle_verdict_lookup(inc, &verdict_cache).await;
@@ -1914,113 +1918,6 @@ fn spawn_supervisor_rpc_handler(
         worker_rpc_endpoints.remove(&worker_id);
         tracing::debug!(worker_id, "supervisor RPC loop exiting");
     })
-}
-
-/// batched entries, applies each consumption to the authoritative
-/// bucket for `{route_id}|{scope_key}`, and replies with a
-/// `RateLimitDeltaResult` carrying the current token count per key
-/// so the worker can refresh its local cache.
-///
-/// The `{route_id}|{scope_key}` key format is assembled by the worker
-/// in `proxy_wiring.rs`; the supervisor only splits it to look up the
-/// route config once per first-seen key (for capacity + refill rate).
-async fn handle_rate_limit_delta(
-    inc: lorica_command::IncomingCommand,
-    registry: &dashmap::DashMap<String, Arc<lorica_limits::token_bucket::AuthoritativeBucket>>,
-    rl_policy_cache: &dashmap::DashMap<String, Option<lorica_config::models::RateLimit>>,
-    store: &Arc<Mutex<lorica_config::ConfigStore>>,
-    worker_id: u32,
-) {
-    use lorica_command::{command, response, RateLimitDeltaResult, RateLimitSnapshot};
-
-    let delta = match inc.command().payload.clone() {
-        Some(command::Payload::RateLimitDelta(d)) => d,
-        _ => {
-            let _ = inc.reply_error("malformed RateLimitDelta payload").await;
-            return;
-        }
-    };
-    if delta.entries.is_empty() {
-        let _ = inc
-            .reply(lorica_command::Response::ok_with(
-                0,
-                response::Payload::RateLimitDeltaResult(RateLimitDeltaResult {
-                    snapshots: Vec::new(),
-                }),
-            ))
-            .await;
-        return;
-    }
-    let now_ns = lorica_shmem::now_ns();
-    let mut snapshots = Vec::with_capacity(delta.entries.len());
-    for entry in &delta.entries {
-        // Key shape: "{route_id}|{scope_key}". Peel off the route id to
-        // fetch capacity/refill for a first-seen key.
-        let route_id = entry.key.split('|').next().unwrap_or("");
-        let bucket = match registry.get(&entry.key) {
-            Some(b) => Arc::clone(b.value()),
-            None => {
-                // Lookup route config to seed the authoritative bucket.
-                // A missing or unlimited route means any contribution
-                // the worker sent is a no-op (the worker's own
-                // LocalBucket should not have existed in the first
-                // place, but we handle it defensively).
-                //
-                // Hit the per-route policy cache first so concurrent
-                // RateLimitDeltas from N workers don't all serialise on
-                // the `store` tokio::Mutex at first-seen time (audit
-                // M-4). The cache is invalidated on every successful
-                // config reload (see `invalidate_rl_policy_cache`).
-                let rl_cfg = if let Some(cached) =
-                    rl_policy_cache.get(route_id).map(|e| e.value().clone())
-                {
-                    cached
-                } else {
-                    let fetched = {
-                        let s = store.lock().await;
-                        s.get_route(route_id)
-                            .ok()
-                            .flatten()
-                            .and_then(|r| r.rate_limit.clone())
-                    };
-                    rl_policy_cache.insert(route_id.to_string(), fetched.clone());
-                    fetched
-                };
-                let Some(rl) = rl_cfg else {
-                    tracing::debug!(
-                        worker_id,
-                        key = %entry.key,
-                        "RateLimitDelta for route with no rate_limit; ignoring"
-                    );
-                    snapshots.push(RateLimitSnapshot {
-                        key: entry.key.clone(),
-                        remaining: 0,
-                    });
-                    continue;
-                };
-                let new = Arc::new(lorica_limits::token_bucket::AuthoritativeBucket::new(
-                    rl.capacity,
-                    rl.refill_per_sec,
-                    now_ns,
-                ));
-                let entry_ref = registry
-                    .entry(entry.key.clone())
-                    .or_insert_with(|| new.clone());
-                Arc::clone(entry_ref.value())
-            }
-        };
-        let remaining = bucket.apply_delta(entry.consumed, now_ns);
-        snapshots.push(RateLimitSnapshot {
-            key: entry.key.clone(),
-            remaining,
-        });
-    }
-    let _ = inc
-        .reply(lorica_command::Response::ok_with(
-            0,
-            response::Payload::RateLimitDeltaResult(RateLimitDeltaResult { snapshots }),
-        ))
-        .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -2439,8 +2336,6 @@ impl SupervisorReloadTargets {
     }
 }
 
-type RateLimitPolicyCache = dashmap::DashMap<String, Option<lorica_config::models::RateLimit>>;
-
 /// Everything one configuration change drives from the supervisor.
 ///
 /// The supervisor's own state is refreshed here, on every change,
@@ -2453,7 +2348,7 @@ struct ConfigReloadBridge {
     worker_endpoints: Arc<dashmap::DashMap<u32, lorica_command::RpcEndpoint>>,
     generation: Arc<std::sync::atomic::AtomicU64>,
     sequence: Arc<std::sync::atomic::AtomicU64>,
-    rl_policy_cache: Arc<RateLimitPolicyCache>,
+    rate_limits: Arc<lorica::proxy_wiring::SupervisorRateLimits>,
     legacy_broadcast: tokio::sync::broadcast::Sender<u64>,
     supervisor_state: SupervisorReloadTargets,
 }
@@ -2463,7 +2358,7 @@ impl ConfigReloadBridge {
         worker_endpoints: Arc<dashmap::DashMap<u32, lorica_command::RpcEndpoint>>,
         generation: Arc<std::sync::atomic::AtomicU64>,
         sequence: Arc<std::sync::atomic::AtomicU64>,
-        rl_policy_cache: Arc<RateLimitPolicyCache>,
+        rate_limits: Arc<lorica::proxy_wiring::SupervisorRateLimits>,
         legacy_broadcast: tokio::sync::broadcast::Sender<u64>,
         supervisor_state: SupervisorReloadTargets,
     ) -> Self {
@@ -2471,7 +2366,7 @@ impl ConfigReloadBridge {
             worker_endpoints,
             generation,
             sequence,
-            rl_policy_cache,
+            rate_limits,
             legacy_broadcast,
             supervisor_state,
         }
@@ -2481,7 +2376,7 @@ impl ConfigReloadBridge {
         self.reload_workers().await;
         // Route policies may have changed whichever way the workers
         // reloaded: the next RateLimitDelta re-reads them (audit M-4).
-        self.rl_policy_cache.clear();
+        self.rate_limits.invalidate_policies();
         self.supervisor_state.refresh().await;
     }
 
@@ -3144,7 +3039,7 @@ mod supervisor_tests {
             endpoints,
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
             Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            Arc::new(dashmap::DashMap::new()),
+            Arc::new(lorica::proxy_wiring::SupervisorRateLimits::new()),
             legacy_tx,
             SupervisorReloadTargets {
                 store: Arc::clone(&store),

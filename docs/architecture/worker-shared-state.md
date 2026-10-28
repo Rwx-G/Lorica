@@ -132,6 +132,11 @@ message ConfigReloadCommit  { uint64 generation = 1; }
 // New worker -> supervisor:
 message RateLimitDelta { repeated RateLimitEntry entries = 1; }
 message RateLimitEntry { string key = 1; uint32 consumed = 2; }
+
+// Supervisor -> worker, in reply:
+message RateLimitSnapshot { string key = 1; uint32 remaining = 2;
+                            bool untracked = 3; }
+message RateLimitDeltaResult { repeated RateLimitSnapshot snapshots = 1; }
 ```
 
 Sequence numbers stay strictly monotonic per channel direction. A
@@ -413,19 +418,53 @@ No IPC, no lock. ~ns per call.
 (component C). Worker hot path:
 
 ```rust
-let bucket = local_buckets.get_or_init((route_id, ip), defaults);
-let allowed = bucket.try_consume(1);                // local atomic
+let (rule, limit) = resolve_request_limit(&route, path)?;   // None: unlimited
+let key = bucket_key(&route.id, rule, &limit, scope_key(&limit, client_ip));
+let allowed = local_buckets.get_or_init(key, limit.capacity)
+    .try_consume(cost, now_ns);                         // local atomic
 if !allowed { return Err(RateLimited); }
-// background task pushes accumulated `consumed` deltas every 100 ms
-// via RPC.RateLimitDelta and refreshes local view from authoritative.
+// background task syncs every 100 ms via RPC.RateLimitDelta and
+// refreshes the local view from the authoritative reply.
 ```
 
-Supervisor maintains the authoritative bucket per `(route_id, ip)`.
-On `RateLimitDelta`, sums consumed across workers, applies to the
-authoritative state, returns a refreshed snapshot. Worker overwrites
-its local view with the snapshot. Imprecision bounded at
-`100 ms × N_workers` worth of in-flight consumption, in the
-direction "could let a few extra requests through". Acceptable.
+The code lives in `lorica/src/proxy_wiring/rate_limit.rs`, shared by
+both ends of the RPC.
+
+- **Key.** `<route_id>|<rule>|<capacity>:<refill_per_sec>|<scope_key>`.
+  `<rule>` is `-` for the route-level limit, or the position of the
+  matched path rule when that rule sets `rate_limit_rps` or
+  `rate_limit_burst`, so such a rule has a bucket of its own. The
+  limit is part of the key: a reload that changes a limit or reorders
+  rules yields a new key, and the old bucket goes idle and is evicted.
+  Nothing is reset on reload. `<scope_key>` is the client IP for
+  `per_ip` (`unknown` when the address is not an IP literal), or
+  `__route__` for `per_route`.
+- **Limit.** Both ends resolve it with `Route::effective_rate_limit`
+  and `Route::effective_rate_limit_with(rule)`, so a route configured
+  with the legacy `rate_limit_rps` / `rate_limit_burst` fields and a
+  path-rule override get the same limit on both sides.
+- **Sync.** Each tick a worker sends every bucket that has unpushed
+  consumption or sits below capacity, the latter with `consumed = 0`.
+  Refused requests consume nothing, so a drained bucket only learns
+  about the refill from the reply. At most `SYNC_BATCH_MAX_ENTRIES`
+  per tick, the RPC frame being capped at 1 MiB; a rotating cursor
+  serves the rest on later ticks.
+- **Reply.** The supervisor keeps one `AuthoritativeBucket` per key,
+  sized from the route in its store (per-route policy cache, cleared on
+  every config change), sums the consumption of every worker into it
+  and returns the remaining count. A key whose route is gone, carries
+  no limit, or resolves to another limit than the one the key encodes
+  is answered `untracked`: the worker drops its bucket and the next
+  request rebuilds it from its own config. "No limit" never reads as
+  "0 tokens left" (issue #45).
+- **Eviction.** Workers and the supervisor both drop buckets idle for
+  `BUCKET_IDLE_TTL`. On a worker a refused request counts as activity,
+  so a client hammering a drained bucket cannot earn a full one by
+  waiting for eviction.
+
+Imprecision is bounded at `100 ms × N_workers` worth of in-flight
+consumption, in the direction "could let a few extra requests
+through". Acceptable.
 
 ## 7. WPAR-2/3/7/8 implementation
 

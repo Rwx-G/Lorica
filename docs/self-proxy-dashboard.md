@@ -140,11 +140,16 @@ curl -sk -b "$COOKIE" "$LORICA/api/v1/routes" \
     "waf_enabled": true,
     "waf_mode": "blocking",
     "rate_limit_rps": 20,
-    "rate_limit_burst": 5,
+    "rate_limit_burst": 60,
     "ip_allowlist": "'"$ALLOWED_CIDR"'",
     "access_log_enabled": true
   }'
 ```
+
+The rate limit is per client IP: 20 requests per second sustained, with a
+burst of 60. The burst must cover the dashboard's first page load, which
+fetches its scripts, styles and API data in parallel; a burst of a few
+requests answers part of that load with `429 Too Many Requests`.
 
 ### Step 5 - Verify
 
@@ -254,7 +259,7 @@ ROUTE_BODY=$(jq -n \
     waf_enabled: true,
     waf_mode: "blocking",
     rate_limit_rps: 20,
-    rate_limit_burst: 5,
+    rate_limit_burst: 60,
     ip_allowlist: $cidr,
     access_log_enabled: true
   } + (if $cid != "" then {certificate_id: $cid} else {} end)')
@@ -279,7 +284,7 @@ echo "Cert ID:    ${CERT_ID:-none}"
 echo ""
 echo "Security:"
 echo "  - WAF:          blocking mode"
-echo "  - Rate limit:   20 req/s (burst 5)"
+echo "  - Rate limit:   20 req/s (burst 60)"
 echo "  - IP allowlist: $ALLOWED_CIDR"
 echo "  - HTTPS:        forced"
 echo ""

@@ -15,14 +15,31 @@ Author: Rwx-G
 
 ### Fixed
 
-- **Upstream Pingora sync into the forked crates (see `FORK.md`).** An empty write on a chunked HTTP/1.x body no longer ends the body early: it was encoded as a zero-length chunk, which is the chunked terminator, so the peer stopped reading there and took the real terminator for the start of the next message, desyncing the connection. With `trace` logging enabled, an upstream response header carrying a non-UTF-8 byte no longer panics the request task while the raw header is logged. Upgraded sessions on the forked proxy's custom-protocol path no longer fail when the client half-closes a finished upgrade request while the response is still draining, and still see a reset that arrives afterwards; Lorica does not wire that path today, so this changes nothing for a running node. The rate estimator in `lorica-limits` wraps on overflow instead of panicking in debug builds, and the L4 socket buffers no longer construct a zero-capacity `BufReader`, which panics from tokio 1.54.0 on every accept and connect (it lands with the tokio 1.54 update under Security, so no release ever carried the crash).
-
 ### Removed
 
 ### Security
 
-- **`tokio` 1.54.1** (RUSTSEC-2026-0386): `AsyncFd::new` in 1.53.1 was unsound. Part of a lockfile-only pass of the SemVer-compatible updates (`hyper` 1.12.0, `tokio-rustls` 0.26.6, `aws-lc-rs` 1.18.2, `webpki-roots` 1.0.11, `serde_json` 1.0.154, `uuid` 1.29.0 among them).
-- **`h2` 0.4.20**, the downstream and upstream HTTP/2 stack: streams refused by the server now count toward its limit on locally reset streams, so a client can no longer open refused streams indefinitely without the connection being torn down, and a request carrying conflicting `Content-Length` values is now reset by h2 itself, before the forked proxy's own check sees it. Such streams are therefore bounded by h2's limit on locally reset streams rather than by the proxy's malformed-request budget, which still applies to conflicting `:authority` and `Host` fields.
+## [1.10.1] - 2026-10-28
+
+The release of 1.10.0. Its tag was cut, but the release pipeline failed on the `.rpm` packages (see Fixed), so no 1.10.0 package exists. A release tag is never moved, so the same changes ship as 1.10.1: everything listed under `[1.10.0]` is in this release.
+
+### Changed
+
+- **A path rule that sets `rate_limit_rps` or `rate_limit_burst` has a token bucket of its own**, in both run modes, instead of sharing the route's. Changing a route's or a rule's limit now applies at once to clients that already hold a bucket, in single-process mode too: the limit is part of the bucket's identity, so the old bucket is dropped rather than kept at its old size. Behind a trusted proxy, requests whose `X-Forwarded-For` client entry is not an IP address share one bucket per route.
+
+### Fixed
+
+- **Rate limiting in worker mode no longer answers `429 Too Many Requests` to clients well under the limit** (issue #45). A route configured with the `rate_limit_rps` / `rate_limit_burst` fields, which the self-proxy dashboard guide uses, refused every client after its first requests under `--workers`, the packaged unit's setting: the supervisor read only the structured `rate_limit` field, reported an empty bucket for such a route, and the worker applied it. Single-process mode was not affected. The supervisor now sizes buckets with the same resolution as the worker, and a key it holds no limit for is answered as untracked, which makes the worker drop the bucket instead of reading it as empty.
+- **A drained rate-limit bucket refills in worker mode.** A worker only resynchronised buckets that had admitted requests since the last round, so a bucket at zero refused everything, admitted nothing and was never refreshed again, until the worker restarted. Buckets below capacity are now synced every round even with nothing consumed.
+- **Rate limits set on a path rule are enforced.** The limiter read the route's own settings, so a stricter limit on a path such as a login endpoint never applied; the route-level limit, or none, did instead.
+- **Rate-limit buckets are evicted in worker mode.** Workers and the supervisor kept one bucket per client address forever; both now drop buckets idle for five minutes, as single-process mode did. On a worker a refused request counts as activity, so waiting does not refill a drained bucket.
+- **The `.rpm` installs with `dnf` again.** `rpmbuild` from rpm 4.19 on (the CI runner moved to Ubuntu 26.04 and RPM 6) derives `user(lorica)` and `group(lorica)` requirements from the package's `lorica`-owned directories, which nothing provided, so `dnf` refused the package and the 1.10.0 release stopped there. The package ships `/usr/lib/sysusers.d/lorica.conf`, which provides them; the `useradd` in `%pre` stays for older rpm.
+- **The self-proxy dashboard guide sizes the rate-limit burst for a page load** (60 instead of 5): the dashboard fetches its scripts, styles and API data in parallel.
+- **The install instructions use `apt` and `dnf`.** The README and `docs/installation.md` said `dpkg -i` and `rpm -i`, which do not resolve the GSS-API runtime library the packages require since the AD CS client, and the README's download link named an asset no release carries. Building from source lists the headers the AD CS client's bindings need (`libkrb5-dev` and `libclang-dev`).
+
+### Security
+
+- **Rate limiting in worker mode could lock a route out for every client** ([GHSA-w5xw-jqc2-qcf5](https://github.com/Rwx-G/Lorica/security/advisories/GHSA-w5xw-jqc2-qcf5), medium). With a `per_route` limit, or a `per_ip` limit behind an address many clients share, a single unauthenticated client could drain the bucket and leave the route answering `429` to everyone served by that worker until it restarted, through the refill defect under Fixed. The advisory also covers the unenforced path-rule limits and the unbounded bucket growth in worker mode, both fixed above. Affects 1.3.0 through 1.9.3.
 
 ## [1.10.0] - 2026-10-27
 
@@ -38,6 +55,7 @@ Author: Rwx-G
 ### Fixed
 
 - **Editing a notification channel no longer drops its cluster alert subscriptions.** The dashboard's form only knew a hand-typed subset of the alert types, so saving a channel removed every type it did not list, including the three cluster alerts. Stored types are now kept and the cluster types have their checkboxes.
+- **Upstream Pingora sync into the forked crates (see `FORK.md`).** An empty write on a chunked HTTP/1.x body no longer ends the body early: it was encoded as a zero-length chunk, which is the chunked terminator, so the peer stopped reading there and took the real terminator for the start of the next message, desyncing the connection. With `trace` logging enabled, an upstream response header carrying a non-UTF-8 byte no longer panics the request task while the raw header is logged. Upgraded sessions on the forked proxy's custom-protocol path no longer fail when the client half-closes a finished upgrade request while the response is still draining, and still see a reset that arrives afterwards; Lorica does not wire that path today, so this changes nothing for a running node. The rate estimator in `lorica-limits` wraps on overflow instead of panicking in debug builds, and the L4 socket buffers no longer construct a zero-capacity `BufReader`, which panics from tokio 1.54.0 on every accept and connect (it lands with the tokio 1.54 update under Security, so no release ever carried the crash).
 
 ### Security
 
@@ -47,6 +65,8 @@ Author: Rwx-G
 - **`zstd` 0.14.3, `zstd-safe` 8.2.0 and `zstd-sys` 2.1.2** (RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403, RUSTSEC-2026-0410): a reused stream context could carry an abandoned stream's data into the next one, seekable decompression could set a `Vec` length past its capacity, a failed streaming decompression of a legacy frame could expose uninitialized memory, and the wasm32 allocator shim corrupted memory on allocation failure. None was reachable: response compression builds a fresh encoder per response without `with_context`, the cache header codec uses the one-shot API rather than streaming decompression, the `seekable` feature is not enabled, and Lorica does not target wasm32. The forked `lorica-core` and `lorica-header-serde` move to the new major versions without a source change.
 - **`ctutils` 0.4.4** (RUSTSEC-2026-0385): constant-time mask generation could compile to a branch. It is reached only inside the RustCrypto `digest` 0.11 stack (`sha2`, `hmac`, `argon2`, `ed25519-dalek`); Lorica's own secret comparisons, such as the challenge cookie tag, use `subtle`.
 - **`ammonia` 4.1.8** (RUSTSEC-2026-0373): a mixed-case CSS `url()` could pass the sanitizer. Lorica's error-page sanitizer does not allow `style` attributes or elements, so it was not reachable.
+- **`tokio` 1.54.1** (RUSTSEC-2026-0386): `AsyncFd::new` in 1.53.1 was unsound. Part of a lockfile-only pass of the SemVer-compatible updates (`hyper` 1.12.0, `tokio-rustls` 0.26.6, `aws-lc-rs` 1.18.2, `webpki-roots` 1.0.11, `serde_json` 1.0.154, `uuid` 1.29.0 among them).
+- **`h2` 0.4.20**, the downstream and upstream HTTP/2 stack: streams refused by the server now count toward its limit on locally reset streams, so a client can no longer open refused streams indefinitely without the connection being torn down, and a request carrying conflicting `Content-Length` values is now reset by h2 itself, before the forked proxy's own check sees it. Such streams are therefore bounded by h2's limit on locally reset streams rather than by the proxy's malformed-request budget, which still applies to conflicting `:authority` and `Host` fields.
 
 ## [1.9.3] - 2026-10-14
 

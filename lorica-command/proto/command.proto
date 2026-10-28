@@ -146,6 +146,17 @@ message BanReportEntry {
 }
 message RateLimitResult { bool allowed = 1; uint32 remaining = 2; }
 
+// One authoritative bucket in reply to a RateLimitDelta, paired by key.
+// `untracked` means the supervisor holds no bucket for the key (route
+// gone, no rate limit, or a limit other than the one the key encodes):
+// the worker drops its local bucket instead of refreshing it.
+message RateLimitSnapshot {
+  string key = 1;
+  uint32 remaining = 2;
+  bool untracked = 3;
+}
+message RateLimitDeltaResult { repeated RateLimitSnapshot snapshots = 1; }
+
 enum Verdict {
   VERDICT_UNSPECIFIED = 0;
   ALLOW = 1;

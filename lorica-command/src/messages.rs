@@ -742,14 +742,24 @@ pub struct RateLimitSnapshot {
     #[prost(string, tag = "1")]
     pub key: String,
     /// Tokens remaining in the authoritative bucket after applying the
-    /// worker's pushed delta.
+    /// worker's pushed delta. Meaningless when `untracked` is set.
     #[prost(uint32, tag = "2")]
     pub remaining: u32,
+    /// The supervisor keeps no authoritative bucket for this key: the
+    /// route is gone, carries no rate limit, or resolves to a limit
+    /// other than the one the key was built for (a reload in flight).
+    /// The worker drops its local bucket rather than refreshing it, so
+    /// "no limit" can never read as "0 tokens left". A separate field
+    /// rather than a sentinel `remaining` so a reader that predates it
+    /// decodes the snapshot unchanged.
+    #[prost(bool, tag = "3")]
+    pub untracked: bool,
 }
 
 /// Supervisor -> worker: batched authoritative snapshots in reply to a
 /// `RateLimitDelta` push. Worker matches each entry by `key` and calls
-/// `LocalBucket::refresh(remaining)`.
+/// `LocalBucket::refresh(remaining)`, or drops the bucket when the entry
+/// is `untracked`.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct RateLimitDeltaResult {
     #[prost(message, repeated, tag = "1")]
@@ -1128,16 +1138,56 @@ mod tests {
                     RateLimitSnapshot {
                         key: "r1:1.2.3.4".into(),
                         remaining: 42,
+                        untracked: false,
                     },
                     RateLimitSnapshot {
                         key: "r1:5.6.7.8".into(),
                         remaining: 0,
+                        untracked: false,
+                    },
+                    RateLimitSnapshot {
+                        key: "r2:5.6.7.8".into(),
+                        remaining: 0,
+                        untracked: true,
                     },
                 ],
             }),
         );
         let roundtrip = Response::decode(&resp.encode_to_vec()[..]).unwrap();
         assert_eq!(roundtrip, resp);
+    }
+
+    #[test]
+    fn test_rate_limit_snapshot_untracked_is_additive() {
+        use prost::Message;
+
+        // A snapshot encoded before the field existed decodes it as
+        // `false`, so such a reply keeps meaning "refresh to `remaining`".
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct SnapshotWithoutUntracked {
+            #[prost(string, tag = "1")]
+            key: String,
+            #[prost(uint32, tag = "2")]
+            remaining: u32,
+        }
+        let old = SnapshotWithoutUntracked {
+            key: "r|-|5:20|10.0.0.1".into(),
+            remaining: 4,
+        };
+        let decoded = RateLimitSnapshot::decode(&old.encode_to_vec()[..]).unwrap();
+        assert_eq!(decoded.key, old.key);
+        assert_eq!(decoded.remaining, 4);
+        assert!(!decoded.untracked);
+
+        // And a reader that predates the field still gets key + remaining.
+        let new = RateLimitSnapshot {
+            key: "r|-|5:20|10.0.0.1".into(),
+            remaining: 0,
+            untracked: true,
+        };
+        let seen_by_old = SnapshotWithoutUntracked::decode(&new.encode_to_vec()[..]).unwrap();
+        assert_eq!(seen_by_old.key, new.key);
+        assert_eq!(seen_by_old.remaining, 0);
     }
 
     #[test]

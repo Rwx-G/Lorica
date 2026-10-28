@@ -6,11 +6,11 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.10.0-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.10.1-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-3476-brightgreen.svg" alt="Lorica Tests">
-  <img src="https://img.shields.io/badge/Pingora%20Tests-782-blue.svg" alt="Inherited Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-3501-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Pingora%20Tests-794-blue.svg" alt="Inherited Tests">
 </p>
 
 ---
@@ -161,11 +161,13 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 
 ### Install from .deb package
 
+Download `lorica_<version>_amd64.deb` from the [latest release](https://github.com/Rwx-G/Lorica/releases/latest), then install it with `apt`, which also pulls the GSS-API runtime library the package requires (`libgssapi-krb5-2`); `dpkg -i` does not:
+
 ```bash
-# Download the latest release
-wget https://github.com/Rwx-G/Lorica/releases/latest/download/lorica.deb
-sudo dpkg -i lorica.deb
+sudo apt install ./lorica_<version>_amd64.deb
 ```
+
+On Fedora or RHEL, `sudo dnf install ./lorica-<version>-1.x86_64.rpm` from the same release. [Package Verification](#package-verification) below checks a download's signature; [docs/installation.md](docs/installation.md) covers upgrades.
 
 The package creates a `lorica` user, installs a systemd service (enabled by default), and starts Lorica on ports 8080 (HTTP), 8443 (HTTPS), and 9443 (dashboard).
 
@@ -706,6 +708,9 @@ The automation routes answer on `--automation-listen`, authenticate with `Author
 # - Rust 1.88+
 # - Node.js 20+ (Vite 8 minimum, dashboard compilation)
 # - Linux (x86_64)
+# - The GSS-API headers and libclang, for the AD CS client's bindings:
+#   libkrb5-dev and libclang-dev (Debian/Ubuntu),
+#   krb5-devel and clang-devel (Fedora/RHEL)
 
 git clone https://github.com/Rwx-G/Lorica.git
 cd Lorica
@@ -721,7 +726,7 @@ cargo build --release
 # Every Rust test in the workspace
 cargo test --workspace
 
-# Product crates only (3476 tests, Lorica-native)
+# Product crates only (3501 tests, Lorica-native)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
            -p lorica-command -p lorica-shmem \
@@ -730,7 +735,7 @@ cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-mcp -p lorica-automation-policy -p lorica-adcs \
            --features otel
 
-# Pingora-forked crates (782 tests)
+# Pingora-forked crates (794 tests)
 cargo test -p lorica-core -p lorica-proxy -p lorica-http \
            -p lorica-error -p lorica-tls -p lorica-cache \
            -p lorica-pool -p lorica-runtime -p lorica-timeout \
@@ -746,7 +751,7 @@ cargo test -p lorica-cluster --tests
 cd lorica-dashboard/frontend && npm run check && npm run lint && npx vitest run
 ```
 
-The `lorica` binary crate carries 22 end-to-end binaries under
+The `lorica` binary crate carries 24 end-to-end binaries under
 `lorica/tests/` that drive a real Pingora `Server` against mock backends
 (mTLS, response rewriting, mirroring, forward auth, stale-while-revalidate,
 the connection pre-filter, canary and header routing, config reload, rate

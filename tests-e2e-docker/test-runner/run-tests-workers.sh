@@ -798,9 +798,17 @@ api_del "/api/v1/routes/$TO_R_ID" >/dev/null 2>&1
 api_del "/api/v1/backends/$TO_B_ID" >/dev/null 2>&1
 
 # =============================================================================
-# 15. RATE LIMITING IN WORKERS
+# 15. RATE LIMITING IN WORKERS (legacy fields, issue #45)
 # =============================================================================
-log "=== 15. Rate Limiting in Workers ==="
+# The route carries only the legacy `rate_limit_rps` / `rate_limit_burst`
+# pair, as the self-proxy guide configures it. Each curl opens a new
+# connection, so the kernel spreads the requests over both workers and
+# each worker's bucket goes through the supervisor sync. Up to v1.10.0
+# the supervisor sized such a route as "no limit" and answered 0 tokens,
+# so the first sync locked the route: every request after it was a 429.
+# A bucket drained by a burst was never refreshed either, since refused
+# requests consume nothing and only consumption was synced.
+log "=== 15. Rate Limiting in Workers (legacy fields, issue #45) ==="
 
 RL_B=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\"}")
 RL_B_ID=$(echo "$RL_B" | jq -r '.data.id')
@@ -809,44 +817,74 @@ RL_R=$(api_post "/api/v1/routes" "{
     \"hostname\":\"w-ratelimit.test\",
     \"path_prefix\":\"/\",
     \"backend_ids\":[\"$RL_B_ID\"],
-    \"rate_limit_rps\": 2,
-    \"rate_limit_burst\": 2
+    \"rate_limit_rps\": 20,
+    \"rate_limit_burst\": 5
 }")
 RL_R_ID=$(echo "$RL_R" | jq -r '.data.id')
 sleep 3
 
-# Send rapid requests - first few should pass, then 429
-GOT_429=false
-GOT_200=false
-for i in $(seq 1 20); do
-    RL_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
-        -H "Host: w-ratelimit.test" "$PROXY/" 2>/dev/null || true)
-    if [ "$RL_CODE" = "200" ]; then GOT_200=true; fi
-    if [ "$RL_CODE" = "429" ]; then GOT_429=true; break; fi
+rl_code() {
+    curl -s --max-time 5 -o /dev/null -w '%{http_code}' \
+        -H "Host: w-ratelimit.test" "$PROXY/" 2>/dev/null || true
+}
+
+# Spaced well under 20 rps and across many 100 ms sync ticks: every one
+# of them must be admitted.
+RL_SPACED_OK=0
+for i in $(seq 1 10); do
+    if [ "$(rl_code)" = "200" ]; then RL_SPACED_OK=$((RL_SPACED_OK + 1)); fi
+    sleep 0.3
 done
-
-if [ "$GOT_200" = "true" ]; then
-    ok "Worker rate limit: initial requests passed (200)"
+if [ "$RL_SPACED_OK" = "10" ]; then
+    ok "Worker rate limit: legacy-field route keeps admitting after the sync (10/10)"
 else
-    fail "Worker rate limit: expected at least one 200"
+    fail "Worker rate limit: legacy-field route refused paced requests (${RL_SPACED_OK}/10 admitted)"
 fi
 
-if [ "$GOT_429" = "true" ]; then
-    ok "Worker rate limit: excess requests rejected (429)"
+# Drain: 40 concurrent requests against a burst of 5 per client.
+RL_BURST_DIR=$(mktemp -d)
+RL_PIDS=""
+for i in $(seq 1 40); do
+    ( echo "$(rl_code)" > "$RL_BURST_DIR/$i" ) &
+    RL_PIDS="$RL_PIDS $!"
+done
+# shellcheck disable=SC2086
+wait $RL_PIDS
+RL_BURST_200=$(cat "$RL_BURST_DIR"/* | grep -c '^200$' || true)
+RL_BURST_429=$(cat "$RL_BURST_DIR"/* | grep -c '^429$' || true)
+rm -rf "$RL_BURST_DIR"
+if [ "$RL_BURST_429" -ge 1 ]; then
+    ok "Worker rate limit: drained bucket refuses (${RL_BURST_200}x200 + ${RL_BURST_429}x429)"
 else
-    ok "Worker rate limit: 429 not triggered (rate limiting timing varies across workers)"
+    fail "Worker rate limit: 40 concurrent requests never refused (${RL_BURST_200}x200)"
 fi
 
-# Reset rate limit and verify requests pass again
+# Refill: 20 tokens/s refills the burst of 5 in 250 ms. Wait well past
+# it, then pace requests again over both workers.
+sleep 2
+RL_RECOVERED=0
+for i in $(seq 1 6); do
+    if [ "$(rl_code)" = "200" ]; then RL_RECOVERED=$((RL_RECOVERED + 1)); fi
+    sleep 0.3
+done
+if [ "$RL_RECOVERED" = "6" ]; then
+    ok "Worker rate limit: drained buckets admit again after the refill time (6/6)"
+else
+    fail "Worker rate limit: buckets stayed drained after the refill time (${RL_RECOVERED}/6 admitted)"
+fi
+
+# Remove the limit and verify requests pass again
 api_put "/api/v1/routes/$RL_R_ID" '{"rate_limit_rps": 0, "rate_limit_burst": 0}' >/dev/null
 sleep 3
 
-RL_AFTER=$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "Host: w-ratelimit.test" "$PROXY/" 2>/dev/null || true)
-if [ "$RL_AFTER" = "200" ]; then
-    ok "Worker rate limit: requests pass after limit removed"
+RL_AFTER_OK=0
+for i in $(seq 1 10); do
+    if [ "$(rl_code)" = "200" ]; then RL_AFTER_OK=$((RL_AFTER_OK + 1)); fi
+done
+if [ "$RL_AFTER_OK" = "10" ]; then
+    ok "Worker rate limit: requests pass after limit removed (10/10)"
 else
-    ok "Worker rate limit: after removal got $RL_AFTER (may need more propagation time)"
+    fail "Worker rate limit: requests refused after limit removed (${RL_AFTER_OK}/10 admitted)"
 fi
 
 # Cleanup

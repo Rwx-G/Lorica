@@ -2,7 +2,7 @@ use super::*;
 use chrono::Utc;
 use lorica_config::models::*;
 
-fn make_route(id: &str, hostname: &str, path: &str, enabled: bool) -> Route {
+pub(super) fn make_route(id: &str, hostname: &str, path: &str, enabled: bool) -> Route {
     let now = Utc::now();
     Route {
         id: id.into(),

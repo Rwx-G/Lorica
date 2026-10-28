@@ -266,8 +266,8 @@ pub(crate) fn run_single_process(cli: Cli) {
         // path comment for rationale.
         let _rate_limit_prune = lorica_proxy.spawn_rate_limit_prune(
             &single_task_tracker,
-            Duration::from_secs(60),
-            Duration::from_secs(5 * 60),
+            lorica::proxy_wiring::rate_limit::BUCKET_PRUNE_INTERVAL,
+            lorica::proxy_wiring::rate_limit::BUCKET_IDLE_TTL,
         );
         let _bot_stash_prune = lorica_proxy.spawn_bot_stash_prune(&single_task_tracker);
         // A capture rule that spends its total stops recording under
