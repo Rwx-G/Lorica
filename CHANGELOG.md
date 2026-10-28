@@ -15,14 +15,9 @@ Author: Rwx-G
 
 ### Fixed
 
-- **Upstream Pingora sync into the forked crates (see `FORK.md`).** An empty write on a chunked HTTP/1.x body no longer ends the body early: it was encoded as a zero-length chunk, which is the chunked terminator, so the peer stopped reading there and took the real terminator for the start of the next message, desyncing the connection. With `trace` logging enabled, an upstream response header carrying a non-UTF-8 byte no longer panics the request task while the raw header is logged. Upgraded sessions on the forked proxy's custom-protocol path no longer fail when the client half-closes a finished upgrade request while the response is still draining, and still see a reset that arrives afterwards; Lorica does not wire that path today, so this changes nothing for a running node. The rate estimator in `lorica-limits` wraps on overflow instead of panicking in debug builds, and the L4 socket buffers no longer construct a zero-capacity `BufReader`, which panics from tokio 1.54.0 on every accept and connect (it lands with the tokio 1.54 update under Security, so no release ever carried the crash).
-
 ### Removed
 
 ### Security
-
-- **`tokio` 1.54.1** (RUSTSEC-2026-0386): `AsyncFd::new` in 1.53.1 was unsound. Part of a lockfile-only pass of the SemVer-compatible updates (`hyper` 1.12.0, `tokio-rustls` 0.26.6, `aws-lc-rs` 1.18.2, `webpki-roots` 1.0.11, `serde_json` 1.0.154, `uuid` 1.29.0 among them).
-- **`h2` 0.4.20**, the downstream and upstream HTTP/2 stack: streams refused by the server now count toward its limit on locally reset streams, so a client can no longer open refused streams indefinitely without the connection being torn down, and a request carrying conflicting `Content-Length` values is now reset by h2 itself, before the forked proxy's own check sees it. Such streams are therefore bounded by h2's limit on locally reset streams rather than by the proxy's malformed-request budget, which still applies to conflicting `:authority` and `Host` fields.
 
 ## [1.10.0] - 2026-10-27
 
@@ -38,6 +33,7 @@ Author: Rwx-G
 ### Fixed
 
 - **Editing a notification channel no longer drops its cluster alert subscriptions.** The dashboard's form only knew a hand-typed subset of the alert types, so saving a channel removed every type it did not list, including the three cluster alerts. Stored types are now kept and the cluster types have their checkboxes.
+- **Upstream Pingora sync into the forked crates (see `FORK.md`).** An empty write on a chunked HTTP/1.x body no longer ends the body early: it was encoded as a zero-length chunk, which is the chunked terminator, so the peer stopped reading there and took the real terminator for the start of the next message, desyncing the connection. With `trace` logging enabled, an upstream response header carrying a non-UTF-8 byte no longer panics the request task while the raw header is logged. Upgraded sessions on the forked proxy's custom-protocol path no longer fail when the client half-closes a finished upgrade request while the response is still draining, and still see a reset that arrives afterwards; Lorica does not wire that path today, so this changes nothing for a running node. The rate estimator in `lorica-limits` wraps on overflow instead of panicking in debug builds, and the L4 socket buffers no longer construct a zero-capacity `BufReader`, which panics from tokio 1.54.0 on every accept and connect (it lands with the tokio 1.54 update under Security, so no release ever carried the crash).
 
 ### Security
 
@@ -47,6 +43,8 @@ Author: Rwx-G
 - **`zstd` 0.14.3, `zstd-safe` 8.2.0 and `zstd-sys` 2.1.2** (RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403, RUSTSEC-2026-0410): a reused stream context could carry an abandoned stream's data into the next one, seekable decompression could set a `Vec` length past its capacity, a failed streaming decompression of a legacy frame could expose uninitialized memory, and the wasm32 allocator shim corrupted memory on allocation failure. None was reachable: response compression builds a fresh encoder per response without `with_context`, the cache header codec uses the one-shot API rather than streaming decompression, the `seekable` feature is not enabled, and Lorica does not target wasm32. The forked `lorica-core` and `lorica-header-serde` move to the new major versions without a source change.
 - **`ctutils` 0.4.4** (RUSTSEC-2026-0385): constant-time mask generation could compile to a branch. It is reached only inside the RustCrypto `digest` 0.11 stack (`sha2`, `hmac`, `argon2`, `ed25519-dalek`); Lorica's own secret comparisons, such as the challenge cookie tag, use `subtle`.
 - **`ammonia` 4.1.8** (RUSTSEC-2026-0373): a mixed-case CSS `url()` could pass the sanitizer. Lorica's error-page sanitizer does not allow `style` attributes or elements, so it was not reachable.
+- **`tokio` 1.54.1** (RUSTSEC-2026-0386): `AsyncFd::new` in 1.53.1 was unsound. Part of a lockfile-only pass of the SemVer-compatible updates (`hyper` 1.12.0, `tokio-rustls` 0.26.6, `aws-lc-rs` 1.18.2, `webpki-roots` 1.0.11, `serde_json` 1.0.154, `uuid` 1.29.0 among them).
+- **`h2` 0.4.20**, the downstream and upstream HTTP/2 stack: streams refused by the server now count toward its limit on locally reset streams, so a client can no longer open refused streams indefinitely without the connection being torn down, and a request carrying conflicting `Content-Length` values is now reset by h2 itself, before the forked proxy's own check sees it. Such streams are therefore bounded by h2's limit on locally reset streams rather than by the proxy's malformed-request budget, which still applies to conflicting `:authority` and `Host` fields.
 
 ## [1.9.3] - 2026-10-14
 
