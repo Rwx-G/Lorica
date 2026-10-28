@@ -241,7 +241,7 @@ jobs:
           SKIP_FRONTEND_BUILD: ""
 
       - name: Run Rust unit tests (forked crates)
-        run: cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error -p lorica-tls -p lorica-worker -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde
+        run: cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error -p lorica-tls -p lorica-worker -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde -p lorica-limits
         env:
           SKIP_FRONTEND_BUILD: "1"
 

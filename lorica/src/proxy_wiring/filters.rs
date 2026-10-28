@@ -793,29 +793,25 @@ impl LoricaProxy {
         }
         // Story 8.10 AC #3. Single admission path: the structured
         // `rate_limit` struct wins, and a legacy `rate_limit_rps` route is
-        // synthesised into an equivalent token bucket by
-        // `Route::effective_rate_limit`.
-        let Some(rl) = entry.route.effective_rate_limit() else {
+        // synthesised into an equivalent token bucket. This stage runs
+        // before backend selection records the matched path rule, so the
+        // rule is matched here too: a rule that sets its own rate limit
+        // (AC #5) is enforced with its own bucket.
+        let Some((rule, rl)) =
+            super::rate_limit::resolve_request_limit(&entry.route, session.req_header().uri.path())
+        else {
             return Ok(None);
         };
 
-        // Bucket key = `<route_id>|<scope>`. The engine's `DashMap` is
-        // keyed by `String`, so the key must materialise as one contiguous
-        // buffer; building it in a single pre-sized `String` keeps the
-        // hottest admission check to one allocation (was two: an
-        // intermediate scope String plus the `format!`). Collapsing to a
-        // zero-alloc `(route_id, IpAddr)` tuple key would mean changing the
-        // engine's key type and its prune task, out of scope here.
-        let scope_key: &str = match rl.scope {
-            lorica_config::models::RateLimitScope::PerIp => {
-                ctx.client_ip.as_deref().unwrap_or("unknown")
-            }
-            lorica_config::models::RateLimitScope::PerRoute => "__route__",
-        };
-        let mut key = String::with_capacity(entry.route.id.len() + 1 + scope_key.len());
-        key.push_str(&entry.route.id);
-        key.push('|');
-        key.push_str(scope_key);
+        // Only an address that parsed as an IP names a client: an
+        // `X-Forwarded-For` entry behind a trusted proxy is free text.
+        let client_ip = ctx.client_ip_addr.and(ctx.client_ip.as_deref());
+        let key = super::rate_limit::bucket_key(
+            &entry.route.id,
+            rule,
+            &rl,
+            super::rate_limit::scope_key(&rl, client_ip),
+        );
 
         // Story 8.10 AC #2. Adaptive flood defense: while the proxy-wide
         // RPS is above `flood_threshold_rps`, tighten per-IP admission by
@@ -1156,26 +1152,23 @@ impl LoricaProxy {
         }
 
         // Path rule matching (first match wins, overrides route config)
-        for (i, rule) in entry.route.path_rules.iter().enumerate() {
-            if rule.matches(path) {
-                let effective = entry.route.with_path_rule_overrides(rule);
-                ctx.route_snapshot = Some(Arc::new(effective));
-                if rule.backend_ids.is_some() {
-                    if let Some(ref backends) = entry.path_rule_backends[i] {
-                        ctx.matched_backends = Some(backends.clone());
-                    }
+        if let Some((i, rule)) = entry.route.matching_path_rule(path) {
+            let effective = entry.route.with_path_rule_overrides(rule);
+            ctx.route_snapshot = Some(Arc::new(effective));
+            if rule.backend_ids.is_some() {
+                if let Some(ref backends) = entry.path_rule_backends[i] {
+                    ctx.matched_backends = Some(backends.clone());
                 }
-                // A path rule that explicitly sets redirect_to means
-                // the operator picked the exact destination for this
-                // path. Flag it so the redirect branches below emit
-                // the target verbatim instead of appending the
-                // request's path/query (which is the documented
-                // route-level behavior, but nonsensical here: the
-                // path has already been matched).
-                if rule.redirect_to.is_some() {
-                    ctx.path_rule_literal_redirect = true;
-                }
-                break;
+            }
+            // A path rule that explicitly sets redirect_to means
+            // the operator picked the exact destination for this
+            // path. Flag it so the redirect branches below emit
+            // the target verbatim instead of appending the
+            // request's path/query (which is the documented
+            // route-level behavior, but nonsensical here: the
+            // path has already been matched).
+            if rule.redirect_to.is_some() {
+                ctx.path_rule_literal_redirect = true;
             }
         }
     }

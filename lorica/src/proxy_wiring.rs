@@ -296,6 +296,9 @@ pub(crate) use helpers::{
 pub mod engines;
 pub use engines::{BreakerAdmission, BreakerEngine, RateLimitEngine, VerdictCacheEngine};
 
+pub mod rate_limit;
+pub use rate_limit::SupervisorRateLimits;
+
 pub mod error_pages;
 pub(crate) use error_pages::render_error_body;
 
@@ -417,7 +420,7 @@ impl LoricaProxy {
     /// Spawn a background prune task for `rate_limit_buckets`.
     ///
     /// For `scope = per_ip` every distinct client IP gets its own
-    /// `AuthoritativeBucket` (~100 B each). Without eviction, a scan
+    /// bucket (~100 B each), in both engines. Without eviction, a scan
     /// or high-cardinality traffic pattern leaks memory at the rate
     /// of "one bucket per unique IP" until process restart. This
     /// task walks the map on `interval` and drops any bucket whose
@@ -438,20 +441,7 @@ impl LoricaProxy {
             ticker.tick().await; // skip the immediate tick
             loop {
                 ticker.tick().await;
-                let now = lorica_shmem::now_ns();
-                match &engine {
-                    RateLimitEngine::Authoritative(map) => {
-                        map.retain(|_, b| now.saturating_sub(b.last_activity_ns()) < idle_ttl_ns);
-                    }
-                    RateLimitEngine::Local(_) => {
-                        // Worker mode: the supervisor sync task drops
-                        // entries via take_delta returning 0 - the local
-                        // cache is kept small by the sync loop walking
-                        // it. Eviction is supervisor-side (future
-                        // follow-up: forward idle-key hints from
-                        // supervisor). No-op here.
-                    }
-                }
+                engine.prune_idle(lorica_shmem::now_ns(), idle_ttl_ns);
             }
         })
     }
@@ -461,11 +451,12 @@ impl LoricaProxy {
     /// `interval`. Called on workers only (single-process mode uses
     /// `RateLimitEngine::Authoritative`, no sync needed).
     ///
-    /// Each tick the task walks every entry of the local map, pulls out
-    /// the accumulated `take_delta`, batches the non-zero entries into a
-    /// `RateLimitDelta` RPC payload, sends it to the supervisor, and on
-    /// the reply refreshes each bucket's token count with the
-    /// authoritative snapshot. See design § 6.
+    /// Each tick the task batches the buckets that carry unpushed
+    /// consumption or sit below capacity (see
+    /// [`rate_limit::collect_sync_batch`]), sends the batch to the
+    /// supervisor as one `RateLimitDelta`, and applies the reply: a
+    /// tracked bucket is refreshed with the authoritative count, an
+    /// untracked one is dropped. See design § 6.
     pub fn spawn_rate_limit_sync(
         &self,
         tracker: &tokio_util::task::TaskTracker,
@@ -485,27 +476,20 @@ impl LoricaProxy {
             };
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await; // skip the immediate tick
+            let mut cursor = 0usize;
             loop {
                 ticker.tick().await;
-                // Phase 1: drain local deltas into a batched payload.
-                let mut entries: Vec<lorica_command::RateLimitEntry> = Vec::new();
-                for item in buckets.iter() {
-                    let consumed = item.value().take_delta();
-                    if consumed > 0 {
-                        entries.push(lorica_command::RateLimitEntry {
-                            key: item.key().clone(),
-                            consumed,
-                        });
-                    }
-                }
+                let entries = rate_limit::collect_sync_batch(
+                    &buckets,
+                    &mut cursor,
+                    rate_limit::SYNC_BATCH_MAX_ENTRIES,
+                );
                 if entries.is_empty() {
                     continue;
                 }
-                // Phase 2: push to the supervisor.
+                let entry_count = entries.len();
                 let payload = lorica_command::command::Payload::RateLimitDelta(
-                    lorica_command::RateLimitDelta {
-                        entries: entries.clone(),
-                    },
+                    lorica_command::RateLimitDelta { entries },
                 );
                 let resp = rpc
                     .request_rpc(
@@ -517,13 +501,7 @@ impl LoricaProxy {
                 match resp {
                     Ok(resp) => match resp.payload {
                         Some(lorica_command::response::Payload::RateLimitDeltaResult(r)) => {
-                            // Phase 3: refresh local buckets with the
-                            // authoritative snapshot.
-                            for snap in r.snapshots {
-                                if let Some(b) = buckets.get(&snap.key) {
-                                    b.value().refresh(snap.remaining);
-                                }
-                            }
+                            rate_limit::apply_sync_reply(&buckets, r.snapshots);
                         }
                         _ => {
                             tracing::debug!(
@@ -534,7 +512,7 @@ impl LoricaProxy {
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            entries = entries.len(),
+                            entries = entry_count,
                             "rate-limit sync: RPC failed; buckets left stale until next tick"
                         );
                     }

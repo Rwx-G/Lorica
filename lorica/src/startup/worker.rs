@@ -646,12 +646,13 @@ pub(crate) fn run_worker(
         .spawn_basic_auth_cache_prune(&worker_auth_prune_tracker, Duration::from_secs(30));
     // Per-IP rate-limit buckets need the same lazy-prune treatment:
     // a scan or high-cardinality traffic pattern would otherwise
-    // accumulate one bucket per distinct IP forever. 5 min idle TTL
-    // matches the shmem WAF eviction cadence.
+    // accumulate one bucket per distinct IP forever. The idle TTL
+    // matches the shmem WAF eviction cadence and the supervisor's own
+    // prune of the authoritative buckets.
     let _rate_limit_prune = lorica_proxy.spawn_rate_limit_prune(
         &worker_auth_prune_tracker,
-        Duration::from_secs(60),
-        Duration::from_secs(5 * 60),
+        lorica::proxy_wiring::rate_limit::BUCKET_PRUNE_INTERVAL,
+        lorica::proxy_wiring::rate_limit::BUCKET_IDLE_TTL,
     );
     let _bot_stash_prune = lorica_proxy.spawn_bot_stash_prune(&worker_auth_prune_tracker);
     // Background OCSP-staple refresh (Story 8.5). Each worker owns its

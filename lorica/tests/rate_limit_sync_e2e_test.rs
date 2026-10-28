@@ -40,8 +40,10 @@ use lorica_limits::token_bucket::{AuthoritativeBucket, LocalBucket};
 
 // ---------------------------------------------------------------------------
 // Supervisor side: spawn a task that services RateLimitDelta requests
-// using a single shared AuthoritativeBucket. Modeled on
-// `handle_rate_limit_delta` in main.rs.
+// using a single shared AuthoritativeBucket of fixed size. A stand-in:
+// the production handler, `lorica::proxy_wiring::rate_limit::
+// handle_rate_limit_delta`, sizes buckets from the route store and is
+// driven end to end by `rate_limit_worker_mode_e2e_test.rs`.
 // ---------------------------------------------------------------------------
 
 fn spawn_supervisor(
@@ -88,7 +90,7 @@ async fn handle_delta(
             Some(b) => Arc::clone(b.value()),
             None => {
                 // Seed with a capacity-100 refill-0 bucket (matches
-                // test fixture). Real main.rs looks up ConfigStore.
+                // test fixture).
                 let new = Arc::new(AuthoritativeBucket::new(100, 0, now));
                 registry.insert(entry.key.clone(), Arc::clone(&new));
                 new
@@ -98,6 +100,7 @@ async fn handle_delta(
         snapshots.push(RateLimitSnapshot {
             key: entry.key.clone(),
             remaining,
+            untracked: false,
         });
     }
     let _ = inc
@@ -144,9 +147,9 @@ async fn single_worker_delta_push_refreshes_local() {
     let _sup_handle = spawn_supervisor(sup_ep, sup_in, Arc::clone(&registry), || 0);
 
     // Worker: consume 30 tokens locally.
-    let local = Arc::new(LocalBucket::new(100));
+    let local = Arc::new(LocalBucket::new(100, 0));
     for _ in 0..30 {
-        assert!(local.try_consume(1));
+        assert!(local.try_consume(1, 0));
     }
     assert_eq!(local.tokens(), 70);
 
@@ -206,17 +209,17 @@ async fn two_workers_aggregate_is_bounded_by_capacity() {
 
     // Both workers think they start with capacity tokens (the design's
     // documented `100 ms * N_workers` initial-tick over-admission).
-    let local_a = Arc::new(LocalBucket::new(100));
-    let local_b = Arc::new(LocalBucket::new(100));
+    let local_a = Arc::new(LocalBucket::new(100, 0));
+    let local_b = Arc::new(LocalBucket::new(100, 0));
 
     // Each worker drains 80 tokens locally over a burst.
     let mut admitted_a = 0;
     let mut admitted_b = 0;
     for _ in 0..80 {
-        if local_a.try_consume(1) {
+        if local_a.try_consume(1, 0) {
             admitted_a += 1;
         }
-        if local_b.try_consume(1) {
+        if local_b.try_consume(1, 0) {
             admitted_b += 1;
         }
     }
@@ -236,10 +239,10 @@ async fn two_workers_aggregate_is_bounded_by_capacity() {
     let mut a2 = 0;
     let mut b2 = 0;
     for _ in 0..50 {
-        if local_a.try_consume(1) {
+        if local_a.try_consume(1, 0) {
             a2 += 1;
         }
-        if local_b.try_consume(1) {
+        if local_b.try_consume(1, 0) {
             b2 += 1;
         }
     }
