@@ -39,6 +39,16 @@ install -m 644 %{_sourcedir}/dist/lorica.service %{buildroot}/usr/lib/systemd/sy
 install -m 644 %{_sourcedir}/LICENSE %{buildroot}/usr/share/licenses/lorica/LICENSE
 install -m 644 %{_sourcedir}/NOTICE %{buildroot}/usr/share/licenses/lorica/NOTICE
 
+# rpm 4.19 and later turn the lorica-owned %files entries into
+# `Requires(pre): user(lorica) group(lorica)`, and only a sysusers.d file
+# in the payload provides them: without it dnf refuses the package. Those
+# versions also create the account from this file before the payload is
+# unpacked; the useradd in %pre still does it on older rpm (RHEL 8 and 9),
+# where the file is only read by systemd-sysusers at boot.
+mkdir -p %{buildroot}/usr/lib/sysusers.d
+printf 'u lorica - "Lorica reverse proxy" /var/lib/lorica /sbin/nologin\n' \
+    > %{buildroot}/usr/lib/sysusers.d/lorica.conf
+
 # The service state an upgrade carries across, read here, before the old
 # package's preun can change it, and restored by posttrans: `install` on
 # a first install ($1 = 1), otherwise whether the unit was enabled and
@@ -178,5 +188,6 @@ fi
 %attr(755, root, root) /usr/bin/lorica
 %attr(755, root, root) /usr/bin/lorica-mcp
 %attr(644, root, root) /usr/lib/systemd/system/lorica.service
+%attr(644, root, root) /usr/lib/sysusers.d/lorica.conf
 %dir %attr(750, lorica, lorica) /var/lib/lorica
 %dir %attr(750, lorica, lorica) /var/lib/lorica/exported-certs
