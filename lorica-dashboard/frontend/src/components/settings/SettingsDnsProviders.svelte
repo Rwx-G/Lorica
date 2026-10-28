@@ -140,7 +140,7 @@
 
 <!-- DNS Providers -->
 <section class="settings-section">
-  <button class="settings-collapsible-header" class:open={expandedSections.dns_providers} onclick={() => toggleSection('dns_providers')}>
+  <button class="settings-collapsible-header" class:open={expandedSections.dns_providers} aria-expanded={Boolean(expandedSections.dns_providers)} onclick={() => toggleSection('dns_providers')}>
     <h2>DNS Providers</h2>
     <span class="settings-chevron" class:expanded={expandedSections.dns_providers}></span>
   </button>

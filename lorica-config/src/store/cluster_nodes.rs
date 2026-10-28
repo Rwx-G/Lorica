@@ -886,6 +886,10 @@ mod tests {
             created_at: at("2026-09-01T00:00:00Z"),
             acme_method: Some("http01".to_string()),
             acme_dns_provider_id: None,
+            adcs_authority_id: None,
+            adcs_template: None,
+            adcs_template_oid: None,
+            adcs_request_id: None,
         };
         store
             .create_certificate(&cert)

@@ -1,0 +1,670 @@
+// Copyright 2026 Rwx-G (Lorica)
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Renewing AD CS certificates (Story 13.4, Epic 13 PRD D6, D14, D15).
+//!
+//! The background loop (`crate::acme::renewal`) selects the AD CS
+//! certificates due for renewal and hands them to [`renew_due`]; the
+//! dashboard's "Renew now" reaches [`renew_manually`] through
+//! `renew_certificate_as`. Both renew in place through
+//! [`super::issue::issue`], with the certificate's current names,
+//! subject and key type and its recorded template, under the
+//! `RenewalLedger` in-flight mark the ACME renewals share.
+//!
+//! # One session per tick
+//!
+//! The loop's renewals of one tick run as one AD CS operation: one hold
+//! of the single-flight guard, one session, so one ticket for the tick
+//! (D3, D15). The loop runs its ACME arm first, so however long the AD
+//! CS batch takes it never delays an ACME renewal.
+//!
+//! # Failures
+//!
+//! A failure keeps the current certificate in service. A failure that
+//! concerns the authority rather than one certificate (a rejected
+//! credential, which also opens the D15 breaker; an unreachable KDC;
+//! the endpoint's TLS or authentication; a timeout) ends the tick: the
+//! renewals left are not attempted, so they cost no Kerberos exchange,
+//! write no audit row and raise no alert of their own. Any other
+//! failure, a pending answer included, backs that certificate off for
+//! [`ADCS_RENEWAL_BACKOFF_HOURS`] in a map of its own, apart from the
+//! ACME rate-limit cooldown, which a CA's message drives and a token's
+//! budget reads.
+//!
+//! `cert_issuance_failed` is raised once per failure state of a
+//! certificate, not once per attempt: [`AdcsRenewalMemory`] keeps the
+//! step last alerted for each certificate, a repeat of it is silent,
+//! and a different step or a success in between re-arms it.
+//!
+//! # Expiry alerts (AC #6)
+//!
+//! `check_cert_expiry` speaks for an AD CS certificate, as it does for
+//! an uploaded one: it alerts on every certificate in the operator's
+//! warning window, with the warning and critical thresholds the
+//! operator set. The loop's own `CertExpiring` is the ACME arm's and is
+//! never sent for an AD CS certificate, so an operator receives one
+//! expiry alert per certificate per check, not two; what the loop adds
+//! for an AD CS certificate is `cert_issuance_failed` when its renewal
+//! fails, which is the alert an operator acts on.
+
+use std::collections::{HashMap, HashSet};
+
+use axum::http::StatusCode;
+use axum::Json;
+use chrono::{DateTime, Utc};
+use lorica_adcs::FailureScope;
+use lorica_config::models::{
+    AdcsAuthority, AdcsKeyType, AdcsSubjectDefaults, Certificate, CertificateSource,
+};
+use parking_lot::Mutex;
+use tracing::{info, warn};
+use x509_parser::certificate::X509Certificate;
+use x509_parser::oid_registry::{OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY, OID_PKCS1_RSAENCRYPTION};
+use x509_parser::public_key::PublicKey;
+use x509_parser::x509::{AttributeTypeAndValue, SubjectPublicKeyInfo, X509Name};
+
+use super::error::IssuanceStep;
+use super::issue::{
+    audit_refusal, issue, issue_with, send_issuance_failed, validate_request, IssueError,
+    IssueOutcome, IssueRequest, IssueSubject, PendingIssuance,
+};
+use super::{prepare_operation, refuse_on_follower, AdcsOperation, LazySession, NotRun};
+use crate::audit::AuditContext;
+use crate::certificates::cert_to_response;
+use crate::db::db_blocking;
+use crate::error::{json_data_with_status, ApiError};
+use crate::server::AppState;
+
+/// How long a certificate whose AD CS renewal failed for a reason of its
+/// own, not the authority's, is left alone by the loop. Longer than the
+/// loop's tick (`crate::acme::renewal`), so a certificate the authority
+/// refuses is not asked about on every tick, and short against the
+/// renewal window, so a transient failure leaves many attempts before
+/// expiry.
+pub const ADCS_RENEWAL_BACKOFF_HOURS: i64 = 24;
+
+/// The actor of every loop renewal's audit rows.
+pub const ADCS_RENEWAL_ACTOR: &str = "adcs-renewal";
+
+/// What the renewal paths remember about each AD CS certificate's
+/// failures between attempts. In memory, one per process: a restart
+/// forgets it, which costs at most one attempt and one alert per
+/// certificate, while the D15 failed state, the one that protects the
+/// service account, is persisted on the authority.
+#[derive(Debug, Default)]
+pub(crate) struct AdcsRenewalMemory {
+    /// Per certificate, the instant before which the loop does not try
+    /// again.
+    backoff: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// Per certificate, the step of the last `cert_issuance_failed`.
+    alerted: Mutex<HashMap<String, String>>,
+}
+
+impl AdcsRenewalMemory {
+    /// The instant `id`'s back-off ends, when one is active at `now`.
+    pub(crate) fn backoff_until(&self, id: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.backoff
+            .lock()
+            .get(id)
+            .copied()
+            .filter(|until| *until > now)
+    }
+
+    fn back_off(&self, id: &str, now: DateTime<Utc>) {
+        self.backoff.lock().insert(
+            id.to_string(),
+            now + chrono::Duration::hours(ADCS_RENEWAL_BACKOFF_HOURS),
+        );
+    }
+
+    /// Whether a failure of `id` at `step` is a new failure state, and
+    /// so owed an alert. Records `step` as the state alerted.
+    pub(crate) fn is_new_failure_state(&self, id: &str, step: &str) -> bool {
+        self.alerted
+            .lock()
+            .insert(id.to_string(), step.to_string())
+            .is_none_or(|previous| previous != step)
+    }
+
+    /// Forget `id`'s back-off and alerted state, after it was renewed.
+    pub(crate) fn forget_failures(&self, id: &str) {
+        self.backoff.lock().remove(id);
+        self.alerted.lock().remove(id);
+    }
+
+    /// Keep only the certificates in `live` and the back-offs still
+    /// running at `now`, so the maps stay bounded by the certificates
+    /// that exist and fail.
+    pub(crate) fn retain(&self, live: &HashSet<&str>, now: DateTime<Utc>) {
+        self.backoff
+            .lock()
+            .retain(|id, until| *until > now && live.contains(id.as_str()));
+        self.alerted
+            .lock()
+            .retain(|id, _| live.contains(id.as_str()));
+    }
+}
+
+/// The DER of `cert`'s leaf, the first certificate of its `cert_pem`.
+pub(super) fn stored_leaf_der(cert: &Certificate) -> Result<Vec<u8>, String> {
+    let blocks: Vec<pem::Pem> = pem::parse_many(&cert.cert_pem)
+        .map_err(|err| format!("the stored certificate is not PEM: {err}"))?;
+    blocks
+        .iter()
+        .find(|block| block.tag() == "CERTIFICATE")
+        .map(|block| block.contents().to_vec())
+        .ok_or_else(|| "the stored certificate holds no CERTIFICATE block".to_string())
+}
+
+/// The subject fields of `leaf` as a renewal requests them again. The
+/// `CN` is not one of them: it is the first SAN, the certificate's
+/// domain.
+fn current_subject(leaf: &X509Certificate<'_>) -> AdcsSubjectDefaults {
+    let subject: &X509Name<'_> = leaf.subject();
+    AdcsSubjectDefaults {
+        country: first_value(subject.iter_country()),
+        state: first_value(subject.iter_state_or_province()),
+        locality: first_value(subject.iter_locality()),
+        organization: first_value(subject.iter_organization()),
+        organizational_unit: first_value(subject.iter_organizational_unit()),
+        email: first_value(subject.iter_email()),
+    }
+}
+
+fn first_value<'a, 'b: 'a>(
+    mut values: impl Iterator<Item = &'a AttributeTypeAndValue<'b>>,
+) -> Option<String> {
+    values
+        .next()
+        .and_then(|value| value.as_str().ok())
+        .map(str::to_string)
+}
+
+/// The key type of `spki` when it is one Lorica generates, or why not.
+///
+/// A renewal keeps the current key's type and size rather than taking
+/// the authority's default: the template the certificate was issued
+/// under accepted that key, and a default changed since (RSA to ECDSA,
+/// say) would be refused by a version 2 template, whose legacy
+/// provider handles RSA only.
+pub(super) fn generated_key_type(spki: &SubjectPublicKeyInfo<'_>) -> Result<AdcsKeyType, String> {
+    let algorithm = &spki.algorithm.algorithm;
+    if *algorithm == OID_PKCS1_RSAENCRYPTION {
+        let bits: usize = match spki.parsed() {
+            Ok(PublicKey::RSA(rsa)) => modulus_bits(rsa.modulus),
+            _ => return Err("an RSA key whose modulus does not parse".to_string()),
+        };
+        return match bits {
+            2048 => Ok(AdcsKeyType::Rsa2048),
+            3072 => Ok(AdcsKeyType::Rsa3072),
+            other => Err(format!("an RSA {other} key")),
+        };
+    }
+    if *algorithm == OID_KEY_TYPE_EC_PUBLIC_KEY {
+        let curve = spki
+            .algorithm
+            .parameters
+            .as_ref()
+            .and_then(|parameters| parameters.as_oid().ok());
+        return match curve {
+            Some(curve) if curve == OID_EC_P256 => Ok(AdcsKeyType::EcdsaP256),
+            Some(curve) => Err(format!("an ECDSA key on curve {}", curve.to_id_string())),
+            None => Err("an ECDSA key with no named curve".to_string()),
+        };
+    }
+    Err(format!("a key of algorithm {}", algorithm.to_id_string()))
+}
+
+/// The bit length of a DER INTEGER's content, leading zero bytes and
+/// bits not counted: x509-parser's own `key_size` assumes the sign byte
+/// is there.
+fn modulus_bits(modulus: &[u8]) -> usize {
+    let significant: &[u8] = match modulus.iter().position(|byte: &u8| *byte != 0) {
+        Some(first) => &modulus[first..],
+        None => return 0,
+    };
+    let leading_zeros: usize = significant[0].leading_zeros() as usize;
+    significant.len() * 8 - leading_zeros
+}
+
+/// The names a renewal of `cert` requests: its domain first, then its
+/// SANs, each once.
+pub(super) fn renewal_names(cert: &Certificate) -> Vec<String> {
+    let mut sans: Vec<String> = vec![cert.domain.clone()];
+    for name in &cert.san_domains {
+        if !sans.contains(name) {
+            sans.push(name.clone());
+        }
+    }
+    sans
+}
+
+/// The in-place issuance that renews `cert`: its names with the domain
+/// first, its current subject, its recorded template (the authority's
+/// default only when none is recorded), its current key type (the
+/// authority's default only when Lorica cannot generate that one), and
+/// its auto-renew setting kept.
+fn renewal_request(cert: &Certificate) -> Result<IssueRequest, String> {
+    let leaf_der: Vec<u8> = stored_leaf_der(cert)?;
+    let (_, leaf): (&[u8], X509Certificate<'_>) = x509_parser::parse_x509_certificate(&leaf_der)
+        .map_err(|err| format!("the stored certificate does not parse: {err}"))?;
+    let key_type: Option<AdcsKeyType> = match generated_key_type(leaf.public_key()) {
+        Ok(key_type) => Some(key_type),
+        Err(current) => {
+            warn!(
+                cert_id = %cert.id,
+                current_key = %current,
+                "AD CS renewal: Lorica cannot generate the current key's type, so the \
+                 renewal uses the authority's default key type"
+            );
+            None
+        }
+    };
+    Ok(IssueRequest {
+        sans: renewal_names(cert),
+        template: cert.adcs_template.clone(),
+        key_type,
+        subject: IssueSubject::Exact(current_subject(&leaf)),
+        auto_renew: None,
+        replace: Some(cert.id.clone()),
+    })
+}
+
+/// Whether an AD CS operation may run at all now: an authority with a
+/// password, not in the failed state. Read before a tick's batch so a
+/// tick that cannot succeed takes no guard and attempts nothing.
+async fn authority_ready(state: &AppState) -> Result<bool, ApiError> {
+    db_blocking(&state.store, |store| {
+        let Some(authority) = store.get_adcs_authority()? else {
+            return Ok::<bool, ApiError>(false);
+        };
+        Ok(!authority.is_failed() && store.has_adcs_password()?)
+    })
+    .await
+}
+
+/// A failure the issuance did not alert itself (a refusal before the
+/// authority was contacted), alerted through the same per-state memory.
+fn alert_unsent_failure(state: &AppState, cert: &Certificate, step: &str, message: &str) {
+    send_issuance_failed(
+        state,
+        cert.adcs_authority_id.as_deref().unwrap_or_default(),
+        &renewal_names(cert),
+        Some(&cert.id),
+        step,
+        message,
+        None,
+    );
+}
+
+/// Whether the loop goes on to the next certificate of the tick.
+enum Next {
+    Continue,
+    EndTick,
+}
+
+/// How many times a tick finding the guard busy tries again before it
+/// leaves its AD CS renewals to the next tick.
+const BUSY_RETRIES: u32 = 10;
+
+/// Renew every certificate of `due`, the AD CS certificates the loop
+/// found bound, opted in and inside the window, one at a time, under
+/// one hold of the single-flight guard and on one session: one ticket
+/// for the tick (Epic 13 D3, D15).
+///
+/// Each certificate is read again right before its renewal and skipped
+/// when it changed since the tick selected it: reverted to manual,
+/// auto-renew turned off, unbound, or already renewed (its fingerprint
+/// moved). The write itself is conditional too (see
+/// [`super::issue`]'s `write_issued`).
+///
+/// Each attempt is audited by the issuance under
+/// [`AuditContext::node`] with [`ADCS_RENEWAL_ACTOR`]. The batch ends at
+/// the first failure that concerns the authority rather than one
+/// certificate ([`lorica_adcs::FailureScope::Authority`]: its KDC, its
+/// credential, its endpoint, a timeout), so an unreachable or refusing
+/// authority costs one attempt per tick, not one per certificate. When
+/// another AD CS operation holds the guard, the batch is tried again
+/// after the runtime's busy-retry delay, up to [`BUSY_RETRIES`] times.
+pub(crate) async fn renew_due(state: &AppState, due: &[&Certificate], now: DateTime<Utc>) {
+    if due.is_empty() {
+        return;
+    }
+    match authority_ready(state).await {
+        Ok(true) => {}
+        Ok(false) => {
+            info!(
+                due = due.len(),
+                "AD CS renewal skipped: no usable authority (none, no password, or in the \
+                 failed state)"
+            );
+            return;
+        }
+        Err(err) => {
+            warn!(error = %err, "AD CS renewal: failed to read the authority");
+            return;
+        }
+    }
+    let due: Vec<Certificate> = due
+        .iter()
+        .map(|cert: &&Certificate| (*cert).clone())
+        .collect();
+    for attempt in 0..=BUSY_RETRIES {
+        let task_state: AppState = state.clone();
+        let batch: Vec<Certificate> = due.clone();
+        let run = super::run_exclusive_to_end(&state.adcs, async move {
+            renew_batch(&task_state, &batch, now).await;
+        })
+        .await;
+        match run {
+            Ok(()) => return,
+            Err(NotRun::Busy) if attempt < BUSY_RETRIES => {
+                info!(
+                    retry_in = ?state.adcs.busy_retry_delay(),
+                    "AD CS renewal: another AD CS operation is running; trying again"
+                );
+                tokio::time::sleep(state.adcs.busy_retry_delay()).await;
+            }
+            Err(NotRun::Busy) => {
+                warn!(
+                    due = due.len(),
+                    "AD CS renewal: the AD CS guard stayed busy; the renewals wait for the next \
+                     tick"
+                );
+                return;
+            }
+            Err(NotRun::StillRunning) => return,
+            Err(NotRun::Lost(reason)) => {
+                warn!(reason = %reason, "AD CS renewal: the batch task failed");
+                return;
+            }
+        }
+    }
+}
+
+/// The body of [`renew_due`], under the guard.
+async fn renew_batch(state: &AppState, due: &[Certificate], now: DateTime<Utc>) {
+    let AdcsOperation {
+        authority,
+        params,
+        password,
+    } = match prepare_operation(state).await {
+        Ok(operation) => operation,
+        Err(unavailable) => {
+            info!(
+                reason = unavailable.audit_reason(),
+                "AD CS renewal: the authority refuses operations; the tick ends"
+            );
+            return;
+        }
+    };
+    let mut session: LazySession<'_> =
+        LazySession::new(state.adcs.client.as_ref(), params, password);
+    let ctx: AuditContext = AuditContext::node(ADCS_RENEWAL_ACTOR);
+    for selected in due {
+        if let Some(until) = state.adcs.renewals.backoff_until(&selected.id, now) {
+            info!(
+                domain = %selected.domain,
+                cert_id = %selected.id,
+                retry_after = %until,
+                "skipping AD CS renewal: back-off after a failure"
+            );
+            continue;
+        }
+        let Some(_in_flight) = state.renewals.begin(&selected.id) else {
+            info!(
+                domain = %selected.domain,
+                cert_id = %selected.id,
+                "skipping AD CS renewal: a renewal of this certificate is in flight"
+            );
+            continue;
+        };
+        let cert: Certificate = match still_due(state, selected, &authority.id).await {
+            Ok(Some(cert)) => cert,
+            Ok(None) => continue,
+            Err(err) => {
+                warn!(cert_id = %selected.id, error = %err, "AD CS renewal: failed to re-read");
+                continue;
+            }
+        };
+        if let Next::EndTick = renew_one(state, &ctx, &authority, &mut session, &cert, now).await {
+            break;
+        }
+    }
+}
+
+/// `selected` as stored now, when the loop should still renew it: AD CS
+/// under `authority_id`, auto-renew on, bound to a route, and not
+/// renewed since the tick selected it. `None` otherwise, logged.
+async fn still_due(
+    state: &AppState,
+    selected: &Certificate,
+    authority_id: &str,
+) -> Result<Option<Certificate>, ApiError> {
+    let id: String = selected.id.clone();
+    let (current, bound) = db_blocking(&state.store, move |store| {
+        let current: Option<Certificate> = store.get_certificate(&id)?;
+        let bound: bool = store
+            .list_routes()?
+            .iter()
+            .any(|route| route.certificate_id.as_deref() == Some(id.as_str()));
+        Ok::<_, ApiError>((current, bound))
+    })
+    .await?;
+    let skip = |why: &str| -> Result<Option<Certificate>, ApiError> {
+        info!(cert_id = %selected.id, reason = why, "skipping AD CS renewal: changed since selection");
+        Ok(None)
+    };
+    let Some(current) = current else {
+        return skip("deleted");
+    };
+    if current.source() != CertificateSource::Adcs
+        || current.adcs_authority_id.as_deref() != Some(authority_id)
+    {
+        return skip("no longer AD CS managed");
+    }
+    if !current.acme_auto_renew {
+        return skip("auto-renew turned off");
+    }
+    if !bound {
+        return skip("no longer bound to a route");
+    }
+    if current.fingerprint != selected.fingerprint {
+        return skip("already renewed");
+    }
+    Ok(Some(current))
+}
+
+async fn renew_one(
+    state: &AppState,
+    ctx: &AuditContext,
+    authority: &AdcsAuthority,
+    session: &mut LazySession<'_>,
+    cert: &Certificate,
+    now: DateTime<Utc>,
+) -> Next {
+    let memory = &state.adcs.renewals;
+    let request: IssueRequest = match renewal_request(cert)
+        .and_then(|request| validate_request(request).map_err(|err: ApiError| err.to_string()))
+    {
+        Ok(request) => request,
+        Err(message) => {
+            warn!(cert_id = %cert.id, error = %message, "AD CS renewal: no request to send");
+            let step: &str = IssuanceStep::Subject.as_str();
+            audit_refusal(state, ctx, step, &cert.id, &message).await;
+            alert_unsent_failure(state, cert, step, &message);
+            memory.back_off(&cert.id, now);
+            return Next::Continue;
+        }
+    };
+    match issue_with(state, ctx, authority, session, request).await {
+        Ok(IssueOutcome::Issued(_)) => {
+            info!(domain = %cert.domain, cert_id = %cert.id, "AD CS certificate renewed");
+            Next::Continue
+        }
+        Ok(IssueOutcome::Pending { request_id, .. }) => {
+            warn!(
+                domain = %cert.domain,
+                cert_id = %cert.id,
+                request_id = %request_id,
+                "AD CS renewal held pending at the authority; the current certificate stays"
+            );
+            memory.back_off(&cert.id, now);
+            Next::Continue
+        }
+        Err(IssueError::Failed {
+            step,
+            authority_failed,
+            scope: FailureScope::Authority,
+            ..
+        }) => {
+            warn!(
+                cert_id = %cert.id,
+                step = %step,
+                authority_failed,
+                "AD CS renewal failed at the authority; the tick ends"
+            );
+            Next::EndTick
+        }
+        Err(IssueError::Unavailable(unavailable)) => {
+            info!(
+                reason = unavailable.audit_reason(),
+                "AD CS renewal: the authority refuses operations; the tick ends"
+            );
+            Next::EndTick
+        }
+        Err(IssueError::Busy | IssueError::StillRunning) => Next::EndTick,
+        Err(IssueError::Api(ApiError::NotFound(_))) => Next::Continue,
+        Err(IssueError::SanRefused { message, .. }) => {
+            warn!(cert_id = %cert.id, error = %message, "AD CS renewal refused its names");
+            alert_unsent_failure(state, cert, IssuanceStep::SanRefused.as_str(), &message);
+            memory.back_off(&cert.id, now);
+            Next::Continue
+        }
+        Err(IssueError::TemplateRefused { message }) => {
+            warn!(cert_id = %cert.id, error = %message, "AD CS renewal refused its template");
+            alert_unsent_failure(
+                state,
+                cert,
+                IssuanceStep::TemplateRefused.as_str(),
+                &message,
+            );
+            memory.back_off(&cert.id, now);
+            Next::Continue
+        }
+        Err(IssueError::Api(err)) => {
+            // A store failure, audited and alerted by the issuance.
+            warn!(cert_id = %cert.id, error = %err, "AD CS renewal could not be stored");
+            memory.back_off(&cert.id, now);
+            Next::Continue
+        }
+        Err(err @ (IssueError::Failed { .. } | IssueError::Denied { .. })) => {
+            warn!(
+                domain = %cert.domain,
+                cert_id = %cert.id,
+                error = ?err,
+                "AD CS renewal failed; the current certificate stays"
+            );
+            memory.back_off(&cert.id, now);
+            Next::Continue
+        }
+    }
+}
+
+/// "Renew now" for an AD CS certificate, as the dashboard's operator
+/// `actor`: in place, under the in-flight mark (409 when the loop or
+/// another request holds it), under the D15 guard and breaker.
+///
+/// Answers 200 with the renewed certificate's view, or 202 with the
+/// authority's request identifier when it held the request pending:
+/// nothing was stored, the current certificate stays in service, and
+/// the attempt was alerted as a failure. A successful renewal writes a
+/// `certificate.renew` row beside the issuance's own rows.
+pub(crate) async fn renew_manually(
+    state: &AppState,
+    actor: &AuditContext,
+    cert: &Certificate,
+    mode: crate::preview::WriteMode,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    refuse_on_follower(state)?;
+    if mode.previews() {
+        return Ok((
+            StatusCode::OK,
+            crate::preview::previewed(
+                "renew",
+                serde_json::to_value(cert_to_response(cert)).ok(),
+                None,
+            ),
+        ));
+    }
+    let Some(_in_flight) = state.renewals.begin(&cert.id) else {
+        return Err(ApiError::Conflict(format!(
+            "certificate `{}`: a renewal is in flight; one renewal per certificate at a time",
+            cert.id
+        )));
+    };
+    let request: IssueRequest = match renewal_request(cert) {
+        Ok(request) => request,
+        Err(message) => {
+            audit_refusal(
+                state,
+                actor,
+                IssuanceStep::Subject.as_str(),
+                &cert.id,
+                &message,
+            )
+            .await;
+            return Err(ApiError::Unprocessable(format!(
+                "certificate `{}` cannot be renewed: {message}",
+                cert.id
+            )));
+        }
+    };
+    match issue(state, actor, request).await? {
+        IssueOutcome::Issued(renewed) => {
+            let payload = serde_json::json!({
+                "renewed": true,
+                "cert_id": renewed.id,
+                "domain": renewed.domain,
+            });
+            crate::audit::record(
+                state,
+                actor,
+                "certificate.renew",
+                ("certificate", &renewed.id),
+                None,
+                Some(&payload),
+            )
+            .await;
+            Ok(json_data_with_status(
+                StatusCode::OK,
+                cert_to_response(&renewed),
+            ))
+        }
+        IssueOutcome::Pending {
+            request_id,
+            message,
+        } => Ok(json_data_with_status(
+            StatusCode::ACCEPTED,
+            PendingIssuance {
+                outcome: "pending",
+                request_id,
+                message,
+            },
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests;

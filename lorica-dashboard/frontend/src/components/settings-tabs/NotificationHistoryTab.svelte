@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { alertLabel, alertTone } from '../../lib/alert-types';
+
   interface NotifEvent {
     alert_type: string;
     summary: string;
@@ -16,7 +18,7 @@
 </script>
 
 <section class="settings-section">
-  <button class="settings-collapsible-header" class:open={expanded} onclick={toggleSection}>
+  <button class="settings-collapsible-header" class:open={expanded} aria-expanded={expanded} onclick={toggleSection}>
     <h2>Notification History</h2>
     <span class="settings-chevron" class:expanded></span>
   </button>
@@ -40,7 +42,7 @@
               {#each notifHistory as ev, i (i)}
                 <tr>
                   <td class="mono">{new Date(ev.timestamp).toLocaleString()}</td>
-                  <td><span class="badge badge-{ev.alert_type === 'sla_breached' || ev.alert_type === 'backend_down' || ev.alert_type === 'log_store_unavailable' ? 'red' : ev.alert_type === 'sla_recovered' || ev.alert_type === 'log_store_recovered' ? 'green' : ev.alert_type === 'cert_expiring' ? 'orange' : 'blue'}">{ev.alert_type}</span></td>
+                  <td><span class="badge badge-{alertTone(ev.alert_type)}" title={ev.alert_type}>{alertLabel(ev.alert_type)}</span></td>
                   <td>{ev.summary}</td>
                 </tr>
               {/each}

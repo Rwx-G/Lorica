@@ -6,10 +6,10 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.9.3-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.10.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-3224-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-3476-brightgreen.svg" alt="Lorica Tests">
   <img src="https://img.shields.io/badge/Pingora%20Tests-782-blue.svg" alt="Inherited Tests">
 </p>
 
@@ -132,6 +132,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **TOML config export/import** - with diff preview before applying changes
 - **Nginx config import** - paste an `nginx.conf` to auto-create routes, backends, certificates, and path rules with cert import support
 - **ACME / Let's Encrypt** - automatic TLS provisioning via HTTP-01 and DNS-01 challenges (Cloudflare, Route53, OVH providers), multi-domain SAN and wildcard support, smart auto-renewal, OCSP stapling
+- **AD CS enrollment** (v1.10.0) - issue, renew and adopt internal certificates from an Active Directory Certificate Services authority through its enrollment web service, with Kerberos bound to the TLS channel and no Kerberos setup on the host; one confirmed click from the route form or the certificate page, names bounded by a SuperAdmin-owned DNS suffix allowlist, renewal in place with a new key, control plane only. See [docs/adcs.md](docs/adcs.md)
 - **DNS providers** - global DNS credentials configured once in Settings and referenced by ID for certificate provisioning (Cloudflare, Route53, OVH)
 - **Notification channels** - stdout, SMTP email, HTTP webhook, Slack with per-channel rate limiting
 - **Ban list management** - view and unban auto-banned IPs from the dashboard
@@ -354,7 +355,7 @@ The dashboard ships inside the binary and is served on the management port (defa
 
 ## Architecture
 
-Lorica is a Rust workspace with 33 crates: 16 forked from Cloudflare Pingora and 17 product crates. See [FORK.md](FORK.md) for the full fork lineage and renaming rules.
+Lorica is a Rust workspace with 34 crates: 16 forked from Cloudflare Pingora and 18 product crates. See [FORK.md](FORK.md) for the full fork lineage and renaming rules.
 
 | Crate | Purpose |
 |-------|---------|
@@ -377,6 +378,7 @@ Lorica is a Rust workspace with 33 crates: 16 forked from Cloudflare Pingora and
 | `lorica-challenge` | Bot challenges: proof-of-work, image captcha (vendored renderer), cookie issuance |
 | `lorica-mcp` | Management MCP server (v1.9.0): a scope-gated tool surface over the automation plane, spoken over stdio or over a path on the automation listener |
 | `lorica-automation-policy` | The automation plane's policy as data (v1.9.0): the scope vocabulary, the MCP tier table, the admin settings allowlist and the one-way route and backend protections, with `serde` as its only dependency so `lorica-mcp` reads it without linking SQLite |
+| `lorica-adcs` | AD CS enrollment client (v1.10.0): turns a CSR into an issued certificate through the authority's CES endpoint, WS-Trust over HTTPS with Kerberos SPNEGO bound to the TLS channel; a leaf crate that links the system GSS-API library |
 | `lorica-lb` | Load balancing (Round Robin, Peak EWMA, Hash, Random, Least Conn) |
 | `lorica-cache` | HTTP response cache, LRU eviction |
 | `lorica-limits` | Rate estimator + per-route `LocalBucket` / `AuthoritativeBucket` token-bucket primitives (lock-free CAS, 100 ms cross-worker sync) |
@@ -719,13 +721,13 @@ cargo build --release
 # Every Rust test in the workspace
 cargo test --workspace
 
-# Product crates only (3224 tests, Lorica-native)
+# Product crates only (3476 tests, Lorica-native)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
            -p lorica-command -p lorica-shmem \
            -p lorica-challenge -p lorica-geoip -p lorica-acme \
            -p lorica-metrics -p lorica-cluster -p lorica-dashboard \
-           -p lorica-mcp -p lorica-automation-policy \
+           -p lorica-mcp -p lorica-automation-policy -p lorica-adcs \
            --features otel
 
 # Pingora-forked crates (782 tests)
@@ -877,6 +879,7 @@ trail, failure modes and how to replace a control plane.
 
 - [docs/installation.md](docs/installation.md) - packages, first boot, the management plane's TLS certificate
 - [docs/cluster.md](docs/cluster.md) - multi-node operation, end to end
+- [docs/adcs.md](docs/adcs.md) - AD CS certificate enrollment: authority-side prerequisites, network and time, issuance, renewal, adoption, the failed state, troubleshooting by failing step
 - [docs/capture.md](docs/capture.md) - traffic capture: rules, budgets, the record, redaction, sinks
 - [docs/automation.md](docs/automation.md) - the CI automation API: the listener, tokens and scopes, the environment resource, GitLab pipelines and OIDC
 - [docs/mcp.md](docs/mcp.md) - the management MCP server: the three tiers, minting a token, configuring a client over stdio or Streamable HTTP, what each tier cannot see or change, the audit
@@ -913,8 +916,9 @@ git verify-tag v1.7.4
 | v1.7.0 | Multi-node cluster (control plane + followers over mutual TLS, token enrollment with explicit activation, two-phase configuration replication with per-node route targeting, fleet-wide certificate issuance with need-to-know key distribution, telemetry and audit-trail fan-in with one chain per node, fleet dashboard), syslog (RFC 5424) and OTLP logs export, `/metrics` authenticated by default | Shipped |
 | v1.8.0 | Conditional request capture (per-route rules with request-side predicates on source CIDR, path, method and headers, response-side predicates on status and latency, capped request and response bodies, per-rule budgets and TTL, header and query-string redaction, export to the log sinks and a dashboard page) and a CI automation API (a separate listener on its own port, off by default, behind a source-CIDR allowlist and scoped bearer tokens while the management API stays on loopback; an idempotent `environment` resource that binds a hostname, a backend and a certificate in one atomic apply for review apps, optional GitLab OIDC ID-token authentication). PRD: [Epic 10](docs/prd/epic-10-v1.8.0.md), stories 10.1 to 10.6. | Shipped |
 | v1.9.0 | Management MCP server with tiered access: an operator drives Lorica from an MCP client with the authority the task needs and no more. Three tiers (read, config, admin) that are scope sets on the Epic 10 automation tokens rather than a second authorization model, one process per tier with no tool that elevates, and every call in the tamper-evident audit chain marked as an MCP call. Streamable HTTP served as a path on the automation listener rather than a new port, so it inherits that listener's TLS, source-CIDR allowlist and token revocation; stdio for the workstation case. PRD: [Epic 11](docs/prd/epic-11-v1.9.0.md), stories 11.1 to 11.4. | Shipped |
-| v1.10.0 | TCP and UDP stream proxying at parity with nginx `stream {}` and HAProxy `mode tcp`: TLS passthrough with SNI and ALPN routing, L4 TLS termination with Lorica's ACME certificates, upstream TLS and mTLS, PROXY protocol v1/v2 both ways (also accepted on the HTTP listeners), the existing balancing algorithms with backup backends and the circuit breaker, TCP send/expect health checks, per-source connection caps, new-connection rate limits, allow/deny and GeoIP, UDP bounded by default in datagrams and bytes against reflection, local backends refused, configurable drain on upgrade. Streams are replicated with per-node targeting, audited, observed, managed from the dashboard and the management API, and read-only on the automation API and the MCP read tier. PRD: [Epic 12](docs/prd/epic-12-v1.10.0.md), Phase 1, stories 12.0 to 12.12. | Planned |
-| v1.11.0 | Stream proxying beyond parity: weighted P2C, transparent proxying, active UDP health checks, protocol detection on a shared port that refuses unrecognised bytes, live TCP passthrough connections and UDP sessions handed over across a hot upgrade (TLS streams drain; scope confirmed by a feasibility spike run during the 1.10.0 cycle), and full nginx `stream {}` import. PRD: [Epic 12](docs/prd/epic-12-v1.10.0.md), Phase 2, stories 12.13 to 12.18. | Planned |
+| v1.10.0 | Internal certificates from Active Directory Certificate Services: Lorica requests, renews and takes over certificates from an AD CS authority through its Certificate Enrollment Web Service, authenticated with Kerberos and a TLS channel binding (Extended Protection), with no Kerberos configuration on the host. Issued in one confirmed click from the route form or the certificate page, keys generated by Lorica and never reused, names bounded by an allowlist of DNS suffixes, the authority managed by SuperAdmins only and kept on the control plane, and manually issued certificates offered for adoption. PRD: [Epic 13](docs/prd/epic-13-v1.10.0.md), stories 13.1 to 13.6. | Shipped |
+| v1.11.0 | TCP and UDP stream proxying at parity with nginx `stream {}` and HAProxy `mode tcp`: TLS passthrough with SNI and ALPN routing, L4 TLS termination with Lorica's ACME certificates, upstream TLS and mTLS, PROXY protocol v1/v2 both ways (also accepted on the HTTP listeners), the existing balancing algorithms with backup backends and the circuit breaker, TCP send/expect health checks, per-source connection caps, new-connection rate limits, allow/deny and GeoIP, UDP bounded by default in datagrams and bytes against reflection, local backends refused, configurable drain on upgrade. Streams are replicated with per-node targeting, audited, observed, managed from the dashboard and the management API, and read-only on the automation API and the MCP read tier. PRD: [Epic 12](docs/prd/epic-12-v1.11.0.md), Phase 1, stories 12.0 to 12.12. | Planned |
+| v1.12.0 | Stream proxying beyond parity: weighted P2C, transparent proxying, active UDP health checks, protocol detection on a shared port that refuses unrecognised bytes, live TCP passthrough connections and UDP sessions handed over across a hot upgrade (TLS streams drain; scope confirmed by a feasibility spike run during the 1.11.0 cycle), and full nginx `stream {}` import. PRD: [Epic 12](docs/prd/epic-12-v1.11.0.md), Phase 2, stories 12.13 to 12.18. | Planned |
 | v2.0.0 | HTTP/3 (QUIC) | Planned |
 
 ### Backlog (tracking only, blocked on upstream)

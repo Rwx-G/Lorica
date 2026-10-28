@@ -1696,6 +1696,10 @@ mod environment_certificate_tests {
             created_at: at("2026-01-01T00:00:00Z"),
             acme_method: None,
             acme_dns_provider_id: None,
+            adcs_authority_id: None,
+            adcs_template: None,
+            adcs_template_oid: None,
+            adcs_request_id: None,
         }
     }
 

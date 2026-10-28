@@ -44,6 +44,13 @@
 #
 # `clean` installs the new package on a host that never had lorica: no
 # warning, the service active and enabled, every shipped path root's.
+#
+# The new package is always installed with `apt-get install`, never
+# `dpkg -i`: it depends on libgssapi-krb5-2, which apt resolves from the
+# archive the way an operator's install does and dpkg would leave
+# unconfigured. Released packages keep `dpkg -i`, as they were installed.
+# After every install of the new package, its binaries must resolve
+# every library and start.
 set -uo pipefail
 
 SERVED_CERT=/var/lib/lorica/management/served-cert.pem
@@ -55,6 +62,46 @@ fail() {
 
 # shellcheck source=persistence.sh
 . "$(dirname "$0")/persistence.sh"
+
+APT_LISTS_FRESH=false
+
+refresh_apt_lists() {
+    [ "$APT_LISTS_FRESH" = true ] && return 0
+    apt-get update -qq > /tmp/lorica-apt-update.out 2>&1 \
+        || { cat /tmp/lorica-apt-update.out; fail "apt-get update"; }
+    APT_LISTS_FRESH=true
+}
+
+# Install the new package through apt, output in $2. apt takes a local
+# file only by a path it can tell from a package name, hence the
+# absolute one; --reinstall makes it act on a version already installed
+# as dpkg -i did. apt runs the maintainer scripts on a pseudo-terminal,
+# whose CR LF line ends would defeat the whole-line greps on their output.
+install_new() {
+    local new="$1" out="$2"
+    refresh_apt_lists
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall "$(realpath "$new")" 2>&1 \
+        | tr -d '\r' > "$out"
+}
+
+# The new package's Depends, installed alone: its CLI runs from an
+# extracted copy before the package is, and links what the package
+# depends on.
+install_new_dependencies() {
+    local new="$1" packages
+    packages=$(dpkg-deb -f "$new" Depends | sed 's/([^)]*)//g; s/|[^,]*//g; s/,/ /g')
+    refresh_apt_lists
+    # shellcheck disable=SC2086 # one word per package
+    DEBIAN_FRONTEND=noninteractive apt-get install -y $packages > /tmp/lorica-deps.out 2>&1 \
+        || { cat /tmp/lorica-deps.out; fail "installing the new package's dependencies: $packages"; }
+}
+
+binaries_run() {
+    ldd /usr/bin/lorica /usr/bin/lorica-mcp | grep -q 'not found' \
+        && { ldd /usr/bin/lorica /usr/bin/lorica-mcp; fail "an unresolved library"; }
+    /usr/bin/lorica --version || fail "lorica --version"
+    echo "every library resolved, GSS-API from $(ldd /usr/bin/lorica | awk '/libgssapi_krb5/ {print $3}')"
+}
 
 # Wait for the service to be active and, unless $1 says otherwise, for the
 # node to have recorded the certificate it serves (1.9.0 and later).
@@ -101,7 +148,7 @@ keeps_state() {
     fi
     touch "$probe"
     chown 0:0 "$probe"
-    dpkg -i "$new" > /tmp/lorica-state.out 2>&1 || { cat /tmp/lorica-state.out; fail "reinstall"; }
+    install_new "$new" /tmp/lorica-state.out || { cat /tmp/lorica-state.out; fail "reinstall"; }
     if [ "$activity" = active ]; then
         wait_active || fail "$enablement and $activity: not running after the reinstall"
         assert_persistence "$enablement and $activity"
@@ -137,6 +184,7 @@ install_old() {
     local extracted
     extracted=$(mktemp -d)
     dpkg-deb -x "$new" "$extracted"
+    install_new_dependencies "$new"
     # The unban answer does not matter: reaching the node's handler proves
     # the pin accepted the certificate it serves and the login went
     # through.
@@ -158,7 +206,7 @@ healthy_host() {
     local new="$1"
     echo "=== reinstall on the now healthy host"
     pid_before=$(systemctl show -p MainPID --value lorica.service)
-    dpkg -i "$new" > /tmp/lorica-again.out 2>&1 || { cat /tmp/lorica-again.out; fail "reinstall"; }
+    install_new "$new" /tmp/lorica-again.out || { cat /tmp/lorica-again.out; fail "reinstall"; }
     if grep -q "WARNING" /tmp/lorica-again.out; then fail "a warning on a healthy host"; fi
     grep -q "installed successfully" /tmp/lorica-again.out || fail "no banner on a healthy host"
     wait_active || fail "not active after the reinstall"
@@ -183,10 +231,11 @@ healthy_host() {
 # shipped paths: repaired silently, enabled and started, with persistence.
 upgrade_from_old_unheld() {
     local new="$1" label="$2"
-    dpkg -i "$new" > /tmp/lorica-new.out 2>&1
+    install_new "$new" /tmp/lorica-new.out
     rc=$?
     cat /tmp/lorica-new.out
-    [ "$rc" = 0 ] || fail "$label: dpkg -i exited $rc"
+    [ "$rc" = 0 ] || fail "$label: apt-get install exited $rc"
+    binaries_run
     if grep -q "WARNING" /tmp/lorica-new.out; then fail "$label: a warning where no account could write the paths"; fi
     if grep -q "left stopped" /tmp/lorica-new.out; then fail "$label: left stopped"; fi
     grep -q "installed successfully" /tmp/lorica-new.out || fail "$label: no banner"
@@ -232,10 +281,11 @@ upgrade_held() {
     install_old "$old" "$new"
 
     echo "=== upgrade to the new package, $account (uid 1001) could write the shipped paths"
-    dpkg -i "$new" > /tmp/lorica-new.out 2>&1
+    install_new "$new" /tmp/lorica-new.out
     rc=$?
     cat /tmp/lorica-new.out
-    [ "$rc" = 0 ] || fail "dpkg -i exited $rc"
+    [ "$rc" = 0 ] || fail "apt-get install exited $rc"
+    binaries_run
     grep -q "WARNING: lorica was NOT started" /tmp/lorica-new.out || fail "no warning on a repaired host"
     grep -qx "    /usr/share/doc/lorica" /tmp/lorica-new.out || fail "the repaired path is not listed"
     grep -qx "    the account $account (uid 1001)" /tmp/lorica-new.out \
@@ -262,8 +312,9 @@ upgrade_held() {
 clean() {
     local new="$1"
     echo "=== install on a host that never had lorica"
-    dpkg -i "$new" > /tmp/lorica-new.out 2>&1 || { cat /tmp/lorica-new.out; fail "install"; }
+    install_new "$new" /tmp/lorica-new.out || { cat /tmp/lorica-new.out; fail "install"; }
     cat /tmp/lorica-new.out
+    binaries_run
     if grep -q "WARNING" /tmp/lorica-new.out; then fail "a warning on a clean host"; fi
     grep -q "installed successfully" /tmp/lorica-new.out || fail "no banner"
     wait_active || fail "not active, or recorded no served certificate"

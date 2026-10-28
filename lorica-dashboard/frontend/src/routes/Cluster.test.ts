@@ -80,11 +80,17 @@ function certificate(id: string, domain: string) {
     san_domains: [],
     fingerprint: 'ab',
     issuer: 'Test CA',
+    subject: `CN=${domain}`,
     not_before: '2026-01-01T00:00:00Z',
     not_after: '2027-01-01T00:00:00Z',
     is_acme: false,
     acme_auto_renew: false,
     created_at: '2026-01-01T00:00:00Z',
+    source: 'manual' as const,
+    adcs_authority_id: null,
+    adcs_template: null,
+    adcs_template_oid: null,
+    adcs_request_id: null,
   };
 }
 

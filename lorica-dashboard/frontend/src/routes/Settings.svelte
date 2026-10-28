@@ -27,6 +27,7 @@
   import BinaryUpgradeTab from '../components/settings-tabs/BinaryUpgradeTab.svelte';
   import UsersAccessTab from '../components/settings-tabs/UsersAccessTab.svelte';
   import AutomationTokensTab from '../components/settings-tabs/AutomationTokensTab.svelte';
+  import AdcsAuthorityTab from '../components/settings-tabs/AdcsAuthorityTab.svelte';
   import { isSuperAdmin, isSuperAdminRole } from '../lib/auth';
   import { parseOctalMode } from '../lib/validators';
 
@@ -153,6 +154,7 @@
     observability: true,
     log_export: true,
     dns_providers: true,
+    adcs_authority: true,
     notifications: true,
     presets: true,
     history: true,
@@ -541,6 +543,16 @@
     />
 
     <SettingsDnsProviders bind:dnsProviders {expandedSections} {toggleSection} onReload={loadAll} />
+
+    <!--
+      Every role sees it: reads are Viewer server-side. The tab gates
+      its own writes (SuperAdmin), its test (Operator) and its follower
+      notice, since the authority never leaves the control plane.
+    -->
+    <AdcsAuthorityTab
+      expanded={expandedSections.adcs_authority}
+      toggleSection={() => toggleSection('adcs_authority')}
+    />
 
     <SettingsNotifications bind:notifications {expandedSections} {toggleSection} onReload={loadAll} />
 

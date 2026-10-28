@@ -2,6 +2,7 @@
 //! consumers. Grouped into per-entity submodules and re-exported here
 //! so that `lorica_config::models::<Type>` paths keep working.
 
+mod adcs_authority;
 mod ai_crawler;
 mod automation_environment;
 mod automation_token;
@@ -24,6 +25,12 @@ mod sla;
 #[cfg(test)]
 mod tests;
 
+pub use adcs_authority::{
+    canonical_dns_name, validate_template_name, AdcsAuthority, AdcsKeyType, AdcsSubjectDefaults,
+    AllowedSuffix, ADCS_ALLOWED_TEMPLATES_MAX, ADCS_TEMPLATE_NAME_MAX_LEN,
+};
+#[cfg(test)]
+pub(crate) use adcs_authority::{sample_adcs_authority, ADCS_FIXTURE_SENTINEL};
 pub use ai_crawler::{
     CustomCrawler, CustomVerification, CUSTOM_CRAWLER_MAX_CIDRS, CUSTOM_CRAWLER_MAX_COUNT,
 };
@@ -55,7 +62,7 @@ pub use capture::{
 pub use cert_export_acl::{resolve as resolve_cert_export_acl, CertExportAcl};
 pub use certificate::{
     resolve_certificate_for_hostname, wildcard_patterns_an_operator_could_provision, Certificate,
-    DnsProvider,
+    CertificateSource, DnsProvider,
 };
 pub use cluster::{ClusterIdentity, ClusterNode, JoinToken, NodeStatus, RevokedSerial, TokenState};
 pub use enums::{

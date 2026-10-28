@@ -1,5 +1,5 @@
 Name:           lorica
-Version:        1.9.3
+Version:        1.10.0
 Release:        1%{?dist}
 Summary:        Modern reverse proxy with built-in dashboard
 License:        Apache-2.0
@@ -7,6 +7,7 @@ URL:            https://github.com/Rwx-G/Lorica
 BuildArch:      x86_64
 
 Requires:       ca-certificates
+Requires:       krb5-libs
 
 %description
 A dashboard-first reverse proxy built in Rust. Single binary,

@@ -166,6 +166,7 @@ const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
     "sticky_session",
     "stored_in",
     "strip_path_prefix",
+    "subject",
     "successful_requests",
     "target_pct",
     "timestamp",

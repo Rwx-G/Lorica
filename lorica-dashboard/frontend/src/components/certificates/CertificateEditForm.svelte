@@ -6,6 +6,8 @@
     type UpdateCertificateRequest,
     type DnsProviderResponse,
   } from '../../lib/api';
+  import { adcsManagedCertificateNotice } from '../../lib/adcs-issuance';
+  import { modalFocus } from '../../lib/modal-focus';
 
   let {
     editingCert,
@@ -32,6 +34,11 @@
   let editAcmeMethod = $state(untrack(() => editingCert.acme_method ?? ''));
   let editAutoRenew = $state(untrack(() => editingCert.acme_auto_renew));
 
+  const managedNotice = $derived(adcsManagedCertificateNotice(editingCert));
+  // Auto-renew drives both renewal loops, ACME and AD CS (Epic 13 D14);
+  // only a manual certificate has nothing to renew from.
+  const renewable = $derived(editingCert.source !== 'manual');
+
   function handleEditKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') onClose();
   }
@@ -57,15 +64,17 @@
     editError = '';
 
     const body: UpdateCertificateRequest = {};
-    if (editDomain !== editingCert.domain) body.domain = editDomain;
-    if (editCertPem.trim()) body.cert_pem = editCertPem;
-    if (editKeyPem.trim()) body.key_pem = editKeyPem;
+    if (!managedNotice) {
+      if (editDomain !== editingCert.domain) body.domain = editDomain;
+      if (editCertPem.trim()) body.cert_pem = editCertPem;
+      if (editKeyPem.trim()) body.key_pem = editKeyPem;
+    }
     if (editingCert.is_acme) {
       const origMethod = editingCert.acme_method ?? '';
       if (editAcmeMethod !== origMethod) body.acme_method = editAcmeMethod || undefined;
       if (editDnsProviderId !== (editingCert.acme_dns_provider_id ?? '')) body.acme_dns_provider_id = editDnsProviderId || '';
-      if (editAutoRenew !== editingCert.acme_auto_renew) body.acme_auto_renew = editAutoRenew;
     }
+    if (renewable && editAutoRenew !== editingCert.acme_auto_renew) body.acme_auto_renew = editAutoRenew;
 
     if (Object.keys(body).length === 0) {
       editError = 'No changes to save';
@@ -87,28 +96,44 @@
 </script>
 
 <!-- Edit Form Modal -->
-<div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) onClose(); }} onkeydown={handleEditKeydown} role="dialog" aria-modal="true" tabindex="-1">
+<div
+  class="overlay"
+  onclick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+  onkeydown={handleEditKeydown}
+  role="dialog"
+  aria-modal="true"
+  aria-labelledby="edit-cert-title"
+  tabindex="-1"
+  {@attach modalFocus}
+>
   <div class="modal" role="document">
-    <h2>Edit Certificate</h2>
+    <h2 id="edit-cert-title">Edit Certificate</h2>
 
     {#if editError}
-      <div class="form-error">{editError}</div>
+      <div class="form-error" role="alert">{editError}</div>
     {/if}
 
-    <div class="form-group">
-      <label for="edit-domain">Domain</label>
-      <input id="edit-domain" type="text" bind:value={editDomain} />
-    </div>
+    {#if managedNotice}
+      <p class="managed-notice" role="note" id="edit-managed-notice" data-testid="adcs-managed-notice">{managedNotice}</p>
+    {/if}
 
-    <div class="form-group">
-      <label for="edit-cert">Replace Certificate PEM (optional)</label>
-      <textarea id="edit-cert" bind:value={editCertPem} placeholder="Leave empty to keep current certificate" rows="4"></textarea>
-    </div>
+    <fieldset class="replace-fields" disabled={managedNotice !== null} aria-describedby={managedNotice ? 'edit-managed-notice' : undefined}>
+      <legend class="sr-only">Domain, certificate and key</legend>
+      <div class="form-group">
+        <label for="edit-domain">Domain</label>
+        <input id="edit-domain" type="text" bind:value={editDomain} />
+      </div>
 
-    <div class="form-group">
-      <label for="edit-key">Replace Private Key PEM (optional)</label>
-      <textarea id="edit-key" bind:value={editKeyPem} placeholder="Leave empty to keep current key" rows="4"></textarea>
-    </div>
+      <div class="form-group">
+        <label for="edit-cert">Replace Certificate PEM (optional)</label>
+        <textarea id="edit-cert" bind:value={editCertPem} placeholder="Leave empty to keep current certificate" rows="4"></textarea>
+      </div>
+
+      <div class="form-group">
+        <label for="edit-key">Replace Private Key PEM (optional)</label>
+        <textarea id="edit-key" bind:value={editKeyPem} placeholder="Leave empty to keep current key" rows="4"></textarea>
+      </div>
+    </fieldset>
 
     {#if editingCert?.is_acme}
       <div class="form-group">
@@ -134,7 +159,9 @@
           <span class="hint">Select the DNS provider for auto-renewal. Configure providers in Settings.</span>
         </div>
       {/if}
+    {/if}
 
+    {#if renewable}
       <div class="form-group">
         <label>
           <input type="checkbox" bind:checked={editAutoRenew} />
@@ -151,3 +178,21 @@
     </div>
   </div>
 </div>
+
+<style>
+  .replace-fields {
+    border: none;
+    padding: 0;
+    margin: 0;
+    min-width: 0;
+  }
+  .managed-notice {
+    padding: 0.5rem 0.75rem;
+    background: var(--color-primary-subtle);
+    border-left: 3px solid var(--color-primary);
+    border-radius: 0 0.25rem 0.25rem 0;
+    font-size: 0.8125rem;
+    line-height: 1.45;
+    color: var(--color-text);
+  }
+</style>

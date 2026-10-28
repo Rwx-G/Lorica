@@ -4,7 +4,7 @@
 #                 [--skip-ai-bot] [--skip-rbac] [--skip-audit] [--skip-hot-upgrade]
 #                 [--skip-log-sinks] [--skip-log-sinks-workers] [--skip-acme]
 #                 [--skip-cluster] [--skip-capture] [--skip-capture-workers]
-#                 [--skip-mcp]
+#                 [--skip-mcp] [--skip-adcs]
 #   --build             Force rebuild all images
 #   --keep              Don't tear down containers after tests
 #   --skip-workers      Skip worker isolation tests (faster)
@@ -20,6 +20,7 @@
 #   --skip-capture      Skip the v1.8.0 Stories 10.1/10.2 capture profile (faster)
 #   --skip-capture-workers  Skip the worker-mode variant of the capture profile
 #   --skip-mcp          Skip the v1.9.0 Story 11.4 MCP profile (faster)
+#   --skip-adcs         Skip the v1.10.0 Story 13.6 AD CS profile (faster)
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -39,6 +40,7 @@ SKIP_CLUSTER=false
 SKIP_CAPTURE=false
 SKIP_CAPTURE_WORKERS=false
 SKIP_MCP=false
+SKIP_ADCS=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -57,6 +59,7 @@ for arg in "$@"; do
         --skip-capture)      SKIP_CAPTURE=true ;;
         --skip-capture-workers) SKIP_CAPTURE_WORKERS=true ;;
         --skip-mcp)          SKIP_MCP=true ;;
+        --skip-adcs)         SKIP_ADCS=true ;;
     esac
 done
 
@@ -86,7 +89,7 @@ dump_node_log() {
 # run boots against stale data - e.g. the cert-export smoke rotates the
 # admin password, and a stale volume 401s the next login), and on BUILD a
 # plain `docker compose build` (no profile flags) skips them entirely.
-ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile rbac --profile rbac-workers --profile audit --profile hot-upgrade --profile log-sinks --profile log-sinks-workers --profile acme --profile cluster --profile capture --profile capture-workers --profile mcp"
+ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile rbac --profile rbac-workers --profile audit --profile hot-upgrade --profile log-sinks --profile log-sinks-workers --profile acme --profile cluster --profile capture --profile capture-workers --profile mcp --profile adcs"
 
 # `docker compose run` never rebuilds an existing image, so a stale runner
 # would silently run old assertions. With --build, build every service
@@ -540,6 +543,53 @@ if [ "$SKIP_MCP" = false ] && [ "$EXIT_CODE" = "0" ]; then
     if ! docker compose --profile mcp run --rm mcp-smoke; then
         EXIT_CODE=1
         dump_node_log lorica-mcp
+    fi
+fi
+
+# ---- Phase 12: AD CS profile (Story 13.6 AC #2, IV1) -----------------
+# A node joined to the Story 13.1 Kerberos harness (an MIT KDC and a CES
+# fixture enforcing the channel binding), driven through the management
+# API: authority and connection test, issuance from a route served on
+# the HTTPS listener, "Renew now", adoption and reversion, and the D15
+# breaker. Then the harness probe client, run where python-gssapi is:
+# a token without a channel binding must be refused. Opt-out via
+# --skip-adcs (default ON).
+if [ "$SKIP_ADCS" = false ] && [ "$EXIT_CODE" = "0" ]; then
+    echo ""
+    echo "=== Lorica E2E Tests (adcs profile) ==="
+    echo ""
+
+    docker compose --profile adcs up $BUILD_FLAG -d lorica-adcs
+
+    echo "Waiting for Lorica (adcs) to initialize..."
+    ADCS_READY_TRIES=60
+    ADCS_READY_INTERVAL_S=2
+    for i in $(seq 1 "$ADCS_READY_TRIES"); do
+        if docker compose --profile adcs exec -T lorica-adcs curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
+            echo "Lorica (adcs) is ready."
+            break
+        fi
+        if [ "$i" = "$ADCS_READY_TRIES" ]; then
+            echo "ERROR: Lorica (adcs) did not start after $ADCS_READY_TRIES tries ${ADCS_READY_INTERVAL_S}s apart"
+            docker compose logs lorica-adcs | tail -20
+            break
+        fi
+        sleep "$ADCS_READY_INTERVAL_S"
+    done
+
+    if ! docker compose --profile adcs run --rm adcs-smoke; then
+        EXIT_CODE=1
+        dump_node_log lorica-adcs
+        dump_node_log ces 40
+        dump_node_log kdc 40
+    fi
+
+    if [ "$EXIT_CODE" = "0" ]; then
+        echo ""
+        echo "=== AD CS harness probe: a token without a channel binding is refused ==="
+        # `sh -c` for the same MSYS path-conversion reason as the cluster
+        # readiness probe below.
+        docker compose --profile adcs exec -T ces sh -c 'python3 /app/probe.py' || EXIT_CODE=$?
     fi
 fi
 

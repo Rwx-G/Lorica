@@ -214,18 +214,83 @@ fn an_upgrade_subscribes_explicit_channels_to_the_log_store_alerts() {
             "backend_down",
             "waf_alert",
             "log_store_unavailable",
-            "log_store_recovered"
+            "log_store_recovered",
+            "adcs_authority_failed",
+            "cert_issuance_failed"
         ]
     );
     assert!(alert_types_of(&store, "everything").is_empty());
     assert_eq!(alert_types_of(&store, "wildcard"), ["*"]);
     assert_eq!(
         alert_types_of(&store, "partial"),
-        ["log_store_recovered", "log_store_unavailable"],
+        [
+            "log_store_recovered",
+            "log_store_unavailable",
+            "adcs_authority_failed",
+            "cert_issuance_failed"
+        ],
         "a type already ticked is not added twice"
     );
 
     // An operator who unticks them afterwards is not overridden.
+    let mut explicit = store
+        .get_notification_config("explicit")
+        .expect("channel reads")
+        .expect("channel kept");
+    explicit.alert_types = vec!["backend_down".to_string()];
+    store
+        .update_notification_config(&explicit)
+        .expect("operator edit");
+    drop(store);
+    let reopened = ConfigStore::open(&path, None).expect("an upgraded file reopens");
+    assert_eq!(alert_types_of(&reopened, "explicit"), ["backend_down"]);
+}
+
+/// Migration 65 does for the AD CS alerts what migration 63 did for the
+/// log-store ones. The file is rewound to version 64 so the channels are
+/// written as a 1.9.x node would have them, then reopened.
+#[test]
+fn an_upgrade_subscribes_explicit_channels_to_the_adcs_alerts() {
+    let dir = tempfile::tempdir().expect("test setup: tempdir");
+    let path = dir.path().join("lorica.db");
+    drop(ConfigStore::open(&path, None).expect("test setup: fresh store"));
+    Connection::open(&path)
+        .expect("test setup: raw open")
+        .execute_batch(
+            r#"
+            DELETE FROM schema_migrations WHERE version >= 65;
+            INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+            VALUES ('explicit', 'webhook', 1, '{"url":"https://hooks.example.com/a"}',
+                    '["backend_down","log_store_unavailable"]');
+            INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+            VALUES ('everything', 'webhook', 1, '{"url":"https://hooks.example.com/b"}', '[]');
+            INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+            VALUES ('wildcard', 'slack', 1, '{"url":"https://hooks.example.com/c"}', '["*"]');
+            INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+            VALUES ('partial', 'webhook', 0, '{"url":"https://hooks.example.com/d"}',
+                    '["cert_issuance_failed"]');
+            "#,
+        )
+        .expect("test setup: channels saved at version 64");
+
+    let store = ConfigStore::open(&path, None).expect("a version 64 lorica.db must open");
+    assert_eq!(
+        alert_types_of(&store, "explicit"),
+        [
+            "backend_down",
+            "log_store_unavailable",
+            "adcs_authority_failed",
+            "cert_issuance_failed"
+        ]
+    );
+    assert!(alert_types_of(&store, "everything").is_empty());
+    assert_eq!(alert_types_of(&store, "wildcard"), ["*"]);
+    assert_eq!(
+        alert_types_of(&store, "partial"),
+        ["cert_issuance_failed", "adcs_authority_failed"],
+        "a type already ticked is not added twice"
+    );
+
     let mut explicit = store
         .get_notification_config("explicit")
         .expect("channel reads")

@@ -59,6 +59,7 @@ pub(crate) async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         mcp_invocations: Arc::new(crate::automation::InvocationLimiter::new()),
         renewals: Arc::new(crate::acme::RenewalLedger::new()),
         automation_writes: crate::middleware::rate_limit::RateLimiter::new(),
+        adcs: crate::adcs::AdcsRuntime::new(None),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -565,7 +566,7 @@ async fn test_change_password_missing_complexity_returns_400() {
 
 /// Create a user with the given role directly in the store, then
 /// log in through the endpoint and return the session cookie.
-async fn create_user_and_login(
+pub(crate) async fn create_user_and_login(
     state: &AppState,
     session_store: &SessionStore,
     rate_limiter: &RateLimiter,
@@ -5389,6 +5390,7 @@ async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         mcp_invocations: Arc::new(crate::automation::InvocationLimiter::new()),
         renewals: Arc::new(crate::acme::RenewalLedger::new()),
         automation_writes: crate::middleware::rate_limit::RateLimiter::new(),
+        adcs: crate::adcs::AdcsRuntime::new(None),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -5433,6 +5435,7 @@ async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         mcp_invocations: Arc::new(crate::automation::InvocationLimiter::new()),
         renewals: Arc::new(crate::acme::RenewalLedger::new()),
         automation_writes: crate::middleware::rate_limit::RateLimiter::new(),
+        adcs: crate::adcs::AdcsRuntime::new(None),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -7058,7 +7061,7 @@ async fn test_cluster_tokens_and_nodes_on_a_control_plane() {
 
 /// A follower runtime for the API tests, holding no live session: the
 /// state a node is in before its first connect and between reconnects.
-fn test_follower_runtime() -> std::sync::Arc<crate::cluster::FollowerRuntime> {
+pub(crate) fn test_follower_runtime() -> std::sync::Arc<crate::cluster::FollowerRuntime> {
     std::sync::Arc::new(crate::cluster::FollowerRuntime {
         node_id: "11111111-2222-3333-4444-555555555555".to_string(),
         node_name: "edge-01".to_string(),

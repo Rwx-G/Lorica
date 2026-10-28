@@ -1,0 +1,79 @@
+[package]
+name = "lorica-adcs"
+version = "1.10.0"
+authors = ["Rwx-G"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+description = "AD CS certificate enrollment client for Lorica: Kerberos SPNEGO with TLS channel binding, WS-Trust over CES"
+
+# A leaf crate (Epic 13 decision D8): it depends on no first-party crate
+# and knows nothing about the store, routes or the dashboard. Keeping the
+# GSS-API FFI surface here keeps it in one place, although every crate
+# that depends on this one still links the system library.
+[dependencies]
+# Approved 2026-10-21 (Epic 13 decision D7) and pinned exactly: it is an
+# FFI binding, so a minor release can change what the generated bindings
+# expect of the system library. `libgssapi-sys` runs `bindgen` at build
+# time, which is why `libclang-dev` and `libkrb5-dev` are build
+# requirements of every job that compiles the workspace, and
+# `libgssapi-krb5-2` / `krb5-libs` a runtime requirement of the packages.
+libgssapi = "=0.11.0"
+# The error type's `Display` and `source`, at the version every other
+# product crate pins.
+thiserror = "2"
+# Channel-binding digests (RFC 5929). The workspace's crypto already, at
+# the version every product crate uses; no `sha2` beside it.
+ring = "0.17"
+# CSR and key generation, at the version `lorica-api` uses. RSA key
+# generation, the default key type of Epic 13 D4, exists only under the
+# `aws_lc_rs` backend (decided 2026-10-21). `aws-lc-rs` and `aws-lc-sys`
+# were already in the lockfile through `jsonwebtoken`, so no crate is
+# added; feature unification makes every rcgen user in the workspace
+# run on that backend.
+rcgen = { version = "0.14", features = ["aws_lc_rs"] }
+# Certificate parsing for the channel binding and the chain; its
+# re-exported `der_parser` / `asn1_rs` read the CMC response, so neither
+# is a direct dependency. `verify` checks each link of the issuing chain
+# by signature, on the `ring` already listed above.
+x509-parser = { version = "0.18", features = ["verify"] }
+# Base64 of the WS-Trust tokens, at the workspace's version.
+base64 = "0.23"
+# The WS-Addressing MessageID, v4 as `lorica-api` generates its ids.
+uuid = { version = "1", features = ["v4"] }
+# Approved 2026-10-21 (Epic 13 decision D7): the SOAP envelope writer and
+# the namespace-aware response reader. No SOAP framework.
+quick-xml = "0.42"
+# The CES exchange over HTTPS, at the version and TLS features
+# `lorica-api` uses, so no second TLS stack enters the binary.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+# The TLS configuration handed to reqwest with `use_preconfigured_tls`:
+# a certificate verifier that keeps the token on the certificate its
+# channel binding was computed from (Epic 13 D2). reqwest downcasts the
+# configuration to its own rustls type, so this must be the rustls
+# reqwest links; the three crates are those reqwest already pulls in,
+# at the versions the lockfile holds, and the roots are the ones reqwest
+# loaded itself before (system store plus the webpki bundle).
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
+rustls-native-certs = "0.8"
+webpki-roots = "1"
+# GSS-API calls go to `spawn_blocking` and the whole operation sits
+# under an outer `tokio::time::timeout` (Epic 13 D8).
+tokio = { workspace = true, features = ["rt", "time"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `getauxval(AT_SECURE)`: MIT krb5 ignores `KRB5_CONFIG` in a process
+# started in secure mode, and only the auxiliary vector says whether
+# this one was. Already in the lockfile through `lorica-core` and most
+# of the async stack; `nix` does not wrap `getauxval`.
+libc = "0.2"
+
+[dev-dependencies]
+# A local HTTPS server standing in for CES in the exchange tests. Every
+# crate below is already in the workspace lockfile through `lorica-api`.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"

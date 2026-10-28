@@ -88,8 +88,16 @@ pub const RL_SETTINGS_UPDATE: u32 = 30;
 /// cookie should not be able to lock the operator out by spamming
 /// password resets, AND argon2 hash cost is per-call expensive.
 pub const RL_PASSWORD_CHANGE: u32 = 3;
-/// ACME provision (rare, hits external CA).
+/// ACME provision (rare, hits external CA). The AD CS connection test
+/// shares the size in its own bucket (Epic 13 D15): each one spends a
+/// pre-authentication attempt against the service account.
 pub const RL_ACME_PROVISION: u32 = 3;
+
+/// The bucket ACME provisioning and an ACME renewal spend.
+pub(crate) const RL_BUCKET_ACME_PROVISION: &str = "acme_provision";
+
+/// The bucket AD CS issuance and an AD CS renewal spend.
+pub(crate) const RL_BUCKET_ADCS_ISSUE: &str = "adcs_issue";
 /// Generic destructive CUD on small endpoints (bans, backends,
 /// cache purge, dns providers, notifications, preferences,
 /// probes, loadtest, sla, waf rule toggles).
@@ -280,6 +288,11 @@ pub struct AppState {
     /// management routes' rate-limit layers, so it holds its own, for
     /// the process, where a credential's window outlives a request.
     pub automation_writes: crate::middleware::rate_limit::RateLimiter,
+    /// The AD CS runtime (Story 13.2): the single-flight guard every AD
+    /// CS operation and authority write takes, the client the handlers
+    /// call, and the channel the breaker's alert goes to. One for the
+    /// process, since the breaker protects one service account.
+    pub adcs: crate::adcs::AdcsRuntime,
 }
 
 impl AppState {
@@ -974,6 +987,34 @@ pub fn build_router(
                 RL_WINDOW_S,
             )),
         )
+        // Issuance from the AD CS authority (Story 13.3). Operator, the
+        // certificate default; the bucket is its own so an issuance
+        // burst does not starve uploads, and its size is ACME's because
+        // each call is an issuance logged at the authority.
+        .route(
+            "/api/v1/certificates/adcs",
+            post(crate::adcs::issue_certificate)
+                .layer(bl(BODY_CAP_DEFAULT))
+                .layer(rl(RL_BUCKET_ADCS_ISSUE, RL_ACME_PROVISION, RL_WINDOW_S)),
+        )
+        // Adoption and reversion (Story 13.5). Operator, the
+        // certificate default; neither contacts the authority, so the
+        // bucket is sized for a bulk adoption the dashboard sends one
+        // certificate at a time, not for issuance.
+        .route(
+            "/api/v1/certificates/{id}/adcs/adopt",
+            post(crate::adcs::adopt_certificate)
+                .layer(bl(BODY_CAP_DEFAULT))
+                .layer(rl("adcs_adopt", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/certificates/{id}/adcs/revert",
+            post(crate::adcs::revert_certificate).layer(rl(
+                "adcs_adopt",
+                RL_DESTRUCTIVE_CUD,
+                RL_WINDOW_S,
+            )),
+        )
         .route(
             "/api/v1/certificates/{id}",
             get(crate::certificates::get_certificate),
@@ -1198,6 +1239,33 @@ pub fn build_router(
                 RL_WINDOW_S,
             )),
         )
+        // The AD CS authority (Story 13.2). Role floors live in the
+        // authorize middleware: writes are SuperAdmin, the connection
+        // test is Operator, the read is Viewer.
+        .route(
+            "/api/v1/adcs/authority",
+            get(crate::adcs::get_adcs_authority),
+        )
+        .route(
+            "/api/v1/adcs/authority",
+            put(crate::adcs::put_adcs_authority)
+                .delete(crate::adcs::delete_adcs_authority)
+                .layer(bl(BODY_CAP_PEM))
+                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+        )
+        // Adoption candidates (Story 13.5): a read, Viewer.
+        .route(
+            "/api/v1/adcs/adoption-candidates",
+            get(crate::adcs::list_adoption_candidates),
+        )
+        .route(
+            "/api/v1/adcs/authority/test",
+            post(crate::adcs::test_adcs_authority).layer(rl(
+                "adcs_test",
+                RL_ACME_PROVISION,
+                RL_WINDOW_S,
+            )),
+        )
         .route(
             "/api/v1/notifications",
             get(crate::settings::list_notifications),
@@ -1294,37 +1362,37 @@ pub fn build_router(
             "/api/v1/acme/provision",
             post(crate::acme::provision_certificate)
                 .layer(bl(BODY_CAP_ACME))
-                .layer(rl("acme_provision", RL_ACME_PROVISION, RL_WINDOW_S)),
+                .layer(rl(RL_BUCKET_ACME_PROVISION, RL_ACME_PROVISION, RL_WINDOW_S)),
         )
         .route(
             "/api/v1/acme/provision-dns",
             post(crate::acme::provision_certificate_dns)
                 .layer(bl(BODY_CAP_ACME))
-                .layer(rl("acme_provision", RL_ACME_PROVISION, RL_WINDOW_S)),
+                .layer(rl(RL_BUCKET_ACME_PROVISION, RL_ACME_PROVISION, RL_WINDOW_S)),
         )
         .route(
             "/api/v1/acme/provision-dns-manual",
             post(crate::acme::provision_dns_manual)
                 .layer(bl(BODY_CAP_ACME))
-                .layer(rl("acme_provision", RL_ACME_PROVISION, RL_WINDOW_S)),
+                .layer(rl(RL_BUCKET_ACME_PROVISION, RL_ACME_PROVISION, RL_WINDOW_S)),
         )
         .route(
             "/api/v1/acme/provision-dns-manual/check",
             post(crate::acme::check_dns_manual)
                 .layer(bl(BODY_CAP_ACME))
-                .layer(rl("acme_provision", RL_ACME_PROVISION, RL_WINDOW_S)),
+                .layer(rl(RL_BUCKET_ACME_PROVISION, RL_ACME_PROVISION, RL_WINDOW_S)),
         )
         .route(
             "/api/v1/acme/provision-dns-manual/confirm",
             post(crate::acme::provision_dns_manual_confirm)
                 .layer(bl(BODY_CAP_ACME))
-                .layer(rl("acme_provision", RL_ACME_PROVISION, RL_WINDOW_S)),
+                .layer(rl(RL_BUCKET_ACME_PROVISION, RL_ACME_PROVISION, RL_WINDOW_S)),
         )
         .route(
             "/api/v1/certificates/{id}/renew",
-            post(crate::acme::renew_certificate)
-                .layer(bl(BODY_CAP_ACME))
-                .layer(rl("acme_provision", RL_ACME_PROVISION, RL_WINDOW_S)),
+            // Rate limited inside the handler, by the certificate's
+            // source (`crate::acme::renew_certificate`).
+            post(crate::acme::renew_certificate).layer(bl(BODY_CAP_ACME)),
         )
         .route("/api/v1/waf/rules", get(crate::waf::get_waf_rules))
         .route(

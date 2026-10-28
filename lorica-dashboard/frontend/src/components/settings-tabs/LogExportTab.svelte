@@ -110,7 +110,7 @@
 </script>
 
 <section class="settings-section">
-  <button class="settings-collapsible-header" class:open={expanded} onclick={toggleSection}>
+  <button class="settings-collapsible-header" class:open={expanded} aria-expanded={expanded} onclick={toggleSection}>
     <h2>Log Export</h2>
     <span class="settings-chevron" class:expanded></span>
   </button>

@@ -162,6 +162,10 @@ async fn handle_config_reload_commit_reloads_cert_resolver() {
             created_at: now,
             acme_method: None,
             acme_dns_provider_id: None,
+            adcs_authority_id: None,
+            adcs_template: None,
+            adcs_template_oid: None,
+            adcs_request_id: None,
         };
         s.create_certificate(&cert).expect("seed cert");
         let route = make_route_referencing(&route_id, "test.local", &cert_id);
@@ -297,6 +301,10 @@ async fn handle_config_reload_commit_unreferenced_cert_stays_unloaded() {
             created_at: now,
             acme_method: None,
             acme_dns_provider_id: None,
+            adcs_authority_id: None,
+            adcs_template: None,
+            adcs_template_oid: None,
+            adcs_request_id: None,
         };
         s.create_certificate(&cert).expect("seed orphan cert");
         // No route referencing this cert.
@@ -390,6 +398,10 @@ async fn handle_config_reload_commit_stale_generation_replies_error_and_skips_re
             created_at: now,
             acme_method: None,
             acme_dns_provider_id: None,
+            adcs_authority_id: None,
+            adcs_template: None,
+            adcs_template_oid: None,
+            adcs_request_id: None,
         };
         s.create_certificate(&cert).expect("seed cert");
         let route = make_route_referencing(&route_id, "test.local", &cert_id);

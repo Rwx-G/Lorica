@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { modalFocus } from '../lib/modal-focus';
+
   interface Props {
     title: string;
     message: string;
@@ -10,6 +12,8 @@
 
   let { title, message, confirmLabel = 'Delete', confirmStyle = 'danger', onconfirm, oncancel }: Props = $props();
 
+  const titleId = $props.id();
+
   function confirmClass(s: 'danger' | 'primary' | 'warning'): string {
     if (s === 'primary') return 'btn-primary';
     if (s === 'warning') return 'btn-warning';
@@ -19,19 +23,30 @@
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
       oncancel();
-    } else if (e.key === 'Enter') {
+    } else if (e.key === 'Enter' && !(e.target instanceof HTMLButtonElement)) {
+      // A focused button answers Enter itself: focus starts on Cancel,
+      // and Enter there must cancel, not confirm.
       e.preventDefault();
       onconfirm();
     }
   }
 </script>
 
-<div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) oncancel(); }} onkeydown={handleKeydown} role="dialog" aria-modal="true" tabindex="-1">
+<div
+  class="overlay"
+  onclick={(e) => { if (e.target === e.currentTarget) oncancel(); }}
+  onkeydown={handleKeydown}
+  role="dialog"
+  aria-modal="true"
+  aria-labelledby={titleId}
+  tabindex="-1"
+  {@attach modalFocus}
+>
   <div class="dialog" role="document">
-    <h3>{title}</h3>
+    <h3 id={titleId}>{title}</h3>
     <p>{message}</p>
     <div class="actions">
-      <button class="btn btn-cancel" onclick={oncancel}>Cancel</button>
+      <button class="btn btn-cancel" onclick={oncancel} data-autofocus>Cancel</button>
       <button class="btn {confirmClass(confirmStyle)}" onclick={onconfirm}>{confirmLabel}</button>
     </div>
   </div>

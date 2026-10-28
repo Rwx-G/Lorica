@@ -1,11 +1,16 @@
 //! TLS certificate CRUD plus self-signed generation. ACME-issued certs are
 //! created via the [`crate::acme`] module but managed here once stored.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
+
 use axum::extract::{Extension, Path, Query};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::Utc;
+use lorica_config::models::CertificateSource;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::db::db_blocking;
@@ -43,6 +48,41 @@ pub struct CertificateResponse {
     /// Global DNS provider ID for DNS-01 renewals.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acme_dns_provider_id: Option<String>,
+    /// The leaf's subject as issued, an RFC 4514 string, RDNs last to first
+    /// as the RFC writes them; empty when the stored PEM cannot be read.
+    pub subject: String,
+    /// Where the certificate comes from, derived (Epic 13 D14), so the
+    /// dashboard never re-derives it.
+    pub source: CertificateSource,
+    /// The AD CS fields, `null` for every other source.
+    #[serde(flatten)]
+    pub adcs: AdcsCertificateFields,
+}
+
+/// The `adcs_*` columns of a certificate as every certificate view
+/// returns them: always present, `null` when unset.
+#[derive(Serialize)]
+pub struct AdcsCertificateFields {
+    /// The AD CS authority that issues and renews the certificate.
+    pub adcs_authority_id: Option<String>,
+    /// The template common name it was requested with.
+    pub adcs_template: Option<String>,
+    /// The template observed in the issued certificate: the OID of
+    /// extension 1.3.6.1.4.1.311.21.7, or the name of 1.3.6.1.4.1.311.20.2.
+    pub adcs_template_oid: Option<String>,
+    /// The authority's request identifier.
+    pub adcs_request_id: Option<String>,
+}
+
+impl AdcsCertificateFields {
+    fn of(c: &lorica_config::models::Certificate) -> AdcsCertificateFields {
+        AdcsCertificateFields {
+            adcs_authority_id: c.adcs_authority_id.clone(),
+            adcs_template: c.adcs_template.clone(),
+            adcs_template_oid: c.adcs_template_oid.clone(),
+            adcs_request_id: c.adcs_request_id.clone(),
+        }
+    }
 }
 
 /// JSON body for `POST /api/v1/certificates` - upload a PEM cert and key.
@@ -111,6 +151,14 @@ pub struct CertificateDetailResponse {
     /// ACME method when `is_acme`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acme_method: Option<String>,
+    /// The leaf's subject as issued, an RFC 4514 string, RDNs last to first
+    /// as the RFC writes them; empty when the stored PEM cannot be read.
+    pub subject: String,
+    /// Where the certificate comes from, derived (Epic 13 D14).
+    pub source: CertificateSource,
+    /// The AD CS fields, `null` for every other source.
+    #[serde(flatten)]
+    pub adcs: AdcsCertificateFields,
 }
 
 pub(crate) fn cert_to_response(c: &lorica_config::models::Certificate) -> CertificateResponse {
@@ -127,17 +175,185 @@ pub(crate) fn cert_to_response(c: &lorica_config::models::Certificate) -> Certif
         created_at: c.created_at.to_rfc3339(),
         acme_method: c.acme_method.clone(),
         acme_dns_provider_id: c.acme_dns_provider_id.clone(),
+        subject: subject_of(&c.cert_pem),
+        source: c.source(),
+        adcs: AdcsCertificateFields::of(c),
     }
 }
 
-/// Compute a SHA-256 fingerprint from PEM cert data using ring.
+/// The most subjects [`SUBJECTS`] keeps before it starts again empty: a
+/// bound for a process whose views are built only one row at a time,
+/// far above any certificate count a listing prunes it to.
+const SUBJECT_CACHE_MAX: usize = 65_536;
+
+/// The subject of every certificate PEM a view was built from, per
+/// SHA-256 of that PEM.
+///
+/// A subject is a function of the PEM bytes alone, so an entry is never
+/// stale: a renewed or replaced certificate is another key. Parsing
+/// every stored chain on every list request is what this saves; hashing
+/// the PEM is an order of magnitude cheaper than decoding and parsing
+/// it. In memory rather than a stored column, because a column would
+/// change the certificate row every follower replicates, for a value
+/// only the management API reads. [`list_certificates`] keeps only the
+/// entries of the rows it listed.
+static SUBJECTS: LazyLock<Mutex<HashMap<[u8; 32], String>>> = LazyLock::new(Mutex::default);
+
+fn pem_digest(cert_pem: &str) -> [u8; 32] {
+    let mut out: [u8; 32] = [0; 32];
+    out.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, cert_pem.as_bytes()).as_ref());
+    out
+}
+
+/// The subject of the leaf in `cert_pem` (its first PEM block) as an
+/// RFC 4514 string: RDNs last-to-first, joined by `,`, multi-valued
+/// RDNs by `+`, the RFC's descriptors for the attributes it names and
+/// the dotted OID for any other, special characters escaped, and a
+/// value that is not a string in `#` hex form. Empty when the PEM holds
+/// no certificate this can read.
+///
+/// Computed from the stored certificate rather than stored: an AD CS
+/// authority may rewrite the subject it was asked for, and the operator
+/// is shown what was issued (Epic 13 D5). Computed once per PEM (see
+/// [`SUBJECTS`]).
+pub(crate) fn subject_of(cert_pem: &str) -> String {
+    let key: [u8; 32] = pem_digest(cert_pem);
+    if let Some(known) = SUBJECTS.lock().get(&key) {
+        return known.clone();
+    }
+    let subject: String = parse_subject(cert_pem);
+    let mut subjects = SUBJECTS.lock();
+    if subjects.len() >= SUBJECT_CACHE_MAX {
+        subjects.clear();
+    }
+    subjects.insert(key, subject.clone());
+    subject
+}
+
+/// Forget every cached subject but those of `live`.
+fn retain_subjects(live: &HashSet<[u8; 32]>) {
+    SUBJECTS.lock().retain(|key, _| live.contains(key));
+}
+
+/// [`subject_of`] without the cache.
+fn parse_subject(cert_pem: &str) -> String {
+    let Some(block) = pem::parse_many(cert_pem)
+        .ok()
+        .and_then(|blocks: Vec<pem::Pem>| blocks.into_iter().next())
+    else {
+        return String::new();
+    };
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(block.contents()) else {
+        return String::new();
+    };
+    let rdns: Vec<String> = cert
+        .subject()
+        .iter()
+        .map(|rdn| {
+            rdn.iter()
+                .map(|attribute| {
+                    format!(
+                        "{}={}",
+                        rfc4514_type(attribute.attr_type()),
+                        rfc4514_value(attribute)
+                    )
+                })
+                .collect::<Vec<String>>()
+                .join("+")
+        })
+        .collect();
+    rdns.into_iter().rev().collect::<Vec<String>>().join(",")
+}
+
+/// RFC 4514 section 3: the descriptors it lists, the dotted OID for any
+/// other attribute type.
+fn rfc4514_type(oid: &x509_parser::der_parser::asn1_rs::Oid<'_>) -> String {
+    let dotted: String = oid.to_id_string();
+    let descriptor: Option<&str> = match dotted.as_str() {
+        "2.5.4.3" => Some("CN"),
+        "2.5.4.7" => Some("L"),
+        "2.5.4.8" => Some("ST"),
+        "2.5.4.10" => Some("O"),
+        "2.5.4.11" => Some("OU"),
+        "2.5.4.6" => Some("C"),
+        "2.5.4.9" => Some("STREET"),
+        "0.9.2342.19200300.100.1.25" => Some("DC"),
+        "0.9.2342.19200300.100.1.1" => Some("UID"),
+        _ => None,
+    };
+    descriptor.map_or(dotted, str::to_string)
+}
+
+/// RFC 4514 section 2.4: a string value escaped, anything else as `#`
+/// followed by the hex of its DER encoding.
+fn rfc4514_value(attribute: &x509_parser::x509::AttributeTypeAndValue<'_>) -> String {
+    use x509_parser::der_parser::asn1_rs::Tag;
+    let value = attribute.attr_value();
+    let text: Option<String> = match value.header.tag() {
+        Tag::BmpString if value.data.len() % 2 == 0 => {
+            let units: Vec<u16> = value
+                .data
+                .chunks_exact(2)
+                .map(|pair: &[u8]| u16::from_be_bytes([pair[0], pair[1]]))
+                .collect();
+            String::from_utf16(&units).ok()
+        }
+        _ => attribute.as_str().ok().map(str::to_string),
+    };
+    match text {
+        Some(text) => escape_rfc4514(&text),
+        None => {
+            let mut der: Vec<u8> = Vec::with_capacity(value.data.len() + 4);
+            // A primitive universal string-like value: one tag byte,
+            // then a DER length.
+            der.push(u8::try_from(value.header.tag().0).unwrap_or(0x04));
+            let len: usize = value.data.len();
+            if len < 0x80 {
+                der.push(u8::try_from(len).unwrap_or(0));
+            } else {
+                let bytes: Vec<u8> = len
+                    .to_be_bytes()
+                    .into_iter()
+                    .skip_while(|b: &u8| *b == 0)
+                    .collect();
+                der.push(0x80 | u8::try_from(bytes.len()).unwrap_or(0));
+                der.extend(bytes);
+            }
+            der.extend_from_slice(value.data);
+            let mut hex: String = String::from("#");
+            for byte in der {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            hex
+        }
+    }
+}
+
+fn escape_rfc4514(value: &str) -> String {
+    let last: usize = value.chars().count().saturating_sub(1);
+    let mut out: String = String::with_capacity(value.len());
+    for (i, c) in value.chars().enumerate() {
+        let leading: bool = i == 0 && (c == ' ' || c == '#');
+        let trailing: bool = i == last && c == ' ';
+        if leading || trailing || matches!(c, '"' | '+' | ',' | ';' | '<' | '>' | '\\') {
+            out.push('\\');
+            out.push(c);
+        } else if c == '\0' {
+            out.push_str("\\00");
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Parsed X.509 metadata from a PEM certificate.
-struct ParsedCertInfo {
-    issuer: String,
-    not_before: chrono::DateTime<chrono::Utc>,
-    not_after: chrono::DateTime<chrono::Utc>,
-    san_domains: Vec<String>,
-    fingerprint: String,
+pub(crate) struct ParsedCertInfo {
+    pub(crate) issuer: String,
+    pub(crate) not_before: chrono::DateTime<chrono::Utc>,
+    pub(crate) not_after: chrono::DateTime<chrono::Utc>,
+    pub(crate) san_domains: Vec<String>,
+    pub(crate) fingerprint: String,
 }
 
 /// Reject a bundle the worker would silently fail to serve. Validates
@@ -169,7 +385,7 @@ pub(crate) fn validate_certificate_bundle(cert_pem: &str, key_pem: &str) -> Resu
 
 /// Parse X.509 metadata from a PEM certificate string.
 /// Falls back to defaults if parsing fails (so uploads always succeed).
-fn parse_cert_pem(cert_pem: &str) -> ParsedCertInfo {
+pub(crate) fn parse_cert_pem(cert_pem: &str) -> ParsedCertInfo {
     let defaults = || ParsedCertInfo {
         issuer: "unknown".to_string(),
         not_before: chrono::Utc::now(),
@@ -286,7 +502,19 @@ pub async fn list_certificates(
         store.list_certificates_without_private_keys()
     })
     .await?;
-    let responses: Vec<_> = certs.iter().map(cert_to_response).collect();
+    // A certificate not seen yet is parsed for its subject: CPU work,
+    // kept off the async workers.
+    let responses: Vec<CertificateResponse> = tokio::task::spawn_blocking(move || {
+        let responses: Vec<CertificateResponse> = certs.iter().map(cert_to_response).collect();
+        let live: HashSet<[u8; 32]> = certs
+            .iter()
+            .map(|cert| pem_digest(&cert.cert_pem))
+            .collect();
+        retain_subjects(&live);
+        responses
+    })
+    .await
+    .map_err(|err| ApiError::Internal(format!("certificate listing task failed: {err}")))?;
     Ok(json_data(serde_json::json!({ "certificates": responses })))
 }
 
@@ -327,6 +555,10 @@ pub async fn create_certificate(
         acme_method: None,
 
         acme_dns_provider_id: None,
+        adcs_authority_id: None,
+        adcs_template: None,
+        adcs_template_oid: None,
+        adcs_request_id: None,
     };
 
     let (cert, export_snapshot) = db_blocking(&state.store, move |store| {
@@ -396,12 +628,29 @@ pub async fn get_certificate(
         created_at: cert.created_at.to_rfc3339(),
         associated_routes,
         acme_method: cert.acme_method.clone(),
+        subject: subject_of(&cert.cert_pem),
+        source: cert.source(),
+        adcs: AdcsCertificateFields::of(&cert),
     };
 
     Ok(json_data(response))
 }
 
+/// The code of a refused PEM or domain change on an AD CS certificate.
+pub const ADCS_CERTIFICATE_MANAGED: &str = crate::adcs::CERTIFICATE_MANAGED.code;
+
+/// The code of a refused private-key download (Epic 13 D16).
+pub const ADCS_KEY_NOT_EXPORTABLE: &str = crate::adcs::KEY_NOT_EXPORTABLE.code;
+
 /// PUT /api/v1/certificates/:id - replace the PEM body, domain, or ACME settings.
+///
+/// An AD CS certificate's PEM, key and domain are refused with 409
+/// `adcs_certificate_managed`: the row is the authority's (its next
+/// renewal requests the stored names and subject under the system
+/// actor), and adoption admits only a certificate the issuing CA signed
+/// (D9), which a replacement would bypass. Reverting it to manual first
+/// makes the replacement an ordinary upload. Its auto-renew setting
+/// stays editable.
 pub async fn update_certificate(
     connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
@@ -410,10 +659,15 @@ pub async fn update_certificate(
     Path(id): Path<String>,
     Json(body): Json<UpdateCertificateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (before_cert, cert) = db_blocking(&state.store, move |store| {
+    let replaces_material: bool =
+        body.domain.is_some() || body.cert_pem.is_some() || body.key_pem.is_some();
+    let updated = db_blocking(&state.store, move |store| {
         let mut cert = store
             .get_certificate(&id)?
             .ok_or_else(|| ApiError::NotFound(format!("certificate {id}")))?;
+        if replaces_material && cert.source() == CertificateSource::Adcs {
+            return Ok(None);
+        }
         let before_cert = cert.clone();
 
         if let Some(domain) = body.domain {
@@ -459,9 +713,15 @@ pub async fn update_certificate(
         }
 
         store.update_certificate(&cert)?;
-        Ok::<_, ApiError>((before_cert, cert))
+        Ok::<_, ApiError>(Some((before_cert, cert)))
     })
     .await?;
+    let Some((before_cert, cert)) = updated else {
+        return Err(crate::adcs::CERTIFICATE_MANAGED.error(
+            "this certificate is issued and renewed by the AD CS authority: its PEM, key and \
+             domain cannot be replaced. Revert it to manual first, then upload the replacement",
+        ));
+    };
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
 
@@ -576,6 +836,10 @@ pub async fn generate_self_signed(
         acme_method: None,
 
         acme_dns_provider_id: None,
+        adcs_authority_id: None,
+        adcs_template: None,
+        adcs_template_oid: None,
+        adcs_request_id: None,
     };
 
     let (certificate, export_snapshot) = db_blocking(&state.store, move |store| {
@@ -626,7 +890,14 @@ pub struct DownloadCertificateQuery {
 }
 
 /// GET /api/v1/certificates/:id/download - emit the PEM payload as a
-/// file download. Auth-gated (this endpoint lives under
+/// file download.
+///
+/// The private key of an AD CS certificate is never served (Epic 13
+/// D16): `key` and `bundle`, the default, answer 403
+/// `adcs_key_not_exportable` for every role. Its `cert` and `chain`
+/// download as any other certificate's. The key is a domain-trusted
+/// identity for any name under the authority's suffixes; Lorica holds
+/// it to serve the certificate and for nothing else. Auth-gated (this endpoint lives under
 /// `protected_routes`), rate-limited per client IP (5 downloads / 60 s,
 /// same bucket shape used for login), audited via `tracing::warn!` with
 /// the operator username + user_id, client IP, cert id, domain and
@@ -670,6 +941,21 @@ pub async fn download_certificate(
     .await?;
 
     let part = q.part.as_deref().unwrap_or("bundle");
+    if cert.source() == CertificateSource::Adcs && matches!(part, "key" | "bundle") {
+        tracing::warn!(
+            username = %session.username,
+            user_id = %session.user_id,
+            client_ip = %client_ip,
+            cert_id = %cert.id,
+            part = %part,
+            "certificate download refused: the private key of an AD CS certificate never leaves \
+             Lorica",
+        );
+        return Err(crate::adcs::KEY_NOT_EXPORTABLE.error(
+            "the private key of a certificate issued by the AD CS authority never leaves Lorica; \
+             download `cert` or `chain` instead",
+        ));
+    }
     let (body, suffix) = match part {
         "cert" => (cert.cert_pem.clone(), "cert"),
         "key" => (cert.key_pem.clone(), "key"),
@@ -765,6 +1051,34 @@ mod download_tests {
         // rejects it - the caller falls back to the opaque cert id,
         // which is exactly what we want for a wildcard cert.
         assert_eq!(sanitize_filename("*.example.com"), None);
+    }
+
+    #[test]
+    fn the_subject_is_written_as_rfc_4514() {
+        let mut params = rcgen::CertificateParams::new(vec!["web.corp.example.org".to_string()])
+            .expect("test setup: params");
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CountryName, "FR");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationName, "Example, Corp");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, " #web.corp.example.org");
+        let key = rcgen::KeyPair::generate().expect("test setup: key");
+        let cert = params.self_signed(&key).expect("test setup: certificate");
+        assert_eq!(
+            subject_of(&cert.pem()),
+            r"CN=\ #web.corp.example.org,O=Example\, Corp,C=FR"
+        );
+        assert_eq!(subject_of("not a certificate"), "");
+        assert_eq!(
+            subject_of(&cert.pem()),
+            parse_subject(&cert.pem()),
+            "the cached subject is the parsed one"
+        );
     }
 
     #[test]

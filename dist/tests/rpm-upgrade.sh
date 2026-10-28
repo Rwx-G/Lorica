@@ -26,6 +26,13 @@
 # although the old preun disables it on the way out whatever its state.
 #
 # `clean` installs the new package on a host that never had lorica.
+#
+# The new package is always installed with dnf, never `rpm -i`/`-U`: it
+# requires krb5-libs, which dnf resolves from the repositories the way
+# an operator's install does and rpm would refuse as a failed
+# dependency. Released packages keep `rpm -ivh`, as they were installed.
+# After every install or upgrade to the new package, its binaries must
+# resolve every library and start.
 set -uo pipefail
 
 SERVED_CERT=/var/lib/lorica/management/served-cert.pem
@@ -60,6 +67,26 @@ install_quietly() {
     fi
 }
 
+# The new package through dnf: `install` for a first install or an
+# upgrade, `reinstall` over the same version, which runs the old
+# instance's preun with $1 = 1 as rpm -U --replacepkgs did. dnf reports
+# every scriptlet it runs, so only a failed one is looked for. The
+# package's signature is the release job's business, not this test's.
+dnf_new() {
+    dnf -y --nogpgcheck "$@" > /tmp/lorica-rpm.out 2>&1 || { cat /tmp/lorica-rpm.out; fail "dnf $*"; }
+    if grep -qiE "scriptlet failed|error in .*scriptlet" /tmp/lorica-rpm.out; then
+        cat /tmp/lorica-rpm.out
+        fail "a scriptlet failed: dnf $*"
+    fi
+}
+
+binaries_run() {
+    ldd /usr/bin/lorica /usr/bin/lorica-mcp | grep -q 'not found' \
+        && { ldd /usr/bin/lorica /usr/bin/lorica-mcp; fail "an unresolved library"; }
+    /usr/bin/lorica --version || fail "lorica --version"
+    echo "every library resolved, GSS-API from $(ldd /usr/bin/lorica | awk '/libgssapi_krb5/ {print $3}')"
+}
+
 # Put the service in the given enablement and activity, reinstall `new`
 # over it, and require both unchanged. A probe file the node's account
 # does not own, below the data directory, must keep its owner: the
@@ -79,7 +106,7 @@ keeps_state() {
     fi
     touch "$probe"
     chown 0:0 "$probe"
-    install_quietly -Uvh --replacepkgs --nosignature "$new"
+    dnf_new reinstall "$new"
     if [ "$activity" = active ]; then
         wait_active || fail "$enablement and $activity: not running after the reinstall"
         assert_persistence "$enablement and $activity"
@@ -107,7 +134,8 @@ upgrade() {
     record_old_audit_rows "$OLD"
 
     echo "=== upgrade to the new package"
-    install_quietly -Uvh --nosignature "$new"
+    dnf_new install "$new"
+    binaries_run
     wait_active || fail "not active after the upgrade from $OLD, or no served certificate"
     [ "$(systemctl is-enabled lorica.service)" = enabled ] || fail "not enabled after the upgrade from $OLD"
     echo "active and enabled, $SERVED_CERT written"
@@ -115,7 +143,7 @@ upgrade() {
 
     echo "=== reinstall over itself (its own preun runs with \$1 = 1)"
     pid_before=$(systemctl show -p MainPID --value lorica.service)
-    install_quietly -Uvh --replacepkgs --nosignature "$new"
+    dnf_new reinstall "$new"
     wait_active || fail "not active after the reinstall"
     [ "$(systemctl is-enabled lorica.service)" = enabled ] || fail "not enabled after the reinstall"
     pid_after=$(systemctl show -p MainPID --value lorica.service)
@@ -137,7 +165,8 @@ upgrade() {
     install_quietly -ivh --nosignature "$old"
     wait_active without-record || fail "$OLD did not start"
     systemctl disable --now lorica.service > /dev/null 2>&1
-    install_quietly -Uvh --nosignature "$new"
+    dnf_new install "$new"
+    binaries_run
     sleep 2
     [ "$(systemctl is-active lorica.service)" != active ] || fail "the upgrade started a stopped $OLD node"
     [ "$(systemctl is-enabled lorica.service)" = disabled ] || fail "the upgrade enabled a disabled $OLD node"
@@ -148,8 +177,9 @@ upgrade() {
 clean() {
     local new="$1"
     echo "=== install on a host that never had lorica"
-    install_quietly -ivh --nosignature "$new"
+    dnf_new install "$new"
     grep -q "served-cert.pem" /tmp/lorica-rpm.out || fail "the banner does not name the served certificate"
+    binaries_run
     wait_active || fail "not active, or no served certificate"
     [ "$(systemctl is-enabled lorica.service)" = enabled ] || fail "not enabled"
     echo "active and enabled, $SERVED_CERT written"

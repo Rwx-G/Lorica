@@ -25,7 +25,7 @@ info:
     reachable by no token, including a token carrying every scope in the
     enum: refusing outright is what keeps a path added without a
     declaration from silently inheriting the widest grant.
-  version: "1.9.3"
+  version: "1.10.0"
   license:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
@@ -1248,8 +1248,11 @@ paths:
       tags: [Reads]
       summary: Certificate metadata
       description: >-
-        Domain, SAN names, SHA-256 fingerprint, issuer, validity window
-        and ACME settings, per stored certificate.
+        Domain, SAN names, SHA-256 fingerprint, issuer, subject,
+        validity window, derived `source` (`acme`, `adcs`, `manual`) and
+        renewal settings, per stored certificate. The AD CS authority id,
+        template and request identifier are not answered: internal PKI
+        detail no token caller acts on.
 
 
         Metadata only. No PEM body of any kind crosses this path, and
@@ -1295,6 +1298,11 @@ paths:
         the token. A certificate that was uploaded rather than issued
         answers 400 exactly as there, because there is nothing to renew
         it against, and no path on this listener takes the replacement.
+        A certificate issued by the AD CS authority answers 403
+        `adcs_renewal_not_on_automation_plane`, preview included: it is
+        renewed by the node's background loop and the dashboard only.
+        The refusal comes after the grant check, so a token outside its
+        grant gets the grant's 403 and learns nothing about the row.
 
 
         No body. Nothing about the certificate is an argument, its key
@@ -1338,7 +1346,11 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
-          $ref: "#/components/responses/Forbidden"
+          description: The token lacks the scope, the certificate is outside its grant, or the certificate is an AD CS one (`adcs_renewal_not_on_automation_plane`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           $ref: "#/components/responses/ManagementRefusal"
         "409":

@@ -26,6 +26,7 @@ use crate::crypto::EncryptionKey;
 use crate::error::{ConfigError, Result};
 
 mod acme_challenges;
+mod adcs_authority;
 mod ai_crawlers;
 mod automation_environment;
 mod automation_token;
@@ -188,6 +189,9 @@ const MIGRATIONS: &[Migration] = &[
     (61, migrate_route_waf_body_scan_cap),
     (62, migrate_downstream_idle_timeout),
     (63, migrate_subscribe_log_store_alerts),
+    (64, migrate_adcs_authority),
+    (65, migrate_subscribe_adcs_alerts),
+    (66, migrate_adcs_allowed_templates),
 ];
 
 /// Which telemetry fan-in cursor a follower is reading or advancing
@@ -1183,6 +1187,28 @@ const LOG_STORE_ALERT_TYPES: [&str; 2] = ["log_store_unavailable", "log_store_re
 /// default, they can untick it. A row whose list does not parse is left
 /// for `row_to_notification_config` to report, as every read does.
 fn migrate_subscribe_log_store_alerts(conn: &Connection) -> rusqlite::Result<()> {
+    subscribe_explicit_channels(conn, &LOG_STORE_ALERT_TYPES)
+}
+
+/// The alert types Story 13.2 introduced, as migration 65 subscribes
+/// existing channels to them. Frozen for the reason given on
+/// `LOG_STORE_ALERT_TYPES`.
+const ADCS_ALERT_TYPES: [&str; 2] = ["adcs_authority_failed", "cert_issuance_failed"];
+
+/// Subscribe every notification channel saved with an explicit
+/// alert-type list to the AD CS alerts, for the reason migration 63
+/// gave: a channel saved before these types existed never had the box
+/// to tick, and an authority whose account is locked out, or a
+/// certificate that silently failed to renew, would page nobody.
+fn migrate_subscribe_adcs_alerts(conn: &Connection) -> rusqlite::Result<()> {
+    subscribe_explicit_channels(conn, &ADCS_ALERT_TYPES)
+}
+
+/// Append `new_types` to every channel whose stored list is explicit.
+/// An empty list or one holding `*` already receives every type, and a
+/// row whose list does not parse is left for
+/// `row_to_notification_config` to report.
+fn subscribe_explicit_channels(conn: &Connection, new_types: &[&str]) -> rusqlite::Result<()> {
     // Absent only from the partial schemas some tests build; with no
     // table there is no channel to subscribe.
     if !column_exists(conn, "notification_configs", "alert_types")? {
@@ -1200,7 +1226,7 @@ fn migrate_subscribe_log_store_alerts(conn: &Connection) -> rusqlite::Result<()>
             continue;
         }
         let before = types.len();
-        for new_type in LOG_STORE_ALERT_TYPES {
+        for &new_type in new_types {
             if !types.iter().any(|t| t == new_type) {
                 types.push(new_type.to_string());
             }
@@ -1213,6 +1239,101 @@ fn migrate_subscribe_log_store_alerts(conn: &Connection) -> rusqlite::Result<()>
         conn.execute(
             "UPDATE notification_configs SET alert_types = ?2 WHERE id = ?1",
             params![id, updated],
+        )?;
+    }
+    Ok(())
+}
+
+/// Story 13.2: the AD CS authority and the certificate columns that
+/// reference it (Epic 13 PRD D10, D14, D15).
+///
+/// One table with a stable `id` rather than `global_settings` rows: a
+/// suffix list, two PEM bundles and a subject do not fit scalar
+/// key/value rows, and the table never replicates (D13), which
+/// `global_settings` routing would have to be taught. At most one row
+/// is a rule of the store's upsert, not of the schema, so a later
+/// release supporting several authorities needs no migration.
+///
+/// `password_enc` is nullable and base64 ciphertext, registered in
+/// `ENCRYPTED_COLUMNS` as a Text column; NULL means "no password set".
+/// The failed-state columns are the D15 breaker, persisted so a restart
+/// does not spend another pre-authentication against a locked account.
+///
+/// `certificates.adcs_authority_id` carries no `REFERENCES`: followers
+/// hold AD CS certificates without the authority row, and under
+/// `PRAGMA foreign_keys=ON` a constraint would fail every replica
+/// apply. The delete guard in `store/adcs_authority.rs` keeps the
+/// reference honest on the control plane. Every column is nullable with
+/// no backfill, so every existing certificate stays manual (D9).
+fn migrate_adcs_authority(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS adcs_authority (
+            id TEXT PRIMARY KEY,
+            endpoint TEXT NOT NULL,
+            realm TEXT NOT NULL,
+            kdcs_json TEXT NOT NULL DEFAULT '[]',
+            principal TEXT NOT NULL,
+            password_enc TEXT DEFAULT NULL,
+            endpoint_ca_pem TEXT DEFAULT NULL,
+            issuing_ca_pem TEXT DEFAULT NULL,
+            default_template TEXT NOT NULL,
+            default_key_type TEXT NOT NULL DEFAULT 'rsa2048',
+            subject_country TEXT DEFAULT NULL,
+            subject_state TEXT DEFAULT NULL,
+            subject_locality TEXT DEFAULT NULL,
+            subject_organization TEXT DEFAULT NULL,
+            subject_organizational_unit TEXT DEFAULT NULL,
+            subject_email TEXT DEFAULT NULL,
+            allowed_suffixes_json TEXT NOT NULL,
+            auto_renew_default INTEGER NOT NULL DEFAULT 1,
+            failed_since TEXT DEFAULT NULL,
+            failed_step TEXT DEFAULT NULL,
+            failed_kdc_code INTEGER DEFAULT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );",
+    )?;
+    add_column_if_absent(
+        conn,
+        "certificates",
+        "adcs_authority_id",
+        "TEXT DEFAULT NULL",
+    )?;
+    add_column_if_absent(conn, "certificates", "adcs_template", "TEXT DEFAULT NULL")?;
+    add_column_if_absent(
+        conn,
+        "certificates",
+        "adcs_template_oid",
+        "TEXT DEFAULT NULL",
+    )?;
+    add_column_if_absent(conn, "certificates", "adcs_request_id", "TEXT DEFAULT NULL")
+}
+
+/// Epic 13 D17: the templates an issuance may request become a list on
+/// the authority. An authority saved before the list existed gets its
+/// default template as the whole list, which is exactly what it
+/// permitted in practice once the override is bounded; anything wider is
+/// a SuperAdmin's decision to make afterwards, not the migration's.
+fn migrate_adcs_allowed_templates(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "adcs_authority",
+        "allowed_templates_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    let unlisted: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, default_template FROM adcs_authority              WHERE allowed_templates_json = '[]'",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<(String, String)>>>()?
+    };
+    for (id, default_template) in unlisted {
+        let list: String = serde_json::to_string(&[default_template])
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+        conn.execute(
+            "UPDATE adcs_authority SET allowed_templates_json = ?1 WHERE id = ?2",
+            params![list, id],
         )?;
     }
     Ok(())
@@ -1257,7 +1378,8 @@ enum EncryptedColumn {
         id_col: &'static str,
         col: &'static str,
     },
-    /// A TEXT column holding base64-wrapped ciphertext.
+    /// A TEXT column holding base64-wrapped ciphertext. NULL means
+    /// "no secret set" and is skipped by the rotation.
     Text {
         table: &'static str,
         id_col: &'static str,
@@ -1314,6 +1436,13 @@ const ENCRYPTED_COLUMNS: &[EncryptedColumn] = &[
         table: "dns_providers",
         id_col: "id",
         col: "config",
+    },
+    // The AD CS service account password (Story 13.2, PRD D3).
+    // Nullable: a row with no password set has nothing to rotate.
+    EncryptedColumn::Text {
+        table: "adcs_authority",
+        id_col: "id",
+        col: "password_enc",
     },
     // Log-export sink secrets (Story 9.8).
     EncryptedColumn::KvText {
@@ -1411,6 +1540,18 @@ impl ConfigStore {
         };
         store.run_migrations()?;
         Ok(store)
+    }
+
+    /// Whether this store encrypts at rest.
+    ///
+    /// The `encrypt_*` helpers pass plaintext through when no key is
+    /// loaded, which is right for a test store and wrong for a secret
+    /// that must never sit on disk in clear, such as the AD CS
+    /// password (PRD D3). Writers of such a secret refuse when this is
+    /// false rather than trusting that every production path opens the
+    /// store with a key.
+    pub fn has_encryption_key(&self) -> bool {
+        self.encryption_key.is_some()
     }
 
     pub(super) fn encrypt_key_pem(&self, key_pem: &str) -> Result<Vec<u8>> {
@@ -1605,10 +1746,19 @@ impl ConfigStore {
                 }
                 EncryptedColumn::Text { table, id_col, col } => {
                     let mut stmt = tx.prepare(&format!("SELECT {id_col}, {col} FROM {table}"))?;
+                    // NULL is an unset secret (the AD CS password before
+                    // anyone enters it): no ciphertext, nothing to
+                    // re-encrypt. Reading it as `String` would fail the
+                    // whole rotation on a perfectly healthy row.
                     let rows: Vec<(String, String)> = stmt
                         .query_map([], |row| {
-                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
                         })?
+                        .filter_map(|row| match row {
+                            Ok((id, Some(stored))) => Some(Ok((id, stored))),
+                            Ok((_, None)) => None,
+                            Err(e) => Some(Err(e)),
+                        })
                         .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
                     drop(stmt);
                     let mut update = tx.prepare(&format!(
@@ -1843,6 +1993,10 @@ impl ConfigStore {
     ///   configuration (target uid / gid live on the destination
     ///   host, not in source-of-truth config). NOT in the TOML
     ///   export today by design.
+    /// - `adcs_authority` : a control-plane object holding a service
+    ///   account credential, absent from the export (Epic 13 PRD
+    ///   D14). An import keeps the node's authority, and a certificate
+    ///   naming another one is imported as manual.
     ///
     /// `dns_providers` IS in the delete set because the TOML export
     /// carries DNS-provider credentials (in scrubbed form per audit

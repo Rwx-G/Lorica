@@ -824,6 +824,10 @@ mod tests {
             created_at: now,
             acme_method: None,
             acme_dns_provider_id: None,
+            adcs_authority_id: None,
+            adcs_template: None,
+            adcs_template_oid: None,
+            adcs_request_id: None,
         }
     }
 
@@ -1116,6 +1120,81 @@ mod tests {
             "Story 9.5 delivers the key on its own path; 9.4 must not invent one"
         );
         assert_eq!(cert.fingerprint, "sha256:replica", "metadata still applies");
+    }
+
+    #[test]
+    fn an_adcs_certificate_replicates_and_its_authority_never_does() {
+        // Epic 13 PRD D13: the authority, its failed state and its
+        // issuing CA certificate stay on the control plane; the
+        // certificates it issued reach followers with their `adcs_*`
+        // columns, and no foreign key refuses them there.
+        let source = ConfigStore::open_in_memory().expect("source opens");
+        let target = ConfigStore::open_in_memory().expect("target opens");
+        seed_source(&source);
+        source
+            .upsert_adcs_authority(&crate::models::sample_adcs_authority("adcs-1"))
+            .expect("test setup: authority");
+        source
+            .set_adcs_failed("ticket_acquisition", Some(24))
+            .expect("test setup: failed state");
+        let mut cert = source
+            .get_certificate("cert-1")
+            .expect("test setup: cert read")
+            .expect("test setup: cert exists");
+        cert.adcs_authority_id = Some("adcs-1".to_string());
+        cert.adcs_template = Some("LoricaWebServer".to_string());
+        cert.adcs_request_id = Some("4242".to_string());
+        source
+            .update_certificate(&cert)
+            .expect("test setup: cert update");
+
+        let fleet = crate::canonical::canonical_config(&source).expect("canonical config");
+        let resolution = crate::canonical::SelectorResolution::from_rows([(
+            "edge-1".to_string(),
+            "id-1".to_string(),
+        )]);
+        let cut = crate::canonical::restrict_for_recipient(&fleet, "id-1", &resolution);
+        assert!(
+            cut.certificates.iter().any(|c| c.id == "cert-1"),
+            "test setup: the follower payload carries the AD CS certificate"
+        );
+        for (payload, label) in [(&fleet, "canonical blob"), (&cut, "follower payload")] {
+            let bytes = crate::canonical::encode_canonical(payload).expect("encode");
+            let text = String::from_utf8(bytes).expect("the blob is UTF-8");
+            assert!(
+                !text
+                    .to_ascii_lowercase()
+                    .contains(crate::models::ADCS_FIXTURE_SENTINEL),
+                "{label} carries authority data: {text}"
+            );
+            assert!(!text.contains("ticket_acquisition"), "{label}: {text}");
+            assert!(!text.contains("\"adcs_authority\""), "{label}: {text}");
+        }
+
+        // The follower already holds the key, so the hash comparison
+        // below is about the authority and nothing else.
+        target
+            .create_certificate(&make_certificate("cert-1", CERT_KEY))
+            .expect("test setup: target holds the key");
+        let config = prepared(&source).expect("prepare");
+        target
+            .apply_replica(&config, "edge-1", 1, "h1")
+            .expect("apply without the authority row");
+        assert!(target
+            .get_adcs_authority()
+            .expect("follower authority read")
+            .is_none());
+        let applied = target
+            .get_certificate("cert-1")
+            .expect("cert")
+            .expect("row");
+        assert_eq!(applied.adcs_authority_id.as_deref(), Some("adcs-1"));
+        assert_eq!(applied.adcs_request_id.as_deref(), Some("4242"));
+        assert_eq!(
+            canonical_hash(&source).expect("source hash"),
+            canonical_hash(&target).expect("target hash"),
+            "the authority is not part of what the fleet hashes"
+        );
     }
 
     #[test]

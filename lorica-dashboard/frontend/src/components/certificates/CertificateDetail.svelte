@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { CertificateDetailResponse, RouteResponse } from '../../lib/api';
+  import { CERTIFICATE_SOURCE_LABELS } from '../../lib/adcs.generated';
   import CertExpiryBadge from '../CertExpiryBadge.svelte';
 
   interface Props {
@@ -50,6 +51,10 @@
           </div>
         {/if}
         <div class="detail-row">
+          <span class="detail-label">Subject</span>
+          <span class="detail-value mono" data-testid="cert-detail-subject">{detailCert.subject || 'not readable'}</span>
+        </div>
+        <div class="detail-row">
           <span class="detail-label">Issuer</span>
           <span class="detail-value">{detailCert.issuer}</span>
         </div>
@@ -69,9 +74,25 @@
           <span class="detail-value mono">{detailCert.fingerprint}</span>
         </div>
         <div class="detail-row">
-          <span class="detail-label">ACME</span>
-          <span class="detail-value">{detailCert.is_acme ? 'Yes' : 'No'}{detailCert.acme_auto_renew ? ' (auto-renew)' : ''}</span>
+          <span class="detail-label">Source</span>
+          <span class="detail-value" data-testid="cert-detail-source">
+            {CERTIFICATE_SOURCE_LABELS[detailCert.source]}{detailCert.source !== 'manual' && detailCert.acme_auto_renew ? ' (auto-renew)' : ''}
+          </span>
         </div>
+        {#if detailCert.source === 'adcs'}
+          <div class="detail-row">
+            <span class="detail-label">AD CS template</span>
+            <span class="detail-value">{detailCert.adcs_template ?? 'unknown'}</span>
+          </div>
+          <div class="detail-row">
+            <span class="detail-label">Template OID</span>
+            <span class="detail-value mono">{detailCert.adcs_template_oid ?? 'not observed'}</span>
+          </div>
+          <div class="detail-row">
+            <span class="detail-label">AD CS request id</span>
+            <span class="detail-value">{detailCert.adcs_request_id ?? 'unknown'}</span>
+          </div>
+        {/if}
         {#if detailCert.acme_method}
           <div class="detail-row">
             <span class="detail-label">ACME Method</span>

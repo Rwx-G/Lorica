@@ -7,6 +7,8 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     protobuf-compiler \
     cmake \
+    libkrb5-dev \
+    libclang-dev \
     rpm \
     dpkg-dev \
     jq \

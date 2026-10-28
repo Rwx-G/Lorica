@@ -1,8 +1,26 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import type { RouteFormState } from '../../lib/route-form';
-  import type { BackendResponse, CertificateResponse } from '../../lib/api';
+  import {
+    api,
+    type AdcsAuthorityState,
+    type AdcsIssueRequest,
+    type BackendResponse,
+    type CertificateResponse,
+  } from '../../lib/api';
   import { ROUTE_DEFAULTS } from '../../lib/route-form';
   import { findUncoveredHostnames } from '../../lib/cert-san-match';
+  import {
+    adcsIssuanceBlocker,
+    adcsIssueOutcome,
+    adcsTemplateOptions,
+    hostnamesWithoutCertificate,
+    type AdcsIssueOutcome,
+  } from '../../lib/adcs-issuance';
+  import { canWriteRole } from '../../lib/auth';
+  import { nodeRole } from '../../lib/cluster';
+  import AdcsIssueConfirm from '../certificates/AdcsIssueConfirm.svelte';
+  import AdcsOutcomeMessage from '../certificates/AdcsOutcomeMessage.svelte';
   import SubsectionHeader from '../SubsectionHeader.svelte';
   import FieldHelpButton from '../FieldHelpButton.svelte';
   import HelpModal from '../HelpModal.svelte';
@@ -19,7 +37,7 @@
     importedFields?: Set<string>;
   }
 
-  let { form = $bindable(), backends, certificates, importedFields }: Props = $props();
+  let { form = $bindable(), backends, certificates = $bindable(), importedFields }: Props = $props();
 
   const loadBalancingOptions = [
     { value: 'round_robin', label: 'Weighted Round Robin' },
@@ -90,6 +108,65 @@
   let uncoveredByCert = $derived(
     selectedCert ? findUncoveredHostnames(routeHostnames, selectedCert.san_domains) : [],
   );
+
+  // Story 13.3: names no stored certificate covers drive the one-click
+  // AD CS issuance. Gated like the certificate page: Operator role, not
+  // a follower, an authority configured and not in the failed state.
+  let hostnamesNeedingCert = $derived(hostnamesWithoutCertificate(routeHostnames, certificates));
+  let adcsState = $state<AdcsAuthorityState | null>(null);
+  let adcsOffered = $derived(
+    adcsState !== null &&
+      hostnamesNeedingCert.length > 0 &&
+      adcsIssuanceBlocker({
+        canIssue: $canWriteRole,
+        follower: $nodeRole === 'follower',
+        state: adcsState,
+      }) === null,
+  );
+  let adcsTemplates = $derived(adcsState?.authority ? adcsTemplateOptions(adcsState.authority) : []);
+  let adcsTemplate = $state('');
+  let adcsRequest = $state<AdcsIssueRequest | null>(null);
+  let adcsSubmitting = $state(false);
+  let adcsOutcome = $state<AdcsIssueOutcome | null>(null);
+
+  onMount(async () => {
+    // A Viewer or a follower is never offered issuance, so the read is
+    // skipped rather than made for nothing.
+    if (!$canWriteRole || $nodeRole === 'follower') return;
+    const res = await api.getAdcsAuthority();
+    if (res.data) {
+      adcsState = res.data;
+      adcsTemplate = res.data.authority?.default_template ?? '';
+    }
+  });
+
+  function openAdcsConfirm(): void {
+    const authority = adcsState?.authority;
+    if (!authority) return;
+    adcsOutcome = null;
+    adcsRequest = {
+      sans: [...hostnamesNeedingCert],
+      ...(adcsTemplate !== authority.default_template ? { template: adcsTemplate } : {}),
+      auto_renew: authority.auto_renew_default,
+    };
+  }
+
+  async function issueFromAdcs(): Promise<void> {
+    if (!adcsRequest) return;
+    adcsSubmitting = true;
+    const res = await api.issueAdcsCertificate(adcsRequest);
+    adcsSubmitting = false;
+    adcsRequest = null;
+    adcsOutcome = adcsIssueOutcome(res);
+    if (adcsOutcome.kind !== 'issued') return;
+    const issued = adcsOutcome.certificate;
+    form.certificate_id = issued.id;
+    const list = await api.listCertificates();
+    // The selection must resolve even when the re-read fails or
+    // predates the new row, or the select would show "None".
+    const fresh = list.data?.certificates ?? certificates;
+    certificates = fresh.some((c) => c.id === issued.id) ? fresh : [...fresh, issued];
+  }
 </script>
 
 <div class="tab-content">
@@ -158,6 +235,35 @@
             Cert SAN list:
             {selectedCert.san_domains.length > 0 ? selectedCert.san_domains.join(', ') : '(empty)'}.
           </div>
+        {/if}
+        {#if adcsOffered}
+          <div class="adcs-offer" role="note" data-testid="adcs-route-offer">
+            <span>
+              No stored certificate covers
+              {hostnamesNeedingCert.length === 1 ? 'this hostname' : 'these hostnames'}:
+              {hostnamesNeedingCert.join(', ')}.
+            </span>
+            <span class="adcs-offer-actions">
+              <label for="adcs-route-template">Template</label>
+              <select id="adcs-route-template" bind:value={adcsTemplate}>
+                {#each adcsTemplates as name (name)}
+                  <option value={name}>{name}{name === adcsState?.authority?.default_template ? ' (default)' : ''}</option>
+                {/each}
+              </select>
+              <button type="button" class="btn-adcs" onclick={openAdcsConfirm}>Issue from AD CS</button>
+            </span>
+          </div>
+        {/if}
+        {#if adcsOutcome?.kind === 'issued'}
+          <div class="adcs-result ok" role="status" data-testid="adcs-route-outcome">
+            Issued a certificate for {adcsOutcome.certificate.domain} from AD CS and
+            selected it. The route uses it once saved.
+            {#if adcsOutcome.certificate.subject}
+              Subject as issued by the authority: <code>{adcsOutcome.certificate.subject}</code>.
+            {/if}
+          </div>
+        {:else if adcsOutcome}
+          <AdcsOutcomeMessage outcome={adcsOutcome} testId="adcs-route-outcome" />
         {/if}
       </div>
 
@@ -265,6 +371,16 @@
     </div>
   </section>
 </div>
+
+{#if adcsRequest && adcsState?.authority}
+  <AdcsIssueConfirm
+    authority={adcsState.authority}
+    request={adcsRequest}
+    submitting={adcsSubmitting}
+    onconfirm={issueFromAdcs}
+    oncancel={() => { adcsRequest = null; }}
+  />
+{/if}
 
 {#if activeHelp === 'section:default_backends'}
   <HelpModal title="Default backends" onclose={() => { activeHelp = null; }}>
@@ -498,6 +614,49 @@
     line-height: 1.45;
   }
   .warn-banner strong { color: var(--color-text-heading); }
+
+  .adcs-offer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-top: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    background: rgba(59, 130, 246, 0.08);
+    border-left: 3px solid var(--color-primary);
+    border-radius: 0 0.25rem 0.25rem 0;
+    font-size: 0.8125rem;
+    color: var(--color-text);
+    line-height: 1.45;
+  }
+  .btn-adcs {
+    flex: none;
+    padding: 0.375rem 0.75rem;
+    border: 1px solid var(--color-primary);
+    border-radius: 0.375rem;
+    background: transparent;
+    color: var(--color-primary);
+    font-size: 0.8125rem;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .btn-adcs:hover { background: var(--color-primary-subtle); }
+  .adcs-result {
+    margin-top: 0.5rem;
+    font-size: 0.8125rem;
+    line-height: 1.45;
+  }
+  .adcs-result.ok { color: var(--color-green); }
+  .adcs-offer-actions {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .adcs-offer-actions select {
+    width: auto;
+    max-width: 14rem;
+  }
 
   .eval-order-banner {
     font-size: 0.8125rem;

@@ -2,6 +2,9 @@
   import { onMount } from 'svelte';
   import {
     api,
+    type AdcsAdoptionCandidates,
+    type AdcsAuthorityState,
+    type CertificateDownloadPart,
     type CertificateResponse,
     type CertificateDetailResponse,
     type RouteResponse,
@@ -9,6 +12,8 @@
   } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import CertificateAcmeForm from '../components/certificates/CertificateAcmeForm.svelte';
+  import AdcsAdoptionPanel from '../components/certificates/AdcsAdoptionPanel.svelte';
+  import CertificateAdcsForm from '../components/certificates/CertificateAdcsForm.svelte';
   import CertificateEditForm from '../components/certificates/CertificateEditForm.svelte';
   import CertificateList from '../components/certificates/CertificateList.svelte';
   import CertificateUploadForm from '../components/certificates/CertificateUploadForm.svelte';
@@ -17,7 +22,17 @@
   import CertificateSelfSignedPrefPrompt from '../components/certificates/CertificateSelfSignedPrefPrompt.svelte';
   import CertificateThresholdsForm from '../components/certificates/CertificateThresholdsForm.svelte';
   import { showToast } from '../lib/toast';
-  import { canWrite, isSuperAdmin } from '../lib/auth';
+  import { canWrite, canWriteRole, isSuperAdmin } from '../lib/auth';
+  import { nodeRole } from '../lib/cluster';
+  import {
+    adcsErrorMessage,
+    adcsRenewalOffered,
+    adcsRenewOutcome,
+    downloadPartRefusal,
+    isAdcsFollower,
+    type AdcsRenewOutcome,
+  } from '../lib/adcs-issuance';
+  import { ADCS_NO_ISSUING_CA_HINT, adcsAdoptionBanner } from '../lib/adcs-adoption';
 
   let certificates: CertificateResponse[] = $state([]);
   let routes: RouteResponse[] = $state([]);
@@ -49,6 +64,64 @@
   // Renew state
   let renewingId = $state('');
 
+  // AD CS renewal (Story 13.4). `canWriteRole`, not `canWrite`: a
+  // follower in a break-glass window regains `canWrite`, but the API
+  // refuses every AD CS operation on a follower.
+  let adcsState = $state<AdcsAuthorityState | null>(null);
+  let adcsRenewable = $derived(
+    adcsRenewalOffered({
+      canIssue: $canWriteRole,
+      follower: $nodeRole === 'follower',
+      state: adcsState,
+    }),
+  );
+  let adcsRenewConfirm: CertificateResponse | null = $state(null);
+  let adcsRenewResult: { domain: string; outcome: AdcsRenewOutcome } | null = $state(null);
+
+  async function loadAdcsState() {
+    // Renewal is never offered to a Viewer or on a follower, so the
+    // read is skipped rather than made for nothing.
+    if (!$canWriteRole || $nodeRole === 'follower') return;
+    const res = await api.getAdcsAuthority();
+    if (res.data) adcsState = res.data;
+  }
+
+  // AD CS adoption (Story 13.5). Same `canWriteRole` reason as renewal:
+  // adopting and reverting are refused on a follower in every window.
+  // Neither issues anything, so the authority's failed state does not
+  // gate them.
+  const onFollower = $derived(isAdcsFollower($nodeRole, adcsState));
+  const adcsOperable = $derived($canWriteRole && !onFollower);
+  let adoption = $state<AdcsAdoptionCandidates | null>(null);
+  let showAdoption = $state(false);
+  let adoptionBanner = $derived(
+    adcsAdoptionBanner({ canAdopt: $canWriteRole, follower: onFollower, candidates: adoption }),
+  );
+  let revertConfirm: CertificateResponse | null = $state(null);
+
+  async function loadAdoptionCandidates() {
+    if (!$canWriteRole || $nodeRole === 'follower') return;
+    const res = await api.listAdcsAdoptionCandidates();
+    if (res.data) adoption = res.data;
+  }
+
+  async function revertToManual() {
+    const cert = revertConfirm;
+    if (!cert) return;
+    revertConfirm = null;
+    const res = await api.revertAdcsCertificate(cert.id);
+    if (res.error) {
+      showToast(adcsErrorMessage(res.error), 'error');
+    } else {
+      showToast(`${cert.domain} is a manual certificate again`, 'success');
+    }
+    await loadData();
+  }
+
+  function revertMessage(cert: CertificateResponse): string {
+    return `Revert ${cert.domain} to manual? Lorica stops renewing it from the AD CS authority and keeps the current certificate in service until you replace it. To pause renewal and keep it AD CS managed, turn auto-renew off in Edit instead.`;
+  }
+
   // Self-signed generation state
   let showSelfSigned = $state(false);
   const SS_PREF_KEY = 'lorica_self_signed_pref';
@@ -68,9 +141,25 @@
     showAcmeForm = true;
   }
 
-  async function loadData() {
+  // AD CS issuance state (Story 13.3)
+  let showAdcsForm = $state(false);
+
+  function viewIssuedCertificate(cert: CertificateResponse) {
+    showAdcsForm = false;
+    void openDetail(cert);
+  }
+
+  /**
+   * `candidates: false` after a renewal: renewing keeps a certificate's
+   * source, so it cannot add or remove an adoption candidate, and the
+   * listing verifies a signature per stored certificate on the server.
+   */
+  async function loadData({ candidates = true }: { candidates?: boolean } = {}) {
     loading = true;
     error = '';
+    // Any other certificate change can add or remove a candidate, so
+    // the candidates are re-read with the list, in parallel with it.
+    const adoptionRead = candidates ? loadAdoptionCandidates() : Promise.resolve();
     const [certsRes, routesRes, settingsRes, , dnsRes] = await Promise.all([
       api.listCertificates(),
       api.listRoutes(),
@@ -93,10 +182,14 @@
     if (dnsRes.data) {
       dnsProviders = dnsRes.data.dns_providers;
     }
+    await adoptionRead;
     loading = false;
   }
 
-  onMount(loadData);
+  onMount(() => {
+    void loadData();
+    void loadAdcsState();
+  });
 
   function getRoutesForCert(certId: string): RouteResponse[] {
     return routes.filter((r) => r.certificate_id === certId);
@@ -140,6 +233,10 @@
   }
 
   async function handleRenew(cert: CertificateResponse) {
+    if (cert.source === 'adcs') {
+      adcsRenewConfirm = cert;
+      return;
+    }
     renewingId = cert.id;
     const res = await api.renewCertificate(cert.id);
     if (res.error) {
@@ -148,7 +245,26 @@
       showToast(`Certificate for ${cert.domain} renewed successfully`, 'success');
     }
     renewingId = '';
-    await loadData();
+    await loadData({ candidates: false });
+  }
+
+  async function renewFromAdcs() {
+    const cert = adcsRenewConfirm;
+    if (!cert) return;
+    adcsRenewConfirm = null;
+    adcsRenewResult = null;
+    renewingId = cert.id;
+    const res = await api.renewCertificate(cert.id);
+    renewingId = '';
+    adcsRenewResult = { domain: cert.domain, outcome: adcsRenewOutcome(res) };
+    // A credential rejection puts the authority in the failed state;
+    // re-reading it hides "Renew now" until a SuperAdmin fixes it.
+    await Promise.all([loadData({ candidates: false }), loadAdcsState()]);
+  }
+
+  function adcsRenewMessage(cert: CertificateResponse): string {
+    const template = cert.adcs_template ? `template ${cert.adcs_template}` : 'its recorded template';
+    return `Renew ${cert.domain} from the AD CS authority? The authority records a new issuance under ${template}, for the same names and subject, with a new key. Only its administrators can revoke it. The current certificate stays in service until the new one is stored.`;
   }
 
   // Two-stage download for private keys: the `key` and `bundle` parts
@@ -156,9 +272,14 @@
   // modal so one click never silently drops a private key onto the
   // operator's filesystem. `cert` and `chain` bypass the confirm -
   // they carry no secret material.
-  let pendingDownload: { cert: CertificateResponse; part: 'cert' | 'key' | 'chain' | 'bundle' } | null = $state(null);
+  let pendingDownload: { cert: CertificateResponse; part: CertificateDownloadPart } | null = $state(null);
 
-  function requestDownload(cert: CertificateResponse, part: 'cert' | 'key' | 'chain' | 'bundle') {
+  function requestDownload(cert: CertificateResponse, part: CertificateDownloadPart) {
+    const refusal = downloadPartRefusal(cert, part);
+    if (refusal) {
+      showToast(refusal, 'error');
+      return;
+    }
     if (part === 'key' || part === 'bundle') {
       pendingDownload = { cert, part };
       return;
@@ -173,7 +294,7 @@
     await performDownload(cert, part);
   }
 
-  async function performDownload(cert: CertificateResponse, part: 'cert' | 'key' | 'chain' | 'bundle') {
+  async function performDownload(cert: CertificateResponse, part: CertificateDownloadPart) {
     const res = await api.downloadCertificate(cert.id, part);
     if (res.ok) {
       showToast(`Downloaded ${cert.domain} (${part})`, 'success');
@@ -184,7 +305,13 @@
 
   function deleteMessage(): string {
     if (!deletingCert) return '';
-    const base = `Are you sure you want to delete the certificate for "${deletingCert.domain}"?`;
+    const question = `Are you sure you want to delete the certificate for "${deletingCert.domain}"?`;
+    // PRD out of scope: Lorica cannot revoke, so a deletion must not
+    // read as one.
+    const base =
+      deletingCert.source === 'adcs'
+        ? `${question} Deleting it in Lorica does not revoke it: the AD CS authority still holds it as issued, and only its administrators can revoke it.`
+        : question;
     if (deleteRoutes.length === 0) {
       return `${base} No routes are using this certificate.`;
     }
@@ -245,6 +372,7 @@
       {#if $canWrite}
         <button class="btn btn-secondary" onclick={openSelfSigned}>Self-signed</button>
         <button class="btn btn-acme" onclick={openAcmeForm}>Let's Encrypt</button>
+        <button class="btn btn-secondary" onclick={() => showAdcsForm = true}>AD CS</button>
         <button class="btn btn-primary" onclick={() => showUploadForm = true}>+ Upload Certificate</button>
       {/if}
     </div>
@@ -252,6 +380,59 @@
 
   {#if error}
     <div class="error-banner">{error}</div>
+  {/if}
+
+  {#if adoptionBanner?.kind === 'candidates' && !showAdoption}
+    <div class="adcs-adoption-banner" role="status" data-testid="adcs-adoption-banner">
+      <span>
+        {adoptionBanner.count === 1
+          ? '1 certificate can be managed by the AD CS authority.'
+          : `${adoptionBanner.count} certificates can be managed by the AD CS authority.`}
+      </span>
+      <button class="btn btn-secondary" onclick={() => (showAdoption = true)}>Review</button>
+    </div>
+  {:else if adoptionBanner?.kind === 'no_issuing_ca'}
+    <div class="adcs-adoption-banner" role="status" data-testid="adcs-adoption-banner">
+      <span>{ADCS_NO_ISSUING_CA_HINT}</span>
+    </div>
+  {/if}
+
+  {#if showAdoption && adoption && adcsOperable}
+    <AdcsAdoptionPanel
+      candidates={adoption.candidates}
+      autoRenewDefault={adcsState?.authority?.auto_renew_default ?? true}
+      onReload={loadData}
+      onClose={() => (showAdoption = false)}
+    />
+  {/if}
+
+  {#if adcsRenewResult}
+    {@const outcome = adcsRenewResult.outcome}
+    {@const domain = adcsRenewResult.domain}
+    <div
+      class="adcs-renew-result"
+      class:ok={outcome.kind === 'renewed'}
+      role={outcome.kind === 'renewed' ? 'status' : 'alert'}
+      data-testid="adcs-renew-outcome"
+    >
+      <span>
+        {#if outcome.kind === 'renewed'}
+          Renewed {domain} from AD CS.
+          {#if outcome.certificate}
+            Subject as issued by the authority:
+            <code>{outcome.certificate.subject || 'not readable'}</code>. Valid until
+            {new Date(outcome.certificate.not_after).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}.
+          {/if}
+        {:else if outcome.kind === 'pending'}
+          The authority answered that the renewal of {domain} is pending, under request id
+          <code>{outcome.requestId}</code>: {outcome.message}
+          Nothing was stored and the current certificate stays in service.
+        {:else}
+          Renewing {domain} from AD CS did not complete: {outcome.message}
+        {/if}
+      </span>
+      <button class="btn-dismiss" aria-label="Dismiss" onclick={() => (adcsRenewResult = null)}>&times;</button>
+    </div>
   {/if}
 
   {#if loading}
@@ -271,9 +452,12 @@
       {warningDays}
       {criticalDays}
       {renewingId}
+      {adcsRenewable}
+      adcsRevertable={adcsOperable}
       onView={openDetail}
       onEdit={openEditForm}
       onRenew={handleRenew}
+      onRevert={(cert) => (revertConfirm = cert)}
       onDelete={openDelete}
       onDownload={requestDownload}
     />
@@ -310,6 +494,28 @@
     message={deleteMessage()}
     onconfirm={handleDelete}
     oncancel={() => { deletingCert = null; deleteRoutes = []; }}
+  />
+{/if}
+
+{#if adcsRenewConfirm}
+  <ConfirmDialog
+    title="Renew from AD CS"
+    message={adcsRenewMessage(adcsRenewConfirm)}
+    confirmLabel="Renew now"
+    confirmStyle="primary"
+    onconfirm={renewFromAdcs}
+    oncancel={() => (adcsRenewConfirm = null)}
+  />
+{/if}
+
+{#if revertConfirm}
+  <ConfirmDialog
+    title="Revert to manual"
+    message={revertMessage(revertConfirm)}
+    confirmLabel="Revert to manual"
+    confirmStyle="warning"
+    onconfirm={revertToManual}
+    oncancel={() => (revertConfirm = null)}
   />
 {/if}
 
@@ -364,6 +570,14 @@
   <CertificateAcmeForm {dnsProviders} onClose={() => showAcmeForm = false} onReload={loadData} />
 {/if}
 
+{#if showAdcsForm}
+  <CertificateAdcsForm
+    onClose={() => showAdcsForm = false}
+    onReload={loadData}
+    onView={viewIssuedCertificate}
+  />
+{/if}
+
 <script lang="ts" module>
   const gearIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>';
 </script>
@@ -392,6 +606,54 @@
 
   .text-muted {
     color: var(--color-text-muted);
+  }
+
+  .adcs-adoption-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.625rem 0.75rem;
+    margin-bottom: 1rem;
+    border: 1px solid var(--color-primary);
+    border-radius: 0.375rem;
+    background: var(--color-primary-subtle);
+    color: var(--color-text);
+    font-size: 0.875rem;
+    line-height: 1.5;
+  }
+
+  .adcs-renew-result {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.625rem 0.75rem;
+    margin-bottom: 1rem;
+    border: 1px solid var(--color-red);
+    border-radius: 0.375rem;
+    color: var(--color-red);
+    font-size: 0.875rem;
+    line-height: 1.5;
+  }
+
+  .adcs-renew-result.ok {
+    border-color: var(--color-green);
+    color: var(--color-green);
+    background: var(--color-green-subtle);
+  }
+
+  .adcs-renew-result code {
+    word-break: break-all;
+  }
+
+  .btn-dismiss {
+    background: none;
+    border: none;
+    color: inherit;
+    font-size: 1.125rem;
+    line-height: 1;
+    padding: 0;
   }
 
   .btn {

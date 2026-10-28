@@ -1,7 +1,9 @@
 <script lang="ts">
-  import type { CertificateResponse, RouteResponse } from '../../lib/api';
+  import type { CertificateDownloadPart, CertificateResponse, RouteResponse } from '../../lib/api';
   import CertExpiryBadge from '../CertExpiryBadge.svelte';
   import { canWrite } from '../../lib/auth';
+  import { downloadPartRefusal } from '../../lib/adcs-issuance';
+  import { CERTIFICATE_SOURCE_LABELS } from '../../lib/adcs.generated';
 
   interface Props {
     certificates: CertificateResponse[];
@@ -9,11 +11,22 @@
     warningDays: number;
     criticalDays: number;
     renewingId: string;
+    /**
+     * Whether "Renew now" is offered on AD CS certificates, decided by
+     * the page from the role, the node and the authority state.
+     */
+    adcsRenewable: boolean;
+    /**
+     * Whether "Revert to manual" is offered on AD CS certificates. It
+     * does not depend on the authority's health, unlike renewal.
+     */
+    adcsRevertable: boolean;
     onView: (cert: CertificateResponse) => void;
     onEdit: (cert: CertificateResponse) => void;
     onRenew: (cert: CertificateResponse) => void;
+    onRevert: (cert: CertificateResponse) => void;
     onDelete: (cert: CertificateResponse) => void;
-    onDownload: (cert: CertificateResponse, part: 'cert' | 'key' | 'chain' | 'bundle') => void;
+    onDownload: (cert: CertificateResponse, part: CertificateDownloadPart) => void;
   }
 
   let {
@@ -22,9 +35,12 @@
     warningDays,
     criticalDays,
     renewingId,
+    adcsRenewable,
+    adcsRevertable,
     onView,
     onEdit,
     onRenew,
+    onRevert,
     onDelete,
     onDownload,
   }: Props = $props();
@@ -35,6 +51,21 @@
   let openMenuId: string | null = $state(null);
   function toggleMenu(id: string) {
     openMenuId = openMenuId === id ? null : id;
+  }
+
+  const DOWNLOAD_CHOICES: { part: CertificateDownloadPart; label: string; sensitive: boolean }[] = [
+    { part: 'bundle', label: 'Bundle (cert + key)', sensitive: false },
+    { part: 'cert', label: 'Certificate only', sensitive: false },
+    { part: 'chain', label: 'Certificate + chain', sensitive: false },
+    { part: 'key', label: 'Private key (sensitive)', sensitive: true },
+  ];
+
+  function downloadRefusal(cert: CertificateResponse): string | null {
+    for (const choice of DOWNLOAD_CHOICES) {
+      const refusal = downloadPartRefusal(cert, choice.part);
+      if (refusal) return refusal;
+    }
+    return null;
   }
 
   function formatDate(iso: string): string {
@@ -53,6 +84,7 @@
   const editIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
   const trashIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
   const renewIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
+  const revertIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg>';
   const downloadIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
 </script>
 
@@ -77,10 +109,12 @@
             {#if cert.san_domains.length > 0}
               <span class="san-count" title={cert.san_domains.join(', ')}>+{cert.san_domains.length} SAN</span>
             {/if}
-            {#if cert.is_acme}
-              <span class="cert-source-badge acme" title={cert.acme_method || 'http01'}>ACME{#if cert.acme_method && cert.acme_method !== 'http01'} ({cert.acme_method.replace('dns01-', '')}){/if}{#if cert.acme_auto_renew} &#x21bb;{/if}</span>
+            {#if cert.source === 'acme'}
+              <span class="cert-source-badge acme" title={cert.acme_method || 'http01'}>{CERTIFICATE_SOURCE_LABELS.acme}{#if cert.acme_method && cert.acme_method !== 'http01'} ({cert.acme_method.replace('dns01-', '')}){/if}{#if cert.acme_auto_renew} &#x21bb;{/if}</span>
+            {:else if cert.source === 'adcs'}
+              <span class="cert-source-badge adcs" title={cert.adcs_template ? `Template ${cert.adcs_template}` : CERTIFICATE_SOURCE_LABELS.adcs}>{CERTIFICATE_SOURCE_LABELS.adcs}{#if cert.acme_auto_renew} &#x21bb;{/if}</span>
             {:else}
-              <span class="cert-source-badge manual">Manual</span>
+              <span class="cert-source-badge manual">{CERTIFICATE_SOURCE_LABELS.manual}</span>
             {/if}
           </td>
           <td class="issuer">{cert.issuer}</td>
@@ -116,6 +150,17 @@
                   <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html renewIcon}
                 </button>
+              {:else if cert.source === 'adcs' && adcsRenewable}
+                <button class="btn-icon" title="Renew now from AD CS" aria-label="Renew certificate from AD CS" onclick={() => onRenew(cert)} disabled={renewingId === cert.id}>
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                  {@html renewIcon}
+                </button>
+              {/if}
+              {#if cert.source === 'adcs' && adcsRevertable}
+                <button class="btn-icon" title="Revert to manual" aria-label="Revert to manual" onclick={() => onRevert(cert)}>
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                  {@html revertIcon}
+                </button>
               {/if}
               <div class="download-menu-wrap">
                 <button
@@ -130,11 +175,21 @@
                   {@html downloadIcon}
                 </button>
                 {#if openMenuId === cert.id}
+                  {@const refusal = downloadRefusal(cert)}
                   <div class="download-menu" role="menu">
-                    <button role="menuitem" onclick={() => { onDownload(cert, 'bundle'); openMenuId = null; }}>Bundle (cert + key)</button>
-                    <button role="menuitem" onclick={() => { onDownload(cert, 'cert'); openMenuId = null; }}>Certificate only</button>
-                    <button role="menuitem" onclick={() => { onDownload(cert, 'chain'); openMenuId = null; }}>Certificate + chain</button>
-                    <button role="menuitem" class="danger" onclick={() => { onDownload(cert, 'key'); openMenuId = null; }}>Private key (sensitive)</button>
+                    {#each DOWNLOAD_CHOICES as choice (choice.part)}
+                      {@const refused = downloadPartRefusal(cert, choice.part) !== null}
+                      <button
+                        role="menuitem"
+                        class:danger={choice.sensitive}
+                        disabled={refused}
+                        aria-describedby={refused ? `download-refusal-${cert.id}` : undefined}
+                        onclick={() => { onDownload(cert, choice.part); openMenuId = null; }}
+                      >{choice.label}</button>
+                    {/each}
+                    {#if refusal}
+                      <p class="download-refusal" id="download-refusal-{cert.id}" role="none" data-testid="download-refusal">{refusal}</p>
+                    {/if}
                   </div>
                 {/if}
               </div>
@@ -184,6 +239,11 @@
   .cert-source-badge.acme {
     background: rgba(34, 197, 94, 0.15);
     color: var(--color-green);
+  }
+
+  .cert-source-badge.adcs {
+    background: rgba(59, 130, 246, 0.15);
+    color: var(--color-primary);
   }
 
   .cert-source-badge.manual {
@@ -245,5 +305,23 @@
   .download-menu button.danger {
     color: var(--color-red);
     border-top: 1px solid var(--color-border);
+  }
+  .download-menu button:disabled {
+    cursor: not-allowed;
+    color: var(--color-text-muted);
+    text-decoration: line-through;
+  }
+  .download-menu button:disabled:hover {
+    background: none;
+  }
+  .download-refusal {
+    margin: 0;
+    padding: 0.5rem 0.75rem;
+    max-width: 16rem;
+    border-top: 1px solid var(--color-border);
+    font-size: 0.75rem;
+    line-height: 1.4;
+    white-space: normal;
+    color: var(--color-text-muted);
   }
 </style>

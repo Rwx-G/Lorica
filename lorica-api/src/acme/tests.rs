@@ -197,6 +197,10 @@ async fn test_check_cert_expiry_dispatches_alerts() {
         acme_method: None,
 
         acme_dns_provider_id: None,
+        adcs_authority_id: None,
+        adcs_template: None,
+        adcs_template_oid: None,
+        adcs_request_id: None,
     };
 
     // Cert expiring in 2 days (critical level)
@@ -216,6 +220,10 @@ async fn test_check_cert_expiry_dispatches_alerts() {
         acme_method: None,
 
         acme_dns_provider_id: None,
+        adcs_authority_id: None,
+        adcs_template: None,
+        adcs_template_oid: None,
+        adcs_request_id: None,
     };
 
     // Cert expiring in 30 days (no alert)
@@ -235,6 +243,10 @@ async fn test_check_cert_expiry_dispatches_alerts() {
         acme_method: Some("http01".into()),
 
         acme_dns_provider_id: None,
+        adcs_authority_id: None,
+        adcs_template: None,
+        adcs_template_oid: None,
+        adcs_request_id: None,
     };
 
     store
@@ -274,6 +286,7 @@ async fn test_check_cert_expiry_dispatches_alerts() {
         mcp_invocations: Arc::new(crate::automation::InvocationLimiter::new()),
         renewals: Arc::new(crate::acme::RenewalLedger::new()),
         automation_writes: crate::middleware::rate_limit::RateLimiter::new(),
+        adcs: crate::adcs::AdcsRuntime::new(None),
     };
 
     let alert_sender = lorica_notify::AlertSender::new(64);
@@ -412,6 +425,10 @@ fn renewal_cert_fixture(
         created_at: now - chrono::Duration::days(60),
         acme_method: acme_method.map(String::from),
         acme_dns_provider_id: None,
+        adcs_authority_id: None,
+        adcs_template: None,
+        adcs_template_oid: None,
+        adcs_request_id: None,
     }
 }
 
@@ -474,6 +491,10 @@ fn should_auto_renew_accepts_exactly_at_threshold() {
         created_at: now - chrono::Duration::days(60),
         acme_method: Some("http01".into()),
         acme_dns_provider_id: None,
+        adcs_authority_id: None,
+        adcs_template: None,
+        adcs_template_oid: None,
+        adcs_request_id: None,
     };
     assert!(
         should_auto_renew(&cert, now, 30),
@@ -662,6 +683,10 @@ fn orphan_cert_fixture(
         created_at: now - chrono::Duration::days(1),
         acme_method: Some("http01".into()),
         acme_dns_provider_id: None,
+        adcs_authority_id: None,
+        adcs_template: None,
+        adcs_template_oid: None,
+        adcs_request_id: None,
     }
 }
 

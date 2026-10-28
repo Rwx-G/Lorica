@@ -378,7 +378,7 @@
   open={showDrawer}
   editing={editingRoute}
   {backends}
-  {certificates}
+  bind:certificates
   onsave={loadData}
   onclose={() => { showDrawer = false; editingRoute = null; }}
 />

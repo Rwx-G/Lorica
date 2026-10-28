@@ -2,7 +2,7 @@
 
 > **Baseline note.** This is the v1.0 planning decomposition (the
 > "Phase 2 / Phase 3" markers are the original roadmap phasing). The
-> workspace has since grown to 33 members; components added after this
+> workspace has since grown to 34 members; components added after this
 > blueprint and not described below include `lorica-acme` (pure ACME
 > core: DNS challengers + instant-acme driver), `lorica-metrics` (shared
 > Prometheus registry + cross-worker counter aggregation),
@@ -12,7 +12,9 @@
 > `lorica-mcp` (the v1.9.0 management MCP server) and
 > `lorica-automation-policy` (the automation plane's scope vocabulary,
 > MCP tier table, settings allowlist and protection rules as data, read
-> by `lorica-config`, `lorica-api`, `lorica-mcp` and `lorica`).
+> by `lorica-config`, `lorica-api`, `lorica-mcp` and `lorica`), and
+> `lorica-adcs` (the v1.10.0 AD CS enrollment client: Kerberos SPNEGO
+> with TLS channel binding and WS-Trust over CES, a leaf crate).
 > See [FORK.md](../../FORK.md) and the README architecture table for the
 > current crate roster, which is authoritative over the count above.
 

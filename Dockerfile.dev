@@ -15,7 +15,7 @@ RUN npm run build
 
 # Stage 2: Rust development environment
 FROM rust:1-bookworm
-RUN apt-get update && apt-get install -y cmake pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y cmake pkg-config libssl-dev libkrb5-dev libclang-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
 # Copy workspace
@@ -52,6 +52,7 @@ COPY lorica-geoip/ lorica-geoip/
 COPY lorica-shmem/ lorica-shmem/
 COPY lorica-mcp/ lorica-mcp/
 COPY lorica-automation-policy/ lorica-automation-policy/
+COPY lorica-adcs/ lorica-adcs/
 COPY tinyufo/ tinyufo/
 # Test-only: tests in lorica-api and lorica-automation-policy compile
 # the top-level docs/*.md pages in with include_str!, which is why

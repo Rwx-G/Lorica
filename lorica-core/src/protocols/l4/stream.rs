@@ -28,7 +28,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 #[cfg(target_os = "linux")]
 use tokio::io::Interest;
-use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, BufStream, ReadBuf};
+use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::net::UnixStream;
 
@@ -329,6 +329,105 @@ const BUF_READ_SIZE: usize = 64 * 1024;
 // And userspace buffering reduce both syscalls and small packets.
 const BUF_WRITE_SIZE: usize = 1460;
 
+/// The L4 buffers in front of a [`RawStreamWrapper`]: a read buffer over a write
+/// buffer, the same layering as tokio's [`BufStream`](tokio::io::BufStream).
+///
+/// A zero read capacity leaves the read buffer out, because [`BufReader`] panics on
+/// a zero capacity. Reads then go straight to the raw stream, as they did through
+/// an empty `BufReader`. [`BufWriter`] accepts a zero capacity and writes straight
+/// through.
+#[derive(Debug)]
+enum BufferedStream {
+    UnbufferedRead(BufWriter<RawStreamWrapper>),
+    BufferedRead(BufReader<BufWriter<RawStreamWrapper>>),
+}
+
+impl BufferedStream {
+    fn with_capacity(read: usize, write: usize, stream: RawStreamWrapper) -> Self {
+        let writer = BufWriter::with_capacity(write, stream);
+        if read == 0 {
+            BufferedStream::UnbufferedRead(writer)
+        } else {
+            BufferedStream::BufferedRead(BufReader::with_capacity(read, writer))
+        }
+    }
+
+    fn writer(&self) -> &BufWriter<RawStreamWrapper> {
+        match self {
+            BufferedStream::UnbufferedRead(writer) => writer,
+            BufferedStream::BufferedRead(reader) => reader.get_ref(),
+        }
+    }
+
+    fn writer_mut(&mut self) -> &mut BufWriter<RawStreamWrapper> {
+        match self {
+            BufferedStream::UnbufferedRead(writer) => writer,
+            BufferedStream::BufferedRead(reader) => reader.get_mut(),
+        }
+    }
+
+    fn get_ref(&self) -> &RawStreamWrapper {
+        self.writer().get_ref()
+    }
+
+    fn get_mut(&mut self) -> &mut RawStreamWrapper {
+        self.writer_mut().get_mut()
+    }
+
+    /// Return the raw stream. Anything left in either buffer is lost.
+    fn into_inner(self) -> RawStreamWrapper {
+        match self {
+            BufferedStream::UnbufferedRead(writer) => writer.into_inner(),
+            BufferedStream::BufferedRead(reader) => reader.into_inner().into_inner(),
+        }
+    }
+}
+
+impl AsyncRead for BufferedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match &mut *self {
+            BufferedStream::UnbufferedRead(writer) => Pin::new(writer).poll_read(cx, buf),
+            BufferedStream::BufferedRead(reader) => Pin::new(reader).poll_read(cx, buf),
+        }
+    }
+}
+
+// `BufReader` only forwards writes to the `BufWriter` under it, so write to the `BufWriter`
+// directly.
+impl AsyncWrite for BufferedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(self.writer_mut()).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        Pin::new(self.writer_mut()).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        Pin::new(self.writer_mut()).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(self.writer_mut()).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.writer().is_write_vectored()
+    }
+}
+
 // NOTE: with writer buffering, users need to call flush() to make sure the data is actually
 // sent. Otherwise data could be stuck in the buffer forever or get lost when stream is closed.
 
@@ -336,7 +435,7 @@ const BUF_WRITE_SIZE: usize = 1460;
 #[derive(Debug)]
 pub struct Stream {
     // Use `Option` to be able to swap to adjust the buffer size. Always safe to unwrap
-    stream: Option<BufStream<RawStreamWrapper>>,
+    stream: Option<BufferedStream>,
     // the data put back at the front of the read buffer, in order to replay the read
     rewind_read_buf: Vec<Vec<u8>>,
     buffer_write: bool,
@@ -364,11 +463,11 @@ impl Stream {
     pub fn set_accept_permit(&mut self, permit: Box<dyn crate::listeners::AcceptPermit>) {
         self.accept_permit = Some(permit);
     }
-    fn stream(&self) -> &BufStream<RawStreamWrapper> {
+    fn stream(&self) -> &BufferedStream {
         self.stream.as_ref().expect("stream should always be set")
     }
 
-    fn stream_mut(&mut self) -> &mut BufStream<RawStreamWrapper> {
+    fn stream_mut(&mut self) -> &mut BufferedStream {
         self.stream.as_mut().expect("stream should always be set")
     }
 
@@ -432,15 +531,15 @@ impl Stream {
         }
     }
 
-    /// Set the buffer of BufStream
+    /// Set the read and write buffer sizes
     /// It is only set later because of the malloc overhead in critical accept() path
     pub(crate) fn set_buffer(&mut self) {
         use std::mem;
-        // Since BufStream doesn't provide an API to adjust the buf directly,
-        // we take the raw stream out of it and put it in a new BufStream with the size we want
+        // Since the buffers can't be resized in place,
+        // we take the raw stream out of them and put it in new buffers with the size we want
         let stream = mem::take(&mut self.stream);
-        let stream =
-            stream.map(|s| BufStream::with_capacity(BUF_READ_SIZE, BUF_WRITE_SIZE, s.into_inner()));
+        let stream = stream
+            .map(|s| BufferedStream::with_capacity(BUF_READ_SIZE, BUF_WRITE_SIZE, s.into_inner()));
         let _ = mem::replace(&mut self.stream, stream);
     }
 }
@@ -448,7 +547,7 @@ impl Stream {
 impl From<TcpStream> for Stream {
     fn from(s: TcpStream) -> Self {
         Stream {
-            stream: Some(BufStream::with_capacity(
+            stream: Some(BufferedStream::with_capacity(
                 0,
                 0,
                 RawStreamWrapper::new(RawStream::Tcp(s)),
@@ -471,7 +570,7 @@ impl From<TcpStream> for Stream {
 impl From<virt::VirtualSocketStream> for Stream {
     fn from(s: virt::VirtualSocketStream) -> Self {
         Stream {
-            stream: Some(BufStream::with_capacity(
+            stream: Some(BufferedStream::with_capacity(
                 0,
                 0,
                 RawStreamWrapper::new(RawStream::Virtual(s)),
@@ -494,7 +593,7 @@ impl From<virt::VirtualSocketStream> for Stream {
 impl From<UnixStream> for Stream {
     fn from(s: UnixStream) -> Self {
         Stream {
-            stream: Some(BufStream::with_capacity(
+            stream: Some(BufferedStream::with_capacity(
                 0,
                 0,
                 RawStreamWrapper::new(RawStream::Unix(s)),
@@ -976,6 +1075,31 @@ mod tests {
         let n = stream.read(buffer.as_mut_slice()).await.unwrap();
         assert_eq!(n, message.len());
         assert_eq!(buffer, message);
+    }
+
+    // A freshly accepted or connected Stream holds zero-capacity buffers until
+    // set_buffer runs; tokio 1.54.0 panics on a zero-capacity BufReader.
+    #[tokio::test]
+    async fn test_zero_capacity_stream_serves_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (raw, _) = listener.accept().await.unwrap();
+            let mut stream: Stream = raw.into();
+            let mut request = [0; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        server.await.unwrap();
+        let mut response = [0; 4];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"pong");
     }
 
     #[tokio::test]

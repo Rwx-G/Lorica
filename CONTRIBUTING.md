@@ -95,7 +95,7 @@ If your change adds a feature, fixes a bug, or changes behavior, update `CHANGEL
 
 ## Architecture
 
-Lorica is a Rust workspace with 33 crates. See [FORK.md](FORK.md) for the Pingora fork lineage and [README.md](README.md) for the architecture overview.
+Lorica is a Rust workspace with 34 crates. See [FORK.md](FORK.md) for the Pingora fork lineage and [README.md](README.md) for the architecture overview.
 
 ### Key Directories
 

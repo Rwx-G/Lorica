@@ -339,6 +339,10 @@ mod tests {
             created_at: chrono::Utc::now(),
             acme_method: None,
             acme_dns_provider_id: None,
+            adcs_authority_id: None,
+            adcs_template: None,
+            adcs_template_oid: None,
+            adcs_request_id: None,
         };
         assert!(matches!(
             refused.check(&certificate),

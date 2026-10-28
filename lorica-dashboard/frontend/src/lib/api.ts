@@ -48,10 +48,27 @@ import type {
   FleetWafRow,
   RevokeNodeResponse,
 } from './cluster';
+import type {
+  AdcsKeyType,
+  AdcsSubjectField,
+  AdoptionUnavailableReason,
+  CertificateSource,
+} from './adcs.generated';
+
+export type { AdcsKeyType, AdcsSubjectField, CertificateSource };
 
 export interface ApiError {
   code: string;
   message: string;
+  /**
+   * The HTTP status of a refused request, absent on a network failure.
+   * Some answers are told apart by status alone: a 504 can come from a
+   * reverse proxy in front of the node, with no JSON envelope and so
+   * no `code` the node chose.
+   */
+  status?: number;
+  /** The failing step's closed name, on an AD CS `adcs_error` (Epic 13). */
+  step?: string;
 }
 
 /** Body of `POST /api/v1/cluster/tokens` (Story 9.3, 9.5 D15). */
@@ -192,14 +209,20 @@ async function request<T>(
     json = await res.json();
   } catch {
     // Non-JSON response (e.g., backend returned HTML error page)
-    return { error: { code: 'parse_error', message: `Server returned invalid response (${res.status})` } };
+    return {
+      error: {
+        code: 'parse_error',
+        message: `Server returned invalid response (${res.status})`,
+        status: res.status,
+      },
+    };
   }
 
   if (!res.ok) {
     const err = json.error && typeof json.error === 'object' && 'code' in json.error
       ? (json.error as ApiError)
       : { code: 'unknown', message: res.statusText };
-    return { error: err };
+    return { error: { ...err, status: res.status } };
   }
   return { data: json.data as T };
 }
@@ -705,13 +728,31 @@ export interface CertificateResponse {
   san_domains: string[];
   fingerprint: string;
   issuer: string;
+  /**
+   * The subject as the certificate carries it, RFC 4514 (`CN=...,O=...`),
+   * empty when the API could not read it. For an AD CS certificate it is
+   * what the authority issued, which its template may have rewritten.
+   */
+  subject: string;
   not_before: string;
   not_after: string;
   is_acme: boolean;
+  /** Auto-renew for both ACME and AD CS certificates; `source` says which. */
   acme_auto_renew: boolean;
   created_at: string;
   acme_method?: string;
   acme_dns_provider_id?: string;
+  /**
+   * Where the certificate comes from, derived by the API (Epic 13 D14);
+   * the dashboard reads it and never re-derives it.
+   */
+  source: CertificateSource;
+  adcs_authority_id: string | null;
+  /** The template name requested at issuance. */
+  adcs_template: string | null;
+  /** The template OID observed in the issued certificate. */
+  adcs_template_oid: string | null;
+  adcs_request_id: string | null;
 }
 
 export interface CertificateDetailResponse extends CertificateResponse {
@@ -724,6 +765,13 @@ export interface CreateCertificateRequest {
   cert_pem: string;
   key_pem: string;
 }
+
+/**
+ * A part of `GET /api/v1/certificates/{id}/download`. `key` and
+ * `bundle` carry the private key, which an AD CS certificate never
+ * releases (Epic 13 D16).
+ */
+export type CertificateDownloadPart = 'cert' | 'key' | 'chain' | 'bundle';
 
 export interface UpdateCertificateRequest {
   domain?: string;
@@ -1217,6 +1265,174 @@ export interface CreateDnsProviderRequest {
   config: DnsProviderConfig;
 }
 
+// ---- AD CS authority (Story 13.2) ----
+
+/** The fixed part of every CSR subject; blank fields are `null`. */
+export type AdcsSubjectDefaults = Record<AdcsSubjectField, string | null>;
+
+/**
+ * The authority as a read returns it. There is no password field: the
+ * password is write-only and only `password_set` says whether one is
+ * stored.
+ */
+export interface AdcsAuthority {
+  id: string;
+  endpoint: string;
+  realm: string;
+  kdcs: string[];
+  principal: string;
+  endpoint_ca_pem: string | null;
+  issuing_ca_pem: string | null;
+  default_template: string;
+  /** The templates an issuance may request, the default first (Epic 13 D17). */
+  allowed_templates: string[];
+  default_key_type: AdcsKeyType;
+  subject: AdcsSubjectDefaults;
+  allowed_suffixes: string[];
+  auto_renew_default: boolean;
+  /** Set while the authority is in the failed state (Epic 13 D15). */
+  failed_since: string | null;
+  failed_step: string | null;
+  failed_kdc_code: number | null;
+  created_at: string;
+  updated_at: string;
+  password_set: boolean;
+}
+
+/** What every role reads of the authority (Epic 13 D18). */
+export interface AdcsAuthoritySummary {
+  allowed_suffixes: string[];
+  /** Set while the authority is in the failed state (Epic 13 D15). */
+  failed_since: string | null;
+  failed_step: string | null;
+  failed_kdc_code: number | null;
+  /** What the KDC code means for the service account, worded by the API. */
+  failed_reason: string | null;
+}
+
+/** Body of `GET /api/v1/adcs/authority`. */
+export interface AdcsAuthorityState {
+  /** Whether an authority is configured on this node; `false` on a follower. */
+  configured: boolean;
+  /** `true` on a follower: the authority lives on the control plane only. */
+  managed_on_control_plane: boolean;
+  /** `null` when none is configured, and always on a follower. */
+  summary: AdcsAuthoritySummary | null;
+  /**
+   * The connection details, for Operators and SuperAdmins only (D18):
+   * `null` for a Viewer as well as when `summary` is.
+   */
+  authority: AdcsAuthority | null;
+}
+
+/** Body of `PUT /api/v1/adcs/authority`. */
+export interface AdcsAuthorityRequest {
+  endpoint: string;
+  realm: string;
+  kdcs: string[];
+  principal: string;
+  /**
+   * Required on creation and with any change of `endpoint`, `realm`,
+   * `kdcs`, `principal` or `endpoint_ca_pem`; omitted otherwise to keep
+   * the stored one.
+   */
+  password?: string;
+  endpoint_ca_pem: string | null;
+  /**
+   * Omitted (or `null`) to keep the stored certificate, which an
+   * issuance may have learned since the form was loaded; blank clears it.
+   */
+  issuing_ca_pem?: string;
+  default_template: string;
+  /** The other templates an issuance may request; the default always may. */
+  allowed_templates: string[];
+  default_key_type: AdcsKeyType;
+  subject: AdcsSubjectDefaults;
+  allowed_suffixes: string[];
+  auto_renew_default: boolean;
+}
+
+/** Body of a completed `POST /api/v1/adcs/authority/test`. */
+export interface AdcsConnectionTestResult {
+  ok: boolean;
+  /** The failing step's closed name, `null` on success. */
+  step: string | null;
+  /** The client's error text, `null` on success. */
+  message: string | null;
+  /** Whether this test put the authority in the failed state. */
+  authority_failed: boolean;
+}
+
+/** Subject overrides of an issuance; an absent field takes the authority's default. */
+export type AdcsSubjectOverrides = Partial<Record<AdcsSubjectField, string>>;
+
+/** Body of `POST /api/v1/certificates/adcs` (Story 13.3). */
+export interface AdcsIssueRequest {
+  /** The first one is the subject's `CN`. */
+  sans: string[];
+  /** One of the authority's `allowed_templates`; its default when absent. */
+  template?: string;
+  key_type?: AdcsKeyType;
+  subject?: AdcsSubjectOverrides;
+  auto_renew?: boolean;
+}
+
+/**
+ * The 202 body: the template needs CA manager approval, which v1.10.0
+ * does not support, so nothing was stored.
+ */
+export interface AdcsIssuePending {
+  outcome: 'pending';
+  request_id: string;
+  message: string;
+}
+
+/** 201 carries the stored certificate, 202 the pending answer. */
+export type AdcsIssueResult = CertificateResponse | AdcsIssuePending;
+
+/** The ACME answer of `POST /api/v1/certificates/:id/renew`: in place, so both ids are equal. */
+export interface AcmeRenewResult {
+  renewed: boolean;
+  old_cert_id: string;
+  new_cert_id: string;
+  domain: string;
+}
+
+/**
+ * `POST /api/v1/certificates/:id/renew`: the ACME shape, or for an AD CS
+ * certificate (Story 13.4) the renewed certificate under the same id,
+ * or the 202 pending body.
+ */
+export type CertificateRenewResult = AcmeRenewResult | CertificateResponse | AdcsIssuePending;
+
+/** Why `GET /api/v1/adcs/adoption-candidates` lists nothing without looking (Story 13.5). */
+export type AdcsAdoptionUnavailableReason = AdoptionUnavailableReason;
+
+/** A manual certificate the authority's issuing CA signed (Story 13.5). */
+export interface AdcsAdoptionCandidate {
+  certificate_id: string;
+  domain: string;
+  san_domains: string[];
+  subject: string;
+  not_after: string;
+  /** The template read from the certificate: an OID, or a version 1 template name. */
+  issued_template: string | null;
+  /** The template seen on certificates Lorica issued; null when it has issued none. */
+  observed_template: string | null;
+  template_mismatch: boolean;
+}
+
+/** Body of `GET /api/v1/adcs/adoption-candidates`. */
+export interface AdcsAdoptionCandidates {
+  reason: AdcsAdoptionUnavailableReason | null;
+  candidates: AdcsAdoptionCandidate[];
+}
+
+/** Body of `POST /api/v1/certificates/{id}/adcs/adopt`; absent, the authority's default applies. */
+export interface AdcsAdoptRequest {
+  auto_renew?: boolean;
+}
+
 export interface UserPreferenceResponse {
   id: string;
   preference_key: string;
@@ -1246,6 +1462,15 @@ export interface ImportDiffResponse {
   user_preferences: EntityDiff;
   users: EntityDiff;
   global_settings: { changes: SettingChange[] };
+}
+
+/// Result of an applied import. `warnings` lists what the import
+/// changed on its own initiative, such as an AD CS certificate made
+/// manual because its authority is absent on this node; the response
+/// is the only place the operator learns it.
+export interface ImportConfigResponse {
+  message: string;
+  warnings: string[];
 }
 
 // --- AI crawler management (Story 8.2) ---
@@ -1466,20 +1691,26 @@ export const api = {
   deleteCertificate: (id: string) =>
     request<{ message: string }>('DELETE', `/certificates/${id}`),
 
+  /**
+   * Renew a certificate in place, ACME or AD CS. An AD CS renewal is an
+   * issuance at the authority, so callers confirm it with the operator.
+   */
   renewCertificate: (id: string) =>
-    request<{ renewed: boolean; old_cert_id: string; new_cert_id: string; domain: string }>('POST', `/certificates/${id}/renew`),
+    request<CertificateRenewResult>('POST', `/certificates/${id}/renew`),
 
   /**
    * Trigger a browser download of the PEM payload for one certificate.
    * Bypasses the `request()` wrapper (which expects a JSON envelope) and
    * talks directly to the endpoint via fetch + Blob so the browser's
    * native download flow picks up the `Content-Disposition` filename.
-   * `part` selects `cert` / `key` / `chain` / `bundle` (default).
+   * `part` selects `cert` / `key` / `chain` / `bundle` (default); the
+   * API refuses `key` and `bundle` of an AD CS certificate with 403
+   * `adcs_key_not_exportable`, whose message comes back as returned.
    * Returns `{ ok }` on success, or `{ ok: false, message }` on error;
    * callers surface a toast and never auto-retry (rate-limit is 5 per
    * 60 s).
    */
-  downloadCertificate: async (id: string, part: 'cert' | 'key' | 'chain' | 'bundle' = 'bundle'): Promise<{ ok: true } | { ok: false; message: string }> => {
+  downloadCertificate: async (id: string, part: CertificateDownloadPart = 'bundle'): Promise<{ ok: true } | { ok: false; message: string }> => {
     const qs = new URLSearchParams({ part }).toString();
     const res = await fetch(`/api/v1/certificates/${id}/download?${qs}`, {
       method: 'GET',
@@ -1681,6 +1912,46 @@ export const api = {
   testDnsProvider: (id: string) =>
     request<{ message: string; provider_type: string }>('POST', `/dns-providers/${id}/test`),
 
+  // AD CS authority (Story 13.2). Reads are Viewer, writes SuperAdmin,
+  // the connection test Operator; `required_role` is the enforcement.
+  getAdcsAuthority: () =>
+    request<AdcsAuthorityState>('GET', '/adcs/authority'),
+
+  /** Create (201) or update (200) the one authority. */
+  putAdcsAuthority: (body: AdcsAuthorityRequest) =>
+    request<AdcsAuthority>('PUT', '/adcs/authority', body),
+
+  /** Refused with 409, naming them, while certificates reference it. */
+  deleteAdcsAuthority: () =>
+    request<{ message: string }>('DELETE', '/adcs/authority'),
+
+  testAdcsAuthority: () =>
+    request<AdcsConnectionTestResult>('POST', '/adcs/authority/test'),
+
+  /**
+   * Issue a certificate from the AD CS authority (Story 13.3), Operator
+   * and above. The authority records the issuance and only its
+   * administrators can revoke it, so callers confirm the full request
+   * with the operator first.
+   */
+  issueAdcsCertificate: (body: AdcsIssueRequest) =>
+    request<AdcsIssueResult>('POST', '/certificates/adcs', body),
+
+  // AD CS adoption (Story 13.5). Detection is computed on every read.
+  listAdcsAdoptionCandidates: () =>
+    request<AdcsAdoptionCandidates>('GET', '/adcs/adoption-candidates'),
+
+  /**
+   * Hand a manual certificate to the AD CS authority, Operator and
+   * above. It issues nothing: renewal takes over at the next window.
+   */
+  adoptAdcsCertificate: (id: string, body: AdcsAdoptRequest) =>
+    request<CertificateResponse>('POST', `/certificates/${id}/adcs/adopt`, body),
+
+  /** Make an AD CS certificate manual again; the current certificate stays in service. */
+  revertAdcsCertificate: (id: string) =>
+    request<CertificateResponse>('POST', `/certificates/${id}/adcs/revert`),
+
   // Cert export ACLs (v1.4.1)
   listCertExportAcls: () =>
     request<{ acls: CertExportAclResponse[] }>('GET', '/cert-export/acls'),
@@ -1732,7 +2003,7 @@ export const api = {
     request<ImportDiffResponse>('POST', '/config/import/preview', { toml_content }),
 
   importConfig: (toml_content: string) =>
-    request<{ message: string }>('POST', '/config/import', { toml_content }),
+    request<ImportConfigResponse>('POST', '/config/import', { toml_content }),
 
   getWorkers: () =>
     request<{ workers: WorkerStatus[]; total: number }>('GET', '/workers'),

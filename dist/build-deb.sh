@@ -90,7 +90,7 @@ Description: Modern reverse proxy with built-in dashboard
  Also ships lorica-mcp, the MCP server an operator's MCP client
  launches; no service starts it.
 Homepage: https://github.com/Rwx-G/Lorica
-Depends: ca-certificates
+Depends: ca-certificates, libgssapi-krb5-2
 EOF
 
 # /run/lorica-package.state carries the service state across a

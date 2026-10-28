@@ -40,7 +40,7 @@
     onclose: () => void;
   }
 
-  let { open, editing, backends, certificates, importedFields, onsave, onclose }: Props = $props();
+  let { open, editing, backends, certificates = $bindable(), importedFields, onsave, onclose }: Props = $props();
 
   let form: RouteFormState = $state({ ...ROUTE_DEFAULTS });
   let formError = $state('');
@@ -427,7 +427,7 @@
         {#if activeTab === 'general'}
           <GeneralTab bind:form={form} editing={!!editing} {importedFields} />
         {:else if activeTab === 'routing'}
-          <RoutingTab bind:form={form} {backends} {certificates} {importedFields} />
+          <RoutingTab bind:form={form} {backends} bind:certificates {importedFields} />
         {:else if activeTab === 'transform'}
           <TransformTab bind:form={form} {importedFields} />
         {:else if activeTab === 'cache'}

@@ -16,6 +16,12 @@ const EXPORT_FORMAT_VERSION: u32 = 1;
 /// Sensitive fields (admin password hashes, certificate private keys,
 /// SMTP passwords) are replaced with `**REDACTED**` before
 /// serialization and re-import is rejected if the placeholder remains.
+///
+/// The AD CS authority has no field here, on purpose (Epic 13 PRD
+/// D14): it carries the service account credential and the names that
+/// credential may request, and it belongs to the control plane it was
+/// configured on. Certificates still carry their `adcs_*` columns; an
+/// import into a node without that authority makes them manual.
 #[derive(Debug, Serialize)]
 pub struct ExportData {
     /// Export schema version (matches `EXPORT_FORMAT_VERSION`).

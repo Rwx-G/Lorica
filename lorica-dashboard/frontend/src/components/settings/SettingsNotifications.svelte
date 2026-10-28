@@ -7,6 +7,7 @@
   import { showToast } from '../../lib/toast';
   import { validateUrl } from '../../lib/validators';
   import { isSuperAdmin } from '../../lib/auth';
+  import { ALERT_TYPE_CHOICES, choiceSelected, mergeAlertTypes } from '../../lib/alert-types';
 
   let {
     notifications = $bindable([]),
@@ -59,14 +60,14 @@
     }
     notifAuthHeaderError = null;
   }
-  // Alert type checkboxes
-  let notifAlertBackendDown = $state(false);
-  let notifAlertCertExpiring = $state(false);
-  let notifAlertWafAlert = $state(false);
-  let notifAlertConfigChanged = $state(false);
-  let notifAlertSlaBreached = $state(false);
-  let notifAlertIpBanned = $state(false);
-  let notifAlertLogStore = $state(false);
+  // Alert type checkboxes, keyed by choice label. The stored list is
+  // kept so a save preserves the types the checkboxes do not show.
+  let notifAlerts = $state<Record<string, boolean>>({});
+  let notifStoredAlertTypes = $state<string[]>([]);
+
+  function setAllAlerts(value: boolean) {
+    notifAlerts = Object.fromEntries(ALERT_TYPE_CHOICES.map((choice) => [choice.label, value]));
+  }
   let notifError = $state('');
   let notifSaving = $state(false);
   let deletingNotif: NotificationConfigResponse | null = $state(null);
@@ -86,13 +87,8 @@
     notifToAddress = '';
     notifUrl = '';
     notifAuthHeader = '';
-    notifAlertBackendDown = false;
-    notifAlertCertExpiring = false;
-    notifAlertWafAlert = false;
-    notifAlertConfigChanged = false;
-    notifAlertSlaBreached = false;
-    notifAlertIpBanned = false;
-    notifAlertLogStore = false;
+    notifStoredAlertTypes = [];
+    setAllAlerts(false);
     notifError = '';
     showNotifForm = true;
   }
@@ -140,14 +136,10 @@
     }
 
     // Populate alert type checkboxes
-    const types = nc.alert_types || [];
-    notifAlertBackendDown = types.includes('backend_down');
-    notifAlertCertExpiring = types.includes('cert_expiring');
-    notifAlertWafAlert = types.includes('waf_alert');
-    notifAlertConfigChanged = types.includes('config_changed');
-    notifAlertSlaBreached = types.includes('sla_breached');
-    notifAlertIpBanned = types.includes('ip_banned');
-    notifAlertLogStore = types.includes('log_store_unavailable');
+    notifStoredAlertTypes = [...(nc.alert_types || [])];
+    notifAlerts = Object.fromEntries(
+      ALERT_TYPE_CHOICES.map((choice) => [choice.label, choiceSelected(choice, notifStoredAlertTypes)]),
+    );
 
     notifError = '';
     showNotifForm = true;
@@ -182,15 +174,8 @@
     }
     const configStr = JSON.stringify(configObj);
 
-    // Build alert_types array from checkboxes
-    const alertArr: string[] = [];
-    if (notifAlertBackendDown) alertArr.push('backend_down');
-    if (notifAlertCertExpiring) alertArr.push('cert_expiring');
-    if (notifAlertWafAlert) alertArr.push('waf_alert');
-    if (notifAlertConfigChanged) alertArr.push('config_changed');
-    if (notifAlertSlaBreached) { alertArr.push('sla_breached'); alertArr.push('sla_recovered'); }
-    if (notifAlertIpBanned) alertArr.push('ip_banned');
-    if (notifAlertLogStore) { alertArr.push('log_store_unavailable'); alertArr.push('log_store_recovered'); }
+    const selected = new Set(ALERT_TYPE_CHOICES.filter((choice) => notifAlerts[choice.label]).map((choice) => choice.label));
+    const alertArr = mergeAlertTypes(notifStoredAlertTypes, selected);
 
     const body = { channel: notifChannel, enabled: notifEnabled, config: configStr, alert_types: alertArr };
 
@@ -227,7 +212,7 @@
 
 <!-- Notification Channels -->
 <section class="settings-section">
-  <button class="settings-collapsible-header" class:open={expandedSections.notifications} onclick={() => toggleSection('notifications')}>
+  <button class="settings-collapsible-header" class:open={expandedSections.notifications} aria-expanded={Boolean(expandedSections.notifications)} onclick={() => toggleSection('notifications')}>
     <h2>Notification Channels</h2>
     <span class="settings-chevron" class:expanded={expandedSections.notifications}></span>
   </button>
@@ -367,18 +352,14 @@
       <fieldset class="settings-fieldset">
         <legend>Alert Types</legend>
         <div class="settings-alert-select-all">
-          <button type="button" class="settings-btn-link" onclick={() => { notifAlertBackendDown = notifAlertCertExpiring = notifAlertWafAlert = notifAlertConfigChanged = notifAlertSlaBreached = notifAlertIpBanned = notifAlertLogStore = true; }}>Select all</button>
+          <button type="button" class="settings-btn-link" onclick={() => setAllAlerts(true)}>Select all</button>
           <span class="settings-separator">|</span>
-          <button type="button" class="settings-btn-link" onclick={() => { notifAlertBackendDown = notifAlertCertExpiring = notifAlertWafAlert = notifAlertConfigChanged = notifAlertSlaBreached = notifAlertIpBanned = notifAlertLogStore = false; }}>None</button>
+          <button type="button" class="settings-btn-link" onclick={() => setAllAlerts(false)}>None</button>
         </div>
         <div class="settings-alert-checkboxes">
-          <label><input type="checkbox" bind:checked={notifAlertBackendDown} /> Backend down</label>
-          <label><input type="checkbox" bind:checked={notifAlertCertExpiring} /> Certificate expiring</label>
-          <label><input type="checkbox" bind:checked={notifAlertWafAlert} /> WAF alert</label>
-          <label><input type="checkbox" bind:checked={notifAlertConfigChanged} /> Configuration changed</label>
-          <label><input type="checkbox" bind:checked={notifAlertSlaBreached} /> SLA breached</label>
-          <label><input type="checkbox" bind:checked={notifAlertIpBanned} /> IP banned</label>
-          <label><input type="checkbox" bind:checked={notifAlertLogStore} /> Log persistence lost / restored</label>
+          {#each ALERT_TYPE_CHOICES as choice (choice.label)}
+            <label><input type="checkbox" bind:checked={notifAlerts[choice.label]} /> {choice.label}</label>
+          {/each}
         </div>
       </fieldset>
       {#if notifError}

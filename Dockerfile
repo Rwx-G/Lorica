@@ -23,7 +23,7 @@ RUN npm run build
 # Stage 2: Build Rust binary
 FROM rust:1-bookworm AS builder
 RUN apt-get update && \
-    apt-get install -y cmake pkg-config protobuf-compiler && \
+    apt-get install -y cmake pkg-config protobuf-compiler libkrb5-dev libclang-dev && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
@@ -63,6 +63,7 @@ COPY lorica-geoip/ lorica-geoip/
 COPY lorica-shmem/ lorica-shmem/
 COPY lorica-mcp/ lorica-mcp/
 COPY lorica-automation-policy/ lorica-automation-policy/
+COPY lorica-adcs/ lorica-adcs/
 COPY tinyufo/ tinyufo/
 
 # Copy pre-built frontend
@@ -74,7 +75,7 @@ RUN cargo build --release --bin lorica --bin lorica-mcp
 # Stage 3: Minimal runtime image
 FROM debian:bookworm-slim
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
+    apt-get install -y --no-install-recommends ca-certificates libgssapi-krb5-2 && \
     rm -rf /var/lib/apt/lists/* && \
     useradd -r -s /usr/sbin/nologin -d /var/lib/lorica lorica && \
     mkdir -p /var/lib/lorica && \
