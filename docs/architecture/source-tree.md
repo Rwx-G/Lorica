@@ -40,6 +40,7 @@ architectural moves per release.
 | `context.rs` | Per-request `RequestCtx`. |
 | `worker_rpc.rs` | Worker-side RPC: two-phase config reload, metrics report. |
 | `engines.rs` | Mode-switching engines (local vs supervisor-RPC: rate limit, verdict cache, breaker). |
+| `rate_limit.rs` | Token-bucket identity (which limit a request draws from, the bucket key) and both ends of the worker-mode `RateLimitDelta` sync: the worker's batch and reply handling, the supervisor's authoritative buckets. |
 | `ai_bot_merged.rs` | The AI-crawler snapshot the request path reads: the built-in registry seeded once, then the enabled custom rows layered on top (a custom row wins on name collision, so an operator can ship a fresh vendor CIDR list mid-cycle). Built per config snapshot and never panics on bad operator data. |
 | `helpers.rs`, `error_pages.rs` + `error_pages.html`, `forward_auth.rs`, `mirror_rewrite.rs`, `bot_handlers.rs` | Shared pure helpers, error-page rendering and its `include_str!`-ed template, forward-auth client, request mirroring + response rewriting, bot solve/captcha handlers. |
 | `tests.rs`, `cert_reload_commit_tests.rs`, `ai_bot_reload_tests.rs` | Unit + regression tests for the above. |
