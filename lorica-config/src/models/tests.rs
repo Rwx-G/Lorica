@@ -595,6 +595,111 @@ fn path_rule_override_reaches_unified_path() {
 }
 
 #[test]
+fn effective_rate_limit_with_rule_matches_the_overridden_route() {
+    use crate::models::{PathRule, RateLimit, RateLimitScope};
+    // The limiter resolves a path rule's limit without cloning the
+    // route; the route snapshot later stages read is the clone. Every
+    // combination of route-level and rule-level fields must give both
+    // the same answer.
+    let structured_options = [
+        None,
+        Some(RateLimit {
+            capacity: 7,
+            refill_per_sec: 3,
+            scope: RateLimitScope::PerRoute,
+        }),
+    ];
+    let field_options = [None, Some(0), Some(4), Some(40)];
+    for structured in &structured_options {
+        for route_rps in field_options {
+            for route_burst in field_options {
+                for rule_rps in field_options {
+                    for rule_burst in field_options {
+                        let mut route = example_route_for_serde();
+                        route.rate_limit = structured.clone();
+                        route.rate_limit_rps = route_rps;
+                        route.rate_limit_burst = route_burst;
+                        let rule = PathRule {
+                            path: "/p".to_string(),
+                            rate_limit_rps: rule_rps,
+                            rate_limit_burst: rule_burst,
+                            ..Default::default()
+                        };
+                        assert_eq!(
+                            route.effective_rate_limit_with(&rule),
+                            route.with_path_rule_overrides(&rule).effective_rate_limit(),
+                            "route ({structured:?}, {route_rps:?}, {route_burst:?}) \
+                             rule ({rule_rps:?}, {rule_burst:?})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn effective_rate_limit_with_rule_overrides_legacy_route() {
+    use crate::models::{PathRule, RateLimit, RateLimitScope};
+    let mut route = example_route_for_serde();
+    route.rate_limit_rps = Some(20);
+    route.rate_limit_burst = Some(5);
+    let rule = PathRule {
+        path: "/login".to_string(),
+        rate_limit_rps: Some(2),
+        rate_limit_burst: Some(3),
+        ..Default::default()
+    };
+    assert_eq!(
+        route.effective_rate_limit_with(&rule),
+        Some(RateLimit {
+            capacity: 3,
+            refill_per_sec: 2,
+            scope: RateLimitScope::PerIp,
+        })
+    );
+    // An `rps` of 0 on the rule lifts the limit for that path.
+    let unlimited = PathRule {
+        path: "/health".to_string(),
+        rate_limit_rps: Some(0),
+        ..Default::default()
+    };
+    assert_eq!(route.effective_rate_limit_with(&unlimited), None);
+}
+
+#[test]
+fn matching_path_rule_returns_first_match_with_its_index() {
+    use crate::models::{PathMatchType, PathRule};
+    let mut route = example_route_for_serde();
+    route.path_rules = vec![
+        PathRule {
+            path: "/api/v2".to_string(),
+            match_type: PathMatchType::Exact,
+            ..Default::default()
+        },
+        PathRule {
+            path: "/api/".to_string(),
+            match_type: PathMatchType::Prefix,
+            rate_limit_rps: Some(1),
+            ..Default::default()
+        },
+        PathRule {
+            path: "/api/v2/".to_string(),
+            match_type: PathMatchType::Prefix,
+            ..Default::default()
+        },
+    ];
+    let (index, rule) = route
+        .matching_path_rule("/api/v2/users")
+        .expect("prefix rule matches");
+    assert_eq!(index, 1, "first match wins, even over a longer prefix");
+    assert!(rule.overrides_rate_limit());
+    assert_eq!(route.matching_path_rule("/api/v2").map(|(i, _)| i), Some(0));
+    assert!(route.matching_path_rule("/static").is_none());
+    assert!(!route.path_rules[0].overrides_rate_limit());
+}
+
+#[test]
 fn legacy_route_keeps_auto_ban_config_for_unified_path() {
     // AC #4: auto-ban escalation reads the route-level
     // `auto_ban_threshold` / `auto_ban_duration_s` directly, so a legacy
