@@ -78,9 +78,10 @@ tags:
       carried (backlog #93). The automation plane holds every later route write
       that would serve those names to the recorded protections, as it holds a
       write to a route it would take traffic from. An operator lists and clears
-      them here; a route create or update through this API on a recorded name
-      clears that record too. Management-plane only: no token can list or clear
-      what bounds it.
+      them here; a route create or update through this API whose route, switched
+      on, serves a recorded name for every path the record holds clears that
+      name from the record, and the record with its last name. Management-plane
+      only: no token can list or clear what bounds it.
 
 paths:
   # ---------------------------------------------------------------------------

@@ -607,10 +607,15 @@ The operator ends a record. The dashboard lists them under Settings,
 Route Protection Records (`GET /api/v1/automation/route-protection-records`,
 Operator), with a confirmed clear
 (`DELETE /api/v1/automation/route-protection-records/{id}`), and a route
-create or update through the dashboard that serves one of a record's
-names clears that record, since the operator has just decided that
-name's protections. Each creation, replacement and clearing is an audit
-row under `route_protection_record.`. Records never replicate and the
+create or update through the dashboard whose route, switched on, serves
+one of a record's names for every path the record holds clears that
+name from the record, since the operator has just decided that name's
+protections; the record keeps its other names, and goes with its last.
+A route switched off decides nothing, so an operator's edit of a
+disabled route a token renamed onto a recorded name clears nothing, and
+neither does a route on another path of the name (`/public` under a
+record of `/`). Each creation, replacement, narrowing and clearing is
+an audit row under `route_protection_record.`. Records never replicate and the
 configuration export does not carry them, like the tokens they bound:
 the automation listener runs only where the records are.
 

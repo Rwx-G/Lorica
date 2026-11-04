@@ -22,6 +22,7 @@ use crate::automation::test_support::{
 };
 use crate::route_protection_records::{
     RECORD_CLEAR_ACTION, RECORD_CLEAR_BY_ROUTE_WRITE_ACTION, RECORD_CREATE_ACTION,
+    RECORD_NARROW_BY_ROUTE_WRITE_ACTION,
 };
 use crate::tests::{body_json, parse_data, send};
 use axum::http::StatusCode;
@@ -518,6 +519,129 @@ async fn a_route_gated_by_forward_auth_or_mtls_keeps_its_gate_against_a_token() 
 }
 
 #[tokio::test]
+async fn an_operator_write_clears_a_record_only_for_the_names_it_serves() {
+    let f = a_node_with_something_to_write().await;
+    let route_id = protected_route(&f).await;
+    token_deletes(&f, &route_id).await;
+    let record_id = record_on(&f, "app.write.example.com").await;
+
+    // An operator route beside the record's path serves none of it.
+    operator_route(
+        &f,
+        serde_json::json!({ "hostname": "app.write.example.com", "path_prefix": "/public" }),
+    )
+    .await;
+    assert_eq!(record_on(&f, "app.write.example.com").await, record_id);
+
+    // An operator route on the recorded hostname, at its path, decides
+    // that name; the alias it does not serve stays held.
+    let operator = automation_route_of_operator(&f, "app.write.example.com").await;
+    let response = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "PUT",
+        &format!("/api/v1/routes/{operator}"),
+        &f.admin,
+        Some(serde_json::json!({ "path_prefix": "/" })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let narrowed = record_on(&f, "www.write.example.com").await;
+    assert_eq!(narrowed, record_id, "the record is narrowed, not replaced");
+    assert_eq!(
+        listed(&f).await[0]["hostname_aliases"],
+        serde_json::json!([])
+    );
+    let rows = audit_rows_under(&f.state, RECORD_NARROW_BY_ROUTE_WRITE_ACTION).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].target_id, record_id);
+    assert!(
+        audit_rows_under(&f.state, RECORD_CLEAR_BY_ROUTE_WRITE_ACTION)
+            .await
+            .is_empty()
+    );
+    assert_record_refused(
+        &f,
+        "POST",
+        "/automation/v1/routes",
+        serde_json::json!({ "hostname": "www.write.example.com" }),
+        "ip_allowlist",
+        &narrowed,
+    )
+    .await;
+}
+
+/// The id of the stored route whose hostname is `hostname`.
+async fn automation_route_of_operator(f: &WriteFixture, hostname: &str) -> String {
+    f.state
+        .store
+        .lock()
+        .await
+        .list_routes()
+        .expect("store")
+        .into_iter()
+        .find(|route| route.hostname == hostname)
+        .expect("the route")
+        .id
+}
+
+#[tokio::test]
+async fn an_operator_edit_of_a_disabled_route_on_a_recorded_name_clears_nothing() {
+    // The decoy: a weak route renamed onto a recorded name while
+    // switched off, which takes no request and so is weighed against
+    // nothing. An operator's edit of it decides no name's protections,
+    // and the token's switch-on is still held to the record.
+    let f = a_node_with_something_to_write().await;
+    let route_id = protected_route(&f).await;
+    token_deletes(&f, &route_id).await;
+    let record_id = record_on(&f, "app.write.example.com").await;
+
+    let decoy = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({ "hostname": "decoy.write.example.com" })),
+    )
+    .await;
+    assert_eq!(decoy.status(), StatusCode::CREATED);
+    let decoy = parse_data(decoy).await["id"]
+        .as_str()
+        .expect("route id")
+        .to_string();
+    token_updates(&f, &decoy, serde_json::json!({ "enabled": false })).await;
+    token_updates(
+        &f,
+        &decoy,
+        serde_json::json!({ "hostname": "app.write.example.com" }),
+    )
+    .await;
+
+    let response = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "PUT",
+        &format!("/api/v1/routes/{decoy}"),
+        &f.admin,
+        Some(serde_json::json!({ "read_timeout_s": 30 })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(record_on(&f, "app.write.example.com").await, record_id);
+    assert_record_refused(
+        &f,
+        "PUT",
+        &format!("/automation/v1/routes/{decoy}"),
+        serde_json::json!({ "enabled": true }),
+        "ip_allowlist",
+        &record_id,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn an_unreadable_record_refuses_only_the_writes_on_its_names() {
     let f = a_node_with_something_to_write().await;
     let record_id = {
@@ -670,8 +794,8 @@ async fn an_operator_route_write_serving_a_recorded_name_clears_the_record() {
             .expect("record id")
             .to_string();
 
-        // A create on the recorded hostname, or an update that adds a
-        // recorded alias to an operator's route.
+        // A create on the recorded names, or an update that gives an
+        // operator's route the recorded names as aliases.
         let written = if alias_only {
             let other = operator_route(
                 &f,
@@ -685,7 +809,9 @@ async fn an_operator_route_write_serving_a_recorded_name_clears_the_record() {
                 "PUT",
                 &format!("/api/v1/routes/{other}"),
                 &f.admin,
-                Some(serde_json::json!({ "hostname_aliases": ["www.write.example.com"] })),
+                Some(serde_json::json!({
+                    "hostname_aliases": ["app.write.example.com", "www.write.example.com"],
+                })),
             )
             .await;
             assert_eq!(response.status(), StatusCode::OK);
@@ -693,7 +819,10 @@ async fn an_operator_route_write_serving_a_recorded_name_clears_the_record() {
         } else {
             operator_route(
                 &f,
-                serde_json::json!({ "hostname": "app.write.example.com" }),
+                serde_json::json!({
+                    "hostname": "app.write.example.com",
+                    "hostname_aliases": ["www.write.example.com"],
+                }),
             )
             .await
         };
