@@ -254,6 +254,19 @@ async fn a_protected_route_a_token_deleted_is_not_created_again_weaker() {
     assert_eq!(listed(&f).await.as_array().map(Vec::len), Some(1));
 }
 
+/// A token's route update, answered 200.
+async fn token_updates(f: &WriteFixture, route_id: &str, body: serde_json::Value) {
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &format!("/automation/v1/routes/{route_id}"),
+        &f.bearer,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "{body}");
+}
+
 /// The id of the one listed record whose hostname is `hostname`.
 async fn record_on(f: &WriteFixture, hostname: &str) -> String {
     let records = listed(f).await;
@@ -286,6 +299,113 @@ async fn operator_route_with(
         .update_route(&route)
         .expect("test setup: the protection lands");
     route_id
+}
+
+#[tokio::test]
+async fn a_token_update_that_releases_a_protected_name_leaves_a_record_of_it() {
+    // Dropping an alias, or renaming the route, vacates a name exactly
+    // as a delete does: the name is then held to the record.
+    let f = a_node_with_something_to_write().await;
+    let route_id = protected_route(&f).await;
+
+    token_updates(&f, &route_id, serde_json::json!({ "hostname_aliases": [] })).await;
+    let released_alias = record_on(&f, "www.write.example.com").await;
+    let records = listed(&f).await;
+    assert_eq!(records[0]["hostname_aliases"], serde_json::json!([]));
+    assert_eq!(records[0]["route_id"], route_id.as_str());
+    assert_record_refused(
+        &f,
+        "POST",
+        "/automation/v1/routes",
+        serde_json::json!({ "hostname": "www.write.example.com" }),
+        "ip_allowlist",
+        &released_alias,
+    )
+    .await;
+
+    token_updates(
+        &f,
+        &route_id,
+        serde_json::json!({ "hostname": "renamed.write.example.com" }),
+    )
+    .await;
+    let released_name = record_on(&f, "app.write.example.com").await;
+    assert_record_refused(
+        &f,
+        "POST",
+        "/automation/v1/routes",
+        serde_json::json!({ "hostname": "app.write.example.com" }),
+        "ip_allowlist",
+        &released_name,
+    )
+    .await;
+    assert_eq!(listed(&f).await.as_array().map(Vec::len), Some(2));
+    let created = audit_rows_under(&f.state, RECORD_CREATE_ACTION).await;
+    assert_eq!(created.len(), 2);
+}
+
+#[tokio::test]
+async fn a_prefix_move_leaves_a_record_and_a_disable_leaves_none() {
+    // Switched off, the route still claims its names and is held in
+    // place, so a disable vacates nothing a token could take; a prefix
+    // moved deeper releases the paths above it.
+    let f = a_node_with_something_to_write().await;
+    let route_id = protected_route(&f).await;
+
+    token_updates(&f, &route_id, serde_json::json!({ "enabled": false })).await;
+    assert_eq!(listed(&f).await, serde_json::json!([]));
+    let claimed = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({ "hostname": "app.write.example.com" })),
+    )
+    .await;
+    assert_eq!(claimed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    token_updates(&f, &route_id, serde_json::json!({ "enabled": true })).await;
+    assert_eq!(listed(&f).await, serde_json::json!([]));
+
+    token_updates(&f, &route_id, serde_json::json!({ "path_prefix": "/api" })).await;
+    let records = listed(&f).await;
+    assert_eq!(records.as_array().map(Vec::len), Some(1), "{records}");
+    assert_eq!(records[0]["path_prefix"], "/");
+    assert_eq!(records[0]["hostname"], "app.write.example.com");
+    assert_eq!(
+        records[0]["hostname_aliases"],
+        serde_json::json!(["www.write.example.com"])
+    );
+    // A move back up serves everything it served again and is held to
+    // the record, which it meets: the route kept its controls.
+    token_updates(&f, &route_id, serde_json::json!({ "path_prefix": "/" })).await;
+}
+
+#[tokio::test]
+async fn an_alias_dropped_through_mcp_and_created_again_is_refused() {
+    let f = a_node_with_something_to_write().await;
+    let route_id = protected_route(&f).await;
+    let updated = mcp_call(
+        &f.state,
+        &f.mcp_bearer,
+        "lorica_route_update",
+        serde_json::json!({ "id": route_id, "route": { "hostname_aliases": [] } }),
+    )
+    .await;
+    assert_eq!(updated["result"]["isError"], false, "{updated}");
+    let record_id = record_on(&f, "www.write.example.com").await;
+    let recreated = mcp_call(
+        &f.state,
+        &f.mcp_bearer,
+        "lorica_route_create",
+        serde_json::json!({ "route": { "hostname": "www.write.example.com" } }),
+    )
+    .await;
+    assert_eq!(recreated["result"]["isError"], true, "{recreated}");
+    let text = recreated["result"].to_string();
+    assert!(
+        text.contains(&format!("route protection record `{record_id}`")),
+        "{text}"
+    );
 }
 
 #[tokio::test]

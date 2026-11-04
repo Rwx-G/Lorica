@@ -562,8 +562,23 @@ predicates' own answer: a control is in force when the route the
 management create stores for a body naming none of the controls would
 be weaker on it, so no second list of controls exists anywhere.
 
+An update that stops such a route serving a name, for every path it
+served there, releases that name exactly as a delete would, and leaves
+a record of the route over the names it released: a new `hostname`
+releases the old one, an alias dropped releases the alias, and a
+`path_prefix` moved deeper (`/` to `/api`) releases every name, since
+`/` is no longer served. Without it, dropping an alias and creating it
+again bare did what deleting the route and creating it again did. A
+prefix moved up serves everything it served and releases nothing.
+Switching a route off releases nothing either: the route still claims
+its names, so no other route can be created on them, and its controls
+are still held in place, so switching it on again is weighed against
+itself; while it is off, its traffic falls through to whatever wildcard
+or catch-all the operator set below it, as any request it does not
+serve always has.
+
 Every later write of this plane that would make a route serve a name
-and path the deleted route would serve today, found through the same
+and path a record holds, found through the same
 route selection (a create, an update that adds a name, moves the prefix
 or switches the route on, and the environment resource), is held to
 the record exactly as it would be held to that route if it were still
@@ -582,8 +597,9 @@ no token route can serve the name, since a token never sends any of
 them; the environment resource can, copying them over server side, and
 an operator can.
 
-What makes no record: a delete through the dashboard, which the rule
-never bound, and the route of an environment, whose controls the
+What makes no record: a write through the dashboard, which the rule
+never bound, a switch-off, and the route of an environment, whose
+controls the
 environment resource rewrites from its profile on every `PUT` and the
 plane therefore never held in place.
 

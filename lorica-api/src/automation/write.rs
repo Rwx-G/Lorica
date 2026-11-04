@@ -109,10 +109,10 @@
 //! controls of the route it displaces instead, through the same rules
 //! (`super::displacement`).
 //!
-//! A route a token deleted is weighed as if it were still there: the
-//! delete leaves a record of the route, and every route write of this
-//! plane is held to it as to a displaced stored route
-//! ([`super::records`]), in the same weighing.
+//! A route a token deleted, or moved off a name, is weighed as if it
+//! still served it: the write leaves a record of the route, and every
+//! route write of this plane is held to it as to a displaced stored
+//! route ([`super::records`]), in the same weighing.
 //!
 //! # The scopes bound each other
 //!
@@ -616,9 +616,10 @@ fn ensure_new_links_granted(
 /// a host from, and the backends linked anew. A header-rule value sent
 /// back as the mask this plane answered it with keeps the stored value
 /// ([`redact::restore_header_rule_values`]) before any of that is
-/// weighed. A delete it allows leaves the deleted route's record when
-/// a control is in force on it
-/// ([`super::records::record_deleted_protections`]).
+/// weighed. A write it allows that stops a route with a control in
+/// force serving a name leaves the route's record over that name
+/// ([`super::records::record_released_protections`]): a delete, a
+/// rename, an alias dropped, a prefix moved deeper.
 fn route_guard(principal: &AutomationPrincipal) -> RouteGuard {
     let principal = principal.clone();
     RouteGuard::bounded(move |store, target| {
@@ -643,7 +644,7 @@ fn route_guard(principal: &AutomationPrincipal) -> RouteGuard {
         ensure_new_links_granted(store, &principal, target)
     })
     .restoring_withheld(redact::restore_header_rule_values)
-    .settling(super::records::record_deleted_protections)
+    .settling(super::records::record_released_protections)
 }
 
 /// A certificate a route write binds anew, weighed as a renewal would

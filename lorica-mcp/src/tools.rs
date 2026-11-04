@@ -1449,7 +1449,12 @@ pub const MUTATIONS: &[Mutation] = &[
                   whole list: a rule sent back with the `[redacted]` value it was read with \
                   keeps the value stored for the rule at the same position with the same \
                   header_name and match_type, and is refused where no such rule is stored, so \
-                  a rule added, moved or retyped carries its value.",
+                  a rule added, moved or retyped carries its value. A patch that stops a \
+                  route carrying a protection serving a name or a path it served (a new \
+                  hostname, an alias dropped, the prefix moved deeper) leaves a record of it, \
+                  as a delete does: a route serving that name later must carry those \
+                  protections at least as strongly until an operator clears the record. \
+                  Switching the route off leaves none: it keeps its names.",
         scope: AutomationScope::RoutesWrite,
         verb: Verb::Put,
         path: "/automation/v1/routes",

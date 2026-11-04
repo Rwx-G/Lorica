@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The protections of a route a token deleted, held against what the
-//! plane writes next (backlog #93, maintainer decision of 2026-11-04).
+//! The protections of a route a token deleted, or moved off a name,
+//! held against what the plane writes next (backlog #93, maintainer
+//! decision of 2026-11-04).
 //!
 //! # The gap
 //!
@@ -22,21 +23,25 @@
 //! request from. A token whose grant lets it delete a route could still
 //! delete a protected one and create it again without its protections:
 //! once deleted, the route was no longer there to be weighed against.
+//! An update that stops the route serving a name does the same for that
+//! name: a rename, an alias dropped, a prefix moved deeper.
 //!
 //! # The record
 //!
-//! A route deleted through this plane that carries at least one control
-//! of [`ROUTE_PROTECTIONS`] in force leaves a
-//! [`RouteProtectionRecord`]: the deleted row itself, as the store held
-//! it. "In force" is the predicates' own answer: a control is in force
-//! when the route the management create stores for a body naming none
-//! of the controls is weaker on it ([`controls_in_force`]). Nothing here
-//! lists a control.
+//! A write through this plane that stops a route carrying at least one
+//! control of [`ROUTE_PROTECTIONS`] in force serving a name, for every
+//! path it served there, leaves a [`RouteProtectionRecord`] of the route
+//! as the store held it over the names it released
+//! ([`record_released_protections`]). "In force" is the predicates' own
+//! answer: a control is in force when the route the management create
+//! stores for a body naming none of the controls is weaker on it
+//! ([`controls_in_force`]). Nothing here lists a control.
 //!
-//! The record stands for the route it was made of, switched on, and is
-//! weighed the way that route would be: every later write of this plane
-//! that would make a route serve a name and path the deleted route
-//! would serve today is held to the same predicates against it, through
+//! The record stands for the route it was made of, switched on, on the
+//! names it released, and is weighed the way that route would be: every
+//! later write of this plane that would make a route serve one of those
+//! names and the path the route would serve today is held to the same
+//! predicates against it, through
 //! the one weighing of what a write takes requests from
 //! (`super::displacement`), where a record sits beside the stored
 //! routes. A token's write is refused naming the control and the record;
@@ -67,8 +72,15 @@
 //!
 //! # What makes no record
 //!
-//! A delete through the dashboard, whose session the rule never bound.
-//! And a route an environment owns: the environment resource rewrites
+//! A write through the dashboard, whose session the rule never bound.
+//! A token switching a route off: the route still claims its names,
+//! which no other route may then take
+//! (`ConfigStore::hostname_claimed_elsewhere`), and its controls are
+//! still held in place, so switching it on again is weighed against
+//! itself; meanwhile its traffic falls through to the wildcard or
+//! catch-all an operator set below it, as a request the route does not
+//! serve always has. And a route an environment owns: the environment
+//! resource rewrites
 //! that route's controls from its profile on every `PUT`, so the plane
 //! never held them in place, and a record would bind the pipeline to a
 //! choice it may undo without deleting anything. What such a route took
@@ -78,7 +90,7 @@
 use std::collections::BTreeSet;
 
 use lorica_config::models::{Route, RouteProtectionRecord};
-use lorica_config::route_selection::same_name;
+use lorica_config::route_selection::{same_name, serves_all_of};
 use lorica_config::ConfigStore;
 
 use super::protections::{as_created_bare, controls_in_force, first_weakened, ROUTE_PROTECTIONS};
@@ -160,31 +172,49 @@ fn same_identity(a: &RouteProtectionRecord, b: &RouteProtectionRecord) -> bool {
     a.path_prefix == b.path_prefix && holds_every_name_of(a, b) && holds_every_name_of(b, a)
 }
 
-/// The automation guard's settle: a route a token deleted, carrying a
-/// control in force and owned by no environment, leaves its record.
+/// The automation guard's settle: a write that stops a route carrying a
+/// control in force, and owned by no environment, serving a name for
+/// every path it served there leaves the route's record over the names
+/// released. A delete releases every name; an update releases each name
+/// the route no longer answers to, and every name when its prefix moves
+/// deeper (`/` to `/api` releases `/`), as [`serves_all_of`] weighs the
+/// route as written. A switch-off releases nothing (the module doc says
+/// why), and neither does a create, which had served nothing.
 ///
-/// A record of the same names and path that the deleted route is at
-/// least as strong as, on every control, is replaced by the new one and
-/// audited as superseded; one it is weaker than on some control stays
-/// beside it, so no recorded control is lost, and so does one that does
-/// not read, which an operator clears. Runs in the transaction that
-/// deletes the route, so the record commits with the delete.
+/// A record of the same names and path that the route is at least as
+/// strong as, on every control, is replaced by the new one and audited
+/// as superseded; one it is weaker than on some control stays beside
+/// it, so no recorded control is lost, and so does one that does not
+/// read, which an operator clears. Runs in the transaction that writes
+/// the route, so the record commits with the write.
 ///
 /// # Errors
 ///
-/// A store failure, which rolls the delete back with it.
-pub(super) fn record_deleted_protections(
+/// A store failure, which rolls the write back with it.
+pub(super) fn record_released_protections(
     store: &ConfigStore,
     actor: &str,
     target: RouteTarget<'_>,
 ) -> Result<Vec<SettledRow>, ApiError> {
-    let (Some(deleted), None) = (target.before, target.after) else {
+    let Some(before) = target.before else {
         return Ok(Vec::new());
     };
-    if deleted.managed_by.is_some() || controls_in_force(deleted)?.is_empty() {
+    if before.managed_by.is_some() || controls_in_force(before)?.is_empty() {
         return Ok(Vec::new());
     }
-    let record = RouteProtectionRecord::of_deleted(deleted, actor, chrono::Utc::now())?;
+    let released: Vec<String> = std::iter::once(&before.hostname)
+        .chain(&before.hostname_aliases)
+        .filter(|name| {
+            !target
+                .after
+                .is_some_and(|after| serves_all_of(after, name, &before.path_prefix))
+        })
+        .cloned()
+        .collect();
+    if released.is_empty() {
+        return Ok(Vec::new());
+    }
+    let record = RouteProtectionRecord::of_released(before, &released, actor, chrono::Utc::now())?;
     let names: BTreeSet<&str> = record.names().collect();
     let names: Vec<&str> = names.into_iter().collect();
     let mut rows = Vec::new();
@@ -195,7 +225,7 @@ pub(super) fn record_deleted_protections(
         let Ok(existing_route) = existing.route() else {
             continue;
         };
-        if first_weakened(ROUTE_PROTECTIONS, &existing_route, deleted).is_some() {
+        if first_weakened(ROUTE_PROTECTIONS, &existing_route, before).is_some() {
             continue;
         }
         store.delete_route_protection_record(&existing.id)?;
@@ -253,10 +283,98 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_token_update_records_the_names_it_releases_and_nothing_else() {
+        let store = ConfigStore::open_in_memory().expect("store");
+        let mut before = fortified("r-1", "app.example.com");
+        before.hostname_aliases = vec!["www.example.com".into(), "api.example.com".into()];
+        let update = |after: &Route| -> Vec<Vec<String>> {
+            record_released_protections(
+                &store,
+                "ci (0123)",
+                RouteTarget {
+                    before: Some(&before),
+                    after: Some(after),
+                    backend_ids: None,
+                },
+            )
+            .expect("settles")
+            .iter()
+            .filter(|row| row.action == RECORD_CREATE_ACTION)
+            .map(|row| {
+                let held = row.after.as_ref().expect("a view");
+                std::iter::once(held["hostname"].as_str().expect("a name").to_string())
+                    .chain(
+                        held["hostname_aliases"]
+                            .as_array()
+                            .expect("aliases")
+                            .iter()
+                            .map(|alias| alias.as_str().expect("a name").to_string()),
+                    )
+                    .collect()
+            })
+            .collect()
+        };
+        let edited = |edit: fn(&mut Route)| {
+            let mut after = before.clone();
+            edit(&mut after);
+            after
+        };
+
+        // Nothing released: an untouched name set, a prefix moved up, a
+        // switch-off, a control strengthened.
+        assert!(update(&before).is_empty());
+        assert!(update(&edited(|r| r.enabled = false)).is_empty());
+        assert!(update(&edited(|r| r.auto_ban_threshold = Some(1))).is_empty());
+        let mut deeper = before.clone();
+        deeper.path_prefix = "/api".into();
+        assert!(record_released_protections(
+            &store,
+            "ci (0123)",
+            RouteTarget {
+                before: Some(&deeper),
+                after: Some(&before),
+                backend_ids: None,
+            },
+        )
+        .expect("settles")
+        .is_empty());
+
+        // An alias dropped, a rename, a prefix moved deeper.
+        assert_eq!(
+            update(&edited(
+                |r| r.hostname_aliases = vec!["api.example.com".into()]
+            )),
+            vec![vec!["www.example.com".to_string()]]
+        );
+        assert_eq!(
+            update(&edited(|r| r.hostname = "renamed.example.com".into())),
+            vec![vec!["app.example.com".to_string()]]
+        );
+        assert_eq!(
+            update(&edited(|r| r.path_prefix = "/v2".into())),
+            vec![vec![
+                "app.example.com".to_string(),
+                "www.example.com".to_string(),
+                "api.example.com".to_string()
+            ]]
+        );
+        // Each release is its own record: the alias drop and the prefix
+        // move hold different names.
+        let released_alias = store
+            .route_protection_records_naming(&["www.example.com"])
+            .expect("lookup");
+        assert_eq!(
+            released_alias.len(),
+            2,
+            "the alias drop and the prefix move"
+        );
+    }
+
+    #[test]
     fn a_token_delete_records_a_protected_route_once_and_nothing_else() {
         let store = ConfigStore::open_in_memory().expect("store");
         let delete = |route: &Route| {
-            record_deleted_protections(
+            record_released_protections(
                 &store,
                 "ci (0123)",
                 RouteTarget {
