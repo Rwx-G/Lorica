@@ -9,8 +9,8 @@
   <img src="https://img.shields.io/badge/version-1.10.1-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-3501-brightgreen.svg" alt="Lorica Tests">
-  <img src="https://img.shields.io/badge/Pingora%20Tests-794-blue.svg" alt="Inherited Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-3527-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Pingora%20Tests-813-blue.svg" alt="Inherited Tests">
 </p>
 
 ---
@@ -726,30 +726,24 @@ cargo build --release
 # Every Rust test in the workspace
 cargo test --workspace
 
-# Product crates only (3501 tests, Lorica-native)
-cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
-           -p lorica-notify -p lorica-bench -p lorica-worker \
-           -p lorica-command -p lorica-shmem \
-           -p lorica-challenge -p lorica-geoip -p lorica-acme \
-           -p lorica-metrics -p lorica-cluster -p lorica-dashboard \
-           -p lorica-mcp -p lorica-automation-policy -p lorica-adcs \
-           --features otel
-
-# Pingora-forked crates (794 tests)
-cargo test -p lorica-core -p lorica-proxy -p lorica-http \
-           -p lorica-error -p lorica-tls -p lorica-cache \
-           -p lorica-pool -p lorica-runtime -p lorica-timeout \
-           -p lorica-lb -p lorica-ketama -p lorica-lru \
-           -p lorica-memory-cache -p lorica-header-serde -p lorica-limits \
-           -p TinyUFO
+# The CI `Test` job's steps: the product crates, the binary crate with
+# `otel`, the Pingora-forked crates, and the forked crates' rustls build.
+# The crate lists live in the workflow; print them rather than copy them.
+grep -E '^\s+run: cargo test' .github/workflows/ci.yml
 
 # The cluster crate's integration binaries, including the frozen v1.7.0
 # wire corpus (every message's encoding, pinned)
 cargo test -p lorica-cluster --tests
 
-# Frontend (538 Vitest cases across 29 files) and its gates
+# Frontend and its gates
 cd lorica-dashboard/frontend && npm run check && npm run lint && npx vitest run
 ```
+
+At 1.10.2 the two product-crate steps run 3527 Rust tests and the
+forked-crate step 813; the rustls build runs 492 more, most of them the
+default-feature tests of `lorica-core` and `lorica-lb` again with TLS on,
+so they are left out of the forked figure. The frontend suite is 762
+Vitest cases across 44 files.
 
 The `lorica` binary crate carries 24 end-to-end binaries under
 `lorica/tests/` that drive a real Pingora `Server` against mock backends
