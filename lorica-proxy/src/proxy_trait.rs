@@ -171,8 +171,8 @@ pub trait ProxyHttp {
     /// (e.g. `Vary` headers, custom request filters that modify the origin host).
     /// Getting this wrong leads to cache poisoning.
     ///
-    /// See `lorica-proxy/tests/utils/server_utils.rs` for a minimal (not
-    /// production-ready) reference implementation.
+    /// Lorica's implementation, in `lorica/src/proxy_wiring.rs`, is the
+    /// reference for this fork.
     ///
     /// # Panics
     ///

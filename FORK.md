@@ -247,9 +247,10 @@ after any upstream sync that touches the function it lives in.
   `ServerConf::default()` with `version: 1`, the value the YAML parse
   produced (a test pins every field), and returns `Self` instead of
   `Option<Self>`; `new_with_opt_override` likewise. `Server::new` keeps its
-  `Result` signature. The integration-test servers of `lorica-core` and
-  `lorica-proxy` build the configuration their `tests/pingora_conf.yaml`
-  used to hold in code, and the two files are deleted. On an upstream
+  `Result` signature. The integration-test server of `lorica-core` builds
+  the configuration its `tests/pingora_conf.yaml` used to hold in code,
+  and the file is deleted (as is `lorica-proxy`'s, with the suites below
+  that read it). On an upstream
   sync, take new `ServerConf` fields with their `Default` value and leave
   the YAML path out.
 - **Forked crates on newer dependency majors (v1.10.2, API adaptations
@@ -273,6 +274,24 @@ after any upstream sync that touches the function it lives in.
   only the `default-hasher` and `inline-more` features. On an upstream
   sync, keep Lorica's version and port the new code to its API rather
   than taking upstream's manifest line.
+- **`lorica-proxy`, no integration suites (v1.10.2, tests only).** Gone:
+  `tests/test_basic.rs`, `tests/test_upstream.rs` and everything under
+  `tests/` only they used (the `utils/` harness with its mock origin,
+  WebSocket echo servers and certificate loaders, the openresty
+  configuration and key material under `utils/conf/`, `tests/keys/`,
+  `tests/headers.dict`), the two `[[test]]` targets, the
+  `integration-tests` feature and the dev-dependencies nothing else in the
+  crate uses (`hyper` 0.14, `hyperlocal` 0.8, `reqwest`, `httparse`,
+  `env_logger`, `tokio-tungstenite`, `futures-util`, and the `lorica-lb`,
+  `lorica-limits`, `prometheus`, `serde` and `serde_json` entries left
+  over from upstream's example binaries). The suites drive the proxy
+  against an openresty origin the fork never provisioned, sat behind a
+  feature no job enabled, and had stopped compiling (hyper 0.14 types
+  against the `http` 1 API, the `tungstenite` `Utf8Bytes` change). The
+  crate's unit tests in `src/` are unaffected. Upstream fixes and new
+  tests in these files no longer port: a fix whose only test lives there
+  is ported with a unit test written against the fork, or recorded as not
+  ported in the sync record below.
 
 ## Upstream sync record
 
