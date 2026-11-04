@@ -178,6 +178,11 @@ pub struct RouteEntry {
     /// all-malformed allowlist stays fail-closed.
     pub ip_allowlist_nets: Vec<ipnet::IpNet>,
     pub ip_denylist_nets: Vec<ipnet::IpNet>,
+    /// The route's prefix and rule paths as a normalising backend reads
+    /// them, read once here so the check of a request whose path
+    /// normalises does not read them again
+    /// ([`ProxyConfig::selects_alike_once_normalised`]).
+    pub normalised_paths: route_selection::NormalisedPaths,
 }
 
 /// Runtime-side view of a route's mTLS policy: the bits we check at
@@ -619,6 +624,7 @@ impl ProxyConfig {
                 bot_ua_regex_set,
                 ip_allowlist_nets: super::filters::compile_ip_patterns(&route.ip_allowlist),
                 ip_denylist_nets: super::filters::compile_ip_patterns(&route.ip_denylist),
+                normalised_paths: route_selection::NormalisedPaths::of(&route),
             });
 
             entries.push(entry);
@@ -737,6 +743,7 @@ impl ProxyConfig {
             host,
             path,
             |entry| entry.route.as_ref(),
+            |entry| &entry.normalised_paths,
         )
     }
 }

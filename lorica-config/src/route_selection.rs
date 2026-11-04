@@ -642,11 +642,37 @@ fn percent_decoded_once(text: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
+/// A route's `path_prefix` and the `path` of each of its path rules, in
+/// order, as [`normalised_path`] reads a request path: what
+/// [`selects_alike_once_normalised`] compares the normalised request
+/// with. Built once per route when the proxy builds a configuration
+/// snapshot, so the check of a request reads no stored path again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalisedPaths {
+    prefix: String,
+    rule_paths: Vec<String>,
+}
+
+impl NormalisedPaths {
+    /// `route`'s prefix and rule paths, normalised.
+    pub fn of(route: &Route) -> NormalisedPaths {
+        NormalisedPaths {
+            prefix: normalised_path(&route.path_prefix).into_owned(),
+            rule_paths: route
+                .path_rules
+                .iter()
+                .map(|rule| normalised_path(&rule.path).into_owned())
+                .collect(),
+        }
+    }
+}
+
 /// Whether `path` and its [`normalised_path`] are served by the same
 /// entry and, within its route, by the same path rule, or both by none.
 /// The normalised path is matched against each route's prefix and each
-/// rule's path read the same way, so a prefix stored with an encoded
-/// octet still matches the decoded request.
+/// rule's path read the same way (`normalised_of`, the entry's
+/// [`NormalisedPaths`]), so a prefix stored with an encoded octet still
+/// matches the decoded request.
 ///
 /// When they differ, a backend that normalises paths would serve, under
 /// the route or the rule the raw path selects, a resource the normalised
@@ -655,33 +681,39 @@ fn percent_decoded_once(text: &str) -> String {
 /// `/admin` that denies it, then `/admin` at the backend. The proxy
 /// refuses such a request rather than guess which reading the backend
 /// applies.
-pub fn selects_alike_once_normalised<E, F>(
+pub fn selects_alike_once_normalised<E, F, G>(
     exact: &HashMap<String, Vec<E>>,
     wildcards: &[(String, Vec<E>)],
     host: &str,
     path: &str,
     route_of: F,
+    normalised_of: G,
 ) -> bool
 where
     F: Fn(&E) -> &Route,
+    G: Fn(&E) -> &NormalisedPaths,
 {
     let Cow::Owned(normalised) = normalised_path(path) else {
         return true;
     };
     let as_sent = select(exact, wildcards, host, path, &route_of);
     let as_normalised = select_where(exact, wildcards, host, |entry| {
-        let route = route_of(entry);
         path_starts_with(
             &normalised,
-            &normalised_path(&route.path_prefix),
-            route.case_insensitive_paths,
+            &normalised_of(entry).prefix,
+            route_of(entry).case_insensitive_paths,
         )
     });
     match (as_sent, as_normalised) {
         (None, None) => true,
         (Some(sent), Some(normalised_entry)) => {
             std::ptr::eq(sent, normalised_entry)
-                && selects_the_same_path_rule(route_of(sent), path, &normalised)
+                && selects_the_same_path_rule(
+                    route_of(sent),
+                    normalised_of(sent),
+                    path,
+                    &normalised,
+                )
         }
         _ => false,
     }
@@ -691,15 +723,20 @@ where
 /// read the same way, select the same rule of `route`, or both none.
 /// First match wins on both readings, as everywhere rules are
 /// evaluated ([`Route::matching_path_rule`]).
-fn selects_the_same_path_rule(route: &Route, path: &str, normalised: &str) -> bool {
+fn selects_the_same_path_rule(
+    route: &Route,
+    normalised_paths: &NormalisedPaths,
+    path: &str,
+    normalised: &str,
+) -> bool {
     let as_sent = route.matching_path_rule(path).map(|(index, _)| index);
-    let as_normalised = route.path_rules.iter().position(|rule| {
-        rule.matches_as(
-            &normalised_path(&rule.path),
-            normalised,
-            route.case_insensitive_paths,
-        )
-    });
+    let as_normalised = route
+        .path_rules
+        .iter()
+        .zip(&normalised_paths.rule_paths)
+        .position(|(rule, rule_path)| {
+            rule.matches_as(rule_path, normalised, route.case_insensitive_paths)
+        });
     as_sent == as_normalised
 }
 
@@ -913,6 +950,24 @@ mod tests {
         .expect("test setup: a route with every defaulted field left out")
     }
 
+    /// Whether `path` selects alike on `host` among `routes`, each held
+    /// with its [`NormalisedPaths`] as the proxy's snapshot holds it.
+    fn alike_among(routes: &[Route], host: &str, path: &str) -> bool {
+        let entries: Vec<(Route, NormalisedPaths)> = routes
+            .iter()
+            .map(|route| (route.clone(), NormalisedPaths::of(route)))
+            .collect();
+        let index = HostIndex::new(entries.iter(), |entry| &entry.0);
+        selects_alike_once_normalised(
+            &index.exact,
+            &index.wildcards,
+            host,
+            path,
+            |entry| &entry.0,
+            |entry| &entry.1,
+        )
+    }
+
     fn served<'a>(index: &'a HostIndex<&Route>, host: &str, path: &str) -> Option<&'a str> {
         index
             .select(host, path, |r| *r)
@@ -953,15 +1008,7 @@ mod tests {
             route("admin", "app.example.com", "/admin"),
         ];
         let index = HostIndex::new(routes.iter(), |r| *r);
-        let alike = |path: &str| {
-            selects_alike_once_normalised(
-                &index.exact,
-                &index.wildcards,
-                "app.example.com",
-                path,
-                |r| *r,
-            )
-        };
+        let alike = |path: &str| alike_among(&routes, "app.example.com", path);
         for steered in [
             "/%61dmin/x",
             "//admin",
@@ -1020,15 +1067,7 @@ mod tests {
             route("admin", "app.example.com", "/admin"),
         ];
         let index = HostIndex::new(routes.iter(), |r| *r);
-        let alike = |path: &str| {
-            selects_alike_once_normalised(
-                &index.exact,
-                &index.wildcards,
-                "app.example.com",
-                path,
-                |r| *r,
-            )
-        };
+        let alike = |path: &str| alike_among(&routes, "app.example.com", path);
         for steered in [
             "/;x=1/admin/x",
             "/..;/admin/x",
@@ -1068,16 +1107,7 @@ mod tests {
             },
         ];
         let routes = [public];
-        let index = HostIndex::new(routes.iter(), |r| *r);
-        let alike = |path: &str| {
-            selects_alike_once_normalised(
-                &index.exact,
-                &index.wildcards,
-                "app.example.com",
-                path,
-                |r| *r,
-            )
-        };
+        let alike = |path: &str| alike_among(&routes, "app.example.com", path);
         // One route either way, but a rule on one reading and none, or
         // another, on the other.
         for steered in [
@@ -1119,16 +1149,7 @@ mod tests {
             ..Default::default()
         }];
         let admin = route("admin", "app.example.com", "/admin");
-        let alike_on = |routes: &[Route], path: &str| {
-            let index = HostIndex::new(routes.iter(), |r| *r);
-            selects_alike_once_normalised(
-                &index.exact,
-                &index.wildcards,
-                "app.example.com",
-                path,
-                |r| *r,
-            )
-        };
+        let alike_on = |routes: &[Route], path: &str| alike_among(routes, "app.example.com", path);
         let sensitive = [public.clone(), admin.clone()];
         let index = HostIndex::new(sensitive.iter(), |r| *r);
         assert_eq!(
@@ -1176,15 +1197,7 @@ mod tests {
             route("cafe", "app.example.com", "/caf%C3%A9"),
         ];
         let index = HostIndex::new(routes.iter(), |r| *r);
-        let alike = |path: &str| {
-            selects_alike_once_normalised(
-                &index.exact,
-                &index.wildcards,
-                "app.example.com",
-                path,
-                |r| *r,
-            )
-        };
+        let alike = |path: &str| alike_among(&routes, "app.example.com", path);
         // Its octets spelled in either hex case select it, as sent and
         // once decoded alike.
         for path in ["/caf%C3%A9/menu", "/caf%c3%a9/menu", "/caf%c3%A9"] {
@@ -1209,16 +1222,7 @@ mod tests {
     #[test]
     fn a_host_no_route_serves_is_alike_both_ways() {
         let routes = [route("admin", "app.example.com", "/admin")];
-        let index = HostIndex::new(routes.iter(), |r| *r);
-        let alike = |path: &str| {
-            selects_alike_once_normalised(
-                &index.exact,
-                &index.wildcards,
-                "app.example.com",
-                path,
-                |r| *r,
-            )
-        };
+        let alike = |path: &str| alike_among(&routes, "app.example.com", path);
         assert!(alike("/x/%2e%2e/other"));
         // No route as sent, the protected one once normalised.
         assert!(!alike("/x/../admin"));
