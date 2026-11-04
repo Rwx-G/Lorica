@@ -368,30 +368,36 @@ fn default_forward_auth_timeout_ms() -> u32 {
 /// by the configured CA bundle and, optionally, constrain which
 /// certificate subjects are allowed.
 ///
-/// The CA bundle is used by the TLS listener to validate the chain;
-/// whether a missing cert counts as a failure is driven by `required`.
-/// rustls is configured with `allow_unauthenticated` so the handshake
-/// always succeeds - final allow/deny lives in the proxy layer, which
-/// lets different routes on the same listener have different policies.
+/// The HTTPS listener trusts the union of every mTLS route's bundle,
+/// with `allow_unauthenticated` so a client without a cert still
+/// completes the handshake. A certificate it accepts may therefore come
+/// from another route's CA, so the proxy layer verifies the chain again
+/// against THIS route's bundle before it reads anything from the
+/// certificate. A certificate that does not chain to this bundle is no
+/// client identity on this route.
 ///
 /// Two enforcement levels:
-/// - `required = true`: the request is denied with 496
-///   (RFC-reserved "SSL certificate required" status) if the client
-///   did not present a cert. This is the zero-trust mode.
-/// - `required = false`: requests without a cert pass through; requests
-///   WITH a cert still get their organization checked against the
-///   allowlist if one is configured. Useful for routes that want to
-///   prefer-but-not-require client certs (mixed public + B2B).
+/// - `required = true`: the request is denied with 496 ("SSL
+///   certificate required") if the client did not present a cert, and
+///   with 495 ("SSL certificate error") if its cert does not chain to
+///   this bundle. This is the zero-trust mode.
+/// - `required = false`: requests without a cert, or with one that does
+///   not chain to this bundle, pass through as anonymous; requests with
+///   a cert that does chain still get their organization checked
+///   against the allowlist if one is configured. Useful for routes that
+///   want to prefer-but-not-require client certs (mixed public + B2B).
 ///
 /// `allowed_organizations` is an optional allowlist matched against the
 /// cert subject's `O=` field. An empty list accepts any cert that
 /// chains to the bundle. When non-empty, the organization is a
 /// case-sensitive exact match.
 ///
-/// Changes to `ca_cert_pem` require a proxy restart because rustls
-/// server configs are immutable after build. Toggling `required` and
-/// editing `allowed_organizations` are both hot-reloadable since those
-/// are enforced in the request path.
+/// A change to `ca_cert_pem` reaches this route's check on reload. The
+/// listener's union only changes on restart, because rustls server
+/// configs are immutable after build: until then a certificate from a
+/// CA no route trusted at startup fails the handshake. Toggling
+/// `required` and editing `allowed_organizations` are both
+/// hot-reloadable since those are enforced in the request path.
 /// Per-route token-bucket rate limit. Cross-worker under `--workers N`
 /// via the lorica-limits `LocalBucket` + supervisor-synced
 /// `AuthoritativeBucket` pair. See
@@ -471,9 +477,11 @@ pub struct MtlsConfig {
     /// issue client certs. Must contain at least one valid CERTIFICATE
     /// block. Empty / garbage PEM is rejected by the API validator.
     pub ca_cert_pem: String,
-    /// When true, requests without a validated client certificate are
-    /// rejected with 496. When false, unauthenticated requests pass
-    /// through but any presented cert must still match the allowlist.
+    /// When true, requests without a client certificate are rejected
+    /// with 496, and requests whose certificate does not chain to
+    /// `ca_cert_pem` with 495. When false, both pass through as
+    /// anonymous, and a certificate that does chain must still match
+    /// the allowlist.
     #[serde(default)]
     pub required: bool,
     /// Optional subject-organization allowlist. Empty = accept any

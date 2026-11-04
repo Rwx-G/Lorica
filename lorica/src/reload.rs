@@ -87,7 +87,7 @@ pub fn commit_prepared_reload(
         warn!(
             installed = ?installed_fp,
             current = ?current_fp,
-            "mtls CA bundle changed since startup; restart Lorica to apply (rustls ServerConfig is immutable). Toggling mtls.required or editing allowed_organizations takes effect live."
+            "mtls CA bundle changed since startup; routes now verify client certificates against their new bundles, but the TLS listener keeps trusting the startup set until Lorica restarts (rustls ServerConfig is immutable): a certificate from a CA added since startup fails the handshake until then. Toggling mtls.required or editing allowed_organizations takes effect live."
         );
     }
     // Evict per-route mirror semaphores for routes that no longer exist,
@@ -1239,8 +1239,9 @@ async fn build_proxy_config_inner(
     info!(routes = route_count, "proxy configuration reloaded");
 
     // mTLS CA bundle drift detection: rustls `ServerConfig` is
-    // immutable after the listener is built, so any edit to a
-    // route's `mtls.ca_cert_pem` at runtime won't take effect until
+    // immutable after the listener is built, so an edit to a route's
+    // `mtls.ca_cert_pem` reaches the per-route check (the new snapshot
+    // builds new route verifiers) but not the listener's union until
     // the process is restarted. We detect drift in Prepare so the
     // log lands once per reload (rather than twice if both Prepare
     // and Commit emit it); the actual warn! is deferred to

@@ -16,7 +16,8 @@
 //!      The `allow_unauthenticated` contract says: trusted + no-cert
 //!      handshake, untrusted fails.
 //!
-//!   2. **Request-phase enforcement of `required` / allowlist.**
+//!   2. **Request-phase enforcement of the route's own CA,
+//!      `required` and the allowlist.**
 //!      A real `LoricaProxy` is instantiated with a route carrying an
 //!      `MtlsConfig`, fed a `Session` built from a tokio-rustls
 //!      `ServerTlsStream`, and `request_filter` is driven against it.
@@ -24,8 +25,10 @@
 //!      the proxy writes back to the rustls stream.
 //!
 //! This covers both halves - the listener-level cryptographic
-//! verification and the proxy-level per-route policy - without
-//! spinning up a full Pingora server just to assert status codes.
+//! verification and the proxy-level per-route policy. The full-stack
+//! tests further down run a real Pingora server with two routes on one
+//! listener, each trusting its own CA, to show the listener union does
+//! not let one route's CA into the other.
 
 #![cfg(unix)]
 
@@ -63,6 +66,11 @@ struct TestPki {
     rogue_ca_pem: String,
     rogue_client_cert_der: CertificateDer<'static>,
     rogue_client_key_der: PrivateKeyDer<'static>,
+    /// Issued by the first CA, carrying the second CA's client
+    /// organization: what a holder of the first CA would mint to pass
+    /// an allowlist on a route that trusts only the second CA.
+    impostor_client_cert_der: CertificateDer<'static>,
+    impostor_client_key_der: PrivateKeyDer<'static>,
 }
 
 fn init_crypto() {
@@ -115,12 +123,16 @@ fn build_pki() -> TestPki {
         sign_cert(&ca_issuer, "localhost", None, vec!["localhost".into()]);
     let (client_cert_der, client_key_der) =
         sign_cert(&ca_issuer, "client-a", Some("Acme Corp"), vec![]);
+    let (impostor_client_cert_der, impostor_client_key_der) =
+        sign_cert(&ca_issuer, "impostor", Some("Evil Corp"), vec![]);
 
     let (_rogue_ca_cert, rogue_ca_issuer, rogue_ca_pem) = build_ca("Rogue CA");
     let (rogue_client_cert_der, rogue_client_key_der) =
         sign_cert(&rogue_ca_issuer, "rogue-client", Some("Evil Corp"), vec![]);
 
     TestPki {
+        impostor_client_cert_der,
+        impostor_client_key_der,
         ca_pem,
         ca_cert_der,
         server_cert_der,
@@ -427,33 +439,50 @@ async fn union_store_accepts_clients_from_either_ca() {
 
 #[test]
 fn policy_grid_matches_spec() {
-    use lorica::proxy_wiring::{evaluate_mtls, MtlsEnforcer};
+    use lorica::proxy_wiring::{evaluate_mtls, MtlsEnforcer, RouteClientCert};
 
     fn e(required: bool, orgs: &[&str]) -> MtlsEnforcer {
         MtlsEnforcer {
             required,
             allowed_organizations: orgs.iter().map(|s| s.to_string()).collect(),
+            client_verifier: None,
         }
     }
+    fn verified(organization: &str) -> RouteClientCert<'_> {
+        RouteClientCert::Verified { organization }
+    }
+    let untrusted = RouteClientCert::Untrusted;
 
     // required=true, no cert -> 496
-    assert_eq!(evaluate_mtls(&e(true, &[]), None), Some(496));
-    // required=true, any signed cert, empty allowlist -> pass
-    assert_eq!(evaluate_mtls(&e(true, &[]), Some("Whatever")), None);
-    // required=false, no cert -> pass (opportunistic)
-    assert_eq!(evaluate_mtls(&e(false, &[]), None), None);
-    // required=true, allowlisted org -> pass
-    assert_eq!(evaluate_mtls(&e(true, &["Acme"]), Some("Acme")), None);
-    // required=true, not in allowlist -> 495
-    assert_eq!(evaluate_mtls(&e(true, &["Acme"]), Some("Gamma")), Some(495));
-    // required=false, cert present but not in allowlist -> still 495
-    // (allowlist always wins when a cert is presented)
     assert_eq!(
-        evaluate_mtls(&e(false, &["Acme"]), Some("Gamma")),
+        evaluate_mtls(&e(true, &[]), RouteClientCert::Absent),
+        Some(496)
+    );
+    // required=true, any signed cert, empty allowlist -> pass
+    assert_eq!(evaluate_mtls(&e(true, &[]), verified("Whatever")), None);
+    // required=false, no cert -> pass (opportunistic)
+    assert_eq!(evaluate_mtls(&e(false, &[]), RouteClientCert::Absent), None);
+    // required=true, allowlisted org -> pass
+    assert_eq!(evaluate_mtls(&e(true, &["Acme"]), verified("Acme")), None);
+    // required=true, not in allowlist -> 495
+    assert_eq!(
+        evaluate_mtls(&e(true, &["Acme"]), verified("Gamma")),
+        Some(495)
+    );
+    // required=false, cert present but not in allowlist -> still 495
+    // (allowlist always wins when a verified cert is presented)
+    assert_eq!(
+        evaluate_mtls(&e(false, &["Acme"]), verified("Gamma")),
         Some(495)
     );
     // empty org on cert vs. non-empty allowlist -> 495
-    assert_eq!(evaluate_mtls(&e(true, &["Acme"]), Some("")), Some(495));
+    assert_eq!(evaluate_mtls(&e(true, &["Acme"]), verified("")), Some(495));
+    // required=true, cert not from this route's CA -> 495
+    assert_eq!(evaluate_mtls(&e(true, &[]), untrusted), Some(495));
+    // required=false, cert not from this route's CA -> pass, anonymous
+    // (the allowlist is not consulted for an identity the route does
+    // not trust)
+    assert_eq!(evaluate_mtls(&e(false, &["Acme"]), untrusted), None);
 }
 
 // A smoke test that proves a LoricaProxy configured with an mtls_enforcer
@@ -625,6 +654,7 @@ fn upstream_backend(id: &str, addr: std::net::SocketAddr) -> Backend {
 
 struct TlsProxyHarness {
     port: u16,
+    proxy_config: Arc<ArcSwap<ProxyConfig>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -705,7 +735,7 @@ impl TlsProxyHarness {
         let log_buffer = Arc::new(lorica_api::logs::LogBuffer::new(128));
         let active_conns = Arc::new(AtomicU64::new(0));
         let sla = Arc::new(lorica_bench::passive_sla::SlaCollector::new());
-        let proxy = LoricaProxy::new(proxy_config, log_buffer, active_conns, sla);
+        let proxy = LoricaProxy::new(Arc::clone(&proxy_config), log_buffer, active_conns, sla);
 
         let port = reserve_port();
         let proxy_addr = format!("127.0.0.1:{port}");
@@ -731,6 +761,7 @@ impl TlsProxyHarness {
         wait_for_port(port).await;
         Self {
             port,
+            proxy_config,
             shutdown_tx,
             thread: Some(thread),
         }
@@ -752,6 +783,17 @@ async fn tls_request(
     port: u16,
     client_config: Arc<RusTlsClientConfig>,
 ) -> Result<(u16, String), String> {
+    tls_request_to(port, client_config, "localhost").await
+}
+
+/// [`tls_request`] naming `host` in the Host header. The SNI stays
+/// `localhost`, the only name the test server certificate carries, so
+/// every route of a harness is reached over the same listener.
+async fn tls_request_to(
+    port: u16,
+    client_config: Arc<RusTlsClientConfig>,
+    host: &str,
+) -> Result<(u16, String), String> {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let stream = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
     let connector = tokio_rustls::TlsConnector::from(client_config);
@@ -765,7 +807,8 @@ async fn tls_request(
     .await
     .map_err(|_| "handshake timeout".to_string())?
     .map_err(|e| format!("handshake: {e}"))?;
-    tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    tls.write_all(request.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
     let mut buf = Vec::with_capacity(4096);
@@ -909,4 +952,209 @@ async fn fullstack_optional_no_cert_passes_through() {
     let (status, body) = tls_request(harness.port, cc).await.expect("tls req");
     assert_eq!(status, 200, "raw response: {body}");
     assert!(body.contains("upstream-ok"));
+}
+
+// ===========================================================================
+// Full-stack: two routes on one listener, each trusting its own CA. The
+// listener verifier is the union of both bundles, so a certificate from
+// either CA completes the handshake; what a route accepts must still be
+// decided by that route's own bundle.
+// ===========================================================================
+
+/// The second route of a two-CA harness: `b.test`, trusting the second
+/// ("rogue") CA only. The first route is `build_test_route_with_mtls`
+/// on `localhost`, trusting the first CA.
+fn second_ca_route(pki: &TestPki, required: bool, orgs: Vec<&str>) -> Route {
+    let mut r = mtls_route(&pki.rogue_ca_pem, required, orgs);
+    r.id = "r-mtls-b".into();
+    r.hostname = "b.test".into();
+    r
+}
+
+/// Route A (`localhost`, first CA, required) plus `route_b`, both
+/// served by the same upstream. Also builds the reloaded snapshot.
+fn two_ca_config(
+    pki: &TestPki,
+    route_b: Route,
+    upstream: std::net::SocketAddr,
+) -> (Vec<Route>, Vec<Backend>, Vec<(String, String)>) {
+    let route_a = build_test_route_with_mtls("u", &pki.ca_pem, true, vec![]);
+    let links = vec![
+        (route_a.id.clone(), "u".into()),
+        (route_b.id.clone(), "u".into()),
+    ];
+    (
+        vec![route_a, route_b],
+        vec![upstream_backend("u", upstream)],
+        links,
+    )
+}
+
+async fn two_ca_harness(pki: &TestPki, route_b: Route) -> (TlsProxyHarness, std::net::SocketAddr) {
+    let upstream = spawn_plain_upstream().await;
+    let (routes, backends, links) = two_ca_config(pki, route_b, upstream);
+    let harness = TlsProxyHarness::start(pki, routes, backends, links).await;
+    (harness, upstream)
+}
+
+fn first_ca_client(pki: &TestPki) -> Arc<RusTlsClientConfig> {
+    client_config_with_cert(
+        &pki.ca_cert_der,
+        pki.client_cert_der.clone(),
+        pki.client_key_der.clone_key(),
+    )
+}
+
+fn second_ca_client(pki: &TestPki) -> Arc<RusTlsClientConfig> {
+    client_config_with_cert(
+        &pki.ca_cert_der,
+        pki.rogue_client_cert_der.clone(),
+        pki.rogue_client_key_der.clone_key(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_cert_from_another_routes_ca_is_refused_on_required_route() {
+    let pki = build_pki();
+    let (harness, _) = two_ca_harness(&pki, second_ca_route(&pki, true, vec![])).await;
+
+    let (status, body) = tls_request_to(harness.port, first_ca_client(&pki), "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 495, "first-CA cert on the second-CA route: {body}");
+    assert!(!body.contains("upstream-ok"), "upstream reached: {body}");
+
+    let (status, body) = tls_request_to(harness.port, second_ca_client(&pki), "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 200, "second-CA cert on its own route: {body}");
+
+    let (status, body) = tls_request_to(harness.port, first_ca_client(&pki), "localhost")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 200, "first-CA cert on its own route: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_cert_from_another_routes_ca_with_the_allowed_org_is_refused() {
+    // The first CA can put any O= it likes in a certificate, so an
+    // allowlist on the second route is no defence on its own.
+    let pki = build_pki();
+    let (harness, _) = two_ca_harness(&pki, second_ca_route(&pki, true, vec!["Evil Corp"])).await;
+
+    let impostor = client_config_with_cert(
+        &pki.ca_cert_der,
+        pki.impostor_client_cert_der.clone(),
+        pki.impostor_client_key_der.clone_key(),
+    );
+    let (status, body) = tls_request_to(harness.port, impostor, "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 495, "first-CA cert carrying O=Evil Corp: {body}");
+    assert!(!body.contains("upstream-ok"), "upstream reached: {body}");
+
+    let (status, body) = tls_request_to(harness.port, second_ca_client(&pki), "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 200, "second-CA cert with the allowed org: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_cert_from_another_routes_ca_is_anonymous_on_optional_route() {
+    // On a route that admits clients without a certificate, a
+    // certificate from a CA the route does not trust carries no
+    // identity: the request passes as anonymous, it is not checked
+    // against the allowlist (and so not refused by it either).
+    let pki = build_pki();
+    let (harness, _) = two_ca_harness(&pki, second_ca_route(&pki, false, vec!["Evil Corp"])).await;
+
+    let (status, body) = tls_request_to(harness.port, first_ca_client(&pki), "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 200, "first-CA cert on optional route: {body}");
+    assert!(body.contains("upstream-ok"), "upstream not reached: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_route_ca_change_applies_on_reload() {
+    // The listener union already trusts the first CA (route A), so
+    // pointing route B at it is a reload, not a restart, for the
+    // per-route check.
+    let pki = build_pki();
+    let (harness, upstream) = two_ca_harness(&pki, second_ca_route(&pki, true, vec![])).await;
+
+    let (status, _) = tls_request_to(harness.port, first_ca_client(&pki), "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 495, "before the reload");
+
+    let mut route_b = second_ca_route(&pki, true, vec![]);
+    route_b.mtls.as_mut().expect("mtls").ca_cert_pem = pki.ca_pem.clone();
+    let (routes, backends, links) = two_ca_config(&pki, route_b, upstream);
+    harness.proxy_config.store(Arc::new(ProxyConfig::from_store(
+        routes,
+        backends,
+        vec![],
+        links,
+        ProxyConfigGlobals::default(),
+    )));
+
+    let (status, body) = tls_request_to(harness.port, first_ca_client(&pki), "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 200, "after the reload: {body}");
+}
+
+/// Read one HTTP/1.1 response framed by `Content-Length` and return its
+/// status, leaving the connection open for the next request.
+async fn read_framed_response<S: tokio::io::AsyncRead + Unpin>(tls: &mut S) -> u16 {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        let n = tls.read(&mut tmp).await.expect("read header");
+        assert!(n > 0, "connection closed mid-header: {buf:?}");
+        buf.push(tmp[0]);
+    }
+    let head = String::from_utf8_lossy(&buf).into_owned();
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .expect("status line");
+    let length: usize = head
+        .lines()
+        .find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())
+                .flatten()
+        })
+        .expect("content-length");
+    let mut body = vec![0u8; length];
+    tls.read_exact(&mut body).await.expect("read body");
+    status
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_one_connection_is_judged_per_route() {
+    // A keep-alive connection reaching both routes: the verdict for one
+    // route must not be reused for the other.
+    let pki = build_pki();
+    let (harness, _) = two_ca_harness(&pki, second_ca_route(&pki, true, vec![])).await;
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", harness.port).parse().unwrap();
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let connector = tokio_rustls::TlsConnector::from(first_ca_client(&pki));
+    let server_name = rustls_pki_types::ServerName::try_from("localhost")
+        .unwrap()
+        .to_owned();
+    let mut tls = connector.connect(server_name, stream).await.expect("tls");
+
+    let mut statuses = Vec::new();
+    for host in ["b.test", "b.test", "localhost"] {
+        let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        tls.write_all(request.as_bytes()).await.expect("write");
+        statuses.push(read_framed_response(&mut tls).await);
+    }
+    assert_eq!(statuses, vec![495, 495, 200]);
 }

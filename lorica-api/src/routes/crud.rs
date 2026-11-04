@@ -4744,9 +4744,11 @@ fn apply_route_patch(
     }
     if let Some(ref m) = body.mtls {
         // Empty ca_cert_pem = explicit "disable" signal from dashboard.
-        // Non-empty = validate + install/replace. Changes to the PEM
-        // take effect on next restart (rustls ServerConfig is immutable
-        // after build); required/allowed_organizations hot-reload.
+        // Non-empty = validate + install/replace. The route's own
+        // check follows a PEM change on reload; the listener's union
+        // of every route's CA only on restart (rustls ServerConfig is
+        // immutable after build). required/allowed_organizations
+        // hot-reload.
         if m.ca_cert_pem.trim().is_empty() {
             route.mtls = None;
         } else {

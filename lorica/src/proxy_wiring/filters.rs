@@ -25,7 +25,7 @@ use tracing::{debug, warn};
 
 use super::ai_bot_merged::{self, MergedCrawler, MergedVerification};
 use super::{
-    bot_handlers, build_mirror_forward_headers, canary_bucket, downstream_ssl_digest,
+    bot_handlers, build_mirror_forward_headers, canary_bucket, downstream_route_client_cert,
     evaluate_mtls, extract_host, host_without_port, mirror_sample_hit, render_error_body,
     request_has_body, request_host, run_forward_auth_keyed, spawn_mirrors, ForwardAuthOutcome,
     LoricaProxy, MirrorBodyState, MirrorPending, ProxyConfig, RequestCtx, RouteEntry,
@@ -930,11 +930,12 @@ impl LoricaProxy {
 
     /// Stage: mTLS client verification. Runs before forward_auth so a
     /// request that failed to present a valid client cert is rejected
-    /// cheaply (no auth sub-request spawned). The listener has already
-    /// validated the cert chain against the union CA bundle; this just
-    /// checks presence and the per-route org allowlist. Terminal: 495
-    /// (cert error) / 496 (cert required), the semi-standard Nginx
-    /// codes that don't collide with our other rejection paths.
+    /// cheaply (no auth sub-request spawned). The listener accepted the
+    /// chain against the union of every mTLS route's CA; this verifies
+    /// it against THIS route's CA, then applies presence and the
+    /// per-route org allowlist. Terminal: 495 (cert error) / 496 (cert
+    /// required), the semi-standard Nginx codes that don't collide with
+    /// our other rejection paths.
     pub(super) async fn check_mtls(
         &self,
         session: &mut Session,
@@ -942,7 +943,7 @@ impl LoricaProxy {
         entry: &RouteEntry,
     ) -> Result<Option<bool>> {
         if let Some(ref enforcer) = entry.mtls_enforcer {
-            let verdict = evaluate_mtls(enforcer, downstream_ssl_digest(session).as_deref());
+            let verdict = evaluate_mtls(enforcer, downstream_route_client_cert(session, enforcer));
             if let Some(status) = verdict {
                 ctx.block_reason = Some(format!("mtls rejected ({status})"));
                 let message = match status {

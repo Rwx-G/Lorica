@@ -316,7 +316,8 @@ pub(crate) fn run_single_process(cli: Cli) {
         // Snapshot the CA fingerprint once at startup and pass the slot
         // to the reload loop further down so it can warn the operator
         // if an `mtls.ca_cert_pem` edit happens at runtime (rustls
-        // ServerConfig is immutable; an edit needs a restart).
+        // ServerConfig is immutable: the listener union only changes on
+        // restart, the per-route check on reload).
         let mtls_installed_fingerprint: Arc<parking_lot::Mutex<Option<String>>> =
             Arc::new(parking_lot::Mutex::new(None));
         {

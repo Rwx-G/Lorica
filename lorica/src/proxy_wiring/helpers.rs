@@ -17,7 +17,8 @@
 //!     `request_host` (the name in it, as routes are looked up).
 //!   - `match_header_rule_backends` (header-based routing override
 //!     selection).
-//!   - `evaluate_mtls` (per-route mTLS policy gate).
+//!   - `route_client_cert` + `evaluate_mtls` (per-route mTLS chain
+//!     verification and policy gate).
 //!   - `canary_bucket` + `pick_traffic_split_backends` (canary
 //!     traffic split assignment, FNV-1a deterministic).
 //!   - `cache_vary_for_request` + `compute_cache_variance` (cache
@@ -235,37 +236,104 @@ pub(crate) fn match_header_rule_backends<'a>(
     None
 }
 
-/// Evaluate the per-route mTLS policy against the connection's client
-/// certificate organization. Returns `None` when the request passes,
-/// and `Some(status)` with the HTTP status the caller should reject
-/// with. Pure so it is trivially unit-testable against synthesized
-/// ssl digests.
+/// What a request's client certificate amounts to on one route.
+///
+/// The only way Lorica reads a client identity: the listener accepted
+/// the chain against the union of every mTLS route's CA, so the raw
+/// digest fields (`SslDigest::organization` and its siblings) may
+/// describe a certificate from another route's CA and are never read
+/// directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteClientCert<'a> {
+    /// No certificate: a plaintext connection, or a TLS client that sent
+    /// none.
+    Absent,
+    /// A certificate whose chain does not verify against this route's CA
+    /// bundle. It carries no identity on this route.
+    Untrusted,
+    /// A certificate that chains to this route's CA, with its subject
+    /// organization (`""` when it has no `O=`, which no non-empty
+    /// allowlist contains).
+    Verified {
+        /// The end-entity's subject organization.
+        organization: &'a str,
+    },
+}
+
+/// Judge the client certificate a connection carries against one
+/// route's own CA bundle.
+///
+/// The chain is verified at most once per connection and route: the
+/// verdict is kept in the digest's `peer_chain_verdicts` under the
+/// route verifier's memo key, which a reload renews.
+pub fn route_client_cert<'a>(
+    ssl: Option<&'a lorica_core::protocols::tls::SslDigest>,
+    enforcer: &MtlsEnforcer,
+) -> RouteClientCert<'a> {
+    let Some(ssl) = ssl else {
+        return RouteClientCert::Absent;
+    };
+    if ssl.peer_cert_chain.is_empty() {
+        return RouteClientCert::Absent;
+    }
+    let Some(verifier) = enforcer.client_verifier.as_ref() else {
+        return RouteClientCert::Untrusted;
+    };
+    let verified = ssl
+        .peer_chain_verdicts
+        .get_or_compute(verifier.memo_key(), || {
+            verifier.verifies(&ssl.peer_cert_chain)
+        });
+    if verified {
+        RouteClientCert::Verified {
+            organization: ssl.organization.as_deref().unwrap_or_default(),
+        }
+    } else {
+        RouteClientCert::Untrusted
+    }
+}
+
+/// [`route_client_cert`] for the downstream connection of `session`.
+pub(crate) fn downstream_route_client_cert<'a>(
+    session: &'a Session,
+    enforcer: &MtlsEnforcer,
+) -> RouteClientCert<'a> {
+    let ssl = session
+        .as_downstream()
+        .digest()
+        .and_then(|d| d.ssl_digest.as_deref());
+    route_client_cert(ssl, enforcer)
+}
+
+/// Evaluate the per-route mTLS policy against what the client
+/// certificate amounts to on the route. Returns `None` when the request
+/// passes, and `Some(status)` with the HTTP status the caller should
+/// reject with.
 ///
 /// Status contract:
-/// - `required = true` and no cert → 496 ("SSL certificate required")
-/// - `allowed_organizations` non-empty, cert org not in list → 495
-///   ("SSL certificate error"). The org check applies whether
-///   required is true or false: an operator who configured an
-///   allowlist meant to enforce it on presented certs.
-/// - `required = false` and no cert presented → pass (opportunistic).
-///
-/// The cert chain itself is validated at the TLS layer by the
-/// listener's WebPkiClientVerifier; the organization string arrives
-/// pre-extracted in `client_organization` (None when no cert was
-/// presented, Some("") for a cert without an O= field).
-pub fn evaluate_mtls(enforcer: &MtlsEnforcer, client_organization: Option<&str>) -> Option<u16> {
-    match client_organization {
-        None => {
-            if enforcer.required {
-                Some(496)
-            } else {
-                None
-            }
-        }
-        Some(org) => {
-            // Empty allowlist = accept any authenticated client.
+/// - no cert, `required = true` → 496 ("SSL certificate required");
+///   `required = false` → pass (opportunistic).
+/// - a cert that does not chain to the route's CA, `required = true` →
+///   495 ("SSL certificate error"): a certificate was presented and
+///   failed verification, nginx's meaning of 495, where 496 means none
+///   was presented. `required = false` → pass, as anonymous: the route
+///   admits clients without a certificate, and the allowlist is not
+///   consulted for an identity the route does not trust.
+/// - a cert that chains to the route's CA, `allowed_organizations`
+///   non-empty and its org not in the list → 495, whether required is
+///   true or false: an operator who configured an allowlist meant to
+///   enforce it on verified certs.
+pub fn evaluate_mtls(enforcer: &MtlsEnforcer, client_cert: RouteClientCert<'_>) -> Option<u16> {
+    match client_cert {
+        RouteClientCert::Absent => enforcer.required.then_some(496),
+        RouteClientCert::Untrusted => enforcer.required.then_some(495),
+        RouteClientCert::Verified { organization } => {
+            // Empty allowlist = accept any verified client.
             if enforcer.allowed_organizations.is_empty()
-                || enforcer.allowed_organizations.iter().any(|a| a == org)
+                || enforcer
+                    .allowed_organizations
+                    .iter()
+                    .any(|a| a == organization)
             {
                 None
             } else {
@@ -273,28 +341,6 @@ pub fn evaluate_mtls(enforcer: &MtlsEnforcer, client_organization: Option<&str>)
             }
         }
     }
-}
-
-/// Extract the client-certificate organization (O= DN field) from a
-/// downstream TLS session, or None when the session is plaintext / the
-/// client did not present a cert / the cert has no O= field.
-///
-/// We go through `downstream_session.digest().ssl_digest`, the TLS
-/// digest the listener records; rustls populates `organization` from
-/// the first cert in the peer chain.
-pub(crate) fn downstream_ssl_digest(session: &Session) -> Option<String> {
-    let digest = session.as_downstream().digest()?;
-    let ssl = digest.ssl_digest.as_ref()?;
-    // cert_digest empty = no client cert was presented (rustls leaves
-    // the digest empty when the handshake completed via
-    // allow_unauthenticated).
-    if ssl.cert_digest.is_empty() {
-        return None;
-    }
-    // An authenticated cert may still lack an O= field. Return Some("")
-    // in that case so the route-level allowlist check correctly fails
-    // (empty string is never in a non-empty allowlist).
-    Some(ssl.organization.clone().unwrap_or_default())
 }
 
 /// Compute a stable bucket in `0..100` for `(route_id, client_ip)`. Same
