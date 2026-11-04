@@ -274,6 +274,33 @@ mod tests {
     }
 
     #[test]
+    fn a_case_insensitive_paths_value_that_does_not_read_fails_the_route_read() {
+        // The flag widens what the route's controls hold; read as `false`
+        // on a column that does not decode, it would silently narrow them.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut route = make_route();
+        route.case_insensitive_paths = true;
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
+        assert!(
+            store
+                .get_route(&route.id)
+                .expect("test setup: route fetch")
+                .expect("test setup: value present")
+                .case_insensitive_paths
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE routes SET case_insensitive_paths = 'yes' WHERE id = ?1",
+                [&route.id],
+            )
+            .expect("test setup: column overwritten");
+        assert!(store.get_route(&route.id).is_err());
+    }
+
+    #[test]
     fn test_route_group_name_round_trips_through_store() {
         // v1.4.1: group_name is a new column; make sure INSERT, UPDATE
         // and SELECT all carry it end-to-end. Uses two routes to also
