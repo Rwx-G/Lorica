@@ -142,6 +142,16 @@ fn info_for_status(status: u16) -> StatusInfo {
             broken_tier: BrokenTier::You,
             wiki_anchor: "403_Forbidden",
         },
+        421 => StatusInfo {
+            title: "Misdirected request",
+            what_happened: "This request reached the site over a connection that was opened \
+                            for another site, so the client certificate it carries, if any, was \
+                            chosen for that other site.",
+            what_can_i_do: "Retry the request: your client may open a new connection for this \
+                            site and present the certificate meant for it.",
+            broken_tier: BrokenTier::You,
+            wiki_anchor: "421_Misdirected_Request",
+        },
         495 => StatusInfo {
             title: "SSL certificate error",
             what_happened: "The client certificate you presented was not issued by a \

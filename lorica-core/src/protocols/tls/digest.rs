@@ -56,6 +56,12 @@ pub struct SslDigest {
     /// Lorica: the application's verdicts on `peer_cert_chain`, kept for the
     /// life of the connection.
     pub peer_chain_verdicts: PeerChainVerdicts,
+    /// Lorica: the server name (SNI) the client sent on a connection a
+    /// listener accepted. `None` when it sent none, and always on a
+    /// connection Lorica opened. A request on the connection may name
+    /// another host (HTTP/2 coalescing, a reused connection); the client
+    /// certificate was chosen for this one.
+    pub server_name: Option<String>,
 }
 
 impl SslDigest {
@@ -80,6 +86,7 @@ impl SslDigest {
             extension: SslDigestExtension::default(),
             peer_cert_chain: PeerCertChain::default(),
             peer_chain_verdicts: PeerChainVerdicts::default(),
+            server_name: None,
         }
     }
 }

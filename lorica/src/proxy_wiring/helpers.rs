@@ -297,16 +297,54 @@ pub fn route_client_cert<'a>(
     }
 }
 
-/// [`route_client_cert`] for the downstream connection of `session`.
-pub(crate) fn downstream_route_client_cert<'a>(
-    session: &'a Session,
-    enforcer: &MtlsEnforcer,
-) -> RouteClientCert<'a> {
-    let ssl = session
+/// The TLS digest of the downstream connection of `session`, `None` on
+/// plaintext.
+pub(crate) fn downstream_ssl_digest(
+    session: &Session,
+) -> Option<&lorica_core::protocols::tls::SslDigest> {
+    session
         .as_downstream()
         .digest()
-        .and_then(|d| d.ssl_digest.as_deref());
-    route_client_cert(ssl, enforcer)
+        .and_then(|d| d.ssl_digest.as_deref())
+}
+
+/// The status a request is refused with on an mTLS route, or `None` when
+/// it passes: [`evaluate_mtls`], except that a refusal for want of a
+/// certificate from the route's CA (none presented, or one the CA did
+/// not issue) becomes 421 Misdirected Request when the connection's
+/// handshake named another host than `request_host` (canonical, as
+/// `request_host` gives it).
+///
+/// The certificate is fixed per connection and chosen by the client for
+/// the server name of its handshake. A browser coalescing this host onto
+/// an HTTP/2 connection opened for another one, or a client reusing a
+/// connection, presents the certificate meant for that other host, and a
+/// 495 or 496 would lock it out for the life of the connection. RFC 9110
+/// section 15.5.20 has a client retry a 421 on a new connection, whose
+/// handshake names this host and can present this route's certificate;
+/// that retry is judged as any other request, so it gets the 495 or 496
+/// a wrong certificate earns. A connection without a server name, or
+/// with this host's, keeps 495 and 496: a new connection would carry the
+/// same certificate. An allowlist refusal of a certificate this route's
+/// CA did issue stays 495, the certificate being one meant for this
+/// route.
+pub fn mtls_refusal_status(
+    enforcer: &MtlsEnforcer,
+    client_cert: RouteClientCert<'_>,
+    connection_server_name: Option<&str>,
+    request_host: &str,
+) -> Option<u16> {
+    let status = evaluate_mtls(enforcer, client_cert)?;
+    let certificate_meant_for_another_host =
+        !matches!(client_cert, RouteClientCert::Verified { .. })
+            && connection_server_name.is_some_and(|server_name| {
+                lorica_config::route_selection::canonical_hostname(server_name) != request_host
+            });
+    Some(if certificate_meant_for_another_host {
+        421
+    } else {
+        status
+    })
 }
 
 /// Evaluate the per-route mTLS policy against what the client

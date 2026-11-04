@@ -284,10 +284,12 @@ pub mod helpers;
 // because they're re-exported by integration tests under `tests/`
 // (canary_e2e_test, mtls_e2e_test).
 pub(crate) use helpers::{
-    cache_vary_for_request, downstream_route_client_cert, extract_host, host_without_port,
+    cache_vary_for_request, downstream_ssl_digest, extract_host, host_without_port,
     pick_consistent_hash, request_host, sanitize_html,
 };
-pub use helpers::{canary_bucket, evaluate_mtls, route_client_cert, RouteClientCert};
+pub use helpers::{
+    canary_bucket, evaluate_mtls, mtls_refusal_status, route_client_cert, RouteClientCert,
+};
 #[cfg(test)]
 pub(crate) use helpers::{
     compute_cache_variance, match_header_rule_backends, pick_traffic_split_backends,

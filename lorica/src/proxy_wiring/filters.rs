@@ -25,9 +25,9 @@ use tracing::{debug, warn};
 
 use super::ai_bot_merged::{self, MergedCrawler, MergedVerification};
 use super::{
-    bot_handlers, build_mirror_forward_headers, canary_bucket, downstream_route_client_cert,
-    evaluate_mtls, extract_host, host_without_port, mirror_sample_hit, render_error_body,
-    request_has_body, request_host, run_forward_auth_keyed, spawn_mirrors, ForwardAuthOutcome,
+    bot_handlers, build_mirror_forward_headers, canary_bucket, downstream_ssl_digest, extract_host,
+    host_without_port, mirror_sample_hit, mtls_refusal_status, render_error_body, request_has_body,
+    request_host, route_client_cert, run_forward_auth_keyed, spawn_mirrors, ForwardAuthOutcome,
     LoricaProxy, MirrorBodyState, MirrorPending, ProxyConfig, RequestCtx, RouteEntry,
     VerdictCacheEngine, WAF_BODY_SCAN_DEFAULT,
 };
@@ -935,7 +935,8 @@ impl LoricaProxy {
     /// it against THIS route's CA, then applies presence and the
     /// per-route org allowlist. Terminal: 495 (cert error) / 496 (cert
     /// required), the semi-standard Nginx codes that don't collide with
-    /// our other rejection paths.
+    /// our other rejection paths, or 421 when the connection was opened
+    /// for another host (`mtls_refusal_status`).
     pub(super) async fn check_mtls(
         &self,
         session: &mut Session,
@@ -943,12 +944,21 @@ impl LoricaProxy {
         entry: &RouteEntry,
     ) -> Result<Option<bool>> {
         if let Some(ref enforcer) = entry.mtls_enforcer {
-            let verdict = evaluate_mtls(enforcer, downstream_route_client_cert(session, enforcer));
+            let verdict = {
+                let ssl = downstream_ssl_digest(session);
+                mtls_refusal_status(
+                    enforcer,
+                    route_client_cert(ssl, enforcer),
+                    ssl.and_then(|digest| digest.server_name.as_deref()),
+                    &request_host(session.req_header()),
+                )
+            };
             if let Some(status) = verdict {
                 ctx.block_reason = Some(format!("mtls rejected ({status})"));
                 let message = match status {
                     496 => "SSL certificate required",
                     495 => "SSL certificate error",
+                    421 => "Misdirected request",
                     _ => "Forbidden",
                 };
                 return self

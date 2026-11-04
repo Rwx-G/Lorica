@@ -399,6 +399,16 @@ lives in.
   new function, and derives `organization` from the list by the same
   join, so that field is unchanged; Lorica's mTLS allowlist reads the
   list. On an upstream sync, keep `from_stream` on the list function.
+- **`lorica-core`, the client's server name in the TLS digest
+  (v1.10.3).** Sites: the `SslDigest::server_name` field in
+  `lorica-core/src/protocols/tls/digest.rs` and its fill in
+  `SslDigest::from_stream` (`protocols/tls/rustls/stream.rs`), on an
+  accepted connection only. Upstream keeps no SNI in the digest. A
+  client chooses its certificate for the server name of its handshake,
+  and a request on the connection may name another host (HTTP/2
+  coalescing, a reused connection); Lorica's mTLS check answers 421
+  rather than 495 or 496 in that case, so the client retries on a new
+  connection for the right host. `SslDigest::new` starts it `None`.
 - **`lorica-core`, a certificate x509-parser refuses is an error
   (v1.10.3).** Site: `parse_der_reporting_errors` in
   `lorica-core/src/utils/tls/rustls.rs`, behind

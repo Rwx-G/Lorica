@@ -2826,6 +2826,89 @@ fn test_route_client_cert_reload_renews_the_verdict() {
     assert_eq!(judge(&digest, &route_enforcer(&ca_a, true, vec![])), None);
 }
 
+// ---- mtls_refusal_status: 421 on a connection opened for another host ----
+
+#[test]
+fn test_mtls_refusal_is_421_when_the_connection_names_another_host() {
+    let required = enforcer(true, vec![]);
+    for client_cert in [RouteClientCert::Absent, RouteClientCert::Untrusted] {
+        assert_eq!(
+            mtls_refusal_status(
+                &required,
+                client_cert,
+                Some("a.example.com"),
+                "b.example.com"
+            ),
+            Some(421),
+            "{client_cert:?}"
+        );
+        // Server names compare in canonical form.
+        assert_eq!(
+            mtls_refusal_status(
+                &required,
+                client_cert,
+                Some("A.Example.com."),
+                "b.example.com"
+            ),
+            Some(421),
+            "{client_cert:?}"
+        );
+    }
+}
+
+#[test]
+fn test_mtls_refusal_keeps_495_and_496_on_the_host_the_connection_names() {
+    let required = enforcer(true, vec![]);
+    for server_name in [Some("b.example.com"), Some("B.EXAMPLE.COM"), None] {
+        assert_eq!(
+            mtls_refusal_status(
+                &required,
+                RouteClientCert::Absent,
+                server_name,
+                "b.example.com"
+            ),
+            Some(496),
+            "{server_name:?}"
+        );
+        assert_eq!(
+            mtls_refusal_status(
+                &required,
+                RouteClientCert::Untrusted,
+                server_name,
+                "b.example.com"
+            ),
+            Some(495),
+            "{server_name:?}"
+        );
+    }
+}
+
+#[test]
+fn test_mtls_refusal_keeps_495_for_an_allowlist_miss_and_passes_what_passes() {
+    // A certificate this route's CA issued was meant for this route: a
+    // new connection would not change the allowlist's verdict.
+    let gamma = orgs(&["Gamma"]);
+    assert_eq!(
+        mtls_refusal_status(
+            &enforcer(true, vec!["Acme"]),
+            verified(&gamma),
+            Some("a.example.com"),
+            "b.example.com"
+        ),
+        Some(495)
+    );
+    // Nothing that passes becomes a refusal.
+    assert_eq!(
+        mtls_refusal_status(
+            &enforcer(false, vec![]),
+            RouteClientCert::Untrusted,
+            Some("a.example.com"),
+            "b.example.com"
+        ),
+        None
+    );
+}
+
 #[test]
 fn test_build_mirror_url_strips_trailing_slash_on_base() {
     assert_eq!(

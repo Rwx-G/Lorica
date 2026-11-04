@@ -402,11 +402,13 @@ impl SslDigest {
         digest.peer_organizations = peer_organizations;
         // Lorica: keep the client's chain on an accepted connection, within
         // `PeerCertChain`'s bounds, so the application can verify it against
-        // per-route roots (FORK.md).
-        if matches!(stream, RusTlsStream::Server(_)) {
+        // per-route roots, and the server name the chain was presented
+        // for (FORK.md).
+        if let RusTlsStream::Server(server) = stream {
             digest.peer_cert_chain = peer_certificates
                 .map(|certs| PeerCertChain::new(certs.iter().map(|cert| cert.as_ref())))
                 .unwrap_or_default();
+            digest.server_name = server.get_ref().1.server_name().map(str::to_owned);
         }
         digest
     }

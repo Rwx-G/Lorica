@@ -116,11 +116,18 @@ fn sign_cert(
     (cert_der, key_der)
 }
 
+/// The names the test server certificate carries: the two hosts the
+/// two-route harness serves, so a client can open a connection for
+/// either.
+fn server_names() -> Vec<String> {
+    vec!["localhost".into(), "b.test".into()]
+}
+
 fn build_pki() -> TestPki {
     let (ca_cert, ca_issuer, ca_pem) = build_ca("Lorica Test CA");
     let ca_cert_der = CertificateDer::from(ca_cert.der().to_vec());
     let (server_cert_der, server_key_der) =
-        sign_cert(&ca_issuer, "localhost", None, vec!["localhost".into()]);
+        sign_cert(&ca_issuer, "localhost", None, server_names());
     let (client_cert_der, client_key_der) =
         sign_cert(&ca_issuer, "client-a", Some("Acme Corp"), vec![]);
     let (impostor_client_cert_der, impostor_client_key_der) =
@@ -719,7 +726,7 @@ impl TlsProxyHarness {
         cert_resolver
             .reload(vec![lorica_tls::cert_resolver::CertData {
                 domain: "localhost".into(),
-                san_domains: vec!["localhost".into()],
+                san_domains: server_names(),
                 cert_pem: server_cert_pem,
                 key_pem: server_key_pem,
                 not_after_epoch: i64::MAX,
@@ -795,18 +802,29 @@ async fn tls_request(
     tls_request_to(port, client_config, "localhost").await
 }
 
-/// [`tls_request`] naming `host` in the Host header. The SNI stays
-/// `localhost`, the only name the test server certificate carries, so
-/// every route of a harness is reached over the same listener.
+/// [`tls_request`] on a connection opened for `host`, naming it in the
+/// Host header as well, as a client does on a fresh connection.
 async fn tls_request_to(
     port: u16,
     client_config: Arc<RusTlsClientConfig>,
     host: &str,
 ) -> Result<(u16, String), String> {
+    tls_request_over(port, client_config, host, host).await
+}
+
+/// One request naming `host` on a connection whose handshake named
+/// `server_name`: an HTTP/2 coalesced or a reused connection when the two
+/// differ.
+async fn tls_request_over(
+    port: u16,
+    client_config: Arc<RusTlsClientConfig>,
+    server_name: &str,
+    host: &str,
+) -> Result<(u16, String), String> {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let stream = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
     let connector = tokio_rustls::TlsConnector::from(client_config);
-    let server_name = rustls_pki_types::ServerName::try_from("localhost")
+    let server_name = rustls_pki_types::ServerName::try_from(server_name)
         .unwrap()
         .to_owned();
     let mut tls = tokio::time::timeout(
@@ -1147,23 +1165,74 @@ async fn read_framed_response<S: tokio::io::AsyncRead + Unpin>(tls: &mut S) -> u
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fullstack_one_connection_is_judged_per_route() {
     // A keep-alive connection reaching both routes: the verdict for one
-    // route must not be reused for the other.
+    // route must not be reused for the other. The connection is opened
+    // for `b.test`, so its refusals there are 495; the first CA's
+    // certificate verifies on `localhost` over it.
     let pki = build_pki();
     let (harness, _) = two_ca_harness(&pki, second_ca_route(&pki, true, vec![])).await;
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", harness.port).parse().unwrap();
     let stream = TcpStream::connect(addr).await.unwrap();
     let connector = tokio_rustls::TlsConnector::from(first_ca_client(&pki));
-    let server_name = rustls_pki_types::ServerName::try_from("localhost")
+    let server_name = rustls_pki_types::ServerName::try_from("b.test")
         .unwrap()
         .to_owned();
     let mut tls = connector.connect(server_name, stream).await.expect("tls");
 
     let mut statuses = Vec::new();
-    for host in ["b.test", "b.test", "localhost"] {
+    for host in ["localhost", "b.test", "b.test", "localhost"] {
         let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
         tls.write_all(request.as_bytes()).await.expect("write");
         statuses.push(read_framed_response(&mut tls).await);
     }
-    assert_eq!(statuses, vec![495, 495, 200]);
+    assert_eq!(statuses, vec![200, 495, 495, 200]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_connection_opened_for_another_host_is_misdirected_on_a_required_route() {
+    // The certificate a connection carries was chosen for the host its
+    // handshake named. On a required route reached over a connection
+    // opened for another host, the refusal is 421, which a client
+    // retries on a new connection; on a connection opened for the route's
+    // own host it stays 495 / 496.
+    let pki = build_pki();
+    let (harness, _) = two_ca_harness(&pki, second_ca_route(&pki, true, vec![])).await;
+
+    let (status, body) =
+        tls_request_over(harness.port, first_ca_client(&pki), "localhost", "b.test")
+            .await
+            .expect("tls req");
+    assert_eq!(
+        status, 421,
+        "first-CA cert over a localhost connection: {body}"
+    );
+    assert!(!body.contains("upstream-ok"), "upstream reached: {body}");
+
+    let no_cert = client_config_trusting(&pki.ca_cert_der);
+    let (status, body) = tls_request_over(harness.port, no_cert.clone(), "localhost", "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 421, "no cert over a localhost connection: {body}");
+
+    let (status, body) = tls_request_to(harness.port, first_ca_client(&pki), "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(
+        status, 495,
+        "first-CA cert over a b.test connection: {body}"
+    );
+    let (status, body) = tls_request_to(harness.port, no_cert, "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 496, "no cert over a b.test connection: {body}");
+
+    // The right certificate passes whichever host the connection names.
+    let (status, body) =
+        tls_request_over(harness.port, second_ca_client(&pki), "localhost", "b.test")
+            .await
+            .expect("tls req");
+    assert_eq!(
+        status, 200,
+        "second-CA cert over a localhost connection: {body}"
+    );
 }
