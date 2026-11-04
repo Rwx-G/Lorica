@@ -20,7 +20,6 @@
 //! * Error log file path
 
 use clap::Parser;
-use lorica_error::{Error, ErrorType::*, Result};
 use std::ffi::OsString;
 
 // default maximum upstream retries for retry-able proxy errors
@@ -209,14 +208,6 @@ impl ServerConf {
         conf
     }
 
-    /// Reject values the server cannot run with.
-    pub fn validate(self) -> Result<Self> {
-        if self.max_blocking_threads == Some(0) {
-            return Error::e_explain(ReadError, "max_blocking_threads must be greater than zero");
-        }
-        Ok(self)
-    }
-
     pub fn merge_with_opt(&mut self, opt: &Opt) {
         if opt.daemon {
             self.daemon = true;
@@ -278,7 +269,6 @@ mod tests {
             upstream_crl_file: None,
         };
         assert_eq!(expected, ServerConf::new());
-        assert_eq!(expected, ServerConf::new().validate().unwrap());
     }
 
     #[test]
@@ -293,32 +283,5 @@ mod tests {
     fn test_conf_flag_is_gone() {
         init_log();
         assert!(Opt::try_parse_from(["lorica", "-c", "conf.yaml"]).is_err());
-    }
-
-    #[test]
-    fn test_zero_max_blocking_threads_is_rejected() {
-        init_log();
-        let conf = ServerConf {
-            max_blocking_threads: Some(0),
-            ..ServerConf::new()
-        };
-        assert!(
-            conf.validate().is_err(),
-            "max_blocking_threads: 0 should fail validation"
-        );
-    }
-
-    #[test]
-    fn test_valid_max_blocking_threads() {
-        init_log();
-        let conf = ServerConf {
-            max_blocking_threads: Some(64),
-            blocking_threads_ttl_seconds: Some(30),
-            ..ServerConf::new()
-        }
-        .validate()
-        .unwrap();
-        assert_eq!(Some(64), conf.max_blocking_threads);
-        assert_eq!(Some(30), conf.blocking_threads_ttl_seconds);
     }
 }
