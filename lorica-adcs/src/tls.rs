@@ -37,7 +37,6 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
 };
-use x509_parser::pem::Pem;
 
 use crate::AdcsError;
 
@@ -138,28 +137,8 @@ impl ServerCertVerifier for PinnedVerifier {
 /// Reads the system store from disk: run it on a blocking thread.
 fn root_store(trust_bundle: Option<&str>) -> Result<RootCertStore, AdcsError> {
     match trust_bundle {
-        Some(pem) => {
-            let mut roots: RootCertStore = RootCertStore::empty();
-            for block in Pem::iter_from_buffer(pem.as_bytes()) {
-                let block: Pem = block.map_err(|err| {
-                    tls_error(format!("the endpoint trust bundle cannot be read: {err}"))
-                })?;
-                if block.label != "CERTIFICATE" {
-                    continue;
-                }
-                roots
-                    .add(CertificateDer::from(block.contents))
-                    .map_err(|err: rustls::Error| {
-                        tls_error(format!("the endpoint trust bundle cannot be read: {err}"))
-                    })?;
-            }
-            if roots.is_empty() {
-                return Err(tls_error(
-                    "the endpoint trust bundle holds no PEM certificate".to_owned(),
-                ));
-            }
-            Ok(roots)
-        }
+        Some(pem) => lorica_tls::http_client::pem_roots(pem.as_bytes())
+            .map_err(|err| tls_error(format!("the endpoint trust bundle is refused: {err}"))),
         None => lorica_tls::http_client::public_roots()
             .map_err(|err| tls_error(format!("the system trust store is unusable: {err}"))),
     }
@@ -211,7 +190,7 @@ mod tests {
         assert_eq!(root_store(Some(&bundle)).expect("roots").len(), 2);
         for empty in ["", "not a PEM bundle"] {
             assert!(
-                matches!(root_store(Some(empty)), Err(AdcsError::Tls { reason }) if reason.contains("no PEM certificate")),
+                matches!(root_store(Some(empty)), Err(AdcsError::Tls { reason }) if reason.contains("holds no certificate")),
                 "{empty:?}"
             );
         }

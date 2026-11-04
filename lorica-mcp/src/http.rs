@@ -185,8 +185,7 @@ impl HttpsPlane {
             HeaderValue::from_static(TRANSPORT_MARKER),
         );
 
-        let builder = reqwest::Client::builder()
-            .tls_backend_preconfigured(trust(config.ca_bundle.as_deref())?)
+        let builder = lorica_tls::http_client::client_builder(trust(config.ca_bundle.as_deref())?)
             .default_headers(headers)
             .timeout(REQUEST_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
@@ -219,44 +218,22 @@ impl HttpsPlane {
 fn trust(bundle: Option<&Path>) -> Result<lorica_tls::ClientConfig, HttpsError> {
     let mut roots: lorica_tls::RootCertStore = lorica_tls::http_client::public_roots()
         .map_err(|reason| HttpsError::ClientUnbuildable(reason.to_string()))?;
-    for authority in trusted_extras(bundle)? {
-        roots
-            .add(authority)
-            .map_err(|reason| HttpsError::ClientUnbuildable(reason.to_string()))?;
-    }
-    Ok(lorica_tls::http_client::verified(roots))
-}
-
-/// The certificates named by `bundle`, or an empty list when none was
-/// named.
-fn trusted_extras(
-    bundle: Option<&Path>,
-) -> Result<Vec<lorica_tls::CertificateDer<'static>>, HttpsError> {
-    use lorica_tls::{CertificateDer, PemObject};
-
-    let Some(path) = bundle else {
-        return Ok(Vec::new());
-    };
-    let pem = std::fs::read(path).map_err(|source| HttpsError::BundleUnreadable {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let certificates = CertificateDer::pem_slice_iter(&pem)
-        .collect::<Result<Vec<CertificateDer<'static>>, _>>()
-        .map_err(|_| {
-            // The parse detail is dropped: it quotes what it choked on, and
-            // an operator who pointed this at the wrong file would see a
-            // line of that file on stderr.
+    if let Some(path) = bundle {
+        let pem = std::fs::read(path).map_err(|source| HttpsError::BundleUnreadable {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        // The workspace's one bundle rule: a file with no certificate, a
+        // block that does not decode or a certificate the store refuses
+        // is refused whole. Its detail is dropped all the same, so the
+        // refusal names the path and nothing from inside the file.
+        lorica_tls::http_client::add_pem_roots(&mut roots, &pem).map_err(|_| {
             HttpsError::BundleNotCertificates {
                 path: path.to_path_buf(),
             }
         })?;
-    if certificates.is_empty() {
-        return Err(HttpsError::BundleNotCertificates {
-            path: path.to_path_buf(),
-        });
     }
-    Ok(certificates)
+    Ok(lorica_tls::http_client::verified(roots))
 }
 
 impl AutomationPlane for HttpsPlane {
@@ -431,35 +408,69 @@ mod tests {
         );
     }
 
-    #[test]
-    fn this_module_offers_no_way_to_skip_verification() {
-        // The property, asserted against this file's own source rather
-        // than promised in a comment. `danger_accept_invalid_certs` and
-        // its siblings are the switch an operator reaches for when a
-        // self-signed certificate is in the way, and the answer here is
-        // the CA bundle instead. The client is preconfigured, so reqwest's
-        // own switches would be ignored anyway; what could skip
-        // verification is the policy's relaxed variants or a verifier of
-        // this module's own.
-        let source = include_str!("http.rs");
-        let body = source.split("#[cfg(test)]").next().unwrap_or(source);
-        for dangerous in [
-            "danger_accept_invalid_certs",
-            "danger_accept_invalid_hostnames",
-            "http_client::unverified",
-            "http_client::with_verifier",
-            "dangerous()",
-            "ServerCertVerifier",
-        ] {
-            assert!(
-                !body.contains(dangerous),
-                "{dangerous} is reachable from this module"
-            );
-        }
-        // And the scan is worth something: the verified configuration it
-        // is meant to be the complement of really is here.
-        assert!(body.contains("lorica_tls::http_client::verified(roots)"));
-        assert!(body.contains(".tls_backend_preconfigured(trust("));
+    /// A client for `config` pointed at the loopback listener on `port`.
+    fn plane_at(config: &ServerConfig, port: u16) -> HttpsPlane {
+        let mut plane = HttpsPlane::new(config).expect("a client builds");
+        plane.endpoint = format!("https://127.0.0.1:{port}");
+        plane
+    }
+
+    async fn whoami(plane: &HttpsPlane) -> Result<String, PlaneError> {
+        plane
+            .call(
+                Verb::Get,
+                "/automation/v1/whoami",
+                None,
+                Reason::Introspection,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn this_client_offers_no_way_to_skip_verification() {
+        // The property observed on the wire rather than read from the
+        // source: whatever the configuration names, the listener's chain
+        // and its name are both checked. A self-signed certificate is the
+        // case an operator would reach for a skip switch over, and the
+        // answer here is the CA bundle; the bundle vouches for the
+        // certificates it holds, for the names they carry, and for
+        // nothing else.
+        let served = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()])
+            .expect("test setup: a certificate");
+        let port = spawn_listener(&served).await;
+        let dir = tempfile::tempdir().expect("test setup: temp dir");
+
+        let refused = whoami(&plane_at(&config_with(None), port))
+            .await
+            .expect_err("no bundle: the public trust does not hold it");
+        assert!(matches!(refused, PlaneError::Transport(_)), "{refused:?}");
+
+        let another = dir.path().join("another.pem");
+        std::fs::write(&another, a_certificate_pem()).expect("test setup: written");
+        let refused = whoami(&plane_at(&config_with(Some(another)), port))
+            .await
+            .expect_err("a bundle naming another certificate does not vouch for this one");
+        assert!(matches!(refused, PlaneError::Transport(_)), "{refused:?}");
+
+        let misnamed =
+            rcgen::generate_simple_self_signed(vec!["elsewhere.example.net".to_string()])
+                .expect("test setup: a certificate");
+        let misnamed_port = spawn_listener(&misnamed).await;
+        let names_it = dir.path().join("misnamed.pem");
+        std::fs::write(&names_it, misnamed.cert.pem()).expect("test setup: written");
+        let refused = whoami(&plane_at(&config_with(Some(names_it)), misnamed_port))
+            .await
+            .expect_err("a trusted certificate for another name is refused");
+        assert!(matches!(refused, PlaneError::Transport(_)), "{refused:?}");
+
+        let names_served = dir.path().join("served.pem");
+        std::fs::write(&names_served, served.cert.pem()).expect("test setup: written");
+        assert_eq!(
+            whoami(&plane_at(&config_with(Some(names_served)), port))
+                .await
+                .expect("the bundle names the served certificate for its name"),
+            "{}"
+        );
     }
 
     /// A listener on loopback that answers every request `{}` over TLS
@@ -500,43 +511,6 @@ mod tests {
             }
         });
         port
-    }
-
-    #[tokio::test]
-    async fn the_listener_is_verified_against_the_public_trust_and_the_named_bundle() {
-        let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()])
-            .expect("test setup: a certificate");
-        let port = spawn_listener(&certificate).await;
-        let endpoint = format!("https://127.0.0.1:{port}");
-
-        let mut public_only = HttpsPlane::new(&config_with(None)).expect("a client builds");
-        public_only.endpoint = endpoint.clone();
-        let refused = public_only
-            .call(
-                Verb::Get,
-                "/automation/v1/whoami",
-                None,
-                Reason::Introspection,
-            )
-            .await
-            .expect_err("a self-signed listener is not publicly trusted");
-        assert!(matches!(refused, PlaneError::Transport(_)), "{refused:?}");
-
-        let dir = tempfile::tempdir().expect("test setup: temp dir");
-        let bundle = dir.path().join("listener.pem");
-        std::fs::write(&bundle, certificate.cert.pem()).expect("test setup: the bundle is written");
-        let mut with_bundle = HttpsPlane::new(&config_with(Some(bundle))).expect("a client builds");
-        with_bundle.endpoint = endpoint;
-        let answer = with_bundle
-            .call(
-                Verb::Get,
-                "/automation/v1/whoami",
-                None,
-                Reason::Introspection,
-            )
-            .await
-            .expect("the bundle names the listener's certificate");
-        assert_eq!(answer, "{}");
     }
 
     #[test]
