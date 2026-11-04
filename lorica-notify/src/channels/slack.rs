@@ -23,9 +23,10 @@ struct SlackMessage {
 ///
 /// Formats the event as a single Slack message (with an emoji chosen from
 /// the alert type) and POSTs the Slack payload as JSON. Also accepts
-/// Discord webhooks in Slack-compatibility mode. Uses a 10-second total
-/// timeout and returns [`NotifyError::Webhook`] on transport failures or
-/// non-2xx responses.
+/// Discord webhooks in Slack-compatibility mode. Uses the channels' shared
+/// client (a 10-second total timeout, no redirect following) and returns
+/// [`NotifyError::Webhook`] on transport failures or non-2xx responses,
+/// a redirect included.
 pub async fn send(config: &WebhookConfig, event: &AlertEvent) -> Result<(), NotifyError> {
     let emoji = match event.alert_type {
         crate::events::AlertType::CertExpiring => ":lock:",
@@ -65,15 +66,7 @@ pub async fn send(config: &WebhookConfig, event: &AlertEvent) -> Result<(), Noti
         icon_emoji: ":shield:".to_string(),
     };
 
-    let tls = lorica_tls::http_client::public()
-        .map_err(|e| NotifyError::Webhook(format!("failed to load the trust roots: {e}")))?;
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(tls)
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| NotifyError::Webhook(format!("failed to create HTTP client: {e}")))?;
-
-    let mut request = client.post(&config.url).json(&message);
+    let mut request = super::http_client()?.post(&config.url).json(&message);
 
     if let Some(ref auth) = config.auth_header {
         request = request.header("Authorization", auth);

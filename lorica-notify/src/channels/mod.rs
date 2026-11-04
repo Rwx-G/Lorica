@@ -18,13 +18,46 @@ pub mod stdout;
 pub mod webhook;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
 use crate::events::AlertEvent;
 use tracing::{info, warn};
+
+/// The HTTP client of the webhook and Slack channels, built once per
+/// process instead of once per alert (which also read the platform
+/// trust store from disk on every send).
+///
+/// Redirects are not followed. Both URLs are operator-configured, and a
+/// 3xx from whatever answers there must not steer the alert, and the
+/// `Authorization` header it may carry, into an internal service
+/// (`http://10.0.0.5:8500/`, `http://169.254.169.254/`). Trust-boundary
+/// fix, audit L-7. A trust store that does not load is logged once and
+/// every send then fails with that reason.
+static HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
+    let client: Result<reqwest::Client, String> = lorica_tls::http_client::public()
+        .map_err(|e| format!("failed to load the trust roots: {e}"))
+        .and_then(|tls| {
+            lorica_tls::http_client::client_builder(tls)
+                .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| format!("failed to create HTTP client: {e}"))
+        });
+    if let Err(reason) = &client {
+        warn!(%reason, "webhook and Slack notifications unavailable");
+    }
+    client
+});
+
+/// The shared client of the HTTP channels, or why there is none.
+fn http_client() -> Result<&'static reqwest::Client, NotifyError> {
+    HTTP_CLIENT
+        .as_ref()
+        .map_err(|reason| NotifyError::Webhook(reason.clone()))
+}
 
 /// Errors from notification delivery.
 #[derive(Debug, thiserror::Error)]
@@ -426,6 +459,60 @@ pub fn validate_webhook_config(config_json: &str) -> Result<WebhookConfig, Notif
 mod tests {
     use super::*;
     use crate::events::AlertType;
+
+    /// A listener on loopback that answers one request with a redirect to
+    /// `location`, on a thread of its own.
+    fn redirecting_once(location: String) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test setup: bind");
+        let port = listener.local_addr().expect("test setup: addr").port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut scratch = [0u8; 4096];
+                let _ = stream.read(&mut scratch);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn neither_http_channel_follows_a_redirect() {
+        // Observed rather than read from the source: the redirect target
+        // is a listener that must never see a connection.
+        let target = std::net::TcpListener::bind("127.0.0.1:0").expect("test setup: bind");
+        target
+            .set_nonblocking(true)
+            .expect("test setup: nonblocking");
+        let location = format!(
+            "http://127.0.0.1:{}/internal",
+            target.local_addr().expect("test setup: addr").port()
+        );
+        let event = AlertEvent::new(AlertType::BackendDown, "redirect probe");
+        for (channel, send) in [("webhook", true), ("slack", false)] {
+            let config = WebhookConfig {
+                url: format!(
+                    "http://127.0.0.1:{}/hook",
+                    redirecting_once(location.clone())
+                ),
+                auth_header: Some("Bearer s3cr3t".into()),
+            };
+            let result = if send {
+                webhook::send(&config, &event).await
+            } else {
+                slack::send(&config, &event).await
+            };
+            let refused = result.expect_err("a redirect is not a delivery");
+            assert!(refused.to_string().contains("302"), "{channel}: {refused}");
+            assert!(
+                matches!(target.accept(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+                "{channel} followed the redirect"
+            );
+        }
+    }
 
     #[test]
     fn test_validate_email_config_valid() {
