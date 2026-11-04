@@ -65,12 +65,14 @@
     <div class="settings-section-body">
       <p class="settings-hint">
         When an automation token deletes a route that carries an access control
-        a token may only strengthen, the node keeps a record of it, listed here
-        with the controls it holds. A route an automation token later creates or
-        moves onto those names must carry them at least as strongly, or it is
-        refused. A route you create or edit in the dashboard on one of those
-        names clears its record. Clear a record only when its protections are no
-        longer wanted.
+        a token may only strengthen, or moves it off a name (a new hostname, an
+        alias dropped, a deeper path prefix), the node keeps a record of it over
+        the names it released, listed here with the controls it holds. A route
+        an automation token later creates or moves onto those names must carry
+        them at least as strongly, or it is refused. A route you create or edit
+        in the dashboard that is switched on and serves one of those names for
+        the recorded path clears that name from its record. Clear a record only
+        when its protections are no longer wanted.
       </p>
 
       {#if loadError}
@@ -87,8 +89,8 @@
               <th>Names</th>
               <th>Path</th>
               <th>Recorded controls</th>
-              <th>Deleted by</th>
-              <th>Deleted</th>
+              <th>Released by</th>
+              <th>Released</th>
               <th>Actions</th>
             </tr>
           </thead>
@@ -141,7 +143,7 @@
 {#if clearing !== null}
   <ConfirmDialog
     title="Clear Route Protection Record"
-    message={`Clear the record for ${names(clearing).join(', ')}? Automation tokens may then create a route on these names without the protections the deleted route carried. The clear is written to the audit log.`}
+    message={`Clear the record for ${names(clearing).join(', ')}? Automation tokens may then create a route on these names without the protections the recorded route carried. The clear is written to the audit log.`}
     confirmLabel="Clear"
     onconfirm={confirmClear}
     oncancel={() => (clearing = null)}
