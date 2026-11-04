@@ -56,6 +56,19 @@ reverse proxy that forwards TLS), set `management_cert_pem_path` and
 `management_key_pem_path` in Settings; when both are set the self-signed
 certificate is not used.
 
+Outbound TLS (ACME, DNS providers, notifications, GeoIP and blocklist
+downloads, OCSP, OIDC key sets, forward auth, mirroring, and backends
+with no CA file of their own) trusts the bundled public roots plus the
+host's trust store, which `SSL_CERT_FILE` and `SSL_CERT_DIR` can point
+elsewhere, for example to add a private CA. A certificate in that store
+that does not load is skipped and logged. Since 1.10.2, a store that
+yields no certificate at all because of an error (a mistyped
+`SSL_CERT_FILE`, an unreadable directory) is an error rather than a
+silent fallback to the bundled roots: forward auth then refuses its
+requests, mirroring is switched off and OCSP stapling is skipped, each
+with an error in the log. An empty store with nothing wrong is not an
+error. Check the log after changing either variable.
+
 Customize ports, worker count, or log level via a drop-in override rather
 than editing the packaged unit (the unit is owned by the package and is
 replaced on upgrade):

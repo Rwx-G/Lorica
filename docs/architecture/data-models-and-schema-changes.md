@@ -8,24 +8,26 @@
 > v1.0 columns. Audit M-24 (v1.5.2) prepended the first version of this
 > banner ; it was refreshed during the v1.8.0 cycle.
 >
-> **What is true today.** The configuration database holds 34 tables
-> and its schema version is 62. Captured traffic is not one of them: a
-> capture rule is a row, the captured bodies are files on disk.
+> **What is true today.** The configuration database's schema version
+> is the last entry of `MIGRATIONS` (below); this banner no longer
+> quotes it or a table count, which it used to do and which drifted
+> with every cycle that added a migration. Captured traffic is not in
+> it: a capture rule is a row, the captured bodies are files on disk.
 >
 > ## Where the migrations actually live
 >
 > The authoritative list is the `MIGRATIONS` constant in
 > `lorica-config/src/store/mod.rs`: a slice of `(version, fn)` pairs,
-> 1 through 62 in ascending order, applied by
+> from 1 in ascending order, applied by
 > `ConfigStore::run_migrations`. Start there. It is the only place that
 > enumerates the whole history.
 >
 > **`lorica-config/src/migrations/` is not that list.** The directory
 > holds 18 `.sql` batch files and they cover schema versions 1-16, 19
-> and 21 only. Every other version (17, 18, 20, and 22 through 62) is a
+> and 21 only. Every other version (17, 18, 20, and 22 onwards) is a
 > Rust function in `store/mod.rs` carrying its DDL inline. A reader who
-> follows the directory alone sees 18 of the 62 migrations and misses
-> every table added since v1.6.0. The filenames also drift from the
+> follows the directory alone sees 18 migrations and misses every table
+> added since v1.6.0. The filenames also drift from the
 > version numbers past 16: `017_acme_method.sql` is version 19 and
 > `019_sessions.sql` is version 21, and no `018_*.sql` exists.
 >
@@ -82,6 +84,17 @@
 >   and a follower behind on schema is refused at the handshake rather
 >   than handed a field it cannot decode. `CANONICAL_FORMAT_VERSION`
 >   stays 2 (the reason is on `CANONICAL_SHAPE_DIGEST`).
+> - v1.9.2 (migration 63): no table; notification channels saved with
+>   an explicit alert-type list are subscribed to the log-store alerts.
+> - v1.10.0 (migrations 64-66, AD CS): `adcs_authority` and the
+>   certificate columns that reference it, the matching alert
+>   subscription (65), and the authority's allowed-template list (66).
+>   The authority never replicates.
+> - v1.10.2 (migrations 67-68): `route_protection_records` and
+>   `route_protection_record_names` (67), node-local, never replicated
+>   or exported; 68 adds nothing and rewrites every stored route name
+>   and record name to the canonical form
+>   (`route_selection::canonical_hostname`).
 >
 > The `Route` table grew from 9 columns to 30+ (basic-auth,
 > stale-while-revalidate, rate-limit struct, geoip, mTLS, forward-auth,
@@ -90,7 +103,7 @@
 > `NotificationChannel` enum gained `Slack` (v1.4.0) ;
 > `UserPreference.value` gained additional variants.
 >
-> A full rewrite is `feat`-shaped and tracked in `docs/backlog.md` ;
+> A full rewrite is `feat`-shaped and not scheduled (no `docs/backlog.md` row carries it) ;
 > for now, treat the sections below as the v1.0 reference baseline and
 > the pointers above as current.
 

@@ -61,8 +61,8 @@
 > - The OTLP **logs** signal, added in v1.7.0 (Story 9.8) behind the
 >   `otel` feature on the `lorica` crate. It pulled in no new crate and
 >   no version bump: it enables the `logs` feature on the already
->   pinned opentelemetry / opentelemetry_sdk / opentelemetry-otlp 0.32
->   trio. The exporter lives in `lorica/src/otel.rs`.
+>   pinned opentelemetry / opentelemetry_sdk / opentelemetry-otlp
+>   trio (version above). The exporter lives in `lorica/src/otel.rs`.
 >
 > **The project declares no workspace MSRV.** This document used to
 > claim "Rust 1.84+ (MSRV)" for the language row; nothing in the tree

@@ -24,12 +24,13 @@ The Svelte frontend is compiled automatically during `cargo build` via `build.rs
 
 ```bash
 # All Rust tests, the product crates and the Pingora-forked ones
-# alike (see the test-coverage table in README.md for the per-layer
-# breakdown; a count written here would be stale by the next merge)
+# alike (README.md, "Running tests", gives the per-step figures; a
+# count written here would be stale by the next merge)
 cargo test
 
-# Product crate tests only: the list is in README.md, under
-# "Running tests"
+# CI's test steps one by one, product crates, binary crate, forked
+# crates and their rustls build: the crate lists live in the workflow
+grep -E '^\s+run: cargo test' .github/workflows/ci.yml
 
 # Frontend tests (Vitest)
 cd lorica-dashboard/frontend && npx vitest run
@@ -55,10 +56,13 @@ We use [Conventional Commits](https://www.conventionalcommits.org/):
 
 **Types:** `feat`, `fix`, `docs`, `refactor`, `test`, `ci`, `chore`
 
-**Scopes:** `ui`, `api`, `waf`, `tls`, `proxy`, `worker`, `notify`, `acme`, `config`, `auth`, `health`, `ci`, `security`, `cluster`, `mcp`
+**Scopes:** `ui`, `api`, `waf`, `tls`, `proxy`, `worker`, `notify`, `acme`, `config`, `auth`, `health`, `ci`, `security`, `cluster`, `mcp`, `adcs`, `deps`
 
 `mcp` covers the `lorica-mcp` crate and the MCP endpoint of the
-automation listener; `api` is the management API.
+automation listener; `api` is the management API. `adcs` covers the
+`lorica-adcs` crate and the AD CS enrollment it serves, not `acme`.
+`deps` is a routine dependency update (`chore(deps): ...`); a bump that
+clears an advisory is `fix(security)`.
 
 ### Code Quality
 

@@ -13,7 +13,7 @@ section stopped being true two releases before anyone noticed.
 ### Known Limitations
 
 - **WAF body scan is bounded.** The WAF engine inspects the URI path, query string, selected headers AND the first 1 MiB of the request body (path-traversal and protocol-violation rules are excluded from body scanning to limit false positives - see v1.1.0 changelog). Bodies exceeding the 1 MiB scan window are handled per the route's `waf_mode` (v1.5.2 audit H-2) : Blocking mode returns `413 Payload Too Large` ; Detection mode emits a `BodyTruncated` WAF event, increments `lorica_waf_events_total{category="protocol_violation",action="detected"}`, and lets the request through with a partial scan on the first 1 MiB. The 1 MiB cap is currently hard-coded ; an operator-tunable knob remains on the backlog. Backend applications remain responsible for input validation on bodies > 1 MiB.
-- **HTTP-01 ACME challenge** requires port 80 reachable from Internet. Not suitable for NAT/internal deployments without DNS-01 (planned).
+- **HTTP-01 ACME challenge** requires port 80 reachable from Internet. Not suitable for NAT/internal deployments: use DNS-01 there (automated through a configured DNS provider, or manual).
 - **HTTPS listener** requires the operator to bind port 443 at boot ; the listener itself is up before any cert is loaded. Certificate add / update / delete + ACME issuance (HTTP-01 / DNS-01 / DNS-01 manual) + ACME auto-renewal hot-reload into the running process across both single-process and multi-worker modes (v1.5.2 fix). A new cert becomes serveable as soon as at least one route's `certificate_id` references it - the resolver filters by route-reference to avoid loading orphan certs. Same window exists for cert removal. Port-level changes (`http_port` / `https_port`) still require a restart - those re-bind the TCP listener.
 
 ## Hardening Guide
@@ -157,6 +157,14 @@ connection torn down rather than the rejections running unbounded.
 An absolute-form request target (`GET http://host/path HTTP/1.1`) is
 refused earlier still, when the request header is parsed, so it never
 reaches routing. Legitimate clients do not send one to a reverse proxy.
+
+The authority that passes is looked up in one form (v1.10.2): without
+its port, an IPv6 literal keeping its brackets (`[2001:db8::1]:8443` is
+`[2001:db8::1]`), ASCII letters lowercased and one trailing dot dropped
+(`route_selection::canonical_hostname` in `lorica-config`), the form
+route names are stored in. `Host: App.Example.COM.` therefore reaches
+the route `app.example.com` and its controls rather than a wildcard or
+the catch-all. The `Host` sent to the backend is the client's, unchanged.
 
 ### WAF body inspection (v1.7.2, v1.8.0)
 

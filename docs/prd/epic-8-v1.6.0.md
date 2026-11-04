@@ -359,6 +359,6 @@ so that the supply-chain takeover surface collapses onto code we review at vendo
 
 ## Out of Scope (deferred)
 
-- **`rustls-pemfile` removal in `lorica-tls` fork** (backlog #14) and **`rand 0.8` removal in forked crates** (backlog #15): blocked on upstream Pingora migration ; tracking-only. Native Lorica code already migrated in v1.5.0 ; transitive deps clear once Pingora upstream lands its own migration.
+- **`rustls-pemfile` removal in `lorica-tls` fork** (backlog #14) and **`rand 0.8` removal in forked crates** (backlog #15): blocked on upstream Pingora migration ; tracking-only. Native Lorica code already migrated in v1.5.0 ; transitive deps clear once Pingora upstream lands its own migration. *Note 2026-11-04 (v1.10.2): both cleared in the fork itself rather than upstream, see `FORK.md`; backlog #14 and #15 are closed.*
 - **Audit-log Merkle-tree mode** (extension of Story 8.9): the v1.6.0 ships a linear SHA-256 chain (each row carries `prev_chain_hash` + `chain_hash` ; verification walks rows in order). A Merkle-tree variant for sub-linear partial-range verification is a v1.7.0+ candidate if operator demand surfaces.
 - **Operator-defined AI crawler retroactive evaluation** (extension of Story 8.2): custom crawlers added via `POST /api/v1/ai-crawlers/custom` apply to NEW requests only ; back-evaluating against the access-log to retroactively flag past requests is out of scope.

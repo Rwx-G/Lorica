@@ -48,8 +48,11 @@ audited: `GET|POST /api/v1/automation/tokens`,
 `DELETE /api/v1/automation/tokens/{public_id}`,
 `GET|POST /api/v1/automation/oidc-issuers` and
 `DELETE /api/v1/automation/oidc-issuers/{id}`, plus the Automation
-tokens sub-page under Settings in the dashboard. The automation listener
-serves none of it, so a token can never mint a token, widen its own
+tokens sub-page under Settings in the dashboard. The route protection
+records the write surface leaves (below) are listed and cleared there
+too, at the Operator floor: `GET /api/v1/automation/route-protection-records`,
+`DELETE /api/v1/automation/route-protection-records/{id}` and Settings,
+Route Protection Records. The automation listener serves none of it, so a token can never mint a token, widen its own
 scopes or extend its own expiry. What the listener serves is
 `GET /automation/v1/whoami`, `GET /automation/v1/environments`,
 `GET|PUT|DELETE /automation/v1/environments/{name}`, the read surface
@@ -537,11 +540,13 @@ writes nothing; an operator reconciles the routes in the dashboard. A
 protection the operator adds to the wildcard after the environment's
 last `PUT` binds the environment from its next `PUT`, not before.
 
-A protected route an automation token deleted is inherited from the same
-way. The delete leaves a route protection record of it (`docs/mcp.md`,
-"A deleted route is still weighed"), and an environment whose hostname
-and path the deleted route would serve takes the recorded controls over
-as it would the route's, the Basic-auth credential copied server side;
+A protected route an automation token deleted, or moved off a name (a
+rename, an alias dropped, a prefix moved deeper), is inherited from the
+same way. The write leaves a route protection record of it over the
+names it released (`docs/mcp.md`, "A deleted route is still weighed"),
+and an environment whose hostname and path the recorded route would
+serve takes the recorded controls over as it would the route's, the
+Basic-auth credential copied server side;
 the answer names the record by id in
 `protections_inherited_from_records`. Deleting an environment, or its
 route, records nothing: its controls are the profile's, rewritten on
