@@ -16,11 +16,13 @@ Author: Rwx-G
 ### Changed
 
 - **Building from source needs Rust 1.99.1**, which `rust-toolchain.toml` pins (was 1.95.0).
+- **Every outbound HTTP client takes its TLS settings from one place** (`lorica-tls`), on reqwest 0.13: ACME DNS providers, notifications, GeoIP and blocklist downloads, OCSP, OIDC key sets, forward auth, mirroring, the MCP client and the CLI. Each keeps the trust it had (the bundled public roots plus the system store, a pinned CA, or a pinned certificate) and the ring crypto provider.
 - **Dependencies refreshed**, majors included: OpenTelemetry 0.33 (the `otel` feature's OTLP exporter), rusqlite 0.41, x509-parser 0.18, nix 0.31, sysinfo 0.40, rand 0.10 across every crate, and the dashboard's build and test toolchain (TypeScript 6, ESLint 10, Vitest 5).
 - **A host trust store with one unreadable or rejected certificate no longer fails the whole load** where Lorica verifies against the system roots (TLS to backends, and a TLS syslog sink with no CA of its own): the certificates that load are used and the others are logged. The load still fails when nothing loads and an error was met.
 
 ### Fixed
 
+- **Builds with the `otel` feature export to an `https` OTLP/HTTP collector** (traces and logs, `http/protobuf` and `http/json`). Since 1.6.0 the exporter's HTTP client was built without TLS and refused every `https` endpoint before connecting; plain `http` collectors worked. The collector's certificate is verified against the public roots, and `OTEL_EXPORTER_OTLP_TIMEOUT` and its per-signal variants still bound each request. The published packages and Docker images are built without `otel` and were not affected.
 - **A route create or update through the management API is applied whole or not at all.** A create naming a backend id that does not exist used to leave the route stored without its backends; the route row, its backend links and the protection records it clears now commit in one transaction.
 - **Upstream Pingora sync into the forked crates (see `FORK.md`).** Pooled upstream connections are no longer discarded when a request picks one up while the idle watcher is still releasing it: the request used to dial a new connection and log `failed to acquire reusable stream`. Brotli-compressed responses now end with the stream's final block, which strict decoders require. A load-balancing selection over backends whose weights are all zero returns no backend instead of panicking (Lorica's own balancer never builds such a set).
 
