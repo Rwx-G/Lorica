@@ -17,7 +17,9 @@ use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
 use crate::server::AppState;
-use lorica_config::route_selection::canonical_hostname;
+use lorica_config::route_selection::{
+    canonical_hostname, same_name, validate_hostname_syntax, HostnameShape, ROUTE_HOSTNAME_SHAPE,
+};
 
 use super::forward_auth::{build_forward_auth, ForwardAuthConfigRequest};
 use super::header_rules::{build_header_rule, HeaderRuleRequest};
@@ -561,116 +563,22 @@ mod node_selector_validation_tests {
     }
 }
 
-/// Knobs for `validate_dns_hostname` (audit M-23 closure).
-///
-/// Two callers in this file used to hand-roll near-identical RFC-1123
-/// label loops with subtle ordering differences ; folding both into
-/// one helper means a future change ("accept IPv6 literals in
-/// brackets", "raise the label cap", "tighten the alphabet") needs a
-/// single edit instead of three.
-struct HostnameOpts<'a> {
-    /// `true` accepts a `*.example.com` leading-wildcard prefix
-    /// (cert SNI / hostname alias semantics) ; `false` rejects it
-    /// (canonical-host redirect target).
-    allow_wildcard: bool,
-    /// `true` returns `Ok(String::new())` on empty input (caller
-    /// interprets as "clear the field") ; `false` returns
-    /// `BadRequest("<field_label> must not be empty")`.
-    allow_empty: bool,
-    /// User-facing field name used in every error message so the
-    /// dashboard can highlight the right input.
-    field_label: &'a str,
+/// [`validate_hostname_syntax`], the one hostname syntax check every
+/// bare-hostname field of this API reads, refusing with a 400.
+fn validate_dns_hostname(raw: &str, shape: HostnameShape<'_>) -> Result<String, ApiError> {
+    validate_hostname_syntax(raw, shape).map_err(ApiError::BadRequest)
 }
 
-/// RFC 1123-shaped DNS hostname validation, used by every "bare
-/// hostname" input in the API. Rejects schemes, paths, ports, query
-/// strings, fragments, userinfo, whitespace, and any per-label
-/// violation (empty / >63 chars / leading-or-trailing dash /
-/// non-alphanumeric). Accepts a leading `*.` wildcard only when
-/// `opts.allow_wildcard` is set.
+/// Validate a route's primary `hostname` as written
+/// ([`ROUTE_HOSTNAME_SHAPE`]: the alias shape, plus the catch-all and a
+/// bracketed IPv6 literal). Returns it in the canonical form every name
+/// is stored in ([`canonical_hostname`]).
 ///
-/// The check order is "cheap discriminator first": URL-shape
-/// rejections fire before length / per-label checks so the operator
-/// gets the actionable "drop the http:// prefix" message instead of
-/// a cryptic "longer than 253 characters" error on a pasted URL.
-fn validate_dns_hostname(raw: &str, opts: HostnameOpts<'_>) -> Result<String, ApiError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        if opts.allow_empty {
-            return Ok(String::new());
-        }
-        return Err(ApiError::BadRequest(format!(
-            "{} must not be empty",
-            opts.field_label
-        )));
-    }
-    if trimmed.contains("://") {
-        return Err(ApiError::BadRequest(format!(
-            "{} must be a bare hostname (e.g. `example.com`) without a scheme \
-             - drop the `http://` / `https://` prefix",
-            opts.field_label
-        )));
-    }
-    if trimmed.contains('/') {
-        return Err(ApiError::BadRequest(format!(
-            "{} must be a bare hostname without a path or trailing slash \
-             - drop everything after the hostname",
-            opts.field_label
-        )));
-    }
-    // `:` rejection = no port in this field. Operators that need a
-    // non-standard port go through `redirect_to` (full URL) instead.
-    if trimmed.contains(|c: char| c.is_whitespace() || matches!(c, '?' | '#' | ':' | '@')) {
-        return Err(ApiError::BadRequest(format!(
-            "{} contains a character that is not valid in a hostname \
-             (whitespace, `?`, `#`, `:`, `@`)",
-            opts.field_label
-        )));
-    }
-    if trimmed.len() > 253 {
-        return Err(ApiError::BadRequest(format!(
-            "{} is longer than 253 characters (DNS limit)",
-            opts.field_label
-        )));
-    }
-    if trimmed.starts_with('.') || trimmed.ends_with('.') {
-        return Err(ApiError::BadRequest(format!(
-            "{} must not start or end with a dot",
-            opts.field_label
-        )));
-    }
-    let check_body = if opts.allow_wildcard {
-        trimmed.strip_prefix("*.").unwrap_or(trimmed)
-    } else {
-        trimmed
-    };
-    for label in check_body.split('.') {
-        if label.is_empty() {
-            return Err(ApiError::BadRequest(format!(
-                "{} contains an empty DNS label (consecutive dots)",
-                opts.field_label
-            )));
-        }
-        if label.len() > 63 {
-            return Err(ApiError::BadRequest(format!(
-                "{} contains a DNS label longer than 63 characters",
-                opts.field_label
-            )));
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            return Err(ApiError::BadRequest(format!(
-                "{} contains a DNS label that starts or ends with `-`",
-                opts.field_label
-            )));
-        }
-        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return Err(ApiError::BadRequest(format!(
-                "{} may only contain ASCII letters, digits, `-` and `.`",
-                opts.field_label
-            )));
-        }
-    }
-    Ok(trimmed.to_string())
+/// Run on a create, and on an update only when the hostname changes,
+/// so a row stored before the check is never refused for keeping the
+/// name it has.
+fn validate_route_hostname(raw: &str) -> Result<String, ApiError> {
+    validate_dns_hostname(&canonical_hostname(raw.trim()), ROUTE_HOSTNAME_SHAPE)
 }
 
 /// Validate a canonical-host redirect target.
@@ -692,9 +600,11 @@ fn validate_dns_hostname(raw: &str, opts: HostnameOpts<'_>) -> Result<String, Ap
 fn validate_redirect_hostname(raw: &str) -> Result<String, ApiError> {
     validate_dns_hostname(
         raw,
-        HostnameOpts {
+        HostnameShape {
             allow_wildcard: false,
             allow_empty: true,
+            allow_catch_all: false,
+            allow_ipv6_literal: false,
             field_label: "redirect_hostname",
         },
     )
@@ -897,9 +807,11 @@ fn validate_http_method(method: &str, field_label: &str) -> Result<(), ApiError>
 fn validate_hostname_alias(raw: &str, field_label: &str) -> Result<String, ApiError> {
     validate_dns_hostname(
         &canonical_hostname(raw.trim()),
-        HostnameOpts {
+        HostnameShape {
             allow_wildcard: true,
             allow_empty: false,
+            allow_catch_all: false,
+            allow_ipv6_literal: false,
             field_label,
         },
     )
@@ -1542,6 +1454,94 @@ mod redirect_hostname_validation_tests {
     fn rejects_non_ascii_or_punctuation() {
         assert!(expect_err("exämple.com").contains("ASCII"));
         assert!(expect_err("example_underscore.com").contains("ASCII"));
+    }
+}
+
+#[cfg(test)]
+mod route_name_patch_tests {
+    use super::*;
+
+    fn stored(hostname: &str, aliases: &[&str]) -> lorica_config::models::Route {
+        let mut route: lorica_config::models::Route = serde_json::from_value(serde_json::json!({
+            "id": "r-1",
+            "hostname": hostname,
+            "path_prefix": "/",
+            "certificate_id": null,
+            "load_balancing": "round_robin",
+            "waf_enabled": false,
+            "waf_mode": "detection",
+            "enabled": true,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .expect("test setup: a route");
+        route.hostname_aliases = aliases.iter().map(|a| a.to_string()).collect();
+        route
+    }
+
+    fn patched(
+        route: lorica_config::models::Route,
+        body: serde_json::Value,
+    ) -> Result<lorica_config::models::Route, ApiError> {
+        let body: UpdateRouteRequest = serde_json::from_value(body).expect("test setup: a patch");
+        apply_route_patch(route, body, None, None)
+    }
+
+    #[test]
+    fn names_sent_back_as_stored_are_kept_as_stored() {
+        // The twin the upgrade left under its own spelling is switched
+        // off through the patch the dashboard sends, every name included.
+        let twin = stored("App.Example.com", &["Www.Example.com"]);
+        let off = patched(
+            twin,
+            serde_json::json!({
+                "hostname": "App.Example.com",
+                "hostname_aliases": ["Www.Example.com"],
+                "enabled": false,
+            }),
+        )
+        .expect("the patch applies");
+        assert_eq!(off.hostname, "App.Example.com");
+        assert_eq!(off.hostname_aliases, vec!["Www.Example.com".to_string()]);
+        assert!(!off.enabled);
+    }
+
+    #[test]
+    fn a_name_the_patch_changes_is_checked_and_every_name_made_canonical() {
+        let route = stored("app.example.com", &[]);
+        let renamed = patched(
+            route.clone(),
+            serde_json::json!({
+                "hostname": "Shop.Example.com.",
+                "hostname_aliases": ["shop.example.com", "WWW.Example.com."],
+            }),
+        )
+        .expect("the patch applies");
+        assert_eq!(renamed.hostname, "shop.example.com");
+        assert_eq!(
+            renamed.hostname_aliases,
+            vec!["www.example.com".to_string()]
+        );
+        for refused in ["https://app.example.com", "app.example.com:8443", "a b"] {
+            assert!(
+                matches!(
+                    patched(route.clone(), serde_json::json!({ "hostname": refused })),
+                    Err(ApiError::BadRequest(_))
+                ),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_primary_takes_the_catch_all_and_an_ipv6_literal_which_an_alias_does_not() {
+        assert_eq!(validate_route_hostname(" _ ").expect("catch-all"), "_");
+        assert_eq!(
+            validate_route_hostname("[2001:DB8::1]").expect("an IPv6 literal"),
+            "[2001:db8::1]"
+        );
+        assert!(validate_hostname_alias("_", "f").is_err());
+        assert!(validate_hostname_alias("[2001:db8::1]", "f").is_err());
     }
 }
 
@@ -3736,6 +3736,7 @@ pub(crate) async fn create_route_as(
     if canonical_hostname(body.hostname.trim()).is_empty() {
         return Err(ApiError::BadRequest("hostname is required".into()));
     }
+    let hostname = validate_route_hostname(&body.hostname)?;
 
     let redirect_hostname = match body.redirect_hostname.as_deref() {
         Some(h) => {
@@ -3898,7 +3899,7 @@ pub(crate) async fn create_route_as(
     let now = Utc::now();
     let mut route = lorica_config::models::Route {
         id: uuid::Uuid::new_v4().to_string(),
-        hostname: body.hostname,
+        hostname,
         path_prefix,
         certificate_id: body.certificate_id,
         load_balancing: lb,
@@ -4433,8 +4434,15 @@ fn apply_route_patch(
     validate_rate_limit_bounds(body.rate_limit_rps, body.rate_limit_burst)?;
     validate_waf_body_scan_max_bytes(body.waf_body_scan_max_bytes)?;
 
+    let stored_names = (route.hostname.clone(), route.hostname_aliases.clone());
     if let Some(hostname) = body.hostname {
-        route.hostname = hostname;
+        if hostname.trim() != route.hostname {
+            route.hostname = if same_name(hostname.trim(), &route.hostname) {
+                canonical_hostname(hostname.trim()).into_owned()
+            } else {
+                validate_route_hostname(&hostname)?
+            };
+        }
     }
     if let Some(path_prefix) = body.path_prefix {
         let v = validate_route_path(&path_prefix, "path_prefix")?;
@@ -4476,14 +4484,16 @@ fn apply_route_patch(
         route.redirect_to = if v.is_empty() { None } else { Some(v) };
     }
     if let Some(hostname_aliases) = body.hostname_aliases {
-        let mut out = Vec::with_capacity(hostname_aliases.len());
-        for (i, a) in hostname_aliases.iter().enumerate() {
-            out.push(validate_hostname_alias(
-                a,
-                &format!("hostname_aliases[{i}]"),
-            )?);
+        if hostname_aliases != route.hostname_aliases {
+            let mut out = Vec::with_capacity(hostname_aliases.len());
+            for (i, a) in hostname_aliases.iter().enumerate() {
+                out.push(validate_hostname_alias(
+                    a,
+                    &format!("hostname_aliases[{i}]"),
+                )?);
+            }
+            route.hostname_aliases = out;
         }
-        route.hostname_aliases = out;
     }
     if let Some(proxy_headers) = body.proxy_headers {
         validate_http_headers_map(&proxy_headers, "proxy_headers")?;
@@ -4801,7 +4811,12 @@ fn apply_route_patch(
     if let Some(b) = body.serve_robots_txt {
         route.serve_robots_txt = b;
     }
-    route.canonicalise_names();
+    // Names the patch left as stored stay as stored, so the twin of a
+    // name another route holds can still be switched off and edited
+    // (`ConfigStore::update_route`); names it changed are canonical.
+    if (&route.hostname, &route.hostname_aliases) != (&stored_names.0, &stored_names.1) {
+        route.canonicalise_names();
+    }
     route.updated_at = Utc::now();
     Ok(route)
 }

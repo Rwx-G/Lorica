@@ -6314,7 +6314,10 @@ components:
             The name the route answers on. Stored, and answered back, with
             ASCII letters lowercased and one trailing dot dropped, the form
             every hostname is compared in: a spelling of a name another
-            route holds is refused (422) as that name.
+            route holds is refused (422) as that name. A DNS name, a `*.`
+            wildcard, the catch-all `_`, an IPv4 address or a bracketed IPv6
+            address; a scheme, path, port or any other character is refused
+            (400). On an update, checked only when the hostname changes.
         path_prefix:
           type: string
           default: "/"
@@ -6360,7 +6363,10 @@ components:
             The name the route answers on. Stored, and answered back, with
             ASCII letters lowercased and one trailing dot dropped, the form
             every hostname is compared in: a spelling of a name another
-            route holds is refused (422) as that name.
+            route holds is refused (422) as that name. A DNS name, a `*.`
+            wildcard, the catch-all `_`, an IPv4 address or a bracketed IPv6
+            address; a scheme, path, port or any other character is refused
+            (400). On an update, checked only when the hostname changes.
         path_prefix:
           type: string
         backend_ids:

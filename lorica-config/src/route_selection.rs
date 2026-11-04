@@ -79,6 +79,154 @@ pub fn canonical_hostname(name: &str) -> Cow<'_, str> {
     }
 }
 
+/// What a hostname field accepts besides an exact DNS name, for
+/// [`validate_hostname_syntax`]. Every field that takes a bare hostname
+/// names its shape here, so the differences between them are these
+/// flags and nothing else (audit M-23 folded the hand-rolled copies).
+#[derive(Debug, Clone, Copy)]
+pub struct HostnameShape<'a> {
+    /// A leading `*.` wildcard (`*.example.com`): a route's hostname or
+    /// alias, which the selection serves as a wildcard. Not a redirect
+    /// target.
+    pub allow_wildcard: bool,
+    /// Empty input is `Ok("")`, which the caller reads as "clear the
+    /// field". Otherwise it is refused as missing.
+    pub allow_empty: bool,
+    /// The catch-all [`CATCH_ALL_HOSTNAME`]: a route's primary hostname
+    /// only, since the selection reads it there and nowhere else.
+    pub allow_catch_all: bool,
+    /// A bracketed IPv6 literal (`[2001:db8::1]`), the form a `Host`
+    /// header carries one in: a route's primary hostname only. An IPv4
+    /// literal needs no flag, it is labels of digits.
+    pub allow_ipv6_literal: bool,
+    /// The field's name, which every refusal starts with so a client can
+    /// point at the input.
+    pub field_label: &'a str,
+}
+
+/// The shape of a route's primary `hostname` as a write sets it: what
+/// an alias takes, plus the two forms only a primary takes, the
+/// catch-all [`CATCH_ALL_HOSTNAME`] and a bracketed IPv6 literal.
+/// Every write path that sets one (the route API on both planes, the
+/// TOML import) checks it against this.
+pub const ROUTE_HOSTNAME_SHAPE: HostnameShape<'static> = HostnameShape {
+    allow_wildcard: true,
+    allow_empty: false,
+    allow_catch_all: true,
+    allow_ipv6_literal: true,
+    field_label: "hostname",
+};
+
+/// RFC 1123-shaped hostname validation for every field that takes a
+/// bare hostname: no scheme, path, port, query, fragment, userinfo or
+/// whitespace, at most 253 characters, every label 1 to 63 ASCII
+/// alphanumerics and inner hyphens, plus what `shape` allows. Returns
+/// the input trimmed, or the refusal as a sentence naming the field.
+///
+/// The check order is "cheap discriminator first": URL-shape refusals
+/// fire before the length and label checks, so a pasted URL gets the
+/// actionable "drop the http:// prefix" rather than a label error. A
+/// caller storing the name canonicalises it first
+/// ([`canonical_hostname`]); a root dot left after that is refused.
+///
+/// ```
+/// use lorica_config::route_selection::{validate_hostname_syntax, HostnameShape};
+/// let primary = HostnameShape {
+///     allow_wildcard: true,
+///     allow_empty: false,
+///     allow_catch_all: true,
+///     allow_ipv6_literal: true,
+///     field_label: "hostname",
+/// };
+/// assert!(validate_hostname_syntax("*.example.com", primary).is_ok());
+/// assert!(validate_hostname_syntax("_", primary).is_ok());
+/// assert!(validate_hostname_syntax("[2001:db8::1]", primary).is_ok());
+/// assert!(validate_hostname_syntax("https://example.com", primary).is_err());
+/// ```
+pub fn validate_hostname_syntax(raw: &str, shape: HostnameShape<'_>) -> Result<String, String> {
+    let label = shape.field_label;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        if shape.allow_empty {
+            return Ok(String::new());
+        }
+        return Err(format!("{label} must not be empty"));
+    }
+    if shape.allow_catch_all && trimmed == CATCH_ALL_HOSTNAME {
+        return Ok(trimmed.to_string());
+    }
+    if shape.allow_ipv6_literal {
+        if let Some(inner) = trimmed
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            return match inner.parse::<std::net::Ipv6Addr>() {
+                Ok(_) => Ok(trimmed.to_string()),
+                Err(_) => Err(format!(
+                    "{label} holds a bracketed literal that is not an IPv6 address"
+                )),
+            };
+        }
+    }
+    if trimmed.contains("://") {
+        return Err(format!(
+            "{label} must be a bare hostname (e.g. `example.com`) without a scheme \
+             - drop the `http://` / `https://` prefix"
+        ));
+    }
+    if trimmed.contains('/') {
+        return Err(format!(
+            "{label} must be a bare hostname without a path or trailing slash \
+             - drop everything after the hostname"
+        ));
+    }
+    // No port in this field. A redirect that needs a non-standard port
+    // goes through `redirect_to` (a full URL) instead.
+    if trimmed.contains(|c: char| c.is_whitespace() || matches!(c, '?' | '#' | ':' | '@')) {
+        return Err(format!(
+            "{label} contains a character that is not valid in a hostname \
+             (whitespace, `?`, `#`, `:`, `@`)"
+        ));
+    }
+    if trimmed.len() > 253 {
+        return Err(format!("{label} is longer than 253 characters (DNS limit)"));
+    }
+    if trimmed.starts_with('.') || trimmed.ends_with('.') {
+        return Err(format!("{label} must not start or end with a dot"));
+    }
+    let check_body = if shape.allow_wildcard {
+        trimmed.strip_prefix("*.").unwrap_or(trimmed)
+    } else {
+        trimmed
+    };
+    for dns_label in check_body.split('.') {
+        if dns_label.is_empty() {
+            return Err(format!(
+                "{label} contains an empty DNS label (consecutive dots)"
+            ));
+        }
+        if dns_label.len() > 63 {
+            return Err(format!(
+                "{label} contains a DNS label longer than 63 characters"
+            ));
+        }
+        if dns_label.starts_with('-') || dns_label.ends_with('-') {
+            return Err(format!(
+                "{label} contains a DNS label that starts or ends with `-`"
+            ));
+        }
+        if !dns_label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return Err(format!(
+                "{label} may only contain ASCII letters, digits, `-` and `.`"
+            ));
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Whether two names are the same name to the selection.
 ///
 /// The one comparison of two route names outside the index, which keys
@@ -693,6 +841,56 @@ mod tests {
         assert!(!same_name("app.example.com", "app.example.org"));
         assert!(wildcard_covers("*.Example.com", "A.EXAMPLE.com."));
         assert_eq!(keys_reaching("A.Example.com.")[0], "a.example.com");
+    }
+
+    #[test]
+    fn a_primary_hostname_takes_every_shape_the_selection_serves_and_nothing_else() {
+        for accepted in [
+            "app.example.com",
+            "localhost",
+            "a",
+            "*.example.com",
+            CATCH_ALL_HOSTNAME,
+            "192.0.2.10",
+            "[2001:db8::1]",
+            "xn--bcher-kva.example",
+        ] {
+            assert_eq!(
+                validate_hostname_syntax(accepted, ROUTE_HOSTNAME_SHAPE).as_deref(),
+                Ok(accepted),
+                "{accepted}"
+            );
+        }
+        for refused in [
+            "",
+            "https://app.example.com",
+            "app.example.com/path",
+            "app.example.com:8443",
+            "user@app.example.com",
+            "app example.com",
+            "app.example.com.",
+            ".example.com",
+            "a..example.com",
+            "-app.example.com",
+            "app_1.example.com",
+            "*",
+            "a.*.example.com",
+            "[not-an-address]",
+            "2001:db8::1",
+            "Bücher.example",
+        ] {
+            let refusal =
+                validate_hostname_syntax(refused, ROUTE_HOSTNAME_SHAPE).expect_err(refused);
+            assert!(refusal.starts_with("hostname "), "{refused}: {refusal}");
+        }
+        // The two forms only a primary takes are explicit flags.
+        let alias = HostnameShape {
+            allow_catch_all: false,
+            allow_ipv6_literal: false,
+            ..ROUTE_HOSTNAME_SHAPE
+        };
+        assert!(validate_hostname_syntax(CATCH_ALL_HOSTNAME, alias).is_err());
+        assert!(validate_hostname_syntax("[2001:db8::1]", alias).is_err());
     }
 
     #[test]

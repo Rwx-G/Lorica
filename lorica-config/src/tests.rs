@@ -3150,6 +3150,12 @@ cert_critical_days = 3
             vec!["www.a.example.com".to_string()]
         );
 
+        let malformed = exported.replace("\"b.example.com\"", "\"b.example.com:8443\"");
+        let err = parse_toml(&malformed)
+            .expect_err("a primary hostname is checked on import")
+            .to_string();
+        assert!(err.contains("hostname contains a character"), "{err}");
+
         let twin = exported.replace("\"b.example.com\"", "\"A.example.com\"");
         let err = import_to_store(&target, &parse_toml(&twin).expect("parses"))
             .expect_err("two spellings of one name are one name")

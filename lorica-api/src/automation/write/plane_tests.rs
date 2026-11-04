@@ -1087,6 +1087,124 @@ async fn a_name_is_stored_canonical_and_its_case_or_root_dot_twin_is_refused_on_
 }
 
 #[tokio::test]
+async fn a_primary_hostname_is_checked_on_write_and_a_stored_one_kept_as_it_is() {
+    let f = a_node_with_something_to_write().await;
+    for accepted in [
+        "*.shapes.example.com",
+        lorica_config::route_selection::CATCH_ALL_HOSTNAME,
+        "192.0.2.10",
+        "[2001:DB8::1]",
+    ] {
+        let response = send(
+            &f.state,
+            &f.session_store,
+            &f.rate_limiter,
+            "POST",
+            "/api/v1/routes",
+            &f.admin,
+            Some(serde_json::json!({ "hostname": accepted })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED, "{accepted}");
+    }
+
+    for refused in [
+        "https://bad.write.example.com",
+        "bad.write.example.com:8443",
+        "bad host.write.example.com",
+        "bad_host.write.example.com",
+    ] {
+        let response = send(
+            &f.state,
+            &f.session_store,
+            &f.rate_limiter,
+            "POST",
+            "/api/v1/routes",
+            &f.admin,
+            Some(serde_json::json!({ "hostname": refused })),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "management {refused}"
+        );
+        let response = automation_call(
+            &f.state,
+            "POST",
+            "/automation/v1/routes",
+            &f.bearer,
+            Some(serde_json::json!({ "hostname": refused })),
+        )
+        .await;
+        // A shape the grant cannot match is refused there first (403);
+        // one inside the grant reaches the syntax check (400).
+        let expected = if lorica_config::models::matches_one_label("*.write.example.com", refused) {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        assert_eq!(response.status(), expected, "token {refused}");
+        let through_mcp = crate::automation::test_support::mcp_call(
+            &f.state,
+            &f.mcp_bearer,
+            "lorica_route_create",
+            serde_json::json!({ "route": { "hostname": refused } }),
+        )
+        .await;
+        assert_eq!(through_mcp["result"]["isError"], true, "mcp {refused}");
+    }
+
+    // A row stored before the check keeps its name through an update
+    // that sends it back unchanged, as the dashboard does on every save;
+    // a change of name is checked.
+    let legacy: lorica_config::models::Route = serde_json::from_value(serde_json::json!({
+        "id": "legacy",
+        "hostname": "legacy.write.example.com:8443",
+        "path_prefix": "/",
+        "certificate_id": null,
+        "load_balancing": "round_robin",
+        "waf_enabled": false,
+        "waf_mode": "detection",
+        "enabled": true,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z"
+    }))
+    .expect("test setup: a route");
+    f.state
+        .store
+        .lock()
+        .await
+        .create_route(&legacy)
+        .expect("test setup: a row the store holds as an older node wrote it");
+    let response = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "PUT",
+        "/api/v1/routes/legacy",
+        &f.admin,
+        Some(serde_json::json!({
+            "hostname": "legacy.write.example.com:8443",
+            "connect_timeout_s": 9,
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "PUT",
+        "/api/v1/routes/legacy",
+        &f.admin,
+        Some(serde_json::json!({ "hostname": "other.write.example.com:8443" })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn a_case_twin_under_a_protected_wildcard_takes_it_over_only_as_strong() {
     let f = a_node_with_something_to_write().await;
     let wildcard = an_operator_route(

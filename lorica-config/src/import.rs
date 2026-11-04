@@ -4,6 +4,7 @@ use serde::Deserialize;
 
 use crate::error::{ConfigError, Result};
 use crate::models::*;
+use crate::route_selection::{canonical_hostname, validate_hostname_syntax, ROUTE_HOSTNAME_SHAPE};
 use crate::store::ConfigStore;
 
 /// Deserialized counterpart of [`crate::export::ExportData`]. Each
@@ -79,6 +80,16 @@ fn validate_structure(data: &ImportData) -> Result<()> {
                 rb.backend_id
             )));
         }
+    }
+
+    // Every primary hostname as a route write sets it; the store makes
+    // it canonical on the way in.
+    for route in &data.routes {
+        validate_hostname_syntax(
+            &canonical_hostname(route.hostname.trim()),
+            ROUTE_HOSTNAME_SHAPE,
+        )
+        .map_err(|reason| ConfigError::Validation(format!("route '{}': {reason}", route.id)))?;
     }
 
     Ok(())
