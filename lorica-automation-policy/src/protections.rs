@@ -20,7 +20,7 @@
 //! route is weaker than the stored one is a function of the stored row's
 //! types, which live in `lorica-config`, so `lorica-api` pairs each rule
 //! below with its predicate (`ROUTE_PROTECTIONS` and
-//! `BACKEND_PROTECTIONS` in `automation/write.rs`) and a test there
+//! `BACKEND_PROTECTIONS` in `automation/protections.rs`) and a test there
 //! holds the pairing to these lists, in order, one predicate per rule.
 
 /// One access-control or trust control of a stored row that an

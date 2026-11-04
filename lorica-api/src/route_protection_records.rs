@@ -107,7 +107,7 @@ pub fn view(record: &RouteProtectionRecord) -> RouteProtectionRecordView {
     let controls = record
         .route()
         .ok()
-        .and_then(|route| crate::automation::records::controls_in_force(&route).ok());
+        .and_then(|route| crate::automation::protections::controls_in_force(&route).ok());
     RouteProtectionRecordView {
         id: record.id.clone(),
         route_id: record.route_id.clone(),

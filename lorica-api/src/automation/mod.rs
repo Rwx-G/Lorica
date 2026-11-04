@@ -86,6 +86,7 @@ pub mod environments;
 pub mod listener;
 pub mod mcp;
 pub mod oidc;
+pub mod protections;
 pub mod read;
 pub mod records;
 pub mod redact;

@@ -30,7 +30,7 @@
 //! [`RouteProtectionRecord`]: the deleted row itself, as the store held
 //! it. "In force" is the predicates' own answer: a control is in force
 //! when the route the management create stores for a body naming none
-//! of the controls ([`as_created_bare`]) is weaker on it. Nothing here
+//! of the controls is weaker on it ([`controls_in_force`]). Nothing here
 //! lists a control.
 //!
 //! The record stands for the route it was made of, switched on, and is
@@ -72,47 +72,12 @@ use lorica_config::models::{Route, RouteProtectionRecord};
 use lorica_config::route_selection::HostIndex;
 use lorica_config::ConfigStore;
 
-use super::write::{first_weakened, Protection, ROUTE_PROTECTIONS};
+use super::protections::{controls_in_force, first_weakened, ROUTE_PROTECTIONS};
 use crate::error::ApiError;
 use crate::route_protection_records::{
     record_view, RECORD_CREATE_ACTION, RECORD_SUPERSEDE_ACTION, RECORD_TARGET_TYPE,
 };
 use crate::target::{RouteTarget, SettledRow};
-
-/// The route the management create stores when the body names nothing
-/// but its hostname: every control of [`ROUTE_PROTECTIONS`] at its
-/// weakest. The fields spelled here are the ones the model requires;
-/// every other field is the model's own default. A test holds this row
-/// to the one the management create actually stores, control by
-/// control, through the predicates.
-fn as_created_bare() -> Result<Route, ApiError> {
-    serde_json::from_value(serde_json::json!({
-        "id": "",
-        "hostname": "",
-        "path_prefix": "/",
-        "load_balancing": "round_robin",
-        "waf_enabled": false,
-        "waf_mode": "detection",
-        "enabled": true,
-        "created_at": "1970-01-01T00:00:00Z",
-        "updated_at": "1970-01-01T00:00:00Z",
-    }))
-    .map_err(|e| ApiError::Internal(format!("the bare route does not build: {e}")))
-}
-
-/// Every control of [`ROUTE_PROTECTIONS`] in force on `route`: those a
-/// route created with none of them named would be weaker on.
-///
-/// # Errors
-///
-/// [`ApiError::Internal`] if the bare route does not build.
-pub fn controls_in_force(route: &Route) -> Result<Vec<&'static Protection<Route>>, ApiError> {
-    let bare = as_created_bare()?;
-    Ok(ROUTE_PROTECTIONS
-        .iter()
-        .filter(|protection| (protection.weakened)(route, &bare))
-        .collect())
-}
 
 /// A record and the route it stands for, switched on: a disabled route
 /// serves nothing, and its controls were held in place all the same, so
@@ -333,46 +298,7 @@ pub(super) fn record_deleted_protections(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn route(id: &str, hostname: &str, path_prefix: &str) -> Route {
-        serde_json::from_value(serde_json::json!({
-            "id": id,
-            "hostname": hostname,
-            "path_prefix": path_prefix,
-            "load_balancing": "round_robin",
-            "waf_enabled": false,
-            "waf_mode": "detection",
-            "enabled": true,
-            "created_at": "2026-11-04T00:00:00Z",
-            "updated_at": "2026-11-04T00:00:00Z",
-        }))
-        .expect("test setup: a route")
-    }
-
-    /// A route with every control of [`ROUTE_PROTECTIONS`] in force,
-    /// held to that by the first assertion of the test that uses it.
-    fn fortified(id: &str, hostname: &str) -> Route {
-        let mut route = route(id, hostname, "/");
-        route.basic_auth_username = Some("user01".into());
-        route.basic_auth_password_hash = Some("$argon2id$stored".into());
-        route.ip_allowlist = vec!["192.0.2.0/24".into()];
-        route.ip_denylist = vec!["198.51.100.0/24".into()];
-        route.geoip = Some(lorica_config::models::GeoIpConfig {
-            mode: lorica_config::models::GeoIpMode::Allowlist,
-            countries: vec!["FR".into()],
-        });
-        route.bot_protection = serde_json::from_value(serde_json::json!({ "mode": "cookie" }))
-            .expect("a bot-protection config");
-        route.waf_enabled = true;
-        route.waf_mode = lorica_config::models::WafMode::Blocking;
-        route.rate_limit = Some(lorica_config::models::RateLimit {
-            capacity: 10,
-            refill_per_sec: 5,
-            scope: lorica_config::models::RateLimitScope::PerIp,
-        });
-        route.auto_ban_threshold = Some(5);
-        route
-    }
+    use crate::automation::protections::{bare_route as route, fortified};
 
     fn recorded_of(deleted: &Route) -> Recorded {
         let record = RouteProtectionRecord::of_deleted(deleted, "ci (0123)", chrono::Utc::now())
@@ -380,36 +306,6 @@ mod tests {
         let mut route = record.route().expect("reads");
         route.enabled = true;
         Recorded { record, route }
-    }
-
-    #[test]
-    fn in_force_is_the_predicates_answer_for_every_control_and_each_alone() {
-        // Walked over the table: a control added to ROUTE_PROTECTIONS is
-        // in force on the fortified route (or this fixture turns red),
-        // and a route carrying it alone has it, and only it, in force.
-        let bare = as_created_bare().expect("the bare route");
-        assert!(controls_in_force(&bare).expect("weighs").is_empty());
-        let strong = fortified("r-1", "app.example.com");
-        let in_force: Vec<&[&str]> = controls_in_force(&strong)
-            .expect("weighs")
-            .iter()
-            .map(|protection| protection.fields)
-            .collect();
-        let every: Vec<&[&str]> = ROUTE_PROTECTIONS.iter().map(|p| p.fields).collect();
-        assert_eq!(
-            in_force, every,
-            "the fixture leaves a control at its weakest"
-        );
-        for protection in ROUTE_PROTECTIONS {
-            let mut alone = route("r-2", "app.example.com", "/");
-            (protection.strengthened)(&strong, &mut alone);
-            let in_force: Vec<&[&str]> = controls_in_force(&alone)
-                .expect("weighs")
-                .iter()
-                .map(|protection| protection.fields)
-                .collect();
-            assert_eq!(in_force, vec![protection.fields], "{:?}", protection.fields);
-        }
     }
 
     #[test]
@@ -550,45 +446,5 @@ mod tests {
             store.list_route_protection_records().expect("list").len(),
             2
         );
-    }
-
-    #[tokio::test]
-    async fn the_bare_route_is_the_one_the_management_create_stores() {
-        // `as_created_bare` spells the model's required fields; the
-        // management create is what decides each default. Weighed both
-        // ways through every predicate, the two rows are the same.
-        let (state, session_store, rate_limiter) = crate::tests::test_state().await;
-        let admin =
-            crate::tests::setup_admin_and_login(&state, &session_store, &rate_limiter).await;
-        let created = crate::tests::send(
-            &state,
-            &session_store,
-            &rate_limiter,
-            "POST",
-            "/api/v1/routes",
-            &admin,
-            Some(serde_json::json!({ "hostname": "bare.example.com" })),
-        )
-        .await;
-        assert_eq!(created.status(), axum::http::StatusCode::CREATED);
-        let id = crate::tests::parse_data(created).await["id"]
-            .as_str()
-            .expect("route id")
-            .to_string();
-        let stored = state
-            .store
-            .lock()
-            .await
-            .get_route(&id)
-            .expect("store")
-            .expect("the route");
-        let bare = as_created_bare().expect("the bare route");
-        for protection in ROUTE_PROTECTIONS {
-            assert!(
-                !(protection.weakened)(&stored, &bare) && !(protection.weakened)(&bare, &stored),
-                "{:?}: the bare route and the management create disagree",
-                protection.fields
-            );
-        }
     }
 }
