@@ -74,8 +74,8 @@ tags:
       needs no secret at all to act on this node.
   - name: AutomationRouteProtectionRecords
     description: >-
-      What a route an automation token deleted served, and the protections it
-      carried (backlog #93). The automation plane holds every later route write
+      What a route an automation token deleted, or moved off a name, served
+      there, and the protections it carried (backlog #93). The automation plane holds every later route write
       that would serve those names to the recorded protections, as it holds a
       write to a route it would take traffic from. An operator lists and clears
       them here; a route create or update through this API whose route, switched
@@ -1276,11 +1276,13 @@ paths:
       tags: [AutomationRouteProtectionRecords]
       summary: List the route protection records (Operator)
       description: >-
-        Every record, the most recent deletion first. A record is written when an
+        Every record, the most recent first. A record is written when an
         automation token deletes a route carrying at least one of the controls the
-        automation plane only lets a token strengthen, and never by a delete
-        through this API. It names what the deleted route served, who deleted it
-        and when, and which controls it holds, never their values.
+        automation plane only lets a token strengthen, or updates it so that it
+        stops serving a name for every path it served there (a new hostname, an
+        alias dropped, a deeper path prefix), and never by a write through this
+        API. It names the names and path released, who released them and when,
+        and which controls it holds, never their values.
       security:
         - sessionCookie: []
       responses:
@@ -1315,7 +1317,7 @@ paths:
       summary: Clear a route protection record (Operator)
       description: >-
         After this, an automation token's route may serve the record's names
-        weaker than the deleted route did. Answers the record as it was and
+        weaker than the recorded route did. Answers the record as it was and
         writes a `route_protection_record.clear` audit row. An unknown id is a
         404. Refused on a follower outside a break-glass window, like every
         configuration write; a follower holds no record anyway.
@@ -6880,16 +6882,16 @@ components:
     RouteProtectionRecord:
       type: object
       description: >-
-        One route protection record as the API answers it: what the deleted route
-        served and which controls it held, never their values and never the
-        Basic-auth password hash the record keeps server side.
+        One route protection record as the API answers it: the names and path a
+        route released and which controls it held, never their values and never
+        the Basic-auth password hash the record keeps server side.
       required: [id, route_id, hostname, hostname_aliases, path_prefix, deleted_by, deleted_at, controls, readable]
       properties:
         id:
           type: string
         route_id:
           type: string
-          description: The id the deleted route had.
+          description: The id of the route that released the names.
         hostname:
           type: string
         hostname_aliases:
@@ -6900,7 +6902,9 @@ components:
           type: string
         deleted_by:
           type: string
-          description: The token that deleted the route, as its audit row names it.
+          description: >-
+            The token that deleted the route or moved it off the names, as its
+            audit row names it.
         deleted_at:
           type: string
           format: date-time

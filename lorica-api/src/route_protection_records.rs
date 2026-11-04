@@ -54,7 +54,8 @@ use crate::target::{RouteGuard, RouteTarget, SettledRow};
 /// `target_type` of every record audit row.
 pub const RECORD_TARGET_TYPE: &str = "route_protection_record";
 
-/// A token deleted a protected route and the record was written.
+/// A token deleted a protected route, or moved it off a name, and the
+/// record was written.
 pub const RECORD_CREATE_ACTION: &str = "route_protection_record.create";
 
 /// A newer record of the same names and path, at least as strong on
@@ -82,27 +83,28 @@ pub struct RecordedControl {
     pub rule: &'static str,
 }
 
-/// A record as the management API and the audit trail render it: what
-/// it serves, who deleted the route and when, and which controls it
-/// holds. Never the snapshot, which carries the recorded values and the
-/// Basic-auth password hash.
+/// A record as the management API and the audit trail render it: the
+/// names and path a route released, who released them and when, and
+/// which controls it holds. Never the snapshot, which carries the
+/// recorded values and the Basic-auth password hash.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RouteProtectionRecordView {
     /// The record's id.
     pub id: String,
-    /// The id the deleted route had.
+    /// The id of the route that released the names.
     pub route_id: String,
-    /// The deleted route's hostname.
+    /// The first name released.
     pub hostname: String,
-    /// The deleted route's aliases.
+    /// The other names released.
     pub hostname_aliases: Vec<String>,
-    /// The deleted route's path prefix.
+    /// The route's path prefix when it released them.
     pub path_prefix: String,
-    /// The actor who deleted the route, as its audit row names it.
+    /// The actor who deleted the route or moved it off the names, as its
+    /// audit row names it.
     pub deleted_by: String,
-    /// When the route was deleted, RFC 3339.
+    /// When, RFC 3339.
     pub deleted_at: String,
-    /// The controls in force on the deleted route, in the order a
+    /// The controls in force on the recorded route, in the order a
     /// refusal weighs them. Empty when the snapshot does not read.
     pub controls: Vec<RecordedControl>,
     /// Whether the snapshot reads. An unreadable record refuses every
