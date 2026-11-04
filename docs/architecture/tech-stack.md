@@ -16,7 +16,39 @@
 > `rustls-no-provider` feature: each client is handed a rustls
 > configuration from `lorica_tls::http_client` (ring, the webpki bundle
 > plus the platform store), so neither `aws-lc-rs` nor the platform
-> verifier reqwest 0.13 defaults to is what a client runs on.
+> verifier reqwest 0.13 defaults to is what a client runs on. The
+> workspace `clippy.toml` refuses reqwest's own constructors and
+> `rustls::ClientConfig::builder` outside `http_client`.
+>
+> Outbound TLS that is not a reqwest client, and so sits outside that
+> policy:
+>
+> - **The OTLP/gRPC exporters** (`otel` feature, tonic). tonic takes
+>   trust anchors, not a rustls configuration, so Lorica hands them the
+>   policy's roots (`http_client::public_roots`); the provider is
+>   tonic's choice, the process default (ring, which `main` installs),
+>   and the ALPN is tonic's `h2`. Before v1.10.2 an `https` collector
+>   was verified against no root at all and always refused.
+> - **The ACME CA client** (`instant-acme`, `lorica-acme/src/driver.rs`).
+>   Its default client verifies through `rustls-platform-verifier` on
+>   the process default provider (ring in the binary): the platform
+>   store only, without the webpki bundle, offering `h2` and `http/1.1`.
+>   instant-acme accepts a client of its own (`Account::builder_with_http`
+>   over a `hyper-util` client with a `hyper-rustls` connector built
+>   from `http_client::public()`); that takes `hyper-util`,
+>   `hyper-rustls` and `bytes` as direct dependencies of `lorica-acme`
+>   (all three already in the lockfile), not yet approved.
+> - **The Route53 DNS-01 client** (`route53` feature, AWS SDK default
+>   HTTPS client). rustls on `aws-lc-rs` with a restricted cipher list,
+>   trusting the platform store alone, read once per process. The SDK
+>   takes a crypto mode and a trust store rather than a rustls
+>   configuration, and only through `aws-smithy-http-client` as a
+>   direct dependency.
+> - **The cluster plane, the syslog sink and SMTP** are not HTTP clients:
+>   the cluster plane pins its own CA and TLS 1.3, the syslog sink takes
+>   the policy's provider and versions (`http_client::config_builder`)
+>   with its own roots and client certificate, and `lettre` builds its
+>   own rustls configuration.
 >
 > Additions after v1.0 that this document never listed:
 >
