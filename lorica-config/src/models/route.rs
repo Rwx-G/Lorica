@@ -348,56 +348,6 @@ fn default_forward_auth_timeout_ms() -> u32 {
     5_000
 }
 
-/// Mutual-TLS client verification.
-///
-/// # HTTP-only listeners
-///
-/// mTLS enforcement is keyed on the downstream TLS digest
-/// (`session.as_downstream().digest().ssl_digest`). Plaintext HTTP
-/// connections have no TLS digest, so a route with `mtls.required =
-/// true` served over an HTTP listener returns 496 unconditionally -
-/// the request never carries a client cert to verify. This is
-/// intentional (fail-closed), but confusing if the operator forgot
-/// to also set `force_https = true` / `redirect_to`. Pair mTLS with
-/// either an HTTPS-only listener or `force_https` so plaintext
-/// clients are redirected to the TLS-terminating port.
-///
-/// # Requirements and constraints
-///
-/// Require connecting clients to present an X.509 certificate signed
-/// by the configured CA bundle and, optionally, constrain which
-/// certificate subjects are allowed.
-///
-/// The HTTPS listener trusts the union of every mTLS route's bundle,
-/// with `allow_unauthenticated` so a client without a cert still
-/// completes the handshake. A certificate it accepts may therefore come
-/// from another route's CA, so the proxy layer verifies the chain again
-/// against THIS route's bundle before it reads anything from the
-/// certificate. A certificate that does not chain to this bundle is no
-/// client identity on this route.
-///
-/// Two enforcement levels:
-/// - `required = true`: the request is denied with 496 ("SSL
-///   certificate required") if the client did not present a cert, and
-///   with 495 ("SSL certificate error") if its cert does not chain to
-///   this bundle. This is the zero-trust mode.
-/// - `required = false`: requests without a cert, or with one that does
-///   not chain to this bundle, pass through as anonymous; requests with
-///   a cert that does chain still get their organization checked
-///   against the allowlist if one is configured. Useful for routes that
-///   want to prefer-but-not-require client certs (mixed public + B2B).
-///
-/// `allowed_organizations` is an optional allowlist matched against the
-/// cert subject's `O=` field. An empty list accepts any cert that
-/// chains to the bundle. When non-empty, the organization is a
-/// case-sensitive exact match.
-///
-/// A change to `ca_cert_pem` reaches this route's check on reload. The
-/// listener's union only changes on restart, because rustls server
-/// configs are immutable after build: until then a certificate from a
-/// CA no route trusted at startup fails the handshake. Toggling
-/// `required` and editing `allowed_organizations` are both
-/// hot-reloadable since those are enforced in the request path.
 /// Per-route token-bucket rate limit. Cross-worker under `--workers N`
 /// via the lorica-limits `LocalBucket` + supervisor-synced
 /// `AuthoritativeBucket` pair. See
@@ -468,8 +418,69 @@ pub enum RateLimitScope {
     PerRoute,
 }
 
-/// mTLS client-certificate verification for a single route. See the
-/// preceding module-level comment for the threat model.
+/// Mutual-TLS client verification.
+///
+/// # HTTP-only listeners
+///
+/// mTLS enforcement is keyed on the downstream TLS digest
+/// (`session.as_downstream().digest().ssl_digest`). Plaintext HTTP
+/// connections have no TLS digest, so a route with `mtls.required =
+/// true` served over an HTTP listener returns 496 unconditionally -
+/// the request never carries a client cert to verify. This is
+/// intentional (fail-closed), but confusing if the operator forgot
+/// to also set `force_https = true` / `redirect_to`. Pair mTLS with
+/// either an HTTPS-only listener or `force_https` so plaintext
+/// clients are redirected to the TLS-terminating port.
+///
+/// # Requirements and constraints
+///
+/// Require connecting clients to present an X.509 certificate signed
+/// by the configured CA bundle and, optionally, constrain which
+/// certificate subjects are allowed.
+///
+/// The HTTPS listener trusts the union of every mTLS route's bundle,
+/// with `allow_unauthenticated` so a client without a cert still
+/// completes the handshake. A certificate it accepts may therefore come
+/// from another route's CA, so the proxy layer verifies the chain again
+/// against THIS route's bundle before it reads anything from the
+/// certificate. A certificate that does not chain to this bundle is no
+/// client identity on this route.
+///
+/// Two enforcement levels:
+/// - `required = true`: the request is denied with 496 ("SSL
+///   certificate required") if the client did not present a cert, and
+///   with 495 ("SSL certificate error") if its cert does not chain to
+///   this bundle. This is the zero-trust mode. Either becomes 421
+///   ("Misdirected Request") when the request names another host than
+///   the connection's TLS handshake did, so a client that coalesced or
+///   reused a connection retries on one opened for this host.
+/// - `required = false`: requests without a cert, or with one that does
+///   not chain to this bundle, pass through as anonymous; requests with
+///   a cert that does chain still get their organization checked
+///   against the allowlist if one is configured. Useful for routes that
+///   want to prefer-but-not-require client certs (mixed public + B2B).
+///
+/// `allowed_organizations` is an optional allowlist matched against the
+/// cert subject's `O=` values. An empty list accepts any cert that
+/// chains to the bundle. When non-empty, each `O=` value is compared
+/// whole, case-sensitively, and a subject with several matches when one
+/// of them is listed. On a route that is not `required`, the allowlist
+/// refuses only certificates of this bundle that miss it: a client
+/// without a certificate, or with another CA's, passes as anonymous, so
+/// the allowlist restricts nobody who presents none.
+///
+/// Every certificate of `ca_cert_pem` is a trust anchor. A bundle that
+/// carries a root trusts every CA that root signed, not only the
+/// issuing CAs pasted beside it; to trust specific issuing CAs, the
+/// bundle holds those and not their root. The dashboard's PEM
+/// validation warns about such a bundle.
+///
+/// A change to `ca_cert_pem` reaches this route's check on reload. The
+/// listener's union only changes on restart, because rustls server
+/// configs are immutable after build: until then a certificate from a
+/// CA no route trusted at startup fails the handshake. Toggling
+/// `required` and editing `allowed_organizations` are both
+/// hot-reloadable since those are enforced in the request path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MtlsConfig {
@@ -479,13 +490,16 @@ pub struct MtlsConfig {
     pub ca_cert_pem: String,
     /// When true, requests without a client certificate are rejected
     /// with 496, and requests whose certificate does not chain to
-    /// `ca_cert_pem` with 495. When false, both pass through as
+    /// `ca_cert_pem` with 495 (421 for either over a connection opened
+    /// for another host). When false, both pass through as
     /// anonymous, and a certificate that does chain must still match
     /// the allowlist.
     #[serde(default)]
     pub required: bool,
     /// Optional subject-organization allowlist. Empty = accept any
-    /// cert that chains to `ca_cert_pem`. Case-sensitive exact match.
+    /// cert that chains to `ca_cert_pem`. Each `O=` value of the
+    /// subject is matched whole and case-sensitively; one listed value
+    /// is enough.
     #[serde(default)]
     pub allowed_organizations: Vec<String>,
 }
