@@ -33,11 +33,13 @@
     "vitest": "^5.1.0"
   },
   "overrides": {
-    "postcss": ">=8.5.10"
+    "postcss": ">=8.5.10",
+    "minimatch": "^11.0.1"
   },
   "pnpm": {
     "overrides": {
-      "postcss": ">=8.5.10"
+      "postcss": ">=8.5.10",
+      "minimatch": "^11.0.1"
     }
   }
 }

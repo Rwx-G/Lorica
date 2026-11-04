@@ -2,5 +2,12 @@
 # package.json. The floor below is the postcss CVE-2026-41305 fix taken
 # in v1.5.2: resolution already sits well above it, this only stops a
 # future resolution from sliding back under.
+#
+# minimatch is lifted to 11 for GHSA-g3hv-75wg-m249, which has no fix
+# on the 10 line that eslint 10 and typescript-eslint 8 still require.
+# They only call `new Minimatch(pattern, { dot, flipNegate })`,
+# `.match(path, partial)`, `.pattern` and `minimatch(path, pattern,
+# { dot })`, all unchanged in 11. Drop the entry once both depend on 11.
 overrides:
   postcss: '>=8.5.10'
+  minimatch: '^11.0.1'
