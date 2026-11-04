@@ -61,7 +61,7 @@ httpdate = "1"
 x509-parser = { version = "0.18", optional = true }
 ouroboros = { version = "0.18.4", optional = true }
 lru = { workspace = true, optional = true }
-daggy = "0.8"
+daggy = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 # daemonize = "0.5.0" removed in v1.3.0 (RUSTSEC-2025-0069,
