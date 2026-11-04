@@ -36,17 +36,17 @@ pub struct SslDigest {
     pub cert_digest: Vec<u8>,
     /// The user-defined TLS data
     pub extension: SslDigestExtension,
-    /// Lorica: the certificate chain a client presented to a listener, DER,
-    /// end-entity first, in the order it was sent. Empty when the client
-    /// presented none, and always empty on a connection Lorica opened, so
-    /// an upstream leg does not carry its server's chain around.
+    /// Lorica: the certificate chain a client presented to a listener.
+    /// Empty when the client presented none, and always empty on a
+    /// connection Lorica opened, so an upstream leg does not carry its
+    /// server's chain around.
     ///
     /// The listener's verifier accepted this chain, but an application that
     /// trusts different roots for different requests on one listener must
     /// verify it again against the roots that apply; `organization`,
     /// `serial_number` and `cert_digest` describe the same end-entity and
     /// are no more trustworthy than it.
-    pub peer_cert_chain: Vec<Vec<u8>>,
+    pub peer_cert_chain: PeerCertChain,
     /// Lorica: the application's verdicts on `peer_cert_chain`, kept for the
     /// life of the connection.
     pub peer_chain_verdicts: PeerChainVerdicts,
@@ -71,9 +71,85 @@ impl SslDigest {
             serial_number,
             cert_digest,
             extension: SslDigestExtension::default(),
-            peer_cert_chain: Vec::new(),
+            peer_cert_chain: PeerCertChain::default(),
             peer_chain_verdicts: PeerChainVerdicts::default(),
         }
+    }
+}
+
+/// Lorica: a client's certificate chain as a connection keeps it, DER,
+/// end-entity first, in the order it was sent.
+///
+/// rustls keeps its own copy for the life of the connection, so this
+/// one is bounded: at most [`PeerCertChain::MAX_CERTIFICATES`]
+/// certificates and [`PeerCertChain::MAX_BYTES`] of DER. A chain past
+/// either bound is kept truncated and marked so; it still counts as
+/// presented, and [`PeerCertChain::verifiable`] withholds it, so a
+/// verification reached through that method refuses it rather than
+/// judging a prefix that might verify on its own. A legitimate client
+/// chain is an end-entity and a few intermediates, far inside both.
+///
+/// `Debug` prints the shape, never the certificates: they are client
+/// identities, and a digest logged with `?` must not dump them.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct PeerCertChain {
+    certificates: Vec<Vec<u8>>,
+    truncated: bool,
+}
+
+impl PeerCertChain {
+    /// How many certificates a connection keeps.
+    pub const MAX_CERTIFICATES: usize = 10;
+    /// How many bytes of DER a connection keeps, all certificates together.
+    pub const MAX_BYTES: usize = 32 * 1024;
+
+    /// Keep `presented` (DER, end-entity first) within the bounds,
+    /// truncating and marking a chain that exceeds them.
+    pub fn new<'c>(presented: impl IntoIterator<Item = &'c [u8]>) -> Self {
+        let mut chain = PeerCertChain::default();
+        let mut kept_bytes = 0usize;
+        for der in presented {
+            if chain.certificates.len() == Self::MAX_CERTIFICATES
+                || kept_bytes + der.len() > Self::MAX_BYTES
+            {
+                chain.truncated = true;
+                break;
+            }
+            kept_bytes += der.len();
+            chain.certificates.push(der.to_vec());
+        }
+        chain
+    }
+
+    /// Whether the client presented a certificate at all, a chain over
+    /// the bounds included.
+    pub fn is_presented(&self) -> bool {
+        self.truncated || !self.certificates.is_empty()
+    }
+
+    /// Whether the presented chain exceeded the bounds.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// The chain to verify: `None` when none was presented or when it was
+    /// truncated, which a verifier must read as a chain that does not
+    /// verify.
+    pub fn verifiable(&self) -> Option<&[Vec<u8>]> {
+        (!self.truncated && !self.certificates.is_empty()).then_some(self.certificates.as_slice())
+    }
+}
+
+impl std::fmt::Debug for PeerCertChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerCertChain")
+            .field("certificates", &self.certificates.len())
+            .field(
+                "bytes",
+                &self.certificates.iter().map(Vec::len).sum::<usize>(),
+            )
+            .field("truncated", &self.truncated)
+            .finish()
     }
 }
 
@@ -181,8 +257,62 @@ mod tests {
     #[test]
     fn a_new_digest_carries_no_chain_and_no_verdict() {
         let digest = SslDigest::new("cipher", "TLSv1.3", None, None, Vec::new());
-        assert!(digest.peer_cert_chain.is_empty());
+        assert!(!digest.peer_cert_chain.is_presented());
+        assert_eq!(digest.peer_cert_chain.verifiable(), None);
         assert_eq!(digest.peer_chain_verdicts.get(0), None);
+    }
+
+    fn chain_of(sizes: &[usize]) -> Vec<Vec<u8>> {
+        sizes.iter().map(|size| vec![0x30; *size]).collect()
+    }
+
+    fn kept(presented: &[Vec<u8>]) -> PeerCertChain {
+        PeerCertChain::new(presented.iter().map(Vec::as_slice))
+    }
+
+    #[test]
+    fn a_chain_within_the_bounds_is_kept_whole_and_verifiable() {
+        let presented = chain_of(&[1_000; PeerCertChain::MAX_CERTIFICATES]);
+        let chain = kept(&presented);
+        assert!(chain.is_presented());
+        assert!(!chain.is_truncated());
+        assert_eq!(chain.verifiable(), Some(presented.as_slice()));
+    }
+
+    #[test]
+    fn a_chain_with_one_certificate_too_many_is_presented_but_not_verifiable() {
+        let presented = chain_of(&[100; PeerCertChain::MAX_CERTIFICATES + 1]);
+        let chain = kept(&presented);
+        assert!(chain.is_presented());
+        assert!(chain.is_truncated());
+        assert_eq!(chain.verifiable(), None);
+        assert_eq!(chain.certificates.len(), PeerCertChain::MAX_CERTIFICATES);
+    }
+
+    #[test]
+    fn a_chain_past_the_byte_bound_is_presented_but_not_verifiable() {
+        let half = PeerCertChain::MAX_BYTES / 2;
+        let chain = kept(&chain_of(&[half, half, 1]));
+        assert!(chain.is_truncated());
+        assert_eq!(chain.verifiable(), None);
+        assert_eq!(chain.certificates.len(), 2);
+        assert!(kept(&chain_of(&[half, half])).verifiable().is_some());
+    }
+
+    #[test]
+    fn an_end_entity_alone_past_the_byte_bound_still_counts_as_presented() {
+        let chain = kept(&chain_of(&[PeerCertChain::MAX_BYTES + 1]));
+        assert!(chain.is_presented());
+        assert_eq!(chain.verifiable(), None);
+    }
+
+    #[test]
+    fn the_chain_debug_output_carries_no_certificate_bytes() {
+        let chain = kept(&[b"CLIENT-IDENTITY".to_vec()]);
+        assert_eq!(
+            format!("{chain:?}"),
+            "PeerCertChain { certificates: 1, bytes: 15, truncated: false }"
+        );
     }
 }
 

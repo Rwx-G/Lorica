@@ -2527,6 +2527,16 @@ fn mtls_test_ca(cn: &str) -> MtlsTestCa {
 /// `ca` with subject `O=org`, through the same parser the rustls stream
 /// uses for `organization`.
 fn client_digest(ca: &MtlsTestCa, org: &str) -> lorica_core::protocols::tls::SslDigest {
+    client_digest_with_chain_tail(ca, org, &[])
+}
+
+/// [`client_digest`] with `tail` sent after the end-entity, as a client
+/// sends intermediates.
+fn client_digest_with_chain_tail(
+    ca: &MtlsTestCa,
+    org: &str,
+    tail: &[Vec<u8>],
+) -> lorica_core::protocols::tls::SslDigest {
     let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
     params
         .distinguished_name
@@ -2545,7 +2555,9 @@ fn client_digest(ca: &MtlsTestCa, org: &str) -> lorica_core::protocols::tls::Ssl
         Some(serial),
         vec![1],
     );
-    digest.peer_cert_chain = vec![der];
+    digest.peer_cert_chain = lorica_core::protocols::tls::PeerCertChain::new(
+        std::iter::once(der.as_slice()).chain(tail.iter().map(Vec::as_slice)),
+    );
     digest
 }
 
@@ -2668,6 +2680,36 @@ fn test_route_client_cert_unusable_bundle_verifies_nothing() {
         RouteClientCert::Untrusted
     );
     assert_eq!(judge(&digest, &route), Some(495));
+}
+
+#[test]
+fn test_route_client_cert_chain_over_the_bound_is_refused_although_its_leaf_verifies() {
+    // Unused extra intermediates do not fail webpki, so without the
+    // bound this chain verifies on its own CA's route. Over the bound
+    // it is presented and never verified: 495 on a required route,
+    // anonymous on an optional one, never an identity.
+    use lorica_core::protocols::tls::PeerCertChain;
+    let ca_b = mtls_test_ca("CA B");
+    let padding = vec![vec![0x30; 512]; PeerCertChain::MAX_CERTIFICATES];
+    let padded = client_digest_with_chain_tail(&ca_b, "Beta", &padding);
+    assert!(padded.peer_cert_chain.is_truncated());
+    let route_b = route_enforcer(&ca_b, true, vec![]);
+    assert_eq!(
+        route_client_cert(Some(&padded), &route_b),
+        RouteClientCert::Untrusted
+    );
+    assert_eq!(judge(&padded, &route_b), Some(495));
+    assert_eq!(
+        judge(&padded, &route_enforcer(&ca_b, false, vec!["Beta"])),
+        None
+    );
+
+    // The same leaf with a tail inside the bound verifies.
+    let within = client_digest_with_chain_tail(&ca_b, "Beta", &padding[..2]);
+    assert!(matches!(
+        route_client_cert(Some(&within), &route_b),
+        RouteClientCert::Verified { .. }
+    ));
 }
 
 #[test]

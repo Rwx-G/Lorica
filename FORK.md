@@ -366,7 +366,8 @@ lives in.
 - **`lorica-core`, the client certificate chain in the TLS digest
   (v1.10.3).** Sites: `lorica-core/src/protocols/tls/digest.rs` (the
   `SslDigest::peer_cert_chain` and `peer_chain_verdicts` fields and the
-  `PeerChainVerdicts` type, which upstream does not have) and
+  `PeerCertChain` and `PeerChainVerdicts` types, which upstream does not
+  have) and
   `lorica-core/src/protocols/tls/rustls/stream.rs`
   (`SslDigest::from_stream` fills the chain, on an accepted connection
   only). Upstream's digest keeps the organization, serial number and a
@@ -376,6 +377,11 @@ lives in.
   certificate the handshake accepted may come from another route's CA:
   the proxy verifies the chain again against the route's own bundle
   (`lorica::mtls::RouteClientVerifier`), and needs the chain to do it.
+  `PeerCertChain` bounds the copy, since rustls keeps its own for the
+  life of the connection: past its certificate count or byte bound the
+  chain is kept truncated, still counts as presented, and is withheld
+  from verification, so it is refused rather than judged on a prefix; its
+  `Debug` prints the shape, never the certificates.
   `PeerChainVerdicts` keeps those verdicts per connection, so a keep-alive
   or HTTP/2 connection verifies once per route rather than once per
   request. `SslDigest::new` keeps upstream's signature and starts both

@@ -273,17 +273,20 @@ pub fn route_client_cert<'a>(
     let Some(ssl) = ssl else {
         return RouteClientCert::Absent;
     };
-    if ssl.peer_cert_chain.is_empty() {
+    if !ssl.peer_cert_chain.is_presented() {
         return RouteClientCert::Absent;
     }
+    // A chain over the digest's bounds is withheld: it was presented and
+    // is never verified, so it can only be refused.
+    let Some(chain) = ssl.peer_cert_chain.verifiable() else {
+        return RouteClientCert::Untrusted;
+    };
     let Some(verifier) = enforcer.client_verifier.as_ref() else {
         return RouteClientCert::Untrusted;
     };
     let verified = ssl
         .peer_chain_verdicts
-        .get_or_compute(verifier.memo_key(), || {
-            verifier.verifies(&ssl.peer_cert_chain)
-        });
+        .get_or_compute(verifier.memo_key(), || verifier.verifies(chain));
     if verified {
         RouteClientCert::Verified {
             organization: ssl.organization.as_deref().unwrap_or_default(),

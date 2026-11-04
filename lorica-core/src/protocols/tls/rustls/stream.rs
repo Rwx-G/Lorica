@@ -21,7 +21,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::listeners::tls::Acceptor;
 use crate::protocols::raw_connect::ProxyDigest;
-use crate::protocols::{tls::SslDigest, Peek, TimingDigest, UniqueIDType};
+use crate::protocols::{
+    tls::{PeerCertChain, SslDigest},
+    Peek, TimingDigest, UniqueIDType,
+};
 use crate::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, SocketDigest, Ssl, UniqueID, ALPN,
 };
@@ -391,11 +394,12 @@ impl SslDigest {
             .unwrap_or_default();
 
         let mut digest = SslDigest::new(cipher, version, organization, serial_number, cert_digest);
-        // Lorica: keep the client's chain on an accepted connection, so the
-        // application can verify it against per-route roots (FORK.md).
+        // Lorica: keep the client's chain on an accepted connection, within
+        // `PeerCertChain`'s bounds, so the application can verify it against
+        // per-route roots (FORK.md).
         if matches!(stream, RusTlsStream::Server(_)) {
             digest.peer_cert_chain = peer_certificates
-                .map(|certs| certs.iter().map(|cert| cert.as_ref().to_vec()).collect())
+                .map(|certs| PeerCertChain::new(certs.iter().map(|cert| cert.as_ref())))
                 .unwrap_or_default();
         }
         digest
