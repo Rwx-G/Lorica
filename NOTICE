@@ -54,5 +54,5 @@ attribution. The map is only used to render a country picker; no
 derivative of it appears in proxied traffic. If the CC BY-SA
 attribution requirement is incompatible with your redistribution,
 delete `lorica-dashboard/frontend/src/assets/world-map.svg` before
-building the dashboard — the picker component falls back to a plain
+building the dashboard: the picker component falls back to a plain
 text input on a missing asset.
