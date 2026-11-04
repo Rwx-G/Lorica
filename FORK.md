@@ -263,7 +263,7 @@ after any upstream sync that touches the function it lives in.
   `SliceRandom::choose` is `IndexedRandom::choose`, `distributions` is
   `distr`, `Uniform::new` returns a `Result`), and 0.9 to 0.10 in
   `lorica-ketama` and `tinyufo` (`rand_distr` 0.6 for the latter's
-  benches). On an upstream sync, keep Lorica's version and port the new
+  benches). `x509-parser` 0.16 to 0.18 in `lorica-core`, no code change. On an upstream sync, keep Lorica's version and port the new
   code to its API rather than taking upstream's manifest line.
 
 ## Upstream sync record
