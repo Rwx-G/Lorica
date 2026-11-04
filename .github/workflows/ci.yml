@@ -228,7 +228,7 @@ jobs:
           npm run build
 
       - name: Run Rust unit tests (product crates)
-        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command -p lorica-cluster -p lorica-tls -p lorica-metrics -p lorica-acme -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-mcp -p lorica-automation-policy -p lorica-adcs
+        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command -p lorica-cluster -p lorica-metrics -p lorica-acme -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-worker -p lorica-dashboard -p lorica-mcp -p lorica-automation-policy -p lorica-adcs
         env:
           SKIP_FRONTEND_BUILD: ""
 
@@ -241,7 +241,7 @@ jobs:
           SKIP_FRONTEND_BUILD: ""
 
       - name: Run Rust unit tests (forked crates)
-        run: cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error -p lorica-tls -p lorica-worker -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde -p lorica-limits
+        run: cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error -p lorica-tls -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde -p lorica-limits -p lorica-runtime -p lorica-timeout -p lorica-ketama -p lorica-lru -p lorica-memory-cache -p TinyUFO
         env:
           SKIP_FRONTEND_BUILD: "1"
 
@@ -303,10 +303,12 @@ jobs:
             -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify \
             -p lorica-bench -p lorica-command -p lorica-metrics -p lorica-acme \
             -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-worker \
-            -p lorica-mcp -p lorica-automation-policy -p lorica-adcs -p lorica \
-            -p lorica-cluster -p lorica-tls \
+            -p lorica-dashboard -p lorica-mcp -p lorica-automation-policy -p lorica-adcs \
+            -p lorica -p lorica-cluster -p lorica-tls \
             -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error \
-            -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde
+            -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde \
+            -p lorica-limits -p lorica-runtime -p lorica-timeout -p lorica-ketama \
+            -p lorica-lru -p lorica-memory-cache -p TinyUFO
 
       - name: Report coverage summary
         run: |
