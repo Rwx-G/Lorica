@@ -57,17 +57,27 @@ pub struct PathRule {
 
 impl PathRule {
     /// Test the rule's `path` against an incoming request path under the
-    /// configured [`PathMatchType`].
-    pub fn matches(&self, request_path: &str) -> bool {
-        self.matches_as(&self.path, request_path)
+    /// configured [`PathMatchType`], ASCII case folded when
+    /// `case_insensitive` (the rule's route's
+    /// [`Route::case_insensitive_paths`]).
+    pub fn matches(&self, request_path: &str, case_insensitive: bool) -> bool {
+        self.matches_as(&self.path, request_path, case_insensitive)
     }
 
     /// [`PathRule::matches`] with `pattern` standing for the rule's
     /// `path`: the rule as another reading of the request spells it
     /// (`crate::route_selection::selects_alike_once_normalised`).
-    pub(crate) fn matches_as(&self, pattern: &str, request_path: &str) -> bool {
+    pub(crate) fn matches_as(
+        &self,
+        pattern: &str,
+        request_path: &str,
+        case_insensitive: bool,
+    ) -> bool {
         match self.match_type {
-            PathMatchType::Prefix => request_path.starts_with(pattern),
+            PathMatchType::Prefix => {
+                crate::route_selection::path_starts_with(request_path, pattern, case_insensitive)
+            }
+            PathMatchType::Exact if case_insensitive => request_path.eq_ignore_ascii_case(pattern),
             PathMatchType::Exact => request_path == pattern,
         }
     }
@@ -1303,7 +1313,19 @@ impl Route {
         self.path_rules
             .iter()
             .enumerate()
-            .find(|(_, rule)| rule.matches(request_path))
+            .find(|(_, rule)| rule.matches(request_path, self.case_insensitive_paths))
+    }
+
+    /// Whether `path` falls under this route's `path_prefix`, ASCII case
+    /// folded when [`Route::case_insensitive_paths`] is on: the test the
+    /// route selection, and everything that asks which paths a route
+    /// serves, applies.
+    pub fn covers_path(&self, path: &str) -> bool {
+        crate::route_selection::path_starts_with(
+            path,
+            &self.path_prefix,
+            self.case_insensitive_paths,
+        )
     }
 
     /// `(rate_limit_rps, rate_limit_burst, rate_limit)` once `rule` is

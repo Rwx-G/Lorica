@@ -1482,12 +1482,16 @@ fn test_path_rule_matching() {
         .route
         .path_rules
         .iter()
-        .find(|r| r.matches("/api/v2/users"));
+        .find(|r| r.matches("/api/v2/users", false));
     assert!(matched.is_some());
     assert_eq!(matched.unwrap().path, "/api/v2");
 
     // Verify exact match rule
-    let matched = entry.route.path_rules.iter().find(|r| r.matches("/health"));
+    let matched = entry
+        .route
+        .path_rules
+        .iter()
+        .find(|r| r.matches("/health", false));
     assert!(matched.is_some());
     assert_eq!(matched.unwrap().return_status, Some(200));
 
@@ -1496,7 +1500,7 @@ fn test_path_rule_matching() {
         .route
         .path_rules
         .iter()
-        .find(|r| r.matches("/health/check"));
+        .find(|r| r.matches("/health/check", false));
     assert!(matched.is_none());
 }
 

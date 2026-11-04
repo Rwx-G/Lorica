@@ -1510,3 +1510,92 @@ async fn fullstack_https_redirect_exempts_only_paths_that_stay_acme_challenges()
         "a path that leaves the challenge namespace is redirected: {answered:?}"
     );
 }
+
+/// Every status `paths` are answered with on the TLS listener, without
+/// a client certificate, with whether the upstream answered.
+async fn answers(
+    harness: &TlsProxyHarness,
+    pki: &TestPki,
+    paths: &[&'static str],
+) -> Vec<(&'static str, u16, bool)> {
+    let no_cert = client_config_trusting(&pki.ca_cert_der);
+    let mut answered = Vec::new();
+    for path in paths {
+        let (status, body) = tls_get(
+            harness.port,
+            no_cert.clone(),
+            "localhost",
+            "localhost",
+            path,
+        )
+        .await
+        .expect("tls req");
+        answered.push((*path, status, body.contains("upstream-ok")));
+    }
+    answered
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_case_insensitive_paths_selects_the_route_and_rule_in_any_case() {
+    // A backend that ignores case serves `/ADMIN/x` as `/admin/x`. With
+    // the routes saying so, the upper-case spellings are served by the
+    // protected route and held to the public route's deny rule.
+    let pki = build_pki();
+    let harness = public_and_admin_harness(&pki, |route| {
+        deny_and_throttle_rules(route);
+        route.case_insensitive_paths = true;
+    })
+    .await;
+    let answered = answers(
+        &harness,
+        &pki,
+        &[
+            "/admin/x",
+            "/ADMIN/x",
+            "/Admin/x",
+            "/internal/x",
+            "/INTERNAL/x",
+            "/Internal",
+            "/public",
+            "/PUBLIC",
+            "/%41DMIN/x",
+            "/X/../ADMIN/x",
+        ],
+    )
+    .await;
+    let expected: Vec<(&str, u16, bool)> = vec![
+        ("/admin/x", 496, false),
+        ("/ADMIN/x", 496, false),
+        ("/Admin/x", 496, false),
+        ("/internal/x", 403, false),
+        ("/INTERNAL/x", 403, false),
+        ("/Internal", 403, false),
+        ("/public", 200, true),
+        ("/PUBLIC", 200, true),
+        // Spellings the raw comparison still misses, folded or not.
+        ("/%41DMIN/x", 400, false),
+        ("/X/../ADMIN/x", 400, false),
+    ];
+    assert_eq!(answered, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_case_sensitive_paths_by_default_match_as_before() {
+    // The flag off, which every route is until an operator says
+    // otherwise: case is significant, exactly as it always was.
+    let pki = build_pki();
+    let harness = public_and_admin_harness(&pki, deny_and_throttle_rules).await;
+    let answered = answers(
+        &harness,
+        &pki,
+        &["/admin/x", "/ADMIN/x", "/internal/x", "/INTERNAL/x"],
+    )
+    .await;
+    let expected: Vec<(&str, u16, bool)> = vec![
+        ("/admin/x", 496, false),
+        ("/ADMIN/x", 200, true),
+        ("/internal/x", 403, false),
+        ("/INTERNAL/x", 200, true),
+    ];
+    assert_eq!(answered, expected);
+}

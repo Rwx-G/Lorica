@@ -424,8 +424,30 @@ where
     F: Fn(&E) -> &Route,
 {
     select_where(exact, wildcards, host, |entry| {
-        path.starts_with(&route_of(entry).path_prefix)
+        route_of(entry).covers_path(path)
     })
+}
+
+/// Whether `path` starts with `prefix`, ASCII case folded when
+/// `case_insensitive`: the one prefix comparison the selection, a path
+/// rule ([`crate::models::PathRule::matches`]) and every question about
+/// which paths a route serves ([`Route::covers_path`]) make. Allocates
+/// nothing either way.
+///
+/// ```
+/// use lorica_config::route_selection::path_starts_with;
+/// assert!(path_starts_with("/ADMIN/x", "/admin", true));
+/// assert!(!path_starts_with("/ADMIN/x", "/admin", false));
+/// assert!(!path_starts_with("/adm", "/admin", true));
+/// ```
+pub fn path_starts_with(path: &str, prefix: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        path.as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+    } else {
+        path.starts_with(prefix)
+    }
 }
 
 /// [`select`] with the path test left to `serves`: the first entry it
@@ -479,7 +501,12 @@ fn select_where<'a, E>(
 /// container never sees, which strips `;%2F..%2Fpublic` and serves
 /// `/admin`. They are read once more after the decoding, so `%3B` and
 /// `%5C` count as the `;` and the `\` a backend that decodes first
-/// reads them as. Case is left as it is.
+/// reads them as.
+///
+/// Case is left as it is: whether it counts is a property of the route
+/// a path is compared against ([`Route::case_insensitive_paths`]), so
+/// [`path_starts_with`] folds it in the comparison, on this reading and
+/// on the raw one alike.
 ///
 /// ```
 /// use lorica_config::route_selection::normalised_path;
@@ -608,7 +635,12 @@ where
     };
     let as_sent = select(exact, wildcards, host, path, &route_of);
     let as_normalised = select_where(exact, wildcards, host, |entry| {
-        normalised.starts_with(normalised_path(&route_of(entry).path_prefix).as_ref())
+        let route = route_of(entry);
+        path_starts_with(
+            &normalised,
+            &normalised_path(&route.path_prefix),
+            route.case_insensitive_paths,
+        )
     });
     match (as_sent, as_normalised) {
         (None, None) => true,
@@ -626,10 +658,13 @@ where
 /// evaluated ([`Route::matching_path_rule`]).
 fn selects_the_same_path_rule(route: &Route, path: &str, normalised: &str) -> bool {
     let as_sent = route.matching_path_rule(path).map(|(index, _)| index);
-    let as_normalised = route
-        .path_rules
-        .iter()
-        .position(|rule| rule.matches_as(&normalised_path(&rule.path), normalised));
+    let as_normalised = route.path_rules.iter().position(|rule| {
+        rule.matches_as(
+            &normalised_path(&rule.path),
+            normalised,
+            route.case_insensitive_paths,
+        )
+    });
     as_sent == as_normalised
 }
 
@@ -793,7 +828,7 @@ pub fn canonicalise_route_names(routes: &mut [RouteNames]) -> Vec<NameCollision>
 
 /// Whether `route` answers to `name` for every path `path_prefix`
 /// covers: it answers to `name` and its own prefix is `path_prefix` or
-/// one above it.
+/// one above it, compared as [`Route::covers_path`] compares a request.
 ///
 /// No other route can take one of those requests from it: a name is
 /// held by one route at most (`ConfigStore::hostname_claimed_elsewhere`),
@@ -803,7 +838,7 @@ pub fn serves_all_of(route: &Route, name: &str, path_prefix: &str) -> bool {
     std::iter::once(route.hostname.as_str())
         .chain(route.hostname_aliases.iter().map(String::as_str))
         .any(|own| same_name(own, name))
-        && path_prefix.starts_with(route.path_prefix.as_str())
+        && route.covers_path(path_prefix)
 }
 
 /// Every index key whose routes [`select`] can reach for `host`: the
@@ -1032,6 +1067,66 @@ mod tests {
             "/caf%C3%A9/menu",
         ] {
             assert!(alike(harmless), "{harmless}");
+        }
+    }
+
+    #[test]
+    fn a_route_that_ignores_case_is_selected_in_any_case_on_both_readings() {
+        use crate::models::PathRule;
+        let mut public = route("public", "app.example.com", "/");
+        public.path_rules = vec![PathRule {
+            path: "/internal".into(),
+            return_status: Some(403),
+            ..Default::default()
+        }];
+        let admin = route("admin", "app.example.com", "/admin");
+        let alike_on = |routes: &[Route], path: &str| {
+            let index = HostIndex::new(routes.iter(), |r| *r);
+            selects_alike_once_normalised(
+                &index.exact,
+                &index.wildcards,
+                "app.example.com",
+                path,
+                |r| *r,
+            )
+        };
+        let sensitive = [public.clone(), admin.clone()];
+        let index = HostIndex::new(sensitive.iter(), |r| *r);
+        assert_eq!(
+            served(&index, "app.example.com", "/ADMIN/x"),
+            Some("public")
+        );
+        assert_eq!(
+            sensitive[0].matching_path_rule("/INTERNAL").map(|(i, _)| i),
+            None
+        );
+
+        let insensitive = [public, admin].map(|mut route| {
+            route.case_insensitive_paths = true;
+            route
+        });
+        let index = HostIndex::new(insensitive.iter(), |r| *r);
+        for path in ["/ADMIN/x", "/Admin", "/aDmIn/x"] {
+            assert_eq!(
+                served(&index, "app.example.com", path),
+                Some("admin"),
+                "{path}"
+            );
+        }
+        assert_eq!(served(&index, "app.example.com", "/ADM"), Some("public"));
+        assert_eq!(
+            insensitive[0]
+                .matching_path_rule("/INTERNAL")
+                .map(|(i, _)| i),
+            Some(0)
+        );
+        // Folded on the normalised reading too: these agree...
+        for path in ["/ADMIN//x", "/Admin;x=1/y", "/INTERNAL//x"] {
+            assert!(alike_on(&insensitive, path), "{path}");
+        }
+        // ...and these still select another route or rule once read.
+        for path in ["/%41DMIN/x", "/x/../ADMIN", "/%49NTERNAL"] {
+            assert!(!alike_on(&insensitive, path), "{path}");
         }
     }
 
@@ -1377,5 +1472,8 @@ mod tests {
         assert!(serves_all_of(&aliased, "app.example.com", "/api/v1"));
         assert!(!serves_all_of(&aliased, "app.example.com", "/"));
         assert!(!serves_all_of(&aliased, "other.example.com", "/api"));
+        assert!(!serves_all_of(&aliased, "app.example.com", "/API/v1"));
+        aliased.case_insensitive_paths = true;
+        assert!(serves_all_of(&aliased, "app.example.com", "/API/v1"));
     }
 }

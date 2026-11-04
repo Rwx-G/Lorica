@@ -170,7 +170,7 @@ impl Serving {
             .chain(
                 self.holders()
                     .map(|holder| holder.route().path_prefix.as_str())
-                    .filter(|prefix| prefix.starts_with(after.path_prefix.as_str())),
+                    .filter(|prefix| after.covers_path(prefix)),
             )
             .collect();
         let names = std::iter::once(&after.hostname).chain(&after.hostname_aliases);
@@ -493,5 +493,25 @@ mod tests {
         let mut mine = route("mine", "mine.example.com", "/");
         mine.read_timeout_s = 5;
         assert!(displaced(stored, Vec::new(), &mine).is_empty());
+    }
+
+    #[test]
+    fn a_route_that_ignores_case_takes_every_spelling_of_the_prefixes_below_it() {
+        // `/api` folding case serves `/API/secret` too, which the wildcard
+        // route below holds today: it is weighed against that route as
+        // well as against the one holding `/`.
+        let mut secret = route("secret", "*.example.com", "/API/secret");
+        secret.waf_enabled = true;
+        let stored = vec![route("wild", "*.example.com", "/"), secret];
+        let mut after = route("n", "a.example.com", "/api");
+        assert_eq!(
+            displaced(stored.clone(), Vec::new(), &after),
+            vec!["wild".to_string()]
+        );
+        after.case_insensitive_paths = true;
+        assert_eq!(
+            displaced(stored, Vec::new(), &after),
+            vec!["secret".to_string(), "wild".to_string()]
+        );
     }
 }

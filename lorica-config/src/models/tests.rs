@@ -380,9 +380,13 @@ fn test_path_rule_matches_prefix() {
         match_type: PathMatchType::Prefix,
         ..Default::default()
     };
-    assert!(rule.matches("/api/users"));
-    assert!(rule.matches("/api/"));
-    assert!(!rule.matches("/other"));
+    assert!(rule.matches("/api/users", false));
+    assert!(rule.matches("/api/", false));
+    assert!(!rule.matches("/other", false));
+    assert!(!rule.matches("/API/users", false));
+    assert!(rule.matches("/API/users", true));
+    assert!(rule.matches("/Api/", true));
+    assert!(!rule.matches("/api", true));
 }
 
 #[test]
@@ -392,9 +396,12 @@ fn test_path_rule_matches_exact() {
         match_type: PathMatchType::Exact,
         ..Default::default()
     };
-    assert!(rule.matches("/health"));
-    assert!(!rule.matches("/health/check"));
-    assert!(!rule.matches("/healthz"));
+    assert!(rule.matches("/health", false));
+    assert!(!rule.matches("/health/check", false));
+    assert!(!rule.matches("/healthz", false));
+    assert!(!rule.matches("/HEALTH", false));
+    assert!(rule.matches("/HEALTH", true));
+    assert!(!rule.matches("/HEALTH/check", true));
 }
 
 // ---- Route::with_path_rule_overrides ----
