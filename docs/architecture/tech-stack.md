@@ -9,9 +9,9 @@
 >
 > Notable major bumps since the v1.0 baseline: axum 0.8, tower 0.5,
 > tower-http 0.7, rusqlite 0.41, rcgen 0.14, sysinfo 0.39,
-> opentelemetry 0.33, argon2 0.6. `nix` is split: product crates
-> (`lorica-api`, `lorica-shmem`) are on 0.31 while the forked crates
-> (`lorica-core`, `lorica-command`, `lorica-worker`) stay on `~0.29`.
+> opentelemetry 0.33, argon2 0.6. `nix` 0.31 in
+> every crate since v1.10.2 (`lorica-core`, `lorica-command` and
+> `lorica-worker` were held on `~0.29` until then).
 >
 > Additions after v1.0 that this document never listed:
 >

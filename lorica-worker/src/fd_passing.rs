@@ -26,7 +26,7 @@
 //! - `shmem`: the anonymous memfd holding the `SharedRegion`
 
 use std::io::{IoSlice, IoSliceMut};
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::sys::socket::{
@@ -250,6 +250,9 @@ pub fn recv_listener_fds(sock: RawFd) -> Result<Vec<(RawFd, String)>, WorkerErro
 
 /// Clear the CLOEXEC flag on a file descriptor so it survives `execv`.
 pub fn clear_cloexec(fd: RawFd) -> Result<(), WorkerError> {
+    // SAFETY: the caller hands an open descriptor it keeps open for the
+    // duration of this call; the borrow does not outlive it.
+    let fd: BorrowedFd<'_> = unsafe { BorrowedFd::borrow_raw(fd) };
     fcntl(fd, FcntlArg::F_SETFD(FdFlag::empty())).map_err(WorkerError::ClearCloexec)?;
     Ok(())
 }
@@ -265,6 +268,9 @@ pub fn clear_cloexec(fd: RawFd) -> Result<(), WorkerError> {
 /// meant to leak across an `execv`; the SCM_RIGHTS transfer dups it again
 /// in the receiver regardless of this flag.
 pub fn dup_cloexec(fd: RawFd) -> Result<OwnedFd, WorkerError> {
+    // SAFETY: the caller hands an open descriptor it keeps open for the
+    // duration of this call; the borrow does not outlive it.
+    let fd: BorrowedFd<'_> = unsafe { BorrowedFd::borrow_raw(fd) };
     let raw: RawFd = fcntl(fd, FcntlArg::F_DUPFD_CLOEXEC(0)).map_err(WorkerError::DupFd)?;
     // SAFETY: `F_DUPFD_CLOEXEC` returns a fresh, exclusively-owned FD;
     // wrapping it in `OwnedFd` is the canonical close-on-drop idiom.
@@ -398,13 +404,13 @@ mod tests {
         let raw = fd.as_raw_fd();
 
         // Initially CLOEXEC should be set (due to SOCK_CLOEXEC)
-        let flags = fcntl(raw, FcntlArg::F_GETFD).expect("F_GETFD failed");
+        let flags = fcntl(&fd, FcntlArg::F_GETFD).expect("F_GETFD failed");
         assert!(FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC));
 
         // Clear it
         clear_cloexec(raw).expect("clear_cloexec failed");
 
-        let flags = fcntl(raw, FcntlArg::F_GETFD).expect("F_GETFD failed");
+        let flags = fcntl(&fd, FcntlArg::F_GETFD).expect("F_GETFD failed");
         assert!(!FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC));
     }
 
@@ -421,11 +427,11 @@ mod tests {
 
     #[test]
     fn test_send_recv_typed_shmem_plus_listener() {
-        use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
+        use nix::sys::memfd::{memfd_create, MFdFlags};
         let (parent_fd, child_fd) = create_socketpair().expect("socketpair failed");
 
         let memfd =
-            memfd_create(c"lorica-shmem-test", MemFdCreateFlag::MFD_CLOEXEC).expect("memfd_create");
+            memfd_create(c"lorica-shmem-test", MFdFlags::MFD_CLOEXEC).expect("memfd_create");
         let dummy = socket::socket(
             AddressFamily::Unix,
             SockType::Stream,
@@ -460,10 +466,10 @@ mod tests {
     #[test]
     fn test_legacy_listener_wrapper_filters_out_shmem() {
         // Sender mixes shmem + listener; legacy receiver keeps only listeners.
-        use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
+        use nix::sys::memfd::{memfd_create, MFdFlags};
         let (parent_fd, child_fd) = create_socketpair().expect("socketpair failed");
 
-        let memfd = memfd_create(c"lorica-shmem-test2", MemFdCreateFlag::MFD_CLOEXEC).unwrap();
+        let memfd = memfd_create(c"lorica-shmem-test2", MFdFlags::MFD_CLOEXEC).unwrap();
         let dummy = socket::socket(
             AddressFamily::Unix,
             SockType::Stream,

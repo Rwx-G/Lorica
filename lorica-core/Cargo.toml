@@ -69,7 +69,7 @@ daggy = "0.8"
 # under systemd with Type=simple; the legacy --daemon flag now
 # emits a warning in src/server/daemon.rs and falls through to
 # foreground execution. See ROADMAP.md audit follow-ups.
-nix = { version = "~0.29", features = ["socket", "uio", "net", "fs", "signal", "user", "process"] }
+nix = { version = "0.31", features = ["socket", "uio", "net", "fs", "signal", "user", "process"] }
 
 [dev-dependencies]
 h2 = { workspace = true, features = ["unstable"] }

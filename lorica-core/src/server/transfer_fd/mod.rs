@@ -142,7 +142,7 @@ where
      * listening-socket handoff off-limits to any other local user (Lorica
      * audit L1). */
     stat::fchmodat(
-        None,
+        nix::fcntl::AT_FDCWD,
         path,
         stat::Mode::from_bits_truncate(0o600),
         stat::FchmodatFlags::FollowSymlink,
