@@ -586,7 +586,8 @@ async fn wait_for_port(port: u16) {
 
 // Plaintext upstream the TLS-terminating proxy forwards to. Responds
 // "upstream-ok" so the test can distinguish a proxy-generated error
-// body (495/496) from a real pass-through.
+// body (495/496) from a real pass-through, followed by the request line
+// it received, so a test can read the target the proxy forwarded.
 async fn spawn_plain_upstream() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -614,13 +615,15 @@ async fn spawn_plain_upstream() -> std::net::SocketAddr {
                         Err(_) => return,
                     }
                 }
-                let body = b"upstream-ok";
+                let head = String::from_utf8_lossy(&buf);
+                let request_line = head.lines().next().unwrap_or_default();
+                let body = format!("upstream-ok\n{request_line}");
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
                 let _ = stream.write_all(resp.as_bytes()).await;
-                let _ = stream.write_all(body).await;
+                let _ = stream.write_all(body.as_bytes()).await;
                 let _ = stream.shutdown().await;
             });
         }
@@ -873,7 +876,23 @@ async fn get_over<S>(stream: &mut S, host: &str, path: &str) -> Result<(u16, Str
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    request_over(stream, "GET", path, host).await
+}
+
+/// Writes `method target` naming `host` on `stream`, `target` sent as
+/// written (origin, absolute, authority or asterisk form), and reads the
+/// answer to its end: the status and the whole response as text.
+async fn request_over<S>(
+    stream: &mut S,
+    method: &str,
+    target: &str,
+    host: &str,
+) -> Result<(u16, String), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let request =
+        format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .await
@@ -1598,4 +1617,145 @@ async fn fullstack_case_sensitive_paths_by_default_match_as_before() {
         ("/INTERNAL/x", 200, true),
     ];
     assert_eq!(answered, expected);
+}
+
+/// `method target` on `localhost` over a TLS connection without a client
+/// certificate.
+async fn tls_send(
+    harness: &TlsProxyHarness,
+    pki: &TestPki,
+    method: &str,
+    target: &str,
+) -> (u16, String) {
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", harness.port).parse().unwrap();
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let connector = tokio_rustls::TlsConnector::from(client_config_trusting(&pki.ca_cert_der));
+    let server_name = rustls_pki_types::ServerName::try_from("localhost")
+        .unwrap()
+        .to_owned();
+    let mut tls = tokio::time::timeout(
+        Duration::from_secs(5),
+        connector.connect(server_name, stream),
+    )
+    .await
+    .expect("handshake timeout")
+    .expect("handshake");
+    request_over(&mut tls, method, target, "localhost")
+        .await
+        .expect("request")
+}
+
+/// The request line the upstream answered with, when it did.
+fn forwarded_line(body: &str) -> Option<&str> {
+    body.split("upstream-ok\n").nth(1).map(str::trim)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_targets_without_a_path_to_misread_pass_the_check_unchanged() {
+    // The check reads the path of the target alone: a query string is
+    // never part of it, an absolute-form target is read by its path,
+    // and `OPTIONS *` and CONNECT carry none to read.
+    let pki = build_pki();
+    let harness = public_and_admin_harness(&pki, |_| {}).await;
+
+    let (status, body) = tls_send(&harness, &pki, "GET", "/public?next=/%61dmin/../x;y").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        forwarded_line(&body),
+        Some("GET /public?next=/%61dmin/../x;y HTTP/1.1"),
+        "the query reaches the backend as sent: {body}"
+    );
+    let (status, body) = tls_send(&harness, &pki, "GET", "/admin/x?a=%2e%2e/..").await;
+    assert_eq!(
+        status, 496,
+        "the protected route, whatever its query: {body}"
+    );
+
+    // An absolute-form target never reaches a filter: the pinned `http`
+    // refuses it when the request is parsed
+    // (`an_absolute_form_target_never_reaches_the_authority_check`), so
+    // its path is never read at all, whatever it spells.
+    for target in [
+        "https://localhost/public?q=1",
+        "https://localhost/admin/x",
+        "https://localhost/%61dmin/x",
+    ] {
+        let (status, body) = tls_send(&harness, &pki, "GET", target).await;
+        assert_eq!(status, 400, "{target}: {body}");
+        assert!(forwarded_line(&body).is_none(), "{target}: {body}");
+    }
+
+    // `*` passes the check and is answered by the selection: no prefix,
+    // `/` included, covers it.
+    let (status, body) = tls_send(&harness, &pki, "OPTIONS", "*").await;
+    assert_eq!(status, 404, "OPTIONS *: {body}");
+    // Nor does an authority-form target: a CONNECT is refused when the
+    // request is parsed (`non_origin_form_targets_do_not_reach_the_header`
+    // in `lorica-core`), before the method is even looked at.
+    let (status, body) = tls_send(&harness, &pki, "CONNECT", "localhost:443").await;
+    assert_eq!(status, 400, "CONNECT: {body}");
+    assert!(forwarded_line(&body).is_none(), "CONNECT: {body}");
+}
+
+/// `/` and an `/api` route that strips `/api` before forwarding, with
+/// `case_insensitive_paths` as `fold` says, beside the `/admin` route
+/// whose CA the listener needs.
+async fn strip_harness(pki: &TestPki, fold: bool) -> TlsProxyHarness {
+    let upstream = spawn_plain_upstream().await;
+    let mut public = mtls_route(&pki.ca_pem, false, vec![]);
+    public.id = "r-public".into();
+    public.mtls = None;
+    let mut admin = mtls_route(&pki.ca_pem, true, vec![]);
+    admin.id = "r-admin".into();
+    admin.path_prefix = "/admin".into();
+    let mut api = mtls_route(&pki.ca_pem, false, vec![]);
+    api.id = "r-api".into();
+    api.mtls = None;
+    api.path_prefix = "/api".into();
+    api.strip_path_prefix = Some("/api".into());
+    api.case_insensitive_paths = fold;
+    let links = [&public, &admin, &api]
+        .iter()
+        .map(|route| (route.id.clone(), "u".to_string()))
+        .collect();
+    TlsProxyHarness::start(
+        pki,
+        vec![public, admin, api],
+        vec![upstream_backend("u", upstream)],
+        links,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_a_route_that_ignores_case_strips_every_spelling_it_serves() {
+    let pki = build_pki();
+    let mut forwarded = Vec::new();
+    for fold in [false, true] {
+        let harness = strip_harness(&pki, fold).await;
+        for path in ["/api/x", "/API/x", "/Api"] {
+            let (status, body) = tls_send(&harness, &pki, "GET", path).await;
+            assert_eq!(status, 200, "{path}: {body}");
+            forwarded.push((
+                fold,
+                path,
+                forwarded_line(&body).unwrap_or_default().to_string(),
+            ));
+        }
+    }
+    let expected: Vec<(bool, &str, String)> = [
+        // Case-sensitive: only the stored spelling selects `/api` and
+        // is stripped; the others are the public route's, unchanged.
+        (false, "/api/x", "GET /x HTTP/1.1"),
+        (false, "/API/x", "GET /API/x HTTP/1.1"),
+        (false, "/Api", "GET /Api HTTP/1.1"),
+        // Folding case: every spelling is the `/api` route's, stripped.
+        (true, "/api/x", "GET /x HTTP/1.1"),
+        (true, "/API/x", "GET /x HTTP/1.1"),
+        (true, "/Api", "GET / HTTP/1.1"),
+    ]
+    .into_iter()
+    .map(|(fold, path, line)| (fold, path, line.to_string()))
+    .collect();
+    assert_eq!(forwarded, expected);
 }
