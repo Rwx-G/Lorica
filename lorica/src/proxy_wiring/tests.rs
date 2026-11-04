@@ -1513,31 +1513,37 @@ fn test_path_rule_matching() {
     let entry = config.find_route("example.com", "/api/v2/users").unwrap();
     assert_eq!(entry.route.id, "r1");
 
-    // Verify first path rule matches prefix
-    let matched = entry
-        .route
-        .path_rules
-        .iter()
-        .find(|r| r.matches("/api/v2/users", false));
-    assert!(matched.is_some());
-    assert_eq!(matched.unwrap().path, "/api/v2");
+    // The rule the proxy applies is the one `matching_path_rule` picks,
+    // under the route's own case setting.
+    let matched = entry.route.matching_path_rule("/api/v2/users");
+    assert_eq!(
+        matched.map(|(i, rule)| (i, rule.path.as_str())),
+        Some((0, "/api/v2"))
+    );
 
-    // Verify exact match rule
-    let matched = entry
-        .route
-        .path_rules
-        .iter()
-        .find(|r| r.matches("/health", false));
-    assert!(matched.is_some());
-    assert_eq!(matched.unwrap().return_status, Some(200));
+    // Exact match rule.
+    let matched = entry.route.matching_path_rule("/health");
+    assert_eq!(
+        matched.map(|(i, rule)| (i, rule.return_status)),
+        Some((1, Some(200)))
+    );
 
-    // Verify exact match does not match prefix
-    let matched = entry
-        .route
-        .path_rules
-        .iter()
-        .find(|r| r.matches("/health/check", false));
-    assert!(matched.is_none());
+    // An exact rule does not match below its path, nor, case-sensitive
+    // as the route is, another case.
+    assert!(entry.route.matching_path_rule("/health/check").is_none());
+    assert!(entry.route.matching_path_rule("/HEALTH").is_none());
+
+    // Folding case on the route folds it for every rule.
+    let mut folding = (*entry.route).clone();
+    folding.case_insensitive_paths = true;
+    assert_eq!(
+        folding.matching_path_rule("/HEALTH").map(|(i, _)| i),
+        Some(1)
+    );
+    assert_eq!(
+        folding.matching_path_rule("/API/V2/x").map(|(i, _)| i),
+        Some(0)
+    );
 }
 
 // ---- Trusted Proxies ----
