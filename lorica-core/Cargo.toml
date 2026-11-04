@@ -90,7 +90,11 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 
 [target.'cfg(unix)'.dev-dependencies]
-hyperlocal = "0.8"
+# The Unix-socket client of tests/test_basic.rs. hyper-util is named only
+# for the `Client` type hyperlocal's `UnixClientExt` returns, and is
+# already in the tree through reqwest.
+hyperlocal = { version = "0.9", default-features = false, features = ["client"] }
+hyper-util = { version = "0.1", features = ["client-legacy"] }
 jemallocator = "0.5"
 
 [[test]]

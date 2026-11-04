@@ -15,7 +15,9 @@
 mod utils;
 
 #[cfg(all(unix, feature = "any_tls"))]
-use hyperlocal::{UnixClientExt, Uri};
+use hyper_util::client::legacy::Client;
+#[cfg(all(unix, feature = "any_tls"))]
+use hyperlocal::{UnixClientExt, UnixConnector, Uri};
 
 #[tokio::test]
 async fn test_http() {
@@ -55,7 +57,7 @@ async fn test_https_http2() {
 async fn test_uds() {
     utils::init();
     let url = Uri::new("/tmp/echo.sock", "/").into();
-    let client = hyper::Client::unix();
+    let client: Client<UnixConnector, String> = Client::unix();
 
     let res = client.get(url).await.unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
