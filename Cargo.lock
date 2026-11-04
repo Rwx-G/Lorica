@@ -3399,12 +3399,14 @@ dependencies = [
  "arc-swap",
  "log",
  "lorica-error",
+ "rcgen",
  "reqwest 0.12.28",
  "ring",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
  "tokio-rustls",
+ "webpki-roots",
  "x509-parser",
 ]
 

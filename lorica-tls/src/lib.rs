@@ -18,6 +18,7 @@
 #![warn(clippy::all)]
 
 pub mod cert_resolver;
+pub mod http_client;
 pub mod no_debug;
 pub mod ocsp;
 
