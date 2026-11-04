@@ -112,7 +112,10 @@ impl Default for SystemCache {
 impl SystemCache {
     /// Initialize the cache and perform a full first refresh.
     pub fn new() -> Self {
-        let mut sys = System::new_all();
+        // sysinfo 0.40 makes construction fallible for the platforms it
+        // does not support; its Linux backend always succeeds, and Linux
+        // is the only platform Lorica runs on.
+        let mut sys = System::new_all().expect("sysinfo supports Linux");
         sys.refresh_all();
         Self { sys }
     }

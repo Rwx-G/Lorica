@@ -8,7 +8,7 @@
 > Vite 8.
 >
 > Notable major bumps since the v1.0 baseline: axum 0.8, tower 0.5,
-> tower-http 0.7, rusqlite 0.41, rcgen 0.14, sysinfo 0.39,
+> tower-http 0.7, rusqlite 0.41, rcgen 0.14, sysinfo 0.40,
 > opentelemetry 0.33, argon2 0.6. `nix` 0.31 in
 > every crate since v1.10.2 (`lorica-core`, `lorica-command` and
 > `lorica-worker` were held on `~0.29` until then).

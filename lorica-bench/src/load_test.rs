@@ -299,7 +299,9 @@ impl LoadTestEngine {
         // Spawn CPU circuit breaker monitor (aborts if CPU > 90% for 3 checks)
         let cpu_state = Arc::clone(&state);
         let cpu_monitor = tokio::spawn(async move {
-            let mut sys = System::new();
+            // Infallible on Linux, the only platform Lorica runs on; see
+            // `lorica_api::system::SystemCache::new`.
+            let mut sys = System::new().expect("sysinfo supports Linux");
             let mut high_cpu_count = 0u32;
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;

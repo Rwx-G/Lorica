@@ -99,7 +99,7 @@ ring = "0.17"
 # across the bump.
 x509-parser = "0.18"
 pem = "4"
-sysinfo = "0.39"
+sysinfo = "0.40"
 # Linux-only. Used for `statvfs` so the System page reports disk
 # usage with the same "used = total - free" semantics as `df -h`
 # (sysinfo's available_space excludes reserved root blocks, which
