@@ -456,20 +456,30 @@ fn select_where<'a, E>(
         .and_then(|entries| serving(entries))
 }
 
-/// `path` as a backend that normalises request paths reads it: every
-/// percent-encoded octet decoded once, each run of `/` merged into one,
-/// and the `.` and `..` segments resolved (RFC 3986 section 5.2.4).
-/// Borrowed when that changes nothing, which is every path a browser
-/// sends.
+/// `path` as a backend that normalises request paths reads it: `\` read
+/// as `/` and each segment's `;` parameters dropped, every
+/// percent-encoded octet decoded once, `\` and `;` read again in what
+/// the decoding produced, each run of `/` merged into one, and the `.`
+/// and `..` segments resolved (RFC 3986 section 5.2.4). Borrowed when
+/// that changes nothing, which is every path a browser sends.
 ///
 /// Selection itself runs on the path as the client sent it, which is
 /// also the path the backend receives. This reading exists for
 /// [`selects_alike_once_normalised`]. It is deliberately broader than
 /// RFC 3986 normalisation (which decodes unreserved characters only and
 /// keeps `//`), because what matters is what some backend may make of
-/// the path: nginx, for one, decodes every octet and merges slashes
-/// before it matches a location. Case and backend-specific syntax
-/// (`;` parameters, `\` as a separator) are left as they are.
+/// the path: nginx decodes every octet and merges slashes before it
+/// matches a location, a servlet container reads `/a;x=1/b` as `/a/b`,
+/// and a Windows backend reads `\` as a separator.
+///
+/// The parameters and separators are read before the decoding, as
+/// Tomcat and Spring strip parameters from the undecoded path: read
+/// after it only, `/%61dmin;%2F..%2Fpublic` would decode its parameter
+/// into a `..` segment that climbs out of `/admin`, a segment the
+/// container never sees, which strips `;%2F..%2Fpublic` and serves
+/// `/admin`. They are read once more after the decoding, so `%3B` and
+/// `%5C` count as the `;` and the `\` a backend that decodes first
+/// reads them as. Case is left as it is.
 ///
 /// ```
 /// use lorica_config::route_selection::normalised_path;
@@ -477,20 +487,23 @@ fn select_where<'a, E>(
 /// assert_eq!(normalised_path("//admin"), "/admin");
 /// assert_eq!(normalised_path("/public/../admin/"), "/admin/");
 /// assert_eq!(normalised_path("/%2e%2e/admin"), "/admin");
+/// assert_eq!(normalised_path("/..;/admin"), "/admin");
+/// assert_eq!(normalised_path("/x\\..\\admin"), "/admin");
 /// assert!(matches!(
 ///     normalised_path("/admin/x"),
 ///     std::borrow::Cow::Borrowed(_)
 /// ));
 /// ```
 pub fn normalised_path(path: &str) -> Cow<'_, str> {
-    if !path.contains('%') && !path.contains("//") && !path.contains("/.") {
+    if !path.contains(['%', ';', '\\']) && !path.contains("//") && !path.contains("/.") {
         return Cow::Borrowed(path);
     }
-    let decoded = percent_decoded_once(path);
-    let leading_slash = decoded.starts_with('/');
+    let decoded = percent_decoded_once(&separators_and_parameters_read(path));
+    let read = separators_and_parameters_read(&decoded);
+    let leading_slash = read.starts_with('/');
     let mut segments: Vec<&str> = Vec::new();
     let mut ends_in_a_directory = false;
-    for segment in decoded.split('/') {
+    for segment in read.split('/') {
         ends_in_a_directory = matches!(segment, "" | "." | "..");
         match segment {
             "" | "." => {}
@@ -500,7 +513,7 @@ pub fn normalised_path(path: &str) -> Cow<'_, str> {
             name => segments.push(name),
         }
     }
-    let mut normalised = String::with_capacity(decoded.len());
+    let mut normalised = String::with_capacity(read.len());
     if leading_slash {
         normalised.push('/');
     }
@@ -513,6 +526,30 @@ pub fn normalised_path(path: &str) -> Cow<'_, str> {
     } else {
         Cow::Owned(normalised)
     }
+}
+
+/// `text` with each `\` read as `/`, and each `;` dropped with the rest
+/// of its segment, up to the next separator: the segment parameters a
+/// servlet container strips (`/a;jsessionid=1/b` is `/a/b`). Borrowed
+/// when `text` holds neither.
+fn separators_and_parameters_read(text: &str) -> Cow<'_, str> {
+    if !text.contains([';', '\\']) {
+        return Cow::Borrowed(text);
+    }
+    let mut read = String::with_capacity(text.len());
+    let mut in_parameters = false;
+    for c in text.chars() {
+        match c {
+            '/' | '\\' => {
+                in_parameters = false;
+                read.push('/');
+            }
+            ';' => in_parameters = true,
+            c if !in_parameters => read.push(c),
+            _ => {}
+        }
+    }
+    Cow::Owned(read)
 }
 
 /// `text` with every `%XX` (two hex digits) replaced by its octet, once,
@@ -861,6 +898,63 @@ mod tests {
         // too: a backend that does not normalise could serve it as
         // `/admin/...`.
         assert!(!alike("/admin/../public"));
+    }
+
+    #[test]
+    fn a_normalised_path_reads_segment_parameters_and_backslashes() {
+        for (sent, read) in [
+            ("/a;x=1/b", "/a/b"),
+            ("/admin;jsessionid=0", "/admin"),
+            ("/;x/admin", "/admin"),
+            ("/..;/admin", "/admin"),
+            ("/x/..;x=1/admin", "/admin"),
+            ("/a%3Bx=1/b", "/a/b"),
+            ("/..%3b/admin", "/admin"),
+            ("/x\\..\\admin", "/admin"),
+            ("\\admin", "/admin"),
+            ("/x%5C..%5Cadmin", "/admin"),
+            ("/x%5c..%5cadmin", "/admin"),
+            ("/admin\\", "/admin/"),
+            // A parameter is dropped before the decoding, so an encoded
+            // separator inside it cannot mint the segment it spells, as
+            // a container that strips parameters first never sees it.
+            ("/%61dmin;%2F..%2Fpublic", "/admin"),
+            ("/admin;%2F..%2F..%2Fpublic/x", "/admin/x"),
+        ] {
+            assert_eq!(normalised_path(sent), read, "{sent}");
+        }
+    }
+
+    #[test]
+    fn a_path_steered_by_parameters_or_backslashes_is_told_apart() {
+        let routes = [
+            route("public", "app.example.com", "/"),
+            route("admin", "app.example.com", "/admin"),
+        ];
+        let index = HostIndex::new(routes.iter(), |r| *r);
+        let alike = |path: &str| {
+            selects_alike_once_normalised(
+                &index.exact,
+                &index.wildcards,
+                "app.example.com",
+                path,
+                |r| *r,
+            )
+        };
+        for steered in [
+            "/;x=1/admin/x",
+            "/..;/admin/x",
+            "/..%3B/admin/x",
+            "/x\\..\\admin/x",
+            "/x%5C..%5Cadmin/x",
+            "/%61dmin;%2F..%2Fpublic",
+        ] {
+            assert_eq!(served(&index, "app.example.com", steered), Some("public"));
+            assert!(!alike(steered), "{steered}");
+        }
+        for harmless in ["/admin;x=1/y", "/public;jsessionid=0", "/files\\x"] {
+            assert!(alike(harmless), "{harmless}");
+        }
     }
 
     #[test]

@@ -1255,13 +1255,9 @@ async fn fullstack_connection_opened_for_another_host_is_misdirected_on_a_requir
 // prefix must not reach that backend through a sibling route without it.
 // ===========================================================================
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fullstack_path_steered_off_the_mtls_prefix_is_refused() {
-    // `/admin` requires a certificate, `/` on the same host does not, and
-    // both are served by one backend. Forwarded as sent under `/`, a path
-    // such as `/%61dmin/x` reaches a backend that decodes it to
-    // `/admin/x` without the certificate check.
-    let pki = build_pki();
+/// `/` without a certificate requirement and `/admin` with one, on one
+/// host and one backend, each route shaped further by `shape`.
+async fn public_and_admin_harness(pki: &TestPki, shape: impl Fn(&mut Route)) -> TlsProxyHarness {
     let upstream = spawn_plain_upstream().await;
     let mut public = mtls_route(&pki.ca_pem, false, vec![]);
     public.id = "r-public".into();
@@ -1269,17 +1265,29 @@ async fn fullstack_path_steered_off_the_mtls_prefix_is_refused() {
     let mut admin = mtls_route(&pki.ca_pem, true, vec![]);
     admin.id = "r-admin".into();
     admin.path_prefix = "/admin".into();
+    shape(&mut public);
+    shape(&mut admin);
     let links = vec![
         (public.id.clone(), "u".into()),
         (admin.id.clone(), "u".into()),
     ];
-    let harness = TlsProxyHarness::start(
-        &pki,
+    TlsProxyHarness::start(
+        pki,
         vec![public, admin],
         vec![upstream_backend("u", upstream)],
         links,
     )
-    .await;
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_path_steered_off_the_mtls_prefix_is_refused() {
+    // `/admin` requires a certificate, `/` on the same host does not, and
+    // both are served by one backend. Forwarded as sent under `/`, a path
+    // such as `/%61dmin/x` reaches a backend that decodes it to
+    // `/admin/x` without the certificate check.
+    let pki = build_pki();
+    let harness = public_and_admin_harness(&pki, |_| {}).await;
     let no_cert = client_config_trusting(&pki.ca_cert_der);
     let port = harness.port;
 
@@ -1318,4 +1326,48 @@ async fn fullstack_path_steered_off_the_mtls_prefix_is_refused() {
     .await
     .expect("tls req");
     assert_eq!(status, 200, "protected path with its certificate: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_path_steered_by_segment_parameters_or_backslashes_is_refused() {
+    // A servlet container reads `/..;/admin/x` as `/admin/x`, a Windows
+    // backend reads `/x\..\admin/x` the same way: forwarded as sent under
+    // `/`, either reaches the protected resource without the certificate.
+    let pki = build_pki();
+    let harness = public_and_admin_harness(&pki, |_| {}).await;
+    let no_cert = client_config_trusting(&pki.ca_cert_der);
+    let port = harness.port;
+
+    let mut answered = Vec::new();
+    for steered in [
+        "/;x=1/admin/x",
+        "/..;/admin/x",
+        "/..%3B/admin/x",
+        "/x\\..\\admin/x",
+        "/x%5C..%5Cadmin/x",
+        "/%61dmin;%2F..%2Fpublic",
+    ] {
+        let (status, body) = tls_get(port, no_cert.clone(), "localhost", "localhost", steered)
+            .await
+            .expect("tls req");
+        answered.push((steered, status, body.contains("upstream-ok")));
+    }
+    assert!(
+        answered
+            .iter()
+            .all(|(_, status, reached)| *status == 400 && !reached),
+        "every steered path is refused before the upstream: {answered:?}"
+    );
+
+    // Parameters and backslashes that leave the route alone still pass.
+    for (path, expected) in [
+        ("/public;jsessionid=0", 200),
+        ("/files\\x", 200),
+        ("/admin;x=1/y", 496),
+    ] {
+        let (status, body) = tls_get(port, no_cert.clone(), "localhost", "localhost", path)
+            .await
+            .expect("tls req");
+        assert_eq!(status, expected, "{path}: {body}");
+    }
 }
