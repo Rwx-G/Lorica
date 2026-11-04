@@ -15,6 +15,10 @@ Author: Rwx-G
 
 ### Changed
 
+- **Building from source needs Rust 1.99.1**, which `rust-toolchain.toml` pins (was 1.95.0).
+- **Dependencies refreshed**, majors included: OpenTelemetry 0.33 (the `otel` feature's OTLP exporter), rusqlite 0.41, x509-parser 0.18, nix 0.31, sysinfo 0.40, rand 0.10 across every crate, and the dashboard's build and test toolchain (TypeScript 6, ESLint 10, Vitest 5).
+- **A host trust store with one unreadable or rejected certificate no longer fails the whole load** where Lorica verifies against the system roots (TLS to backends, and a TLS syslog sink with no CA of its own): the certificates that load are used and the others are logged. The load still fails when nothing loads and an error was met.
+
 ### Fixed
 
 - **A route create or update through the management API is applied whole or not at all.** A create naming a backend id that does not exist used to leave the route stored without its backends; the route row, its backend links and the protection records it clears now commit in one transaction.
@@ -25,6 +29,7 @@ Author: Rwx-G
 ### Security
 
 - **A token could remove a route's access controls by deleting the route and creating it again.** The automation plane only lets a token strengthen a route's controls in place, but a delete followed by a create was two writes the guard weighed separately, and the second had nothing left to be weighed against. This was documented as a residual of the automation plane since 1.9.0; the protection records under Added close it.
+- **`cargo audit` reports nothing, allowed warnings included.** The three unmaintained crates that reached the build through the forked Pingora crates are gone: `rustls-pemfile` (RUSTSEC-2025-0134, through `rustls-native-certs` 0.7), `derivative` (RUSTSEC-2024-0388) and `unsafe-libyaml` (RUSTSEC-2024-0449, through the YAML server configuration Lorica never used). The `rand` 0.8 line has left the tree.
 
 ## [1.10.1] - 2026-10-28
 
