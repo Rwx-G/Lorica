@@ -254,6 +254,149 @@ async fn a_protected_route_a_token_deleted_is_not_created_again_weaker() {
     assert_eq!(listed(&f).await.as_array().map(Vec::len), Some(1));
 }
 
+/// The id of the one listed record whose hostname is `hostname`.
+async fn record_on(f: &WriteFixture, hostname: &str) -> String {
+    let records = listed(f).await;
+    let matching: Vec<&serde_json::Value> = records
+        .as_array()
+        .expect("a list")
+        .iter()
+        .filter(|record| record["hostname"] == hostname)
+        .collect();
+    assert_eq!(matching.len(), 1, "{hostname}: {records}");
+    matching[0]["id"].as_str().expect("record id").to_string()
+}
+
+/// An operator route on `hostname`, created bare through the management
+/// API and then given what `protect` sets, straight in the store as the
+/// dashboard's own validators would have stored it; its id.
+async fn operator_route_with(
+    f: &WriteFixture,
+    hostname: &str,
+    protect: impl FnOnce(&mut lorica_config::models::Route),
+) -> String {
+    let route_id = operator_route(f, serde_json::json!({ "hostname": hostname })).await;
+    let store = f.state.store.lock().await;
+    let mut route = store
+        .get_route(&route_id)
+        .expect("store")
+        .expect("the operator route");
+    protect(&mut route);
+    store
+        .update_route(&route)
+        .expect("test setup: the protection lands");
+    route_id
+}
+
+#[tokio::test]
+async fn every_protection_alone_is_recorded_on_a_token_delete_and_held_against_a_bare_recreate() {
+    // Walked over the table: a control added to it is recorded and held
+    // over REST without this test naming it.
+    let f = a_node_with_something_to_write().await;
+    let strong = crate::automation::protections::fortified("strong", "strong.write.example.com");
+    for (index, protection) in crate::automation::protections::ROUTE_PROTECTIONS
+        .iter()
+        .enumerate()
+    {
+        let hostname = format!("p{index}.write.example.com");
+        let route_id = operator_route_with(&f, &hostname, |route| {
+            (protection.strengthened)(&strong, route)
+        })
+        .await;
+        token_deletes(&f, &route_id).await;
+        let record_id = record_on(&f, &hostname).await;
+        let records = listed(&f).await;
+        let record = records
+            .as_array()
+            .expect("a list")
+            .iter()
+            .find(|record| record["id"] == record_id.as_str())
+            .expect("the record")
+            .clone();
+        assert_eq!(
+            record["controls"][0]["fields"],
+            serde_json::json!(protection.fields),
+            "{record}"
+        );
+        assert_eq!(record["controls"].as_array().map(Vec::len), Some(1));
+        assert_record_refused(
+            &f,
+            "POST",
+            "/automation/v1/routes",
+            serde_json::json!({ "hostname": hostname }),
+            &protection.fields.join(" / "),
+            &record_id,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn a_route_gated_by_forward_auth_or_mtls_keeps_its_gate_against_a_token() {
+    // Neither field can be sent by a token, so a token's route never
+    // carries one: deleting the gated route and creating it again, or
+    // creating an exact name under a gated wildcard, would drop it.
+    type Gate = fn(&mut lorica_config::models::Route);
+    let f = a_node_with_something_to_write().await;
+    let gates: [(&str, Gate); 2] = [
+        ("forward_auth", |route| {
+            route.forward_auth = serde_json::from_value(serde_json::json!({
+                "address": "http://auth.internal.example.org:9091/verify",
+            }))
+            .expect("test setup: a forward-auth gate");
+        }),
+        ("mtls", |route| {
+            route.mtls = serde_json::from_value(serde_json::json!({
+                "ca_cert_pem": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+                "required": true,
+            }))
+            .expect("test setup: an mTLS gate");
+        }),
+    ];
+    for (field, gate) in gates {
+        let hostname = format!("{}.write.example.com", field.replace('_', "-"));
+        let route_id = operator_route_with(&f, &hostname, gate).await;
+        token_deletes(&f, &route_id).await;
+        let record_id = record_on(&f, &hostname).await;
+        assert_record_refused(
+            &f,
+            "POST",
+            "/automation/v1/routes",
+            serde_json::json!({ "hostname": hostname }),
+            field,
+            &record_id,
+        )
+        .await;
+
+        let wildcard = operator_route_with(&f, "*.write.example.com", gate).await;
+        let response = automation_call(
+            &f.state,
+            "POST",
+            "/automation/v1/routes",
+            &f.bearer,
+            Some(serde_json::json!({ "hostname": "under.write.example.com" })),
+        )
+        .await;
+        crate::automation::test_support::assert_forbidden_naming(
+            response,
+            &format!("{field}: route `{wildcard}`"),
+            field,
+        )
+        .await;
+        let response = send(
+            &f.state,
+            &f.session_store,
+            &f.rate_limiter,
+            "DELETE",
+            &format!("/api/v1/routes/{wildcard}"),
+            &f.admin,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
 #[tokio::test]
 async fn an_unreadable_record_refuses_only_the_writes_on_its_names() {
     let f = a_node_with_something_to_write().await;

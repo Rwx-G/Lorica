@@ -486,6 +486,8 @@ the constant and asserts it is here:
 | Control | From an automation token |
 |---|---|
 | `basic_auth_username` | the Basic-auth credential in force is neither cleared nor changed |
+| `forward_auth` | kept as the dashboard set it; a token sends none, so no token's route takes requests from a route carrying one |
+| `mtls` | kept as the dashboard set it; a token sends none, so no token's route takes requests from a route carrying one |
 | `ip_allowlist` | added, or narrowed so every entry sits inside one already there; never removed or widened |
 | `ip_denylist` | extended, every entry already there staying covered; never shortened |
 | `geoip` | added, or tightened in the same mode (fewer countries allowed, more denied); never removed or switched to the other mode |
@@ -510,7 +512,12 @@ traffic to a row with none of the wildcard's protections, and the token
 never had to reach the protected route. The refusal names the control
 and the displaced route's id. One consequence to plan for: a catch-all
 carrying Basic auth refuses every token route create on a host it
-serves, since a token never sends the password a new route would need.
+serves, since a token never sends the password a new route would need,
+and so does a wildcard or catch-all gated by `forward_auth` or `mtls`,
+which are withheld from every token yet weighed here like the rest:
+without that, a route gated only by single sign-on or a client
+certificate counted as carrying nothing, and a token's exact name under
+it took the host ungated.
 The environment resource (`environments:write`, no MCP tool) writes its
 exact-host route from a fixed profile rather than a body a model
 shapes, so it is not refused there: by the maintainer's decision of
@@ -570,9 +577,10 @@ is matched by a route serving one of its names, and consuming it would
 let the next write take the others weaker. A token deleting the route
 of the same names and path again replaces a record it is at least as
 strong as, so a loop of deletes and creates leaves one row. A recorded
-Basic-auth credential means no token route can serve the name, since a
-token never sends the password; the environment resource can, and an
-operator can.
+Basic-auth credential, `forward_auth` gate or `mtls` requirement means
+no token route can serve the name, since a token never sends any of
+them; the environment resource can, copying them over server side, and
+an operator can.
 
 What makes no record: a delete through the dashboard, which the rule
 never bound, and the route of an environment, whose controls the

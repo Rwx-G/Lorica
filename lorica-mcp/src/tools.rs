@@ -1412,7 +1412,8 @@ pub const MUTATIONS: &[Mutation] = &[
                   id are refused by the store when the change is applied. A certificate bound \
                   here must cover only names inside allowed_hostnames. A name served today by \
                   a protected wildcard or catch-all route, or by a protected route a token \
-                  deleted, takes its protections at least as strongly or is refused.",
+                  deleted, takes its protections at least as strongly or is refused; one gated \
+                  by forward auth or mTLS, which no token sets, is refused.",
         scope: AutomationScope::RoutesWrite,
         verb: Verb::Post,
         path: "/automation/v1/routes",

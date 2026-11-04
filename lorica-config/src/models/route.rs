@@ -310,7 +310,7 @@ fn default_mirror_max_body_bytes() -> u32 {
 ///   headers included. Critical for Authelia's login-redirect flow.
 /// - Timeout / connection error / unexpected status: fail closed with
 ///   503.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardAuthConfig {
     /// Absolute URL of the auth service endpoint (scheme + host +
@@ -464,7 +464,7 @@ pub enum RateLimitScope {
 
 /// mTLS client-certificate verification for a single route. See the
 /// preceding module-level comment for the threat model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MtlsConfig {
     /// Concatenated PEM-encoded CA certificates that are allowed to

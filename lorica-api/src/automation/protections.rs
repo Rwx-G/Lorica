@@ -95,6 +95,12 @@ pub const ROUTE_PROTECTIONS: &[Protection<Route>] = &[
         adopt_basic_auth,
     ),
     Protection::weighing(
+        route_rule::FORWARD_AUTH,
+        forward_auth_weakened,
+        adopt_forward_auth,
+    ),
+    Protection::weighing(route_rule::MTLS, mtls_weakened, adopt_mtls),
+    Protection::weighing(
         route_rule::IP_ALLOWLIST,
         allowlist_weakened,
         adopt_allowlist,
@@ -229,6 +235,17 @@ pub(crate) fn fortified(id: &str, hostname: &str) -> Route {
     let mut route = bare_route(id, hostname, "/");
     route.basic_auth_username = Some("user01".into());
     route.basic_auth_password_hash = Some("$argon2id$stored".into());
+    route.forward_auth = Some(lorica_config::models::ForwardAuthConfig {
+        address: "http://auth.internal.example.org:9091/verify".into(),
+        timeout_ms: 5_000,
+        response_headers: Vec::new(),
+        verdict_cache_ttl_ms: 0,
+    });
+    route.mtls = Some(lorica_config::models::MtlsConfig {
+        ca_cert_pem: "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n".into(),
+        required: true,
+        allowed_organizations: Vec::new(),
+    });
     route.ip_allowlist = vec!["192.0.2.0/24".into()];
     route.ip_denylist = vec!["198.51.100.0/24".into()];
     route.geoip = Some(lorica_config::models::GeoIpConfig {
@@ -254,6 +271,16 @@ fn basic_auth_weakened(before: &Route, after: &Route) -> bool {
     in_force
         && (before.basic_auth_username != after.basic_auth_username
             || before.basic_auth_password_hash != after.basic_auth_password_hash)
+}
+
+/// A gate a token cannot send: weakened by any route that does not
+/// carry it exactly as set, which every token's route is.
+fn forward_auth_weakened(before: &Route, after: &Route) -> bool {
+    before.forward_auth.is_some() && before.forward_auth != after.forward_auth
+}
+
+fn mtls_weakened(before: &Route, after: &Route) -> bool {
+    before.mtls.is_some() && before.mtls != after.mtls
 }
 
 /// An allowlist or denylist entry as the proxy compiles it, through
@@ -366,6 +393,19 @@ fn adopt_basic_auth(from: &Route, to: &mut Route) {
     to.basic_auth_username.clone_from(&from.basic_auth_username);
     to.basic_auth_password_hash
         .clone_from(&from.basic_auth_password_hash);
+}
+
+/// The gate as the dashboard set it, copied server side: the
+/// environment resource's route takes it over, and no answer, audit row
+/// or log carries its address.
+fn adopt_forward_auth(from: &Route, to: &mut Route) {
+    to.forward_auth.clone_from(&from.forward_auth);
+}
+
+/// The trust anchor and its requirement as the dashboard set them,
+/// copied server side.
+fn adopt_mtls(from: &Route, to: &mut Route) {
+    to.mtls.clone_from(&from.mtls);
 }
 
 fn adopt_allowlist(from: &Route, to: &mut Route) {

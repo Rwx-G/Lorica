@@ -516,15 +516,15 @@ control by control, the protections of every route it displaces, found
 by the proxy's own route selection (`lorica-config/src/route_selection.rs`)
 over the stored rows, for the environment's path prefix and every
 stored prefix below it. The controls are the ones a token's own route
-may only strengthen (`ROUTE_PROTECTIONS`, listed in `docs/mcp.md`):
-the Basic-auth credential, `ip_allowlist`, `ip_denylist` (merged, so no
-address either list refused is admitted), `geoip`, `bot_protection`,
-the WAF switch and mode, the rate-limit bucket the proxy enforces and
-`auto_ban_threshold`. Each is raised only where the profile is weaker,
-so a WAF the request switched on stays on over a wildcard without one.
-The Basic-auth credential is copied as the stored username and password
-hash, server side; neither ever appears in the answer, the audit row or
-a log. Every `PUT` inherits again from what serves the host underneath
+may only strengthen (`ROUTE_PROTECTIONS`, whose table in `docs/mcp.md`
+a test holds to the constant). Each is raised only where the profile is
+weaker, so a WAF the request switched on stays on over a wildcard
+without one, and `ip_denylist` is merged, so no address either list
+refused is admitted. The Basic-auth credential (the stored username and
+password hash), a `forward_auth` gate and an `mtls` trust anchor, none
+of which a token can send, are copied as stored, server side; the
+answer and the audit row name the routes they came from, never the
+values. Every `PUT` inherits again from what serves the host underneath
 the environment's own route, so an update picks up a protection the
 operator added to the wildcard since, and an environment under an
 unprotected wildcard keeps its profile unchanged. The answer names the
