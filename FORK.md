@@ -269,7 +269,8 @@ after any upstream sync that touches the function it lives in.
   `lorica-core`, no code change. `sfv` 0.10 to 0.16 in `lorica-core`
   (`Parser::new(..).parse::<List>()`, tokens read through `as_str`).
   `blake2` 0.10 to 0.11 in `lorica-cache`, no code change (the key-hash
-  vectors in its tests are unchanged). On an upstream sync, keep Lorica's version and port the new
+  vectors in its tests are unchanged). `brotli` 8 to 9 in `lorica-core`,
+  no code change. On an upstream sync, keep Lorica's version and port the new
   code to its API rather than taking upstream's manifest line.
 
 ## Upstream sync record
