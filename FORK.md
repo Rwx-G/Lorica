@@ -266,7 +266,8 @@ after any upstream sync that touches the function it lives in.
   benches). `x509-parser` 0.16 to 0.18 in `lorica-core`, no code change.
   `nix` 0.29 to 0.31 in `lorica-core` (`fchmodat` takes `AT_FDCWD`
   where it took `None`). `strum` / `strum_macros` 0.26 to 0.28 in
-  `lorica-core`, no code change. On an upstream sync, keep Lorica's version and port the new
+  `lorica-core`, no code change. `sfv` 0.10 to 0.16 in `lorica-core`
+  (`Parser::new(..).parse::<List>()`, tokens read through `as_str`). On an upstream sync, keep Lorica's version and port the new
   code to its API rather than taking upstream's manifest line.
 
 ## Upstream sync record
