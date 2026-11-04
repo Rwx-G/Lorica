@@ -59,9 +59,16 @@ impl PathRule {
     /// Test the rule's `path` against an incoming request path under the
     /// configured [`PathMatchType`].
     pub fn matches(&self, request_path: &str) -> bool {
+        self.matches_as(&self.path, request_path)
+    }
+
+    /// [`PathRule::matches`] with `pattern` standing for the rule's
+    /// `path`: the rule as another reading of the request spells it
+    /// (`crate::route_selection::selects_alike_once_normalised`).
+    pub(crate) fn matches_as(&self, pattern: &str, request_path: &str) -> bool {
         match self.match_type {
-            PathMatchType::Prefix => request_path.starts_with(&self.path),
-            PathMatchType::Exact => request_path == self.path,
+            PathMatchType::Prefix => request_path.starts_with(pattern),
+            PathMatchType::Exact => request_path == pattern,
         }
     }
 

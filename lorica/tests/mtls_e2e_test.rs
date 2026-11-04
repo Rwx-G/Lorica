@@ -1371,3 +1371,77 @@ async fn fullstack_path_steered_by_segment_parameters_or_backslashes_is_refused(
         assert_eq!(status, expected, "{path}: {body}");
     }
 }
+
+/// The public route's path rules: `/internal` denied with a 403, and
+/// `/login` held to one request per bucket refill.
+fn deny_and_throttle_rules(route: &mut Route) {
+    if route.id != "r-public" {
+        return;
+    }
+    route.path_rules = vec![
+        PathRule {
+            path: "/internal".into(),
+            return_status: Some(403),
+            ..Default::default()
+        },
+        PathRule {
+            path: "/login".into(),
+            rate_limit_rps: Some(1),
+            rate_limit_burst: Some(1),
+            ..Default::default()
+        },
+    ];
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_path_rule_applies_to_every_spelling_of_its_path() {
+    // A rule that denies `/internal` or throttles `/login` attaches to
+    // the path a backend serves: a spelling the raw comparison misses
+    // and a normalising backend reads as that path must not skip it.
+    let pki = build_pki();
+    let harness = public_and_admin_harness(&pki, deny_and_throttle_rules).await;
+    let no_cert = client_config_trusting(&pki.ca_cert_der);
+    let port = harness.port;
+    let get = |path: &'static str| {
+        let client = no_cert.clone();
+        async move {
+            tls_get(port, client, "localhost", "localhost", path)
+                .await
+                .expect("tls req")
+        }
+    };
+
+    let (status, body) = get("/internal/x").await;
+    assert_eq!(status, 403, "the rule's own spelling: {body}");
+    let (status, body) = get("/other").await;
+    assert_eq!(status, 200, "a path no rule covers: {body}");
+
+    let mut answered = Vec::new();
+    for steered in [
+        "/%69nternal/x",
+        "//internal/x",
+        "/x/../internal/x",
+        "/;x/internal/x",
+        "/x%5C..%5Cinternal",
+    ] {
+        let (status, body) = get(steered).await;
+        answered.push((steered, status, body.contains("upstream-ok")));
+    }
+    // The throttled path, spelled so the raw comparison misses it, more
+    // times than its bucket admits.
+    for _ in 0..3 {
+        let (status, body) = get("/%6Cogin").await;
+        answered.push(("/%6Cogin", status, body.contains("upstream-ok")));
+    }
+    assert!(
+        answered
+            .iter()
+            .all(|(_, status, reached)| *status == 400 && !reached),
+        "every spelling of a rule's path is refused before the upstream: {answered:?}"
+    );
+
+    let (status, body) = get("/login").await;
+    assert_eq!(status, 200, "the throttled path within its bucket: {body}");
+    let (status, body) = get("/login").await;
+    assert_eq!(status, 429, "the throttled path past its bucket: {body}");
+}

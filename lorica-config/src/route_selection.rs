@@ -581,16 +581,18 @@ fn percent_decoded_once(text: &str) -> String {
 }
 
 /// Whether `path` and its [`normalised_path`] are served by the same
-/// entry, or both by none. The normalised path is matched against each
-/// route's prefix read the same way, so a prefix stored with an encoded
+/// entry and, within its route, by the same path rule, or both by none.
+/// The normalised path is matched against each route's prefix and each
+/// rule's path read the same way, so a prefix stored with an encoded
 /// octet still matches the decoded request.
 ///
 /// When they differ, a backend that normalises paths would serve, under
-/// the route the raw path selects, a resource the normalised path's
-/// route covers: `/%61dmin` reaching a catch-all route that does not
-/// require what the `/admin` route requires, then `/admin` at the
-/// backend. The proxy refuses such a request rather than guess which
-/// reading the backend applies.
+/// the route or the rule the raw path selects, a resource the normalised
+/// path's route or rule covers: `/%61dmin` reaching a catch-all route
+/// that does not require what the `/admin` route requires, or a rule on
+/// `/admin` that denies it, then `/admin` at the backend. The proxy
+/// refuses such a request rather than guess which reading the backend
+/// applies.
 pub fn selects_alike_once_normalised<E, F>(
     exact: &HashMap<String, Vec<E>>,
     wildcards: &[(String, Vec<E>)],
@@ -610,9 +612,25 @@ where
     });
     match (as_sent, as_normalised) {
         (None, None) => true,
-        (Some(sent), Some(normalised)) => std::ptr::eq(sent, normalised),
+        (Some(sent), Some(normalised_entry)) => {
+            std::ptr::eq(sent, normalised_entry)
+                && selects_the_same_path_rule(route_of(sent), path, &normalised)
+        }
         _ => false,
     }
+}
+
+/// Whether `path`, and `normalised` matched against each rule's path
+/// read the same way, select the same rule of `route`, or both none.
+/// First match wins on both readings, as everywhere rules are
+/// evaluated ([`Route::matching_path_rule`]).
+fn selects_the_same_path_rule(route: &Route, path: &str, normalised: &str) -> bool {
+    let as_sent = route.matching_path_rule(path).map(|(index, _)| index);
+    let as_normalised = route
+        .path_rules
+        .iter()
+        .position(|rule| rule.matches_as(&normalised_path(&rule.path), normalised));
+    as_sent == as_normalised
 }
 
 /// Whether the wildcard `pattern` (`*.example.com`) covers `host`: any
@@ -953,6 +971,66 @@ mod tests {
             assert!(!alike(steered), "{steered}");
         }
         for harmless in ["/admin;x=1/y", "/public;jsessionid=0", "/files\\x"] {
+            assert!(alike(harmless), "{harmless}");
+        }
+    }
+
+    #[test]
+    fn a_path_that_selects_another_path_rule_once_normalised_is_told_apart() {
+        use crate::models::{PathMatchType, PathRule};
+        let mut public = route("public", "app.example.com", "/");
+        public.path_rules = vec![
+            PathRule {
+                path: "/admin".into(),
+                return_status: Some(403),
+                ..Default::default()
+            },
+            PathRule {
+                path: "/health".into(),
+                match_type: PathMatchType::Exact,
+                return_status: Some(200),
+                ..Default::default()
+            },
+            PathRule {
+                path: "/caf%C3%A9".into(),
+                rate_limit_rps: Some(1),
+                ..Default::default()
+            },
+        ];
+        let routes = [public];
+        let index = HostIndex::new(routes.iter(), |r| *r);
+        let alike = |path: &str| {
+            selects_alike_once_normalised(
+                &index.exact,
+                &index.wildcards,
+                "app.example.com",
+                path,
+                |r| *r,
+            )
+        };
+        // One route either way, but a rule on one reading and none, or
+        // another, on the other.
+        for steered in [
+            "/%61dmin",
+            "//admin/x",
+            "/x/../admin",
+            "/..;/admin",
+            "/x%5C..%5Cadmin",
+            "/admin/../x",
+            "/%68ealth",
+            "/health;x",
+            "/caf%c3%a9",
+        ] {
+            assert!(!alike(steered), "{steered}");
+        }
+        for harmless in [
+            "/admin",
+            "/admin//x",
+            "/admin;x=1",
+            "/x//y",
+            "/health",
+            "/caf%C3%A9/menu",
+        ] {
             assert!(alike(harmless), "{harmless}");
         }
     }

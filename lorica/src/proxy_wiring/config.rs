@@ -722,13 +722,14 @@ impl ProxyConfig {
         )
     }
 
-    /// Whether `path` selects the same route as it does once normalised
-    /// the way a backend may normalise it
+    /// Whether `path` selects the same route, and the same path rule of
+    /// it, as it does once normalised the way a backend may normalise it
     /// ([`route_selection::selects_alike_once_normalised`]). A request
     /// for which it does not is refused before any route's policy runs:
-    /// served under the route its raw path selects, it could reach a
-    /// resource another route guards with mTLS, Basic auth, forward auth
-    /// or an IP list.
+    /// served under the route or rule its raw path selects, it could
+    /// reach a resource another route guards with mTLS, Basic auth,
+    /// forward auth or an IP list, or skip the deny, redirect or tighter
+    /// rate limit a rule attaches to it.
     pub fn selects_alike_once_normalised(&self, host: &str, path: &str) -> bool {
         route_selection::selects_alike_once_normalised(
             &self.routes_by_host,

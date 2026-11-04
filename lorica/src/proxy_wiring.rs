@@ -1077,17 +1077,19 @@ impl ProxyHttp for LoricaProxy {
                 }
             }
 
-            // A path whose percent-decoded, slash-merged, dot-resolved
-            // reading selects another route than the path as sent is
-            // refused: forwarded as sent under the first route, a backend
-            // that normalises it would serve what the second one guards.
+            // A path whose normalised reading selects another route, or
+            // another path rule of its route, than the path as sent is
+            // refused: forwarded as sent under the first, a backend that
+            // normalises it would serve what the second one guards. Every
+            // later stage that matches a path rule (the rate limit, the
+            // backend selection) can then read the raw path alone.
             let selects_alike = {
                 let req = session.req_header();
                 config.selects_alike_once_normalised(&request_host(req), req.uri.path())
             };
             if !selects_alike {
                 ctx.block_reason =
-                    Some("request path selects another route once normalised".into());
+                    Some("request path selects another route or path rule once normalised".into());
                 return self
                     .write_error_response(session, 400, &ctx.request_id, None, "Bad request", &[])
                     .await;
