@@ -265,7 +265,8 @@ after any upstream sync that touches the function it lives in.
   `lorica-ketama` and `tinyufo` (`rand_distr` 0.6 for the latter's
   benches). `x509-parser` 0.16 to 0.18 in `lorica-core`, no code change.
   `nix` 0.29 to 0.31 in `lorica-core` (`fchmodat` takes `AT_FDCWD`
-  where it took `None`). On an upstream sync, keep Lorica's version and port the new
+  where it took `None`). `strum` / `strum_macros` 0.26 to 0.28 in
+  `lorica-core`, no code change. On an upstream sync, keep Lorica's version and port the new
   code to its API rather than taking upstream's manifest line.
 
 ## Upstream sync record
