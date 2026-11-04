@@ -198,15 +198,66 @@ not start a segment there. The same reading decides whether a request
 under `/.well-known/acme-challenge/` is an ACME challenge and so exempt
 from a route's HTTPS redirect: it has to be one under both readings.
 
+The two hex digits of an encoded octet compare in either case on both
+readings, as every backend decodes them alike: a request for
+`/caf%c3%a9` is served by a route or a rule stored as `/caf%C3%A9`.
+
 Case is significant by default. A route whose backend treats paths
 case-insensitively (IIS, a case-insensitive file system) says so with
 `case_insensitive_paths` (dashboard: Security tab, *Path matching*):
-its `path_prefix` and each of its path rules then match with ASCII case
-folded, under both readings, so `/ADMIN/x` is served by the route on
-`/admin` and held to its rules, while `/%41DMIN/x`, which only the
-second reading folds into `/admin`, is still refused. The path sent to
-the backend never changes. An automation token may switch the flag on
-and never off (`docs/mcp.md`).
+its `path_prefix`, each of its path rules and its `strip_path_prefix`
+then match with ASCII case folded, under both readings, so `/ADMIN/x`
+is served by the route on `/admin` and held to its rules, and a route
+on `/api` that strips `/api` forwards `/API/x` as `/x`. `/%41DMIN/x`,
+which only the second reading folds into `/admin`, is still refused.
+The path sent to the backend is otherwise never changed. An automation
+token may switch the flag on and never off (`docs/mcp.md`), and a
+token's route that folds case is weighed against every route it would
+take a spelling from, as one that takes a path is.
+
+#### When Lorica answers 400, and what to do about it
+
+Lorica answers 400 (`Bad request`) to exactly one class of path: a
+request whose path, read the second way, selects a different route, or
+a different path rule of its route (or a rule on one reading and none
+on the other), than the path as sent. The access log records it with
+the error `request path selects another route or path rule once
+normalised`; the upstream is never contacted. A path that selects the
+same route and rule both ways is forwarded as sent, however it is
+spelled, and so is a request target without a path to read: the query
+string is never part of the path, and `OPTIONS *` is answered by the
+selection like any other target.
+
+The check takes the union of every backend's reading, because the
+proxy cannot know which one the backend applies. On a host where a
+deeper route or a path rule exists, that also refuses some spellings a
+browser does not send but a client or a script may:
+
+- `//static/x` from a base URL and a path joined with two slashes, when
+  `/static` is a route of its own;
+- `/health;jsessionid=...` against an *exact* rule on `/health`, or any
+  `;` parameter that moves a path out of a rule's reach;
+- an encoded letter or slash (`/%61pi`, `/a%2Fb`) where the decoded
+  path reaches another route or rule;
+- `/x/../admin`, `/./admin` and their encoded forms.
+
+What an operator does about one, in order of preference:
+
+1. **Fix the client.** Each of these is a non-canonical spelling of
+   the path the client means; sending the plain one (`/static/x`,
+   `/health`, `/api`) is always accepted. This is the answer for a
+   script that joins URLs or encodes letters.
+2. **Make the rule or the route match both readings** when the
+   spelling is legitimate for the application: an exact rule that
+   clients reach with `;` parameters becomes a prefix rule, and a
+   prefix stored encoded can stay as it is, since its octets match in
+   either hex case and once decoded.
+3. **Say the backend ignores case** with `case_insensitive_paths` when
+   it does, rather than adding a route per spelling.
+
+There is no switch to turn the check off: a request it refuses is one
+a normalising backend would serve as a resource whose route or rule
+the proxy did not apply.
 
 ### mTLS client verification
 
