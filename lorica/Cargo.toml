@@ -89,8 +89,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 # PEM parsing via the official rustls pki-types crate. Replaces
 # rustls-pemfile (v1.5.0 audit HIGH-2: RUSTSEC-2025-0134, unmaintained).
 # pki-types is maintained by the rustls team and its `pem_slice_iter`
-# API is a 1:1 replacement for the old iterator. Advisory remains
-# transitive via the forked lorica-tls crate; tracked upstream.
+# API is a 1:1 replacement for the old iterator. The crate itself left
+# the tree in v1.10.2 with `rustls-native-certs` 0.8 (the RUSTSEC-2025-0134
+# row of docs/security/threat-model.md).
 rustls-pki-types = { version = "1", features = ["alloc"] }
 futures-util = "0.3"
 arc-swap = "1"
@@ -193,7 +194,8 @@ otel = [
     "dep:tracing-opentelemetry",
     # The OTLP/HTTP exporters are handed a blocking client built on
     # `lorica_tls::http_client` instead of building their own. The
-    # exporter crate already turns this feature on; it is named here
+    # exporter crate already turns reqwest's feature on; it is named here
     # because `otel.rs` names the type.
     "reqwest/blocking",
+    "lorica-tls/blocking",
 ]

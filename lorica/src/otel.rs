@@ -265,7 +265,7 @@ mod imp {
     use once_cell::sync::Lazy;
     use opentelemetry::global;
     use opentelemetry::KeyValue;
-    use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig};
+    use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig, WithTonicConfig};
     use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
     use opentelemetry_sdk::Resource;
 
@@ -293,14 +293,33 @@ mod imp {
             .map_err(|e| format!("OTLP HTTP client trust roots: {e}"))?;
         let timeout = otlp_request_timeout(signal_timeout_var, |var| std::env::var(var).ok());
         std::thread::spawn(move || {
-            reqwest::blocking::Client::builder()
-                .tls_backend_preconfigured(tls)
+            lorica_tls::http_client::blocking_client_builder(tls)
                 .timeout(timeout)
                 .build()
         })
         .join()
         .map_err(|_| "the thread building the OTLP HTTP client panicked".to_string())?
         .map_err(|e| format!("OTLP HTTP client build failed: {e}"))
+    }
+
+    /// The TLS settings of the OTLP/gRPC exporters: the public trust of
+    /// every outbound client (`lorica_tls::http_client::public_roots`).
+    ///
+    /// Left alone, the exporter hands an `https` endpoint tonic's default
+    /// `ClientTlsConfig`, which enables no roots whatever the `tls-*-roots`
+    /// features say, so it verified every collector against an empty
+    /// store and refused them all. tonic takes trust anchors rather than
+    /// a finished rustls configuration, so the provider is its own: the
+    /// process default (ring, which `main` installs), else ring by its
+    /// `tls-ring` feature. An `http` endpoint ignores the setting.
+    fn otlp_grpc_tls() -> Result<opentelemetry_otlp::tonic_types::transport::ClientTlsConfig, String>
+    {
+        let roots: lorica_tls::RootCertStore = lorica_tls::http_client::public_roots()
+            .map_err(|e| format!("OTLP gRPC trust roots: {e}"))?;
+        Ok(
+            opentelemetry_otlp::tonic_types::transport::ClientTlsConfig::new()
+                .trust_anchors(roots.roots),
+        )
     }
 
     /// The timeout opentelemetry-otlp gives the HTTP client it builds
@@ -376,6 +395,7 @@ mod imp {
                 .map_err(|e| format!("OTLP HTTP/JSON exporter build failed: {e}"))?,
             OtlpProtocol::Grpc => SpanExporter::builder()
                 .with_tonic()
+                .with_tls_config(otlp_grpc_tls()?)
                 .with_endpoint(&cfg.endpoint)
                 .build()
                 .map_err(|e| format!("OTLP gRPC exporter build failed: {e}"))?,
@@ -529,6 +549,7 @@ mod imp {
                 }
                 LogExporter::builder()
                     .with_tonic()
+                    .with_tls_config(otlp_grpc_tls()?)
                     .with_endpoint(&cfg.endpoint)
                     .build()
                     .map_err(|e| format!("OTLP gRPC logs exporter build failed: {e}"))?
@@ -696,6 +717,20 @@ mod imp {
             super::emit_sink_event(&logger, &event);
             assert_eq!(otlp_capture_sent(), before + 1);
             let _ = provider.shutdown();
+        }
+
+        /// The gRPC exporters are handed the public trust; tonic's own
+        /// default, which they took before, holds no root at all.
+        #[test]
+        fn the_grpc_exporters_trust_the_public_roots() {
+            use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
+            assert!(
+                format!("{:?}", ClientTlsConfig::new()).contains("trust_anchors: []"),
+                "tonic's default changed: re-check what an https collector is verified against"
+            );
+            let ours: String = format!("{:?}", super::otlp_grpc_tls().expect("public roots"));
+            assert!(!ours.contains("trust_anchors: []"), "{ours}");
+            assert!(ours.contains("TrustAnchor"), "{ours}");
         }
 
         /// The client handed to the exporter keeps the per-request bound
