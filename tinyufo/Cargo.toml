@@ -28,7 +28,6 @@ rand_distr = "0.5"
 moka = { version = "0.12", features = ["sync"] }
 dhat = "0.3"
 quick_cache = "0.6"
-triomphe = "<=0.1.11" # 0.1.12 requires Rust 1.76
 
 [[bench]]
 name = "bench_perf"

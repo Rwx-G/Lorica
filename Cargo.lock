@@ -16,7 +16,6 @@ dependencies = [
  "quick_cache",
  "rand 0.9.5",
  "rand_distr",
- "triomphe",
 ]
 
 [[package]]
@@ -6268,16 +6267,6 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
-]
-
-[[package]]
-name = "triomphe"
-version = "0.1.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "859eb650cfee7434994602c3a68b25d77ad9e68c8a6cd491616ef86661382eb3"
-dependencies = [
- "serde",
- "stable_deref_trait",
 ]
 
 [[package]]
