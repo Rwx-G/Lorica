@@ -195,8 +195,7 @@ fn build_client(ca_pem: Option<&str>) -> Result<reqwest::Client, String> {
         Some(pem) => lorica_tls::http_client::verified(pinned_roots(pem)?),
         None => lorica_tls::http_client::public().map_err(|e| e.to_string())?,
     };
-    reqwest::Client::builder()
-        .tls_backend_preconfigured(tls)
+    lorica_tls::http_client::client_builder(tls)
         .https_only(true)
         .redirect(reqwest::redirect::Policy::custom(same_origin_redirects))
         .connect_timeout(JWKS_CONNECT_TIMEOUT)
@@ -207,20 +206,14 @@ fn build_client(ca_pem: Option<&str>) -> Result<reqwest::Client, String> {
 
 /// Every certificate of `ca_pem`, and nothing else, as a root store.
 ///
-/// A block that is not valid PEM, or a certificate the root store
-/// refuses, fails the whole set, as reqwest's own bundle reader did:
-/// a pin that silently dropped one of its anchors would trust less
-/// than the operator wrote, and one that kept nothing would trust
-/// nothing without saying why.
+/// The workspace's one bundle rule (`lorica_tls::http_client::pem_roots`):
+/// a block that does not decode, a certificate the root store refuses,
+/// or a bundle with no certificate fails the whole set. A pin that
+/// silently dropped one of its anchors would trust less than the
+/// operator wrote, and one that kept nothing would trust nothing
+/// without saying why.
 fn pinned_roots(ca_pem: &str) -> Result<lorica_tls::RootCertStore, String> {
-    use lorica_tls::{CertificateDer, PemObject};
-
-    let mut roots = lorica_tls::RootCertStore::empty();
-    for certificate in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
-        let certificate = certificate.map_err(|e| e.to_string())?;
-        roots.add(certificate).map_err(|e| e.to_string())?;
-    }
-    Ok(roots)
+    lorica_tls::http_client::pem_roots(ca_pem.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// Follow a redirect only when it stays on the scheme, host and port
