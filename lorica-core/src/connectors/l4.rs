@@ -23,7 +23,7 @@ use crate::upstreams::peer::Peer;
 use async_trait::async_trait;
 use log::debug;
 use lorica_error::{Context, Error, ErrorType::*, OrErr, Result};
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use std::net::SocketAddr as InetSocketAddr;
 use std::os::unix::io::AsRawFd;
 
@@ -211,7 +211,7 @@ pub(crate) fn bind_to_random<P: Peer>(
             1 => Some(ips[0]),
             _ => {
                 // pick a random bind ip
-                ips.choose(&mut rand::thread_rng()).copied()
+                ips.choose(&mut rand::rng()).copied()
             }
         }
     }

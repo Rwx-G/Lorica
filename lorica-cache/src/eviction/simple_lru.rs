@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use lorica_error::{BError, ErrorType::*, OrErr, Result};
 use lru::LruCache;
 use parking_lot::RwLock;
-use rand::Rng;
+use rand::RngExt;
 use serde::de::SeqAccess;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -280,7 +280,7 @@ impl EvictionManager for Manager {
 
             let final_file_path = dir_path.join(FILE_NAME);
             // create a temporary filename using a randomized u32 hash to minimize the chance of multiple writers writing to the same tmp file
-            let random_suffix: u32 = rand::thread_rng().gen();
+            let random_suffix: u32 = rand::rng().random();
             let temp_file_path = dir_path.join(format!("{}.{:08x}.tmp", FILE_NAME, random_suffix));
             let mut file = File::create(&temp_file_path).or_err_with(InternalError, || {
                 format!("fail to create temporary file {}", temp_file_path.display())

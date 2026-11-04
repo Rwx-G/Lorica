@@ -50,7 +50,7 @@ parking_lot = { version = "0.12", features = ["arc_lock"] }
 socket2 = { version = ">=0.4, <1.0.0", features = ["all"] }
 flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
 sfv = "0.10.4"
-rand = "0.8"
+rand = "0.10"
 ahash = { workspace = true }
 unicase = "2"
 brotli = "8"

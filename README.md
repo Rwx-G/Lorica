@@ -926,10 +926,6 @@ git verify-tag v1.7.4
 | v1.12.0 | Stream proxying beyond parity: weighted P2C, transparent proxying, active UDP health checks, protocol detection on a shared port that refuses unrecognised bytes, live TCP passthrough connections and UDP sessions handed over across a hot upgrade (TLS streams drain; scope confirmed by a feasibility spike run during the 1.11.0 cycle), and full nginx `stream {}` import. PRD: [Epic 12](docs/prd/epic-12-v1.11.0.md), Phase 2, stories 12.13 to 12.18. | Planned |
 | v2.0.0 | HTTP/3 (QUIC) | Planned |
 
-### Backlog (tracking only, blocked on upstream)
-
-- **`rand 0.8` removal in forked crates.** Native Lorica code bumped to `rand 0.9` in v1.5.0. RUSTSEC-2026-0097 (unsound with custom logger) was cleared in v1.5.8 by bumping the transitive `0.8` line to `0.8.6` ; removing the `0.8` line entirely still depends on the upstream forks (`lorica-runtime`, `lorica-limits`) and the `axum` / `tungstenite` majors.
-
 The table above tracks feature milestones; the current release and the patch cycles (v1.5.3+) live in [CHANGELOG.md](CHANGELOG.md).
 
 See [COMPARISON.md](COMPARISON.md) for a detailed feature comparison with Nginx, Traefik, HAProxy, Caddy, BunkerWeb, Sozu, and Pingora.

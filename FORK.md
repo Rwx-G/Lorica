@@ -252,6 +252,19 @@ after any upstream sync that touches the function it lives in.
   used to hold in code, and the two files are deleted. On an upstream
   sync, take new `ServerConf` fields with their `Default` value and leave
   the YAML path out.
+- **Forked crates on newer dependency majors (v1.10.2, API adaptations
+  only).** Upstream's forked crates pin dependency majors the rest of the
+  workspace has left, which kept a second copy of each in the binary.
+  Lorica moves them to the workspace's version and adapts the call sites
+  without changing what the code does. `rand` 0.8 to 0.10 in
+  `lorica-core`, `lorica-cache`, `lorica-lb`, `lorica-lru`,
+  `lorica-proxy`, `lorica-runtime` and `lorica-limits` (`thread_rng` is
+  `rng`, `gen` / `gen_range` are `random` / `random_range` on `RngExt`,
+  `SliceRandom::choose` is `IndexedRandom::choose`, `distributions` is
+  `distr`, `Uniform::new` returns a `Result`), and 0.9 to 0.10 in
+  `lorica-ketama` and `tinyufo` (`rand_distr` 0.6 for the latter's
+  benches). On an upstream sync, keep Lorica's version and port the new
+  code to its API rather than taking upstream's manifest line.
 
 ## Upstream sync record
 

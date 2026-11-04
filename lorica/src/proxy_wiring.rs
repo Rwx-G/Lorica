@@ -540,16 +540,16 @@ fn extract_sticky_backend(cookie_header: &str) -> Option<&str> {
 
 /// Generate a compact hex request ID (16 bytes = 32 hex chars).
 ///
-/// Uses `OsRng` (getrandom) so request IDs are unpredictable and
+/// Uses `SysRng` (getrandom) so request IDs are unpredictable and
 /// collision-resistant even under concurrent same-nanosecond requests
 /// on the same thread (audit M-5). The prior `DefaultHasher`
 /// implementation was SipHash-keyed per process and emitted
 /// deterministic output given `(now, thread_id)` inputs, so an
 /// attacker observing a few IDs could predict future ones.
 fn generate_request_id() -> String {
-    use rand::TryRngCore;
+    use rand::TryRng;
     let mut bytes = [0u8; 16];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .expect("OS RNG must produce entropy for request id");
     let hi = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));

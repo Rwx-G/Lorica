@@ -6063,7 +6063,7 @@ async fn test_otel_connection_unreachable_when_port_is_dead() {
 async fn test_rotate_bot_hmac_is_non_deterministic_across_calls() {
     // Two back-to-back rotations on the same state must produce two
     // different secrets - the rotation path pulls fresh bytes from
-    // `rand::rngs::OsRng`, so a collision here means the CSPRNG call
+    // `rand::rngs::SysRng`, so a collision here means the CSPRNG call
     // was accidentally swapped for a deterministic generator.
     let (state, _session_store, _rate_limiter) = test_state().await;
 

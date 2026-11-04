@@ -22,9 +22,9 @@ crossbeam-queue = "0.3"
 crossbeam-skiplist = "0.1"
 
 [dev-dependencies]
-rand = "0.9"
+rand = "0.10"
 lru = { workspace = true }
-rand_distr = "0.5"
+rand_distr = "0.6"
 moka = { version = "0.12", features = ["sync"] }
 dhat = "0.3"
 quick_cache = "0.6"

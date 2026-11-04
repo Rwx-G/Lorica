@@ -24,7 +24,7 @@
 //! program to use multiple cores.
 
 use once_cell::sync::{Lazy, OnceCell};
-use rand::Rng;
+use rand::RngExt;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -182,8 +182,8 @@ pub fn current_handle() -> Handle {
     if let Some(pools) = CURRENT_HANDLE.get() {
         // safety: the CURRENT_HANDLE is set when the pool is being initialized in init_pools()
         let pools = pools.get().unwrap();
-        let mut rng = rand::thread_rng();
-        let index = rng.gen_range(0..pools.len());
+        let mut rng = rand::rng();
+        let index = rng.random_range(0..pools.len());
         pools[index].clone()
     } else {
         // not NoStealRuntime, just check the current tokio runtime
@@ -247,9 +247,9 @@ impl NoStealRuntime {
 
     /// Return the &[Handle] of a random thread of this runtime
     pub fn get_runtime(&self) -> &Handle {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
-        let index = rng.gen_range(0..self.threads);
+        let index = rng.random_range(0..self.threads);
         self.get_runtime_at(index)
     }
 

@@ -64,7 +64,7 @@ pub struct RngCaptcha<T> {
     rng: T,
 }
 
-impl<T: rand::Rng + rand::RngCore> RngCaptcha<T> {
+impl<T: rand::Rng> RngCaptcha<T> {
     pub fn from_rng(rng: T) -> RngCaptcha<T> {
         let w = 400;
         let h = 300;

@@ -14,7 +14,7 @@ dependencies = [
  "lru",
  "moka",
  "quick_cache",
- "rand 0.9.5",
+ "rand 0.10.3",
  "rand_distr",
 ]
 
@@ -1746,7 +1746,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2973,7 +2973,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "parking_lot",
- "rand 0.9.5",
+ "rand 0.10.3",
  "rcgen",
  "regex",
  "reqwest 0.12.28",
@@ -3076,8 +3076,8 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "pem",
- "rand 0.9.5",
- "rand_chacha 0.9.0",
+ "rand 0.10.3",
+ "rand_chacha 0.10.0",
  "rcgen",
  "regex",
  "reqwest 0.12.28",
@@ -3151,7 +3151,7 @@ dependencies = [
  "lru",
  "once_cell",
  "parking_lot",
- "rand 0.8.8",
+ "rand 0.10.3",
  "regex",
  "rmp",
  "rmp-serde",
@@ -3172,8 +3172,7 @@ dependencies = [
  "image",
  "lodepng",
  "once_cell",
- "rand 0.9.5",
- "rand_chacha 0.9.0",
+ "rand 0.10.3",
  "serde_json",
  "sha2",
  "subtle",
@@ -3268,7 +3267,7 @@ dependencies = [
  "parking_lot",
  "percent-encoding",
  "prometheus",
- "rand 0.8.8",
+ "rand 0.10.3",
  "regex",
  "reqwest 0.12.28",
  "rstest",
@@ -3353,7 +3352,7 @@ dependencies = [
  "env_logger",
  "i_key_sort",
  "log",
- "rand 0.9.5",
+ "rand 0.10.3",
 ]
 
 [[package]]
@@ -3371,7 +3370,7 @@ dependencies = [
  "lorica-http",
  "lorica-ketama",
  "lorica-runtime",
- "rand 0.8.8",
+ "rand 0.10.3",
  "rustls",
  "tokio",
 ]
@@ -3384,7 +3383,7 @@ dependencies = [
  "dashmap",
  "dhat",
  "float-cmp",
- "rand 0.8.8",
+ "rand 0.10.3",
 ]
 
 [[package]]
@@ -3395,7 +3394,7 @@ dependencies = [
  "hashbrown 0.12.3",
  "lru",
  "parking_lot",
- "rand 0.8.8",
+ "rand 0.10.3",
 ]
 
 [[package]]
@@ -3491,7 +3490,7 @@ dependencies = [
  "lorica-limits",
  "once_cell",
  "prometheus",
- "rand 0.8.8",
+ "rand 0.10.3",
  "regex",
  "reqwest 0.12.28",
  "serde",
@@ -3506,7 +3505,7 @@ name = "lorica-runtime"
 version = "0.1.0"
 dependencies = [
  "once_cell",
- "rand 0.8.8",
+ "rand 0.10.3",
  "thread_local",
  "tokio",
 ]
@@ -3516,7 +3515,7 @@ name = "lorica-shmem"
 version = "1.10.1"
 dependencies = [
  "nix 0.31.3",
- "rand 0.9.5",
+ "rand 0.10.3",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -4586,7 +4585,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4618,17 +4617,6 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
-version = "0.8.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
-dependencies = [
- "libc",
- "rand_chacha 0.3.1",
- "rand_core 0.6.4",
-]
-
-[[package]]
-name = "rand"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41"
@@ -4650,22 +4638,22 @@ dependencies = [
 
 [[package]]
 name = "rand_chacha"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
-dependencies = [
- "ppv-lite86",
- "rand_core 0.6.4",
-]
-
-[[package]]
-name = "rand_chacha"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
 dependencies = [
  "ppv-lite86",
  "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand_chacha"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e6af7f3e25ded52c41df4e0b1af2d047e45896c2f3281792ed68a1c243daedb"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -4694,12 +4682,12 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rand_distr"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8615d50dcf34fa31f7ab52692afec947c4dd0ab803cc87cb3b0b4570ff7463"
+checksum = "4d431c2703ccf129de4d45253c03f49ebb22b97d6ad79ee3ecfc7e3f4862c1d8"
 dependencies = [
  "num-traits",
- "rand 0.9.5",
+ "rand 0.10.3",
 ]
 
 [[package]]
@@ -5081,7 +5069,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5140,7 +5128,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5697,7 +5685,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6493,7 +6481,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

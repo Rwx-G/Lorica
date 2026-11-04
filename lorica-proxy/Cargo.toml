@@ -32,7 +32,7 @@ log = { workspace = true }
 h2 = { workspace = true }
 once_cell = { workspace = true }
 regex = "1"
-rand = "0.8"
+rand = "0.10"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["gzip", "rustls-tls-webpki-roots"], default-features = false }

@@ -87,8 +87,8 @@ ed25519-dalek = "3"
 # through the `route53` feature path. No `use_pem`: the verifier
 # builds its keys from JWK components, never from PEM.
 jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs"] }
-rand = "0.9"
-rand_chacha = "0.9"
+rand = "0.10"
+rand_chacha = "0.10"
 rcgen = "0.14"
 regex = "1"
 ring = "0.17"

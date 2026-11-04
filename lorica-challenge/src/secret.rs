@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use once_cell::sync::Lazy;
-use rand::TryRngCore;
+use rand::TryRng;
 
 /// Size of the HMAC secret in bytes. 32 bytes = the full SHA-256
 /// block and the RustCrypto `hmac::Hmac<Sha256>` native key size;
@@ -89,13 +89,13 @@ pub fn handle() -> Option<Arc<[u8; SECRET_LEN]>> {
 /// supervisor's first-boot path and by the cert-renewal path to
 /// mint a new secret for [`rotate`].
 ///
-/// Uses `rand::rngs::OsRng` (syscall-backed on Linux: getrandom on
+/// Uses `rand::rngs::SysRng` (syscall-backed on Linux: getrandom on
 /// glibc-based distros, /dev/urandom as the fallback). Blocks only
 /// if the kernel's random pool is not yet seeded, which on a
 /// modern Linux box is ≤ 10 ms at cold boot and zero thereafter.
 pub fn generate() -> [u8; SECRET_LEN] {
     let mut out = [0u8; SECRET_LEN];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut out)
         .expect("OS RNG must produce entropy for HMAC secret");
     out

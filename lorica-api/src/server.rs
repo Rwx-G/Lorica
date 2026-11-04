@@ -421,7 +421,7 @@ impl AppState {
     /// "rotate the secret on every cert renewal so cookie
     /// lifetime is capped at the cert TTL".
     ///
-    /// Generates fresh 32 bytes via `OsRng`, persists the hex
+    /// Generates fresh 32 bytes via `SysRng`, persists the hex
     /// form to `GlobalSettings.bot_hmac_secret_hex`, and leaves
     /// the actual in-memory swap to the next
     /// `apply_bot_secret_from_store` invocation (which fires on
@@ -437,9 +437,9 @@ impl AppState {
     /// higher-priority operation).
     pub async fn rotate_bot_hmac_on_cert_event(&self) {
         let new_bytes: [u8; 32] = {
-            use rand::TryRngCore;
+            use rand::TryRng;
             let mut out = [0u8; 32];
-            rand::rngs::OsRng
+            rand::rngs::SysRng
                 .try_fill_bytes(&mut out)
                 .expect("OS RNG must produce entropy for HMAC rotation");
             out

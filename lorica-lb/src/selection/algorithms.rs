@@ -54,9 +54,9 @@ impl SelectionAlgorithm for Random {
         Self
     }
     fn next(&self, _key: &[u8]) -> u64 {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        rng.gen()
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        rng.random()
     }
 }
 
