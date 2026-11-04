@@ -222,6 +222,17 @@ after any upstream sync that touches the function it lives in.
   store with no error is still `Ok`, as upstream. The re-exported
   `load_native_certs` now has the 0.8 signature; nothing in the
   workspace calls it.
+- **`lorica-core` and `lorica-lb`, no `derivative` (v1.10.2,
+  RUSTSEC-2024-0388).** Sites: `lorica-core/src/upstreams/peer.rs`
+  (`impl Debug for PeerOptions`) and `lorica-lb/src/lib.rs` (`Backend`:
+  `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`). Upstream derives these
+  with the unmaintained `derivative` crate. Lorica writes them by hand
+  with the same semantics: `PeerOptions`' `Debug` prints every field in
+  declaration order except the two hook closures, and `Backend` compares
+  and hashes `addr` then `weight` and never `ext`. `Backend`'s `Clone`
+  and `Debug` are plain std derives. On an upstream sync, a field added
+  to either struct must be added to the hand-written impl: no derive
+  picks it up.
 
 ## Upstream sync record
 

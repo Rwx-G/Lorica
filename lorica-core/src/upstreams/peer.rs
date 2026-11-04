@@ -21,7 +21,6 @@ use crate::protocols::ConnFdReusable;
 use crate::protocols::TcpKeepalive;
 use crate::utils::tls::{get_organization_unit, CertKey};
 use ahash::AHasher;
-use derivative::Derivative;
 use lorica_error::ErrorType::{InternalError, SocketError};
 use lorica_error::Result;
 use lorica_error::{OkOrErr, OrErr};
@@ -417,8 +416,7 @@ pub enum H1UpgradePolicy {
 ///
 /// See [`Peer`] for the meaning of the fields
 #[non_exhaustive]
-#[derive(Clone, Derivative)]
-#[derivative(Debug)]
+#[derive(Clone)]
 pub struct PeerOptions {
     pub bind_to: Option<BindTo>,
     pub connection_timeout: Option<Duration>,
@@ -464,11 +462,50 @@ pub struct PeerOptions {
     pub tracer: Option<Tracer>,
     // A custom L4 connector to use to establish new L4 connections
     pub custom_l4: Option<Arc<dyn L4Connect + Send + Sync>>,
-    #[derivative(Debug = "ignore")]
     pub upstream_tcp_sock_tweak_hook:
         Option<Arc<dyn Fn(&TcpSocket) -> Result<()> + Send + Sync + 'static>>,
-    #[derivative(Debug = "ignore")]
     pub proxy_digest_user_data_hook: Option<ProxyDigestUserDataHook>,
+}
+
+// Lorica: written by hand where upstream derives it with `derivative`
+// (RUSTSEC-2024-0388, unmaintained). Same output as the derive: every
+// field in declaration order, except the two hook closures, which have
+// no `Debug` and which upstream marks `Debug = "ignore"`.
+impl std::fmt::Debug for PeerOptions {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.debug_struct("PeerOptions")
+            .field("bind_to", &self.bind_to)
+            .field("connection_timeout", &self.connection_timeout)
+            .field("total_connection_timeout", &self.total_connection_timeout)
+            .field("read_timeout", &self.read_timeout)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("write_timeout", &self.write_timeout)
+            .field("verify_cert", &self.verify_cert)
+            .field("verify_hostname", &self.verify_hostname)
+            .field("alternative_cn", &self.alternative_cn)
+            .field("alpn", &self.alpn)
+            .field("ca", &self.ca)
+            .field("tcp_keepalive", &self.tcp_keepalive)
+            .field("tcp_recv_buf", &self.tcp_recv_buf)
+            .field("dscp", &self.dscp)
+            .field("h2_ping_interval", &self.h2_ping_interval)
+            .field("max_h2_streams", &self.max_h2_streams)
+            .field(
+                "allow_h1_response_invalid_content_length",
+                &self.allow_h1_response_invalid_content_length,
+            )
+            .field(
+                "http_upstream_request_policy",
+                &self.http_upstream_request_policy,
+            )
+            .field("extra_proxy_headers", &self.extra_proxy_headers)
+            .field("curves", &self.curves)
+            .field("second_keyshare", &self.second_keyshare)
+            .field("tcp_fast_open", &self.tcp_fast_open)
+            .field("tracer", &self.tracer)
+            .field("custom_l4", &self.custom_l4)
+            .finish()
+    }
 }
 
 impl PeerOptions {
@@ -761,6 +798,17 @@ impl Display for Proxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_options_debug_skips_only_the_hooks() {
+        let mut options = PeerOptions::new();
+        options.upstream_tcp_sock_tweak_hook = Some(Arc::new(|_: &TcpSocket| Ok(())));
+        let rendered = format!("{options:?}");
+        assert!(rendered.starts_with("PeerOptions { bind_to: None,"));
+        assert!(rendered.ends_with("tracer: None, custom_l4: None }"));
+        assert!(!rendered.contains("upstream_tcp_sock_tweak_hook"));
+        assert!(!rendered.contains("proxy_digest_user_data_hook"));
+    }
 
     #[test]
     fn default_http_upstream_request_policy_is_standards_oriented() {

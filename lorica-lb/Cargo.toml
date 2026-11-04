@@ -30,7 +30,6 @@ tokio = { workspace = true }
 futures = "0.3"
 log = { workspace = true }
 http = { workspace = true }
-derivative.workspace = true
 
 [dev-dependencies]
 # The tests install the ring provider explicitly

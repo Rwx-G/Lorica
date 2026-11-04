@@ -16,16 +16,12 @@
 //! This crate provides common service discovery, health check and load balancing
 //! algorithms for proxies to use.
 
-// https://github.com/mcarton/rust-derivative/issues/112
-// False positive for macro generated code
-#![allow(clippy::non_canonical_partial_ord_impl)]
-
 use arc_swap::ArcSwap;
-use derivative::Derivative;
 use futures::FutureExt;
 pub use http::Extensions;
 use lorica_core::protocols::l4::socket::SocketAddr;
 use lorica_error::{ErrorType, OrErr, Result};
+use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
@@ -51,8 +47,7 @@ pub mod prelude {
 }
 
 /// [Backend] represents a server to proxy or connect to.
-#[derive(Derivative)]
-#[derivative(Clone, Hash, PartialEq, PartialOrd, Eq, Ord, Debug)]
+#[derive(Clone, Debug)]
 pub struct Backend {
     /// The address to the backend server.
     pub addr: SocketAddr,
@@ -66,11 +61,42 @@ pub struct Backend {
     /// [SocketAddr] and the same weight but different `ext` data are considered
     /// identical.
     /// See [Extensions] for how to add and read the data.
-    #[derivative(PartialEq = "ignore")]
-    #[derivative(PartialOrd = "ignore")]
-    #[derivative(Hash = "ignore")]
-    #[derivative(Ord = "ignore")]
     pub ext: Extensions,
+}
+
+// Lorica: the comparison and hashing impls below are written by hand
+// where upstream derives them with `derivative` (RUSTSEC-2024-0388,
+// unmaintained). Same semantics as upstream's `ignore` attributes: `addr`
+// then `weight`, in that order, and never `ext`. The health and
+// enablement tables are keyed by `hash_key`, so two backends that differ
+// only in `ext` must stay the same backend.
+impl PartialEq for Backend {
+    fn eq(&self, other: &Self) -> bool {
+        self.addr == other.addr && self.weight == other.weight
+    }
+}
+
+impl Eq for Backend {}
+
+impl PartialOrd for Backend {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Backend {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.addr
+            .cmp(&other.addr)
+            .then_with(|| self.weight.cmp(&other.weight))
+    }
+}
+
+impl Hash for Backend {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.addr.hash(state);
+        self.weight.hash(state);
+    }
 }
 
 impl Backend {
@@ -494,6 +520,25 @@ mod test {
 
     fn init_crypto() {
         let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    #[test]
+    fn test_backend_identity_ignores_ext() {
+        let plain = Backend::new("127.0.0.1:80").unwrap();
+        let mut tagged = plain.clone();
+        tagged.ext.insert(7u32);
+        assert_eq!(plain, tagged);
+        assert_eq!(plain.cmp(&tagged), std::cmp::Ordering::Equal);
+        assert_eq!(plain.hash_key(), tagged.hash_key());
+
+        let heavier = Backend::new_with_weight("127.0.0.1:80", 2).unwrap();
+        assert_ne!(plain, heavier);
+        assert!(plain < heavier);
+        assert_ne!(plain.hash_key(), heavier.hash_key());
+
+        // `addr` is compared before `weight`.
+        let later = Backend::new("127.0.0.2:80").unwrap();
+        assert!(heavier < later);
     }
 
     #[tokio::test]

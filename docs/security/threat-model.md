@@ -105,9 +105,10 @@ These RUSTSEC advisories were visible to `cargo audit` through forked Pingora cr
 | ID | Crate | Surface in Lorica-native code | Path |
 |----|-------|-------------------------------|------|
 | RUSTSEC-2025-0134 | `rustls-pemfile 2.2.0` (unmaintained) | **Cleared in v1.10.2**: `lorica-tls` moved to `rustls-native-certs 0.8`, which dropped the dep, so `rustls-pemfile` left the tree. Direct usage had already moved to `rustls-pki-types::pem_slice_iter` in the `lorica` runtime crate (v1.5.0) and `lorica-tls` (v1.5.2 audit L-16) | Was transitive via `lorica-tls` → `rustls-native-certs 0.7.x` |
+| RUSTSEC-2024-0388 | `derivative 2.2.0` (unmaintained) | **Cleared in v1.10.2**: the `derivative` derives in `lorica-core` (`PeerOptions`) and `lorica-lb` (`Backend`) were replaced by std derives and hand-written impls with the same semantics, so the crate left the tree | Was a direct dependency of the forked `lorica-core` and `lorica-lb` |
 | RUSTSEC-2026-0097 | `rand 0.8.6` (was `0.8.5`; unsound with custom logger) | **Cleared in v1.5.8**: the transitive `0.8` line was bumped `0.8.5 -> 0.8.6` via `cargo update`, so `cargo audit` no longer flags it. Native call sites had already moved to `rand 0.9` in v1.5.0 | Was transitive via `captcha`, forked `lorica-runtime`/`lorica-limits` |
 
-`RUSTSEC-2026-0097` is resolved as of v1.5.8 (bumped to the fixed `rand 0.8.6`) and `RUSTSEC-2025-0134` as of v1.10.2. `cargo audit` is the authority on what is live; `.cargo/audit.toml` holds no ignore.
+`RUSTSEC-2026-0097` is resolved as of v1.5.8 (bumped to the fixed `rand 0.8.6`) and `RUSTSEC-2025-0134` and `RUSTSEC-2024-0388` as of v1.10.2. `cargo audit` is the authority on what is live; `.cargo/audit.toml` holds no ignore.
 
 ### T6: Cluster Plane (v1.7.0+)
 
