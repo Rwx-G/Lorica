@@ -333,12 +333,13 @@ async fn header_rules_route_to_correct_backend_end_to_end() {
 
     wait_for_port(proxy_port).await;
 
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
-        .pool_max_idle_per_host(0) // force a fresh connection per request
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0) // force a fresh connection per request
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
     let base = format!("http://127.0.0.1:{proxy_port}/");
 
     // No tenant header -> default backend.
@@ -461,12 +462,13 @@ async fn header_rules_hot_reload_end_to_end() {
 
     wait_for_port(proxy_port).await;
 
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
     let base = format!("http://127.0.0.1:{proxy_port}/");
 
     // Baseline: no rules, everything goes to default.

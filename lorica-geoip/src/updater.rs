@@ -201,8 +201,7 @@ pub async fn run_once(resolver: &dyn MmdbResolver, cfg: &UpdaterConfig) -> Resul
     //    fresh Client each call is cheaper than holding one open.
     let tls = lorica_tls::http_client::public()
         .map_err(|e| UpdateError::Download(format!("trust roots: {e}")))?;
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(tls)
+    let client = lorica_tls::http_client::client_builder(tls)
         .timeout(DOWNLOAD_TIMEOUT)
         .user_agent(format!(
             "lorica/{} (+github.com/Rwx-G/Lorica)",

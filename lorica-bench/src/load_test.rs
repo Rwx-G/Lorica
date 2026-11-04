@@ -221,11 +221,11 @@ pub struct LoadTestEngine {
 impl LoadTestEngine {
     pub fn new() -> Self {
         // Load tests target localhost with self-signed certs, not checked.
-        let http_client = reqwest::Client::builder()
-            .tls_backend_preconfigured(lorica_tls::http_client::unverified())
-            .pool_max_idle_per_host(200)
-            .build()
-            .expect("a preconfigured client with a pool size has nothing left to fail on");
+        let http_client =
+            lorica_tls::http_client::client_builder(lorica_tls::http_client::unverified())
+                .pool_max_idle_per_host(200)
+                .build()
+                .expect("a preconfigured client with a pool size has nothing left to fail on");
 
         Self {
             http_client,
@@ -276,9 +276,9 @@ impl LoadTestEngine {
         // send SNI=127.0.0.1 which doesn't match any certificate.
         let run_client = {
             // Load tests target localhost with self-signed certs, not checked.
-            let mut builder = reqwest::Client::builder()
-                .tls_backend_preconfigured(lorica_tls::http_client::unverified())
-                .pool_max_idle_per_host(200);
+            let mut builder =
+                lorica_tls::http_client::client_builder(lorica_tls::http_client::unverified())
+                    .pool_max_idle_per_host(200);
             if let Ok(url) = reqwest::Url::parse(&config.target_url) {
                 if let Some(host) = url.host_str() {
                     let port = url.port_or_known_default().unwrap_or(80);

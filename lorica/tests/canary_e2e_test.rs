@@ -332,12 +332,13 @@ async fn canary_split_end_to_end_routes_by_client_ip_bucket() {
 
     let (canary_ip, default_ip) = find_bucketed_ips(route_id, 20);
 
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
     let base = format!("http://127.0.0.1:{proxy_port}/");
 
     // Client IP in the canary band -> v2 backend.
@@ -457,12 +458,13 @@ async fn header_rule_overrides_canary_end_to_end() {
 
     wait_for_port(proxy_port).await;
 
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
     let base = format!("http://127.0.0.1:{proxy_port}/");
 
     // With header rule match: stable backend, canary bypassed.
@@ -556,12 +558,13 @@ async fn canary_split_hot_reload_reshuffles_buckets_end_to_end() {
 
     wait_for_port(proxy_port).await;
 
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
     let base = format!("http://127.0.0.1:{proxy_port}/");
     // Any IP works with 0% / 100% splits since the bucket comparison is
     // always < weight (false for 0, true for 100 since bucket is 0..99).

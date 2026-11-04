@@ -177,8 +177,7 @@ pub async fn validate_forward_auth(
 
     let tls = lorica_tls::http_client::public()
         .map_err(|e| ApiError::Internal(format!("trust roots: {e}")))?;
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(tls)
+    let client = lorica_tls::http_client::client_builder(tls)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_millis(
             cfg.timeout_ms.min(5_000) as u64

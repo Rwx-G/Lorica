@@ -28,7 +28,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::rustls::{ClientConfig, ConfigBuilder, RootCertStore, WantsVerifier};
 use tokio_rustls::TlsConnector;
 
 use lorica_cluster::handshake::{client_handshake, HandshakeConfig};
@@ -100,6 +100,17 @@ fn roots(p: &Pki) -> RootCertStore {
     roots
 }
 
+/// A client configuration builder on the ring provider, named rather
+/// than read from the process (the workspace `clippy.toml` refuses
+/// `ClientConfig::builder`).
+fn ring_client_builder() -> ConfigBuilder<ClientConfig, WantsVerifier> {
+    ClientConfig::builder_with_provider(Arc::new(
+        tokio_rustls::rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("ring supports the default protocol versions")
+}
+
 /// An operational listener on a fresh 127.0.0.1 port with test-sized
 /// defaults; `tune` adjusts the config before spawn.
 async fn spawn_operational(
@@ -143,7 +154,7 @@ fn node_client_without_alpn(p: &Pki) -> TlsConnector {
             .map(|c| c.into_owned())
             .collect();
     let key = PrivateKeyDer::from_pem_slice(p.client_key.as_bytes()).expect("client key");
-    let config = ClientConfig::builder()
+    let config = ring_client_builder()
         .with_root_certificates(roots(p))
         .with_client_auth_cert(certs, key)
         .expect("client config");
@@ -191,7 +202,7 @@ fn enrollment_acceptor(p: &Pki) -> Arc<SwappableAcceptor> {
 /// TLS client with NO client certificate (an enrolling node) that
 /// still verifies the control plane against the cluster CA.
 fn anonymous_client(p: &Pki) -> TlsConnector {
-    let mut config = ClientConfig::builder()
+    let mut config = ring_client_builder()
         .with_root_certificates(roots(p))
         .with_no_client_auth();
     // The enrollment listener drops peers that do not negotiate the

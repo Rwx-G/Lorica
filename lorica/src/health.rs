@@ -51,8 +51,7 @@ const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// is the operator-configured backend URL ; the trust boundary
 /// is the operator's network, not the public internet.
 static HEALTH_HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::unverified())
+    lorica_tls::http_client::client_builder(lorica_tls::http_client::unverified())
         .timeout(TCP_CONNECT_TIMEOUT)
         .pool_max_idle_per_host(8)
         .build()

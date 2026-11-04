@@ -49,14 +49,12 @@ jobs:
         run: cargo fmt --all -- --check
 
       # Same four gates as the local Docker recipe (see CONTRIBUTING.md).
-      - name: Clippy (product crates)
-        run: cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -p lorica-automation-policy -p lorica-adcs -- -D warnings
-
-      - name: Clippy (tests and benches of the API, cluster, MCP, policy and AD CS crates)
-        run: cargo clippy -p lorica-api -p lorica-cluster -p lorica-mcp -p lorica-automation-policy -p lorica-adcs --all-targets -- -D warnings
-
-      - name: Clippy (binary crate with the otel feature)
-        run: cargo clippy -p lorica --all-targets --features otel -- -D warnings
+      # Every member and every target, so no crate list can leave one
+      # out: the lists this replaced skipped lorica-tls, which holds the
+      # outbound TLS policy, and seven product crates. `clippy.toml`
+      # turns that policy into lints, which only hold where clippy runs.
+      - name: Clippy (every crate and target, the binary with the otel feature)
+        run: cargo clippy --workspace --all-targets --features lorica/otel -- -D warnings
 
       # lorica-mcp is a subprocess an operator's MCP client launches and
       # reads no database. The first-party crates it may link are

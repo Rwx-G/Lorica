@@ -175,8 +175,7 @@ fn https_client() -> reqwest::Client {
                 .expect("root CA"),
         )
         .expect("root CA");
-    reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::verified(roots))
+    lorica_tls::http_client::client_builder(lorica_tls::http_client::verified(roots))
         .tls_info(true)
         .build()
         .expect("client")

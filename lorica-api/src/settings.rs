@@ -1751,8 +1751,7 @@ async fn probe_otlp_endpoint(
             });
         }
     };
-    let client = match reqwest::Client::builder()
-        .tls_backend_preconfigured(tls)
+    let client = match lorica_tls::http_client::client_builder(tls)
         .timeout(Duration::from_secs(5))
         .build()
     {

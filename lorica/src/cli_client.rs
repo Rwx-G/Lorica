@@ -116,9 +116,8 @@ async fn open_session(
 ) -> Result<reqwest::Client, String> {
     let tls =
         lorica_tls::http_client::with_verifier(Arc::clone(&pin) as Arc<dyn ServerCertVerifier>);
-    let client = reqwest::Client::builder()
+    let client = lorica_tls::http_client::client_builder(tls)
         .cookie_store(true)
-        .tls_backend_preconfigured(tls)
         .build()
         .map_err(|e| format!("HTTP client: {e}"))?;
 

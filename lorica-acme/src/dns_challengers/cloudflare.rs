@@ -63,8 +63,7 @@ impl CloudflareDnsChallenger {
     ) -> Result<Self, String> {
         let tls = lorica_tls::http_client::public()
             .map_err(|e| format!("Cloudflare API client trust roots: {e}"))?;
-        let client = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls)
+        let client = lorica_tls::http_client::client_builder(tls)
             .timeout(CLOUDFLARE_HTTP_TIMEOUT)
             .build()
             .map_err(|e| format!("Cloudflare API client: {e}"))?;

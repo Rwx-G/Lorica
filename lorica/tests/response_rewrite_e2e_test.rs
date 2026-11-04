@@ -393,12 +393,13 @@ async fn rewrite_literal_html_body_end_to_end() {
     );
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
     let resp = client.get(harness.url()).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     // Content-Length must be gone: the rewrite produces a body of
@@ -439,12 +440,13 @@ async fn rewrite_across_chunk_boundaries() {
     );
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
     let resp = client.get(harness.url()).send().await.unwrap();
     assert_eq!(resp.text().await.unwrap(), "before-[redacted]-after");
 }
@@ -475,12 +477,13 @@ async fn rewrite_skips_non_text_content_type() {
     );
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
     let resp = client.get(harness.url()).send().await.unwrap();
     let body = resp.bytes().await.unwrap();
     assert_eq!(
@@ -515,15 +518,16 @@ async fn rewrite_skips_gzip_encoded_responses() {
 
     // Tell reqwest not to decompress so we observe exactly what the
     // proxy emits on the wire.
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .no_gzip()
-        .no_brotli()
-        .no_deflate()
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .no_gzip()
+    .no_brotli()
+    .no_deflate()
+    .build()
+    .unwrap();
     let resp = client.get(harness.url()).send().await.unwrap();
     let body = resp.bytes().await.unwrap();
     assert_eq!(
@@ -557,12 +561,13 @@ async fn rewrite_regex_with_capture_groups_end_to_end() {
     );
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
     let resp = client.get(harness.url()).send().await.unwrap();
     assert_eq!(
         resp.text().await.unwrap(),
@@ -596,12 +601,13 @@ async fn rewrite_oversize_body_streams_unchanged() {
     );
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
     let resp = client.get(harness.url()).send().await.unwrap();
     let body = resp.bytes().await.unwrap();
     assert_eq!(
@@ -629,12 +635,13 @@ async fn rewrite_disabled_route_passes_body_through() {
     );
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
     let resp = client.get(harness.url()).send().await.unwrap();
     // Content-Length MUST still be present when rewrite is off -
     // proves we only drop it on the rewrite path.
@@ -683,12 +690,13 @@ async fn rewrite_skipped_for_head_requests_preserves_content_length() {
     );
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
     let resp = client.head(harness.url()).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(
@@ -727,12 +735,13 @@ async fn rewrite_is_disabled_when_cache_enabled_on_same_route() {
     );
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
     let resp = client.get(harness.url()).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
@@ -768,12 +777,13 @@ async fn rewrite_multiple_rules_compose_in_declaration_order() {
     );
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
     let resp = client.get(harness.url()).send().await.unwrap();
     assert_eq!(
         resp.text().await.unwrap(),
@@ -896,12 +906,13 @@ async fn rewrite_does_not_buffer_sse_event_stream() {
     );
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
     let start = std::time::Instant::now();
     let mut resp = client.get(harness.url()).send().await.unwrap();
     assert_eq!(resp.status(), 200);
