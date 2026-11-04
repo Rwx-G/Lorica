@@ -278,7 +278,8 @@ after any upstream sync that touches the function it lives in.
   `openssl-probe` 0.1 to 0.2 in `lorica-core`; its one call site sits in
   the never-compiled `connectors/tls/boringssl_openssl` module and calls
   `try_init_openssl_env_vars`. `rstest` 0.27 to 0.28 in `lorica-core`
-  (tests), no code change. On an upstream sync, keep Lorica's version and port the new
+  (tests), no code change. `quick_cache` 0.6 to 0.7 in `tinyufo`
+  (benches), no code change. On an upstream sync, keep Lorica's version and port the new
   code to its API rather than taking upstream's manifest line.
 
 ## Upstream sync record
