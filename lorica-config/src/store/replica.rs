@@ -72,6 +72,7 @@ use crate::canonical::{
 };
 use crate::error::{ConfigError, Result};
 use crate::models::{Certificate, Route};
+use crate::route_selection::{self, RouteNames};
 
 /// Why a replica could not be applied.
 ///
@@ -434,6 +435,15 @@ impl ConfigStore {
     /// `ConfigStore::insert_route_row`): the blob is one consistent
     /// snapshot, and checking row by row would reject a generation
     /// that merely swaps two hostnames.
+    ///
+    /// The names land canonical, the set rewritten as one
+    /// ([`route_selection::canonicalise_route_names`]): a control plane
+    /// older than this rule ships each name as its client sent it, and
+    /// this node's proxy looks requests up in canonical form. A twin of
+    /// a name another row serves keeps its spelling, as the upgrade
+    /// leaves it, and the reload reports it. The applied-generation hash
+    /// is the control plane's, recorded as sent, so the rewrite is no
+    /// drift.
     fn apply_replica_routes(&self, kept: &[&Route]) -> Result<()> {
         let kept_ids: HashSet<&str> = kept.iter().map(|r| r.id.as_str()).collect();
         let local_ids: HashSet<String> = self.local_route_ids()?;
@@ -442,11 +452,16 @@ impl ConfigStore {
                 self.delete_route(id)?;
             }
         }
-        for route in kept {
+        let mut names: Vec<RouteNames> = kept.iter().map(|route| RouteNames::of(route)).collect();
+        route_selection::canonicalise_route_names(&mut names);
+        for (route, names) in kept.iter().zip(names) {
+            let mut route = (*route).clone();
+            route.hostname = names.hostname;
+            route.hostname_aliases = names.aliases;
             if local_ids.contains(route.id.as_str()) {
-                self.update_route_row(route)?;
+                self.update_route_row(&route)?;
             } else {
-                self.insert_route_row(route)?;
+                self.insert_route_row(&route)?;
             }
         }
         Ok(())
@@ -1395,6 +1410,46 @@ mod tests {
             !second.global_fields_changed,
             "the second apply finds every fleet-policy field already in place"
         );
+    }
+
+    #[test]
+    fn a_replica_from_a_control_plane_storing_names_as_sent_lands_them_canonical() {
+        // A control plane older than 1.10.2 stores and ships each name
+        // as its client sent it; the follower applies the form its proxy
+        // looks requests up by, and leaves a twin of a name another row
+        // already spells canonically as it came.
+        let source = ConfigStore::open_in_memory().expect("source opens");
+        let target = ConfigStore::open_in_memory().expect("target opens");
+        let mut mixed = make_route("r-mixed", "App.Example.COM.", &[]);
+        mixed.certificate_id = None;
+        mixed.hostname_aliases = vec!["WWW.Example.com".into(), "www.example.com.".into()];
+        let mut canonical = make_route("r-canonical", "shop.example.com", &[]);
+        canonical.certificate_id = None;
+        let mut twin = make_route("r-twin", "Shop.Example.com", &[]);
+        twin.certificate_id = None;
+        for route in [&mixed, &canonical, &twin] {
+            source
+                .insert_route_row(route)
+                .expect("test setup: a row as an older control plane stored it");
+        }
+
+        let config = prepared(&source).expect("prepare");
+        target
+            .apply_replica(&config, "edge-1", 1, "h1")
+            .expect("apply");
+        let names = |id: &str| {
+            let route = target.get_route(id).expect("reads").expect("applied");
+            (route.hostname, route.hostname_aliases)
+        };
+        assert_eq!(
+            names("r-mixed"),
+            (
+                "app.example.com".to_string(),
+                vec!["www.example.com".to_string()]
+            )
+        );
+        assert_eq!(names("r-canonical").0, "shop.example.com");
+        assert_eq!(names("r-twin").0, "Shop.Example.com");
     }
 
     #[test]

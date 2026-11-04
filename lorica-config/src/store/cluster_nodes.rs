@@ -16,6 +16,7 @@ use super::row_helpers::{parse_datetime, parse_optional_datetime};
 use super::ConfigStore;
 use crate::error::{ConfigError, Result};
 use crate::models::{ClusterNode, NodeStatus, RevokedSerial};
+use crate::route_selection;
 
 const NODE_COLUMNS: &str = "node_id, name, cert_fingerprint, cert_serial, prev_cert_fingerprint, \
      prev_cert_serial, address, version, schema_version, status, enrolled_at, last_seen_at, \
@@ -72,8 +73,8 @@ fn route_serves_hostname(route_hostname: &str, aliases: &[String], hostname: &st
         .any(|pattern| host_pattern_matches(pattern, hostname))
 }
 
-/// One host key against one hostname, byte-for-byte as
-/// `ProxyConfig::find_route` does it.
+/// One host key against one hostname, as `ProxyConfig::find_route`
+/// does it: both in `route_selection::canonical_hostname` form.
 ///
 /// A `*.` pattern matches any host ending in the pattern's dot-suffix
 /// and strictly longer than it. That is an ANY-DEPTH match, not a
@@ -86,17 +87,13 @@ fn route_serves_hostname(route_hostname: &str, aliases: &[String], hostname: &st
 ///
 /// A pattern that starts with `*` but not `*.` is an exact key to the
 /// proxy (`from_store` filters on `starts_with("*.")`), so it is one
-/// here too. Comparison is case-sensitive, matching both the proxy,
-/// which compares the raw request host, and the lowercase-hostname
-/// invariant the route model documents.
+/// here too. ASCII case and a root dot make no difference, as they make
+/// none to the proxy.
 fn host_pattern_matches(pattern: &str, hostname: &str) -> bool {
-    if pattern.starts_with("*.") {
-        // "*.example.com" -> ".example.com", exactly `&pattern[1..]`
-        // in the proxy.
-        let suffix = &pattern[1..];
-        hostname.ends_with(suffix) && hostname.len() > suffix.len()
+    if route_selection::canonical_hostname(pattern).starts_with("*.") {
+        route_selection::wildcard_covers(pattern, hostname)
     } else {
-        pattern == hostname
+        route_selection::same_name(pattern, hostname)
     }
 }
 
@@ -632,11 +629,9 @@ impl ConfigStore {
     /// token nothing serves. The caller must treat the empty case as a
     /// refusal, not as a vacuous success.
     ///
-    /// Matching is case-sensitive, as the proxy's is. Route hostnames
-    /// are stored lowercase and ACME identifiers are lowercase, so the
-    /// two agree; a row that broke that invariant resolves to nobody,
-    /// which the paragraph above turns into a refusal rather than a
-    /// silent mis-issuance.
+    /// Names compare as the proxy compares them, ASCII case and a root
+    /// dot aside, so a route stored in another spelling than the ACME
+    /// identifier still receives its token.
     ///
     /// # Errors
     ///
@@ -1279,12 +1274,14 @@ mod tests {
             .challenge_recipients("unknown.example.com")
             .expect("an unserved hostname is not an error")
             .is_empty());
-        assert!(
+        assert_eq!(
             store
-                .challenge_recipients("SHOP.EXAMPLE.COM")
-                .expect("recipients resolve")
-                .is_empty(),
-            "hostname is matched exactly, as stored"
+                .challenge_recipients("SHOP.EXAMPLE.COM.")
+                .expect("recipients resolve"),
+            store
+                .challenge_recipients("shop.example.com")
+                .expect("recipients resolve"),
+            "a spelling is the name, as it is to the proxy"
         );
     }
 
@@ -1445,6 +1442,16 @@ mod tests {
         assert!(!host_pattern_matches("*example.com", "a.example.com"));
         // The catch-all routing key is not a challenge fan-out rule.
         assert!(!host_pattern_matches("_", "shop.example.com"));
+        // Case and a root dot are no difference, on either side.
+        assert!(host_pattern_matches(
+            "Shop.Example.com.",
+            "shop.example.com"
+        ));
+        assert!(host_pattern_matches(
+            "shop.example.com",
+            "SHOP.example.com."
+        ));
+        assert!(host_pattern_matches("*.Example.com", "a.example.COM"));
     }
 
     #[test]
