@@ -285,7 +285,7 @@ pub mod helpers;
 // (canary_e2e_test, mtls_e2e_test).
 pub(crate) use helpers::{
     cache_vary_for_request, downstream_ssl_digest, extract_host, host_without_port,
-    pick_consistent_hash, request_host, sanitize_html,
+    path_after_strip, pick_consistent_hash, request_host, sanitize_html,
 };
 pub use helpers::{
     canary_bucket, evaluate_mtls, mtls_refusal_status, route_client_cert, RouteClientCert,
@@ -2297,16 +2297,7 @@ impl ProxyHttp for LoricaProxy {
             .map(|q| format!("?{q}"))
             .unwrap_or_default();
 
-        let mut rewritten = original_path.clone();
-
-        if let Some(ref strip) = route.strip_path_prefix {
-            if rewritten.starts_with(strip.as_str()) {
-                rewritten = rewritten[strip.len()..].to_string();
-                if rewritten.is_empty() || !rewritten.starts_with('/') {
-                    rewritten = format!("/{rewritten}");
-                }
-            }
-        }
+        let mut rewritten = path_after_strip(&original_path, route).into_owned();
 
         if let Some(ref add) = route.add_path_prefix {
             rewritten = format!("{add}{rewritten}");

@@ -140,6 +140,30 @@ pub(crate) fn request_host(req: &lorica_http::RequestHeader) -> Cow<'_, str> {
     lorica_config::route_selection::canonical_hostname(host_without_port(extract_host(req)))
 }
 
+/// `path` as the backend receives it once `route.strip_path_prefix` is
+/// cut off: unchanged unless it starts with that prefix, compared as the
+/// route's own prefix is ([`lorica_config::route_selection::path_starts_with`]),
+/// so a route that folds case strips every spelling it was selected
+/// for; `/` added in front of what is left when that does not start
+/// with one.
+pub(crate) fn path_after_strip<'a>(path: &'a str, route: &Route) -> Cow<'a, str> {
+    let Some(strip) = route.strip_path_prefix.as_deref() else {
+        return Cow::Borrowed(path);
+    };
+    if !lorica_config::route_selection::path_starts_with(path, strip, route.case_insensitive_paths)
+    {
+        return Cow::Borrowed(path);
+    }
+    // `path_starts_with` folds ASCII bytes only, so the prefix ends on a
+    // character boundary of `path` too.
+    let rest = &path[strip.len()..];
+    if rest.starts_with('/') {
+        Cow::Borrowed(rest)
+    } else {
+        Cow::Owned(format!("/{rest}"))
+    }
+}
+
 /// `authority` without its `:port`. An IPv6 literal keeps its brackets
 /// and every colon inside them (`[2001:db8::1]:8443` is
 /// `[2001:db8::1]`); a bracket left open is returned whole.

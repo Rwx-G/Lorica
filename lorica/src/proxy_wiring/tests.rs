@@ -889,6 +889,42 @@ fn test_exact_match_takes_precedence_over_wildcard() {
 }
 
 #[test]
+fn the_prefix_strip_matches_as_the_route_selection_matched() {
+    let mut route = make_route("r1", "example.com", "/api", true);
+    route.strip_path_prefix = Some("/api".into());
+    // Case-sensitive, as every route is by default: only the stored
+    // spelling is stripped.
+    for (sent, forwarded) in [
+        ("/api/x", "/x"),
+        ("/api", "/"),
+        ("/apix", "/x"),
+        ("/API/x", "/API/x"),
+        ("/other", "/other"),
+    ] {
+        assert_eq!(path_after_strip(sent, &route), forwarded, "{sent}");
+    }
+    // A route that folds case is selected for `/API/x`, and strips it.
+    route.case_insensitive_paths = true;
+    for (sent, forwarded) in [
+        ("/api/x", "/x"),
+        ("/API/x", "/x"),
+        ("/Api", "/"),
+        ("/other", "/other"),
+    ] {
+        assert_eq!(path_after_strip(sent, &route), forwarded, "{sent}");
+    }
+    // An encoded octet strips in either hex case, as it selects.
+    route.case_insensitive_paths = false;
+    route.strip_path_prefix = Some("/caf%C3%A9".into());
+    assert_eq!(path_after_strip("/caf%c3%a9/menu", &route), "/menu");
+    route.strip_path_prefix = None;
+    assert!(matches!(
+        path_after_strip("/api/x", &route),
+        std::borrow::Cow::Borrowed("/api/x")
+    ));
+}
+
+#[test]
 fn a_host_finds_its_route_whatever_its_case_and_root_dot() {
     // RFC 9110: a host name is case-insensitive, and the absolute name
     // with its root dot is the same host. Either spelling used to miss
