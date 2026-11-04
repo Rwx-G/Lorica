@@ -1654,7 +1654,7 @@ export const api = {
     request<RouteResponse>('PUT', `/routes/${id}`, body),
 
   validateMtlsPem: (ca_cert_pem: string) =>
-    request<{ ca_count: number; subjects: string[] }>(
+    request<{ ca_count: number; subjects: string[]; warnings: string[] }>(
       'POST',
       '/validate/mtls-pem',
       { ca_cert_pem },

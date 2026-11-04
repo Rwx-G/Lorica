@@ -62,6 +62,9 @@
     | { status: 'error'; message: string };
 
   let mtlsValidation: ActionState = $state({ status: 'idle' });
+  // What the last validated bundle trusts beyond the certificates it
+  // lists (a root, or a CA beside one it issued), as the API words it.
+  let mtlsBundleWarnings: string[] = $state([]);
   let faTest: ActionState = $state({ status: 'idle' });
 
   // Blur-time validation for forward_auth_address so the operator
@@ -96,10 +99,12 @@
       return;
     }
     mtlsValidation = { status: 'running' };
+    mtlsBundleWarnings = [];
     const res = await api.validateMtlsPem(pem);
     if (res.error) {
       mtlsValidation = { status: 'error', message: res.error.message };
     } else if (res.data) {
+      mtlsBundleWarnings = res.data.warnings ?? [];
       const n = res.data.ca_count;
       const subj = res.data.subjects.slice(0, 5).join(' · ');
       const more = res.data.subjects.length > 5 ? ` (+${res.data.subjects.length - 5} more)` : '';
@@ -341,7 +346,9 @@
     {#if mtlsPemError}<span class="field-error" role="alert">{mtlsPemError}</span>{/if}
     <span class="hint">
       One or more <code>-----BEGIN CERTIFICATE-----</code> blocks. Empty = feature
-      disabled. Max 1 MiB.
+      disabled. Max 1 MiB. Every certificate pasted here is trusted on its
+      own: paste the issuing CAs this route accepts, not their root, since
+      a root trusts every CA it signed.
     </span>
     <div class="inline-action">
       <button
@@ -358,6 +365,17 @@
         <span class="action-result err">{mtlsValidation.message}</span>
       {/if}
     </div>
+    {#if mtlsValidation.status === 'ok' && mtlsBundleWarnings.length > 0}
+      <div class="warn-banner" role="status" aria-live="polite" data-testid="mtls-bundle-warnings">
+        <strong>This bundle trusts more than the CAs it lists.</strong>
+        <ul class="restart-hints">
+          {#each mtlsBundleWarnings as warning (warning)}
+            <li>{warning}</li>
+          {/each}
+        </ul>
+        The bundle is accepted as it is.
+      </div>
+    {/if}
     {#if mtlsCaChangedFromInitial}
       <div class="warn-banner" role="status" aria-live="polite">
         <strong>Restart may be required.</strong> This route checks
@@ -412,9 +430,11 @@
       />
       {#if mtlsOrgsError}<span class="field-error" role="alert">{mtlsOrgsError}</span>{/if}
       <span class="hint">
-        Comma or newline-separated exact matches against the cert
-        subject's <code>O=</code> field, checked once the cert chains to
-        this route's bundle. Empty = accept any cert that does.
+        Comma or newline-separated exact matches against each
+        <code>O=</code> value of the cert subject, checked once the cert
+        chains to this route's bundle. Empty = accept any cert that does.
+        With <em>Required</em> off, it restricts only clients that present
+        a certificate from this bundle.
       </span>
     </div>
   </div>
