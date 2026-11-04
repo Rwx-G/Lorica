@@ -398,9 +398,15 @@ lives in.
   allowlist. `from_stream` now parses the end-entity once, through the
   new function, and derives `organization` from the list by the same
   join, so that field is unchanged; Lorica's mTLS allowlist reads the
-  list. The new function returns an error on a certificate x509-parser
-  refuses, where upstream's `get_organization_serial_bytes` panicked.
-  On an upstream sync, keep `from_stream` on the list function.
+  list. On an upstream sync, keep `from_stream` on the list function.
+- **`lorica-core`, a certificate x509-parser refuses is an error
+  (v1.10.3).** Site: `parse_der_reporting_errors` in
+  `lorica-core/src/utils/tls/rustls.rs`, behind
+  `get_organization_serial_bytes` and `get_organizations_serial_bytes`.
+  Upstream's `get_organization_serial_bytes` returns a `Result` and
+  still `expect`s the parse, so a peer certificate the handshake
+  accepted and x509-parser refused would panic the connection task; its
+  caller in `from_stream` already treats an error as "no organization".
 
 ## Upstream sync record
 
