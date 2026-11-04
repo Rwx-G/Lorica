@@ -619,6 +619,23 @@ an audit row under `route_protection_record.`. Records never replicate and the
 configuration export does not carry them, like the tokens they bound:
 the automation listener runs only where the records are.
 
+A record binds every token on its names, not only the one that left
+it, so a token whose grant overlaps another's can leave one on a shared
+name by creating a protected route there and deleting it. That gives it
+nothing it did not have: a name is held by one route at most, so the
+same token could keep the protected route stored instead, and the other
+principal would then be refused the name outright (a token's create on
+it is a `422`, an environment's `PUT` a `409`), while every write it
+could make to that route, its delete included, would be held to the
+same protections, the delete through the record it leaves. A record
+holds what that route held and nothing more, serves no request, lets in
+a route that matches it, and lasts until an operator ends it, as the
+route would. Two records on one name at different paths, with
+allowlists no one value meets, refuse an environment's `PUT` there,
+which one stored route on the name already does by holding it. An
+operator who does not want one principal's choices to bind another's
+on a name grants the name to one principal only.
+
 **A backend create is not idempotent.** A route create is refused on
 a hostname already held, and every other write names its resource by
 id, but a backend create that timed out on the client's side may have
