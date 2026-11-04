@@ -255,32 +255,24 @@ after any upstream sync that touches the function it lives in.
 - **Forked crates on newer dependency majors (v1.10.2, API adaptations
   only).** Upstream's forked crates pin dependency majors the rest of the
   workspace has left, which kept a second copy of each in the binary.
-  Lorica moves them to the workspace's version and adapts the call sites
-  without changing what the code does. `rand` 0.8 to 0.10 in
-  `lorica-core`, `lorica-cache`, `lorica-lb`, `lorica-lru`,
-  `lorica-proxy`, `lorica-runtime` and `lorica-limits` (`thread_rng` is
-  `rng`, `gen` / `gen_range` are `random` / `random_range` on `RngExt`,
+  Lorica moves them to the workspace's version, in each fork's
+  `Cargo.toml` (the authority on which crate is at which version), and
+  adapts the call sites without changing what the code does. The moves
+  that needed code: `rand` 0.10 everywhere (`thread_rng` is `rng`,
+  `gen` / `gen_range` are `random` / `random_range` on `RngExt`,
   `SliceRandom::choose` is `IndexedRandom::choose`, `distributions` is
-  `distr`, `Uniform::new` returns a `Result`), and 0.9 to 0.10 in
-  `lorica-ketama` and `tinyufo` (`rand_distr` 0.6 for the latter's
-  benches). `x509-parser` 0.16 to 0.18 in `lorica-core`, no code change.
-  `nix` 0.29 to 0.31 in `lorica-core` (`fchmodat` takes `AT_FDCWD`
-  where it took `None`). `strum` / `strum_macros` 0.26 to 0.28 in
-  `lorica-core`, no code change. `sfv` 0.10 to 0.16 in `lorica-core`
-  (`Parser::new(..).parse::<List>()`, tokens read through `as_str`).
-  `blake2` 0.10 to 0.11 in `lorica-cache`, no code change (the key-hash
-  vectors in its tests are unchanged). `brotli` 8 to 9 in `lorica-core`,
-  no code change. `daggy` 0.8 to 0.9 in `lorica-core`, no code change.
-  `float-cmp` 0.9 to 0.10 in `lorica-limits` (tests), no code change.
-  `hashbrown` 0.12 to 0.17 in `lorica-lru`, on the `default-hasher` and
-  `inline-more` features only, no code change. `i_key_sort` 0.10 to
-  0.12 in `lorica-ketama` (the optional `v2` feature), no code change.
-  `openssl-probe` 0.1 to 0.2 in `lorica-core`; its one call site sits in
-  the never-compiled `connectors/tls/boringssl_openssl` module and calls
-  `try_init_openssl_env_vars`. `rstest` 0.27 to 0.28 in `lorica-core`
-  (tests), no code change. `quick_cache` 0.6 to 0.7 in `tinyufo`
-  (benches), no code change. On an upstream sync, keep Lorica's version and port the new
-  code to its API rather than taking upstream's manifest line.
+  `distr`, `Uniform::new` returns a `Result`); `nix` 0.31 in
+  `lorica-core` (`transfer_fd` passes `AT_FDCWD` to `fchmodat` where it
+  passed `None`); `sfv` 0.16 in `lorica-core` (the Accept-Encoding parser
+  calls `Parser::new(..).parse::<List>()` and reads tokens through
+  `as_str`); `openssl-probe` 0.2 in `lorica-core` (its one call site, in
+  the never-compiled `connectors/tls/boringssl_openssl` module, calls
+  `try_init_openssl_env_vars`). The `x509-parser`, `strum`, `blake2`,
+  `brotli`, `daggy`, `float-cmp`, `hashbrown`, `i_key_sort`, `rstest` and
+  `quick_cache` moves needed none; `lorica-lru` takes `hashbrown` with
+  only the `default-hasher` and `inline-more` features. On an upstream
+  sync, keep Lorica's version and port the new code to its API rather
+  than taking upstream's manifest line.
 
 ## Upstream sync record
 
