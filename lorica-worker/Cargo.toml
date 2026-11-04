@@ -11,4 +11,4 @@ description = "Process-based worker isolation for Lorica reverse proxy"
 nix = { version = "0.31", features = ["socket", "uio", "signal", "process", "fs"] }
 tracing = "0.1"
 thiserror = "2"
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
