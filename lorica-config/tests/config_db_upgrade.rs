@@ -326,10 +326,10 @@ fn an_upgrade_subscribes_explicit_channels_to_the_adcs_alerts() {
 }
 
 /// Migration 67 on a node that ran 1.10.1: the file is rewound to
-/// version 66 with the table gone, as such a node holds it, beside the
-/// released route, which must come through untouched.
+/// version 66 with the record tables gone, as such a node holds it,
+/// beside the released route, which must come through untouched.
 #[test]
-fn an_upgrade_from_version_66_adds_the_records_table_and_touches_nothing_else() {
+fn an_upgrade_from_version_66_adds_the_record_tables_and_touches_nothing_else() {
     let dir = tempfile::tempdir().expect("test setup: tempdir");
     let path = dir.path().join("lorica.db");
     write_released_file(&path, LORICA_DB_V1_5_13);
@@ -337,7 +337,8 @@ fn an_upgrade_from_version_66_adds_the_records_table_and_touches_nothing_else() 
     Connection::open(&path)
         .expect("test setup: raw open")
         .execute_batch(
-            "DROP TABLE route_protection_records;
+            "DROP TABLE route_protection_record_names;
+             DROP TABLE route_protection_records;
              DELETE FROM schema_migrations WHERE version >= 67;",
         )
         .expect("test setup: a file at version 66");

@@ -1341,33 +1341,44 @@ fn migrate_adcs_allowed_templates(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Backlog #93: what a route deleted through the automation plane
-/// served, kept after the route is gone.
+/// Backlog #93: what a route the automation plane deleted, or moved off
+/// a name, served, kept after the route stopped serving it.
 ///
-/// No foreign key: the row exists because its route does not. The
-/// identity columns (hostname, aliases, path prefix) are the deleted
-/// route's own, copied out of `route_json` so the dashboard lists a
-/// record, and an operator clears it, without reading the snapshot. No
-/// index: every read is the whole table, which holds one row per
-/// protected route a token deleted.
+/// No foreign key to `routes`: the row exists because its route no
+/// longer serves those names, or no longer exists. The names it holds
+/// are rows of `route_protection_record_names`, indexed by name, so a
+/// write reads only the records naming a host it could serve and
+/// decodes no other snapshot; they go with their record
+/// (`ON DELETE CASCADE`, `PRAGMA foreign_keys` being on for every
+/// connection). The path prefix is a column of its own for the same
+/// reason: the dashboard lists a record, and an operator clears it,
+/// without reading the snapshot.
 ///
-/// A new table and nothing else, so every database reaches it the same
+/// New tables and nothing else, so every database reaches them the same
 /// way whatever it was born as: `CREATE TABLE IF NOT EXISTS` touches no
-/// existing row and no existing column. It never replicates and the
-/// configuration export does not carry it (`store/route_protection_records.rs`
-/// says why).
+/// existing row and no existing column. They never replicate and the
+/// configuration export does not carry them (`store/route_protection_records.rs`
+/// says why). Unreleased when it was last changed: no node ran an
+/// earlier shape of this migration outside a development tree.
 fn migrate_route_protection_records(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS route_protection_records (
             id TEXT PRIMARY KEY,
             route_id TEXT NOT NULL,
-            hostname TEXT NOT NULL,
-            hostname_aliases_json TEXT NOT NULL,
             path_prefix TEXT NOT NULL,
             route_json TEXT NOT NULL,
             deleted_by TEXT NOT NULL,
             deleted_at TEXT NOT NULL
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS route_protection_record_names (
+            record_id TEXT NOT NULL
+                REFERENCES route_protection_records(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            PRIMARY KEY (record_id, position)
+        );
+        CREATE INDEX IF NOT EXISTS idx_route_protection_record_names_name
+            ON route_protection_record_names(name, record_id);",
     )
 }
 

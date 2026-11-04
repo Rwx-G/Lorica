@@ -16,84 +16,161 @@
 //! `route_protection_records_stay_out_of_the_canonical_blob_and_the_export`
 //! asserts the absence so a later slice cannot add it back by symmetry.
 //!
+//! # A record's names are rows of their own
+//!
+//! Every write a record could bind reads only the records naming a host
+//! that write could serve (`route_selection::keys_reaching`), so the
+//! names sit in `route_protection_record_names`, indexed, rather than in
+//! a JSON column every lookup would have to decode. A name matches as
+//! the table's binary collation compares it, which is
+//! `route_selection::same_name`'s byte equality.
+//!
+//! # A snapshot that does not parse still lists
+//!
+//! `route_json` is read leniently: text that is not JSON is kept as a
+//! JSON string, which [`RouteProtectionRecord::route`] then reports as
+//! corrupt for that record alone. Refusing the row here would fail every
+//! listing, the dashboard's included, and leave the operator who must
+//! clear it nothing but the sqlite CLI. A record whose names do not
+//! read still fails the whole read: the plane cannot tell which writes
+//! it binds, so it binds them all.
+//!
 //! [`CanonicalConfig`]: crate::canonical::CanonicalConfig
 
 use rusqlite::{params, OptionalExtension};
 
-use super::row_helpers::{json_column, parse_datetime};
+use super::row_helpers::parse_datetime;
 use super::{serialize_field, ConfigStore};
 use crate::error::{ConfigError, Result};
 use crate::models::RouteProtectionRecord;
 
 /// The column list every record read binds, in the order
 /// [`row_to_record`] expects.
-const RECORD_COLUMNS: &str =
-    "id, route_id, hostname, hostname_aliases_json, path_prefix, route_json, deleted_by, deleted_at";
+const RECORD_COLUMNS: &str = "id, route_id, path_prefix, route_json, deleted_by, deleted_at";
 
-/// Decode one `route_protection_records` row.
+/// Every record holding one of `count` names, bound `?1` to `?count`,
+/// the most recent first.
+fn records_naming_sql(count: usize) -> String {
+    let placeholders: Vec<String> = (1..=count).map(|at| format!("?{at}")).collect();
+    format!(
+        "SELECT {RECORD_COLUMNS} FROM route_protection_records WHERE id IN \
+         (SELECT record_id FROM route_protection_record_names WHERE name IN ({})) \
+         ORDER BY deleted_at DESC, id ASC",
+        placeholders.join(", ")
+    )
+}
+
+/// Decode one `route_protection_records` row, its names left for
+/// [`ConfigStore::read_route_protection_records`] to attach.
 fn row_to_record(row: &rusqlite::Row<'_>) -> Result<RouteProtectionRecord> {
-    let deleted_at: String = row.get(7)?;
+    let route_json: String = row.get(3)?;
+    let deleted_at: String = row.get(5)?;
     Ok(RouteProtectionRecord {
         id: row.get(0)?,
         route_id: row.get(1)?,
-        hostname: row.get(2)?,
-        hostname_aliases: json_column(row, 3, "route protection record", "hostname_aliases")?,
-        path_prefix: row.get(4)?,
-        route: json_column(row, 5, "route protection record", "route")?,
-        deleted_by: row.get(6)?,
+        hostname: String::new(),
+        hostname_aliases: Vec::new(),
+        path_prefix: row.get(2)?,
+        route: match serde_json::from_str(&route_json) {
+            Ok(snapshot) => snapshot,
+            Err(_) => serde_json::Value::String(route_json),
+        },
+        deleted_by: row.get(4)?,
         deleted_at: parse_datetime(&deleted_at)?,
     })
 }
 
 impl ConfigStore {
-    /// Every record, the most recent deletion first.
+    /// Every record, the most recent first.
     pub fn list_route_protection_records(&self) -> Result<Vec<RouteProtectionRecord>> {
-        let sql = format!(
-            "SELECT {RECORD_COLUMNS} FROM route_protection_records \
-             ORDER BY deleted_at DESC, id ASC"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| Ok(row_to_record(row)))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row??);
+        self.read_route_protection_records(
+            &format!(
+                "SELECT {RECORD_COLUMNS} FROM route_protection_records \
+                 ORDER BY deleted_at DESC, id ASC"
+            ),
+            [],
+        )
+    }
+
+    /// Every record holding at least one of `names`, the most recent
+    /// first, found through the index on the names and decoding no other
+    /// record.
+    pub fn route_protection_records_naming(
+        &self,
+        names: &[&str],
+    ) -> Result<Vec<RouteProtectionRecord>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        self.read_route_protection_records(
+            &records_naming_sql(names.len()),
+            rusqlite::params_from_iter(names.iter()),
+        )
     }
 
     /// One record by id, or `None` when no such row exists.
     pub fn get_route_protection_record(&self, id: &str) -> Result<Option<RouteProtectionRecord>> {
-        let sql = format!("SELECT {RECORD_COLUMNS} FROM route_protection_records WHERE id = ?1");
-        self.conn
-            .query_row(&sql, params![id], |row| Ok(row_to_record(row)))
-            .optional()?
-            .transpose()
+        Ok(self
+            .read_route_protection_records(
+                &format!("SELECT {RECORD_COLUMNS} FROM route_protection_records WHERE id = ?1"),
+                params![id],
+            )?
+            .pop())
     }
 
-    /// Store a record.
+    /// Store a record and its names.
+    ///
+    /// Two statements: the settles that write a record run inside the
+    /// transaction of the route write it belongs to, so the row and its
+    /// names commit together.
     pub fn create_route_protection_record(&self, record: &RouteProtectionRecord) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO route_protection_records (id, route_id, hostname, hostname_aliases_json,
-             path_prefix, route_json, deleted_by, deleted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO route_protection_records (id, route_id, path_prefix, route_json,
+             deleted_by, deleted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 record.id,
                 record.route_id,
-                record.hostname,
-                serialize_field(
-                    "route protection record hostname_aliases",
-                    &record.hostname_aliases
-                )?,
                 record.path_prefix,
                 serialize_field("route protection record route", &record.route)?,
                 record.deleted_by,
                 record.deleted_at.to_rfc3339(),
             ],
         )?;
-        Ok(())
+        self.insert_route_protection_record_names(record)
     }
 
-    /// Delete one record by id.
+    /// Replace the names a stored record holds with `record`'s.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::NotFound`] when no record has `record.id`.
+    pub fn update_route_protection_record_names(
+        &self,
+        record: &RouteProtectionRecord,
+    ) -> Result<()> {
+        let stored: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM route_protection_records WHERE id = ?1",
+                params![record.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if stored.is_none() {
+            return Err(ConfigError::NotFound(format!(
+                "route protection record {}",
+                record.id
+            )));
+        }
+        self.conn.execute(
+            "DELETE FROM route_protection_record_names WHERE record_id = ?1",
+            params![record.id],
+        )?;
+        self.insert_route_protection_record_names(record)
+    }
+
+    /// Delete one record by id, its names with it.
     ///
     /// # Errors
     ///
@@ -107,6 +184,50 @@ impl ConfigStore {
             return Err(ConfigError::NotFound(format!(
                 "route protection record {id}"
             )));
+        }
+        Ok(())
+    }
+
+    /// The records `sql` selects (its columns [`RECORD_COLUMNS`]), each
+    /// with its names in order.
+    fn read_route_protection_records(
+        &self,
+        sql: &str,
+        bound: impl rusqlite::Params,
+    ) -> Result<Vec<RouteProtectionRecord>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(bound, |row| Ok(row_to_record(row)))?;
+        let mut names = self.conn.prepare(
+            "SELECT name FROM route_protection_record_names WHERE record_id = ?1 \
+             ORDER BY position",
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            let mut record = row??;
+            let held = names
+                .query_map(params![record.id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            let Some((hostname, aliases)) = held.split_first() else {
+                return Err(ConfigError::Corrupt(format!(
+                    "route protection record {} holds no name",
+                    record.id
+                )));
+            };
+            record.hostname.clone_from(hostname);
+            record.hostname_aliases = aliases.to_vec();
+            out.push(record);
+        }
+        Ok(out)
+    }
+
+    /// Store `record`'s names, its hostname first.
+    fn insert_route_protection_record_names(&self, record: &RouteProtectionRecord) -> Result<()> {
+        let mut insert = self.conn.prepare(
+            "INSERT INTO route_protection_record_names (record_id, position, name)
+             VALUES (?1, ?2, ?3)",
+        )?;
+        for (position, name) in record.names().enumerate() {
+            insert.execute(params![record.id, position as i64, name])?;
         }
         Ok(())
     }
@@ -184,6 +305,126 @@ mod tests {
             store.get_route_protection_record("rec-1").expect("get"),
             None
         );
+    }
+
+    #[test]
+    fn a_record_whose_snapshot_text_is_not_json_lists_and_reads_as_corrupt() {
+        // The listing and the clear must keep working, or the operator's
+        // remedy for an unreadable record needs the sqlite CLI.
+        let store = ConfigStore::open_in_memory().expect("store");
+        store
+            .create_route_protection_record(&record("rec-1", "app.example.com", 1_700_000_000))
+            .expect("insert");
+        store
+            .conn
+            .execute(
+                "UPDATE route_protection_records SET route_json = '{\"truncated' WHERE id = 'rec-1'",
+                [],
+            )
+            .expect("test setup: the snapshot is damaged");
+        let listed = store.list_route_protection_records().expect("still lists");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].hostname, "app.example.com");
+        assert!(matches!(listed[0].route(), Err(ConfigError::Corrupt(_))));
+        store
+            .delete_route_protection_record("rec-1")
+            .expect("still clears");
+    }
+
+    #[test]
+    fn a_lookup_by_name_is_served_by_an_index() {
+        let store = ConfigStore::open_in_memory().expect("store");
+        let plan: Vec<String> = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", records_naming_sql(2)))
+            .expect("the lookup prepares")
+            .query_map(["a.example.com", "b.example.com"], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("plan")
+            .collect::<std::result::Result<_, _>>()
+            .expect("plan rows");
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("route_protection_record_names")
+                    && step.contains("USING COVERING INDEX")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn a_lookup_by_name_reads_the_records_holding_it_and_no_other() {
+        let store = ConfigStore::open_in_memory().expect("store");
+        let app = record("rec-1", "app.example.com", 1_700_000_000);
+        let other = record("rec-2", "other.example.com", 1_800_000_000);
+        for record in [&app, &other] {
+            store
+                .create_route_protection_record(record)
+                .expect("insert");
+        }
+        let ids = |names: &[&str]| -> Vec<String> {
+            store
+                .route_protection_records_naming(names)
+                .expect("lookup")
+                .into_iter()
+                .map(|record| record.id)
+                .collect()
+        };
+        // An alias is a name the record holds.
+        assert_eq!(ids(&["www.app.example.com"]), vec!["rec-1"]);
+        assert_eq!(
+            ids(&["app.example.com", "www.other.example.com"]),
+            vec!["rec-2", "rec-1"]
+        );
+        assert!(ids(&["unrelated.example.com"]).is_empty());
+        assert!(ids(&[]).is_empty());
+        assert_eq!(
+            store
+                .route_protection_records_naming(&["www.app.example.com"])
+                .expect("lookup"),
+            vec![app]
+        );
+    }
+
+    #[test]
+    fn a_record_narrowed_to_fewer_names_reads_back_with_them_and_its_names_go_with_it() {
+        let store = ConfigStore::open_in_memory().expect("store");
+        let mut held = record("rec-1", "app.example.com", 1_700_000_000);
+        store.create_route_protection_record(&held).expect("insert");
+        held.hostname = "www.app.example.com".to_string();
+        held.hostname_aliases = Vec::new();
+        store
+            .update_route_protection_record_names(&held)
+            .expect("narrowed");
+        assert_eq!(
+            store.get_route_protection_record("rec-1").expect("get"),
+            Some(held.clone())
+        );
+        assert!(store
+            .route_protection_records_naming(&["app.example.com"])
+            .expect("lookup")
+            .is_empty());
+
+        store
+            .delete_route_protection_record("rec-1")
+            .expect("delete");
+        let names: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM route_protection_record_names",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(names, 0);
+        assert!(matches!(
+            store.update_route_protection_record_names(&held),
+            Err(ConfigError::NotFound(_))
+        ));
     }
 
     #[test]
