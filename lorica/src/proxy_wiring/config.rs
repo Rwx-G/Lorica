@@ -721,6 +721,23 @@ impl ProxyConfig {
             |entry| entry.route.as_ref(),
         )
     }
+
+    /// Whether `path` selects the same route as it does once normalised
+    /// the way a backend may normalise it
+    /// ([`route_selection::selects_alike_once_normalised`]). A request
+    /// for which it does not is refused before any route's policy runs:
+    /// served under the route its raw path selects, it could reach a
+    /// resource another route guards with mTLS, Basic auth, forward auth
+    /// or an IP list.
+    pub fn selects_alike_once_normalised(&self, host: &str, path: &str) -> bool {
+        route_selection::selects_alike_once_normalised(
+            &self.routes_by_host,
+            &self.wildcard_routes,
+            host,
+            path,
+            |entry| entry.route.as_ref(),
+        )
+    }
 }
 
 /// Compute the upstream keepalive pool size based on the number of backends.

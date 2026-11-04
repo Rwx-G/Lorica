@@ -821,6 +821,19 @@ async fn tls_request_over(
     server_name: &str,
     host: &str,
 ) -> Result<(u16, String), String> {
+    tls_get(port, client_config, server_name, host, "/").await
+}
+
+/// `GET path` naming `host`, on a connection whose handshake named
+/// `server_name`. `path` is sent as written, encoded octets and dot
+/// segments included.
+async fn tls_get(
+    port: u16,
+    client_config: Arc<RusTlsClientConfig>,
+    server_name: &str,
+    host: &str,
+    path: &str,
+) -> Result<(u16, String), String> {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let stream = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
     let connector = tokio_rustls::TlsConnector::from(client_config);
@@ -834,7 +847,7 @@ async fn tls_request_over(
     .await
     .map_err(|_| "handshake timeout".to_string())?
     .map_err(|e| format!("handshake: {e}"))?;
-    let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     tls.write_all(request.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
@@ -1235,4 +1248,74 @@ async fn fullstack_connection_opened_for_another_host_is_misdirected_on_a_requir
         status, 200,
         "second-CA cert over a localhost connection: {body}"
     );
+}
+
+// ===========================================================================
+// Full-stack: a path that a normalising backend reads as the mTLS route's
+// prefix must not reach that backend through a sibling route without it.
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_path_steered_off_the_mtls_prefix_is_refused() {
+    // `/admin` requires a certificate, `/` on the same host does not, and
+    // both are served by one backend. Forwarded as sent under `/`, a path
+    // such as `/%61dmin/x` reaches a backend that decodes it to
+    // `/admin/x` without the certificate check.
+    let pki = build_pki();
+    let upstream = spawn_plain_upstream().await;
+    let mut public = mtls_route(&pki.ca_pem, false, vec![]);
+    public.id = "r-public".into();
+    public.mtls = None;
+    let mut admin = mtls_route(&pki.ca_pem, true, vec![]);
+    admin.id = "r-admin".into();
+    admin.path_prefix = "/admin".into();
+    let links = vec![
+        (public.id.clone(), "u".into()),
+        (admin.id.clone(), "u".into()),
+    ];
+    let harness = TlsProxyHarness::start(
+        &pki,
+        vec![public, admin],
+        vec![upstream_backend("u", upstream)],
+        links,
+    )
+    .await;
+    let no_cert = client_config_trusting(&pki.ca_cert_der);
+    let port = harness.port;
+
+    let (status, body) = tls_get(port, no_cert.clone(), "localhost", "localhost", "/public")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 200, "public path: {body}");
+    let (status, body) = tls_get(port, no_cert.clone(), "localhost", "localhost", "/admin/x")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 496, "protected path without a certificate: {body}");
+
+    for steered in [
+        "/%61dmin/x",
+        "//admin/x",
+        "/x/../admin/x",
+        "/%2e%2e/admin/x",
+    ] {
+        let (status, body) = tls_get(port, no_cert.clone(), "localhost", "localhost", steered)
+            .await
+            .expect("tls req");
+        assert_eq!(status, 400, "{steered}: {body}");
+        assert!(
+            !body.contains("upstream-ok"),
+            "{steered} reached the upstream: {body}"
+        );
+    }
+
+    let (status, body) = tls_get(
+        port,
+        first_ca_client(&pki),
+        "localhost",
+        "localhost",
+        "/admin/x",
+    )
+    .await
+    .expect("tls req");
+    assert_eq!(status, 200, "protected path with its certificate: {body}");
 }

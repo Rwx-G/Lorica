@@ -423,12 +423,21 @@ pub fn select<'a, E, F>(
 where
     F: Fn(&E) -> &Route,
 {
+    select_where(exact, wildcards, host, |entry| {
+        path.starts_with(&route_of(entry).path_prefix)
+    })
+}
+
+/// [`select`] with the path test left to `serves`: the first entry it
+/// accepts at the first level of the precedence that has one.
+fn select_where<'a, E>(
+    exact: &'a HashMap<String, Vec<E>>,
+    wildcards: &'a [(String, Vec<E>)],
+    host: &str,
+    serves: impl Fn(&E) -> bool,
+) -> Option<&'a E> {
     let host = canonical_hostname(host);
-    let serving = |entries: &'a [E]| {
-        entries
-            .iter()
-            .find(|entry| path.starts_with(&route_of(entry).path_prefix))
-    };
+    let serving = |entries: &'a [E]| entries.iter().find(|entry| serves(*entry));
     if let Some(entry) = exact
         .get(host.as_ref())
         .and_then(|entries| serving(entries))
@@ -445,6 +454,128 @@ where
     exact
         .get(CATCH_ALL_HOSTNAME)
         .and_then(|entries| serving(entries))
+}
+
+/// `path` as a backend that normalises request paths reads it: every
+/// percent-encoded octet decoded once, each run of `/` merged into one,
+/// and the `.` and `..` segments resolved (RFC 3986 section 5.2.4).
+/// Borrowed when that changes nothing, which is every path a browser
+/// sends.
+///
+/// Selection itself runs on the path as the client sent it, which is
+/// also the path the backend receives. This reading exists for
+/// [`selects_alike_once_normalised`]. It is deliberately broader than
+/// RFC 3986 normalisation (which decodes unreserved characters only and
+/// keeps `//`), because what matters is what some backend may make of
+/// the path: nginx, for one, decodes every octet and merges slashes
+/// before it matches a location. Case and backend-specific syntax
+/// (`;` parameters, `\` as a separator) are left as they are.
+///
+/// ```
+/// use lorica_config::route_selection::normalised_path;
+/// assert_eq!(normalised_path("/%61dmin/x"), "/admin/x");
+/// assert_eq!(normalised_path("//admin"), "/admin");
+/// assert_eq!(normalised_path("/public/../admin/"), "/admin/");
+/// assert_eq!(normalised_path("/%2e%2e/admin"), "/admin");
+/// assert!(matches!(
+///     normalised_path("/admin/x"),
+///     std::borrow::Cow::Borrowed(_)
+/// ));
+/// ```
+pub fn normalised_path(path: &str) -> Cow<'_, str> {
+    if !path.contains('%') && !path.contains("//") && !path.contains("/.") {
+        return Cow::Borrowed(path);
+    }
+    let decoded = percent_decoded_once(path);
+    let leading_slash = decoded.starts_with('/');
+    let mut segments: Vec<&str> = Vec::new();
+    let mut ends_in_a_directory = false;
+    for segment in decoded.split('/') {
+        ends_in_a_directory = matches!(segment, "" | "." | "..");
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            name => segments.push(name),
+        }
+    }
+    let mut normalised = String::with_capacity(decoded.len());
+    if leading_slash {
+        normalised.push('/');
+    }
+    normalised.push_str(&segments.join("/"));
+    if ends_in_a_directory && !segments.is_empty() {
+        normalised.push('/');
+    }
+    if normalised == path {
+        Cow::Borrowed(path)
+    } else {
+        Cow::Owned(normalised)
+    }
+}
+
+/// `text` with every `%XX` (two hex digits) replaced by its octet, once,
+/// and an octet sequence that is not UTF-8 read lossily. A `%` that does
+/// not start such a triplet is kept.
+fn percent_decoded_once(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let octet = (bytes[at] == b'%')
+            .then(|| bytes.get(at + 1..at + 3))
+            .flatten()
+            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match octet {
+            Some(octet) => {
+                decoded.push(octet);
+                at += 3;
+            }
+            None => {
+                decoded.push(bytes[at]);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+/// Whether `path` and its [`normalised_path`] are served by the same
+/// entry, or both by none. The normalised path is matched against each
+/// route's prefix read the same way, so a prefix stored with an encoded
+/// octet still matches the decoded request.
+///
+/// When they differ, a backend that normalises paths would serve, under
+/// the route the raw path selects, a resource the normalised path's
+/// route covers: `/%61dmin` reaching a catch-all route that does not
+/// require what the `/admin` route requires, then `/admin` at the
+/// backend. The proxy refuses such a request rather than guess which
+/// reading the backend applies.
+pub fn selects_alike_once_normalised<E, F>(
+    exact: &HashMap<String, Vec<E>>,
+    wildcards: &[(String, Vec<E>)],
+    host: &str,
+    path: &str,
+    route_of: F,
+) -> bool
+where
+    F: Fn(&E) -> &Route,
+{
+    let Cow::Owned(normalised) = normalised_path(path) else {
+        return true;
+    };
+    let as_sent = select(exact, wildcards, host, path, &route_of);
+    let as_normalised = select_where(exact, wildcards, host, |entry| {
+        normalised.starts_with(normalised_path(&route_of(entry).path_prefix).as_ref())
+    });
+    match (as_sent, as_normalised) {
+        (None, None) => true,
+        (Some(sent), Some(normalised)) => std::ptr::eq(sent, normalised),
+        _ => false,
+    }
 }
 
 /// Whether the wildcard `pattern` (`*.example.com`) covers `host`: any
@@ -661,6 +792,109 @@ mod tests {
         index
             .select(host, path, |r| *r)
             .map(|route| route.id.as_str())
+    }
+
+    #[test]
+    fn a_normalised_path_decodes_merges_and_resolves_dot_segments() {
+        for (sent, read) in [
+            ("/%61dmin", "/admin"),
+            ("/%41dmin", "/Admin"),
+            ("//admin", "/admin"),
+            ("/./admin", "/admin"),
+            ("/x/../admin", "/admin"),
+            ("/%2e%2e/admin", "/admin"),
+            ("/x%2f..%2fadmin", "/admin"),
+            ("/admin/./", "/admin/"),
+            ("/admin/x/..", "/admin/"),
+            ("/../../admin", "/admin"),
+            ("/a%2", "/a%2"),
+            ("/a%+1", "/a%+1"),
+            ("/caf%C3%A9", "/café"),
+        ] {
+            assert_eq!(normalised_path(sent), read, "{sent}");
+        }
+        for unchanged in ["/", "/admin", "/admin/", "/.well-known/acme-challenge/x"] {
+            assert!(
+                matches!(normalised_path(unchanged), Cow::Borrowed(_)),
+                "{unchanged}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_that_selects_another_route_once_normalised_is_told_apart() {
+        let routes = [
+            route("public", "app.example.com", "/"),
+            route("admin", "app.example.com", "/admin"),
+        ];
+        let index = HostIndex::new(routes.iter(), |r| *r);
+        let alike = |path: &str| {
+            selects_alike_once_normalised(
+                &index.exact,
+                &index.wildcards,
+                "app.example.com",
+                path,
+                |r| *r,
+            )
+        };
+        for steered in [
+            "/%61dmin/x",
+            "//admin",
+            "/./admin",
+            "/x/../admin",
+            "/%2e%2e/admin",
+        ] {
+            assert_eq!(served(&index, "app.example.com", steered), Some("public"));
+            assert!(!alike(steered), "{steered}");
+        }
+        // Normalisation that leaves the route alone is no ambiguity.
+        for harmless in [
+            "/admin",
+            "/admin//x",
+            "/admin/./x",
+            "/files/My%20Doc",
+            "/x/../y",
+        ] {
+            assert!(alike(harmless), "{harmless}");
+        }
+        // A path that leaves the protected route once normalised is one
+        // too: a backend that does not normalise could serve it as
+        // `/admin/...`.
+        assert!(!alike("/admin/../public"));
+    }
+
+    #[test]
+    fn a_prefix_stored_encoded_matches_the_decoded_request() {
+        let routes = [
+            route("public", "app.example.com", "/"),
+            route("cafe", "app.example.com", "/caf%C3%A9"),
+        ];
+        let index = HostIndex::new(routes.iter(), |r| *r);
+        assert!(selects_alike_once_normalised(
+            &index.exact,
+            &index.wildcards,
+            "app.example.com",
+            "/caf%C3%A9/menu",
+            |r| *r,
+        ));
+    }
+
+    #[test]
+    fn a_host_no_route_serves_is_alike_both_ways() {
+        let routes = [route("admin", "app.example.com", "/admin")];
+        let index = HostIndex::new(routes.iter(), |r| *r);
+        let alike = |path: &str| {
+            selects_alike_once_normalised(
+                &index.exact,
+                &index.wildcards,
+                "app.example.com",
+                path,
+                |r| *r,
+            )
+        };
+        assert!(alike("/x/%2e%2e/other"));
+        // No route as sent, the protected one once normalised.
+        assert!(!alike("/x/../admin"));
     }
 
     #[test]
