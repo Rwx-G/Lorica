@@ -264,10 +264,7 @@ impl<S> ConnectionPool<S> {
     pub fn get(&self, key: &GroupKey) -> Option<S> {
         let pool_node = {
             let pool = self.pool.read();
-            match pool.get(key) {
-                Some(v) => (*v).clone(),
-                None => return None,
-            }
+            (*pool.get(key)?).clone()
         }; // read lock released here
 
         if let Some((id, connection)) = pool_node.get_any() {

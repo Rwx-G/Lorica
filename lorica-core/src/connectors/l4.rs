@@ -261,7 +261,7 @@ async fn proxy_connect<P: Peer>(peer: &P) -> Result<Stream> {
         connect_uds(&proxy.next_hop)
             .await
             .or_err_with(ConnectError, || {
-                format!("CONNECT proxy connect() error to {:?}", &proxy.next_hop)
+                format!("CONNECT proxy connect() error to {:?}", proxy.next_hop)
             })?
             .into(),
     );

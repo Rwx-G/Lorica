@@ -17,6 +17,6 @@
 # toolchain@v1` which reads the same file.
 
 [toolchain]
-channel = "1.95.0"
+channel = "1.99.1"
 components = ["clippy", "rustfmt"]
 profile = "minimal"

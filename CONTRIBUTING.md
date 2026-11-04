@@ -6,7 +6,7 @@ Thank you for considering contributing to Lorica! This document explains how to 
 
 ### Prerequisites
 
-- Rust 1.95.0. `rust-toolchain.toml` pins it for local builds and CI both, and rustup installs it on first use; do not override it locally, a version skew is exactly what the pin exists to prevent
+- Rust 1.99.1. `rust-toolchain.toml` pins it for local builds and CI both, and rustup installs it on first use; do not override it locally, a version skew is exactly what the pin exists to prevent
 - Node.js 22+ (for dashboard frontend; Vite 8 rejects Node 18)
 - Linux x86_64 (native builds) or Docker (for development on other platforms)
 

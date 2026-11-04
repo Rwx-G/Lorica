@@ -342,6 +342,13 @@ fn add_column_if_absent(
     }
 }
 
+/// A flush barrier found its writer thread gone, so nothing is left
+/// to flush. Returned by [`LogStore::flush_audit`] and
+/// [`crate::log_writer::LogWriteHandle::flush`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the log writer thread is gone")]
+pub struct WriterGone;
+
 /// Persistent log database wrapper. Cheaply cloneable through `Arc<LogStore>`.
 pub struct LogStore {
     /// Shared with the audit consumer thread, which therefore cannot
@@ -696,15 +703,15 @@ impl LogStore {
     ///
     /// # Errors
     ///
-    /// Returns `Err(())` when the consumer thread is gone, which
+    /// Returns [`WriterGone`] when the consumer thread is gone, which
     /// callers read as "nothing left to flush".
-    pub async fn flush_audit(&self) -> Result<(), ()> {
+    pub async fn flush_audit(&self) -> Result<(), WriterGone> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.audit_tx
             .send(AuditWrite::Barrier(ack_tx))
             .await
-            .map_err(|_| ())?;
-        ack_rx.await.map_err(|_| ())
+            .map_err(|_| WriterGone)?;
+        ack_rx.await.map_err(|_| WriterGone)
     }
 
     /// Stall the audit writer by taking the connection it needs.

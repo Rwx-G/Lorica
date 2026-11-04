@@ -293,8 +293,10 @@ fn rfc4514_value(attribute: &x509_parser::x509::AttributeTypeAndValue<'_>) -> St
         Tag::BmpString if value.data.len() % 2 == 0 => {
             let units: Vec<u16> = value
                 .data
-                .chunks_exact(2)
-                .map(|pair: &[u8]| u16::from_be_bytes([pair[0], pair[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair: &[u8; 2]| u16::from_be_bytes(*pair))
                 .collect();
             String::from_utf16(&units).ok()
         }

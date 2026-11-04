@@ -157,7 +157,7 @@ impl ByteReservation {
         let outcome =
             self.budget
                 .in_flight
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     let next = current.checked_add(extra)?;
                     (next <= ceiling).then_some(next)
                 });

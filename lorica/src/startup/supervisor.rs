@@ -1815,8 +1815,10 @@ fn spawn_worker_channel_task(
                                         .map(|e| {
                                             let pairs: Vec<(String, String)> = e
                                                 .labels
-                                                .chunks_exact(2)
-                                                .map(|c| (c[0].clone(), c[1].clone()))
+                                                .as_chunks::<2>()
+                                                .0
+                                                .iter()
+                                                .map(|[k, v]| (k.clone(), v.clone()))
                                                 .collect();
                                             (e.name.clone(), pairs, e.value)
                                         })
@@ -2729,8 +2731,10 @@ async fn pull_all_metrics_via_rpc(
                         .map(|e| {
                             let pairs: Vec<(String, String)> = e
                                 .labels
-                                .chunks_exact(2)
-                                .map(|c| (c[0].clone(), c[1].clone()))
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .map(|[k, v]| (k.clone(), v.clone()))
                                 .collect();
                             (e.name.clone(), pairs, e.value)
                         })

@@ -29,7 +29,7 @@
 > **The project declares no workspace MSRV.** This document used to
 > claim "Rust 1.84+ (MSRV)" for the language row; nothing in the tree
 > ever backed that number. There is no `rust-version` key in the
-> workspace `Cargo.toml`. `rust-toolchain.toml` pins `channel = "1.95.0"` and
+> workspace `Cargo.toml`. `rust-toolchain.toml` pins `channel = "1.99.1"` and
 > that single file governs both local development and GitHub Actions
 > CI, which is what actually decides whether a build succeeds. Two
 > forked crates, `lorica-cache` and `lorica-proxy`, carry their own
@@ -40,7 +40,7 @@
 
 | Category | Current Technology | Version | Usage in Enhancement | Notes |
 |----------|-------------------|---------|---------------------|-------|
-| Language | Rust | 1.95.0 pinned | All components | No workspace MSRV; `rust-toolchain.toml` pins the channel for dev and CI alike |
+| Language | Rust | 1.99.1 pinned | All components | No workspace MSRV; `rust-toolchain.toml` pins the channel for dev and CI alike |
 | Async Runtime | tokio | 1.x | Proxy engine, API server | Keep |
 | HTTP/1.1 Parser | httparse | 1.x | Request/response parsing | Keep |
 | HTTP/2 | h2 | >= 0.4.11 | HTTP/2 proxy | Keep |

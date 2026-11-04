@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use crate::log_store::LogStore;
+use crate::log_store::{LogStore, WriterGone};
 use crate::logs::LogEntry;
 
 /// Bounded queue capacity. At ~300 bytes per entry the worst-case
@@ -78,15 +78,15 @@ impl LogWriteHandle {
     /// (`send().await`) instead of dropping on a full queue: it is
     /// called from rate-limited management endpoints (logs / WAF event
     /// clear), never from the request hot path, and the wipe must not
-    /// silently skip the barrier. Returns `Err(())` when the writer
+    /// silently skip the barrier. Returns [`WriterGone`] when the writer
     /// thread is gone; callers treat that as "nothing left to flush".
-    pub async fn flush(&self) -> Result<(), ()> {
+    pub async fn flush(&self) -> Result<(), WriterGone> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(LogWrite::Barrier(ack_tx))
             .await
-            .map_err(|_| ())?;
-        ack_rx.await.map_err(|_| ())
+            .map_err(|_| WriterGone)?;
+        ack_rx.await.map_err(|_| WriterGone)
     }
 }
 
