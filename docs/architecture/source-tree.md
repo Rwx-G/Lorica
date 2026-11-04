@@ -27,7 +27,7 @@ architectural moves per release.
 | `lorica-shmem` | Cross-worker shared-memory region (WAF auto-ban counters, rate-limit buckets). |
 | `lorica-mcp` | Management MCP server (Epic 11), a library and the `lorica-mcp` binary: the hand-rolled JSON-RPC core (`server.rs`, `jsonrpc.rs`), what the policy crate's tier table means for the catalogue (`tier.rs`: a tier's tools, the one registry rule, the scopes a tier mints), the tool catalogue (`tools.rs`), the untrusted-data fence every answer is built through (`untrusted.rs`), the stdio adapter and the HTTPS client it reaches the plane with (`stdio.rs`, `http.rs`, `config.rs`). The registry is built from a token's one tier and scopes, once at startup over stdio and per request over Streamable HTTP. It binds no socket of its own; the remote transport is a path on the `lorica-api` automation listener, and `lorica-api` depends on this crate, never the reverse, so the stdio binary carries no SQLite. |
 | `lorica-automation-policy` | The automation plane's policy as data and pure functions, no I/O, `serde` its only dependency: the scope vocabulary (`scope.rs`, `AutomationScope` and the `settings:write` lifetime ceiling), the MCP tier table and the rule resolving a scope set to one tier (`tier.rs`), the admin settings allowlist (`settings.rs`) and the withheld route fields and one-way protection rules (`protections.rs`). `lorica-config`, `lorica-api`, `lorica-mcp` and `lorica` read it; the dashboard reads the tier table through the fixture `lorica-api/tests/automation_scope_fixture.rs` renders from it. |
-| `lorica-adcs` | AD CS enrollment client (Epic 13): turns a CSR into an issued certificate through the authority's Certificate Enrollment Web Service, WS-Trust (MS-WSTEP) over SOAP 1.2 and HTTPS, authenticated with Kerberos SPNEGO bound to the TLS channel. It owns ticket acquisition, the channel binding, the SPNEGO exchange, the envelope and response parsing, chain extraction, CSR construction and the `krb5.conf` renderer. A leaf crate: no first-party dependency, nothing of the store, routes or dashboard; the GSS-API FFI surface (`libgssapi`) lives here and nowhere else. When to issue, renew and store belongs to `lorica-api`. |
+| `lorica-adcs` | AD CS enrollment client (Epic 13): turns a CSR into an issued certificate through the authority's Certificate Enrollment Web Service, WS-Trust (MS-WSTEP) over SOAP 1.2 and HTTPS, authenticated with Kerberos SPNEGO bound to the TLS channel. It owns ticket acquisition, the channel binding, the SPNEGO exchange, the envelope and response parsing, chain extraction, CSR construction and the `krb5.conf` renderer. A leaf crate: its one first-party dependency is `lorica-tls`, for the outbound HTTP TLS policy, and it holds nothing of the store, routes or dashboard; the GSS-API FFI surface (`libgssapi`) lives here and nowhere else. When to issue, renew and store belongs to `lorica-api`. |
 
 ## `lorica/src/proxy_wiring/` (data plane, backlog #7 layout)
 
@@ -62,7 +62,9 @@ in `lorica/src/capture/`.
 `lorica-pool`, `lorica-runtime`, `lorica-header-serde`, pinned at
 0.1.0, and `tinyufo`, which keeps its own upstream version, preserve
 upstream Pingora structure to stay rebaseable. `lorica-tls`
-additionally carries the native cert resolver + OCSP stapling.
+additionally carries the native cert resolver + OCSP stapling, and
+`http_client.rs`, the rustls configuration every outbound reqwest client
+of the workspace is built on (provider, protocol versions, trust roots).
 `lorica-worker` and `lorica-command` are first-party process/IPC crates
 and follow the product version, bumped with the product per
 `docs/BUMP-CHECKLIST.md`, not the forked-crate 0.1.0 pin. Each crate's

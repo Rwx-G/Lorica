@@ -306,6 +306,30 @@ after any upstream sync that touches the function it lives in.
   upstream wrote them. On an upstream sync, keep the `ignore` on those
   tests, and give one to any new test of these modules that leaves the
   machine.
+- **`lorica-tls` and `lorica-core`, reqwest 0.13 on a preconfigured TLS
+  configuration (v1.10.2).** Sites: the reqwest entry of the workspace
+  `Cargo.toml`, which the forks' manifests take with `workspace = true`;
+  `lorica-tls/src/http_client.rs` (a Lorica module, no upstream
+  counterpart) and the `PemObject` re-export in `lorica-tls/src/lib.rs`;
+  the reqwest clients of `lorica-core/tests/test_basic.rs` and of
+  `lorica-core/src/listeners/mod.rs`'s tests. Upstream's forks use reqwest
+  0.12 with `rustls-tls-webpki-roots`, which falls back to the `ring`
+  provider and seeds the root store from the webpki bundle. reqwest 0.13
+  has no such feature: left to itself it verifies through
+  `rustls-platform-verifier` on the process-wide provider and panics in
+  `Client::build` when none is installed, and its default provider is
+  `aws-lc-rs`. Lorica builds every client, the forks' test clients
+  included, on a `ClientConfig` from `lorica_tls::http_client`, handed
+  over with `tls_backend_preconfigured`: `ring`, rustls' default protocol
+  versions, ALPN `http/1.1`, and the webpki bundle plus the platform store
+  (`public()`), or no verification at all where upstream called
+  `danger_accept_invalid_certs(true)` (`unverified()`). reqwest leaves the
+  ALPN of a preconfigured configuration alone, so a client that must be
+  able to negotiate HTTP/2 is built on `offering_http2(..)`, as the h2
+  assertions of `test_basic.rs` are; `.http1_only()` clients keep the
+  `http/1.1`-only offer. `reqwest::get` there becomes a client built the
+  same way. On an upstream sync, a new test client goes through the same
+  helpers.
 
 ## Upstream sync record
 

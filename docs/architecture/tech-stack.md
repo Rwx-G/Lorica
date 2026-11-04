@@ -11,7 +11,12 @@
 > tower-http 0.7, rusqlite 0.41, rcgen 0.14, sysinfo 0.40,
 > opentelemetry 0.33, argon2 0.6. `nix` 0.31 in
 > every crate since v1.10.2 (`lorica-core`, `lorica-command` and
-> `lorica-worker` were held on `~0.29` until then).
+> `lorica-worker` were held on `~0.29` until then). reqwest 0.13 in
+> every crate, forks included, since v1.10.2, on its
+> `rustls-no-provider` feature: each client is handed a rustls
+> configuration from `lorica_tls::http_client` (ring, the webpki bundle
+> plus the platform store), so neither `aws-lc-rs` nor the platform
+> verifier reqwest 0.13 defaults to is what a client runs on.
 >
 > Additions after v1.0 that this document never listed:
 >
