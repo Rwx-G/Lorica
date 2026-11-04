@@ -11,7 +11,13 @@ Author: Rwx-G
 
 ### Added
 
+- **`case_insensitive_paths` on a route**, for a backend that treats request paths case-insensitively (IIS, a case-insensitive file system). With it on, the route's path prefix, its path rules and its prefix stripping match regardless of letter case, so `/ADMIN/x` is held to the controls of a protected `/admin` route instead of reaching that backend through a sibling route. Off by default; behaviour is unchanged without it. On the automation plane it is a control a token may turn on but never off. Route form, Security tab. Schema migration 69: upgrade followers first; a 1.10.2 follower is refused by a 1.10.3 control plane at the schema handshake.
+- **The mTLS bundle check warns about a root certificate.** Validate PEM and a route save report a bundle that holds a self-signed root next to other certificates, or a CA next to a certificate it issued: every CA that root or CA signed is then trusted by the route. Such bundles are still accepted; the route should hold only the issuing CAs it trusts.
+
 ### Changed
+
+- **A request whose path reads differently once normalised is refused with `400` when the two readings select different routes or path rules.** The normalised reading decodes percent-escapes once, reads `\` as `/`, drops `;` segment parameters, merges repeated slashes and resolves `.` and `..` segments, which is how common backends interpret a path. Ordinary paths are untouched, and the path sent to the backend is always the one the client sent. `docs/security.md` describes the rule.
+- **An mTLS route checks the client certificate against its own CA bundle.** A certificate another route's CA issued counts, on this route, as no certificate: a required route answers `495`, an optional route treats the client as anonymous. On a connection whose TLS name differs from the request's `Host` (a reused or HTTP/2-coalesced connection), a required route answers `421 Misdirected Request` instead, so the client retries with a handshake of its own. A CA bundle change now applies to the per-route check on save; a CA that no route trusted when Lorica started is still refused at the handshake until a restart. The organisation allowlist compares each `O=` value of the subject on its own.
 
 ### Fixed
 
@@ -20,6 +26,9 @@ Author: Rwx-G
 ### Removed
 
 ### Security
+
+- **A client certificate issued for one mTLS route was accepted on another.** The HTTPS listener verifies client certificates against the CA bundles of every mTLS route together, and a route then checked only that a certificate was present and, with an allowlist, its `O=` value. With two routes trusting different CAs on one listener, a certificate from the first route's CA was accepted on the second, allowlist included, since that CA could issue any `O=`. Each route now verifies the chain against its own bundle (see Changed). Affects 1.3.0 through 1.10.2, on nodes with mTLS on two or more routes whose bundles differ.
+- **A path written differently could skip the controls of the route or path rule that serves it.** Routes and path rules were selected on the raw path, while backends decode it, merge slashes, resolve `..`, and for some read `\` as `/` or drop `;` parameters. A spelling such as `/%61dmin` or `//admin` was routed to an unprotected sibling route, or past a deny or rate-limit path rule, and the backend then served the protected path: mTLS, Basic auth, forward auth, IP lists, `return_status` rules and per-rule rate limits could all be skipped this way, and a path under `/.well-known/acme-challenge/` could skip the HTTPS redirect. Such requests are now refused (see Changed). Affects every release up to 1.10.2 where a host has more than one route, or a route has path rules.
 
 ## [1.10.2] - 2026-11-04
 
