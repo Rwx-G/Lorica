@@ -17,6 +17,7 @@ use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
 use crate::server::AppState;
+use lorica_config::route_selection::canonical_hostname;
 
 use super::forward_auth::{build_forward_auth, ForwardAuthConfigRequest};
 use super::header_rules::{build_header_rule, HeaderRuleRequest};
@@ -890,11 +891,12 @@ fn validate_http_method(method: &str, field_label: &str) -> Result<(), ApiError>
 /// Validate a single hostname alias. Same RFC 1123 shape check as
 /// `validate_redirect_hostname` but accepts a leading `*.` wildcard
 /// (legal for SNI match) and uses the caller's `field_label` so the
-/// UI can point at the right input. Returns the trimmed value on
-/// success.
+/// UI can point at the right input. Returns the value trimmed and in
+/// the canonical form every name is stored in
+/// ([`canonical_hostname`]), so a root dot is accepted and dropped.
 fn validate_hostname_alias(raw: &str, field_label: &str) -> Result<String, ApiError> {
     validate_dns_hostname(
-        raw,
+        &canonical_hostname(raw.trim()),
         HostnameOpts {
             allow_wildcard: true,
             allow_empty: false,
@@ -1565,7 +1567,11 @@ mod hostname_alias_tests {
     #[test]
     fn rejects_leading_trailing_dot_and_dash() {
         assert!(validate_hostname_alias(".example.com", "f").is_err());
-        assert!(validate_hostname_alias("example.com.", "f").is_err());
+        assert_eq!(
+            validate_hostname_alias(" WWW.Example.com. ", "f").expect("a root dot"),
+            "www.example.com"
+        );
+        assert!(validate_hostname_alias("example.com..", "f").is_err());
         assert!(validate_hostname_alias("-example.com", "f").is_err());
         assert!(validate_hostname_alias("example-.com", "f").is_err());
     }
@@ -3727,7 +3733,7 @@ pub(crate) async fn create_route_as(
     guard: crate::target::RouteGuard,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     refuse_client_managed_by(body.managed_by.as_ref())?;
-    if body.hostname.is_empty() {
+    if canonical_hostname(body.hostname.trim()).is_empty() {
         return Err(ApiError::BadRequest("hostname is required".into()));
     }
 
@@ -4051,6 +4057,7 @@ pub(crate) async fn create_route_as(
         updated_at: now,
     };
 
+    route.canonicalise_names();
     guard.restore_withheld(None, &mut route)?;
     let backend_ids = body.backend_ids.unwrap_or_default();
     let actor_name = actor.username.clone();
@@ -4794,6 +4801,7 @@ fn apply_route_patch(
     if let Some(b) = body.serve_robots_txt {
         route.serve_robots_txt = b;
     }
+    route.canonicalise_names();
     route.updated_at = Utc::now();
     Ok(route)
 }

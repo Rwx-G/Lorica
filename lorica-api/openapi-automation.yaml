@@ -970,7 +970,11 @@ paths:
 
         The hostname and every alias must be inside the token's
         `allowed_hostnames` (403); a wildcard alias is refused outright,
-        because the grant is checked one exact host at a time.
+        because the grant is checked one exact host at a time. They are
+        stored, and answered back, with ASCII letters lowercased and one
+        trailing dot dropped, the one form every guard and the proxy
+        compare a name in, so a spelling of a name another route holds
+        is refused (422) as that name.
         `managed_by` is refused (422) as it is on the management path.
         `basic_auth_password`, `forward_auth`, `mirror`, `mtls` and
         `proxy_headers` are refused from a token whatever their value

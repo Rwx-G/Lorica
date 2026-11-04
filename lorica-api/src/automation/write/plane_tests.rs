@@ -998,6 +998,116 @@ async fn a_name_another_route_holds_is_refused_without_that_routes_id() {
 }
 
 #[tokio::test]
+async fn a_name_is_stored_canonical_and_its_case_or_root_dot_twin_is_refused_on_every_door() {
+    // Audit finding, hostname spelling twin: a name differing only in
+    // ASCII case or a root dot is the same host to every client, and was
+    // a second, unguarded name to the store.
+    let f = a_node_with_something_to_write().await;
+    let created = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &f.admin,
+        Some(serde_json::json!({
+            "hostname": "App.Write.Example.COM.",
+            "hostname_aliases": ["WWW.Write.Example.com."],
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let view = parse_data(created).await;
+    assert_eq!(view["hostname"], "app.write.example.com");
+    assert_eq!(
+        view["hostname_aliases"],
+        serde_json::json!(["www.write.example.com"])
+    );
+
+    for twin in [
+        "app.write.example.com.",
+        "APP.write.example.com",
+        "Www.Write.Example.com",
+    ] {
+        let response = send(
+            &f.state,
+            &f.session_store,
+            &f.rate_limiter,
+            "POST",
+            "/api/v1/routes",
+            &f.admin,
+            Some(serde_json::json!({ "hostname": twin })),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "management {twin}"
+        );
+
+        for suffix in ["", "?dry_run=true"] {
+            let response = automation_call(
+                &f.state,
+                "POST",
+                &format!("/automation/v1/routes{suffix}"),
+                &f.bearer,
+                Some(serde_json::json!({ "hostname": twin })),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "token {twin}{suffix}"
+            );
+            let message = body_json(response).await["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                message.contains("already used by another route"),
+                "{message}"
+            );
+        }
+
+        let through_mcp = crate::automation::test_support::mcp_call(
+            &f.state,
+            &f.mcp_bearer,
+            "lorica_route_create",
+            serde_json::json!({ "route": { "hostname": twin } }),
+        )
+        .await;
+        assert_eq!(through_mcp["result"]["isError"], true, "mcp {twin}");
+        assert!(
+            through_mcp["result"]
+                .to_string()
+                .contains("already used by another route"),
+            "{through_mcp}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_case_twin_under_a_protected_wildcard_takes_it_over_only_as_strong() {
+    let f = a_node_with_something_to_write().await;
+    let wildcard = an_operator_route(
+        &f,
+        "*.write.example.com",
+        serde_json::json!({ "ip_allowlist": ["10.0.0.0/8"] }),
+    )
+    .await;
+    assert_displacement_refused(
+        &f,
+        "POST",
+        "/automation/v1/routes",
+        serde_json::json!({ "hostname": "App.Write.Example.com." }),
+        "ip_allowlist",
+        &wildcard,
+        "10.0.0.0",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn a_route_displaces_only_the_paths_the_protected_route_serves_today() {
     let f = a_node_with_something_to_write().await;
     let admin_only = an_operator_route(

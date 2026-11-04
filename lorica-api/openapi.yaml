@@ -6230,6 +6230,10 @@ components:
           format: uuid
         hostname:
           type: string
+          description: >-
+            The name the route answers on, as stored: ASCII letters
+            lowercased and one trailing dot dropped, whatever spelling the
+            write sent. Requests are looked up in the same form.
         path_prefix:
           type: string
         backends:
@@ -6306,6 +6310,11 @@ components:
       properties:
         hostname:
           type: string
+          description: >-
+            The name the route answers on. Stored, and answered back, with
+            ASCII letters lowercased and one trailing dot dropped, the form
+            every hostname is compared in: a spelling of a name another
+            route holds is refused (422) as that name.
         path_prefix:
           type: string
           default: "/"
@@ -6347,6 +6356,11 @@ components:
       properties:
         hostname:
           type: string
+          description: >-
+            The name the route answers on. Stored, and answered back, with
+            ASCII letters lowercased and one trailing dot dropped, the form
+            every hostname is compared in: a spelling of a name another
+            route holds is refused (422) as that name.
         path_prefix:
           type: string
         backend_ids:

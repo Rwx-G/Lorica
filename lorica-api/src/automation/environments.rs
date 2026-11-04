@@ -74,6 +74,7 @@ use lorica_config::models::{
     ManagedBy, PipelineIdentity, Route, WafMode, AUTOMATION_MAX_BACKENDS_PER_ENVIRONMENT,
     AUTOMATION_MAX_ENVIRONMENTS_PER_PRINCIPAL,
 };
+use lorica_config::route_selection::{canonical_hostname, same_name};
 use lorica_config::{parse_cidr, ConfigError, ConfigStore, ConnectionFilterPolicy};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -361,10 +362,10 @@ pub struct DeletedEnvironment {
 /// Same shape as the route API's own hostname check: a bare name, no
 /// scheme, path, port, wildcard or address literal, 253 characters at
 /// most, every label 1 to 63 ASCII alphanumerics and inner hyphens.
-/// Returns the name lowercased with a trailing dot folded away, which
-/// is the form the rows store and compare.
+/// Returns the name in the form every route name is stored and
+/// compared in ([`canonical_hostname`]).
 fn validate_dns_name(raw: &str, field: &str) -> Result<String, ApiError> {
-    let name = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    let name = canonical_hostname(raw.trim()).into_owned();
     let refuse = |why: &str| ApiError::Unprocessable(format!("{field} {why}"));
     if name.is_empty() {
         return Err(refuse("must not be empty"));
@@ -945,22 +946,17 @@ fn write_environment(store: &ConfigStore, input: &WriteInput) -> Result<PutOutco
     // The conflict names the hostname and nothing about the route
     // holding it: the caller is a credential from another project, and
     // which manual route sits on a name is an operator's business.
-    let own_route_id = existing.as_ref().map(|e| e.route_id.as_str());
-    for route in store.list_routes()? {
-        if Some(route.id.as_str()) == own_route_id {
-            continue;
-        }
-        let taken = route.hostname.eq_ignore_ascii_case(&input.hostname)
-            || route
-                .hostname_aliases
-                .iter()
-                .any(|alias| alias.eq_ignore_ascii_case(&input.hostname));
-        if taken {
-            return Err(ApiError::Conflict(format!(
-                "hostname `{}` is already used by another route",
-                input.hostname
-            )));
-        }
+    // The store's own rule, so a name the route keeps over a twin
+    // spelled otherwise is not refused here either.
+    let own_route_id = existing.as_ref().map_or("", |e| e.route_id.as_str());
+    if store
+        .hostname_claimed_elsewhere(own_route_id, &input.hostname, &[])?
+        .is_some()
+    {
+        return Err(ApiError::Conflict(format!(
+            "hostname `{}` is already used by another route",
+            input.hostname
+        )));
     }
 
     let certificates = store.list_certificates()?;
@@ -1565,7 +1561,7 @@ pub async fn list_environments(
     let hostname: Option<String> = query
         .hostname
         .as_deref()
-        .map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase());
+        .map(|h| canonical_hostname(h.trim()).into_owned());
     let expiring_before: Option<DateTime<Utc>> = match query.expiring_before.as_deref() {
         Some(raw) => Some(
             DateTime::parse_from_rfc3339(raw.trim())
@@ -1604,7 +1600,7 @@ pub async fn list_environments(
                 continue;
             };
             if let Some(wanted) = &hostname {
-                if !view.hostname.eq_ignore_ascii_case(wanted) {
+                if !same_name(&view.hostname, wanted) {
                     continue;
                 }
             }

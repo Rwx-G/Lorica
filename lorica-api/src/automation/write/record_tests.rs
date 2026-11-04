@@ -382,6 +382,47 @@ async fn a_prefix_move_leaves_a_record_and_a_disable_leaves_none() {
 }
 
 #[tokio::test]
+async fn a_deleted_protected_route_is_not_created_again_under_another_spelling() {
+    let f = a_node_with_something_to_write().await;
+    let route_id = protected_route(&f).await;
+    token_deletes(&f, &route_id).await;
+    let record_id = listed(&f).await[0]["id"]
+        .as_str()
+        .expect("the delete left a record")
+        .to_string();
+
+    for twin in [
+        "App.Write.Example.com",
+        "app.write.example.com.",
+        "WWW.write.example.com.",
+    ] {
+        assert_record_refused(
+            &f,
+            "POST",
+            "/automation/v1/routes",
+            serde_json::json!({ "hostname": twin }),
+            "ip_allowlist",
+            &record_id,
+        )
+        .await;
+        let recreated = mcp_call(
+            &f.state,
+            &f.mcp_bearer,
+            "lorica_route_create",
+            serde_json::json!({ "route": { "hostname": twin } }),
+        )
+        .await;
+        assert_eq!(recreated["result"]["isError"], true, "{recreated}");
+        assert!(
+            recreated["result"]
+                .to_string()
+                .contains(&format!("route protection record `{record_id}`")),
+            "{recreated}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn an_alias_dropped_through_mcp_and_created_again_is_refused() {
     let f = a_node_with_something_to_write().await;
     let route_id = protected_route(&f).await;
