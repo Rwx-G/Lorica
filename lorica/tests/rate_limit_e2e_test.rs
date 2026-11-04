@@ -311,6 +311,7 @@ async fn empty_bucket_returns_429_with_retry_after() {
     })
     .await;
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -356,6 +357,7 @@ async fn one_shot_bucket_has_60_second_retry_after() {
     })
     .await;
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -390,6 +392,7 @@ async fn no_rate_limit_does_not_short_circuit() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -413,6 +416,7 @@ async fn per_route_scope_caps_aggregate_across_clients() {
     })
     .await;
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()

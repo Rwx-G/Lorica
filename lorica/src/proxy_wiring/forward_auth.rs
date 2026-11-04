@@ -26,8 +26,14 @@ use once_cell::sync::Lazy;
 
 use super::VerdictCacheEngine;
 
+/// Panics on first use when the platform trust store offers
+/// certificates and none is usable, as reqwest 0.12's own root loading
+/// did at `build`.
 static FORWARD_AUTH_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
+        .tls_backend_preconfigured(
+            lorica_tls::http_client::public().expect("forward-auth client trust roots"),
+        )
         .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(32)
         // Default connect timeout; per-request total timeout is set on each call.

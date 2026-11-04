@@ -596,7 +596,9 @@ pub async fn fetch_and_load_blocklist(
     // party feed) ; a redirect to an internal address would let an
     // attacker who controls the feed pivot into the supervisor's
     // loopback. Audit L-7.
+    let tls = lorica_tls::http_client::public().map_err(|e| format!("trust roots: {e}"))?;
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
         .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()

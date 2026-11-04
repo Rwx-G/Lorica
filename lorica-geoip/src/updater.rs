@@ -197,10 +197,12 @@ pub async fn run_once(resolver: &dyn MmdbResolver, cfg: &UpdaterConfig) -> Resul
     }
 
     // 2. HTTP GET with a strict timeout so a hung proxy cannot wedge
-    //    the task forever. reqwest's default client is fine; we only
-    //    need one download per 7 days so a fresh Client each call is
-    //    cheaper than holding one open.
+    //    the task forever. We only need one download per 7 days so a
+    //    fresh Client each call is cheaper than holding one open.
+    let tls = lorica_tls::http_client::public()
+        .map_err(|e| UpdateError::Download(format!("trust roots: {e}")))?;
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
         .timeout(DOWNLOAD_TIMEOUT)
         .user_agent(format!(
             "lorica/{} (+github.com/Rwx-G/Lorica)",

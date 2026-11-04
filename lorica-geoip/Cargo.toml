@@ -22,11 +22,11 @@ chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 
 # Auto-update job. `reqwest` is the same HTTP client already used by
-# the rest of the workspace (forward_auth, ACME, OTel exporter); we
-# reuse the rustls-webpki-roots feature so the download path reuses
-# the same TLS stack Lorica already depends on. `flate2` decompresses
+# the rest of the workspace (forward_auth, ACME, OTel exporter), on the
+# same TLS policy (`lorica_tls::http_client`). `flate2` decompresses
 # the .mmdb.gz payload - no zlib / gzip dep otherwise.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+reqwest = { workspace = true }
+lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
 flate2 = "1"
 tokio = { version = "1", features = ["fs", "io-util", "time", "rt"] }
 

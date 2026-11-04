@@ -185,7 +185,8 @@ impl HttpsPlane {
             HeaderValue::from_static(TRANSPORT_MARKER),
         );
 
-        let mut builder = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
+            .tls_backend_preconfigured(trust(config.ca_bundle.as_deref())?)
             .default_headers(headers)
             .timeout(REQUEST_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
@@ -198,9 +199,6 @@ impl HttpsPlane {
             .https_only(true)
             // The plane is one node and a read tier is not a crawler.
             .pool_max_idle_per_host(2);
-        for authority in trusted_extras(config.ca_bundle.as_deref())? {
-            builder = builder.add_root_certificate(authority);
-        }
 
         Ok(HttpsPlane {
             client: builder
@@ -211,13 +209,31 @@ impl HttpsPlane {
     }
 }
 
+/// The TLS configuration of the client: the public trust of every
+/// outbound client of the workspace, plus the certificates `bundle`
+/// names.
+///
+/// Additive: the bundle is added to the platform store and the built-in
+/// roots rather than replacing either, so naming an internal CA does not
+/// stop a publicly signed listener from verifying.
+fn trust(bundle: Option<&Path>) -> Result<lorica_tls::ClientConfig, HttpsError> {
+    let mut roots: lorica_tls::RootCertStore = lorica_tls::http_client::public_roots()
+        .map_err(|reason| HttpsError::ClientUnbuildable(reason.to_string()))?;
+    for authority in trusted_extras(bundle)? {
+        roots
+            .add(authority)
+            .map_err(|reason| HttpsError::ClientUnbuildable(reason.to_string()))?;
+    }
+    Ok(lorica_tls::http_client::verified(roots))
+}
+
 /// The certificates named by `bundle`, or an empty list when none was
 /// named.
-///
-/// Additive: what comes back is added to the platform store and the
-/// built-in roots rather than replacing either, so naming an internal
-/// CA does not stop a publicly signed listener from verifying.
-fn trusted_extras(bundle: Option<&Path>) -> Result<Vec<reqwest::Certificate>, HttpsError> {
+fn trusted_extras(
+    bundle: Option<&Path>,
+) -> Result<Vec<lorica_tls::CertificateDer<'static>>, HttpsError> {
+    use lorica_tls::{CertificateDer, PemObject};
+
     let Some(path) = bundle else {
         return Ok(Vec::new());
     };
@@ -225,14 +241,16 @@ fn trusted_extras(bundle: Option<&Path>) -> Result<Vec<reqwest::Certificate>, Ht
         path: path.to_path_buf(),
         source,
     })?;
-    let certificates = reqwest::Certificate::from_pem_bundle(&pem).map_err(|_| {
-        // The parse detail is dropped: it quotes what it choked on, and
-        // an operator who pointed this at the wrong file would see a
-        // line of that file on stderr.
-        HttpsError::BundleNotCertificates {
-            path: path.to_path_buf(),
-        }
-    })?;
+    let certificates = CertificateDer::pem_slice_iter(&pem)
+        .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+        .map_err(|_| {
+            // The parse detail is dropped: it quotes what it choked on, and
+            // an operator who pointed this at the wrong file would see a
+            // line of that file on stderr.
+            HttpsError::BundleNotCertificates {
+                path: path.to_path_buf(),
+            }
+        })?;
     if certificates.is_empty() {
         return Err(HttpsError::BundleNotCertificates {
             path: path.to_path_buf(),
@@ -419,23 +437,106 @@ mod tests {
         // than promised in a comment. `danger_accept_invalid_certs` and
         // its siblings are the switch an operator reaches for when a
         // self-signed certificate is in the way, and the answer here is
-        // the CA bundle instead.
+        // the CA bundle instead. The client is preconfigured, so reqwest's
+        // own switches would be ignored anyway; what could skip
+        // verification is the policy's relaxed variants or a verifier of
+        // this module's own.
         let source = include_str!("http.rs");
         let body = source.split("#[cfg(test)]").next().unwrap_or(source);
         for dangerous in [
             "danger_accept_invalid_certs",
             "danger_accept_invalid_hostnames",
-            "tls_built_in_root_certs(false)",
-            "use_preconfigured_tls",
+            "http_client::unverified",
+            "http_client::with_verifier",
+            "dangerous()",
+            "ServerCertVerifier",
         ] {
             assert!(
                 !body.contains(dangerous),
                 "{dangerous} is reachable from this module"
             );
         }
-        // And the scan is worth something: the bundle call it is meant
-        // to be the complement of really is here.
-        assert!(body.contains("add_root_certificate"));
+        // And the scan is worth something: the verified configuration it
+        // is meant to be the complement of really is here.
+        assert!(body.contains("lorica_tls::http_client::verified(roots)"));
+        assert!(body.contains(".tls_backend_preconfigured(trust("));
+    }
+
+    /// A listener on loopback that answers every request `{}` over TLS
+    /// with `certificate`, until the test ends.
+    async fn spawn_listener(certificate: &rcgen::CertifiedKey<rcgen::KeyPair>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let config = lorica_tls::ServerConfig::builder_with_provider(
+            lorica_tls::http_client::crypto_provider(),
+        )
+        .with_safe_default_protocol_versions()
+        .expect("test setup: versions")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certificate.cert.der().clone()],
+            lorica_tls::PrivateKeyDer::try_from(certificate.signing_key.serialize_der())
+                .expect("test setup: key"),
+        )
+        .expect("test setup: server config");
+        let acceptor = lorica_tls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test setup: bind");
+        let port = listener.local_addr().expect("test setup: addr").port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    continue;
+                };
+                let mut scratch = [0u8; 2048];
+                let _ = tls.read(&mut scratch).await;
+                let _ = tls
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await;
+                let _ = tls.shutdown().await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn the_listener_is_verified_against_the_public_trust_and_the_named_bundle() {
+        let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()])
+            .expect("test setup: a certificate");
+        let port = spawn_listener(&certificate).await;
+        let endpoint = format!("https://127.0.0.1:{port}");
+
+        let mut public_only = HttpsPlane::new(&config_with(None)).expect("a client builds");
+        public_only.endpoint = endpoint.clone();
+        let refused = public_only
+            .call(
+                Verb::Get,
+                "/automation/v1/whoami",
+                None,
+                Reason::Introspection,
+            )
+            .await
+            .expect_err("a self-signed listener is not publicly trusted");
+        assert!(matches!(refused, PlaneError::Transport(_)), "{refused:?}");
+
+        let dir = tempfile::tempdir().expect("test setup: temp dir");
+        let bundle = dir.path().join("listener.pem");
+        std::fs::write(&bundle, certificate.cert.pem()).expect("test setup: the bundle is written");
+        let mut with_bundle = HttpsPlane::new(&config_with(Some(bundle))).expect("a client builds");
+        with_bundle.endpoint = endpoint;
+        let answer = with_bundle
+            .call(
+                Verb::Get,
+                "/automation/v1/whoami",
+                None,
+                Reason::Introspection,
+            )
+            .await
+            .expect("the bundle names the listener's certificate");
+        assert_eq!(answer, "{}");
     }
 
     #[test]

@@ -487,6 +487,7 @@ async fn forward_auth_allow_injects_response_headers_and_reaches_upstream() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -542,6 +543,7 @@ async fn forward_auth_deny_forwards_status_and_body_verbatim() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -611,6 +613,7 @@ async fn forward_auth_redirect_is_forwarded_verbatim_to_client() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
@@ -659,6 +662,7 @@ async fn forward_auth_timeout_fails_closed_503() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -705,6 +709,7 @@ async fn forward_auth_unreachable_fails_closed_503() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -732,6 +737,7 @@ async fn forward_auth_disabled_route_skips_auth_altogether() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -783,6 +789,7 @@ async fn forward_auth_forwards_client_context_headers_to_auth() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()

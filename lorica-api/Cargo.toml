@@ -108,17 +108,14 @@ sysinfo = "0.40"
 # `#![deny(unsafe_code)]` stays intact.
 nix = { version = "0.31", default-features = false, features = ["fs", "user"] }
 thiserror = "2"
-# `rustls-tls-native-roots` sits beside the webpki bundle rather than
-# replacing it: with both on, reqwest seeds its root store from
-# webpki-roots AND from the platform store, which is where a
-# distribution's CA bundle and anything `SSL_CERT_FILE` points at
-# land. Without it the OIDC JWKS fetch (Story 10.5) trusts webpki's
-# public roots only, so a self-hosted GitLab under a corporate PKI
-# answered every ID token with `jwks_unavailable` however the host was
-# configured. `rustls-native-certs` is already in the lockfile through
-# the cluster TLS stack, so this is a feature flag and not a new
-# dependency.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots", "json"] }
+# Every client takes its TLS from `lorica_tls::http_client`, whose
+# public trust is the webpki bundle AND the platform store: the
+# platform store is where a distribution's CA bundle and anything
+# `SSL_CERT_FILE` points at land. Without it the OIDC JWKS fetch
+# (Story 10.5) would trust webpki's public roots only, so a self-hosted
+# GitLab under a corporate PKI would answer every ID token with
+# `jwks_unavailable` however the host was configured.
+reqwest = { workspace = true, features = ["json"] }
 async-trait = { workspace = true }
 base64 = "0.23"
 dashmap = "6"

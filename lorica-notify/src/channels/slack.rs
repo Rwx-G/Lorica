@@ -65,7 +65,10 @@ pub async fn send(config: &WebhookConfig, event: &AlertEvent) -> Result<(), Noti
         icon_emoji: ":shield:".to_string(),
     };
 
+    let tls = lorica_tls::http_client::public()
+        .map_err(|e| NotifyError::Webhook(format!("failed to load the trust roots: {e}")))?;
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| NotifyError::Webhook(format!("failed to create HTTP client: {e}")))?;

@@ -220,11 +220,12 @@ pub struct LoadTestEngine {
 
 impl LoadTestEngine {
     pub fn new() -> Self {
+        // Load tests target localhost with self-signed certs, not checked.
         let http_client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true) // Load tests target localhost with self-signed certs
+            .tls_backend_preconfigured(lorica_tls::http_client::unverified())
             .pool_max_idle_per_host(200)
             .build()
-            .unwrap_or_default();
+            .expect("a preconfigured client with a pool size has nothing left to fail on");
 
         Self {
             http_client,
@@ -274,8 +275,9 @@ impl LoadTestEngine {
         // traffic stays local (loopback). Without this, https://127.0.0.1 would
         // send SNI=127.0.0.1 which doesn't match any certificate.
         let run_client = {
+            // Load tests target localhost with self-signed certs, not checked.
             let mut builder = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true) // Load tests target localhost with self-signed certs
+                .tls_backend_preconfigured(lorica_tls::http_client::unverified())
                 .pool_max_idle_per_host(200);
             if let Ok(url) = reqwest::Url::parse(&config.target_url) {
                 if let Some(host) = url.host_str() {

@@ -249,6 +249,7 @@ impl Drop for ProxyHarness {
 
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()

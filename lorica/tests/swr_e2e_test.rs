@@ -379,6 +379,7 @@ async fn swr_serves_stale_immediately_and_refreshes_in_background() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -459,6 +460,7 @@ async fn swr_disabled_route_revalidates_synchronously() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -514,6 +516,7 @@ async fn stale_if_error_serves_cached_body_when_upstream_fails() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -561,6 +564,7 @@ async fn swr_concurrent_requests_spawn_exactly_one_background_refresh() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -639,6 +643,7 @@ async fn swr_background_refresh_failure_does_not_poison_cache() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -695,6 +700,7 @@ async fn swr_window_expiry_falls_back_to_synchronous_fetch() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()

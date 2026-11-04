@@ -33,7 +33,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{Resumption, WebPkiServerVerifier};
-use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
@@ -132,15 +131,15 @@ impl ServerCertVerifier for PinnedVerifier {
 }
 
 /// The roots the endpoint's certificate must chain to: the PEM
-/// `trust_bundle` alone when set (Epic 13 D12), else the system store
-/// and the webpki bundle, the two sets reqwest itself loaded under the
-/// features this crate enables.
+/// `trust_bundle` alone when set (Epic 13 D12), else the public trust of
+/// every outbound HTTP client, the webpki bundle and the system store
+/// (`lorica_tls::http_client::public_roots`).
 ///
 /// Reads the system store from disk: run it on a blocking thread.
 fn root_store(trust_bundle: Option<&str>) -> Result<RootCertStore, AdcsError> {
-    let mut roots: RootCertStore = RootCertStore::empty();
     match trust_bundle {
         Some(pem) => {
+            let mut roots: RootCertStore = RootCertStore::empty();
             for block in Pem::iter_from_buffer(pem.as_bytes()) {
                 let block: Pem = block.map_err(|err| {
                     tls_error(format!("the endpoint trust bundle cannot be read: {err}"))
@@ -159,21 +158,11 @@ fn root_store(trust_bundle: Option<&str>) -> Result<RootCertStore, AdcsError> {
                     "the endpoint trust bundle holds no PEM certificate".to_owned(),
                 ));
             }
+            Ok(roots)
         }
-        None => {
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let native: rustls_native_certs::CertificateResult =
-                rustls_native_certs::load_native_certs();
-            let offered: usize = native.certs.len();
-            let (valid, _invalid): (usize, usize) = roots.add_parsable_certificates(native.certs);
-            if valid == 0 && offered > 0 {
-                return Err(tls_error(
-                    "the system trust store holds no usable certificate".to_owned(),
-                ));
-            }
-        }
+        None => lorica_tls::http_client::public_roots()
+            .map_err(|err| tls_error(format!("the system trust store is unusable: {err}"))),
     }
-    Ok(roots)
 }
 
 /// The TLS configuration of a session: the normal verification against
@@ -182,29 +171,21 @@ fn root_store(trust_bundle: Option<&str>) -> Result<RootCertStore, AdcsError> {
 /// Session resumption is off: a resumed handshake skips certificate
 /// verification, and the pin must hold for every connection without a
 /// reasoning about which earlier session a ticket came from. HTTP/1.1
-/// only, as reqwest offered it under this crate's features.
+/// only, as every outbound client offers it.
 pub(crate) fn client_config(
     trust_bundle: Option<&str>,
     pin: Arc<CertificatePin>,
 ) -> Result<ClientConfig, AdcsError> {
-    // The provider `lorica` installs as the process default, and the one
-    // reqwest falls back to without one.
-    let provider: Arc<CryptoProvider> = Arc::new(rustls::crypto::ring::default_provider());
     let roots: RootCertStore = root_store(trust_bundle)?;
-    let inner: Arc<WebPkiServerVerifier> =
-        WebPkiServerVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider))
-            .build()
-            .map_err(|err| tls_error(format!("the certificate verifier cannot be built: {err}")))?;
-    let mut config: ClientConfig = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|err: rustls::Error| {
-            tls_error(format!("the TLS configuration cannot be built: {err}"))
-        })?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedVerifier { inner, pin }))
-        .with_no_client_auth();
+    let inner: Arc<WebPkiServerVerifier> = WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        lorica_tls::http_client::crypto_provider(),
+    )
+    .build()
+    .map_err(|err| tls_error(format!("the certificate verifier cannot be built: {err}")))?;
+    let mut config: ClientConfig =
+        lorica_tls::http_client::with_verifier(Arc::new(PinnedVerifier { inner, pin }));
     config.resumption = Resumption::disabled();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
 }
 
@@ -237,9 +218,18 @@ mod tests {
     }
 
     #[test]
-    fn without_a_bundle_the_webpki_roots_are_trusted() {
+    fn without_a_bundle_the_public_roots_are_trusted() {
         let roots: RootCertStore = root_store(None).expect("roots");
-        assert!(roots.len() >= webpki_roots::TLS_SERVER_ROOTS.len());
+        let public: RootCertStore = lorica_tls::http_client::public_roots().expect("public roots");
+        assert!(!roots.is_empty());
+        assert_eq!(roots.len(), public.len());
+    }
+
+    #[test]
+    fn a_session_offers_http_1_1_alone() {
+        let config: ClientConfig =
+            client_config(None, Arc::new(CertificatePin::default())).expect("configuration");
+        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
     }
 
     #[test]

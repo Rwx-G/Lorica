@@ -360,7 +360,7 @@ impl<B: GssBackend> Session<B> {
         })
         .await??;
         let http: Client = Client::builder()
-            .use_preconfigured_tls(tls)
+            .tls_backend_preconfigured(tls)
             .https_only(true)
             .tls_info(true)
             // A redirect would send the next request, and its token, to a

@@ -31,8 +31,15 @@ const OCSP_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// responder URL comes from the certificate AIA extension, which an
 /// attacker-issued chain controls, so a 3xx must not steer the fetch
 /// into an internal service (`http://169.254.169.254/`). Audit L-7.
+///
+/// Panics on first use when the platform trust store offers
+/// certificates and none is usable, as reqwest 0.12's own root loading
+/// did at `build`.
 static OCSP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
+        .tls_backend_preconfigured(
+            crate::http_client::public().expect("OCSP client trust roots (platform store)"),
+        )
         .timeout(OCSP_FETCH_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()

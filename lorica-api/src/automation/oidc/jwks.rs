@@ -45,10 +45,9 @@
 //!
 //! # What "the node's trust roots" means
 //!
-//! `lorica-api` builds `reqwest` with both `rustls-tls-webpki-roots`
-//! and `rustls-tls-native-roots`, so the default client anchors on
-//! webpki's public bundle AND on the platform store, which is where a
-//! distribution's CA bundle and `SSL_CERT_FILE` land. With webpki
+//! The default client is built on `lorica_tls::http_client::public`, so
+//! it anchors on webpki's public bundle AND on the platform store, which
+//! is where a distribution's CA bundle and `SSL_CERT_FILE` land. With webpki
 //! alone, a self-hosted GitLab under a corporate PKI answered every ID
 //! token with `jwks_unavailable` no matter how the host was set up.
 //!
@@ -137,14 +136,14 @@ pub struct HttpJwksFetcher {
 }
 
 impl HttpJwksFetcher {
-    /// Build the default client. Fails only when `reqwest` cannot
-    /// initialise its TLS backend, which is a broken build rather than
-    /// a runtime condition.
+    /// Build the default client. Fails when the platform trust store
+    /// offers certificates and none is usable, or when `reqwest` cannot
+    /// build a client on the TLS configuration it is handed.
     ///
     /// # Errors
     ///
-    /// The `reqwest` build error.
-    pub fn new() -> Result<Self, reqwest::Error> {
+    /// A one-line reason for the startup log.
+    pub fn new() -> Result<Self, String> {
         Ok(Self {
             default_client: build_client(None)?,
             pinned_clients: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -191,19 +190,37 @@ impl HttpJwksFetcher {
 /// expect to have signed that endpoint, and adding it to the public
 /// bundle would leave every commercial CA able to vouch for the issuer
 /// as well.
-fn build_client(ca_pem: Option<&str>) -> Result<reqwest::Client, reqwest::Error> {
-    let mut builder = reqwest::Client::builder()
+fn build_client(ca_pem: Option<&str>) -> Result<reqwest::Client, String> {
+    let tls: lorica_tls::ClientConfig = match ca_pem {
+        Some(pem) => lorica_tls::http_client::verified(pinned_roots(pem)?),
+        None => lorica_tls::http_client::public().map_err(|e| e.to_string())?,
+    };
+    reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
         .https_only(true)
         .redirect(reqwest::redirect::Policy::custom(same_origin_redirects))
         .connect_timeout(JWKS_CONNECT_TIMEOUT)
-        .timeout(JWKS_TOTAL_TIMEOUT);
-    if let Some(pem) = ca_pem {
-        builder = builder.tls_built_in_root_certs(false);
-        for certificate in reqwest::Certificate::from_pem_bundle(pem.as_bytes())? {
-            builder = builder.add_root_certificate(certificate);
-        }
+        .timeout(JWKS_TOTAL_TIMEOUT)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// Every certificate of `ca_pem`, and nothing else, as a root store.
+///
+/// A block that is not valid PEM, or a certificate the root store
+/// refuses, fails the whole set, as reqwest's own bundle reader did:
+/// a pin that silently dropped one of its anchors would trust less
+/// than the operator wrote, and one that kept nothing would trust
+/// nothing without saying why.
+fn pinned_roots(ca_pem: &str) -> Result<lorica_tls::RootCertStore, String> {
+    use lorica_tls::{CertificateDer, PemObject};
+
+    let mut roots = lorica_tls::RootCertStore::empty();
+    for certificate in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
+        let certificate = certificate.map_err(|e| e.to_string())?;
+        roots.add(certificate).map_err(|e| e.to_string())?;
     }
-    builder.build()
+    Ok(roots)
 }
 
 /// Follow a redirect only when it stays on the scheme, host and port

@@ -333,6 +333,7 @@ async fn canary_split_end_to_end_routes_by_client_ip_bucket() {
     let (canary_ip, default_ip) = find_bucketed_ips(route_id, 20);
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -457,6 +458,7 @@ async fn header_rule_overrides_canary_end_to_end() {
     wait_for_port(proxy_port).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -555,6 +557,7 @@ async fn canary_split_hot_reload_reshuffles_buckets_end_to_end() {
     wait_for_port(proxy_port).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()

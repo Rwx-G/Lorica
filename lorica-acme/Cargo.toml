@@ -16,7 +16,9 @@ description = "Pure ACME / Let's Encrypt protocol core for Lorica: instant-acme 
 # parallel. `rcgen` (below) generates the CSR fed into `finalize_csr`.
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
 rcgen = "0.14"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+reqwest = { workspace = true, features = ["json"] }
+# The TLS policy of the DNS provider clients (`lorica_tls::http_client`).
+lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ring = "0.17"

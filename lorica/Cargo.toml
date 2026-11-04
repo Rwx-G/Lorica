@@ -84,7 +84,7 @@ bytes = "1"
 # the import in `bot_rdns.rs` follows.
 hickory-resolver = { version = "0.26", default-features = false, features = ["system-config", "tokio"] }
 lru = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "cookies", "json"] }
+reqwest = { workspace = true, features = ["cookies", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 # PEM parsing via the official rustls pki-types crate. Replaces
 # rustls-pemfile (v1.5.0 audit HIGH-2: RUSTSEC-2025-0134, unmaintained).
@@ -191,4 +191,9 @@ otel = [
     "dep:opentelemetry-otlp",
     "dep:opentelemetry-semantic-conventions",
     "dep:tracing-opentelemetry",
+    # The OTLP/HTTP exporters are handed a blocking client built on
+    # `lorica_tls::http_client` instead of building their own. The
+    # exporter crate already turns this feature on; it is named here
+    # because `otel.rs` names the type.
+    "reqwest/blocking",
 ]

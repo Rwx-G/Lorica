@@ -23,7 +23,10 @@ use crate::events::AlertEvent;
 /// verbatim as the `Authorization` header. Returns [`NotifyError::Webhook`]
 /// on transport failures or when the response status is not 2xx.
 pub async fn send(config: &WebhookConfig, event: &AlertEvent) -> Result<(), NotifyError> {
+    let tls = lorica_tls::http_client::public()
+        .map_err(|e| NotifyError::Webhook(format!("failed to load the trust roots: {e}")))?;
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
         .timeout(std::time::Duration::from_secs(10))
         // Disable redirect following to defend against an attacker
         // who controls the configured webhook URL redirecting to an

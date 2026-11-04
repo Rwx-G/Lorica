@@ -49,7 +49,9 @@ pub use rustls_native_certs::load_native_certs;
 // only yield the section type they were called on (other PEM
 // blocks are skipped silently), so the previous "match on Item
 // variant" pattern collapses into a typed iterator per call site.
-use rustls_pki_types::pem::PemObject;
+// Lorica: re-exported so a crate reading PEM roots for
+// `http_client::verified` needs no pki-types dependency of its own.
+pub use rustls_pki_types::pem::PemObject;
 pub use rustls_pki_types::{
     CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime,
 };

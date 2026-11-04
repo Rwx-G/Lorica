@@ -391,6 +391,7 @@ async fn mirror_100_percent_duplicates_every_request_to_each_shadow() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -456,6 +457,7 @@ async fn mirror_zero_percent_disables_mirroring() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -506,6 +508,7 @@ async fn mirror_dead_shadow_does_not_affect_primary() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(2))
         .build()
@@ -550,6 +553,7 @@ async fn mirror_disabled_route_never_produces_shadow_traffic() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -594,6 +598,7 @@ async fn mirror_post_body_is_forwarded_to_shadow() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -661,6 +666,7 @@ async fn mirror_oversize_body_is_not_mirrored() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -719,6 +725,7 @@ async fn mirror_max_body_bytes_zero_is_headers_only() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()
@@ -771,6 +778,7 @@ async fn mirror_dangling_backend_id_is_inert() {
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
     let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(lorica_tls::http_client::public().expect("trust roots"))
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .build()

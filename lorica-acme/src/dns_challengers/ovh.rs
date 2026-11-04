@@ -52,12 +52,17 @@ impl OvhDnsChallenger {
     /// Construct a new OVH challenger from the four-part credential set.
     /// `endpoint` is the bare host (e.g. `"eu.api.ovh.com"`) ; the
     /// `https://{endpoint}/1.0` prefix is computed internally.
+    ///
+    /// # Errors
+    ///
+    /// The HTTP client cannot be built: the platform trust store offers
+    /// certificates and none is usable.
     pub fn new(
         endpoint: String,
         application_key: String,
         application_secret: String,
         consumer_key: String,
-    ) -> Self {
+    ) -> Result<Self, String> {
         Self::with_base_url(
             format!("https://{endpoint}/1.0"),
             application_key,
@@ -75,19 +80,22 @@ impl OvhDnsChallenger {
         application_key: String,
         application_secret: String,
         consumer_key: String,
-    ) -> Self {
+    ) -> Result<Self, String> {
+        let tls = lorica_tls::http_client::public()
+            .map_err(|e| format!("OVH API client trust roots: {e}"))?;
         let client = reqwest::Client::builder()
+            .tls_backend_preconfigured(tls)
             .timeout(OVH_HTTP_TIMEOUT)
             .build()
-            .expect("reqwest::Client builder with a static timeout is infallible");
-        Self {
+            .map_err(|e| format!("OVH API client: {e}"))?;
+        Ok(Self {
             base_url,
             application_key,
             application_secret,
             consumer_key,
             client,
             created_records: parking_lot::Mutex::new(std::collections::HashMap::new()),
-        }
+        })
     }
 
     /// Extract zone and subdomain from a domain name.

@@ -52,11 +52,12 @@ impl ProbeScheduler {
         store: Arc<TokioMutex<ConfigStore>>,
         dispatcher: Option<Arc<TokioMutex<NotifyDispatcher>>>,
     ) -> Self {
+        // Probes hit internal backends, whose certificates are not checked.
         let http_client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true) // Probes hit internal backends
+            .tls_backend_preconfigured(lorica_tls::http_client::unverified())
             .timeout(Duration::from_secs(10))
             .build()
-            .unwrap_or_default();
+            .expect("a preconfigured client with a timeout has nothing left to fail on");
 
         Self {
             store,

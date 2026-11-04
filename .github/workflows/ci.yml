@@ -59,15 +59,17 @@ jobs:
         run: cargo clippy -p lorica --all-targets --features otel -- -D warnings
 
       # lorica-mcp is a subprocess an operator's MCP client launches and
-      # reads no database. The one first-party crate it may link is
+      # reads no database. The first-party crates it may link are
       # lorica-automation-policy, pure data with serde as its only
-      # dependency; any other lorica-* crate (lorica-config and its
-      # bundled SQLite, lorica-api) or SQLite itself fails this step.
+      # dependency, and lorica-tls with its error type lorica-error, the
+      # TLS policy every outbound HTTP client is built on; any other
+      # lorica-* crate (lorica-config and its bundled SQLite, lorica-api)
+      # or SQLite itself fails this step.
       - name: lorica-mcp links neither the management crates nor SQLite
         run: |
           linked=$(cargo tree -p lorica-mcp -e normal --prefix none | awk '{print $1}' | sort -u \
             | grep -xE 'rusqlite|libsqlite3-sys|lorica-.*' \
-            | grep -vxE 'lorica-mcp|lorica-automation-policy' || true)
+            | grep -vxE 'lorica-mcp|lorica-automation-policy|lorica-tls|lorica-error' || true)
           if [ -n "$linked" ]; then
             echo "FAIL: lorica-mcp links: $linked"
             exit 1

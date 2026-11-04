@@ -380,8 +380,9 @@ mod test {
         // make sure the above starts before the lines below
         sleep(Duration::from_millis(10)).await;
 
+        // Lorica: reqwest 0.13 is handed its TLS configuration (FORK.md).
         let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
+            .tls_backend_preconfigured(lorica_tls::http_client::unverified())
             .build()
             .unwrap();
 

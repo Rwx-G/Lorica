@@ -48,18 +48,19 @@ percent-encoding = "2.1"
 # answers one message at a time by design, so a thread pool would be
 # threads asleep in a subprocess an operator's editor launched.
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt"] }
-# The client for the automation listener. `rustls-tls-native-roots`
-# sits beside the webpki bundle for the same reason it does in
-# `lorica-api`: with both on, the root store is seeded from the public
-# roots AND from the platform store, which is where a distribution's CA
-# bundle and anything `SSL_CERT_FILE` points at land. The listener's
+# The client for the automation listener, on the workspace's reqwest
+# entry.
+reqwest = { workspace = true }
+# Its TLS configuration (`lorica_tls::http_client`), the policy every
+# outbound client of the workspace is built on: the public roots are the
+# webpki bundle AND the platform store, which is where a distribution's
+# CA bundle and anything `SSL_CERT_FILE` points at land. The listener's
 # default certificate is self-signed on top of that, so
 # `LORICA_MCP_CA_BUNDLE` adds what an operator names. There is
-# deliberately no feature and no option here that skips verification.
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls-native-roots",
-    "rustls-tls-webpki-roots",
-] }
+# deliberately no option here that skips verification. A TLS utility
+# crate carrying no store, route or SQLite code; the CI step that keeps
+# management crates out of this binary admits it and its error type.
+lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
 # The error types' `Display` and `source` (maintainer decision,
 # 2026-09-30), at the version every other product crate pins. A
 # proc-macro: it generates the impls the crate used to write by hand
@@ -72,3 +73,5 @@ thiserror = "2"
 # chose.
 rcgen = "0.14"
 tempfile = "3"
+# The loopback TLS listener the CA-bundle handshake test serves from.
+tokio = { version = "1", features = ["net"] }

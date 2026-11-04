@@ -34,8 +34,14 @@ use once_cell::sync::Lazy;
 
 use super::Backend;
 
+/// Panics on first use when the platform trust store offers
+/// certificates and none is usable, as reqwest 0.12's own root loading
+/// did at `build`.
 static MIRROR_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
+        .tls_backend_preconfigured(
+            lorica_tls::http_client::public().expect("mirror client trust roots"),
+        )
         .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(16)
         .connect_timeout(Duration::from_secs(3))
