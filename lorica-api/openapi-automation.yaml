@@ -1100,14 +1100,19 @@ paths:
         needs `certificates:write` beside `routes:write`, and a
         certificate whose `domain` and every SAN are inside
         `allowed_hostnames` (403). The route's access controls move one
-        way from a token (403 otherwise): the Basic-auth credential in
-        force is neither cleared nor changed, `ip_allowlist` is added or
-        narrowed, `ip_denylist` extended, `geoip` added or tightened in
-        its mode, `bot_protection` never changed once set, the WAF
-        switched on and moved to blocking, `rate_limit`,
-        `rate_limit_rps`, `rate_limit_burst` and `auto_ban_threshold`
-        added or lowered, and `case_insensitive_paths` switched on, never
-        off; `docs/mcp.md` has the rule for each. A patch
+        way from a token (403 otherwise): `basic_auth_username`, the
+        Basic-auth credential in force, is neither cleared nor changed,
+        `ip_allowlist` is added or narrowed, `ip_denylist` extended,
+        `geoip` added or tightened in its mode, `bot_protection` never
+        changed once set (`bot_protection_disable` included),
+        `waf_enabled` switched on and `waf_mode` moved to blocking,
+        `rate_limit`, `rate_limit_rps`, `rate_limit_burst` and
+        `auto_ban_threshold` added or lowered, and
+        `case_insensitive_paths` switched on, never off; `docs/mcp.md`
+        has the rule for each. A route a token's route would take
+        requests from, `forward_auth` and `mtls` included, is weighed
+        the same way, on every spelling of the paths it would take. A
+        patch
         that adds a name, moves the prefix or switches the route on is
         also held to the route protection record of a route a token
         deleted that would serve those names, as on create.

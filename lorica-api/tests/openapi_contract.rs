@@ -1338,6 +1338,67 @@ fn every_protection_the_plane_holds_is_named_by_the_tool_that_reaches_it() {
     );
 }
 
+/// The `description` of `method` on `path` in an OpenAPI document, its
+/// folded lines joined: every line under the operation's `description:`
+/// key, up to the next key of the operation.
+fn operation_description(spec: &str, path: &str, method: &str) -> String {
+    let mut lines = spec
+        .lines()
+        .skip_while(|line| *line != format!("  {path}:"))
+        .skip_while(|line| *line != format!("    {method}:"))
+        .skip_while(|line| !line.starts_with("      description:"))
+        .skip(1);
+    let mut description = Vec::new();
+    for line in lines.by_ref() {
+        if !line.trim().is_empty() && !line.starts_with("        ") {
+            break;
+        }
+        description.push(line.trim());
+    }
+    description.join(" ")
+}
+
+#[test]
+fn the_automation_document_names_every_protection_on_the_update_that_reaches_it() {
+    // `openapi-automation.yaml` tells a REST caller which controls move
+    // one way, in prose; each field the plane weighs must be named in
+    // it, or the next control added to the table reads as free to move.
+    let spec: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/openapi-automation.yaml"
+    ));
+    for (path, protections) in [
+        (
+            "/automation/v1/routes/{id}",
+            lorica_api::automation::protections::ROUTE_PROTECTIONS
+                .iter()
+                .map(|protection| (protection.fields, protection.rule))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "/automation/v1/backends/{id}",
+            lorica_api::automation::protections::BACKEND_PROTECTIONS
+                .iter()
+                .map(|protection| (protection.fields, protection.rule))
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let description = operation_description(spec, path, "put");
+        assert!(
+            description.contains("Required scope"),
+            "the description of PUT {path} was not found: {description:?}"
+        );
+        for (fields, rule) in protections {
+            for field in fields {
+                assert!(
+                    description.contains(&format!("`{field}`")),
+                    "PUT {path} does not name `{field}` ({rule})"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn the_operator_reference_states_every_protection_rule_as_the_plane_holds_it() {
     // `docs/mcp.md` tabulates the one-way rules an operator reads before
