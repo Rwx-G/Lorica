@@ -98,16 +98,16 @@ Control plane  -->  [ AD CS authority: CES over HTTPS, KDCs on 88 ]
 | Malicious crate injection | Cargo.lock pinned, reproducible builds | Implemented |
 | Binary tampering | GPG package signing | Implemented |
 
-#### Known transitive advisories (awaiting upstream)
+#### Transitive advisories reached through the forked crates
 
-These RUSTSEC advisories are visible to `cargo audit` but hit only through forked Pingora crates (`lorica-tls`, `lorica-core`, etc.) that we deliberately do not modify to keep upstream resync cheap. They are tracked here so an incremental review is unambiguous:
+These RUSTSEC advisories were visible to `cargo audit` through forked Pingora crates (`lorica-tls`, `lorica-core`, etc.). They used to wait for upstream; since v1.10.2 Lorica fixes them in the fork itself and records each divergence in `FORK.md`. They are kept here so an incremental review is unambiguous:
 
 | ID | Crate | Surface in Lorica-native code | Path |
 |----|-------|-------------------------------|------|
-| RUSTSEC-2025-0134 | `rustls-pemfile 2.2.0` (unmaintained) | None : direct usage swapped to `rustls-pki-types::pem_slice_iter` in the `lorica` runtime crate (v1.5.0) and the forked `lorica-tls` crate (v1.5.2 audit L-16) | Transitive via `lorica-tls` → `rustls-native-certs 0.7.x` only. Closes when `lorica-tls` bumps `rustls-native-certs` to `0.8` (which itself dropped the dep) - tracked in `docs/backlog.md` deps batch (audit L-15) |
+| RUSTSEC-2025-0134 | `rustls-pemfile 2.2.0` (unmaintained) | **Cleared in v1.10.2**: `lorica-tls` moved to `rustls-native-certs 0.8`, which dropped the dep, so `rustls-pemfile` left the tree. Direct usage had already moved to `rustls-pki-types::pem_slice_iter` in the `lorica` runtime crate (v1.5.0) and `lorica-tls` (v1.5.2 audit L-16) | Was transitive via `lorica-tls` → `rustls-native-certs 0.7.x` |
 | RUSTSEC-2026-0097 | `rand 0.8.6` (was `0.8.5`; unsound with custom logger) | **Cleared in v1.5.8**: the transitive `0.8` line was bumped `0.8.5 -> 0.8.6` via `cargo update`, so `cargo audit` no longer flags it. Native call sites had already moved to `rand 0.9` in v1.5.0 | Was transitive via `captcha`, forked `lorica-runtime`/`lorica-limits` |
 
-`RUSTSEC-2026-0097` is resolved as of v1.5.8 (bumped to the fixed `rand 0.8.6`). `RUSTSEC-2025-0134` (`rustls-pemfile`) remains the one live transitive advisory: the forked crates inherit the upstream fix when Pingora migrates, and until then the mitigation is scope limitation (Lorica-native code does not call the affected API directly) plus the fact that it requires a condition we do not create (an unmaintained-but-functional parser on a known PEM format).
+`RUSTSEC-2026-0097` is resolved as of v1.5.8 (bumped to the fixed `rand 0.8.6`) and `RUSTSEC-2025-0134` as of v1.10.2. `cargo audit` is the authority on what is live; `.cargo/audit.toml` holds no ignore.
 
 ### T6: Cluster Plane (v1.7.0+)
 

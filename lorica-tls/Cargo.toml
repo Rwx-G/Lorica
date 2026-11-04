@@ -27,7 +27,12 @@ ring = "0.17.12"
 # `lorica/Cargo.toml`, `lorica-api/Cargo.toml::instant-acme`), so
 # the only remaining stack-duplication source was here.
 rustls = { version = "0.23.12", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-rustls-native-certs = "0.7.1"
+# 0.8 since v1.10.2: 0.7 was the last thing in the tree pulling
+# `rustls-pemfile` (RUSTSEC-2025-0134, unmaintained). 0.8 returns the
+# certificates it could load beside the errors it met instead of failing
+# the whole load on the first one; see
+# `load_platform_certs_incl_env_into_store`.
+rustls-native-certs = "0.8"
 # rustls-pemfile dropped in v1.5.2 (audit L-16, RUSTSEC-2025-0134
 # unmaintained). PEM parsing now goes through `rustls-pki-types`'s
 # `PemObject` trait (the rustls team's actively-maintained

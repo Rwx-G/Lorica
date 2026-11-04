@@ -208,6 +208,20 @@ after any upstream sync that touches the function it lives in.
   budget stays exercised by `test_authority_mismatch_exhausts_malformed_stream_budget`.
   Take upstream's version of these two tests only once upstream runs on
   h2 0.4.20 or later.
+- **`lorica-tls`, the platform trust store load on `rustls-native-certs`
+  0.8 (v1.10.2, RUSTSEC-2025-0134).** Site: `lorica-tls/src/lib.rs`
+  (`load_platform_certs_incl_env_into_store` and the private
+  `add_native_certs_into_store` it calls). Upstream pins
+  `rustls-native-certs` 0.7, the last thing in the tree pulling the
+  unmaintained `rustls-pemfile`. 0.8 no longer returns `Result<Vec<_>>`
+  but every certificate it could load beside every error it met.
+  Upstream failed the whole load on the first read error or the first
+  certificate the root store rejected; Lorica keeps what loaded, logs the
+  rest at WARN, and fails only when nothing loaded and something went
+  wrong, with the first read error, else the first rejection. An empty
+  store with no error is still `Ok`, as upstream. The re-exported
+  `load_native_certs` now has the 0.8 signature; nothing in the
+  workspace calls it.
 
 ## Upstream sync record
 

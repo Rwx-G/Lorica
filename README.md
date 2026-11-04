@@ -928,8 +928,7 @@ git verify-tag v1.7.4
 
 ### Backlog (tracking only, blocked on upstream)
 
-- **`rustls-pemfile` removal in the `lorica-tls` fork.** RUSTSEC-2025-0134 (unmaintained) still shows transitively through our Pingora fork. Native Lorica code migrated to `rustls-pki-types` in v1.5.0 ; the transitive dep clears once Pingora upstream migrates.
-- **`rand 0.8` removal in forked crates.** Native Lorica code bumped to `rand 0.9` in v1.5.0. RUSTSEC-2026-0097 (unsound with custom logger) was cleared in v1.5.8 by bumping the transitive `0.8` line to `0.8.6` ; removing the `0.8` line entirely still depends on the upstream forks (`lorica-runtime`, `lorica-limits`) and the `axum` / `tungstenite` majors. Same monitoring as the `rustls-pemfile` row.
+- **`rand 0.8` removal in forked crates.** Native Lorica code bumped to `rand 0.9` in v1.5.0. RUSTSEC-2026-0097 (unsound with custom logger) was cleared in v1.5.8 by bumping the transitive `0.8` line to `0.8.6` ; removing the `0.8` line entirely still depends on the upstream forks (`lorica-runtime`, `lorica-limits`) and the `axum` / `tungstenite` majors.
 
 The table above tracks feature milestones; the current release and the patch cycles (v1.5.3+) live in [CHANGELOG.md](CHANGELOG.md).
 
