@@ -54,7 +54,7 @@
 | Atomic | arc-swap | 1.x | Atomic Arc swapping | Keep |
 | Compression | flate2, brotli 3, zstd | Various | Response compression | Keep |
 | Unix | nix | 0.24 -> **0.29+** | Syscalls, signals | **Upgrade** |
-| YAML | serde_yaml | 0.9 | Server config | **Replace with serde_yml** |
+| YAML | none (was serde_yaml_ng 0.10) | - | Server config | **Removed in v1.10.2**: `ServerConf` is built in code, see `FORK.md` |
 | Socket | socket2 | Latest | Advanced socket ops | Keep |
 
 ## New Technology Additions

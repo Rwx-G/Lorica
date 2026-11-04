@@ -15,7 +15,6 @@
 #[cfg(feature = "any_tls")]
 use super::cert;
 use async_trait::async_trait;
-use clap::Parser;
 use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING, VARY};
 use http::HeaderValue;
 use log::error;
@@ -34,7 +33,7 @@ use lorica_core::modules::http::compression::ResponseCompression;
 use lorica_core::protocols::{
     http::error_resp::gen_error_response, l4::socket::SocketAddr, Digest,
 };
-use lorica_core::server::configuration::Opt;
+use lorica_core::server::configuration::ServerConf;
 use lorica_core::services::{Service, ServiceWithDependents};
 use lorica_core::upstreams::peer::HttpPeer;
 use lorica_core::utils::tls::CertKey;
@@ -766,12 +765,12 @@ impl ProxyHttp for ExampleProxyCache {
 fn test_main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let opts: Vec<String> = vec![
-        "pingora-proxy".into(),
-        "-c".into(),
-        "tests/pingora_conf.yaml".into(),
-    ];
-    let mut my_server = lorica_core::server::Server::new(Some(Opt::parse_from_args(opts))).unwrap();
+    let conf = ServerConf {
+        client_bind_to_ipv4: vec!["127.0.0.2".into()],
+        ca_file: Some("tests/keys/server.crt".into()),
+        ..ServerConf::new()
+    };
+    let mut my_server = lorica_core::server::Server::new_with_opt_and_conf(None, conf);
     my_server.bootstrap();
 
     let mut proxy_service_http =

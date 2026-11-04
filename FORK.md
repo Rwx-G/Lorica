@@ -233,6 +233,25 @@ after any upstream sync that touches the function it lives in.
   and `Debug` are plain std derives. On an upstream sync, a field added
   to either struct must be added to the hand-written impl: no derive
   picks it up.
+- **`lorica-core`, no YAML server configuration (v1.10.2,
+  RUSTSEC-2024-0449).** Sites: `lorica-core/src/server/configuration/mod.rs`
+  (`ServerConf`, `Opt`) and `lorica-core/src/server/mod.rs`
+  (`Server::new`, `Server::new_with_opt_and_conf`). Upstream reads
+  `ServerConf` from the YAML file the `-c` / `--conf` flag names
+  (`load_from_yaml`, `load_yaml_with_opt_override`, `from_yaml`,
+  `to_yaml`) and builds even its defaults by parsing the document
+  `version: 1`, through `serde_yaml_ng` and the unmaintained
+  `unsafe-libyaml`. Lorica only ever calls `Server::new(None)`, so all of
+  it is gone, with the `Opt::conf` field and the serde derives on
+  `ServerConf` that nothing else used. `ServerConf::new` constructs
+  `ServerConf::default()` with `version: 1`, the value the YAML parse
+  produced (a test pins every field), and returns `Self` instead of
+  `Option<Self>`; `new_with_opt_override` likewise. `Server::new` keeps its
+  `Result` signature. The integration-test servers of `lorica-core` and
+  `lorica-proxy` build the configuration their `tests/pingora_conf.yaml`
+  used to hold in code, and the two files are deleted. On an upstream
+  sync, take new `ServerConf` fields with their `Default` value and leave
+  the YAML path out.
 
 ## Upstream sync record
 
