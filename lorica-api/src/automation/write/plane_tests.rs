@@ -1351,6 +1351,95 @@ async fn a_route_displaces_only_the_paths_the_protected_route_serves_today() {
 }
 
 #[tokio::test]
+async fn a_route_that_ignores_case_is_weighed_on_every_spelling_it_takes_over_rest_or_mcp() {
+    // Security review H1: the wildcard's `/api` is case-sensitive, so
+    // `/API/x` on `app.write.example.com` reaches the protected
+    // catch-all today. A token's `/api` there that folds case would
+    // serve it bare.
+    let f = a_node_with_something_to_write().await;
+    let catch_all = an_operator_route(
+        &f,
+        lorica_config::route_selection::CATCH_ALL_HOSTNAME,
+        serde_json::json!({ "waf_enabled": true }),
+    )
+    .await;
+    an_operator_route(
+        &f,
+        "*.write.example.com",
+        serde_json::json!({ "path_prefix": "/api" }),
+    )
+    .await;
+    let folding = serde_json::json!({
+        "hostname": "app.write.example.com",
+        "path_prefix": "/api",
+        "case_insensitive_paths": true,
+    });
+    assert_displacement_refused(
+        &f,
+        "POST",
+        "/automation/v1/routes",
+        folding.clone(),
+        "waf_enabled",
+        &catch_all,
+        "*.write.example.com",
+    )
+    .await;
+    for tool in ["lorica_route_create", "lorica_route_create_preview"] {
+        let refused = mcp_call(
+            &f.state,
+            &f.mcp_bearer,
+            tool,
+            serde_json::json!({ "route": folding.clone() }),
+        )
+        .await;
+        assert_eq!(
+            refused["result"]["isError"],
+            serde_json::json!(true),
+            "{refused}"
+        );
+        let text = refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(text.contains("HTTP 403"), "{tool}: {text}");
+        assert!(
+            text.contains(&format!("waf_enabled: route `{catch_all}` serves")),
+            "{tool}: {text}"
+        );
+    }
+
+    // Case-sensitive, the same route takes only what the unprotected
+    // wildcard serves; folding case, it is created as strong as the
+    // catch-all.
+    let mut sensitive = folding.clone();
+    sensitive["case_insensitive_paths"] = serde_json::json!(false);
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes?dry_run=true",
+        &f.bearer,
+        Some(sensitive),
+    )
+    .await;
+    assert_eq!(
+        created.status(),
+        StatusCode::OK,
+        "the preview of the bare route"
+    );
+    let mut strong = folding;
+    strong["waf_enabled"] = serde_json::json!(true);
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(strong),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
 async fn an_update_that_moves_a_route_under_a_protected_route_is_weighed_against_it() {
     let f = a_node_with_something_to_write().await;
     let created = automation_call(

@@ -666,6 +666,79 @@ async fn an_environment_under_an_unprotected_wildcard_keeps_its_profile() {
     assert!(route.basic_auth_password_hash.is_none());
 }
 
+/// [`env_body`] on `path_prefix`.
+fn env_body_on(path_prefix: &str) -> serde_json::Value {
+    let mut body = env_body();
+    body["path_prefix"] = serde_json::json!(path_prefix);
+    body
+}
+
+#[tokio::test]
+async fn an_environment_inherits_from_a_route_that_ignores_case_on_a_spelling_it_takes() {
+    // The wildcard's `/API/x` folds case, so it serves `/api/x` today,
+    // which the environment's case-sensitive `/api` takes from it.
+    let state = crate::tests::test_state().await.0;
+    seed_wildcard(&state).await;
+    seed_protected_route(
+        &state,
+        "fold-route",
+        "*.review.example.com",
+        "/API/x",
+        fortify,
+    )
+    .await;
+    let token = writer(&state, "acme-ci").await;
+
+    let response = put(&state, &token, "pr-42", env_body_on("/api")).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let data = body_json(response).await["data"].clone();
+    assert_eq!(
+        data["protections_inherited_from"],
+        serde_json::json!(["fold-route"])
+    );
+    let route = environment_route_of(&state, &data).await;
+    assert!(route.waf_enabled && route.case_insensitive_paths);
+}
+
+#[tokio::test]
+async fn an_environment_raised_to_ignore_case_is_weighed_on_the_spellings_it_then_takes() {
+    // Inheriting `case_insensitive_paths` from the wildcard on `/API/x`,
+    // the environment's `/api` also serves `/Api`, which `*.example.com`
+    // on a case-sensitive `/api` misses and the catch-all serves today:
+    // the catch-all's denylist is inherited too.
+    let state = crate::tests::test_state().await.0;
+    seed_wildcard(&state).await;
+    seed_protected_route(
+        &state,
+        "fold-route",
+        "*.review.example.com",
+        "/API/x",
+        fortify,
+    )
+    .await;
+    seed_protected_route(&state, "api-route", "*.example.com", "/api", |_| {}).await;
+    seed_protected_route(&state, "catch-all", "_", "/", |route| {
+        route.ip_denylist = vec!["203.0.113.0/24".to_string()];
+    })
+    .await;
+    let token = writer(&state, "acme-ci").await;
+
+    let response = put(&state, &token, "pr-42", env_body_on("/api")).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let data = body_json(response).await["data"].clone();
+    assert_eq!(
+        data["protections_inherited_from"],
+        serde_json::json!(["fold-route", "catch-all"])
+    );
+    let route = environment_route_of(&state, &data).await;
+    assert!(route.case_insensitive_paths);
+    assert!(
+        route.ip_denylist.contains(&"203.0.113.0/24".to_string()),
+        "{:?}",
+        route.ip_denylist
+    );
+}
+
 #[tokio::test]
 async fn an_update_inherits_a_protection_added_underneath_it_since() {
     let state = crate::tests::test_state().await.0;
