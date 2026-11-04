@@ -3134,7 +3134,6 @@ dependencies = [
  "lru",
  "nix",
  "once_cell",
- "openssl-probe",
  "ouroboros",
  "parking_lot",
  "percent-encoding",

@@ -54,7 +54,6 @@ rand = "0.10"
 ahash = { workspace = true }
 unicase = "2"
 brotli = "9"
-openssl-probe = "0.2"
 tokio-test = "0.4"
 zstd = "0.14.3"
 httpdate = "1"
@@ -108,9 +107,6 @@ required-features = ["integration-tests"]
 [[test]]
 name = "server_phase_gracefulshutdown"
 required-features = ["integration-tests"]
-
-[lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("openssl", "s2n"))'] }
 
 [features]
 default = []

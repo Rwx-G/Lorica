@@ -45,10 +45,11 @@ The following upstream crates and features were **deleted** during the fork:
 | `pingora-openssl` | Lorica uses rustls exclusively |
 | `pingora-boringssl` | Lorica uses rustls exclusively |
 | `pingora-s2n` | Lorica uses rustls exclusively |
-| Conditional TLS compilation (`#[cfg]` blocks) | Only rustls remains |
+| The OpenSSL/BoringSSL and s2n backends of `lorica-core` (the `boringssl_openssl` and `s2n` modules under `connectors/tls`, `listeners/tls`, `protocols/tls` and `utils/tls`) | Lorica uses rustls exclusively. Until v1.10.2 their sources stayed on disk, declared by no `mod` and never compiled; they are deleted now |
+| The `openssl`, `boringssl`, `s2n` and `openssl_derived` features and the `#[cfg]` branches on them | Only rustls remains. The `rustls` feature (which implies `any_tls`) still chooses between rustls and the no-TLS stub in `protocols/tls/noop_tls` |
 | Sentry integration | Cloudflare-specific observability |
 | `cf-rustracing` | Cloudflare-specific tracing |
-| Example binaries | Replaced by Lorica's own binary |
+| Example binaries, except the `lorica-core` ones that build on rustls | Replaced by Lorica's own binary. The OpenSSL-only `client_cert` example of `lorica-core` and its keys went with the backends in v1.10.2 |
 | Windows support (787 lines) | Linux-only project |
 
 ## Added Crates (Lorica-specific)
@@ -266,9 +267,9 @@ after any upstream sync that touches the function it lives in.
   `lorica-core` (`transfer_fd` passes `AT_FDCWD` to `fchmodat` where it
   passed `None`); `sfv` 0.16 in `lorica-core` (the Accept-Encoding parser
   calls `Parser::new(..).parse::<List>()` and reads tokens through
-  `as_str`); `openssl-probe` 0.2 in `lorica-core` (its one call site, in
-  the never-compiled `connectors/tls/boringssl_openssl` module, calls
-  `try_init_openssl_env_vars`). The `x509-parser`, `strum`, `blake2`,
+  `as_str`). `openssl-probe` left `lorica-core` altogether: its one call
+  site was the never-compiled OpenSSL connector, deleted with the other
+  backends (see Removed Components). The `x509-parser`, `strum`, `blake2`,
   `brotli`, `daggy`, `float-cmp`, `hashbrown`, `i_key_sort`, `rstest` and
   `quick_cache` moves needed none; `lorica-lru` takes `hashbrown` with
   only the `default-hasher` and `inline-more` features. On an upstream
