@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use chrono::{TimeZone, Utc};
-use lorica_config::models::Role;
+use lorica_config::models::{Role, RouteProtectionRecord};
 use lorica_config::ConfigStore;
 use rusqlite::Connection;
 
@@ -104,9 +104,30 @@ fn assert_upgrades(fixture: &str) {
         9444
     );
 
+    // Migration 67: an upgraded node records a protected route a token
+    // deletes, and keeps the record across a restart.
+    assert!(store
+        .list_route_protection_records()
+        .expect("the records table reads")
+        .is_empty());
+    let record =
+        RouteProtectionRecord::of_deleted(&route, "ci (0123456789abcdef01234567)", Utc::now())
+            .expect("a record of the released route");
+    store
+        .create_route_protection_record(&record)
+        .expect("a record lands on an upgraded file");
+
     drop(store);
     let reopened = ConfigStore::open(&path, None).expect("an upgraded file reopens");
     assert_eq!(reopened.schema_version().expect("version"), head);
+    let kept = reopened
+        .list_route_protection_records()
+        .expect("the records table reads after a restart");
+    assert_eq!(kept, vec![record]);
+    assert_eq!(
+        kept[0].route().expect("the snapshot reads").hostname,
+        "app.example.com"
+    );
 }
 
 #[test]
@@ -302,4 +323,49 @@ fn an_upgrade_subscribes_explicit_channels_to_the_adcs_alerts() {
     drop(store);
     let reopened = ConfigStore::open(&path, None).expect("an upgraded file reopens");
     assert_eq!(alert_types_of(&reopened, "explicit"), ["backend_down"]);
+}
+
+/// Migration 67 on a node that ran 1.10.1: the file is rewound to
+/// version 66 with the table gone, as such a node holds it, beside the
+/// released route, which must come through untouched.
+#[test]
+fn an_upgrade_from_version_66_adds_the_records_table_and_touches_nothing_else() {
+    let dir = tempfile::tempdir().expect("test setup: tempdir");
+    let path = dir.path().join("lorica.db");
+    write_released_file(&path, LORICA_DB_V1_5_13);
+    drop(ConfigStore::open(&path, None).expect("test setup: upgraded to the head"));
+    Connection::open(&path)
+        .expect("test setup: raw open")
+        .execute_batch(
+            "DROP TABLE route_protection_records;
+             DELETE FROM schema_migrations WHERE version >= 67;",
+        )
+        .expect("test setup: a file at version 66");
+    let before = ConfigStore::open_in_memory()
+        .expect("fresh store")
+        .schema_version()
+        .expect("fresh version");
+
+    let store = ConfigStore::open(&path, None).expect("a version 66 lorica.db must open");
+    assert_eq!(store.schema_version().expect("version"), before);
+    let route = store
+        .get_route("route-1")
+        .expect("route reads")
+        .expect("route kept");
+    assert_eq!(route.hostname, "app.example.com");
+    assert!(store
+        .list_route_protection_records()
+        .expect("the table is back")
+        .is_empty());
+    let record = RouteProtectionRecord::of_deleted(&route, "admin", Utc::now()).expect("record");
+    store
+        .create_route_protection_record(&record)
+        .expect("the table takes a row");
+
+    drop(store);
+    let reopened = ConfigStore::open(&path, None).expect("reopens");
+    assert_eq!(
+        reopened.list_route_protection_records().expect("reads"),
+        vec![record]
+    );
 }

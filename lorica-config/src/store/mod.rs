@@ -49,6 +49,7 @@ mod preferences;
 mod probes;
 mod replica;
 pub use replica::{ReplicaError, ReplicaOutcome};
+mod route_protection_records;
 mod routes;
 pub use routes::HostnameClaim;
 mod row_helpers;
@@ -192,6 +193,7 @@ const MIGRATIONS: &[Migration] = &[
     (64, migrate_adcs_authority),
     (65, migrate_subscribe_adcs_alerts),
     (66, migrate_adcs_allowed_templates),
+    (67, migrate_route_protection_records),
 ];
 
 /// Which telemetry fan-in cursor a follower is reading or advancing
@@ -1339,6 +1341,36 @@ fn migrate_adcs_allowed_templates(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Backlog #93: what a route deleted through the automation plane
+/// served, kept after the route is gone.
+///
+/// No foreign key: the row exists because its route does not. The
+/// identity columns (hostname, aliases, path prefix) are the deleted
+/// route's own, copied out of `route_json` so the dashboard lists a
+/// record, and an operator clears it, without reading the snapshot. No
+/// index: every read is the whole table, which holds one row per
+/// protected route a token deleted.
+///
+/// A new table and nothing else, so every database reaches it the same
+/// way whatever it was born as: `CREATE TABLE IF NOT EXISTS` touches no
+/// existing row and no existing column. It never replicates and the
+/// configuration export does not carry it (`store/route_protection_records.rs`
+/// says why).
+fn migrate_route_protection_records(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS route_protection_records (
+            id TEXT PRIMARY KEY,
+            route_id TEXT NOT NULL,
+            hostname TEXT NOT NULL,
+            hostname_aliases_json TEXT NOT NULL,
+            path_prefix TEXT NOT NULL,
+            route_json TEXT NOT NULL,
+            deleted_by TEXT NOT NULL,
+            deleted_at TEXT NOT NULL
+        );",
+    )
+}
+
 fn migrate_acme_challenge_expiry(conn: &Connection) -> rusqlite::Result<()> {
     // Story 9.5 AC #6 / D11: `acme_challenges` carried no timestamp, no
     // index and no purge, so an order that died between the write and
@@ -1997,6 +2029,11 @@ impl ConfigStore {
     ///   account credential, absent from the export (Epic 13 PRD
     ///   D14). An import keeps the node's authority, and a certificate
     ///   naming another one is imported as manual.
+    /// - `route_protection_records` : what routes deleted through the
+    ///   automation plane served (backlog #93), a bound on this node's
+    ///   automation tokens rather than configuration, absent from the
+    ///   export like the tokens it bounds. An import keeps them; an
+    ///   operator clears one in the dashboard.
     ///
     /// `dns_providers` IS in the delete set because the TOML export
     /// carries DNS-provider credentials (in scrubbed form per audit
