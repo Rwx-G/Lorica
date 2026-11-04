@@ -461,8 +461,10 @@ fn an_upgrade_canonicalises_route_and_record_names_and_keeps_a_colliding_twin_as
         vec!["www.gone.example.com".to_string()]
     );
 
-    // The route that keeps the name is still edited freely; the twin is
-    // edited only once it is renamed off the name.
+    // The route that keeps the name is still edited freely. The twin is
+    // switched off and edited under its own spelling, short of a rename;
+    // switched on, or left on, while it still answers to the name, it is
+    // refused, naming the route that holds it.
     let mut canonical = store
         .get_route("r-canonical")
         .expect("reads")
@@ -473,14 +475,46 @@ fn an_upgrade_canonicalises_route_and_record_names_and_keeps_a_colliding_twin_as
         .expect("the route keeping the name updates");
     let mut twin = store.get_route("r-twin").expect("reads").expect("kept");
     twin.connect_timeout_s = 9;
-    let err = store
+    let refused_on = |twin: &lorica_config::models::Route| {
+        let err = store
+            .update_route(twin)
+            .expect_err("the twin's name is held by r-canonical")
+            .to_string();
+        assert!(
+            err.contains("already used") && err.contains("r-canonical"),
+            "{err}"
+        );
+    };
+    refused_on(&twin);
+
+    twin.enabled = false;
+    store.update_route(&twin).expect("the twin is switched off");
+    twin.read_timeout_s = 7;
+    store
         .update_route(&twin)
-        .expect_err("the twin's name is held by r-canonical")
-        .to_string();
-    assert!(
-        err.contains("already used") && err.contains("r-canonical"),
-        "{err}"
+        .expect("the switched-off twin is edited short of its names");
+    let stored = store.get_route("r-twin").expect("reads").expect("kept");
+    assert!(!stored.enabled);
+    assert_eq!(
+        (stored.hostname.as_str(), stored.read_timeout_s),
+        ("App.Example.com", 7)
     );
+
+    twin.enabled = true;
+    refused_on(&twin);
+    twin.enabled = false;
+    twin.hostname_aliases = vec!["other.example.com".into()];
+    refused_on(&twin);
+
     twin.hostname = "renamed.example.com".into();
+    twin.enabled = true;
     store.update_route(&twin).expect("a renamed twin updates");
+    assert_eq!(
+        names_of(&store, "r-twin").0,
+        "renamed.example.com",
+        "and is canonical from then on"
+    );
+    store
+        .delete_route("r-b2")
+        .expect("a twin is deleted as any route");
 }

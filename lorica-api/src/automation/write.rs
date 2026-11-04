@@ -361,11 +361,11 @@ fn refuse_withheld(body: &impl WithheldFields) -> Result<(), ApiError> {
 
 /// A name `after` answers to that another route already holds, refused
 /// before the write on the store's own rule
-/// ([`ConfigStore::hostname_claimed_elsewhere`]) with the store's 422,
-/// worded without the other route's id: the store's message names it,
-/// and a token may not be allowed to see that route.
+/// ([`ConfigStore::route_as_written`]) with the store's 422, worded
+/// without the other route's id: the store's message names it, and a
+/// token may not be allowed to see that route.
 fn ensure_names_unclaimed(store: &ConfigStore, after: &Route) -> Result<(), ApiError> {
-    match store.hostname_claimed_elsewhere(&after.id, &after.hostname, &after.hostname_aliases)? {
+    match store.route_as_written(after)?.1 {
         Some(claim) => Err(ApiError::Unprocessable(format!(
             "hostname '{}' already used by another route",
             claim.hostname
