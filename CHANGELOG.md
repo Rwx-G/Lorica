@@ -11,6 +11,20 @@ Author: Rwx-G
 
 ### Added
 
+### Changed
+
+### Fixed
+
+### Removed
+
+### Security
+
+## [1.10.3] - 2026-11-04
+
+A security release: mTLS routes now check client certificates against their own CA, and route and path-rule selection reads a path the way backends do. Schema migration 69: upgrade followers before the control plane.
+
+### Added
+
 - **`case_insensitive_paths` on a route**, for a backend that treats request paths case-insensitively (IIS, a case-insensitive file system). With it on, the route's path prefix, its path rules and its prefix stripping match regardless of letter case, so `/ADMIN/x` is held to the controls of a protected `/admin` route instead of reaching that backend through a sibling route. Off by default; behaviour is unchanged without it. On the automation plane it is a control a token may turn on but never off. Route form, Security tab. Schema migration 69: upgrade followers first; a 1.10.2 follower is refused by a 1.10.3 control plane at the schema handshake.
 - **The mTLS bundle check warns about a root certificate.** Validate PEM and a route save report a bundle that holds a self-signed root next to other certificates, or a CA next to a certificate it issued: every CA that root or CA signed is then trusted by the route. Such bundles are still accepted; the route should hold only the issuing CAs it trusts.
 
@@ -22,8 +36,6 @@ Author: Rwx-G
 ### Fixed
 
 - **The WAF flood and auto-ban counters shared between workers no longer drop increments when several workers count a new key at once.** The first increments of a key raced: the worker that claimed the counter's slot overwrote what another had just added, and a worker that lost the claim took a second slot for the same key, which reads never reach. Each contended first increment could be lost, so a burst spread across workers took slightly longer to reach its flood or auto-ban threshold. Since 1.3.0.
-
-### Removed
 
 ### Security
 
