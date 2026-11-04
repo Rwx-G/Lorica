@@ -183,9 +183,12 @@ name the hostnames and the address range the change touches, not the parent
 zone and not the whole private range. Inside the grant, the node lets a token
 strengthen a route's access control and an upstream's TLS but never weaken
 either (the rule and its fields are in `docs/mcp.md`, "Protections move one
-way"); it does not stop a token deleting a route inside the grant and creating
-it again without its protections, so a hostname whose protections must never
-be removed by a model belongs in no config-tier grant. The grants also bound what a config-tier
+way"). A token that deletes a protected route leaves a route protection
+record, and a route created again on its names is held to it, so the delete
+is no way around the rule; review the records under Settings, Route
+Protection Records, and clear one only when the protections it holds are
+truly no longer wanted, since clearing it lets a token serve those names
+bare. The grants also bound what a config-tier
 session reads: its route, backend and certificate listings answer only the
 rows inside them, so text another principal wrote elsewhere never reaches the
 model. The read and admin tiers carry no grant at all, and the mint refuses

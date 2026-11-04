@@ -537,6 +537,16 @@ writes nothing; an operator reconciles the routes in the dashboard. A
 protection the operator adds to the wildcard after the environment's
 last `PUT` binds the environment from its next `PUT`, not before.
 
+A protected route an automation token deleted is inherited from the same
+way. The delete leaves a route protection record of it (`docs/mcp.md`,
+"A deleted route is still weighed"), and an environment whose hostname
+and path the deleted route would serve takes the recorded controls over
+as it would the route's, the Basic-auth credential copied server side;
+the answer names the record by id in
+`protections_inherited_from_records`. Deleting an environment, or its
+route, records nothing: its controls are the profile's, rewritten on
+every `PUT`.
+
 **The hostname rules.** Beyond the shape rules in the table, the
 hostname must not be held by another route: any route's `hostname` or
 `hostname_aliases` entry equal to it, case-insensitively, other than
@@ -590,7 +600,9 @@ either way, and a body of `name`, `url`
 (`https://<hostname><path_prefix>`), `route_id`, `backend_ids[]` in
 request order, `certificate_id`, `certificate_not_after`, `expires_at`,
 `protections_inherited_from` (the routes whose protections the route
-inherited, above; empty when none) and `applied_generation`.
+inherited, above; empty when none), `protections_inherited_from_records`
+(the route protection records it inherited from, above; empty when none)
+and `applied_generation`.
 
 `applied_generation` is a FLOOR, not a target. It is the fleet
 configuration generation the control plane had PUBLISHED when the

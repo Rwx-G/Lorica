@@ -542,11 +542,53 @@ the AI-crawler policy, a content policy toward clients that declare
 themselves, which a hostile client does not; and the routing fields,
 where a request goes, bounded by the hostname and CIDR grants.
 
-The rule bounds a write in place, not a sequence of them: a token that
-may delete a route inside its grant may create it again without its
-protections, in two audited rows, `route.delete` and `route.create`.
-A hostname whose protections no model may remove belongs in no
-config-tier grant.
+**A deleted route is still weighed.** The rule would bound a write in
+place and not a sequence of them if a token could delete a protected
+route and create it again bare, so a delete leaves the route behind as
+a record (backlog #93, the maintainer's decision of 2026-11-04). When a
+token deletes a route, over REST or through `lorica_route_delete`, and
+the route carries at least one control of the table in force, the
+delete writes a route protection record in the same transaction: the
+deleted row as the store held it, with the names it answered to, its
+path prefix, the token that deleted it and when. "In force" is the
+predicates' own answer: a control is in force when the route the
+management create stores for a body naming none of the controls would
+be weaker on it, so no second list of controls exists anywhere.
+
+Every later write of this plane that would make a route serve a name
+and path the deleted route would serve today, found through the same
+route selection (a create, an update that adds a name, moves the prefix
+or switches the route on, and the environment resource), is held to
+the record exactly as it would be held to that route if it were still
+stored: a token's route is refused with a `403` naming the control and
+the record's id and echoing no value; the environment's route takes the
+recorded controls over, the Basic-auth credential copied server side,
+and names the record in `protections_inherited_from_records`. A route
+that matches or strengthens the record lands, and the record is kept
+rather than consumed: a record of a wildcard or of a route with aliases
+is matched by a route serving one of its names, and consuming it would
+let the next write take the others weaker. A token deleting the route
+of the same names and path again replaces a record it is at least as
+strong as, so a loop of deletes and creates leaves one row. A recorded
+Basic-auth credential means no token route can serve the name, since a
+token never sends the password; the environment resource can, and an
+operator can.
+
+What makes no record: a delete through the dashboard, which the rule
+never bound, and the route of an environment, whose controls the
+environment resource rewrites from its profile on every `PUT` and the
+plane therefore never held in place.
+
+The operator ends a record. The dashboard lists them under Settings,
+Route Protection Records (`GET /api/v1/automation/route-protection-records`,
+Operator), with a confirmed clear
+(`DELETE /api/v1/automation/route-protection-records/{id}`), and a route
+create or update through the dashboard that serves one of a record's
+names clears that record, since the operator has just decided that
+name's protections. Each creation, replacement and clearing is an audit
+row under `route_protection_record.`. Records never replicate and the
+configuration export does not carry them, like the tokens they bound:
+the automation listener runs only where the records are.
 
 **A backend create is not idempotent.** A route create is refused on
 a hostname already held, and every other write names its resource by
