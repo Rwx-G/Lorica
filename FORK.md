@@ -363,6 +363,24 @@ lives in.
   same way. On an upstream sync, a new test client goes through the same
   helpers: the workspace `clippy.toml` refuses `reqwest::Client::builder`
   and its siblings everywhere else, the forks included.
+- **`lorica-core`, the client certificate chain in the TLS digest
+  (v1.10.3).** Sites: `lorica-core/src/protocols/tls/digest.rs` (the
+  `SslDigest::peer_cert_chain` and `peer_chain_verdicts` fields and the
+  `PeerChainVerdicts` type, which upstream does not have) and
+  `lorica-core/src/protocols/tls/rustls/stream.rs`
+  (`SslDigest::from_stream` fills the chain, on an accepted connection
+  only). Upstream's digest keeps the organization, serial number and a
+  hash of the peer's end-entity certificate and drops the rest, which is
+  enough when one listener trusts one set of roots. Lorica installs on its
+  HTTPS listener the union of every mTLS route's CA bundle, so a
+  certificate the handshake accepted may come from another route's CA:
+  the proxy verifies the chain again against the route's own bundle
+  (`lorica::mtls::RouteClientVerifier`), and needs the chain to do it.
+  `PeerChainVerdicts` keeps those verdicts per connection, so a keep-alive
+  or HTTP/2 connection verifies once per route rather than once per
+  request. `SslDigest::new` keeps upstream's signature and starts both
+  empty. On an upstream sync, keep the two fields and the fill in
+  `from_stream`; a new field upstream adds goes beside them.
 
 ## Upstream sync record
 

@@ -390,7 +390,15 @@ impl SslDigest {
             .map(|(organization, serial)| (organization, Some(serial)))
             .unwrap_or_default();
 
-        SslDigest::new(cipher, version, organization, serial_number, cert_digest)
+        let mut digest = SslDigest::new(cipher, version, organization, serial_number, cert_digest);
+        // Lorica: keep the client's chain on an accepted connection, so the
+        // application can verify it against per-route roots (FORK.md).
+        if matches!(stream, RusTlsStream::Server(_)) {
+            digest.peer_cert_chain = peer_certificates
+                .map(|certs| certs.iter().map(|cert| cert.as_ref().to_vec()).collect())
+                .unwrap_or_default();
+        }
+        digest
     }
 }
 
