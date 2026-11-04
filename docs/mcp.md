@@ -636,6 +636,26 @@ which one stored route on the name already does by holding it. An
 operator who does not want one principal's choices to bind another's
 on a name grants the name to one principal only.
 
+**A name has one spelling.** A host name is case-insensitive, and a
+name with its trailing root dot is the same host, so every comparison
+the rules above make, the hostname grant, the store's uniqueness, the
+displacement guard, the records and the proxy's own lookup of a
+request's `Host`, reads a name in one form: ASCII letters lowercased
+and one trailing dot dropped (`route_selection::canonical_hostname` in
+`lorica-config`). A route write stores its `hostname` and
+`hostname_aliases` in that form, so `App.Example.com.` is answered back
+as `app.example.com`, and a write naming a spelling of a name another
+route holds is refused as that name, a `422` like any other. Before
+1.10.2 a name was stored as sent and compared byte for byte, so a
+token could create `App.Example.com` beside a protected
+`app.example.com`, or after deleting it, with no guard seeing the
+name, and a client choosing that spelling reached the bare route.
+Names stored before are rewritten on the upgrade; where two routes held
+two spellings of one name, the name stays with the route that already
+spelled it canonically, the other keeps its spelling, serves nothing on
+that name, and is named in a warning at startup and on every reload
+until an operator renames or deletes it.
+
 **A backend create is not idempotent.** A route create is refused on
 a hostname already held, and every other write names its resource by
 id, but a backend create that timed out on the client's side may have
