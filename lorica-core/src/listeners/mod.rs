@@ -97,6 +97,9 @@ pub trait TlsAccept {
     /// implement this function should provide tls certificate and key to the
     /// [TlsRef] via `ssl_use_certificate` and `ssl_use_private_key`.
     /// Note. This is only supported for openssl and boringssl
+    //
+    // Lorica: neither backend is in the fork, so nothing calls this;
+    // certificates come from `lorica_tls::cert_resolver`.
     async fn certificate_callback(&self, _ssl: &mut TlsRef) -> () {
         // does nothing by default
     }

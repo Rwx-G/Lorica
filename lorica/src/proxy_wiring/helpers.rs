@@ -253,9 +253,9 @@ pub fn evaluate_mtls(enforcer: &MtlsEnforcer, client_organization: Option<&str>)
 /// downstream TLS session, or None when the session is plaintext / the
 /// client did not present a cert / the cert has no O= field.
 ///
-/// We go through `downstream_session.digest().ssl_digest` because that
-/// is the only shared abstraction over rustls / boringssl; rustls
-/// populates `organization` from the first cert in the peer chain.
+/// We go through `downstream_session.digest().ssl_digest`, the TLS
+/// digest the listener records; rustls populates `organization` from
+/// the first cert in the peer chain.
 pub(crate) fn downstream_ssl_digest(session: &Session) -> Option<String> {
     let digest = session.as_downstream().digest()?;
     let ssl = digest.ssl_digest.as_ref()?;

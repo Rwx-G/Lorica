@@ -20,7 +20,7 @@
 - Pingora's rustls backend is marked "experimental" - needs hardening
 - Process isolation (fork+exec) is Unix-only - limits Windows support
 - Sozu code is AGPL-3.0 - only concepts can be reimplemented, zero code copying
-- serde_yaml 0.9 and nix 0.24 are deprecated - must be updated during fork
+- serde_yaml 0.9 and nix 0.24 are deprecated - must be updated during fork (since done: `nix` moved on, and v1.10.2 removed the YAML server configuration)
 - Pingora has no config format, no API, no dashboard - entire product layer is new
 - Single binary constraint means dashboard frontend must be embeddable (< 5MB assets)
 
