@@ -3205,7 +3205,7 @@ dependencies = [
  "lru",
  "nix",
  "once_cell",
- "openssl-probe 0.1.6",
+ "openssl-probe",
  "ouroboros",
  "parking_lot",
  "percent-encoding",
@@ -3902,12 +3902,6 @@ name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
-
-[[package]]
-name = "openssl-probe"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
 
 [[package]]
 name = "openssl-probe"
@@ -5027,7 +5021,7 @@ version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a073f5dc7469f984c52ad2752b63b0807745133b6de880b7b64c1ac4c48aec4"
 dependencies = [
- "openssl-probe 0.2.2",
+ "openssl-probe",
  "rustls-pki-types",
  "schannel",
  "security-framework",

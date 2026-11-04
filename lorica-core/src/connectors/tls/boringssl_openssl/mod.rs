@@ -85,7 +85,9 @@ fn init_ssl_cert_env_vars() {
     // it is universal across openssl and boringssl
     // safety: although impossible to prove safe we assume it's safe since the call is
     // wrapped in a call_once and it's unlikely other threads are reading these vars
-    INIT_CA_ENV.call_once(|| unsafe { openssl_probe::init_openssl_env_vars() });
+    INIT_CA_ENV.call_once(|| unsafe {
+        openssl_probe::try_init_openssl_env_vars();
+    });
 }
 
 #[derive(Clone)]

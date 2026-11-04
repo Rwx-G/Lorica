@@ -54,7 +54,7 @@ rand = "0.10"
 ahash = { workspace = true }
 unicase = "2"
 brotli = "9"
-openssl-probe = "0.1.6"
+openssl-probe = "0.2"
 tokio-test = "0.4"
 zstd = "0.14.3"
 httpdate = "1"

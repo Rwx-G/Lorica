@@ -274,7 +274,10 @@ after any upstream sync that touches the function it lives in.
   `float-cmp` 0.9 to 0.10 in `lorica-limits` (tests), no code change.
   `hashbrown` 0.12 to 0.17 in `lorica-lru`, on the `default-hasher` and
   `inline-more` features only, no code change. `i_key_sort` 0.10 to
-  0.12 in `lorica-ketama` (the optional `v2` feature), no code change. On an upstream sync, keep Lorica's version and port the new
+  0.12 in `lorica-ketama` (the optional `v2` feature), no code change.
+  `openssl-probe` 0.1 to 0.2 in `lorica-core`; its one call site sits in
+  the never-compiled `connectors/tls/boringssl_openssl` module and calls
+  `try_init_openssl_env_vars`. On an upstream sync, keep Lorica's version and port the new
   code to its API rather than taking upstream's manifest line.
 
 ## Upstream sync record
