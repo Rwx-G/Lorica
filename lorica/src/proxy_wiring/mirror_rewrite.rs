@@ -34,20 +34,32 @@ use once_cell::sync::Lazy;
 
 use super::Backend;
 
-/// Panics on first use when the platform trust store offers
-/// certificates and none is usable, as reqwest 0.12's own root loading
-/// did at `build`.
-static MIRROR_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
-        .tls_backend_preconfigured(
-            lorica_tls::http_client::public().expect("mirror client trust roots"),
-        )
-        .redirect(reqwest::redirect::Policy::none())
-        .pool_max_idle_per_host(16)
-        .connect_timeout(Duration::from_secs(3))
-        .build()
-        .expect("build mirror reqwest client")
+/// Built once per process, at startup ([`prepare_client`]) rather than
+/// on the first mirrored request. A platform trust store that does not
+/// load is logged once there, and every mirror is then dropped (counted
+/// as `errored`) instead of panicking on the request path.
+static MIRROR_CLIENT: Lazy<Result<reqwest::Client, String>> = Lazy::new(|| {
+    let client: Result<reqwest::Client, String> = lorica_tls::http_client::public()
+        .map_err(|e| format!("mirror client trust roots: {e}"))
+        .and_then(|tls| {
+            lorica_tls::http_client::client_builder(tls)
+                .redirect(reqwest::redirect::Policy::none())
+                .pool_max_idle_per_host(16)
+                .connect_timeout(Duration::from_secs(3))
+                .build()
+                .map_err(|e| format!("mirror client: {e}"))
+        });
+    if let Err(reason) = &client {
+        tracing::error!(%reason, "request mirroring unavailable: every mirror is dropped");
+    }
+    client
 });
+
+/// Build the mirror client now, so a trust store that does not load is
+/// reported when the process starts.
+pub(crate) fn prepare_client() {
+    Lazy::force(&MIRROR_CLIENT);
+}
 
 /// Coarse global safety net on in-flight mirror sub-requests across
 /// ALL routes (Story 8.9 AC #7, `mirror_max_concurrent_global`,
@@ -470,7 +482,12 @@ pub(crate) fn spawn_mirrors(
                     return;
                 }
             };
-            let mut builder = MIRROR_CLIENT.request(method_r, &url).timeout(timeout);
+            let Ok(client) = &*MIRROR_CLIENT else {
+                // Logged once, when the client failed to build.
+                lorica_api::metrics::inc_mirror_outcome(&route_id_c, "errored");
+                return;
+            };
+            let mut builder = client.request(method_r, &url).timeout(timeout);
             for (name, value) in headers_c {
                 builder = builder.header(name, value);
             }

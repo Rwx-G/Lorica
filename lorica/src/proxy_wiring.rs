@@ -335,6 +335,11 @@ impl LoricaProxy {
         active_connections: Arc<AtomicU64>,
         sla_collector: Arc<SlaCollector>,
     ) -> Self {
+        // The request path's outbound clients are built with the proxy,
+        // so a trust store that does not load is logged when the process
+        // starts rather than on the first request that needs one.
+        forward_auth::prepare_client();
+        mirror_rewrite::prepare_client();
         Self {
             config,
             log_buffer,

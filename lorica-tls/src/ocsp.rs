@@ -32,18 +32,24 @@ const OCSP_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// attacker-issued chain controls, so a 3xx must not steer the fetch
 /// into an internal service (`http://169.254.169.254/`). Audit L-7.
 ///
-/// Panics on first use when the platform trust store offers
-/// certificates and none is usable, as reqwest 0.12's own root loading
-/// did at `build`.
-static OCSP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .tls_backend_preconfigured(
-            crate::http_client::public().expect("OCSP client trust roots (platform store)"),
-        )
-        .timeout(OCSP_FETCH_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("build OCSP reqwest client (static config is infallible)")
+/// A platform trust store that does not load is logged once, when the
+/// first fetch builds the client, and every fetch then fails with that
+/// reason (stapling is skipped, as for any other fetch failure) instead
+/// of panicking in the refresh loop.
+static OCSP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
+    let client: Result<reqwest::Client, String> = crate::http_client::public()
+        .map_err(|e| format!("OCSP client trust roots: {e}"))
+        .and_then(|tls| {
+            crate::http_client::client_builder(tls)
+                .timeout(OCSP_FETCH_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| format!("OCSP client: {e}"))
+        });
+    if let Err(reason) = &client {
+        warn!("OCSP stapling unavailable: {reason}");
+    }
+    client
 });
 
 /// Extract the OCSP responder URL from a PEM-encoded certificate chain.
@@ -120,6 +126,8 @@ pub async fn fetch_ocsp_response(cert_pem: &str, responder_url: &str) -> Result<
     // redirect policy baked into the static builder - see the client
     // doc comment for the AIA-controlled-URL / audit L-7 rationale).
     let resp = OCSP_CLIENT
+        .as_ref()
+        .map_err(Clone::clone)?
         .post(responder_url)
         .header("Content-Type", "application/ocsp-request")
         .body(ocsp_request)
