@@ -12,17 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The TLS configuration every outbound HTTP client of the workspace is
-//! built on.
+//! The TLS configuration every outbound `reqwest` client of the
+//! workspace is built on.
 //!
-//! Every `reqwest` client is handed a finished rustls [`ClientConfig`]
-//! from here (`ClientBuilder::tls_backend_preconfigured`) instead of
-//! letting reqwest assemble one. Left to itself, reqwest 0.13 verifies
-//! through `rustls-platform-verifier` on the process-wide default crypto
-//! provider, and panics in `Client::build` when no default is installed.
-//! A preconfigured client does neither: the provider is `ring`, named
-//! here rather than read from the process, the roots are the ones listed
-//! below, and the protocol versions are rustls' safe defaults.
+//! Every `reqwest` client starts from [`client_builder`] (or
+//! [`blocking_client_builder`]), which hands reqwest a finished rustls
+//! [`ClientConfig`] from here instead of letting it assemble one. Left to
+//! itself, reqwest 0.13 verifies through `rustls-platform-verifier` on the
+//! process-wide default crypto provider, and panics in `Client::build`
+//! when no default is installed. A preconfigured client does neither: the
+//! provider is `ring`, named here rather than read from the process, the
+//! roots are the ones listed below, and the protocol versions are rustls'
+//! safe defaults. The workspace `clippy.toml` refuses reqwest's own
+//! constructors and `rustls::ClientConfig::builder` everywhere but here.
 //!
 //! [`public_roots`] is the trust every client had under reqwest 0.12 with
 //! the features the shipped binaries unified onto it: the webpki bundle
@@ -43,14 +45,14 @@
 //! # Ok::<(), Box<lorica_error::Error>>(())
 //! ```
 
-use std::fmt::Write as _;
 use std::sync::Arc;
 
-use lorica_error::{Error, ErrorType, Result};
+use lorica_error::{Error, ErrorType, OrErr, Result};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::WantsClientCert;
 use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, ConfigBuilder, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 
 const HTTP_1_1: &[u8] = b"http/1.1";
@@ -62,33 +64,105 @@ pub fn crypto_provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// A `reqwest` client builder that verifies with `tls`: where every
+/// asynchronous client of the workspace starts.
+///
+/// reqwest never rewrites a preconfigured configuration, so what the
+/// builder is given here (roots, provider, ALPN) is what the client
+/// speaks, whatever reqwest features the build unified.
+pub fn client_builder(tls: ClientConfig) -> reqwest::ClientBuilder {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the one constructor the workspace ban leaves open: it carries the TLS policy"
+    )]
+    let builder: reqwest::ClientBuilder = reqwest::Client::builder();
+    builder.tls_backend_preconfigured(tls)
+}
+
+/// [`client_builder`] for a blocking client, behind this crate's
+/// `blocking` feature.
+#[cfg(feature = "blocking")]
+pub fn blocking_client_builder(tls: ClientConfig) -> reqwest::blocking::ClientBuilder {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the one constructor the workspace ban leaves open: it carries the TLS policy"
+    )]
+    let builder: reqwest::blocking::ClientBuilder = reqwest::blocking::Client::builder();
+    builder.tls_backend_preconfigured(tls)
+}
+
 /// The webpki bundle and the platform store.
 ///
 /// Reads the platform store from disk on every call, as reqwest did on
-/// every `Client::build`. A platform store whose certificates the root
-/// store rejects one and all is an error; an empty or unreadable one
-/// leaves the webpki bundle alone, which is what reqwest 0.12 did.
+/// every `Client::build`; a long-lived client is built once and kept. The
+/// platform store is read by the loader backend TLS uses
+/// ([`crate::load_platform_certs_incl_env_into_store`]), so both fail
+/// on the same input and log a partial load the same way. A platform
+/// store that is empty with nothing wrong leaves the webpki bundle alone.
 ///
 /// # Errors
 ///
-/// [`ErrorType::InvalidCert`] when the platform store offered
-/// certificates and not one of them was usable.
+/// [`ErrorType::InvalidCert`] when the platform store yielded no
+/// certificate and a read or a certificate failed: a store an operator
+/// pointed `SSL_CERT_FILE` at and that does not load is reported rather
+/// than quietly replaced by the webpki bundle alone.
 pub fn public_roots() -> Result<RootCertStore> {
+    public_roots_from(rustls_native_certs::load_native_certs())
+}
+
+fn public_roots_from(native: rustls_native_certs::CertificateResult) -> Result<RootCertStore> {
     let mut roots: RootCertStore = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let native: rustls_native_certs::CertificateResult = rustls_native_certs::load_native_certs();
-    let (valid, invalid): (usize, usize) = roots.add_parsable_certificates(native.certs);
-    if valid == 0 && invalid > 0 {
-        let mut reasons: String = String::new();
-        for error in &native.errors {
-            let _ = write!(reasons, "; {error}");
-        }
+    crate::add_native_certs_into_store(&mut roots, native)?;
+    Ok(roots)
+}
+
+/// Every certificate of the PEM bundle `pem`, as a root store of its own.
+///
+/// Sections other than certificates (a key, a CRL, text around the
+/// blocks) are skipped. A certificate block that does not decode, or that
+/// the root store refuses, fails the whole bundle, and so does a bundle
+/// with no certificate in it: a trust anchor dropped silently would trust
+/// less than the operator wrote, and a store with none would refuse every
+/// server without saying why. The error never quotes the bundle, which an
+/// operator who named the wrong file would otherwise see a line of.
+///
+/// # Errors
+///
+/// [`ErrorType::InvalidCert`] in each of those cases.
+pub fn pem_roots(pem: &[u8]) -> Result<RootCertStore> {
+    let mut roots: RootCertStore = RootCertStore::empty();
+    for certificate in CertificateDer::pem_slice_iter(pem) {
+        let Ok(certificate) = certificate else {
+            return Error::e_explain(
+                ErrorType::InvalidCert,
+                "a certificate of the PEM bundle does not decode",
+            );
+        };
+        roots.add(certificate).or_err(
+            ErrorType::InvalidCert,
+            "the root store refuses a certificate of the PEM bundle",
+        )?;
+    }
+    if roots.is_empty() {
         return Error::e_explain(
             ErrorType::InvalidCert,
-            format!("no usable certificate in the platform trust store{reasons}"),
+            "the PEM bundle holds no certificate",
         );
     }
     Ok(roots)
+}
+
+/// Add every certificate of the PEM bundle `pem` to `roots`, on the
+/// terms of [`pem_roots`]. `roots` is left as it was when the bundle is
+/// refused.
+///
+/// # Errors
+///
+/// Those of [`pem_roots`].
+pub fn add_pem_roots(roots: &mut RootCertStore, pem: &[u8]) -> Result<()> {
+    roots.extend(pem_roots(pem)?.roots);
+    Ok(())
 }
 
 /// Verify against [`public_roots`]: what every client trusts unless its
@@ -137,6 +211,15 @@ pub fn unverified() -> ClientConfig {
 pub fn offering_http2(mut config: ClientConfig) -> ClientConfig {
     config.alpn_protocols = vec![H2.to_vec(), HTTP_1_1.to_vec()];
     config
+}
+
+/// The provider and protocol versions of the policy, before any trust
+/// is chosen: for a TLS client that is not an HTTP client and so needs
+/// neither this module's ALPN nor its lack of a client certificate (the
+/// syslog sink's mutual TLS). An HTTP client takes one of the finished
+/// configurations above instead.
+pub fn config_builder() -> ConfigBuilder<ClientConfig, rustls::WantsVerifier> {
+    builder()
 }
 
 fn builder() -> ConfigBuilder<ClientConfig, rustls::WantsVerifier> {
@@ -205,6 +288,7 @@ mod tests {
 
     struct Server {
         certificate: CertificateDer<'static>,
+        pem: String,
         config: Arc<ServerConfig>,
     }
 
@@ -217,11 +301,8 @@ mod tests {
         let mut params: CertificateParams =
             CertificateParams::new(vec![SERVER_NAME.into()]).expect("test setup: params");
         params.distinguished_name.push(DnType::CommonName, subject);
-        let certificate: CertificateDer<'static> = params
-            .self_signed(&key)
-            .expect("test setup: certificate")
-            .der()
-            .clone();
+        let signed: rcgen::Certificate = params.self_signed(&key).expect("test setup: certificate");
+        let certificate: CertificateDer<'static> = signed.der().clone();
         let mut config: ServerConfig = ServerConfig::builder_with_provider(crypto_provider())
             .with_safe_default_protocol_versions()
             .expect("test setup: versions")
@@ -236,6 +317,7 @@ mod tests {
         config.alpn_protocols = vec![H2.to_vec(), HTTP_1_1.to_vec()];
         Server {
             certificate,
+            pem: signed.pem(),
             config: Arc::new(config),
         }
     }
@@ -298,7 +380,10 @@ mod tests {
         let suites = |provider: &CryptoProvider| -> Vec<rustls::CipherSuite> {
             provider.cipher_suites.iter().map(|s| s.suite()).collect()
         };
-        for config in [public().expect("public roots"), unverified()] {
+        let syslog_like: ClientConfig = config_builder()
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+        for config in [public().expect("public roots"), unverified(), syslog_like] {
             assert_eq!(suites(config.crypto_provider()), suites(&ring));
             assert_eq!(
                 config.crypto_provider().kx_groups.len(),
@@ -308,11 +393,87 @@ mod tests {
         assert_eq!(suites(&crypto_provider()), suites(&ring));
     }
 
+    fn native(
+        certs: Vec<CertificateDer<'static>>,
+        failures: usize,
+    ) -> rustls_native_certs::CertificateResult {
+        let mut result = rustls_native_certs::CertificateResult::default();
+        result.certs = certs;
+        result.errors = (0..failures)
+            .map(|_| rustls_native_certs::Error {
+                context: "failed to read certificate",
+                kind: rustls_native_certs::ErrorKind::Io {
+                    inner: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                    path: "/path/to/file".into(),
+                },
+            })
+            .collect();
+        result
+    }
+
     #[test]
-    fn the_public_roots_hold_the_webpki_bundle() {
-        let roots: RootCertStore = public_roots().expect("public roots");
-        assert!(!roots.is_empty());
-        assert!(roots.len() >= webpki_roots::TLS_SERVER_ROOTS.len());
+    fn the_public_roots_follow_the_platform_store_rule() {
+        let webpki: usize = webpki_roots::TLS_SERVER_ROOTS.len();
+        let origin: Server = server();
+
+        let empty: RootCertStore = public_roots_from(native(vec![], 0)).expect("empty store");
+        assert_eq!(empty.len(), webpki, "an empty platform store adds nothing");
+
+        let partial: RootCertStore = public_roots_from(native(vec![origin.certificate.clone()], 2))
+            .expect("a partial load is usable");
+        assert_eq!(partial.len(), webpki + 1);
+
+        let unreadable = public_roots_from(native(vec![], 1))
+            .expect_err("a platform store that yields nothing and failed is reported");
+        assert_eq!(unreadable.etype, ErrorType::InvalidCert);
+
+        let rejected = public_roots_from(native(
+            vec![CertificateDer::from(vec![0x30, 0x03, 0x02, 0x01, 0x00])],
+            0,
+        ))
+        .expect_err("a platform store whose certificates are all refused is reported");
+        assert_eq!(rejected.etype, ErrorType::InvalidCert);
+    }
+
+    /// A well-formed PEM block whose content is no certificate the root
+    /// store accepts (`SEQUENCE { INTEGER 0 }`).
+    const REFUSED_PEM: &str = "-----BEGIN CERTIFICATE-----\nMAMCAQA=\n-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn a_pem_bundle_is_every_certificate_it_holds_or_refused() {
+        let first: Server = server_named("first");
+        let second: Server = server_named("second");
+        let bundle: String = format!(
+            "an operator's note\n{}-----BEGIN X509 CRL-----\nAA==\n-----END X509 CRL-----\n{}",
+            first.pem, second.pem
+        );
+        assert_eq!(pem_roots(bundle.as_bytes()).expect("two roots").len(), 2);
+
+        for (refused, why) in [
+            ("".to_owned(), "an empty bundle"),
+            (
+                "not a certificate\n".to_owned(),
+                "a bundle with no PEM block",
+            ),
+            (
+                "-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n".to_owned(),
+                "a block that does not decode",
+            ),
+            (
+                REFUSED_PEM.to_owned(),
+                "a certificate the root store refuses",
+            ),
+        ] {
+            let error = pem_roots(refused.as_bytes()).expect_err(why);
+            assert_eq!(error.etype, ErrorType::InvalidCert, "{why}");
+            assert!(!error.to_string().contains("!!!"), "{why}: {error}");
+        }
+
+        let mut roots: RootCertStore = only(&first.certificate);
+        add_pem_roots(&mut roots, b"no certificate").expect_err("refused");
+        assert_eq!(roots.len(), 1, "a refused bundle leaves the store alone");
+        add_pem_roots(&mut roots, second.pem.as_bytes()).expect("added");
+        assert_eq!(roots.len(), 2);
     }
 
     #[test]

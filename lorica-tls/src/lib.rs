@@ -41,9 +41,10 @@ pub use rustls::{
     Error as RusTlsError, KeyLogFile, RootCertStore, ServerConfig, SignatureScheme, Stream,
 };
 pub use rustls_native_certs::load_native_certs;
-// v1.5.1 audit L-16 : the `rustls-pemfile` crate (RUSTSEC-2025-0134,
-// unmaintained) was the last hop on Lorica's outstanding RUSTSEC
-// chain. PEM parsing now goes through `rustls_pki_types::pem`'s
+// v1.5.1 audit L-16 : direct use of the `rustls-pemfile` crate
+// (RUSTSEC-2025-0134, unmaintained) is gone; the crate itself stayed
+// reachable through `rustls-native-certs` 0.7 until v1.10.2 moved to
+// 0.8. PEM parsing now goes through `rustls_pki_types::pem`'s
 // `PemObject` trait (`pem_slice_iter` + `from_pem_slice`), which
 // is the rustls team's actively-maintained replacement. Iterators
 // only yield the section type they were called on (other PEM
@@ -80,25 +81,9 @@ where
     P: AsRef<Path>,
 {
     let bytes = read_file(path)?;
-    let mut added = 0usize;
-    for cert_result in CertificateDer::pem_slice_iter(&bytes) {
-        let cert = cert_result.or_err(
-            ErrorType::InvalidCert,
-            "Certificate in pem file could not be read",
-        )?;
-        cert_store.add(cert).or_err(
-            ErrorType::InvalidCert,
-            "Failed to load X509 certificate into root store",
-        )?;
-        added += 1;
-    }
-    if added == 0 {
-        return Error::e_explain(
-            ErrorType::InvalidCert,
-            "Pem file contains no loadable X509 certificate",
-        );
-    }
-    Ok(())
+    // Lorica: the one PEM trust bundle rule of the workspace, which
+    // refuses a file with no certificate as this function always did.
+    http_client::add_pem_roots(cert_store, &bytes)
 }
 
 /// Attempt to load the native cas into the given root-certificate store
@@ -110,13 +95,14 @@ where
 /// store, so this fails only when nothing at all loaded and something
 /// went wrong; the errors are logged when the store is usable anyway. A
 /// platform with no certificate and no error still returns an empty store,
-/// as before.
+/// as before. `http_client::public_roots` reads the platform store
+/// through the same rule.
 pub fn load_platform_certs_incl_env_into_store(ca_certs: &mut RootCertStore) -> Result<()> {
     // this includes handling of ENV vars SSL_CERT_FILE & SSL_CERT_DIR
     add_native_certs_into_store(ca_certs, load_native_certs())
 }
 
-fn add_native_certs_into_store(
+pub(crate) fn add_native_certs_into_store(
     ca_certs: &mut RootCertStore,
     native: rustls_native_certs::CertificateResult,
 ) -> Result<()> {
