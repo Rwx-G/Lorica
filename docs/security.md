@@ -168,22 +168,39 @@ the catch-all. The `Host` sent to the backend is the client's, unchanged.
 
 ### Request path validation (v1.10.3)
 
-Routes on one host are told apart by their path prefix, matched on the
-path as the client sent it, which is also the path the backend
-receives. Backends often read a path differently: nginx, for one,
-decodes every percent-encoded octet, merges runs of `/` and resolves
-`.` and `..` before it matches a location. Lorica therefore also reads
-each path that way (decoded once, slashes merged, dot segments
-resolved) and refuses with 400 a request whose two readings select
-different routes, such as `/%61dmin`, `//admin` or `/x/../admin` on a
-host where `/admin` is a route of its own. A path whose readings agree,
-which is every path a browser sends, is forwarded as sent.
+Routes on one host are told apart by their path prefix, and the path
+rules of a route by their path, both matched on the path as the client
+sent it, which is also the path the backend receives. Backends often
+read a path differently: nginx decodes every percent-encoded octet,
+merges runs of `/` and resolves `.` and `..` before it matches a
+location; a Java servlet container drops each segment's `;` parameters
+(`/a;jsessionid=1/b` is `/a/b`); a Windows backend reads `\` as `/`.
+Lorica therefore also reads each path the way all of them together
+would, and refuses with 400 a request whose two readings select
+different routes, or different path rules of one route (or a rule on
+one reading and none on the other). On a host where `/admin` is a route
+of its own, or the path of a rule that denies or throttles it,
+`/%61dmin`, `//admin`, `/x/../admin`, `/..;/admin` and `/x\..\admin`
+are each refused. A path whose readings agree, which is every path a
+browser sends, is forwarded as sent.
 
-Case is not folded and backend-specific syntax (`;` path parameters,
-`\` as a separator) is not interpreted. A route whose controls guard a
-path prefix behind a backend that is case-insensitive or reads such
-syntax is better served by putting the controls on the whole host, or
-by a backend that applies the same rules.
+The second reading, step by step:
+
+1. `\` is read as `/`, and a `;` drops the rest of its segment, up to
+   the next `/` or `\`;
+2. every percent-encoded octet is decoded once;
+3. step 1 again, so `%5C` and `%3B` count as `\` and `;`;
+4. runs of `/` are merged and `.` and `..` segments resolved.
+
+Parameters are read before the decoding because Tomcat and Spring strip
+them from the undecoded path, so an encoded `/` inside a parameter does
+not start a segment there. The same reading decides whether a request
+under `/.well-known/acme-challenge/` is an ACME challenge and so exempt
+from a route's HTTPS redirect: it has to be one under both readings.
+
+Case is not folded. A route whose controls guard a path prefix behind a
+case-insensitive backend is better served by putting the controls on
+the whole host.
 
 ### mTLS client verification
 
