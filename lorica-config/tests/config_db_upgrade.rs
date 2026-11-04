@@ -370,3 +370,117 @@ fn an_upgrade_from_version_66_adds_the_record_tables_and_touches_nothing_else() 
         vec![record]
     );
 }
+
+/// Names as a node before 1.10.2 could store them: each spelled as the
+/// client sent it. `r-canonical` and `r-twin` are one name to a client,
+/// as are `r-b1` and `r-b2`, neither of which spells it canonically.
+const SPELLED_AS_SENT: &str = r#"
+    INSERT INTO routes (id, hostname, hostname_aliases, created_at, updated_at) VALUES
+        ('r-canonical', 'app.example.com', '[]', '2026-01-01T00:00:00+00:00',
+            '2026-01-01T00:00:00+00:00'),
+        ('r-twin', 'App.Example.com', '["Twin-Only.Example.com"]', '2026-01-01T00:00:00+00:00',
+            '2026-01-01T00:00:00+00:00'),
+        ('r-mixed', 'Shop.Example.COM.', '["WWW.Shop.Example.com","www.shop.example.com."]',
+            '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+        ('r-b1', 'B.example.com', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+        ('r-b2', 'b.EXAMPLE.com', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+    INSERT INTO route_protection_records (id, route_id, path_prefix, route_json, deleted_by,
+        deleted_at)
+    VALUES ('rec-1', 'r-gone', '/', '{}', 'ci (0123)', '2026-01-02T00:00:00+00:00');
+    INSERT INTO route_protection_record_names (record_id, position, name) VALUES
+        ('rec-1', 0, 'Gone.Example.com.'),
+        ('rec-1', 1, 'gone.example.com'),
+        ('rec-1', 2, 'WWW.Gone.Example.com');
+"#;
+
+fn names_of(store: &ConfigStore, id: &str) -> (String, Vec<String>) {
+    let route = store
+        .get_route(id)
+        .expect("route reads")
+        .expect("route kept");
+    (route.hostname, route.hostname_aliases)
+}
+
+/// The upgrade rewrites every stored name to the form the proxy looks a
+/// request up by. A name two routes held under two spellings stays with
+/// the route that already spelled it canonically, else with the smaller
+/// id: the other row keeps that spelling, and is neither deleted nor
+/// disabled.
+#[test]
+fn an_upgrade_canonicalises_route_and_record_names_and_keeps_a_colliding_twin_as_stored() {
+    let dir = tempfile::tempdir().expect("test setup: tempdir");
+    let path = dir.path().join("lorica.db");
+    drop(ConfigStore::open(&path, None).expect("test setup: fresh store"));
+    let conn = Connection::open(&path).expect("test setup: raw open");
+    let head: i64 = conn
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .expect("test setup: version");
+    conn.execute_batch("DELETE FROM schema_migrations WHERE version >= 68;")
+        .expect("test setup: rewound before the canonical names");
+    conn.execute_batch(SPELLED_AS_SENT)
+        .expect("test setup: names as sent");
+    drop(conn);
+
+    let store = ConfigStore::open(&path, None).expect("the file opens");
+    assert_eq!(store.schema_version().expect("version"), head);
+    assert_eq!(
+        names_of(&store, "r-canonical"),
+        ("app.example.com".to_string(), vec![])
+    );
+    assert_eq!(
+        names_of(&store, "r-twin"),
+        (
+            "App.Example.com".to_string(),
+            vec!["twin-only.example.com".to_string()]
+        ),
+        "the colliding name is kept as stored, the free one is canonical"
+    );
+    assert_eq!(
+        names_of(&store, "r-mixed"),
+        (
+            "shop.example.com".to_string(),
+            vec!["www.shop.example.com".to_string()]
+        )
+    );
+    assert_eq!(names_of(&store, "r-b1").0, "b.example.com");
+    assert_eq!(names_of(&store, "r-b2").0, "b.EXAMPLE.com");
+    for id in ["r-twin", "r-b2"] {
+        assert!(
+            store.get_route(id).expect("reads").expect("kept").enabled,
+            "{id}"
+        );
+    }
+
+    let records = store.list_route_protection_records().expect("records read");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].hostname, "gone.example.com");
+    assert_eq!(
+        records[0].hostname_aliases,
+        vec!["www.gone.example.com".to_string()]
+    );
+
+    // The route that keeps the name is still edited freely; the twin is
+    // edited only once it is renamed off the name.
+    let mut canonical = store
+        .get_route("r-canonical")
+        .expect("reads")
+        .expect("kept");
+    canonical.path_prefix = "/v2".into();
+    store
+        .update_route(&canonical)
+        .expect("the route keeping the name updates");
+    let mut twin = store.get_route("r-twin").expect("reads").expect("kept");
+    twin.connect_timeout_s = 9;
+    let err = store
+        .update_route(&twin)
+        .expect_err("the twin's name is held by r-canonical")
+        .to_string();
+    assert!(
+        err.contains("already used") && err.contains("r-canonical"),
+        "{err}"
+    );
+    twin.hostname = "renamed.example.com".into();
+    store.update_route(&twin).expect("a renamed twin updates");
+}

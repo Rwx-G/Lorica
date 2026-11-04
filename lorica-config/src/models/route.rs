@@ -1144,6 +1144,29 @@ pub fn validate_node_selector_names(names: &[String]) -> Result<(), String> {
 }
 
 impl Route {
+    /// Rewrite `hostname` and every alias to the form the store keeps
+    /// and the proxy looks a request up by
+    /// ([`crate::route_selection::canonical_hostname`]), dropping an
+    /// alias that is then the hostname or an earlier alias again.
+    ///
+    /// ```
+    /// use lorica_config::models::Route;
+    /// # fn demo(mut route: Route) {
+    /// route.hostname = "App.Example.com.".to_string();
+    /// route.hostname_aliases = vec!["app.example.com".to_string()];
+    /// route.canonicalise_names();
+    /// assert_eq!(route.hostname, "app.example.com");
+    /// assert!(route.hostname_aliases.is_empty());
+    /// # }
+    /// ```
+    pub fn canonicalise_names(&mut self) {
+        let mut names = [crate::route_selection::RouteNames::of(self)];
+        crate::route_selection::canonicalise_route_names(&mut names);
+        let [names] = names;
+        self.hostname = names.hostname;
+        self.hostname_aliases = names.aliases;
+    }
+
     /// Whether this route is served by the node called `node_name`
     /// (Story 9.4 D11, AC #13): true when the selector is empty
     /// (fleet-wide) or names the node.

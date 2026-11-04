@@ -194,6 +194,7 @@ const MIGRATIONS: &[Migration] = &[
     (65, migrate_subscribe_adcs_alerts),
     (66, migrate_adcs_allowed_templates),
     (67, migrate_route_protection_records),
+    (68, migrate_canonical_route_names),
 ];
 
 /// Which telemetry fan-in cursor a follower is reading or advancing
@@ -1380,6 +1381,125 @@ fn migrate_route_protection_records(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_route_protection_record_names_name
             ON route_protection_record_names(name, record_id);",
     )
+}
+
+/// Rewrite every stored route name, and every route protection record
+/// name, to the form the store now keeps and the proxy looks a request
+/// up by (`route_selection::canonical_hostname`).
+///
+/// Before it, a name was stored as its client sent it, so `App.Example.com`
+/// or `app.example.com.` could sit beside a protected `app.example.com`
+/// as a second name no guard weighed. A name two routes hold under two
+/// spellings is rewritten on the route the selection serves it from and
+/// kept as stored on the other (`route_selection::canonicalise_route_names`):
+/// nothing is deleted or switched off, and the proxy reports the pair on
+/// every reload. A row whose alias list does not parse keeps it as it is,
+/// and its hostname still takes part; so does a table without the
+/// column, which only a hand-built test schema is.
+///
+/// Its own version rather than part of 67, which only adds the record
+/// tables: this one rewrites rows, and a test rewinds it alone.
+fn migrate_canonical_route_names(conn: &Connection) -> rusqlite::Result<()> {
+    use crate::route_selection::{canonical_names, canonicalise_route_names, RouteNames};
+
+    let mut routes: Vec<RouteNames> = Vec::new();
+    let mut aliases_unreadable: HashSet<String> = HashSet::new();
+    {
+        let select = if column_exists(conn, "routes", "hostname_aliases")? {
+            "SELECT id, hostname, hostname_aliases FROM routes ORDER BY id"
+        } else {
+            "SELECT id, hostname, NULL FROM routes ORDER BY id"
+        };
+        let mut stmt = conn.prepare(select)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (route_id, hostname, aliases_json) = row?;
+            let parsed = aliases_json.map(|json| serde_json::from_str::<Vec<String>>(&json));
+            let aliases = match parsed {
+                Some(Ok(aliases)) => aliases,
+                _ => {
+                    aliases_unreadable.insert(route_id.clone());
+                    Vec::new()
+                }
+            };
+            routes.push(RouteNames {
+                route_id,
+                hostname,
+                aliases,
+            });
+        }
+    }
+    let stored = routes.clone();
+    for collision in canonicalise_route_names(&mut routes) {
+        tracing::warn!(
+            name = %collision.name,
+            served_route_id = %collision.served_route_id,
+            shadowed_route_id = %collision.shadowed_route_id,
+            shadowed_spelling = %collision.shadowed_spelling,
+            "two routes answer to one hostname under two spellings; it stays with the first, \
+             the second keeps its spelling and serves nothing on it until renamed"
+        );
+    }
+    for (before, after) in stored.iter().zip(&routes) {
+        if before == after {
+            continue;
+        }
+        if aliases_unreadable.contains(&after.route_id) {
+            conn.execute(
+                "UPDATE routes SET hostname = ?1 WHERE id = ?2",
+                params![after.hostname, after.route_id],
+            )?;
+            continue;
+        }
+        let aliases_json = serde_json::to_string(&after.aliases)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        conn.execute(
+            "UPDATE routes SET hostname = ?1, hostname_aliases = ?2 WHERE id = ?3",
+            params![after.hostname, aliases_json, after.route_id],
+        )?;
+    }
+
+    let mut records: Vec<(String, Vec<String>)> = Vec::new();
+    if column_exists(conn, "route_protection_record_names", "name")? {
+        let mut stmt = conn.prepare(
+            "SELECT record_id, name FROM route_protection_record_names \
+             ORDER BY record_id, position",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (record_id, name) = row?;
+            match records.last_mut() {
+                Some((held, names)) if *held == record_id => names.push(name),
+                _ => records.push((record_id, vec![name])),
+            }
+        }
+    }
+    for (record_id, names) in records {
+        let canonical = canonical_names(names.iter().map(String::as_str));
+        if canonical == names {
+            continue;
+        }
+        conn.execute(
+            "DELETE FROM route_protection_record_names WHERE record_id = ?1",
+            params![record_id],
+        )?;
+        for (position, name) in canonical.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO route_protection_record_names (record_id, position, name) \
+                 VALUES (?1, ?2, ?3)",
+                params![record_id, position as i64, name],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn migrate_acme_challenge_expiry(conn: &Connection) -> rusqlite::Result<()> {

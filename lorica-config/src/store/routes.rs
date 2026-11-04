@@ -6,6 +6,7 @@ use super::row_helpers::row_to_route;
 use super::{serialize_field, serialize_optional_field, ConfigStore};
 use crate::error::{ConfigError, Result};
 use crate::models::*;
+use crate::route_selection;
 
 /// A name a route would answer to that another route already holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,15 @@ impl ConfigStore {
     /// rule [`ConfigStore::create_route`] and
     /// [`ConfigStore::update_route`] refuse a write on.
     ///
+    /// Names compare as the selection compares them
+    /// ([`route_selection::same_name`]), so a spelling that differs in
+    /// ASCII case or a root dot is the name itself. A name two stored
+    /// routes spell differently, which a store written before that rule
+    /// can hold, is held by the route the selection serves it from
+    /// ([`route_selection::served_spelling`]) and by no other: the route
+    /// keeping it is still written freely, and the twin only once it no
+    /// longer answers to it.
+    ///
     /// Public so a caller that must not learn the other route's id (the
     /// automation plane, which answers a token that may not see it) can
     /// weigh the same rule before the write and word its own refusal.
@@ -38,39 +48,49 @@ impl ConfigStore {
         hostname: &str,
         aliases: &[String],
     ) -> Result<Option<HostnameClaim>> {
-        let mut check: Vec<&str> = vec![hostname];
-        for a in aliases {
-            check.push(a.as_str());
-        }
-
         let mut stmt = self
             .conn
-            .prepare("SELECT id, hostname, hostname_aliases FROM routes WHERE id != ?1")?;
-        let rows = stmt.query_map(params![route_id], |row| {
+            .prepare("SELECT id, hostname, hostname_aliases FROM routes ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
             ))
         })?;
-
+        let mut stored: Vec<(String, String, Vec<String>)> = Vec::new();
         for row in rows {
-            let (other_id, other_host, aliases_json) = row?;
-            let other_aliases: Vec<String> =
-                serde_json::from_str(&aliases_json).unwrap_or_default();
+            let (id, host, aliases_json) = row?;
+            let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
+            stored.push((id, host, aliases));
+        }
 
-            for h in &check {
-                let as_alias = if *h == other_host {
-                    false
-                } else if other_aliases.iter().any(|a| a == *h) {
-                    true
-                } else {
-                    continue;
-                };
+        for name in std::iter::once(hostname).chain(aliases.iter().map(String::as_str)) {
+            let key = route_selection::canonical_hostname(name);
+            let holders: Vec<(&str, &str, bool)> = stored
+                .iter()
+                .filter_map(|(id, host, aliases)| {
+                    let spelling = std::iter::once(host)
+                        .chain(aliases.iter())
+                        .filter(|own| route_selection::same_name(own, &key))
+                        .min_by_key(|own| own.as_str() != key.as_ref())?;
+                    Some((spelling.as_str(), id.as_str(), spelling != host))
+                })
+                .collect();
+            let Some((served, _)) = route_selection::served_spelling(
+                &key,
+                holders.iter().map(|(spelling, id, _)| (*spelling, *id)),
+            ) else {
+                continue;
+            };
+            if let Some((_, other_id, as_alias)) = holders
+                .iter()
+                .find(|(spelling, id, _)| *spelling == served && *id != route_id)
+            {
                 return Ok(Some(HostnameClaim {
-                    hostname: (*h).to_string(),
-                    route_id: other_id,
-                    as_alias,
+                    hostname: name.to_string(),
+                    route_id: other_id.to_string(),
+                    as_alias: *as_alias,
                 }));
             }
         }
@@ -105,9 +125,14 @@ impl ConfigStore {
     }
 
     /// Insert a new route into the database.
+    ///
+    /// The names are stored canonical ([`Route::canonicalise_names`]),
+    /// whatever the caller sent, and held unique in that form.
     pub fn create_route(&self, route: &Route) -> Result<()> {
+        let mut route = route.clone();
+        route.canonicalise_names();
         self.validate_hostname_uniqueness(&route.id, &route.hostname, &route.hostname_aliases)?;
-        self.insert_route_row(route)
+        self.insert_route_row(&route)
     }
 
     /// The INSERT half of [`ConfigStore::create_route`], without the
@@ -381,9 +406,14 @@ impl ConfigStore {
     }
 
     /// Update an existing route. Returns `NotFound` if the ID does not exist.
+    ///
+    /// The names are stored canonical ([`Route::canonicalise_names`]),
+    /// whatever the caller sent, and held unique in that form.
     pub fn update_route(&self, route: &Route) -> Result<()> {
+        let mut route = route.clone();
+        route.canonicalise_names();
         self.validate_hostname_uniqueness(&route.id, &route.hostname, &route.hostname_aliases)?;
-        self.update_route_row(route)
+        self.update_route_row(&route)
     }
 
     /// The UPDATE half of [`ConfigStore::update_route`], without the

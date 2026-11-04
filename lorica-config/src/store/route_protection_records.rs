@@ -21,9 +21,10 @@
 //! Every write a record could bind reads only the records naming a host
 //! that write could serve (`route_selection::keys_reaching`), so the
 //! names sit in `route_protection_record_names`, indexed, rather than in
-//! a JSON column every lookup would have to decode. A name matches as
-//! the table's binary collation compares it, which is
-//! `route_selection::same_name`'s byte equality.
+//! a JSON column every lookup would have to decode. Every name is
+//! stored, and every lookup bound, in `route_selection::canonical_hostname`
+//! form, so the table's binary collation compares them as
+//! `route_selection::same_name` does.
 //!
 //! # A snapshot that does not parse still lists
 //!
@@ -43,6 +44,7 @@ use super::row_helpers::parse_datetime;
 use super::{serialize_field, ConfigStore};
 use crate::error::{ConfigError, Result};
 use crate::models::RouteProtectionRecord;
+use crate::route_selection::canonical_names;
 
 /// The column list every record read binds, in the order
 /// [`row_to_record`] expects.
@@ -92,13 +94,14 @@ impl ConfigStore {
         )
     }
 
-    /// Every record holding at least one of `names`, the most recent
-    /// first, found through the index on the names and decoding no other
-    /// record.
+    /// Every record holding at least one of `names`, in any spelling the
+    /// selection takes for the same name, the most recent first, found
+    /// through the index on the names and decoding no other record.
     pub fn route_protection_records_naming(
         &self,
         names: &[&str],
     ) -> Result<Vec<RouteProtectionRecord>> {
+        let names = canonical_names(names.iter().copied());
         if names.is_empty() {
             return Ok(Vec::new());
         }
@@ -220,13 +223,14 @@ impl ConfigStore {
         Ok(out)
     }
 
-    /// Store `record`'s names, its hostname first.
+    /// Store `record`'s names, its hostname first, each canonical and
+    /// once.
     fn insert_route_protection_record_names(&self, record: &RouteProtectionRecord) -> Result<()> {
         let mut insert = self.conn.prepare(
             "INSERT INTO route_protection_record_names (record_id, position, name)
              VALUES (?1, ?2, ?3)",
         )?;
-        for (position, name) in record.names().enumerate() {
+        for (position, name) in canonical_names(record.names()).iter().enumerate() {
             insert.execute(params![record.id, position as i64, name])?;
         }
         Ok(())

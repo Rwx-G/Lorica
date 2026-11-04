@@ -608,7 +608,20 @@ impl ProxyConfig {
         let HostIndex {
             exact: routes_by_host,
             wildcards: wildcard_routes,
+            collisions,
         } = HostIndex::new(entries, |entry| entry.route.as_ref());
+        // Once per build, so at startup and on every reload, until an
+        // operator renames or deletes the twin.
+        for collision in &collisions {
+            warn!(
+                hostname = %collision.name,
+                served_route_id = %collision.served_route_id,
+                shadowed_route_id = %collision.shadowed_route_id,
+                shadowed_spelling = %collision.shadowed_spelling,
+                "two routes answer to one hostname under two spellings; the hostname is served \
+                 by the first, and the second serves nothing on it until it is renamed or deleted"
+            );
+        }
 
         // Merge security presets: start with builtins, let custom override by name
         let mut presets = lorica_config::models::builtin_security_presets();

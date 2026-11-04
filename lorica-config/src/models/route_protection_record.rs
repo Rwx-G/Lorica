@@ -92,6 +92,9 @@ impl RouteProtectionRecord {
 
     /// The record of `route` over `names`, which a write by
     /// `released_by` at `released_at` stopped it serving at its prefix.
+    /// The names are held canonical
+    /// ([`crate::route_selection::canonical_names`]), as the selection
+    /// and the store compare them.
     ///
     /// # Errors
     ///
@@ -103,6 +106,7 @@ impl RouteProtectionRecord {
         released_by: &str,
         released_at: DateTime<Utc>,
     ) -> Result<RouteProtectionRecord> {
+        let names = crate::route_selection::canonical_names(names.iter().map(String::as_str));
         let Some((hostname, aliases)) = names.split_first() else {
             return Err(ConfigError::Validation(
                 "a route protection record holds at least one name".to_string(),

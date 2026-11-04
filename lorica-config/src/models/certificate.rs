@@ -212,7 +212,7 @@ pub fn resolve_certificate_for_hostname<'a>(
 /// assert!(wildcard_patterns_an_operator_could_provision("example.com").is_empty());
 /// ```
 pub fn wildcard_patterns_an_operator_could_provision(hostname: &str) -> Vec<String> {
-    let name = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
+    let name = crate::route_selection::canonical_hostname(hostname.trim());
     let Some((_, parent)) = name.split_once('.') else {
         return Vec::new();
     };
