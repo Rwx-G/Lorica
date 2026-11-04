@@ -456,6 +456,7 @@ mod test {
 
     #[cfg(feature = "any_tls")]
     #[tokio::test]
+    #[ignore = "needs network access to one.one.one.one (1.1.1.1:443)"]
     async fn test_tls_check() {
         init_crypto();
         let tls_check = TcpHealthCheck::new_tls("one.one.one.one");
@@ -470,6 +471,7 @@ mod test {
 
     #[cfg(feature = "any_tls")]
     #[tokio::test]
+    #[ignore = "needs network access to one.one.one.one (1.1.1.1:443)"]
     async fn test_https_check() {
         init_crypto();
         let https_check = HttpHealthCheck::new("one.one.one.one", true);

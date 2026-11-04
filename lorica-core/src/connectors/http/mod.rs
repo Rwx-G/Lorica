@@ -195,6 +195,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs network access to one.one.one.one (1.1.1.1:443)"]
     async fn test_connect_h2() {
         init_crypto();
         let connector = Connector::new(None);
@@ -221,6 +222,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs network access to one.one.one.one (1.1.1.1:443)"]
     async fn test_connect_h1() {
         init_crypto();
         let connector = Connector::new(None);
@@ -248,6 +250,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs network access to one.one.one.one (1.1.1.1:443)"]
     async fn test_connect_h2_fallback_h1_reuse() {
         // this test verify that if the server doesn't support h2, the Connector will reuse the
         // h1 session instead.
@@ -284,6 +287,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs network access to one.one.one.one (1.1.1.1:443)"]
     async fn test_connect_prefer_h1() {
         init_crypto();
         let connector = Connector::new(None);

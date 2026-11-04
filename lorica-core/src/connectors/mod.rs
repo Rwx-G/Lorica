@@ -493,6 +493,7 @@ mod tests {
     const BLACK_HOLE: &str = "192.0.2.1:79";
 
     #[tokio::test]
+    #[ignore = "needs network access to 1.1.1.1:80"]
     async fn test_connect() {
         init_crypto();
         let connector = TransportConnector::new(None);
@@ -506,6 +507,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs network access to one.one.one.one (1.1.1.1:443)"]
     async fn test_connect_tls() {
         init_crypto();
         let connector = TransportConnector::new(None);
@@ -636,8 +638,8 @@ mod tests {
     }
 }
 
-// Outside `tests`, which needs `any_tls`: the forked-crate test job does not enable it on
-// this crate, and this test only needs plain TCP.
+// Outside `tests`, which needs `any_tls`: this test only needs plain TCP, so it also runs
+// in the forked-crate test job's default-feature build, not only in its TLS step.
 #[cfg(test)]
 mod reuse_race_tests {
     use super::*;

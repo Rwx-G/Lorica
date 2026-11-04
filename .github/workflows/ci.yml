@@ -245,6 +245,17 @@ jobs:
         env:
           SKIP_FRONTEND_BUILD: "1"
 
+      # Upstream gates its connector, listener and TLS tests on `any_tls`,
+      # which the step above never enables, so they compiled nowhere. They
+      # run here, in the rustls build the binary ships, with lorica-core's
+      # self-contained integration binaries. A step of its own: the same
+      # features on the line above would unify into every crate built on
+      # lorica-core and leave the no-TLS build untested.
+      - name: Run Rust unit tests (forked crates, rustls build)
+        run: cargo test -p lorica-core -p lorica-lb --features lorica-core/rustls,lorica-core/integration-tests,lorica-lb/rustls
+        env:
+          SKIP_FRONTEND_BUILD: "1"
+
       - name: Run frontend tests
         run: |
           cd lorica-dashboard/frontend

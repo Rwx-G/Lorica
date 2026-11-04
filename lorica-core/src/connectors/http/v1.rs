@@ -170,6 +170,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "any_tls")]
+    #[ignore = "needs network access to one.one.one.one (1.1.1.1:443)"]
     async fn test_connect_tls() {
         init_crypto();
         let connector = Connector::new(None);
