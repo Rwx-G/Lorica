@@ -18,9 +18,10 @@
 //! every table once per minute. A slot is evicted when its
 //! `last_update_ns` is older than 5 minutes; eviction CAS's the `key`
 //! from `h` to `0` to release the slot. `value` and `last_update_ns`
-//! are *not* reset at eviction time - they are reset by the next
-//! `increment` that claims the slot, which is safe because the claim
-//! CAS serialises reuse (§ 5.3).
+//! are *not* reset at eviction time: the next `increment` that claims
+//! the slot subtracts the value it found there and stamps
+//! `last_update_ns`, which is safe because the claim CAS serialises
+//! reuse (§ 5.3).
 //!
 //! A writer that raced with eviction (read `cur_key == h`, then
 //! eviction CAS'd to 0, then a new key claimed the slot) may pollute
@@ -102,8 +103,8 @@ fn evict_table<const N: usize>(
             evicted += 1;
             // Intentionally do not reset `value` or `last_update_ns`.
             // The next increment() that claims this slot via CAS from
-            // 0 to a new tagged hash resets value to `by` and stamps
-            // last_update_ns. See design § 5.3.
+            // 0 to a new tagged hash starts the counter at `by` and
+            // stamps last_update_ns. See design § 5.3.
         }
     });
     (scanned, evicted)

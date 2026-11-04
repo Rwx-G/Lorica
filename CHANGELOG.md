@@ -15,6 +15,8 @@ Author: Rwx-G
 
 ### Fixed
 
+- **The WAF flood and auto-ban counters shared between workers no longer drop increments when several workers count a new key at once.** The first increments of a key raced: the worker that claimed the counter's slot overwrote what another had just added, and a worker that lost the claim took a second slot for the same key, which reads never reach. Each contended first increment could be lost, so a burst spread across workers took slightly longer to reach its flood or auto-ban threshold. Since 1.3.0.
+
 ### Removed
 
 ### Security

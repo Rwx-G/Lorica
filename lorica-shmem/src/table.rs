@@ -124,20 +124,35 @@ impl<const N: usize> AtomicHashTable<N> {
         for probe in 0..MAX_PROBE {
             let i = (start + probe) & mask;
             let s = &self.slots[i];
-            let cur = s.key.load(Ordering::Acquire);
+            let mut cur = s.key.load(Ordering::Acquire);
             if cur == 0 {
-                // Try to claim the slot for this key.
-                if s.key
+                // A released slot keeps the value it had (eviction and
+                // `reset` only clear the key), so the claim must start
+                // the counter from `by`. It cannot store `by`: other
+                // writers see the key as soon as the CAS lands and add
+                // to `value` at once, and a store would erase their
+                // adds. It subtracts what the slot held instead, read
+                // before the CAS while no writer of this key exists.
+                let left_over = s.value.load(Ordering::Acquire);
+                match s
+                    .key
                     .compare_exchange(0, tagged_hash, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
                 {
-                    // Slot may have been evicted; reset counter.
-                    s.value.store(by, Ordering::Release);
-                    s.last_update_ns.store(now_ns, Ordering::Release);
-                    return by;
+                    Ok(_) => {
+                        let delta = by.wrapping_sub(left_over);
+                        let new = s
+                            .value
+                            .fetch_add(delta, Ordering::AcqRel)
+                            .wrapping_add(delta);
+                        s.last_update_ns.store(now_ns, Ordering::Release);
+                        return new;
+                    }
+                    // Another writer claimed this slot first, often for
+                    // this same key. Weigh the key it wrote rather than
+                    // probing on: probing on would claim a second slot
+                    // for the key, and reads stop at the first one.
+                    Err(claimed) => cur = claimed,
                 }
-                // Lost the race; re-read this slot (might be us now).
-                continue;
             }
             if cur == tagged_hash {
                 // Existing owner: commutative atomic add.
@@ -199,7 +214,7 @@ impl<const N: usize> AtomicHashTable<N> {
     /// `tagged_hash` back to `0`. Returns `true` if the slot was
     /// released, `false` if the key was not present or a concurrent
     /// writer claimed it already. Subsequent `increment` on the same
-    /// key will reclaim a fresh slot with `value = by`.
+    /// key will reclaim a slot whose counter starts at `by`.
     ///
     /// Used by the WAF auto-ban path to clear a counter after a ban
     /// has been issued - a repeat offender after ban expiry starts
@@ -405,6 +420,54 @@ mod tests {
         let h2 = tagged_hash(0x5555 | 1);
         assert_eq!(t.increment(h2, 1, 200), 1);
         assert_eq!(t.read(h1), None);
+    }
+
+    #[test]
+    fn concurrent_first_increments_of_fresh_keys_lose_nothing() {
+        // Every thread walks the same fresh keys in the same order, so
+        // the first increment of each key is contended: one thread
+        // claims the slot while the others add to it at once.
+        const THREADS: u64 = 8;
+        const KEYS: u64 = 20_000;
+        let t: Arc<AtomicHashTable<65_536>> = Arc::from(AtomicHashTable::new_zeroed());
+        let start = Arc::new(std::sync::Barrier::new(THREADS as usize));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let t = t.clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    for k in 0..KEYS {
+                        t.increment(tagged_hash(k << 1), 1, 0);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let short: Vec<u64> = (0..KEYS)
+            .filter(|&k| t.read(tagged_hash(k << 1)) != Some(THREADS))
+            .collect();
+        assert!(
+            short.is_empty(),
+            "{} of {KEYS} keys lost an increment, first {:?}",
+            short.len(),
+            &short[..short.len().min(5)]
+        );
+    }
+
+    #[test]
+    fn a_reclaimed_slot_starts_from_by_whatever_value_it_held() {
+        let t: Box<AtomicHashTable<1024>> = AtomicHashTable::new_zeroed();
+        let h = tagged_hash(0x7777);
+        assert_eq!(t.increment(h, 1_000, 1), 1_000);
+        assert!(t.reset(h));
+        // The released slot still holds 1 000; the new claim must not
+        // inherit it.
+        assert_eq!(t.increment(h, 2, 2), 2);
+        assert_eq!(t.read(h), Some(2));
+        assert_eq!(t.increment(h, 3, 3), 5);
     }
 
     #[test]

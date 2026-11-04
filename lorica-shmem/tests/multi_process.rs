@@ -101,6 +101,41 @@ fn two_children_increment_same_key_sum_correct() {
 }
 
 #[test]
+fn children_racing_on_the_first_increment_of_fresh_keys_lose_nothing() {
+    // `two_children_increment_same_key_sum_correct` contends on one
+    // key, so its claim race happens once per run and was seen lost
+    // only under coverage instrumentation. Here every child walks the
+    // same fresh keys, so every key's claim is contended.
+    let (region, fd) = SharedRegion::create_supervisor().expect("create");
+    let fd_raw = fd.as_raw_fd();
+
+    const CHILDREN: u64 = 4;
+    const KEYS: u64 = 30_000;
+
+    let pids: Vec<Pid> = (0..CHILDREN)
+        .map(|_| {
+            fork_child(fd_raw, move |r| {
+                for k in 0..KEYS {
+                    r.waf_flood.increment(r.tagged(k), 1, 1);
+                }
+            })
+        })
+        .collect();
+    wait_all(&pids);
+
+    let short: Vec<u64> = (0..KEYS)
+        .filter(|&k| region.waf_flood.read(region.tagged(k)) != Some(CHILDREN))
+        .collect();
+    assert!(
+        short.is_empty(),
+        "{} of {KEYS} keys lost an increment, first {:?}",
+        short.len(),
+        &short[..short.len().min(5)]
+    );
+    drop(fd);
+}
+
+#[test]
 fn children_increment_disjoint_keys_no_crosstalk() {
     let (region, fd) = SharedRegion::create_supervisor().expect("create");
     let fd_raw = fd.as_raw_fd();
