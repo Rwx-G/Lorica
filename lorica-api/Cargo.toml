@@ -125,7 +125,7 @@ dashmap = "6"
 tracing = "0.1"
 once_cell = { workspace = true }
 http = { workspace = true }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 parking_lot = "0.12"
 ipnet = "2"
 strum = "0.28"
