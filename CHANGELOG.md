@@ -11,6 +11,20 @@ Author: Rwx-G
 
 ### Added
 
+### Changed
+
+### Fixed
+
+### Removed
+
+### Security
+
+## [1.10.2] - 2026-11-04
+
+A hardening and hygiene release: the automation plane's last documented residual closed, route names made canonical, the upstream Pingora fixes since 1.10.0, every dependency refreshed with `cargo audit` at zero, and one TLS policy for outbound clients. Schema migrations 67 and 68: upgrade followers before the control plane.
+
+### Added
+
 - **Route protection records.** When a token write makes a route that carries an access control in force (Basic auth, IP allowlist, forward auth, mTLS and the other controls a token may only strengthen) stop serving a name, whether by deleting the route, renaming it, dropping an alias or moving its path prefix, the node keeps a record of the names and path released and of the route's controls. A later token write that would serve those names, whether a route create, an update adding a name or an environment, is held to the record exactly as it is held to a stored route: matching or strengthening is allowed, weakening is refused with a `403`. Disabling a route records nothing: it keeps its names and its controls stay held in place. Operators list and clear records under Settings > Route Protection Records or through `GET` / `DELETE /api/v1/automation/route-protection-records`; an operator's create or update clears a record only for the names its route serves once written and only if that route is enabled, and an operator's delete records nothing. Every creation, narrowing and clearing is audited. A record that cannot be read refuses only the token writes that would reach its own names. Records are node-local: not replicated to followers and not part of the configuration export. Schema migrations 67 and 68 (see Changed): upgrade followers first.
 
 ### Changed
@@ -29,8 +43,6 @@ Author: Rwx-G
 - **Builds with the `otel` feature export to an `https` OTLP/HTTP collector** (traces and logs, `http/protobuf` and `http/json`). Since 1.6.0 the exporter's HTTP client was built without TLS and refused every `https` endpoint before connecting; plain `http` collectors worked. The collector's certificate is verified against the public roots, and `OTEL_EXPORTER_OTLP_TIMEOUT` and its per-signal variants still bound each request. The OTLP gRPC exporter verified `https` collectors against an empty root store and refused every one; it now uses the same roots. The published packages and Docker images are built without `otel` and were not affected.
 - **A route create or update through the management API is applied whole or not at all.** A create naming a backend id that does not exist used to leave the route stored without its backends; the route row, its backend links and the protection records it clears now commit in one transaction.
 - **Upstream Pingora sync into the forked crates (see `FORK.md`).** Pooled upstream connections are no longer discarded when a request picks one up while the idle watcher is still releasing it: the request used to dial a new connection and log `failed to acquire reusable stream`. Brotli-compressed responses now end with the stream's final block, which strict decoders require. A load-balancing selection over backends whose weights are all zero returns no backend instead of panicking (Lorica's own balancer never builds such a set).
-
-### Removed
 
 ### Security
 
