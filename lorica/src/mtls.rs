@@ -83,9 +83,14 @@ pub fn build_union_root_store(routes: &[Route]) -> Option<RootCertStore> {
 /// and return how many were added.
 ///
 /// `CertificateDer::pem_slice_iter` walks every `CERTIFICATE` block and
-/// skips other block types (PRIVATE KEY, etc.). A bundle can carry an
-/// intermediate and its root, and both become anchors: a client chain
-/// that stops at the intermediate verifies, as it does at the listener.
+/// skips other block types (PRIVATE KEY, etc.). Every certificate becomes
+/// an anchor on its own, the X.509 semantics nginx shares. A bundle that
+/// carries a root therefore trusts every CA the root signed, the
+/// siblings of the issuing CA pasted beside it included, as long as the
+/// client sends its own issuing CA as an intermediate. The bundle a route
+/// means to restrict to some issuing CAs holds those and not their root;
+/// the API's PEM validation warns about the other shape, and still
+/// accepts it.
 fn add_pem_bundle(store: &mut RootCertStore, pem_text: &str) -> usize {
     let mut added = 0usize;
     for der_result in CertificateDer::pem_slice_iter(pem_text.as_bytes()) {
@@ -665,6 +670,22 @@ mod tests {
         let issuing_b = intermediate_ca(&root, "Issuing B");
         let chain = vec![leaf(&issuing_a, "Acme"), issuing_a.der.clone()];
         assert!(!verifier_for(&issuing_b).verifies(&chain));
+    }
+
+    #[test]
+    fn route_verifier_with_the_root_in_its_bundle_trusts_every_ca_the_root_signed() {
+        // The anchor semantics the API warns about, kept executable: a
+        // bundle of Issuing B and its root accepts a leaf of Issuing A
+        // presented with Issuing A, because the root is an anchor.
+        let root = root_ca("Root");
+        let issuing_a = intermediate_ca(&root, "Issuing A");
+        let issuing_b = intermediate_ca(&root, "Issuing B");
+        init_crypto_once();
+        let bundle = format!("{}{}", issuing_b.pem, root.pem);
+        let verifier = RouteClientVerifier::from_pem("r", &bundle).expect("verifier");
+        assert!(verifier.verifies(&[leaf(&issuing_a, "Acme"), issuing_a.der.clone()]));
+        // Without the root, the sibling is refused.
+        assert!(!verifier_for(&issuing_b).verifies(&[leaf(&issuing_a, "Acme"), issuing_a.der]));
     }
 
     #[test]

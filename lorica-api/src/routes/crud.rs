@@ -24,7 +24,7 @@ use lorica_config::route_selection::{
 use super::forward_auth::{build_forward_auth, ForwardAuthConfigRequest};
 use super::header_rules::{build_header_rule, HeaderRuleRequest};
 use super::mirror::{build_mirror_config, MirrorConfigRequest};
-use super::mtls::{build_mtls_config, MtlsConfigRequest};
+use super::mtls::{build_mtls_config, log_mtls_bundle_trust_warnings, MtlsConfigRequest};
 use super::path_rules::{build_path_rules, PathRuleRequest, PathRuleResponse};
 use super::response_rewrite::{
     build_response_rewrite, ResponseRewriteConfigRequest, ResponseRewriteRuleRequest,
@@ -4018,7 +4018,9 @@ pub(crate) async fn create_route_as(
             _ => None,
         },
         mtls: match body.mtls.as_ref() {
-            Some(m) if !m.ca_cert_pem.trim().is_empty() => Some(build_mtls_config(m)?),
+            Some(m) if !m.ca_cert_pem.trim().is_empty() => {
+                Some(build_mtls_config(m).inspect(log_mtls_bundle_trust_warnings)?)
+            }
             _ => None,
         },
         rate_limit: match body.rate_limit.as_ref() {
@@ -4752,7 +4754,7 @@ fn apply_route_patch(
         if m.ca_cert_pem.trim().is_empty() {
             route.mtls = None;
         } else {
-            route.mtls = Some(build_mtls_config(m)?);
+            route.mtls = Some(build_mtls_config(m).inspect(log_mtls_bundle_trust_warnings)?);
         }
     }
     if let Some(ref rl) = body.rate_limit {

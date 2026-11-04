@@ -4106,10 +4106,14 @@ paths:
       tags: [Validation]
       summary: Pre-flight check on a PEM-encoded mTLS CA bundle
       description: |
-        Parses the supplied PEM and reports the leaf + chain cert
-        details (subject, SANs, validity dates) so the operator
-        can confirm a CA / client cert is well-formed before
-        wiring it into a route's mTLS config.
+        Runs the validator a route save runs on `mtls.ca_cert_pem` and
+        reports the subject of every certificate in the bundle, so the
+        operator can confirm it before wiring it into a route's mTLS
+        config. Every certificate of the bundle is a trust anchor:
+        `warnings` names the ones that make the route trust more than
+        the bundle lists (a self-signed root next to other
+        certificates, or a CA next to a certificate it issued). Such a
+        bundle is still accepted.
       security:
         - sessionCookie: []
       requestBody:
@@ -4118,9 +4122,9 @@ paths:
           application/json:
             schema:
               type: object
-              required: [pem]
+              required: [ca_cert_pem]
               properties:
-                pem:
+                ca_cert_pem:
                   type: string
                   description: One or more `-----BEGIN CERTIFICATE-----` blocks.
       responses:
@@ -4130,6 +4134,29 @@ paths:
             application/json:
               schema:
                 type: object
+                properties:
+                  data:
+                    type: object
+                    required: [ca_count, subjects, warnings]
+                    properties:
+                      ca_count:
+                        type: integer
+                        description: Number of CERTIFICATE blocks parsed.
+                      subjects:
+                        type: array
+                        items:
+                          type: string
+                        description: The subject of each certificate, in bundle order.
+                      warnings:
+                        type: array
+                        items:
+                          type: string
+                        description: |
+                          One sentence per certificate that widens what the
+                          route trusts: a self-signed root (every CA it
+                          signed is trusted) or a CA that issued another
+                          certificate of the bundle. Empty when there is
+                          none.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
