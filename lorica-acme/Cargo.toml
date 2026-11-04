@@ -15,9 +15,19 @@ description = "Pure ACME / Let's Encrypt protocol core for Lorica: instant-acme 
 # `lorica/rustls`) so the binary does not carry two crypto providers in
 # parallel. `rcgen` (below) generates the CSR fed into `finalize_csr`.
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
+# The HTTP client handed to instant-acme (`Account::builder_with_http`)
+# in place of its own, which verifies through the platform verifier on
+# the process-wide provider. These three name the client's type and
+# build its connector around a rustls configuration from
+# `lorica_tls::http_client`; instant-acme already pulls all of them.
+# hyper-rustls' default features would add `aws-lc-rs`.
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false }
+bytes = "1"
 rcgen = "0.14"
 reqwest = { workspace = true, features = ["json"] }
-# The TLS policy of the DNS provider clients (`lorica_tls::http_client`).
+# The TLS policy of the ACME client and of the DNS provider clients
+# (`lorica_tls::http_client`).
 lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -44,7 +54,8 @@ default = []
 route53 = ["dep:aws-config", "dep:aws-sdk-route53"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# `net` and `io-util` for the TLS server `tests/tls_policy.rs` runs.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
 # HTTP mock server for unit-testing the Cloudflare + OVH DNS challengers
 # without hitting the real providers (v1.5.0 backlog #9). Scoped to dev so
 # the runtime binary does not pick up the dep.

@@ -20,8 +20,18 @@
 > workspace `clippy.toml` refuses reqwest's own constructors and
 > `rustls::ClientConfig::builder` outside `http_client`.
 >
-> Outbound TLS that is not a reqwest client, and so sits outside that
-> policy:
+> The ACME CA client is not a reqwest client but is on the policy too,
+> since v1.10.2: `lorica-acme/src/driver.rs` hands instant-acme a
+> `hyper-util` client (`Account::builder_with_http`) whose `hyper-rustls`
+> connector speaks `http_client::public()` as given, ALPN included.
+> Before, instant-acme's own client verified through
+> `rustls-platform-verifier` on the process default provider: the
+> platform store without the webpki bundle, offering `h2`. A private
+> ACME CA (step-ca, the e2e Pebble fixture) is still trusted through
+> `SSL_CERT_FILE`, which the platform half of `public()` reads;
+> `lorica-acme/tests/tls_policy.rs` holds that path.
+>
+> Outbound TLS that is not on that policy:
 >
 > - **The OTLP/gRPC exporters** (`otel` feature, tonic). tonic takes
 >   trust anchors, not a rustls configuration, so Lorica hands them the
@@ -29,15 +39,6 @@
 >   tonic's choice, the process default (ring, which `main` installs),
 >   and the ALPN is tonic's `h2`. Before v1.10.2 an `https` collector
 >   was verified against no root at all and always refused.
-> - **The ACME CA client** (`instant-acme`, `lorica-acme/src/driver.rs`).
->   Its default client verifies through `rustls-platform-verifier` on
->   the process default provider (ring in the binary): the platform
->   store only, without the webpki bundle, offering `h2` and `http/1.1`.
->   instant-acme accepts a client of its own (`Account::builder_with_http`
->   over a `hyper-util` client with a `hyper-rustls` connector built
->   from `http_client::public()`); that takes `hyper-util`,
->   `hyper-rustls` and `bytes` as direct dependencies of `lorica-acme`
->   (all three already in the lockfile), not yet approved.
 > - **The Route53 DNS-01 client** (`route53` feature, AWS SDK default
 >   HTTPS client). rustls on `aws-lc-rs` with a restricted cipher list,
 >   trusting the platform store alone, read once per process. The SDK

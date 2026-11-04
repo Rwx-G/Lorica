@@ -20,11 +20,22 @@
 //! functions touch a configuration store, an audit log, or any
 //! management-plane state; the caller persists the returned
 //! [`IssuedCertificate`] however it sees fit.
+//!
+//! Every request to the CA goes through one HTTP client, which
+//! verifies the directory with the shared outbound TLS policy
+//! (`lorica_tls::http_client::public`) rather than with instant-acme's
+//! own client.
 
+use bytes::Bytes;
+use hyper_rustls::HttpsConnector;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::rt::TokioExecutor;
 use instant_acme::{
-    Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewAccount,
-    NewOrder, OrderStatus, RetryPolicy,
+    Account, AccountBuilder, AccountCredentials, AuthorizationStatus, BodyWrapper, ChallengeType,
+    Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
+use lorica_tls::ClientConfig;
 use tracing::info;
 
 use crate::config::AcmeConfig;
@@ -97,16 +108,47 @@ fn generate_csr(domains: &[String]) -> Result<(Vec<u8>, String), AcmeError> {
     Ok((csr.der().to_vec(), private_key.serialize_pem()))
 }
 
+/// The HTTP client every request to the CA goes through: hyper over a
+/// rustls connector that speaks `tls` exactly as given.
+///
+/// The connector is assembled from its parts rather than through
+/// `HttpsConnectorBuilder`, which panics on a configuration that already
+/// carries ALPN and then rewrites it; the policy's `http/1.1` offer
+/// reaches the wire as the policy wrote it. No timeout and no user agent
+/// are set here, as with instant-acme's own client: instant-acme names
+/// itself on every request.
+fn policy_http_client(
+    tls: ClientConfig,
+) -> HyperClient<HttpsConnector<HttpConnector>, BodyWrapper<Bytes>> {
+    let mut tcp: HttpConnector = HttpConnector::new();
+    // The TCP connector sees `https://` URLs; the TLS one owns the scheme.
+    tcp.enforce_http(false);
+    let mut https: HttpsConnector<HttpConnector> = HttpsConnector::from((tcp, tls));
+    https.enforce_https();
+    HyperClient::builder(TokioExecutor::new()).build(https)
+}
+
+/// An account builder on [`policy_http_client`] with the public trust
+/// (`lorica_tls::http_client::public`): the webpki bundle plus the
+/// platform store, which is where `SSL_CERT_FILE` points a private ACME
+/// CA (the e2e Pebble fixture).
+fn account_builder() -> Result<AccountBuilder, AcmeError> {
+    let tls: ClientConfig = lorica_tls::http_client::public()
+        .map_err(|e| AcmeError::Account(format!("the ACME client's trust store: {e}")))?;
+    Ok(Account::builder_with_http(Box::new(policy_http_client(
+        tls,
+    ))))
+}
+
 /// Build (or load) an ACME account against the directory in `config`.
 async fn build_account(config: &AcmeConfig) -> Result<Account, AcmeError> {
     let contact = config.contact_email.as_ref().map(|e| format!("mailto:{e}"));
     let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
 
     // instant-acme 0.8 (audit L-15) : `Account::create` moved to a
-    // builder-mediated path. The builder owns the HTTP client (default
-    // `hyper-rustls` feature) ; `directory_url` is now an owned `String`.
-    let (account, _) = Account::builder()
-        .map_err(|e| AcmeError::Account(e.to_string()))?
+    // builder-mediated path. The builder owns the HTTP client
+    // ([`account_builder`]) ; `directory_url` is now an owned `String`.
+    let (account, _) = account_builder()?
         .create(
             &NewAccount {
                 contact: &contact_refs,
@@ -373,8 +415,7 @@ pub async fn begin_manual_dns01(
     let contact = config.contact_email.as_ref().map(|e| format!("mailto:{e}"));
     let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
 
-    let (account, credentials) = Account::builder()
-        .map_err(|e| AcmeError::Account(e.to_string()))?
+    let (account, credentials) = account_builder()?
         .create(
             &NewAccount {
                 contact: &contact_refs,
@@ -457,8 +498,7 @@ pub async fn finalize_manual_dns01(
 
     // instant-acme 0.8 (audit L-15) : `Account::from_credentials` moved onto
     // `AccountBuilder`. Restore an account from previously-stored credentials.
-    let account = Account::builder()
-        .map_err(|e| AcmeError::Account(e.to_string()))?
+    let account = account_builder()?
         .from_credentials(credentials)
         .await
         .map_err(|e| AcmeError::Account(e.to_string()))?;

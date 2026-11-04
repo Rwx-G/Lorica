@@ -12,8 +12,8 @@
 #     than the Let's Encrypt /directory path.
 #     Its directory TLS leaf is signed by a fixture CA generated at
 #     boot by `acme-ca-init`; the Lorica node trusts that CA via
-#     SSL_CERT_FILE (honoured by instant-acme's platform verifier
-#     through openssl-probe).
+#     SSL_CERT_FILE (honoured by the platform store of
+#     `lorica_tls::http_client::public`, which the ACME client uses).
 #   - `challtestsrv` (pebble-challtestsrv:2.8.0) is Pebble's resolver
 #     (-dnsserver challtestsrv:8053) and the mock DNS provider: the
 #     smoke provisions A and TXT records over its management API on
