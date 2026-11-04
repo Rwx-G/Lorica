@@ -11,13 +11,20 @@ Author: Rwx-G
 
 ### Added
 
+- **Route protection records.** When a token deletes a route that carries an access control in force (Basic auth, IP allowlist and the other controls a token may only strengthen), the node keeps a record of the names and path that route served and of its controls. A later token write that would serve those names, whether a route create, an update adding a name or an environment, is held to the record exactly as it is held to a stored route: matching or strengthening is allowed, weakening is refused with a `403`. Operators list and clear records under Settings > Route Protection Records or through `GET` / `DELETE /api/v1/automation/route-protection-records`; an operator's own create or update of a recorded name clears its record, and an operator's delete records nothing. Every creation and clearing is audited. Records are node-local: not replicated to followers and not part of the configuration export. Schema migration 67: upgrade followers first.
+
 ### Changed
 
 ### Fixed
 
+- **A route create or update through the management API is applied whole or not at all.** A create naming a backend id that does not exist used to leave the route stored without its backends; the route row, its backend links and the protection records it clears now commit in one transaction.
+- **Upstream Pingora sync into the forked crates (see `FORK.md`).** Pooled upstream connections are no longer discarded when a request picks one up while the idle watcher is still releasing it: the request used to dial a new connection and log `failed to acquire reusable stream`. Brotli-compressed responses now end with the stream's final block, which strict decoders require. A load-balancing selection over backends whose weights are all zero returns no backend instead of panicking (Lorica's own balancer never builds such a set).
+
 ### Removed
 
 ### Security
+
+- **A token could remove a route's access controls by deleting the route and creating it again.** The automation plane only lets a token strengthen a route's controls in place, but a delete followed by a create was two writes the guard weighed separately, and the second had nothing left to be weighed against. This was documented as a residual of the automation plane since 1.9.0; the protection records under Added close it.
 
 ## [1.10.1] - 2026-10-28
 
