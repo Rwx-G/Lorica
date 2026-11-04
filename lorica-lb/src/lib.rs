@@ -69,10 +69,24 @@ pub struct Backend {
 // unmaintained). Same semantics as upstream's `ignore` attributes: `addr`
 // then `weight`, in that order, and never `ext`. The health and
 // enablement tables are keyed by `hash_key`, so two backends that differ
-// only in `ext` must stay the same backend.
+// only in `ext` must stay the same backend. All three read `identity`,
+// whose destructuring names every field: a field a later sync adds to
+// `Backend` fails to compile there until it is placed in the identity
+// or explicitly left out of it.
+impl Backend {
+    fn identity(&self) -> (&SocketAddr, &usize) {
+        let Backend {
+            addr,
+            weight,
+            ext: _,
+        } = self;
+        (addr, weight)
+    }
+}
+
 impl PartialEq for Backend {
     fn eq(&self, other: &Self) -> bool {
-        self.addr == other.addr && self.weight == other.weight
+        self.identity() == other.identity()
     }
 }
 
@@ -86,16 +100,13 @@ impl PartialOrd for Backend {
 
 impl Ord for Backend {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.addr
-            .cmp(&other.addr)
-            .then_with(|| self.weight.cmp(&other.weight))
+        self.identity().cmp(&other.identity())
     }
 }
 
 impl Hash for Backend {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.addr.hash(state);
-        self.weight.hash(state);
+        self.identity().hash(state);
     }
 }
 

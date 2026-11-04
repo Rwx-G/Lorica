@@ -470,40 +470,67 @@ pub struct PeerOptions {
 // Lorica: written by hand where upstream derives it with `derivative`
 // (RUSTSEC-2024-0388, unmaintained). Same output as the derive: every
 // field in declaration order, except the two hook closures, which have
-// no `Debug` and which upstream marks `Debug = "ignore"`.
+// no `Debug` and which upstream marks `Debug = "ignore"`. The
+// destructuring names every field, so a field a later sync adds fails to
+// compile here until it is printed or explicitly left out.
 impl std::fmt::Debug for PeerOptions {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        let PeerOptions {
+            bind_to,
+            connection_timeout,
+            total_connection_timeout,
+            read_timeout,
+            idle_timeout,
+            write_timeout,
+            verify_cert,
+            verify_hostname,
+            alternative_cn,
+            alpn,
+            ca,
+            tcp_keepalive,
+            tcp_recv_buf,
+            dscp,
+            h2_ping_interval,
+            max_h2_streams,
+            allow_h1_response_invalid_content_length,
+            http_upstream_request_policy,
+            extra_proxy_headers,
+            curves,
+            second_keyshare,
+            tcp_fast_open,
+            tracer,
+            custom_l4,
+            upstream_tcp_sock_tweak_hook: _,
+            proxy_digest_user_data_hook: _,
+        } = self;
         f.debug_struct("PeerOptions")
-            .field("bind_to", &self.bind_to)
-            .field("connection_timeout", &self.connection_timeout)
-            .field("total_connection_timeout", &self.total_connection_timeout)
-            .field("read_timeout", &self.read_timeout)
-            .field("idle_timeout", &self.idle_timeout)
-            .field("write_timeout", &self.write_timeout)
-            .field("verify_cert", &self.verify_cert)
-            .field("verify_hostname", &self.verify_hostname)
-            .field("alternative_cn", &self.alternative_cn)
-            .field("alpn", &self.alpn)
-            .field("ca", &self.ca)
-            .field("tcp_keepalive", &self.tcp_keepalive)
-            .field("tcp_recv_buf", &self.tcp_recv_buf)
-            .field("dscp", &self.dscp)
-            .field("h2_ping_interval", &self.h2_ping_interval)
-            .field("max_h2_streams", &self.max_h2_streams)
+            .field("bind_to", bind_to)
+            .field("connection_timeout", connection_timeout)
+            .field("total_connection_timeout", total_connection_timeout)
+            .field("read_timeout", read_timeout)
+            .field("idle_timeout", idle_timeout)
+            .field("write_timeout", write_timeout)
+            .field("verify_cert", verify_cert)
+            .field("verify_hostname", verify_hostname)
+            .field("alternative_cn", alternative_cn)
+            .field("alpn", alpn)
+            .field("ca", ca)
+            .field("tcp_keepalive", tcp_keepalive)
+            .field("tcp_recv_buf", tcp_recv_buf)
+            .field("dscp", dscp)
+            .field("h2_ping_interval", h2_ping_interval)
+            .field("max_h2_streams", max_h2_streams)
             .field(
                 "allow_h1_response_invalid_content_length",
-                &self.allow_h1_response_invalid_content_length,
+                allow_h1_response_invalid_content_length,
             )
-            .field(
-                "http_upstream_request_policy",
-                &self.http_upstream_request_policy,
-            )
-            .field("extra_proxy_headers", &self.extra_proxy_headers)
-            .field("curves", &self.curves)
-            .field("second_keyshare", &self.second_keyshare)
-            .field("tcp_fast_open", &self.tcp_fast_open)
-            .field("tracer", &self.tracer)
-            .field("custom_l4", &self.custom_l4)
+            .field("http_upstream_request_policy", http_upstream_request_policy)
+            .field("extra_proxy_headers", extra_proxy_headers)
+            .field("curves", curves)
+            .field("second_keyshare", second_keyshare)
+            .field("tcp_fast_open", tcp_fast_open)
+            .field("tracer", tracer)
+            .field("custom_l4", custom_l4)
             .finish()
     }
 }
