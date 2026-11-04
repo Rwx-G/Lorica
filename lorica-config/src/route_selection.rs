@@ -557,9 +557,22 @@ fn select_where<'a, E>(
 /// ));
 /// ```
 pub fn normalised_path(path: &str) -> Cow<'_, str> {
+    // Every step of the reading needs one of these, and in a path that
+    // starts with `/` a `.` segment always follows a `/`: such a path
+    // without any of them reads as itself.
     if !path.contains(['%', ';', '\\']) && !path.contains("//") && !path.contains("/.") {
         return Cow::Borrowed(path);
     }
+    let normalised = read_in_full(path);
+    if normalised == path {
+        Cow::Borrowed(path)
+    } else {
+        Cow::Owned(normalised)
+    }
+}
+
+/// [`normalised_path`] without its shortcut: every step run on `path`.
+fn read_in_full(path: &str) -> String {
     let decoded = percent_decoded_once(&separators_and_parameters_read(path));
     let read = separators_and_parameters_read(&decoded);
     let leading_slash = read.starts_with('/');
@@ -583,11 +596,7 @@ pub fn normalised_path(path: &str) -> Cow<'_, str> {
     if ends_in_a_directory && !segments.is_empty() {
         normalised.push('/');
     }
-    if normalised == path {
-        Cow::Borrowed(path)
-    } else {
-        Cow::Owned(normalised)
-    }
+    normalised
 }
 
 /// `text` with each `\` read as `/`, and each `;` dropped with the rest
@@ -998,6 +1007,37 @@ mod tests {
                 matches!(normalised_path(unchanged), Cow::Borrowed(_)),
                 "{unchanged}"
             );
+        }
+    }
+
+    #[test]
+    fn the_shortcut_of_normalised_path_answers_what_the_full_reading_does() {
+        // Every origin-form path up to six characters over the alphabet
+        // each step of the reading turns on, plus the two targets that
+        // are not origin-form (`OPTIONS *`, and the empty path of a
+        // CONNECT): the shortcut must never skip a path the full reading
+        // changes, and either way the answer is the full reading.
+        const ALPHABET: [char; 10] = ['/', '.', '%', ';', '\\', 'a', 'A', '2', 'e', 'F'];
+        let mut paths: Vec<String> = vec![String::new(), "*".to_string()];
+        let mut level: Vec<String> = vec!["/".to_string()];
+        for _ in 1..6 {
+            paths.extend(level.iter().cloned());
+            level = level
+                .iter()
+                .flat_map(|path| ALPHABET.iter().map(move |c| format!("{path}{c}")))
+                .collect();
+        }
+        paths.extend(level);
+        assert!(paths.len() > 100_000, "the generator went blind");
+        for path in &paths {
+            let full = read_in_full(path);
+            match normalised_path(path) {
+                Cow::Borrowed(same) => assert_eq!(full, same, "{path:?} was skipped"),
+                Cow::Owned(read) => {
+                    assert_eq!(read, full, "{path:?}");
+                    assert_ne!(read, *path, "{path:?} allocated to read as itself");
+                }
+            }
         }
     }
 
