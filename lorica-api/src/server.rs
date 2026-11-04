@@ -421,7 +421,7 @@ impl AppState {
     /// "rotate the secret on every cert renewal so cookie
     /// lifetime is capped at the cert TTL".
     ///
-    /// Generates fresh 32 bytes via `OsRng`, persists the hex
+    /// Generates fresh 32 bytes via `SysRng`, persists the hex
     /// form to `GlobalSettings.bot_hmac_secret_hex`, and leaves
     /// the actual in-memory swap to the next
     /// `apply_bot_secret_from_store` invocation (which fires on
@@ -437,9 +437,9 @@ impl AppState {
     /// higher-priority operation).
     pub async fn rotate_bot_hmac_on_cert_event(&self) {
         let new_bytes: [u8; 32] = {
-            use rand::TryRngCore;
+            use rand::TryRng;
             let mut out = [0u8; 32];
-            rand::rngs::OsRng
+            rand::rngs::SysRng
                 .try_fill_bytes(&mut out)
                 .expect("OS RNG must produce entropy for HMAC rotation");
             out
@@ -914,6 +914,23 @@ pub fn build_router(
             delete(crate::oidc_issuers::delete_oidc_issuer).layer(rl(
                 "automation_tokens",
                 RL_CLUSTER,
+                RL_WINDOW_S,
+            )),
+        )
+        // Route protection records (backlog #93): what a route an
+        // automation token deleted served, which the automation plane
+        // holds its later writes to. Management-plane only, like the
+        // tokens: the automation listener has no route for these paths,
+        // so no token can list or clear what bounds it.
+        .route(
+            "/api/v1/automation/route-protection-records",
+            get(crate::route_protection_records::list_route_protection_records),
+        )
+        .route(
+            "/api/v1/automation/route-protection-records/{id}",
+            delete(crate::route_protection_records::clear_route_protection_record).layer(rl(
+                "destructive_cud",
+                RL_DESTRUCTIVE_CUD,
                 RL_WINDOW_S,
             )),
         )

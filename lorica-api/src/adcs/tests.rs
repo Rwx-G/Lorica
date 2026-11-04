@@ -717,6 +717,8 @@ async fn a_second_operation_is_refused_while_one_runs() {
 }
 
 const SLOW_OPERATION: Duration = Duration::from_millis(1500);
+/// Applied once the authority exists: under the full parallel test run
+/// the authority create itself was seen past 200 ms, answered 504.
 const SHORT_HANDLER_DEADLINE: Duration = Duration::from_millis(200);
 
 /// D15: an operation that outlives the handler's deadline is answered
@@ -726,10 +728,9 @@ const SHORT_HANDLER_DEADLINE: Duration = Duration::from_millis(200);
 #[tokio::test]
 async fn an_operation_past_the_handler_deadline_keeps_the_guard_until_it_ends() {
     let client = StubClient::slow_once(SLOW_OPERATION, || Ok(()));
-    let f = fixture(Arc::clone(&client), None)
-        .await
-        .with_handler_deadline(SHORT_HANDLER_DEADLINE);
+    let f = fixture(Arc::clone(&client), None).await;
     f.create_authority().await;
+    let f = f.with_handler_deadline(SHORT_HANDLER_DEADLINE);
 
     let resp = f.test_unlimited().await;
     assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
@@ -773,10 +774,9 @@ async fn a_rejected_credential_past_the_handler_deadline_still_opens_the_breaker
     let client = StubClient::slow_once(SLOW_OPERATION, || Err(rejected_credential()));
     let alerts = lorica_notify::AlertSender::new(16);
     let mut received = alerts.subscribe();
-    let f = fixture(Arc::clone(&client), Some(alerts))
-        .await
-        .with_handler_deadline(SHORT_HANDLER_DEADLINE);
+    let f = fixture(Arc::clone(&client), Some(alerts)).await;
     f.create_authority().await;
+    let f = f.with_handler_deadline(SHORT_HANDLER_DEADLINE);
 
     let resp = f.test_unlimited().await;
     assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);

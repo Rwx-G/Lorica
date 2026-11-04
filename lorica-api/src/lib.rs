@@ -49,6 +49,7 @@ pub mod oidc_issuers;
 pub mod password_policy;
 pub mod preview;
 pub mod probes;
+pub mod route_protection_records;
 pub mod routes;
 /// Axum router + shared `AppState` construction.
 pub mod server;

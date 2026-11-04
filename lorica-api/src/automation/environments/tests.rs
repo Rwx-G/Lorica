@@ -461,26 +461,16 @@ async fn seed_protected_route(
 }
 
 /// Every control `ROUTE_PROTECTIONS` weighs, set the way an operator
-/// would protect a preview estate.
+/// would protect a preview estate: the table's fortified route, raised
+/// onto `route` rule by rule, with the credential this module's secret
+/// checks look for.
 fn fortify(route: &mut Route) {
-    route.basic_auth_username = Some(INHERITED_USER.to_string());
-    route.basic_auth_password_hash = Some(INHERITED_HASH.to_string());
-    route.ip_allowlist = vec!["192.0.2.0/24".to_string()];
-    route.ip_denylist = vec!["192.0.2.66".to_string()];
-    route.geoip = Some(lorica_config::models::GeoIpConfig {
-        mode: lorica_config::models::GeoIpMode::Allowlist,
-        countries: vec!["FR".to_string()],
-    });
-    route.bot_protection = serde_json::from_value(serde_json::json!({ "mode": "cookie" }))
-        .expect("test setup: a bot-protection config");
-    route.waf_enabled = true;
-    route.waf_mode = WafMode::Blocking;
-    route.rate_limit = Some(lorica_config::models::RateLimit {
-        capacity: 20,
-        refill_per_sec: 5,
-        scope: lorica_config::models::RateLimitScope::PerIp,
-    });
-    route.auto_ban_threshold = Some(5);
+    let mut strong = crate::automation::protections::fortified(&route.id, &route.hostname);
+    strong.basic_auth_username = Some(INHERITED_USER.to_string());
+    strong.basic_auth_password_hash = Some(INHERITED_HASH.to_string());
+    for protection in crate::automation::protections::ROUTE_PROTECTIONS {
+        (protection.strengthened)(&strong, route);
+    }
 }
 
 /// The route a written environment owns, as stored.
@@ -495,26 +485,20 @@ async fn environment_route_of(state: &AppState, data: &serde_json::Value) -> Rou
         .expect("the environment's route exists")
 }
 
-/// Every protected control of `route` equals `expected`'s.
+/// Every protected control of `route` is `expected`'s: neither row is
+/// weaker than the other on any rule of the table.
 fn assert_protections_equal(route: &Route, expected: &Route) {
-    assert_eq!(route.basic_auth_username, expected.basic_auth_username);
     assert_eq!(
         route.basic_auth_password_hash, expected.basic_auth_password_hash,
         "the stored hash is copied server side"
     );
-    assert_eq!(route.ip_allowlist, expected.ip_allowlist);
-    assert_eq!(route.ip_denylist, expected.ip_denylist);
-    assert_eq!(route.geoip, expected.geoip);
-    assert_eq!(route.bot_protection, expected.bot_protection);
-    assert_eq!(route.waf_enabled, expected.waf_enabled);
-    assert_eq!(route.waf_mode, expected.waf_mode);
-    let bucket = |route: &Route| {
-        route
-            .effective_rate_limit()
-            .map(|limit| (limit.capacity, limit.refill_per_sec, limit.scope))
-    };
-    assert_eq!(bucket(route), bucket(expected));
-    assert_eq!(route.auto_ban_threshold, expected.auto_ban_threshold);
+    for protection in crate::automation::protections::ROUTE_PROTECTIONS {
+        assert!(
+            !(protection.weakened)(expected, route) && !(protection.weakened)(route, expected),
+            "{:?} differs",
+            protection.fields
+        );
+    }
 }
 
 /// No inherited secret anywhere in `text`.

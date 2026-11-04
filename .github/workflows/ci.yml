@@ -49,25 +49,25 @@ jobs:
         run: cargo fmt --all -- --check
 
       # Same four gates as the local Docker recipe (see CONTRIBUTING.md).
-      - name: Clippy (product crates)
-        run: cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-mcp -p lorica-automation-policy -p lorica-adcs -- -D warnings
-
-      - name: Clippy (tests and benches of the API, cluster, MCP, policy and AD CS crates)
-        run: cargo clippy -p lorica-api -p lorica-cluster -p lorica-mcp -p lorica-automation-policy -p lorica-adcs --all-targets -- -D warnings
-
-      - name: Clippy (binary crate with the otel feature)
-        run: cargo clippy -p lorica --all-targets --features otel -- -D warnings
+      # Every member and every target, so no crate list can leave one
+      # out: the lists this replaced skipped lorica-tls, which holds the
+      # outbound TLS policy, and seven product crates. `clippy.toml`
+      # turns that policy into lints, which only hold where clippy runs.
+      - name: Clippy (every crate and target, the binary with the otel feature)
+        run: cargo clippy --workspace --all-targets --features lorica/otel -- -D warnings
 
       # lorica-mcp is a subprocess an operator's MCP client launches and
-      # reads no database. The one first-party crate it may link is
+      # reads no database. The first-party crates it may link are
       # lorica-automation-policy, pure data with serde as its only
-      # dependency; any other lorica-* crate (lorica-config and its
-      # bundled SQLite, lorica-api) or SQLite itself fails this step.
+      # dependency, and lorica-tls with its error type lorica-error, the
+      # TLS policy every outbound HTTP client is built on; any other
+      # lorica-* crate (lorica-config and its bundled SQLite, lorica-api)
+      # or SQLite itself fails this step.
       - name: lorica-mcp links neither the management crates nor SQLite
         run: |
           linked=$(cargo tree -p lorica-mcp -e normal --prefix none | awk '{print $1}' | sort -u \
             | grep -xE 'rusqlite|libsqlite3-sys|lorica-.*' \
-            | grep -vxE 'lorica-mcp|lorica-automation-policy' || true)
+            | grep -vxE 'lorica-mcp|lorica-automation-policy|lorica-tls|lorica-error' || true)
           if [ -n "$linked" ]; then
             echo "FAIL: lorica-mcp links: $linked"
             exit 1
@@ -228,7 +228,7 @@ jobs:
           npm run build
 
       - name: Run Rust unit tests (product crates)
-        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command -p lorica-cluster -p lorica-tls -p lorica-metrics -p lorica-acme -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-mcp -p lorica-automation-policy -p lorica-adcs
+        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command -p lorica-cluster -p lorica-metrics -p lorica-acme -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-worker -p lorica-dashboard -p lorica-mcp -p lorica-automation-policy -p lorica-adcs
         env:
           SKIP_FRONTEND_BUILD: ""
 
@@ -241,7 +241,18 @@ jobs:
           SKIP_FRONTEND_BUILD: ""
 
       - name: Run Rust unit tests (forked crates)
-        run: cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error -p lorica-tls -p lorica-worker -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde -p lorica-limits
+        run: cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error -p lorica-tls -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde -p lorica-limits -p lorica-runtime -p lorica-timeout -p lorica-ketama -p lorica-lru -p lorica-memory-cache -p TinyUFO
+        env:
+          SKIP_FRONTEND_BUILD: "1"
+
+      # Upstream gates its connector, listener and TLS tests on `any_tls`,
+      # which the step above never enables, so they compiled nowhere. They
+      # run here, in the rustls build the binary ships, with lorica-core's
+      # self-contained integration binaries. A step of its own: the same
+      # features on the line above would unify into every crate built on
+      # lorica-core and leave the no-TLS build untested.
+      - name: Run Rust unit tests (forked crates, rustls build)
+        run: cargo test -p lorica-core -p lorica-lb --features lorica-core/rustls,lorica-core/integration-tests,lorica-lb/rustls
         env:
           SKIP_FRONTEND_BUILD: "1"
 
@@ -292,10 +303,12 @@ jobs:
             -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify \
             -p lorica-bench -p lorica-command -p lorica-metrics -p lorica-acme \
             -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-worker \
-            -p lorica-mcp -p lorica-automation-policy -p lorica-adcs -p lorica \
-            -p lorica-cluster -p lorica-tls \
+            -p lorica-dashboard -p lorica-mcp -p lorica-automation-policy -p lorica-adcs \
+            -p lorica -p lorica-cluster -p lorica-tls \
             -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error \
-            -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde
+            -p lorica-lb -p lorica-pool -p lorica-cache -p lorica-header-serde \
+            -p lorica-limits -p lorica-runtime -p lorica-timeout -p lorica-ketama \
+            -p lorica-lru -p lorica-memory-cache -p TinyUFO
 
       - name: Report coverage summary
         run: |

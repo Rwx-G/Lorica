@@ -2301,7 +2301,57 @@ export const api = {
    */
   revokeAutomationToken: (publicId: string) =>
     request<AutomationTokenResponse>('DELETE', `/automation/tokens/${encodeURIComponent(publicId)}`),
+
+  // Route protection records (backlog #93). Operator on both verbs; the
+  // server's `required_role` is the enforcement.
+  listRouteProtectionRecords: () =>
+    request<{ records: RouteProtectionRecord[] }>('GET', '/automation/route-protection-records'),
+
+  /**
+   * Clear one record. Afterwards an automation token's route may serve
+   * the record's names weaker than the deleted route did. Answers the
+   * record as it was.
+   */
+  clearRouteProtectionRecord: (id: string) =>
+    request<RouteProtectionRecord>(
+      'DELETE',
+      `/automation/route-protection-records/${encodeURIComponent(id)}`,
+    ),
 };
+
+/**
+ * One control a route protection record holds: the fields its rule
+ * weighs and the safe direction, never a value. The server renders both
+ * from `ROUTE_PROTECTIONS`; nothing here lists a control.
+ */
+export interface RecordedControl {
+  fields: string[];
+  rule: string;
+}
+
+/**
+ * What a route an automation token deleted served, and which controls
+ * it carried. The automation plane holds every later route write on
+ * these names to them until an operator clears the record.
+ */
+export interface RouteProtectionRecord {
+  id: string;
+  /** The id the deleted route had. */
+  route_id: string;
+  hostname: string;
+  hostname_aliases: string[];
+  path_prefix: string;
+  /** The token that deleted the route, as its audit row names it. */
+  deleted_by: string;
+  deleted_at: string;
+  /** Empty when `readable` is false. */
+  controls: RecordedControl[];
+  /**
+   * An unreadable record refuses every token route create or update,
+   * and every environment write, until it is cleared.
+   */
+  readable: boolean;
+}
 
 /**
  * The closed scope enum an automation token carries (Story 10.3, widened

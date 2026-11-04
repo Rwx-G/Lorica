@@ -27,12 +27,20 @@ ring = "0.17.12"
 # `lorica/Cargo.toml`, `lorica-api/Cargo.toml::instant-acme`), so
 # the only remaining stack-duplication source was here.
 rustls = { version = "0.23.12", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-rustls-native-certs = "0.7.1"
-# rustls-pemfile dropped in v1.5.2 (audit L-16, RUSTSEC-2025-0134
-# unmaintained). PEM parsing now goes through `rustls-pki-types`'s
-# `PemObject` trait (the rustls team's actively-maintained
-# replacement). Closes the only outstanding RUSTSEC chain in the
-# workspace - the runtime crate had already migrated in v1.5.0.
+# 0.8 since v1.10.2: 0.7 was the last thing in the tree pulling
+# `rustls-pemfile` (RUSTSEC-2025-0134, unmaintained). 0.8 returns the
+# certificates it could load beside the errors it met instead of failing
+# the whole load on the first one; see
+# `load_platform_certs_incl_env_into_store`.
+rustls-native-certs = "0.8"
+# The public half of the outbound HTTP trust (`http_client::public_roots`),
+# the bundle reqwest 0.12 seeded its root store from.
+webpki-roots = "1"
+# Direct use of rustls-pemfile dropped in v1.5.2 (audit L-16,
+# RUSTSEC-2025-0134 unmaintained). PEM parsing now goes through
+# `rustls-pki-types`'s `PemObject` trait (the rustls team's
+# actively-maintained replacement). The crate stayed in the tree
+# through `rustls-native-certs` 0.7 until the 0.8 bump above.
 rustls-pki-types = { version = "1.7.0", features = ["alloc", "std"] }
 # Same `ring`-only pin as the rustls dep above (audit M-6).
 tokio-rustls = { version = "0.26.0", default-features = false, features = ["ring"] }
@@ -48,4 +56,15 @@ tokio-rustls = { version = "0.26.0", default-features = false, features = ["ring
 # InfoAccess, GeneralName::URI}`, `oid_registry::OID_PKIX_ACCESS_
 # DESCRIPTOR_OCSP`) is stable across 0.16 -> 0.17 -> 0.18.
 x509-parser = "0.18"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+reqwest = { workspace = true }
+
+[features]
+# `http_client::blocking_client_builder`, for the binary's OTLP/HTTP
+# exporters (`lorica/otel`). Off by default so no other build compiles
+# reqwest's blocking client.
+blocking = ["reqwest/blocking"]
+
+[dev-dependencies]
+# Certificates for the in-memory handshakes of the `http_client` tests,
+# at the version `lorica-api` uses.
+rcgen = "0.14"

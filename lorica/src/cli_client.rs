@@ -114,17 +114,10 @@ async fn open_session(
     user: &str,
     password: &str,
 ) -> Result<reqwest::Client, String> {
-    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|e| format!("TLS configuration: {e}"))?
-    .dangerous()
-    .with_custom_certificate_verifier(Arc::clone(&pin) as Arc<dyn ServerCertVerifier>)
-    .with_no_client_auth();
-    let client = reqwest::Client::builder()
+    let tls =
+        lorica_tls::http_client::with_verifier(Arc::clone(&pin) as Arc<dyn ServerCertVerifier>);
+    let client = lorica_tls::http_client::client_builder(tls)
         .cookie_store(true)
-        .use_preconfigured_tls(tls)
         .build()
         .map_err(|e| format!("HTTP client: {e}"))?;
 
@@ -220,7 +213,8 @@ impl PinnedLeaf {
         Ok(Self {
             path,
             leaf,
-            algorithms: rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            algorithms: lorica_tls::http_client::crypto_provider()
+                .signature_verification_algorithms,
             refused: AtomicBool::new(false),
         })
     }

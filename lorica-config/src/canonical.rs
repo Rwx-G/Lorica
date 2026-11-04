@@ -578,13 +578,11 @@ fn pem_blocks_der(text: &str) -> Option<Vec<u8>> {
     let mut der = Vec::new();
     let mut rest = text;
     while let Some(begin) = rest.find("-----BEGIN ") {
-        let after_begin = match rest[begin..]
-            .find("-----\n")
-            .or_else(|| rest[begin..].find("-----\r\n"))
-        {
-            Some(offset) => begin + offset + "-----".len(),
-            None => return None,
-        };
+        let after_begin = begin
+            + rest[begin..]
+                .find("-----\n")
+                .or_else(|| rest[begin..].find("-----\r\n"))?
+            + "-----".len();
         let end = rest[after_begin..].find("-----END ")? + after_begin;
         let body: String = rest[after_begin..end]
             .chars()

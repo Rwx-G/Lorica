@@ -412,20 +412,21 @@ static DUMMY_PASSWORD_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::n
 
 /// Generate a random password for first-run admin setup.
 ///
-/// Uses `OsRng` (getrandom) rather than the thread-local RNG so the
+/// Uses `SysRng` (getrandom) rather than the thread-local RNG so the
 /// first-run password is unpredictable even if any thread-local
 /// seeding path ever degrades. Matches the other crypto-sensitive
 /// RNG in this file (`hash_password`'s `SaltString::generate(OsRng)`).
 /// Audit L-5.
 pub fn generate_random_password() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%&*";
-    // ChaCha20 seeded from OsRng : fast, deterministic-per-seed
-    // sequence but seeded from OS entropy. `rand::rngs::OsRng` is
-    // `CryptoRng + RngCore` ; `random_range` requires a `Rng`, so we
-    // re-seed a CSPRNG from OsRng.
-    let mut rng = rand_chacha::ChaCha20Rng::from_os_rng();
+    // ChaCha20 seeded from SysRng : fast, deterministic-per-seed
+    // sequence but seeded from OS entropy. `rand::rngs::SysRng` is a
+    // fallible `TryRng` ; `random_range` requires an infallible `Rng`,
+    // so we seed a CSPRNG from it.
+    let mut rng = rand_chacha::ChaCha20Rng::try_from_rng(&mut rand::rngs::SysRng)
+        .expect("OS RNG must produce entropy for the first-run password");
     (0..24)
         .map(|_| {
             let idx = rng.random_range(0..CHARSET.len());

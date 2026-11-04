@@ -6,11 +6,11 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.10.1-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.10.2-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-3501-brightgreen.svg" alt="Lorica Tests">
-  <img src="https://img.shields.io/badge/Pingora%20Tests-794-blue.svg" alt="Inherited Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-3527-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Pingora%20Tests-813-blue.svg" alt="Inherited Tests">
 </p>
 
 ---
@@ -726,30 +726,24 @@ cargo build --release
 # Every Rust test in the workspace
 cargo test --workspace
 
-# Product crates only (3501 tests, Lorica-native)
-cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
-           -p lorica-notify -p lorica-bench -p lorica-worker \
-           -p lorica-command -p lorica-shmem \
-           -p lorica-challenge -p lorica-geoip -p lorica-acme \
-           -p lorica-metrics -p lorica-cluster -p lorica-dashboard \
-           -p lorica-mcp -p lorica-automation-policy -p lorica-adcs \
-           --features otel
-
-# Pingora-forked crates (794 tests)
-cargo test -p lorica-core -p lorica-proxy -p lorica-http \
-           -p lorica-error -p lorica-tls -p lorica-cache \
-           -p lorica-pool -p lorica-runtime -p lorica-timeout \
-           -p lorica-lb -p lorica-ketama -p lorica-lru \
-           -p lorica-memory-cache -p lorica-header-serde -p lorica-limits \
-           -p TinyUFO
+# The CI `Test` job's steps: the product crates, the binary crate with
+# `otel`, the Pingora-forked crates, and the forked crates' rustls build.
+# The crate lists live in the workflow; print them rather than copy them.
+grep -E '^\s+run: cargo test' .github/workflows/ci.yml
 
 # The cluster crate's integration binaries, including the frozen v1.7.0
 # wire corpus (every message's encoding, pinned)
 cargo test -p lorica-cluster --tests
 
-# Frontend (538 Vitest cases across 29 files) and its gates
+# Frontend and its gates
 cd lorica-dashboard/frontend && npm run check && npm run lint && npx vitest run
 ```
+
+At 1.10.2 the two product-crate steps run 3527 Rust tests and the
+forked-crate step 813; the rustls build runs 492 more, most of them the
+default-feature tests of `lorica-core` and `lorica-lb` again with TLS on,
+so they are left out of the forked figure. The frontend suite is 762
+Vitest cases across 44 files.
 
 The `lorica` binary crate carries 24 end-to-end binaries under
 `lorica/tests/` that drive a real Pingora `Server` against mock backends
@@ -925,11 +919,6 @@ git verify-tag v1.7.4
 | v1.11.0 | TCP and UDP stream proxying at parity with nginx `stream {}` and HAProxy `mode tcp`: TLS passthrough with SNI and ALPN routing, L4 TLS termination with Lorica's ACME certificates, upstream TLS and mTLS, PROXY protocol v1/v2 both ways (also accepted on the HTTP listeners), the existing balancing algorithms with backup backends and the circuit breaker, TCP send/expect health checks, per-source connection caps, new-connection rate limits, allow/deny and GeoIP, UDP bounded by default in datagrams and bytes against reflection, local backends refused, configurable drain on upgrade. Streams are replicated with per-node targeting, audited, observed, managed from the dashboard and the management API, and read-only on the automation API and the MCP read tier. PRD: [Epic 12](docs/prd/epic-12-v1.11.0.md), Phase 1, stories 12.0 to 12.12. | Planned |
 | v1.12.0 | Stream proxying beyond parity: weighted P2C, transparent proxying, active UDP health checks, protocol detection on a shared port that refuses unrecognised bytes, live TCP passthrough connections and UDP sessions handed over across a hot upgrade (TLS streams drain; scope confirmed by a feasibility spike run during the 1.11.0 cycle), and full nginx `stream {}` import. PRD: [Epic 12](docs/prd/epic-12-v1.11.0.md), Phase 2, stories 12.13 to 12.18. | Planned |
 | v2.0.0 | HTTP/3 (QUIC) | Planned |
-
-### Backlog (tracking only, blocked on upstream)
-
-- **`rustls-pemfile` removal in the `lorica-tls` fork.** RUSTSEC-2025-0134 (unmaintained) still shows transitively through our Pingora fork. Native Lorica code migrated to `rustls-pki-types` in v1.5.0 ; the transitive dep clears once Pingora upstream migrates.
-- **`rand 0.8` removal in forked crates.** Native Lorica code bumped to `rand 0.9` in v1.5.0. RUSTSEC-2026-0097 (unsound with custom logger) was cleared in v1.5.8 by bumping the transitive `0.8` line to `0.8.6` ; removing the `0.8` line entirely still depends on the upstream forks (`lorica-runtime`, `lorica-limits`) and the `axum` / `tungstenite` majors. Same monitoring as the `rustls-pemfile` row.
 
 The table above tracks feature milestones; the current release and the patch cycles (v1.5.3+) live in [CHANGELOG.md](CHANGELOG.md).
 

@@ -1,6 +1,6 @@
 // Vendored from the `captcha` crate v1.0.0 (`src/filters/noise.rs`).
 
-use rand::{rng, Rng};
+use rand::{rng, RngExt};
 
 use super::super::images::{Image, Pixl};
 use super::Filter;

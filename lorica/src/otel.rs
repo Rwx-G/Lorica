@@ -265,7 +265,7 @@ mod imp {
     use once_cell::sync::Lazy;
     use opentelemetry::global;
     use opentelemetry::KeyValue;
-    use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig};
+    use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig, WithTonicConfig};
     use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
     use opentelemetry_sdk::Resource;
 
@@ -276,6 +276,72 @@ mod imp {
     /// previous provider when settings change at runtime. `Mutex`
     /// because init can race with shutdown during a config reload.
     static PROVIDER: Lazy<Mutex<Option<SdkTracerProvider>>> = Lazy::new(|| Mutex::new(None));
+
+    /// The HTTP client of the OTLP/HTTP exporters, on the workspace's
+    /// outbound TLS policy (`lorica_tls::http_client`). Left to build
+    /// its own, the exporter would take reqwest's built-in TLS: the
+    /// platform verifier on whatever crypto provider the process
+    /// installed, or a panic when none is.
+    ///
+    /// The per-request timeout is the one the exporter would have given
+    /// the client it builds itself ([`otlp_request_timeout`] for
+    /// `signal_timeout_var`). Built on a thread of its own, as the
+    /// exporter builds its client: the blocking client starts a runtime,
+    /// which a thread already driving one must not do.
+    fn otlp_http_client(signal_timeout_var: &str) -> Result<reqwest::blocking::Client, String> {
+        let tls = lorica_tls::http_client::public()
+            .map_err(|e| format!("OTLP HTTP client trust roots: {e}"))?;
+        let timeout = otlp_request_timeout(signal_timeout_var, |var| std::env::var(var).ok());
+        std::thread::spawn(move || {
+            lorica_tls::http_client::blocking_client_builder(tls)
+                .timeout(timeout)
+                .build()
+        })
+        .join()
+        .map_err(|_| "the thread building the OTLP HTTP client panicked".to_string())?
+        .map_err(|e| format!("OTLP HTTP client build failed: {e}"))
+    }
+
+    /// The TLS settings of the OTLP/gRPC exporters: the public trust of
+    /// every outbound client (`lorica_tls::http_client::public_roots`).
+    ///
+    /// Left alone, the exporter hands an `https` endpoint tonic's default
+    /// `ClientTlsConfig`, which enables no roots whatever the `tls-*-roots`
+    /// features say, so it verified every collector against an empty
+    /// store and refused them all. tonic takes trust anchors rather than
+    /// a finished rustls configuration, so the provider is its own: the
+    /// process default (ring, which `main` installs), else ring by its
+    /// `tls-ring` feature. An `http` endpoint ignores the setting.
+    fn otlp_grpc_tls() -> Result<opentelemetry_otlp::tonic_types::transport::ClientTlsConfig, String>
+    {
+        let roots: lorica_tls::RootCertStore = lorica_tls::http_client::public_roots()
+            .map_err(|e| format!("OTLP gRPC trust roots: {e}"))?;
+        Ok(
+            opentelemetry_otlp::tonic_types::transport::ClientTlsConfig::new()
+                .trust_anchors(roots.roots),
+        )
+    }
+
+    /// The timeout opentelemetry-otlp gives the HTTP client it builds
+    /// for a signal when no timeout is set in code, which Lorica never
+    /// sets: the signal's variable (`OTEL_EXPORTER_OTLP_TRACES_TIMEOUT`,
+    /// `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT`), else
+    /// `OTEL_EXPORTER_OTLP_TIMEOUT`, in milliseconds, a value that does
+    /// not parse counting as unset; else the crate's default. `env` reads
+    /// a variable, so a test needs no process environment.
+    fn otlp_request_timeout(
+        signal_timeout_var: &str,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> std::time::Duration {
+        [
+            signal_timeout_var,
+            opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT,
+        ]
+        .into_iter()
+        .find_map(|var| env(var)?.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT)
+    }
 
     /// Initialise the global OpenTelemetry tracer provider with an
     /// OTLP exporter. Returns `Ok(())` on success; on failure the
@@ -311,18 +377,25 @@ mod imp {
         let exporter = match cfg.protocol {
             OtlpProtocol::HttpProto => SpanExporter::builder()
                 .with_http()
+                .with_http_client(otlp_http_client(
+                    opentelemetry_otlp::OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
+                )?)
                 .with_endpoint(http_endpoint())
                 .with_protocol(Protocol::HttpBinary)
                 .build()
                 .map_err(|e| format!("OTLP HTTP/protobuf exporter build failed: {e}"))?,
             OtlpProtocol::HttpJson => SpanExporter::builder()
                 .with_http()
+                .with_http_client(otlp_http_client(
+                    opentelemetry_otlp::OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
+                )?)
                 .with_endpoint(http_endpoint())
                 .with_protocol(Protocol::HttpJson)
                 .build()
                 .map_err(|e| format!("OTLP HTTP/JSON exporter build failed: {e}"))?,
             OtlpProtocol::Grpc => SpanExporter::builder()
                 .with_tonic()
+                .with_tls_config(otlp_grpc_tls()?)
                 .with_endpoint(&cfg.endpoint)
                 .build()
                 .map_err(|e| format!("OTLP gRPC exporter build failed: {e}"))?,
@@ -445,6 +518,9 @@ mod imp {
         let exporter = match cfg.protocol {
             OtlpProtocol::HttpProto => LogExporter::builder()
                 .with_http()
+                .with_http_client(otlp_http_client(
+                    opentelemetry_otlp::OTEL_EXPORTER_OTLP_LOGS_TIMEOUT,
+                )?)
                 .with_endpoint(http_endpoint())
                 .with_protocol(Protocol::HttpBinary)
                 .with_headers(headers())
@@ -452,6 +528,9 @@ mod imp {
                 .map_err(|e| format!("OTLP HTTP/protobuf logs exporter build failed: {e}"))?,
             OtlpProtocol::HttpJson => LogExporter::builder()
                 .with_http()
+                .with_http_client(otlp_http_client(
+                    opentelemetry_otlp::OTEL_EXPORTER_OTLP_LOGS_TIMEOUT,
+                )?)
                 .with_endpoint(http_endpoint())
                 .with_protocol(Protocol::HttpJson)
                 .with_headers(headers())
@@ -470,6 +549,7 @@ mod imp {
                 }
                 LogExporter::builder()
                     .with_tonic()
+                    .with_tls_config(otlp_grpc_tls()?)
                     .with_endpoint(&cfg.endpoint)
                     .build()
                     .map_err(|e| format!("OTLP gRPC logs exporter build failed: {e}"))?
@@ -637,6 +717,69 @@ mod imp {
             super::emit_sink_event(&logger, &event);
             assert_eq!(otlp_capture_sent(), before + 1);
             let _ = provider.shutdown();
+        }
+
+        /// The gRPC exporters are handed the public trust; tonic's own
+        /// default, which they took before, holds no root at all.
+        #[test]
+        fn the_grpc_exporters_trust_the_public_roots() {
+            use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
+            assert!(
+                format!("{:?}", ClientTlsConfig::new()).contains("trust_anchors: []"),
+                "tonic's default changed: re-check what an https collector is verified against"
+            );
+            let ours: String = format!("{:?}", super::otlp_grpc_tls().expect("public roots"));
+            assert!(!ours.contains("trust_anchors: []"), "{ours}");
+            assert!(ours.contains("TrustAnchor"), "{ours}");
+        }
+
+        /// The client handed to the exporter keeps the per-request bound
+        /// the exporter's own client had: the signal variable first, the
+        /// generic one second, a value that does not parse skipped, the
+        /// crate default last.
+        #[test]
+        fn the_http_client_timeout_is_read_as_the_exporter_reads_it() {
+            use opentelemetry_otlp::{
+                OTEL_EXPORTER_OTLP_LOGS_TIMEOUT, OTEL_EXPORTER_OTLP_TIMEOUT,
+                OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT, OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
+            };
+            use std::time::Duration;
+
+            fn env(vars: Vec<(&'static str, &'static str)>) -> impl Fn(&str) -> Option<String> {
+                move |name: &str| {
+                    vars.iter()
+                        .find(|(key, _)| *key == name)
+                        .map(|(_, value)| value.to_string())
+                }
+            }
+            let generic = OTEL_EXPORTER_OTLP_TIMEOUT;
+            for signal in [
+                OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
+                OTEL_EXPORTER_OTLP_LOGS_TIMEOUT,
+            ] {
+                let timeout = |vars| super::otlp_request_timeout(signal, env(vars));
+                assert_eq!(timeout(vec![]), OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT);
+                assert_eq!(
+                    timeout(vec![(generic, "2500")]),
+                    Duration::from_millis(2500)
+                );
+                assert_eq!(
+                    timeout(vec![(signal, "700"), (generic, "2500")]),
+                    Duration::from_millis(700)
+                );
+                assert_eq!(
+                    timeout(vec![(signal, "5s"), (generic, "2500")]),
+                    Duration::from_millis(2500)
+                );
+            }
+            // The other signal's variable is not this one's.
+            assert_eq!(
+                super::otlp_request_timeout(
+                    OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
+                    env(vec![(OTEL_EXPORTER_OTLP_LOGS_TIMEOUT, "700")])
+                ),
+                OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT
+            );
         }
     }
 }

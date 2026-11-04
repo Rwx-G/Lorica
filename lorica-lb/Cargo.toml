@@ -25,12 +25,11 @@ lorica-ketama = { version = "0.1.0", path = "../lorica-ketama" }
 lorica-runtime = { version = "0.1.0", path = "../lorica-runtime" }
 arc-swap = "1"
 fnv = "1"
-rand = "0.8"
+rand = "0.10"
 tokio = { workspace = true }
 futures = "0.3"
 log = { workspace = true }
 http = { workspace = true }
-derivative.workspace = true
 
 [dev-dependencies]
 # The tests install the ring provider explicitly

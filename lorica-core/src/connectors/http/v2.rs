@@ -554,6 +554,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "any_tls")]
+    #[ignore = "needs network access to one.one.one.one (1.1.1.1:443)"]
     async fn test_connect_h2() {
         init_crypto();
         init_crypto();
@@ -573,6 +574,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "any_tls")]
+    #[ignore = "needs network access to one.one.one.one (1.1.1.1:443)"]
     async fn test_connect_h1() {
         init_crypto();
         let connector = Connector::new(None);
@@ -609,6 +611,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "any_tls")]
+    #[ignore = "needs network access to one.one.one.one (1.1.1.1:443)"]
     async fn test_h2_single_stream() {
         init_crypto();
         let connector = Connector::new(None);
@@ -646,6 +649,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "any_tls")]
+    #[ignore = "needs network access to one.one.one.one (1.1.1.1:443)"]
     async fn test_h2_multiple_stream() {
         init_crypto();
         let connector = Connector::new(None);
@@ -709,6 +713,7 @@ mod tests {
 
     #[cfg(all(feature = "any_tls", unix))]
     #[tokio::test]
+    #[ignore = "needs network access to one.one.one.one (1.1.1.1:443)"]
     async fn test_h2_reuse_rejects_fd_mismatch() {
         init_crypto();
         use crate::protocols::l4::socket::SocketAddr;

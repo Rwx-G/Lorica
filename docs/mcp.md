@@ -486,6 +486,8 @@ the constant and asserts it is here:
 | Control | From an automation token |
 |---|---|
 | `basic_auth_username` | the Basic-auth credential in force is neither cleared nor changed |
+| `forward_auth` | kept as the dashboard set it; a token sends none, so no token's route takes requests from a route carrying one |
+| `mtls` | kept as the dashboard set it; a token sends none, so no token's route takes requests from a route carrying one |
 | `ip_allowlist` | added, or narrowed so every entry sits inside one already there; never removed or widened |
 | `ip_denylist` | extended, every entry already there staying covered; never shortened |
 | `geoip` | added, or tightened in the same mode (fewer countries allowed, more denied); never removed or switched to the other mode |
@@ -510,7 +512,12 @@ traffic to a row with none of the wildcard's protections, and the token
 never had to reach the protected route. The refusal names the control
 and the displaced route's id. One consequence to plan for: a catch-all
 carrying Basic auth refuses every token route create on a host it
-serves, since a token never sends the password a new route would need.
+serves, since a token never sends the password a new route would need,
+and so does a wildcard or catch-all gated by `forward_auth` or `mtls`,
+which are withheld from every token yet weighed here like the rest:
+without that, a route gated only by single sign-on or a client
+certificate counted as carrying nothing, and a token's exact name under
+it took the host ungated.
 The environment resource (`environments:write`, no MCP tool) writes its
 exact-host route from a fixed profile rather than a body a model
 shapes, so it is not refused there: by the maintainer's decision of
@@ -542,11 +549,112 @@ the AI-crawler policy, a content policy toward clients that declare
 themselves, which a hostile client does not; and the routing fields,
 where a request goes, bounded by the hostname and CIDR grants.
 
-The rule bounds a write in place, not a sequence of them: a token that
-may delete a route inside its grant may create it again without its
-protections, in two audited rows, `route.delete` and `route.create`.
-A hostname whose protections no model may remove belongs in no
-config-tier grant.
+**A deleted route is still weighed.** The rule would bound a write in
+place and not a sequence of them if a token could delete a protected
+route and create it again bare, so a delete leaves the route behind as
+a record (backlog #93, the maintainer's decision of 2026-11-04). When a
+token deletes a route, over REST or through `lorica_route_delete`, and
+the route carries at least one control of the table in force, the
+delete writes a route protection record in the same transaction: the
+deleted row as the store held it, with the names it answered to, its
+path prefix, the token that deleted it and when. "In force" is the
+predicates' own answer: a control is in force when the route the
+management create stores for a body naming none of the controls would
+be weaker on it, so no second list of controls exists anywhere.
+
+An update that stops such a route serving a name, for every path it
+served there, releases that name exactly as a delete would, and leaves
+a record of the route over the names it released: a new `hostname`
+releases the old one, an alias dropped releases the alias, and a
+`path_prefix` moved deeper (`/` to `/api`) releases every name, since
+`/` is no longer served. Without it, dropping an alias and creating it
+again bare did what deleting the route and creating it again did. A
+prefix moved up serves everything it served and releases nothing.
+Switching a route off releases nothing either: the route still claims
+its names, so no other route can be created on them, and its controls
+are still held in place, so switching it on again is weighed against
+itself; while it is off, its traffic falls through to whatever wildcard
+or catch-all the operator set below it, as any request it does not
+serve always has.
+
+Every later write of this plane that would make a route serve a name
+and path a record holds, found through the same
+route selection (a create, an update that adds a name, moves the prefix
+or switches the route on, and the environment resource), is held to
+the record exactly as it would be held to that route if it were still
+stored: a token's route is refused with a `403` naming the control and
+the record's id and echoing no value; the environment's route takes the
+recorded controls over, the Basic-auth credential copied server side,
+and names the record in `protections_inherited_from_records`. A route
+that matches or strengthens the record lands, and the record is kept
+rather than consumed: a record of a wildcard or of a route with aliases
+is matched by a route serving one of its names, and consuming it would
+let the next write take the others weaker. A token deleting the route
+of the same names and path again replaces a record it is at least as
+strong as, so a loop of deletes and creates leaves one row. A recorded
+Basic-auth credential, `forward_auth` gate or `mtls` requirement means
+no token route can serve the name, since a token never sends any of
+them; the environment resource can, copying them over server side, and
+an operator can.
+
+What makes no record: a write through the dashboard, which the rule
+never bound, a switch-off, and the route of an environment, whose
+controls the
+environment resource rewrites from its profile on every `PUT` and the
+plane therefore never held in place.
+
+The operator ends a record. The dashboard lists them under Settings,
+Route Protection Records (`GET /api/v1/automation/route-protection-records`,
+Operator), with a confirmed clear
+(`DELETE /api/v1/automation/route-protection-records/{id}`), and a route
+create or update through the dashboard whose route, switched on, serves
+one of a record's names for every path the record holds clears that
+name from the record, since the operator has just decided that name's
+protections; the record keeps its other names, and goes with its last.
+A route switched off decides nothing, so an operator's edit of a
+disabled route a token renamed onto a recorded name clears nothing, and
+neither does a route on another path of the name (`/public` under a
+record of `/`). Each creation, replacement, narrowing and clearing is
+an audit row under `route_protection_record.`. Records never replicate and the
+configuration export does not carry them, like the tokens they bound:
+the automation listener runs only where the records are.
+
+A record binds every token on its names, not only the one that left
+it, so a token whose grant overlaps another's can leave one on a shared
+name by creating a protected route there and deleting it. That gives it
+nothing it did not have: a name is held by one route at most, so the
+same token could keep the protected route stored instead, and the other
+principal would then be refused the name outright (a token's create on
+it is a `422`, an environment's `PUT` a `409`), while every write it
+could make to that route, its delete included, would be held to the
+same protections, the delete through the record it leaves. A record
+holds what that route held and nothing more, serves no request, lets in
+a route that matches it, and lasts until an operator ends it, as the
+route would. Two records on one name at different paths, with
+allowlists no one value meets, refuse an environment's `PUT` there,
+which one stored route on the name already does by holding it. An
+operator who does not want one principal's choices to bind another's
+on a name grants the name to one principal only.
+
+**A name has one spelling.** A host name is case-insensitive, and a
+name with its trailing root dot is the same host, so every comparison
+the rules above make, the hostname grant, the store's uniqueness, the
+displacement guard, the records and the proxy's own lookup of a
+request's `Host`, reads a name in one form: ASCII letters lowercased
+and one trailing dot dropped (`route_selection::canonical_hostname` in
+`lorica-config`). A route write stores its `hostname` and
+`hostname_aliases` in that form, so `App.Example.com.` is answered back
+as `app.example.com`, and a write naming a spelling of a name another
+route holds is refused as that name, a `422` like any other. Before
+1.10.2 a name was stored as sent and compared byte for byte, so a
+token could create `App.Example.com` beside a protected
+`app.example.com`, or after deleting it, with no guard seeing the
+name, and a client choosing that spelling reached the bare route.
+Names stored before are rewritten on the upgrade; where two routes held
+two spellings of one name, the name stays with the route that already
+spelled it canonically, the other keeps its spelling, serves nothing on
+that name, and is named in a warning at startup and on every reload
+until an operator renames or deletes it.
 
 **A backend create is not idempotent.** A route create is refused on
 a hostname already held, and every other write names its resource by

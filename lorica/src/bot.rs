@@ -51,7 +51,7 @@ use lorica_challenge::{IpPrefix, Mode};
 use lorica_config::ConfigStore;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use rand::TryRngCore;
+use rand::TryRng;
 
 /// Path prefix for all Lorica-handled bot-protection endpoints.
 /// Chosen to be improbable-to-collide with real routes; the `lorica`
@@ -191,7 +191,7 @@ impl BotEngine {
     }
 
     /// Generate a fresh 16-byte random nonce with its hex encoding.
-    /// Uses `OsRng` so nonces are unpredictable - a predictable nonce
+    /// Uses `SysRng` so nonces are unpredictable - a predictable nonce
     /// would let an attacker pre-register a matching row and bypass
     /// the verify step.
     ///
@@ -204,7 +204,7 @@ impl BotEngine {
     pub fn fresh_nonce(&self) -> ([u8; 16], String) {
         use std::fmt::Write;
         let mut raw = [0u8; 16];
-        rand::rngs::OsRng
+        rand::rngs::SysRng
             .try_fill_bytes(&mut raw)
             .expect("OS RNG must produce entropy for bot-protection nonce");
         let mut hex = String::with_capacity(32);

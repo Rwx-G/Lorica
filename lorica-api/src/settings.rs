@@ -1742,7 +1742,16 @@ async fn probe_otlp_endpoint(
         _ => endpoint.to_string(),
     };
 
-    let client = match reqwest::Client::builder()
+    let tls = match lorica_tls::http_client::public() {
+        Ok(tls) => tls,
+        Err(e) => {
+            return serde_json::json!({
+                "ok": false,
+                "message": format!("trust roots failed to load: {e}"),
+            });
+        }
+    };
+    let client = match lorica_tls::http_client::client_builder(tls)
         .timeout(Duration::from_secs(5))
         .build()
     {

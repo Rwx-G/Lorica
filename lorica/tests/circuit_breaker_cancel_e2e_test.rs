@@ -329,11 +329,13 @@ async fn client_cancel_must_not_open_circuit_breaker() {
 
     // A healthy follow-up must still reach the backend and get 200. With the
     // bug, the breaker is Open and this returns a spurious 502 immediately.
-    let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
     let r = client.get(harness.url()).send().await.unwrap();
     assert_eq!(
         r.status(),

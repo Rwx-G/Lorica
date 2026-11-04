@@ -13,7 +13,8 @@
 //! modules:
 //!   - HTML sanitization regexes + `sanitize_html` (used to render
 //!     custom error pages and the WAF block page without XSS).
-//!   - `extract_host` (Host header / URI authority pick).
+//!   - `extract_host` (Host header / URI authority pick) and
+//!     `request_host` (the name in it, as routes are looked up).
 //!   - `match_header_rule_backends` (header-based routing override
 //!     selection).
 //!   - `evaluate_mtls` (per-route mTLS policy gate).
@@ -33,6 +34,7 @@ use lorica_cache::{CacheMeta, VarianceBuilder};
 use lorica_config::models::Route;
 use lorica_proxy::Session;
 use once_cell::sync::Lazy;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 #[cfg(test)]
@@ -126,6 +128,30 @@ pub(crate) fn extract_host(req: &lorica_http::RequestHeader) -> &str {
         .and_then(|v| v.to_str().ok())
         .or_else(|| req.uri.authority().map(|a| a.as_str()))
         .unwrap_or("")
+}
+
+/// The host a request names, as routes are looked up: [`extract_host`]
+/// without its port, in `route_selection::canonical_hostname` form.
+/// Borrowed, without an allocation, when the client sent it canonical,
+/// as browsers do. What is forwarded upstream is [`extract_host`],
+/// untouched.
+pub(crate) fn request_host(req: &lorica_http::RequestHeader) -> Cow<'_, str> {
+    lorica_config::route_selection::canonical_hostname(host_without_port(extract_host(req)))
+}
+
+/// `authority` without its `:port`. An IPv6 literal keeps its brackets
+/// and every colon inside them (`[2001:db8::1]:8443` is
+/// `[2001:db8::1]`); a bracket left open is returned whole.
+pub(crate) fn host_without_port(authority: &str) -> &str {
+    if authority.starts_with('[') {
+        return match authority.find(']') {
+            Some(close) => &authority[..=close],
+            None => authority,
+        };
+    }
+    authority
+        .split_once(':')
+        .map_or(authority, |(host, _port)| host)
 }
 
 /// Pick a backend index using the Ketama consistent-hash ring keyed
@@ -253,9 +279,9 @@ pub fn evaluate_mtls(enforcer: &MtlsEnforcer, client_organization: Option<&str>)
 /// downstream TLS session, or None when the session is plaintext / the
 /// client did not present a cert / the cert has no O= field.
 ///
-/// We go through `downstream_session.digest().ssl_digest` because that
-/// is the only shared abstraction over rustls / boringssl; rustls
-/// populates `organization` from the first cert in the peer chain.
+/// We go through `downstream_session.digest().ssl_digest`, the TLS
+/// digest the listener records; rustls populates `organization` from
+/// the first cert in the peer chain.
 pub(crate) fn downstream_ssl_digest(session: &Session) -> Option<String> {
     let digest = session.as_downstream().digest()?;
     let ssl = digest.ssl_digest.as_ref()?;

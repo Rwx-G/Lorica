@@ -1217,7 +1217,8 @@ async fn build_proxy_config_inner(
             if rebuilt.contains_key(&entry.route.id) {
                 continue;
             }
-            if let Some(old_entries) = old_config.routes_by_host.get(&entry.route.hostname) {
+            let key = lorica_config::route_selection::canonical_hostname(&entry.route.hostname);
+            if let Some(old_entries) = old_config.routes_by_host.get(key.as_ref()) {
                 if let Some(old_entry) = old_entries.iter().find(|e| e.route.id == entry.route.id) {
                     let mut new_inner = (**entry).clone();
                     new_inner.wrr_state = Arc::clone(&old_entry.wrr_state);

@@ -44,16 +44,15 @@ const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// `proxy_wiring/mirror_rewrite.rs::MIRROR_CLIENT` and
 /// `proxy_wiring/forward_auth.rs::FORWARD_AUTH_CLIENT`.
 ///
-/// `danger_accept_invalid_certs(true)` is kept because operator
-/// backends commonly run with self-signed or wildcard certs that
-/// the proxy is not expected to validate (this is a liveness
+/// Certificate verification is off (`http_client::unverified`) because
+/// operator backends commonly run with self-signed or wildcard certs
+/// that the proxy is not expected to validate (this is a liveness
 /// probe, not an end-to-end TLS chain check). The probe target
 /// is the operator-configured backend URL ; the trust boundary
 /// is the operator's network, not the public internet.
 static HEALTH_HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
+    lorica_tls::http_client::client_builder(lorica_tls::http_client::unverified())
         .timeout(TCP_CONNECT_TIMEOUT)
-        .danger_accept_invalid_certs(true)
         .pool_max_idle_per_host(8)
         .build()
         .expect("build health-probe reqwest client (static config is infallible)")

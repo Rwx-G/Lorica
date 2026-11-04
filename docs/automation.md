@@ -516,15 +516,15 @@ control by control, the protections of every route it displaces, found
 by the proxy's own route selection (`lorica-config/src/route_selection.rs`)
 over the stored rows, for the environment's path prefix and every
 stored prefix below it. The controls are the ones a token's own route
-may only strengthen (`ROUTE_PROTECTIONS`, listed in `docs/mcp.md`):
-the Basic-auth credential, `ip_allowlist`, `ip_denylist` (merged, so no
-address either list refused is admitted), `geoip`, `bot_protection`,
-the WAF switch and mode, the rate-limit bucket the proxy enforces and
-`auto_ban_threshold`. Each is raised only where the profile is weaker,
-so a WAF the request switched on stays on over a wildcard without one.
-The Basic-auth credential is copied as the stored username and password
-hash, server side; neither ever appears in the answer, the audit row or
-a log. Every `PUT` inherits again from what serves the host underneath
+may only strengthen (`ROUTE_PROTECTIONS`, whose table in `docs/mcp.md`
+a test holds to the constant). Each is raised only where the profile is
+weaker, so a WAF the request switched on stays on over a wildcard
+without one, and `ip_denylist` is merged, so no address either list
+refused is admitted. The Basic-auth credential (the stored username and
+password hash), a `forward_auth` gate and an `mtls` trust anchor, none
+of which a token can send, are copied as stored, server side; the
+answer and the audit row name the routes they came from, never the
+values. Every `PUT` inherits again from what serves the host underneath
 the environment's own route, so an update picks up a protection the
 operator added to the wildcard since, and an environment under an
 unprotected wildcard keeps its profile unchanged. The answer names the
@@ -536,6 +536,16 @@ credentials, two allowlists neither of which covers the other), the
 writes nothing; an operator reconciles the routes in the dashboard. A
 protection the operator adds to the wildcard after the environment's
 last `PUT` binds the environment from its next `PUT`, not before.
+
+A protected route an automation token deleted is inherited from the same
+way. The delete leaves a route protection record of it (`docs/mcp.md`,
+"A deleted route is still weighed"), and an environment whose hostname
+and path the deleted route would serve takes the recorded controls over
+as it would the route's, the Basic-auth credential copied server side;
+the answer names the record by id in
+`protections_inherited_from_records`. Deleting an environment, or its
+route, records nothing: its controls are the profile's, rewritten on
+every `PUT`.
 
 **The hostname rules.** Beyond the shape rules in the table, the
 hostname must not be held by another route: any route's `hostname` or
@@ -590,7 +600,9 @@ either way, and a body of `name`, `url`
 (`https://<hostname><path_prefix>`), `route_id`, `backend_ids[]` in
 request order, `certificate_id`, `certificate_not_after`, `expires_at`,
 `protections_inherited_from` (the routes whose protections the route
-inherited, above; empty when none) and `applied_generation`.
+inherited, above; empty when none), `protections_inherited_from_records`
+(the route protection records it inherited from, above; empty when none)
+and `applied_generation`.
 
 `applied_generation` is a FLOOR, not a target. It is the fleet
 configuration generation the control plane had PUBLISHED when the

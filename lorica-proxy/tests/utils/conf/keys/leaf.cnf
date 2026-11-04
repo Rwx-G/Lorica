@@ -1,4 +1,0 @@
-[ v3 ]
-subjectKeyIdentifier = hash
-basicConstraints = CA:false
-keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment

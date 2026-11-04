@@ -18,7 +18,7 @@ name = "lorica_runtime"
 path = "src/lib.rs"
 
 [dependencies]
-rand = "0.8"
+rand = "0.10"
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 once_cell = { workspace = true }
 thread_local = "1"

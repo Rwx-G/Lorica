@@ -112,7 +112,7 @@ pub async fn build_dns_challenger(
         "cloudflare" => Ok(Box::new(CloudflareDnsChallenger::new(
             config.zone_id.clone(),
             config.api_token.clone(),
-        ))),
+        )?)),
         #[cfg(feature = "route53")]
         "route53" => Ok(Box::new(
             Route53DnsChallenger::new(
@@ -141,7 +141,7 @@ pub async fn build_dns_challenger(
                 .ovh_consumer_key
                 .clone()
                 .expect("validate() ensures ovh_consumer_key is Some for ovh"),
-        ))),
+        )?)),
         other => Err(format!("unsupported DNS provider: {other}")),
     }
 }

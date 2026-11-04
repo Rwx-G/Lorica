@@ -20,7 +20,7 @@
 //! route is weaker than the stored one is a function of the stored row's
 //! types, which live in `lorica-config`, so `lorica-api` pairs each rule
 //! below with its predicate (`ROUTE_PROTECTIONS` and
-//! `BACKEND_PROTECTIONS` in `automation/write.rs`) and a test there
+//! `BACKEND_PROTECTIONS` in `automation/protections.rs`) and a test there
 //! holds the pairing to these lists, in order, one predicate per rule.
 
 /// One access-control or trust control of a stored row that an
@@ -46,6 +46,24 @@ pub mod route {
         rule: "the Basic-auth credential in force is neither cleared nor changed",
         why: "clearing the username switches the route's Basic auth off, and renaming it \
               changes a credential whose password a token never sees",
+    };
+
+    /// The external authentication gate.
+    pub const FORWARD_AUTH: ProtectionRule = ProtectionRule {
+        fields: &["forward_auth"],
+        rule: "kept as the dashboard set it; a token sends none, so no token's route takes \
+               requests from a route carrying one",
+        why: "it is the route's external authentication gate, and a route without it serves the \
+              gated host to anyone",
+    };
+
+    /// The client-certificate requirement.
+    pub const MTLS: ProtectionRule = ProtectionRule {
+        fields: &["mtls"],
+        rule: "kept as the dashboard set it; a token sends none, so no token's route takes \
+               requests from a route carrying one",
+        why: "it is the route's client-certificate requirement, and a route without it serves \
+              the gated host to any client",
     };
 
     /// The source-address allowlist.
@@ -145,6 +163,13 @@ pub mod backend {
 /// Every route control an automation token may only strengthen, in the
 /// order a refusal weighs them.
 ///
+/// A field [`WITHHELD_ROUTE_FIELDS`] refuses from every token may carry
+/// a rule here too (`forward_auth`, `mtls`): the body refusal keeps it
+/// from moving in place, and the rule is what weighs it against a route,
+/// or the record of a deleted one, that a token's route would take
+/// requests from. Without it, a route gated only by one of them was
+/// weighed as carrying nothing.
+///
 /// A route create is weighed against the route that serves its host
 /// today, when one does (a wildcard or the catch-all the new exact name
 /// would take the host from), and against nothing otherwise: each of
@@ -160,6 +185,8 @@ pub mod backend {
 /// (where a request goes, bounded by the hostname and CIDR grants).
 pub const ROUTE_PROTECTION_RULES: &[ProtectionRule] = &[
     route::BASIC_AUTH,
+    route::FORWARD_AUTH,
+    route::MTLS,
     route::IP_ALLOWLIST,
     route::IP_DENYLIST,
     route::GEOIP,
@@ -222,10 +249,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_field_is_weighed_twice_withheld_and_weighed_or_left_without_words() {
+    fn no_field_is_weighed_twice_or_left_without_words() {
         // A field under two rules would be refused for whichever runs
-        // first, and a withheld field under a rule is a rule nothing can
-        // reach, so each field has one home.
+        // first, so each field has one rule. A withheld field may have
+        // one: it is weighed against what a token's route takes requests
+        // from, never moved in place.
         let withheld: BTreeSet<&str> = WITHHELD_ROUTE_FIELDS.iter().map(|(f, _)| *f).collect();
         assert_eq!(withheld.len(), WITHHELD_ROUTE_FIELDS.len());
         for rules in [ROUTE_PROTECTION_RULES, BACKEND_PROTECTION_RULES] {
@@ -236,7 +264,6 @@ mod tests {
                 assert!(!rule.rule.trim().is_empty() && !rule.why.trim().is_empty());
                 for field in rule.fields {
                     assert!(seen.insert(field), "{field} is weighed twice");
-                    assert!(!withheld.contains(field), "{field} is withheld and weighed");
                 }
             }
         }

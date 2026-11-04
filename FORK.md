@@ -32,9 +32,18 @@ All crate names and Rust module paths were renamed:
 | `pingora-cache` | `lorica-cache` | HTTP response cache |
 | `pingora-memory-cache` | `lorica-memory-cache` | In-memory cache backend |
 | `pingora-lru` | `lorica-lru` | LRU eviction |
+| `pingora-rustls` | `lorica-tls` | rustls integration, plus Lorica-owned modules (below) |
 | `tinyufo` | `tinyufo` | TinyUFO cache algorithm (unchanged) |
 
 **Rust imports**: all `use pingora_*` became `use lorica_*`.
+
+**`lorica-tls` is half upstream.** A source file whose header carries
+Cloudflare's copyright tracks `pingora-rustls` and is diffed against it
+on a sync; one that carries Lorica's has no upstream counterpart and is
+not (the SNI certificate resolver and its hot swap, OCSP stapling, the
+inlined `no_debug`, and `http_client`, the TLS policy of every outbound
+`reqwest` client). `grep -l Cloudflare lorica-tls/src/*.rs` lists the
+first kind.
 
 ## Removed Components
 
@@ -45,10 +54,11 @@ The following upstream crates and features were **deleted** during the fork:
 | `pingora-openssl` | Lorica uses rustls exclusively |
 | `pingora-boringssl` | Lorica uses rustls exclusively |
 | `pingora-s2n` | Lorica uses rustls exclusively |
-| Conditional TLS compilation (`#[cfg]` blocks) | Only rustls remains |
+| The OpenSSL/BoringSSL and s2n backends of `lorica-core` (the `boringssl_openssl` and `s2n` modules under `connectors/tls`, `listeners/tls`, `protocols/tls` and `utils/tls`) | Lorica uses rustls exclusively. Until v1.10.2 their sources stayed on disk, declared by no `mod` and never compiled; they are deleted now |
+| The `openssl`, `boringssl`, `s2n` and `openssl_derived` features and the `#[cfg]` branches on them | Only rustls remains. The `rustls` feature (which implies `any_tls`) still chooses between rustls and the no-TLS stub in `protocols/tls/noop_tls` |
 | Sentry integration | Cloudflare-specific observability |
 | `cf-rustracing` | Cloudflare-specific tracing |
-| Example binaries | Replaced by Lorica's own binary |
+| Example binaries, except the `lorica-core` ones that build on rustls | Replaced by Lorica's own binary. The OpenSSL-only `client_cert` example of `lorica-core` and its keys went with the backends in v1.10.2 |
 | Windows support (787 lines) | Linux-only project |
 
 ## Added Crates (Lorica-specific)
@@ -75,7 +85,6 @@ These crates do not exist in upstream Pingora:
 | `lorica-mcp` | Management MCP server: a scope-gated tool surface over the automation plane, spoken over stdio or over a path on the automation listener |
 | `lorica-automation-policy` | The automation plane's policy as data: scope vocabulary, MCP tier table, admin settings allowlist, one-way protections |
 | `lorica-adcs` | AD CS enrollment client: CSR to issued certificate through CES, WS-Trust over HTTPS with Kerberos SPNEGO bound to the TLS channel |
-| `lorica-tls` | SNI resolver, hot-swap, encrypted key storage (extends upstream TLS) |
 
 ## Comparing with Upstream
 
@@ -98,7 +107,7 @@ diff -rq <(git archive upstream/main pingora-proxy/src | tar -tf -) \
 
 When comparing files across repositories, apply these substitutions:
 
-- Directory: `pingora-{name}` - `lorica-{name}` (except `pingora-load-balancing` - `lorica-lb`)
+- Directory: `pingora-{name}` - `lorica-{name}` (except `pingora-load-balancing` - `lorica-lb` and `pingora-rustls` - `lorica-tls`)
 - Cargo.toml package names: `pingora-{name}` - `lorica-{name}`
 - Rust imports: `pingora_{name}` - `lorica_{name}`
 - Feature flags: `pingora_` prefix - `lorica_` prefix (where applicable)
@@ -113,8 +122,10 @@ When comparing files across repositories, apply these substitutions:
 ## Lorica divergences in forked crates
 
 Behaviour changes Lorica made inside a forked crate, beyond the renaming.
-Each is marked `Lorica:` in a comment at its site. Re-apply every one
-after any upstream sync that touches the function it lives in.
+Each is marked `Lorica:` in a comment at its site, except an upstream
+test the fork skips, whose `#[ignore = "..."]` reason is the marker.
+Re-apply every one after any upstream sync that touches the function it
+lives in.
 
 - **`lorica-proxy`, the initial body send of the upstream leg (v1.9.0).**
   Sites: `proxy_h1.rs` `proxy_handle_downstream`, `proxy_h2.rs`
@@ -208,6 +219,150 @@ after any upstream sync that touches the function it lives in.
   budget stays exercised by `test_authority_mismatch_exhausts_malformed_stream_budget`.
   Take upstream's version of these two tests only once upstream runs on
   h2 0.4.20 or later.
+- **`lorica-core`, one HTTP/2 server test skipped since h2 0.4.16 (tests
+  only).** Site: `lorica-core/src/protocols/http/v2/server.rs`,
+  `test_req_header_no_eos_empty_data_with_eos`, under
+  `#[ignore = "h2 >= 0.4.16 (RUSTSEC-2026-0258 fix): ..."]`. Its client
+  drops the stream right after the trailing empty DATA frame, and since
+  the RUSTSEC-2026-0258 fix the resulting `RST_STREAM(CANCEL)` overtakes
+  that frame, so the server sees a reset rather than the end of the body:
+  the test racing itself, not a server defect. Kept as upstream wrote it
+  so the file stays rebaseable; drop the `ignore` once upstream reworks
+  the test.
+- **`lorica-tls`, the platform trust store load on `rustls-native-certs`
+  0.8 (v1.10.2, RUSTSEC-2025-0134).** Site: `lorica-tls/src/lib.rs`
+  (`load_platform_certs_incl_env_into_store` and the crate-private
+  `add_native_certs_into_store` it calls, which the Lorica module
+  `http_client::public_roots` calls too, so outbound HTTP reads the
+  platform store on the same rule as backend TLS). Upstream pins
+  `rustls-native-certs` 0.7, the last thing in the tree pulling the
+  unmaintained `rustls-pemfile`. 0.8 no longer returns `Result<Vec<_>>`
+  but every certificate it could load beside every error it met.
+  Upstream failed the whole load on the first read error or the first
+  certificate the root store rejected; Lorica keeps what loaded, logs the
+  rest at WARN, and fails only when nothing loaded and something went
+  wrong, with the first read error, else the first rejection. An empty
+  store with no error is still `Ok`, as upstream. The re-exported
+  `load_native_certs` now has the 0.8 signature; nothing in the
+  workspace calls it. `load_ca_file_into_store` in the same file reads its
+  PEM through `http_client::add_pem_roots`, with the refusals it already
+  had (a block that does not decode, a certificate the store refuses, a
+  file with none), and now leaves the store untouched when it refuses.
+- **`lorica-core` and `lorica-lb`, no `derivative` (v1.10.2,
+  RUSTSEC-2024-0388).** Sites: `lorica-core/src/upstreams/peer.rs`
+  (`impl Debug for PeerOptions`) and `lorica-lb/src/lib.rs` (`Backend`:
+  `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`). Upstream derives these
+  with the unmaintained `derivative` crate. Lorica writes them by hand
+  with the same semantics: `PeerOptions`' `Debug` prints every field in
+  declaration order except the two hook closures, and `Backend` compares
+  and hashes `addr` then `weight` and never `ext`. `Backend`'s `Clone`
+  and `Debug` are plain std derives. Each hand-written impl starts from a
+  destructuring that names every field (`PeerOptions`' `Debug`, and
+  `Backend::identity`, which `Backend`'s comparisons and hash read), so a field
+  an upstream sync adds to either struct fails to compile there until it
+  is printed or compared, or explicitly left out.
+- **`lorica-core`, no YAML server configuration (v1.10.2,
+  RUSTSEC-2024-0449).** Sites: `lorica-core/src/server/configuration/mod.rs`
+  (`ServerConf`, `Opt`) and `lorica-core/src/server/mod.rs`
+  (`Server::new`, `Server::new_with_opt_and_conf`). Upstream reads
+  `ServerConf` from the YAML file the `-c` / `--conf` flag names
+  (`load_from_yaml`, `load_yaml_with_opt_override`, `from_yaml`,
+  `to_yaml`) and builds even its defaults by parsing the document
+  `version: 1`, through `serde_yaml_ng` and the unmaintained
+  `unsafe-libyaml`. Lorica only ever calls `Server::new(None)`, so all of
+  it is gone, with the `Opt::conf` field and the serde derives on
+  `ServerConf` that nothing else used. `ServerConf::new` constructs
+  `ServerConf::default()` with `version: 1`, the value the YAML parse
+  produced (a test pins every field), and returns `Self` instead of
+  `Option<Self>`; `new_with_opt_override` likewise. `ServerConf::validate`
+  is gone with the loader that was its only caller: it refused a
+  `max_blocking_threads` of zero, which `ServerConf::new` never sets; a
+  configuration built by hand with it still stops the server at startup,
+  on the assertion in tokio's runtime builder rather than with an error.
+  `Server::new` keeps its `Result` signature, which nothing can fail any
+  more. The integration-test server of `lorica-core` builds
+  the configuration its `tests/pingora_conf.yaml` used to hold in code,
+  and the file is deleted (as is `lorica-proxy`'s, with the suites below
+  that read it). On an upstream
+  sync, take new `ServerConf` fields with their `Default` value and leave
+  the YAML path out.
+- **Forked crates on newer dependency majors (v1.10.2, API adaptations
+  only).** Upstream's forked crates pin dependency majors the rest of the
+  workspace has left, which kept a second copy of each in the binary.
+  Lorica moves them to the workspace's version, in each fork's
+  `Cargo.toml` (the authority on which crate is at which version), and
+  adapts the call sites without changing what the code does. The moves
+  that needed code: `rand` 0.10 everywhere (`thread_rng` is `rng`,
+  `gen` / `gen_range` are `random` / `random_range` on `RngExt`,
+  `SliceRandom::choose` is `IndexedRandom::choose`, `distributions` is
+  `distr`, `Uniform::new` returns a `Result`); `nix` 0.31 in
+  `lorica-core` (`transfer_fd` passes `AT_FDCWD` to `fchmodat` where it
+  passed `None`); `sfv` 0.16 in `lorica-core` (the Accept-Encoding parser
+  calls `Parser::new(..).parse::<List>()` and reads tokens through
+  `as_str`). `openssl-probe` left `lorica-core` altogether: its one call
+  site was the never-compiled OpenSSL connector, deleted with the other
+  backends (see Removed Components). The `x509-parser`, `strum`, `blake2`,
+  `brotli`, `daggy`, `float-cmp`, `hashbrown`, `i_key_sort`, `rstest` and
+  `quick_cache` moves needed none; `lorica-lru` takes `hashbrown` with
+  only the `default-hasher` and `inline-more` features. On an upstream
+  sync, keep Lorica's version and port the new code to its API rather
+  than taking upstream's manifest line.
+- **`lorica-proxy`, no integration suites (v1.10.2, tests only).** Gone:
+  `tests/test_basic.rs`, `tests/test_upstream.rs` and everything under
+  `tests/` only they used (the `utils/` harness with its mock origin,
+  WebSocket echo servers and certificate loaders, the openresty
+  configuration and key material under `utils/conf/`, `tests/keys/`,
+  `tests/headers.dict`), the two `[[test]]` targets, the
+  `integration-tests` feature and the dev-dependencies nothing else in the
+  crate uses (`hyper` 0.14, `hyperlocal` 0.8, `reqwest`, `httparse`,
+  `env_logger`, `tokio-tungstenite`, `futures-util`, and the `lorica-lb`,
+  `lorica-limits`, `prometheus`, `serde` and `serde_json` entries left
+  over from upstream's example binaries). The suites drive the proxy
+  against an openresty origin the fork never provisioned, sat behind a
+  feature no job enabled, and had stopped compiling (hyper 0.14 types
+  against the `http` 1 API, the `tungstenite` `Utf8Bytes` change). The
+  crate's unit tests in `src/` are unaffected. Upstream fixes and new
+  tests in these files no longer port: a fix whose only test lives there
+  is ported with a unit test written against the fork, or recorded as not
+  ported in the sync record below.
+- **`lorica-core` and `lorica-lb`, the TLS-gated tests run, minus the
+  ones that dial the Internet (v1.10.2, tests only).** Upstream gates its
+  connector, listener and TLS tests on `any_tls`; the forked-crate test
+  job now has a rustls step that compiles and runs them. The ones that
+  connect to `1.1.1.1` / `one.one.one.one` carry
+  `#[ignore = "needs network access to ..."]` (`cargo test -- --ignored`
+  still runs them): sites in `lorica-core/src/connectors/mod.rs`,
+  `connectors/http/mod.rs`, `connectors/http/v1.rs`,
+  `connectors/http/v2.rs` and `lorica-lb/src/health_check.rs`. Plain-TCP
+  tests in the default-feature build that dial the same hosts are left as
+  upstream wrote them. On an upstream sync, keep the `ignore` on those
+  tests, and give one to any new test of these modules that leaves the
+  machine.
+- **`lorica-tls` and `lorica-core`, reqwest 0.13 on a preconfigured TLS
+  configuration (v1.10.2).** Sites: the reqwest entry of the workspace
+  `Cargo.toml`, which the forks' manifests take with `workspace = true`;
+  `lorica-tls/src/http_client.rs` (a Lorica module, no upstream
+  counterpart) and the `PemObject` re-export in `lorica-tls/src/lib.rs`;
+  the reqwest clients of `lorica-core/tests/test_basic.rs` and of
+  `lorica-core/src/listeners/mod.rs`'s tests. Upstream's forks use reqwest
+  0.12 with `rustls-tls-webpki-roots`, which falls back to the `ring`
+  provider and seeds the root store from the webpki bundle. reqwest 0.13
+  has no such feature: left to itself it verifies through
+  `rustls-platform-verifier` on the process-wide provider and panics in
+  `Client::build` when none is installed, and its default provider is
+  `aws-lc-rs`. Lorica builds every client, the forks' test clients
+  included, on a `ClientConfig` from `lorica_tls::http_client`, handed
+  over by `http_client::client_builder`: `ring`, rustls' default protocol
+  versions, ALPN `http/1.1`, and the webpki bundle plus the platform store
+  (`public()`), or no verification at all where upstream called
+  `danger_accept_invalid_certs(true)` (`unverified()`). reqwest leaves the
+  ALPN of a preconfigured configuration alone, so a client that must be
+  able to negotiate HTTP/2 is built on `offering_http2(..)`, as the h2
+  assertions of `test_basic.rs` are; `.http1_only()` clients keep the
+  `http/1.1`-only offer. `reqwest::get` there becomes a client built the
+  same way. On an upstream sync, a new test client goes through the same
+  helpers: the workspace `clippy.toml` refuses `reqwest::Client::builder`
+  and its siblings everywhere else, the forks included.
 
 ## Upstream sync record
 
@@ -218,6 +373,7 @@ commit; the `[1.7.0]` CHANGELOG entries describe the user-visible effect.
 
 | Cycle | Upstream range | Ported | Not ported (deliberate) |
 |-------|----------------|--------|-------------------------|
+| 1.10.2 (2026-11-04) | `84f21ee9`..`1adcb381` | `80b68c34` + `56965c34` (by hand: neither connector hunk applied, the fork's `reused_stream` calls `matches_fd` without the `cfg(unix)` and its imports differ; the `idle_poll` signature change in `lorica-pool` came over as upstream wrote it, the `RwLock` pool itself is untouched; the hand-off race test sits in its own `reuse_race_tests` module rather than upstream's `any_tls`-gated `tests`, so that it also runs in the forked-crate test job's default-feature build; the gated module itself runs in that job's rustls step since the same cycle), `b5dea5a6` (with its strict round-trip tests), `1adcb381`, `a7106806` | early request body buffering before peer selection `da2af11e`, `23d43604`, `9836342e`, `7b709f12` (a new opt-in feature, its phase docs, and a fix to its `body_routing` example, an example binary the fork does not carry); it lands on exactly the sites of the initial body send divergence in `proxy_h1.rs`, `proxy_h2.rs` and `proxy_custom.rs`, which the WAF body hold depends on. `cb16c871` (TLS verify callback for upstream connections) and `b0c6e442` (vectored TLS write coalescing), both OpenSSL/BoringSSL-only; the fork is rustls-only. `95857fe8` (illumos and Solaris builds; Linux-only project). `e479d66c` (docs.rs metadata). `6502a633` (audit ignore for `crypto-bigint` 0.5.5, absent from Lorica's lockfile). `8d1adda2` (zstd 0.14.3, which Lorica's lockfile already resolves) |
 | 1.10.0 (2026-10-27) | `4487f7b2`..`84f21ee9` | `b62452fc` (by hand: the completion sync lands in the inlined upstream task branch, no `PipeState` assertions in its tests), `81463f8a` (by hand: `read_body_or_idle` stays an `async_trait` method on the dyn custom session, `custom_session_tests.rs` adapted), `10a83456` (the `do_write_chunked_body` hunk and its unit test; the body-task hunk patches the proxy task API path the fork lacks, and the `test_basic.rs` test needs the upstream `HttpOrigin` utilities), `c1c4a0da`, `a554e713` (with `read_response_header_non_utf8`, not the HEAD-response tests that rode along in the conflicting hunk), `5b30d71d` (by hand: no `L4BufferSettings` here, so a stream-level zero-capacity test replaces the listener one) | `7de472d2` (custom upload failure handling): its fix is written against `PipeState` and the producer/delivery split of `ResponseStateMachine` from `7142ad46`, part of the proxy task API family deferred in the 1.7.0 row (backlog #83), and its tests sit on the `989ed973` cache-fill abandonment harness and `tokio` `test-util`; Lorica does not wire the custom-protocol path it fixes. Features: `5641e50c` (configurable HTTP/1 response parser; this fork already normalises obsolete line folding since 1.7.0 and keeps its lenient defaults), `5dc98c41` (runtime groups shared across services; Lorica runs one proxy service per worker), `62b3227e` (Dial9 profiling runtime options, no Dial9 here), `42df06a3` (downstream fd in the TLS certificate callback, an OpenSSL/BoringSSL-only change; the fork is rustls-only). Cache opt-ins `989ed973`, `0741cf08`, `565ec1ef`, `ac7cf04e` (downstream abandonment of a cache fill, early cancellation, client watch during a stalled hit or a subrequest pipe: new opt-in APIs, defaults unchanged). LRU and storage `9c589336`, `11b9eb3c`, `327cc69c` (new conditional and paired LRU mutations, eviction-accounting hooks for out-of-band storage, a data-peek helper), `27e90f93`, `1f59e578` (an `unwrap` on a write into a `Vec` turned into an error, and its message). CI and test-only: `84f21ee9`, `1b0a4b97`, `d316bab1`, `9b88c0ff`, `623e163d`, `3e204141`, `952b5caa`, `a884c5b3`, `962a6b63`, `7010f0d5`, `3658dafb` |
 | 1.9.2 (2026-10-14) | commits deferred by the `4487f7b2` pass | `b01edce5` (sharded shutdown `Notify`, which also closes a lost wakeup: a request that started waiting for its header after `http_cleanup()` had fired waited out the grace period; both tests in `lorica-proxy/src/lib.rs`, not the `benches/shutdown_signal.rs` benchmark, which mirrors private types) | the request-target chain, upstream order `ffab8302` -> `1e551289` -> `baf4fe5c` -> `ee78ceb6`. Only the authority checks of `ffab8302` were ported (1.7.2); its absolute-form and CONNECT classifier, its H2 egress rewrite and the three commits after it were not. Together they make absolute-form, authority-form CONNECT and non-UTF-8 targets parse, then fix how they are stored, fragment-stripped and forwarded. None of those shapes reach a header here, whatever the method (`non_origin_form_targets_do_not_reach_the_header` in `lorica-core/src/protocols/http/v1/server.rs`, which sends authority-form as both `GET` and `CONNECT`, and `absolute_form_targets_do_not_survive_header_parsing` in `authority.rs`), so for this fork the chain is a feature: RFC 9112 absolute-form acceptance |
 | 1.7.0 (2026-09-09) | fork baseline to `09696b51` (2026-08-25) | `aece9932`, `6e2158d5` (re-implemented on the `RwLock` pool), `d5ade3a2`, `e21646be`, `f486cd84`, `b8aacad8`, `28c18e6b` + `ca23f166` (source, not the integration tests), `ff6693b7`, `d248583f` (source), `0c081493`, `7166d81e`, `6dcc236a`, `5bec4059`, `915590a9`, `3e657e2f` + `3dd51643` | proxy task API family `d7728cac`, `5a822047`, `8683056e`, `7142ad46`, `9c16af9c`, `17325ff4`, `b90d4203` and the six April feature commits it sits on (backlog #83); feature commits `21140569`, `4a9a34c5`, `600c5c0d`, `402acae5` |

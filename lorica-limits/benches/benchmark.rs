@@ -19,8 +19,8 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 use ahash::RandomState;
 use dashmap::DashMap;
 use lorica_limits::estimator::Estimator;
-use rand::distributions::Uniform;
-use rand::{thread_rng, Rng};
+use rand::distr::Uniform;
+use rand::{rng, RngExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -82,7 +82,7 @@ fn run_bench<T: Counter>(
     distribution: &Uniform<u32>,
     test_name: &str,
 ) {
-    let mut rng = thread_rng();
+    let mut rng = rng();
     let before = Instant::now();
     for _ in 0..samples {
         let event: u32 = rng.sample(distribution);
@@ -171,7 +171,7 @@ fn main() {
     const THREADS: usize = 8;
     const ITEMS: u32 = 1_000_000;
     const SAMPLES_PER_THREAD: usize = SAMPLES / THREADS;
-    let distribution = Uniform::new(0, ITEMS);
+    let distribution = Uniform::new(0, ITEMS).unwrap();
 
     // single thread
     {

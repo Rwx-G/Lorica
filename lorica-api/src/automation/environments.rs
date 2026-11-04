@@ -53,8 +53,10 @@
 //! protections of every route it displaces (the maintainer's decision
 //! of 2026-10-04), through the same rules and the same host selection
 //! that bound a token's own route
-//! ([`super::write::inherit_displaced_protections`]), and the answer
-//! names those routes by id in `protections_inherited_from`.
+//! ([`super::displacement::inherit_displaced_protections`]), and the answer
+//! names those routes by id in `protections_inherited_from`. The record
+//! of a protected route a token deleted (`super::records`) is inherited
+//! from the same way, named in `protections_inherited_from_records`.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -72,12 +74,13 @@ use lorica_config::models::{
     ManagedBy, PipelineIdentity, Route, WafMode, AUTOMATION_MAX_BACKENDS_PER_ENVIRONMENT,
     AUTOMATION_MAX_ENVIRONMENTS_PER_PRINCIPAL,
 };
+use lorica_config::route_selection::{canonical_hostname, same_name};
 use lorica_config::{parse_cidr, ConfigError, ConfigStore, ConnectionFilterPolicy};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::auth::AutomationPrincipal;
-use super::write::inherit_displaced_protections;
+use super::displacement::inherit_displaced_protections;
 use crate::audit::{AuditContext, ClientConnectInfo};
 use crate::cluster::ClusterRuntime;
 use crate::db::db_blocking;
@@ -195,6 +198,12 @@ pub struct EnvironmentWriteResponse {
     /// are not answered: a Basic auth credential among them stays in
     /// the store.
     pub protections_inherited_from: Vec<String>,
+    /// The route protection records, by id, whose protections the
+    /// environment's route inherited the same way: each holds a route an
+    /// automation token deleted that served this hostname (backlog #93).
+    /// Empty when no such record covers it. The values inherited are not
+    /// answered.
+    pub protections_inherited_from_records: Vec<String>,
     /// The fleet configuration generation the control plane had
     /// PUBLISHED when this response was built; 0 on a standalone node,
     /// which has no fleet to wait for.
@@ -294,6 +303,7 @@ struct Written {
     created: bool,
     route: Route,
     protections_inherited_from: Vec<String>,
+    protections_inherited_from_records: Vec<String>,
     backend_ids: Vec<String>,
     certificate_id: String,
     certificate_not_after: DateTime<Utc>,
@@ -352,10 +362,10 @@ pub struct DeletedEnvironment {
 /// Same shape as the route API's own hostname check: a bare name, no
 /// scheme, path, port, wildcard or address literal, 253 characters at
 /// most, every label 1 to 63 ASCII alphanumerics and inner hyphens.
-/// Returns the name lowercased with a trailing dot folded away, which
-/// is the form the rows store and compare.
+/// Returns the name in the form every route name is stored and
+/// compared in ([`canonical_hostname`]).
 fn validate_dns_name(raw: &str, field: &str) -> Result<String, ApiError> {
-    let name = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    let name = canonical_hostname(raw.trim()).into_owned();
     let refuse = |why: &str| ApiError::Unprocessable(format!("{field} {why}"));
     if name.is_empty() {
         return Err(refuse("must not be empty"));
@@ -936,22 +946,17 @@ fn write_environment(store: &ConfigStore, input: &WriteInput) -> Result<PutOutco
     // The conflict names the hostname and nothing about the route
     // holding it: the caller is a credential from another project, and
     // which manual route sits on a name is an operator's business.
-    let own_route_id = existing.as_ref().map(|e| e.route_id.as_str());
-    for route in store.list_routes()? {
-        if Some(route.id.as_str()) == own_route_id {
-            continue;
-        }
-        let taken = route.hostname.eq_ignore_ascii_case(&input.hostname)
-            || route
-                .hostname_aliases
-                .iter()
-                .any(|alias| alias.eq_ignore_ascii_case(&input.hostname));
-        if taken {
-            return Err(ApiError::Conflict(format!(
-                "hostname `{}` is already used by another route",
-                input.hostname
-            )));
-        }
+    // The store's own rule, so a name the route keeps over a twin
+    // spelled otherwise is not refused here either.
+    let own_route_id = existing.as_ref().map_or("", |e| e.route_id.as_str());
+    if store
+        .hostname_claimed_elsewhere(own_route_id, &input.hostname, &[])?
+        .is_some()
+    {
+        return Err(ApiError::Conflict(format!(
+            "hostname `{}` is already used by another route",
+            input.hostname
+        )));
     }
 
     let certificates = store.list_certificates()?;
@@ -1007,7 +1012,7 @@ fn write_environment(store: &ConfigStore, input: &WriteInput) -> Result<PutOutco
         None => (uuid::Uuid::new_v4().to_string(), input.now),
     };
     let mut route = environment_route(input, route_id.clone(), &certificate.id, route_created_at);
-    let protections_inherited_from = inherit_displaced_protections(store, &mut route)?;
+    let inherited = inherit_displaced_protections(store, &mut route)?;
     if existing.is_some() {
         store.update_route(&route)?;
     } else {
@@ -1067,7 +1072,8 @@ fn write_environment(store: &ConfigStore, input: &WriteInput) -> Result<PutOutco
     Ok(PutOutcome::Written(Box::new(Written {
         created: existing.is_none(),
         route,
-        protections_inherited_from,
+        protections_inherited_from: inherited.routes,
+        protections_inherited_from_records: inherited.records,
         backend_ids,
         certificate_id: certificate.id.clone(),
         certificate_not_after: certificate.not_after,
@@ -1510,6 +1516,7 @@ async fn put_environment_inner(
         certificate_not_after: written.certificate_not_after.to_rfc3339(),
         expires_at: written.environment.expires_at.to_rfc3339(),
         protections_inherited_from: written.protections_inherited_from.clone(),
+        protections_inherited_from_records: written.protections_inherited_from_records.clone(),
         applied_generation: applied_generation(state),
     };
     let action = if written.created {
@@ -1554,7 +1561,7 @@ pub async fn list_environments(
     let hostname: Option<String> = query
         .hostname
         .as_deref()
-        .map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase());
+        .map(|h| canonical_hostname(h.trim()).into_owned());
     let expiring_before: Option<DateTime<Utc>> = match query.expiring_before.as_deref() {
         Some(raw) => Some(
             DateTime::parse_from_rfc3339(raw.trim())
@@ -1593,7 +1600,7 @@ pub async fn list_environments(
                 continue;
             };
             if let Some(wanted) = &hostname {
-                if !view.hostname.eq_ignore_ascii_case(wanted) {
+                if !same_name(&view.hostname, wanted) {
                     continue;
                 }
             }

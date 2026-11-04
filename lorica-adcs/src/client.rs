@@ -359,8 +359,7 @@ impl<B: GssBackend> Session<B> {
             client_config(bundle.as_deref(), verifier_pin)
         })
         .await??;
-        let http: Client = Client::builder()
-            .use_preconfigured_tls(tls)
+        let http: Client = lorica_tls::http_client::client_builder(tls)
             .https_only(true)
             .tls_info(true)
             // A redirect would send the next request, and its token, to a

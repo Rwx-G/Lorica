@@ -72,6 +72,13 @@ export default [
         sourceType: "module",
       },
     },
+    rules: {
+      // ESLint 10 added this rule to `recommended`. Its code-path
+      // analysis follows source order, so a `<script module>` const
+      // declared below the markup and read only from it (the static
+      // SVG icons fed to `{@html}`) reads as written after its last use.
+      "no-useless-assignment": "off",
+    },
   },
 
   // Ignore built artifacts, vendored code, and test fixtures.

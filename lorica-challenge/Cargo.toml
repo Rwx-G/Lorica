@@ -1,6 +1,6 @@
 [package]
 name = "lorica-challenge"
-version = "1.10.1"
+version = "1.10.2"
 edition = "2021"
 license = "Apache-2.0"
 description = "Bot-protection challenges (cookie + PoW + captcha) for Lorica"
@@ -22,12 +22,10 @@ subtle = "2"
 # the workspace on 0.22.
 base64 = "0.23"
 # CSPRNG for the HMAC secret, the PoW challenge nonce, and the
-# captcha solution text. Bumped to 0.9 in v1.5.0 (RUSTSEC-2026-0097
-# unsoundness when a custom logger + `rand::rng()` combine ; fixed
-# in rand >= 0.9). 0.10 would also work but the surrounding
-# ecosystem (argon2, rand_chacha) lags behind, so 0.9 is the path
-# of least friction.
-rand = "0.9"
+# captcha solution text. 0.9 since v1.5.0 (RUSTSEC-2026-0097), 0.10
+# since v1.10.2 with the rest of the workspace, so a single rand line
+# is linked.
+rand = "0.10"
 # PNG generation for the image captcha. The rendering engine
 # (font + distortion filters + PNG encode) is vendored in-tree
 # under `src/captcha/vendored/` from the `captcha` crate 1.0.0
@@ -59,8 +57,3 @@ arc-swap = "1"
 # Module-static lazy init for the `ArcSwap` slot. Matches the rest
 # of the workspace (lorica-api / lorica-geoip both on 1.x).
 once_cell = "1"
-
-[dev-dependencies]
-# Deterministic RNG for reproducing challenge / solve cycles in
-# tests without flakiness from timing-sensitive captchas.
-rand_chacha = "0.9"

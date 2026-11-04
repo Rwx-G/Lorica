@@ -25,7 +25,7 @@ use tokio::sync::mpsc::Receiver;
 use tokio::time::Instant;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::rustls::RootCertStore;
 use tokio_rustls::TlsConnector;
 
 use super::{SinkEvent, SinkKind, SyslogSinkConfig, SyslogTransport};
@@ -290,32 +290,19 @@ fn build_tls_connector(config: &SyslogSinkConfig) -> Result<Option<TlsConnector>
     if config.transport != SyslogTransport::TcpTls {
         return Ok(None);
     }
-    let mut roots = RootCertStore::empty();
-    match &config.tls_ca_pem {
-        Some(ca_pem) => {
-            let mut added = 0usize;
-            for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
-                // PEM parse errors are mapped to fixed strings: some
-                // rustls-pki-types error variants embed the offending
-                // input, which for the key path would put private-key
-                // bytes into an HTTP body and the journal (QA finding).
-                let cert =
-                    cert.map_err(|_| "invalid CA PEM (unparseable certificate)".to_string())?;
-                roots
-                    .add(cert)
-                    .map_err(|e| format!("CA certificate rejected: {e}"))?;
-                added += 1;
-            }
-            if added == 0 {
-                return Err("CA PEM contains no certificate".to_string());
-            }
-        }
+    let roots: RootCertStore = match &config.tls_ca_pem {
+        // The shared bundle rule refuses an empty or unparsable bundle
+        // and never quotes it.
+        Some(ca_pem) => lorica_tls::http_client::pem_roots(ca_pem.as_bytes())
+            .map_err(|e| format!("invalid CA PEM: {e}"))?,
         None => {
+            let mut roots = RootCertStore::empty();
             lorica_tls::load_platform_certs_incl_env_into_store(&mut roots)
                 .map_err(|e| format!("platform trust store unavailable: {e}"))?;
+            roots
         }
-    }
-    let builder = ClientConfig::builder().with_root_certificates(roots);
+    };
+    let builder = lorica_tls::http_client::config_builder().with_root_certificates(roots);
     let client_config = match (&config.tls_client_cert_pem, &config.tls_client_key_pem) {
         (Some(cert_pem), Some(key_pem)) => {
             let certs: Vec<CertificateDer<'static>> =
@@ -691,11 +678,21 @@ mod tests {
     }
 
     #[test]
+    fn tls_connector_rejects_a_ca_bundle_with_no_certificate_without_quoting_it() {
+        let mut config = test_config("host01:6514", SyslogTransport::TcpTls);
+        config.tls_ca_pem = Some("secret-looking line, not a certificate\n".to_string());
+        let err = match build_tls_connector(&config) {
+            Err(e) => e,
+            Ok(_) => panic!("a CA bundle with no certificate must fail"),
+        };
+        assert!(err.starts_with("invalid CA PEM"), "{err}");
+        assert!(!err.contains("secret-looking"), "{err}");
+    }
+
+    #[test]
     fn tls_connector_rejects_key_without_cert() {
-        // `ClientConfig::builder()` needs a process-level provider;
-        // which test installs it first is scheduling luck, so install
-        // it here too (idempotent).
-        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        // No process-wide crypto provider is needed: the connector is
+        // built on the policy's own (`http_client::config_builder`).
         let mut config = test_config("host01:6514", SyslogTransport::TcpTls);
         config.tls_client_key_pem = Some("-----BEGIN PRIVATE KEY-----".to_string());
         // expect_err needs Debug on the Ok side, which TlsConnector

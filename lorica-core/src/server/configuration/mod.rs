@@ -20,25 +20,17 @@
 //! * Error log file path
 
 use clap::Parser;
-use log::{debug, trace};
-use lorica_error::{Error, ErrorType::*, OrErr, Result};
-use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::fs;
 
 // default maximum upstream retries for retry-able proxy errors
 const DEFAULT_MAX_RETRIES: usize = 16;
 
-/// The configuration file
+/// The server configuration
 ///
-/// Lorica configuration files are by default YAML files, but any key value format can potentially
-/// be used.
-///
-/// # Extension
-/// New keys can be added to the configuration files which this configuration object will ignore.
-/// Then, users can parse these key-values to pass to their code to use.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+/// Lorica: built in code only. Upstream also loads it from a YAML file
+/// named by the `-c` flag; that path is removed (see `FORK.md`), so start
+/// from [`ServerConf::new`] or [`ServerConf::default`] and set fields.
+#[derive(Debug, PartialEq, Eq)]
 pub struct ServerConf {
     /// Version
     pub version: usize,
@@ -193,71 +185,27 @@ pub struct Opt {
         long_help = None
     )]
     pub test: bool,
-
-    /// The path to the configuration file.
-    ///
-    /// See [`ServerConf`] for more details of the configuration file.
-    #[clap(short, long, help = "The path to the configuration file.", long_help = None)]
-    pub conf: Option<String>,
 }
 
 impl ServerConf {
-    // Does not has to be async until we want runtime reload
-    pub fn load_from_yaml<P>(path: P) -> Result<Self>
-    where
-        P: AsRef<std::path::Path> + std::fmt::Display,
-    {
-        let conf_str = fs::read_to_string(&path).or_err_with(ReadError, || {
-            format!("Unable to read conf file from {path}")
-        })?;
-        debug!("Conf file read from {path}");
-        Self::from_yaml(&conf_str)
-    }
-
-    pub fn load_yaml_with_opt_override(opt: &Opt) -> Result<Self> {
-        if let Some(path) = &opt.conf {
-            let mut conf = Self::load_from_yaml(path)?;
-            conf.merge_with_opt(opt);
-            Ok(conf)
-        } else {
-            Error::e_explain(ReadError, "No path specified")
+    /// The configuration a [`Server`](crate::server::Server) starts with:
+    /// [`ServerConf::default`] with `version` 1.
+    ///
+    /// Lorica: upstream builds it by parsing the YAML document
+    /// `version: 1` over the serde defaults, which are exactly
+    /// [`ServerConf::default`]; this constructs the same value directly.
+    pub fn new() -> Self {
+        ServerConf {
+            version: 1,
+            ..Default::default()
         }
     }
 
-    pub fn new() -> Option<Self> {
-        Self::from_yaml("---\nversion: 1").ok()
-    }
-
-    pub fn new_with_opt_override(opt: &Opt) -> Option<Self> {
-        let conf = Self::new();
-        match conf {
-            Some(mut c) => {
-                c.merge_with_opt(opt);
-                Some(c)
-            }
-            None => None,
-        }
-    }
-
-    pub fn from_yaml(conf_str: &str) -> Result<Self> {
-        trace!("Read conf file: {conf_str}");
-        let conf: ServerConf = serde_yaml_ng::from_str(conf_str).or_err_with(ReadError, || {
-            format!("Unable to parse yaml conf {conf_str}")
-        })?;
-
-        trace!("Loaded conf: {conf:?}");
-        conf.validate()
-    }
-
-    pub fn to_yaml(&self) -> String {
-        serde_yaml_ng::to_string(self).unwrap()
-    }
-
-    pub fn validate(self) -> Result<Self> {
-        if self.max_blocking_threads == Some(0) {
-            return Error::e_explain(ReadError, "max_blocking_threads must be greater than zero");
-        }
-        Ok(self)
+    /// [`ServerConf::new`] with the command-line overrides of `opt` applied.
+    pub fn new_with_opt_override(opt: &Opt) -> Self {
+        let mut conf = Self::new();
+        conf.merge_with_opt(opt);
+        conf
     }
 
     pub fn merge_with_opt(&mut self, opt: &Opt) {
@@ -293,98 +241,47 @@ mod tests {
     }
 
     #[test]
-    fn not_a_test_i_cannot_write_yaml_by_hand() {
-        init_log();
-        let conf = ServerConf {
+    fn test_new_pins_the_defaults() {
+        let expected = ServerConf {
             version: 1,
-            client_bind_to_ipv4: vec!["1.2.3.4".to_string(), "5.6.7.8".to_string()],
-            client_bind_to_ipv6: vec![],
-            ca_file: None,
             daemon: false,
             error_log: None,
-            upstream_debug_ssl_keylog: false,
-            pid_file: "".to_string(),
-            upgrade_sock: "".to_string(),
+            pid_file: "/tmp/lorica.pid".to_string(),
+            upgrade_sock: "/tmp/lorica_upgrade.sock".to_string(),
             user: None,
             group: None,
             threads: 1,
             listener_tasks_per_fd: 1,
             work_stealing: true,
-            upstream_keepalive_pool_size: 4,
-            upstream_connect_offload_threadpools: None,
-            upstream_connect_offload_thread_per_pool: None,
+            ca_file: None,
             grace_period_seconds: None,
             graceful_shutdown_timeout_seconds: None,
-            max_retries: 1,
+            client_bind_to_ipv4: vec![],
+            client_bind_to_ipv6: vec![],
+            upstream_keepalive_pool_size: 128,
+            upstream_connect_offload_threadpools: None,
+            upstream_connect_offload_thread_per_pool: None,
+            upstream_debug_ssl_keylog: false,
+            max_retries: 16,
             upgrade_sock_connect_accept_max_retries: None,
             max_blocking_threads: None,
             blocking_threads_ttl_seconds: None,
             upstream_crl_file: None,
         };
-        // cargo test -- --nocapture not_a_test_i_cannot_write_yaml_by_hand
-        println!("{}", conf.to_yaml());
+        assert_eq!(expected, ServerConf::new());
     }
 
     #[test]
-    fn test_load_file() {
+    fn test_opt_override_sets_daemon() {
         init_log();
-        let conf_str = r#"
----
-version: 1
-client_bind_to_ipv4:
-    - 1.2.3.4
-    - 5.6.7.8
-client_bind_to_ipv6: []
-        "#
-        .to_string();
-        let conf = ServerConf::from_yaml(&conf_str).unwrap();
-        assert_eq!(2, conf.client_bind_to_ipv4.len());
-        assert_eq!(0, conf.client_bind_to_ipv6.len());
-        assert_eq!(1, conf.version);
+        let opt = Opt::parse_from_args(["lorica", "-d"]);
+        assert!(ServerConf::new_with_opt_override(&opt).daemon);
+        assert!(!ServerConf::new_with_opt_override(&Opt::default()).daemon);
     }
 
     #[test]
-    fn test_default() {
+    fn test_conf_flag_is_gone() {
         init_log();
-        let conf_str = r#"
----
-version: 1
-        "#
-        .to_string();
-        let conf = ServerConf::from_yaml(&conf_str).unwrap();
-        assert_eq!(0, conf.client_bind_to_ipv4.len());
-        assert_eq!(0, conf.client_bind_to_ipv6.len());
-        assert_eq!(1, conf.version);
-        assert_eq!(DEFAULT_MAX_RETRIES, conf.max_retries);
-        assert_eq!("/tmp/lorica.pid", conf.pid_file);
-    }
-
-    #[test]
-    fn test_zero_max_blocking_threads_is_rejected() {
-        init_log();
-        let conf_str = r#"
----
-version: 1
-max_blocking_threads: 0
-        "#;
-        let result = ServerConf::from_yaml(conf_str);
-        assert!(
-            result.is_err(),
-            "max_blocking_threads: 0 should fail validation"
-        );
-    }
-
-    #[test]
-    fn test_valid_max_blocking_threads() {
-        init_log();
-        let conf_str = r#"
----
-version: 1
-max_blocking_threads: 64
-blocking_threads_ttl_seconds: 30
-        "#;
-        let conf = ServerConf::from_yaml(conf_str).unwrap();
-        assert_eq!(Some(64), conf.max_blocking_threads);
-        assert_eq!(Some(30), conf.blocking_threads_ttl_seconds);
+        assert!(Opt::try_parse_from(["lorica", "-c", "conf.yaml"]).is_err());
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "lorica-api"
-version = "1.10.1"
+version = "1.10.2"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -8,31 +8,31 @@ repository = "https://github.com/Rwx-G/Lorica"
 description = "REST API for Lorica reverse proxy management"
 
 [dependencies]
-lorica-acme = { version = "1.10.1", path = "../lorica-acme" }
+lorica-acme = { version = "1.10.2", path = "../lorica-acme" }
 # The AD CS enrollment client (Epic 13). Every binary that links this
 # crate links the system GSS-API library through it (PRD D7, D8): the
 # management API is where the authority's password is decrypted and
 # the client is called, on the control plane only.
-lorica-adcs = { version = "1.10.1", path = "../lorica-adcs" }
+lorica-adcs = { version = "1.10.2", path = "../lorica-adcs" }
 lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
-lorica-config = { version = "1.10.1", path = "../lorica-config" }
+lorica-config = { version = "1.10.2", path = "../lorica-config" }
 # The settings allowlist and the route and backend protection rules
 # the automation plane enforces, declared where `lorica-mcp` reads
 # them too.
-lorica-automation-policy = { version = "1.10.1", path = "../lorica-automation-policy" }
-lorica-dashboard = { version = "1.10.1", path = "../lorica-dashboard" }
-lorica-metrics = { version = "1.10.1", path = "../lorica-metrics" }
-lorica-waf = { version = "1.10.1", path = "../lorica-waf" }
-lorica-notify = { version = "1.10.1", path = "../lorica-notify" }
-lorica-bench = { version = "1.10.1", path = "../lorica-bench" }
-lorica-cluster = { version = "1.10.1", path = "../lorica-cluster" }
+lorica-automation-policy = { version = "1.10.2", path = "../lorica-automation-policy" }
+lorica-dashboard = { version = "1.10.2", path = "../lorica-dashboard" }
+lorica-metrics = { version = "1.10.2", path = "../lorica-metrics" }
+lorica-waf = { version = "1.10.2", path = "../lorica-waf" }
+lorica-notify = { version = "1.10.2", path = "../lorica-notify" }
+lorica-bench = { version = "1.10.2", path = "../lorica-bench" }
+lorica-cluster = { version = "1.10.2", path = "../lorica-cluster" }
 # The shared MCP core (Story 11.1 AC #9 and AC #10). The Streamable
 # HTTP binding is a path on the automation listener rather than a
 # second process, so the adapter runs here and reaches the protocol
 # core through this edge. The inversion is deliberate: `lorica-mcp`
 # must not depend on `lorica-api`, or the stdio subprocess would carry
 # the whole management crate.
-lorica-mcp = { version = "1.10.1", path = "../lorica-mcp" }
+lorica-mcp = { version = "1.10.2", path = "../lorica-mcp" }
 # Used in `certificates.rs::validate_certificate_bundle` to gate
 # every cert upload (POST /certificates, PUT /certificates/{id},
 # POST /config/import) with the exact loader the worker uses :
@@ -87,8 +87,8 @@ ed25519-dalek = "3"
 # through the `route53` feature path. No `use_pem`: the verifier
 # builds its keys from JWK components, never from PEM.
 jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs"] }
-rand = "0.9"
-rand_chacha = "0.9"
+rand = "0.10"
+rand_chacha = "0.10"
 rcgen = "0.14"
 regex = "1"
 ring = "0.17"
@@ -99,7 +99,7 @@ ring = "0.17"
 # across the bump.
 x509-parser = "0.18"
 pem = "4"
-sysinfo = "0.39"
+sysinfo = "0.40"
 # Linux-only. Used for `statvfs` so the System page reports disk
 # usage with the same "used = total - free" semantics as `df -h`
 # (sysinfo's available_space excludes reserved root blocks, which
@@ -108,24 +108,21 @@ sysinfo = "0.39"
 # `#![deny(unsafe_code)]` stays intact.
 nix = { version = "0.31", default-features = false, features = ["fs", "user"] }
 thiserror = "2"
-# `rustls-tls-native-roots` sits beside the webpki bundle rather than
-# replacing it: with both on, reqwest seeds its root store from
-# webpki-roots AND from the platform store, which is where a
-# distribution's CA bundle and anything `SSL_CERT_FILE` points at
-# land. Without it the OIDC JWKS fetch (Story 10.5) trusts webpki's
-# public roots only, so a self-hosted GitLab under a corporate PKI
-# answered every ID token with `jwks_unavailable` however the host was
-# configured. `rustls-native-certs` is already in the lockfile through
-# the cluster TLS stack, so this is a feature flag and not a new
-# dependency.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots", "json"] }
+# Every client takes its TLS from `lorica_tls::http_client`, whose
+# public trust is the webpki bundle AND the platform store: the
+# platform store is where a distribution's CA bundle and anything
+# `SSL_CERT_FILE` points at land. Without it the OIDC JWKS fetch
+# (Story 10.5) would trust webpki's public roots only, so a self-hosted
+# GitLab under a corporate PKI would answer every ID token with
+# `jwks_unavailable` however the host was configured.
+reqwest = { workspace = true, features = ["json"] }
 async-trait = { workspace = true }
 base64 = "0.23"
 dashmap = "6"
 tracing = "0.1"
 once_cell = { workspace = true }
 http = { workspace = true }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 parking_lot = "0.12"
 ipnet = "2"
 strum = "0.28"

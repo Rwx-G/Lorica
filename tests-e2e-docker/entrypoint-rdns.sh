@@ -20,7 +20,7 @@ set -e
 # read_system_conf() picks it up.
 DNSMASQ_IP=$(getent hosts dnsmasq | awk '{print $1}')
 if [ -z "$DNSMASQ_IP" ]; then
-    echo "ERROR: dnsmasq sidecar unreachable — profile 'rdns' requires it" >&2
+    echo "ERROR: dnsmasq sidecar unreachable - profile 'rdns' requires it" >&2
     exit 1
 fi
 cat > /etc/resolv.conf <<EOF

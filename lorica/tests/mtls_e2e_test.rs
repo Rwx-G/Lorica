@@ -268,7 +268,7 @@ fn client_config_trusting(ca_der: &CertificateDer<'_>) -> Arc<RusTlsClientConfig
     let mut roots = RootCertStore::empty();
     roots.add(ca_der.clone()).unwrap();
     Arc::new(
-        RusTlsClientConfig::builder()
+        lorica_tls::http_client::config_builder()
             .with_root_certificates(roots)
             .with_no_client_auth(),
     )
@@ -282,7 +282,7 @@ fn client_config_with_cert(
     let mut roots = RootCertStore::empty();
     roots.add(ca_der.clone()).unwrap();
     Arc::new(
-        RusTlsClientConfig::builder()
+        lorica_tls::http_client::config_builder()
             .with_root_certificates(roots)
             .with_client_auth_cert(vec![cert], key)
             .unwrap(),

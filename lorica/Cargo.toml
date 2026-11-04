@@ -1,6 +1,6 @@
 [package]
 name = "lorica"
-version = "1.10.1"
+version = "1.10.2"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -39,32 +39,32 @@ lorica-lb = { version = "0.1.0", path = "../lorica-lb", optional = true, default
 # call site explicit.
 lorica-ketama = { version = "0.1.0", path = "../lorica-ketama" }
 lorica-proxy = { version = "0.1.0", path = "../lorica-proxy", optional = true, default-features = false }
-lorica-config = { version = "1.10.1", path = "../lorica-config" }
-lorica-api = { version = "1.10.1", path = "../lorica-api" }
+lorica-config = { version = "1.10.2", path = "../lorica-config" }
+lorica-api = { version = "1.10.2", path = "../lorica-api" }
 # `main` points `KRB5_CONFIG` at the `krb5.conf` path this crate owns
 # (Epic 13 D3), before any thread exists.
-lorica-adcs = { version = "1.10.1", path = "../lorica-adcs" }
+lorica-adcs = { version = "1.10.2", path = "../lorica-adcs" }
 # `lorica mcp token create --tier` reads the MCP tier table and tool
 # catalogue from here, so the scopes it mints and the blast radius it
 # prints are the ones the MCP server enforces rather than a copy.
-lorica-mcp = { version = "1.10.1", path = "../lorica-mcp" }
+lorica-mcp = { version = "1.10.2", path = "../lorica-mcp" }
 # The settings allowlist the admin tier's blast radius prints, read
 # from the one statement the plane enforces.
-lorica-automation-policy = { version = "1.10.1", path = "../lorica-automation-policy" }
+lorica-automation-policy = { version = "1.10.2", path = "../lorica-automation-policy" }
 lorica-error = { version = "0.1.0", path = "../lorica-error" }
 lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
-lorica-worker = { version = "1.10.1", path = "../lorica-worker" }
-lorica-command = { version = "1.10.1", path = "../lorica-command" }
-lorica-cluster = { version = "1.10.1", path = "../lorica-cluster" }
-lorica-shmem = { version = "1.10.1", path = "../lorica-shmem" }
-lorica-waf = { version = "1.10.1", path = "../lorica-waf" }
-lorica-notify = { version = "1.10.1", path = "../lorica-notify" }
+lorica-worker = { version = "1.10.2", path = "../lorica-worker" }
+lorica-command = { version = "1.10.2", path = "../lorica-command" }
+lorica-cluster = { version = "1.10.2", path = "../lorica-cluster" }
+lorica-shmem = { version = "1.10.2", path = "../lorica-shmem" }
+lorica-waf = { version = "1.10.2", path = "../lorica-waf" }
+lorica-notify = { version = "1.10.2", path = "../lorica-notify" }
 lorica-limits = { version = "0.1.0", path = "../lorica-limits" }
 lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
-lorica-geoip = { version = "1.10.1", path = "../lorica-geoip" }
-lorica-challenge = { version = "1.10.1", path = "../lorica-challenge" }
+lorica-geoip = { version = "1.10.2", path = "../lorica-geoip" }
+lorica-challenge = { version = "1.10.2", path = "../lorica-challenge" }
 once_cell = { workspace = true }
-lorica-bench = { version = "1.10.1", path = "../lorica-bench" }
+lorica-bench = { version = "1.10.2", path = "../lorica-bench" }
 regex = "1"
 # HTML sanitization for operator-supplied error_page_html (v1.5.0
 # audit finding HIGH-1). Whitelist-based parser replaces the
@@ -84,18 +84,19 @@ bytes = "1"
 # the import in `bot_rdns.rs` follows.
 hickory-resolver = { version = "0.26", default-features = false, features = ["system-config", "tokio"] }
 lru = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "cookies", "json"] }
+reqwest = { workspace = true, features = ["cookies", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 # PEM parsing via the official rustls pki-types crate. Replaces
 # rustls-pemfile (v1.5.0 audit HIGH-2: RUSTSEC-2025-0134, unmaintained).
 # pki-types is maintained by the rustls team and its `pem_slice_iter`
-# API is a 1:1 replacement for the old iterator. Advisory remains
-# transitive via the forked lorica-tls crate; tracked upstream.
+# API is a 1:1 replacement for the old iterator. The crate itself left
+# the tree in v1.10.2 with `rustls-native-certs` 0.8 (the RUSTSEC-2025-0134
+# row of docs/security/threat-model.md).
 rustls-pki-types = { version = "1", features = ["alloc"] }
 futures-util = "0.3"
 arc-swap = "1"
 dashmap = "6"
-rand = "0.9"
+rand = "0.10"
 parking_lot = "0.12"
 argon2 = "0.6"
 base64 = "0.23"
@@ -110,11 +111,11 @@ ipnet = "2"
 # OpenTelemetry (feature-gated, off by default)
 # Enabled via `--features otel`. Policy matches `route53` since v1.3.0
 # supply-chain audit SC-M-3: non-OTel users do not pay the dep-graph cost.
-opentelemetry = { version = "0.32", optional = true, default-features = false, features = ["trace", "logs", "internal-logs"] }
-opentelemetry_sdk = { version = "0.32", optional = true, default-features = false, features = ["trace", "logs", "rt-tokio", "internal-logs"] }
-opentelemetry-otlp = { version = "0.32", optional = true, default-features = false, features = ["trace", "logs", "http-proto", "http-json", "grpc-tonic", "reqwest-blocking-client", "tls-ring", "tls-webpki-roots", "internal-logs"] }
-opentelemetry-semantic-conventions = { version = "0.32", optional = true }
-tracing-opentelemetry = { version = "0.33", optional = true, default-features = false }
+opentelemetry = { version = "0.33", optional = true, default-features = false, features = ["trace", "logs", "internal-logs"] }
+opentelemetry_sdk = { version = "0.33", optional = true, default-features = false, features = ["trace", "logs", "rt-tokio", "internal-logs"] }
+opentelemetry-otlp = { version = "0.33", optional = true, default-features = false, features = ["trace", "logs", "http-proto", "http-json", "grpc-tonic", "reqwest-blocking-client", "tls-ring", "tls-webpki-roots", "internal-logs"] }
+opentelemetry-semantic-conventions = { version = "0.33", optional = true }
+tracing-opentelemetry = { version = "0.34", optional = true, default-features = false }
 
 [dev-dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -191,4 +192,10 @@ otel = [
     "dep:opentelemetry-otlp",
     "dep:opentelemetry-semantic-conventions",
     "dep:tracing-opentelemetry",
+    # The OTLP/HTTP exporters are handed a blocking client built on
+    # `lorica_tls::http_client` instead of building their own. The
+    # exporter crate already turns reqwest's feature on; it is named here
+    # because `otel.rs` names the type.
+    "reqwest/blocking",
+    "lorica-tls/blocking",
 ]

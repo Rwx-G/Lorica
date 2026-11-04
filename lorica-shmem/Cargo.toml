@@ -1,6 +1,6 @@
 [package]
 name = "lorica-shmem"
-version = "1.10.1"
+version = "1.10.2"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -9,7 +9,7 @@ description = "Cross-worker shared-memory primitives for Lorica (anonymous memfd
 
 [dependencies]
 nix = { version = "0.31", features = ["mman", "fs", "socket", "time"] }
-rand = "0.9"
+rand = "0.10"
 tracing = "0.1"
 thiserror = "2"
 

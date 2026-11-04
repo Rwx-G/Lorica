@@ -19,6 +19,7 @@ mod oidc_issuer;
 mod preferences;
 mod probes;
 mod route;
+mod route_protection_record;
 mod settings;
 mod sla;
 
@@ -88,6 +89,7 @@ pub use route::{
     MtlsConfig, PathRule, RateLimit, RateLimitScope, ResponseRewriteConfig, ResponseRewriteRule,
     Route, SpoofedFallback, TrafficSplit, NODE_SELECTOR_MAX_ENTRIES,
 };
+pub use route_protection_record::RouteProtectionRecord;
 pub use settings::{
     builtin_security_presets, resolve_security_preset, GlobalSettings, SecurityHeaderPreset,
     DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S, DEFAULT_HEADER_TIMEOUT_S, MAX_HEADER_TIMEOUT_S,

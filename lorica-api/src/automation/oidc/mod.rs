@@ -223,8 +223,9 @@ impl OidcVerifier {
     ///
     /// # Errors
     ///
-    /// The `reqwest` build error, which is a broken TLS backend.
-    pub fn with_http_fetcher() -> Result<Self, reqwest::Error> {
+    /// Why the HTTPS client could not be built: an unusable platform
+    /// trust store, or a client reqwest refuses to build.
+    pub fn with_http_fetcher() -> Result<Self, String> {
         Ok(Self::new(Arc::new(HttpJwksFetcher::new()?)))
     }
 

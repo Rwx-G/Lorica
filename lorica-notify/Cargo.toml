@@ -1,11 +1,11 @@
 [package]
 name = "lorica-notify"
-version = "1.10.1"
+version = "1.10.2"
 edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-lorica-metrics = { version = "1.10.1", path = "../lorica-metrics" }
+lorica-metrics = { version = "1.10.2", path = "../lorica-metrics" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
@@ -17,6 +17,8 @@ tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
 # vulnerable `boring-tls` backend, so the path is inactive here, but
 # the floor blocks any resolve below the fix as defense in depth.
 lettre = { version = "0.11.22", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+reqwest = { workspace = true, features = ["json"] }
+# The TLS policy of the webhook and Slack clients (`lorica_tls::http_client`).
+lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
 thiserror = "2"
 parking_lot = "0.12"

@@ -1189,8 +1189,8 @@ services:
   # the staging hostname and serves its directory on 443 with a leaf
   # covering those SANs, signed by a fixture CA that `acme-ca-init`
   # generates into the shared volume at boot. The Lorica node trusts
-  # that CA via SSL_CERT_FILE (instant-acme's platform verifier loads
-  # native roots through openssl-probe, which honours the env var).
+  # that CA via SSL_CERT_FILE (the ACME client verifies with
+  # `lorica_tls::http_client::public`, whose platform store honours it).
   # Pebble's VA resolves via challtestsrv (-dnsserver) and dials
   # HTTP-01 on 8080 - the Lorica proxy port.
   #

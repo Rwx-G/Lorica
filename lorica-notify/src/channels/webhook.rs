@@ -19,23 +19,12 @@ use crate::events::AlertEvent;
 
 /// POST an alert event as JSON to the configured webhook URL.
 ///
-/// Uses a 10-second total timeout. If `auth_header` is set it is sent
-/// verbatim as the `Authorization` header. Returns [`NotifyError::Webhook`]
-/// on transport failures or when the response status is not 2xx.
+/// Uses the channels' shared client: a 10-second total timeout and no
+/// redirect following. If `auth_header` is set it is sent verbatim as the
+/// `Authorization` header. Returns [`NotifyError::Webhook`] on transport
+/// failures or when the response status is not 2xx (a redirect included).
 pub async fn send(config: &WebhookConfig, event: &AlertEvent) -> Result<(), NotifyError> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        // Disable redirect following to defend against an attacker
-        // who controls the configured webhook URL redirecting to an
-        // internal service (`http://10.0.0.5:8500/`,
-        // `http://169.254.169.254/`). Webhook bodies are operator-
-        // supplied JSON alerts ; leaking them is a soft data-leak.
-        // Trust-boundary fix, audit L-7.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| NotifyError::Webhook(format!("failed to create HTTP client: {e}")))?;
-
-    let mut request = client.post(&config.url).json(event);
+    let mut request = super::http_client()?.post(&config.url).json(event);
 
     if let Some(ref auth) = config.auth_header {
         request = request.header("Authorization", auth);

@@ -304,7 +304,8 @@ async fn cloudflare_create_txt_happy_path() {
         .await;
 
     let cf =
-        CloudflareDnsChallenger::with_base_url("zone123".into(), "token456".into(), server.uri());
+        CloudflareDnsChallenger::with_base_url("zone123".into(), "token456".into(), server.uri())
+            .expect("test setup: challenger");
     cf.create_txt_record("example.com", "value-abc")
         .await
         .expect("create should succeed on 200");
@@ -323,7 +324,8 @@ async fn cloudflare_create_txt_surfaces_4xx_with_body() {
         .await;
 
     let cf =
-        CloudflareDnsChallenger::with_base_url("zone123".into(), "bad-token".into(), server.uri());
+        CloudflareDnsChallenger::with_base_url("zone123".into(), "bad-token".into(), server.uri())
+            .expect("test setup: challenger");
     let err = cf
         .create_txt_record("example.com", "val")
         .await
@@ -366,7 +368,8 @@ async fn cloudflare_delete_txt_happy_path() {
         .await;
 
     let cf =
-        CloudflareDnsChallenger::with_base_url("zone123".into(), "token456".into(), server.uri());
+        CloudflareDnsChallenger::with_base_url("zone123".into(), "token456".into(), server.uri())
+            .expect("test setup: challenger");
     cf.delete_txt_record("example.com")
         .await
         .expect("delete should succeed when record exists");
@@ -386,7 +389,8 @@ async fn cloudflare_delete_txt_missing_record_is_err() {
         .await;
 
     let cf =
-        CloudflareDnsChallenger::with_base_url("zone123".into(), "token456".into(), server.uri());
+        CloudflareDnsChallenger::with_base_url("zone123".into(), "token456".into(), server.uri())
+            .expect("test setup: challenger");
     let err = cf
         .delete_txt_record("example.com")
         .await
@@ -446,7 +450,8 @@ async fn ovh_create_txt_happy_path_signs_every_request() {
         "app-key".into(),
         "app-secret".into(),
         "consumer-key".into(),
-    );
+    )
+    .expect("test setup: challenger");
     ovh.create_txt_record("example.com", "challenge-value")
         .await
         .expect("happy-path create must succeed");
@@ -475,7 +480,8 @@ async fn ovh_create_txt_surfaces_4xx_with_body() {
         "app-key".into(),
         "app-secret".into(),
         "bad-consumer-key".into(),
-    );
+    )
+    .expect("test setup: challenger");
     let err = ovh
         .create_txt_record("example.com", "val")
         .await
@@ -498,7 +504,8 @@ async fn ovh_delete_without_tracked_record_is_err() {
         "app-key".into(),
         "app-secret".into(),
         "consumer-key".into(),
-    );
+    )
+    .expect("test setup: challenger");
     let err = ovh
         .delete_txt_record("example.com")
         .await

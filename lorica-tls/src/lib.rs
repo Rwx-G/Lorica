@@ -18,6 +18,7 @@
 #![warn(clippy::all)]
 
 pub mod cert_resolver;
+pub mod http_client;
 pub mod no_debug;
 pub mod ocsp;
 
@@ -40,15 +41,18 @@ pub use rustls::{
     Error as RusTlsError, KeyLogFile, RootCertStore, ServerConfig, SignatureScheme, Stream,
 };
 pub use rustls_native_certs::load_native_certs;
-// v1.5.1 audit L-16 : the `rustls-pemfile` crate (RUSTSEC-2025-0134,
-// unmaintained) was the last hop on Lorica's outstanding RUSTSEC
-// chain. PEM parsing now goes through `rustls_pki_types::pem`'s
+// v1.5.1 audit L-16 : direct use of the `rustls-pemfile` crate
+// (RUSTSEC-2025-0134, unmaintained) is gone; the crate itself stayed
+// reachable through `rustls-native-certs` 0.7 until v1.10.2 moved to
+// 0.8. PEM parsing now goes through `rustls_pki_types::pem`'s
 // `PemObject` trait (`pem_slice_iter` + `from_pem_slice`), which
 // is the rustls team's actively-maintained replacement. Iterators
 // only yield the section type they were called on (other PEM
 // blocks are skipped silently), so the previous "match on Item
 // variant" pattern collapses into a typed iterator per call site.
-use rustls_pki_types::pem::PemObject;
+// Lorica: re-exported so a crate reading PEM roots for
+// `http_client::verified` needs no pki-types dependency of its own.
+pub use rustls_pki_types::pem::PemObject;
 pub use rustls_pki_types::{
     CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime,
 };
@@ -77,38 +81,57 @@ where
     P: AsRef<Path>,
 {
     let bytes = read_file(path)?;
-    let mut added = 0usize;
-    for cert_result in CertificateDer::pem_slice_iter(&bytes) {
-        let cert = cert_result.or_err(
-            ErrorType::InvalidCert,
-            "Certificate in pem file could not be read",
-        )?;
-        cert_store.add(cert).or_err(
-            ErrorType::InvalidCert,
-            "Failed to load X509 certificate into root store",
-        )?;
-        added += 1;
-    }
-    if added == 0 {
-        return Error::e_explain(
-            ErrorType::InvalidCert,
-            "Pem file contains no loadable X509 certificate",
-        );
-    }
-    Ok(())
+    // Lorica: the one PEM trust bundle rule of the workspace, which
+    // refuses a file with no certificate as this function always did.
+    http_client::add_pem_roots(cert_store, &bytes)
 }
 
 /// Attempt to load the native cas into the given root-certificate store
+///
+/// Lorica: `rustls-native-certs` 0.8 reports the certificates it could
+/// load beside the errors it met (an unreadable `SSL_CERT_DIR` entry, a
+/// certificate the store rejects), where 0.7 failed the whole load on the
+/// first one. A platform store with one bad entry still yields a usable
+/// store, so this fails only when nothing at all loaded and something
+/// went wrong; the errors are logged when the store is usable anyway. A
+/// platform with no certificate and no error still returns an empty store,
+/// as before. `http_client::public_roots` reads the platform store
+/// through the same rule.
 pub fn load_platform_certs_incl_env_into_store(ca_certs: &mut RootCertStore) -> Result<()> {
     // this includes handling of ENV vars SSL_CERT_FILE & SSL_CERT_DIR
-    for cert in load_native_certs()
-        .or_err(ErrorType::InvalidCert, "Failed to load native certificates")?
-        .into_iter()
-    {
-        ca_certs.add(cert).or_err(
-            ErrorType::InvalidCert,
-            "Failed to load native certificate into root store",
-        )?;
+    add_native_certs_into_store(ca_certs, load_native_certs())
+}
+
+pub(crate) fn add_native_certs_into_store(
+    ca_certs: &mut RootCertStore,
+    native: rustls_native_certs::CertificateResult,
+) -> Result<()> {
+    let mut loaded: usize = 0;
+    let mut first_add_error: Option<RusTlsError> = None;
+    for cert in native.certs {
+        match ca_certs.add(cert) {
+            Ok(()) => loaded += 1,
+            Err(e) => {
+                warn!("Skipping native certificate the root store rejects: {e}");
+                first_add_error.get_or_insert(e);
+            }
+        }
+    }
+
+    if loaded == 0 {
+        if let Some(e) = native.errors.into_iter().next() {
+            return Err(e).or_err(ErrorType::InvalidCert, "Failed to load native certificates");
+        }
+        if let Some(e) = first_add_error {
+            return Err(e).or_err(
+                ErrorType::InvalidCert,
+                "Failed to load native certificate into root store",
+            );
+        }
+    } else {
+        for e in native.errors {
+            warn!("Native certificate store partially loaded: {e}");
+        }
     }
 
     Ok(())
@@ -260,6 +283,63 @@ pub fn hash_certificate(cert: &CertificateDer) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn native_result(
+        certs: Vec<CertificateDer<'static>>,
+        failures: usize,
+    ) -> rustls_native_certs::CertificateResult {
+        let mut result = rustls_native_certs::CertificateResult::default();
+        result.certs = certs;
+        result.errors = (0..failures)
+            .map(|_| rustls_native_certs::Error {
+                context: "failed to read certificate",
+                kind: rustls_native_certs::ErrorKind::Io {
+                    inner: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                    path: "/path/to/file".into(),
+                },
+            })
+            .collect();
+        result
+    }
+
+    fn valid_cert() -> CertificateDer<'static> {
+        CertificateDer::from_pem_slice(include_bytes!("../tests/test-cert.pem")).unwrap()
+    }
+
+    fn rejected_cert() -> CertificateDer<'static> {
+        CertificateDer::from(vec![0x30, 0x03, 0x02, 0x01, 0x00])
+    }
+
+    #[test]
+    fn test_native_certs_partial_load_keeps_what_parsed() {
+        let mut store = RootCertStore::empty();
+        let native = native_result(vec![rejected_cert(), valid_cert()], 2);
+        add_native_certs_into_store(&mut store, native).unwrap();
+        assert_eq!(1, store.len());
+    }
+
+    #[test]
+    fn test_native_certs_nothing_loaded_surfaces_the_read_error() {
+        let mut store = RootCertStore::empty();
+        let err = add_native_certs_into_store(&mut store, native_result(vec![], 1)).unwrap_err();
+        assert_eq!(ErrorType::InvalidCert, err.etype);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn test_native_certs_nothing_loaded_surfaces_the_store_rejection() {
+        let mut store = RootCertStore::empty();
+        let native = native_result(vec![rejected_cert()], 0);
+        let err = add_native_certs_into_store(&mut store, native).unwrap_err();
+        assert_eq!(ErrorType::InvalidCert, err.etype);
+    }
+
+    #[test]
+    fn test_native_certs_empty_platform_store_is_not_an_error() {
+        let mut store = RootCertStore::empty();
+        add_native_certs_into_store(&mut store, native_result(vec![], 0)).unwrap();
+        assert!(store.is_empty());
+    }
 
     // Valid PEM-encoded CRL (generated by openssl, empty revocation list, signed by TestCA)
     const TEST_CRL_PEM: &str = "-----BEGIN X509 CRL-----\n\

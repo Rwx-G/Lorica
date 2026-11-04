@@ -107,7 +107,12 @@
 //! The environment resource writes its route from a fixed profile the
 //! pipeline cannot shape, so it is not refused there: it takes over the
 //! controls of the route it displaces instead, through the same rules
-//! ([`inherit_displaced_protections`]).
+//! (`super::displacement`).
+//!
+//! A route a token deleted, or moved off a name, is weighed as if it
+//! still served it: the write leaves a record of the route, and every
+//! route write of this plane is held to it as to a displaced stored
+//! route ([`super::records`]), in the same weighing.
 //!
 //! # The scopes bound each other
 //!
@@ -198,11 +203,7 @@ use axum::extract::{Extension, Path, Query};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use lorica_automation_policy::admin_setting;
-use lorica_automation_policy::protections::{
-    backend as backend_rule, route as route_rule, ProtectionRule,
-};
 use lorica_config::models::{AutomationScope, Backend, ManagedBy, Route};
-use lorica_config::route_selection::HostIndex;
 use lorica_config::ConfigStore;
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -211,6 +212,7 @@ use super::auth::AutomationPrincipal;
 use super::environments::{
     audit_context, caller_may_access, ensure_backend_address_granted, ensure_environment_binding,
 };
+use super::protections::{ensure_not_weakened, BACKEND_PROTECTIONS, ROUTE_PROTECTIONS};
 use super::redact;
 use super::scope::scope_str;
 use crate::audit::ClientConnectInfo;
@@ -357,503 +359,19 @@ fn refuse_withheld(body: &impl WithheldFields) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// One access-control or trust field of a stored row that an
-/// automation token may move only toward stronger (the maintainer's
-/// decision of 2026-09-30, "safe direction only"): a
-/// [`ProtectionRule`] of `lorica-automation-policy`, paired with the
-/// predicate that weighs it on this crate's row types.
-///
-/// The rule runs in the guard, inside the store closure, on the row as
-/// stored and the row as it would be written, so the direction is
-/// weighed against what the store holds under the lock that writes it
-/// and never against what a caller says the row was. A preview is
-/// refused exactly where the apply would be.
-#[derive(Clone, Copy)]
-pub struct Protection<T: 'static> {
-    /// The fields the rule weighs, as the request bodies spell them.
-    pub fields: &'static [&'static str],
-    /// The safe direction, in the words a refusal and the docs use.
-    pub rule: &'static str,
-    /// Why the other direction is the dashboard's and not a token's.
-    pub why: &'static str,
-    /// Whether `after` is weaker than `before` on this control.
-    pub weakened: fn(&T, &T) -> bool,
-    /// Raises the second row to the first on this control, for a row
-    /// that takes the control over instead of being refused: an
-    /// environment's route ([`inherit_displaced_protections`]). Called
-    /// only where `weakened` holds, after which it no longer does; a
-    /// test holds every rule to that.
-    pub strengthened: fn(&T, &mut T),
-}
-
-impl<T> Protection<T> {
-    /// `policy`, weighed by `weakened` and raised by `strengthened`.
-    const fn weighing(
-        policy: ProtectionRule,
-        weakened: fn(&T, &T) -> bool,
-        strengthened: fn(&T, &mut T),
-    ) -> Protection<T> {
-        Protection {
-            fields: policy.fields,
-            rule: policy.rule,
-            why: policy.why,
-            weakened,
-            strengthened,
-        }
-    }
-}
-
-impl<T> std::fmt::Debug for Protection<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Protection")
-            .field("fields", &self.fields)
-            .field("rule", &self.rule)
-            .finish()
-    }
-}
-
-/// Every route control an automation token may only strengthen:
-/// `ROUTE_PROTECTION_RULES`, in its order, each with its predicate. A
-/// test holds this list to that one, so a rule declared there without a
-/// predicate here is a red gate rather than a control nobody weighs.
-pub const ROUTE_PROTECTIONS: &[Protection<Route>] = &[
-    Protection::weighing(
-        route_rule::BASIC_AUTH,
-        basic_auth_weakened,
-        adopt_basic_auth,
-    ),
-    Protection::weighing(
-        route_rule::IP_ALLOWLIST,
-        allowlist_weakened,
-        adopt_allowlist,
-    ),
-    Protection::weighing(route_rule::IP_DENYLIST, denylist_weakened, extend_denylist),
-    Protection::weighing(route_rule::GEOIP, geoip_weakened, adopt_geoip),
-    Protection::weighing(
-        route_rule::BOT_PROTECTION,
-        bot_protection_weakened,
-        adopt_bot_protection,
-    ),
-    Protection::weighing(route_rule::WAF_ENABLED, waf_switched_off, switch_waf_on),
-    Protection::weighing(route_rule::WAF_MODE, waf_mode_weakened, adopt_waf_mode),
-    Protection::weighing(
-        route_rule::RATE_LIMIT,
-        rate_limit_weakened,
-        adopt_rate_limit,
-    ),
-    Protection::weighing(
-        route_rule::AUTO_BAN_THRESHOLD,
-        auto_ban_weakened,
-        adopt_auto_ban,
-    ),
-];
-
-/// Every backend control an automation token may only strengthen:
-/// `BACKEND_PROTECTION_RULES`, each with its predicate, held to that
-/// list by the same test.
-pub const BACKEND_PROTECTIONS: &[Protection<Backend>] = &[
-    Protection::weighing(
-        backend_rule::TLS_SKIP_VERIFY,
-        verification_switched_off,
-        adopt_verification,
-    ),
-    Protection::weighing(
-        backend_rule::TLS_UPSTREAM,
-        upstream_tls_switched_off,
-        switch_upstream_tls_on,
-    ),
-    Protection::weighing(
-        backend_rule::TLS_SNI,
-        verified_name_changed,
-        adopt_verified_name,
-    ),
-];
-
-/// The first rule of `protections` that `after` breaks against
-/// `before`.
-fn first_weakened<'p, T>(
-    protections: &'p [Protection<T>],
-    before: &T,
-    after: &T,
-) -> Option<&'p Protection<T>> {
-    protections
-        .iter()
-        .find(|protection| (protection.weakened)(before, after))
-}
-
-/// The first rule of `protections` that `after` breaks against
-/// `before`, refused with a 403 naming the field and the rule and
-/// echoing neither value.
-fn ensure_not_weakened<T>(
-    protections: &[Protection<T>],
-    kind: &str,
-    id: &str,
-    before: &T,
-    after: &T,
-) -> Result<(), ApiError> {
-    match first_weakened(protections, before, after) {
-        Some(protection) => Err(ApiError::Forbidden(format!(
-            "{} on {kind} `{id}` may only be strengthened by an automation token: {}, because \
-             {}; weaken it in the dashboard",
-            protection.fields.join(" / "),
-            protection.rule,
-            protection.why
-        ))),
-        None => Ok(()),
-    }
-}
-
-/// Every route `after` would take a request from, each once, in the
-/// order found: for each name it answers to and each path it would
-/// serve, the route the proxy picks from `stored` today, by the proxy's
-/// own selection ([`HostIndex`]), where the pick once `after` replaces
-/// its own row in `stored` is `after`. A disabled `after` serves
-/// nothing and displaces nothing.
-///
-/// The paths weighed are `after`'s prefix and every stored prefix below
-/// it, the only places where the pick can change.
-fn routes_displaced_by<'s>(stored: &'s [Route], after: &Route) -> Vec<&'s Route> {
-    let mut displaced: Vec<&'s Route> = Vec::new();
-    if !after.enabled {
-        return displaced;
-    }
-    let today = HostIndex::new(stored.iter(), |route| *route);
-    let tomorrow = HostIndex::new(
-        stored
-            .iter()
-            .filter(|route| route.id != after.id)
-            .chain(std::iter::once(after)),
-        |route| *route,
-    );
-    let paths: BTreeSet<&str> = std::iter::once(after.path_prefix.as_str())
-        .chain(
-            stored
-                .iter()
-                .map(|route| route.path_prefix.as_str())
-                .filter(|prefix| prefix.starts_with(after.path_prefix.as_str())),
-        )
-        .collect();
-    let names = std::iter::once(&after.hostname).chain(&after.hostname_aliases);
-    for name in names {
-        for path in &paths {
-            let taken = tomorrow.select(name, path, |route| *route);
-            if taken.map(|route| route.id.as_str()) != Some(after.id.as_str()) {
-                continue;
-            }
-            let Some(route) = today
-                .select(name, path, |route| *route)
-                .filter(|route| route.id != after.id)
-            else {
-                continue;
-            };
-            if !displaced.iter().any(|known| known.id == route.id) {
-                displaced.push(*route);
-            }
-        }
-    }
-    displaced
-}
-
-/// A token's route about to be written, weighed against every route it
-/// would take a request from ([`routes_displaced_by`] over the stored
-/// rows): `after` is held to [`ROUTE_PROTECTIONS`] against each, exactly
-/// as an update is held against the row it replaces.
-///
-/// Without this, an exact name created under an operator's
-/// `*.review.example.com` or catch-all route took that host's traffic
-/// to a row carrying none of the protections the operator set there,
-/// and the token never had to reach the protected route itself.
-///
-/// The refusal names the field and the displaced route's id, and
-/// nothing of that route's values.
-fn ensure_no_route_displaced_weaker(store: &ConfigStore, after: &Route) -> Result<(), ApiError> {
-    if !after.enabled {
-        return Ok(());
-    }
-    let stored = store.list_routes()?;
-    for displaced in routes_displaced_by(&stored, after) {
-        if let Some(protection) = first_weakened(ROUTE_PROTECTIONS, displaced, after) {
-            return Err(ApiError::Forbidden(format!(
-                "{}: route `{}` serves this route's host today, and this route would take it \
-                 over weaker on that control. A token's route may only match or strengthen it \
-                 ({}), because {}; set it in the dashboard",
-                protection.fields.join(" / "),
-                displaced.id,
-                protection.rule,
-                protection.why
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// A name `after` answers to that another route already holds, refused
 /// before the write on the store's own rule
-/// ([`ConfigStore::hostname_claimed_elsewhere`]) with the store's 422,
-/// worded without the other route's id: the store's message names it,
-/// and a token may not be allowed to see that route.
+/// ([`ConfigStore::route_as_written`]) with the store's 422, worded
+/// without the other route's id: the store's message names it, and a
+/// token may not be allowed to see that route.
 fn ensure_names_unclaimed(store: &ConfigStore, after: &Route) -> Result<(), ApiError> {
-    match store.hostname_claimed_elsewhere(&after.id, &after.hostname, &after.hostname_aliases)? {
+    match store.route_as_written(after)?.1 {
         Some(claim) => Err(ApiError::Unprocessable(format!(
             "hostname '{}' already used by another route",
             claim.hostname
         ))),
         None => Ok(()),
     }
-}
-
-/// An environment's route raised, control by control, to every route it
-/// takes a request from (the maintainer's decision of 2026-10-04), so
-/// the environment resource cannot do what the token-route guard
-/// refuses: put a host a protected wildcard or catch-all serves today
-/// behind a row with none of its protections.
-///
-/// The environment's route is written from a fixed profile the pipeline
-/// cannot shape, so it inherits rather than being refused. Each of
-/// [`ROUTE_PROTECTIONS`] the route is weaker on is raised to the
-/// displaced route's value by the rule's own `strengthened`, and a
-/// control the profile already holds more strongly (the WAF a pipeline
-/// switched on) is kept. Basic auth is copied as the stored username
-/// and password hash, server side; neither reaches the answer, the
-/// audit row or a log, which carry the ids this returns and nothing
-/// more.
-///
-/// The route weighs against the rows as they would be without its own:
-/// a `PUT` rewrites the whole route from the profile, so an update
-/// inherits from what serves the host underneath it today, a
-/// protection the operator added there since included.
-///
-/// Returns the ids of the routes at least one control was raised from.
-///
-/// # Errors
-///
-/// A store read failure, or a 403 naming the field and the displaced
-/// route's id when two displaced routes ask for what no one value
-/// meets (two Basic auth credentials, two allowlists neither of which
-/// covers the other), which the environment's route cannot satisfy.
-pub(super) fn inherit_displaced_protections(
-    store: &ConfigStore,
-    route: &mut Route,
-) -> Result<Vec<String>, ApiError> {
-    let stored: Vec<Route> = store
-        .list_routes()?
-        .into_iter()
-        .filter(|stored| stored.id != route.id)
-        .collect();
-    let displaced = routes_displaced_by(&stored, route);
-    let mut inherited_from: Vec<String> = Vec::new();
-    for from in &displaced {
-        for protection in ROUTE_PROTECTIONS {
-            if (protection.weakened)(from, route) {
-                (protection.strengthened)(from, route);
-                if !inherited_from.contains(&from.id) {
-                    inherited_from.push(from.id.clone());
-                }
-            }
-        }
-    }
-    for from in &displaced {
-        if let Some(protection) = first_weakened(ROUTE_PROTECTIONS, from, route) {
-            return Err(ApiError::Forbidden(format!(
-                "{}: route `{}` serves this environment's hostname today, and the \
-                 environment's route cannot take over its protections without being weaker \
-                 on that control ({}); another route serving the same hostname asks for a \
-                 different value, and an operator reconciles them in the dashboard",
-                protection.fields.join(" / "),
-                from.id,
-                protection.rule
-            )));
-        }
-    }
-    Ok(inherited_from)
-}
-
-fn basic_auth_weakened(before: &Route, after: &Route) -> bool {
-    let in_force =
-        before.basic_auth_username.is_some() && before.basic_auth_password_hash.is_some();
-    in_force
-        && (before.basic_auth_username != after.basic_auth_username
-            || before.basic_auth_password_hash != after.basic_auth_password_hash)
-}
-
-/// An allowlist or denylist entry as the proxy compiles it, through
-/// the workspace's one address parser: a CIDR, or a bare address as its
-/// host network. `None` for what the proxy skips.
-fn listed_network(entry: &str) -> Option<ipnet::IpNet> {
-    lorica_config::connection_filter::parse_cidr(entry).ok()
-}
-
-/// Whether some network of `within` contains `net`.
-fn covered(net: &ipnet::IpNet, within: &[String]) -> bool {
-    within
-        .iter()
-        .filter_map(|entry| listed_network(entry))
-        .any(|outer| outer.contains(net))
-}
-
-/// An allowlist admits every address when empty and otherwise only
-/// what its parsed entries cover; an entry the proxy cannot parse
-/// admits nothing. Narrowed means every parsed entry after sits inside
-/// a parsed entry before.
-fn allowlist_weakened(before: &Route, after: &Route) -> bool {
-    if before.ip_allowlist.is_empty() {
-        return false;
-    }
-    after.ip_allowlist.is_empty()
-        || after
-            .ip_allowlist
-            .iter()
-            .filter_map(|entry| listed_network(entry))
-            .any(|net| !covered(&net, &before.ip_allowlist))
-}
-
-/// A denylist refuses what its parsed entries cover. Extended means
-/// every parsed entry before is covered by a parsed entry after.
-fn denylist_weakened(before: &Route, after: &Route) -> bool {
-    before
-        .ip_denylist
-        .iter()
-        .filter_map(|entry| listed_network(entry))
-        .any(|net| !covered(&net, &after.ip_denylist))
-}
-
-fn geoip_weakened(before: &Route, after: &Route) -> bool {
-    use lorica_config::models::GeoIpMode;
-    let Some(stored) = &before.geoip else {
-        return false;
-    };
-    let Some(patched) = &after.geoip else {
-        return true;
-    };
-    let listed = |countries: &[String], country: &str| {
-        countries.iter().any(|c| c.eq_ignore_ascii_case(country))
-    };
-    if stored.mode != patched.mode {
-        return true;
-    }
-    match stored.mode {
-        GeoIpMode::Allowlist => patched
-            .countries
-            .iter()
-            .any(|country| !listed(&stored.countries, country)),
-        GeoIpMode::Denylist => stored
-            .countries
-            .iter()
-            .any(|country| !listed(&patched.countries, country)),
-    }
-}
-
-fn bot_protection_weakened(before: &Route, after: &Route) -> bool {
-    before.bot_protection.is_some() && before.bot_protection != after.bot_protection
-}
-
-fn waf_switched_off(before: &Route, after: &Route) -> bool {
-    before.waf_enabled && !after.waf_enabled
-}
-
-fn waf_mode_weakened(before: &Route, after: &Route) -> bool {
-    use lorica_config::models::WafMode;
-    before.waf_mode == WafMode::Blocking && after.waf_mode != WafMode::Blocking
-}
-
-/// The bucket the proxy builds for the route, the structured
-/// `rate_limit` when set and the legacy pair otherwise
-/// ([`Route::effective_rate_limit`]), so adding a generous structured
-/// bucket over a strict legacy rate reads as the raise it is.
-fn rate_limit_weakened(before: &Route, after: &Route) -> bool {
-    let Some(stored) = before.effective_rate_limit() else {
-        return false;
-    };
-    let Some(patched) = after.effective_rate_limit() else {
-        return true;
-    };
-    patched.capacity > stored.capacity
-        || patched.refill_per_sec > stored.refill_per_sec
-        || patched.scope != stored.scope
-}
-
-fn auto_ban_weakened(before: &Route, after: &Route) -> bool {
-    match (before.auto_ban_threshold, after.auto_ban_threshold) {
-        (None, _) => false,
-        (Some(_), None) => true,
-        (Some(stored), Some(patched)) => patched > stored,
-    }
-}
-
-/// The stored credential, hash and all, never a password: the row is
-/// copied server side and the hash stays in the store.
-fn adopt_basic_auth(from: &Route, to: &mut Route) {
-    to.basic_auth_username.clone_from(&from.basic_auth_username);
-    to.basic_auth_password_hash
-        .clone_from(&from.basic_auth_password_hash);
-}
-
-fn adopt_allowlist(from: &Route, to: &mut Route) {
-    to.ip_allowlist.clone_from(&from.ip_allowlist);
-}
-
-/// The union: every parsed entry `to` does not already cover is added,
-/// so neither list loses an address it refused.
-fn extend_denylist(from: &Route, to: &mut Route) {
-    let missing: Vec<String> = from
-        .ip_denylist
-        .iter()
-        .filter(|entry| listed_network(entry).is_some_and(|net| !covered(&net, &to.ip_denylist)))
-        .cloned()
-        .collect();
-    to.ip_denylist.extend(missing);
-}
-
-fn adopt_geoip(from: &Route, to: &mut Route) {
-    to.geoip.clone_from(&from.geoip);
-}
-
-fn adopt_bot_protection(from: &Route, to: &mut Route) {
-    to.bot_protection.clone_from(&from.bot_protection);
-}
-
-fn switch_waf_on(_from: &Route, to: &mut Route) {
-    to.waf_enabled = true;
-}
-
-fn adopt_waf_mode(from: &Route, to: &mut Route) {
-    to.waf_mode = from.waf_mode.clone();
-}
-
-/// Both spellings, so the bucket the proxy builds is the displaced
-/// route's whichever of them it was set with.
-fn adopt_rate_limit(from: &Route, to: &mut Route) {
-    to.rate_limit.clone_from(&from.rate_limit);
-    to.rate_limit_rps = from.rate_limit_rps;
-    to.rate_limit_burst = from.rate_limit_burst;
-}
-
-fn adopt_auto_ban(from: &Route, to: &mut Route) {
-    to.auto_ban_threshold = from.auto_ban_threshold;
-}
-
-fn verification_switched_off(before: &Backend, after: &Backend) -> bool {
-    !before.tls_skip_verify && after.tls_skip_verify
-}
-
-fn upstream_tls_switched_off(before: &Backend, after: &Backend) -> bool {
-    before.tls_upstream && !after.tls_upstream
-}
-
-fn verified_name_changed(before: &Backend, after: &Backend) -> bool {
-    before.tls_upstream && !before.tls_skip_verify && before.tls_sni != after.tls_sni
-}
-
-fn adopt_verification(from: &Backend, to: &mut Backend) {
-    to.tls_skip_verify = from.tls_skip_verify;
-}
-
-fn switch_upstream_tls_on(_from: &Backend, to: &mut Backend) {
-    to.tls_upstream = true;
-}
-
-fn adopt_verified_name(from: &Backend, to: &mut Backend) {
-    to.tls_sni.clone_from(&from.tls_sni);
 }
 
 /// The backend the management create would store with none of
@@ -1094,11 +612,14 @@ fn ensure_new_links_granted(
 
 /// The token's grant as the guard a route write runs inside its store
 /// closure: the row as stored, the row as it would be, the route it
-/// would take a host from, and the backends linked anew. A header-rule
-/// value sent back as the mask this plane answered it with keeps the
-/// stored value
+/// would take a host from, the record of a deleted route it would take
+/// a host from, and the backends linked anew. A header-rule value sent
+/// back as the mask this plane answered it with keeps the stored value
 /// ([`redact::restore_header_rule_values`]) before any of that is
-/// weighed.
+/// weighed. A write it allows that stops a route with a control in
+/// force serving a name leaves the route's record over that name
+/// ([`super::records::record_released_protections`]): a delete, a
+/// rename, an alias dropped, a prefix moved deeper.
 fn route_guard(principal: &AutomationPrincipal) -> RouteGuard {
     let principal = principal.clone();
     RouteGuard::bounded(move |store, target| {
@@ -1118,11 +639,12 @@ fn route_guard(principal: &AutomationPrincipal) -> RouteGuard {
         }
         if let Some(after) = target.after {
             ensure_names_unclaimed(store, after)?;
-            ensure_no_route_displaced_weaker(store, after)?;
+            super::displacement::ensure_not_displaced_weaker(store, after)?;
         }
         ensure_new_links_granted(store, &principal, target)
     })
     .restoring_withheld(redact::restore_header_rule_values)
+    .settling(super::records::record_released_protections)
 }
 
 /// A certificate a route write binds anew, weighed as a renewal would
@@ -1723,32 +1245,13 @@ pub async fn update_settings(
 mod admin_tier_tests;
 #[cfg(test)]
 mod plane_tests;
+#[cfg(test)]
+mod record_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lorica_automation_policy::{BACKEND_PROTECTION_RULES, ROUTE_PROTECTION_RULES};
     use lorica_config::models::{AutomationScope, OwnerKind};
-
-    #[test]
-    fn every_protection_rule_is_weighed_here_once_in_its_order() {
-        // The rules are the policy crate's and the predicates are this
-        // module's; the pairing is the one thing written twice, so it is
-        // held to the rule lists entry by entry. A rule added there and
-        // not paired here, or paired twice, turns this red.
-        fn stated<T>(protections: &[Protection<T>]) -> Vec<ProtectionRule> {
-            protections
-                .iter()
-                .map(|protection| ProtectionRule {
-                    fields: protection.fields,
-                    rule: protection.rule,
-                    why: protection.why,
-                })
-                .collect()
-        }
-        assert_eq!(stated(ROUTE_PROTECTIONS), ROUTE_PROTECTION_RULES);
-        assert_eq!(stated(BACKEND_PROTECTIONS), BACKEND_PROTECTION_RULES);
-    }
 
     /// A principal granted `*.review.example.com` and `10.0.0.0/8`.
     fn principal() -> AutomationPrincipal {
@@ -1913,330 +1416,6 @@ mod tests {
         }
     }
 
-    /// A stored route with every protection at its create default.
-    fn stored_route() -> Route {
-        serde_json::from_value(serde_json::json!({
-            "id": "r-1",
-            "hostname": "pr-42.review.example.com",
-            "path_prefix": "/",
-            "load_balancing": "round_robin",
-            "waf_enabled": false,
-            "waf_mode": "detection",
-            "enabled": true,
-            "created_at": "2026-09-30T00:00:00Z",
-            "updated_at": "2026-09-30T00:00:00Z",
-        }))
-        .expect("a minimal route")
-    }
-
-    /// Whether the guard's direction rules accept `after` over `before`.
-    fn route_move(before: &Route, after: &Route) -> Result<(), ApiError> {
-        ensure_not_weakened(ROUTE_PROTECTIONS, "route", &before.id, before, after)
-    }
-
-    /// The route `edit` makes of the stored row `base`.
-    fn edited(base: &Route, edit: impl FnOnce(&mut Route)) -> Route {
-        let mut route = base.clone();
-        edit(&mut route);
-        route
-    }
-
-    /// `strong` over `weak` is accepted, `weak` over `strong` refused
-    /// naming `field` and echoing no value of either.
-    fn only_strengthens(weak: &Route, strong: &Route, field: &str) {
-        route_move(weak, strong).unwrap_or_else(|e| panic!("{field} strengthened: {e:?}"));
-        route_move(strong, strong).unwrap_or_else(|e| panic!("{field} unchanged: {e:?}"));
-        match route_move(strong, weak).expect_err(field) {
-            ApiError::Forbidden(message) => {
-                assert!(message.starts_with(field), "{message}");
-                assert!(message.contains("dashboard"), "{message}");
-                assert!(!message.contains("192.0.2"), "{message}");
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_route_protection_moves_toward_stronger_and_never_back() {
-        let base = stored_route();
-        let with = |edit: fn(&mut Route)| edited(&base, edit);
-
-        only_strengthens(
-            &base,
-            &with(|r| {
-                r.basic_auth_username = Some("ops".into());
-                r.basic_auth_password_hash = Some("$argon2id$stored".into());
-            }),
-            "basic_auth_username",
-        );
-        let protected = with(|r| {
-            r.basic_auth_username = Some("ops".into());
-            r.basic_auth_password_hash = Some("$argon2id$stored".into());
-        });
-        route_move(
-            &protected,
-            &edited(&protected, |r| r.basic_auth_username = Some("guest".into())),
-        )
-        .expect_err("a renamed credential");
-        // A username with no password stored is not a credential in
-        // force: setting or clearing it weakens nothing.
-        let inert = with(|r| r.basic_auth_username = Some("ops".into()));
-        route_move(&inert, &base).expect("no Basic auth was in force");
-
-        only_strengthens(
-            &with(|r| r.ip_allowlist = vec!["10.0.0.0/8".into()]),
-            &with(|r| r.ip_allowlist = vec!["10.1.0.0/16".into(), "10.2.0.7".into()]),
-            "ip_allowlist",
-        );
-        only_strengthens(
-            &base,
-            &with(|r| r.ip_allowlist = vec!["192.0.2.0/24".into()]),
-            "ip_allowlist",
-        );
-        route_move(
-            &with(|r| r.ip_allowlist = vec!["10.0.0.0/8".into()]),
-            &with(|r| r.ip_allowlist = vec!["10.0.0.0/8".into(), "192.0.2.0/24".into()]),
-        )
-        .expect_err("an allowlist widened");
-
-        only_strengthens(
-            &with(|r| r.ip_denylist = vec!["192.0.2.10".into()]),
-            &with(|r| r.ip_denylist = vec!["192.0.2.0/24".into(), "198.51.100.0/24".into()]),
-            "ip_denylist",
-        );
-
-        only_strengthens(
-            &with(|r| {
-                r.geoip = Some(lorica_config::models::GeoIpConfig {
-                    mode: lorica_config::models::GeoIpMode::Allowlist,
-                    countries: vec!["FR".into(), "DE".into()],
-                })
-            }),
-            &with(|r| {
-                r.geoip = Some(lorica_config::models::GeoIpConfig {
-                    mode: lorica_config::models::GeoIpMode::Allowlist,
-                    countries: vec!["FR".into()],
-                })
-            }),
-            "geoip",
-        );
-        only_strengthens(
-            &base,
-            &with(|r| {
-                r.geoip = Some(lorica_config::models::GeoIpConfig {
-                    mode: lorica_config::models::GeoIpMode::Denylist,
-                    countries: vec!["XX".into()],
-                })
-            }),
-            "geoip",
-        );
-        route_move(
-            &with(|r| {
-                r.geoip = Some(lorica_config::models::GeoIpConfig {
-                    mode: lorica_config::models::GeoIpMode::Denylist,
-                    countries: vec!["XX".into()],
-                })
-            }),
-            &with(|r| {
-                r.geoip = Some(lorica_config::models::GeoIpConfig {
-                    mode: lorica_config::models::GeoIpMode::Allowlist,
-                    countries: vec!["FR".into()],
-                })
-            }),
-        )
-        .expect_err("a mode switched");
-
-        let challenged = with(|r| {
-            r.bot_protection = serde_json::from_value(serde_json::json!({ "mode": "cookie" }))
-                .expect("a bot-protection config");
-        });
-        only_strengthens(&base, &challenged, "bot_protection");
-        let bypassed = edited(&challenged, |r| {
-            if let Some(config) = r.bot_protection.as_mut() {
-                config.bypass.ip_cidrs.push("0.0.0.0/0".into());
-            }
-        });
-        route_move(&challenged, &bypassed).expect_err("a bypass added");
-
-        only_strengthens(&base, &with(|r| r.waf_enabled = true), "waf_enabled");
-        only_strengthens(
-            &base,
-            &with(|r| r.waf_mode = lorica_config::models::WafMode::Blocking),
-            "waf_mode",
-        );
-
-        let bucket = |capacity: u32, refill_per_sec: u32| lorica_config::models::RateLimit {
-            capacity,
-            refill_per_sec,
-            scope: lorica_config::models::RateLimitScope::PerIp,
-        };
-        only_strengthens(
-            &edited(&base, |r| r.rate_limit = Some(bucket(100, 10))),
-            &edited(&base, |r| r.rate_limit = Some(bucket(50, 5))),
-            "rate_limit",
-        );
-        only_strengthens(
-            &base,
-            &edited(&base, |r| r.rate_limit = Some(bucket(100, 10))),
-            "rate_limit",
-        );
-
-        // The legacy pair is weighed as the bucket the proxy builds from
-        // it, under the same rule, whose refusal names `rate_limit` first.
-        only_strengthens(
-            &with(|r| r.rate_limit_rps = Some(100)),
-            &with(|r| r.rate_limit_rps = Some(10)),
-            "rate_limit",
-        );
-        route_move(
-            &with(|r| r.rate_limit_rps = Some(10)),
-            &with(|r| {
-                r.rate_limit_rps = Some(10);
-                r.rate_limit_burst = Some(1_000);
-            }),
-        )
-        .expect_err("a burst raised alone raises the capacity");
-        only_strengthens(&base, &with(|r| r.rate_limit_rps = Some(10)), "rate_limit");
-
-        // Security audit L1: the structured bucket replaces the legacy one
-        // outright, so one added over a strict legacy rate is weighed
-        // against that rate, never against "no structured bucket yet".
-        let strict_legacy = with(|r| r.rate_limit_rps = Some(10));
-        route_move(
-            &strict_legacy,
-            &edited(&strict_legacy, |r| {
-                r.rate_limit = Some(bucket(1_000_000, 1_000_000))
-            }),
-        )
-        .expect_err("a generous structured bucket lifts the legacy rate");
-        route_move(
-            &strict_legacy,
-            &edited(&strict_legacy, |r| r.rate_limit = Some(bucket(10, 5))),
-        )
-        .expect("a structured bucket at most as wide as the legacy one");
-        // And a structured bucket in force hides the legacy pair, so the
-        // pair alone moves nothing the proxy enforces.
-        let structured = edited(&strict_legacy, |r| r.rate_limit = Some(bucket(10, 5)));
-        route_move(
-            &structured,
-            &edited(&structured, |r| r.rate_limit_rps = Some(1_000)),
-        )
-        .expect("the legacy pair under a structured bucket is not enforced");
-        route_move(&structured, &edited(&structured, |r| r.rate_limit = None))
-            .expect_err("removing the structured bucket falls back to a wider legacy one");
-
-        only_strengthens(
-            &with(|r| r.auto_ban_threshold = Some(50)),
-            &with(|r| r.auto_ban_threshold = Some(5)),
-            "auto_ban_threshold",
-        );
-        only_strengthens(
-            &base,
-            &with(|r| r.auto_ban_threshold = Some(5)),
-            "auto_ban_threshold",
-        );
-    }
-
-    #[test]
-    fn every_protection_raises_a_weaker_row_to_the_stronger_one() {
-        // The environment resource inherits a displaced route's controls
-        // through each rule's `strengthened`: walked over the tables, so
-        // a rule added without a fixture value below, or whose raise
-        // leaves the row weaker, turns this red.
-        let weak = stored_route();
-        let fortified = edited(&weak, |r| {
-            r.basic_auth_username = Some("ops".into());
-            r.basic_auth_password_hash = Some("$argon2id$stored".into());
-            r.ip_allowlist = vec!["192.0.2.0/24".into()];
-            r.ip_denylist = vec!["198.51.100.0/24".into()];
-            r.geoip = Some(lorica_config::models::GeoIpConfig {
-                mode: lorica_config::models::GeoIpMode::Allowlist,
-                countries: vec!["FR".into()],
-            });
-            r.bot_protection = serde_json::from_value(serde_json::json!({ "mode": "cookie" }))
-                .expect("a bot-protection config");
-            r.waf_enabled = true;
-            r.waf_mode = lorica_config::models::WafMode::Blocking;
-            r.rate_limit = Some(lorica_config::models::RateLimit {
-                capacity: 10,
-                refill_per_sec: 5,
-                scope: lorica_config::models::RateLimitScope::PerIp,
-            });
-            r.auto_ban_threshold = Some(5);
-        });
-        for protection in ROUTE_PROTECTIONS {
-            assert!(
-                (protection.weakened)(&fortified, &weak),
-                "{:?}: the fixture does not set this control",
-                protection.fields
-            );
-            let mut raised = weak.clone();
-            (protection.strengthened)(&fortified, &mut raised);
-            assert!(
-                !(protection.weakened)(&fortified, &raised),
-                "{:?}: raising leaves the row weaker",
-                protection.fields
-            );
-        }
-
-        let mut verified = stored_backend();
-        verified.tls_upstream = true;
-        verified.tls_sni = Some("upstream.internal.example.org".into());
-        let mut unverified = stored_backend();
-        unverified.tls_skip_verify = true;
-        for protection in BACKEND_PROTECTIONS {
-            assert!(
-                (protection.weakened)(&verified, &unverified),
-                "{:?}: the fixture does not set this control",
-                protection.fields
-            );
-            let mut raised = unverified.clone();
-            (protection.strengthened)(&verified, &mut raised);
-            assert!(
-                !(protection.weakened)(&verified, &raised),
-                "{:?}: raising leaves the row weaker",
-                protection.fields
-            );
-        }
-    }
-
-    #[test]
-    fn a_denylist_is_raised_to_the_union_and_keeps_its_own_entries() {
-        let base = stored_route();
-        let displaced = edited(&base, |r| {
-            r.ip_denylist = vec!["198.51.100.0/24".into(), "203.0.113.7".into()]
-        });
-        let mut own = edited(&base, |r| {
-            r.ip_denylist = vec!["192.0.2.0/24".into(), "203.0.113.0/24".into()]
-        });
-        extend_denylist(&displaced, &mut own);
-        assert_eq!(
-            own.ip_denylist,
-            vec![
-                "192.0.2.0/24".to_string(),
-                "203.0.113.0/24".to_string(),
-                "198.51.100.0/24".to_string(),
-            ],
-            "an entry already covered is not repeated, and none is dropped"
-        );
-    }
-
-    #[test]
-    fn a_route_field_outside_the_protections_moves_either_way() {
-        // The rules bound the controls they name and nothing else: a
-        // model still turns maintenance on and off, moves a timeout
-        // both ways and edits the routing.
-        let base = stored_route();
-        let moved = edited(&base, |r| {
-            r.maintenance_mode = true;
-            r.read_timeout_s = 5;
-            r.enabled = false;
-            r.redirect_to = Some("https://pr-43.review.example.com".into());
-        });
-        route_move(&base, &moved).expect("either way");
-        route_move(&moved, &base).expect("either way");
-    }
-
     /// A stored backend inside the grant, plain HTTP.
     fn stored_backend() -> Backend {
         Backend {
@@ -2343,9 +1522,11 @@ mod tests {
         let store = ConfigStore::open_in_memory().expect("store");
         let now = chrono::Utc::now();
         for (name, route_id) in [("review-mr-42", "r-42"), ("review-mr-43", "r-43")] {
-            let mut route = stored_route();
-            route.id = route_id.to_string();
-            route.hostname = format!("{name}.review.example.com");
+            let route = crate::automation::protections::bare_route(
+                route_id,
+                &format!("{name}.review.example.com"),
+                "/",
+            );
             store.create_route(&route).expect("the route lands");
             store
                 .upsert_automation_environment(&AutomationEnvironment {

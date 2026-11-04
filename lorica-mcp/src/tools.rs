@@ -1410,7 +1410,10 @@ pub const MUTATIONS: &[Mutation] = &[
                   or inside path_rules, header_rules and traffic_splits, must sit inside the \
                   token's allowed_backend_cidrs. A duplicate hostname and an unknown backend \
                   id are refused by the store when the change is applied. A certificate bound \
-                  here must cover only names inside allowed_hostnames.",
+                  here must cover only names inside allowed_hostnames. A name served today by \
+                  a protected wildcard or catch-all route, or by a protected route a token \
+                  deleted, takes its protections at least as strongly or is refused; one gated \
+                  by forward auth or mTLS, which no token sets, is refused.",
         scope: AutomationScope::RoutesWrite,
         verb: Verb::Post,
         path: "/automation/v1/routes",
@@ -1446,7 +1449,12 @@ pub const MUTATIONS: &[Mutation] = &[
                   whole list: a rule sent back with the `[redacted]` value it was read with \
                   keeps the value stored for the rule at the same position with the same \
                   header_name and match_type, and is refused where no such rule is stored, so \
-                  a rule added, moved or retyped carries its value.",
+                  a rule added, moved or retyped carries its value. A patch that stops a \
+                  route carrying a protection serving a name or a path it served (a new \
+                  hostname, an alias dropped, the prefix moved deeper) leaves a record of it, \
+                  as a delete does: a route serving that name later must carry those \
+                  protections at least as strongly until an operator clears the record. \
+                  Switching the route off leaves none: it keeps its names.",
         scope: AutomationScope::RoutesWrite,
         verb: Verb::Put,
         path: "/automation/v1/routes",
@@ -1467,7 +1475,11 @@ pub const MUTATIONS: &[Mutation] = &[
         summary: "Delete one route by id. The route named must be inside the token's \
                   allowed_hostnames on its current hostname and aliases. A route an \
                   environment owns takes the environment with it, as the dashboard's delete \
-                  does, and is refused unless the environment is this token's own.",
+                  does, and is refused unless the environment is this token's own. Deleting a \
+                  route that carries a protection leaves a record of it: a route created or \
+                  updated later on its names must carry those protections at least as \
+                  strongly, as the deleted route would have required, until an operator \
+                  clears the record in the dashboard.",
         scope: AutomationScope::RoutesWrite,
         verb: Verb::Delete,
         path: "/automation/v1/routes",

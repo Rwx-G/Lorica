@@ -24,9 +24,11 @@
 //! The crate holds the protocol client and nothing else (Epic 13 decision
 //! D8): ticket acquisition, the channel binding, the SPNEGO exchange, the
 //! WS-Trust envelope, response and fault parsing, chain extraction, CSR
-//! construction and the `krb5.conf` renderer. It depends on no
-//! first-party crate and knows nothing about the store, routes or the
-//! dashboard; when to issue, renew and store is `lorica-api`'s business.
+//! construction and the `krb5.conf` renderer. Its one first-party
+//! dependency is `lorica-tls`, for the TLS policy every outbound HTTP
+//! client is built on; it knows nothing about the store, routes or the
+//! dashboard, and when to issue, renew and store is `lorica-api`'s
+//! business.
 //!
 //! The calls the rest of Lorica makes go through a [`CesSession`], which
 //! acquires one ticket and turns CSRs from [`build_csr`] into

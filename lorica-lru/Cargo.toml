@@ -17,10 +17,10 @@ name = "lorica_lru"
 path = "src/lib.rs"
 
 [dependencies]
-hashbrown = "0.12"
+hashbrown = { version = "0.17", default-features = false, features = ["default-hasher", "inline-more"] }
 parking_lot = "0.12"
 arrayvec = "0.7"
-rand = "0.8"
+rand = "0.10"
 
 [dev-dependencies]
 lru = { workspace = true }

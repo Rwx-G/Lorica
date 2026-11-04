@@ -132,28 +132,34 @@ worth stating rather than discovering:
 A handful of user-visible numbers live in code AND in marketing-style docs, and the docs have drifted twice in the past. Re-run these greps when editing `lorica-waf/` or bumping the version, and update the docs if the numbers moved :
 
 ```bash
-# Test counts quoted in README.md ("Product crates only (N tests)",
-# "Pingora-forked crates (N tests)", the Vitest figure). CONTRIBUTING.md
-# deliberately quotes none. They drift every cycle that adds a test and
-# nothing recomputes them. Sum the per-binary results rather than
-# trusting the last edit.
+# Test counts quoted in README.md (the paragraph after "Running tests":
+# product-crate steps, forked-crate step, rustls build, Vitest cases and
+# files). CONTRIBUTING.md deliberately quotes none. They drift every
+# cycle that adds a test and nothing recomputes them. Sum the per-binary
+# results rather than trusting the last edit.
 #
-# README.md carries the product-crate figure TWICE, in the shell
-# comment under "Running tests" and in the `Lorica%20Tests-N` shields
-# badge at the top, and the forked figure twice too, in its comment and
-# in the `Pingora%20Tests-N` badge. The badges are the ones that get
+# README.md carries the product-crate figure TWICE, in that paragraph
+# and in the `Lorica%20Tests-N` shields badge at the top, and the forked
+# figure twice too, in the paragraph and in the `Pingora%20Tests-N` badge. The badges are the ones that get
 # missed: the product badge was left behind three separate times during
 # the v1.9.0 cycle, and the forked badge and comment disagreed at its
 # end. Grep for the OLD numbers after editing, not for the new ones,
 # and expect zero hits:
 #   grep -n '<old count>' README.md
-cargo test <the README product-crate list> 2>&1 \
+# The figures are those of the CI `Test` job's own steps, whose crate
+# lists README.md prints rather than copies: the product figure sums the
+# product-crate step and the binary-crate step, the forked figure is the
+# forked-crate step alone (the rustls build, quoted on its own, reruns
+# most of `lorica-core`'s and `lorica-lb`'s tests). Run each step and sum
+# its per-binary results:
+grep -E '^\s+run: cargo test' .github/workflows/ci.yml | sed -E 's/^\s+run: //'
+<one step> 2>&1 \
   | grep -oE 'test result: ok\. [0-9]+ passed' | grep -oE '[0-9]+' \
   | python3 -c 'import sys; print(sum(int(x) for x in sys.stdin))'
-# Same for the forked list, and `ls lorica/tests/*.rs | wc -l` for the
-# count of end-to-end binaries. Note the forked list needs `-p TinyUFO`,
-# not `-p tinyufo`: the package name is case-sensitive and the lowercase
-# form fails resolution.
+# `ls lorica/tests/*.rs | wc -l` counts the end-to-end binaries. The
+# Vitest figure is the last lines of `npx vitest run` ("Test Files" and
+# "Tests"). A package named in a step is case-sensitive: `-p TinyUFO`,
+# not `-p tinyufo`.
 
 # WAF rule count (code = 49 today : 46 general in `RuleSet::rules` +
 # 3 header-scoped in `RuleSet::header_scoped` since v1.5.2 H-3).

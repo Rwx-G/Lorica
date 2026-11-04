@@ -26,9 +26,10 @@ use tracing::{debug, warn};
 use super::ai_bot_merged::{self, MergedCrawler, MergedVerification};
 use super::{
     bot_handlers, build_mirror_forward_headers, canary_bucket, downstream_ssl_digest,
-    evaluate_mtls, extract_host, mirror_sample_hit, render_error_body, request_has_body,
-    run_forward_auth_keyed, spawn_mirrors, ForwardAuthOutcome, LoricaProxy, MirrorBodyState,
-    MirrorPending, ProxyConfig, RequestCtx, RouteEntry, VerdictCacheEngine, WAF_BODY_SCAN_DEFAULT,
+    evaluate_mtls, extract_host, host_without_port, mirror_sample_hit, render_error_body,
+    request_has_body, request_host, run_forward_auth_keyed, spawn_mirrors, ForwardAuthOutcome,
+    LoricaProxy, MirrorBodyState, MirrorPending, ProxyConfig, RequestCtx, RouteEntry,
+    VerdictCacheEngine, WAF_BODY_SCAN_DEFAULT,
 };
 use crate::ai_bot::build_robots_txt_from_names;
 
@@ -719,8 +720,7 @@ impl LoricaProxy {
         entry: &RouteEntry,
     ) -> Result<Option<bool>> {
         let req = session.req_header();
-        let host_raw = extract_host(req);
-        let host = host_raw.split(':').next().unwrap_or(host_raw);
+        let host = request_host(req);
         let path = req.uri.path();
 
         // Force HTTPS redirect (skip for ACME challenges - must stay HTTP)
@@ -753,7 +753,7 @@ impl LoricaProxy {
 
         // Hostname redirect
         if let Some(ref target) = entry.route.redirect_hostname {
-            if host != target.as_str() {
+            if !lorica_config::route_selection::same_name(&host, target) {
                 let redir_path = req.uri.path();
                 let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
                 let scheme = req
@@ -2299,8 +2299,9 @@ impl LoricaProxy {
         }
 
         let req = session.req_header();
-        let host_raw = extract_host(req);
-        let host = host_raw.split(':').next().unwrap_or(host_raw);
+        // As the client sent it, its port aside: the WAF inspects the
+        // request, not the name routes are looked up by.
+        let host = host_without_port(extract_host(req));
         let path = req.uri.path();
         let query = req.uri.query();
 

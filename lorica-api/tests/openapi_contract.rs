@@ -1308,7 +1308,7 @@ fn every_protection_the_plane_holds_is_named_by_the_tool_that_reaches_it() {
             .summary
     };
     let routes = summary("lorica_route_update");
-    for protection in lorica_api::automation::write::ROUTE_PROTECTIONS {
+    for protection in lorica_api::automation::protections::ROUTE_PROTECTIONS {
         for field in protection.fields {
             if not_offered.contains(field) {
                 continue;
@@ -1321,7 +1321,7 @@ fn every_protection_the_plane_holds_is_named_by_the_tool_that_reaches_it() {
         }
     }
     let backends = summary("lorica_backend_update");
-    for protection in lorica_api::automation::write::BACKEND_PROTECTIONS {
+    for protection in lorica_api::automation::protections::BACKEND_PROTECTIONS {
         for field in protection.fields {
             assert!(
                 backends.contains(&format!("`{field}`")),
@@ -1353,10 +1353,10 @@ fn the_operator_reference_states_every_protection_rule_as_the_plane_holds_it() {
         .filter(|line| line.starts_with("| `"))
         .map(str::to_string)
         .collect();
-    let route_rows = lorica_api::automation::write::ROUTE_PROTECTIONS
+    let route_rows = lorica_api::automation::protections::ROUTE_PROTECTIONS
         .iter()
         .map(|protection| (protection.fields, protection.rule));
-    let backend_rows = lorica_api::automation::write::BACKEND_PROTECTIONS
+    let backend_rows = lorica_api::automation::protections::BACKEND_PROTECTIONS
         .iter()
         .map(|protection| (protection.fields, protection.rule));
     let expected: BTreeSet<String> = route_rows

@@ -184,9 +184,15 @@ async fn client_without_certificate_fails_the_tls_handshake() {
     for cert in CertificateDer::pem_slice_iter(p.ca.cert_pem().as_bytes()) {
         roots.add(cert.expect("ca der")).expect("root add");
     }
-    let no_cert_cfg = tokio_rustls::rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    // On the ring provider by name (the workspace `clippy.toml` refuses
+    // `ClientConfig::builder`, which reads it from the process).
+    let no_cert_cfg = tokio_rustls::rustls::ClientConfig::builder_with_provider(Arc::new(
+        tokio_rustls::rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("ring supports the default protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(no_cert_cfg));
     let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp");
     let name = ServerName::try_from(CP_HOST.to_string()).expect("name");

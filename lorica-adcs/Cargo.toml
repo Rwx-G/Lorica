@@ -1,14 +1,15 @@
 [package]
 name = "lorica-adcs"
-version = "1.10.1"
+version = "1.10.2"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
 repository = "https://github.com/Rwx-G/Lorica"
 description = "AD CS certificate enrollment client for Lorica: Kerberos SPNEGO with TLS channel binding, WS-Trust over CES"
 
-# A leaf crate (Epic 13 decision D8): it depends on no first-party crate
-# and knows nothing about the store, routes or the dashboard. Keeping the
+# A leaf crate (Epic 13 decision D8): it knows nothing about the store,
+# routes or the dashboard, and its one first-party dependency is the TLS
+# policy of outbound HTTP clients in `lorica-tls`. Keeping the
 # GSS-API FFI surface here keeps it in one place, although every crate
 # that depends on this one still links the system library.
 [dependencies]
@@ -44,19 +45,20 @@ uuid = { version = "1", features = ["v4"] }
 # Approved 2026-10-21 (Epic 13 decision D7): the SOAP envelope writer and
 # the namespace-aware response reader. No SOAP framework.
 quick-xml = "0.42"
-# The CES exchange over HTTPS, at the version and TLS features
-# `lorica-api` uses, so no second TLS stack enters the binary.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
-# The TLS configuration handed to reqwest with `use_preconfigured_tls`:
-# a certificate verifier that keeps the token on the certificate its
+# The CES exchange over HTTPS, on the workspace's reqwest entry, so no
+# second TLS stack enters the binary.
+reqwest = { workspace = true }
+# The TLS configuration handed to reqwest with `tls_backend_preconfigured`
+# comes from the workspace's outbound HTTP policy
+# (`lorica_tls::http_client`): the provider, the protocol versions and the
+# public roots are decided there. The one first-party dependency of this
+# crate; it carries no store, route or dashboard code (Epic 13 D8).
+lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
+# A certificate verifier that keeps the token on the certificate its
 # channel binding was computed from (Epic 13 D2). reqwest downcasts the
 # configuration to its own rustls type, so this must be the rustls
-# reqwest links; the three crates are those reqwest already pulls in,
-# at the versions the lockfile holds, and the roots are the ones reqwest
-# loaded itself before (system store plus the webpki bundle).
+# reqwest links.
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
-rustls-native-certs = "0.8"
-webpki-roots = "1"
 # GSS-API calls go to `spawn_blocking` and the whole operation sits
 # under an outer `tokio::time::timeout` (Epic 13 D8).
 tokio = { workspace = true, features = ["rt", "time"] }

@@ -34,7 +34,7 @@ This document supplements the Pingora framework architecture by defining how new
 - Pingora's rustls backend is marked "experimental" - needs hardening
 - Process isolation (fork+exec) is Unix-only - limits Windows support
 - Sozu code is AGPL-3.0 - only concepts can be reimplemented, zero code copying
-- serde_yaml 0.9 and nix 0.24 are deprecated - must be updated during fork
+- serde_yaml 0.9 and nix 0.24 are deprecated - must be updated during fork (since done: `nix` moved on, and v1.10.2 removed the YAML server configuration)
 - Pingora has no config format, no API, no dashboard - entire product layer is new
 - Single binary constraint means dashboard frontend must be embeddable (< 5MB assets)
 
@@ -93,7 +93,7 @@ This document supplements the Pingora framework architecture by defining how new
 | Atomic | arc-swap | 1.x | Atomic Arc swapping | Keep |
 | Compression | flate2, brotli 3, zstd | Various | Response compression | Keep |
 | Unix | nix | 0.24 -> **0.29+** | Syscalls, signals | **Upgrade** |
-| YAML | serde_yaml | 0.9 | Server config | **Replace with serde_yml** |
+| YAML | serde_yaml | 0.9 | Server config | **Removed in v1.10.2**: the server configuration is built in code (see `architecture/tech-stack.md`) |
 | Socket | socket2 | Latest | Advanced socket ops | Keep |
 
 ### 3.2 New Technology Additions

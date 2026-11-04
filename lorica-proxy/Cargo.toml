@@ -9,7 +9,6 @@ rust-version = "1.88"
 repository = "https://github.com/Rwx-G/Lorica"
 categories = ["asynchronous", "network-programming"]
 keywords = ["async", "http", "proxy", "lorica"]
-exclude = ["tests/*"]
 description = """
 Lorica HTTP proxy APIs and traits. Forked from Pingora.
 """
@@ -31,38 +30,14 @@ async-trait = { workspace = true }
 log = { workspace = true }
 h2 = { workspace = true }
 once_cell = { workspace = true }
-clap = { version = "4", features = ["derive"] }
 regex = "1"
-rand = "0.8"
+rand = "0.10"
 
 [dev-dependencies]
-reqwest = { version = "0.12", features = ["gzip", "rustls-tls-webpki-roots"], default-features = false }
-httparse = { workspace = true }
 tokio-test = "0.4"
-env_logger = "0.11"
-hyper = "0.14"
-tokio-tungstenite = "0.29"
-lorica-limits = { version = "0.1.0", path = "../lorica-limits" }
-lorica-lb = { version = "0.1.0", path = "../lorica-lb", default-features = false }
-prometheus = "0.14"
-futures-util = "0.3"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-
-[target.'cfg(unix)'.dev-dependencies]
-hyperlocal = "0.8"
-
-[[test]]
-name = "test_basic"
-required-features = ["integration-tests"]
-
-[[test]]
-name = "test_upstream"
-required-features = ["integration-tests"]
 
 [features]
 default = []
-integration-tests = []
 rustls = ["lorica-core/rustls", "lorica-cache/rustls", "any_tls"]
 any_tls = []
 connection_filter = ["lorica-core/connection_filter"]
@@ -72,4 +47,4 @@ prometheus = ["lorica-core/prometheus"]
 rustdoc-args = ["--cfg", "doc_async_trait"]
 
 [lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ['cfg(doc_async_trait)', 'cfg(feature, values("s2n", "openssl_derived"))'] }
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(doc_async_trait)'] }

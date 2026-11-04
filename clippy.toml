@@ -1,0 +1,20 @@
+# The outbound TLS policy (`lorica_tls::http_client`) as a gate rather
+# than a convention. Every reqwest client starts from
+# `http_client::client_builder` (or `blocking_client_builder`), which
+# hands reqwest a finished rustls configuration; a client built from
+# reqwest's own constructors compiles and runs on reqwest's built-in
+# TLS instead, with other roots and the process-wide crypto provider.
+# `rustls::ClientConfig::builder` is refused for the same reason: it
+# takes whatever provider the process installed. The two constructors
+# in `http_client` carry the one `#[allow]`.
+disallowed-methods = [
+    { path = "reqwest::Client::builder", reason = "start from lorica_tls::http_client::client_builder, which carries the TLS policy" },
+    { path = "reqwest::Client::new", reason = "start from lorica_tls::http_client::client_builder, which carries the TLS policy" },
+    { path = "reqwest::ClientBuilder::new", reason = "start from lorica_tls::http_client::client_builder, which carries the TLS policy" },
+    { path = "reqwest::get", reason = "build a client from lorica_tls::http_client::client_builder, which carries the TLS policy" },
+    { path = "reqwest::blocking::Client::builder", reason = "start from lorica_tls::http_client::blocking_client_builder, which carries the TLS policy", allow-invalid = true },
+    { path = "reqwest::blocking::Client::new", reason = "start from lorica_tls::http_client::blocking_client_builder, which carries the TLS policy", allow-invalid = true },
+    { path = "reqwest::blocking::ClientBuilder::new", reason = "start from lorica_tls::http_client::blocking_client_builder, which carries the TLS policy", allow-invalid = true },
+    { path = "reqwest::blocking::get", reason = "build a client from lorica_tls::http_client::blocking_client_builder, which carries the TLS policy", allow-invalid = true },
+    { path = "rustls::ClientConfig::builder", reason = "takes the process-wide crypto provider; use lorica_tls::http_client (config_builder for a client that is not HTTP)" },
+]

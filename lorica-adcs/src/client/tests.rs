@@ -672,7 +672,7 @@ async fn a_bundle_without_certificates_is_refused() {
         .await
         .expect_err("empty bundle");
     assert!(
-        matches!(&err, AdcsError::Tls { reason } if reason.contains("no PEM certificate")),
+        matches!(&err, AdcsError::Tls { reason } if reason.contains("holds no certificate")),
         "{err}"
     );
     assert!(ces.seen().is_empty());

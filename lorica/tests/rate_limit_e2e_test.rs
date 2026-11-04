@@ -310,11 +310,13 @@ async fn empty_bucket_returns_429_with_retry_after() {
         scope: RateLimitScope::PerIp,
     })
     .await;
-    let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
 
     // Two successful consumptions drain the bucket.
     let r1 = client.get(harness.url()).send().await.unwrap();
@@ -355,11 +357,13 @@ async fn one_shot_bucket_has_60_second_retry_after() {
         scope: RateLimitScope::PerIp,
     })
     .await;
-    let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
 
     let _ = client.get(harness.url()).send().await.unwrap();
     let r = client.get(harness.url()).send().await.unwrap();
@@ -389,11 +393,13 @@ async fn no_rate_limit_does_not_short_circuit() {
     );
     let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
 
-    let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
     for _ in 0..5 {
         let r = client.get(harness.url()).send().await.unwrap();
         assert_eq!(r.status(), 200);
@@ -412,11 +418,13 @@ async fn per_route_scope_caps_aggregate_across_clients() {
         scope: RateLimitScope::PerRoute,
     })
     .await;
-    let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .pool_max_idle_per_host(0)
+    .timeout(Duration::from_secs(5))
+    .build()
+    .unwrap();
 
     // Fire 5 requests; only 2 should reach the origin.
     let mut ok_count = 0usize;

@@ -22,7 +22,10 @@ jobs:
 
       - name: Run fuzz target (${{ matrix.target }})
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=600
-        timeout-minutes: 15
+        # 600 s of fuzzing plus a cold build of up to 5 minutes. rust-cache
+        # saves nothing for a failed job, so one timeout makes the next run
+        # cold as well.
+        timeout-minutes: 25
 
       - name: Upload crash artifacts
         if: failure()

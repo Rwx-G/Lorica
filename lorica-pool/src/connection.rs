@@ -19,10 +19,11 @@ use lorica_timeout::{sleep, timeout};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::io;
+use std::ops::DerefMut;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::{oneshot, watch, Notify, OwnedMutexGuard};
+use tokio::sync::{oneshot, watch, Notify};
 
 use super::lru::Lru;
 
@@ -263,10 +264,7 @@ impl<S> ConnectionPool<S> {
     pub fn get(&self, key: &GroupKey) -> Option<S> {
         let pool_node = {
             let pool = self.pool.read();
-            match pool.get(key) {
-                Some(v) => (*v).clone(),
-                None => return None,
-            }
+            (*pool.get(key)?).clone()
         }; // read lock released here
 
         if let Some((id, connection)) = pool_node.get_any() {
@@ -313,9 +311,12 @@ impl<S> ConnectionPool<S> {
     /// remove it from the pool and drop the connection.
     ///
     /// If the connection is reused via [Self::get()] or being evicted, this function will just exit.
+    ///
+    /// `connection` is a guard that gives exclusive access to the connection while it is polled.
+    /// It is dropped when this function returns.
     pub async fn idle_poll<Stream>(
         &self,
-        connection: OwnedMutexGuard<Stream>,
+        connection: impl DerefMut<Target = Stream>,
         meta: &ConnectionMeta,
         timeout: Option<Duration>,
         notify_evicted: Arc<Notify>,
@@ -390,7 +391,7 @@ impl<S> ConnectionPool<S> {
 }
 
 async fn read_with_timeout<S>(
-    mut connection: OwnedMutexGuard<S>,
+    mut connection: impl DerefMut<Target = S>,
     timeout_duration: Option<Duration>,
 ) -> io::Result<usize>
 where

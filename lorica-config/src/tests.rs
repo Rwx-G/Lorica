@@ -1315,14 +1315,14 @@ created_at = "2026-01-01T00:00:00Z"
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        // 66 is the current head of the tracked MIGRATIONS table (every
+        // 68 is the current head of the tracked MIGRATIONS table (every
         // schema change now carries a distinct version, including the
         // former post-v22 unconditional ALTER blocks).
         assert_eq!(
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            66
+            68
         );
     }
 
@@ -1340,7 +1340,7 @@ created_at = "2026-01-01T00:00:00Z"
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                66
+                68
             );
         }
     }
@@ -3058,6 +3058,109 @@ cert_critical_days = 3
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("already used as alias"));
+    }
+
+    #[test]
+    fn test_hostname_and_aliases_are_stored_canonical() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut route = make_route();
+        route.hostname = "Shop.Example.COM.".into();
+        route.hostname_aliases = vec![
+            "WWW.Example.com.".into(),
+            "www.example.com".into(),
+            "shop.example.com".into(),
+        ];
+        store
+            .create_route(&route)
+            .expect("a mixed-case route lands");
+        let stored = store
+            .get_route(&route.id)
+            .expect("route reads")
+            .expect("route kept");
+        assert_eq!(stored.hostname, "shop.example.com");
+        assert_eq!(stored.hostname_aliases, vec!["www.example.com".to_string()]);
+
+        route.hostname = "Other.Example.com".into();
+        route.hostname_aliases = vec!["*.Example.COM.".into()];
+        store.update_route(&route).expect("an update lands");
+        let stored = store
+            .get_route(&route.id)
+            .expect("route reads")
+            .expect("route kept");
+        assert_eq!(stored.hostname, "other.example.com");
+        assert_eq!(stored.hostname_aliases, vec!["*.example.com".to_string()]);
+    }
+
+    #[test]
+    fn test_hostname_uniqueness_refuses_a_case_or_root_dot_twin() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut held = make_route();
+        held.hostname_aliases = vec!["alias.example.com".into()];
+        store
+            .create_route(&held)
+            .expect("test setup: route inserts");
+
+        for twin in [
+            "EXAMPLE.com",
+            "example.com.",
+            "Alias.Example.com.",
+            "ALIAS.example.com",
+        ] {
+            let mut as_hostname = make_route();
+            as_hostname.hostname = twin.into();
+            let err = store
+                .create_route(&as_hostname)
+                .expect_err(twin)
+                .to_string();
+            assert!(err.contains("already used"), "{twin}: {err}");
+
+            let mut as_alias = make_route();
+            as_alias.hostname = "free.example.org".into();
+            as_alias.hostname_aliases = vec![twin.into()];
+            let err = store.create_route(&as_alias).expect_err(twin).to_string();
+            assert!(err.contains("already used"), "{twin}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_import_stores_canonical_hostnames_and_refuses_a_twin() {
+        let source = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut first = make_route();
+        first.hostname = "a.example.com".into();
+        first.hostname_aliases = vec!["www.a.example.com".into()];
+        source.create_route(&first).expect("test setup: route");
+        let mut second = make_route();
+        second.hostname = "b.example.com".into();
+        source.create_route(&second).expect("test setup: route");
+        let exported = export_to_toml(&source).expect("test setup: export");
+
+        let mixed = exported
+            .replace("\"a.example.com\"", "\"A.Example.COM.\"")
+            .replace("\"www.a.example.com\"", "\"WWW.a.example.com.\"");
+        assert_ne!(mixed, exported, "test setup: the export names both");
+        let target = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        import_to_store(&target, &parse_toml(&mixed).expect("parses")).expect("imports");
+        let imported = target
+            .get_route(&first.id)
+            .expect("route reads")
+            .expect("route imported");
+        assert_eq!(imported.hostname, "a.example.com");
+        assert_eq!(
+            imported.hostname_aliases,
+            vec!["www.a.example.com".to_string()]
+        );
+
+        let malformed = exported.replace("\"b.example.com\"", "\"b.example.com:8443\"");
+        let err = parse_toml(&malformed)
+            .expect_err("a primary hostname is checked on import")
+            .to_string();
+        assert!(err.contains("hostname contains a character"), "{err}");
+
+        let twin = exported.replace("\"b.example.com\"", "\"A.example.com\"");
+        let err = import_to_store(&target, &parse_toml(&twin).expect("parses"))
+            .expect_err("two spellings of one name are one name")
+            .to_string();
+        assert!(err.contains("already used"), "{err}");
     }
 
     #[test]

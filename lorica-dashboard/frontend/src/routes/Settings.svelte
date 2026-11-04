@@ -27,8 +27,9 @@
   import BinaryUpgradeTab from '../components/settings-tabs/BinaryUpgradeTab.svelte';
   import UsersAccessTab from '../components/settings-tabs/UsersAccessTab.svelte';
   import AutomationTokensTab from '../components/settings-tabs/AutomationTokensTab.svelte';
+  import RouteProtectionRecordsTab from '../components/settings-tabs/RouteProtectionRecordsTab.svelte';
   import AdcsAuthorityTab from '../components/settings-tabs/AdcsAuthorityTab.svelte';
-  import { isSuperAdmin, isSuperAdminRole } from '../lib/auth';
+  import { canWriteRole, isSuperAdmin, isSuperAdminRole } from '../lib/auth';
   import { parseOctalMode } from '../lib/validators';
 
   // Global settings
@@ -166,6 +167,7 @@
     binary_upgrade: true,
     users_access: true,
     automation_tokens: true,
+    route_protection_records: true,
   };
   let expandedSections = $state<Record<string, boolean>>((() => {
     try {
@@ -595,6 +597,21 @@
       <AutomationTokensTab
         expanded={expandedSections.automation_tokens}
         toggleSection={() => toggleSection('automation_tokens')}
+      />
+    {/if}
+
+    <!--
+      Route protection records are Operator on both verbs server-side,
+      so the section is hidden from a Viewer, whose listing the server
+      refuses. `canWriteRole` rather than `canWrite` for the section: a
+      follower answers the listing (empty, since records never
+      replicate) and refuses the clear, which the tab gates on
+      `canWrite` itself.
+    -->
+    {#if $canWriteRole}
+      <RouteProtectionRecordsTab
+        expanded={expandedSections.route_protection_records}
+        toggleSection={() => toggleSection('route_protection_records')}
       />
     {/if}
 

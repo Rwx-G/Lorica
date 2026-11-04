@@ -26,15 +26,33 @@ use once_cell::sync::Lazy;
 
 use super::VerdictCacheEngine;
 
-static FORWARD_AUTH_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .pool_max_idle_per_host(32)
-        // Default connect timeout; per-request total timeout is set on each call.
-        .connect_timeout(Duration::from_secs(5))
-        .build()
-        .expect("build forward-auth reqwest client")
+/// Built once per process, at startup ([`prepare_client`]) rather than
+/// on the first protected request. A platform trust store that does not
+/// load is logged once there, and every forward-auth request then fails
+/// closed with that reason instead of panicking on the request path.
+static FORWARD_AUTH_CLIENT: Lazy<Result<reqwest::Client, String>> = Lazy::new(|| {
+    let client: Result<reqwest::Client, String> = lorica_tls::http_client::public()
+        .map_err(|e| format!("forward-auth client trust roots: {e}"))
+        .and_then(|tls| {
+            lorica_tls::http_client::client_builder(tls)
+                .redirect(reqwest::redirect::Policy::none())
+                .pool_max_idle_per_host(32)
+                // Default connect timeout; per-request total timeout is set on each call.
+                .connect_timeout(Duration::from_secs(5))
+                .build()
+                .map_err(|e| format!("forward-auth client: {e}"))
+        });
+    if let Err(reason) = &client {
+        tracing::error!(%reason, "forward auth unavailable: every protected request fails closed");
+    }
+    client
 });
+
+/// Build the forward-auth client now, so a trust store that does not
+/// load is reported when the process starts.
+pub(crate) fn prepare_client() {
+    Lazy::force(&FORWARD_AUTH_CLIENT);
+}
 
 /// Per-route verdict cache for forward-auth. ONLY caches `Allow`
 /// outcomes keyed on the downstream session cookie. `Deny` and
@@ -383,7 +401,15 @@ pub(crate) async fn run_forward_auth_keyed(
 
     let headers_out = build_forward_auth_headers(req, client_ip, scheme);
 
-    let mut builder = FORWARD_AUTH_CLIENT
+    let client: &reqwest::Client = match &*FORWARD_AUTH_CLIENT {
+        Ok(client) => client,
+        Err(reason) => {
+            return ForwardAuthOutcome::FailClosed {
+                reason: reason.clone(),
+            };
+        }
+    };
+    let mut builder = client
         .get(&cfg.address)
         .timeout(Duration::from_millis(cfg.timeout_ms as u64));
     for (name, value) in &headers_out {

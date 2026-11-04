@@ -44,24 +44,35 @@ pub struct CloudflareDnsChallenger {
 impl CloudflareDnsChallenger {
     /// Construct a new challenger bound to a Cloudflare zone and API token,
     /// targeting the public Cloudflare API.
-    pub fn new(zone_id: String, api_token: String) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// The HTTP client cannot be built: the platform trust store offers
+    /// certificates and none is usable.
+    pub fn new(zone_id: String, api_token: String) -> Result<Self, String> {
         Self::with_base_url(zone_id, api_token, CLOUDFLARE_API_V4.to_string())
     }
 
     /// Construct a challenger with a custom API base URL. `pub(crate)` so
     /// unit tests in `acme::tests` can point the challenger at a
     /// `wiremock::MockServer` instance.
-    pub(crate) fn with_base_url(zone_id: String, api_token: String, base_url: String) -> Self {
-        let client = reqwest::Client::builder()
+    pub(crate) fn with_base_url(
+        zone_id: String,
+        api_token: String,
+        base_url: String,
+    ) -> Result<Self, String> {
+        let tls = lorica_tls::http_client::public()
+            .map_err(|e| format!("Cloudflare API client trust roots: {e}"))?;
+        let client = lorica_tls::http_client::client_builder(tls)
             .timeout(CLOUDFLARE_HTTP_TIMEOUT)
             .build()
-            .expect("reqwest::Client builder with a static timeout is infallible");
-        Self {
+            .map_err(|e| format!("Cloudflare API client: {e}"))?;
+        Ok(Self {
             zone_id,
             api_token,
             base_url,
             client,
-        }
+        })
     }
 
     /// Find the record ID for a given TXT record name.

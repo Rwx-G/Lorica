@@ -5,8 +5,8 @@
 # Generates, at container start, the throwaway PKI the `acme` profile
 # needs:
 #   - pebble-ca.pem / pebble-ca.key : a root CA trusted by the Lorica
-#     node via SSL_CERT_FILE (instant-acme's platform verifier loads
-#     native roots through openssl-probe, which honours that env var).
+#     node via SSL_CERT_FILE (the ACME client verifies with
+#     `lorica_tls::http_client::public`, whose platform store honours it).
 #   - pebble-dir.pem / pebble-dir.key : the leaf Pebble presents on its
 #     ACME directory listener. Its SANs cover the Let's Encrypt staging
 #     and production hostnames: the compose network aliases the pebble

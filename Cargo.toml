@@ -46,13 +46,21 @@ tokio-stream = { version = "0.1" }
 async-trait = "0.1.42"
 httparse = "1"
 bytes = "1.0"
-derivative = "2.2.0"
 http = "1"
 log = "0.4"
 h2 = ">=0.4.16"
 once_cell = "1"
-lru = "0.18"
+lru = "0.19"
 ahash = ">=0.8.9"
+# Every reqwest client is handed its TLS configuration by
+# `lorica_tls::http_client` (`tls_backend_preconfigured`), so reqwest
+# never chooses a provider or a verifier of its own. `rustls-no-provider`
+# is the one rustls feature of 0.13 that brings neither `aws-lc-rs` (the
+# ring-only rule, audit M-6) nor a process-wide provider; it still
+# compiles `rustls-platform-verifier`, which a preconfigured client never
+# calls. No `http2`: the clients offer `http/1.1` alone. A crate adds the
+# features it uses (`json`, `cookies`, ...) on top of this entry.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 
 [profile.bench]
 debug = true

@@ -14,7 +14,7 @@
 
 use log::debug;
 use once_cell::sync::OnceCell;
-use rand::Rng;
+use rand::RngExt;
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::oneshot::{channel, Sender};
 
@@ -64,13 +64,13 @@ impl OffloadRuntime {
     }
 
     pub fn get_runtime(&self, hash: u64) -> &Handle {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         // choose a shard based on hash and a random thread with in that shard
         // e.g. say thread_per_shard=2, shard 1 thread 1 is 1 * 2 + 1 = 3
         // [[th0, th1], [th2, th3], ...]
         let shard = hash as usize % self.shards;
-        let thread_in_shard = rng.gen_range(0..self.thread_per_shard);
+        let thread_in_shard = rng.random_range(0..self.thread_per_shard);
         let pools = self.pools.get_or_init(|| self.init_pools());
         &pools[shard * self.thread_per_shard + thread_in_shard].0
     }

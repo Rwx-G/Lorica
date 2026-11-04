@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rand::distributions::WeightedIndex;
+use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use std::sync::Arc;
 use std::thread;
@@ -42,7 +42,7 @@ fn main() {
     }
 
     // single thread
-    let mut rng = thread_rng();
+    let mut rng = rand::rng();
     let dist = WeightedIndex::new(WEIGHTS).unwrap();
 
     let before = Instant::now();
@@ -82,7 +82,7 @@ fn main() {
     for i in 0..THREADS {
         let lru = lru.clone();
         let handler = thread::spawn(move || {
-            let mut rng = thread_rng();
+            let mut rng = rand::rng();
             let dist = WeightedIndex::new(WEIGHTS).unwrap();
             let before = Instant::now();
             for _ in 0..ITERATIONS {
@@ -106,7 +106,7 @@ fn main() {
     for i in 0..THREADS {
         let plru = plru.clone();
         let handler = thread::spawn(move || {
-            let mut rng = thread_rng();
+            let mut rng = rand::rng();
             let dist = WeightedIndex::new(WEIGHTS).unwrap();
             let before = Instant::now();
             for _ in 0..ITERATIONS {
@@ -128,7 +128,7 @@ fn main() {
     for i in 0..THREADS {
         let plru = plru.clone();
         let handler = thread::spawn(move || {
-            let mut rng = thread_rng();
+            let mut rng = rand::rng();
             let dist = WeightedIndex::new(WEIGHTS).unwrap();
             let before = Instant::now();
             for _ in 0..ITERATIONS {

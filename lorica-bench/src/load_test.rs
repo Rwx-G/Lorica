@@ -220,11 +220,12 @@ pub struct LoadTestEngine {
 
 impl LoadTestEngine {
     pub fn new() -> Self {
-        let http_client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true) // Load tests target localhost with self-signed certs
-            .pool_max_idle_per_host(200)
-            .build()
-            .unwrap_or_default();
+        // Load tests target localhost with self-signed certs, not checked.
+        let http_client =
+            lorica_tls::http_client::client_builder(lorica_tls::http_client::unverified())
+                .pool_max_idle_per_host(200)
+                .build()
+                .expect("a preconfigured client with a pool size has nothing left to fail on");
 
         Self {
             http_client,
@@ -274,9 +275,10 @@ impl LoadTestEngine {
         // traffic stays local (loopback). Without this, https://127.0.0.1 would
         // send SNI=127.0.0.1 which doesn't match any certificate.
         let run_client = {
-            let mut builder = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true) // Load tests target localhost with self-signed certs
-                .pool_max_idle_per_host(200);
+            // Load tests target localhost with self-signed certs, not checked.
+            let mut builder =
+                lorica_tls::http_client::client_builder(lorica_tls::http_client::unverified())
+                    .pool_max_idle_per_host(200);
             if let Ok(url) = reqwest::Url::parse(&config.target_url) {
                 if let Some(host) = url.host_str() {
                     let port = url.port_or_known_default().unwrap_or(80);
@@ -299,7 +301,9 @@ impl LoadTestEngine {
         // Spawn CPU circuit breaker monitor (aborts if CPU > 90% for 3 checks)
         let cpu_state = Arc::clone(&state);
         let cpu_monitor = tokio::spawn(async move {
-            let mut sys = System::new();
+            // Infallible on Linux, the only platform Lorica runs on; see
+            // `lorica_api::system::SystemCache::new`.
+            let mut sys = System::new().expect("sysinfo supports Linux");
             let mut high_cpu_count = 0u32;
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;

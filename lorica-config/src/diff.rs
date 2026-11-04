@@ -305,8 +305,10 @@ fn diff_settings(current: &GlobalSettings, incoming: &GlobalSettings) -> Setting
     SettingsDiff { changes }
 }
 
+/// Whether an import would leave `a` as `b`; names as the store keeps
+/// them, so a spelling it would store canonical is no change.
 fn route_eq(a: &Route, b: &Route) -> bool {
-    a.hostname == b.hostname
+    crate::route_selection::same_name(&a.hostname, &b.hostname)
         && a.path_prefix == b.path_prefix
         && a.certificate_id == b.certificate_id
         && a.load_balancing == b.load_balancing

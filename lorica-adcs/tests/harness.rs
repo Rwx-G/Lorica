@@ -30,6 +30,7 @@ use lorica_adcs::{
     CesTimeouts, EnrollOutcome, FailureScope, FaultKind, GeneratedCsr, KdcAddress, KdcTiming,
     KeyType, Krb5Config, Realm, Secret, SubjectFields, TicketFailure,
 };
+use rustls::pki_types::pem::PemObject;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::certification_request::X509CertificationRequest;
 use x509_parser::extensions::GeneralName;
@@ -167,12 +168,14 @@ fn csr(sans: &[&str]) -> GeneratedCsr {
 }
 
 fn https_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .use_rustls_tls()
-        .tls_built_in_root_certs(false)
-        .add_root_certificate(
-            reqwest::Certificate::from_pem(root_ca_pem().as_bytes()).expect("root CA"),
+    let mut roots: rustls::RootCertStore = rustls::RootCertStore::empty();
+    roots
+        .add(
+            rustls::pki_types::CertificateDer::from_pem_slice(root_ca_pem().as_bytes())
+                .expect("root CA"),
         )
+        .expect("root CA");
+    lorica_tls::http_client::client_builder(lorica_tls::http_client::verified(roots))
         .tls_info(true)
         .build()
         .expect("client")

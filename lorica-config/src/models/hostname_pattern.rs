@@ -27,8 +27,13 @@
 //!
 //! A third matcher, `host_pattern_matches` in
 //! `crate::store::cluster_nodes`, is deliberately NOT one of these: it
-//! mirrors `ProxyConfig::find_route` byte for byte, case-sensitivity
-//! included, and its own doc carries that reason.
+//! mirrors `ProxyConfig::find_route`, any-depth wildcard included, and
+//! its own doc carries that reason.
+//!
+//! All of them compare names in the form
+//! [`crate::route_selection::canonical_hostname`] defines.
+
+use crate::route_selection::canonical_hostname;
 
 /// Does `pattern` match `hostname`, with a wildcard covering any depth?
 ///
@@ -52,8 +57,8 @@ pub fn matches_any_depth(pattern: &str, hostname: &str) -> bool {
     if pattern == "*" {
         return true;
     }
-    let host_lc = hostname.to_ascii_lowercase();
-    let pat_lc = pattern.to_ascii_lowercase();
+    let host_lc = canonical_hostname(hostname);
+    let pat_lc = canonical_hostname(pattern);
     if let Some(suffix) = pat_lc.strip_prefix("*.") {
         // `host_lc` must end with `.suffix` AND have at least one
         // label before it. `*.example.com` matches `a.example.com`
@@ -91,8 +96,8 @@ pub fn matches_any_depth(pattern: &str, hostname: &str) -> bool {
 /// assert!(!matches_one_label("*", "anything.example.com"));
 /// ```
 pub fn matches_one_label(pattern: &str, hostname: &str) -> bool {
-    let pat_lc = strip_root_label(&pattern.to_ascii_lowercase());
-    let host_lc = strip_root_label(&hostname.to_ascii_lowercase());
+    let pat_lc = canonical_hostname(pattern);
+    let host_lc = canonical_hostname(hostname);
     if pat_lc.is_empty() || host_lc.is_empty() || pat_lc == "*" {
         return false;
     }
@@ -110,12 +115,6 @@ pub fn matches_one_label(pattern: &str, hostname: &str) -> bool {
         return !label.is_empty() && !label.contains('.');
     }
     pat_lc == host_lc
-}
-
-/// Drop the root label a fully qualified name may carry, so
-/// `a.example.com.` and `a.example.com` compare equal.
-fn strip_root_label(name: &str) -> String {
-    name.strip_suffix('.').unwrap_or(name).to_string()
 }
 
 /// Rank a pattern by specificity so the most specific match wins.

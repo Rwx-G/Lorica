@@ -15,9 +15,8 @@
 use once_cell::sync::Lazy;
 use std::{thread, time};
 
-use clap::Parser;
 use lorica_core::listeners::Listeners;
-use lorica_core::server::configuration::Opt;
+use lorica_core::server::configuration::ServerConf;
 use lorica_core::server::Server;
 use lorica_core::services::listening::Service;
 
@@ -68,13 +67,13 @@ pub struct MyServer {
     pub handle: thread::JoinHandle<()>,
 }
 
-fn entry_point(opt: Option<Opt>) {
+fn entry_point(conf: ServerConf) {
     env_logger::init();
 
     let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
     let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
 
-    let mut my_server = Server::new(opt).unwrap();
+    let mut my_server = Server::new_with_opt_and_conf(None, conf);
     my_server.bootstrap();
 
     let mut listeners = Listeners::tcp("0.0.0.0:6145");
@@ -108,13 +107,13 @@ fn entry_point(opt: Option<Opt>) {
 
 impl MyServer {
     pub fn start() -> Self {
-        let opts: Vec<String> = vec![
-            "lorica".into(),
-            "-c".into(),
-            "tests/pingora_conf.yaml".into(),
-        ];
+        let conf = ServerConf {
+            client_bind_to_ipv4: vec!["127.0.0.2".into()],
+            ca_file: Some("tests/keys/server.crt".into()),
+            ..ServerConf::new()
+        };
         let server_handle = thread::spawn(|| {
-            entry_point(Some(Opt::parse_from(opts)));
+            entry_point(conf);
         });
         // wait until the server is up
         thread::sleep(time::Duration::from_secs(2));

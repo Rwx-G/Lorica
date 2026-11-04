@@ -14,13 +14,27 @@
 
 mod utils;
 
+// Lorica: every reqwest client here is handed its TLS configuration by
+// `lorica_tls::http_client`, which reqwest 0.13 needs (see FORK.md,
+// "reqwest 0.13 on a preconfigured TLS configuration").
+
 #[cfg(all(unix, feature = "any_tls"))]
-use hyperlocal::{UnixClientExt, Uri};
+use hyper_util::client::legacy::Client;
+#[cfg(all(unix, feature = "any_tls"))]
+use hyperlocal::{UnixClientExt, UnixConnector, Uri};
 
 #[tokio::test]
 async fn test_http() {
     utils::init();
-    let res = reqwest::get("http://127.0.0.1:6145").await.unwrap();
+    let res = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .build()
+    .unwrap()
+    .get("http://127.0.0.1:6145")
+    .send()
+    .await
+    .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
 }
 
@@ -29,17 +43,17 @@ async fn test_http() {
 async fn test_https_http2() {
     utils::init();
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(lorica_tls::http_client::offering_http2(
+        lorica_tls::http_client::unverified(),
+    ))
+    .build()
+    .unwrap();
 
     let res = client.get("https://127.0.0.1:6146").send().await.unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_2);
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+    let client = lorica_tls::http_client::client_builder(lorica_tls::http_client::unverified())
         .http1_only()
         .build()
         .unwrap();
@@ -55,7 +69,7 @@ async fn test_https_http2() {
 async fn test_uds() {
     utils::init();
     let url = Uri::new("/tmp/echo.sock", "/").into();
-    let client = hyper::Client::unix();
+    let client: Client<UnixConnector, String> = Client::unix();
 
     let res = client.get(url).await.unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
@@ -66,8 +80,7 @@ async fn test_uds() {
 async fn test_h1_tls_with_h2c_enabled() {
     utils::init();
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+    let client = lorica_tls::http_client::client_builder(lorica_tls::http_client::unverified())
         .http1_only()
         .build()
         .unwrap();
@@ -82,10 +95,11 @@ async fn test_h1_tls_with_h2c_enabled() {
 async fn test_h2_tls_with_h2c_enabled() {
     utils::init();
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
+    let client = lorica_tls::http_client::client_builder(lorica_tls::http_client::offering_http2(
+        lorica_tls::http_client::unverified(),
+    ))
+    .build()
+    .unwrap();
 
     let res = client.get("https://127.0.0.1:6161").send().await.unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
@@ -96,7 +110,15 @@ async fn test_h2_tls_with_h2c_enabled() {
 async fn test_h2c_tcp_still_works() {
     utils::init();
 
-    let res = reqwest::get("http://127.0.0.1:6160").await.unwrap();
+    let res = lorica_tls::http_client::client_builder(
+        lorica_tls::http_client::public().expect("trust roots"),
+    )
+    .build()
+    .unwrap()
+    .get("http://127.0.0.1:6160")
+    .send()
+    .await
+    .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_11);
 }

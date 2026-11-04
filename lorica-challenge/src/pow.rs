@@ -25,7 +25,7 @@
 //! See `docs/architecture/bot-protection.md` § 5 for the full
 //! specification.
 
-use rand::TryRngCore;
+use rand::TryRng;
 use sha2::{Digest, Sha256};
 
 use crate::{ChallengeError, Result};
@@ -84,7 +84,7 @@ impl Challenge {
             ));
         }
         let mut nonce = [0u8; NONCE_LEN];
-        rand::rngs::OsRng
+        rand::rngs::SysRng
             .try_fill_bytes(&mut nonce)
             .expect("OS RNG must produce entropy for PoW nonce");
         Ok(Challenge {

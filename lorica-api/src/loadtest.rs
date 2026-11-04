@@ -157,7 +157,9 @@ fn validate_target_url(
     let routes = store
         .list_routes()
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let is_route = routes.iter().any(|r| r.hostname == host);
+    let is_route = routes
+        .iter()
+        .any(|r| lorica_config::route_selection::same_name(&r.hostname, host));
     if !is_route {
         return Err(ApiError::BadRequest(
             "load test target must be a configured route hostname or localhost".into(),
