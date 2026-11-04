@@ -255,6 +255,64 @@ async fn a_protected_route_a_token_deleted_is_not_created_again_weaker() {
 }
 
 #[tokio::test]
+async fn an_unreadable_record_refuses_only_the_writes_on_its_names() {
+    let f = a_node_with_something_to_write().await;
+    let record_id = {
+        let store = f.state.store.lock().await;
+        let deleted: lorica_config::models::Route = serde_json::from_value(serde_json::json!({
+            "id": "gone",
+            "hostname": "app.write.example.com",
+            "path_prefix": "/",
+            "load_balancing": "round_robin",
+            "waf_enabled": true,
+            "waf_mode": "blocking",
+            "enabled": true,
+            "created_at": "2026-11-04T00:00:00Z",
+            "updated_at": "2026-11-04T00:00:00Z",
+        }))
+        .expect("test setup: a route");
+        let mut record = lorica_config::models::RouteProtectionRecord::of_deleted(
+            &deleted,
+            "ci (0123)",
+            chrono::Utc::now(),
+        )
+        .expect("test setup: a record");
+        record.route["waf_enabled"] = serde_json::json!("not a boolean");
+        store
+            .create_route_protection_record(&record)
+            .expect("test setup: the record lands");
+        record.id
+    };
+
+    let elsewhere = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({ "hostname": "elsewhere.write.example.com" })),
+    )
+    .await;
+    assert_eq!(elsewhere.status(), StatusCode::CREATED);
+
+    let response = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({ "hostname": "app.write.example.com", "waf_enabled": true })),
+    )
+    .await;
+    crate::automation::test_support::assert_forbidden_naming(
+        response,
+        &format!("route protection record `{record_id}` cannot be read"),
+        "a write on the unreadable record's name",
+    )
+    .await;
+    let records = listed(&f).await;
+    assert_eq!(records[0]["readable"], false, "{records}");
+}
+
+#[tokio::test]
 async fn the_same_delete_and_recreate_through_mcp_is_refused() {
     let f = a_node_with_something_to_write().await;
     let route_id = protected_route(&f).await;

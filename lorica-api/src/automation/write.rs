@@ -107,12 +107,12 @@
 //! The environment resource writes its route from a fixed profile the
 //! pipeline cannot shape, so it is not refused there: it takes over the
 //! controls of the route it displaces instead, through the same rules
-//! ([`inherit_displaced_protections`]).
+//! (`super::displacement`).
 //!
 //! A route a token deleted is weighed as if it were still there: the
 //! delete leaves a record of the route, and every route write of this
 //! plane is held to it as to a displaced stored route
-//! ([`super::records`]).
+//! ([`super::records`]), in the same weighing.
 //!
 //! # The scopes bound each other
 //!
@@ -204,7 +204,6 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use lorica_automation_policy::admin_setting;
 use lorica_config::models::{AutomationScope, Backend, ManagedBy, Route};
-use lorica_config::route_selection::HostIndex;
 use lorica_config::ConfigStore;
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -213,9 +212,7 @@ use super::auth::AutomationPrincipal;
 use super::environments::{
     audit_context, caller_may_access, ensure_backend_address_granted, ensure_environment_binding,
 };
-use super::protections::{
-    ensure_not_weakened, first_weakened, BACKEND_PROTECTIONS, ROUTE_PROTECTIONS,
-};
+use super::protections::{ensure_not_weakened, BACKEND_PROTECTIONS, ROUTE_PROTECTIONS};
 use super::redact;
 use super::scope::scope_str;
 use crate::audit::ClientConnectInfo;
@@ -362,90 +359,6 @@ fn refuse_withheld(body: &impl WithheldFields) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Every route `after` would take a request from, each once, in the
-/// order found: for each name it answers to and each path it would
-/// serve, the route the proxy picks from `stored` today, by the proxy's
-/// own selection ([`HostIndex`]), where the pick once `after` replaces
-/// its own row in `stored` is `after`. A disabled `after` serves
-/// nothing and displaces nothing.
-///
-/// The paths weighed are `after`'s prefix and every stored prefix below
-/// it, the only places where the pick can change.
-fn routes_displaced_by<'s>(stored: &'s [Route], after: &Route) -> Vec<&'s Route> {
-    let mut displaced: Vec<&'s Route> = Vec::new();
-    if !after.enabled {
-        return displaced;
-    }
-    let today = HostIndex::new(stored.iter(), |route| *route);
-    let tomorrow = HostIndex::new(
-        stored
-            .iter()
-            .filter(|route| route.id != after.id)
-            .chain(std::iter::once(after)),
-        |route| *route,
-    );
-    let paths: BTreeSet<&str> = std::iter::once(after.path_prefix.as_str())
-        .chain(
-            stored
-                .iter()
-                .map(|route| route.path_prefix.as_str())
-                .filter(|prefix| prefix.starts_with(after.path_prefix.as_str())),
-        )
-        .collect();
-    let names = std::iter::once(&after.hostname).chain(&after.hostname_aliases);
-    for name in names {
-        for path in &paths {
-            let taken = tomorrow.select(name, path, |route| *route);
-            if taken.map(|route| route.id.as_str()) != Some(after.id.as_str()) {
-                continue;
-            }
-            let Some(route) = today
-                .select(name, path, |route| *route)
-                .filter(|route| route.id != after.id)
-            else {
-                continue;
-            };
-            if !displaced.iter().any(|known| known.id == route.id) {
-                displaced.push(*route);
-            }
-        }
-    }
-    displaced
-}
-
-/// A token's route about to be written, weighed against every route it
-/// would take a request from ([`routes_displaced_by`] over the stored
-/// rows): `after` is held to [`ROUTE_PROTECTIONS`] against each, exactly
-/// as an update is held against the row it replaces.
-///
-/// Without this, an exact name created under an operator's
-/// `*.review.example.com` or catch-all route took that host's traffic
-/// to a row carrying none of the protections the operator set there,
-/// and the token never had to reach the protected route itself.
-///
-/// The refusal names the field and the displaced route's id, and
-/// nothing of that route's values.
-fn ensure_no_route_displaced_weaker(store: &ConfigStore, after: &Route) -> Result<(), ApiError> {
-    if !after.enabled {
-        return Ok(());
-    }
-    let stored = store.list_routes()?;
-    for displaced in routes_displaced_by(&stored, after) {
-        if let Some(protection) = first_weakened(ROUTE_PROTECTIONS, displaced, after) {
-            return Err(ApiError::Forbidden(format!(
-                "{}: route `{}` serves this route's host today, and this route would take it \
-                 over weaker on that control. A token's route may only match or strengthen it \
-                 ({}), because {}; set it in the dashboard",
-                protection.fields.join(" / "),
-                displaced.id,
-                protection.rule,
-                protection.why
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// A name `after` answers to that another route already holds, refused
 /// before the write on the store's own rule
 /// ([`ConfigStore::hostname_claimed_elsewhere`]) with the store's 422,
@@ -458,125 +371,6 @@ fn ensure_names_unclaimed(store: &ConfigStore, after: &Route) -> Result<(), ApiE
             claim.hostname
         ))),
         None => Ok(()),
-    }
-}
-
-/// An environment's route raised, control by control, to every route it
-/// takes a request from (the maintainer's decision of 2026-10-04), so
-/// the environment resource cannot do what the token-route guard
-/// refuses: put a host a protected wildcard or catch-all serves today
-/// behind a row with none of its protections.
-///
-/// The environment's route is written from a fixed profile the pipeline
-/// cannot shape, so it inherits rather than being refused. Each of
-/// [`ROUTE_PROTECTIONS`] the route is weaker on is raised to the
-/// displaced route's value by the rule's own `strengthened`, and a
-/// control the profile already holds more strongly (the WAF a pipeline
-/// switched on) is kept. Basic auth is copied as the stored username
-/// and password hash, server side; neither reaches the answer, the
-/// audit row or a log, which carry the ids this returns and nothing
-/// more.
-///
-/// The route weighs against the rows as they would be without its own:
-/// a `PUT` rewrites the whole route from the profile, so an update
-/// inherits from what serves the host underneath it today, a
-/// protection the operator added there since included.
-///
-/// The record of a deleted route the environment's route would serve
-/// the names of ([`super::records`]) is a displaced route like any
-/// other here: its controls are raised to the same way.
-///
-/// Returns the ids of the routes, and of the records, at least one
-/// control was raised from.
-///
-/// # Errors
-///
-/// A store read failure, a 403 naming a record that does not read, or a
-/// 403 naming the field and the displaced route's or record's id when
-/// two of them ask for what no one value meets (two Basic auth
-/// credentials, two allowlists neither of which covers the other),
-/// which the environment's route cannot satisfy.
-pub(super) fn inherit_displaced_protections(
-    store: &ConfigStore,
-    route: &mut Route,
-) -> Result<Inherited, ApiError> {
-    let stored: Vec<Route> = store
-        .list_routes()?
-        .into_iter()
-        .filter(|stored| stored.id != route.id)
-        .collect();
-    let recorded = super::records::recorded(store)?;
-    let displaced: Vec<(Source, &Route)> = routes_displaced_by(&stored, route)
-        .into_iter()
-        .map(|from| (Source::Route(from.id.clone()), from))
-        .chain(
-            super::records::records_displaced_by(&stored, &recorded, route)
-                .into_iter()
-                .map(|from| (Source::Record(from.record.id.clone()), &from.route)),
-        )
-        .collect();
-    let mut inherited = Inherited::default();
-    for (source, from) in &displaced {
-        for protection in ROUTE_PROTECTIONS {
-            if (protection.weakened)(from, route) {
-                (protection.strengthened)(from, route);
-                inherited.note(source);
-            }
-        }
-    }
-    for (source, from) in &displaced {
-        if let Some(protection) = first_weakened(ROUTE_PROTECTIONS, from, route) {
-            let named = match source {
-                Source::Route(id) => {
-                    format!("route `{id}` serves this environment's hostname today")
-                }
-                Source::Record(id) => format!(
-                    "route protection record `{id}` holds the protections of a deleted route \
-                     that served this environment's hostname"
-                ),
-            };
-            return Err(ApiError::Forbidden(format!(
-                "{}: {named}, and the environment's route cannot take over its protections \
-                 without being weaker on that control ({}); another route serving the same \
-                 hostname asks for a different value, and an operator reconciles them in the \
-                 dashboard",
-                protection.fields.join(" / "),
-                protection.rule
-            )));
-        }
-    }
-    Ok(inherited)
-}
-
-/// What an environment's route was raised from, as
-/// [`inherit_displaced_protections`] reports it.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct Inherited {
-    /// The stored routes at least one control was raised from.
-    pub(super) routes: Vec<String>,
-    /// The route protection records at least one control was raised
-    /// from.
-    pub(super) records: Vec<String>,
-}
-
-/// Where a displaced control comes from.
-enum Source {
-    /// A stored route, by id.
-    Route(String),
-    /// A route protection record, by id.
-    Record(String),
-}
-
-impl Inherited {
-    /// Notes `source` once.
-    fn note(&mut self, source: &Source) {
-        let (ids, id) = match source {
-            Source::Route(id) => (&mut self.routes, id),
-            Source::Record(id) => (&mut self.records, id),
-        };
-        if !ids.contains(id) {
-            ids.push(id.clone());
-        }
     }
 }
 
@@ -844,8 +638,7 @@ fn route_guard(principal: &AutomationPrincipal) -> RouteGuard {
         }
         if let Some(after) = target.after {
             ensure_names_unclaimed(store, after)?;
-            ensure_no_route_displaced_weaker(store, after)?;
-            super::records::ensure_no_record_displaced_weaker(store, after)?;
+            super::displacement::ensure_not_displaced_weaker(store, after)?;
         }
         ensure_new_links_granted(store, &principal, target)
     })

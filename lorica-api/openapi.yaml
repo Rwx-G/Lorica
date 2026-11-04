@@ -6922,8 +6922,8 @@ components:
           type: boolean
           description: >-
             Whether the stored route reads. An unreadable record refuses every
-            automation route create, update and environment write until an
-            operator clears it.
+            automation route write and environment write that would serve one
+            of its names until an operator clears it.
 
     OidcIssuer:
       type: object

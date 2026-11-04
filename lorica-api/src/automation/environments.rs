@@ -53,7 +53,7 @@
 //! protections of every route it displaces (the maintainer's decision
 //! of 2026-10-04), through the same rules and the same host selection
 //! that bound a token's own route
-//! ([`super::write::inherit_displaced_protections`]), and the answer
+//! ([`super::displacement::inherit_displaced_protections`]), and the answer
 //! names those routes by id in `protections_inherited_from`. The record
 //! of a protected route a token deleted (`super::records`) is inherited
 //! from the same way, named in `protections_inherited_from_records`.
@@ -79,7 +79,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::auth::AutomationPrincipal;
-use super::write::inherit_displaced_protections;
+use super::displacement::inherit_displaced_protections;
 use crate::audit::{AuditContext, ClientConnectInfo};
 use crate::cluster::ClusterRuntime;
 use crate::db::db_blocking;

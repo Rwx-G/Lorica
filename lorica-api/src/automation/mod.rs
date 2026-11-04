@@ -82,6 +82,7 @@
 
 pub mod audit;
 pub mod auth;
+mod displacement;
 pub mod environments;
 pub mod listener;
 pub mod mcp;

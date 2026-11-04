@@ -97,17 +97,25 @@ pub struct RouteProtectionRecordView {
     /// refusal weighs them. Empty when the snapshot does not read.
     pub controls: Vec<RecordedControl>,
     /// Whether the snapshot reads. An unreadable record refuses every
-    /// token route create and update, and every environment write, until
-    /// it is cleared.
+    /// token route write and environment write that would serve one of
+    /// its names, until it is cleared.
     pub readable: bool,
 }
 
 /// The view of `record`.
 pub fn view(record: &RouteProtectionRecord) -> RouteProtectionRecordView {
-    let controls = record
-        .route()
-        .ok()
-        .and_then(|route| crate::automation::protections::controls_in_force(&route).ok());
+    let read = record.route();
+    let readable = read.is_ok();
+    let controls = match read {
+        Ok(route) => match crate::automation::protections::controls_in_force(&route) {
+            Ok(controls) => controls,
+            Err(error) => {
+                tracing::warn!(record = %record.id, %error, "a record's controls are not named");
+                Vec::new()
+            }
+        },
+        Err(_) => Vec::new(),
+    };
     RouteProtectionRecordView {
         id: record.id.clone(),
         route_id: record.route_id.clone(),
@@ -116,9 +124,8 @@ pub fn view(record: &RouteProtectionRecord) -> RouteProtectionRecordView {
         path_prefix: record.path_prefix.clone(),
         deleted_by: record.deleted_by.clone(),
         deleted_at: record.deleted_at.to_rfc3339(),
-        readable: controls.is_some(),
+        readable,
         controls: controls
-            .unwrap_or_default()
             .into_iter()
             .map(|protection| RecordedControl {
                 fields: protection.fields.to_vec(),

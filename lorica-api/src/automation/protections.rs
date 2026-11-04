@@ -52,7 +52,7 @@ pub struct Protection<T: 'static> {
     pub weakened: fn(&T, &T) -> bool,
     /// Raises the second row to the first on this control, for a row
     /// that takes the control over instead of being refused: an
-    /// environment's route ([`inherit_displaced_protections`]). Called
+    /// environment's route (`super::displacement::inherit_displaced_protections`). Called
     /// only where `weakened` holds, after which it no longer does; a
     /// test holds every rule to that.
     pub strengthened: fn(&T, &mut T),
@@ -181,7 +181,7 @@ pub(super) fn ensure_not_weakened<T>(
 /// every other field is the model's own default. A test holds this row
 /// to the one the management create actually stores, control by
 /// control, through the predicates.
-fn as_created_bare() -> Result<Route, ApiError> {
+pub(crate) fn as_created_bare() -> Result<Route, ApiError> {
     serde_json::from_value(serde_json::json!({
         "id": "",
         "hostname": "",

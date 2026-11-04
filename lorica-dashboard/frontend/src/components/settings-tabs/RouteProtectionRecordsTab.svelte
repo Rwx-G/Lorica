@@ -109,7 +109,7 @@
                       </span>
                     {/each}
                   {:else}
-                    <span class="badge badge-unreadable" title="This record refuses every automation route create or update until it is cleared.">
+                    <span class="badge badge-unreadable" title="This record refuses every automation route write that would serve its names until it is cleared.">
                       Unreadable
                     </span>
                   {/if}

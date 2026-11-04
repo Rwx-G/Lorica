@@ -36,11 +36,20 @@
 //! The record stands for the route it was made of, switched on, and is
 //! weighed the way that route would be: every later write of this plane
 //! that would make a route serve a name and path the deleted route
-//! would serve today, through the proxy's own selection
-//! ([`records_displaced_by`]), is held to the same predicates against
-//! it. A token's write is refused naming the control and the record; the
-//! environment resource, which cannot be refused there, takes the
+//! would serve today is held to the same predicates against it, through
+//! the one weighing of what a write takes requests from
+//! (`super::displacement`), where a record sits beside the stored
+//! routes. A token's write is refused naming the control and the record;
+//! the environment resource, which cannot be refused there, takes the
 //! recorded controls over instead, as it takes a displaced route's.
+//!
+//! # A record that does not read binds its own names, and only them
+//!
+//! A record whose snapshot does not read is weighed as a route carrying
+//! nothing on its names and path, which the store keeps apart from the
+//! snapshot, and a write that would take a request from it is refused
+//! naming it, so an operator reads and clears it in the dashboard rather
+//! than the record weighing nothing. A write elsewhere never reads it.
 //!
 //! # A record is kept, not consumed
 //!
@@ -69,10 +78,10 @@
 use std::collections::BTreeSet;
 
 use lorica_config::models::{Route, RouteProtectionRecord};
-use lorica_config::route_selection::HostIndex;
+use lorica_config::route_selection::same_name;
 use lorica_config::ConfigStore;
 
-use super::protections::{controls_in_force, first_weakened, ROUTE_PROTECTIONS};
+use super::protections::{as_created_bare, controls_in_force, first_weakened, ROUTE_PROTECTIONS};
 use crate::error::ApiError;
 use crate::route_protection_records::{
     record_view, RECORD_CREATE_ACTION, RECORD_SUPERSEDE_ACTION, RECORD_TARGET_TYPE,
@@ -84,160 +93,71 @@ use crate::target::{RouteTarget, SettledRow};
 /// a write that would switch a route on for those names is weighed.
 pub(super) struct Recorded {
     pub(super) record: RouteProtectionRecord,
+    /// The recorded route, or, when the snapshot does not read, a route
+    /// on the record's names and path carrying nothing.
     pub(super) route: Route,
+    /// Whether the snapshot read. A record that did not is never
+    /// weighed: a write that would take a request from it is refused.
+    pub(super) readable: bool,
 }
 
-/// Every record in the store, read back.
-///
-/// A record whose snapshot does not read fails closed: the write is
-/// refused naming the record, so an operator reads and clears it in the
-/// dashboard, rather than the record weighing nothing.
-pub(super) fn recorded(store: &ConfigStore) -> Result<Vec<Recorded>, ApiError> {
-    store
-        .list_route_protection_records()?
-        .into_iter()
-        .map(|record| match record.route() {
-            Ok(mut route) => {
-                route.enabled = true;
-                Ok(Recorded { record, route })
+impl Recorded {
+    /// `record` read back, or stood in for when its snapshot does not
+    /// read.
+    fn of(record: RouteProtectionRecord) -> Result<Recorded, ApiError> {
+        let (mut route, readable) = match record.route() {
+            Ok(route) => (route, true),
+            Err(_) => {
+                let mut stand_in = as_created_bare()?;
+                stand_in.id.clone_from(&record.route_id);
+                stand_in.hostname.clone_from(&record.hostname);
+                stand_in
+                    .hostname_aliases
+                    .clone_from(&record.hostname_aliases);
+                stand_in.path_prefix.clone_from(&record.path_prefix);
+                (stand_in, false)
             }
-            Err(_) => Err(ApiError::Forbidden(format!(
-                "route protection record `{}` cannot be read, so this node cannot tell \
-                 whether this write takes over the protections it holds; an operator clears \
-                 it in the dashboard",
-                record.id
-            ))),
+        };
+        route.enabled = true;
+        Ok(Recorded {
+            record,
+            route,
+            readable,
         })
-        .collect()
-}
-
-/// Every record `after` would take a request from, each once, in the
-/// order found: for each name `after` answers to and each path it would
-/// serve, the pick once `after` replaces its own row in `stored` is
-/// `after`, and the pick from `stored` with every record's route beside
-/// it is that record's. A stored route wins a tie against a record, so a
-/// record shadowed by a route serving the same name and path today is
-/// not weighed: that route is, in place.
-///
-/// The paths weighed are `after`'s prefix and every stored or recorded
-/// prefix below it, the only places where the pick can change. A
-/// disabled `after` serves nothing and takes nothing.
-pub(super) fn records_displaced_by<'r>(
-    stored: &[Route],
-    recorded: &'r [Recorded],
-    after: &Route,
-) -> Vec<&'r Recorded> {
-    let mut displaced: Vec<&'r Recorded> = Vec::new();
-    if !after.enabled || recorded.is_empty() {
-        return displaced;
     }
-    let with_records = HostIndex::new(
-        stored.iter().map(|route| (None, route)).chain(
-            recorded
-                .iter()
-                .enumerate()
-                .map(|(index, entry)| (Some(index), &entry.route)),
-        ),
-        route_of,
-    );
-    let tomorrow = HostIndex::new(
-        stored
-            .iter()
-            .filter(|route| route.id != after.id)
-            .chain(std::iter::once(after)),
-        |route| *route,
-    );
-    let paths: BTreeSet<&str> = std::iter::once(after.path_prefix.as_str())
-        .chain(
-            stored
-                .iter()
-                .map(|route| route.path_prefix.as_str())
-                .chain(
-                    recorded
-                        .iter()
-                        .map(|entry| entry.route.path_prefix.as_str()),
-                )
-                .filter(|prefix| prefix.starts_with(after.path_prefix.as_str())),
-        )
-        .collect();
-    let names = std::iter::once(&after.hostname).chain(&after.hostname_aliases);
-    for name in names {
-        for path in &paths {
-            let taken = tomorrow.select(name, path, |route| *route);
-            if taken.map(|route| route.id.as_str()) != Some(after.id.as_str()) {
-                continue;
-            }
-            let Some((Some(index), _)) = with_records.select(name, path, route_of) else {
-                continue;
-            };
-            let Some(record) = recorded.get(*index) else {
-                continue;
-            };
-            if !displaced
-                .iter()
-                .any(|known| known.record.id == record.record.id)
-            {
-                displaced.push(record);
-            }
-        }
+
+    /// The refusal of a write that would take a request from a record
+    /// that does not read: the node cannot tell what it would weaken.
+    pub(super) fn unreadable(&self) -> ApiError {
+        ApiError::Forbidden(format!(
+            "route protection record `{}` cannot be read, so this node cannot tell whether this \
+             write takes over the protections it holds; an operator clears it in the dashboard",
+            self.record.id
+        ))
     }
-    displaced
 }
 
-/// The route of an index entry: a stored route (`None`) or the route of
-/// the record at that index.
-fn route_of<'e>(entry: &'e (Option<usize>, &Route)) -> &'e Route {
-    entry.1
-}
-
-/// A token's route about to be written, weighed against every record it
-/// would take a request from ([`records_displaced_by`]), exactly as it
-/// is weighed against a stored route it displaces.
-///
-/// The refusal names the control and the record's id, and nothing of
-/// what the record holds.
-pub(super) fn ensure_no_record_displaced_weaker(
+/// Every record holding one of `names`, read back, found through the
+/// store's index on the names and decoding no other record.
+pub(super) fn recorded_naming(
     store: &ConfigStore,
-    after: &Route,
-) -> Result<(), ApiError> {
-    if !after.enabled {
-        return Ok(());
-    }
-    let recorded = recorded(store)?;
-    if recorded.is_empty() {
-        return Ok(());
-    }
-    let stored = store.list_routes()?;
-    for displaced in records_displaced_by(&stored, &recorded, after) {
-        if let Some(protection) = first_weakened(ROUTE_PROTECTIONS, &displaced.route, after) {
-            return Err(ApiError::Forbidden(format!(
-                "{}: route protection record `{}` holds the protections of a route an \
-                 automation token deleted, which served this route's host, and this route \
-                 would serve it weaker on that control. A token's route may only match or \
-                 strengthen it ({}), because {}; set it in the dashboard, or clear the record \
-                 there",
-                protection.fields.join(" / "),
-                displaced.record.id,
-                protection.rule,
-                protection.why
-            )));
-        }
-    }
-    Ok(())
+    names: &[&str],
+) -> Result<Vec<Recorded>, ApiError> {
+    store
+        .route_protection_records_naming(names)?
+        .into_iter()
+        .map(Recorded::of)
+        .collect()
 }
 
 /// Whether two records stand for the same names and path.
 fn same_identity(a: &RouteProtectionRecord, b: &RouteProtectionRecord) -> bool {
-    let aliases = |record: &RouteProtectionRecord| -> BTreeSet<String> {
-        record
-            .hostname_aliases
-            .iter()
-            .map(|alias| alias.to_ascii_lowercase())
-            .collect()
+    let holds_every_name_of = |one: &RouteProtectionRecord, other: &RouteProtectionRecord| {
+        other
+            .names()
+            .all(|name| one.names().any(|held| same_name(held, name)))
     };
-    a.hostname.eq_ignore_ascii_case(&b.hostname)
-        && a.path_prefix == b.path_prefix
-        && aliases(a) == aliases(b)
+    a.path_prefix == b.path_prefix && holds_every_name_of(a, b) && holds_every_name_of(b, a)
 }
 
 /// The automation guard's settle: a route a token deleted, carrying a
@@ -246,8 +166,9 @@ fn same_identity(a: &RouteProtectionRecord, b: &RouteProtectionRecord) -> bool {
 /// A record of the same names and path that the deleted route is at
 /// least as strong as, on every control, is replaced by the new one and
 /// audited as superseded; one it is weaker than on some control stays
-/// beside it, so no recorded control is lost. Runs in the transaction
-/// that deletes the route, so the record commits with the delete.
+/// beside it, so no recorded control is lost, and so does one that does
+/// not read, which an operator clears. Runs in the transaction that
+/// deletes the route, so the record commits with the delete.
 ///
 /// # Errors
 ///
@@ -264,8 +185,10 @@ pub(super) fn record_deleted_protections(
         return Ok(Vec::new());
     }
     let record = RouteProtectionRecord::of_deleted(deleted, actor, chrono::Utc::now())?;
+    let names: BTreeSet<&str> = record.names().collect();
+    let names: Vec<&str> = names.into_iter().collect();
     let mut rows = Vec::new();
-    for existing in store.list_route_protection_records()? {
+    for existing in store.route_protection_records_naming(&names)? {
         if !same_identity(&existing, &record) {
             continue;
         }
@@ -296,93 +219,37 @@ pub(super) fn record_deleted_protections(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::automation::protections::{bare_route as route, fortified};
 
-    fn recorded_of(deleted: &Route) -> Recorded {
+    /// `deleted`'s record, read back as the plane weighs it.
+    pub(in crate::automation) fn recorded_of(deleted: &Route) -> Recorded {
         let record = RouteProtectionRecord::of_deleted(deleted, "ci (0123)", chrono::Utc::now())
             .expect("a record");
-        let mut route = record.route().expect("reads");
-        route.enabled = true;
-        Recorded { record, route }
+        Recorded::of(record).expect("reads")
     }
 
     #[test]
-    fn a_record_is_weighed_by_every_protection_exactly_as_a_displaced_route_would_be() {
-        // For each control alone: the bare recreate takes the record
-        // over weaker on that control and is refused by its predicate,
-        // and the recreate carrying the control as recorded is not.
-        let strong = fortified("r-1", "app.example.com");
-        for protection in ROUTE_PROTECTIONS {
-            let mut deleted = route("r-1", "app.example.com", "/");
-            (protection.strengthened)(&strong, &mut deleted);
-            let recorded = vec![recorded_of(&deleted)];
-            let bare = route("r-2", "app.example.com", "/");
-            let displaced = records_displaced_by(&[], &recorded, &bare);
-            assert_eq!(displaced.len(), 1, "{:?}", protection.fields);
-            let refused = first_weakened(ROUTE_PROTECTIONS, &displaced[0].route, &bare)
-                .expect("the bare recreate is weaker");
-            assert_eq!(refused.fields, protection.fields);
-            let mut matching = bare.clone();
-            (protection.strengthened)(&displaced[0].route, &mut matching);
-            assert!(
-                first_weakened(ROUTE_PROTECTIONS, &displaced[0].route, &matching).is_none(),
-                "{:?}: a matching recreate is refused",
-                protection.fields
-            );
-        }
-    }
-
-    #[test]
-    fn a_record_is_taken_over_through_the_proxys_own_selection() {
-        let mut aliased = fortified("gone", "app.example.com");
-        aliased.hostname_aliases = vec!["www.example.com".into()];
-        aliased.path_prefix = "/api".into();
-        let recorded = vec![recorded_of(&aliased)];
-        let ids = |after: &Route, stored: &[Route]| -> usize {
-            records_displaced_by(stored, &recorded, after).len()
-        };
-
-        // An alias is a name the record serves; a path below its prefix
-        // is served by it; a path beside it is not.
-        assert_eq!(ids(&route("n", "www.example.com", "/"), &[]), 1);
-        assert_eq!(ids(&route("n", "app.example.com", "/api/v2"), &[]), 1);
-        assert_eq!(ids(&route("n", "app.example.com", "/public"), &[]), 0);
-        // `/` on that host takes `/api` from the record too.
-        assert_eq!(ids(&route("n", "app.example.com", "/"), &[]), 1);
-        // Another host takes nothing; a disabled route takes nothing.
-        assert_eq!(ids(&route("n", "other.example.com", "/"), &[]), 0);
-        let mut off = route("n", "app.example.com", "/api");
-        off.enabled = false;
-        assert_eq!(ids(&off, &[]), 0);
-
-        // A stored route on the same name and path shadows the record:
-        // an update of that route is weighed against itself in place.
-        let shadow = route("s", "app.example.com", "/api");
-        let mut updated = shadow.clone();
-        updated.read_timeout_s = 5;
-        assert_eq!(ids(&updated, std::slice::from_ref(&shadow)), 0);
-
-        // A recorded wildcard is taken by any exact name under it.
-        let wildcard = vec![recorded_of(&fortified("w", "*.example.com"))];
-        assert_eq!(
-            records_displaced_by(&[], &wildcard, &route("n", "a.example.com", "/")).len(),
-            1
-        );
-        assert_eq!(
-            records_displaced_by(&[], &wildcard, &route("n", "example.org", "/")).len(),
-            0
-        );
-
-        // A disabled deleted route is recorded switched on.
-        let mut disabled = fortified("d", "off.example.com");
-        disabled.enabled = false;
-        let recorded = vec![recorded_of(&disabled)];
-        assert_eq!(
-            records_displaced_by(&[], &recorded, &route("n", "off.example.com", "/")).len(),
-            1
-        );
+    fn a_record_whose_snapshot_does_not_read_stands_in_on_its_names_alone() {
+        let mut record = RouteProtectionRecord::of_deleted(
+            &fortified("gone", "app.example.com"),
+            "ci (0123)",
+            chrono::Utc::now(),
+        )
+        .expect("a record");
+        record.route = serde_json::json!("not a route");
+        let recorded = Recorded::of(record).expect("stands in");
+        assert!(!recorded.readable);
+        assert_eq!(recorded.route.hostname, "app.example.com");
+        assert!(recorded.route.enabled);
+        assert!(controls_in_force(&recorded.route)
+            .expect("weighs")
+            .is_empty());
+        assert!(matches!(
+            recorded.unreadable(),
+            ApiError::Forbidden(message) if message.contains("cannot be read")
+        ));
     }
 
     #[test]

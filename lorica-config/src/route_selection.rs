@@ -152,6 +152,47 @@ pub fn wildcard_covers(pattern: &str, host: &str) -> bool {
     host.len() > suffix.len() && host.ends_with(suffix)
 }
 
+/// Whether two names are the same name to the selection.
+///
+/// The one comparison of two route names outside the index, which keys
+/// its maps by the same equality: a caller asking whether a route still
+/// answers to a name, or holds one another row holds, asks here, so the
+/// day names are compared in another form every such caller moves with
+/// the index.
+pub fn same_name(a: &str, b: &str) -> bool {
+    a == b
+}
+
+/// Whether `route` answers to `name` for every path `path_prefix`
+/// covers: it answers to `name` and its own prefix is `path_prefix` or
+/// one above it.
+///
+/// No other route can take one of those requests from it: a name is
+/// held by one route at most (`ConfigStore::hostname_claimed_elsewhere`),
+/// so at that name's level of the selection `route` is the only entry,
+/// and a longer prefix it does not cover would be its own.
+pub fn serves_all_of(route: &Route, name: &str, path_prefix: &str) -> bool {
+    std::iter::once(route.hostname.as_str())
+        .chain(route.hostname_aliases.iter().map(String::as_str))
+        .any(|own| same_name(own, name))
+        && path_prefix.starts_with(route.path_prefix.as_str())
+}
+
+/// Every index key whose routes [`select`] can reach for `host`: the
+/// name itself, each wildcard pattern that covers it, and the
+/// catch-all, so a caller holding rows outside an index reads only the
+/// ones that could serve `host` before it builds one.
+pub fn keys_reaching(host: &str) -> Vec<String> {
+    let mut keys = vec![host.to_string()];
+    keys.extend(
+        host.match_indices('.')
+            .filter(|(at, _)| *at > 0)
+            .map(|(at, _)| format!("*{}", &host[at..])),
+    );
+    keys.push(CATCH_ALL_HOSTNAME.to_string());
+    keys
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +294,49 @@ mod tests {
         assert!(!wildcard_covers("*.example.com", "example.com"));
         assert!(!wildcard_covers("*.example.com", ".example.com"));
         assert!(!wildcard_covers("example.com", "a.example.com"));
+    }
+
+    #[test]
+    fn the_keys_reaching_a_host_are_exactly_those_the_selection_can_pick() {
+        // Held to `select` itself: a lone route under each key is picked
+        // for the host exactly when the key is among those listed.
+        let keys = [
+            "a.b.example.com",
+            "b.example.com",
+            "*.b.example.com",
+            "*.example.com",
+            "*.com",
+            "*.a.b.example.com",
+            "*.other.com",
+            "example.com",
+            CATCH_ALL_HOSTNAME,
+        ];
+        for host in [
+            "a.b.example.com",
+            "b.example.com",
+            "example.com",
+            "x.other.com",
+        ] {
+            let reaching = keys_reaching(host);
+            for key in keys {
+                let lone = [route("lone", key, "/")];
+                let index = HostIndex::new(lone.iter(), |r| *r);
+                assert_eq!(
+                    served(&index, host, "/").is_some(),
+                    reaching.iter().any(|reached| reached == key),
+                    "{host} under {key}: {reaching:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_route_serves_all_of_a_name_from_its_own_prefix_down() {
+        let mut aliased = route("r", "app.example.com", "/api");
+        aliased.hostname_aliases = vec!["www.example.com".to_string()];
+        assert!(serves_all_of(&aliased, "www.example.com", "/api"));
+        assert!(serves_all_of(&aliased, "app.example.com", "/api/v1"));
+        assert!(!serves_all_of(&aliased, "app.example.com", "/"));
+        assert!(!serves_all_of(&aliased, "other.example.com", "/api"));
     }
 }
