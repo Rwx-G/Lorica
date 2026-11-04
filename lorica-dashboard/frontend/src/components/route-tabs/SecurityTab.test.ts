@@ -2,7 +2,12 @@ import { render, screen, fireEvent } from '@testing-library/svelte';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 import { api } from '../../lib/api';
-import { ROUTE_DEFAULTS, type RouteFormState } from '../../lib/route-form';
+import {
+  ROUTE_DEFAULTS,
+  formStateToCreateRequest,
+  formStateToUpdateRequest,
+  type RouteFormState,
+} from '../../lib/route-form';
 import { reactive } from '../../test-reactive.svelte';
 import SecurityTab from './SecurityTab.svelte';
 
@@ -26,6 +31,26 @@ async function validate(): Promise<void> {
 
 beforeEach(() => {
   vi.restoreAllMocks();
+});
+
+describe('SecurityTab path matching', () => {
+  it('binds the case-insensitive paths checkbox to the form and sends it', async () => {
+    const form = routeForm();
+    render(SecurityTab, { props: { form } });
+    const box = screen.getByRole('checkbox', {
+      name: 'Backend treats paths case-insensitively',
+    }) as HTMLInputElement;
+    expect(box.checked).toBe(false);
+    expect(screen.getByText(/IIS, a case-insensitive file system/)).toBeInTheDocument();
+
+    await fireEvent.click(box);
+    expect(form.case_insensitive_paths).toBe(true);
+    expect(formStateToUpdateRequest(form).case_insensitive_paths).toBe(true);
+    expect(formStateToCreateRequest(form).case_insensitive_paths).toBe(true);
+
+    await fireEvent.click(box);
+    expect(formStateToUpdateRequest(form).case_insensitive_paths).toBe(false);
+  });
 });
 
 describe('SecurityTab Validate PEM', () => {

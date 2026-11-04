@@ -664,6 +664,13 @@ describe('routeToFormState', () => {
     expect(form.waf_body_scan_max_mb).toBe('8');
   });
 
+  it('reads case_insensitive_paths, absent as off', () => {
+    expect(routeToFormState(mockRoute).case_insensitive_paths).toBe(false);
+    expect(
+      routeToFormState({ ...mockRoute, case_insensitive_paths: true }).case_insensitive_paths,
+    ).toBe(true);
+  });
+
   it('maps a null waf_body_scan_max_bytes to an empty field', () => {
     const form = routeToFormState({ ...mockRoute, waf_body_scan_max_bytes: null });
     expect(form.waf_body_scan_max_mb).toBe('');

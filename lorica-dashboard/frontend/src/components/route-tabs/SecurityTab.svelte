@@ -170,6 +170,30 @@
     </div>
   </section>
 
+  <section id="sec-path-case" class="subsection">
+    <SubsectionHeader
+      title="Path matching"
+      description="How this route's path prefix and path rules compare to a request path."
+      accent="orange"
+    />
+    <div class="subsection-body">
+      <div class="form-group" class:modified={isModified('case_insensitive_paths')}>
+        <label class="checkbox-item">
+          <input type="checkbox" bind:checked={form.case_insensitive_paths} />
+          <span>Backend treats paths case-insensitively</span>
+        </label>
+        {#if isImported('case_insensitive_paths')}<span class="imported-badge">imported</span>{/if}
+        <span class="hint">
+          Turn on when the backend serves <code>/Admin</code> and <code>/admin</code> as the same
+          resource (IIS, a case-insensitive file system). The path prefix and the path rules then
+          match in any case, so the controls on <code>/admin</code> also hold for
+          <code>/ADMIN</code>. Leave off for a backend where case matters. The path sent to the
+          backend is never changed.
+        </span>
+      </div>
+    </div>
+  </section>
+
   <section id="sec-preset" class="subsection">
     <SubsectionHeader
       title="Security headers preset"

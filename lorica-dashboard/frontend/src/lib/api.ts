@@ -402,6 +402,9 @@ export interface RouteResponse {
   /// When true, Lorica auto-serves a registry-driven `/robots.txt` for
   /// this route instead of passing the path through to the backend.
   serve_robots_txt?: boolean;
+  /// The backend treats paths case-insensitively: the prefix and the
+  /// path rules match with ASCII case folded. Absent = false.
+  case_insensitive_paths?: boolean;
   /// Free-form classification label (prod / staging / homelab / ...).
   /// Empty string = ungrouped. Mirrors `Backend.group_name`.
   group_name?: string;
@@ -614,6 +617,7 @@ export interface CreateRouteRequest {
   ai_bot_policy?: AiBotPolicy;
   ai_bot_spoofed_fallback?: AiBotSpoofedFallback | null;
   serve_robots_txt?: boolean;
+  case_insensitive_paths?: boolean;
   group_name?: string;
 }
 
@@ -692,6 +696,7 @@ export interface UpdateRouteRequest {
   ai_bot_policy?: AiBotPolicy;
   ai_bot_spoofed_fallback?: AiBotSpoofedFallback | null;
   serve_robots_txt?: boolean;
+  case_insensitive_paths?: boolean;
   /// Free-form operator classification (prod / staging / homelab / ...).
   /// Empty string clears the grouping. `undefined` leaves the field
   /// unchanged (follows the same missing-= no-op rule as every other
