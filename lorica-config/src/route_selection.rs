@@ -430,24 +430,59 @@ where
 
 /// Whether `path` starts with `prefix`, ASCII case folded when
 /// `case_insensitive`: the one prefix comparison the selection, a path
-/// rule ([`crate::models::PathRule::matches`]) and every question about
-/// which paths a route serves ([`Route::covers_path`]) make. Allocates
-/// nothing either way.
+/// rule ([`crate::models::PathRule::matches`]), the prefix strip and
+/// every question about which paths a route serves
+/// ([`Route::covers_path`]) make. Allocates nothing either way.
+///
+/// The hex digits of a percent-encoded octet compare in any case
+/// whatever `case_insensitive` says: `%c3%a9` and `%C3%A9` are the same
+/// octets (RFC 3986 section 2.1) to every backend, so a prefix stored
+/// with one spelling serves a request sent with the other.
 ///
 /// ```
 /// use lorica_config::route_selection::path_starts_with;
 /// assert!(path_starts_with("/ADMIN/x", "/admin", true));
 /// assert!(!path_starts_with("/ADMIN/x", "/admin", false));
 /// assert!(!path_starts_with("/adm", "/admin", true));
+/// assert!(path_starts_with("/caf%c3%a9/x", "/caf%C3%A9", false));
+/// assert!(!path_starts_with("/CAF%c3%a9/x", "/caf%C3%A9", false));
 /// ```
 pub fn path_starts_with(path: &str, prefix: &str, case_insensitive: bool) -> bool {
-    if case_insensitive {
-        path.as_bytes()
-            .get(..prefix.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
-    } else {
-        path.starts_with(prefix)
+    path.len() >= prefix.len()
+        && spelled_alike(path.as_bytes(), prefix.as_bytes(), case_insensitive)
+}
+
+/// Whether `path` is `pattern`, compared as [`path_starts_with`]
+/// compares a prefix: the test of an exact path rule.
+pub(crate) fn path_equals(path: &str, pattern: &str, case_insensitive: bool) -> bool {
+    path.len() == pattern.len()
+        && spelled_alike(path.as_bytes(), pattern.as_bytes(), case_insensitive)
+}
+
+/// Whether `pattern` spells the first `pattern.len()` bytes of `path`,
+/// which is at least that long: byte for byte, but for the hex digits of
+/// each `%XX` octet of `path`, and every ASCII letter when
+/// `case_insensitive`, which compare in any case. Either fold keeps the
+/// byte length, so a caller may cut `path` at `pattern.len()`.
+fn spelled_alike(path: &[u8], pattern: &[u8], case_insensitive: bool) -> bool {
+    let mut hex_digits_left = 0;
+    for (at, (&sent, &stored)) in path.iter().zip(pattern).enumerate() {
+        let in_escape = hex_digits_left > 0;
+        if in_escape {
+            hex_digits_left -= 1;
+        } else if sent == b'%'
+            && path
+                .get(at + 1..at + 3)
+                .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+        {
+            hex_digits_left = 2;
+        }
+        let folds = case_insensitive || in_escape;
+        if sent != stored && !(folds && sent.eq_ignore_ascii_case(&stored)) {
+            return false;
+        }
     }
+    true
 }
 
 /// [`select`] with the path test left to `serves`: the first entry it
@@ -1054,10 +1089,12 @@ mod tests {
             "/admin/../x",
             "/%68ealth",
             "/health;x",
-            "/caf%c3%a9",
+            "/caf%c3%a9;x/../%61dmin",
         ] {
             assert!(!alike(steered), "{steered}");
         }
+        // The hex digits of an encoded octet compare in any case on the
+        // path as sent, as every backend decodes them alike.
         for harmless in [
             "/admin",
             "/admin//x",
@@ -1065,6 +1102,8 @@ mod tests {
             "/x//y",
             "/health",
             "/caf%C3%A9/menu",
+            "/caf%c3%a9",
+            "/caf%C3%a9/menu",
         ] {
             assert!(alike(harmless), "{harmless}");
         }
@@ -1137,13 +1176,34 @@ mod tests {
             route("cafe", "app.example.com", "/caf%C3%A9"),
         ];
         let index = HostIndex::new(routes.iter(), |r| *r);
-        assert!(selects_alike_once_normalised(
-            &index.exact,
-            &index.wildcards,
-            "app.example.com",
-            "/caf%C3%A9/menu",
-            |r| *r,
-        ));
+        let alike = |path: &str| {
+            selects_alike_once_normalised(
+                &index.exact,
+                &index.wildcards,
+                "app.example.com",
+                path,
+                |r| *r,
+            )
+        };
+        // Its octets spelled in either hex case select it, as sent and
+        // once decoded alike.
+        for path in ["/caf%C3%A9/menu", "/caf%c3%a9/menu", "/caf%c3%A9"] {
+            assert_eq!(
+                served(&index, "app.example.com", path),
+                Some("cafe"),
+                "{path}"
+            );
+            assert!(alike(path), "{path}");
+        }
+        // Folding the hex digits folds nothing else: the letters of the
+        // prefix stay significant, and a decoded spelling still differs
+        // as sent.
+        assert_eq!(
+            served(&index, "app.example.com", "/CAF%c3%a9"),
+            Some("public")
+        );
+        assert!(!alike("/caf%25C3%25A9/x/../../caf%c3%a9"));
+        assert!(!alike("/%63af%c3%a9"));
     }
 
     #[test]

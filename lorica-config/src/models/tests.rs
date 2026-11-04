@@ -404,6 +404,25 @@ fn test_path_rule_matches_exact() {
     assert!(!rule.matches("/HEALTH/check", true));
 }
 
+#[test]
+fn test_path_rule_reads_encoded_octets_in_either_hex_case() {
+    for match_type in [PathMatchType::Exact, PathMatchType::Prefix] {
+        let rule = PathRule {
+            path: "/caf%C3%A9".to_string(),
+            match_type: match_type.clone(),
+            ..Default::default()
+        };
+        for sent in ["/caf%C3%A9", "/caf%c3%a9", "/caf%c3%A9"] {
+            assert!(rule.matches(sent, false), "{match_type:?} {sent}");
+        }
+        // Only the escape's digits fold: the letters around it do not,
+        // and `%C3` is not the unencoded text `C3`.
+        assert!(!rule.matches("/CAF%c3%a9", false), "{match_type:?}");
+        assert!(rule.matches("/CAF%c3%a9", true), "{match_type:?}");
+        assert!(!rule.matches("/caf%C3A9", false), "{match_type:?}");
+    }
+}
+
 // ---- Route::with_path_rule_overrides ----
 
 #[test]

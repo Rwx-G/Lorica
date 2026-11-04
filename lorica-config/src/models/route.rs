@@ -59,7 +59,9 @@ impl PathRule {
     /// Test the rule's `path` against an incoming request path under the
     /// configured [`PathMatchType`], ASCII case folded when
     /// `case_insensitive` (the rule's route's
-    /// [`Route::case_insensitive_paths`]).
+    /// [`Route::case_insensitive_paths`]), and the hex digits of a
+    /// percent-encoded octet in any case either way
+    /// ([`crate::route_selection::path_starts_with`]).
     pub fn matches(&self, request_path: &str, case_insensitive: bool) -> bool {
         self.matches_as(&self.path, request_path, case_insensitive)
     }
@@ -77,8 +79,9 @@ impl PathRule {
             PathMatchType::Prefix => {
                 crate::route_selection::path_starts_with(request_path, pattern, case_insensitive)
             }
-            PathMatchType::Exact if case_insensitive => request_path.eq_ignore_ascii_case(pattern),
-            PathMatchType::Exact => request_path == pattern,
+            PathMatchType::Exact => {
+                crate::route_selection::path_equals(request_path, pattern, case_insensitive)
+            }
         }
     }
 
