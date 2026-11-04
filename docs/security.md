@@ -198,9 +198,15 @@ not start a segment there. The same reading decides whether a request
 under `/.well-known/acme-challenge/` is an ACME challenge and so exempt
 from a route's HTTPS redirect: it has to be one under both readings.
 
-Case is not folded. A route whose controls guard a path prefix behind a
-case-insensitive backend is better served by putting the controls on
-the whole host.
+Case is significant by default. A route whose backend treats paths
+case-insensitively (IIS, a case-insensitive file system) says so with
+`case_insensitive_paths` (dashboard: Security tab, *Path matching*):
+its `path_prefix` and each of its path rules then match with ASCII case
+folded, under both readings, so `/ADMIN/x` is served by the route on
+`/admin` and held to its rules, while `/%41DMIN/x`, which only the
+second reading folds into `/admin`, is still refused. The path sent to
+the backend never changes. An automation token may switch the flag on
+and never off (`docs/mcp.md`).
 
 ### mTLS client verification
 
