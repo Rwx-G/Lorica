@@ -166,6 +166,62 @@ route names are stored in. `Host: App.Example.COM.` therefore reaches
 the route `app.example.com` and its controls rather than a wildcard or
 the catch-all. The `Host` sent to the backend is the client's, unchanged.
 
+### Request path validation (v1.10.3)
+
+Routes on one host are told apart by their path prefix, matched on the
+path as the client sent it, which is also the path the backend
+receives. Backends often read a path differently: nginx, for one,
+decodes every percent-encoded octet, merges runs of `/` and resolves
+`.` and `..` before it matches a location. Lorica therefore also reads
+each path that way (decoded once, slashes merged, dot segments
+resolved) and refuses with 400 a request whose two readings select
+different routes, such as `/%61dmin`, `//admin` or `/x/../admin` on a
+host where `/admin` is a route of its own. A path whose readings agree,
+which is every path a browser sends, is forwarded as sent.
+
+Case is not folded and backend-specific syntax (`;` path parameters,
+`\` as a separator) is not interpreted. A route whose controls guard a
+path prefix behind a backend that is case-insensitive or reads such
+syntax is better served by putting the controls on the whole host, or
+by a backend that applies the same rules.
+
+### mTLS client verification
+
+A route with mTLS checks the client certificate against its own CA
+bundle (`mtls.ca_cert_pem`), on top of the HTTPS listener's handshake.
+
+- **What the bundle trusts.** Every certificate in the bundle is a
+  trust anchor on its own, as in nginx. A bundle that carries a root
+  trusts every CA that root signed, not only the issuing CA pasted
+  beside it; the "full chain" a PKI portal exports is such a bundle. To
+  trust one or a few issuing CAs, put those in the bundle and leave
+  their root out: a client then sends its own issuing CA if it is not
+  in the bundle, and a sibling issuing CA under the same root is
+  refused. The dashboard's *Validate PEM* (`POST
+  /api/v1/validate/mtls-pem`) lists, under `warnings`, every root found
+  beside other certificates and every CA found beside a certificate it
+  issued; such a bundle is still accepted, and a route save logs the
+  same warnings.
+- **`required`.** On, a request without a certificate is answered 496
+  and one whose certificate does not chain to the bundle 495. Either is
+  421 (Misdirected Request) when the request names another host than
+  the TLS handshake of its connection did, which happens when a browser
+  coalesces two hosts on one HTTP/2 connection or reuses one: the
+  client retries on a new connection, opened for this host, and can
+  present the certificate meant for it. Off, both pass as anonymous.
+- **`allowed_organizations`.** Matched against each `O=` value of the
+  certificate subject, whole and case-sensitively; a subject with
+  several matches when one of them is listed. It applies only to a
+  certificate that chains to the bundle, so on a route that is not
+  `required` it restricts nobody who presents no certificate.
+- **Changes.** A bundle edit reaches the route's check on reload. The
+  listener only learns a CA no route trusted at startup on a restart,
+  and until then refuses its certificates at the handshake.
+- **Bounds.** A client certificate chain is kept for verification up
+  to a bounded count and size (`PeerCertChain::MAX_CERTIFICATES` and
+  `MAX_BYTES` in `lorica-core`), far above any real chain; a longer one
+  is refused (495 on a required route, anonymous otherwise).
+
 ### WAF body inspection (v1.7.2, v1.8.0)
 
 The WAF buffers a request body only when it can parse it, and the
