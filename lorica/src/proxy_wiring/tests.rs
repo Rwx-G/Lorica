@@ -2406,8 +2406,41 @@ fn enforcer(required: bool, orgs: Vec<&str>) -> MtlsEnforcer {
     }
 }
 
-fn verified(organization: &str) -> RouteClientCert<'_> {
-    RouteClientCert::Verified { organization }
+fn orgs(list: &[&str]) -> Vec<String> {
+    list.iter().map(|o| o.to_string()).collect()
+}
+
+fn verified(organizations: &[String]) -> RouteClientCert<'_> {
+    RouteClientCert::Verified { organizations }
+}
+
+#[test]
+fn test_evaluate_mtls_allowlist_never_matches_joined_organizations() {
+    // `O=Ac, O=me` is two organizations, neither of them `Acme`.
+    assert_eq!(
+        evaluate_mtls(
+            &enforcer(true, vec!["Acme"]),
+            verified(&orgs(&["Ac", "me"]))
+        ),
+        Some(495)
+    );
+}
+
+#[test]
+fn test_evaluate_mtls_allowlist_matches_any_one_of_several_organizations() {
+    let corp = orgs(&["Acme", "Corp"]);
+    assert_eq!(
+        evaluate_mtls(&enforcer(true, vec!["Corp"]), verified(&corp)),
+        None
+    );
+    assert_eq!(
+        evaluate_mtls(&enforcer(true, vec!["Acme"]), verified(&corp)),
+        None
+    );
+    assert_eq!(
+        evaluate_mtls(&enforcer(true, vec!["AcmeCorp"]), verified(&corp)),
+        Some(495)
+    );
 }
 
 #[test]
@@ -2425,7 +2458,7 @@ fn test_evaluate_mtls_required_with_cert_and_empty_allowlist_passes() {
     // Allowlist empty = trust the chain verifier. Any verified
     // cert passes.
     assert_eq!(
-        evaluate_mtls(&enforcer(true, vec![]), verified("Acme Corp")),
+        evaluate_mtls(&enforcer(true, vec![]), verified(&orgs(&["Acme Corp"]))),
         None
     );
 }
@@ -2443,7 +2476,10 @@ fn test_evaluate_mtls_optional_no_cert_passes() {
 #[test]
 fn test_evaluate_mtls_allowlist_match_passes() {
     assert_eq!(
-        evaluate_mtls(&enforcer(true, vec!["Acme", "Beta"]), verified("Acme")),
+        evaluate_mtls(
+            &enforcer(true, vec!["Acme", "Beta"]),
+            verified(&orgs(&["Acme"]))
+        ),
         None
     );
 }
@@ -2454,7 +2490,7 @@ fn test_evaluate_mtls_allowlist_miss_denies_495() {
     // allowlist - 495 ("SSL certificate error") is the right
     // status code.
     assert_eq!(
-        evaluate_mtls(&enforcer(true, vec!["Acme"]), verified("Gamma")),
+        evaluate_mtls(&enforcer(true, vec!["Acme"]), verified(&orgs(&["Gamma"]))),
         Some(495)
     );
 }
@@ -2464,7 +2500,7 @@ fn test_evaluate_mtls_allowlist_miss_denies_even_when_not_required() {
     // Opportunistic + allowlist is still enforcing: if a verified
     // cert is presented but doesn't match, deny.
     assert_eq!(
-        evaluate_mtls(&enforcer(false, vec!["Acme"]), verified("Gamma")),
+        evaluate_mtls(&enforcer(false, vec!["Acme"]), verified(&orgs(&["Gamma"]))),
         Some(495)
     );
 }
@@ -2474,18 +2510,18 @@ fn test_evaluate_mtls_allowlist_is_case_sensitive() {
     // Exact match, no case folding. Organization strings come
     // from the X.509 subject verbatim.
     assert_eq!(
-        evaluate_mtls(&enforcer(true, vec!["Acme"]), verified("acme")),
+        evaluate_mtls(&enforcer(true, vec!["Acme"]), verified(&orgs(&["acme"]))),
         Some(495)
     );
 }
 
 #[test]
 fn test_evaluate_mtls_empty_org_on_cert_fails_non_empty_allowlist() {
-    // Verified cert without an O= field (organization "" per the
-    // route_client_cert contract) vs a non-empty allowlist: empty
-    // string never matches, so deny.
+    // Verified cert without an O= field (no organizations per the
+    // route_client_cert contract) vs a non-empty allowlist: nothing
+    // matches, so deny.
     assert_eq!(
-        evaluate_mtls(&enforcer(true, vec!["Acme"]), verified("")),
+        evaluate_mtls(&enforcer(true, vec!["Acme"]), verified(&[])),
         Some(495)
     );
 }
@@ -2527,7 +2563,7 @@ fn mtls_test_ca(cn: &str) -> MtlsTestCa {
 /// `ca` with subject `O=org`, through the same parser the rustls stream
 /// uses for `organization`.
 fn client_digest(ca: &MtlsTestCa, org: &str) -> lorica_core::protocols::tls::SslDigest {
-    client_digest_with_chain_tail(ca, org, &[])
+    client_digest_full(ca, &[org], &[])
 }
 
 /// [`client_digest`] with `tail` sent after the end-entity, as a client
@@ -2537,28 +2573,71 @@ fn client_digest_with_chain_tail(
     org: &str,
     tail: &[Vec<u8>],
 ) -> lorica_core::protocols::tls::SslDigest {
+    client_digest_full(ca, &[org], tail)
+}
+
+/// The digest for a leaf of `ca` whose subject carries one `O=` per
+/// entry of `organizations` (at most two: rcgen keys a name by attribute
+/// type, so the second goes in under the organizationName OID spelled as
+/// a custom type), filled as `SslDigest::from_stream` fills it.
+fn client_digest_full(
+    ca: &MtlsTestCa,
+    organizations: &[&str],
+    tail: &[Vec<u8>],
+) -> lorica_core::protocols::tls::SslDigest {
+    const ORGANIZATION_NAME_OID: [u64; 4] = [2, 5, 4, 10];
+    assert!(
+        organizations.len() <= 2,
+        "test setup: at most two O= values"
+    );
     let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "client");
-    params
-        .distinguished_name
-        .push(rcgen::DnType::OrganizationName, org);
+    if let Some(first) = organizations.first() {
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationName, *first);
+    }
+    if let Some(second) = organizations.get(1) {
+        params.distinguished_name.push(
+            rcgen::DnType::CustomDnType(ORGANIZATION_NAME_OID.to_vec()),
+            *second,
+        );
+    }
     let key = rcgen::KeyPair::generate().unwrap();
     let der = params.signed_by(&key, &ca.issuer).unwrap().der().to_vec();
-    let (organization, serial) =
-        lorica_core::utils::tls::get_organization_serial_bytes(&der).unwrap();
+    let (peer_organizations, serial) =
+        lorica_core::utils::tls::get_organizations_serial_bytes(&der).unwrap();
     let mut digest = lorica_core::protocols::tls::SslDigest::new(
         "TLS13_AES_128_GCM_SHA256",
         "TLSv1.3",
-        organization,
+        (!peer_organizations.is_empty()).then(|| peer_organizations.concat()),
         Some(serial),
         vec![1],
     );
+    digest.peer_organizations = peer_organizations;
     digest.peer_cert_chain = lorica_core::protocols::tls::PeerCertChain::new(
         std::iter::once(der.as_slice()).chain(tail.iter().map(Vec::as_slice)),
     );
     digest
+}
+
+#[test]
+fn test_route_client_cert_two_o_values_never_join_into_an_allowed_org() {
+    let ca_b = mtls_test_ca("CA B");
+    let split = client_digest_full(&ca_b, &["Ac", "me"], &[]);
+    // Upstream's joined field reads `Acme`; the policy must not.
+    assert_eq!(split.organization.as_deref(), Some("Acme"));
+    assert_eq!(split.peer_organizations, orgs(&["Ac", "me"]));
+    assert_eq!(
+        judge(&split, &route_enforcer(&ca_b, true, vec!["Acme"])),
+        Some(495)
+    );
+    assert_eq!(
+        judge(&split, &route_enforcer(&ca_b, true, vec!["me"])),
+        None
+    );
 }
 
 fn route_enforcer(ca: &MtlsTestCa, required: bool, orgs: Vec<&str>) -> MtlsEnforcer {
@@ -2614,7 +2693,7 @@ fn test_route_client_cert_own_ca_leaf_accepted() {
     assert_eq!(
         route_client_cert(Some(&digest), &route_b),
         RouteClientCert::Verified {
-            organization: "Beta"
+            organizations: &orgs(&["Beta"])
         }
     );
     assert_eq!(judge(&digest, &route_b), None);

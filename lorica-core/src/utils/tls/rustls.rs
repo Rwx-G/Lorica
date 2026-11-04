@@ -55,6 +55,36 @@ pub fn get_organization_x509(x509cert: &X509Certificate<'_>) -> Option<String> {
         .reduce(|cur, next| cur + &next)
 }
 
+/// Lorica: every `O=` value of the certificate's subject, each whole, in
+/// the order the subject lists them. [`get_organization_x509`] joins them
+/// with no separator, so `O=Ac, O=me` and `O=Acme` read the same there;
+/// a policy that matches organizations compares these instead. A value
+/// that is not a decodable string is left out, as it is there.
+pub fn get_organizations_x509(x509cert: &X509Certificate<'_>) -> Vec<String> {
+    x509cert
+        .subject
+        .iter_organization()
+        .filter_map(|a| a.as_str().ok())
+        .map(|a| a.to_string())
+        .collect()
+}
+
+/// Lorica: [`get_organization_serial_bytes`] with the `O=` values kept
+/// apart ([`get_organizations_x509`]), and a certificate x509-parser
+/// refuses reported as an error.
+pub fn get_organizations_serial_bytes(cert: &[u8]) -> Result<(Vec<String>, String)> {
+    let (_, x509cert) = X509Certificate::from_der(cert).map_err(|e| {
+        lorica_error::Error::explain(
+            lorica_error::ErrorType::InvalidCert,
+            format!("failed to parse certificate from DER format: {e}"),
+        )
+    })?;
+    Ok((
+        get_organizations_x509(&x509cert),
+        x509cert.raw_serial_as_string(),
+    ))
+}
+
 /// Return the organization associated with the X509 certificate (as bytes).
 /// see https://en.wikipedia.org/wiki/X.509#Structure_of_a_certificate
 pub fn get_organization_serial_bytes(cert: &[u8]) -> Result<(Option<String>, String)> {

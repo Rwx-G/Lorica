@@ -252,11 +252,12 @@ pub enum RouteClientCert<'a> {
     /// bundle. It carries no identity on this route.
     Untrusted,
     /// A certificate that chains to this route's CA, with its subject
-    /// organization (`""` when it has no `O=`, which no non-empty
-    /// allowlist contains).
+    /// organizations (none when it has no `O=`, which no non-empty
+    /// allowlist then matches).
     Verified {
-        /// The end-entity's subject organization.
-        organization: &'a str,
+        /// Every `O=` value of the end-entity's subject, each whole
+        /// (`SslDigest::peer_organizations`).
+        organizations: &'a [String],
     },
 }
 
@@ -289,7 +290,7 @@ pub fn route_client_cert<'a>(
         .get_or_compute(verifier.memo_key(), || verifier.verifies(chain));
     if verified {
         RouteClientCert::Verified {
-            organization: ssl.organization.as_deref().unwrap_or_default(),
+            organizations: &ssl.peer_organizations,
         }
     } else {
         RouteClientCert::Untrusted
@@ -323,20 +324,27 @@ pub(crate) fn downstream_route_client_cert<'a>(
 ///   admits clients without a certificate, and the allowlist is not
 ///   consulted for an identity the route does not trust.
 /// - a cert that chains to the route's CA, `allowed_organizations`
-///   non-empty and its org not in the list → 495, whether required is
-///   true or false: an operator who configured an allowlist meant to
-///   enforce it on verified certs.
+///   non-empty and none of its `O=` values in the list → 495, whether
+///   required is true or false: an operator who configured an allowlist
+///   meant to enforce it on verified certs.
+///
+/// Each `O=` value is compared whole and exactly, never their
+/// concatenation, so `O=Ac, O=me` does not match `Acme`. A subject with
+/// several `O=` values matches when any one of them is listed: the CA
+/// the route trusts asserted each of them, as much as it asserts a lone
+/// one, so refusing the subject would add no assurance and would lock
+/// out certificates that name a parent and a member organization.
 pub fn evaluate_mtls(enforcer: &MtlsEnforcer, client_cert: RouteClientCert<'_>) -> Option<u16> {
     match client_cert {
         RouteClientCert::Absent => enforcer.required.then_some(496),
         RouteClientCert::Untrusted => enforcer.required.then_some(495),
-        RouteClientCert::Verified { organization } => {
+        RouteClientCert::Verified { organizations } => {
             // Empty allowlist = accept any verified client.
             if enforcer.allowed_organizations.is_empty()
                 || enforcer
                     .allowed_organizations
                     .iter()
-                    .any(|a| a == organization)
+                    .any(|allowed| organizations.iter().any(|o| o == allowed))
             {
                 None
             } else {

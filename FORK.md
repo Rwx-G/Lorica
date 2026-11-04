@@ -387,6 +387,20 @@ lives in.
   request. `SslDigest::new` keeps upstream's signature and starts both
   empty. On an upstream sync, keep the two fields and the fill in
   `from_stream`; a new field upstream adds goes beside them.
+- **`lorica-core`, each subject organization kept apart (v1.10.3).**
+  Sites: `lorica-core/src/utils/tls/rustls.rs`
+  (`get_organizations_x509` and `get_organizations_serial_bytes`, which
+  upstream does not have), the `SslDigest::peer_organizations` field in
+  `digest.rs`, and `SslDigest::from_stream` in
+  `protocols/tls/rustls/stream.rs`. Upstream's `organization` joins every
+  `O=` value of the peer's subject with no separator, so `O=Ac, O=me`
+  reads as `Acme`, which is harmless for display and wrong for an
+  allowlist. `from_stream` now parses the end-entity once, through the
+  new function, and derives `organization` from the list by the same
+  join, so that field is unchanged; Lorica's mTLS allowlist reads the
+  list. The new function returns an error on a certificate x509-parser
+  refuses, where upstream's `get_organization_serial_bytes` panicked.
+  On an upstream sync, keep `from_stream` on the list function.
 
 ## Upstream sync record
 

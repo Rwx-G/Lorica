@@ -448,8 +448,11 @@ fn policy_grid_matches_spec() {
             client_verifier: None,
         }
     }
-    fn verified(organization: &str) -> RouteClientCert<'_> {
-        RouteClientCert::Verified { organization }
+    fn orgs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|o| o.to_string()).collect()
+    }
+    fn verified(organizations: &[String]) -> RouteClientCert<'_> {
+        RouteClientCert::Verified { organizations }
     }
     let untrusted = RouteClientCert::Untrusted;
 
@@ -459,24 +462,30 @@ fn policy_grid_matches_spec() {
         Some(496)
     );
     // required=true, any signed cert, empty allowlist -> pass
-    assert_eq!(evaluate_mtls(&e(true, &[]), verified("Whatever")), None);
+    assert_eq!(
+        evaluate_mtls(&e(true, &[]), verified(&orgs(&["Whatever"]))),
+        None
+    );
     // required=false, no cert -> pass (opportunistic)
     assert_eq!(evaluate_mtls(&e(false, &[]), RouteClientCert::Absent), None);
     // required=true, allowlisted org -> pass
-    assert_eq!(evaluate_mtls(&e(true, &["Acme"]), verified("Acme")), None);
+    assert_eq!(
+        evaluate_mtls(&e(true, &["Acme"]), verified(&orgs(&["Acme"]))),
+        None
+    );
     // required=true, not in allowlist -> 495
     assert_eq!(
-        evaluate_mtls(&e(true, &["Acme"]), verified("Gamma")),
+        evaluate_mtls(&e(true, &["Acme"]), verified(&orgs(&["Gamma"]))),
         Some(495)
     );
     // required=false, cert present but not in allowlist -> still 495
     // (allowlist always wins when a verified cert is presented)
     assert_eq!(
-        evaluate_mtls(&e(false, &["Acme"]), verified("Gamma")),
+        evaluate_mtls(&e(false, &["Acme"]), verified(&orgs(&["Gamma"]))),
         Some(495)
     );
     // empty org on cert vs. non-empty allowlist -> 495
-    assert_eq!(evaluate_mtls(&e(true, &["Acme"]), verified("")), Some(495));
+    assert_eq!(evaluate_mtls(&e(true, &["Acme"]), verified(&[])), Some(495));
     // required=true, cert not from this route's CA -> 495
     assert_eq!(evaluate_mtls(&e(true, &[]), untrusted), Some(495));
     // required=false, cert not from this route's CA -> pass, anonymous

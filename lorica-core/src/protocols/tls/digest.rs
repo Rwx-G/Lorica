@@ -30,6 +30,12 @@ pub struct SslDigest {
     pub version: Cow<'static, str>,
     /// The organization of the peer's certificate
     pub organization: Option<String>,
+    /// Lorica: every `O=` value of the peer's end-entity subject, each
+    /// whole, in subject order. `organization` joins them with no
+    /// separator, so `O=Ac, O=me` reads as `Acme` there; a policy that
+    /// matches organizations compares these. Empty when the peer sent no
+    /// certificate or its subject has no `O=`.
+    pub peer_organizations: Vec<String>,
     /// The serial number of the peer's certificate
     pub serial_number: Option<String>,
     /// The digest of the peer's certificate
@@ -68,6 +74,7 @@ impl SslDigest {
             cipher: cipher.into(),
             version: version.into(),
             organization,
+            peer_organizations: Vec::new(),
             serial_number,
             cert_digest,
             extension: SslDigestExtension::default(),
