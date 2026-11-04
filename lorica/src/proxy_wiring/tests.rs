@@ -887,6 +887,71 @@ fn test_exact_match_takes_precedence_over_wildcard() {
     assert_eq!(entry.route.id, "r1"); // wildcard matches
 }
 
+#[test]
+fn a_host_finds_its_route_whatever_its_case_and_root_dot() {
+    // RFC 9110: a host name is case-insensitive, and the absolute name
+    // with its root dot is the same host. Either spelling used to miss
+    // the exact route and fall to the wildcard.
+    let config = ProxyConfig::from_store(
+        vec![
+            make_route("wild", "*.example.com", "/", true),
+            make_route("exact", "app.example.com", "/", true),
+        ],
+        vec![],
+        vec![],
+        vec![],
+        ProxyConfigGlobals::default(),
+    );
+    for host in ["app.example.com", "App.Example.COM", "app.example.com."] {
+        let entry = config.find_route(host, "/").expect(host);
+        assert_eq!(entry.route.id, "exact", "{host}");
+    }
+    let entry = config.find_route("Other.EXAMPLE.com.", "/").expect("wild");
+    assert_eq!(entry.route.id, "wild");
+}
+
+#[test]
+fn the_request_host_drops_its_port_and_is_looked_up_canonical() {
+    let config = ProxyConfig::from_store(
+        vec![
+            make_route("exact", "app.example.com", "/", true),
+            make_route("v6", "[2001:db8::1]", "/", true),
+        ],
+        vec![],
+        vec![],
+        vec![],
+        ProxyConfigGlobals::default(),
+    );
+    for (sent, host, route) in [
+        ("app.example.com", "app.example.com", Some("exact")),
+        ("App.Example.com:8443", "app.example.com", Some("exact")),
+        ("app.example.com.:443", "app.example.com", Some("exact")),
+        ("[2001:DB8::1]:8443", "[2001:db8::1]", Some("v6")),
+        ("[2001:db8::1]", "[2001:db8::1]", Some("v6")),
+        ("[2001:db8::1", "[2001:db8::1", None),
+    ] {
+        let mut req = lorica_http::RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("Host", sent).unwrap();
+        let looked_up = request_host(&req);
+        assert_eq!(looked_up, host, "{sent}");
+        assert_eq!(
+            config
+                .find_route(&looked_up, "/")
+                .map(|e| e.route.id.as_str()),
+            route,
+            "{sent}"
+        );
+        // Forwarded upstream as the client sent it.
+        assert_eq!(extract_host(&req), sent);
+    }
+    let mut req = lorica_http::RequestHeader::build("GET", b"/", None).unwrap();
+    req.insert_header("Host", "app.example.com:8080").unwrap();
+    assert!(matches!(
+        request_host(&req),
+        std::borrow::Cow::Borrowed("app.example.com")
+    ));
+}
+
 // ---- Rate Limiter ----
 
 #[test]

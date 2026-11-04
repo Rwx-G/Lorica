@@ -284,8 +284,8 @@ pub mod helpers;
 // because they're re-exported by integration tests under `tests/`
 // (canary_e2e_test, mtls_e2e_test).
 pub(crate) use helpers::{
-    cache_vary_for_request, downstream_ssl_digest, extract_host, pick_consistent_hash,
-    sanitize_html,
+    cache_vary_for_request, downstream_ssl_digest, extract_host, host_without_port,
+    pick_consistent_hash, request_host, sanitize_html,
 };
 pub use helpers::{canary_bucket, evaluate_mtls};
 #[cfg(test)]
@@ -1076,14 +1076,13 @@ impl ProxyHttp for LoricaProxy {
             }
 
             let req = session.req_header();
-            let host_raw = extract_host(req);
-            let host = host_raw.split(':').next().unwrap_or(host_raw);
+            let host = request_host(req);
             let path = req.uri.path();
 
             // Find matching route (exact hostname first, then wildcard).
             // Cache the matched entry in ctx so upstream_peer does not
             // re-run find_route on the same request.
-            let entry = match config.find_route(host, path) {
+            let entry = match config.find_route(&host, path) {
                 Some(e) => e,
                 None => return Ok(false), // No route = let upstream_peer handle 404
             };
@@ -1984,8 +1983,7 @@ impl ProxyHttp for LoricaProxy {
     ) -> Result<Box<HttpPeer>> {
         let req = session.req_header();
 
-        let host_raw = extract_host(req);
-        let host = host_raw.split(':').next().unwrap_or(host_raw);
+        let host = request_host(req);
 
         let path = req.uri.path();
 
@@ -1998,7 +1996,7 @@ impl ProxyHttp for LoricaProxy {
             Some(cached) => Arc::clone(cached),
             None => {
                 config_guard = self.config.load();
-                match config_guard.find_route(host, path) {
+                match config_guard.find_route(&host, path) {
                     Some(e) => Arc::clone(e),
                     None => {
                         return Error::e_explain(
