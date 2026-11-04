@@ -4053,6 +4053,7 @@ pub(crate) async fn create_route_as(
         ai_bot_policy: body.ai_bot_policy,
         ai_bot_spoofed_fallback: body.ai_bot_spoofed_fallback,
         serve_robots_txt: body.serve_robots_txt.unwrap_or(false),
+        case_insensitive_paths: false,
         // The dashboard and the operator API only ever create
         // operator-managed rows; the automation API sets the mark.
         managed_by: None,

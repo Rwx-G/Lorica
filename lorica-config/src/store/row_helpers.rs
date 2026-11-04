@@ -333,6 +333,9 @@ pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
             .get::<_, Option<i64>>(71)
             .unwrap_or(None)
             .map(|v| v as u64),
+        // Column index 72 (migration V69). 0 = case-sensitive, what
+        // every route written before it was matched as.
+        case_insensitive_paths: row.get::<_, i32>(72).unwrap_or(0) != 0,
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(44)?)?,
     })

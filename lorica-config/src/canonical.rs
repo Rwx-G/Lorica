@@ -1076,6 +1076,7 @@ mod tests {
             ai_bot_policy: None,
             ai_bot_spoofed_fallback: None,
             serve_robots_txt: false,
+            case_insensitive_paths: false,
             managed_by: None,
             created_at: now,
             updated_at: now,
@@ -1399,6 +1400,31 @@ mod tests {
     }
 
     #[test]
+    fn a_1_10_2_blob_without_case_insensitive_paths_decodes_to_case_sensitive_routes() {
+        let mut cfg = fleet_config();
+        for route in &mut cfg.routes {
+            route.case_insensitive_paths = true;
+        }
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
+        for route in root["routes"]
+            .as_array_mut()
+            .expect("test setup: routes is an array")
+        {
+            let removed = route
+                .as_object_mut()
+                .expect("test setup: a route is an object")
+                .remove("case_insensitive_paths");
+            assert_eq!(removed, Some(serde_json::json!(true)), "on the wire");
+        }
+        let older = serde_json::to_vec(&root).expect("test setup: re-encode");
+        let decoded = decode_canonical(&older).expect("a 1.10.2-shaped blob still decodes");
+        assert!(!decoded.routes.is_empty());
+        assert!(decoded.routes.iter().all(|r| !r.case_insensitive_paths));
+    }
+
+    #[test]
     fn the_canonical_format_version_is_two() {
         let bytes = encode_canonical(&fleet_config()).expect("test setup: encode");
         let peek: serde_json::Value =
@@ -1442,8 +1468,18 @@ mod tests {
     /// handshake refuses it first. The version stays at 2. Pinned by
     /// `a_1_9_blob_without_the_adcs_certificate_fields_decodes_to_manual_certificates`.
     /// The AD CS authority itself is not in the blob at all (PRD D13).
+    ///
+    /// 1.10.3 moved it again, on the same argument: `Route` gained
+    /// `case_insensitive_paths`, a `bool` with a serde default of
+    /// `false`. A 1.10.3 follower decodes the 1.10.2 blob its control
+    /// plane sends until that control plane is upgraded last, and reads
+    /// every route as case-sensitive, which is how 1.10.2 matched it; a
+    /// 1.10.2 follower never receives the new shape, because migration
+    /// 69 puts it behind on schema and the handshake refuses it first.
+    /// The version stays at 2. Pinned by
+    /// `a_1_10_2_blob_without_case_insensitive_paths_decodes_to_case_sensitive_routes`.
     const CANONICAL_SHAPE_DIGEST: &str =
-        "8e3bb7aa1c7070ca67b2af5fe10dce2736be3c2b2e81f2429124f26498b257ed";
+        "a823349c9508932da6768c21e6da71241ee384287bb870369db859294166e9b7";
 
     /// Every field name `T` accepts, read from the type itself rather
     /// than from the JSON of some fixture.

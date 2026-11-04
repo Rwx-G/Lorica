@@ -261,6 +261,7 @@ fn test_route(mirror: Option<MirrorConfig>) -> Route {
         ai_bot_policy: None,
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
+        case_insensitive_paths: false,
         managed_by: None,
         waf_body_scan_max_bytes: None,
         created_at: chrono::Utc::now(),

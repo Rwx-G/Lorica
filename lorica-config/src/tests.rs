@@ -84,6 +84,7 @@ mod tests {
             ai_bot_policy: None,
             ai_bot_spoofed_fallback: None,
             serve_robots_txt: false,
+            case_insensitive_paths: false,
             managed_by: None,
             created_at: now,
             updated_at: now,
@@ -1315,14 +1316,14 @@ created_at = "2026-01-01T00:00:00Z"
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        // 68 is the current head of the tracked MIGRATIONS table (every
+        // 69 is the current head of the tracked MIGRATIONS table (every
         // schema change now carries a distinct version, including the
         // former post-v22 unconditional ALTER blocks).
         assert_eq!(
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            68
+            69
         );
     }
 
@@ -1340,7 +1341,7 @@ created_at = "2026-01-01T00:00:00Z"
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                68
+                69
             );
         }
     }
@@ -3299,6 +3300,72 @@ cert_critical_days = 3
             .expect("test setup: route fetch")
             .expect("test setup: value present");
         assert!(fetched.waf_body_scan_max_bytes.is_none());
+    }
+
+    #[test]
+    fn test_route_case_insensitive_paths_round_trip() {
+        // The last column on `routes`, read positionally: insert, both
+        // SELECTs and the update each carry it or it reads as false.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut route = make_route();
+        assert!(!route.case_insensitive_paths);
+        route.case_insensitive_paths = true;
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
+        let fetched = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
+        assert!(fetched.case_insensitive_paths);
+        assert!(store.list_routes().expect("test setup: route list")[0].case_insensitive_paths);
+
+        route.case_insensitive_paths = false;
+        store
+            .update_route(&route)
+            .expect("test setup: route updates");
+        let fetched = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
+        assert!(!fetched.case_insensitive_paths);
+    }
+
+    #[test]
+    fn test_case_insensitive_paths_survives_export_and_import() {
+        let source = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut route = make_route();
+        route.case_insensitive_paths = true;
+        source
+            .create_route(&route)
+            .expect("test setup: route inserts");
+        let toml_str = export_to_toml(&source).expect("export succeeds");
+        assert!(
+            toml_str.contains("case_insensitive_paths = true"),
+            "{toml_str}"
+        );
+
+        let target = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        import_to_store(&target, &parse_toml(&toml_str).expect("parses")).expect("imports");
+        let imported = target
+            .get_route(&route.id)
+            .expect("route reads")
+            .expect("route imported");
+        assert!(imported.case_insensitive_paths);
+
+        // A file exported before the field existed imports as it was
+        // matched then: case-sensitive.
+        let older = toml_str.replace("case_insensitive_paths = true\n", "");
+        assert!(!older.contains("case_insensitive_paths"));
+        let target = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        import_to_store(&target, &parse_toml(&older).expect("parses")).expect("imports");
+        assert!(
+            !target
+                .get_route(&route.id)
+                .expect("route reads")
+                .expect("route imported")
+                .case_insensitive_paths
+        );
     }
 
     #[test]

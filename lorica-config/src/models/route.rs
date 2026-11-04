@@ -577,6 +577,16 @@ pub struct Route {
     /// URL path prefix the route answers under (e.g. `"/api"`).
     /// Requests to `https://{hostname}{path_prefix}...` land here.
     pub path_prefix: String,
+    /// The route's backend treats paths case-insensitively (IIS, a
+    /// case-insensitive file system). On, `path_prefix` and each path
+    /// rule's `path` match a request path with ASCII case folded, under
+    /// both readings the selection compares
+    /// (`crate::route_selection::selects_alike_once_normalised`), so
+    /// `/ADMIN` is served by a route on `/admin` and its controls rather
+    /// than by a broader route without them. Off, case is significant,
+    /// as it always was. The path the backend receives never changes.
+    #[serde(default)]
+    pub case_insensitive_paths: bool,
     /// ID of the [`Certificate`] used to terminate TLS for this
     /// route. `None` means plaintext-only (HTTP listener).
     ///

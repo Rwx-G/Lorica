@@ -195,6 +195,7 @@ const MIGRATIONS: &[Migration] = &[
     (66, migrate_adcs_allowed_templates),
     (67, migrate_route_protection_records),
     (68, migrate_canonical_route_names),
+    (69, migrate_route_case_insensitive_paths),
 ];
 
 /// Which telemetry fan-in cursor a follower is reading or advancing
@@ -1500,6 +1501,21 @@ fn migrate_canonical_route_names(conn: &Connection) -> rusqlite::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `routes.case_insensitive_paths`: whether the route's backend treats
+/// paths case-insensitively, so its prefix and path rules match with
+/// ASCII case folded. 0 for every existing row, which is how each was
+/// matched before. Appended at the end of the table, as
+/// `migrate_route_waf_body_scan_cap` explains, because `row_to_route`
+/// reads the columns positionally.
+fn migrate_route_case_insensitive_paths(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "routes",
+        "case_insensitive_paths",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
 }
 
 fn migrate_acme_challenge_expiry(conn: &Connection) -> rusqlite::Result<()> {

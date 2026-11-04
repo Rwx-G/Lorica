@@ -792,6 +792,7 @@ mod tests {
             ai_bot_policy: None,
             ai_bot_spoofed_fallback: None,
             serve_robots_txt: false,
+            case_insensitive_paths: false,
             managed_by: None,
             created_at: now,
             updated_at: now,
@@ -1450,6 +1451,39 @@ mod tests {
         );
         assert_eq!(names("r-canonical").0, "shop.example.com");
         assert_eq!(names("r-twin").0, "Shop.Example.com");
+    }
+
+    #[test]
+    fn case_insensitive_paths_lands_on_the_follower_both_ways() {
+        let source = ConfigStore::open_in_memory().expect("source opens");
+        let target = ConfigStore::open_in_memory().expect("target opens");
+        let mut route = make_route("r-iis", "iis.example.com", &[]);
+        route.certificate_id = None;
+        route.case_insensitive_paths = true;
+        source.create_route(&route).expect("test setup: route");
+        let applied = || {
+            target
+                .get_route("r-iis")
+                .expect("reads")
+                .expect("applied")
+                .case_insensitive_paths
+        };
+
+        let config = prepared(&source).expect("prepare");
+        target
+            .apply_replica(&config, "edge-1", 1, "h1")
+            .expect("apply");
+        assert!(applied());
+
+        route.case_insensitive_paths = false;
+        source
+            .update_route(&route)
+            .expect("test setup: switched off");
+        let config = prepared(&source).expect("prepare");
+        target
+            .apply_replica(&config, "edge-1", 2, "h2")
+            .expect("apply");
+        assert!(!applied());
     }
 
     #[test]

@@ -65,6 +65,10 @@ fn assert_upgrades(fixture: &str) {
         .expect("route kept");
     assert_eq!(route.hostname, "app.example.com");
     assert_eq!(route.certificate_id.as_deref(), Some("cert-1"));
+    assert!(
+        !route.case_insensitive_paths,
+        "a released route is matched as it was, case-sensitively"
+    );
     assert_eq!(
         store.list_backends_for_route("route-1").expect("links"),
         vec!["backend-1".to_string()]
@@ -368,6 +372,50 @@ fn an_upgrade_from_version_66_adds_the_record_tables_and_touches_nothing_else() 
     assert_eq!(
         reopened.list_route_protection_records().expect("reads"),
         vec![record]
+    );
+}
+
+/// Migration 69 on a node that ran 1.10.2: the file is rewound to
+/// version 68, without the column, as such a node holds it. Its route
+/// comes through matched as it was, case-sensitively, and takes the
+/// flag once the column is there.
+#[test]
+fn an_upgrade_from_version_68_adds_case_insensitive_paths_switched_off() {
+    let dir = tempfile::tempdir().expect("test setup: tempdir");
+    let path = dir.path().join("lorica.db");
+    write_released_file(&path, LORICA_DB_V1_5_13);
+    drop(ConfigStore::open(&path, None).expect("test setup: upgraded to the head"));
+    Connection::open(&path)
+        .expect("test setup: raw open")
+        .execute_batch(
+            "ALTER TABLE routes DROP COLUMN case_insensitive_paths;
+             DELETE FROM schema_migrations WHERE version >= 69;",
+        )
+        .expect("test setup: a file at version 68");
+    let head = ConfigStore::open_in_memory()
+        .expect("fresh store")
+        .schema_version()
+        .expect("fresh version");
+
+    let store = ConfigStore::open(&path, None).expect("a version 68 lorica.db must open");
+    assert_eq!(store.schema_version().expect("version"), head);
+    let mut route = store
+        .get_route("route-1")
+        .expect("route reads")
+        .expect("route kept");
+    assert_eq!(route.hostname, "app.example.com");
+    assert!(!route.case_insensitive_paths);
+
+    route.case_insensitive_paths = true;
+    store.update_route(&route).expect("the flag is written");
+    drop(store);
+    let reopened = ConfigStore::open(&path, None).expect("reopens");
+    assert!(
+        reopened
+            .get_route("route-1")
+            .expect("route reads")
+            .expect("route kept")
+            .case_insensitive_paths
     );
 }
 

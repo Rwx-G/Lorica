@@ -866,6 +866,7 @@ fn environment_route(
         ai_bot_policy: None,
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
+        case_insensitive_paths: false,
         managed_by: managed_by(&input.name),
         created_at,
         updated_at: input.now,
