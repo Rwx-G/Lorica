@@ -670,6 +670,8 @@ fn upstream_backend(id: &str, addr: std::net::SocketAddr) -> Backend {
 
 struct TlsProxyHarness {
     port: u16,
+    /// The same proxy's plaintext listener.
+    plain_port: u16,
     proxy_config: Arc<ArcSwap<ProxyConfig>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -755,6 +757,8 @@ impl TlsProxyHarness {
 
         let port = reserve_port();
         let proxy_addr = format!("127.0.0.1:{port}");
+        let plain_port = reserve_port();
+        let plain_addr = format!("127.0.0.1:{plain_port}");
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let thread = std::thread::spawn(move || {
             let server_conf = Arc::new(lorica_core::server::configuration::ServerConf {
@@ -767,6 +771,7 @@ impl TlsProxyHarness {
             tls_settings.enable_h2();
             tls_settings.set_client_cert_verifier(mtls_verifier);
             proxy_service.add_tls_with_settings(&proxy_addr, None, tls_settings);
+            proxy_service.add_tcp(&plain_addr);
             let mut server = Server::new(None).unwrap();
             server.add_service(proxy_service);
             server.bootstrap();
@@ -775,8 +780,10 @@ impl TlsProxyHarness {
             });
         });
         wait_for_port(port).await;
+        wait_for_port(plain_port).await;
         Self {
             port,
+            plain_port,
             proxy_config,
             shutdown_tx,
             thread: Some(thread),
@@ -847,14 +854,33 @@ async fn tls_get(
     .await
     .map_err(|_| "handshake timeout".to_string())?
     .map_err(|e| format!("handshake: {e}"))?;
+    get_over(&mut tls, host, path).await
+}
+
+/// `GET path` naming `host` over the proxy's plaintext listener on
+/// `port`, `path` sent as written.
+async fn plain_get(port: u16, host: &str, path: &str) -> Result<(u16, String), String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .map_err(|e| e.to_string())?;
+    get_over(&mut stream, host, path).await
+}
+
+/// Writes `GET path` naming `host` on `stream` and reads the answer to
+/// its end: the status and the whole response as text.
+async fn get_over<S>(stream: &mut S, host: &str, path: &str) -> Result<(u16, String), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-    tls.write_all(request.as_bytes())
+    stream
+        .write_all(request.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
     loop {
-        match tls.read(&mut tmp).await {
+        match stream.read(&mut tmp).await {
             Ok(0) => break,
             Ok(n) => {
                 buf.extend_from_slice(&tmp[..n]);
@@ -1444,4 +1470,42 @@ async fn fullstack_path_rule_applies_to_every_spelling_of_its_path() {
     assert_eq!(status, 200, "the throttled path within its bucket: {body}");
     let (status, body) = get("/login").await;
     assert_eq!(status, 429, "the throttled path past its bucket: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_https_redirect_exempts_only_paths_that_stay_acme_challenges() {
+    // The HTTPS redirect spares ACME HTTP-01 challenges, which the CA
+    // fetches over plain HTTP. A path that is one only as sent, and
+    // another resource once a backend normalises it, is not spared.
+    let pki = build_pki();
+    let harness = public_and_admin_harness(&pki, |route| route.force_https = true).await;
+    let port = harness.plain_port;
+
+    let (status, body) = plain_get(port, "localhost", "/public")
+        .await
+        .expect("plain req");
+    assert_eq!(status, 301, "plain HTTP is redirected: {body}");
+    let (status, body) = plain_get(port, "localhost", "/.well-known/acme-challenge/token-1")
+        .await
+        .expect("plain req");
+    assert_eq!(status, 200, "a challenge stays on plain HTTP: {body}");
+
+    let mut answered = Vec::new();
+    for steered in [
+        "/.well-known/acme-challenge/../../public",
+        "/.well-known/acme-challenge/%2E%2E/%2E%2E/public",
+        "/.well-known/acme-challenge/..;/..;/public",
+        "/.well-known/acme-challenge/..\\..\\public",
+    ] {
+        let (status, body) = plain_get(port, "localhost", steered)
+            .await
+            .expect("plain req");
+        answered.push((steered, status, body.contains("upstream-ok")));
+    }
+    assert!(
+        answered
+            .iter()
+            .all(|(_, status, reached)| *status == 301 && !reached),
+        "a path that leaves the challenge namespace is redirected: {answered:?}"
+    );
 }

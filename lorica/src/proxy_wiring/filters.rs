@@ -136,6 +136,23 @@ pub(crate) fn build_redirect_location(
     format!("{base}{req_path}{query_suffix}")
 }
 
+/// Where an ACME CA fetches an HTTP-01 challenge token (RFC 8555
+/// section 8.3).
+pub(crate) const ACME_CHALLENGE_PATH_PREFIX: &str = "/.well-known/acme-challenge/";
+
+/// Whether `path` is an ACME HTTP-01 challenge both as sent and once
+/// normalised the way a backend may read it
+/// ([`lorica_config::route_selection::normalised_path`]), which is what
+/// exempts it from the HTTPS redirect: the CA fetches it over plain
+/// HTTP. Judged on the raw path alone, a path under the prefix that a
+/// backend reads as another resource would skip the redirect and be
+/// served in clear text.
+pub(crate) fn is_acme_challenge_path(path: &str) -> bool {
+    path.starts_with(ACME_CHALLENGE_PATH_PREFIX)
+        && lorica_config::route_selection::normalised_path(path)
+            .starts_with(ACME_CHALLENGE_PATH_PREFIX)
+}
+
 impl LoricaProxy {
     /// Persist a `WafEvent` to the SQLite-backed `LogStore`.
     ///
@@ -724,7 +741,7 @@ impl LoricaProxy {
         let path = req.uri.path();
 
         // Force HTTPS redirect (skip for ACME challenges - must stay HTTP)
-        if entry.route.force_https && !path.starts_with("/.well-known/acme-challenge/") {
+        if entry.route.force_https && !is_acme_challenge_path(path) {
             let is_tls = session
                 .digest()
                 .and_then(|d| d.ssl_digest.as_ref())
@@ -2476,6 +2493,21 @@ mod tests {
     use super::*;
     use ipnet::IpNet;
     use regex::Regex;
+
+    #[test]
+    fn an_acme_challenge_is_one_under_both_readings() {
+        assert!(is_acme_challenge_path("/.well-known/acme-challenge/tok"));
+        assert!(is_acme_challenge_path("/.well-known/acme-challenge//tok"));
+        for leaves in [
+            "/.well-known/acme-challenge/../../admin",
+            "/.well-known/acme-challenge/%2e%2e/%2e%2e/admin",
+            "/.well-known/acme-challenge/..;/..;/admin",
+            "/.well-known/acme-challenge/..\\..\\admin",
+            "/admin",
+        ] {
+            assert!(!is_acme_challenge_path(leaves), "{leaves}");
+        }
+    }
 
     #[test]
     fn the_slowloris_threshold_never_wraps_on_an_unvalidated_header_timeout() {
