@@ -6263,6 +6263,13 @@ components:
             write sent. Requests are looked up in the same form.
         path_prefix:
           type: string
+        case_insensitive_paths:
+          type: boolean
+          description: >-
+            The route's backend treats paths case-insensitively (IIS, a
+            case-insensitive file system): `path_prefix` and each path
+            rule's `path` match a request path with ASCII case folded. The
+            path sent to the backend never changes.
         backends:
           type: array
           items:
@@ -6348,6 +6355,13 @@ components:
         path_prefix:
           type: string
           default: "/"
+        case_insensitive_paths:
+          type: boolean
+          default: false
+          description: >-
+            Match `path_prefix` and each path rule's `path` with ASCII case
+            folded, for a backend that treats paths case-insensitively. On
+            the automation API a token may switch it on, never off.
         backend_ids:
           type: array
           items:
@@ -6396,6 +6410,13 @@ components:
             (400). On an update, checked only when the hostname changes.
         path_prefix:
           type: string
+        case_insensitive_paths:
+          type: boolean
+          description: >-
+            Match `path_prefix` and each path rule's `path` with ASCII case
+            folded, for a backend that treats paths case-insensitively.
+            Absent leaves it as stored. On the automation API a token may
+            switch it on, never off (403).
         backend_ids:
           type: array
           items:

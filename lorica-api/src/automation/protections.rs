@@ -124,6 +124,11 @@ pub const ROUTE_PROTECTIONS: &[Protection<Route>] = &[
         auto_ban_weakened,
         adopt_auto_ban,
     ),
+    Protection::weighing(
+        route_rule::CASE_INSENSITIVE_PATHS,
+        case_folding_switched_off,
+        switch_case_folding_on,
+    ),
 ];
 
 /// Every backend control an automation token may only strengthen:
@@ -262,6 +267,7 @@ pub(crate) fn fortified(id: &str, hostname: &str) -> Route {
         scope: lorica_config::models::RateLimitScope::PerIp,
     });
     route.auto_ban_threshold = Some(5);
+    route.case_insensitive_paths = true;
     route
 }
 
@@ -450,6 +456,14 @@ fn adopt_rate_limit(from: &Route, to: &mut Route) {
 
 fn adopt_auto_ban(from: &Route, to: &mut Route) {
     to.auto_ban_threshold = from.auto_ban_threshold;
+}
+
+fn case_folding_switched_off(before: &Route, after: &Route) -> bool {
+    before.case_insensitive_paths && !after.case_insensitive_paths
+}
+
+fn switch_case_folding_on(_from: &Route, to: &mut Route) {
+    to.case_insensitive_paths = true;
 }
 
 fn verification_switched_off(before: &Backend, after: &Backend) -> bool {
@@ -752,6 +766,12 @@ mod tests {
             &base,
             &with(|r| r.auto_ban_threshold = Some(5)),
             "auto_ban_threshold",
+        );
+
+        only_strengthens(
+            &base,
+            &with(|r| r.case_insensitive_paths = true),
+            "case_insensitive_paths",
         );
     }
 

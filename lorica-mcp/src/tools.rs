@@ -1129,6 +1129,7 @@ const ROUTE_CREATE_FIELDS: &[&str] = &[
     "cache_max_bytes",
     "cache_ttl_s",
     "cache_vary_headers",
+    "case_insensitive_paths",
     "certificate_id",
     "compression_enabled",
     "connect_timeout_s",
@@ -1211,6 +1212,7 @@ const ROUTE_UPDATE_FIELDS: &[&str] = &[
     "cache_max_bytes",
     "cache_ttl_s",
     "cache_vary_headers",
+    "case_insensitive_paths",
     "certificate_id",
     "compression_enabled",
     "connect_timeout_s",
@@ -1444,7 +1446,9 @@ pub const MUTATIONS: &[Mutation] = &[
                   or tightened in its mode; `bot_protection` added where none is set, never \
                   changed or removed (`bot_protection_disable` included); `rate_limit`, \
                   `rate_limit_rps`, `rate_limit_burst` and `auto_ban_threshold` added or \
-                  lowered, never raised or cleared. A write in the other direction is refused, \
+                  lowered, never raised or cleared; `case_insensitive_paths` (the backend \
+                  ignores case, so the prefix and path rules match in any case) on, never \
+                  off. A write in the other direction is refused, \
                   preview included; it is made in the dashboard. `header_rules` replaces the \
                   whole list: a rule sent back with the `[redacted]` value it was read with \
                   keeps the value stored for the rule at the same position with the same \
