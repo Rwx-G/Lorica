@@ -917,6 +917,23 @@ pub fn build_router(
                 RL_WINDOW_S,
             )),
         )
+        // Route protection records (backlog #93): what a route an
+        // automation token deleted served, which the automation plane
+        // holds its later writes to. Management-plane only, like the
+        // tokens: the automation listener has no route for these paths,
+        // so no token can list or clear what bounds it.
+        .route(
+            "/api/v1/automation/route-protection-records",
+            get(crate::route_protection_records::list_route_protection_records),
+        )
+        .route(
+            "/api/v1/automation/route-protection-records/{id}",
+            delete(crate::route_protection_records::clear_route_protection_record).layer(rl(
+                "destructive_cud",
+                RL_DESTRUCTIVE_CUD,
+                RL_WINDOW_S,
+            )),
+        )
         .route(
             "/api/v1/validate/mtls-pem",
             post(crate::routes::validate_mtls_pem),

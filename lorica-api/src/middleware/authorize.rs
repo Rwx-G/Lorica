@@ -156,6 +156,17 @@ pub fn required_role(method: &http::Method, path: &str) -> Role {
     {
         return Role::SuperAdmin;
     }
+    // Route protection records (backlog #93) sit at the Operator floor
+    // for every method, listing included. Clearing one lets a token's
+    // route serve the record's names weaker than the deleted route did,
+    // which an Operator may already do by deleting a route and creating
+    // it bare; and the listing names which token deleted what, which is
+    // the audit log's floor, not a Viewer's.
+    if path == "/api/v1/automation/route-protection-records"
+        || path.starts_with("/api/v1/automation/route-protection-records/")
+    {
+        return Role::Operator;
+    }
 
     if method == http::Method::GET || method == http::Method::HEAD {
         // `format=key` / `format=full` return the private key; the
@@ -573,6 +584,31 @@ mod tests {
             required_role(&Method::GET, "/api/v1/capture/rules/abc"),
             Role::SuperAdmin
         );
+    }
+
+    #[test]
+    fn route_protection_records_are_operator_for_every_method() {
+        // Stated because the GET default is Viewer and the token paths
+        // beside these are SuperAdmin: the listing names which token
+        // deleted what, and the clear is a decision an Operator already
+        // takes by deleting a route and creating it bare.
+        for (method, path) in [
+            (Method::GET, "/api/v1/automation/route-protection-records"),
+            (
+                Method::DELETE,
+                "/api/v1/automation/route-protection-records/abc",
+            ),
+        ] {
+            assert_eq!(
+                required_role(&method, path),
+                Role::Operator,
+                "{method} {path}"
+            );
+        }
+        assert!(!follower_local_request(
+            &Method::DELETE,
+            "/api/v1/automation/route-protection-records/abc"
+        ));
     }
 
     #[test]

@@ -109,6 +109,11 @@
 //! controls of the route it displaces instead, through the same rules
 //! ([`inherit_displaced_protections`]).
 //!
+//! A route a token deleted is weighed as if it were still there: the
+//! delete leaves a record of the route, and every route write of this
+//! plane is held to it as to a displaced stored route
+//! ([`super::records`]).
+//!
 //! # The scopes bound each other
 //!
 //! A route write naming `certificate_id` binds a certificate, which is
@@ -471,7 +476,7 @@ pub const BACKEND_PROTECTIONS: &[Protection<Backend>] = &[
 
 /// The first rule of `protections` that `after` breaks against
 /// `before`.
-fn first_weakened<'p, T>(
+pub(super) fn first_weakened<'p, T>(
     protections: &'p [Protection<T>],
     before: &T,
     after: &T,
@@ -623,49 +628,102 @@ fn ensure_names_unclaimed(store: &ConfigStore, after: &Route) -> Result<(), ApiE
 /// inherits from what serves the host underneath it today, a
 /// protection the operator added there since included.
 ///
-/// Returns the ids of the routes at least one control was raised from.
+/// The record of a deleted route the environment's route would serve
+/// the names of ([`super::records`]) is a displaced route like any
+/// other here: its controls are raised to the same way.
+///
+/// Returns the ids of the routes, and of the records, at least one
+/// control was raised from.
 ///
 /// # Errors
 ///
-/// A store read failure, or a 403 naming the field and the displaced
-/// route's id when two displaced routes ask for what no one value
-/// meets (two Basic auth credentials, two allowlists neither of which
-/// covers the other), which the environment's route cannot satisfy.
+/// A store read failure, a 403 naming a record that does not read, or a
+/// 403 naming the field and the displaced route's or record's id when
+/// two of them ask for what no one value meets (two Basic auth
+/// credentials, two allowlists neither of which covers the other),
+/// which the environment's route cannot satisfy.
 pub(super) fn inherit_displaced_protections(
     store: &ConfigStore,
     route: &mut Route,
-) -> Result<Vec<String>, ApiError> {
+) -> Result<Inherited, ApiError> {
     let stored: Vec<Route> = store
         .list_routes()?
         .into_iter()
         .filter(|stored| stored.id != route.id)
         .collect();
-    let displaced = routes_displaced_by(&stored, route);
-    let mut inherited_from: Vec<String> = Vec::new();
-    for from in &displaced {
+    let recorded = super::records::recorded(store)?;
+    let displaced: Vec<(Source, &Route)> = routes_displaced_by(&stored, route)
+        .into_iter()
+        .map(|from| (Source::Route(from.id.clone()), from))
+        .chain(
+            super::records::records_displaced_by(&stored, &recorded, route)
+                .into_iter()
+                .map(|from| (Source::Record(from.record.id.clone()), &from.route)),
+        )
+        .collect();
+    let mut inherited = Inherited::default();
+    for (source, from) in &displaced {
         for protection in ROUTE_PROTECTIONS {
             if (protection.weakened)(from, route) {
                 (protection.strengthened)(from, route);
-                if !inherited_from.contains(&from.id) {
-                    inherited_from.push(from.id.clone());
-                }
+                inherited.note(source);
             }
         }
     }
-    for from in &displaced {
+    for (source, from) in &displaced {
         if let Some(protection) = first_weakened(ROUTE_PROTECTIONS, from, route) {
+            let named = match source {
+                Source::Route(id) => {
+                    format!("route `{id}` serves this environment's hostname today")
+                }
+                Source::Record(id) => format!(
+                    "route protection record `{id}` holds the protections of a deleted route \
+                     that served this environment's hostname"
+                ),
+            };
             return Err(ApiError::Forbidden(format!(
-                "{}: route `{}` serves this environment's hostname today, and the \
-                 environment's route cannot take over its protections without being weaker \
-                 on that control ({}); another route serving the same hostname asks for a \
-                 different value, and an operator reconciles them in the dashboard",
+                "{}: {named}, and the environment's route cannot take over its protections \
+                 without being weaker on that control ({}); another route serving the same \
+                 hostname asks for a different value, and an operator reconciles them in the \
+                 dashboard",
                 protection.fields.join(" / "),
-                from.id,
                 protection.rule
             )));
         }
     }
-    Ok(inherited_from)
+    Ok(inherited)
+}
+
+/// What an environment's route was raised from, as
+/// [`inherit_displaced_protections`] reports it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Inherited {
+    /// The stored routes at least one control was raised from.
+    pub(super) routes: Vec<String>,
+    /// The route protection records at least one control was raised
+    /// from.
+    pub(super) records: Vec<String>,
+}
+
+/// Where a displaced control comes from.
+enum Source {
+    /// A stored route, by id.
+    Route(String),
+    /// A route protection record, by id.
+    Record(String),
+}
+
+impl Inherited {
+    /// Notes `source` once.
+    fn note(&mut self, source: &Source) {
+        let (ids, id) = match source {
+            Source::Route(id) => (&mut self.routes, id),
+            Source::Record(id) => (&mut self.records, id),
+        };
+        if !ids.contains(id) {
+            ids.push(id.clone());
+        }
+    }
 }
 
 fn basic_auth_weakened(before: &Route, after: &Route) -> bool {
@@ -1094,11 +1152,13 @@ fn ensure_new_links_granted(
 
 /// The token's grant as the guard a route write runs inside its store
 /// closure: the row as stored, the row as it would be, the route it
-/// would take a host from, and the backends linked anew. A header-rule
-/// value sent back as the mask this plane answered it with keeps the
-/// stored value
+/// would take a host from, the record of a deleted route it would take
+/// a host from, and the backends linked anew. A header-rule value sent
+/// back as the mask this plane answered it with keeps the stored value
 /// ([`redact::restore_header_rule_values`]) before any of that is
-/// weighed.
+/// weighed. A delete it allows leaves the deleted route's record when
+/// a control is in force on it
+/// ([`super::records::record_deleted_protections`]).
 fn route_guard(principal: &AutomationPrincipal) -> RouteGuard {
     let principal = principal.clone();
     RouteGuard::bounded(move |store, target| {
@@ -1119,10 +1179,12 @@ fn route_guard(principal: &AutomationPrincipal) -> RouteGuard {
         if let Some(after) = target.after {
             ensure_names_unclaimed(store, after)?;
             ensure_no_route_displaced_weaker(store, after)?;
+            super::records::ensure_no_record_displaced_weaker(store, after)?;
         }
         ensure_new_links_granted(store, &principal, target)
     })
     .restoring_withheld(redact::restore_header_rule_values)
+    .settling(super::records::record_deleted_protections)
 }
 
 /// A certificate a route write binds anew, weighed as a renewal would
@@ -1723,6 +1785,8 @@ pub async fn update_settings(
 mod admin_tier_tests;
 #[cfg(test)]
 mod plane_tests;
+#[cfg(test)]
+mod record_tests;
 
 #[cfg(test)]
 mod tests {

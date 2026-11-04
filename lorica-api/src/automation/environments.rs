@@ -54,7 +54,9 @@
 //! of 2026-10-04), through the same rules and the same host selection
 //! that bound a token's own route
 //! ([`super::write::inherit_displaced_protections`]), and the answer
-//! names those routes by id in `protections_inherited_from`.
+//! names those routes by id in `protections_inherited_from`. The record
+//! of a protected route a token deleted (`super::records`) is inherited
+//! from the same way, named in `protections_inherited_from_records`.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -195,6 +197,12 @@ pub struct EnvironmentWriteResponse {
     /// are not answered: a Basic auth credential among them stays in
     /// the store.
     pub protections_inherited_from: Vec<String>,
+    /// The route protection records, by id, whose protections the
+    /// environment's route inherited the same way: each holds a route an
+    /// automation token deleted that served this hostname (backlog #93).
+    /// Empty when no such record covers it. The values inherited are not
+    /// answered.
+    pub protections_inherited_from_records: Vec<String>,
     /// The fleet configuration generation the control plane had
     /// PUBLISHED when this response was built; 0 on a standalone node,
     /// which has no fleet to wait for.
@@ -294,6 +302,7 @@ struct Written {
     created: bool,
     route: Route,
     protections_inherited_from: Vec<String>,
+    protections_inherited_from_records: Vec<String>,
     backend_ids: Vec<String>,
     certificate_id: String,
     certificate_not_after: DateTime<Utc>,
@@ -1007,7 +1016,7 @@ fn write_environment(store: &ConfigStore, input: &WriteInput) -> Result<PutOutco
         None => (uuid::Uuid::new_v4().to_string(), input.now),
     };
     let mut route = environment_route(input, route_id.clone(), &certificate.id, route_created_at);
-    let protections_inherited_from = inherit_displaced_protections(store, &mut route)?;
+    let inherited = inherit_displaced_protections(store, &mut route)?;
     if existing.is_some() {
         store.update_route(&route)?;
     } else {
@@ -1067,7 +1076,8 @@ fn write_environment(store: &ConfigStore, input: &WriteInput) -> Result<PutOutco
     Ok(PutOutcome::Written(Box::new(Written {
         created: existing.is_none(),
         route,
-        protections_inherited_from,
+        protections_inherited_from: inherited.routes,
+        protections_inherited_from_records: inherited.records,
         backend_ids,
         certificate_id: certificate.id.clone(),
         certificate_not_after: certificate.not_after,
@@ -1510,6 +1520,7 @@ async fn put_environment_inner(
         certificate_not_after: written.certificate_not_after.to_rfc3339(),
         expires_at: written.environment.expires_at.to_rfc3339(),
         protections_inherited_from: written.protections_inherited_from.clone(),
+        protections_inherited_from_records: written.protections_inherited_from_records.clone(),
         applied_generation: applied_generation(state),
     };
     let action = if written.created {

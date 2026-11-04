@@ -42,6 +42,17 @@
 //! it and under the same lock, that puts the stored value back or
 //! refuses a mask it cannot place, so the marker is never stored.
 //!
+//! # A guard also says what a write leaves behind beside its row
+//!
+//! A route guard can carry a settle, run inside the transaction that
+//! writes the row and after the write, never on a preview. It is how
+//! the two planes keep the route protection records (backlog #93): the
+//! automation plane's records the protections of a route a token
+//! deletes, and the management plane's clears the records of every name
+//! an operator's route write serves. It answers the audit rows the `_as`
+//! body then records beside its own, so a record is written, and
+//! audited, exactly when the route write it belongs to commits.
+//!
 //! # Who builds one
 //!
 //! The management wrappers pass an unbounded guard: the session's role
@@ -90,6 +101,10 @@ type RouteCheck = Arc<dyn Fn(&ConfigStore, RouteTarget<'_>) -> Result<(), ApiErr
 /// caller was shown masked and sent back unchanged; see
 /// [`RouteGuard::restoring_withheld`].
 type RouteRestore = fn(Option<&Route>, &mut Route) -> Result<(), ApiError>;
+/// Leaves behind, in the transaction that wrote the row, what the write
+/// owes beside it; see [`RouteGuard::settling`]. Handed the store, the
+/// actor as its audit row names it, and the rows as the write saw them.
+type RouteSettle = fn(&ConfigStore, &str, RouteTarget<'_>) -> Result<Vec<SettledRow>, ApiError>;
 type BackendCheck =
     Arc<dyn Fn(&ConfigStore, BackendTarget<'_>) -> Result<(), ApiError> + Send + Sync>;
 /// Puts back, in the backend about to be written, the stored values a
@@ -98,12 +113,29 @@ type BackendCheck =
 type BackendRestore = fn(Option<&Backend>, &mut Backend) -> Result<(), ApiError>;
 type CertificateCheck = Arc<dyn Fn(&Certificate) -> Result<(), ApiError> + Send + Sync>;
 
-/// Who may act on a route row, and what a caller shown masked values
-/// means by sending them back.
+/// One audit row a guard's settle asks the write to record beside its
+/// own, in the shape [`crate::audit::record`] takes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettledRow {
+    /// The dotted action verb.
+    pub action: &'static str,
+    /// The row's `target_type`.
+    pub target_type: &'static str,
+    /// The row's `target_id`.
+    pub target_id: String,
+    /// The payload before.
+    pub before: Option<serde_json::Value>,
+    /// The payload after.
+    pub after: Option<serde_json::Value>,
+}
+
+/// Who may act on a route row, what a caller shown masked values means
+/// by sending them back, and what a write leaves behind beside the row.
 #[derive(Clone)]
 pub struct RouteGuard {
     check: Option<RouteCheck>,
     restore: Option<RouteRestore>,
+    settle: Option<RouteSettle>,
 }
 
 impl RouteGuard {
@@ -113,6 +145,7 @@ impl RouteGuard {
         Self {
             check: None,
             restore: None,
+            settle: None,
         }
     }
 
@@ -123,6 +156,7 @@ impl RouteGuard {
         Self {
             check: Some(Arc::new(check)),
             restore: None,
+            settle: None,
         }
     }
 
@@ -164,6 +198,36 @@ impl RouteGuard {
         match &self.check {
             Some(check) => check(store, target),
             None => Ok(()),
+        }
+    }
+
+    /// This guard, with `settle` run after every write it guards: in the
+    /// transaction that wrote the row, on the rows as the write saw them
+    /// (`before` as read, `after` as written), never on a preview. What
+    /// it writes commits or rolls back with the row, and the audit rows
+    /// it answers are recorded beside the write's own.
+    pub fn settling(self, settle: RouteSettle) -> Self {
+        Self {
+            settle: Some(settle),
+            ..self
+        }
+    }
+
+    /// Run the settle, if this guard has one, as `actor`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the settle fails with; the caller's transaction rolls the
+    /// write back with it.
+    pub fn settle(
+        &self,
+        store: &ConfigStore,
+        actor: &str,
+        target: RouteTarget<'_>,
+    ) -> Result<Vec<SettledRow>, ApiError> {
+        match self.settle {
+            Some(settle) => settle(store, actor, target),
+            None => Ok(Vec::new()),
         }
     }
 }

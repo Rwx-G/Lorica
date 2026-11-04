@@ -983,6 +983,13 @@ paths:
         (403).
 
 
+        A name and path a route a token deleted would serve today is held
+        to that route's recorded protections (a route protection record),
+        exactly as a name a stored wildcard or catch-all serves is held to
+        that route's: a 403 names the control and the record, never a
+        value. An operator lists and clears records on the management API.
+
+
         With `?dry_run=true`, which needs `routes:read` (403), the route
         it would have created, and nothing created (200): see `DryRun`.
 
@@ -1095,7 +1102,10 @@ paths:
         its mode, `bot_protection` never changed once set, the WAF
         switched on and moved to blocking, and `rate_limit`,
         `rate_limit_rps`, `rate_limit_burst` and `auto_ban_threshold`
-        added or lowered; `docs/mcp.md` has the rule for each.
+        added or lowered; `docs/mcp.md` has the rule for each. A patch
+        that adds a name, moves the prefix or switches the route on is
+        also held to the route protection record of a route a token
+        deleted that would serve those names, as on create.
 
 
         `header_rules` replaces the whole list, and this plane answers
@@ -1154,6 +1164,15 @@ paths:
         an environment owns is deletable there and therefore here, and
         takes the environment with it; the audit row names the
         environment.
+
+
+        A route no environment owns that carries at least one control a
+        token may only strengthen leaves a route protection record, in the
+        same transaction, audited as `route_protection_record.create`:
+        every later route write on this plane that would serve its names
+        is held to it, so deleting a protected route and creating it again
+        is no way around the one-way rule. A delete through the management
+        API records nothing.
 
 
         With `?dry_run=true`, the route that would go, its environment
@@ -2036,7 +2055,7 @@ components:
 
     EnvironmentWriteResponse:
       type: object
-      required: [name, url, route_id, backend_ids, certificate_id, certificate_not_after, expires_at, protections_inherited_from, applied_generation]
+      required: [name, url, route_id, backend_ids, certificate_id, certificate_not_after, expires_at, protections_inherited_from, protections_inherited_from_records, applied_generation]
       properties:
         name:
           type: string
@@ -2070,6 +2089,16 @@ components:
             own profile was weaker on at least one of them. Empty when
             it displaced no protected route. The inherited values are
             not answered.
+        protections_inherited_from_records:
+          type: array
+          items:
+            type: string
+          description: >-
+            The ids of the route protection records whose protections
+            the environment's route inherited the same way: each holds a
+            route an automation token deleted that served this hostname.
+            Empty when none covers it. The inherited values are not
+            answered.
         applied_generation:
           type: integer
           format: int64

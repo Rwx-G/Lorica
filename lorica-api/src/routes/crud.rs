@@ -3694,7 +3694,7 @@ pub async fn create_route(
         &audit_ctx,
         body,
         crate::preview::WriteMode::Apply,
-        crate::target::RouteGuard::unbounded(),
+        crate::route_protection_records::management_guard(),
     )
     .await
 }
@@ -4053,7 +4053,8 @@ pub(crate) async fn create_route_as(
 
     guard.restore_withheld(None, &mut route)?;
     let backend_ids = body.backend_ids.unwrap_or_default();
-    let (route, backend_ids) = db_blocking(&state.store, move |store| {
+    let actor_name = actor.username.clone();
+    let (route, backend_ids, settled) = db_blocking(&state.store, move |store| {
         // The guard resolves the backend ids against the rows they
         // name under the same lock the links are written under, so the
         // backend it weighed is the backend the link reaches.
@@ -4066,16 +4067,26 @@ pub(crate) async fn create_route_as(
             },
         )?;
         if mode.previews() {
-            return Ok::<_, ApiError>((route, backend_ids));
+            return Ok::<_, ApiError>((route, backend_ids, Vec::new()));
         }
-        store.create_route(&route)?;
-
-        // Backend links land under the same single lock acquisition
-        // as the route insert, exactly as before.
-        for bid in &backend_ids {
-            store.link_route_backend(&route.id, bid)?;
-        }
-        Ok((route, backend_ids))
+        // The insert, its links and what the guard's settle leaves
+        // behind commit together or not at all.
+        let settled = store.in_transaction(|store| {
+            store.create_route(&route)?;
+            for bid in &backend_ids {
+                store.link_route_backend(&route.id, bid)?;
+            }
+            guard.settle(
+                store,
+                &actor_name,
+                crate::target::RouteTarget {
+                    before: None,
+                    after: Some(&route),
+                    backend_ids: Some(&backend_ids),
+                },
+            )
+        })?;
+        Ok((route, backend_ids, settled))
     })
     .await?;
     if mode.previews() {
@@ -4104,8 +4115,29 @@ pub(crate) async fn create_route_as(
         after.as_ref(),
     )
     .await;
+    record_settled(state, actor, settled).await;
 
     Ok(json_data_with_status(StatusCode::CREATED, response))
+}
+
+/// The audit rows a route guard's settle answered, recorded beside the
+/// write's own row.
+async fn record_settled(
+    state: &AppState,
+    actor: &crate::audit::AuditContext,
+    settled: Vec<crate::target::SettledRow>,
+) {
+    for row in settled {
+        crate::audit::record(
+            state,
+            actor,
+            row.action,
+            (row.target_type, &row.target_id),
+            row.before.as_ref(),
+            row.after.as_ref(),
+        )
+        .await;
+    }
 }
 
 /// GET /api/v1/routes/:id - fetch a single route by id.
@@ -4140,7 +4172,7 @@ pub async fn update_route(
         id,
         body,
         crate::preview::WriteMode::Apply,
-        crate::target::RouteGuard::unbounded(),
+        crate::route_protection_records::management_guard(),
     )
     .await
 }
@@ -4232,6 +4264,7 @@ pub(crate) async fn update_route_as(
     };
 
     let linked = body.backend_ids.clone();
+    let actor_name = actor.username.clone();
     let patched = apply_route_patch(
         snapshot.clone(),
         body.clone(),
@@ -4243,7 +4276,7 @@ pub(crate) async fn update_route_as(
     // The backend links before the patch are read only for a preview,
     // whose `before` view is the one place they are shown: the audit
     // row's `before` leaves them out rather than pay the read.
-    let (before_route, before_backend_ids, route, backend_ids) =
+    let (before_route, before_backend_ids, route, backend_ids, settled) =
         db_blocking(&state.store, move |store| {
             let before_route = store
                 .get_route(&id)?
@@ -4287,24 +4320,43 @@ pub(crate) async fn update_route_as(
             if mode.previews() {
                 let before_backend_ids = store.list_backends_for_route(&id)?;
                 let backend_ids = linked.unwrap_or_else(|| before_backend_ids.clone());
-                return Ok::<_, ApiError>((before_route, before_backend_ids, route, backend_ids));
+                return Ok::<_, ApiError>((
+                    before_route,
+                    before_backend_ids,
+                    route,
+                    backend_ids,
+                    Vec::new(),
+                ));
             }
 
-            store.update_route(&route)?;
+            // The update, its links and what the guard's settle leaves
+            // behind commit together or not at all.
+            let settled = store.in_transaction(|store| {
+                store.update_route(&route)?;
 
-            // Update backend associations if provided
-            if let Some(backend_ids) = &linked {
-                let current = store.list_backends_for_route(&id)?;
-                for bid in &current {
-                    store.unlink_route_backend(&id, bid)?;
+                // Update backend associations if provided
+                if let Some(backend_ids) = &linked {
+                    let current = store.list_backends_for_route(&id)?;
+                    for bid in &current {
+                        store.unlink_route_backend(&id, bid)?;
+                    }
+                    for bid in backend_ids {
+                        store.link_route_backend(&id, bid)?;
+                    }
                 }
-                for bid in backend_ids {
-                    store.link_route_backend(&id, bid)?;
-                }
-            }
+                guard.settle(
+                    store,
+                    &actor_name,
+                    crate::target::RouteTarget {
+                        before: Some(&before_route),
+                        after: Some(&route),
+                        backend_ids: linked.as_deref(),
+                    },
+                )
+            })?;
 
             let backend_ids = store.list_backends_for_route(&id)?;
-            Ok::<_, ApiError>((before_route, Vec::new(), route, backend_ids))
+            Ok::<_, ApiError>((before_route, Vec::new(), route, backend_ids, settled))
         })
         .await?;
     if mode.previews() {
@@ -4332,6 +4384,7 @@ pub(crate) async fn update_route_as(
         after.as_ref(),
     )
     .await;
+    record_settled(state, actor, settled).await;
 
     Ok(json_data(response))
 }
@@ -4766,7 +4819,7 @@ pub async fn delete_route(
         &audit_ctx,
         id,
         crate::preview::WriteMode::Apply,
-        crate::target::RouteGuard::unbounded(),
+        crate::route_protection_records::management_guard(),
     )
     .await
 }
@@ -4785,23 +4838,29 @@ pub(crate) async fn delete_route_as(
     mode: crate::preview::WriteMode,
     guard: crate::target::RouteGuard,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let route = db_blocking(&state.store, move |store| {
+    let actor_name = actor.username.clone();
+    let (route, settled) = db_blocking(&state.store, move |store| {
         let route = store
             .get_route(&id)?
             .ok_or_else(|| ApiError::NotFound(format!("route {id}")))?;
-        guard.check(
-            store,
-            crate::target::RouteTarget {
-                before: Some(&route),
-                after: None,
-                backend_ids: None,
-            },
-        )?;
+        let target = crate::target::RouteTarget {
+            before: Some(&route),
+            after: None,
+            backend_ids: None,
+        };
+        guard.check(store, target)?;
         if mode.previews() {
-            return Ok::<_, ApiError>(route);
+            return Ok::<_, ApiError>((route.clone(), Vec::new()));
         }
-        store.delete_route(&id)?;
-        Ok::<_, ApiError>(route)
+        // The delete and what the guard's settle leaves behind, the
+        // automation plane's record of the route's protections, commit
+        // together: a delete that outran its record would reopen the gap
+        // the record closes.
+        let settled = store.in_transaction(|store| {
+            store.delete_route(&id)?;
+            guard.settle(store, &actor_name, target)
+        })?;
+        Ok::<_, ApiError>((route.clone(), settled))
     })
     .await?;
 
@@ -4828,6 +4887,7 @@ pub(crate) async fn delete_route_as(
         None,
     )
     .await;
+    record_settled(state, actor, settled).await;
 
     Ok(json_data(serde_json::json!({"message": "route deleted"})))
 }
