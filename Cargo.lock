@@ -2329,9 +2329,9 @@ dependencies = [
 
 [[package]]
 name = "i_key_sort"
-version = "0.10.3"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d73d122b937fca067feb0ad74f62388920272b27c356d4df2d0cfdd59e044cf0"
+checksum = "14269ee362009550495e20650ff3c2bca14a8147fe251e216760381ffed90b6f"
 dependencies = [
  "rayon",
 ]

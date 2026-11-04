@@ -273,7 +273,8 @@ after any upstream sync that touches the function it lives in.
   no code change. `daggy` 0.8 to 0.9 in `lorica-core`, no code change.
   `float-cmp` 0.9 to 0.10 in `lorica-limits` (tests), no code change.
   `hashbrown` 0.12 to 0.17 in `lorica-lru`, on the `default-hasher` and
-  `inline-more` features only, no code change. On an upstream sync, keep Lorica's version and port the new
+  `inline-more` features only, no code change. `i_key_sort` 0.10 to
+  0.12 in `lorica-ketama` (the optional `v2` feature), no code change. On an upstream sync, keep Lorica's version and port the new
   code to its API rather than taking upstream's manifest line.
 
 ## Upstream sync record
