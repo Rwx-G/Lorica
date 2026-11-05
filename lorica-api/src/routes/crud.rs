@@ -24,7 +24,7 @@ use lorica_config::route_selection::{
 use super::forward_auth::{build_forward_auth, ForwardAuthConfigRequest};
 use super::header_rules::{build_header_rule, HeaderRuleRequest};
 use super::mirror::{build_mirror_config, MirrorConfigRequest};
-use super::mtls::{build_mtls_config, MtlsConfigRequest};
+use super::mtls::{build_mtls_config, log_mtls_bundle_trust_warnings, MtlsConfigRequest};
 use super::path_rules::{build_path_rules, PathRuleRequest, PathRuleResponse};
 use super::response_rewrite::{
     build_response_rewrite, ResponseRewriteConfigRequest, ResponseRewriteRuleRequest,
@@ -3038,6 +3038,10 @@ pub struct RouteResponse {
     /// (Story 8.2 AC #10). Default `false` = passthrough to backend.
     #[serde(default)]
     pub serve_robots_txt: bool,
+    /// Mirror of `Route.case_insensitive_paths`: the prefix and the
+    /// path rules match with ASCII case folded.
+    #[serde(default)]
+    pub case_insensitive_paths: bool,
     /// Who manages this route when it is not the operator (Story 10.4
     /// AC #8). Absent on an operator-managed row. A `Some` is badged by
     /// the dashboard and refused in-place edits by this API.
@@ -3241,6 +3245,10 @@ pub struct CreateRouteRequest {
     /// Auto-serve a Lorica-generated `/robots.txt` for this route
     /// (Story 8.2 AC #10). Default `false` = passthrough to backend.
     pub serve_robots_txt: Option<bool>,
+    /// The route's backend treats paths case-insensitively, so the
+    /// prefix and the path rules match with ASCII case folded
+    /// (`Route.case_insensitive_paths`). Default `false`.
+    pub case_insensitive_paths: Option<bool>,
     /// Refused with 422 when present: the mark is server-owned (see
     /// [`refuse_client_managed_by`]). Declared so the refusal is a
     /// deliberate check and not a silently dropped unknown field.
@@ -3441,6 +3449,8 @@ pub struct UpdateRouteRequest {
     /// Auto-serve a Lorica-generated `/robots.txt` for this route
     /// (Story 8.2 AC #10). `None` leaves alone.
     pub serve_robots_txt: Option<bool>,
+    /// `Route.case_insensitive_paths`. `None` leaves alone.
+    pub case_insensitive_paths: Option<bool>,
     /// Refused with 422 when present: the mark is server-owned (see
     /// [`refuse_client_managed_by`]).
     #[serde(default)]
@@ -3601,6 +3611,7 @@ pub(crate) fn route_to_response(
         ai_bot_policy: route.ai_bot_policy,
         ai_bot_spoofed_fallback: route.ai_bot_spoofed_fallback,
         serve_robots_txt: route.serve_robots_txt,
+        case_insensitive_paths: route.case_insensitive_paths,
         managed_by: route.managed_by.clone(),
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
@@ -4018,7 +4029,9 @@ pub(crate) async fn create_route_as(
             _ => None,
         },
         mtls: match body.mtls.as_ref() {
-            Some(m) if !m.ca_cert_pem.trim().is_empty() => Some(build_mtls_config(m)?),
+            Some(m) if !m.ca_cert_pem.trim().is_empty() => {
+                Some(build_mtls_config(m).inspect(log_mtls_bundle_trust_warnings)?)
+            }
             _ => None,
         },
         rate_limit: match body.rate_limit.as_ref() {
@@ -4051,6 +4064,7 @@ pub(crate) async fn create_route_as(
         ai_bot_policy: body.ai_bot_policy,
         ai_bot_spoofed_fallback: body.ai_bot_spoofed_fallback,
         serve_robots_txt: body.serve_robots_txt.unwrap_or(false),
+        case_insensitive_paths: body.case_insensitive_paths.unwrap_or(false),
         // The dashboard and the operator API only ever create
         // operator-managed rows; the automation API sets the mark.
         managed_by: None,
@@ -4744,13 +4758,15 @@ fn apply_route_patch(
     }
     if let Some(ref m) = body.mtls {
         // Empty ca_cert_pem = explicit "disable" signal from dashboard.
-        // Non-empty = validate + install/replace. Changes to the PEM
-        // take effect on next restart (rustls ServerConfig is immutable
-        // after build); required/allowed_organizations hot-reload.
+        // Non-empty = validate + install/replace. The route's own
+        // check follows a PEM change on reload; the listener's union
+        // of every route's CA only on restart (rustls ServerConfig is
+        // immutable after build). required/allowed_organizations
+        // hot-reload.
         if m.ca_cert_pem.trim().is_empty() {
             route.mtls = None;
         } else {
-            route.mtls = Some(build_mtls_config(m)?);
+            route.mtls = Some(build_mtls_config(m).inspect(log_mtls_bundle_trust_warnings)?);
         }
     }
     if let Some(ref rl) = body.rate_limit {
@@ -4810,6 +4826,9 @@ fn apply_route_patch(
     }
     if let Some(b) = body.serve_robots_txt {
         route.serve_robots_txt = b;
+    }
+    if let Some(b) = body.case_insensitive_paths {
+        route.case_insensitive_paths = b;
     }
     // Names the patch left as stored stay as stored, so the twin of a
     // name another route holds can still be switched off and edited

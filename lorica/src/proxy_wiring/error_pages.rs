@@ -142,12 +142,24 @@ fn info_for_status(status: u16) -> StatusInfo {
             broken_tier: BrokenTier::You,
             wiki_anchor: "403_Forbidden",
         },
+        421 => StatusInfo {
+            title: "Misdirected request",
+            what_happened: "This request reached the site over a connection that was opened \
+                            for another site, so the client certificate it carries, if any, was \
+                            chosen for that other site.",
+            what_can_i_do: "Retry the request: your client may open a new connection for this \
+                            site and present the certificate meant for it.",
+            broken_tier: BrokenTier::You,
+            wiki_anchor: "421_Misdirected_Request",
+        },
         495 => StatusInfo {
             title: "SSL certificate error",
-            what_happened: "The client certificate you presented is valid but its subject \
+            what_happened: "The client certificate you presented was not issued by a \
+                            certificate authority this route trusts, or its subject \
                             organization is not in the route's allowlist.",
-            what_can_i_do: "Use a client certificate whose subject organization is permitted, \
-                            or contact the site administrator to request access.",
+            what_can_i_do: "Use a client certificate issued for this site whose subject \
+                            organization is permitted, or contact the site administrator to \
+                            request access.",
             broken_tier: BrokenTier::You,
             wiki_anchor: "495_SSL_Certificate_Error",
         },

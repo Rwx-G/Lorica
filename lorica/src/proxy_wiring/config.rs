@@ -158,12 +158,13 @@ pub struct RouteEntry {
     /// source rule's regex failed to compile - that rule is silently
     /// skipped at runtime. Empty vec when the feature is off.
     pub response_rewrite_compiled: Vec<Option<CompiledRewriteRule>>,
-    /// Pre-compiled mTLS enforcement state (required flag + a
-    /// pre-lowercased org allowlist). `None` when mTLS is disabled
-    /// for this route. Chain validation itself is done by the
-    /// listener-level rustls verifier; per-request decisions (does
-    /// this route require a cert, did it present one, does the
-    /// organization match) happen in `request_filter`.
+    /// Pre-compiled mTLS enforcement state: the route's own client
+    /// verifier, the required flag and the org allowlist. `None` when
+    /// mTLS is disabled for this route. The listener-level rustls
+    /// verifier trusts every mTLS route's CA at once; whether the
+    /// presented chain comes from THIS route's CA, whether the route
+    /// requires a cert and whether the organization matches are decided
+    /// per request in `check_mtls`.
     pub mtls_enforcer: Option<MtlsEnforcer>,
     /// Pre-compiled regex set for bot-protection `bypass.user_agents`.
     /// Built once at config-reload time so the per-request evaluate()
@@ -177,15 +178,41 @@ pub struct RouteEntry {
     /// all-malformed allowlist stays fail-closed.
     pub ip_allowlist_nets: Vec<ipnet::IpNet>,
     pub ip_denylist_nets: Vec<ipnet::IpNet>,
+    /// The route's prefix and rule paths as a normalising backend reads
+    /// them, read once here so the check of a request whose path
+    /// normalises does not read them again
+    /// ([`ProxyConfig::selects_alike_once_normalised`]).
+    pub normalised_paths: route_selection::NormalisedPaths,
 }
 
 /// Runtime-side view of a route's mTLS policy: the bits we check at
-/// request time. The CA bundle itself is installed on the listener at
-/// startup and is not needed here.
+/// request time, built with the snapshot so a reload rebuilds them.
 #[derive(Debug, Clone)]
 pub struct MtlsEnforcer {
+    /// Refuse a request that carries no client certificate from this
+    /// route's CA.
     pub required: bool,
+    /// Subject organizations accepted from a verified certificate; empty
+    /// accepts any.
     pub allowed_organizations: Vec<String>,
+    /// The route's own CA bundle. `None` when it holds no usable
+    /// certificate: then no presented chain verifies on this route.
+    pub client_verifier: Option<Arc<crate::mtls::RouteClientVerifier>>,
+}
+
+impl MtlsEnforcer {
+    /// Build the enforcer for one route's mTLS configuration.
+    pub fn from_config(route_id: &str, config: &lorica_config::models::MtlsConfig) -> Self {
+        MtlsEnforcer {
+            required: config.required,
+            allowed_organizations: config.allowed_organizations.clone(),
+            client_verifier: crate::mtls::RouteClientVerifier::from_pem(
+                route_id,
+                &config.ca_cert_pem,
+            )
+            .map(Arc::new),
+        }
+    }
 }
 
 /// In-memory configuration snapshot used by the proxy.
@@ -557,10 +584,10 @@ impl ProxyConfig {
                 })
                 .collect();
 
-            let mtls_enforcer = route.mtls.as_ref().map(|m| MtlsEnforcer {
-                required: m.required,
-                allowed_organizations: m.allowed_organizations.clone(),
-            });
+            let mtls_enforcer = route
+                .mtls
+                .as_ref()
+                .map(|m| MtlsEnforcer::from_config(&route.id, m));
 
             let bot_ua_regex_set = route.bot_protection.as_ref().and_then(|bp| {
                 let pats = &bp.bypass.user_agents;
@@ -597,6 +624,7 @@ impl ProxyConfig {
                 bot_ua_regex_set,
                 ip_allowlist_nets: super::filters::compile_ip_patterns(&route.ip_allowlist),
                 ip_denylist_nets: super::filters::compile_ip_patterns(&route.ip_denylist),
+                normalised_paths: route_selection::NormalisedPaths::of(&route),
             });
 
             entries.push(entry);
@@ -697,6 +725,25 @@ impl ProxyConfig {
             host,
             path,
             |entry| entry.route.as_ref(),
+        )
+    }
+
+    /// Whether `path` selects the same route, and the same path rule of
+    /// it, as it does once normalised the way a backend may normalise it
+    /// ([`route_selection::selects_alike_once_normalised`]). A request
+    /// for which it does not is refused before any route's policy runs:
+    /// served under the route or rule its raw path selects, it could
+    /// reach a resource another route guards with mTLS, Basic auth,
+    /// forward auth or an IP list, or skip the deny, redirect or tighter
+    /// rate limit a rule attaches to it.
+    pub fn selects_alike_once_normalised(&self, host: &str, path: &str) -> bool {
+        route_selection::selects_alike_once_normalised(
+            &self.routes_by_host,
+            &self.wildcard_routes,
+            host,
+            path,
+            |entry| entry.route.as_ref(),
+            |entry| &entry.normalised_paths,
         )
     }
 }

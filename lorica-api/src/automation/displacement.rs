@@ -34,7 +34,7 @@
 use std::collections::BTreeSet;
 
 use lorica_config::models::Route;
-use lorica_config::route_selection::{keys_reaching, HostIndex};
+use lorica_config::route_selection::{keys_reaching, path_starts_with, HostIndex};
 use lorica_config::ConfigStore;
 
 use super::protections::{first_weakened, Protection, ROUTE_PROTECTIONS};
@@ -152,7 +152,13 @@ impl Serving {
     /// disabled `after` serves nothing and takes nothing.
     ///
     /// The paths weighed are `after`'s prefix and every held prefix
-    /// below it, the only places where the pick can change.
+    /// below it in some case, the only places where the pick can change,
+    /// each in every spelling a case-sensitive prefix tells apart
+    /// ([`spellings_told_apart`]): a route that folds case serves the
+    /// upper-case spellings of its prefix too, which a shallower route
+    /// serves today wherever the case-sensitive route on that prefix
+    /// misses them, and a held prefix that folds case is served today in
+    /// spellings a case-sensitive `after` takes.
     pub(super) fn displaced_by(&self, after: &Route) -> Vec<Holder<'_>> {
         let mut displaced: Vec<Holder<'_>> = Vec::new();
         if !after.enabled {
@@ -166,12 +172,23 @@ impl Serving {
                 .chain(std::iter::once(after)),
             |route| *route,
         );
-        let paths: BTreeSet<&str> = std::iter::once(after.path_prefix.as_str())
+        let case_sensitive_prefixes: Vec<&str> = self
+            .holders()
+            .map(|holder| holder.route())
+            .chain(std::iter::once(after))
+            .filter(|route| !route.case_insensitive_paths)
+            .map(|route| route.path_prefix.as_str())
+            .collect();
+        let probes: BTreeSet<&str> = std::iter::once(after.path_prefix.as_str())
             .chain(
                 self.holders()
                     .map(|holder| holder.route().path_prefix.as_str())
-                    .filter(|prefix| prefix.starts_with(after.path_prefix.as_str())),
+                    .filter(|prefix| path_starts_with(prefix, &after.path_prefix, true)),
             )
+            .collect();
+        let paths: BTreeSet<String> = probes
+            .into_iter()
+            .flat_map(|probe| spellings_told_apart(probe, &case_sensitive_prefixes))
             .collect();
         let names = std::iter::once(&after.hostname).chain(&after.hostname_aliases);
         for name in names {
@@ -193,6 +210,80 @@ impl Serving {
         }
         displaced
     }
+}
+
+/// One spelling of `path` for each way the case-sensitive prefixes
+/// among `prefixes` can tell its spellings apart: the selection of a
+/// spelling turns only on which of them it starts with, as a prefix
+/// that folds case matches every spelling alike, so the picks of these
+/// are every pick a spelling of `path` can have.
+///
+/// The spellings form a tree over the bytes of `path`: every prefix of
+/// `path` that one of `prefixes` spells, in some case, is a node, and a
+/// spelling that leaves the tree, at the first letter it spells as none
+/// of them does, starts with exactly the prefixes on its way. One
+/// spelling is taken per exit and per complete branch. The hex digits of
+/// an encoded octet stay as `path` has them: every comparison already
+/// reads them in either case ([`path_starts_with`]).
+fn spellings_told_apart(path: &str, prefixes: &[&str]) -> Vec<String> {
+    let sent = path.as_bytes();
+    let mut escape_digit = vec![false; sent.len()];
+    let mut at = 0;
+    while at < sent.len() {
+        if sent[at] == b'%'
+            && sent
+                .get(at + 1..at + 3)
+                .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+        {
+            escape_digit[at + 1] = true;
+            escape_digit[at + 2] = true;
+            at += 3;
+        } else {
+            at += 1;
+        }
+    }
+    let spelled_as_sent = |at: usize, byte: u8| if escape_digit[at] { sent[at] } else { byte };
+    let mut nodes: BTreeSet<Vec<u8>> = BTreeSet::from([Vec::new()]);
+    for prefix in prefixes {
+        if !path_starts_with(path, prefix, true) {
+            continue;
+        }
+        let spelled: Vec<u8> = prefix
+            .bytes()
+            .enumerate()
+            .map(|(at, byte)| spelled_as_sent(at, byte))
+            .collect();
+        for end in 1..=spelled.len() {
+            nodes.insert(spelled[..end].to_vec());
+        }
+    }
+    let mut spellings: Vec<Vec<u8>> = Vec::new();
+    for node in &nodes {
+        let at = node.len();
+        let Some(&byte) = sent.get(at) else {
+            spellings.push(node.clone());
+            continue;
+        };
+        let cases = if byte.is_ascii_alphabetic() && !escape_digit[at] {
+            vec![byte.to_ascii_lowercase(), byte.to_ascii_uppercase()]
+        } else {
+            vec![byte]
+        };
+        for case in cases {
+            let mut spelling = node.clone();
+            spelling.push(case);
+            if !nodes.contains(&spelling) {
+                spelling.extend_from_slice(&sent[at + 1..]);
+                spellings.push(spelling);
+            }
+        }
+    }
+    // Only ASCII letters change case, so every spelling is UTF-8 as
+    // `path` is.
+    spellings
+        .into_iter()
+        .filter_map(|spelling| String::from_utf8(spelling).ok())
+        .collect()
 }
 
 /// A token's route about to be written, weighed against every holder of
@@ -243,7 +334,8 @@ pub(super) fn ensure_not_displaced_weaker(
 /// [`ROUTE_PROTECTIONS`] the route is weaker on is raised to the
 /// holder's value by the rule's own `strengthened`, and a control the
 /// profile already holds more strongly (the WAF a pipeline switched on)
-/// is kept. Basic auth is copied as the stored username and password
+/// is kept. A route raised to fold case serves spellings it did not, so
+/// it is weighed again, against what serves those today. Basic auth is copied as the stored username and password
 /// hash, server side; neither reaches the answer, the audit row or a
 /// log, which carry the ids this returns and nothing more.
 ///
@@ -267,22 +359,33 @@ pub(super) fn inherit_displaced_protections(
     route: &mut Route,
 ) -> Result<Inherited, ApiError> {
     let serving = Serving::read(store, route)?.without(&route.id);
-    let displaced = serving.displaced_by(route);
-    for holder in &displaced {
-        if let Holder::Record(recorded) = holder {
-            if !recorded.readable {
-                return Err(recorded.unreadable());
-            }
-        }
-    }
+    let mut displaced = serving.displaced_by(route);
     let mut inherited = Inherited::default();
-    for holder in &displaced {
-        for protection in ROUTE_PROTECTIONS {
-            if (protection.weakened)(holder.route(), route) {
-                (protection.strengthened)(holder.route(), route);
-                inherited.note(holder);
+    loop {
+        for holder in &displaced {
+            if let Holder::Record(recorded) = holder {
+                if !recorded.readable {
+                    return Err(recorded.unreadable());
+                }
             }
         }
+        let folded_case = route.case_insensitive_paths;
+        for holder in &displaced {
+            for protection in ROUTE_PROTECTIONS {
+                if (protection.weakened)(holder.route(), route) {
+                    (protection.strengthened)(holder.route(), route);
+                    inherited.note(holder);
+                }
+            }
+        }
+        // `case_insensitive_paths` raised from a holder makes the route
+        // serve spellings it did not, which another route may serve
+        // today: weigh it again as it now is. Raised once at most, so
+        // this runs twice at most.
+        if folded_case || !route.case_insensitive_paths {
+            break;
+        }
+        displaced = serving.displaced_by(route);
     }
     for holder in &displaced {
         if let Some(protection) = first_weakened(ROUTE_PROTECTIONS, holder.route(), route) {
@@ -493,5 +596,128 @@ mod tests {
         let mut mine = route("mine", "mine.example.com", "/");
         mine.read_timeout_s = 5;
         assert!(displaced(stored, Vec::new(), &mine).is_empty());
+    }
+
+    #[test]
+    fn a_route_that_ignores_case_takes_every_spelling_of_the_prefixes_below_it() {
+        // `/api` folding case serves `/API/secret` too, which the wildcard
+        // route below holds today: it is weighed against that route as
+        // well as against the one holding `/`.
+        let mut secret = route("secret", "*.example.com", "/API/secret");
+        secret.waf_enabled = true;
+        let stored = vec![route("wild", "*.example.com", "/"), secret];
+        let mut after = route("n", "a.example.com", "/api");
+        assert_eq!(
+            displaced(stored.clone(), Vec::new(), &after),
+            vec!["wild".to_string()]
+        );
+        after.case_insensitive_paths = true;
+        let mut taken = displaced(stored, Vec::new(), &after);
+        taken.sort();
+        assert_eq!(taken, vec!["secret".to_string(), "wild".to_string()]);
+    }
+
+    #[test]
+    fn a_route_that_ignores_case_takes_the_spellings_a_case_sensitive_holder_misses() {
+        // Security review H1: `/api` on the wildcard is case-sensitive,
+        // so `/API/x` on `a.example.com` reaches the protected catch-all
+        // today. A token's `/api` that folds case serves it tomorrow:
+        // the catch-all is weighed, not only the route spelled `/api`.
+        let stored = vec![
+            fortified("catch", "_"),
+            route("wild", "*.example.com", "/api"),
+        ];
+        let mut after = route("n", "a.example.com", "/api");
+        assert_eq!(
+            displaced(stored.clone(), Vec::new(), &after),
+            vec!["wild".to_string()]
+        );
+        after.case_insensitive_paths = true;
+        let mut taken = displaced(stored.clone(), Vec::new(), &after);
+        taken.sort();
+        assert_eq!(taken, vec!["catch".to_string(), "wild".to_string()]);
+        let holders = Serving {
+            stored,
+            recorded: Vec::new(),
+        };
+        let weighed = holders.displaced_by(&after);
+        let catch = weighed
+            .iter()
+            .find(|holder| holder.route().id == "catch")
+            .expect("the catch-all is weighed");
+        assert!(
+            first_weakened(ROUTE_PROTECTIONS, catch.route(), &after).is_some(),
+            "a bare route is weaker than the catch-all it takes `/API` from"
+        );
+
+        // A record of a deleted protected route is a holder like any.
+        let recorded = vec![recorded_of(&fortified("gone", "*.example.com"))];
+        let mut taken = displaced(
+            vec![route("wild", "*.example.com", "/api")],
+            recorded,
+            &after,
+        );
+        taken.sort();
+        assert_eq!(taken, vec!["record:gone".to_string(), "wild".to_string()]);
+    }
+
+    #[test]
+    fn a_case_sensitive_route_takes_the_spellings_a_holder_that_ignores_case_serves() {
+        // `/API/x` folding on the wildcard serves `/api/x` today; a
+        // token's case-sensitive `/api` on an exact name takes it.
+        let mut folding = route("fold", "*.example.com", "/API/x");
+        folding.case_insensitive_paths = true;
+        let stored = vec![route("catch", "_", "/"), folding];
+        let after = route("n", "a.example.com", "/api");
+        let mut taken = displaced(stored, Vec::new(), &after);
+        taken.sort();
+        assert_eq!(taken, vec!["catch".to_string(), "fold".to_string()]);
+    }
+
+    #[test]
+    fn a_spelling_no_case_can_avoid_is_not_weighed_against_what_it_cannot_reach() {
+        // A prefix without a letter has one spelling: the wildcard on
+        // `/123` takes every request the token's route would, and the
+        // catch-all below it none.
+        let stored = vec![
+            fortified("catch", "_"),
+            route("wild", "*.example.com", "/123"),
+        ];
+        let mut after = route("n", "a.example.com", "/123");
+        after.case_insensitive_paths = true;
+        assert_eq!(
+            displaced(stored, Vec::new(), &after),
+            vec!["wild".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_spellings_told_apart_are_one_per_set_of_case_sensitive_prefixes_matched() {
+        // No case-sensitive prefix: the path as sent stands for all.
+        assert_eq!(spellings_told_apart("/api", &[]), vec!["/api".to_string()]);
+        // `/api` alone splits the spellings in two: itself, and every
+        // other, one of which stands for them.
+        let mut split = spellings_told_apart("/api/x", &["/api"]);
+        split.sort();
+        assert_eq!(split, vec!["/Api/x", "/aPi/x", "/apI/x", "/api/x"]);
+        // Two spellings of one prefix, and one beside it that is not a
+        // spelling of it at all.
+        let spellings = spellings_told_apart("/ab", &["/ab", "/AB", "/x"]);
+        for spelling in &spellings {
+            assert!(spelling.eq_ignore_ascii_case("/ab"), "{spelling}");
+        }
+        for wanted in ["/ab", "/AB"] {
+            assert!(spellings.iter().any(|s| s == wanted), "{wanted}");
+        }
+        assert!(
+            spellings.iter().any(|s| s != "/ab" && s != "/AB"),
+            "{spellings:?}"
+        );
+        // The hex digits of an encoded octet are never varied: every
+        // comparison reads them in either case already.
+        assert_eq!(
+            spellings_told_apart("/%c3%a9", &["/%C3%A9"]),
+            vec!["/%c3%a9".to_string()]
+        );
     }
 }

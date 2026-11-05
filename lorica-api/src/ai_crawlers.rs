@@ -969,6 +969,7 @@ mod tests {
             ai_bot_policy: policy,
             ai_bot_spoofed_fallback: None,
             serve_robots_txt: false,
+            case_insensitive_paths: false,
             managed_by: None,
             group_name: String::new(),
             node_selector: Vec::new(),

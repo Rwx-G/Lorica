@@ -95,6 +95,8 @@
 >   or exported; 68 adds nothing and rewrites every stored route name
 >   and record name to the canonical form
 >   (`route_selection::canonical_hostname`).
+> - v1.10.3 (migration 69): `routes.case_insensitive_paths`, default 0,
+>   replicated with the route.
 >
 > The `Route` table grew from 9 columns to 30+ (basic-auth,
 > stale-while-revalidate, rate-limit struct, geoip, mTLS, forward-auth,

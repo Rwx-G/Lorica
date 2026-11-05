@@ -114,6 +114,73 @@ pub(super) fn build_mtls_config(
     })
 }
 
+/// What a bundle trusts beyond the certificates it lists, one sentence
+/// per finding, for the operator to read before saving.
+///
+/// Every certificate of a route's bundle is a trust anchor, the X.509
+/// semantics every TLS stack shares. A bundle that carries a root
+/// therefore trusts every CA the root signed, and one that carries a CA
+/// with a certificate it issued trusts every other CA that one signed:
+/// a "full chain" export of one issuing CA silently admits its
+/// siblings. Such bundles stay valid, since refusing them would break
+/// routes saved before this check; this names the certificates that
+/// widen the trust. Issuance is read from the names (an issuer name
+/// equal to another certificate's subject), without checking the
+/// signature, which is enough for a warning.
+pub(super) fn mtls_bundle_trust_warnings(pem_text: &str) -> Vec<String> {
+    let Ok(blocks) = pem::parse_many(pem_text.trim().as_bytes()) else {
+        return Vec::new();
+    };
+    let certificates: Vec<x509_parser::certificate::X509Certificate<'_>> = blocks
+        .iter()
+        .filter(|block| block.tag() == "CERTIFICATE")
+        .filter_map(|block| x509_parser::parse_x509_certificate(block.contents()).ok())
+        .map(|(_, certificate)| certificate)
+        .collect();
+    fn self_issued(certificate: &x509_parser::certificate::X509Certificate<'_>) -> bool {
+        certificate.subject().as_raw() == certificate.issuer().as_raw()
+    }
+    const ADVICE: &str =
+        "Keep only the issuing CAs this route trusts in the bundle, not the CA above them.";
+
+    let mut warnings = Vec::new();
+    if certificates.len() > 1 {
+        for root in certificates.iter().filter(|c| self_issued(c)) {
+            warnings.push(format!(
+                "{} is a self-signed root: every CA it signed is trusted on this route, not only the other certificates of this bundle. {ADVICE}",
+                root.subject()
+            ));
+        }
+    }
+    for issuer in certificates.iter().filter(|c| !self_issued(c)) {
+        let issued: Vec<String> = certificates
+            .iter()
+            .filter(|other| {
+                !self_issued(other) && other.issuer().as_raw() == issuer.subject().as_raw()
+            })
+            .map(|other| other.subject().to_string())
+            .collect();
+        if !issued.is_empty() {
+            warnings.push(format!(
+                "{} issued {} of this bundle: every CA it signed is trusted on this route, not only those. {ADVICE}",
+                issuer.subject(),
+                issued.join(", ")
+            ));
+        }
+    }
+    warnings
+}
+
+/// The save-time side of [`mtls_bundle_trust_warnings`]. A route write
+/// answers with the route alone, so the warnings go to the log, where an
+/// operator who saved through the API without validating first still
+/// finds them.
+pub(super) fn log_mtls_bundle_trust_warnings(config: &lorica_config::models::MtlsConfig) {
+    for warning in mtls_bundle_trust_warnings(&config.ca_cert_pem) {
+        tracing::warn!(%warning, "mtls: the CA bundle trusts more than the CAs it lists");
+    }
+}
+
 /// JSON body for `POST /api/v1/validate/mtls-pem`.
 #[derive(Deserialize)]
 pub struct ValidateMtlsPemRequest {
@@ -130,6 +197,11 @@ pub struct ValidateMtlsPemResponse {
     /// per cert so the operator can cross-check their bundle ("yes,
     /// these are the two CAs I expected").
     pub subjects: Vec<String>,
+    /// What the bundle trusts beyond the certificates it lists (a root,
+    /// or a CA next to a certificate it issued), one sentence each.
+    /// Empty when the bundle holds only CAs that issued none of the
+    /// others. The bundle is valid either way.
+    pub warnings: Vec<String>,
 }
 
 /// POST /api/v1/validate/mtls-pem - run the same validator used on
@@ -171,6 +243,7 @@ pub async fn validate_mtls_pem(
     Ok(json_data(ValidateMtlsPemResponse {
         ca_count: subjects.len(),
         subjects,
+        warnings: mtls_bundle_trust_warnings(&req.ca_cert_pem),
     }))
 }
 
@@ -299,6 +372,69 @@ mod tests {
         let err =
             build_mtls_config(&mtls_req(&pem, false, vec!["Acme\nInc"])).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("control character")));
+    }
+
+    /// A CA named `cn`, self-signed or signed by `parent`.
+    fn ca(
+        cn: &str,
+        parent: Option<&rcgen::Issuer<'static, rcgen::KeyPair>>,
+    ) -> (String, rcgen::Issuer<'static, rcgen::KeyPair>) {
+        let mut params = rcgen::CertificateParams::new(Vec::new()).expect("test setup");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        let key = rcgen::KeyPair::generate().expect("test setup");
+        let cert = match parent {
+            Some(parent) => params.signed_by(&key, parent),
+            None => params.self_signed(&key),
+        }
+        .expect("test setup");
+        (cert.pem(), rcgen::Issuer::new(params, key))
+    }
+
+    #[test]
+    fn a_bundle_of_unrelated_issuing_cas_carries_no_trust_warning() {
+        let (_, root) = ca("Root", None);
+        let (issuing_a, _) = ca("Issuing A", Some(&root));
+        let (issuing_b, _) = ca("Issuing B", Some(&root));
+        assert!(mtls_bundle_trust_warnings(&format!("{issuing_a}{issuing_b}")).is_empty());
+        let (lone_root, _) = ca("Lone Root", None);
+        assert!(mtls_bundle_trust_warnings(&lone_root).is_empty());
+    }
+
+    #[test]
+    fn a_bundle_carrying_a_root_beside_other_certificates_is_warned_about() {
+        let (root_pem, root) = ca("Root", None);
+        let (issuing_a, _) = ca("Issuing A", Some(&root));
+        let warnings = mtls_bundle_trust_warnings(&format!("{issuing_a}{root_pem}"));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("CN=Root"), "{warnings:?}");
+        assert!(warnings[0].contains("self-signed root"), "{warnings:?}");
+        assert!(warnings[0].contains("every CA it signed"), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_bundle_carrying_a_ca_and_a_certificate_it_issued_is_warned_about() {
+        let (_, root) = ca("Root", None);
+        let (policy_pem, policy) = ca("Policy CA", Some(&root));
+        let (issuing_pem, _) = ca("Issuing A", Some(&policy));
+        let warnings = mtls_bundle_trust_warnings(&format!("{issuing_pem}{policy_pem}"));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("CN=Policy CA issued CN=Issuing A"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn build_mtls_accepts_a_bundle_it_warns_about() {
+        // Backward compatibility: the warning never refuses a bundle.
+        let (root_pem, root) = ca("Root", None);
+        let (issuing_a, _) = ca("Issuing A", Some(&root));
+        let pem = format!("{issuing_a}{root_pem}");
+        assert!(!mtls_bundle_trust_warnings(&pem).is_empty());
+        assert!(build_mtls_config(&mtls_req(&pem, true, vec![])).is_ok());
     }
 
     #[test]

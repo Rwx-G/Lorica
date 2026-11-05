@@ -55,11 +55,49 @@ pub fn get_organization_x509(x509cert: &X509Certificate<'_>) -> Option<String> {
         .reduce(|cur, next| cur + &next)
 }
 
+/// Lorica: every `O=` value of the certificate's subject, each whole, in
+/// the order the subject lists them. [`get_organization_x509`] joins them
+/// with no separator, so `O=Ac, O=me` and `O=Acme` read the same there;
+/// a policy that matches organizations compares these instead. A value
+/// that is not a decodable string is left out, as it is there.
+pub fn get_organizations_x509(x509cert: &X509Certificate<'_>) -> Vec<String> {
+    x509cert
+        .subject
+        .iter_organization()
+        .filter_map(|a| a.as_str().ok())
+        .map(|a| a.to_string())
+        .collect()
+}
+
+/// Lorica: [`get_organization_serial_bytes`] with the `O=` values kept
+/// apart ([`get_organizations_x509`]), and a certificate x509-parser
+/// refuses reported as an error.
+pub fn get_organizations_serial_bytes(cert: &[u8]) -> Result<(Vec<String>, String)> {
+    let x509cert = parse_der_reporting_errors(cert)?;
+    Ok((
+        get_organizations_x509(&x509cert),
+        x509cert.raw_serial_as_string(),
+    ))
+}
+
+/// Lorica: the certificate in `cert`, or an `InvalidCert` error where
+/// upstream's `expect` panicked. Both callers return a `Result`, and a
+/// peer's certificate is input, not an invariant.
+fn parse_der_reporting_errors(cert: &[u8]) -> Result<X509Certificate<'_>> {
+    X509Certificate::from_der(cert)
+        .map(|(_, x509cert)| x509cert)
+        .map_err(|e| {
+            lorica_error::Error::explain(
+                lorica_error::ErrorType::InvalidCert,
+                format!("failed to parse certificate from DER format: {e}"),
+            )
+        })
+}
+
 /// Return the organization associated with the X509 certificate (as bytes).
 /// see https://en.wikipedia.org/wiki/X.509#Structure_of_a_certificate
 pub fn get_organization_serial_bytes(cert: &[u8]) -> Result<(Option<String>, String)> {
-    let (_, x509cert) = x509_parser::certificate::X509Certificate::from_der(cert)
-        .expect("Failed to parse certificate from DER format.");
+    let x509cert = parse_der_reporting_errors(cert)?;
 
     get_organization_serial_x509(&x509cert)
 }
@@ -220,5 +258,17 @@ impl Hash for CertKey {
 impl<'a> From<&'a WrappedX509> for CertificateDer<'static> {
     fn from(value: &'a WrappedX509) -> Self {
         CertificateDer::from(value.borrow_raw_cert().as_slice().to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytes_that_are_not_a_certificate_are_an_error_not_a_panic() {
+        let junk = b"not a certificate";
+        assert!(get_organization_serial_bytes(junk).is_err());
+        assert!(get_organizations_serial_bytes(junk).is_err());
     }
 }

@@ -16,7 +16,8 @@
 //!      The `allow_unauthenticated` contract says: trusted + no-cert
 //!      handshake, untrusted fails.
 //!
-//!   2. **Request-phase enforcement of `required` / allowlist.**
+//!   2. **Request-phase enforcement of the route's own CA,
+//!      `required` and the allowlist.**
 //!      A real `LoricaProxy` is instantiated with a route carrying an
 //!      `MtlsConfig`, fed a `Session` built from a tokio-rustls
 //!      `ServerTlsStream`, and `request_filter` is driven against it.
@@ -24,8 +25,10 @@
 //!      the proxy writes back to the rustls stream.
 //!
 //! This covers both halves - the listener-level cryptographic
-//! verification and the proxy-level per-route policy - without
-//! spinning up a full Pingora server just to assert status codes.
+//! verification and the proxy-level per-route policy. The full-stack
+//! tests further down run a real Pingora server with two routes on one
+//! listener, each trusting its own CA, to show the listener union does
+//! not let one route's CA into the other.
 
 #![cfg(unix)]
 
@@ -63,6 +66,11 @@ struct TestPki {
     rogue_ca_pem: String,
     rogue_client_cert_der: CertificateDer<'static>,
     rogue_client_key_der: PrivateKeyDer<'static>,
+    /// Issued by the first CA, carrying the second CA's client
+    /// organization: what a holder of the first CA would mint to pass
+    /// an allowlist on a route that trusts only the second CA.
+    impostor_client_cert_der: CertificateDer<'static>,
+    impostor_client_key_der: PrivateKeyDer<'static>,
 }
 
 fn init_crypto() {
@@ -108,19 +116,30 @@ fn sign_cert(
     (cert_der, key_der)
 }
 
+/// The names the test server certificate carries: the two hosts the
+/// two-route harness serves, so a client can open a connection for
+/// either.
+fn server_names() -> Vec<String> {
+    vec!["localhost".into(), "b.test".into()]
+}
+
 fn build_pki() -> TestPki {
     let (ca_cert, ca_issuer, ca_pem) = build_ca("Lorica Test CA");
     let ca_cert_der = CertificateDer::from(ca_cert.der().to_vec());
     let (server_cert_der, server_key_der) =
-        sign_cert(&ca_issuer, "localhost", None, vec!["localhost".into()]);
+        sign_cert(&ca_issuer, "localhost", None, server_names());
     let (client_cert_der, client_key_der) =
         sign_cert(&ca_issuer, "client-a", Some("Acme Corp"), vec![]);
+    let (impostor_client_cert_der, impostor_client_key_der) =
+        sign_cert(&ca_issuer, "impostor", Some("Evil Corp"), vec![]);
 
     let (_rogue_ca_cert, rogue_ca_issuer, rogue_ca_pem) = build_ca("Rogue CA");
     let (rogue_client_cert_der, rogue_client_key_der) =
         sign_cert(&rogue_ca_issuer, "rogue-client", Some("Evil Corp"), vec![]);
 
     TestPki {
+        impostor_client_cert_der,
+        impostor_client_key_der,
         ca_pem,
         ca_cert_der,
         server_cert_der,
@@ -257,6 +276,7 @@ fn mtls_route(ca_pem: &str, required: bool, orgs: Vec<&str>) -> Route {
         ai_bot_policy: None,
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
+        case_insensitive_paths: false,
         managed_by: None,
         waf_body_scan_max_bytes: None,
         created_at: now,
@@ -427,33 +447,59 @@ async fn union_store_accepts_clients_from_either_ca() {
 
 #[test]
 fn policy_grid_matches_spec() {
-    use lorica::proxy_wiring::{evaluate_mtls, MtlsEnforcer};
+    use lorica::proxy_wiring::{evaluate_mtls, MtlsEnforcer, RouteClientCert};
 
     fn e(required: bool, orgs: &[&str]) -> MtlsEnforcer {
         MtlsEnforcer {
             required,
             allowed_organizations: orgs.iter().map(|s| s.to_string()).collect(),
+            client_verifier: None,
         }
     }
+    fn orgs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|o| o.to_string()).collect()
+    }
+    fn verified(organizations: &[String]) -> RouteClientCert<'_> {
+        RouteClientCert::Verified { organizations }
+    }
+    let untrusted = RouteClientCert::Untrusted;
 
     // required=true, no cert -> 496
-    assert_eq!(evaluate_mtls(&e(true, &[]), None), Some(496));
-    // required=true, any signed cert, empty allowlist -> pass
-    assert_eq!(evaluate_mtls(&e(true, &[]), Some("Whatever")), None);
-    // required=false, no cert -> pass (opportunistic)
-    assert_eq!(evaluate_mtls(&e(false, &[]), None), None);
-    // required=true, allowlisted org -> pass
-    assert_eq!(evaluate_mtls(&e(true, &["Acme"]), Some("Acme")), None);
-    // required=true, not in allowlist -> 495
-    assert_eq!(evaluate_mtls(&e(true, &["Acme"]), Some("Gamma")), Some(495));
-    // required=false, cert present but not in allowlist -> still 495
-    // (allowlist always wins when a cert is presented)
     assert_eq!(
-        evaluate_mtls(&e(false, &["Acme"]), Some("Gamma")),
+        evaluate_mtls(&e(true, &[]), RouteClientCert::Absent),
+        Some(496)
+    );
+    // required=true, any signed cert, empty allowlist -> pass
+    assert_eq!(
+        evaluate_mtls(&e(true, &[]), verified(&orgs(&["Whatever"]))),
+        None
+    );
+    // required=false, no cert -> pass (opportunistic)
+    assert_eq!(evaluate_mtls(&e(false, &[]), RouteClientCert::Absent), None);
+    // required=true, allowlisted org -> pass
+    assert_eq!(
+        evaluate_mtls(&e(true, &["Acme"]), verified(&orgs(&["Acme"]))),
+        None
+    );
+    // required=true, not in allowlist -> 495
+    assert_eq!(
+        evaluate_mtls(&e(true, &["Acme"]), verified(&orgs(&["Gamma"]))),
+        Some(495)
+    );
+    // required=false, cert present but not in allowlist -> still 495
+    // (allowlist always wins when a verified cert is presented)
+    assert_eq!(
+        evaluate_mtls(&e(false, &["Acme"]), verified(&orgs(&["Gamma"]))),
         Some(495)
     );
     // empty org on cert vs. non-empty allowlist -> 495
-    assert_eq!(evaluate_mtls(&e(true, &["Acme"]), Some("")), Some(495));
+    assert_eq!(evaluate_mtls(&e(true, &["Acme"]), verified(&[])), Some(495));
+    // required=true, cert not from this route's CA -> 495
+    assert_eq!(evaluate_mtls(&e(true, &[]), untrusted), Some(495));
+    // required=false, cert not from this route's CA -> pass, anonymous
+    // (the allowlist is not consulted for an identity the route does
+    // not trust)
+    assert_eq!(evaluate_mtls(&e(false, &["Acme"]), untrusted), None);
 }
 
 // A smoke test that proves a LoricaProxy configured with an mtls_enforcer
@@ -540,7 +586,8 @@ async fn wait_for_port(port: u16) {
 
 // Plaintext upstream the TLS-terminating proxy forwards to. Responds
 // "upstream-ok" so the test can distinguish a proxy-generated error
-// body (495/496) from a real pass-through.
+// body (495/496) from a real pass-through, followed by the request line
+// it received, so a test can read the target the proxy forwarded.
 async fn spawn_plain_upstream() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -568,13 +615,15 @@ async fn spawn_plain_upstream() -> std::net::SocketAddr {
                         Err(_) => return,
                     }
                 }
-                let body = b"upstream-ok";
+                let head = String::from_utf8_lossy(&buf);
+                let request_line = head.lines().next().unwrap_or_default();
+                let body = format!("upstream-ok\n{request_line}");
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
                 let _ = stream.write_all(resp.as_bytes()).await;
-                let _ = stream.write_all(body).await;
+                let _ = stream.write_all(body.as_bytes()).await;
                 let _ = stream.shutdown().await;
             });
         }
@@ -625,6 +674,9 @@ fn upstream_backend(id: &str, addr: std::net::SocketAddr) -> Backend {
 
 struct TlsProxyHarness {
     port: u16,
+    /// The same proxy's plaintext listener.
+    plain_port: u16,
+    proxy_config: Arc<ArcSwap<ProxyConfig>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -680,7 +732,7 @@ impl TlsProxyHarness {
         cert_resolver
             .reload(vec![lorica_tls::cert_resolver::CertData {
                 domain: "localhost".into(),
-                san_domains: vec!["localhost".into()],
+                san_domains: server_names(),
                 cert_pem: server_cert_pem,
                 key_pem: server_key_pem,
                 not_after_epoch: i64::MAX,
@@ -705,10 +757,12 @@ impl TlsProxyHarness {
         let log_buffer = Arc::new(lorica_api::logs::LogBuffer::new(128));
         let active_conns = Arc::new(AtomicU64::new(0));
         let sla = Arc::new(lorica_bench::passive_sla::SlaCollector::new());
-        let proxy = LoricaProxy::new(proxy_config, log_buffer, active_conns, sla);
+        let proxy = LoricaProxy::new(Arc::clone(&proxy_config), log_buffer, active_conns, sla);
 
         let port = reserve_port();
         let proxy_addr = format!("127.0.0.1:{port}");
+        let plain_port = reserve_port();
+        let plain_addr = format!("127.0.0.1:{plain_port}");
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let thread = std::thread::spawn(move || {
             let server_conf = Arc::new(lorica_core::server::configuration::ServerConf {
@@ -721,6 +775,7 @@ impl TlsProxyHarness {
             tls_settings.enable_h2();
             tls_settings.set_client_cert_verifier(mtls_verifier);
             proxy_service.add_tls_with_settings(&proxy_addr, None, tls_settings);
+            proxy_service.add_tcp(&plain_addr);
             let mut server = Server::new(None).unwrap();
             server.add_service(proxy_service);
             server.bootstrap();
@@ -729,8 +784,11 @@ impl TlsProxyHarness {
             });
         });
         wait_for_port(port).await;
+        wait_for_port(plain_port).await;
         Self {
             port,
+            plain_port,
+            proxy_config,
             shutdown_tx,
             thread: Some(thread),
         }
@@ -752,10 +810,45 @@ async fn tls_request(
     port: u16,
     client_config: Arc<RusTlsClientConfig>,
 ) -> Result<(u16, String), String> {
+    tls_request_to(port, client_config, "localhost").await
+}
+
+/// [`tls_request`] on a connection opened for `host`, naming it in the
+/// Host header as well, as a client does on a fresh connection.
+async fn tls_request_to(
+    port: u16,
+    client_config: Arc<RusTlsClientConfig>,
+    host: &str,
+) -> Result<(u16, String), String> {
+    tls_request_over(port, client_config, host, host).await
+}
+
+/// One request naming `host` on a connection whose handshake named
+/// `server_name`: an HTTP/2 coalesced or a reused connection when the two
+/// differ.
+async fn tls_request_over(
+    port: u16,
+    client_config: Arc<RusTlsClientConfig>,
+    server_name: &str,
+    host: &str,
+) -> Result<(u16, String), String> {
+    tls_get(port, client_config, server_name, host, "/").await
+}
+
+/// `GET path` naming `host`, on a connection whose handshake named
+/// `server_name`. `path` is sent as written, encoded octets and dot
+/// segments included.
+async fn tls_get(
+    port: u16,
+    client_config: Arc<RusTlsClientConfig>,
+    server_name: &str,
+    host: &str,
+    path: &str,
+) -> Result<(u16, String), String> {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let stream = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
     let connector = tokio_rustls::TlsConnector::from(client_config);
-    let server_name = rustls_pki_types::ServerName::try_from("localhost")
+    let server_name = rustls_pki_types::ServerName::try_from(server_name)
         .unwrap()
         .to_owned();
     let mut tls = tokio::time::timeout(
@@ -765,13 +858,49 @@ async fn tls_request(
     .await
     .map_err(|_| "handshake timeout".to_string())?
     .map_err(|e| format!("handshake: {e}"))?;
-    tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    get_over(&mut tls, host, path).await
+}
+
+/// `GET path` naming `host` over the proxy's plaintext listener on
+/// `port`, `path` sent as written.
+async fn plain_get(port: u16, host: &str, path: &str) -> Result<(u16, String), String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .map_err(|e| e.to_string())?;
+    get_over(&mut stream, host, path).await
+}
+
+/// Writes `GET path` naming `host` on `stream` and reads the answer to
+/// its end: the status and the whole response as text.
+async fn get_over<S>(stream: &mut S, host: &str, path: &str) -> Result<(u16, String), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    request_over(stream, "GET", path, host).await
+}
+
+/// Writes `method target` naming `host` on `stream`, `target` sent as
+/// written (origin, absolute, authority or asterisk form), and reads the
+/// answer to its end: the status and the whole response as text.
+async fn request_over<S>(
+    stream: &mut S,
+    method: &str,
+    target: &str,
+    host: &str,
+) -> Result<(u16, String), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let request =
+        format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
     loop {
-        match tls.read(&mut tmp).await {
+        match stream.read(&mut tmp).await {
             Ok(0) => break,
             Ok(n) => {
                 buf.extend_from_slice(&tmp[..n]);
@@ -909,4 +1038,724 @@ async fn fullstack_optional_no_cert_passes_through() {
     let (status, body) = tls_request(harness.port, cc).await.expect("tls req");
     assert_eq!(status, 200, "raw response: {body}");
     assert!(body.contains("upstream-ok"));
+}
+
+// ===========================================================================
+// Full-stack: two routes on one listener, each trusting its own CA. The
+// listener verifier is the union of both bundles, so a certificate from
+// either CA completes the handshake; what a route accepts must still be
+// decided by that route's own bundle.
+// ===========================================================================
+
+/// The second route of a two-CA harness: `b.test`, trusting the second
+/// ("rogue") CA only. The first route is `build_test_route_with_mtls`
+/// on `localhost`, trusting the first CA.
+fn second_ca_route(pki: &TestPki, required: bool, orgs: Vec<&str>) -> Route {
+    let mut r = mtls_route(&pki.rogue_ca_pem, required, orgs);
+    r.id = "r-mtls-b".into();
+    r.hostname = "b.test".into();
+    r
+}
+
+/// Route A (`localhost`, first CA, required) plus `route_b`, both
+/// served by the same upstream. Also builds the reloaded snapshot.
+fn two_ca_config(
+    pki: &TestPki,
+    route_b: Route,
+    upstream: std::net::SocketAddr,
+) -> (Vec<Route>, Vec<Backend>, Vec<(String, String)>) {
+    let route_a = build_test_route_with_mtls("u", &pki.ca_pem, true, vec![]);
+    let links = vec![
+        (route_a.id.clone(), "u".into()),
+        (route_b.id.clone(), "u".into()),
+    ];
+    (
+        vec![route_a, route_b],
+        vec![upstream_backend("u", upstream)],
+        links,
+    )
+}
+
+async fn two_ca_harness(pki: &TestPki, route_b: Route) -> (TlsProxyHarness, std::net::SocketAddr) {
+    let upstream = spawn_plain_upstream().await;
+    let (routes, backends, links) = two_ca_config(pki, route_b, upstream);
+    let harness = TlsProxyHarness::start(pki, routes, backends, links).await;
+    (harness, upstream)
+}
+
+fn first_ca_client(pki: &TestPki) -> Arc<RusTlsClientConfig> {
+    client_config_with_cert(
+        &pki.ca_cert_der,
+        pki.client_cert_der.clone(),
+        pki.client_key_der.clone_key(),
+    )
+}
+
+fn second_ca_client(pki: &TestPki) -> Arc<RusTlsClientConfig> {
+    client_config_with_cert(
+        &pki.ca_cert_der,
+        pki.rogue_client_cert_der.clone(),
+        pki.rogue_client_key_der.clone_key(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_cert_from_another_routes_ca_is_refused_on_required_route() {
+    let pki = build_pki();
+    let (harness, _) = two_ca_harness(&pki, second_ca_route(&pki, true, vec![])).await;
+
+    let (status, body) = tls_request_to(harness.port, first_ca_client(&pki), "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 495, "first-CA cert on the second-CA route: {body}");
+    assert!(!body.contains("upstream-ok"), "upstream reached: {body}");
+
+    let (status, body) = tls_request_to(harness.port, second_ca_client(&pki), "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 200, "second-CA cert on its own route: {body}");
+
+    let (status, body) = tls_request_to(harness.port, first_ca_client(&pki), "localhost")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 200, "first-CA cert on its own route: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_cert_from_another_routes_ca_with_the_allowed_org_is_refused() {
+    // The first CA can put any O= it likes in a certificate, so an
+    // allowlist on the second route is no defence on its own.
+    let pki = build_pki();
+    let (harness, _) = two_ca_harness(&pki, second_ca_route(&pki, true, vec!["Evil Corp"])).await;
+
+    let impostor = client_config_with_cert(
+        &pki.ca_cert_der,
+        pki.impostor_client_cert_der.clone(),
+        pki.impostor_client_key_der.clone_key(),
+    );
+    let (status, body) = tls_request_to(harness.port, impostor, "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 495, "first-CA cert carrying O=Evil Corp: {body}");
+    assert!(!body.contains("upstream-ok"), "upstream reached: {body}");
+
+    let (status, body) = tls_request_to(harness.port, second_ca_client(&pki), "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 200, "second-CA cert with the allowed org: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_cert_from_another_routes_ca_is_anonymous_on_optional_route() {
+    // On a route that admits clients without a certificate, a
+    // certificate from a CA the route does not trust carries no
+    // identity: the request passes as anonymous, it is not checked
+    // against the allowlist (and so not refused by it either).
+    let pki = build_pki();
+    let (harness, _) = two_ca_harness(&pki, second_ca_route(&pki, false, vec!["Evil Corp"])).await;
+
+    let (status, body) = tls_request_to(harness.port, first_ca_client(&pki), "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 200, "first-CA cert on optional route: {body}");
+    assert!(body.contains("upstream-ok"), "upstream not reached: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_route_ca_change_applies_on_reload() {
+    // The listener union already trusts the first CA (route A), so
+    // pointing route B at it is a reload, not a restart, for the
+    // per-route check.
+    let pki = build_pki();
+    let (harness, upstream) = two_ca_harness(&pki, second_ca_route(&pki, true, vec![])).await;
+
+    let (status, _) = tls_request_to(harness.port, first_ca_client(&pki), "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 495, "before the reload");
+
+    let mut route_b = second_ca_route(&pki, true, vec![]);
+    route_b.mtls.as_mut().expect("mtls").ca_cert_pem = pki.ca_pem.clone();
+    let (routes, backends, links) = two_ca_config(&pki, route_b, upstream);
+    harness.proxy_config.store(Arc::new(ProxyConfig::from_store(
+        routes,
+        backends,
+        vec![],
+        links,
+        ProxyConfigGlobals::default(),
+    )));
+
+    let (status, body) = tls_request_to(harness.port, first_ca_client(&pki), "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 200, "after the reload: {body}");
+}
+
+/// Read one HTTP/1.1 response framed by `Content-Length` and return its
+/// status, leaving the connection open for the next request.
+async fn read_framed_response<S: tokio::io::AsyncRead + Unpin>(tls: &mut S) -> u16 {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        let n = tls.read(&mut tmp).await.expect("read header");
+        assert!(n > 0, "connection closed mid-header: {buf:?}");
+        buf.push(tmp[0]);
+    }
+    let head = String::from_utf8_lossy(&buf).into_owned();
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .expect("status line");
+    let length: usize = head
+        .lines()
+        .find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())
+                .flatten()
+        })
+        .expect("content-length");
+    let mut body = vec![0u8; length];
+    tls.read_exact(&mut body).await.expect("read body");
+    status
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_one_connection_is_judged_per_route() {
+    // A keep-alive connection reaching both routes: the verdict for one
+    // route must not be reused for the other. The connection is opened
+    // for `b.test`, so its refusals there are 495; the first CA's
+    // certificate verifies on `localhost` over it.
+    let pki = build_pki();
+    let (harness, _) = two_ca_harness(&pki, second_ca_route(&pki, true, vec![])).await;
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", harness.port).parse().unwrap();
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let connector = tokio_rustls::TlsConnector::from(first_ca_client(&pki));
+    let server_name = rustls_pki_types::ServerName::try_from("b.test")
+        .unwrap()
+        .to_owned();
+    let mut tls = connector.connect(server_name, stream).await.expect("tls");
+
+    let mut statuses = Vec::new();
+    for host in ["localhost", "b.test", "b.test", "localhost"] {
+        let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        tls.write_all(request.as_bytes()).await.expect("write");
+        statuses.push(read_framed_response(&mut tls).await);
+    }
+    assert_eq!(statuses, vec![200, 495, 495, 200]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_connection_opened_for_another_host_is_misdirected_on_a_required_route() {
+    // The certificate a connection carries was chosen for the host its
+    // handshake named. On a required route reached over a connection
+    // opened for another host, the refusal is 421, which a client
+    // retries on a new connection; on a connection opened for the route's
+    // own host it stays 495 / 496.
+    let pki = build_pki();
+    let (harness, _) = two_ca_harness(&pki, second_ca_route(&pki, true, vec![])).await;
+
+    let (status, body) =
+        tls_request_over(harness.port, first_ca_client(&pki), "localhost", "b.test")
+            .await
+            .expect("tls req");
+    assert_eq!(
+        status, 421,
+        "first-CA cert over a localhost connection: {body}"
+    );
+    assert!(!body.contains("upstream-ok"), "upstream reached: {body}");
+
+    let no_cert = client_config_trusting(&pki.ca_cert_der);
+    let (status, body) = tls_request_over(harness.port, no_cert.clone(), "localhost", "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 421, "no cert over a localhost connection: {body}");
+
+    let (status, body) = tls_request_to(harness.port, first_ca_client(&pki), "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(
+        status, 495,
+        "first-CA cert over a b.test connection: {body}"
+    );
+    let (status, body) = tls_request_to(harness.port, no_cert, "b.test")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 496, "no cert over a b.test connection: {body}");
+
+    // The right certificate passes whichever host the connection names.
+    let (status, body) =
+        tls_request_over(harness.port, second_ca_client(&pki), "localhost", "b.test")
+            .await
+            .expect("tls req");
+    assert_eq!(
+        status, 200,
+        "second-CA cert over a localhost connection: {body}"
+    );
+}
+
+// ===========================================================================
+// Full-stack: a path that a normalising backend reads as the mTLS route's
+// prefix must not reach that backend through a sibling route without it.
+// ===========================================================================
+
+/// `/` without a certificate requirement and `/admin` with one, on one
+/// host and one backend, each route shaped further by `shape`.
+async fn public_and_admin_harness(pki: &TestPki, shape: impl Fn(&mut Route)) -> TlsProxyHarness {
+    let upstream = spawn_plain_upstream().await;
+    let mut public = mtls_route(&pki.ca_pem, false, vec![]);
+    public.id = "r-public".into();
+    public.mtls = None;
+    let mut admin = mtls_route(&pki.ca_pem, true, vec![]);
+    admin.id = "r-admin".into();
+    admin.path_prefix = "/admin".into();
+    shape(&mut public);
+    shape(&mut admin);
+    let links = vec![
+        (public.id.clone(), "u".into()),
+        (admin.id.clone(), "u".into()),
+    ];
+    TlsProxyHarness::start(
+        pki,
+        vec![public, admin],
+        vec![upstream_backend("u", upstream)],
+        links,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_path_steered_off_the_mtls_prefix_is_refused() {
+    // `/admin` requires a certificate, `/` on the same host does not, and
+    // both are served by one backend. Forwarded as sent under `/`, a path
+    // such as `/%61dmin/x` reaches a backend that decodes it to
+    // `/admin/x` without the certificate check.
+    let pki = build_pki();
+    let harness = public_and_admin_harness(&pki, |_| {}).await;
+    let no_cert = client_config_trusting(&pki.ca_cert_der);
+    let port = harness.port;
+
+    let (status, body) = tls_get(port, no_cert.clone(), "localhost", "localhost", "/public")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 200, "public path: {body}");
+    let (status, body) = tls_get(port, no_cert.clone(), "localhost", "localhost", "/admin/x")
+        .await
+        .expect("tls req");
+    assert_eq!(status, 496, "protected path without a certificate: {body}");
+
+    for steered in [
+        "/%61dmin/x",
+        "//admin/x",
+        "/x/../admin/x",
+        "/%2e%2e/admin/x",
+    ] {
+        let (status, body) = tls_get(port, no_cert.clone(), "localhost", "localhost", steered)
+            .await
+            .expect("tls req");
+        assert_eq!(status, 400, "{steered}: {body}");
+        assert!(
+            !body.contains("upstream-ok"),
+            "{steered} reached the upstream: {body}"
+        );
+    }
+
+    let (status, body) = tls_get(
+        port,
+        first_ca_client(&pki),
+        "localhost",
+        "localhost",
+        "/admin/x",
+    )
+    .await
+    .expect("tls req");
+    assert_eq!(status, 200, "protected path with its certificate: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_path_steered_by_segment_parameters_or_backslashes_is_refused() {
+    // A servlet container reads `/..;/admin/x` as `/admin/x`, a Windows
+    // backend reads `/x\..\admin/x` the same way: forwarded as sent under
+    // `/`, either reaches the protected resource without the certificate.
+    let pki = build_pki();
+    let harness = public_and_admin_harness(&pki, |_| {}).await;
+    let no_cert = client_config_trusting(&pki.ca_cert_der);
+    let port = harness.port;
+
+    let mut answered = Vec::new();
+    for steered in [
+        "/;x=1/admin/x",
+        "/..;/admin/x",
+        "/..%3B/admin/x",
+        "/x\\..\\admin/x",
+        "/x%5C..%5Cadmin/x",
+        "/%61dmin;%2F..%2Fpublic",
+    ] {
+        let (status, body) = tls_get(port, no_cert.clone(), "localhost", "localhost", steered)
+            .await
+            .expect("tls req");
+        answered.push((steered, status, body.contains("upstream-ok")));
+    }
+    assert!(
+        answered
+            .iter()
+            .all(|(_, status, reached)| *status == 400 && !reached),
+        "every steered path is refused before the upstream: {answered:?}"
+    );
+
+    // Parameters and backslashes that leave the route alone still pass.
+    for (path, expected) in [
+        ("/public;jsessionid=0", 200),
+        ("/files\\x", 200),
+        ("/admin;x=1/y", 496),
+    ] {
+        let (status, body) = tls_get(port, no_cert.clone(), "localhost", "localhost", path)
+            .await
+            .expect("tls req");
+        assert_eq!(status, expected, "{path}: {body}");
+    }
+}
+
+/// The public route's path rules: `/internal` denied with a 403, and
+/// `/login` held to one request per bucket refill.
+fn deny_and_throttle_rules(route: &mut Route) {
+    if route.id != "r-public" {
+        return;
+    }
+    route.path_rules = vec![
+        PathRule {
+            path: "/internal".into(),
+            return_status: Some(403),
+            ..Default::default()
+        },
+        PathRule {
+            path: "/login".into(),
+            rate_limit_rps: Some(1),
+            rate_limit_burst: Some(1),
+            ..Default::default()
+        },
+    ];
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_path_rule_applies_to_every_spelling_of_its_path() {
+    // A rule that denies `/internal` or throttles `/login` attaches to
+    // the path a backend serves: a spelling the raw comparison misses
+    // and a normalising backend reads as that path must not skip it.
+    let pki = build_pki();
+    let harness = public_and_admin_harness(&pki, deny_and_throttle_rules).await;
+    let no_cert = client_config_trusting(&pki.ca_cert_der);
+    let port = harness.port;
+    let get = |path: &'static str| {
+        let client = no_cert.clone();
+        async move {
+            tls_get(port, client, "localhost", "localhost", path)
+                .await
+                .expect("tls req")
+        }
+    };
+
+    let (status, body) = get("/internal/x").await;
+    assert_eq!(status, 403, "the rule's own spelling: {body}");
+    let (status, body) = get("/other").await;
+    assert_eq!(status, 200, "a path no rule covers: {body}");
+
+    let mut answered = Vec::new();
+    for steered in [
+        "/%69nternal/x",
+        "//internal/x",
+        "/x/../internal/x",
+        "/;x/internal/x",
+        "/x%5C..%5Cinternal",
+    ] {
+        let (status, body) = get(steered).await;
+        answered.push((steered, status, body.contains("upstream-ok")));
+    }
+    // The throttled path, spelled so the raw comparison misses it, more
+    // times than its bucket admits.
+    for _ in 0..3 {
+        let (status, body) = get("/%6Cogin").await;
+        answered.push(("/%6Cogin", status, body.contains("upstream-ok")));
+    }
+    assert!(
+        answered
+            .iter()
+            .all(|(_, status, reached)| *status == 400 && !reached),
+        "every spelling of a rule's path is refused before the upstream: {answered:?}"
+    );
+
+    let (status, body) = get("/login").await;
+    assert_eq!(status, 200, "the throttled path within its bucket: {body}");
+    let (status, body) = get("/login").await;
+    assert_eq!(status, 429, "the throttled path past its bucket: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_https_redirect_exempts_only_paths_that_stay_acme_challenges() {
+    // The HTTPS redirect spares ACME HTTP-01 challenges, which the CA
+    // fetches over plain HTTP. A path that is one only as sent, and
+    // another resource once a backend normalises it, is not spared.
+    let pki = build_pki();
+    let harness = public_and_admin_harness(&pki, |route| route.force_https = true).await;
+    let port = harness.plain_port;
+
+    let (status, body) = plain_get(port, "localhost", "/public")
+        .await
+        .expect("plain req");
+    assert_eq!(status, 301, "plain HTTP is redirected: {body}");
+    let (status, body) = plain_get(port, "localhost", "/.well-known/acme-challenge/token-1")
+        .await
+        .expect("plain req");
+    assert_eq!(status, 200, "a challenge stays on plain HTTP: {body}");
+
+    let mut answered = Vec::new();
+    for steered in [
+        "/.well-known/acme-challenge/../../public",
+        "/.well-known/acme-challenge/%2E%2E/%2E%2E/public",
+        "/.well-known/acme-challenge/..;/..;/public",
+        "/.well-known/acme-challenge/..\\..\\public",
+    ] {
+        let (status, body) = plain_get(port, "localhost", steered)
+            .await
+            .expect("plain req");
+        answered.push((steered, status, body.contains("upstream-ok")));
+    }
+    assert!(
+        answered
+            .iter()
+            .all(|(_, status, reached)| *status == 301 && !reached),
+        "a path that leaves the challenge namespace is redirected: {answered:?}"
+    );
+}
+
+/// Every status `paths` are answered with on the TLS listener, without
+/// a client certificate, with whether the upstream answered.
+async fn answers(
+    harness: &TlsProxyHarness,
+    pki: &TestPki,
+    paths: &[&'static str],
+) -> Vec<(&'static str, u16, bool)> {
+    let no_cert = client_config_trusting(&pki.ca_cert_der);
+    let mut answered = Vec::new();
+    for path in paths {
+        let (status, body) = tls_get(
+            harness.port,
+            no_cert.clone(),
+            "localhost",
+            "localhost",
+            path,
+        )
+        .await
+        .expect("tls req");
+        answered.push((*path, status, body.contains("upstream-ok")));
+    }
+    answered
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_case_insensitive_paths_selects_the_route_and_rule_in_any_case() {
+    // A backend that ignores case serves `/ADMIN/x` as `/admin/x`. With
+    // the routes saying so, the upper-case spellings are served by the
+    // protected route and held to the public route's deny rule.
+    let pki = build_pki();
+    let harness = public_and_admin_harness(&pki, |route| {
+        deny_and_throttle_rules(route);
+        route.case_insensitive_paths = true;
+    })
+    .await;
+    let answered = answers(
+        &harness,
+        &pki,
+        &[
+            "/admin/x",
+            "/ADMIN/x",
+            "/Admin/x",
+            "/internal/x",
+            "/INTERNAL/x",
+            "/Internal",
+            "/public",
+            "/PUBLIC",
+            "/%41DMIN/x",
+            "/X/../ADMIN/x",
+        ],
+    )
+    .await;
+    let expected: Vec<(&str, u16, bool)> = vec![
+        ("/admin/x", 496, false),
+        ("/ADMIN/x", 496, false),
+        ("/Admin/x", 496, false),
+        ("/internal/x", 403, false),
+        ("/INTERNAL/x", 403, false),
+        ("/Internal", 403, false),
+        ("/public", 200, true),
+        ("/PUBLIC", 200, true),
+        // Spellings the raw comparison still misses, folded or not.
+        ("/%41DMIN/x", 400, false),
+        ("/X/../ADMIN/x", 400, false),
+    ];
+    assert_eq!(answered, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_case_sensitive_paths_by_default_match_as_before() {
+    // The flag off, which every route is until an operator says
+    // otherwise: case is significant, exactly as it always was.
+    let pki = build_pki();
+    let harness = public_and_admin_harness(&pki, deny_and_throttle_rules).await;
+    let answered = answers(
+        &harness,
+        &pki,
+        &["/admin/x", "/ADMIN/x", "/internal/x", "/INTERNAL/x"],
+    )
+    .await;
+    let expected: Vec<(&str, u16, bool)> = vec![
+        ("/admin/x", 496, false),
+        ("/ADMIN/x", 200, true),
+        ("/internal/x", 403, false),
+        ("/INTERNAL/x", 200, true),
+    ];
+    assert_eq!(answered, expected);
+}
+
+/// `method target` on `localhost` over a TLS connection without a client
+/// certificate.
+async fn tls_send(
+    harness: &TlsProxyHarness,
+    pki: &TestPki,
+    method: &str,
+    target: &str,
+) -> (u16, String) {
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", harness.port).parse().unwrap();
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let connector = tokio_rustls::TlsConnector::from(client_config_trusting(&pki.ca_cert_der));
+    let server_name = rustls_pki_types::ServerName::try_from("localhost")
+        .unwrap()
+        .to_owned();
+    let mut tls = tokio::time::timeout(
+        Duration::from_secs(5),
+        connector.connect(server_name, stream),
+    )
+    .await
+    .expect("handshake timeout")
+    .expect("handshake");
+    request_over(&mut tls, method, target, "localhost")
+        .await
+        .expect("request")
+}
+
+/// The request line the upstream answered with, when it did.
+fn forwarded_line(body: &str) -> Option<&str> {
+    body.split("upstream-ok\n").nth(1).map(str::trim)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_targets_without_a_path_to_misread_pass_the_check_unchanged() {
+    // The check reads the path of the target alone: a query string is
+    // never part of it, an absolute-form target is read by its path,
+    // and `OPTIONS *` and CONNECT carry none to read.
+    let pki = build_pki();
+    let harness = public_and_admin_harness(&pki, |_| {}).await;
+
+    let (status, body) = tls_send(&harness, &pki, "GET", "/public?next=/%61dmin/../x;y").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        forwarded_line(&body),
+        Some("GET /public?next=/%61dmin/../x;y HTTP/1.1"),
+        "the query reaches the backend as sent: {body}"
+    );
+    let (status, body) = tls_send(&harness, &pki, "GET", "/admin/x?a=%2e%2e/..").await;
+    assert_eq!(
+        status, 496,
+        "the protected route, whatever its query: {body}"
+    );
+
+    // An absolute-form target never reaches a filter: the pinned `http`
+    // refuses it when the request is parsed
+    // (`an_absolute_form_target_never_reaches_the_authority_check`), so
+    // its path is never read at all, whatever it spells.
+    for target in [
+        "https://localhost/public?q=1",
+        "https://localhost/admin/x",
+        "https://localhost/%61dmin/x",
+    ] {
+        let (status, body) = tls_send(&harness, &pki, "GET", target).await;
+        assert_eq!(status, 400, "{target}: {body}");
+        assert!(forwarded_line(&body).is_none(), "{target}: {body}");
+    }
+
+    // `*` passes the check and is answered by the selection: no prefix,
+    // `/` included, covers it.
+    let (status, body) = tls_send(&harness, &pki, "OPTIONS", "*").await;
+    assert_eq!(status, 404, "OPTIONS *: {body}");
+    // Nor does an authority-form target: a CONNECT is refused when the
+    // request is parsed (`non_origin_form_targets_do_not_reach_the_header`
+    // in `lorica-core`), before the method is even looked at.
+    let (status, body) = tls_send(&harness, &pki, "CONNECT", "localhost:443").await;
+    assert_eq!(status, 400, "CONNECT: {body}");
+    assert!(forwarded_line(&body).is_none(), "CONNECT: {body}");
+}
+
+/// `/` and an `/api` route that strips `/api` before forwarding, with
+/// `case_insensitive_paths` as `fold` says, beside the `/admin` route
+/// whose CA the listener needs.
+async fn strip_harness(pki: &TestPki, fold: bool) -> TlsProxyHarness {
+    let upstream = spawn_plain_upstream().await;
+    let mut public = mtls_route(&pki.ca_pem, false, vec![]);
+    public.id = "r-public".into();
+    public.mtls = None;
+    let mut admin = mtls_route(&pki.ca_pem, true, vec![]);
+    admin.id = "r-admin".into();
+    admin.path_prefix = "/admin".into();
+    let mut api = mtls_route(&pki.ca_pem, false, vec![]);
+    api.id = "r-api".into();
+    api.mtls = None;
+    api.path_prefix = "/api".into();
+    api.strip_path_prefix = Some("/api".into());
+    api.case_insensitive_paths = fold;
+    let links = [&public, &admin, &api]
+        .iter()
+        .map(|route| (route.id.clone(), "u".to_string()))
+        .collect();
+    TlsProxyHarness::start(
+        pki,
+        vec![public, admin, api],
+        vec![upstream_backend("u", upstream)],
+        links,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_a_route_that_ignores_case_strips_every_spelling_it_serves() {
+    let pki = build_pki();
+    let mut forwarded = Vec::new();
+    for fold in [false, true] {
+        let harness = strip_harness(&pki, fold).await;
+        for path in ["/api/x", "/API/x", "/Api"] {
+            let (status, body) = tls_send(&harness, &pki, "GET", path).await;
+            assert_eq!(status, 200, "{path}: {body}");
+            forwarded.push((
+                fold,
+                path,
+                forwarded_line(&body).unwrap_or_default().to_string(),
+            ));
+        }
+    }
+    let expected: Vec<(bool, &str, String)> = [
+        // Case-sensitive: only the stored spelling selects `/api` and
+        // is stripped; the others are the public route's, unchanged.
+        (false, "/api/x", "GET /x HTTP/1.1"),
+        (false, "/API/x", "GET /API/x HTTP/1.1"),
+        (false, "/Api", "GET /Api HTTP/1.1"),
+        // Folding case: every spelling is the `/api` route's, stripped.
+        (true, "/api/x", "GET /x HTTP/1.1"),
+        (true, "/API/x", "GET /x HTTP/1.1"),
+        (true, "/Api", "GET / HTTP/1.1"),
+    ]
+    .into_iter()
+    .map(|(fold, path, line)| (fold, path, line.to_string()))
+    .collect();
+    assert_eq!(forwarded, expected);
 }

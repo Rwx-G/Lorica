@@ -333,6 +333,12 @@ pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
             .get::<_, Option<i64>>(71)
             .unwrap_or(None)
             .map(|v| v as u64),
+        // Column index 72 (migration V69, NOT NULL DEFAULT 0). 0 =
+        // case-sensitive, what every route written before it was
+        // matched as. A read error is a hard error, as `managed_by` is:
+        // read as `false`, it would narrow what the route's prefix and
+        // rules hold without a word.
+        case_insensitive_paths: row.get::<_, i32>(72)? != 0,
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(44)?)?,
     })

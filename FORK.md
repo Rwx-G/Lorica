@@ -363,6 +363,60 @@ lives in.
   same way. On an upstream sync, a new test client goes through the same
   helpers: the workspace `clippy.toml` refuses `reqwest::Client::builder`
   and its siblings everywhere else, the forks included.
+- **`lorica-core`, the client certificate chain in the TLS digest
+  (v1.10.3).** Sites: `lorica-core/src/protocols/tls/digest.rs` (the
+  `SslDigest::peer_cert_chain` and `peer_chain_verdicts` fields and the
+  `PeerCertChain` and `PeerChainVerdicts` types, which upstream does not
+  have) and
+  `lorica-core/src/protocols/tls/rustls/stream.rs`
+  (`SslDigest::from_stream` fills the chain, on an accepted connection
+  only). Upstream's digest keeps the organization, serial number and a
+  hash of the peer's end-entity certificate and drops the rest, which is
+  enough when one listener trusts one set of roots. Lorica installs on its
+  HTTPS listener the union of every mTLS route's CA bundle, so a
+  certificate the handshake accepted may come from another route's CA:
+  the proxy verifies the chain again against the route's own bundle
+  (`lorica::mtls::RouteClientVerifier`), and needs the chain to do it.
+  `PeerCertChain` bounds the copy, since rustls keeps its own for the
+  life of the connection: past its certificate count or byte bound the
+  chain is kept truncated, still counts as presented, and is withheld
+  from verification, so it is refused rather than judged on a prefix; its
+  `Debug` prints the shape, never the certificates.
+  `PeerChainVerdicts` keeps those verdicts per connection, so a keep-alive
+  or HTTP/2 connection verifies once per route rather than once per
+  request. `SslDigest::new` keeps upstream's signature and starts both
+  empty. On an upstream sync, keep the two fields and the fill in
+  `from_stream`; a new field upstream adds goes beside them.
+- **`lorica-core`, each subject organization kept apart (v1.10.3).**
+  Sites: `lorica-core/src/utils/tls/rustls.rs`
+  (`get_organizations_x509` and `get_organizations_serial_bytes`, which
+  upstream does not have), the `SslDigest::peer_organizations` field in
+  `digest.rs`, and `SslDigest::from_stream` in
+  `protocols/tls/rustls/stream.rs`. Upstream's `organization` joins every
+  `O=` value of the peer's subject with no separator, so `O=Ac, O=me`
+  reads as `Acme`, which is harmless for display and wrong for an
+  allowlist. `from_stream` now parses the end-entity once, through the
+  new function, and derives `organization` from the list by the same
+  join, so that field is unchanged; Lorica's mTLS allowlist reads the
+  list. On an upstream sync, keep `from_stream` on the list function.
+- **`lorica-core`, the client's server name in the TLS digest
+  (v1.10.3).** Sites: the `SslDigest::server_name` field in
+  `lorica-core/src/protocols/tls/digest.rs` and its fill in
+  `SslDigest::from_stream` (`protocols/tls/rustls/stream.rs`), on an
+  accepted connection only. Upstream keeps no SNI in the digest. A
+  client chooses its certificate for the server name of its handshake,
+  and a request on the connection may name another host (HTTP/2
+  coalescing, a reused connection); Lorica's mTLS check answers 421
+  rather than 495 or 496 in that case, so the client retries on a new
+  connection for the right host. `SslDigest::new` starts it `None`.
+- **`lorica-core`, a certificate x509-parser refuses is an error
+  (v1.10.3).** Site: `parse_der_reporting_errors` in
+  `lorica-core/src/utils/tls/rustls.rs`, behind
+  `get_organization_serial_bytes` and `get_organizations_serial_bytes`.
+  Upstream's `get_organization_serial_bytes` returns a `Result` and
+  still `expect`s the parse, so a peer certificate the handshake
+  accepted and x509-parser refused would panic the connection task; its
+  caller in `from_stream` already treats an error as "no organization".
 
 ## Upstream sync record
 

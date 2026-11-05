@@ -166,6 +166,136 @@ route names are stored in. `Host: App.Example.COM.` therefore reaches
 the route `app.example.com` and its controls rather than a wildcard or
 the catch-all. The `Host` sent to the backend is the client's, unchanged.
 
+### Request path validation (v1.10.3)
+
+Routes on one host are told apart by their path prefix, and the path
+rules of a route by their path, both matched on the path as the client
+sent it, which is also the path the backend receives. Backends often
+read a path differently: nginx decodes every percent-encoded octet,
+merges runs of `/` and resolves `.` and `..` before it matches a
+location; a Java servlet container drops each segment's `;` parameters
+(`/a;jsessionid=1/b` is `/a/b`); a Windows backend reads `\` as `/`.
+Lorica therefore also reads each path the way all of them together
+would, and refuses with 400 a request whose two readings select
+different routes, or different path rules of one route (or a rule on
+one reading and none on the other). On a host where `/admin` is a route
+of its own, or the path of a rule that denies or throttles it,
+`/%61dmin`, `//admin`, `/x/../admin`, `/..;/admin` and `/x\..\admin`
+are each refused. A path whose readings agree, which is every path a
+browser sends, is forwarded as sent.
+
+The second reading, step by step:
+
+1. `\` is read as `/`, and a `;` drops the rest of its segment, up to
+   the next `/` or `\`;
+2. every percent-encoded octet is decoded once;
+3. step 1 again, so `%5C` and `%3B` count as `\` and `;`;
+4. runs of `/` are merged and `.` and `..` segments resolved.
+
+Parameters are read before the decoding because Tomcat and Spring strip
+them from the undecoded path, so an encoded `/` inside a parameter does
+not start a segment there. The same reading decides whether a request
+under `/.well-known/acme-challenge/` is an ACME challenge and so exempt
+from a route's HTTPS redirect: it has to be one under both readings.
+
+The two hex digits of an encoded octet compare in either case on both
+readings, as every backend decodes them alike: a request for
+`/caf%c3%a9` is served by a route or a rule stored as `/caf%C3%A9`.
+
+Case is significant by default. A route whose backend treats paths
+case-insensitively (IIS, a case-insensitive file system) says so with
+`case_insensitive_paths` (dashboard: Security tab, *Path matching*):
+its `path_prefix`, each of its path rules and its `strip_path_prefix`
+then match with ASCII case folded, under both readings, so `/ADMIN/x`
+is served by the route on `/admin` and held to its rules, and a route
+on `/api` that strips `/api` forwards `/API/x` as `/x`. `/%41DMIN/x`,
+which only the second reading folds into `/admin`, is still refused.
+The path sent to the backend is otherwise never changed. An automation
+token may switch the flag on and never off (`docs/mcp.md`), and a
+token's route that folds case is weighed against every route it would
+take a spelling from, as one that takes a path is.
+
+#### When Lorica answers 400, and what to do about it
+
+Lorica answers 400 (`Bad request`) to exactly one class of path: a
+request whose path, read the second way, selects a different route, or
+a different path rule of its route (or a rule on one reading and none
+on the other), than the path as sent. The access log records it with
+the error `request path selects another route or path rule once
+normalised`; the upstream is never contacted. A path that selects the
+same route and rule both ways is forwarded as sent, however it is
+spelled, and so is a request target without a path to read: the query
+string is never part of the path, and `OPTIONS *` is answered by the
+selection like any other target.
+
+The check takes the union of every backend's reading, because the
+proxy cannot know which one the backend applies. On a host where a
+deeper route or a path rule exists, that also refuses some spellings a
+browser does not send but a client or a script may:
+
+- `//static/x` from a base URL and a path joined with two slashes, when
+  `/static` is a route of its own;
+- `/health;jsessionid=...` against an *exact* rule on `/health`, or any
+  `;` parameter that moves a path out of a rule's reach;
+- an encoded letter or slash (`/%61pi`, `/a%2Fb`) where the decoded
+  path reaches another route or rule;
+- `/x/../admin`, `/./admin` and their encoded forms.
+
+What an operator does about one, in order of preference:
+
+1. **Fix the client.** Each of these is a non-canonical spelling of
+   the path the client means; sending the plain one (`/static/x`,
+   `/health`, `/api`) is always accepted. This is the answer for a
+   script that joins URLs or encodes letters.
+2. **Make the rule or the route match both readings** when the
+   spelling is legitimate for the application: an exact rule that
+   clients reach with `;` parameters becomes a prefix rule, and a
+   prefix stored encoded can stay as it is, since its octets match in
+   either hex case and once decoded.
+3. **Say the backend ignores case** with `case_insensitive_paths` when
+   it does, rather than adding a route per spelling.
+
+There is no switch to turn the check off: a request it refuses is one
+a normalising backend would serve as a resource whose route or rule
+the proxy did not apply.
+
+### mTLS client verification
+
+A route with mTLS checks the client certificate against its own CA
+bundle (`mtls.ca_cert_pem`), on top of the HTTPS listener's handshake.
+
+- **What the bundle trusts.** Every certificate in the bundle is a
+  trust anchor on its own, as in nginx. A bundle that carries a root
+  trusts every CA that root signed, not only the issuing CA pasted
+  beside it; the "full chain" a PKI portal exports is such a bundle. To
+  trust one or a few issuing CAs, put those in the bundle and leave
+  their root out: a client then sends its own issuing CA if it is not
+  in the bundle, and a sibling issuing CA under the same root is
+  refused. The dashboard's *Validate PEM* (`POST
+  /api/v1/validate/mtls-pem`) lists, under `warnings`, every root found
+  beside other certificates and every CA found beside a certificate it
+  issued; such a bundle is still accepted, and a route save logs the
+  same warnings.
+- **`required`.** On, a request without a certificate is answered 496
+  and one whose certificate does not chain to the bundle 495. Either is
+  421 (Misdirected Request) when the request names another host than
+  the TLS handshake of its connection did, which happens when a browser
+  coalesces two hosts on one HTTP/2 connection or reuses one: the
+  client retries on a new connection, opened for this host, and can
+  present the certificate meant for it. Off, both pass as anonymous.
+- **`allowed_organizations`.** Matched against each `O=` value of the
+  certificate subject, whole and case-sensitively; a subject with
+  several matches when one of them is listed. It applies only to a
+  certificate that chains to the bundle, so on a route that is not
+  `required` it restricts nobody who presents no certificate.
+- **Changes.** A bundle edit reaches the route's check on reload. The
+  listener only learns a CA no route trusted at startup on a restart,
+  and until then refuses its certificates at the handshake.
+- **Bounds.** A client certificate chain is kept for verification up
+  to a bounded count and size (`PeerCertChain::MAX_CERTIFICATES` and
+  `MAX_BYTES` in `lorica-core`), far above any real chain; a longer one
+  is refused (495 on a required route, anonymous otherwise).
+
 ### WAF body inspection (v1.7.2, v1.8.0)
 
 The WAF buffers a request body only when it can parse it, and the

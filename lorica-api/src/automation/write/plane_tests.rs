@@ -20,7 +20,7 @@
 use crate::automation::test_support::{
     a_node_with_something_to_read, a_node_with_something_to_write, allowlisted_settings,
     an_environment_owning, assert_forbidden_naming, assert_no_secret_field_name, audit_rows_under,
-    automation_audit_rows, automation_call, automation_send, canonical_now, data_keys,
+    automation_audit_rows, automation_call, automation_send, canonical_now, data_keys, mcp_call,
     mint_automation, WriteFixture, WRITE_TOKEN_NAME,
 };
 use crate::server::AppState;
@@ -823,6 +823,96 @@ async fn a_token_strengthens_a_protection_through_the_plane_and_never_weakens_on
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn a_token_switches_case_insensitive_paths_on_and_never_off_over_rest_or_mcp() {
+    let f = a_node_with_something_to_write().await;
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(serde_json::json!({ "hostname": "case.write.example.com" })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = parse_data(created).await;
+    assert_eq!(created["case_insensitive_paths"], serde_json::json!(false));
+    let route_id = created["id"].as_str().expect("route id").to_string();
+    let route_path = format!("/automation/v1/routes/{route_id}");
+
+    let switched_on = automation_call(
+        &f.state,
+        "PUT",
+        &route_path,
+        &f.bearer,
+        Some(serde_json::json!({ "case_insensitive_paths": true })),
+    )
+    .await;
+    assert_eq!(switched_on.status(), StatusCode::OK);
+    assert_eq!(
+        parse_data(switched_on).await["case_insensitive_paths"],
+        serde_json::json!(true)
+    );
+
+    let before = canonical_now(&f.state).await;
+    let before_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
+    let off = serde_json::json!({ "case_insensitive_paths": false });
+    for suffix in ["", "?dry_run=true"] {
+        let response = automation_call(
+            &f.state,
+            "PUT",
+            &format!("{route_path}{suffix}"),
+            &f.bearer,
+            Some(off.clone()),
+        )
+        .await;
+        assert_forbidden_naming(response, "case_insensitive_paths", suffix).await;
+    }
+    for tool in ["lorica_route_update", "lorica_route_update_preview"] {
+        let refused = mcp_call(
+            &f.state,
+            &f.mcp_bearer,
+            tool,
+            serde_json::json!({ "id": route_id, "route": off.clone() }),
+        )
+        .await;
+        assert_eq!(
+            refused["result"]["isError"],
+            serde_json::json!(true),
+            "{refused}"
+        );
+        let text = refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(text.contains("HTTP 403"), "{tool}: {text}");
+        assert!(text.contains("case_insensitive_paths"), "{tool}: {text}");
+    }
+    let after = canonical_now(&f.state).await;
+    assert_eq!(
+        before_bytes,
+        lorica_config::canonical::encode_canonical(&after).expect("encodes"),
+        "a refused switch-off changed the store"
+    );
+
+    // The dashboard is not held to it.
+    let response = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "PUT",
+        &format!("/api/v1/routes/{route_id}"),
+        &f.admin,
+        Some(off),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        parse_data(response).await["case_insensitive_paths"],
+        serde_json::json!(false)
+    );
+}
+
 /// An operator route on `hostname` through the management API, with
 /// `protections` merged into its body; its id.
 async fn an_operator_route(
@@ -1258,6 +1348,95 @@ async fn a_route_displaces_only_the_paths_the_protected_route_serves_today() {
         "*.write.example.com",
     )
     .await;
+}
+
+#[tokio::test]
+async fn a_route_that_ignores_case_is_weighed_on_every_spelling_it_takes_over_rest_or_mcp() {
+    // Security review H1: the wildcard's `/api` is case-sensitive, so
+    // `/API/x` on `app.write.example.com` reaches the protected
+    // catch-all today. A token's `/api` there that folds case would
+    // serve it bare.
+    let f = a_node_with_something_to_write().await;
+    let catch_all = an_operator_route(
+        &f,
+        lorica_config::route_selection::CATCH_ALL_HOSTNAME,
+        serde_json::json!({ "waf_enabled": true }),
+    )
+    .await;
+    an_operator_route(
+        &f,
+        "*.write.example.com",
+        serde_json::json!({ "path_prefix": "/api" }),
+    )
+    .await;
+    let folding = serde_json::json!({
+        "hostname": "app.write.example.com",
+        "path_prefix": "/api",
+        "case_insensitive_paths": true,
+    });
+    assert_displacement_refused(
+        &f,
+        "POST",
+        "/automation/v1/routes",
+        folding.clone(),
+        "waf_enabled",
+        &catch_all,
+        "*.write.example.com",
+    )
+    .await;
+    for tool in ["lorica_route_create", "lorica_route_create_preview"] {
+        let refused = mcp_call(
+            &f.state,
+            &f.mcp_bearer,
+            tool,
+            serde_json::json!({ "route": folding.clone() }),
+        )
+        .await;
+        assert_eq!(
+            refused["result"]["isError"],
+            serde_json::json!(true),
+            "{refused}"
+        );
+        let text = refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(text.contains("HTTP 403"), "{tool}: {text}");
+        assert!(
+            text.contains(&format!("waf_enabled: route `{catch_all}` serves")),
+            "{tool}: {text}"
+        );
+    }
+
+    // Case-sensitive, the same route takes only what the unprotected
+    // wildcard serves; folding case, it is created as strong as the
+    // catch-all.
+    let mut sensitive = folding.clone();
+    sensitive["case_insensitive_paths"] = serde_json::json!(false);
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes?dry_run=true",
+        &f.bearer,
+        Some(sensitive),
+    )
+    .await;
+    assert_eq!(
+        created.status(),
+        StatusCode::OK,
+        "the preview of the bare route"
+    );
+    let mut strong = folding;
+    strong["waf_enabled"] = serde_json::json!(true);
+    let created = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/routes",
+        &f.bearer,
+        Some(strong),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
 }
 
 #[tokio::test]

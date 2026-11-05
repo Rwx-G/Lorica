@@ -73,6 +73,7 @@ pub(super) fn make_route(id: &str, hostname: &str, path: &str, enabled: bool) ->
         ai_bot_policy: None,
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
+        case_insensitive_paths: false,
         managed_by: None,
         waf_body_scan_max_bytes: None,
         created_at: now,
@@ -888,6 +889,42 @@ fn test_exact_match_takes_precedence_over_wildcard() {
 }
 
 #[test]
+fn the_prefix_strip_matches_as_the_route_selection_matched() {
+    let mut route = make_route("r1", "example.com", "/api", true);
+    route.strip_path_prefix = Some("/api".into());
+    // Case-sensitive, as every route is by default: only the stored
+    // spelling is stripped.
+    for (sent, forwarded) in [
+        ("/api/x", "/x"),
+        ("/api", "/"),
+        ("/apix", "/x"),
+        ("/API/x", "/API/x"),
+        ("/other", "/other"),
+    ] {
+        assert_eq!(path_after_strip(sent, &route), forwarded, "{sent}");
+    }
+    // A route that folds case is selected for `/API/x`, and strips it.
+    route.case_insensitive_paths = true;
+    for (sent, forwarded) in [
+        ("/api/x", "/x"),
+        ("/API/x", "/x"),
+        ("/Api", "/"),
+        ("/other", "/other"),
+    ] {
+        assert_eq!(path_after_strip(sent, &route), forwarded, "{sent}");
+    }
+    // An encoded octet strips in either hex case, as it selects.
+    route.case_insensitive_paths = false;
+    route.strip_path_prefix = Some("/caf%C3%A9".into());
+    assert_eq!(path_after_strip("/caf%c3%a9/menu", &route), "/menu");
+    route.strip_path_prefix = None;
+    assert!(matches!(
+        path_after_strip("/api/x", &route),
+        std::borrow::Cow::Borrowed("/api/x")
+    ));
+}
+
+#[test]
 fn a_host_finds_its_route_whatever_its_case_and_root_dot() {
     // RFC 9110: a host name is case-insensitive, and the absolute name
     // with its root dot is the same host. Either spelling used to miss
@@ -1476,27 +1513,37 @@ fn test_path_rule_matching() {
     let entry = config.find_route("example.com", "/api/v2/users").unwrap();
     assert_eq!(entry.route.id, "r1");
 
-    // Verify first path rule matches prefix
-    let matched = entry
-        .route
-        .path_rules
-        .iter()
-        .find(|r| r.matches("/api/v2/users"));
-    assert!(matched.is_some());
-    assert_eq!(matched.unwrap().path, "/api/v2");
+    // The rule the proxy applies is the one `matching_path_rule` picks,
+    // under the route's own case setting.
+    let matched = entry.route.matching_path_rule("/api/v2/users");
+    assert_eq!(
+        matched.map(|(i, rule)| (i, rule.path.as_str())),
+        Some((0, "/api/v2"))
+    );
 
-    // Verify exact match rule
-    let matched = entry.route.path_rules.iter().find(|r| r.matches("/health"));
-    assert!(matched.is_some());
-    assert_eq!(matched.unwrap().return_status, Some(200));
+    // Exact match rule.
+    let matched = entry.route.matching_path_rule("/health");
+    assert_eq!(
+        matched.map(|(i, rule)| (i, rule.return_status)),
+        Some((1, Some(200)))
+    );
 
-    // Verify exact match does not match prefix
-    let matched = entry
-        .route
-        .path_rules
-        .iter()
-        .find(|r| r.matches("/health/check"));
-    assert!(matched.is_none());
+    // An exact rule does not match below its path, nor, case-sensitive
+    // as the route is, another case.
+    assert!(entry.route.matching_path_rule("/health/check").is_none());
+    assert!(entry.route.matching_path_rule("/HEALTH").is_none());
+
+    // Folding case on the route folds it for every rule.
+    let mut folding = (*entry.route).clone();
+    folding.case_insensitive_paths = true;
+    assert_eq!(
+        folding.matching_path_rule("/HEALTH").map(|(i, _)| i),
+        Some(1)
+    );
+    assert_eq!(
+        folding.matching_path_rule("/API/V2/x").map(|(i, _)| i),
+        Some(0)
+    );
 }
 
 // ---- Trusted Proxies ----
@@ -2402,14 +2449,55 @@ fn enforcer(required: bool, orgs: Vec<&str>) -> MtlsEnforcer {
     MtlsEnforcer {
         required,
         allowed_organizations: orgs.into_iter().map(String::from).collect(),
+        client_verifier: None,
     }
+}
+
+fn orgs(list: &[&str]) -> Vec<String> {
+    list.iter().map(|o| o.to_string()).collect()
+}
+
+fn verified(organizations: &[String]) -> RouteClientCert<'_> {
+    RouteClientCert::Verified { organizations }
+}
+
+#[test]
+fn test_evaluate_mtls_allowlist_never_matches_joined_organizations() {
+    // `O=Ac, O=me` is two organizations, neither of them `Acme`.
+    assert_eq!(
+        evaluate_mtls(
+            &enforcer(true, vec!["Acme"]),
+            verified(&orgs(&["Ac", "me"]))
+        ),
+        Some(495)
+    );
+}
+
+#[test]
+fn test_evaluate_mtls_allowlist_matches_any_one_of_several_organizations() {
+    let corp = orgs(&["Acme", "Corp"]);
+    assert_eq!(
+        evaluate_mtls(&enforcer(true, vec!["Corp"]), verified(&corp)),
+        None
+    );
+    assert_eq!(
+        evaluate_mtls(&enforcer(true, vec!["Acme"]), verified(&corp)),
+        None
+    );
+    assert_eq!(
+        evaluate_mtls(&enforcer(true, vec!["AcmeCorp"]), verified(&corp)),
+        Some(495)
+    );
 }
 
 #[test]
 fn test_evaluate_mtls_required_no_cert_denies_496() {
     // required = true with an absent client cert is the canonical
     // zero-trust denial. 496 matches Nginx's reserved status.
-    assert_eq!(evaluate_mtls(&enforcer(true, vec![]), None), Some(496));
+    assert_eq!(
+        evaluate_mtls(&enforcer(true, vec![]), RouteClientCert::Absent),
+        Some(496)
+    );
 }
 
 #[test]
@@ -2417,7 +2505,7 @@ fn test_evaluate_mtls_required_with_cert_and_empty_allowlist_passes() {
     // Allowlist empty = trust the chain verifier. Any verified
     // cert passes.
     assert_eq!(
-        evaluate_mtls(&enforcer(true, vec![]), Some("Acme Corp")),
+        evaluate_mtls(&enforcer(true, vec![]), verified(&orgs(&["Acme Corp"]))),
         None
     );
 }
@@ -2426,13 +2514,19 @@ fn test_evaluate_mtls_required_with_cert_and_empty_allowlist_passes() {
 fn test_evaluate_mtls_optional_no_cert_passes() {
     // required = false is the opportunistic mode: a missing cert
     // is allowed through to the upstream.
-    assert_eq!(evaluate_mtls(&enforcer(false, vec![]), None), None);
+    assert_eq!(
+        evaluate_mtls(&enforcer(false, vec![]), RouteClientCert::Absent),
+        None
+    );
 }
 
 #[test]
 fn test_evaluate_mtls_allowlist_match_passes() {
     assert_eq!(
-        evaluate_mtls(&enforcer(true, vec!["Acme", "Beta"]), Some("Acme")),
+        evaluate_mtls(
+            &enforcer(true, vec!["Acme", "Beta"]),
+            verified(&orgs(&["Acme"]))
+        ),
         None
     );
 }
@@ -2443,18 +2537,17 @@ fn test_evaluate_mtls_allowlist_miss_denies_495() {
     // allowlist - 495 ("SSL certificate error") is the right
     // status code.
     assert_eq!(
-        evaluate_mtls(&enforcer(true, vec!["Acme"]), Some("Gamma")),
+        evaluate_mtls(&enforcer(true, vec!["Acme"]), verified(&orgs(&["Gamma"]))),
         Some(495)
     );
 }
 
 #[test]
 fn test_evaluate_mtls_allowlist_miss_denies_even_when_not_required() {
-    // Opportunistic + allowlist is still enforcing: if a cert is
-    // presented but doesn't match, deny. Otherwise the allowlist
-    // would be silently bypassable by omitting the cert.
+    // Opportunistic + allowlist is still enforcing: if a verified
+    // cert is presented but doesn't match, deny.
     assert_eq!(
-        evaluate_mtls(&enforcer(false, vec!["Acme"]), Some("Gamma")),
+        evaluate_mtls(&enforcer(false, vec!["Acme"]), verified(&orgs(&["Gamma"]))),
         Some(495)
     );
 }
@@ -2464,19 +2557,402 @@ fn test_evaluate_mtls_allowlist_is_case_sensitive() {
     // Exact match, no case folding. Organization strings come
     // from the X.509 subject verbatim.
     assert_eq!(
-        evaluate_mtls(&enforcer(true, vec!["Acme"]), Some("acme")),
+        evaluate_mtls(&enforcer(true, vec!["Acme"]), verified(&orgs(&["acme"]))),
         Some(495)
     );
 }
 
 #[test]
 fn test_evaluate_mtls_empty_org_on_cert_fails_non_empty_allowlist() {
-    // Cert present but carries no O= field (Some("") per
-    // downstream_ssl_digest contract) vs a non-empty allowlist:
-    // empty string never matches, so deny.
+    // Verified cert without an O= field (no organizations per the
+    // route_client_cert contract) vs a non-empty allowlist: nothing
+    // matches, so deny.
     assert_eq!(
-        evaluate_mtls(&enforcer(true, vec!["Acme"]), Some("")),
+        evaluate_mtls(&enforcer(true, vec!["Acme"]), verified(&[])),
         Some(495)
+    );
+}
+
+// ---- route_client_cert: per-route chain verification ----
+//
+// Two CAs as on a listener serving two mTLS routes: the listener trusts
+// both, so a digest carrying either CA's leaf is what reaches the proxy
+// layer. Each route must judge it against its own CA only.
+
+fn init_mtls_crypto() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+struct MtlsTestCa {
+    pem: String,
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+}
+
+fn mtls_test_ca(cn: &str) -> MtlsTestCa {
+    let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    let key = rcgen::KeyPair::generate().unwrap();
+    let pem = params.self_signed(&key).unwrap().pem();
+    MtlsTestCa {
+        pem,
+        issuer: rcgen::Issuer::new(params, key),
+    }
+}
+
+/// The digest the listener records for a client presenting a leaf of
+/// `ca` with subject `O=org`, through the same parser the rustls stream
+/// uses for `organization`.
+fn client_digest(ca: &MtlsTestCa, org: &str) -> lorica_core::protocols::tls::SslDigest {
+    client_digest_full(ca, &[org], &[])
+}
+
+/// [`client_digest`] with `tail` sent after the end-entity, as a client
+/// sends intermediates.
+fn client_digest_with_chain_tail(
+    ca: &MtlsTestCa,
+    org: &str,
+    tail: &[Vec<u8>],
+) -> lorica_core::protocols::tls::SslDigest {
+    client_digest_full(ca, &[org], tail)
+}
+
+/// The digest for a leaf of `ca` whose subject carries one `O=` per
+/// entry of `organizations` (at most two: rcgen keys a name by attribute
+/// type, so the second goes in under the organizationName OID spelled as
+/// a custom type), filled as `SslDigest::from_stream` fills it.
+fn client_digest_full(
+    ca: &MtlsTestCa,
+    organizations: &[&str],
+    tail: &[Vec<u8>],
+) -> lorica_core::protocols::tls::SslDigest {
+    const ORGANIZATION_NAME_OID: [u64; 4] = [2, 5, 4, 10];
+    assert!(
+        organizations.len() <= 2,
+        "test setup: at most two O= values"
+    );
+    let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "client");
+    if let Some(first) = organizations.first() {
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationName, *first);
+    }
+    if let Some(second) = organizations.get(1) {
+        params.distinguished_name.push(
+            rcgen::DnType::CustomDnType(ORGANIZATION_NAME_OID.to_vec()),
+            *second,
+        );
+    }
+    let key = rcgen::KeyPair::generate().unwrap();
+    let der = params.signed_by(&key, &ca.issuer).unwrap().der().to_vec();
+    let (peer_organizations, serial) =
+        lorica_core::utils::tls::get_organizations_serial_bytes(&der).unwrap();
+    let mut digest = lorica_core::protocols::tls::SslDigest::new(
+        "TLS13_AES_128_GCM_SHA256",
+        "TLSv1.3",
+        (!peer_organizations.is_empty()).then(|| peer_organizations.concat()),
+        Some(serial),
+        vec![1],
+    );
+    digest.peer_organizations = peer_organizations;
+    digest.peer_cert_chain = lorica_core::protocols::tls::PeerCertChain::new(
+        std::iter::once(der.as_slice()).chain(tail.iter().map(Vec::as_slice)),
+    );
+    digest
+}
+
+#[test]
+fn test_route_client_cert_two_o_values_never_join_into_an_allowed_org() {
+    let ca_b = mtls_test_ca("CA B");
+    let split = client_digest_full(&ca_b, &["Ac", "me"], &[]);
+    // Upstream's joined field reads `Acme`; the policy must not.
+    assert_eq!(split.organization.as_deref(), Some("Acme"));
+    assert_eq!(split.peer_organizations, orgs(&["Ac", "me"]));
+    assert_eq!(
+        judge(&split, &route_enforcer(&ca_b, true, vec!["Acme"])),
+        Some(495)
+    );
+    assert_eq!(
+        judge(&split, &route_enforcer(&ca_b, true, vec!["me"])),
+        None
+    );
+}
+
+fn route_enforcer(ca: &MtlsTestCa, required: bool, orgs: Vec<&str>) -> MtlsEnforcer {
+    init_mtls_crypto();
+    MtlsEnforcer::from_config(
+        "route-b",
+        &MtlsConfig {
+            ca_cert_pem: ca.pem.clone(),
+            required,
+            allowed_organizations: orgs.into_iter().map(String::from).collect(),
+        },
+    )
+}
+
+fn judge(digest: &lorica_core::protocols::tls::SslDigest, enforcer: &MtlsEnforcer) -> Option<u16> {
+    evaluate_mtls(enforcer, route_client_cert(Some(digest), enforcer))
+}
+
+#[test]
+fn test_route_client_cert_other_ca_leaf_refused_on_required_route() {
+    let ca_a = mtls_test_ca("CA A");
+    let ca_b = mtls_test_ca("CA B");
+    let digest = client_digest(&ca_a, "Acme");
+    let route_b = route_enforcer(&ca_b, true, vec![]);
+    assert_eq!(
+        route_client_cert(Some(&digest), &route_b),
+        RouteClientCert::Untrusted
+    );
+    assert_eq!(judge(&digest, &route_b), Some(495));
+}
+
+#[test]
+fn test_route_client_cert_other_ca_leaf_carries_no_identity_on_optional_route() {
+    let ca_a = mtls_test_ca("CA A");
+    let ca_b = mtls_test_ca("CA B");
+    let digest = client_digest(&ca_a, "Acme");
+    // An allowlist that would refuse "Acme" is not consulted: the
+    // certificate is no identity here, and the route admits anonymous
+    // clients.
+    let route_b = route_enforcer(&ca_b, false, vec!["Beta"]);
+    assert_eq!(
+        route_client_cert(Some(&digest), &route_b),
+        RouteClientCert::Untrusted
+    );
+    assert_eq!(judge(&digest, &route_b), None);
+}
+
+#[test]
+fn test_route_client_cert_own_ca_leaf_accepted() {
+    let ca_b = mtls_test_ca("CA B");
+    let digest = client_digest(&ca_b, "Beta");
+    let route_b = route_enforcer(&ca_b, true, vec![]);
+    assert_eq!(
+        route_client_cert(Some(&digest), &route_b),
+        RouteClientCert::Verified {
+            organizations: &orgs(&["Beta"])
+        }
+    );
+    assert_eq!(judge(&digest, &route_b), None);
+}
+
+#[test]
+fn test_route_client_cert_allowlist_applies_after_chain_verification() {
+    let ca_b = mtls_test_ca("CA B");
+    let route_b = route_enforcer(&ca_b, true, vec!["Beta"]);
+    assert_eq!(judge(&client_digest(&ca_b, "Beta"), &route_b), None);
+    assert_eq!(judge(&client_digest(&ca_b, "Gamma"), &route_b), Some(495));
+    let optional_b = route_enforcer(&ca_b, false, vec!["Beta"]);
+    assert_eq!(
+        judge(&client_digest(&ca_b, "Gamma"), &optional_b),
+        Some(495)
+    );
+}
+
+#[test]
+fn test_route_client_cert_other_ca_leaf_with_the_allowed_org_refused() {
+    // CA A can write any O= it likes: B's allowlist is no defence
+    // without B's chain check.
+    let ca_a = mtls_test_ca("CA A");
+    let ca_b = mtls_test_ca("CA B");
+    let impostor = client_digest(&ca_a, "Beta");
+    assert_eq!(
+        judge(&impostor, &route_enforcer(&ca_b, true, vec!["Beta"])),
+        Some(495)
+    );
+    assert_eq!(
+        route_client_cert(Some(&impostor), &route_enforcer(&ca_b, false, vec!["Beta"])),
+        RouteClientCert::Untrusted
+    );
+}
+
+#[test]
+fn test_route_client_cert_absent_without_digest_or_chain() {
+    let ca_b = mtls_test_ca("CA B");
+    let route_b = route_enforcer(&ca_b, true, vec![]);
+    assert_eq!(route_client_cert(None, &route_b), RouteClientCert::Absent);
+    let no_cert = lorica_core::protocols::tls::SslDigest::new(
+        "TLS13_AES_128_GCM_SHA256",
+        "TLSv1.3",
+        None,
+        None,
+        Vec::new(),
+    );
+    assert_eq!(
+        route_client_cert(Some(&no_cert), &route_b),
+        RouteClientCert::Absent
+    );
+    assert_eq!(judge(&no_cert, &route_b), Some(496));
+}
+
+#[test]
+fn test_route_client_cert_unusable_bundle_verifies_nothing() {
+    let ca_b = mtls_test_ca("CA B");
+    let digest = client_digest(&ca_b, "Beta");
+    let mut route = route_enforcer(&ca_b, true, vec![]);
+    route.client_verifier = None;
+    assert_eq!(
+        route_client_cert(Some(&digest), &route),
+        RouteClientCert::Untrusted
+    );
+    assert_eq!(judge(&digest, &route), Some(495));
+}
+
+#[test]
+fn test_route_client_cert_chain_over_the_bound_is_refused_although_its_leaf_verifies() {
+    // Unused extra intermediates do not fail webpki, so without the
+    // bound this chain verifies on its own CA's route. Over the bound
+    // it is presented and never verified: 495 on a required route,
+    // anonymous on an optional one, never an identity.
+    use lorica_core::protocols::tls::PeerCertChain;
+    let ca_b = mtls_test_ca("CA B");
+    let padding = vec![vec![0x30; 512]; PeerCertChain::MAX_CERTIFICATES];
+    let padded = client_digest_with_chain_tail(&ca_b, "Beta", &padding);
+    assert!(padded.peer_cert_chain.is_truncated());
+    let route_b = route_enforcer(&ca_b, true, vec![]);
+    assert_eq!(
+        route_client_cert(Some(&padded), &route_b),
+        RouteClientCert::Untrusted
+    );
+    assert_eq!(judge(&padded, &route_b), Some(495));
+    assert_eq!(
+        judge(&padded, &route_enforcer(&ca_b, false, vec!["Beta"])),
+        None
+    );
+
+    // The same leaf with a tail inside the bound verifies.
+    let within = client_digest_with_chain_tail(&ca_b, "Beta", &padding[..2]);
+    assert!(matches!(
+        route_client_cert(Some(&within), &route_b),
+        RouteClientCert::Verified { .. }
+    ));
+}
+
+#[test]
+fn test_route_client_cert_verdict_is_kept_per_connection_and_route() {
+    let ca_a = mtls_test_ca("CA A");
+    let ca_b = mtls_test_ca("CA B");
+    let digest = client_digest(&ca_a, "Acme");
+    let route_a = route_enforcer(&ca_a, true, vec![]);
+    let route_b = route_enforcer(&ca_b, true, vec![]);
+    let key_a = route_a.client_verifier.as_ref().unwrap().memo_key();
+    let key_b = route_b.client_verifier.as_ref().unwrap().memo_key();
+
+    assert_eq!(judge(&digest, &route_a), None);
+    assert_eq!(judge(&digest, &route_b), Some(495));
+    assert_eq!(digest.peer_chain_verdicts.get(key_a), Some(true));
+    assert_eq!(digest.peer_chain_verdicts.get(key_b), Some(false));
+
+    // The recorded verdict is what later requests on the connection
+    // read: overwrite it and the chain is not verified again.
+    digest.peer_chain_verdicts.record(key_a, false);
+    assert_eq!(judge(&digest, &route_a), Some(495));
+}
+
+#[test]
+fn test_route_client_cert_reload_renews_the_verdict() {
+    // A reload rebuilds the enforcer, hence a new memo key: a CA change
+    // reaches connections already open.
+    let ca_a = mtls_test_ca("CA A");
+    let ca_b = mtls_test_ca("CA B");
+    let digest = client_digest(&ca_a, "Acme");
+    assert_eq!(
+        judge(&digest, &route_enforcer(&ca_b, true, vec![])),
+        Some(495)
+    );
+    assert_eq!(judge(&digest, &route_enforcer(&ca_a, true, vec![])), None);
+}
+
+// ---- mtls_refusal_status: 421 on a connection opened for another host ----
+
+#[test]
+fn test_mtls_refusal_is_421_when_the_connection_names_another_host() {
+    let required = enforcer(true, vec![]);
+    for client_cert in [RouteClientCert::Absent, RouteClientCert::Untrusted] {
+        assert_eq!(
+            mtls_refusal_status(
+                &required,
+                client_cert,
+                Some("a.example.com"),
+                "b.example.com"
+            ),
+            Some(421),
+            "{client_cert:?}"
+        );
+        // Server names compare in canonical form.
+        assert_eq!(
+            mtls_refusal_status(
+                &required,
+                client_cert,
+                Some("A.Example.com."),
+                "b.example.com"
+            ),
+            Some(421),
+            "{client_cert:?}"
+        );
+    }
+}
+
+#[test]
+fn test_mtls_refusal_keeps_495_and_496_on_the_host_the_connection_names() {
+    let required = enforcer(true, vec![]);
+    for server_name in [Some("b.example.com"), Some("B.EXAMPLE.COM"), None] {
+        assert_eq!(
+            mtls_refusal_status(
+                &required,
+                RouteClientCert::Absent,
+                server_name,
+                "b.example.com"
+            ),
+            Some(496),
+            "{server_name:?}"
+        );
+        assert_eq!(
+            mtls_refusal_status(
+                &required,
+                RouteClientCert::Untrusted,
+                server_name,
+                "b.example.com"
+            ),
+            Some(495),
+            "{server_name:?}"
+        );
+    }
+}
+
+#[test]
+fn test_mtls_refusal_keeps_495_for_an_allowlist_miss_and_passes_what_passes() {
+    // A certificate this route's CA issued was meant for this route: a
+    // new connection would not change the allowlist's verdict.
+    let gamma = orgs(&["Gamma"]);
+    assert_eq!(
+        mtls_refusal_status(
+            &enforcer(true, vec!["Acme"]),
+            verified(&gamma),
+            Some("a.example.com"),
+            "b.example.com"
+        ),
+        Some(495)
+    );
+    // Nothing that passes becomes a refusal.
+    assert_eq!(
+        mtls_refusal_status(
+            &enforcer(false, vec![]),
+            RouteClientCert::Untrusted,
+            Some("a.example.com"),
+            "b.example.com"
+        ),
+        None
     );
 }
 

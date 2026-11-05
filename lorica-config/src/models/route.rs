@@ -57,11 +57,31 @@ pub struct PathRule {
 
 impl PathRule {
     /// Test the rule's `path` against an incoming request path under the
-    /// configured [`PathMatchType`].
-    pub fn matches(&self, request_path: &str) -> bool {
+    /// configured [`PathMatchType`], ASCII case folded when
+    /// `case_insensitive` (the rule's route's
+    /// [`Route::case_insensitive_paths`]), and the hex digits of a
+    /// percent-encoded octet in any case either way
+    /// ([`crate::route_selection::path_starts_with`]).
+    pub fn matches(&self, request_path: &str, case_insensitive: bool) -> bool {
+        self.matches_as(&self.path, request_path, case_insensitive)
+    }
+
+    /// [`PathRule::matches`] with `pattern` standing for the rule's
+    /// `path`: the rule as another reading of the request spells it
+    /// (`crate::route_selection::selects_alike_once_normalised`).
+    pub(crate) fn matches_as(
+        &self,
+        pattern: &str,
+        request_path: &str,
+        case_insensitive: bool,
+    ) -> bool {
         match self.match_type {
-            PathMatchType::Prefix => request_path.starts_with(&self.path),
-            PathMatchType::Exact => request_path == self.path,
+            PathMatchType::Prefix => {
+                crate::route_selection::path_starts_with(request_path, pattern, case_insensitive)
+            }
+            PathMatchType::Exact => {
+                crate::route_selection::path_equals(request_path, pattern, case_insensitive)
+            }
         }
     }
 
@@ -348,50 +368,6 @@ fn default_forward_auth_timeout_ms() -> u32 {
     5_000
 }
 
-/// Mutual-TLS client verification.
-///
-/// # HTTP-only listeners
-///
-/// mTLS enforcement is keyed on the downstream TLS digest
-/// (`session.as_downstream().digest().ssl_digest`). Plaintext HTTP
-/// connections have no TLS digest, so a route with `mtls.required =
-/// true` served over an HTTP listener returns 496 unconditionally -
-/// the request never carries a client cert to verify. This is
-/// intentional (fail-closed), but confusing if the operator forgot
-/// to also set `force_https = true` / `redirect_to`. Pair mTLS with
-/// either an HTTPS-only listener or `force_https` so plaintext
-/// clients are redirected to the TLS-terminating port.
-///
-/// # Requirements and constraints
-///
-/// Require connecting clients to present an X.509 certificate signed
-/// by the configured CA bundle and, optionally, constrain which
-/// certificate subjects are allowed.
-///
-/// The CA bundle is used by the TLS listener to validate the chain;
-/// whether a missing cert counts as a failure is driven by `required`.
-/// rustls is configured with `allow_unauthenticated` so the handshake
-/// always succeeds - final allow/deny lives in the proxy layer, which
-/// lets different routes on the same listener have different policies.
-///
-/// Two enforcement levels:
-/// - `required = true`: the request is denied with 496
-///   (RFC-reserved "SSL certificate required" status) if the client
-///   did not present a cert. This is the zero-trust mode.
-/// - `required = false`: requests without a cert pass through; requests
-///   WITH a cert still get their organization checked against the
-///   allowlist if one is configured. Useful for routes that want to
-///   prefer-but-not-require client certs (mixed public + B2B).
-///
-/// `allowed_organizations` is an optional allowlist matched against the
-/// cert subject's `O=` field. An empty list accepts any cert that
-/// chains to the bundle. When non-empty, the organization is a
-/// case-sensitive exact match.
-///
-/// Changes to `ca_cert_pem` require a proxy restart because rustls
-/// server configs are immutable after build. Toggling `required` and
-/// editing `allowed_organizations` are both hot-reloadable since those
-/// are enforced in the request path.
 /// Per-route token-bucket rate limit. Cross-worker under `--workers N`
 /// via the lorica-limits `LocalBucket` + supervisor-synced
 /// `AuthoritativeBucket` pair. See
@@ -462,8 +438,69 @@ pub enum RateLimitScope {
     PerRoute,
 }
 
-/// mTLS client-certificate verification for a single route. See the
-/// preceding module-level comment for the threat model.
+/// Mutual-TLS client verification.
+///
+/// # HTTP-only listeners
+///
+/// mTLS enforcement is keyed on the downstream TLS digest
+/// (`session.as_downstream().digest().ssl_digest`). Plaintext HTTP
+/// connections have no TLS digest, so a route with `mtls.required =
+/// true` served over an HTTP listener returns 496 unconditionally -
+/// the request never carries a client cert to verify. This is
+/// intentional (fail-closed), but confusing if the operator forgot
+/// to also set `force_https = true` / `redirect_to`. Pair mTLS with
+/// either an HTTPS-only listener or `force_https` so plaintext
+/// clients are redirected to the TLS-terminating port.
+///
+/// # Requirements and constraints
+///
+/// Require connecting clients to present an X.509 certificate signed
+/// by the configured CA bundle and, optionally, constrain which
+/// certificate subjects are allowed.
+///
+/// The HTTPS listener trusts the union of every mTLS route's bundle,
+/// with `allow_unauthenticated` so a client without a cert still
+/// completes the handshake. A certificate it accepts may therefore come
+/// from another route's CA, so the proxy layer verifies the chain again
+/// against THIS route's bundle before it reads anything from the
+/// certificate. A certificate that does not chain to this bundle is no
+/// client identity on this route.
+///
+/// Two enforcement levels:
+/// - `required = true`: the request is denied with 496 ("SSL
+///   certificate required") if the client did not present a cert, and
+///   with 495 ("SSL certificate error") if its cert does not chain to
+///   this bundle. This is the zero-trust mode. Either becomes 421
+///   ("Misdirected Request") when the request names another host than
+///   the connection's TLS handshake did, so a client that coalesced or
+///   reused a connection retries on one opened for this host.
+/// - `required = false`: requests without a cert, or with one that does
+///   not chain to this bundle, pass through as anonymous; requests with
+///   a cert that does chain still get their organization checked
+///   against the allowlist if one is configured. Useful for routes that
+///   want to prefer-but-not-require client certs (mixed public + B2B).
+///
+/// `allowed_organizations` is an optional allowlist matched against the
+/// cert subject's `O=` values. An empty list accepts any cert that
+/// chains to the bundle. When non-empty, each `O=` value is compared
+/// whole, case-sensitively, and a subject with several matches when one
+/// of them is listed. On a route that is not `required`, the allowlist
+/// refuses only certificates of this bundle that miss it: a client
+/// without a certificate, or with another CA's, passes as anonymous, so
+/// the allowlist restricts nobody who presents none.
+///
+/// Every certificate of `ca_cert_pem` is a trust anchor. A bundle that
+/// carries a root trusts every CA that root signed, not only the
+/// issuing CAs pasted beside it; to trust specific issuing CAs, the
+/// bundle holds those and not their root. The dashboard's PEM
+/// validation warns about such a bundle.
+///
+/// A change to `ca_cert_pem` reaches this route's check on reload. The
+/// listener's union only changes on restart, because rustls server
+/// configs are immutable after build: until then a certificate from a
+/// CA no route trusted at startup fails the handshake. Toggling
+/// `required` and editing `allowed_organizations` are both
+/// hot-reloadable since those are enforced in the request path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MtlsConfig {
@@ -471,13 +508,18 @@ pub struct MtlsConfig {
     /// issue client certs. Must contain at least one valid CERTIFICATE
     /// block. Empty / garbage PEM is rejected by the API validator.
     pub ca_cert_pem: String,
-    /// When true, requests without a validated client certificate are
-    /// rejected with 496. When false, unauthenticated requests pass
-    /// through but any presented cert must still match the allowlist.
+    /// When true, requests without a client certificate are rejected
+    /// with 496, and requests whose certificate does not chain to
+    /// `ca_cert_pem` with 495 (421 for either over a connection opened
+    /// for another host). When false, both pass through as
+    /// anonymous, and a certificate that does chain must still match
+    /// the allowlist.
     #[serde(default)]
     pub required: bool,
     /// Optional subject-organization allowlist. Empty = accept any
-    /// cert that chains to `ca_cert_pem`. Case-sensitive exact match.
+    /// cert that chains to `ca_cert_pem`. Each `O=` value of the
+    /// subject is matched whole and case-sensitively; one listed value
+    /// is enough.
     #[serde(default)]
     pub allowed_organizations: Vec<String>,
 }
@@ -548,6 +590,16 @@ pub struct Route {
     /// URL path prefix the route answers under (e.g. `"/api"`).
     /// Requests to `https://{hostname}{path_prefix}...` land here.
     pub path_prefix: String,
+    /// The route's backend treats paths case-insensitively (IIS, a
+    /// case-insensitive file system). On, `path_prefix` and each path
+    /// rule's `path` match a request path with ASCII case folded, under
+    /// both readings the selection compares
+    /// (`crate::route_selection::selects_alike_once_normalised`), so
+    /// `/ADMIN` is served by a route on `/admin` and its controls rather
+    /// than by a broader route without them. Off, case is significant,
+    /// as it always was. The path the backend receives never changes.
+    #[serde(default)]
+    pub case_insensitive_paths: bool,
     /// ID of the [`Certificate`] used to terminate TLS for this
     /// route. `None` means plaintext-only (HTTP listener).
     ///
@@ -1264,7 +1316,19 @@ impl Route {
         self.path_rules
             .iter()
             .enumerate()
-            .find(|(_, rule)| rule.matches(request_path))
+            .find(|(_, rule)| rule.matches(request_path, self.case_insensitive_paths))
+    }
+
+    /// Whether `path` falls under this route's `path_prefix`, ASCII case
+    /// folded when [`Route::case_insensitive_paths`] is on: the test the
+    /// route selection, and everything that asks which paths a route
+    /// serves, applies.
+    pub fn covers_path(&self, path: &str) -> bool {
+        crate::route_selection::path_starts_with(
+            path,
+            &self.path_prefix,
+            self.case_insensitive_paths,
+        )
     }
 
     /// `(rate_limit_rps, rate_limit_burst, rate_limit)` once `rule` is

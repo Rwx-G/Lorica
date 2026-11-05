@@ -62,6 +62,9 @@
     | { status: 'error'; message: string };
 
   let mtlsValidation: ActionState = $state({ status: 'idle' });
+  // What the last validated bundle trusts beyond the certificates it
+  // lists (a root, or a CA beside one it issued), as the API words it.
+  let mtlsBundleWarnings: string[] = $state([]);
   let faTest: ActionState = $state({ status: 'idle' });
 
   // Blur-time validation for forward_auth_address so the operator
@@ -96,10 +99,12 @@
       return;
     }
     mtlsValidation = { status: 'running' };
+    mtlsBundleWarnings = [];
     const res = await api.validateMtlsPem(pem);
     if (res.error) {
       mtlsValidation = { status: 'error', message: res.error.message };
     } else if (res.data) {
+      mtlsBundleWarnings = res.data.warnings ?? [];
       const n = res.data.ca_count;
       const subj = res.data.subjects.slice(0, 5).join(' · ');
       const more = res.data.subjects.length > 5 ? ` (+${res.data.subjects.length - 5} more)` : '';
@@ -162,6 +167,30 @@
           <span class="hint">Start in Detection for a few days, then flip to Blocking once the baseline is clean.</span>
         </div>
       {/if}
+    </div>
+  </section>
+
+  <section id="sec-path-case" class="subsection">
+    <SubsectionHeader
+      title="Path matching"
+      description="How this route's path prefix and path rules compare to a request path."
+      accent="orange"
+    />
+    <div class="subsection-body">
+      <div class="form-group" class:modified={isModified('case_insensitive_paths')}>
+        <label class="checkbox-item">
+          <input type="checkbox" bind:checked={form.case_insensitive_paths} />
+          <span>Backend treats paths case-insensitively</span>
+        </label>
+        {#if isImported('case_insensitive_paths')}<span class="imported-badge">imported</span>{/if}
+        <span class="hint">
+          Turn on when the backend serves <code>/Admin</code> and <code>/admin</code> as the same
+          resource (IIS, a case-insensitive file system). The path prefix and the path rules then
+          match in any case, so the controls on <code>/admin</code> also hold for
+          <code>/ADMIN</code>. Leave off for a backend where case matters. The path sent to the
+          backend is never changed.
+        </span>
+      </div>
     </div>
   </section>
 
@@ -324,7 +353,7 @@
   <section id="sec-mtls" class="subsection">
     <SubsectionHeader
       title="mTLS client verification"
-      description="Require clients to present an X.509 certificate signed by the configured CA bundle. Chain validation at TLS handshake; required toggle + optional O= allowlist. CA PEM changes need a restart; toggling required and editing the allowlist hot-reload."
+      description="Require clients to present an X.509 certificate issued by this route's CA bundle. Each route checks the presented chain against its own bundle; required toggle + optional O= allowlist, all applied on save. A CA that no route trusted when Lorica started is refused at the handshake until a restart."
       accent="slate"
     />
     <div class="subsection-body">
@@ -341,7 +370,9 @@
     {#if mtlsPemError}<span class="field-error" role="alert">{mtlsPemError}</span>{/if}
     <span class="hint">
       One or more <code>-----BEGIN CERTIFICATE-----</code> blocks. Empty = feature
-      disabled. Max 1 MiB.
+      disabled. Max 1 MiB. Every certificate pasted here is trusted on its
+      own: paste the issuing CAs this route accepts, not their root, since
+      a root trusts every CA it signed.
     </span>
     <div class="inline-action">
       <button
@@ -358,13 +389,26 @@
         <span class="action-result err">{mtlsValidation.message}</span>
       {/if}
     </div>
+    {#if mtlsValidation.status === 'ok' && mtlsBundleWarnings.length > 0}
+      <div class="warn-banner" role="status" aria-live="polite" data-testid="mtls-bundle-warnings">
+        <strong>This bundle trusts more than the CAs it lists.</strong>
+        <ul class="restart-hints">
+          {#each mtlsBundleWarnings as warning (warning)}
+            <li>{warning}</li>
+          {/each}
+        </ul>
+        The bundle is accepted as it is.
+      </div>
+    {/if}
     {#if mtlsCaChangedFromInitial}
       <div class="warn-banner" role="status" aria-live="polite">
-        <strong>Restart required.</strong> The TLS listener's client-CA
-        bundle is fixed after startup (rustls
-        <code>ServerConfig</code> is immutable). Saving will persist
-        the new bundle, but the change won't take effect on
-        handshakes until Lorica is restarted.
+        <strong>Restart may be required.</strong> This route checks
+        client certificates against the new bundle as soon as you save.
+        The TLS listener, which decides which certificates a client may
+        present at all, keeps the bundles it started with (rustls
+        <code>ServerConfig</code> is immutable): a certificate from a CA
+        that no route trusted at startup is refused at the handshake
+        until Lorica is restarted.
         <ul class="restart-hints">
           <li>systemd: <code>sudo systemctl restart lorica</code></li>
           <li>Docker: <code>docker restart &lt;container&gt;</code></li>
@@ -390,9 +434,11 @@
         <span>Required (reject if no client cert)</span>
       </label>
       <span class="hint">
-        On &rarr; no cert presented returns 496. Off &rarr; opportunistic
-        (no cert passes through; a presented cert must still pass the
-        allowlist if one is configured).
+        On &rarr; no cert presented returns 496, a cert this route's CA
+        did not issue returns 495. Off &rarr; opportunistic (no cert, or
+        a cert from another CA, passes through as anonymous; a cert from
+        this route's CA must still pass the allowlist if one is
+        configured).
       </span>
     </div>
     <div class="form-group" class:modified={form.mtls_allowed_organizations !== ''}>
@@ -408,9 +454,11 @@
       />
       {#if mtlsOrgsError}<span class="field-error" role="alert">{mtlsOrgsError}</span>{/if}
       <span class="hint">
-        Comma or newline-separated exact matches against the cert
-        subject's <code>O=</code> field. Empty = accept any cert that
-        chains to the bundle.
+        Comma or newline-separated exact matches against each
+        <code>O=</code> value of the cert subject, checked once the cert
+        chains to this route's bundle. Empty = accept any cert that does.
+        With <em>Required</em> off, it restricts only clients that present
+        a certificate from this bundle.
       </span>
     </div>
   </div>

@@ -65,6 +65,7 @@ const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
     "cache_max_bytes",
     "cache_ttl_s",
     "cache_vary_headers",
+    "case_insensitive_paths",
     "category",
     "certificate_id",
     "client_ip",

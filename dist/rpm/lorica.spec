@@ -1,5 +1,5 @@
 Name:           lorica
-Version:        1.10.2
+Version:        1.10.3
 Release:        1%{?dist}
 Summary:        Modern reverse proxy with built-in dashboard
 License:        Apache-2.0

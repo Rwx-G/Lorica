@@ -496,6 +496,7 @@ the constant and asserts it is here:
 | `waf_mode` | moved to blocking, never back to detection |
 | `rate_limit`, `rate_limit_rps`, `rate_limit_burst` | the bucket the proxy enforces, `rate_limit` when set and the legacy pair otherwise, is added, or tightened with its capacity and refill never raised and its scope unchanged; never removed |
 | `auto_ban_threshold` | added, or lowered; never raised or cleared |
+| `case_insensitive_paths` | switched on, never off |
 | `tls_skip_verify` | switched off, never on |
 | `tls_upstream` | switched on, never off |
 | `tls_sni` | left unchanged while the upstream certificate is verified |

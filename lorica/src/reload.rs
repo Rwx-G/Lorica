@@ -87,7 +87,7 @@ pub fn commit_prepared_reload(
         warn!(
             installed = ?installed_fp,
             current = ?current_fp,
-            "mtls CA bundle changed since startup; restart Lorica to apply (rustls ServerConfig is immutable). Toggling mtls.required or editing allowed_organizations takes effect live."
+            "mtls CA bundle changed since startup; routes now verify client certificates against their new bundles, but the TLS listener keeps trusting the startup set until Lorica restarts (rustls ServerConfig is immutable): a certificate from a CA added since startup fails the handshake until then. Toggling mtls.required or editing allowed_organizations takes effect live."
         );
     }
     // Evict per-route mirror semaphores for routes that no longer exist,
@@ -1157,6 +1157,15 @@ async fn build_proxy_config_inner(
         .map(|rb| (rb.route_id, rb.backend_id))
         .collect();
 
+    // The fingerprint the drift check below compares with the startup
+    // one. Taken over the stored routes, as startup takes it to build
+    // the listener's union: disabled routes count there, and each route
+    // counts once. The snapshot's index would skip the disabled ones and
+    // the wildcards and repeat a route under each alias, so a route with
+    // either would read as drift on every reload.
+    let current_mtls_fingerprint =
+        installed_mtls_fingerprint.map(|_| crate::mtls::compute_ca_fingerprint(&routes));
+
     let mut new_config = ProxyConfig::from_store(
         routes,
         backends,
@@ -1239,29 +1248,20 @@ async fn build_proxy_config_inner(
     info!(routes = route_count, "proxy configuration reloaded");
 
     // mTLS CA bundle drift detection: rustls `ServerConfig` is
-    // immutable after the listener is built, so any edit to a
-    // route's `mtls.ca_cert_pem` at runtime won't take effect until
+    // immutable after the listener is built, so an edit to a route's
+    // `mtls.ca_cert_pem` reaches the per-route check (the new snapshot
+    // builds new route verifiers) but not the listener's union until
     // the process is restarted. We detect drift in Prepare so the
     // log lands once per reload (rather than twice if both Prepare
     // and Commit emit it); the actual warn! is deferred to
     // `commit_prepared_reload` so it only fires if the commit
     // succeeds.
-    let mtls_fingerprint_drift = if let Some(slot) = installed_mtls_fingerprint {
-        let current_routes: Vec<lorica_config::models::Route> = new_config
-            .routes_by_host
-            .values()
-            .flat_map(|v| v.iter().map(|e| (*e.route).clone()))
-            .collect();
-        let current_fp = crate::mtls::compute_ca_fingerprint(&current_routes);
-        let installed_fp = slot.lock().clone();
-        if installed_fp != current_fp {
-            Some((installed_fp, current_fp))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let mtls_fingerprint_drift = installed_mtls_fingerprint
+        .zip(current_mtls_fingerprint)
+        .and_then(|(slot, current_fp)| {
+            let installed_fp = slot.lock().clone();
+            (installed_fp != current_fp).then_some((installed_fp, current_fp))
+        });
 
     Ok(PreparedReload {
         config: new_config,
@@ -1775,6 +1775,7 @@ mod environment_certificate_tests {
             ai_bot_policy: None,
             ai_bot_spoofed_fallback: None,
             serve_robots_txt: false,
+            case_insensitive_paths: false,
             managed_by: Some(lorica_config::models::ManagedBy::Automation {
                 environment: "pr-42".to_string(),
             }),
@@ -1980,6 +1981,102 @@ mod environment_certificate_tests {
                 .any(|environment| environment.contains("pr-42")),
             "a WARN must name the environment; warned: {warned:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod mtls_drift_tests {
+    //! The mTLS CA drift warning, through the real snapshot build.
+
+    use std::sync::Arc;
+
+    use arc_swap::ArcSwap;
+    use lorica_config::models::{MtlsConfig, Route};
+    use lorica_config::ConfigStore;
+    use tokio::sync::Mutex;
+
+    use super::build_proxy_config;
+    use crate::proxy_wiring::ProxyConfig;
+
+    fn ca_pem(cn: &str) -> String {
+        let mut params = rcgen::CertificateParams::new(Vec::new()).expect("test setup");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        let key = rcgen::KeyPair::generate().expect("test setup");
+        params.self_signed(&key).expect("test setup").pem()
+    }
+
+    fn mtls_route(id: &str, hostname: &str, ca_cert_pem: String) -> Route {
+        let mut route: Route = serde_json::from_value(serde_json::json!({
+            "id": id,
+            "hostname": hostname,
+            "path_prefix": "/",
+            "certificate_id": null,
+            "load_balancing": "round_robin",
+            "waf_enabled": false,
+            "waf_mode": "detection",
+            "enabled": true,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .expect("test setup: a route with every defaulted field left out");
+        route.mtls = Some(MtlsConfig {
+            ca_cert_pem,
+            required: true,
+            allowed_organizations: Vec::new(),
+        });
+        route
+    }
+
+    /// Whether a reload of `routes` reports drift against the
+    /// fingerprint startup takes of the same stored rows.
+    async fn reload_reports_drift(routes: Vec<Route>) -> bool {
+        let store = ConfigStore::open_in_memory().expect("test setup: store opens");
+        for route in &routes {
+            store.create_route(route).expect("test setup: route");
+        }
+        let startup = parking_lot::Mutex::new(crate::mtls::compute_ca_fingerprint(
+            &store.list_routes().expect("test setup: routes"),
+        ));
+        let store = Arc::new(Mutex::new(store));
+        let proxy_config = Arc::new(ArcSwap::from_pointee(ProxyConfig::default()));
+        build_proxy_config(&store, &proxy_config, Some(&startup))
+            .await
+            .expect("the snapshot builds")
+            .mtls_fingerprint_drift
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_route_set_reports_no_drift_whatever_its_shape() {
+        let mut aliased = mtls_route("aliased", "a.example.com", ca_pem("CA A"));
+        aliased.hostname_aliases = vec!["a2.example.com".into(), "a3.example.com".into()];
+        let wildcard = mtls_route("wild", "*.example.org", ca_pem("CA W"));
+        let mut disabled = mtls_route("off", "off.example.com", ca_pem("CA D"));
+        disabled.enabled = false;
+        assert!(!reload_reports_drift(vec![aliased]).await, "alias");
+        assert!(!reload_reports_drift(vec![wildcard]).await, "wildcard");
+        assert!(!reload_reports_drift(vec![disabled]).await, "disabled");
+    }
+
+    #[tokio::test]
+    async fn a_bundle_changed_since_startup_reports_drift() {
+        let store = ConfigStore::open_in_memory().expect("test setup: store opens");
+        let mut route = mtls_route("r", "r.example.com", ca_pem("CA 1"));
+        store.create_route(&route).expect("test setup: route");
+        let startup = parking_lot::Mutex::new(crate::mtls::compute_ca_fingerprint(
+            &store.list_routes().expect("test setup: routes"),
+        ));
+        route.mtls.as_mut().expect("mtls").ca_cert_pem = ca_pem("CA 2");
+        store.update_route(&route).expect("test setup: edit");
+        let store = Arc::new(Mutex::new(store));
+        let proxy_config = Arc::new(ArcSwap::from_pointee(ProxyConfig::default()));
+        let prepared = build_proxy_config(&store, &proxy_config, Some(&startup))
+            .await
+            .expect("the snapshot builds");
+        assert!(prepared.mtls_fingerprint_drift.is_some());
     }
 }
 

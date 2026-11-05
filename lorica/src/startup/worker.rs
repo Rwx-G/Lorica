@@ -796,7 +796,8 @@ pub(crate) fn run_worker(
 
     // Build the optional mTLS client-cert verifier from the union of
     // per-route CA bundles. This is done once here; rustls
-    // ServerConfig is immutable so reloading a CA requires a restart.
+    // ServerConfig is immutable so the union only changes on restart
+    // (each route's own bundle is rebuilt with every snapshot).
     // We also snapshot the CA fingerprint so `reload_proxy_config`
     // can warn if an operator edits `mtls.ca_cert_pem` at runtime.
     let (mtls_verifier, mtls_installed_fingerprint) = {

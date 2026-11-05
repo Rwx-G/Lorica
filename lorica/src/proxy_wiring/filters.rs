@@ -25,9 +25,9 @@ use tracing::{debug, warn};
 
 use super::ai_bot_merged::{self, MergedCrawler, MergedVerification};
 use super::{
-    bot_handlers, build_mirror_forward_headers, canary_bucket, downstream_ssl_digest,
-    evaluate_mtls, extract_host, host_without_port, mirror_sample_hit, render_error_body,
-    request_has_body, request_host, run_forward_auth_keyed, spawn_mirrors, ForwardAuthOutcome,
+    bot_handlers, build_mirror_forward_headers, canary_bucket, downstream_ssl_digest, extract_host,
+    host_without_port, mirror_sample_hit, mtls_refusal_status, render_error_body, request_has_body,
+    request_host, route_client_cert, run_forward_auth_keyed, spawn_mirrors, ForwardAuthOutcome,
     LoricaProxy, MirrorBodyState, MirrorPending, ProxyConfig, RequestCtx, RouteEntry,
     VerdictCacheEngine, WAF_BODY_SCAN_DEFAULT,
 };
@@ -134,6 +134,23 @@ pub(crate) fn build_redirect_location(
     let query_suffix = req_query.map(|q| format!("?{q}")).unwrap_or_default();
     let base = target.trim_end_matches('/');
     format!("{base}{req_path}{query_suffix}")
+}
+
+/// Where an ACME CA fetches an HTTP-01 challenge token (RFC 8555
+/// section 8.3).
+pub(crate) const ACME_CHALLENGE_PATH_PREFIX: &str = "/.well-known/acme-challenge/";
+
+/// Whether `path` is an ACME HTTP-01 challenge both as sent and once
+/// normalised the way a backend may read it
+/// ([`lorica_config::route_selection::normalised_path`]), which is what
+/// exempts it from the HTTPS redirect: the CA fetches it over plain
+/// HTTP. Judged on the raw path alone, a path under the prefix that a
+/// backend reads as another resource would skip the redirect and be
+/// served in clear text.
+pub(crate) fn is_acme_challenge_path(path: &str) -> bool {
+    path.starts_with(ACME_CHALLENGE_PATH_PREFIX)
+        && lorica_config::route_selection::normalised_path(path)
+            .starts_with(ACME_CHALLENGE_PATH_PREFIX)
 }
 
 impl LoricaProxy {
@@ -724,7 +741,7 @@ impl LoricaProxy {
         let path = req.uri.path();
 
         // Force HTTPS redirect (skip for ACME challenges - must stay HTTP)
-        if entry.route.force_https && !path.starts_with("/.well-known/acme-challenge/") {
+        if entry.route.force_https && !is_acme_challenge_path(path) {
             let is_tls = session
                 .digest()
                 .and_then(|d| d.ssl_digest.as_ref())
@@ -930,11 +947,13 @@ impl LoricaProxy {
 
     /// Stage: mTLS client verification. Runs before forward_auth so a
     /// request that failed to present a valid client cert is rejected
-    /// cheaply (no auth sub-request spawned). The listener has already
-    /// validated the cert chain against the union CA bundle; this just
-    /// checks presence and the per-route org allowlist. Terminal: 495
-    /// (cert error) / 496 (cert required), the semi-standard Nginx
-    /// codes that don't collide with our other rejection paths.
+    /// cheaply (no auth sub-request spawned). The listener accepted the
+    /// chain against the union of every mTLS route's CA; this verifies
+    /// it against THIS route's CA, then applies presence and the
+    /// per-route org allowlist. Terminal: 495 (cert error) / 496 (cert
+    /// required), the semi-standard Nginx codes that don't collide with
+    /// our other rejection paths, or 421 when the connection was opened
+    /// for another host (`mtls_refusal_status`).
     pub(super) async fn check_mtls(
         &self,
         session: &mut Session,
@@ -942,12 +961,21 @@ impl LoricaProxy {
         entry: &RouteEntry,
     ) -> Result<Option<bool>> {
         if let Some(ref enforcer) = entry.mtls_enforcer {
-            let verdict = evaluate_mtls(enforcer, downstream_ssl_digest(session).as_deref());
+            let verdict = {
+                let ssl = downstream_ssl_digest(session);
+                mtls_refusal_status(
+                    enforcer,
+                    route_client_cert(ssl, enforcer),
+                    ssl.and_then(|digest| digest.server_name.as_deref()),
+                    &request_host(session.req_header()),
+                )
+            };
             if let Some(status) = verdict {
                 ctx.block_reason = Some(format!("mtls rejected ({status})"));
                 let message = match status {
                     496 => "SSL certificate required",
                     495 => "SSL certificate error",
+                    421 => "Misdirected request",
                     _ => "Forbidden",
                 };
                 return self
@@ -2465,6 +2493,21 @@ mod tests {
     use super::*;
     use ipnet::IpNet;
     use regex::Regex;
+
+    #[test]
+    fn an_acme_challenge_is_one_under_both_readings() {
+        assert!(is_acme_challenge_path("/.well-known/acme-challenge/tok"));
+        assert!(is_acme_challenge_path("/.well-known/acme-challenge//tok"));
+        for leaves in [
+            "/.well-known/acme-challenge/../../admin",
+            "/.well-known/acme-challenge/%2e%2e/%2e%2e/admin",
+            "/.well-known/acme-challenge/..;/..;/admin",
+            "/.well-known/acme-challenge/..\\..\\admin",
+            "/admin",
+        ] {
+            assert!(!is_acme_challenge_path(leaves), "{leaves}");
+        }
+    }
 
     #[test]
     fn the_slowloris_threshold_never_wraps_on_an_unvalidated_header_timeout() {

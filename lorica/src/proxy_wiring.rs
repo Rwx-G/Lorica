@@ -280,14 +280,16 @@ pub(crate) use mirror_rewrite::{
 };
 
 pub mod helpers;
-// `pub` (not `pub(crate)`) for `canary_bucket` and `evaluate_mtls`
+// `pub` (not `pub(crate)`) for `canary_bucket` and the mTLS helpers
 // because they're re-exported by integration tests under `tests/`
 // (canary_e2e_test, mtls_e2e_test).
 pub(crate) use helpers::{
     cache_vary_for_request, downstream_ssl_digest, extract_host, host_without_port,
-    pick_consistent_hash, request_host, sanitize_html,
+    path_after_strip, pick_consistent_hash, request_host, sanitize_html,
 };
-pub use helpers::{canary_bucket, evaluate_mtls};
+pub use helpers::{
+    canary_bucket, evaluate_mtls, mtls_refusal_status, route_client_cert, RouteClientCert,
+};
 #[cfg(test)]
 pub(crate) use helpers::{
     compute_cache_variance, match_header_rule_backends, pick_traffic_split_backends,
@@ -1017,11 +1019,14 @@ impl ProxyHttp for LoricaProxy {
             // ACME HTTP-01 challenge intercept (must respond before any other check)
             if let Some(ref challenge_store) = self.acme_challenge_store {
                 let path = session.req_header().uri.path();
-                if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
+                if let Some(token) = path.strip_prefix(filters::ACME_CHALLENGE_PATH_PREFIX) {
                     // Nothing is logged here: this is an unauthenticated
                     // public path and the token is caller-controlled
                     // text. `get` validates its shape and refuses an
-                    // expired entry.
+                    // expired entry. Matched on the raw path alone: this
+                    // answers a stored token itself and forwards nothing,
+                    // and any other path falls through to every check
+                    // below.
                     if let Some(key_auth) = challenge_store.get(token).await {
                         let mut header = ResponseHeader::build(200, None)?;
                         header.insert_header("Content-Type", "text/plain")?;
@@ -1073,6 +1078,24 @@ impl ProxyHttp for LoricaProxy {
                         return Ok(handled);
                     }
                 }
+            }
+
+            // A path whose normalised reading selects another route, or
+            // another path rule of its route, than the path as sent is
+            // refused: forwarded as sent under the first, a backend that
+            // normalises it would serve what the second one guards. Every
+            // later stage that matches a path rule (the rate limit, the
+            // backend selection) can then read the raw path alone.
+            let selects_alike = {
+                let req = session.req_header();
+                config.selects_alike_once_normalised(&request_host(req), req.uri.path())
+            };
+            if !selects_alike {
+                ctx.block_reason =
+                    Some("request path selects another route or path rule once normalised".into());
+                return self
+                    .write_error_response(session, 400, &ctx.request_id, None, "Bad request", &[])
+                    .await;
             }
 
             let req = session.req_header();
@@ -2274,16 +2297,7 @@ impl ProxyHttp for LoricaProxy {
             .map(|q| format!("?{q}"))
             .unwrap_or_default();
 
-        let mut rewritten = original_path.clone();
-
-        if let Some(ref strip) = route.strip_path_prefix {
-            if rewritten.starts_with(strip.as_str()) {
-                rewritten = rewritten[strip.len()..].to_string();
-                if rewritten.is_empty() || !rewritten.starts_with('/') {
-                    rewritten = format!("/{rewritten}");
-                }
-            }
-        }
+        let mut rewritten = path_after_strip(&original_path, route).into_owned();
 
         if let Some(ref add) = route.add_path_prefix {
             rewritten = format!("{add}{rewritten}");

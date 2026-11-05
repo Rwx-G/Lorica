@@ -128,6 +128,15 @@ pub mod route {
         rule: "added, or lowered; never raised or cleared",
         why: "the threshold is how many blocks earn an automatic ban, and cleared it bans no one",
     };
+
+    /// Path matching with case folded.
+    pub const CASE_INSENSITIVE_PATHS: ProtectionRule = ProtectionRule {
+        fields: &["case_insensitive_paths"],
+        rule: "switched on, never off",
+        why: "on, the prefix and path rules hold every spelling of a path a case-insensitive \
+              backend serves as one, and off, a spelling in another case reaches that backend \
+              past the route or the rule that guards the path",
+    };
 }
 
 /// The backend controls, one constant each for the same reason as
@@ -195,6 +204,7 @@ pub const ROUTE_PROTECTION_RULES: &[ProtectionRule] = &[
     route::WAF_MODE,
     route::RATE_LIMIT,
     route::AUTO_BAN_THRESHOLD,
+    route::CASE_INSENSITIVE_PATHS,
 ];
 
 /// Every backend control an automation token may only strengthen.

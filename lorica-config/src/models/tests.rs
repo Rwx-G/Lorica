@@ -380,9 +380,13 @@ fn test_path_rule_matches_prefix() {
         match_type: PathMatchType::Prefix,
         ..Default::default()
     };
-    assert!(rule.matches("/api/users"));
-    assert!(rule.matches("/api/"));
-    assert!(!rule.matches("/other"));
+    assert!(rule.matches("/api/users", false));
+    assert!(rule.matches("/api/", false));
+    assert!(!rule.matches("/other", false));
+    assert!(!rule.matches("/API/users", false));
+    assert!(rule.matches("/API/users", true));
+    assert!(rule.matches("/Api/", true));
+    assert!(!rule.matches("/api", true));
 }
 
 #[test]
@@ -392,9 +396,31 @@ fn test_path_rule_matches_exact() {
         match_type: PathMatchType::Exact,
         ..Default::default()
     };
-    assert!(rule.matches("/health"));
-    assert!(!rule.matches("/health/check"));
-    assert!(!rule.matches("/healthz"));
+    assert!(rule.matches("/health", false));
+    assert!(!rule.matches("/health/check", false));
+    assert!(!rule.matches("/healthz", false));
+    assert!(!rule.matches("/HEALTH", false));
+    assert!(rule.matches("/HEALTH", true));
+    assert!(!rule.matches("/HEALTH/check", true));
+}
+
+#[test]
+fn test_path_rule_reads_encoded_octets_in_either_hex_case() {
+    for match_type in [PathMatchType::Exact, PathMatchType::Prefix] {
+        let rule = PathRule {
+            path: "/caf%C3%A9".to_string(),
+            match_type: match_type.clone(),
+            ..Default::default()
+        };
+        for sent in ["/caf%C3%A9", "/caf%c3%a9", "/caf%c3%A9"] {
+            assert!(rule.matches(sent, false), "{match_type:?} {sent}");
+        }
+        // Only the escape's digits fold: the letters around it do not,
+        // and `%C3` is not the unencoded text `C3`.
+        assert!(!rule.matches("/CAF%c3%a9", false), "{match_type:?}");
+        assert!(rule.matches("/CAF%c3%a9", true), "{match_type:?}");
+        assert!(!rule.matches("/caf%C3A9", false), "{match_type:?}");
+    }
 }
 
 // ---- Route::with_path_rule_overrides ----
@@ -472,6 +498,7 @@ fn test_route_with_path_rule_overrides_applies_some_fields() {
         ai_bot_policy: None,
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
+        case_insensitive_paths: false,
         managed_by: None,
         created_at: now,
         updated_at: now,
@@ -840,6 +867,7 @@ fn example_route_for_serde() -> Route {
         ai_bot_policy: None,
         ai_bot_spoofed_fallback: None,
         serve_robots_txt: false,
+        case_insensitive_paths: false,
         managed_by: None,
         created_at: now,
         updated_at: now,

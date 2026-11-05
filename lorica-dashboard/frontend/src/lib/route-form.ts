@@ -212,6 +212,9 @@ export interface RouteFormState {
   ai_bot_policy: AiBotPolicy;
   ai_bot_spoofed_fallback: '' | AiBotSpoofedFallback;
   serve_robots_txt: boolean;
+  // The backend treats paths case-insensitively, so the prefix and the
+  // path rules match with ASCII case folded.
+  case_insensitive_paths: boolean;
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -305,6 +308,7 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   ai_bot_policy: 'off',
   ai_bot_spoofed_fallback: '',
   serve_robots_txt: false,
+  case_insensitive_paths: false,
 };
 
 // Tab field mappings for dot indicators
@@ -356,6 +360,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'basic_auth_username', 'basic_auth_password',
     'forward_auth_address', 'forward_auth_timeout_ms', 'forward_auth_response_headers',
     'mtls_ca_cert_pem', 'mtls_required', 'mtls_allowed_organizations',
+    'case_insensitive_paths',
   ],
   cache: [
     // Renamed from 'caching' (v1.4.0 UX refactor).
@@ -614,6 +619,7 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     ai_bot_policy: route.ai_bot_policy ?? 'off',
     ai_bot_spoofed_fallback: route.ai_bot_spoofed_fallback ?? '',
     serve_robots_txt: route.serve_robots_txt ?? false,
+    case_insensitive_paths: route.case_insensitive_paths ?? false,
   };
 }
 
@@ -842,6 +848,7 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     ai_bot_spoofed_fallback:
       form.ai_bot_spoofed_fallback === '' ? null : form.ai_bot_spoofed_fallback,
     serve_robots_txt: form.serve_robots_txt,
+    case_insensitive_paths: form.case_insensitive_paths,
   };
 }
 

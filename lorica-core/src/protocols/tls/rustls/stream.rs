@@ -21,11 +21,14 @@ use std::time::{Duration, SystemTime};
 
 use crate::listeners::tls::Acceptor;
 use crate::protocols::raw_connect::ProxyDigest;
-use crate::protocols::{tls::SslDigest, Peek, TimingDigest, UniqueIDType};
+use crate::protocols::{
+    tls::{PeerCertChain, SslDigest},
+    Peek, TimingDigest, UniqueIDType,
+};
 use crate::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, SocketDigest, Ssl, UniqueID, ALPN,
 };
-use crate::utils::tls::get_organization_serial_bytes;
+use crate::utils::tls::get_organizations_serial_bytes;
 use lorica_error::ErrorType::{AcceptError, ConnectError, InternalError, TLSHandshakeFailure};
 use lorica_error::{OkOrErr, OrErr, Result};
 use lorica_tls::TlsStream as RusTlsStream;
@@ -381,16 +384,33 @@ impl SslDigest {
             .map(|cert| hash_certificate(cert))
             .unwrap_or_default();
 
-        let (organization, serial_number) = peer_certificates
+        // Lorica: the end-entity is parsed once, its `O=` values kept apart
+        // for `peer_organizations` and joined for upstream's `organization`
+        // (what `get_organization_x509` returns). A certificate x509-parser
+        // refuses yields neither, where upstream's parse panicked.
+        let (peer_organizations, serial_number) = peer_certificates
             .and_then(|certs| certs.first())
-            .map(|cert| get_organization_serial_bytes(cert.as_bytes()))
+            .map(|cert| get_organizations_serial_bytes(cert.as_bytes()))
             .transpose()
             .ok()
             .flatten()
-            .map(|(organization, serial)| (organization, Some(serial)))
+            .map(|(organizations, serial)| (organizations, Some(serial)))
             .unwrap_or_default();
+        let organization = (!peer_organizations.is_empty()).then(|| peer_organizations.concat());
 
-        SslDigest::new(cipher, version, organization, serial_number, cert_digest)
+        let mut digest = SslDigest::new(cipher, version, organization, serial_number, cert_digest);
+        digest.peer_organizations = peer_organizations;
+        // Lorica: keep the client's chain on an accepted connection, within
+        // `PeerCertChain`'s bounds, so the application can verify it against
+        // per-route roots, and the server name the chain was presented
+        // for (FORK.md).
+        if let RusTlsStream::Server(server) = stream {
+            digest.peer_cert_chain = peer_certificates
+                .map(|certs| PeerCertChain::new(certs.iter().map(|cert| cert.as_ref())))
+                .unwrap_or_default();
+            digest.server_name = server.get_ref().1.server_name().map(str::to_owned);
+        }
+        digest
     }
 }
 

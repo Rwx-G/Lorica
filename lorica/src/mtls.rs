@@ -2,26 +2,44 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 
-//! Listener-side mTLS wiring. Collects the union of client-CA PEM
-//! bundles across all routes that have mTLS enabled, builds a single
-//! `WebPkiClientVerifier`, and exposes it for installation on the
-//! HTTPS listener's `TlsSettings`.
+//! mTLS client-certificate verification, in two layers.
 //!
-//! The verifier is built with `allow_unauthenticated()` so connections
-//! without a client cert still complete the TLS handshake. Per-route
-//! enforcement lives in the proxy layer (`proxy_wiring::evaluate_mtls`),
-//! which lets different routes on the same listener have different
-//! policies (require vs. opportunistic vs. off).
+//! **The listener.** One HTTPS listener serves every route, and a rustls
+//! `ServerConfig` takes one client verifier. [`build_from_routes`]
+//! builds it from the union of the CA bundles of every route with mTLS,
+//! with `allow_unauthenticated()` so a client without a certificate still
+//! completes the handshake. Its job is to make the handshake ask for a
+//! certificate, prove the client holds the key, and refuse a chain that
+//! no route trusts. It cannot tell which route the client is after, so
+//! a certificate it accepts may come from any route's CA.
 //!
-//! Limitation: rustls `ServerConfig` is immutable after build, so
-//! changes to the CA bundle require a restart. Toggling `required`
-//! and editing `allowed_organizations` are still hot-reloadable since
-//! those checks happen in the proxy layer, not at the handshake.
+//! **The route.** [`RouteClientVerifier`] holds one route's own bundle,
+//! built with the route snapshot (`ProxyConfig::from_store`, at startup
+//! and on every reload). The proxy layer verifies the presented chain
+//! against it before it reads any identity from the certificate
+//! (`proxy_wiring::route_client_cert`), so a certificate from route A's
+//! CA is no certificate at all on route B, whatever its `O=` says. The
+//! policy itself (`required`, `allowed_organizations`) is
+//! `proxy_wiring::evaluate_mtls`.
+//!
+//! **Reloads.** rustls `ServerConfig` is immutable after build, so the
+//! listener keeps the union it started with until a restart. The route
+//! layer follows every reload. Together:
+//! - removing a CA from a route, or pointing a route at a CA another
+//!   route already trusts, takes effect on reload;
+//! - a CA no route trusted at startup is unknown to the listener, so
+//!   its certificates fail the handshake until a restart;
+//! - a CA removed from every route still passes the handshake until a
+//!   restart, and is refused by every route from the reload on.
+//!
+//! `required` and `allowed_organizations` are read per request and
+//! always hot-reload.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use lorica_config::models::Route;
-use lorica_tls::{ClientCertVerifier, RootCertStore, WebPkiClientVerifier};
+use lorica_tls::{ClientCertVerifier, RootCertStore, UnixTime, WebPkiClientVerifier};
 use rustls_pki_types::{pem::PemObject, CertificateDer};
 
 /// Aggregate all mTLS CA PEMs found across `routes` into a single
@@ -49,31 +67,7 @@ pub fn build_union_root_store(routes: &[Route]) -> Option<RootCertStore> {
     let mut store = RootCertStore::empty();
     let mut added = 0usize;
     for pem_text in pems {
-        // `CertificateDer::pem_slice_iter` walks every `-----BEGIN
-        // CERTIFICATE-----` / `-----END CERTIFICATE-----` block in the
-        // PEM bundle and returns the DER payload. A single PEM bundle
-        // can carry an intermediate + root, and we want both in the
-        // store. Non-certificate blocks (PRIVATE KEY, etc.) are
-        // silently skipped by the iterator.
-        for der_result in CertificateDer::pem_slice_iter(pem_text.as_bytes()) {
-            let der = match der_result {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "mtls: skipping CA cert block that failed PEM parse"
-                    );
-                    continue;
-                }
-            };
-            match store.add(der) {
-                Ok(()) => added += 1,
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "mtls: skipping CA cert that rustls rejected"
-                ),
-            }
-        }
+        added += add_pem_bundle(&mut store, pem_text);
     }
 
     if added == 0 {
@@ -85,10 +79,128 @@ pub fn build_union_root_store(routes: &[Route]) -> Option<RootCertStore> {
     Some(store)
 }
 
+/// Add every certificate of one PEM bundle to `store` as a trust anchor
+/// and return how many were added.
+///
+/// `CertificateDer::pem_slice_iter` walks every `CERTIFICATE` block and
+/// skips other block types (PRIVATE KEY, etc.). Every certificate becomes
+/// an anchor on its own, the X.509 semantics nginx shares. A bundle that
+/// carries a root therefore trusts every CA the root signed, the
+/// siblings of the issuing CA pasted beside it included, as long as the
+/// client sends its own issuing CA as an intermediate. The bundle a route
+/// means to restrict to some issuing CAs holds those and not their root;
+/// the API's PEM validation warns about the other shape, and still
+/// accepts it.
+fn add_pem_bundle(store: &mut RootCertStore, pem_text: &str) -> usize {
+    let mut added = 0usize;
+    for der_result in CertificateDer::pem_slice_iter(pem_text.as_bytes()) {
+        let der = match der_result {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "mtls: skipping CA cert block that failed PEM parse"
+                );
+                continue;
+            }
+        };
+        match store.add(der) {
+            Ok(()) => added += 1,
+            Err(e) => tracing::warn!(
+                error = %e,
+                "mtls: skipping CA cert that rustls rejected"
+            ),
+        }
+    }
+    added
+}
+
+/// Source of [`RouteClientVerifier::memo_key`]. Every verifier built gets
+/// a fresh value, so a verdict a connection cached for one route or one
+/// snapshot is never read back for another.
+static NEXT_MEMO_KEY: AtomicU64 = AtomicU64::new(1);
+
+/// One route's client-CA bundle, ready to verify a presented chain.
+///
+/// Built with the route snapshot, never per request. A chain verifies
+/// when it leads from its end-entity, through the intermediates the
+/// client sent, to a certificate of this bundle, with every certificate
+/// inside its validity period and the end-entity usable for client
+/// authentication: what `WebPkiClientVerifier` checks at a handshake.
+/// Proof that the client holds the end-entity's key is the handshake's
+/// job and is not repeated here.
+#[derive(Debug)]
+pub struct RouteClientVerifier {
+    verifier: Arc<dyn ClientCertVerifier>,
+    memo_key: u64,
+}
+
+impl RouteClientVerifier {
+    /// Build the verifier for one route's `ca_cert_pem`.
+    ///
+    /// Returns `None` when the bundle holds no usable certificate. The
+    /// route then verifies no chain at all: a `required` route refuses
+    /// every client, which is the fail-safe reading of a broken bundle.
+    pub fn from_pem(route_id: &str, ca_pem: &str) -> Option<Self> {
+        let mut roots = RootCertStore::empty();
+        if add_pem_bundle(&mut roots, ca_pem) == 0 {
+            tracing::warn!(
+                route_id = %route_id,
+                "mtls: route CA bundle holds no usable certificate; no client certificate will verify on this route"
+            );
+            return None;
+        }
+        // An explicit provider, unlike the listener's `builder`: this runs
+        // on every snapshot build, tests and reloads included, and must
+        // not depend on a process-wide default having been installed.
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        match WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider).build() {
+            Ok(verifier) => Some(RouteClientVerifier {
+                verifier,
+                memo_key: NEXT_MEMO_KEY.fetch_add(1, Ordering::Relaxed),
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    route_id = %route_id,
+                    error = ?e,
+                    "mtls: failed to build the route's client verifier; no client certificate will verify on this route"
+                );
+                None
+            }
+        }
+    }
+
+    /// Whether `chain` (DER, end-entity first, then the intermediates in
+    /// the order the client sent them) verifies against this route's
+    /// bundle now. An empty chain never does.
+    pub fn verifies(&self, chain: &[Vec<u8>]) -> bool {
+        let Some((end_entity, intermediates)) = chain.split_first() else {
+            return false;
+        };
+        let end_entity = CertificateDer::from(end_entity.as_slice());
+        let intermediates: Vec<CertificateDer<'_>> = intermediates
+            .iter()
+            .map(|der| CertificateDer::from(der.as_slice()))
+            .collect();
+        self.verifier
+            .verify_client_cert(&end_entity, &intermediates, UnixTime::now())
+            .is_ok()
+    }
+
+    /// The key a connection files this verifier's verdict under
+    /// (`SslDigest::peer_chain_verdicts`). Unique to this verifier, hence
+    /// to one route in one snapshot: a reload builds new verifiers, so a
+    /// changed bundle is verified afresh on connections already open.
+    pub fn memo_key(&self) -> u64 {
+        self.memo_key
+    }
+}
+
 /// Build an mTLS client cert verifier from the given root store.
 /// Uses `allow_unauthenticated()` so the TLS handshake accepts clients
 /// that omit a cert; enforcement is delegated to the proxy layer
-/// (per-route `required` / `allowed_organizations`).
+/// (per-route chain verification, `required` and
+/// `allowed_organizations`).
 ///
 /// Returns `None` when verifier construction fails (unusable roots);
 /// the listener then falls back to no-client-auth and per-route
@@ -119,9 +231,10 @@ pub fn build_from_routes(routes: &[Route]) -> Option<Arc<dyn ClientCertVerifier>
 
 /// Deterministic fingerprint of the union CA bundle installed on the
 /// listener. Used by `reload_proxy_config` to detect post-startup
-/// edits to `mtls.ca_cert_pem` - those require a restart because
-/// rustls `ServerConfig` is immutable, and we want to surface that
-/// via a warn log instead of silently accepting stale CAs.
+/// edits to `mtls.ca_cert_pem`: the per-route check follows them on
+/// reload, but the listener keeps the union it started with until a
+/// restart (rustls `ServerConfig` is immutable), and we want to surface
+/// that via a warn log rather than leave it silent.
 ///
 /// Returns `None` when no route has mTLS configured (fingerprint
 /// undefined; also how we distinguish "listener has no verifier" from
@@ -237,6 +350,7 @@ mod tests {
             ai_bot_policy: None,
             ai_bot_spoofed_fallback: None,
             serve_robots_txt: false,
+            case_insensitive_paths: false,
             managed_by: None,
             waf_body_scan_max_bytes: None,
             created_at: now,
@@ -437,5 +551,153 @@ mod tests {
             }),
         )]);
         assert_eq!(fp_strict, fp_loose);
+    }
+
+    // ---- RouteClientVerifier ----
+
+    /// A CA (root or intermediate) able to sign further certificates.
+    struct TestCa {
+        pem: String,
+        der: Vec<u8>,
+        issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+    }
+
+    fn ca_params(cn: &str) -> rcgen::CertificateParams {
+        let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params
+    }
+
+    fn root_ca(cn: &str) -> TestCa {
+        let params = ca_params(cn);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        TestCa {
+            pem: cert.pem(),
+            der: cert.der().to_vec(),
+            issuer: rcgen::Issuer::new(params, key),
+        }
+    }
+
+    fn intermediate_ca(parent: &TestCa, cn: &str) -> TestCa {
+        let params = ca_params(cn);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, &parent.issuer).unwrap();
+        TestCa {
+            pem: cert.pem(),
+            der: cert.der().to_vec(),
+            issuer: rcgen::Issuer::new(params, key),
+        }
+    }
+
+    fn leaf(issuer: &TestCa, org: &str) -> Vec<u8> {
+        let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "client");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationName, org);
+        let key = rcgen::KeyPair::generate().unwrap();
+        params
+            .signed_by(&key, &issuer.issuer)
+            .unwrap()
+            .der()
+            .to_vec()
+    }
+
+    fn verifier_for(ca: &TestCa) -> RouteClientVerifier {
+        init_crypto_once();
+        RouteClientVerifier::from_pem("r", &ca.pem).expect("verifier")
+    }
+
+    #[test]
+    fn route_verifier_accepts_a_leaf_of_its_own_ca() {
+        let ca_b = root_ca("CA B");
+        assert!(verifier_for(&ca_b).verifies(&[leaf(&ca_b, "Beta")]));
+    }
+
+    #[test]
+    fn route_verifier_refuses_a_leaf_of_another_ca() {
+        let ca_a = root_ca("CA A");
+        let ca_b = root_ca("CA B");
+        assert!(!verifier_for(&ca_b).verifies(&[leaf(&ca_a, "Acme")]));
+    }
+
+    #[test]
+    fn route_verifier_refuses_another_ca_leaf_carrying_the_expected_org() {
+        // The organization is the issuing CA's say-so: a leaf from the
+        // wrong CA is refused whatever it claims.
+        let ca_a = root_ca("CA A");
+        let ca_b = root_ca("CA B");
+        assert!(!verifier_for(&ca_b).verifies(&[leaf(&ca_a, "Beta")]));
+    }
+
+    #[test]
+    fn route_verifier_refuses_a_bare_ca_certificate_and_an_empty_chain() {
+        let ca_b = root_ca("CA B");
+        let verifier = verifier_for(&ca_b);
+        assert!(!verifier.verifies(&[]));
+        assert!(!verifier.verifies(&[b"not a certificate".to_vec()]));
+    }
+
+    #[test]
+    fn route_verifier_follows_intermediates_the_client_sends() {
+        let root = root_ca("Root B");
+        let intermediate = intermediate_ca(&root, "Issuing B");
+        let client = leaf(&intermediate, "Beta");
+        let verifier = verifier_for(&root);
+        assert!(verifier.verifies(&[client.clone(), intermediate.der.clone()]));
+        // Without the intermediate the chain does not reach the root.
+        assert!(!verifier.verifies(&[client]));
+    }
+
+    #[test]
+    fn route_verifier_accepts_a_bundle_that_stops_at_the_intermediate() {
+        let root = root_ca("Root B");
+        let intermediate = intermediate_ca(&root, "Issuing B");
+        assert!(verifier_for(&intermediate).verifies(&[leaf(&intermediate, "Beta")]));
+    }
+
+    #[test]
+    fn route_verifier_refuses_a_sibling_intermediate_of_the_same_root() {
+        // A bundle holding only one issuing CA does not trust its
+        // sibling, even though both chain to the same root.
+        let root = root_ca("Root");
+        let issuing_a = intermediate_ca(&root, "Issuing A");
+        let issuing_b = intermediate_ca(&root, "Issuing B");
+        let chain = vec![leaf(&issuing_a, "Acme"), issuing_a.der.clone()];
+        assert!(!verifier_for(&issuing_b).verifies(&chain));
+    }
+
+    #[test]
+    fn route_verifier_with_the_root_in_its_bundle_trusts_every_ca_the_root_signed() {
+        // The anchor semantics the API warns about, kept executable: a
+        // bundle of Issuing B and its root accepts a leaf of Issuing A
+        // presented with Issuing A, because the root is an anchor.
+        let root = root_ca("Root");
+        let issuing_a = intermediate_ca(&root, "Issuing A");
+        let issuing_b = intermediate_ca(&root, "Issuing B");
+        init_crypto_once();
+        let bundle = format!("{}{}", issuing_b.pem, root.pem);
+        let verifier = RouteClientVerifier::from_pem("r", &bundle).expect("verifier");
+        assert!(verifier.verifies(&[leaf(&issuing_a, "Acme"), issuing_a.der.clone()]));
+        // Without the root, the sibling is refused.
+        assert!(!verifier_for(&issuing_b).verifies(&[leaf(&issuing_a, "Acme"), issuing_a.der]));
+    }
+
+    #[test]
+    fn route_verifier_none_for_a_bundle_without_certificates() {
+        init_crypto_once();
+        assert!(RouteClientVerifier::from_pem("r", "not-a-pem").is_none());
+    }
+
+    #[test]
+    fn route_verifiers_get_distinct_memo_keys() {
+        let ca = root_ca("CA");
+        assert_ne!(verifier_for(&ca).memo_key(), verifier_for(&ca).memo_key());
     }
 }

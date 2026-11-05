@@ -3234,7 +3234,14 @@ mod test_header_timeout {
             .expect("the header timeout never fired");
         let elapsed = started.elapsed();
         assert_eq!(res.unwrap_err().etype(), &ReadTimedout);
-        assert!(elapsed >= limit, "cut before the timeout: {elapsed:?}");
+        // tokio's timer wheel works in whole milliseconds, so the sleep can
+        // end a fraction of one before `Instant` says the limit is reached
+        // (CI measured 499.83 ms for a 500 ms limit).
+        let timer_resolution = Duration::from_millis(1);
+        assert!(
+            elapsed + timer_resolution >= limit,
+            "cut before the timeout: {elapsed:?}"
+        );
         assert!(elapsed < 3 * GAP + limit, "cut late: {elapsed:?}");
     }
 
@@ -3243,7 +3250,11 @@ mod test_header_timeout {
         let mut session = session(trickled_header(true), Some(Duration::from_secs(2)));
         assert!(session.read_request().await.unwrap().is_some());
         let took = session.header_read_duration().expect("a header was read");
-        assert!(took >= 3 * GAP, "the duration missed the gaps: {took:?}");
+        // One timer-wheel millisecond per mock wait, as in the test above.
+        assert!(
+            took + 3 * Duration::from_millis(1) >= 3 * GAP,
+            "the duration missed the gaps: {took:?}"
+        );
         assert!(took < Duration::from_secs(2), "{took:?}");
     }
 
