@@ -17,6 +17,7 @@ env:
 jobs:
   lint:
     name: Lint
+    if: github.repository == 'Rwx-G/Lorica'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -80,6 +81,7 @@ jobs:
 
   semgrep:
     name: Semgrep (security)
+    if: github.repository == 'Rwx-G/Lorica'
     runs-on: ubuntu-latest
     # Runs in parallel with `lint` to keep total CI wall time down.
     # Non-blocking on findings so Semgrep registry flakes don't
@@ -151,7 +153,7 @@ jobs:
   verify-tag:
     name: Verify tag signature
     # Only a tag push reaches this. A branch build has no tag to verify.
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.repository == 'Rwx-G/Lorica' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -179,6 +181,7 @@ jobs:
 
   test:
     name: Test
+    if: github.repository == 'Rwx-G/Lorica'
     needs: lint
     runs-on: ubuntu-latest
     steps:
@@ -263,6 +266,7 @@ jobs:
 
   coverage:
     name: Coverage
+    if: github.repository == 'Rwx-G/Lorica'
     needs: lint
     runs-on: ubuntu-latest
     # Reports line coverage for the product crates and uploads an lcov
@@ -329,6 +333,7 @@ jobs:
 
   e2e-docker:
     name: E2E (Docker)
+    if: github.repository == 'Rwx-G/Lorica'
     needs: lint
     runs-on: ubuntu-latest
     # The tests-e2e-docker/ suite drives Lorica against real backend
@@ -350,6 +355,7 @@ jobs:
 
   adcs-harness:
     name: AD CS Kerberos harness
+    if: github.repository == 'Rwx-G/Lorica'
     needs: lint
     runs-on: ubuntu-latest
     # What Epic 13 exists to guarantee is proven only against a real MIT
@@ -377,7 +383,7 @@ jobs:
     name: Build & Package
     needs: test
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    if: github.repository == 'Rwx-G/Lorica' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -512,6 +518,7 @@ jobs:
 
   test-deb-install:
     name: Test .deb install
+    if: github.repository == 'Rwx-G/Lorica'
     needs: build-and-package
     runs-on: ubuntu-latest
     steps:
@@ -598,6 +605,7 @@ jobs:
   # upgraded hosts do not.
   test-deb-upgrade:
     name: Test .deb upgrade from ${{ matrix.old }}
+    if: github.repository == 'Rwx-G/Lorica'
     needs: build-and-package
     runs-on: ubuntu-latest
     strategy:
@@ -665,6 +673,7 @@ jobs:
   # versions are the deb job's, for the same reasons.
   test-rpm-upgrade:
     name: Test .rpm upgrade from ${{ matrix.old }}
+    if: github.repository == 'Rwx-G/Lorica'
     needs: build-and-package
     runs-on: ubuntu-latest
     strategy:
@@ -744,6 +753,7 @@ jobs:
 
   test-rpm-install:
     name: Test .rpm install
+    if: github.repository == 'Rwx-G/Lorica'
     needs: build-and-package
     runs-on: ubuntu-latest
     container: fedora:latest
@@ -783,7 +793,7 @@ jobs:
 
   release:
     name: Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.repository == 'Rwx-G/Lorica' && startsWith(github.ref, 'refs/tags/v')
     needs: [verify-tag, test-deb-install, test-rpm-install, test-deb-upgrade, test-rpm-upgrade]
     runs-on: ubuntu-latest
     permissions:
