@@ -1,0 +1,14 @@
+# Third-party actions are pinned to a commit, since a tag can be moved
+# under a workflow; this is what keeps those pins from going stale.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      actions:
+        patterns: ["*"]
