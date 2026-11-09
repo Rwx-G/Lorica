@@ -15,10 +15,13 @@
 # Stage 1: Build frontend
 FROM node:22-slim AS frontend
 WORKDIR /app/lorica-dashboard/frontend
-COPY lorica-dashboard/frontend/package.json lorica-dashboard/frontend/pnpm-lock.yaml* lorica-dashboard/frontend/pnpm-workspace.yaml* lorica-dashboard/frontend/package-lock.json* ./
-RUN npm i -g pnpm@10 && (pnpm install --frozen-lockfile 2>/dev/null || npm ci)
+# pnpm and its lock file only, with no fallback: package-lock.json
+# resolves without the security overrides in pnpm-workspace.yaml, and a
+# silent fallback to it shipped exactly what they exist to keep out.
+COPY lorica-dashboard/frontend/package.json lorica-dashboard/frontend/pnpm-lock.yaml lorica-dashboard/frontend/pnpm-workspace.yaml ./
+RUN npm i -g pnpm@10 && pnpm install --frozen-lockfile
 COPY lorica-dashboard/frontend/ ./
-RUN npm run build
+RUN pnpm run build
 
 # Stage 2: Build Rust binary
 FROM rust:1-bookworm AS builder

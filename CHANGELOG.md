@@ -20,6 +20,7 @@ Author: Rwx-G
 
 - The released binaries start on Debian 12, Ubuntu 22.04 and RHEL 9. Up to 1.10.3 they were compiled on `ubuntu-latest`, needed glibc 2.38 and refused to start on those systems, while the packages installed without complaint. They are now compiled on AlmaLinux 9 against glibc 2.34, both packages declare that requirement, and CI starts both binaries on those three distributions.
 - The README's package verification commands work: the `.deb` check read a keyring the documented `gpg --verify` never consulted, so it reported no public key, and there was no `.rpm` command.
+- The Docker image builds its dashboard from `pnpm-lock.yaml` only. When pnpm failed it fell back to `npm ci` without a word, and `package-lock.json` resolves without the security overrides in `pnpm-workspace.yaml`.
 
 ### Removed
 
