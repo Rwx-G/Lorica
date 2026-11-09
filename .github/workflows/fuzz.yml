@@ -8,7 +8,7 @@ on:
 jobs:
   fuzz:
     name: Fuzz (${{ matrix.target }})
-    if: github.repository == 'Rwx-G/Lorica'
+    if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     strategy:
       matrix:
