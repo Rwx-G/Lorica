@@ -13,6 +13,9 @@ Author: Rwx-G
 
 ### Changed
 
+- A release now waits for the Docker e2e suite and the AD CS Kerberos harness, which it used to overtake.
+- A release no longer carries `build-deb.sh`, `build-rpm.sh` and `lorica.service` as assets; they were picked up from the checkout by accident.
+
 ### Fixed
 
 - The released binaries start on Debian 12, Ubuntu 22.04 and RHEL 9 again. They were compiled on `ubuntu-latest`, needed glibc 2.38 and refused to start on those systems, while the packages installed without complaint. They are now compiled on AlmaLinux 9 against glibc 2.34, both packages declare that requirement, and CI starts both binaries on those three distributions.
@@ -20,6 +23,8 @@ Author: Rwx-G
 ### Removed
 
 ### Security
+
+- The package signing key is used only by the release job, once the tag's signature and every test have passed; it used to be loaded on every push to `main`. A signing failure now stops the release, where a failed `.rpm` signature was ignored and the package would have shipped unsigned. Each package is verified against the published key before publication, and a re-run can no longer replace a published release.
 
 ## [1.10.3] - 2026-11-04
 

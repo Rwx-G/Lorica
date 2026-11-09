@@ -77,7 +77,7 @@ jobs:
           echo "TAG_MESSAGE<<EOF" >> "$GITHUB_ENV"
           echo "$msg" >> "$GITHUB_ENV"
           echo "EOF" >> "$GITHUB_ENV"
-          echo "Tagging ${{ env.TAG }} as: $msg"
+          echo "Tagging $TAG as: $msg"
 
       - name: Import the signing key
         env:
@@ -122,6 +122,6 @@ jobs:
         run: |
           echo "### $TAG pushed" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "The CI workflow runs on the tag: \`verify-tag\` first, then the build, the package signing and the release." >> "$GITHUB_STEP_SUMMARY"
+          echo "The CI workflow runs on the tag: the tests and the packages first, then \`verify-tag\`, the package signing and the release." >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "https://github.com/${{ github.repository }}/actions?query=branch%3A$TAG" >> "$GITHUB_STEP_SUMMARY"
