@@ -15,7 +15,7 @@
 
 ---
 
-Lorica is a production-ready reverse proxy with a built-in web dashboard, WAF, SLA monitoring, and HTTP caching. One binary, zero external dependencies. Install it, open your browser, and manage everything from the UI - routes, backends, certificates, security rules, and performance metrics. Since 1.7.0 the same binary runs as a fleet: one control plane pushes configuration and certificates to any number of followers over mutual TLS, and their logs, WAF events and audit trails fan back in. Since 1.8.0 a CI pipeline can bind a review app's hostname, backends and certificate in one call on a separate automation listener, and an operator can capture the full exchange for the one request in twenty that fails. Since 1.9.0 an operator can drive Lorica from an MCP client in three tiers, read, config and admin, each with the authority its task needs and no more: a token that spans two tiers cannot start a server.
+Lorica is a production-ready reverse proxy with a built-in web dashboard, WAF, SLA monitoring, and HTTP caching. One binary, no external service to run. Install it, open your browser, and manage everything from the UI - routes, backends, certificates, security rules, and performance metrics. Since 1.7.0 the same binary runs as a fleet: one control plane pushes configuration and certificates to any number of followers over mutual TLS, and their logs, WAF events and audit trails fan back in. Since 1.8.0 a CI pipeline can bind a review app's hostname, backends and certificate in one call on a separate automation listener, and an operator can capture the full exchange for the one request in twenty that fails. Since 1.9.0 an operator can drive Lorica from an MCP client in three tiers, read, config and admin, each with the authority its task needs and no more: a token that spans two tiers cannot start a server.
 
 Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine that powers a significant portion of Cloudflare's CDN traffic.
 
@@ -716,6 +716,9 @@ The automation routes answer on `--automation-listen`, authenticate with `Author
 # - The GSS-API headers and libclang, for the AD CS client's bindings:
 #   libkrb5-dev and libclang-dev (Debian/Ubuntu),
 #   krb5-devel and clang-devel (Fedora/RHEL)
+# - A C toolchain, cmake and pkg-config, for the crates that build
+#   native code. CI's `Build binaries` job installs the full list, on
+#   AlmaLinux 9.
 
 git clone https://github.com/Rwx-G/Lorica.git
 cd Lorica
@@ -843,7 +846,7 @@ bans and audit trail back in. Followers are read-only (a mutation answers
 ```bash
 # On the control plane: generate the fleet CA (once, service stopped), then
 # serve the cluster plane. On a packaged install the two flags go in the
-# systemd drop-in (`sudo systemctl edit lorica`, see "systemd Service" below).
+# systemd drop-in (`sudo systemctl edit lorica`, see "systemd Service" above).
 lorica --data-dir /var/lib/lorica cluster init
 lorica --data-dir /var/lib/lorica --cluster-listen 10.0.0.10:9444 --cluster-advertise cp.internal.example.org
 
@@ -894,11 +897,21 @@ trail, failure modes and how to replace a control plane.
 
 ## Package Verification
 
-Release `.deb` and `.rpm` packages are GPG-signed. Import the public key to verify:
+Release packages are signed with the project key, published at
+[docs/lorica-signing-key.asc](docs/lorica-signing-key.asc): the `.deb` by a
+detached signature (`lorica_<version>_amd64.deb.asc`, in the same release),
+the `.rpm` by an embedded one.
 
 ```bash
-curl -fsSL https://github.com/Rwx-G/Lorica/raw/main/docs/lorica-signing-key.asc | sudo gpg --dearmor -o /usr/share/keyrings/lorica.gpg
-gpg --verify lorica.deb.asc lorica.deb
+curl -fsSL https://github.com/Rwx-G/Lorica/raw/main/docs/lorica-signing-key.asc -o lorica-signing-key.asc
+
+# .deb, checked against that key alone
+gpg --dearmor < lorica-signing-key.asc > lorica.gpg
+gpgv --keyring ./lorica.gpg lorica_<version>_amd64.deb.asc lorica_<version>_amd64.deb
+
+# .rpm
+sudo rpm --import lorica-signing-key.asc
+rpm --checksig lorica-<version>-1.x86_64.rpm
 ```
 
 From v1.7.4 on, the release tag is signed with the same key, so the chain runs
@@ -906,6 +919,7 @@ from the package back to the commit it was built from. Earlier tags are
 unsigned; verify those releases by their package signature.
 
 ```bash
+gpg --import lorica-signing-key.asc
 git verify-tag v1.7.4
 ```
 
