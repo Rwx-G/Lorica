@@ -34,17 +34,24 @@ jobs:
         with:
           node-version: 22
 
+      # pnpm, as the e2e image: its lock file is the one dependency updates
+      # refresh and the one the security overrides in pnpm-workspace.yaml
+      # apply to. package-lock.json resolves without them.
       - name: Build frontend (needed by lorica-api dependency)
         run: |
           cd lorica-dashboard/frontend
-          npm ci
-          npm run build
+          npm install -g pnpm@10
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Frontend audit (the dependencies the dashboard ships)
+        run: cd lorica-dashboard/frontend && pnpm audit --prod
 
       - name: Frontend lint (svelte-check + ESLint svelte plugin)
         run: |
           cd lorica-dashboard/frontend
-          npm run check
-          npm run lint
+          pnpm run check
+          pnpm run lint
 
       - name: Rustfmt
         run: cargo fmt --all -- --check
@@ -169,8 +176,9 @@ jobs:
       - name: Build frontend
         run: |
           cd lorica-dashboard/frontend
-          npm ci
-          npm run build
+          npm install -g pnpm@10
+          pnpm install --frozen-lockfile
+          pnpm run build
 
       - name: Run Rust unit tests (product crates)
         run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command -p lorica-cluster -p lorica-metrics -p lorica-acme -p lorica-challenge -p lorica-geoip -p lorica-shmem -p lorica-worker -p lorica-dashboard -p lorica-mcp -p lorica-automation-policy -p lorica-adcs
@@ -204,7 +212,7 @@ jobs:
       - name: Run frontend tests
         run: |
           cd lorica-dashboard/frontend
-          npx vitest run
+          pnpm exec vitest run
 
   coverage:
     name: Coverage
@@ -232,8 +240,9 @@ jobs:
       - name: Build frontend (needed by lorica-api dependency)
         run: |
           cd lorica-dashboard/frontend
-          npm ci
-          npm run build
+          npm install -g pnpm@10
+          pnpm install --frozen-lockfile
+          pnpm run build
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -341,8 +350,9 @@ jobs:
       - name: Build frontend
         run: |
           cd lorica-dashboard/frontend
-          npm ci
-          npm run build
+          npm install -g pnpm@10
+          pnpm install --frozen-lockfile
+          pnpm run build
 
       # `-p lorica` alone links lorica-mcp as a library and never builds
       # its binary, which both packages ship (Story 11.4).

@@ -741,7 +741,7 @@ grep -E '^\s+run: cargo test' .github/workflows/ci.yml
 cargo test -p lorica-cluster --tests
 
 # Frontend and its gates
-cd lorica-dashboard/frontend && npm run check && npm run lint && npx vitest run
+cd lorica-dashboard/frontend && pnpm install --frozen-lockfile && pnpm run check && pnpm run lint && pnpm exec vitest run
 ```
 
 At 1.10.2 the two product-crate steps run 3527 Rust tests and the

@@ -83,8 +83,10 @@ then `cargo audit`, which the workflow's "Cargo audit" step runs after
 target fails the Test and Coverage jobs even when clippy is clean:
 `export RUSTFLAGS="-D warnings"` locally too.
 
-For the dashboard, run `npm run check`, `npm run lint` and `npx vitest run`
-in `lorica-dashboard/frontend`. The Docker e2e suite
+For the dashboard, run `pnpm install --frozen-lockfile`, `pnpm audit --prod`,
+`pnpm run check`, `pnpm run lint` and `pnpm exec vitest run` in
+`lorica-dashboard/frontend`, as CI does: `pnpm-lock.yaml` carries the
+security overrides, `package-lock.json` does not. The Docker e2e suite
 (`tests-e2e-docker/run.sh --build`) is the release gate.
 
 - New code has corresponding tests
