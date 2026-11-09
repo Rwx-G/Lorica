@@ -17,6 +17,7 @@ env:
 jobs:
   lint:
     name: Lint
+    if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -80,6 +81,7 @@ jobs:
 
   semgrep:
     name: Semgrep (security)
+    if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     # Runs in parallel with `lint` to keep total CI wall time down.
     # Non-blocking on findings so Semgrep registry flakes don't
@@ -151,7 +153,7 @@ jobs:
   verify-tag:
     name: Verify tag signature
     # Only a tag push reaches this. A branch build has no tag to verify.
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event.repository.fork == false && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

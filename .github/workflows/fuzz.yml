@@ -8,6 +8,7 @@ on:
 jobs:
   fuzz:
     name: Fuzz (${{ matrix.target }})
+    if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     strategy:
       matrix:
