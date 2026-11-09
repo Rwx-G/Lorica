@@ -27,7 +27,7 @@ on:
 jobs:
   tag:
     name: Cut a signed release tag
-    if: github.repository == 'Rwx-G/Lorica'
+    if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     environment: release
     steps:
