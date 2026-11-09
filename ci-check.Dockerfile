@@ -30,7 +30,7 @@ COPY . .
 # `run: cargo fmt|clippy|test` line of the workflow, read from it rather
 # than copied here, in the workflow's order and with the RUSTFLAGS its
 # toolchain action exports; the frontend tests; the release build and
-# the binary check of Build & Package.
+# the binary check of Build binaries.
 #
 # Not run: Semgrep, cargo audit, the lorica-mcp dependency check, the
 # seccomp regression probes (they need systemd-run), coverage, the Docker

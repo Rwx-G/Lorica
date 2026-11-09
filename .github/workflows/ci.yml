@@ -375,19 +375,23 @@ jobs:
       - name: Run the AD CS Kerberos harness
         run: tests-e2e-docker/adcs/run.sh
 
-  build-and-package:
-    name: Build & Package
+  # The oldest glibc a binary runs on is the one it was linked against, so
+  # the binaries are compiled on the oldest distribution they support.
+  # `ubuntu-latest` linked every release up to 1.10.3 against 2.39: Debian
+  # 12, Ubuntu 22.04 and RHEL 9 could not start them, while every job here,
+  # all on newer systems, passed.
+  build-binaries:
+    name: Build binaries
     needs: test
     runs-on: ubuntu-latest
+    container: almalinux:9
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     steps:
+      - name: Install the build requirements
+        run: dnf install -y --setopt=install_weak_deps=False clang-devel cmake file gcc gcc-c++ git gzip krb5-devel make pkgconf-pkg-config tar xz
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
-      # lorica-adcs links the system GSS-API library: libgssapi-sys runs
-      # bindgen (libclang) against the MIT krb5 headers at build time.
-      - name: Install the GSS-API build requirements
-        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -425,7 +429,55 @@ jobs:
             target/release/lorica-mcp
           retention-days: 30
 
-      # Package .deb (same job, no artifact download needed)
+  # Compiling on the oldest base proves nothing unless the result starts
+  # there. These are the oldest distributions the packages support.
+  run-on-oldest:
+    name: Run on ${{ matrix.image }}
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: rockylinux:9
+            install: dnf install -y krb5-libs
+          - image: ubuntu:22.04
+            install: apt-get update && apt-get install -y libgssapi-krb5-2
+          - image: debian:12
+            install: apt-get update && apt-get install -y libgssapi-krb5-2
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: lorica-linux-x86_64
+          path: bin/
+      - name: Install the runtime library the packages require
+        run: ${{ matrix.install }}
+      - name: Both binaries start
+        run: |
+          chmod +x bin/lorica bin/lorica-mcp
+          bin/lorica --version
+          # lorica-mcp has no --version. With no configuration it must
+          # refuse with EX_CONFIG (78), which proves it links and runs.
+          rc=0
+          bin/lorica-mcp < /dev/null || rc=$?
+          if [ "$rc" -ne 78 ]; then
+            echo "FAIL: lorica-mcp exited $rc, expected 78"
+            exit 1
+          fi
+
+  package:
+    name: Package
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: lorica-linux-x86_64
+          path: target/release/
+
       - name: Build .deb package
         run: |
           chmod +x target/release/lorica target/release/lorica-mcp
@@ -479,6 +531,23 @@ jobs:
             fi
           done
 
+      # What keeps the declared requirement from drifting away from the
+      # binaries: the base image above can move, the two package manifests
+      # do not move with it.
+      - name: The packages declare the glibc the binaries need
+        run: |
+          needed=$(objdump -T target/release/lorica target/release/lorica-mcp \
+            | grep -oE 'GLIBC_[0-9.]+' | sed 's/GLIBC_//' | sort -Vu | tail -1)
+          deb_floor=$(dpkg-deb -f dist/*.deb Depends | grep -oP 'libc6 \(>= \K[0-9.]+')
+          rpm_floor=$(rpm -qpR dist/*.rpm | awk '$1 == "glibc" && $2 == ">=" {print $3}')
+          echo "needed: $needed, .deb declares: $deb_floor, .rpm declares: $rpm_floor"
+          for floor in "$deb_floor" "$rpm_floor"; do
+            if [ -z "$floor" ] || [ "$(printf '%s\n%s\n' "$needed" "$floor" | sort -V | tail -1)" != "$floor" ]; then
+              echo "FAIL: a package declares less than glibc $needed"
+              exit 1
+            fi
+          done
+
       - name: Import GPG key
         run: |
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | base64 -d | gpg --batch --import
@@ -514,7 +583,7 @@ jobs:
 
   test-deb-install:
     name: Test .deb install
-    needs: build-and-package
+    needs: package
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -600,7 +669,7 @@ jobs:
   # upgraded hosts do not.
   test-deb-upgrade:
     name: Test .deb upgrade from ${{ matrix.old }}
-    needs: build-and-package
+    needs: package
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -667,7 +736,7 @@ jobs:
   # versions are the deb job's, for the same reasons.
   test-rpm-upgrade:
     name: Test .rpm upgrade from ${{ matrix.old }}
-    needs: build-and-package
+    needs: package
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -746,7 +815,7 @@ jobs:
 
   test-rpm-install:
     name: Test .rpm install
-    needs: build-and-package
+    needs: package
     runs-on: ubuntu-latest
     container: fedora:latest
     steps:
@@ -786,7 +855,7 @@ jobs:
   release:
     name: Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [verify-tag, test-deb-install, test-rpm-install, test-deb-upgrade, test-rpm-upgrade]
+    needs: [verify-tag, run-on-oldest, test-deb-install, test-rpm-install, test-deb-upgrade, test-rpm-upgrade]
     runs-on: ubuntu-latest
     permissions:
       contents: write

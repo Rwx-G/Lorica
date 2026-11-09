@@ -15,6 +15,8 @@ Author: Rwx-G
 
 ### Fixed
 
+- The released binaries start on Debian 12, Ubuntu 22.04 and RHEL 9 again. They were compiled on `ubuntu-latest`, needed glibc 2.38 and refused to start on those systems, while the packages installed without complaint. They are now compiled on AlmaLinux 9 against glibc 2.34, both packages declare that requirement, and CI starts both binaries on those three distributions.
+
 ### Removed
 
 ### Security

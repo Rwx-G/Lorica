@@ -169,6 +169,8 @@ sudo apt install ./lorica_<version>_amd64.deb
 
 On Fedora or RHEL, `sudo dnf install ./lorica-<version>-1.x86_64.rpm` from the same release. [Package Verification](#package-verification) below checks a download's signature; [docs/installation.md](docs/installation.md) covers upgrades.
 
+Releases after 1.10.3 need glibc 2.34 or later: CI starts them on Debian 12, Ubuntu 22.04 and RHEL 9. Up to 1.10.3 they need glibc 2.38, so Debian 13, Ubuntu 24.04, RHEL 10 or a current Fedora.
+
 The package creates a `lorica` user, installs a systemd service (enabled by default), and starts Lorica on ports 8080 (HTTP), 8443 (HTTPS), and 9443 (dashboard).
 
 To customize ports, workers, or log level, edit the systemd unit:
