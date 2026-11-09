@@ -27,6 +27,7 @@ on:
 jobs:
   tag:
     name: Cut a signed release tag
+    timeout-minutes: 15
     if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     environment: release

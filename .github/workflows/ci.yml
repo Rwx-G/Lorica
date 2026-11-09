@@ -11,12 +11,20 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request makes its running pipeline moot. A push
+# to main or a tag gets a group of its own, so none is ever cancelled or
+# left pending behind another: each one is a build of record.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.ref) || format('ci-{0}', github.run_id) }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   lint:
     name: Lint
+    timeout-minutes: 30
     if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     steps:
@@ -88,12 +96,13 @@ jobs:
 
   semgrep:
     name: Semgrep (security)
+    timeout-minutes: 20
     if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     # Runs in parallel with `lint` to keep total CI wall time down.
-    # Non-blocking on findings so Semgrep registry flakes don't
-    # fail the pipeline; `continue-on-error` + SARIF upload lets
-    # reviewers still see the report on the PR.
+    # Non-blocking so Semgrep registry flakes don't fail the pipeline:
+    # the findings land in the run's `semgrep-reports` artifact, not on
+    # the pull request.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
@@ -159,6 +168,7 @@ jobs:
 
   test:
     name: Test
+    timeout-minutes: 45
     needs: lint
     runs-on: ubuntu-latest
     steps:
@@ -216,6 +226,7 @@ jobs:
 
   coverage:
     name: Coverage
+    timeout-minutes: 45
     needs: lint
     runs-on: ubuntu-latest
     # Reports line coverage for the product crates and uploads an lcov
@@ -334,6 +345,7 @@ jobs:
   # all on newer systems, passed.
   build-binaries:
     name: Build binaries
+    timeout-minutes: 45
     needs: test
     runs-on: ubuntu-latest
     container: almalinux:9
@@ -405,6 +417,7 @@ jobs:
   # there. These are the oldest distributions the packages support.
   run-on-oldest:
     name: Run on ${{ matrix.image }}
+    timeout-minutes: 10
     needs: build-binaries
     runs-on: ubuntu-latest
     container: ${{ matrix.image }}
@@ -440,6 +453,7 @@ jobs:
 
   package:
     name: Package
+    timeout-minutes: 20
     needs: build-binaries
     runs-on: ubuntu-latest
     steps:
@@ -527,6 +541,7 @@ jobs:
 
   test-deb-install:
     name: Test .deb install
+    timeout-minutes: 15
     needs: package
     runs-on: ubuntu-latest
     steps:
@@ -613,6 +628,7 @@ jobs:
   # upgraded hosts do not.
   test-deb-upgrade:
     name: Test .deb upgrade from ${{ matrix.old }}
+    timeout-minutes: 30
     needs: package
     runs-on: ubuntu-latest
     strategy:
@@ -680,6 +696,7 @@ jobs:
   # versions are the deb job's, for the same reasons.
   test-rpm-upgrade:
     name: Test .rpm upgrade from ${{ matrix.old }}
+    timeout-minutes: 30
     needs: package
     runs-on: ubuntu-latest
     strategy:
@@ -759,6 +776,7 @@ jobs:
 
   test-rpm-install:
     name: Test .rpm install
+    timeout-minutes: 15
     needs: package
     runs-on: ubuntu-latest
     container: fedora:latest
@@ -800,6 +818,7 @@ jobs:
   # signature, after every test passed on exactly those packages.
   verify-tag:
     name: Verify tag signature
+    timeout-minutes: 10
     needs: [run-on-oldest, test-deb-install, test-rpm-install, test-deb-upgrade, test-rpm-upgrade, e2e-docker, adcs-harness]
     # Only a tag push reaches this. A branch build has no tag to verify.
     if: startsWith(github.ref, 'refs/tags/v')
@@ -833,6 +852,7 @@ jobs:
   # .rpm whose signing failed used to be published unsigned.
   release:
     name: Release
+    timeout-minutes: 20
     needs: verify-tag
     runs-on: ubuntu-latest
     permissions:

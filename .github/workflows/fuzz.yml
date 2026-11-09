@@ -8,9 +8,12 @@ on:
 jobs:
   fuzz:
     name: Fuzz (${{ matrix.target }})
+    timeout-minutes: 45
     if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     strategy:
+      # One target's crash must not cancel the others' runs.
+      fail-fast: false
       matrix:
         target: [fuzz_waf_evaluate, fuzz_api_input, fuzz_ocsp_response]
     steps:
@@ -19,7 +22,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
 
       - name: Run fuzz target (${{ matrix.target }})
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=600
