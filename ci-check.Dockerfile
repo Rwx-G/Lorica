@@ -30,10 +30,11 @@ COPY . .
 # `run: cargo fmt|clippy|test` line of the workflow, read from it rather
 # than copied here, in the workflow's order and with the RUSTFLAGS its
 # toolchain action exports; the frontend tests; the release build and
-# the binary check of Build & Package.
+# the binary check of Build binaries.
 #
-# Not run: Semgrep, cargo audit, the lorica-mcp dependency check, the
-# seccomp regression probes (they need systemd-run), coverage, the Docker
+# Not run: Semgrep, cargo audit, the frontend audit, the lorica-mcp
+# dependency check, the seccomp regression probes (they need
+# systemd-run), coverage, the Docker
 # e2e suite, the packages and their install and upgrade jobs (they need a
 # host booted with systemd; dist/tests holds the scripts), the tag
 # signature check and the release.
@@ -46,10 +47,11 @@ COPY . .
 # ===== JOB 1: LINT =====
 RUN echo "===== LINT: Build, check and lint the frontend =====" \
     && cd lorica-dashboard/frontend \
-    && npm ci \
-    && npm run build \
-    && npm run check \
-    && npm run lint
+    && npm install -g pnpm@10 \
+    && pnpm install --frozen-lockfile \
+    && pnpm run build \
+    && pnpm run check \
+    && pnpm run lint
 
 # The frontend is built above, so the crates embedding it skip the rebuild,
 # as they do in CI, where every cargo step sets SKIP_FRONTEND_BUILD.
@@ -64,7 +66,7 @@ RUN grep -E '^\s+run: cargo (fmt|clippy|test)' .github/workflows/ci.yml \
        done < /tmp/ci-cargo-gates
 
 RUN echo "===== TEST: Frontend tests =====" \
-    && cd lorica-dashboard/frontend && npx vitest run
+    && cd lorica-dashboard/frontend && pnpm exec vitest run
 
 # ===== JOB 3: BUILD =====
 RUN echo "===== BUILD: Release binaries =====" \

@@ -7,6 +7,7 @@ URL:            https://github.com/Rwx-G/Lorica
 BuildArch:      x86_64
 
 Requires:       ca-certificates
+Requires:       glibc >= 2.34
 Requires:       krb5-libs
 
 %description

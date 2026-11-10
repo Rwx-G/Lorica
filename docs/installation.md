@@ -24,6 +24,12 @@ Since 1.10.1 the packages require the GSS-API runtime library
 them. `dpkg -i` and `rpm -i` do not resolve dependencies and refuse the
 package on a host that lacks it.
 
+Releases after 1.10.3 need glibc 2.34 or later, and the packages
+declare it: CI starts the binaries on Debian 12, Ubuntu 22.04 and
+RHEL 9, the oldest systems supported. Up to 1.10.3 the binaries need
+glibc 2.38 and refuse to start on those three, though the package
+installs: use Debian 13, Ubuntu 24.04, RHEL 10 or a current Fedora.
+
 On a first install the post-install hook enables and starts the service.
 An upgrade keeps the state you left it in: it never enables the
 service, and restarts it only if it was running. The one hop it cannot
