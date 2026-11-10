@@ -14,7 +14,8 @@
 # rustup honours this file automatically, so `cargo clippy` / `cargo
 # test` inside `rust:1-bookworm` will auto-install the pinned
 # version on first use. CI uses `actions-rust-lang/setup-rust-
-# toolchain@v1` which reads the same file.
+# toolchain`, which reads the same file. Its `build-warnings: deny`
+# default needs cargo 1.97 or later: do not pin below that.
 
 [toolchain]
 channel = "1.99.1"
