@@ -30,9 +30,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Read channel + components from rust-toolchain.toml so CI and
-      # local dev always run identical rustc/clippy versions.
+      # local dev always run identical rustc/clippy versions. The action
+      # also runs Swatinem/rust-cache itself (`cache: true` by default):
+      # no separate rust-cache step, or every job restores and saves twice.
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # lorica-adcs links the system GSS-API library: libgssapi-sys runs
       # bindgen (libclang) against the MIT krb5 headers at build time.
       - name: Install the GSS-API build requirements
@@ -174,7 +175,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # lorica-adcs links the system GSS-API library: libgssapi-sys runs
       # bindgen (libclang) against the MIT krb5 headers at build time.
       - name: Install the GSS-API build requirements
@@ -239,7 +239,6 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # lorica-adcs links the system GSS-API library: libgssapi-sys runs
       # bindgen (libclang) against the MIT krb5 headers at build time.
       - name: Install the GSS-API build requirements
@@ -356,7 +355,6 @@ jobs:
         run: dnf install -y --setopt=install_weak_deps=False clang-devel cmake file gcc gcc-c++ git gzip krb5-devel make pkgconf-pkg-config python3 tar xz
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: actions/setup-node@v7
         with:
           node-version: 22
