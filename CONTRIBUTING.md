@@ -78,10 +78,10 @@ grep -E '^\s+run: cargo (fmt|clippy|test)' .github/workflows/ci.yml
 
 then `cargo audit`, which the workflow's "Cargo audit" step runs after
 `cargo install cargo-audit --locked`. CI exports
-`RUSTFLAGS="-D warnings"` (set by
+`CARGO_BUILD_WARNINGS=deny` (set by
 `actions-rust-lang/setup-rust-toolchain`), so a rustc warning in a test
 target fails the Test and Coverage jobs even when clippy is clean:
-`export RUSTFLAGS="-D warnings"` locally too.
+`export CARGO_BUILD_WARNINGS=deny` locally too.
 
 For the dashboard, run `pnpm install --frozen-lockfile`, `pnpm audit --prod`,
 `pnpm run check`, `pnpm run lint` and `pnpm exec vitest run` in
