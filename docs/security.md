@@ -193,8 +193,12 @@ IPv4 address only as dotted decimal without leading zeros, and refuse
 the other spellings. A wildcard never covers an address: `*.0.2.10` is
 refused at save, and a wildcard route or grant stored before (and so
 still on disk) never matches a request or a route named by an address,
-in route selection, token grants and the certificate export ACL. A
-route already stored under another spelling of an address is left as it
+in route selection, token grants and the certificate export ACL. Such
+a host now falls to the next rule: an exact route or the catch-all
+route under its own controls, or the next export ACL (a `*` one, if
+any). The upgrade (migration 70) keeps those rows and names each one in
+a warning (table, row id, pattern) so an operator can replace it with
+exact names. A route already stored under another spelling of an address is left as it
 is; it never matched a browser request, and it still does not. The rule
 is `lorica_config::host_shape`; the dashboard replays its vector set
 (`ip-literal.generated.ts`).
