@@ -348,7 +348,12 @@ bundle (`mtls.ca_cert_pem`), on top of the HTTPS listener's handshake.
   the TLS handshake of its connection did, which happens when a browser
   coalesces two hosts on one HTTP/2 connection or reuses one: the
   client retries on a new connection, opened for this host, and can
-  present the certificate meant for it. Off, both pass as anonymous.
+  present the certificate meant for it. A handshake without a server
+  name counts as one for another host when the request names a DNS
+  host (v1.10.5): such a connection was opened for an address and given
+  the certificate of the local address, and a request for a DNS name
+  coalesced onto it would otherwise be locked out for the connection's
+  life. Off, both pass as anonymous.
 - **`allowed_organizations`.** Matched against each `O=` value of the
   certificate subject, whole and case-sensitively; a subject with
   several matches when one of them is listed. It applies only to a

@@ -288,7 +288,8 @@ pub(crate) use helpers::{
     path_after_strip, pick_consistent_hash, request_host, sanitize_html,
 };
 pub use helpers::{
-    canary_bucket, evaluate_mtls, mtls_refusal_status, route_client_cert, RouteClientCert,
+    canary_bucket, evaluate_mtls, mtls_refusal_status, route_client_cert, HandshakeName,
+    RouteClientCert,
 };
 #[cfg(test)]
 pub(crate) use helpers::{
@@ -864,6 +865,7 @@ impl ProxyHttp for LoricaProxy {
             waf_detected: false,
             route_snapshot: None,
             matched_route_entry: None,
+            request_host: String::new(),
             path_rewrite_regex: None,
             request_id: generate_request_id(),
             access_log_enabled: true,
@@ -1080,16 +1082,35 @@ impl ProxyHttp for LoricaProxy {
                 }
             }
 
+            // The host routes are looked up by, once for every stage. A
+            // bracketed host that is not an IPv6 literal and a port is
+            // refused like the other malformed hosts: routed by its
+            // literal alone, the rest would reach that route's backend.
+            match request_host(session.req_header()) {
+                Ok(host) => ctx.request_host = host.into_owned(),
+                Err(_) => {
+                    ctx.block_reason = Some("malformed Host header".into());
+                    return self
+                        .write_error_response(
+                            session,
+                            400,
+                            &ctx.request_id,
+                            None,
+                            "Bad request",
+                            &[],
+                        )
+                        .await;
+                }
+            }
+
             // A path whose normalised reading selects another route, or
             // another path rule of its route, than the path as sent is
             // refused: forwarded as sent under the first, a backend that
             // normalises it would serve what the second one guards. Every
             // later stage that matches a path rule (the rate limit, the
             // backend selection) can then read the raw path alone.
-            let selects_alike = {
-                let req = session.req_header();
-                config.selects_alike_once_normalised(&request_host(req), req.uri.path())
-            };
+            let selects_alike = config
+                .selects_alike_once_normalised(&ctx.request_host, session.req_header().uri.path());
             if !selects_alike {
                 ctx.block_reason =
                     Some("request path selects another route or path rule once normalised".into());
@@ -1099,13 +1120,12 @@ impl ProxyHttp for LoricaProxy {
             }
 
             let req = session.req_header();
-            let host = request_host(req);
             let path = req.uri.path();
 
             // Find matching route (exact hostname first, then wildcard).
             // Cache the matched entry in ctx so upstream_peer does not
             // re-run find_route on the same request.
-            let entry = match config.find_route(&host, path) {
+            let entry = match config.find_route(&ctx.request_host, path) {
                 Some(e) => e,
                 None => return Ok(false), // No route = let upstream_peer handle 404
             };
@@ -1166,7 +1186,10 @@ impl ProxyHttp for LoricaProxy {
             }
 
             // Force HTTPS redirect + hostname redirect
-            if let Some(handled) = self.check_route_redirects(session, entry).await? {
+            if let Some(handled) = self
+                .check_route_redirects(session, entry, &ctx.request_host)
+                .await?
+            {
                 return Ok(handled);
             }
 
@@ -2006,7 +2029,7 @@ impl ProxyHttp for LoricaProxy {
     ) -> Result<Box<HttpPeer>> {
         let req = session.req_header();
 
-        let host = request_host(req);
+        let host: &str = &ctx.request_host;
 
         let path = req.uri.path();
 
@@ -2019,7 +2042,7 @@ impl ProxyHttp for LoricaProxy {
             Some(cached) => Arc::clone(cached),
             None => {
                 config_guard = self.config.load();
-                match config_guard.find_route(&host, path) {
+                match config_guard.find_route(host, path) {
                     Some(e) => Arc::clone(e),
                     None => {
                         return Error::e_explain(

@@ -47,6 +47,11 @@ pub struct RequestCtx {
     /// `ProxyConfig`. `None` when no route matched (request_filter
     /// returned `Ok(false)` and upstream_peer will 404).
     pub matched_route_entry: Option<Arc<RouteEntry>>,
+    /// The request's host as routes are looked up (`request_host`):
+    /// computed once by `request_filter` before it selects a route, and
+    /// read by every later stage that compares it (the redirects, mTLS,
+    /// `upstream_peer`). Empty until then.
+    pub request_host: String,
     /// Unique request identifier for tracing (propagated to backend via X-Request-Id).
     pub request_id: String,
     /// Whether access logging is enabled for this route.

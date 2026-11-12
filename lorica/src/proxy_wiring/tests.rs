@@ -972,11 +972,11 @@ fn the_request_host_drops_its_port_and_is_looked_up_canonical() {
             Some("v6"),
         ),
         ("[2001:db8::2]", "[2001:db8::2]", None),
-        ("[2001:db8::1", "[2001:db8::1", None),
+        ("[2001:db8::1]:65535", "[2001:db8::1]", Some("v6")),
     ] {
         let mut req = lorica_http::RequestHeader::build("GET", b"/", None).unwrap();
         req.insert_header("Host", sent).unwrap();
-        let looked_up = request_host(&req);
+        let looked_up = request_host(&req).expect(sent);
         assert_eq!(looked_up, host, "{sent}");
         assert_eq!(
             config
@@ -992,8 +992,45 @@ fn the_request_host_drops_its_port_and_is_looked_up_canonical() {
     req.insert_header("Host", "app.example.com:8080").unwrap();
     assert!(matches!(
         request_host(&req),
-        std::borrow::Cow::Borrowed("app.example.com")
+        Ok(std::borrow::Cow::Borrowed("app.example.com"))
     ));
+}
+
+/// A bracketed host is an IPv6 literal and at most a port, or it names
+/// no route at all: what follows the bracket would otherwise reach the
+/// literal's route's backend in the forwarded `Host`.
+#[test]
+fn a_bracketed_host_is_an_ipv6_literal_and_a_port_or_it_is_refused() {
+    for malformed in [
+        "[2001:db8::1]junk",
+        "[2001:db8::1]attacker.example",
+        "[2001:db8::1].example",
+        "[2001:db8::1]:",
+        "[2001:db8::1]:x",
+        "[2001:db8::1]:0",
+        "[2001:db8::1]:65536",
+        "[2001:db8::1]:+443",
+        "[2001:db8::1]:443junk",
+        "[2001:db8::1]:443:1",
+        "[2001:db8::1",
+        "[fe80::1%25eth0]",
+        "[not-an-address]",
+        "[192.0.2.10]",
+        "[]",
+    ] {
+        let mut req = lorica_http::RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("Host", malformed).unwrap();
+        assert_eq!(
+            request_host(&req),
+            Err(helpers::MalformedHost),
+            "{malformed}"
+        );
+    }
+    // Without brackets the host is read up to its first colon, as
+    // before: only the bracketed form carries an address to route by.
+    let mut req = lorica_http::RequestHeader::build("GET", b"/", None).unwrap();
+    req.insert_header("Host", "app.example.com:8443").unwrap();
+    assert_eq!(request_host(&req).as_deref(), Ok("app.example.com"));
 }
 
 // ---- Rate Limiter ----
@@ -2890,7 +2927,7 @@ fn test_mtls_refusal_is_421_when_the_connection_names_another_host() {
             mtls_refusal_status(
                 &required,
                 client_cert,
-                Some("a.example.com"),
+                HandshakeName::ServerName("a.example.com"),
                 "b.example.com"
             ),
             Some(421),
@@ -2901,8 +2938,28 @@ fn test_mtls_refusal_is_421_when_the_connection_names_another_host() {
             mtls_refusal_status(
                 &required,
                 client_cert,
-                Some("A.Example.com."),
+                HandshakeName::ServerName("A.Example.com."),
                 "b.example.com"
+            ),
+            Some(421),
+            "{client_cert:?}"
+        );
+    }
+}
+
+/// A connection without a server name was opened for an address and got
+/// the certificate of the local address; a request on it naming a DNS
+/// host was coalesced there, and a new connection would name the host.
+#[test]
+fn test_mtls_refusal_is_421_for_a_dns_host_on_a_connection_without_server_name() {
+    let required = enforcer(true, vec![]);
+    for client_cert in [RouteClientCert::Absent, RouteClientCert::Untrusted] {
+        assert_eq!(
+            mtls_refusal_status(
+                &required,
+                client_cert,
+                HandshakeName::NoServerName,
+                "app.example.com"
             ),
             Some(421),
             "{client_cert:?}"
@@ -2913,26 +2970,27 @@ fn test_mtls_refusal_is_421_when_the_connection_names_another_host() {
 #[test]
 fn test_mtls_refusal_keeps_495_and_496_on_the_host_the_connection_names() {
     let required = enforcer(true, vec![]);
-    for server_name in [Some("b.example.com"), Some("B.EXAMPLE.COM"), None] {
+    let cases = [
+        (HandshakeName::ServerName("b.example.com"), "b.example.com"),
+        (HandshakeName::ServerName("B.EXAMPLE.COM"), "b.example.com"),
+        // No server name, and the request names an address: the
+        // connection was opened for it, and a new one would be too.
+        (HandshakeName::NoServerName, "192.0.2.10"),
+        (HandshakeName::NoServerName, "[2001:db8::1]"),
+        // Plaintext: no connection ever carries a certificate.
+        (HandshakeName::Plaintext, "b.example.com"),
+        (HandshakeName::Plaintext, "192.0.2.10"),
+    ];
+    for (handshake, host) in cases {
         assert_eq!(
-            mtls_refusal_status(
-                &required,
-                RouteClientCert::Absent,
-                server_name,
-                "b.example.com"
-            ),
+            mtls_refusal_status(&required, RouteClientCert::Absent, handshake, host),
             Some(496),
-            "{server_name:?}"
+            "{handshake:?} {host}"
         );
         assert_eq!(
-            mtls_refusal_status(
-                &required,
-                RouteClientCert::Untrusted,
-                server_name,
-                "b.example.com"
-            ),
+            mtls_refusal_status(&required, RouteClientCert::Untrusted, handshake, host),
             Some(495),
-            "{server_name:?}"
+            "{handshake:?} {host}"
         );
     }
 }
@@ -2946,7 +3004,16 @@ fn test_mtls_refusal_keeps_495_for_an_allowlist_miss_and_passes_what_passes() {
         mtls_refusal_status(
             &enforcer(true, vec!["Acme"]),
             verified(&gamma),
-            Some("a.example.com"),
+            HandshakeName::ServerName("a.example.com"),
+            "b.example.com"
+        ),
+        Some(495)
+    );
+    assert_eq!(
+        mtls_refusal_status(
+            &enforcer(true, vec!["Acme"]),
+            verified(&gamma),
+            HandshakeName::NoServerName,
             "b.example.com"
         ),
         Some(495)
@@ -2956,7 +3023,7 @@ fn test_mtls_refusal_keeps_495_for_an_allowlist_miss_and_passes_what_passes() {
         mtls_refusal_status(
             &enforcer(false, vec![]),
             RouteClientCert::Untrusted,
-            Some("a.example.com"),
+            HandshakeName::ServerName("a.example.com"),
             "b.example.com"
         ),
         None
