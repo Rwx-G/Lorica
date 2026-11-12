@@ -1,6 +1,6 @@
 # Lorica - Competitive Feature Comparison
 
-> Last updated: 2026-11-10 | Lorica v1.10.4
+> Last updated: 2026-11-12 | Lorica v1.10.5
 >
 > **Legend:** Y = Yes | N = No | P = Partial | Paid = Paid/Enterprise only | Plug = Plugin, third-party module or external agent (not built-in) | ? = not verified | - = not applicable
 >
@@ -56,7 +56,8 @@
 ### Lorica Notes
 
 - **TLS termination** - Lorica terminates TLS with rustls only; no OpenSSL, BoringSSL or s2n is linked. The competitors terminate TLS with their own stacks (Go `crypto/tls` for Traefik, OpenSSL-family libraries for HAProxy).
-- **Host matching** - case-insensitive, and a trailing dot or an IPv6 literal with a port resolves to the same route (canonical hostnames, fixed in v1.10.2). Every competitor treats this as table stakes, so it carries no row.
+- **Host matching** - case-insensitive, and a trailing dot or an IPv6 literal with a port resolves to the same route (canonical hostnames, fixed in v1.10.2); since v1.10.5 an IPv6 literal however it is written, and an IPv4 address only in dotted decimal, as browsers send it.
+- **Clients dialing an IP** (v1.10.5) - a client that sends no SNI gets the certificate whose IP SAN is the address it connected to, so a route named by an IP is served over HTTPS without a DNS name. Every competitor treats this as table stakes, so it carries no row.
 
 ### Gaps for Lorica
 

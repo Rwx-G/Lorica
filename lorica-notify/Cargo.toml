@@ -1,11 +1,11 @@
 [package]
 name = "lorica-notify"
-version = "1.10.4"
+version = "1.10.5"
 edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-lorica-metrics = { version = "1.10.4", path = "../lorica-metrics" }
+lorica-metrics = { version = "1.10.5", path = "../lorica-metrics" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"

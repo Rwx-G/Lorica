@@ -9,9 +9,19 @@ Author: Rwx-G
 
 ## [Unreleased]
 
-Schema migration 70: upgrade followers before the control plane.
-
 ### Added
+
+### Changed
+
+### Fixed
+
+### Removed
+
+### Security
+
+## [1.10.5] - 2026-11-12
+
+Routes named by an IP address work over HTTPS ([#53](https://github.com/Rwx-G/Lorica/issues/53)), host names are read the way browsers read them, and the upstream Pingora sync and dependencies are current. Schema migration 70: upgrade followers before the control plane.
 
 ### Changed
 
@@ -30,10 +40,6 @@ Schema migration 70: upgrade followers before the control plane.
 - **An mTLS route answers 421 instead of 495/496 to a request for a DNS host on a connection opened without SNI.** Such a connection, now possible since a client dialing an IP gets the certificate carrying it, could be reused by a browser for another host the same certificate covers, and was then refused for the life of the connection; 421 makes the client retry on a connection of its own.
 - **A `Host` (or HTTP/2 `:authority`) may carry nothing after the host but a port from 1 to 65535.** `app.example.com:junk` or `host:0` was routed by the part before the colon and forwarded to the backend, and to forward auth as `X-Forwarded-Host`, as sent; a bracketed host followed by anything else did the same. All are now refused with 400, as are an unclosed `[`, a zone id and an unbracketed IPv6 address (the last three answered 404 or reached the catch-all route before).
 - **The configuration import checks a route's redirect host as the route API does.** An imported `0x7f.1` was stored and sent browsers to 127.0.0.1.
-
-### Removed
-
-### Security
 
 ## [1.10.4] - 2026-11-10
 
