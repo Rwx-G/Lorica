@@ -106,7 +106,12 @@
     ].filter((s) => s.length > 0),
   );
   let uncoveredByCert = $derived(
-    selectedCert ? findUncoveredHostnames(routeHostnames, selectedCert.san_domains) : [],
+    selectedCert
+      ? findUncoveredHostnames(routeHostnames, selectedCert.san_domains, selectedCert.san_ips)
+      : [],
+  );
+  let selectedCertSans = $derived(
+    selectedCert ? [...selectedCert.san_domains, ...selectedCert.san_ips] : [],
   );
 
   // Story 13.3: names no stored certificate covers drive the one-click
@@ -233,7 +238,7 @@
             handshake error (SAN mismatch). Pick a cert whose SAN list
             includes the hostname (or a wildcard that covers it).
             Cert SAN list:
-            {selectedCert.san_domains.length > 0 ? selectedCert.san_domains.join(', ') : '(empty)'}.
+            {selectedCertSans.length > 0 ? selectedCertSans.join(', ') : '(empty)'}.
           </div>
         {/if}
         {#if adcsOffered}

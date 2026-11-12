@@ -102,7 +102,7 @@ export function adcsSanHints(sans: readonly string[], allowedSuffixes: readonly 
 
 /**
  * The route's names that no stored certificate covers, by its `domain`
- * or any SAN, in RFC 6125 terms. Wildcard names are dropped first:
+ * or any SAN, in RFC 6125 terms (an IP literal by the IP SANs alone). Wildcard names are dropped first:
  * AD CS issuance refuses them (Epic 13 D5), so offering them would
  * only produce a refusal.
  */
@@ -111,9 +111,11 @@ export function hostnamesWithoutCertificate(
   certificates: readonly CertificateResponse[],
 ): string[] {
   const names = certificates.flatMap((cert) => [cert.domain, ...cert.san_domains]);
+  const ips = certificates.flatMap((cert) => cert.san_ips);
   return findUncoveredHostnames(
     hostnames.filter((name) => !isWildcardName(name)),
     names,
+    ips,
   );
 }
 

@@ -50,6 +50,12 @@
             <span class="detail-value">{detailCert.san_domains.join(', ')}</span>
           </div>
         {/if}
+        {#if detailCert.san_ips.length > 0}
+          <div class="detail-row">
+            <span class="detail-label">SAN IP Addresses</span>
+            <span class="detail-value mono" data-testid="cert-detail-san-ips">{detailCert.san_ips.join(', ')}</span>
+          </div>
+        {/if}
         <div class="detail-row">
           <span class="detail-label">Subject</span>
           <span class="detail-value mono" data-testid="cert-detail-subject">{detailCert.subject || 'not readable'}</span>

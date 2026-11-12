@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  canonicalIp,
   hostnameMatchesSan,
   hostnameCoveredByAny,
   findUncoveredHostnames,
@@ -142,5 +143,69 @@ describe('findUncoveredHostnames', () => {
       ['*.example.com'],
     );
     expect(result).toEqual(['Admin.Other.Com']);
+  });
+});
+
+describe('canonicalIp', () => {
+  it('reads an IPv4 literal', () => {
+    expect(canonicalIp('192.0.2.10')).toBe('192.0.2.10');
+    expect(canonicalIp(' 192.0.2.10 ')).toBe('192.0.2.10');
+  });
+
+  it('canonicalises an IPv6 literal, with or without brackets', () => {
+    expect(canonicalIp('2001:DB8:0:0:0:0:0:1')).toBe('[2001:db8::1]');
+    expect(canonicalIp('[2001:db8::1]')).toBe('[2001:db8::1]');
+    expect(canonicalIp('::1')).toBe('[::1]');
+    expect(canonicalIp('[::1]')).toBe('[::1]');
+  });
+
+  it('is null for a DNS name or a malformed literal', () => {
+    expect(canonicalIp('localhost')).toBeNull();
+    expect(canonicalIp('pki.example.com')).toBeNull();
+    expect(canonicalIp('999.0.2.10')).toBeNull();
+    expect(canonicalIp('2001:db8::1::2')).toBeNull();
+    expect(canonicalIp('')).toBeNull();
+  });
+});
+
+// Issue #53: a route whose hostname is an IP, with a certificate that
+// carries the IP as an IP address SAN.
+describe('hostnameCoveredByAny - IP hostnames', () => {
+  it('matches an IPv4 hostname against the IP SANs', () => {
+    expect(hostnameCoveredByAny('192.168.153.1', ['localhost'], ['192.168.153.1'])).toBe(true);
+    expect(hostnameCoveredByAny('192.168.153.2', ['localhost'], ['192.168.153.1'])).toBe(false);
+  });
+
+  it('matches an IPv6 hostname in any spelling', () => {
+    expect(hostnameCoveredByAny('2001:db8::1', [], ['2001:db8::1'])).toBe(true);
+    expect(hostnameCoveredByAny('[2001:db8::1]', [], ['2001:db8::1'])).toBe(true);
+    expect(hostnameCoveredByAny('2001:DB8:0:0:0:0:0:1', [], ['2001:db8::1'])).toBe(true);
+    expect(hostnameCoveredByAny('::1', [], ['2001:db8::1'])).toBe(false);
+  });
+
+  it('never matches an IP hostname against a DNS SAN', () => {
+    expect(hostnameCoveredByAny('192.168.153.1', ['192.168.153.1'], [])).toBe(false);
+    expect(hostnameCoveredByAny('::1', ['::1'])).toBe(false);
+  });
+
+  it('keeps the address families apart', () => {
+    expect(hostnameCoveredByAny('192.0.2.10', [], ['::ffff:192.0.2.10'])).toBe(false);
+    expect(hostnameCoveredByAny('::ffff:192.0.2.10', [], ['192.0.2.10'])).toBe(false);
+  });
+
+  it('never matches a DNS hostname against an IP SAN', () => {
+    expect(hostnameCoveredByAny('localhost', [], ['127.0.0.1'])).toBe(false);
+    expect(hostnameCoveredByAny('pki.example.com', ['*.example.com'], ['192.0.2.10'])).toBe(true);
+  });
+});
+
+describe('findUncoveredHostnames - IP hostnames', () => {
+  it('reports only the names neither SAN list covers', () => {
+    const result = findUncoveredHostnames(
+      ['192.168.153.1', 'localhost', '192.168.153.2', 'other.example.com'],
+      ['localhost'],
+      ['192.168.153.1'],
+    );
+    expect(result).toEqual(['192.168.153.2', 'other.example.com']);
   });
 });

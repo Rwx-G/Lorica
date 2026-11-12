@@ -115,6 +115,7 @@ const mockCert = {
   id: 'cert-1',
   domain: 'example.com',
   san_domains: [],
+  san_ips: [],
   fingerprint: 'AA:BB:CC',
   issuer: 'Test CA',
   subject: 'CN=example.com',

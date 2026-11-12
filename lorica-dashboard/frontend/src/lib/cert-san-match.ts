@@ -1,5 +1,7 @@
 /**
- * RFC 6125 hostname matching against a TLS certificate's SAN list.
+ * RFC 6125 hostname matching against a TLS certificate's SAN list:
+ * its DNS names and, for a hostname that is an IP literal, its IP
+ * addresses.
  *
  * Used by the route editor to flag a configured hostname that the
  * selected certificate does not cover, before the route goes live
@@ -23,10 +25,46 @@
  *     them; RFC 6125 6.4.3 considers them ambiguous).
  *   - "*.example.com" does NOT match "example.com" (the bare apex
  *     needs an explicit SAN entry).
- *   - SANs that are not pure wildcards or exact names (IP literals,
- *     malformed inputs, multi-wildcard like "*.*.example.com") are
- *     ignored - they cannot match a hostname under the rules above.
+ *   - SANs that are not pure wildcards or exact names (malformed
+ *     inputs, multi-wildcard like "*.*.example.com") are ignored -
+ *     they cannot match a hostname under the rules above.
+ *
+ * IP literals (issue #53):
+ *   - A hostname that is an IPv4 literal, or an IPv6 literal with or
+ *     without brackets, is matched against the certificate's IP
+ *     address SANs only, by equality of canonical forms ("2001:DB8::1",
+ *     "[2001:db8:0:0:0:0:0:1]" and "2001:db8::1" are one address).
+ *   - It never matches a DNS SAN, not even one spelling the same
+ *     address: browsers verify an IP against IP address SANs alone.
+ *   - An IPv4 hostname does not match an IPv4-mapped IPv6 SAN
+ *     ("::ffff:192.0.2.10"), nor the reverse: the families differ.
  */
+
+/**
+ * The canonical form of `host` when it is an IP literal - IPv4 in
+ * dotted-decimal, or IPv6 with or without brackets - and null for
+ * anything else. The browser's own URL parser canonicalises, so the
+ * form is the one the browser compares.
+ */
+export function canonicalIp(host: string): string | null {
+  let h = host.trim();
+  if (h.startsWith('[') && h.endsWith(']')) h = h.slice(1, -1);
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) {
+    try {
+      return new URL(`http://${h}/`).hostname;
+    } catch {
+      return null;
+    }
+  }
+  if (h.includes(':')) {
+    try {
+      return new URL(`http://[${h}]/`).hostname;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
 
 function normalize(name: string): string {
   let n = name.trim().toLowerCase();
@@ -58,13 +96,25 @@ export function hostnameMatchesSan(hostname: string, san: string): boolean {
   return h === s;
 }
 
-export function hostnameCoveredByAny(hostname: string, sans: readonly string[]): boolean {
+/**
+ * Whether the certificate covers `hostname`: an IP literal by `ipSans`
+ * alone, any other hostname by the DNS names in `sans`.
+ */
+export function hostnameCoveredByAny(
+  hostname: string,
+  sans: readonly string[],
+  ipSans: readonly string[] = [],
+): boolean {
+  const ip = canonicalIp(hostname);
+  if (ip !== null) return ipSans.some((san) => canonicalIp(san) === ip);
   return sans.some((s) => hostnameMatchesSan(hostname, s));
 }
 
+/** The hostnames the certificate does not cover, in {@link hostnameCoveredByAny} terms. */
 export function findUncoveredHostnames(
   hostnames: readonly string[],
   sans: readonly string[],
+  ipSans: readonly string[] = [],
 ): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
@@ -74,7 +124,7 @@ export function findUncoveredHostnames(
     const key = h.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-    if (!hostnameCoveredByAny(h, sans)) out.push(h);
+    if (!hostnameCoveredByAny(h, sans, ipSans)) out.push(h);
   }
   return out;
 }
