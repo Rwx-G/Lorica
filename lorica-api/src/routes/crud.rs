@@ -19,7 +19,7 @@ use crate::middleware::auth::Session;
 use crate::server::AppState;
 use lorica_config::route_selection::{
     canonical_hostname, same_name, validate_hostname_syntax, HostnameShape, ROUTE_ALIAS_SHAPE,
-    ROUTE_HOSTNAME_SHAPE,
+    ROUTE_HOSTNAME_SHAPE, ROUTE_REDIRECT_HOSTNAME_SHAPE,
 };
 
 use super::forward_auth::{build_forward_auth, ForwardAuthConfigRequest};
@@ -606,16 +606,7 @@ fn validate_route_hostname(raw: &str) -> Result<String, ApiError> {
 /// create, and on an update only when the target changes, so a row
 /// stored before the rule keeps saving.
 fn validate_redirect_hostname(raw: &str) -> Result<String, ApiError> {
-    validate_dns_hostname(
-        raw,
-        HostnameShape {
-            allow_wildcard: false,
-            allow_empty: true,
-            allow_catch_all: false,
-            allow_ipv6_literal: false,
-            field_label: "redirect_hostname",
-        },
-    )
+    validate_dns_hostname(raw, ROUTE_REDIRECT_HOSTNAME_SHAPE)
 }
 
 /// Validate a `redirect_to` input. Accepts a full HTTP(S) URL and

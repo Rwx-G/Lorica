@@ -3231,6 +3231,36 @@ cert_critical_days = 3
         parse_toml(&address).expect("an address alias in the dotted spelling imports");
     }
 
+    /// The redirect host is checked on import as the route API checks
+    /// it: `0x7f.1` would send browsers to 127.0.0.1.
+    #[test]
+    fn test_import_checks_the_redirect_host_as_the_api_does() {
+        let source = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut route = make_route();
+        route.hostname = "a.example.com".into();
+        route.redirect_hostname = Some("www.example.com".into());
+        source.create_route(&route).expect("test setup: route");
+        let exported = export_to_toml(&source).expect("test setup: export");
+        parse_toml(&exported).expect("a DNS redirect host imports");
+        for target in [
+            "0x7f.1",
+            "010.0.0.1",
+            "evil.example/x",
+            "evil.example:8443",
+            "*.example.com",
+            "[2001:db8::1]",
+        ] {
+            let edited = exported.replace("\"www.example.com\"", &format!("\"{target}\""));
+            assert_ne!(edited, exported, "test setup: the export names the target");
+            let err = parse_toml(&edited).expect_err(target).to_string();
+            assert!(err.contains("redirect_hostname"), "{target}: {err}");
+        }
+        for target in ["192.0.2.10", ""] {
+            let edited = exported.replace("\"www.example.com\"", &format!("\"{target}\""));
+            parse_toml(&edited).expect(target);
+        }
+    }
+
     #[test]
     fn test_hostname_uniqueness_allows_update_own_hostname() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");

@@ -152,6 +152,18 @@ pub const ROUTE_HOSTNAME_SHAPE: HostnameShape<'static> = HostnameShape {
     field_label: "hostname",
 };
 
+/// The shape of a route's `redirect_hostname`, the host a canonical-host
+/// redirect sends a browser to: a bare DNS name or dotted IPv4 address,
+/// never a wildcard, the catch-all or an IPv6 literal; empty clears it.
+/// The route API and the TOML import both check it against this.
+pub const ROUTE_REDIRECT_HOSTNAME_SHAPE: HostnameShape<'static> = HostnameShape {
+    allow_wildcard: false,
+    allow_empty: true,
+    allow_catch_all: false,
+    allow_ipv6_literal: false,
+    field_label: "redirect_hostname",
+};
+
 /// The shape of a route's alias as the TOML import checks it: a DNS
 /// name, an IPv4 address or a wildcard, never the catch-all or an IPv6
 /// literal, which only a primary hostname takes.
