@@ -486,9 +486,25 @@ lives in.
   the owned variants and the overread hand-off, restores upstream's
   debug log, and drops this entry; taking `L4BufferSettings` replaces
   `set_buffer_capacity` and `BUF_READ_SIZE` with upstream's settings and
-  `DEFAULT_L4_READ_BUFFER_SIZE`. The 32 KiB sizes are upstream's, whose
-  reason (jemalloc's tcache) does not hold for a binary on glibc malloc;
-  both comments say so, pending a benchmark.
+  `DEFAULT_L4_READ_BUFFER_SIZE`.
+- **`lorica-core`, 64 KiB read buffers where upstream uses 32 KiB
+  (v1.10.5).** Sites: `BODY_BUFFER_SIZE` in
+  `lorica-core/src/protocols/http/v1/body.rs` and `BUF_READ_SIZE` in
+  `lorica-core/src/protocols/l4/stream.rs`. Upstream's `f8ecae90` halves
+  both to fit jemalloc's default tcache; no Lorica binary sets a global
+  allocator, so production runs on glibc malloc, where that reason does
+  not hold. Measured on the 1.10.5 branch (one host, WSL2, a worker on
+  two pinned vCPUs, 100 MiB transfers through the proxy to nginx, nine
+  runs per cell, 2,000 idle connections for memory): at 64 KiB,
+  chunked uploads ran 65 to 113 % faster, plaintext downloads 10 to
+  16 % faster and the other transfers up to 11 % faster or within
+  noise, for idle memory within 0.6 KiB per connection of 32 KiB.
+  Upstream's release of empty read storage while a connection waits is
+  kept: against 1.10.4 it saves 24 and 22 KiB per idle plaintext
+  connection (keep-alive, stalled upload) and 10 and 17 KiB over TLS,
+  with worker CPU per GiB never more than 4.7 % worse. On an upstream
+  sync, keep both constants at 64 KiB; taking `L4BufferSettings` makes
+  the read-ahead a setting whose Lorica default is 64 KiB.
 
 ## Upstream sync record
 

@@ -33,9 +33,11 @@ use crate::utils::BufRef;
 // allocator, so production runs on glibc malloc, where that limit does not apply:
 // with its default tunables glibc's tcache holds chunks of up to 1032 bytes only, and
 // 32 KiB and 64 KiB are both below its default mmap threshold (128 KiB), so either size
-// comes from and returns to the malloc arenas. The value is upstream's, kept until a
-// benchmark settles it against the former 64 KiB.
-const BODY_BUFFER_SIZE: usize = 32 * 1024;
+// comes from and returns to the malloc arenas. Lorica keeps the former 64 KiB, measured
+// against upstream's 32 KiB in 1.10.5 (FORK.md, the `f8ecae90` buffer size entry):
+// chunked uploads ran 65 to 113 % faster and other transfers up to 16 % faster at 64 KiB, for
+// the same idle memory, since the buffer is released while a connection waits.
+const BODY_BUFFER_SIZE: usize = 64 * 1024;
 // limit how much incomplete chunk-size and chunk-ext to buffer
 const PARTIAL_CHUNK_HEAD_LIMIT: usize = 1024 * 8;
 // Trailers: https://datatracker.ietf.org/doc/html/rfc9112#section-7.1.2

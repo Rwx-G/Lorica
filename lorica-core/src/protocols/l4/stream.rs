@@ -339,11 +339,12 @@ impl AsRawFd for RawStreamWrapper {
 // production runs on glibc malloc, where that limit does not apply:
 // with its default tunables glibc's tcache holds chunks of up to 1032 bytes only, and
 // 32 KiB and 64 KiB are both below its default mmap threshold (128 KiB), so either size
-// comes from and returns to the malloc arenas. The value is upstream's, kept until a
-// benchmark settles it against the former 64 KiB, as is the release of empty read-ahead
-// storage below.
+// comes from and returns to the malloc arenas. Lorica keeps the former 64 KiB, measured
+// against upstream's 32 KiB in 1.10.5 (FORK.md, the `f8ecae90` buffer size entry), and
+// keeps upstream's release of empty read-ahead storage below, which the same measurement
+// found to save 10 to 24 KiB per idle connection at no measurable cost.
 // Lorica: fixed sizes here where upstream reads them from `L4BufferSettings`.
-pub(crate) const BUF_READ_SIZE: usize = 32 * 1024;
+pub(crate) const BUF_READ_SIZE: usize = 64 * 1024;
 // Small write buf to match MSS. Too large write buf delays real time communication.
 // This buffering effectively implements something similar to Nagle's algorithm.
 // The benefit is that user space can control when to flush, where Nagle's can't be controlled.
