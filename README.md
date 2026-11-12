@@ -29,7 +29,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **Canary traffic split** - send `X%` of requests to an alternate backend group with sticky-per-IP deterministic bucketing. Multiple splits per route; weights capped at 100 cumulative
 - **Response body rewriting** - ordered search-and-replace rules (literal or regex with capture groups) applied to upstream response bodies. Configurable content-type filter, max body cap, streams verbatim over the cap
 - TLS termination via rustls (no OpenSSL dependency)
-- SNI-based certificate selection with wildcard domain support (`*.example.com`)
+- SNI-based certificate selection with wildcard domain support (`*.example.com`); a client dialing an IP, which sends no SNI, gets the certificate whose `IP Address` SAN is the local address it arrived on (see `docs/security.md`, *Certificates for an IP address*)
 - Path rewriting (strip/add prefix, regex with capture groups), hostname aliases, HTTP-to-HTTPS redirect
 - Catch-all hostname (`_`) as last-resort fallback, `redirect_to` for domain redirects, `return_status` for direct responses
 - **gRPC-Web bridge** - transparently converts HTTP/1.1 gRPC-web requests to HTTP/2 gRPC for upstream backends

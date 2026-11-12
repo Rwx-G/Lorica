@@ -259,6 +259,38 @@ There is no switch to turn the check off: a request it refuses is one
 a normalising backend would serve as a resource whose route or rule
 the proxy did not apply.
 
+### Certificates for an IP address
+
+A client dialing `https://192.0.2.10` sends no SNI: RFC 6066 forbids an
+IP literal there. The HTTPS listener then picks the certificate whose
+leaf lists, as an `IP Address` SAN entry, the local address the
+connection arrived on; when several do, the one that expires last. The
+address is read from the certificate itself, so a certificate stored
+before v1.10.5 needs no re-upload. A route whose hostname is that IP
+(`192.0.2.10`, or `[2001:db8::1]` for IPv6) then serves the request.
+
+- **Only without SNI.** A client that sends SNI is served by name as
+  before; a name no certificate covers fails the handshake and never
+  falls back to the address.
+- **The local address, not the dialed one.** Behind NAT, for example a
+  Docker bridge with published ports, the address the connection
+  arrives on is the container's, not the one the client dialed, so the
+  certificate for the dialed address is not found. Put the address the
+  listener sees in the certificate, or run Lorica on the host network.
+  A dual-stack listener's IPv4 clients are matched by their IPv4
+  address.
+- **Exposure.** Anyone who reaches the address without SNI, a scanner
+  sweeping IP ranges included, now receives that certificate and so
+  learns every name in its SAN list. Before, such a handshake failed.
+  Keep names you do not want disclosed out of a certificate that
+  carries an IP.
+- **Display only in the API.** The management API's certificate views
+  list these entries as `san_ips`. They are never part of
+  `san_domains`, which ACME and AD CS renewal and automation token
+  grants read as DNS names, and the automation plane and the MCP
+  server do not answer them: a grant is checked against DNS names
+  only.
+
 ### mTLS client verification
 
 A route with mTLS checks the client certificate against its own CA
