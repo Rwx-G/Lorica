@@ -20,13 +20,16 @@ use lorica_error::{
     OrErr, Result,
 };
 use std::fmt::Debug;
+use std::future::{poll_fn, Future};
+use std::pin::pin;
+use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::protocols::l4::stream::AsyncWriteVec;
 use crate::utils::BufRef;
 
-// TODO: make this dynamically adjusted
-const BODY_BUFFER_SIZE: usize = 1024 * 64;
+// Match the default transport read buffer and fit jemalloc's default tcache limit.
+const BODY_BUFFER_SIZE: usize = 32 * 1024;
 // limit how much incomplete chunk-size and chunk-ext to buffer
 const PARTIAL_CHUNK_HEAD_LIMIT: usize = 1024 * 8;
 // Trailers: https://datatracker.ietf.org/doc/html/rfc9112#section-7.1.2
@@ -172,19 +175,65 @@ impl BodyReader {
     }
 
     fn prepare_buf(&mut self, buf_to_rewind: &[u8]) {
-        let mut body_buf = BytesMut::with_capacity(self.body_buf_size);
-        if !buf_to_rewind.is_empty() {
-            self.rewind_buf_len = buf_to_rewind.len();
-            // TODO: this is still 1 copy. Make it zero
-            body_buf.put_slice(buf_to_rewind);
+        self.rewind_buf_len = buf_to_rewind.len();
+        self.body_buf = Some(BytesMut::from(buf_to_rewind));
+    }
+
+    /// Read into a fresh logical buffer, releasing empty storage before Pending.
+    ///
+    /// This **discards** whatever the buffer currently holds, so callers must only use it once
+    /// every previously buffered byte has been parsed and handed to the caller. Paths that still
+    /// need the buffered bytes (a pending rewind, a partial chunk head, or the trailer tail left
+    /// behind by [`Self::do_read_chunked_body`]) must reuse the existing buffer instead.
+    async fn read_new_buf<S>(&mut self, stream: &mut S, read_size: usize) -> std::io::Result<usize>
+    where
+        S: AsyncRead + Unpin,
+    {
+        if let Some(body_buf) = self.body_buf.as_mut() {
+            body_buf.clear();
         }
-        if self.body_buf_size > buf_to_rewind.len() {
-            //body_buf.resize(self.body_buf_size, 0);
-            unsafe {
-                body_buf.set_len(self.body_buf_size);
+        self.read_more(stream, read_size).await
+    }
+
+    /// Append a single read, keeping only existing framing on Pending, EOF, or error.
+    /// AsyncRead has no separate readiness operation: temporary destination
+    /// storage may be needed to discover Pending, but it must not survive it.
+    async fn read_more<S>(&mut self, stream: &mut S, read_size: usize) -> std::io::Result<usize>
+    where
+        S: AsyncRead + Unpin,
+    {
+        poll_fn(|cx| {
+            let body_buf = self.body_buf.get_or_insert_default();
+            if body_buf.capacity() - body_buf.len() < read_size {
+                // BytesMut::reserve can double a preread allocation past the
+                // requested size and out of the allocator's thread cache.
+                let mut storage = BytesMut::with_capacity(body_buf.len() + read_size);
+                storage.extend_from_slice(body_buf);
+                *body_buf = storage;
             }
+            let mut limited = (&mut *stream).take(read_size as u64);
+            let result = pin!(limited.read_buf(body_buf)).poll(cx);
+            if !matches!(result, Poll::Ready(Ok(1..))) {
+                if body_buf.is_empty() {
+                    self.body_buf = None;
+                } else if body_buf.capacity() > body_buf.len() {
+                    // Only partial framing is retained here. Its offsets were
+                    // committed by the parser before polling, so cancellation
+                    // and retry see the same bytes at the same positions.
+                    self.body_buf = Some(BytesMut::from(&body_buf[..]));
+                }
+            }
+            result
+        })
+        .await
+    }
+
+    /// Release the final read after a caller has copied its payload. Borrowed
+    /// payloads must instead stay alive until the next mutable read operation.
+    pub fn release_completed_buf(&mut self) {
+        if self.body_done() {
+            self.body_buf = None;
         }
-        self.body_buf = Some(body_buf);
     }
 
     pub fn init_chunked(&mut self, buf_to_rewind: &[u8]) {
@@ -277,36 +326,40 @@ impl BodyReader {
     where
         S: AsyncRead + Unpin + Send,
     {
-        match self.body_state {
-            PS::Complete(_) => Ok(None),
-            PS::Done(_) => Ok(None),
+        let result = match self.body_state {
+            PS::Complete(_) | PS::Done(_) => Ok(None),
             PS::Partial(_, _) => self.do_read_body(stream).await,
             PS::Chunked(..) => self.do_read_chunked_body(stream).await,
             PS::ChunkedFinal(..) => self.do_read_chunked_body_final(stream).await,
             PS::UntilClose(_) => self.do_read_body_until_closed(stream).await,
             PS::ToStart => panic!("need to init BodyReader first"),
+        };
+        if matches!(result, Ok(None)) {
+            self.release_completed_buf();
         }
+        result
     }
 
     pub async fn do_read_body<S>(&mut self, stream: &mut S) -> Result<Option<BufRef>>
     where
         S: AsyncRead + Unpin + Send,
     {
-        let mut body_buf = self.body_buf.as_deref_mut().unwrap();
         let mut n = self.rewind_buf_len;
         self.rewind_buf_len = 0; // we only need to read rewind data once
-        if n == 0 {
-            // downstream should not discard remaining data if peer sent more.
-            if !self.upstream {
-                if let PS::Partial(_, to_read) = self.body_state {
-                    if to_read < body_buf.len() {
-                        body_buf = &mut body_buf[..to_read];
-                    }
-                }
+
+        // Downstream leaves anything past this body on the stream. Upstream reads can
+        // overread by up to 1 KiB to detect excess bytes and prevent connection reuse.
+        let read_size = match self.body_state {
+            PS::Partial(_, remaining) if self.upstream => {
+                remaining.saturating_add(1024).min(self.body_buf_size)
             }
+            PS::Partial(_, remaining) => remaining.min(self.body_buf_size),
+            _ => self.body_buf_size,
+        };
+        if n == 0 {
             /* Need to actually read */
-            n = stream
-                .read(body_buf)
+            n = self
+                .read_new_buf(stream, read_size)
                 .await
                 .or_err(ReadError, "when reading body")?;
         }
@@ -346,13 +399,13 @@ impl BodyReader {
     where
         S: AsyncRead + Unpin + Send,
     {
-        let body_buf = self.body_buf.as_deref_mut().unwrap();
         let mut n = self.rewind_buf_len;
         self.rewind_buf_len = 0; // we only need to read rewind data once
         if n == 0 {
             /* Need to actually read */
-            n = stream
-                .read(body_buf)
+            let read_size = self.body_buf_size;
+            n = self
+                .read_new_buf(stream, read_size)
                 .await
                 .or_err(ReadError, "when reading body")?;
         }
@@ -382,14 +435,13 @@ impl BodyReader {
                 mut expecting_from_io,
             ) => {
                 if existing_buf_start == 0 {
-                    // read a new buf from IO
-                    let body_buf = self.body_buf.as_deref_mut().unwrap();
                     if existing_buf_end == 0 {
                         existing_buf_end = self.rewind_buf_len;
                         self.rewind_buf_len = 0; // we only need to read rewind data once
                         if existing_buf_end == 0 {
-                            existing_buf_end = stream
-                                .read(body_buf)
+                            let read_size = self.body_buf_size;
+                            existing_buf_end = self
+                                .read_new_buf(stream, read_size)
                                 .await
                                 .or_err(ReadError, "when reading body")?;
                         }
@@ -398,11 +450,27 @@ impl BodyReader {
                         /* copy the #expecting_from_io bytes until index existing_buf_end
                          * to the front and read more to form a valid chunk head.
                          * existing_buf_end is the end of the partial head and
-                         * expecting_from_io is the len of it */
-                        body_buf
-                            .copy_within(existing_buf_end - expecting_from_io..existing_buf_end, 0);
-                        let new_bytes = stream
-                            .read(&mut body_buf[expecting_from_io..])
+                         * expecting_from_io is the len of it.
+                         * The head is capped at PARTIAL_CHUNK_HEAD_LIMIT and is normally a few
+                         * bytes, so the move is bounded and cheap. The read helper reserves
+                         * space only for the read attempt, retaining just this prefix if the
+                         * stream is pending. */
+                        let body_buf = self
+                            .body_buf
+                            .as_mut()
+                            .expect("body buf exists once a partial chunk head was buffered");
+                        let partial_head_start = existing_buf_end - expecting_from_io;
+                        if partial_head_start != 0 {
+                            body_buf.copy_within(partial_head_start..existing_buf_end, 0);
+                        }
+                        body_buf.truncate(expecting_from_io);
+                        // Commit the compacted offsets before awaiting so cancellation leaves the
+                        // parser and buffer in a state that the next call can safely resume.
+                        self.body_state = self
+                            .body_state
+                            .partial_chunk_head(expecting_from_io, expecting_from_io);
+                        let new_bytes = self
+                            .read_more(stream, self.body_buf_size - expecting_from_io)
                             .await
                             .or_err(ReadError, "when reading body")?;
                         if new_bytes == 0 {
@@ -499,14 +567,20 @@ impl BodyReader {
                     if buf_res.is_some() {
                         if let Some(idx) = last_chunk_size_end {
                             // just read the last 0 + CRLF, but not final end CRLF
-                            // copy the rest of the buffer to the start of the body_buf
-                            // so we can parse the remaining bytes as trailers / end
-                            let body_buf = self.body_buf.as_deref_mut().unwrap();
+                            // Split the rest of the buffer to the start in O(1) so the trailers
+                            // and any bytes past the message stay in the same allocation.
+                            // `do_read_chunked_body_final` must not reset this buffer, see the
+                            // `existing_buf_end` handling there.
+                            let mut body_buf = self
+                                .body_buf
+                                .take()
+                                .expect("body buf exists once a chunk was parsed out of it");
                             trace!(
                                 "last chunk size end buf {:?}",
                                 body_buf[..existing_buf_end].escape_ascii(),
                             );
-                            body_buf.copy_within(idx..existing_buf_end, 0);
+                            body_buf.truncate(existing_buf_end);
+                            self.body_buf = Some(body_buf.split_off(idx));
                         }
                     }
                     Ok(buf_res)
@@ -676,21 +750,22 @@ impl BodyReader {
         // Really we are just waiting for a consecutive CRLF + CRLF to end the body.
         match self.body_state {
             PS::ChunkedFinal(read, trailers_read, existing_buf_end, end_read) => {
-                let body_buf = self.body_buf.as_deref_mut().unwrap();
-                let (buf, n) = if existing_buf_end != 0 {
-                    // finish rest of buf that was read with Chunked state
-                    // existing_buf_end is non-zero only once
+                let n = if existing_buf_end != 0 {
+                    // Finish the rest of the buf that was read while in the Chunked state.
+                    // `do_read_chunked_body` split that tail to the front of `body_buf`, so it
+                    // must be parsed in place: resetting the buffer here would discard both the
+                    // trailers and any bytes past the message sitting behind them.
+                    // existing_buf_end is non-zero only once.
                     self.body_state = PS::ChunkedFinal(read, trailers_read, 0, end_read);
-                    (&body_buf[..existing_buf_end], existing_buf_end)
+                    existing_buf_end
                 } else {
-                    let n = stream
-                        .read(body_buf)
+                    // Every previously buffered byte has already been parsed by the loop below
+                    // (it only exits once `start` reaches `n`), so the buffer can be reset.
+                    let read_size = self.body_buf_size;
+                    self.read_new_buf(stream, read_size)
                         .await
-                        .or_err(ReadError, "when reading trailers end")?;
-
-                    (&body_buf[..n], n)
+                        .or_err(ReadError, "when reading trailers end")?
                 };
-
                 if n == 0 {
                     self.body_state = PS::Done(read);
                     return Error::e_explain(
@@ -701,6 +776,12 @@ impl BodyReader {
                         ),
                     );
                 }
+
+                // Re-borrow just the buffer field so `self.body_state` stays assignable below.
+                let buf = &self
+                    .body_buf
+                    .as_deref()
+                    .expect("body buf is initialized before reading trailers")[..n];
 
                 let mut start = 0;
                 // try to find end within the current IO buffer
@@ -1157,10 +1238,273 @@ impl BodyWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use tokio_test::io::Builder;
 
     fn init_log() {
         let _ = env_logger::builder().is_test(true).try_init();
+    }
+
+    #[tokio::test]
+    async fn pending_body_reads_release_empty_storage_and_can_resume() {
+        for upstream in [false, true] {
+            for framing in ["fixed", "chunked", "close"] {
+                let (mut stream, mut peer) = tokio::io::duplex(64);
+                let mut reader = BodyReader::new(upstream);
+                match framing {
+                    "fixed" => reader.init_content_length(3, b""),
+                    "chunked" => reader.init_chunked(b""),
+                    "close" => reader.init_close_delimited(b""),
+                    _ => unreachable!(),
+                }
+                assert_eq!(reader.body_buf.as_ref().unwrap().capacity(), 0);
+                for _ in 0..3 {
+                    assert!(reader.read_body(&mut stream).now_or_never().is_none());
+                    assert!(reader.body_buf.is_none());
+                }
+
+                let wire: &[u8] = if framing == "chunked" {
+                    b"3\r\nabc\r\n0\r\n\r\n"
+                } else {
+                    b"abc"
+                };
+                peer.write_all(wire).await.unwrap();
+                peer.shutdown().await.unwrap();
+                let mut body = Vec::new();
+                while let Some(part) = reader.read_body(&mut stream).await.unwrap() {
+                    body.extend_from_slice(reader.get_body(&part));
+                }
+                assert_eq!(body, b"abc");
+                assert!(reader.body_buf.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn body_read_errors_release_empty_storage_and_can_resume() {
+        for upstream in [false, true] {
+            for framing in ["fixed", "chunked", "close"] {
+                let wire: &[u8] = if framing == "chunked" {
+                    b"3\r\nabc\r\n0\r\n\r\n"
+                } else {
+                    b"abc"
+                };
+                let mut stream = Builder::new()
+                    .read_error(std::io::Error::other("test read error"))
+                    .read(wire)
+                    .build();
+                let mut reader = BodyReader::new(upstream);
+                match framing {
+                    "fixed" => reader.init_content_length(3, b""),
+                    "chunked" => reader.init_chunked(b""),
+                    "close" => reader.init_close_delimited(b""),
+                    _ => unreachable!(),
+                }
+                let state = reader.body_state.clone();
+
+                let error = reader.read_body(&mut stream).await.unwrap_err();
+                assert_eq!(error.etype(), &ReadError);
+                assert_eq!(error.root_cause().to_string(), "test read error");
+                assert!(reader.body_buf.is_none());
+                assert_eq!(reader.body_state, state);
+
+                let mut body = Vec::new();
+                while let Some(part) = reader.read_body(&mut stream).await.unwrap() {
+                    body.extend_from_slice(reader.get_body(&part));
+                }
+                assert_eq!(body, b"abc");
+                assert!(reader.body_complete());
+                assert!(reader.body_buf.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn body_read_errors_keep_only_partial_chunk_head_and_can_resume() {
+        let mut stream = Builder::new()
+            .read_error(std::io::Error::other("test read error"))
+            .read(b"\na\r\n0\r\nX-Test: trailer\r\n\r\nnext")
+            .build();
+        let mut reader = BodyReader::new(false);
+        reader.init_chunked(b"1\r");
+        let part = reader.read_body(&mut stream).await.unwrap().unwrap();
+        assert!(reader.get_body(&part).is_empty());
+
+        let error = reader.read_body(&mut stream).await.unwrap_err();
+        assert_eq!(error.etype(), &ReadError);
+        assert_eq!(error.root_cause().to_string(), "test read error");
+        let buf = reader.body_buf.as_ref().unwrap();
+        assert_eq!(&buf[..], b"1\r");
+        assert_eq!(buf.capacity(), 2);
+
+        let mut body = Vec::new();
+        while let Some(part) = reader.read_body(&mut stream).await.unwrap() {
+            body.extend_from_slice(reader.get_body(&part));
+        }
+        assert_eq!(body, b"a");
+        assert!(reader.body_complete());
+        assert_eq!(reader.get_body_overread(), Some(&b"next"[..]));
+    }
+
+    #[tokio::test]
+    async fn pending_after_payload_releases_previous_allocation() {
+        let (mut stream, mut peer) = tokio::io::duplex(64);
+        let mut reader = BodyReader::new(true);
+        reader.init_content_length(6, b"abc");
+        let part = reader.read_body(&mut stream).await.unwrap().unwrap();
+        assert_eq!(reader.get_body(&part), b"abc");
+        assert!(reader.read_body(&mut stream).now_or_never().is_none());
+        assert!(reader.body_buf.is_none());
+        peer.write_all(b"def").await.unwrap();
+        let part = reader.read_body(&mut stream).await.unwrap().unwrap();
+        assert_eq!(reader.get_body(&part), b"def");
+        assert!(reader.body_complete());
+    }
+
+    #[tokio::test]
+    async fn pending_partial_chunk_head_keeps_only_framing_and_can_resume() {
+        let (mut stream, mut peer) = tokio::io::duplex(64);
+        let mut reader = BodyReader::new(false);
+        reader.init_chunked(b"1\r");
+        let part = reader.read_body(&mut stream).await.unwrap().unwrap();
+        assert!(reader.get_body(&part).is_empty());
+        for _ in 0..3 {
+            assert!(reader.read_body(&mut stream).now_or_never().is_none());
+            let buf = reader.body_buf.as_ref().unwrap();
+            assert_eq!(&buf[..], b"1\r");
+            assert_eq!(buf.capacity(), 2);
+        }
+        peer.write_all(b"\na\r\n0\r\nX-Test: trailer\r\n\r\nnext")
+            .await
+            .unwrap();
+        let mut body = Vec::new();
+        while let Some(part) = reader.read_body(&mut stream).await.unwrap() {
+            body.extend_from_slice(reader.get_body(&part));
+        }
+        assert_eq!(body, b"a");
+        assert_eq!(reader.get_body_overread(), Some(&b"next"[..]));
+    }
+
+    #[tokio::test]
+    async fn small_upstream_content_length_uses_small_buffer() {
+        let payload = [b'a'; 200];
+        let mut stream = Builder::new()
+            .read(&payload[..100])
+            .read(&payload[100..])
+            .build();
+        let mut reader = BodyReader::new(true);
+        reader.init_content_length(payload.len(), b"");
+
+        let part = reader.read_body(&mut stream).await.unwrap().unwrap();
+        assert_eq!(reader.get_body(&part), &payload[..100]);
+        assert_eq!(reader.body_state, ParseState::Partial(100, 100));
+        // Check before completion splits the buffer and hides spare capacity.
+        assert!(reader.body_buf.as_ref().unwrap().capacity() <= 200 + 1024);
+        let part = reader.read_body(&mut stream).await.unwrap().unwrap();
+        assert_eq!(reader.get_body(&part), &payload[100..]);
+        assert!(reader.body_complete());
+        assert!(!reader.has_bytes_overread());
+    }
+
+    #[tokio::test]
+    async fn upstream_content_length_caps_overread_after_preread() {
+        let mut wire = vec![b'a'; 200];
+        wire.extend_from_slice(&[b'x'; 2048]);
+        for preread in [&b""[..], &b"prefix"[..]] {
+            let mut stream = &wire[..];
+            let mut reader = BodyReader::new(true);
+            let length = preread.len() + 200;
+            reader.init_content_length(length, preread);
+            if !preread.is_empty() {
+                let part = reader.read_body(&mut stream).await.unwrap().unwrap();
+                assert_eq!(reader.get_body(&part), preread);
+            }
+
+            let part = reader.read_body(&mut stream).await.unwrap().unwrap();
+            assert_eq!(reader.get_body(&part), &[b'a'; 200]);
+            assert_eq!(reader.body_state, ParseState::Complete(length));
+            assert!(reader.has_bytes_overread());
+            assert_eq!(reader.get_body_overread(), Some(&[b'x'; 1024][..]));
+            assert_eq!(stream, &[b'x'; 1024]);
+            assert!(reader.body_buf.as_ref().unwrap().capacity() <= 200 + 1024);
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_content_length_respects_configured_buffer_limit() {
+        let payload = vec![b'a'; BODY_BUFFER_SIZE + 200];
+        for capacity in [128, BODY_BUFFER_SIZE] {
+            let mut stream = &payload[..];
+            let mut reader = BodyReader::new(true);
+            reader.body_buf_size = capacity;
+            reader.init_content_length(payload.len(), b"");
+            let mut received = Vec::new();
+            while let Some(part) = reader.read_body(&mut stream).await.unwrap() {
+                let bytes = reader.get_body(&part);
+                assert!(bytes.len() <= capacity);
+                assert!(reader.body_buf.as_ref().unwrap().capacity() <= capacity);
+                received.extend_from_slice(bytes);
+            }
+            assert_eq!(received, payload);
+            assert!(reader.body_complete());
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_content_length_near_usize_max_does_not_overflow() {
+        let mut stream = &b"abc"[..];
+        let mut reader = BodyReader::new(true);
+        reader.body_buf_size = 2;
+        reader.init_content_length(usize::MAX, b"");
+
+        let part = reader.read_body(&mut stream).await.unwrap().unwrap();
+        assert_eq!(reader.get_body(&part), b"ab");
+        assert_eq!(reader.body_state, ParseState::Partial(2, usize::MAX - 2));
+        assert_eq!(reader.body_buf.as_ref().unwrap().capacity(), 2);
+    }
+
+    #[tokio::test]
+    async fn body_scratch_growth_after_preread_stays_within_read_size() {
+        let preread = vec![b'a'; 20 * 1024];
+        let payload = vec![b'b'; 16 * 1024];
+        for upstream in [false, true] {
+            let mut stream = Builder::new().read(&payload).read(&payload).build();
+            let mut reader = BodyReader::new(upstream);
+            reader.body_buf_size = 32 * 1024;
+            let length = preread.len() + 2 * payload.len();
+            reader.init_content_length(length, &preread);
+
+            let first = reader.read_body(&mut stream).await.unwrap().unwrap();
+            assert_eq!(reader.get_body(&first), preread);
+            let second = reader.read_body(&mut stream).await.unwrap().unwrap();
+            assert_eq!(reader.get_body(&second), payload);
+            assert_eq!(reader.body_buf.as_ref().unwrap().capacity(), 32 * 1024);
+            let last = reader.read_body(&mut stream).await.unwrap().unwrap();
+            assert_eq!(reader.get_body(&last), payload);
+            assert!(reader.body_complete());
+        }
+    }
+
+    #[tokio::test]
+    async fn body_scratch_growth_preserves_partial_chunk_head() {
+        let mut reader = BodyReader::new(false);
+        reader.body_buf_size = 32 * 1024;
+        reader.init_chunked(b"1\r");
+        let mut stream = Builder::new()
+            .read(b"\na\r\n")
+            .read(b"0\r\n\r\nnext")
+            .build();
+
+        let first = reader.read_body(&mut stream).await.unwrap().unwrap();
+        assert!(reader.get_body(&first).is_empty());
+        let second = reader.read_body(&mut stream).await.unwrap().unwrap();
+        assert_eq!(reader.get_body(&second), b"a");
+        assert_eq!(reader.body_buf.as_ref().unwrap().capacity(), 32 * 1024);
+        while let Some(part) = reader.read_body(&mut stream).await.unwrap() {
+            assert!(reader.get_body(&part).is_empty());
+        }
+        assert!(reader.body_complete());
+        assert_eq!(reader.get_body_overread(), Some(&b"next"[..]));
     }
 
     #[tokio::test]
@@ -2298,12 +2642,16 @@ mod tests {
         assert_eq!(res, BufRef::new(0, 0));
         assert_eq!(body_reader.body_state, ParseState::ChunkedFinal(1, 7, 0, 0));
         // aaa...
-        let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
-        assert_eq!(res, BufRef::new(0, 0));
-        assert_eq!(
-            body_reader.body_state,
-            ParseState::ChunkedFinal(1, 1024 * 60 + 7, 0, 0)
-        );
+        let mut trailers_read = 7;
+        for chunk in trailer1.chunks(body_reader.body_buf_size) {
+            let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
+            assert_eq!(res, BufRef::new(0, 0));
+            trailers_read += chunk.len();
+            assert_eq!(
+                body_reader.body_state,
+                ParseState::ChunkedFinal(1, trailers_read, 0, 0)
+            );
+        }
         // CRLF
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(0, 0));
