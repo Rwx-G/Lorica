@@ -336,7 +336,7 @@ impl AsRawFd for RawStreamWrapper {
 // Ssl layer always does "small" reads in 16k (TLS record size) so L4 read buffer helps a lot.
 // The 32 KiB default fits jemalloc's default tcache limit and matches the HTTP/1 body read
 // buffer.
-const BUF_READ_SIZE: usize = 32 * 1024;
+pub(crate) const BUF_READ_SIZE: usize = 32 * 1024;
 // Small write buf to match MSS. Too large write buf delays real time communication.
 // This buffering effectively implements something similar to Nagle's algorithm.
 // The benefit is that user space can control when to flush, where Nagle's can't be controlled.
