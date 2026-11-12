@@ -235,7 +235,7 @@
         </select>
         <span class="hint">TLS certificate presented to clients on port 443 for this hostname.</span>
         {#if selectedCert && uncoveredByCert.length > 0}
-          <div class="warn-banner" role="note">
+          <div class="warn-banner" role="note" data-testid="cert-uncovered-warning">
             <strong>
               Certificate does not cover {uncoveredByCert.length === 1 ? 'this hostname' : 'these hostnames'}:
             </strong>

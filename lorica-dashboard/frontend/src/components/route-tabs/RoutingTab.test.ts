@@ -123,6 +123,43 @@ describe('RoutingTab AD CS offer', () => {
   });
 });
 
+// Issue #53: the selected certificate covers an IP hostname by its IP
+// address SANs, which the tab must pass on to the coverage check.
+describe('RoutingTab certificate coverage warning', () => {
+  const ipCertificate = () =>
+    testCertificate('ip.corp.example.org', [], { id: 'cert-ip', san_ips: ['192.0.2.10'] });
+
+  it('names only the hostname the selected certificate leaves out, an IP SAN covering the address', async () => {
+    served();
+    await rendered(
+      routeForm({ hostname: '192.0.2.10', hostname_aliases: 'other.corp.example.org', certificate_id: 'cert-ip' }),
+      [ipCertificate()],
+    );
+    const warning = await screen.findByTestId('cert-uncovered-warning');
+    expect(warning).toHaveTextContent('Certificate does not cover this hostname: other.corp.example.org.');
+    expect(warning).not.toHaveTextContent('this hostname: 192.0.2.10');
+  });
+
+  it('says nothing when the IP SAN covers the IP hostname', async () => {
+    served();
+    await rendered(routeForm({ hostname: '192.0.2.10', hostname_aliases: '', certificate_id: 'cert-ip' }), [
+      ipCertificate(),
+    ]);
+    expect((document.getElementById('certificate') as HTMLSelectElement).value).toBe('cert-ip');
+    expect(screen.queryByTestId('cert-uncovered-warning')).not.toBeInTheDocument();
+  });
+
+  it('names an IP hostname the certificate does not carry, listing its IP SANs', async () => {
+    served();
+    await rendered(routeForm({ hostname: '192.0.2.11', hostname_aliases: '', certificate_id: 'cert-ip' }), [
+      ipCertificate(),
+    ]);
+    const warning = await screen.findByTestId('cert-uncovered-warning');
+    expect(warning).toHaveTextContent('this hostname: 192.0.2.11.');
+    expect(warning).toHaveTextContent('Cert SAN list: 192.0.2.10.');
+  });
+});
+
 describe('RoutingTab AD CS issuance', () => {
   it('confirms the uncovered names, then selects the issued certificate', async () => {
     served();
