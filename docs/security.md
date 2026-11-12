@@ -184,8 +184,9 @@ name whose last label is a number (decimal, hex `0x..` or octal `0..`)
 as an IPv4 address and sends it as four decimal numbers: `010.0.0.1`
 goes out as `8.0.0.1`, `0xc0.0.2.10` and `3221225994` as `192.0.2.10`,
 and `1.2.3.256` is refused. A route stored under such a spelling could
-never match, so a route hostname or alias, an automation token or OIDC
-issuer `allowed_hostnames` entry and a configuration import accept an
+never match, so a route hostname, alias or `redirect_hostname`, an
+automation token or OIDC issuer `allowed_hostnames` entry, a
+certificate export ACL pattern and a configuration import accept an
 IPv4 address only as dotted decimal without leading zeros, and refuse
 the other spellings. A wildcard never covers an address: `*.0.2.10` is
 refused at save, and a wildcard route or grant stored before (and so
