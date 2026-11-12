@@ -201,7 +201,9 @@ pub fn resolve_certificate_for_hostname<'a>(
 /// `pr-42.review.example.com` yields `*.review.example.com`. A name
 /// with fewer than three labels yields nothing: `*.com` is not a
 /// certificate a public CA issues, so suggesting it would send the
-/// operator down a path that ends in a refusal.
+/// operator down a path that ends in a refusal. An IP address yields
+/// nothing either: a wildcard is a DNS pattern and never covers one,
+/// which only an `iPAddress` SAN does.
 ///
 /// ```
 /// use lorica_config::models::wildcard_patterns_an_operator_could_provision;
@@ -210,9 +212,13 @@ pub fn resolve_certificate_for_hostname<'a>(
 ///     vec!["*.review.example.com".to_string()]
 /// );
 /// assert!(wildcard_patterns_an_operator_could_provision("example.com").is_empty());
+/// assert!(wildcard_patterns_an_operator_could_provision("192.0.2.10").is_empty());
 /// ```
 pub fn wildcard_patterns_an_operator_could_provision(hostname: &str) -> Vec<String> {
     let name = crate::route_selection::canonical_hostname(hostname.trim());
+    if crate::route_selection::is_ip_literal(&name) {
+        return Vec::new();
+    }
     let Some((_, parent)) = name.split_once('.') else {
         return Vec::new();
     };
@@ -434,5 +440,27 @@ mod tests {
         // `*.com` is not a certificate anyone issues.
         assert!(wildcard_patterns_an_operator_could_provision("example.com").is_empty());
         assert!(wildcard_patterns_an_operator_could_provision("localhost").is_empty());
+    }
+
+    #[test]
+    fn an_ip_hostname_gets_no_wildcard_suggestion() {
+        for hostname in [
+            "192.0.2.10",
+            "192.0.2.10.",
+            " 10.0.0.10 ",
+            "[2001:db8::1]",
+            "[::ffff:192.0.2.10]",
+            "2001:db8::1",
+        ] {
+            assert!(
+                wildcard_patterns_an_operator_could_provision(hostname).is_empty(),
+                "{hostname}"
+            );
+        }
+        assert_eq!(
+            wildcard_patterns_an_operator_could_provision("host.10.0.example.org"),
+            vec!["*.10.0.example.org".to_string()],
+            "digits in a DNS name are not an address"
+        );
     }
 }
