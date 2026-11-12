@@ -7575,10 +7575,16 @@ components:
           $ref: "#/components/schemas/AdcsSubjectDefaults"
         allowed_suffixes:
           type: array
-          minItems: 1
           items:
             type: string
-          description: DNS suffixes Lorica may request names under; wildcards are refused
+          description: >-
+            DNS suffixes Lorica may request names under; wildcards and
+            entries whose top-level label is a number (an IP address or its
+            tail, in any spelling) are refused. At least one is required (422
+            otherwise), except on an update of an authority whose stored list
+            is already empty, which the 1.10.5 upgrade leaves when every entry
+            named an address: that authority saves as it stands and permits
+            no name until a suffix is added.
         auto_renew_default:
           type: boolean
     AdcsConnectionTestResult:
