@@ -14,6 +14,7 @@ Author: Rwx-G
 ### Changed
 
 - **Idle connections hold less memory.** An HTTP/1 connection waiting for its next request or for more of a body releases its empty read buffer instead of keeping it allocated, the default read-ahead and body buffers are 32 KiB instead of 64 KiB, and a body read from a backend that announced its length asks for at most what remains plus 1 KiB. The request retry buffer keeps the body as the chunks it arrived in instead of copying it into one block. Ported from upstream Pingora; the full record of the 1.10.5 upstream sync is in `FORK.md`.
+- Dependencies refreshed: rusqlite 0.42 (bundled SQLite unchanged at 3.54.1), maxminddb 0.33, rustls-webpki 0.103.17, webpki-roots 1.0.12, the AWS SDK clients; dashboard tooling vite 8.3.8 and jsdom 31.
 
 ### Fixed
 
