@@ -44,6 +44,7 @@ use rustls::sign::CertifiedKey;
 // per-call pattern.
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::GeneralName;
 
 use crate::load_first_private_key;
@@ -111,7 +112,7 @@ struct CertResolverInner {
     /// Maps lowercase domain -> certs sorted by expiry (longest-lived first).
     certs: HashMap<String, Vec<CertEntry>>,
     /// Maps an address carried as an `iPAddress` SAN of a leaf, in the
-    /// family the SAN is written in (see [`ip_sans_of_leaf`]) -> certs
+    /// family the SAN is written in ([`ip_sans_of_leaf`]) -> certs
     /// sorted like `certs`. Read only for a ClientHello without SNI,
     /// never as a fallback for an SNI the domain map does not know.
     certs_by_ip: HashMap<IpAddr, Vec<CertEntry>>,
@@ -277,7 +278,9 @@ impl CertResolver {
     /// `https://192.0.2.10` sends none, and the local address is the only
     /// name left to choose by. `local_ip` is canonicalised first: a
     /// dual-stack `[::]` listener reports an IPv4 client's local address
-    /// as `::ffff:a.b.c.d`.
+    /// as `::ffff:a.b.c.d`, and that client dialed the IPv4 address. The
+    /// SANs are not canonicalised (see [`ip_sans_of_leaf`]), so an
+    /// IPv4-mapped SAN, which no client would accept, is never served.
     pub fn resolve_by_local_ip(&self, local_ip: IpAddr) -> Option<Arc<CertifiedKey>> {
         self.inner
             .load()
@@ -397,41 +400,51 @@ impl CertResolver {
     }
 }
 
-/// The canonical `iPAddress` entries of the subjectAltName of `chain`'s
-/// leaf, without duplicates; empty when the leaf cannot be parsed or
-/// lists none. An entry of any length but 4 or 16 octets is not an
-/// address (RFC 5280 section 4.2.1.6) and is skipped.
+/// The `iPAddress` entries of `leaf`'s subjectAltName, in certificate
+/// order without duplicates; empty when it lists none.
+///
+/// Each entry keeps the family its length says: 4 octets are an IPv4
+/// address, 16 octets an IPv6 one, an IPv4-mapped `::ffff:a.b.c.d`
+/// included. That entry is never folded to IPv4, because a client that
+/// dialed `a.b.c.d` compares the 4-octet form and refuses the 16-octet
+/// one. An entry of any other length is not an address (RFC 5280
+/// section 4.2.1.6) and is skipped.
+///
+/// The one reading of IP SANs, behind both the resolver's IP index and
+/// the management API's view of a certificate, so the two cannot
+/// disagree on what a certificate covers.
+pub fn ip_sans_of_leaf(leaf: &X509Certificate<'_>) -> Vec<IpAddr> {
+    let Ok(Some(san)) = leaf.subject_alternative_name() else {
+        return Vec::new();
+    };
+    let mut ips: Vec<IpAddr> = Vec::new();
+    for name in &san.value.general_names {
+        let GeneralName::IPAddress(octets) = name else {
+            continue;
+        };
+        let ip: IpAddr = if let Ok(v4) = <[u8; 4]>::try_from(*octets) {
+            IpAddr::from(v4)
+        } else if let Ok(v6) = <[u8; 16]>::try_from(*octets) {
+            IpAddr::from(v6)
+        } else {
+            continue;
+        };
+        if !ips.contains(&ip) {
+            ips.push(ip);
+        }
+    }
+    ips
+}
+
+/// [`ip_sans_of_leaf`] of `chain`'s leaf; empty when it cannot be parsed.
 fn leaf_ip_sans(chain: &[CertificateDer<'_>]) -> Vec<IpAddr> {
     let Some(leaf) = chain.first() else {
         return Vec::new();
     };
-    let Ok((_, cert)) = x509_parser::parse_x509_certificate(leaf.as_ref()) else {
-        return Vec::new();
-    };
-    let Ok(Some(san)) = cert.subject_alternative_name() else {
-        return Vec::new();
-    };
-    let mut ips: Vec<IpAddr> = san
-        .value
-        .general_names
-        .iter()
-        .filter_map(|name: &GeneralName<'_>| match name {
-            GeneralName::IPAddress(octets) => ip_from_san_octets(octets),
-            _ => None,
-        })
-        .collect();
-    ips.sort_unstable();
-    ips.dedup();
-    ips
-}
-
-fn ip_from_san_octets(octets: &[u8]) -> Option<IpAddr> {
-    if let Ok(v4) = <[u8; 4]>::try_from(octets) {
-        return Some(IpAddr::from(v4));
+    match x509_parser::parse_x509_certificate(leaf.as_ref()) {
+        Ok((_, cert)) => ip_sans_of_leaf(&cert),
+        Err(_) => Vec::new(),
     }
-    <[u8; 16]>::try_from(octets)
-        .ok()
-        .map(|v6: [u8; 16]| IpAddr::from(v6).to_canonical())
 }
 
 /// A certificate resolver that can also answer a ClientHello carrying no
@@ -1166,6 +1179,44 @@ mod tests {
         assert_eq!(
             served_der(&resolver, ip("::ffff:192.0.2.10")),
             Some(cert.der)
+        );
+    }
+
+    /// An IPv4-mapped SAN is an IPv6 entry: listed as written, and never
+    /// served to a connection on the IPv4 address it maps, whether the
+    /// listener reports that address as IPv4 or, dual-stack, as mapped.
+    /// A browser that dialed the IPv4 address would refuse it.
+    #[test]
+    fn an_ipv4_mapped_san_is_not_an_ipv4_san() {
+        let mapped: IpAddr = ip("::ffff:192.0.2.10");
+        let cert: IpCert = ip_cert("localhost", &[], &[mapped], 9_999_999_999);
+        let (_, parsed) = x509_parser::parse_x509_certificate(&cert.der).unwrap();
+        assert_eq!(ip_sans_of_leaf(&parsed), vec![mapped]);
+        assert!(matches!(ip_sans_of_leaf(&parsed)[0], IpAddr::V6(_)));
+
+        let resolver = CertResolver::new();
+        resolver.reload(vec![cert.data]).unwrap();
+        assert_eq!(served_der(&resolver, ip("192.0.2.10")), None);
+        assert_eq!(served_der(&resolver, mapped), None);
+    }
+
+    #[test]
+    fn ip_sans_of_leaf_keeps_certificate_order_without_duplicates() {
+        let cert: IpCert = ip_cert(
+            "localhost",
+            &["localhost"],
+            &[
+                ip("2001:db8::1"),
+                ip("192.0.2.10"),
+                ip("2001:db8::1"),
+                ip("::ffff:192.0.2.10"),
+            ],
+            9_999_999_999,
+        );
+        let (_, parsed) = x509_parser::parse_x509_certificate(&cert.der).unwrap();
+        assert_eq!(
+            ip_sans_of_leaf(&parsed),
+            vec![ip("2001:db8::1"), ip("192.0.2.10"), ip("::ffff:192.0.2.10")]
         );
     }
 

@@ -285,6 +285,10 @@ before v1.10.5 needs no re-upload. A route whose hostname is that IP
   listener sees in the certificate, or run Lorica on the host network.
   A dual-stack listener's IPv4 clients are matched by their IPv4
   address.
+- **An address in the family it is written in.** An IPv4-mapped SAN
+  such as `::ffff:192.0.2.10` is an IPv6 entry: no IPv4 client is
+  served that certificate, since a browser that dialed `192.0.2.10`
+  refuses it. Put an IPv4 address in the certificate as IPv4.
 - **Exposure.** Anyone who reaches the address without SNI, a scanner
   sweeping IP ranges included, now receives that certificate and so
   learns every name in its SAN list. Before, such a handshake failed.

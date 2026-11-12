@@ -200,17 +200,15 @@ const LEAF_VIEW_CACHE_MAX: usize = 65_536;
 struct LeafView {
     /// See [`subject_of`].
     subject: String,
-    /// The `iPAddress` entries of the leaf's subjectAltName, in
-    /// certificate order, each in the `std::net::IpAddr` display form
-    /// (RFC 5952 for IPv6); empty when there are none or the PEM cannot
-    /// be read. An entry of any length but 4 or 16 octets is not an
-    /// address and is left out.
+    /// The leaf's IP SANs as `lorica_tls::cert_resolver::ip_sans_of_leaf`
+    /// reads them for the TLS listener, each in the `std::net::IpAddr`
+    /// display form (RFC 5952 for IPv6, so an IPv4-mapped entry shows as
+    /// `::ffff:a.b.c.d`); empty when the PEM cannot be read.
     ///
     /// For display only: the dashboard checks a route whose hostname is
     /// an IP against them. They are never written to `san_domains`,
     /// which feeds ACME and AD CS renewal, automation grants and metrics,
-    /// all of which take every entry for a DNS name. The TLS listener
-    /// derives its own IP index from the same certificate.
+    /// all of which take every entry for a DNS name.
     san_ips: Vec<String>,
 }
 
@@ -286,32 +284,11 @@ fn parse_leaf_view(cert_pem: &str) -> LeafView {
     };
     LeafView {
         subject: subject_of_leaf(&cert),
-        san_ips: san_ips_of_leaf(&cert),
+        san_ips: lorica_tls::cert_resolver::ip_sans_of_leaf(&cert)
+            .iter()
+            .map(std::net::IpAddr::to_string)
+            .collect(),
     }
-}
-
-fn san_ips_of_leaf(cert: &x509_parser::certificate::X509Certificate<'_>) -> Vec<String> {
-    let Ok(Some(san)) = cert.subject_alternative_name() else {
-        return Vec::new();
-    };
-    let mut ips: Vec<String> = Vec::new();
-    for name in &san.value.general_names {
-        let x509_parser::prelude::GeneralName::IPAddress(octets) = name else {
-            continue;
-        };
-        let ip: std::net::IpAddr = if let Ok(v4) = <[u8; 4]>::try_from(*octets) {
-            std::net::IpAddr::from(v4)
-        } else if let Ok(v6) = <[u8; 16]>::try_from(*octets) {
-            std::net::IpAddr::from(v6)
-        } else {
-            continue;
-        };
-        let text: String = ip.to_string();
-        if !ips.contains(&text) {
-            ips.push(text);
-        }
-    }
-    ips
 }
 
 fn subject_of_leaf(cert: &x509_parser::certificate::X509Certificate<'_>) -> String {
@@ -1190,6 +1167,28 @@ mod download_tests {
             "the cached addresses are the parsed ones"
         );
         assert!(leaf_view("not a certificate").san_ips.is_empty());
+    }
+
+    /// An IPv4-mapped SAN is listed as written, an IPv6 entry, never as
+    /// the IPv4 address it maps: the listener does not serve it to that
+    /// address either, and a browser that dialed it would refuse it.
+    #[test]
+    fn an_ipv4_mapped_san_is_listed_as_written() {
+        let mut params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).expect("test setup: params");
+        params.subject_alt_names.push(rcgen::SanType::IpAddress(
+            "::ffff:192.0.2.10".parse().expect("test setup: mapped"),
+        ));
+        let key = rcgen::KeyPair::generate().expect("test setup: key");
+        let pem: String = params
+            .self_signed(&key)
+            .expect("test setup: certificate")
+            .pem();
+
+        assert_eq!(
+            parse_leaf_view(&pem).san_ips,
+            vec!["::ffff:192.0.2.10".to_string()]
+        );
     }
 
     #[test]
