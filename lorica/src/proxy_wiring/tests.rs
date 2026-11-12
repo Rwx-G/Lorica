@@ -1026,11 +1026,80 @@ fn a_bracketed_host_is_an_ipv6_literal_and_a_port_or_it_is_refused() {
             "{malformed}"
         );
     }
-    // Without brackets the host is read up to its first colon, as
-    // before: only the bracketed form carries an address to route by.
     let mut req = lorica_http::RequestHeader::build("GET", b"/", None).unwrap();
     req.insert_header("Host", "app.example.com:8443").unwrap();
     assert_eq!(request_host(&req).as_deref(), Ok("app.example.com"));
+}
+
+/// Any host takes a port in decimal digits from 1 to 65535 and nothing
+/// else after it: what followed would reach the route's backend in the
+/// forwarded `Host` and its forward-auth service in `X-Forwarded-Host`.
+#[test]
+fn a_host_is_followed_by_a_port_or_nothing_or_it_is_refused() {
+    for malformed in [
+        "app.example.com:junk",
+        "app.example.com:.public.example.com",
+        "app.example.com:",
+        "app.example.com:0",
+        "app.example.com:99999",
+        "app.example.com:65536",
+        "app.example.com:+80",
+        "app.example.com:443junk",
+        "app.example.com:443:1",
+        "app.example.com:000443",
+        "192.0.2.10:junk",
+        "192.0.2.10:443junk",
+        "2001:db8::1",
+        ":443",
+    ] {
+        let mut req = lorica_http::RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("Host", malformed).unwrap();
+        assert_eq!(
+            request_host(&req),
+            Err(helpers::MalformedHost),
+            "{malformed}"
+        );
+    }
+    for (sent, host) in [
+        ("app.example.com", "app.example.com"),
+        ("app.example.com:1", "app.example.com"),
+        ("app.example.com:65535", "app.example.com"),
+        ("192.0.2.10:8443", "192.0.2.10"),
+    ] {
+        let mut req = lorica_http::RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("Host", sent).unwrap();
+        assert_eq!(request_host(&req).as_deref(), Ok(host), "{sent}");
+    }
+}
+
+/// An HTTP/2 request names its host in `:authority`, the URI authority
+/// the same check reads when no `Host` header is present.
+#[test]
+fn an_http2_authority_is_held_to_the_same_port_rule() {
+    let authority = |value: &str| {
+        let mut req = lorica_http::RequestHeader::build("GET", b"/", None).unwrap();
+        req.set_uri(
+            http::Uri::builder()
+                .scheme("https")
+                .authority(value)
+                .path_and_query("/")
+                .build()
+                .expect("test setup: uri"),
+        );
+        req
+    };
+    assert_eq!(
+        request_host(&authority("app.example.com:8443")).as_deref(),
+        Ok("app.example.com")
+    );
+    assert_eq!(
+        request_host(&authority("app.example.com:0")),
+        Err(helpers::MalformedHost)
+    );
+    assert_eq!(
+        request_host(&authority("[2001:db8::1]:0")),
+        Err(helpers::MalformedHost)
+    );
 }
 
 // ---- Rate Limiter ----

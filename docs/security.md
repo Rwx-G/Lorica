@@ -172,12 +172,14 @@ stays an IPv6 name, apart from the dotted IPv4 one, and a literal with
 a zone id is refused as a route name. The `Host` sent to the backend is
 the client's, unchanged.
 
-A bracketed `Host` must be an IPv6 address in brackets, optionally
-followed by `:` and a port from 1 to 65535 (v1.10.5). Anything else
-(`[2001:db8::1]junk`, `[2001:db8::1]:x`, a zone id, text that is not an
-address) is answered 400, like the other malformed hosts above: routed
-by its literal alone, it would reach that route's backend carrying what
-followed the bracket.
+A `Host` (or HTTP/2 `:authority`) must be a host optionally followed by
+`:` and a port of decimal digits from 1 to 65535, and a bracketed host
+must be an IPv6 address (v1.10.5). Anything else (`app.example.com:junk`,
+`192.0.2.10:443junk`, `host:`, `host:0`, `[2001:db8::1]junk`, a zone id,
+bracketed text that is not an address) is answered 400, like the other
+malformed hosts above: routed by its host alone, it would reach that
+route's backend, and its forward-auth service as `X-Forwarded-Host`,
+carrying what followed.
 
 **Addresses as route names (v1.10.5).** A browser's URL parser reads a
 name whose last label is a number (decimal, hex `0x..` or octal `0..`)

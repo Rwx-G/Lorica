@@ -1083,9 +1083,10 @@ impl ProxyHttp for LoricaProxy {
             }
 
             // The host routes are looked up by, once for every stage. A
-            // bracketed host that is not an IPv6 literal and a port is
-            // refused like the other malformed hosts: routed by its
-            // literal alone, the rest would reach that route's backend.
+            // host followed by anything but a port, or a bracketed one
+            // that is not an IPv6 literal, is refused like the other
+            // malformed hosts: routed by the host alone, the rest would
+            // reach that route's backend and its forward-auth service.
             match request_host(session.req_header()) {
                 Ok(host) => ctx.request_host = host.into_owned(),
                 Err(_) => {

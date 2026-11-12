@@ -131,10 +131,11 @@ pub(crate) fn extract_host(req: &lorica_http::RequestHeader) -> &str {
         .unwrap_or("")
 }
 
-/// A `Host` (or URI authority) that opens an IPv6 literal with `[` and
-/// then is not `[address]` followed by nothing or a port. Refused with
-/// 400: routed by the literal alone, it would reach that route's
-/// backend carrying whatever followed the bracket.
+/// A `Host` (or URI authority) that is not a host followed by nothing or
+/// a port, or that opens an IPv6 literal with `[` and is not
+/// `[address]`. Refused with 400: routed by the host alone, it would
+/// reach that route's backend, and its forward-auth service as
+/// `X-Forwarded-Host`, carrying whatever followed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MalformedHost;
 
@@ -150,33 +151,38 @@ pub(crate) struct MalformedHost;
 ///
 /// # Errors
 ///
-/// [`MalformedHost`] when the host starts with `[` and is not an IPv6
-/// address in brackets, optionally followed by `:` and a port from 1 to
-/// 65535: `[2001:db8::1]junk`, `[2001:db8::1]:x`, `[fe80::1%25eth0]`.
+/// [`MalformedHost`] when what follows the host is not nothing or `:`
+/// and a port from 1 to 65535 in decimal digits (`app.example.com:junk`,
+/// `192.0.2.10:443junk`, `host:`, `host:0`, `host:+80`), when a port
+/// follows no host (`:443`; an empty value still names no host and
+/// falls to the catch-all), or when the host starts with `[` and is not
+/// an IPv6 address in brackets (`[2001:db8::1]junk`,
+/// `[fe80::1%25eth0]`). The value is the `Host`
+/// header, or on HTTP/2 the `:authority` it must equal, as
+/// [`extract_host`] reads it.
 pub(crate) fn request_host(
     req: &lorica_http::RequestHeader,
 ) -> Result<Cow<'_, str>, MalformedHost> {
     let authority = extract_host(req);
-    if authority.starts_with('[') {
-        let literal = host_without_port(authority);
-        let rest = &authority[literal.len()..];
-        let address = literal
+    let host = host_without_port(authority);
+    let port_is_valid = match &authority[host.len()..] {
+        "" => true,
+        rest => rest.strip_prefix(':').is_some_and(|port| {
+            (1..=5).contains(&port.len())
+                && port.bytes().all(|b| b.is_ascii_digit())
+                && port.parse::<u16>().is_ok_and(|port| port != 0)
+        }),
+    };
+    let bracket_is_an_address = !host.starts_with('[')
+        || host
             .strip_prefix('[')
             .and_then(|inner| inner.strip_suffix(']'))
-            .and_then(|inner| inner.parse::<std::net::Ipv6Addr>().ok());
-        let port_is_valid = rest.is_empty()
-            || rest.strip_prefix(':').is_some_and(|port| {
-                (1..=5).contains(&port.len())
-                    && port.bytes().all(|b| b.is_ascii_digit())
-                    && port.parse::<u16>().is_ok_and(|port| port != 0)
-            });
-        if address.is_none() || !port_is_valid {
-            return Err(MalformedHost);
-        }
+            .is_some_and(|inner| inner.parse::<std::net::Ipv6Addr>().is_ok());
+    let host_is_named = !host.is_empty() || authority.is_empty();
+    if !port_is_valid || !bracket_is_an_address || !host_is_named {
+        return Err(MalformedHost);
     }
-    Ok(lorica_config::route_selection::canonical_hostname(
-        host_without_port(authority),
-    ))
+    Ok(lorica_config::route_selection::canonical_hostname(host))
 }
 
 /// `path` as the backend receives it once `route.strip_path_prefix` is
