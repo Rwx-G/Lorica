@@ -226,8 +226,15 @@ impl Acceptor {
     /// Lorica: the acceptor dedicated to the local address `stream` was
     /// accepted on, when a certificate carries that address (see
     /// [`LocalIpAcceptors`]).
+    ///
+    /// The socket digest computes the local address lazily with a
+    /// `getsockname` syscall, so it is not read at all while no loaded
+    /// certificate carries an address.
     fn local_ip_acceptor<S: IO>(&self, stream: &S) -> Option<Acceptor> {
         let local_ip_acceptors = self.local_ip_acceptors.as_ref()?;
+        if !local_ip_acceptors.resolver.has_local_ip_certs() {
+            return None;
+        }
         let digest = stream.get_socket_digest()?;
         let local_ip: IpAddr = digest.local_addr()?.as_inet()?.ip();
         Some(Acceptor {
@@ -235,5 +242,75 @@ impl Acceptor {
             callbacks: None,
             local_ip_acceptors: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::l4::stream::Stream;
+    use crate::protocols::{GetSocketDigest, SocketDigest};
+    use rustls::server::ClientHello;
+    use rustls::sign::CertifiedKey;
+    use std::os::unix::io::AsRawFd;
+
+    /// A resolver that serves nothing and reports whether it holds an IP
+    /// certificate as told.
+    #[derive(Debug)]
+    struct StubResolver {
+        has_local_ip_certs: bool,
+    }
+
+    impl lorica_tls::ResolvesServerCert for StubResolver {
+        fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            None
+        }
+    }
+
+    impl ResolvesServerCertByLocalIp for StubResolver {
+        fn resolve_by_local_ip(&self, _local_ip: IpAddr) -> Option<Arc<CertifiedKey>> {
+            None
+        }
+
+        fn has_local_ip_certs(&self) -> bool {
+            self.has_local_ip_certs
+        }
+    }
+
+    /// An accepted TCP stream carrying a fresh socket digest, as the
+    /// listener hands it to `tls_handshake`, and that digest.
+    async fn accepted_stream() -> (Stream, Arc<SocketDigest>, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test setup: bind");
+        let client = tokio::net::TcpStream::connect(listener.local_addr().expect("test setup"))
+            .await
+            .expect("test setup: connect");
+        let (accepted, _) = listener.accept().await.expect("test setup: accept");
+        let mut stream: Stream = accepted.into();
+        stream.set_socket_digest(SocketDigest::from_raw_fd(stream.as_raw_fd()));
+        let digest = stream.get_socket_digest().expect("test setup: digest");
+        (stream, digest, client)
+    }
+
+    fn acceptor(has_local_ip_certs: bool) -> Acceptor {
+        TlsSettings::with_resolver(Arc::new(StubResolver { has_local_ip_certs })).build()
+    }
+
+    #[tokio::test]
+    async fn no_ip_certificate_leaves_the_local_address_unread() {
+        let (stream, digest, _client) = accepted_stream().await;
+        assert!(acceptor(false).local_ip_acceptor(&stream).is_none());
+        assert!(
+            digest.local_addr.get().is_none(),
+            "the getsockname behind local_addr() must not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ip_certificate_makes_the_listener_read_the_local_address() {
+        let (stream, digest, _client) = accepted_stream().await;
+        assert!(acceptor(true).local_ip_acceptor(&stream).is_none());
+        assert!(digest.local_addr.get().is_some());
     }
 }

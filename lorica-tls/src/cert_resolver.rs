@@ -270,6 +270,14 @@ impl CertResolver {
             .map(|entry| Arc::clone(&entry.key))
     }
 
+    /// Whether any loaded certificate carries an `iPAddress` SAN, read
+    /// from the current hot-swapped table. When it is `false`,
+    /// [`Self::resolve_by_local_ip`] answers `None` for every address, so
+    /// a listener can skip learning the local address of a connection.
+    pub fn has_local_ip_certs(&self) -> bool {
+        !self.inner.load().certs_by_ip.is_empty()
+    }
+
     /// Atomically replace the OCSP staple bytes on already-loaded
     /// certificates without re-parsing PEM or re-deriving signing keys.
     ///
@@ -410,11 +418,22 @@ pub trait ResolvesServerCertByLocalIp: ResolvesServerCert {
     /// The certificate for a connection accepted on `local_ip` whose
     /// ClientHello names no server, `None` when none carries that address.
     fn resolve_by_local_ip(&self, local_ip: IpAddr) -> Option<Arc<CertifiedKey>>;
+
+    /// Whether [`Self::resolve_by_local_ip`] can answer anything at all
+    /// right now. A listener asks this on every accept before it reads the
+    /// connection's local address, which costs a `getsockname` syscall, so
+    /// it must be cheap and must never answer `false` while some address
+    /// would resolve.
+    fn has_local_ip_certs(&self) -> bool;
 }
 
 impl ResolvesServerCertByLocalIp for CertResolver {
     fn resolve_by_local_ip(&self, local_ip: IpAddr) -> Option<Arc<CertifiedKey>> {
         CertResolver::resolve_by_local_ip(self, local_ip)
+    }
+
+    fn has_local_ip_certs(&self) -> bool {
+        CertResolver::has_local_ip_certs(self)
     }
 }
 
@@ -1074,6 +1093,31 @@ mod tests {
         assert_eq!(
             served_der(&resolver, ip("::ffff:192.0.2.10")),
             Some(cert.der)
+        );
+    }
+
+    #[test]
+    fn has_local_ip_certs_follows_the_loaded_table() {
+        let resolver = CertResolver::new();
+        assert!(!resolver.has_local_ip_certs(), "an empty resolver");
+
+        let dns_only: IpCert = ip_cert("example.com", &["example.com"], &[], 9_999_999_999);
+        resolver.reload(vec![dns_only.data.clone()]).unwrap();
+        assert!(!resolver.has_local_ip_certs(), "DNS SANs only");
+
+        let with_ip: IpCert = ip_cert("localhost", &[], &[ip("192.0.2.10")], 9_999_999_999);
+        resolver
+            .reload(vec![dns_only.data.clone(), with_ip.data])
+            .unwrap();
+        assert!(
+            resolver.has_local_ip_certs(),
+            "a certificate with an IP SAN"
+        );
+
+        resolver.reload(vec![dns_only.data]).unwrap();
+        assert!(
+            !resolver.has_local_ip_certs(),
+            "a reload that drops the IP certificate"
         );
     }
 

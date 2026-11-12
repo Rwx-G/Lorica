@@ -426,7 +426,11 @@ lives in.
   absent: the certificate for the address), cached per address in the
   `Acceptor`. Otherwise the listener's own config runs, as upstream. The
   clone keeps ALPN, the client certificate verifier, session storage and
-  ticketer. No `LazyConfigAcceptor`. On an upstream sync, keep the extra
+  ticketer. No `LazyConfigAcceptor`. The digest's `local_addr` is a
+  lazy `getsockname`, so `tls_handshake` reads it only while
+  `has_local_ip_certs` on the resolver says some loaded certificate
+  carries an address; without one, an accept costs no more than
+  upstream. On an upstream sync, keep the extra
   `Acceptor` field and its fill in `build`, and keep `tls_handshake`
   choosing the acceptor before it calls `handshake` or
   `handshake_with_callback`.
