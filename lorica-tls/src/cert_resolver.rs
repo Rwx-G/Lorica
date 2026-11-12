@@ -24,7 +24,7 @@
 //! - A ClientHello without SNI, answered by the `iPAddress` SAN matching the
 //!   local address the connection arrived on (see [`ResolvesServerCertByLocalIp`])
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -48,6 +48,35 @@ use x509_parser::extensions::GeneralName;
 
 use crate::load_first_private_key;
 
+/// The identity of a certificate: the SHA-256 of its leaf's DER.
+///
+/// An OCSP response is about one certificate (its CertID names the
+/// leaf's serial and issuer), so [`CertResolver::refresh_staples`] takes
+/// staples by this identity rather than by a name. Two certificates may
+/// share a name, and each must keep its own staple whatever name or
+/// address it is reached by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LeafFingerprint([u8; 32]);
+
+impl LeafFingerprint {
+    /// The fingerprint of the leaf whose DER encoding is `der`.
+    pub fn of_der(der: &[u8]) -> LeafFingerprint {
+        let mut out: [u8; 32] = [0; 32];
+        out.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, der).as_ref());
+        LeafFingerprint(out)
+    }
+
+    /// The fingerprint of the leaf of `cert_pem`, read as
+    /// [`CertResolver::reload`] reads it (the first certificate block);
+    /// `None` when the PEM holds no certificate.
+    pub fn of_pem(cert_pem: &str) -> Option<LeafFingerprint> {
+        parse_certs_from_pem(cert_pem)
+            .ok()?
+            .first()
+            .map(|leaf: &CertificateDer<'static>| LeafFingerprint::of_der(leaf.as_ref()))
+    }
+}
+
 /// Data needed to load a certificate into the resolver.
 #[derive(Clone)]
 pub struct CertData {
@@ -66,39 +95,25 @@ pub struct CertData {
 }
 
 /// A single certificate entry, sorted by expiration.
+///
+/// Every name and address of one certificate holds a clone of the same
+/// entry, so its `key` is one `Arc` shared by all of them.
 #[derive(Clone)]
 struct CertEntry {
     key: Arc<CertifiedKey>,
     not_after_epoch: i64,
-    /// The lowercased primary domain of the [`CertData`] this entry was
-    /// built from: the key the OCSP loop always staples a certificate
-    /// under, so [`CertResolver::refresh_staples`] can staple the entries
-    /// of the IP index, which are not keyed by any domain.
-    primary_domain: Arc<str>,
-}
-
-impl CertEntry {
-    /// This entry with `ocsp` as its staple, sharing the parsed chain and
-    /// the signing key.
-    fn with_staple(&self, ocsp: &[u8]) -> CertEntry {
-        let mut ck = CertifiedKey::new(self.key.cert.clone(), Arc::clone(&self.key.key));
-        ck.ocsp = Some(ocsp.to_vec());
-        CertEntry {
-            key: Arc::new(ck),
-            not_after_epoch: self.not_after_epoch,
-            primary_domain: Arc::clone(&self.primary_domain),
-        }
-    }
+    /// Which certificate this is, for [`CertResolver::refresh_staples`].
+    leaf: LeafFingerprint,
 }
 
 /// Inner state of the resolver, atomically swapped on reload.
 struct CertResolverInner {
     /// Maps lowercase domain -> certs sorted by expiry (longest-lived first).
     certs: HashMap<String, Vec<CertEntry>>,
-    /// Maps a canonical IP address (IPv4-mapped IPv6 folded to IPv4) carried
-    /// as an `iPAddress` SAN of a leaf -> certs sorted like `certs`. Read
-    /// only for a ClientHello without SNI, never as a fallback for an SNI
-    /// the domain map does not know.
+    /// Maps an address carried as an `iPAddress` SAN of a leaf, in the
+    /// family the SAN is written in (see [`ip_sans_of_leaf`]) -> certs
+    /// sorted like `certs`. Read only for a ClientHello without SNI,
+    /// never as a fallback for an SNI the domain map does not know.
     certs_by_ip: HashMap<IpAddr, Vec<CertEntry>>,
 }
 
@@ -203,10 +218,12 @@ impl CertResolver {
             };
             let ip_sans: Vec<IpAddr> = leaf_ip_sans(&certified_key.cert);
             let domain = cert_data.domain.to_lowercase();
+            // `build_certified_key` refuses a PEM without a certificate.
+            let leaf = LeafFingerprint::of_der(certified_key.cert[0].as_ref());
             let entry = CertEntry {
                 key: Arc::new(certified_key),
                 not_after_epoch: cert_data.not_after_epoch,
-                primary_domain: Arc::from(domain.as_str()),
+                leaf,
             };
 
             // Register for primary domain
@@ -281,64 +298,57 @@ impl CertResolver {
     /// Atomically replace the OCSP staple bytes on already-loaded
     /// certificates without re-parsing PEM or re-deriving signing keys.
     ///
-    /// `staples` maps a lowercased domain key (primary or SAN, matching
-    /// the resolver's own key space) to a fresh DER-encoded OCSP response.
-    /// Every registered [`CertEntry`] whose domain is present in the map is
-    /// rebuilt with a new `CertifiedKey` carrying the fresh staple; the
-    /// parsed certificate chain is cloned and the signing key is `Arc`-
-    /// shared, so this path never touches PEM parsing or key derivation.
-    /// Domains absent from the map keep their current key untouched. The
-    /// whole rebuilt table is published with a single `arc-swap`, so
-    /// in-flight TLS handshakes keep serving their already-negotiated
-    /// `CertifiedKey` (Story 8.5 AC #2 / AC #6). This is the OCSP-only
-    /// counterpart to [`Self::reload`]: reload swaps cert bodies, this
-    /// swaps staples, and the two never block each other on the network.
-    ///
-    /// The IP index carries no domain key, so each of its entries takes
-    /// the staple listed under the primary domain of the certificate it
-    /// was built from: the key the OCSP loop staples every certificate
-    /// under. A certificate served without SNI thus carries the staple
-    /// it carries when its primary domain is named. The counts cover
-    /// domain keys only.
-    pub fn refresh_staples(&self, staples: &HashMap<String, Vec<u8>>) -> RefreshStats {
+    /// `staples` maps a certificate, by [`LeafFingerprint`], to a fresh
+    /// DER-encoded OCSP response. Each loaded certificate present in the
+    /// map gets one new `CertifiedKey` carrying its staple (the parsed
+    /// chain is cloned once, the signing key is `Arc`-shared), and every
+    /// name and address that certificate is registered under shares that
+    /// one key. A certificate is therefore served with its own staple
+    /// whatever name or address it is reached by, even when another
+    /// certificate shares one of its names. Certificates absent from the
+    /// map keep their current key untouched. The whole rebuilt table is
+    /// published with a single `arc-swap`, so in-flight TLS handshakes
+    /// keep serving their already-negotiated `CertifiedKey` (Story 8.5
+    /// AC #2 / AC #6). This is the OCSP-only counterpart to
+    /// [`Self::reload`]: reload swaps cert bodies, this swaps staples,
+    /// and the two never block each other on the network.
+    pub fn refresh_staples(&self, staples: &HashMap<LeafFingerprint, Vec<u8>>) -> RefreshStats {
         let current = self.inner.load();
-        let mut map: HashMap<String, Vec<CertEntry>> = HashMap::with_capacity(current.certs.len());
-        let mut refreshed: usize = 0;
-        let mut unchanged: usize = 0;
-
-        for (domain, entries) in current.certs.iter() {
-            if let Some(ocsp) = staples.get(domain) {
-                let rebuilt: Vec<CertEntry> = entries.iter().map(|e| e.with_staple(ocsp)).collect();
-                map.insert(domain.clone(), rebuilt);
-                refreshed += 1;
-            } else {
-                map.insert(domain.clone(), entries.clone());
-                unchanged += 1;
+        let mut restapled: HashMap<LeafFingerprint, Arc<CertifiedKey>> = HashMap::new();
+        let mut unchanged: HashSet<LeafFingerprint> = HashSet::new();
+        let mut restaple = |entry: &CertEntry| -> CertEntry {
+            let Some(ocsp) = staples.get(&entry.leaf) else {
+                unchanged.insert(entry.leaf);
+                return entry.clone();
+            };
+            let key: &Arc<CertifiedKey> = restapled.entry(entry.leaf).or_insert_with(|| {
+                let mut ck = CertifiedKey::new(entry.key.cert.clone(), Arc::clone(&entry.key.key));
+                ck.ocsp = Some(ocsp.clone());
+                Arc::new(ck)
+            });
+            CertEntry {
+                key: Arc::clone(key),
+                not_after_epoch: entry.not_after_epoch,
+                leaf: entry.leaf,
             }
-        }
+        };
 
-        let by_ip: HashMap<IpAddr, Vec<CertEntry>> = current
+        let certs: HashMap<String, Vec<CertEntry>> = current
+            .certs
+            .iter()
+            .map(|(domain, entries)| (domain.clone(), entries.iter().map(&mut restaple).collect()))
+            .collect();
+        let certs_by_ip: HashMap<IpAddr, Vec<CertEntry>> = current
             .certs_by_ip
             .iter()
-            .map(|(ip, entries)| {
-                let rebuilt: Vec<CertEntry> = entries
-                    .iter()
-                    .map(|e| match staples.get(&*e.primary_domain) {
-                        Some(ocsp) => e.with_staple(ocsp),
-                        None => e.clone(),
-                    })
-                    .collect();
-                (*ip, rebuilt)
-            })
+            .map(|(ip, entries)| (*ip, entries.iter().map(&mut restaple).collect()))
             .collect();
 
-        self.inner.store(Arc::new(CertResolverInner {
-            certs: map,
-            certs_by_ip: by_ip,
-        }));
+        self.inner
+            .store(Arc::new(CertResolverInner { certs, certs_by_ip }));
         RefreshStats {
-            refreshed,
-            unchanged,
+            refreshed: restapled.len(),
+            unchanged: unchanged.len(),
         }
     }
 
@@ -368,6 +378,22 @@ impl CertResolver {
     fn ip_staple_for(&self, ip: IpAddr) -> Option<Vec<u8>> {
         self.resolve_by_local_ip(ip)
             .and_then(|key: Arc<CertifiedKey>| key.ocsp.clone())
+    }
+
+    /// Every key registered under `domain`, in serving order.
+    #[cfg(test)]
+    fn keys_for(&self, domain: &str) -> Vec<Arc<CertifiedKey>> {
+        self.inner
+            .load()
+            .certs
+            .get(domain)
+            .map(|entries: &Vec<CertEntry>| {
+                entries
+                    .iter()
+                    .map(|entry: &CertEntry| Arc::clone(&entry.key))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -470,16 +496,17 @@ impl ResolvesServerCert for LocalIpResolver {
     }
 }
 
-/// Outcome counts for one [`CertResolver::refresh_staples`] call.
-///
-/// `refreshed` is the number of distinct domain keys whose staple was
-/// replaced; `unchanged` counts registered domains absent from the
-/// staple map (their existing staple, if any, is preserved). The OCSP
-/// refresh loop in `lorica` feeds `refreshed` into the
-/// `lorica_ocsp_refresh_total{result="ok"}` Prometheus counter.
+/// Outcome counts for one [`CertResolver::refresh_staples`] call, in
+/// loaded certificates (distinct [`LeafFingerprint`]s), not in the names
+/// or addresses they are registered under. The OCSP refresh loop in
+/// `lorica` logs them; its `lorica_ocsp_refresh_total` counter counts
+/// responder fetches instead.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RefreshStats {
+    /// Certificates whose staple was replaced.
     pub refreshed: usize,
+    /// Certificates absent from the staple map, whose existing staple,
+    /// if any, is kept.
     pub unchanged: usize,
 }
 
@@ -929,32 +956,22 @@ mod tests {
     /// loop attaches the staple later without a PEM re-parse.
     #[test]
     fn refresh_staples_replaces_ocsp_bytes_and_counts() {
-        let cert_pem = include_str!("../tests/test-cert.pem");
-        let key_pem = include_str!("../tests/test-key.pem");
-
+        let cert: IpCert = ip_cert(
+            "stapled.example.com",
+            &["alt.example.com"],
+            &[],
+            9_999_999_999,
+        );
         let resolver = CertResolver::new();
-        resolver
-            .reload(vec![CertData {
-                domain: "stapled.example.com".to_string(),
-                san_domains: vec!["alt.example.com".to_string()],
-                cert_pem: cert_pem.to_string(),
-                key_pem: key_pem.to_string(),
-                not_after_epoch: 9999999999,
-                ocsp_response: None,
-            }])
-            .unwrap();
+        resolver.reload(vec![cert.data.clone()]).unwrap();
 
         // No staple after a body-only reload.
         assert_eq!(resolver.staple_for("stapled.example.com"), None);
 
-        let fresh = vec![0x30, 0x03, 0x0A, 0x01, 0x00];
-        let mut staples = std::collections::HashMap::new();
-        staples.insert("stapled.example.com".to_string(), fresh.clone());
-        staples.insert("alt.example.com".to_string(), fresh.clone());
+        let fresh: Vec<u8> = vec![0x30, 0x03, 0x0A, 0x01, 0x00];
+        let stats: RefreshStats = resolver.refresh_staples(&staples_of(&[(&cert, fresh.clone())]));
 
-        let stats = resolver.refresh_staples(&staples);
-
-        assert_eq!(stats.refreshed, 2, "primary + SAN domain keys refreshed");
+        assert_eq!(stats.refreshed, 1, "one certificate, whatever its names");
         assert_eq!(stats.unchanged, 0);
         assert_eq!(resolver.domain_count(), 2, "domain set is unchanged");
         assert_eq!(
@@ -962,43 +979,28 @@ mod tests {
             Some(fresh.clone())
         );
         assert_eq!(resolver.staple_for("alt.example.com"), Some(fresh));
+        assert!(
+            Arc::ptr_eq(
+                &resolver.keys_for("stapled.example.com")[0],
+                &resolver.keys_for("alt.example.com")[0]
+            ),
+            "the names of one certificate share one restapled key"
+        );
     }
 
-    /// A staple map that misses a registered domain must leave that
-    /// domain's existing key untouched and count it as `unchanged`, so a
-    /// transient OCSP-fetch failure for one vhost never drops the staple
-    /// (or the cert) of the others.
+    /// A staple map that misses a loaded certificate must leave that
+    /// certificate's existing key untouched and count it as `unchanged`,
+    /// so a transient OCSP-fetch failure for one vhost never drops the
+    /// staple (or the cert) of the others.
     #[test]
-    fn refresh_staples_leaves_unlisted_domains_untouched() {
-        let cert_pem = include_str!("../tests/test-cert.pem");
-        let key_pem = include_str!("../tests/test-key.pem");
-
+    fn refresh_staples_leaves_unlisted_certificates_untouched() {
+        let a: IpCert = ip_cert("a.example.com", &[], &[], 9_999_999_999);
+        let mut b: IpCert = ip_cert("b.example.com", &[], &[], 9_999_999_999);
+        b.data.ocsp_response = Some(vec![0xBB]);
         let resolver = CertResolver::new();
-        resolver
-            .reload(vec![
-                CertData {
-                    domain: "a.example.com".to_string(),
-                    san_domains: vec![],
-                    cert_pem: cert_pem.to_string(),
-                    key_pem: key_pem.to_string(),
-                    not_after_epoch: 9999999999,
-                    ocsp_response: Some(vec![0xAA]),
-                },
-                CertData {
-                    domain: "b.example.com".to_string(),
-                    san_domains: vec![],
-                    cert_pem: cert_pem.to_string(),
-                    key_pem: key_pem.to_string(),
-                    not_after_epoch: 9999999999,
-                    ocsp_response: Some(vec![0xBB]),
-                },
-            ])
-            .unwrap();
+        resolver.reload(vec![a.data.clone(), b.data]).unwrap();
 
-        let mut staples = std::collections::HashMap::new();
-        staples.insert("a.example.com".to_string(), vec![0xCC]);
-
-        let stats = resolver.refresh_staples(&staples);
+        let stats: RefreshStats = resolver.refresh_staples(&staples_of(&[(&a, vec![0xCC])]));
 
         assert_eq!(stats.refreshed, 1);
         assert_eq!(stats.unchanged, 1);
@@ -1006,8 +1008,65 @@ mod tests {
         assert_eq!(
             resolver.staple_for("b.example.com"),
             Some(vec![0xBB]),
-            "an unlisted domain keeps its prior staple"
+            "an unlisted certificate keeps its prior staple"
         );
+    }
+
+    /// Two certificates sharing a name each keep their own staple, under
+    /// that name, under their other names and on the IP path. Keyed by
+    /// name, the last certificate written won the shared name and its
+    /// response was stapled to the other.
+    #[test]
+    fn two_certificates_sharing_a_name_each_keep_their_own_staple() {
+        let first: IpCert = ip_cert("shared.example.com", &[], &[ip("192.0.2.10")], 9_000);
+        let second: IpCert = ip_cert(
+            "other.example.com",
+            &["shared.example.com"],
+            &[ip("192.0.2.20")],
+            9_999,
+        );
+        let resolver = CertResolver::new();
+        resolver
+            .reload(vec![first.data.clone(), second.data.clone()])
+            .unwrap();
+
+        let stats: RefreshStats =
+            resolver.refresh_staples(&staples_of(&[(&first, vec![0x01]), (&second, vec![0x02])]));
+
+        assert_eq!(stats.refreshed, 2);
+        let under_shared: Vec<(Vec<u8>, Option<Vec<u8>>)> = resolver
+            .keys_for("shared.example.com")
+            .iter()
+            .map(|key: &Arc<CertifiedKey>| (key.cert[0].to_vec(), key.ocsp.clone()))
+            .collect();
+        assert_eq!(
+            under_shared,
+            vec![
+                (second.der.clone(), Some(vec![0x02])),
+                (first.der.clone(), Some(vec![0x01])),
+            ],
+            "each certificate under the shared name carries its own staple"
+        );
+        assert_eq!(resolver.staple_for("other.example.com"), Some(vec![0x02]));
+        assert_eq!(resolver.ip_staple_for(ip("192.0.2.10")), Some(vec![0x01]));
+        assert_eq!(resolver.ip_staple_for(ip("192.0.2.20")), Some(vec![0x02]));
+        assert!(
+            Arc::ptr_eq(
+                &resolver.keys_for("shared.example.com")[1],
+                &resolver.resolve_by_local_ip(ip("192.0.2.10")).unwrap()
+            ),
+            "a certificate's name and address share one restapled key"
+        );
+    }
+
+    #[test]
+    fn a_leaf_fingerprint_is_the_same_from_the_pem_and_from_the_loaded_chain() {
+        let cert: IpCert = ip_cert("a.example.com", &[], &[], 9_999_999_999);
+        assert_eq!(
+            LeafFingerprint::of_pem(&cert.data.cert_pem),
+            Some(LeafFingerprint::of_der(&cert.der))
+        );
+        assert_eq!(LeafFingerprint::of_pem("not a certificate"), None);
     }
 
     /// A self-signed certificate, its key, and the leaf's DER, for the
@@ -1044,6 +1103,20 @@ mod tests {
 
     fn ip(text: &str) -> IpAddr {
         text.parse().expect("test setup: address")
+    }
+
+    /// A staple map as the OCSP loop builds it, from each certificate's
+    /// stored PEM.
+    fn staples_of(staples: &[(&IpCert, Vec<u8>)]) -> HashMap<LeafFingerprint, Vec<u8>> {
+        staples
+            .iter()
+            .map(|(cert, ocsp): &(&IpCert, Vec<u8>)| {
+                (
+                    LeafFingerprint::of_pem(&cert.data.cert_pem).expect("test setup: PEM"),
+                    ocsp.clone(),
+                )
+            })
+            .collect()
     }
 
     fn served_der(resolver: &CertResolver, local_ip: IpAddr) -> Option<Vec<u8>> {
@@ -1163,10 +1236,9 @@ mod tests {
         );
     }
 
-    /// The OCSP loop staples under every name of a certificate, its
-    /// primary domain first among them; a certificate served by IP must
-    /// carry the same fresh staple as when its name is sent as SNI, and a
-    /// certificate whose staple is missing keeps the one it had.
+    /// A certificate served by IP must carry the same fresh staple as
+    /// when its name is sent as SNI, and a certificate whose staple is
+    /// missing keeps the one it had.
     #[test]
     fn a_staple_refresh_reaches_the_ip_index() {
         let stapled: IpCert = ip_cert(
@@ -1179,13 +1251,14 @@ mod tests {
             ip_cert("kept.example.com", &[], &[ip("2001:db8::1")], 9_999_999_999);
         kept.data.ocsp_response = Some(vec![0xBB]);
         let resolver = CertResolver::new();
-        resolver.reload(vec![stapled.data, kept.data]).unwrap();
+        resolver
+            .reload(vec![stapled.data.clone(), kept.data])
+            .unwrap();
         assert_eq!(resolver.ip_staple_for(ip("192.0.2.10")), None);
 
         let fresh: Vec<u8> = vec![0x30, 0x03, 0x0A, 0x01, 0x00];
-        let mut staples: HashMap<String, Vec<u8>> = HashMap::new();
-        staples.insert("stapled.example.com".to_string(), fresh.clone());
-        let stats: RefreshStats = resolver.refresh_staples(&staples);
+        let stats: RefreshStats =
+            resolver.refresh_staples(&staples_of(&[(&stapled, fresh.clone())]));
 
         assert_eq!(stats.refreshed, 1);
         assert_eq!(stats.unchanged, 1);
