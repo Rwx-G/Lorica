@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::Arc;
 
 use crate::listeners::TlsAcceptCallbacks;
@@ -21,14 +19,13 @@ use crate::protocols::tls::{server::handshake, server::handshake_with_callback, 
 use log::debug;
 use lorica_error::ErrorType::InternalError;
 use lorica_error::{Error, OrErr, Result};
-use lorica_tls::cert_resolver::{LocalIpResolver, ResolvesServerCertByLocalIp};
+use lorica_tls::cert_resolver::{LocalIpConfigs, ResolvesServerCertByLocalIp};
 use lorica_tls::load_certs_and_key_files;
 use lorica_tls::ClientCertVerifier;
 use lorica_tls::ServerConfig;
 use lorica_tls::{version, TlsAcceptor as RusTlsAcceptor};
 
 use crate::protocols::{ALPN, IO};
-use parking_lot::RwLock;
 
 /// Certificate source for a TLS listener.
 enum CertSource {
@@ -49,50 +46,9 @@ pub struct TlsSettings {
 pub struct Acceptor {
     pub acceptor: RusTlsAcceptor,
     callbacks: Option<TlsAcceptCallbacks>,
-    local_ip_acceptors: Option<LocalIpAcceptors>,
-}
-
-/// Lorica: the acceptors for connections whose local address some
-/// certificate carries as an `iPAddress` SAN.
-///
-/// rustls resolves a certificate from the ClientHello alone, and a client
-/// dialing an IP sends no SNI (RFC 6066), so the local address is decided
-/// before the handshake: such a connection gets a copy of the listener's
-/// config whose resolver is a [`LocalIpResolver`] for that address.
-/// Everything else in the copy (ALPN, client certificate verifier,
-/// session storage, ticketer) is the listener's own.
-struct LocalIpAcceptors {
-    resolver: Arc<dyn ResolvesServerCertByLocalIp>,
-    base_config: Arc<ServerConfig>,
-    /// One acceptor per canonical local address, built on first use. An
-    /// entry is added only for an address a loaded certificate carries
-    /// and that an accepted socket reported as its local address, so the
-    /// map is bounded by the addresses the host has bound. It never goes
-    /// stale: each [`LocalIpResolver`] reads the hot-swapped resolver on
-    /// every handshake.
-    by_ip: RwLock<HashMap<IpAddr, RusTlsAcceptor>>,
-}
-
-impl LocalIpAcceptors {
-    /// The acceptor for `local_ip`, `None` when no certificate carries it
-    /// (the listener's own acceptor then applies, unchanged).
-    fn for_local_ip(&self, local_ip: IpAddr) -> Option<RusTlsAcceptor> {
-        let local_ip: IpAddr = local_ip.to_canonical();
-        self.resolver.resolve_by_local_ip(local_ip)?;
-        if let Some(acceptor) = self.by_ip.read().get(&local_ip) {
-            return Some(acceptor.clone());
-        }
-        let mut config: ServerConfig = (*self.base_config).clone();
-        config.cert_resolver = Arc::new(LocalIpResolver::new(Arc::clone(&self.resolver), local_ip));
-        let acceptor = RusTlsAcceptor::from(Arc::new(config));
-        Some(
-            self.by_ip
-                .write()
-                .entry(local_ip)
-                .or_insert(acceptor)
-                .clone(),
-        )
-    }
+    /// Lorica: the configs for a connection to an address a certificate
+    /// carries (see `LocalIpConfigs`).
+    local_ip_configs: Option<LocalIpConfigs>,
 }
 
 impl TlsSettings {
@@ -112,7 +68,7 @@ impl TlsSettings {
             builder.with_no_client_auth()
         };
 
-        // Lorica: the resolver, kept for the per-local-address acceptors.
+        // Lorica: the resolver, kept for the per-local-address configs.
         let mut ip_resolver = None;
         let mut config = match self.cert_source {
             CertSource::Files {
@@ -145,11 +101,7 @@ impl TlsSettings {
         Acceptor {
             acceptor: RusTlsAcceptor::from(Arc::clone(&config)),
             callbacks: None,
-            local_ip_acceptors: ip_resolver.map(|resolver| LocalIpAcceptors {
-                resolver,
-                base_config: config,
-                by_ip: RwLock::new(HashMap::new()),
-            }),
+            local_ip_configs: ip_resolver.map(|resolver| LocalIpConfigs::new(config, resolver)),
         }
     }
 
@@ -212,7 +164,7 @@ impl Acceptor {
     pub async fn tls_handshake<S: IO>(&self, stream: S) -> Result<TlsStream<S>> {
         debug!("new tls session");
         // Lorica: a connection to an address a certificate carries gets
-        // that address's acceptor (see `LocalIpAcceptors`).
+        // that address's config (see `LocalIpConfigs`).
         let local_ip_acceptor = self.local_ip_acceptor(&stream);
         let acceptor = local_ip_acceptor.as_ref().unwrap_or(self);
         // TODO: be able to offload this handshake in a thread pool
@@ -223,24 +175,19 @@ impl Acceptor {
         }
     }
 
-    /// Lorica: the acceptor dedicated to the local address `stream` was
-    /// accepted on, when a certificate carries that address (see
-    /// [`LocalIpAcceptors`]).
-    ///
-    /// The socket digest computes the local address lazily with a
-    /// `getsockname` syscall, so it is not read at all while no loaded
-    /// certificate carries an address.
+    /// Lorica: the acceptor for the local address `stream` was accepted
+    /// on, when a certificate carries that address. The local address
+    /// is a lazy `getsockname` in the socket digest, read only while some
+    /// loaded certificate carries an address.
     fn local_ip_acceptor<S: IO>(&self, stream: &S) -> Option<Acceptor> {
-        let local_ip_acceptors = self.local_ip_acceptors.as_ref()?;
-        if !local_ip_acceptors.resolver.has_local_ip_certs() {
-            return None;
-        }
-        let digest = stream.get_socket_digest()?;
-        let local_ip: IpAddr = digest.local_addr()?.as_inet()?.ip();
+        let config = self
+            .local_ip_configs
+            .as_ref()?
+            .for_connection(|| Some(stream.get_socket_digest()?.local_addr()?.as_inet()?.ip()))?;
         Some(Acceptor {
-            acceptor: local_ip_acceptors.for_local_ip(local_ip)?,
+            acceptor: RusTlsAcceptor::from(config),
             callbacks: None,
-            local_ip_acceptors: None,
+            local_ip_configs: None,
         })
     }
 }
@@ -252,6 +199,7 @@ mod tests {
     use crate::protocols::{GetSocketDigest, SocketDigest};
     use rustls::server::ClientHello;
     use rustls::sign::CertifiedKey;
+    use std::net::IpAddr;
     use std::os::unix::io::AsRawFd;
 
     /// A resolver that serves nothing and reports whether it holds an IP

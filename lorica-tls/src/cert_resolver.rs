@@ -37,6 +37,7 @@ use lorica_error::{Error, ErrorType, OrErr, Result};
 use rustls::crypto::ring::sign::any_supported_type;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
+use rustls::ServerConfig;
 // v1.5.1 audit L-16 : `rustls-pemfile` (RUSTSEC-2025-0134,
 // unmaintained) replaced by the `PemObject` trait from
 // `rustls-pki-types`. Iterators yield only the section type they
@@ -452,7 +453,7 @@ fn leaf_ip_sans(chain: &[CertificateDer<'_>]) -> Vec<IpAddr> {
 ///
 /// rustls hands [`ResolvesServerCert::resolve`] the ClientHello alone, so
 /// a listener that serves this path learns the local address before the
-/// handshake and gives that connection a [`LocalIpResolver`].
+/// handshake and runs it on the config [`LocalIpConfigs`] gives it.
 pub trait ResolvesServerCertByLocalIp: ResolvesServerCert {
     /// The certificate for a connection accepted on `local_ip` whose
     /// ClientHello names no server, `None` when none carries that address.
@@ -462,8 +463,18 @@ pub trait ResolvesServerCertByLocalIp: ResolvesServerCert {
     /// right now. A listener asks this on every accept before it reads the
     /// connection's local address, which costs a `getsockname` syscall, so
     /// it must be cheap and must never answer `false` while some address
-    /// would resolve.
-    fn has_local_ip_certs(&self) -> bool;
+    /// would resolve. The default answers `true`, which is always correct
+    /// and only gives up the saving.
+    fn has_local_ip_certs(&self) -> bool {
+        true
+    }
+
+    /// Whether [`Self::resolve_by_local_ip`] answers for `local_ip`. The
+    /// default asks it and drops the key; a resolver that can tell
+    /// without cloning one overrides it.
+    fn serves_local_ip(&self, local_ip: IpAddr) -> bool {
+        self.resolve_by_local_ip(local_ip).is_some()
+    }
 }
 
 impl ResolvesServerCertByLocalIp for CertResolver {
@@ -473,6 +484,92 @@ impl ResolvesServerCertByLocalIp for CertResolver {
 
     fn has_local_ip_certs(&self) -> bool {
         CertResolver::has_local_ip_certs(self)
+    }
+
+    fn serves_local_ip(&self, local_ip: IpAddr) -> bool {
+        self.inner
+            .load()
+            .certs_by_ip
+            .contains_key(&local_ip.to_canonical())
+    }
+}
+
+/// The server configs of a TLS listener that also answers a client
+/// sending no SNI by the local address it dialed.
+///
+/// rustls resolves a certificate from the ClientHello alone, and a
+/// client dialing an IP sends no SNI (RFC 6066), so the local address is
+/// decided before the handshake: a connection to an address some loaded
+/// certificate carries runs on a copy of the listener's config whose
+/// resolver is a [`LocalIpResolver`] for that address. Everything else in
+/// the copy (ALPN, client certificate verifier, session storage,
+/// ticketer) is the listener's own. Any listener that terminates TLS
+/// over the shared resolver builds one, so a no-SNI client is answered
+/// the same way wherever it connects.
+pub struct LocalIpConfigs {
+    resolver: Arc<dyn ResolvesServerCertByLocalIp>,
+    base: Arc<ServerConfig>,
+    /// One config per canonical local address, built on first use. An
+    /// entry is added only for an address a loaded certificate carries
+    /// and that an accepted socket reported as its local address, so the
+    /// map is bounded by the addresses the host has bound. It never goes
+    /// stale: each [`LocalIpResolver`] reads the hot-swapped resolver on
+    /// every handshake. Read without a lock on every such accept.
+    by_ip: ArcSwap<HashMap<IpAddr, Arc<ServerConfig>>>,
+}
+
+impl LocalIpConfigs {
+    /// The configs for a listener whose own config is `base`, resolving
+    /// its certificates with `resolver`, which `base` should use too.
+    pub fn new(
+        base: Arc<ServerConfig>,
+        resolver: Arc<dyn ResolvesServerCertByLocalIp>,
+    ) -> LocalIpConfigs {
+        LocalIpConfigs {
+            resolver,
+            base,
+            by_ip: ArcSwap::from_pointee(HashMap::new()),
+        }
+    }
+
+    /// The config for a connection whose local address `local_ip` reads,
+    /// `None` when the listener's own config applies unchanged.
+    ///
+    /// `local_ip` runs only while some loaded certificate carries an
+    /// address, so a listener whose certificates carry none never pays
+    /// for learning the local address of a connection.
+    pub fn for_connection(
+        &self,
+        local_ip: impl FnOnce() -> Option<IpAddr>,
+    ) -> Option<Arc<ServerConfig>> {
+        if !self.resolver.has_local_ip_certs() {
+            return None;
+        }
+        self.for_local_ip(local_ip()?)
+    }
+
+    /// The config for a connection accepted on `local_ip`, `None` when no
+    /// certificate carries that address (the listener's own config then
+    /// applies unchanged).
+    pub fn for_local_ip(&self, local_ip: IpAddr) -> Option<Arc<ServerConfig>> {
+        let local_ip: IpAddr = local_ip.to_canonical();
+        if !self.resolver.serves_local_ip(local_ip) {
+            return None;
+        }
+        if let Some(config) = self.by_ip.load().get(&local_ip) {
+            return Some(Arc::clone(config));
+        }
+        let mut config: ServerConfig = (*self.base).clone();
+        config.cert_resolver = Arc::new(LocalIpResolver::new(Arc::clone(&self.resolver), local_ip));
+        let config: Arc<ServerConfig> = Arc::new(config);
+        let mut kept: Arc<ServerConfig> = Arc::clone(&config);
+        self.by_ip
+            .rcu(|current: &Arc<HashMap<IpAddr, Arc<ServerConfig>>>| {
+                let mut next: HashMap<IpAddr, Arc<ServerConfig>> = HashMap::clone(current);
+                kept = Arc::clone(next.entry(local_ip).or_insert_with(|| Arc::clone(&config)));
+                next
+            });
+        Some(kept)
     }
 }
 
@@ -1218,6 +1315,106 @@ mod tests {
             ip_sans_of_leaf(&parsed),
             vec![ip("2001:db8::1"), ip("192.0.2.10"), ip("::ffff:192.0.2.10")]
         );
+    }
+
+    /// `LocalIpConfigs` over `resolver`, on a base config with ALPN set,
+    /// and that base.
+    fn local_ip_configs(resolver: Arc<CertResolver>) -> (LocalIpConfigs, Arc<ServerConfig>) {
+        let mut base: ServerConfig =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("test setup: versions")
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>);
+        base.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let base: Arc<ServerConfig> = Arc::new(base);
+        (LocalIpConfigs::new(Arc::clone(&base), resolver), base)
+    }
+
+    #[test]
+    fn local_ip_configs_never_read_the_local_address_without_an_ip_certificate() {
+        let dns_only: IpCert = ip_cert("example.com", &["example.com"], &[], 9_999_999_999);
+        let resolver: Arc<CertResolver> = Arc::new(CertResolver::new());
+        resolver.reload(vec![dns_only.data]).unwrap();
+        let (configs, _) = local_ip_configs(resolver);
+
+        let read: std::cell::Cell<bool> = std::cell::Cell::new(false);
+        let config = configs.for_connection(|| {
+            read.set(true);
+            Some(ip("192.0.2.10"))
+        });
+        assert!(config.is_none());
+        assert!(!read.get(), "the local address must not be read");
+    }
+
+    #[test]
+    fn local_ip_configs_answer_only_an_address_a_certificate_carries() {
+        let cert: IpCert = ip_cert("localhost", &[], &[ip("192.0.2.10")], 9_999_999_999);
+        let resolver: Arc<CertResolver> = Arc::new(CertResolver::new());
+        resolver.reload(vec![cert.data]).unwrap();
+        let (configs, base) = local_ip_configs(resolver);
+
+        assert!(configs.for_connection(|| Some(ip("192.0.2.11"))).is_none());
+        assert!(configs.for_connection(|| None).is_none());
+
+        let config: Arc<ServerConfig> = configs
+            .for_connection(|| Some(ip("192.0.2.10")))
+            .expect("the address a certificate carries");
+        assert!(!Arc::ptr_eq(&config, &base), "a copy, not the base");
+        assert_eq!(config.alpn_protocols, base.alpn_protocols, "ALPN is kept");
+        assert!(
+            Arc::ptr_eq(&config, &configs.for_local_ip(ip("192.0.2.10")).unwrap()),
+            "built once per address"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &config,
+                &configs.for_local_ip(ip("::ffff:192.0.2.10")).unwrap()
+            ),
+            "a dual-stack listener's IPv4 client gets the IPv4 address's config"
+        );
+    }
+
+    /// A resolver that implements only what the trait requires.
+    #[derive(Debug)]
+    struct MinimalResolver(Option<Arc<CertifiedKey>>);
+
+    impl ResolvesServerCert for MinimalResolver {
+        fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            None
+        }
+    }
+
+    impl ResolvesServerCertByLocalIp for MinimalResolver {
+        fn resolve_by_local_ip(&self, _local_ip: IpAddr) -> Option<Arc<CertifiedKey>> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn the_default_methods_never_hide_an_address_that_resolves() {
+        let cert: IpCert = ip_cert("localhost", &[], &[], 9_999_999_999);
+        let key: CertifiedKey =
+            build_certified_key(&cert.data.cert_pem, &cert.data.key_pem, None).unwrap();
+        let some = MinimalResolver(Some(Arc::new(key)));
+        assert!(some.has_local_ip_certs());
+        assert!(some.serves_local_ip(ip("192.0.2.10")));
+        assert!(!MinimalResolver(None).serves_local_ip(ip("192.0.2.10")));
+    }
+
+    #[test]
+    fn the_resolver_serves_an_address_exactly_when_it_resolves_it() {
+        let cert: IpCert = ip_cert("localhost", &[], &[ip("192.0.2.10")], 9_999_999_999);
+        let resolver = CertResolver::new();
+        resolver.reload(vec![cert.data]).unwrap();
+        for local_ip in ["192.0.2.10", "::ffff:192.0.2.10", "192.0.2.11", "::1"] {
+            let local_ip: IpAddr = ip(local_ip);
+            assert_eq!(
+                ResolvesServerCertByLocalIp::serves_local_ip(&resolver, local_ip),
+                resolver.resolve_by_local_ip(local_ip).is_some(),
+                "{local_ip}"
+            );
+        }
     }
 
     #[test]

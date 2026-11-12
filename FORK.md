@@ -412,28 +412,26 @@ lives in.
 - **`lorica-core`, a certificate for a client that sends no SNI
   (v1.10.5, issue #53).** Site: `lorica-core/src/listeners/tls/rustls/mod.rs`
   (`TlsSettings::with_resolver`, `TlsSettings::build`, the
-  `LocalIpAcceptors` type and `Acceptor::tls_handshake` with its helper
-  `local_ip_acceptor`). rustls chooses the certificate from the
-  ClientHello alone, and a client dialing an IP sends no SNI (RFC 6066),
-  so Lorica's resolver cannot answer it. `with_resolver`, Lorica's
-  constructor for its hot-swapped resolver, now takes a
+  `local_ip_configs` field of `Acceptor`, and `Acceptor::tls_handshake`
+  with its helper `local_ip_acceptor`). rustls chooses the certificate
+  from the ClientHello alone, and a client dialing an IP sends no SNI
+  (RFC 6066), so Lorica's resolver cannot answer it. `with_resolver`,
+  Lorica's constructor for its hot-swapped resolver, now takes a
   `lorica_tls::cert_resolver::ResolvesServerCertByLocalIp` (a Lorica
-  trait, beside `CertResolver` in `lorica-tls`). Before the handshake,
-  `tls_handshake` reads the local address from the stream's socket
-  digest; when the resolver has a certificate for it, the handshake runs
-  on a clone of the listener's `ServerConfig` whose `cert_resolver` is a
-  `LocalIpResolver` for that address (SNI present: the shared SNI lookup;
-  absent: the certificate for the address), cached per address in the
-  `Acceptor`. Otherwise the listener's own config runs, as upstream. The
-  clone keeps ALPN, the client certificate verifier, session storage and
-  ticketer. No `LazyConfigAcceptor`. The digest's `local_addr` is a
-  lazy `getsockname`, so `tls_handshake` reads it only while
-  `has_local_ip_certs` on the resolver says some loaded certificate
-  carries an address; without one, an accept costs no more than
-  upstream. On an upstream sync, keep the extra
-  `Acceptor` field and its fill in `build`, and keep `tls_handshake`
-  choosing the acceptor before it calls `handshake` or
-  `handshake_with_callback`.
+  trait, beside `CertResolver` in `lorica-tls`), and `build` hands the
+  listener's `ServerConfig` and that resolver to a
+  `lorica_tls::cert_resolver::LocalIpConfigs`. Before the handshake,
+  `tls_handshake` asks it for a config, giving it a closure that reads
+  the local address from the stream's socket digest; when it answers,
+  the handshake runs on that config, otherwise on the listener's own,
+  as upstream. Which config, when the local address is read (the
+  digest's `local_addr` is a lazy `getsockname`, read only while some
+  loaded certificate carries an address), the caching and what the
+  copy keeps all live in `lorica-tls`, so a stream TLS terminator
+  outside Pingora's listeners can use the same type. No
+  `LazyConfigAcceptor`. On an upstream sync, keep the extra `Acceptor`
+  field and its fill in `build`, and keep `tls_handshake` choosing the
+  acceptor before it calls `handshake` or `handshake_with_callback`.
 - **`lorica-core`, a certificate x509-parser refuses is an error
   (v1.10.3).** Site: `parse_der_reporting_errors` in
   `lorica-core/src/utils/tls/rustls.rs`, behind
