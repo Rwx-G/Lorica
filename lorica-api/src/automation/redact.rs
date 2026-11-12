@@ -46,13 +46,14 @@
 //!   every field the environment resource derives from that name
 //!   ([`ENVIRONMENT_NAMED_FIELDS`]).
 //!
-//! One thing is withheld whole, key and value: a certificate's
+//! Two things are withheld whole, key and value. A certificate's
 //! [`ADCS_INTERNAL_FIELDS`], the authority id, the template and the
 //! authority's request identifier (Epic 13). They are internal PKI
 //! detail no token caller needs: a token cannot issue or renew an AD
 //! CS certificate, and `source` and `subject`, which stay, say what a
 //! certificate is. A field that answers no caller's need is not
-//! published (the Epic 10 and 11 rule).
+//! published (the Epic 10 and 11 rule). And a certificate's
+//! [`DASHBOARD_ONLY_CERTIFICATE_FIELDS`], its IP address SANs.
 //!
 //! The mask applies wherever the automation plane or the MCP server
 //! answers such a row: the read listings, and every write answer and
@@ -321,11 +322,22 @@ pub const ADCS_INTERNAL_FIELDS: &[&str] = &[
     "adcs_request_id",
 ];
 
+/// The certificate view's fields derived for the dashboard alone: the
+/// leaf's IP address SANs (issue #53), which it checks a route whose
+/// hostname is an IP against. A grant bounds which certificates a token
+/// sees by DNS names, the `domain` and `san_domains` against
+/// `allowed_hostnames`, and says nothing of addresses, so answering them
+/// would show a token addresses no grant was checked against.
+pub const DASHBOARD_ONLY_CERTIFICATE_FIELDS: &[&str] = &["san_ips"];
+
 /// A certificate row as the automation plane may answer it: without
-/// [`ADCS_INTERNAL_FIELDS`].
+/// [`ADCS_INTERNAL_FIELDS`] and [`DASHBOARD_ONLY_CERTIFICATE_FIELDS`].
 pub fn certificate_row(row: &mut Value) {
     if let Some(fields) = row.as_object_mut() {
-        for field in ADCS_INTERNAL_FIELDS {
+        for field in ADCS_INTERNAL_FIELDS
+            .iter()
+            .chain(DASHBOARD_ONLY_CERTIFICATE_FIELDS)
+        {
             fields.remove(*field);
         }
     }
@@ -386,6 +398,33 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_certificate_row_loses_the_withheld_fields_and_keeps_the_rest() {
+        let mut row = json!({
+            "domain": "localhost",
+            "san_domains": ["localhost"],
+            "subject": "CN=localhost",
+        });
+        let withheld = ADCS_INTERNAL_FIELDS
+            .iter()
+            .chain(DASHBOARD_ONLY_CERTIFICATE_FIELDS);
+        for field in withheld.clone() {
+            row[*field] = json!(["192.0.2.10"]);
+        }
+        certificate_row(&mut row);
+        for field in withheld {
+            assert!(row.get(*field).is_none(), "{field} answered: {row}");
+        }
+        assert_eq!(
+            row,
+            json!({
+                "domain": "localhost",
+                "san_domains": ["localhost"],
+                "subject": "CN=localhost",
+            })
+        );
+    }
 
     #[test]
     fn a_query_value_is_withheld_and_its_name_kept_whatever_the_shape() {

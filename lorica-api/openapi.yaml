@@ -7120,6 +7120,15 @@ components:
           type: array
           items:
             type: string
+        san_ips:
+          type: array
+          items:
+            type: string
+          description: >-
+            The leaf certificate's IP address SAN entries, IPv6 in RFC 5952
+            form. Derived from the stored PEM on every read, never stored,
+            and never part of `san_domains`: renewal and automation grants
+            read only `san_domains`.
         fingerprint:
           type: string
         issuer:
