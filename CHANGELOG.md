@@ -15,6 +15,9 @@ Author: Rwx-G
 
 ### Fixed
 
+- **A route whose hostname is an IP address can be served over HTTPS with a certificate carrying that address as an IP SAN** ([#53](https://github.com/Rwx-G/Lorica/issues/53)). A client dialing an IP sends no SNI (RFC 6066 forbids an address there), and the certificate resolver selected by SNI alone, so the handshake failed with no certificate to present (`ERR_SSL_PROTOCOL_ERROR` in Chrome). A ClientHello without SNI now gets the certificate whose IP SAN is the local address the connection arrived on; certificates already uploaded need no re-upload. Behind NAT, such as Docker with published ports, the local address is not the one the client dialed and nothing matches. A client that sends an SNI is served exactly as before. `docs/security.md` describes the behaviour, including what a scanner sweeping addresses now sees.
+- **The route editor no longer warns that a certificate does not cover an IP hostname it does cover.** The certificate parser kept DNS SANs only. Certificate views now show IP SANs as `san_ips`, and an IP hostname is checked against them, never against DNS names, as browsers do. `san_ips` is not returned on the automation plane or to the MCP server, whose certificate grants are checked against DNS names.
+
 ### Removed
 
 ### Security
