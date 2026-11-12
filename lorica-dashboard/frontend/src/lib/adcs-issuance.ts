@@ -33,7 +33,7 @@ import {
   ADCS_SUBJECT_FIELD_LABELS,
   type AdcsSubjectField,
 } from './adcs.generated';
-import { canonicalIp, findUncoveredHostnames } from './cert-san-match';
+import { findUncoveredHostnames, namesAnAddress, normalizeDnsName } from './cert-san-match';
 
 export const ADCS_KEY_TYPES = Object.keys(ADCS_KEY_TYPE_LABELS) as AdcsKeyType[];
 export const ADCS_SUBJECT_FIELDS = Object.keys(ADCS_SUBJECT_FIELD_LABELS) as AdcsSubjectField[];
@@ -46,12 +46,6 @@ export const ADCS_STILL_FINISHING =
 export const ADCS_RENEWAL_STILL_FINISHING =
   'The renewal is still finishing on the server. Reload the certificate list before retrying shortly: it may have completed.';
 
-function normalize(name: string): string {
-  let n = name.trim().toLowerCase();
-  if (n.endsWith('.')) n = n.slice(0, -1);
-  return n;
-}
-
 export function isWildcardName(name: string): boolean {
   return name.includes('*');
 }
@@ -63,7 +57,7 @@ export function parseSanList(text: string): string[] {
   for (const raw of text.split(/[,\n]/)) {
     const name = raw.trim();
     if (name.length === 0) continue;
-    const key = normalize(name);
+    const key = normalizeDnsName(name);
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(name);
@@ -81,26 +75,26 @@ export function parseSanList(text: string): string[] {
  * read differently is refused by the API with its own message.
  */
 export function nameUnderSuffix(name: string, suffix: string): boolean {
-  const n = normalize(name);
-  const s = normalize(suffix);
+  const n = normalizeDnsName(name);
+  const s = normalizeDnsName(suffix);
   if (n.length === 0 || s.length === 0) return false;
   return n === s || n.endsWith('.' + s);
 }
 
 export interface SanHints {
   wildcards: string[];
-  /** IP literals, which the API refuses: Lorica requests DNS names only. */
+  /** Addresses in any spelling, which the API refuses: Lorica requests DNS names only. */
   ipLiterals: string[];
   outsideSuffixes: string[];
 }
 
 export function adcsSanHints(sans: readonly string[], allowedSuffixes: readonly string[]): SanHints {
   const wildcards = sans.filter(isWildcardName);
-  const ipLiterals = sans.filter((name) => !isWildcardName(name) && canonicalIp(name) !== null);
+  const ipLiterals = sans.filter((name) => !isWildcardName(name) && namesAnAddress(name));
   const outsideSuffixes = sans.filter(
     (name) =>
       !isWildcardName(name) &&
-      canonicalIp(name) === null &&
+      !namesAnAddress(name) &&
       !allowedSuffixes.some((suffix) => nameUnderSuffix(name, suffix)),
   );
   return { wildcards, ipLiterals, outsideSuffixes };
@@ -131,7 +125,7 @@ export function hostnamesWithoutCertificate(
   certificates: readonly CertificateResponse[],
 ): string[] {
   return uncoveredByStoredCertificates(
-    hostnames.filter((name) => !isWildcardName(name) && canonicalIp(name) === null),
+    hostnames.filter((name) => !isWildcardName(name) && !namesAnAddress(name)),
     certificates,
   );
 }
@@ -146,7 +140,7 @@ export function ipHostnamesWithoutCertificate(
   certificates: readonly CertificateResponse[],
 ): string[] {
   return uncoveredByStoredCertificates(
-    hostnames.filter((name) => canonicalIp(name) !== null),
+    hostnames.filter((name) => namesAnAddress(name)),
     certificates,
   );
 }

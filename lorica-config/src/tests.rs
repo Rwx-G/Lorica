@@ -3208,6 +3208,32 @@ cert_critical_days = 3
         assert!(err.contains("already used"), "{err}");
     }
 
+    /// An address a browser would rewrite, or a wildcard over an
+    /// address tail, is refused on import as on every route write, on a
+    /// primary hostname and on an alias alike.
+    #[test]
+    fn test_import_refuses_an_address_spelled_otherwise_or_under_a_wildcard() {
+        let source = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut route = make_route();
+        route.hostname = "a.example.com".into();
+        route.hostname_aliases = vec!["www.a.example.com".into()];
+        source.create_route(&route).expect("test setup: route");
+        let exported = export_to_toml(&source).expect("test setup: export");
+        for (field, spelled) in [
+            ("a.example.com", "010.0.0.1"),
+            ("a.example.com", "*.0.2.10"),
+            ("www.a.example.com", "0xc0.0.2.10"),
+            ("www.a.example.com", "*.2.10"),
+        ] {
+            let edited = exported.replace(&format!("\"{field}\""), &format!("\"{spelled}\""));
+            assert_ne!(edited, exported, "test setup: the export names {field}");
+            let err = parse_toml(&edited).expect_err(spelled).to_string();
+            assert!(err.contains(&format!("route '{}'", route.id)), "{err}");
+        }
+        let address = exported.replace("\"www.a.example.com\"", "\"192.0.2.10\"");
+        parse_toml(&address).expect("an address alias in the dotted spelling imports");
+    }
+
     #[test]
     fn test_hostname_uniqueness_allows_update_own_hostname() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");

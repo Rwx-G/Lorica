@@ -59,7 +59,7 @@
 //! from the same way, named in `protections_inherited_from_records`.
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, Query};
@@ -384,8 +384,11 @@ fn validate_dns_name(raw: &str, field: &str) -> Result<String, ApiError> {
              `@`, `[`)",
         ));
     }
-    if name.parse::<IpAddr>().is_ok() {
-        return Err(refuse("must be a DNS name, not an address literal"));
+    if lorica_config::host_shape::names_an_address(&name) {
+        return Err(refuse(
+            "must be a DNS name, not an address literal (a last label that is a number is \
+             read as one)",
+        ));
     }
     if name.len() > 253 {
         return Err(refuse("is longer than 253 characters (DNS limit)"));

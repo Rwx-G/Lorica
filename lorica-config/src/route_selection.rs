@@ -48,6 +48,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use crate::host_shape::{host_shape, names_an_address, HostShape};
 use crate::models::Route;
 
 /// The hostname of a route that serves every host no other route
@@ -123,7 +124,8 @@ pub struct HostnameShape<'a> {
     pub allow_catch_all: bool,
     /// A bracketed IPv6 literal (`[2001:db8::1]`), the form a `Host`
     /// header carries one in: a route's primary hostname only. An IPv4
-    /// literal needs no flag, it is labels of digits.
+    /// literal needs no flag, it is labels of digits, but only in the
+    /// dotted spelling a browser sends ([`crate::host_shape`]).
     pub allow_ipv6_literal: bool,
     /// The field's name, which every refusal starts with so a client can
     /// point at the input.
@@ -143,11 +145,29 @@ pub const ROUTE_HOSTNAME_SHAPE: HostnameShape<'static> = HostnameShape {
     field_label: "hostname",
 };
 
+/// The shape of a route's alias as the TOML import checks it: a DNS
+/// name, an IPv4 address or a wildcard, never the catch-all or an IPv6
+/// literal, which only a primary hostname takes.
+pub const ROUTE_ALIAS_SHAPE: HostnameShape<'static> = HostnameShape {
+    allow_catch_all: false,
+    allow_ipv6_literal: false,
+    field_label: "hostname alias",
+    ..ROUTE_HOSTNAME_SHAPE
+};
+
 /// RFC 1123-shaped hostname validation for every field that takes a
 /// bare hostname: no scheme, path, port, query, fragment, userinfo or
 /// whitespace, at most 253 characters, every label 1 to 63 ASCII
 /// alphanumerics and inner hyphens, plus what `shape` allows. Returns
 /// the input trimmed, or the refusal as a sentence naming the field.
+///
+/// A name a browser reads as an IPv4 address is accepted only in the
+/// dotted spelling it sends (`192.0.2.10`): `010.0.0.1`, `0xc0.0.2.10`
+/// or `192.0.10` would be rewritten before any request named them, so
+/// a route stored under one could never match
+/// ([`crate::host_shape::HostShape::NonCanonicalIpv4`]). A wildcard
+/// whose last label is a number is refused too: it would stand for
+/// addresses, which a wildcard never covers.
 ///
 /// The check order is "cheap discriminator first": URL-shape refusals
 /// fire before the length and label checks, so a pasted URL gets the
@@ -250,13 +270,34 @@ pub fn validate_hostname_syntax(raw: &str, shape: HostnameShape<'_>) -> Result<S
             ));
         }
     }
+    let is_wildcard = check_body.len() != trimmed.len();
+    match host_shape(check_body) {
+        HostShape::NotAnAddress => {}
+        _ if is_wildcard => {
+            return Err(format!(
+                "{label} is a wildcard whose last label is a number: it would stand for IP \
+                 addresses, which a wildcard never covers; name each address as its own route"
+            ));
+        }
+        HostShape::NonCanonicalIpv4 => {
+            return Err(format!(
+                "{label} is read by browsers as an IPv4 address spelled another way, or refused \
+                 as one, so no request would ever name it as written; write an address as four \
+                 decimal numbers from 0 to 255 without leading zeros (e.g. `192.0.2.10`)"
+            ));
+        }
+        HostShape::Ipv4(_) | HostShape::Ipv6(_) => {}
+    }
     Ok(trimmed.to_string())
 }
 
-/// Whether `name` is an IP address rather than a DNS name: dotted IPv4,
-/// or IPv6 with or without the brackets a `Host` header carries it in.
-/// Such a name is served by an `iPAddress` SAN, never by a DNS name or
-/// a wildcard.
+/// Whether `name` is an IP address in the spelling a browser sends:
+/// dotted IPv4, or IPv6 with or without the brackets a `Host` header
+/// carries it in ([`HostShape::Ipv4`] or [`HostShape::Ipv6`]). Such a
+/// name is served by an `iPAddress` SAN, never by a DNS name or a
+/// wildcard. A caller asking whether a name is a DNS name at all asks
+/// [`crate::host_shape::names_an_address`], which also answers for the
+/// other spellings of an IPv4 address.
 ///
 /// ```
 /// use lorica_config::route_selection::is_ip_literal;
@@ -264,13 +305,10 @@ pub fn validate_hostname_syntax(raw: &str, shape: HostnameShape<'_>) -> Result<S
 /// assert!(is_ip_literal("[2001:db8::1]"));
 /// assert!(is_ip_literal("2001:db8::1"));
 /// assert!(!is_ip_literal("192.0.2.10.example.org"));
+/// assert!(!is_ip_literal("010.0.0.1"));
 /// ```
 pub fn is_ip_literal(name: &str) -> bool {
-    let unbracketed: &str = name
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or(name);
-    unbracketed.parse::<std::net::IpAddr>().is_ok()
+    matches!(host_shape(name), HostShape::Ipv4(_) | HostShape::Ipv6(_))
 }
 
 /// Whether two names are the same name to the selection.
@@ -533,6 +571,10 @@ fn spelled_alike(path: &[u8], pattern: &[u8], case_insensitive: bool) -> bool {
 
 /// [`select`] with the path test left to `serves`: the first entry it
 /// accepts at the first level of the precedence that has one.
+///
+/// A host that names an address skips the wildcard level: `*.0.2.10`
+/// never covers `192.0.2.10`, whatever a configuration stored before
+/// the save refused such a pattern holds.
 fn select_where<'a, E>(
     exact: &'a HashMap<String, Vec<E>>,
     wildcards: &'a [(String, Vec<E>)],
@@ -547,10 +589,12 @@ fn select_where<'a, E>(
     {
         return Some(entry);
     }
-    for (pattern, entries) in wildcards {
-        if suffix_covers(pattern, &host) {
-            if let Some(entry) = serving(entries) {
-                return Some(entry);
+    if !wildcards.is_empty() && !names_an_address(&host) {
+        for (pattern, entries) in wildcards {
+            if suffix_covers(pattern, &host) {
+                if let Some(entry) = serving(entries) {
+                    return Some(entry);
+                }
             }
         }
     }
@@ -797,13 +841,22 @@ fn selects_the_same_path_rule(
 
 /// Whether the wildcard `pattern` (`*.example.com`) covers `host`: any
 /// name ending in `.example.com` with at least one character before it,
-/// deeper labels included, and never `example.com` itself. Both are
-/// compared in [`canonical_hostname`] form.
+/// deeper labels included, and never `example.com` itself, nor a host
+/// that names an address ([`names_an_address`]). Both are compared in
+/// [`canonical_hostname`] form.
+///
+/// ```
+/// use lorica_config::route_selection::wildcard_covers;
+/// assert!(wildcard_covers("*.example.com", "a.example.com"));
+/// assert!(!wildcard_covers("*.0.2.10", "192.0.2.10"));
+/// ```
 pub fn wildcard_covers(pattern: &str, host: &str) -> bool {
-    suffix_covers(&canonical_hostname(pattern), &canonical_hostname(host))
+    let host = canonical_hostname(host);
+    !names_an_address(&host) && suffix_covers(&canonical_hostname(pattern), &host)
 }
 
-/// [`wildcard_covers`] on two names already canonical.
+/// [`wildcard_covers`] on two names already canonical, the host already
+/// known to be no address.
 fn suffix_covers(pattern: &str, host: &str) -> bool {
     let Some(suffix) = pattern.strip_prefix('*') else {
         return false;
@@ -969,18 +1022,20 @@ pub fn serves_all_of(route: &Route, name: &str, path_prefix: &str) -> bool {
 }
 
 /// Every index key whose routes [`select`] can reach for `host`: the
-/// name itself, each wildcard pattern that covers it, and the
-/// catch-all, so a caller holding rows outside an index reads only the
-/// ones that could serve `host` before it builds one. Every key is in
-/// [`canonical_hostname`] form.
+/// name itself, each wildcard pattern that covers it (none for an
+/// address), and the catch-all, so a caller holding rows outside an
+/// index reads only the ones that could serve `host` before it builds
+/// one. Every key is in [`canonical_hostname`] form.
 pub fn keys_reaching(host: &str) -> Vec<String> {
     let host = canonical_hostname(host);
     let mut keys = vec![host.to_string()];
-    keys.extend(
-        host.match_indices('.')
-            .filter(|(at, _)| *at > 0)
-            .map(|(at, _)| format!("*{}", &host[at..])),
-    );
+    if !names_an_address(&host) {
+        keys.extend(
+            host.match_indices('.')
+                .filter(|(at, _)| *at > 0)
+                .map(|(at, _)| format!("*{}", &host[at..])),
+        );
+    }
     keys.push(CATCH_ALL_HOSTNAME.to_string());
     keys
 }
@@ -1391,6 +1446,61 @@ mod tests {
         assert!(!wildcard_covers("example.com", "a.example.com"));
     }
 
+    /// A wildcard stored before the save refused it still never takes a
+    /// request naming an address, in any spelling a client sends.
+    #[test]
+    fn a_wildcard_never_covers_an_address() {
+        for (pattern, host) in [
+            ("*.0.2.10", "192.0.2.10"),
+            ("*.2.10", "192.0.2.10"),
+            ("*.0.2.10", "010.0.2.10"),
+            ("*.0.2.10", "0xc0.0.2.10"),
+            ("*.0.2.10", "192.0.2.10."),
+        ] {
+            assert!(!wildcard_covers(pattern, host), "{pattern} {host}");
+        }
+        let routes = [
+            route("wild", "*.0.2.10", "/"),
+            route("catch", CATCH_ALL_HOSTNAME, "/"),
+            route("dns-wild", "*.example.com", "/"),
+        ];
+        let index = HostIndex::new(routes.iter(), |r| *r);
+        assert_eq!(served(&index, "192.0.2.10", "/"), Some("catch"));
+        assert_eq!(served(&index, "[2001:db8::1]", "/"), Some("catch"));
+        assert_eq!(served(&index, "a.example.com", "/"), Some("dns-wild"));
+        assert!(alike_among(&routes, "192.0.2.10", "/%61"));
+    }
+
+    #[test]
+    fn an_address_is_stored_only_as_a_browser_sends_it_and_never_under_a_wildcard() {
+        for shape in [ROUTE_HOSTNAME_SHAPE, ROUTE_ALIAS_SHAPE] {
+            for accepted in ["192.0.2.10", "0.0.0.0", "app.0x.example", "v10.example"] {
+                assert!(
+                    validate_hostname_syntax(accepted, shape).is_ok(),
+                    "{accepted}"
+                );
+            }
+            for refused in [
+                "010.0.0.1",
+                "192.0.2.010",
+                "0xc0.0.2.10",
+                "0XC0.0.2.10",
+                "3221225994",
+                "192.0.10",
+                "1.2.3.256",
+                "1.2.3.4.5",
+                "example.123",
+                "example.0x1f",
+                "*.0.2.10",
+                "*.10",
+                "*.2.0xa",
+            ] {
+                let refusal = validate_hostname_syntax(refused, shape).expect_err(refused);
+                assert!(refusal.starts_with("hostname "), "{refused}: {refusal}");
+            }
+        }
+    }
+
     #[test]
     fn the_keys_reaching_a_host_are_exactly_those_the_selection_can_pick() {
         // Held to `select` itself: a lone route under each key is picked
@@ -1406,14 +1516,21 @@ mod tests {
             "example.com",
             CATCH_ALL_HOSTNAME,
         ];
+        let keys = [
+            keys.as_slice(),
+            &["192.0.2.10", "*.0.2.10", "*.2.10", "[2001:db8::1]"],
+        ]
+        .concat();
         for host in [
             "a.b.example.com",
             "b.example.com",
             "example.com",
             "x.other.com",
+            "192.0.2.10",
+            "[2001:db8::1]",
         ] {
             let reaching = keys_reaching(host);
-            for key in keys {
+            for key in keys.iter().copied() {
                 let lone = [route("lone", key, "/")];
                 let index = HostIndex::new(lone.iter(), |r| *r);
                 assert_eq!(

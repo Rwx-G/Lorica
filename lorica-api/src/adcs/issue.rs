@@ -440,13 +440,13 @@ pub(crate) fn check_sans(authority: &AdcsAuthority, sans: &[String]) -> Result<(
             format!("sans: wildcard names are refused: {}", quoted(&wildcards)),
         ));
     }
-    // Before the allowlist, so an address gets a refusal that says what
-    // to do instead. No allowlist permits one (`AllowedSuffix::new`
-    // refuses an all-numeric top label), but the CSR must not depend on
-    // that alone.
+    // Before the allowlist, so an address in any spelling a browser reads
+    // as one gets a refusal that says what to do instead. No allowlist
+    // permits one (`AllowedSuffix::new` refuses a numeric top label by
+    // the same rule), but the CSR must not depend on that alone.
     let addresses: Vec<String> = sans
         .iter()
-        .filter(|name: &&String| lorica_config::route_selection::is_ip_literal(name))
+        .filter(|name: &&String| lorica_config::host_shape::names_an_address(name))
         .cloned()
         .collect();
     if !addresses.is_empty() {

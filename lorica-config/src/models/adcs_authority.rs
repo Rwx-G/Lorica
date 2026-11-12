@@ -190,10 +190,12 @@ impl AllowedSuffix {
     /// leading dot, an empty label, a label outside RFC 1123 (LDH, 1 to
     /// 63 characters, no hyphen at either end), a name over 253
     /// characters, a single label (a bare TLD as an allowlist entry would
-    /// let Lorica request any name under it), or a last label of digits
-    /// alone. A top-level domain is never all-numeric (RFC 3696 section
-    /// 2), so such a suffix names no DNS zone: it is the tail of an IPv4
-    /// address (`0.2.10`, or `192.0.2.10` whole), and would let a dotted
+    /// let Lorica request any name under it), or a last label a browser
+    /// reads as a number: decimal digits, or a hex (`0x`) or octal
+    /// (leading `0`) number ([`crate::host_shape`]). A top-level domain
+    /// is never numeric (RFC 3696 section 2), so such a suffix names no
+    /// DNS zone: it is the tail of an IPv4 address in some spelling
+    /// (`0.2.10`, `0x2.0xa`, or `192.0.2.10` whole), and would let an
     /// address pass for a name under it. An IPv6 address or fragment is
     /// refused as not LDH.
     ///
@@ -227,11 +229,10 @@ impl AllowedSuffix {
                 "allowed suffix {raw:?}: at least two labels are required"
             )));
         }
-        let top_level: &str = name.rsplit('.').next().unwrap_or_default();
-        if top_level.bytes().all(|b: u8| b.is_ascii_digit()) {
+        if crate::host_shape::names_an_address(&name) {
             return Err(ConfigError::Validation(format!(
-                "allowed suffix {raw:?}: an all-numeric top-level label is an IP address, \
-                 not a DNS zone; AD CS issuance requests DNS names only"
+                "allowed suffix {raw:?}: a numeric top-level label makes it an IP address \
+                 or its tail, not a DNS zone; AD CS issuance requests DNS names only"
             )));
         }
         Ok(Self(name))
@@ -569,11 +570,17 @@ mod tests {
             ".",
             "*.corp.example.org",
             "*",
-            // An IPv4 address, its tail, or any all-numeric top label.
+            // An IPv4 address, its tail, or any numeric top label, in
+            // any spelling a browser reads as a number.
             "0.2.10",
             "192.0.2.10",
             "192.0.2.10.",
             "corp.10",
+            "0x2.0xa",
+            "corp.0XA",
+            "corp.010",
+            "corp.0x",
+            "010.0.0.1",
             // An IPv6 address or fragment, bracketed or not.
             "2001:db8::1",
             "[2001:db8::1]",

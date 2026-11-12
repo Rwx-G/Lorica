@@ -31,8 +31,13 @@
 //! its own doc carries that reason.
 //!
 //! All of them compare names in the form
-//! [`crate::route_selection::canonical_hostname`] defines.
+//! [`crate::route_selection::canonical_hostname`] defines, and none of
+//! them lets a wildcard cover a host that names an IP address
+//! ([`crate::host_shape::names_an_address`]): `*.0.2.10` is a pattern
+//! over the tail of addresses, and an address is matched exactly or not
+//! at all.
 
+use crate::host_shape::names_an_address;
 use crate::route_selection::canonical_hostname;
 
 /// Does `pattern` match `hostname`, with a wildcard covering any depth?
@@ -42,7 +47,8 @@ use crate::route_selection::canonical_hostname;
 /// * A pattern starting with `*.` matches any hostname whose suffix
 ///   is `pattern[2..]`, but only on a full label boundary. So
 ///   `*.example.com` matches `grafana.example.com` but NOT
-///   `somethingelse.com` or `example.com` itself.
+///   `somethingelse.com` or `example.com` itself, and never a hostname
+///   that names an address.
 /// * Everything else matches as an exact string (case-insensitive).
 ///
 /// See [`matches_one_label`] for the stricter sibling that stops at one
@@ -60,6 +66,9 @@ pub fn matches_any_depth(pattern: &str, hostname: &str) -> bool {
     let host_lc = canonical_hostname(hostname);
     let pat_lc = canonical_hostname(pattern);
     if let Some(suffix) = pat_lc.strip_prefix("*.") {
+        if names_an_address(&host_lc) {
+            return false;
+        }
         // `host_lc` must end with `.suffix` AND have at least one
         // label before it. `*.example.com` matches `a.example.com`
         // but not `example.com`.
@@ -78,7 +87,9 @@ pub fn matches_any_depth(pattern: &str, hostname: &str) -> bool {
 /// * A pattern starting with `*.` matches a hostname whose suffix is
 ///   `pattern[2..]` preceded by exactly ONE more label. So
 ///   `*.example.com` matches `a.example.com` and refuses
-///   `a.b.example.com`, `example.com` and `.example.com`.
+///   `a.b.example.com`, `example.com` and `.example.com`. It never
+///   matches a hostname that names an address: `*.0.2.10` does not
+///   cover `192.0.2.10`.
 /// * Everything else matches as an exact string (case-insensitive).
 ///
 /// One trailing dot is stripped from both arguments first, because
@@ -102,7 +113,7 @@ pub fn matches_one_label(pattern: &str, hostname: &str) -> bool {
         return false;
     }
     if let Some(parent) = pat_lc.strip_prefix("*.") {
-        if parent.is_empty() {
+        if parent.is_empty() || names_an_address(&host_lc) {
             return false;
         }
         let needle = format!(".{parent}");
@@ -234,6 +245,24 @@ mod tests {
         let deep = "a.b.example.com";
         assert!(matches_any_depth(pattern, deep));
         assert!(!matches_one_label(pattern, deep));
+    }
+
+    #[test]
+    fn no_wildcard_covers_an_address_under_either_rule() {
+        for (pattern, host) in [
+            ("*.0.2.10", "192.0.2.10"),
+            ("*.0.2.10", "010.0.2.10"),
+            ("*.2.10", "0.0.2.10"),
+            ("*.0.2.0xa", "0xc0.0.2.0xa"),
+        ] {
+            assert!(!matches_one_label(pattern, host), "{pattern} {host}");
+            assert!(!matches_any_depth(pattern, host), "{pattern} {host}");
+        }
+        // An address still matches itself exactly, and the bare `*` of
+        // the export ACL still covers everything.
+        assert!(matches_one_label("192.0.2.10", "192.0.2.10"));
+        assert!(matches_any_depth("192.0.2.10", "192.0.2.10"));
+        assert!(matches_any_depth("*", "192.0.2.10"));
     }
 
     // ---- specificity ----

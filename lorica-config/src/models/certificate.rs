@@ -213,10 +213,11 @@ pub fn resolve_certificate_for_hostname<'a>(
 /// );
 /// assert!(wildcard_patterns_an_operator_could_provision("example.com").is_empty());
 /// assert!(wildcard_patterns_an_operator_could_provision("192.0.2.10").is_empty());
+/// assert!(wildcard_patterns_an_operator_could_provision("010.0.2.10").is_empty());
 /// ```
 pub fn wildcard_patterns_an_operator_could_provision(hostname: &str) -> Vec<String> {
     let name = crate::route_selection::canonical_hostname(hostname.trim());
-    if crate::route_selection::is_ip_literal(&name) {
+    if crate::host_shape::names_an_address(&name) {
         return Vec::new();
     }
     let Some((_, parent)) = name.split_once('.') else {

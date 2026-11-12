@@ -1,10 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import {
   canonicalIp,
+  hostShape,
   hostnameMatchesSan,
   hostnameCoveredByAny,
   findUncoveredHostnames,
+  namesAnAddress,
 } from './cert-san-match';
+import { HOST_SHAPE_VECTORS } from './ip-literal.generated';
 
 describe('hostnameMatchesSan - exact match', () => {
   it('matches identical names', () => {
@@ -89,18 +92,18 @@ describe('hostnameMatchesSan - empty inputs', () => {
 describe('hostnameCoveredByAny', () => {
   it('returns true when any SAN matches', () => {
     expect(
-      hostnameCoveredByAny('pki.example.com', ['other.example.com', '*.example.com']),
+      hostnameCoveredByAny('pki.example.com', ['other.example.com', '*.example.com'], []),
     ).toBe(true);
   });
 
   it('returns false when no SAN matches', () => {
     expect(
-      hostnameCoveredByAny('pki.example.com', ['other.example.com', '*.foo.example.com']),
+      hostnameCoveredByAny('pki.example.com', ['other.example.com', '*.foo.example.com'], []),
     ).toBe(false);
   });
 
   it('returns false on empty SAN list', () => {
-    expect(hostnameCoveredByAny('pki.example.com', [])).toBe(false);
+    expect(hostnameCoveredByAny('pki.example.com', [], [])).toBe(false);
   });
 });
 
@@ -109,6 +112,7 @@ describe('findUncoveredHostnames', () => {
     const result = findUncoveredHostnames(
       ['pki.example.com', 'api.example.com', 'admin.other.com'],
       ['*.example.com'],
+      [],
     );
     expect(result).toEqual(['admin.other.com']);
   });
@@ -117,6 +121,7 @@ describe('findUncoveredHostnames', () => {
     const result = findUncoveredHostnames(
       ['pki.example.com', 'example.com'],
       ['*.example.com', 'example.com'],
+      [],
     );
     expect(result).toEqual([]);
   });
@@ -125,6 +130,7 @@ describe('findUncoveredHostnames', () => {
     const result = findUncoveredHostnames(
       ['pki.example.com', '', '   '],
       ['*.example.com'],
+      [],
     );
     expect(result).toEqual([]);
   });
@@ -133,6 +139,7 @@ describe('findUncoveredHostnames', () => {
     const result = findUncoveredHostnames(
       ['admin.other.com', 'ADMIN.other.com', 'Admin.Other.Com'],
       ['*.example.com'],
+      [],
     );
     expect(result).toEqual(['admin.other.com']);
   });
@@ -141,6 +148,7 @@ describe('findUncoveredHostnames', () => {
     const result = findUncoveredHostnames(
       ['Admin.Other.Com', 'admin.other.com'],
       ['*.example.com'],
+      [],
     );
     expect(result).toEqual(['Admin.Other.Com']);
   });
@@ -172,8 +180,8 @@ describe('canonicalIp', () => {
 // carries the IP as an IP address SAN.
 describe('hostnameCoveredByAny - IP hostnames', () => {
   it('matches an IPv4 hostname against the IP SANs', () => {
-    expect(hostnameCoveredByAny('192.168.153.1', ['localhost'], ['192.168.153.1'])).toBe(true);
-    expect(hostnameCoveredByAny('192.168.153.2', ['localhost'], ['192.168.153.1'])).toBe(false);
+    expect(hostnameCoveredByAny('192.0.2.20', ['localhost'], ['192.0.2.20'])).toBe(true);
+    expect(hostnameCoveredByAny('192.0.2.21', ['localhost'], ['192.0.2.20'])).toBe(false);
   });
 
   it('matches an IPv6 hostname in any spelling', () => {
@@ -184,8 +192,8 @@ describe('hostnameCoveredByAny - IP hostnames', () => {
   });
 
   it('never matches an IP hostname against a DNS SAN', () => {
-    expect(hostnameCoveredByAny('192.168.153.1', ['192.168.153.1'], [])).toBe(false);
-    expect(hostnameCoveredByAny('::1', ['::1'])).toBe(false);
+    expect(hostnameCoveredByAny('192.0.2.20', ['192.0.2.20'], [])).toBe(false);
+    expect(hostnameCoveredByAny('::1', ['::1'], [])).toBe(false);
   });
 
   it('keeps the address families apart', () => {
@@ -202,10 +210,71 @@ describe('hostnameCoveredByAny - IP hostnames', () => {
 describe('findUncoveredHostnames - IP hostnames', () => {
   it('reports only the names neither SAN list covers', () => {
     const result = findUncoveredHostnames(
-      ['192.168.153.1', 'localhost', '192.168.153.2', 'other.example.com'],
+      ['192.0.2.20', 'localhost', '192.0.2.21', 'other.example.com'],
       ['localhost'],
-      ['192.168.153.1'],
+      ['192.0.2.20'],
     );
-    expect(result).toEqual(['192.168.153.2', 'other.example.com']);
+    expect(result).toEqual(['192.0.2.21', 'other.example.com']);
+  });
+});
+
+// The vector set rendered from `lorica_config::host_shape` by
+// lorica-api/tests/ip_literal_fixture.rs: the Rust rule and this one must
+// answer every vector alike.
+describe('hostShape - the vector set shared with lorica-config', () => {
+  it('answers every vector as the Rust rule does', () => {
+    expect(HOST_SHAPE_VECTORS.length).toBeGreaterThan(0);
+    for (const vector of HOST_SHAPE_VECTORS) {
+      expect(hostShape(vector.input), vector.input).toEqual({ kind: vector.kind, canonical: vector.canonical });
+    }
+  });
+
+  // What the rule claims about browsers, held against the URL parser
+  // itself: a canonical address is sent as written, another spelling of
+  // an IPv4 address is rewritten or refused, and a DNS name is never
+  // read as an address.
+  it('agrees with the URL parser on what a browser sends', () => {
+    const dottedQuad = /^\d{1,3}(\.\d{1,3}){3}$/;
+    const sent = (host: string): string | null => {
+      try {
+        return new URL(`http://${host}/`).hostname;
+      } catch {
+        return null;
+      }
+    };
+    for (const { input, kind, canonical } of HOST_SHAPE_VECTORS) {
+      const withoutRoot = input.endsWith('.') ? input.slice(0, -1) : input;
+      if (kind === 'ipv4') {
+        expect(sent(input), input).toBe(canonical);
+      } else if (kind === 'non_canonical_ipv4') {
+        const host = sent(input);
+        expect(host === null || (dottedQuad.test(host) && host !== withoutRoot), input).toBe(true);
+      } else if (kind === 'ipv6') {
+        const bracketed = withoutRoot.startsWith('[') ? withoutRoot : `[${withoutRoot}]`;
+        expect(sent(bracketed), input).not.toBeNull();
+        expect(hostShape(sent(bracketed) ?? '').canonical, input).toBe(canonical);
+      } else if (!/[:[\]%*]/.test(input) && input !== '') {
+        const host = sent(input);
+        expect(host === null || !dottedQuad.test(host), input).toBe(true);
+      }
+    }
+  });
+});
+
+describe('hostnameCoveredByAny - addresses spelled otherwise', () => {
+  it('covers an IPv4 address spelled otherwise by nothing, its canonical SAN included', () => {
+    expect(hostnameCoveredByAny('010.0.0.1', ['010.0.0.1'], ['8.0.0.1', '10.0.0.1'])).toBe(false);
+    expect(hostnameCoveredByAny('0xc0.0.2.10', [], ['192.0.2.10'])).toBe(false);
+    expect(namesAnAddress('0xc0.0.2.10')).toBe(true);
+    expect(canonicalIp('0xc0.0.2.10')).toBeNull();
+  });
+
+  it('never lets a wildcard SAN cover an address', () => {
+    expect(hostnameMatchesSan('192.0.2.10', '*.0.2.10')).toBe(false);
+    expect(hostnameCoveredByAny('192.0.2.10', ['*.0.2.10'], [])).toBe(false);
+  });
+
+  it('reads an IPv4-mapped SAN in either spelling as one address', () => {
+    expect(hostnameCoveredByAny('[::ffff:192.0.2.10]', [], ['::ffff:c000:20a'])).toBe(true);
   });
 });
