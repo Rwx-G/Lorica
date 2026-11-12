@@ -651,14 +651,16 @@ impl HttpPeer {
     }
 
     /// Create a new [`HttpPeer`] with the given socket address and TLS settings.
-    pub fn new<A: ToInetSocketAddrs>(address: A, tls: bool, sni: String) -> Self {
-        Self::try_new(address, tls, sni).expect("DNS resolution failed for backend address")
-    }
-
-    /// Fallible variant of [`new`](Self::new). Returns an error when DNS
-    /// resolution fails (e.g. transient network blip, misconfigured
-    /// backend hostname) instead of panicking the proxy thread.
-    pub fn try_new<A: ToInetSocketAddrs>(address: A, tls: bool, sni: String) -> Result<Self> {
+    ///
+    /// `address` is anything that implements [`ToSocketAddrs`](std::net::ToSocketAddrs).
+    /// The first socket address it yields is used.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SocketError`] if `address` cannot be converted to a socket address, for
+    /// example because it is malformed or its hostname does not resolve, or if it converts
+    /// but yields no socket addresses (Lorica: upstream panics on that last case).
+    pub fn new<A: ToInetSocketAddrs>(address: A, tls: bool, sni: String) -> Result<Self> {
         let mut addrs_iter = address
             .to_socket_addrs()
             .or_err(SocketError, "failed to resolve backend address")?;
@@ -703,14 +705,18 @@ impl HttpPeer {
     }
 
     /// Create a new [`HttpPeer`] with client certificate and key for mutual TLS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`HttpPeer::new`].
     pub fn new_mtls<A: ToInetSocketAddrs>(
         address: A,
         sni: String,
         client_cert_key: Arc<CertKey>,
-    ) -> Self {
-        let mut peer = Self::new(address, true, sni);
+    ) -> Result<Self> {
+        let mut peer = Self::new(address, true, sni)?;
         peer.client_cert_key = Some(client_cert_key);
-        peer
+        Ok(peer)
     }
 
     fn peer_hash(&self) -> u64 {
@@ -853,5 +859,18 @@ mod tests {
         assert!(!policy.strip_connection_nominated);
         assert!(!policy.reject_malformed_connection_nominations);
         assert_eq!(policy.h1_upgrade, H1UpgradePolicy::Preserve);
+    }
+
+    #[test]
+    fn http_peer_new_refuses_an_address_it_cannot_use() {
+        let malformed = HttpPeer::new("not an address", false, String::new()).unwrap_err();
+        assert_eq!(malformed.etype(), &SocketError);
+
+        let no_addresses: &[InetSocketAddr] = &[];
+        let empty = HttpPeer::new(no_addresses, false, String::new()).unwrap_err();
+        assert_eq!(empty.etype(), &SocketError);
+
+        let peer = HttpPeer::new("127.0.0.1:443", true, "example.com".into()).unwrap();
+        assert_eq!(peer.address().to_string(), "127.0.0.1:443");
     }
 }

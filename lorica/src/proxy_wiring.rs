@@ -2202,11 +2202,7 @@ impl ProxyHttp for LoricaProxy {
         } else {
             String::new()
         };
-        let mut peer = Box::new(HttpPeer::try_new(
-            &*backend.address,
-            backend.tls_upstream,
-            sni,
-        )?);
+        let mut peer = Box::new(HttpPeer::new(&*backend.address, backend.tls_upstream, sni)?);
 
         // Force HTTP/2 upstream if configured on the backend
         if backend.h2_upstream {

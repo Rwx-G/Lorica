@@ -92,7 +92,7 @@ mod tests {
     async fn test_connect() {
         init_crypto();
         let connector = Connector::new(None);
-        let peer = HttpPeer::new(("1.1.1.1", 80), false, "".into());
+        let peer = HttpPeer::new(("1.1.1.1", 80), false, "".into()).unwrap();
         // make a new connection to 1.1.1.1
         let (http, reused) = connector.get_http_session(&peer).await.unwrap();
         let server_addr = http.server_addr().unwrap();
@@ -151,7 +151,7 @@ mod tests {
         }
 
         let connector = Connector::new(None);
-        let peer = HttpPeer::new(("1.1.1.1", 80), false, "".into());
+        let peer = HttpPeer::new(("1.1.1.1", 80), false, "".into()).unwrap();
         let (mut http, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(!reused);
         get_http(&mut http, 301).await;
@@ -174,7 +174,7 @@ mod tests {
     async fn test_connect_tls() {
         init_crypto();
         let connector = Connector::new(None);
-        let peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         // make a new connection to https://1.1.1.1
         let (http, reused) = connector.get_http_session(&peer).await.unwrap();
         let server_addr = http.server_addr().unwrap();
