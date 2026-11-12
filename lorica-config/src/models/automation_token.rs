@@ -330,6 +330,12 @@ impl AutomationToken {
 /// node serves is describing an operator credential, not an automation
 /// one.
 ///
+/// A wildcard whose last label is a number is refused, and so is an
+/// exact name a browser reads as an IPv4 address spelled another way
+/// ([`crate::host_shape`]): the first would stand for addresses, which a
+/// wildcard never covers ([`matches_one_label`] does not match one
+/// either), and the second names a route no save accepts.
+///
 /// Shared with the OIDC issuer entry (Story 10.5) through
 /// [`validate_automation_grants`]: it grants the same kind of authority over a
 /// name and must read a pattern the same way.
@@ -354,6 +360,22 @@ fn validate_hostname_pattern(pattern: &str) -> Result<(), String> {
     }
     for label in parent.split('.') {
         validate_hostname_label(label).map_err(|why| invalid(&why))?;
+    }
+    match crate::host_shape::host_shape(parent) {
+        crate::host_shape::HostShape::NotAnAddress => {}
+        _ if parent.len() != pattern.len() => {
+            return Err(invalid(
+                "a wildcard whose last label is a number would stand for IP addresses, \
+                 which a wildcard never covers; grant each address by name",
+            ));
+        }
+        crate::host_shape::HostShape::NonCanonicalIpv4 => {
+            return Err(invalid(
+                "browsers read it as an IPv4 address spelled another way; write the address \
+                 as four decimal numbers without leading zeros",
+            ));
+        }
+        crate::host_shape::HostShape::Ipv4(_) | crate::host_shape::HostShape::Ipv6(_) => {}
     }
     Ok(())
 }
@@ -711,6 +733,37 @@ mod tests {
         let token = valid_token();
         assert!(!token.allows_hostname("example.com"));
         assert!(!token.allows_hostname("preview.example.com.evil.test"));
+    }
+
+    /// A grant stored before the save refused `*.0.2.10` never reaches a
+    /// route named by an address; the address itself is granted only by
+    /// name.
+    #[test]
+    fn a_wildcard_grant_never_covers_an_address_and_is_refused_at_save() {
+        let mut token = valid_token();
+        token.allowed_hostnames = vec!["*.0.2.10".to_string(), "198.51.100.7".to_string()];
+        for address in ["192.0.2.10", "010.0.2.10", "0xc0.0.2.10"] {
+            assert!(!token.allows_hostname(address), "{address}");
+        }
+        assert!(token.allows_hostname("198.51.100.7"));
+        let refused = token
+            .validate()
+            .expect_err("a wildcard over an address tail");
+        assert!(
+            refused.contains("`*.0.2.10` is not a valid hostname pattern"),
+            "{refused}"
+        );
+
+        for pattern in ["*.10", "*.2.0xa", "010.0.0.1", "0xc0.0.2.10", "192.0.10"] {
+            token.allowed_hostnames = vec![pattern.to_string()];
+            let refused = token.validate().expect_err(pattern);
+            assert!(
+                refused.contains("is not a valid hostname pattern"),
+                "{refused}"
+            );
+        }
+        token.allowed_hostnames = vec!["198.51.100.7".to_string(), "*.v10.example".to_string()];
+        assert_eq!(token.validate(), Ok(()));
     }
 
     // ---- Validation ----

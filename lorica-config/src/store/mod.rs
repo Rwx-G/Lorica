@@ -196,7 +196,12 @@ const MIGRATIONS: &[Migration] = &[
     (67, migrate_route_protection_records),
     (68, migrate_canonical_route_names),
     (69, migrate_route_case_insensitive_paths),
+    (70, migrate_address_spellings),
 ];
+
+/// The newest schema version, the last entry of [`MIGRATIONS`].
+#[cfg(test)]
+pub(crate) const SCHEMA_HEAD: i64 = MIGRATIONS[MIGRATIONS.len() - 1].0;
 
 /// Which telemetry fan-in cursor a follower is reading or advancing
 /// (Story 9.6 AC #5).
@@ -1401,6 +1406,22 @@ fn migrate_route_protection_records(conn: &Connection) -> rusqlite::Result<()> {
 /// Its own version rather than part of 67, which only adds the record
 /// tables: this one rewrites rows, and a test rewinds it alone.
 fn migrate_canonical_route_names(conn: &Connection) -> rusqlite::Result<()> {
+    rewrite_canonical_route_names(conn, 68, |_| true)
+}
+
+/// The body of every migration that rewrites stored route and record
+/// names to `route_selection::canonical_hostname` form (68, 70): it runs
+/// the function as this binary has it, so each such migration exists
+/// because that function changed, and a change to it needs one more.
+///
+/// `migration` tags every line it logs. `reports` picks the collisions
+/// worth a warning: a re-run reports only those its own change can have
+/// created, not the ones an earlier run already reported.
+fn rewrite_canonical_route_names(
+    conn: &Connection,
+    migration: i64,
+    reports: impl Fn(&crate::route_selection::NameCollision) -> bool,
+) -> rusqlite::Result<()> {
     use crate::route_selection::{canonical_names, canonicalise_route_names, RouteNames};
 
     let mut routes: Vec<RouteNames> = Vec::new();
@@ -1437,8 +1458,12 @@ fn migrate_canonical_route_names(conn: &Connection) -> rusqlite::Result<()> {
         }
     }
     let stored = routes.clone();
-    for collision in canonicalise_route_names(&mut routes) {
+    for collision in canonicalise_route_names(&mut routes)
+        .into_iter()
+        .filter(|collision| reports(collision))
+    {
         tracing::warn!(
+            migration,
             name = %collision.name,
             served_route_id = %collision.served_route_id,
             shadowed_route_id = %collision.shadowed_route_id,
@@ -1516,6 +1541,207 @@ fn migrate_route_case_insensitive_paths(conn: &Connection) -> rusqlite::Result<(
         "case_insensitive_paths",
         "INTEGER NOT NULL DEFAULT 0",
     )
+}
+
+/// The two 1.10.5 rules about addresses, applied to what is stored.
+///
+/// Migration 68's rewrite run again, now that
+/// `route_selection::canonical_hostname` also writes a bracketed IPv6
+/// literal in its RFC 5952 spelling: a route or record name stored as
+/// `[2001:DB8:0:0::1]` becomes `[2001:db8::1]`, the form a request is
+/// looked up in and a record lookup binds. The same body, so the same
+/// policy: a name two routes hold under two spellings of one address is
+/// rewritten on the route the selection serves it from and kept as
+/// stored on the other, nothing deleted or switched off. Every name 68
+/// already rewrote is canonical and stays as it is, and so does every
+/// twin it kept. Only collisions on IPv6 literal names are reported,
+/// the only names whose form this run changed; a pair 68 already
+/// reported on a DNS name is not reported twice.
+///
+/// Then each AD CS allowed suffix that names an IP address or its tail
+/// (`crate::host_shape::names_an_address`) is removed from the stored
+/// allowlist, with one warning per entry: such a suffix names no DNS
+/// zone, and `AllowedSuffix::new` refuses it from 1.10.5 on. A list left
+/// empty permits nothing, and the store still saves it as it stands
+/// (`ConfigStore::upsert_adcs_authority`).
+///
+/// Last, every stored wildcard whose last label is a number is named in
+/// one warning ([`wildcards_over_addresses`]): from 1.10.5 on it covers
+/// no address, so a host or certificate it used to take falls to the
+/// next rule. Those rows are left as they are.
+///
+/// Unreleased when it was last changed: no node ran an earlier shape of
+/// this migration outside a development tree.
+fn migrate_address_spellings(conn: &Connection) -> rusqlite::Result<()> {
+    rewrite_canonical_route_names(conn, 70, |collision| collision.name.starts_with('['))?;
+    drop_address_suffixes_from_adcs_allowlist(conn, 70)?;
+    for row in wildcards_over_addresses(conn)? {
+        tracing::warn!(
+            migration = 70,
+            table = row.table,
+            row_id = %row.row_id,
+            pattern = %row.pattern,
+            "a wildcard whose last label is a number covers no IP address since 1.10.5: {}; \
+             the row is kept as it is",
+            row.now
+        );
+    }
+    Ok(())
+}
+
+/// A stored wildcard pattern whose body names an address (`*.0.2.10`),
+/// which the matchers no longer let cover one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WildcardOverAddresses {
+    /// The table that holds it.
+    table: &'static str,
+    /// The row's key in that table.
+    row_id: String,
+    /// The pattern as stored.
+    pattern: String,
+    /// What a host or certificate it used to take falls to now.
+    now: &'static str,
+}
+
+/// Every stored wildcard whose body names an address
+/// (`crate::host_shape::names_an_address`): route hostnames and aliases,
+/// token and OIDC issuer hostname grants, and certificate export ACL
+/// patterns. Read only. A table or column absent from a hand-built test
+/// schema, and a JSON list that does not parse, are skipped.
+fn wildcards_over_addresses(conn: &Connection) -> rusqlite::Result<Vec<WildcardOverAddresses>> {
+    const ROUTE: &str = "a request naming such an address is served by an exact route or \
+                         the catch-all route, under that route's controls";
+    const GRANT: &str = "the grant no longer covers a route named by such an address";
+    const ACL: &str = "a certificate named by such an address takes the next matching \
+                       export ACL (a `*` one, if any) or the global default owner";
+    let over_an_address = |pattern: &str| {
+        crate::route_selection::canonical_hostname(pattern)
+            .strip_prefix("*.")
+            .is_some_and(crate::host_shape::names_an_address)
+    };
+    let mut found: Vec<WildcardOverAddresses> = Vec::new();
+    let mut scan = |table: &'static str,
+                    select: &str,
+                    is_list: bool,
+                    now: &'static str|
+     -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare(select)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (row_id, value) = row?;
+            let Some(value) = value else { continue };
+            let patterns: Vec<String> = if is_list {
+                serde_json::from_str(&value).unwrap_or_default()
+            } else {
+                vec![value]
+            };
+            for pattern in patterns.into_iter().filter(|p| over_an_address(p)) {
+                found.push(WildcardOverAddresses {
+                    table,
+                    row_id: row_id.clone(),
+                    pattern,
+                    now,
+                });
+            }
+        }
+        Ok(())
+    };
+    if column_exists(conn, "routes", "hostname")? {
+        scan(
+            "routes",
+            "SELECT id, hostname FROM routes ORDER BY id",
+            false,
+            ROUTE,
+        )?;
+    }
+    if column_exists(conn, "routes", "hostname_aliases")? {
+        scan(
+            "routes",
+            "SELECT id, hostname_aliases FROM routes ORDER BY id",
+            true,
+            ROUTE,
+        )?;
+    }
+    if column_exists(conn, "api_tokens", "allowed_hostnames_json")? {
+        scan(
+            "api_tokens",
+            "SELECT public_id, allowed_hostnames_json FROM api_tokens ORDER BY public_id",
+            true,
+            GRANT,
+        )?;
+    }
+    if column_exists(conn, "oidc_issuers", "allowed_hostnames_json")? {
+        scan(
+            "oidc_issuers",
+            "SELECT id, allowed_hostnames_json FROM oidc_issuers ORDER BY id",
+            true,
+            GRANT,
+        )?;
+    }
+    if column_exists(conn, "cert_export_acls", "hostname_pattern")? {
+        scan(
+            "cert_export_acls",
+            "SELECT id, hostname_pattern FROM cert_export_acls ORDER BY id",
+            false,
+            ACL,
+        )?;
+    }
+    Ok(found)
+}
+
+/// Remove every allowed suffix that names an address from the stored AD
+/// CS authority, logging each one. A column that does not parse is left
+/// for the read to report as corrupt; a table without the column is a
+/// hand-built test schema.
+fn drop_address_suffixes_from_adcs_allowlist(
+    conn: &Connection,
+    migration: i64,
+) -> rusqlite::Result<()> {
+    if !column_exists(conn, "adcs_authority", "allowed_suffixes_json")? {
+        return Ok(());
+    }
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn.prepare("SELECT id, allowed_suffixes_json FROM adcs_authority")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<(String, String)>>>()?
+    };
+    for (authority_id, json) in rows {
+        let Ok(stored) = serde_json::from_str::<Vec<String>>(&json) else {
+            continue;
+        };
+        let (dropped, kept): (Vec<String>, Vec<String>) = stored
+            .into_iter()
+            .partition(|suffix: &String| crate::host_shape::names_an_address(suffix));
+        if dropped.is_empty() {
+            continue;
+        }
+        for suffix in &dropped {
+            tracing::warn!(
+                migration,
+                authority_id = %authority_id,
+                suffix = %suffix,
+                "AD CS allowed suffix names an IP address, not a DNS zone, and was removed \
+                 from the allowlist; AD CS issuance requests DNS names only"
+            );
+        }
+        if kept.is_empty() {
+            tracing::warn!(
+                migration,
+                authority_id = %authority_id,
+                "the AD CS allowlist is now empty: the authority issues and renews nothing \
+                 until a DNS suffix is added under Settings"
+            );
+        }
+        let kept_json = serde_json::to_string(&kept)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        conn.execute(
+            "UPDATE adcs_authority SET allowed_suffixes_json = ?1 WHERE id = ?2",
+            params![kept_json, authority_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn migrate_acme_challenge_expiry(conn: &Connection) -> rusqlite::Result<()> {
@@ -2616,5 +2842,253 @@ mod migration_tests {
                 .expect("purge succeeds"),
             1
         );
+    }
+
+    /// Spellings of every class of name `canonical_hostname` handles:
+    /// case, root dots, wildcards, the catch-all, IPv4 and its other
+    /// spellings, IPv6 under several spellings, mapped, zoned or not an
+    /// address at all, and text outside ASCII.
+    const CANONICAL_FORM_PROBES: &[&str] = &[
+        "",
+        ".",
+        "_",
+        "app.example.com",
+        "App.Example.COM",
+        "app.example.com.",
+        "app.example.com..",
+        "*.Example.com.",
+        "Bücher.Example",
+        "192.0.2.10",
+        "192.0.2.10.",
+        "010.0.0.1",
+        "0XC0.0.2.10",
+        "[2001:db8::1]",
+        "[2001:DB8:0:0::0001]",
+        "[2001:db8::1].",
+        "[0:0:0:0:0:0:0:1]",
+        "[::FFFF:C000:20A]",
+        "[::ffff:192.0.2.10]",
+        "[FE80::1%25ETH0]",
+        "[Not-An-Address]",
+        "2001:DB8::1",
+        "[2001:db8::1]:443",
+    ];
+
+    /// The migration that last rewrote the stored names, and the digest
+    /// of what `canonical_hostname` answered for
+    /// [`CANONICAL_FORM_PROBES`] when it did.
+    const CANONICAL_FORM_PIN: (i64, u64) = (70, 0x1f23_fb53_d398_7d28);
+
+    /// FNV-1a over each probe and its canonical form: a fixed function
+    /// of the answers, the same on every platform and toolchain.
+    fn canonical_form_digest() -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut digest = FNV_OFFSET;
+        for probe in CANONICAL_FORM_PROBES {
+            let canonical = crate::route_selection::canonical_hostname(probe);
+            for byte in probe
+                .bytes()
+                .chain([0])
+                .chain(canonical.bytes())
+                .chain(*b"\n")
+            {
+                digest ^= u64::from(byte);
+                digest = digest.wrapping_mul(FNV_PRIME);
+            }
+        }
+        digest
+    }
+
+    /// Stored names are in `canonical_hostname` form, and the proxy
+    /// looks a request up in it: the function cannot change what it
+    /// answers unless a migration rewrites the stored names under the
+    /// new answers.
+    #[test]
+    fn canonical_hostname_changes_only_with_a_migration_that_rewrites_stored_names() {
+        let (migration, pinned) = CANONICAL_FORM_PIN;
+        let digest = canonical_form_digest();
+        assert_eq!(
+            digest, pinned,
+            "\n`route_selection::canonical_hostname` answers differently than when migration \
+             {migration} last rewrote the stored route and record names, so names stored \
+             under the old form no longer match the requests that name them. Add a \
+             migration that calls `rewrite_canonical_route_names`, then pin it here as \
+             ({{its version}}, {digest:#x}).\n"
+        );
+        assert!(
+            migration <= SCHEMA_HEAD,
+            "the pinned migration {migration} is not in MIGRATIONS"
+        );
+    }
+
+    /// The pinned migration is one that rewrites stored names: run on
+    /// rows spelled otherwise, it leaves each canonical.
+    #[test]
+    fn the_pinned_migration_rewrites_stored_names_to_the_canonical_form() {
+        let (migration, _) = CANONICAL_FORM_PIN;
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO routes (id, hostname, hostname_aliases, created_at, updated_at)
+                 VALUES ('r-1', 'App.Example.COM.', '[\"WWW.Example.com\"]',
+                     '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+                 ('r-2', '[2001:DB8:0:0::0001]', '[]',
+                     '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');",
+            )
+            .expect("test setup: names as written");
+        let (_, rewrite) = MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == migration)
+            .expect("the pinned migration is in MIGRATIONS");
+        rewrite(&store.conn).expect("the migration runs");
+        for (id, hostname, aliases) in [
+            ("r-1", "app.example.com", "[\"www.example.com\"]"),
+            ("r-2", "[2001:db8::1]", "[]"),
+        ] {
+            let stored: (String, String) = store
+                .conn
+                .query_row(
+                    "SELECT hostname, hostname_aliases FROM routes WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("the row reads");
+            assert_eq!(stored, (hostname.to_string(), aliases.to_string()), "{id}");
+        }
+    }
+
+    /// The fields of every event logged while it is the default
+    /// subscriber, each as text.
+    #[derive(Clone, Default)]
+    struct CapturedEvents(
+        std::sync::Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>,
+    );
+
+    struct FieldsAsText<'a>(&'a mut std::collections::BTreeMap<String, String>);
+
+    impl tracing::field::Visit for FieldsAsText<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl tracing::Subscriber for CapturedEvents {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = std::collections::BTreeMap::new();
+            event.record(&mut FieldsAsText(&mut fields));
+            self.0.lock().expect("not poisoned").push(fields);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Migration 70 names each stored wildcard over an address in one
+    /// warning (table, row, pattern), and leaves every row as it was.
+    #[test]
+    fn migration_70_warns_about_each_wildcard_over_addresses_and_changes_nothing() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO routes (id, hostname, hostname_aliases, created_at, updated_at)
+                 VALUES ('r-wild', '*.0.2.10', '[]',
+                     '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+                 ('r-alias', 'app.example.com', '[\"*.2.10\",\"*.example.com\"]',
+                     '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+                 ('r-dns', '*.example.org', '[]',
+                     '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+                 INSERT INTO api_tokens (public_id, name, secret_hmac, scopes_json,
+                     allowed_hostnames_json, allowed_backend_cidrs_json, max_ttl_seconds,
+                     created_by, created_at, expires_at)
+                 VALUES ('tok-1', 'ci', '00', '[]', '[\"*.0.2.0xa\",\"*.preview.example.com\"]',
+                     '[]', 3600, 'admin', '2026-01-01T00:00:00+00:00',
+                     '2027-01-01T00:00:00+00:00');
+                 INSERT INTO oidc_issuers (id, issuer, audience, jwks_url, bound_claims_json,
+                     scopes_json, allowed_hostnames_json, allowed_backend_cidrs_json,
+                     max_ttl_seconds, created_by, created_at)
+                 VALUES ('iss-1', 'https://issuer.example.com', 'lorica',
+                     'https://issuer.example.com/jwks', '{}', '[]', '[\"*.10\"]', '[]', 3600,
+                     'admin', '2026-01-01T00:00:00+00:00');
+                 INSERT INTO cert_export_acls (id, hostname_pattern)
+                 VALUES ('acl-1', '*.0.2.10'), ('acl-2', '*'), ('acl-3', '*.example.com');",
+            )
+            .expect("test setup: rows stored before 1.10.5");
+        let snapshot = || -> Vec<String> {
+            let mut rows: Vec<String> = Vec::new();
+            for select in [
+                "SELECT id || hostname || hostname_aliases FROM routes ORDER BY id",
+                "SELECT public_id || allowed_hostnames_json FROM api_tokens",
+                "SELECT id || allowed_hostnames_json FROM oidc_issuers",
+                "SELECT id || hostname_pattern FROM cert_export_acls ORDER BY id",
+            ] {
+                let mut stmt = store.conn.prepare(select).expect("test setup: select");
+                let read = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .expect("test setup: rows")
+                    .collect::<rusqlite::Result<Vec<String>>>()
+                    .expect("test setup: rows read");
+                rows.extend(read);
+            }
+            rows
+        };
+        let before = snapshot();
+
+        let captured = CapturedEvents::default();
+        tracing::subscriber::with_default(captured.clone(), || {
+            migrate_address_spellings(&store.conn).expect("the migration runs")
+        });
+
+        assert_eq!(snapshot(), before, "no row is rewritten or deleted");
+        let mut warned: Vec<(String, String, String)> = captured
+            .0
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .filter(|fields| fields.get("migration").map(String::as_str) == Some("70"))
+            .filter_map(|fields| {
+                Some((
+                    fields.get("table")?.clone(),
+                    fields.get("row_id")?.clone(),
+                    fields.get("pattern")?.clone(),
+                ))
+            })
+            .collect();
+        warned.sort();
+        let expected: Vec<(String, String, String)> = [
+            ("api_tokens", "tok-1", "*.0.2.0xa"),
+            ("cert_export_acls", "acl-1", "*.0.2.10"),
+            ("oidc_issuers", "iss-1", "*.10"),
+            ("routes", "r-alias", "*.2.10"),
+            ("routes", "r-wild", "*.0.2.10"),
+        ]
+        .iter()
+        .map(|(table, id, pattern)| (table.to_string(), id.to_string(), pattern.to_string()))
+        .collect();
+        assert_eq!(warned, expected);
     }
 }

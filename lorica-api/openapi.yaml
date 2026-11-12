@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: Lorica API
   description: REST API for Lorica reverse proxy management
-  version: "1.10.4"
+  version: "1.10.5"
   license:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
@@ -1716,8 +1716,9 @@ paths:
         lowercased and deduplicated (the first one is the `CN` and the
         stored `domain`), then checked against the authority's allowed DNS
         suffixes on whole labels before anything is sent: a name outside
-        them, a wildcard, an empty list or more than 100 names is refused
-        with 422 `adcs_san_refused` naming the offending names. The subject
+        them, a wildcard, an IP address, an empty list or more than 100
+        names is refused with 422 `adcs_san_refused` naming the offending
+        names. The subject
         is the authority's defaults with the request's set fields over
         them; the template and key type default to the authority's. The
         template must be the authority's default or one of its
@@ -7120,6 +7121,15 @@ components:
           type: array
           items:
             type: string
+        san_ips:
+          type: array
+          items:
+            type: string
+          description: >-
+            The leaf certificate's IP address SAN entries, IPv6 in RFC 5952
+            form. Derived from the stored PEM on every read, never stored,
+            and never part of `san_domains`: renewal and automation grants
+            read only `san_domains`.
         fingerprint:
           type: string
         issuer:
@@ -7565,10 +7575,16 @@ components:
           $ref: "#/components/schemas/AdcsSubjectDefaults"
         allowed_suffixes:
           type: array
-          minItems: 1
           items:
             type: string
-          description: DNS suffixes Lorica may request names under; wildcards are refused
+          description: >-
+            DNS suffixes Lorica may request names under; wildcards and
+            entries whose top-level label is a number (an IP address or its
+            tail, in any spelling) are refused. At least one is required (422
+            otherwise), except on an update of an authority whose stored list
+            is already empty, which the 1.10.5 upgrade leaves when every entry
+            named an address: that authority saves as it stands and permits
+            no name until a suffix is added.
         auto_renew_default:
           type: boolean
     AdcsConnectionTestResult:

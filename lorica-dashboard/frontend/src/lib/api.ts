@@ -731,6 +731,12 @@ export interface CertificateResponse {
   id: string;
   domain: string;
   san_domains: string[];
+  /**
+   * The leaf's IP address SANs, derived by the API from the PEM, for
+   * display and for checking a route whose hostname is an IP. Never
+   * part of `san_domains`, which renewal reads as DNS names.
+   */
+  san_ips: string[];
   fingerprint: string;
   issuer: string;
   /**

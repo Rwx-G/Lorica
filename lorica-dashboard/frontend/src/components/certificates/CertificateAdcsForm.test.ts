@@ -105,6 +105,16 @@ describe('CertificateAdcsForm hints and request', () => {
     expect(screen.getByTestId('adcs-issue-confirm')).toBeInTheDocument();
   });
 
+  it('hints that an IP address is refused, apart from the suffix hint', async () => {
+    served();
+    await rendered();
+    await fireEvent.input(screen.getByLabelText(/^DNS names/), {
+      target: { value: '192.0.2.10\n[2001:db8::1]' },
+    });
+    expect(screen.getByTestId('adcs-hint-ip')).toHaveTextContent('192.0.2.10, [2001:db8::1]');
+    expect(screen.queryByTestId('adcs-hint-suffix')).not.toBeInTheDocument();
+  });
+
   it('refuses to review an empty name list', async () => {
     served();
     const issue = vi.spyOn(api, 'issueAdcsCertificate');

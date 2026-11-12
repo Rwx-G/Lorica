@@ -28,6 +28,9 @@ pub struct CertificateResponse {
     pub domain: String,
     /// Extra SAN DNS names parsed from the cert.
     pub san_domains: Vec<String>,
+    /// The leaf's `iPAddress` SAN entries, derived from the PEM, for
+    /// display only: never part of `san_domains`.
+    pub san_ips: Vec<String>,
     /// SHA-256 fingerprint (hex).
     pub fingerprint: String,
     /// Issuer DN.
@@ -130,6 +133,9 @@ pub struct CertificateDetailResponse {
     pub domain: String,
     /// SAN DNS names from the cert.
     pub san_domains: Vec<String>,
+    /// The leaf's `iPAddress` SAN entries, derived from the PEM, for
+    /// display only: never part of `san_domains`.
+    pub san_ips: Vec<String>,
     /// SHA-256 fingerprint (hex).
     pub fingerprint: String,
     /// PEM-encoded leaf + chain.
@@ -162,10 +168,12 @@ pub struct CertificateDetailResponse {
 }
 
 pub(crate) fn cert_to_response(c: &lorica_config::models::Certificate) -> CertificateResponse {
+    let leaf: LeafView = leaf_view(&c.cert_pem);
     CertificateResponse {
         id: c.id.clone(),
         domain: c.domain.clone(),
         san_domains: c.san_domains.clone(),
+        san_ips: leaf.san_ips,
         fingerprint: c.fingerprint.clone(),
         issuer: c.issuer.clone(),
         not_before: c.not_before.to_rfc3339(),
@@ -175,29 +183,47 @@ pub(crate) fn cert_to_response(c: &lorica_config::models::Certificate) -> Certif
         created_at: c.created_at.to_rfc3339(),
         acme_method: c.acme_method.clone(),
         acme_dns_provider_id: c.acme_dns_provider_id.clone(),
-        subject: subject_of(&c.cert_pem),
+        subject: leaf.subject,
         source: c.source(),
         adcs: AdcsCertificateFields::of(c),
     }
 }
 
-/// The most subjects [`SUBJECTS`] keeps before it starts again empty: a
+/// The most entries [`LEAF_VIEWS`] keeps before it starts again empty: a
 /// bound for a process whose views are built only one row at a time,
 /// far above any certificate count a listing prunes it to.
-const SUBJECT_CACHE_MAX: usize = 65_536;
+const LEAF_VIEW_CACHE_MAX: usize = 65_536;
 
-/// The subject of every certificate PEM a view was built from, per
+/// What a certificate view reads from the stored leaf rather than from
+/// the row.
+#[derive(Clone)]
+struct LeafView {
+    /// See [`subject_of`].
+    subject: String,
+    /// The leaf's IP SANs as `lorica_tls::cert_resolver::ip_sans_of_leaf`
+    /// reads them for the TLS listener, each in the `std::net::IpAddr`
+    /// display form (RFC 5952 for IPv6, so an IPv4-mapped entry shows as
+    /// `::ffff:a.b.c.d`); empty when the PEM cannot be read.
+    ///
+    /// For display only: the dashboard checks a route whose hostname is
+    /// an IP against them. They are never written to `san_domains`,
+    /// which feeds ACME and AD CS renewal, automation grants and metrics,
+    /// all of which take every entry for a DNS name.
+    san_ips: Vec<String>,
+}
+
+/// The [`LeafView`] of every certificate PEM a view was built from, per
 /// SHA-256 of that PEM.
 ///
-/// A subject is a function of the PEM bytes alone, so an entry is never
-/// stale: a renewed or replaced certificate is another key. Parsing
-/// every stored chain on every list request is what this saves; hashing
-/// the PEM is an order of magnitude cheaper than decoding and parsing
-/// it. In memory rather than a stored column, because a column would
-/// change the certificate row every follower replicates, for a value
-/// only the management API reads. [`list_certificates`] keeps only the
-/// entries of the rows it listed.
-static SUBJECTS: LazyLock<Mutex<HashMap<[u8; 32], String>>> = LazyLock::new(Mutex::default);
+/// A leaf view is a function of the PEM bytes alone, so an entry is
+/// never stale: a renewed or replaced certificate is another key.
+/// Parsing every stored chain on every list request is what this saves;
+/// hashing the PEM is an order of magnitude cheaper than decoding and
+/// parsing it. In memory rather than a stored column, because a column
+/// would change the certificate row every follower replicates, for a
+/// value only the management API reads. [`list_certificates`] keeps
+/// only the entries of the rows it listed.
+static LEAF_VIEWS: LazyLock<Mutex<HashMap<[u8; 32], LeafView>>> = LazyLock::new(Mutex::default);
 
 fn pem_digest(cert_pem: &str) -> [u8; 32] {
     let mut out: [u8; 32] = [0; 32];
@@ -215,37 +241,57 @@ fn pem_digest(cert_pem: &str) -> [u8; 32] {
 /// Computed from the stored certificate rather than stored: an AD CS
 /// authority may rewrite the subject it was asked for, and the operator
 /// is shown what was issued (Epic 13 D5). Computed once per PEM (see
-/// [`SUBJECTS`]).
+/// [`LEAF_VIEWS`]).
 pub(crate) fn subject_of(cert_pem: &str) -> String {
+    leaf_view(cert_pem).subject
+}
+
+/// The [`LeafView`] of the leaf in `cert_pem`, computed once per PEM
+/// (see [`LEAF_VIEWS`]).
+fn leaf_view(cert_pem: &str) -> LeafView {
     let key: [u8; 32] = pem_digest(cert_pem);
-    if let Some(known) = SUBJECTS.lock().get(&key) {
+    if let Some(known) = LEAF_VIEWS.lock().get(&key) {
         return known.clone();
     }
-    let subject: String = parse_subject(cert_pem);
-    let mut subjects = SUBJECTS.lock();
-    if subjects.len() >= SUBJECT_CACHE_MAX {
-        subjects.clear();
+    let view: LeafView = parse_leaf_view(cert_pem);
+    let mut views = LEAF_VIEWS.lock();
+    if views.len() >= LEAF_VIEW_CACHE_MAX {
+        views.clear();
     }
-    subjects.insert(key, subject.clone());
-    subject
+    views.insert(key, view.clone());
+    view
 }
 
-/// Forget every cached subject but those of `live`.
-fn retain_subjects(live: &HashSet<[u8; 32]>) {
-    SUBJECTS.lock().retain(|key, _| live.contains(key));
+/// Forget every cached leaf view but those of `live`.
+fn retain_leaf_views(live: &HashSet<[u8; 32]>) {
+    LEAF_VIEWS.lock().retain(|key, _| live.contains(key));
 }
 
-/// [`subject_of`] without the cache.
-fn parse_subject(cert_pem: &str) -> String {
+/// [`leaf_view`] without the cache.
+fn parse_leaf_view(cert_pem: &str) -> LeafView {
+    let unreadable = || LeafView {
+        subject: String::new(),
+        san_ips: Vec::new(),
+    };
     let Some(block) = pem::parse_many(cert_pem)
         .ok()
         .and_then(|blocks: Vec<pem::Pem>| blocks.into_iter().next())
     else {
-        return String::new();
+        return unreadable();
     };
     let Ok((_, cert)) = x509_parser::parse_x509_certificate(block.contents()) else {
-        return String::new();
+        return unreadable();
     };
+    LeafView {
+        subject: subject_of_leaf(&cert),
+        san_ips: lorica_tls::cert_resolver::ip_sans_of_leaf(&cert)
+            .iter()
+            .map(std::net::IpAddr::to_string)
+            .collect(),
+    }
+}
+
+fn subject_of_leaf(cert: &x509_parser::certificate::X509Certificate<'_>) -> String {
     let rdns: Vec<String> = cert
         .subject()
         .iter()
@@ -504,7 +550,7 @@ pub async fn list_certificates(
         store.list_certificates_without_private_keys()
     })
     .await?;
-    // A certificate not seen yet is parsed for its subject: CPU work,
+    // A certificate not seen yet is parsed for its leaf view: CPU work,
     // kept off the async workers.
     let responses: Vec<CertificateResponse> = tokio::task::spawn_blocking(move || {
         let responses: Vec<CertificateResponse> = certs.iter().map(cert_to_response).collect();
@@ -512,7 +558,7 @@ pub async fn list_certificates(
             .iter()
             .map(|cert| pem_digest(&cert.cert_pem))
             .collect();
-        retain_subjects(&live);
+        retain_leaf_views(&live);
         responses
     })
     .await
@@ -616,10 +662,12 @@ pub async fn get_certificate(
     })
     .await?;
 
+    let leaf: LeafView = leaf_view(&cert.cert_pem);
     let response = CertificateDetailResponse {
         id: cert.id.clone(),
         domain: cert.domain.clone(),
         san_domains: cert.san_domains.clone(),
+        san_ips: leaf.san_ips,
         fingerprint: cert.fingerprint.clone(),
         cert_pem: cert.cert_pem.clone(),
         issuer: cert.issuer.clone(),
@@ -630,7 +678,7 @@ pub async fn get_certificate(
         created_at: cert.created_at.to_rfc3339(),
         associated_routes,
         acme_method: cert.acme_method.clone(),
-        subject: subject_of(&cert.cert_pem),
+        subject: leaf.subject,
         source: cert.source(),
         adcs: AdcsCertificateFields::of(&cert),
     };
@@ -1078,8 +1126,68 @@ mod download_tests {
         assert_eq!(subject_of("not a certificate"), "");
         assert_eq!(
             subject_of(&cert.pem()),
-            parse_subject(&cert.pem()),
+            parse_leaf_view(&cert.pem()).subject,
             "the cached subject is the parsed one"
+        );
+    }
+
+    /// Issue #53: a certificate for an IP carries it as an `iPAddress`
+    /// SAN. The view shows it in `san_ips`, IPv6 compressed, and
+    /// `san_domains`, which renewal and automation grants read as DNS
+    /// names, stays DNS-only.
+    #[test]
+    fn ip_sans_are_shown_apart_from_the_dns_names() {
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .expect("test setup: params");
+        params.subject_alt_names.extend([
+            rcgen::SanType::IpAddress("192.0.2.10".parse().expect("test setup: v4")),
+            rcgen::SanType::IpAddress(
+                "2001:0db8:0000:0000:0000:0000:0000:0001"
+                    .parse()
+                    .expect("test setup: v6"),
+            ),
+        ]);
+        let key = rcgen::KeyPair::generate().expect("test setup: key");
+        let pem: String = params
+            .self_signed(&key)
+            .expect("test setup: certificate")
+            .pem();
+
+        assert_eq!(
+            leaf_view(&pem).san_ips,
+            vec!["192.0.2.10".to_string(), "2001:db8::1".to_string()]
+        );
+        assert_eq!(
+            parse_cert_pem(&pem).san_domains,
+            vec!["localhost".to_string()]
+        );
+        assert_eq!(
+            leaf_view(&pem).san_ips,
+            parse_leaf_view(&pem).san_ips,
+            "the cached addresses are the parsed ones"
+        );
+        assert!(leaf_view("not a certificate").san_ips.is_empty());
+    }
+
+    /// An IPv4-mapped SAN is listed as written, an IPv6 entry, never as
+    /// the IPv4 address it maps: the listener does not serve it to that
+    /// address either, and a browser that dialed it would refuse it.
+    #[test]
+    fn an_ipv4_mapped_san_is_listed_as_written() {
+        let mut params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).expect("test setup: params");
+        params.subject_alt_names.push(rcgen::SanType::IpAddress(
+            "::ffff:192.0.2.10".parse().expect("test setup: mapped"),
+        ));
+        let key = rcgen::KeyPair::generate().expect("test setup: key");
+        let pem: String = params
+            .self_signed(&key)
+            .expect("test setup: certificate")
+            .pem();
+
+        assert_eq!(
+            parse_leaf_view(&pem).san_ips,
+            vec!["::ffff:192.0.2.10".to_string()]
         );
     }
 

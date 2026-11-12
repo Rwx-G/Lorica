@@ -18,7 +18,8 @@ use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
 use crate::server::AppState;
 use lorica_config::route_selection::{
-    canonical_hostname, same_name, validate_hostname_syntax, HostnameShape, ROUTE_HOSTNAME_SHAPE,
+    canonical_hostname, same_name, validate_hostname_syntax, HostnameShape, ROUTE_ALIAS_SHAPE,
+    ROUTE_HOSTNAME_SHAPE, ROUTE_REDIRECT_HOSTNAME_SHAPE,
 };
 
 use super::forward_auth::{build_forward_auth, ForwardAuthConfigRequest};
@@ -597,17 +598,15 @@ fn validate_route_hostname(raw: &str) -> Result<String, ApiError> {
 /// ports, userinfo, and explicit schemes. Splitting the two fields
 /// keeps the common case (canonical-host) typo-proof without forcing
 /// a full URL parser on every write path.
+///
+/// An IPv4 address is taken only as dotted decimal: a browser following
+/// `Location: https://010.0.0.1/` goes to `8.0.0.1`, and one following
+/// `https://1.2.3.256/` goes nowhere, so a target spelled that way is
+/// refused rather than sent somewhere else than it reads. Run on a
+/// create, and on an update only when the target changes, so a row
+/// stored before the rule keeps saving.
 fn validate_redirect_hostname(raw: &str) -> Result<String, ApiError> {
-    validate_dns_hostname(
-        raw,
-        HostnameShape {
-            allow_wildcard: false,
-            allow_empty: true,
-            allow_catch_all: false,
-            allow_ipv6_literal: false,
-            field_label: "redirect_hostname",
-        },
-    )
+    validate_dns_hostname(raw, ROUTE_REDIRECT_HOSTNAME_SHAPE)
 }
 
 /// Validate a `redirect_to` input. Accepts a full HTTP(S) URL and
@@ -798,21 +797,17 @@ fn validate_http_method(method: &str, field_label: &str) -> Result<(), ApiError>
     Ok(())
 }
 
-/// Validate a single hostname alias. Same RFC 1123 shape check as
-/// `validate_redirect_hostname` but accepts a leading `*.` wildcard
-/// (legal for SNI match) and uses the caller's `field_label` so the
-/// UI can point at the right input. Returns the value trimmed and in
-/// the canonical form every name is stored in
+/// Validate a single hostname alias against [`ROUTE_ALIAS_SHAPE`], the
+/// one alias rule the TOML import applies too, under the caller's
+/// `field_label` so the UI can point at the right input. Returns the
+/// value trimmed and in the canonical form every name is stored in
 /// ([`canonical_hostname`]), so a root dot is accepted and dropped.
 fn validate_hostname_alias(raw: &str, field_label: &str) -> Result<String, ApiError> {
     validate_dns_hostname(
         &canonical_hostname(raw.trim()),
         HostnameShape {
-            allow_wildcard: true,
-            allow_empty: false,
-            allow_catch_all: false,
-            allow_ipv6_literal: false,
             field_label,
+            ..ROUTE_ALIAS_SHAPE
         },
     )
 }
@@ -1373,6 +1368,87 @@ mod redirect_hostname_validation_tests {
     }
 
     #[test]
+    fn takes_an_address_only_in_the_spelling_a_browser_follows() {
+        assert_eq!(
+            validate_redirect_hostname("192.0.2.10").unwrap(),
+            "192.0.2.10"
+        );
+        for spelled_otherwise in ["010.0.0.1", "0xc0.0.2.10", "3221225994", "1.2.3.256"] {
+            assert!(
+                expect_err(spelled_otherwise).contains("IPv4 address spelled another way"),
+                "{spelled_otherwise}"
+            );
+        }
+    }
+
+    /// A target stored before the rule still reads, and an update that
+    /// sends it back unchanged, as the dashboard's form does, still
+    /// saves; a new target spelled that way is refused.
+    #[tokio::test]
+    async fn a_stored_target_spelled_otherwise_still_loads_and_saves() {
+        use crate::tests::{body_json, send, setup_admin_and_login, test_state};
+        use axum::http::StatusCode;
+
+        let (state, sessions, limiter) = test_state().await;
+        let admin = setup_admin_and_login(&state, &sessions, &limiter).await;
+        let resp = send(
+            &state,
+            &sessions,
+            &limiter,
+            "POST",
+            "/api/v1/routes",
+            &admin,
+            Some(serde_json::json!({ "hostname": "legacy.example.com" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let id = body_json(resp).await["data"]["id"]
+            .as_str()
+            .expect("route id")
+            .to_string();
+        {
+            let store = state.store.lock().await;
+            let mut route = store.get_route(&id).expect("reads").expect("stored");
+            route.redirect_hostname = Some("010.0.0.1".to_string());
+            store
+                .update_route(&route)
+                .expect("test setup: legacy target");
+        }
+        let uri = format!("/api/v1/routes/{id}");
+
+        let resp = send(&state, &sessions, &limiter, "GET", &uri, &admin, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(resp).await["data"]["redirect_hostname"],
+            "010.0.0.1"
+        );
+
+        let resp = send(
+            &state,
+            &sessions,
+            &limiter,
+            "PUT",
+            &uri,
+            &admin,
+            Some(serde_json::json!({ "redirect_hostname": "010.0.0.1", "force_https": false })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = send(
+            &state,
+            &sessions,
+            &limiter,
+            "PUT",
+            &uri,
+            &admin,
+            Some(serde_json::json!({ "redirect_hostname": "0xc0.0.2.10" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn accepts_single_label_hostname() {
         // "localhost" and similar single-label internal names are common
         // in home-lab Lorica setups; we must not reject them.
@@ -1540,6 +1616,11 @@ mod route_name_patch_tests {
             validate_route_hostname("[2001:DB8::1]").expect("an IPv6 literal"),
             "[2001:db8::1]"
         );
+        assert_eq!(
+            validate_route_hostname("[2001:db8:0:0::0001]").expect("an uncompressed literal"),
+            "[2001:db8::1]"
+        );
+        assert!(validate_route_hostname("[fe80::1%25eth0]").is_err());
         assert!(validate_hostname_alias("_", "f").is_err());
         assert!(validate_hostname_alias("[2001:db8::1]", "f").is_err());
     }
@@ -4490,8 +4571,10 @@ fn apply_route_patch(
         route.force_https = force_https;
     }
     if let Some(redirect_hostname) = body.redirect_hostname {
-        let v = validate_redirect_hostname(&redirect_hostname)?;
-        route.redirect_hostname = if v.is_empty() { None } else { Some(v) };
+        if redirect_hostname.trim() != route.redirect_hostname.as_deref().unwrap_or("") {
+            let v = validate_redirect_hostname(&redirect_hostname)?;
+            route.redirect_hostname = if v.is_empty() { None } else { Some(v) };
+        }
     }
     if let Some(redirect_to) = body.redirect_to {
         let v = validate_redirect_to(&redirect_to, "redirect_to")?;

@@ -572,6 +572,41 @@ async fn names_outside_the_allowlist_are_refused_before_the_authority_is_contact
     assert_eq!(f.audit_actions().await, expected_audit);
 }
 
+/// Lorica requests DNS names only, so an IP address is refused as one,
+/// with its own refusal rather than as a name outside the allowlist. No
+/// allowlist can permit one: a suffix with an all-numeric top label is
+/// refused when the authority is configured.
+#[tokio::test]
+async fn an_ip_address_is_refused_before_the_authority_is_contacted() {
+    let stub = StubAuthority::new(issue_v2());
+    let f = issuing(&stub, None).await;
+
+    let cases: Vec<(serde_json::Value, Vec<&str>)> = vec![
+        (
+            serde_json::json!(["web01.corp.example.org", "192.0.2.10"]),
+            vec!["192.0.2.10"],
+        ),
+        (serde_json::json!(["[2001:db8::1]"]), vec!["[2001:db8::1]"]),
+        (serde_json::json!(["2001:DB8::1"]), vec!["2001:db8::1"]),
+    ];
+    let mut expected_audit: Vec<String> = vec!["adcs.authority.create".to_string()];
+    for (sans, named) in &cases {
+        let resp = f.issue(serde_json::json!({ "sans": sans })).await;
+        let (status, error) = error_of(resp).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{sans}");
+        assert_eq!(error["code"], "adcs_san_refused", "{sans}");
+        let message = error["message"].as_str().unwrap_or_default();
+        assert!(message.contains("IP address"), "{message}");
+        for name in named {
+            assert!(message.contains(name), "{message}");
+        }
+        expected_audit.push("adcs.certificate.issue.refused:san_ip_address".to_string());
+    }
+    assert_eq!(stub.calls(), 0, "no request reached the authority");
+    assert!(f.certificates().await.is_empty());
+    assert_eq!(f.audit_actions().await, expected_audit);
+}
+
 /// AC #6 pending, AC #7: nothing stored, the identifier shown, audited
 /// and alerted.
 #[tokio::test]

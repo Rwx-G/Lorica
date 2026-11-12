@@ -334,7 +334,11 @@ have. Re-mint it without them whenever convenient; nothing forces it.
 `*.review.example.com` covers `mr-42.review.example.com` and refuses
 `a.b.review.example.com`, `review.example.com` and `.review.example.com`;
 a bare `*` matches nothing; a trailing root dot is stripped from both
-sides before comparing. This is DELIBERATELY narrower than the
+sides before comparing. A wildcard never covers an IP address: since
+v1.10.5 a pattern whose last label is a number (`*.0.2.10`) is refused,
+one stored before matches no route named by an address, and an address
+is granted by name in dotted decimal (`192.0.2.10`), never in another
+spelling a browser would rewrite (`010.0.0.1`). This is DELIBERATELY narrower than the
 certificate-export ACL, whose wildcard covers a parent at any depth,
 and the two matchers live side by side in one module so a reader meets
 the sibling before picking one. They differ because the two callers

@@ -116,12 +116,37 @@ fn csr_error(reason: impl Into<String>) -> AdcsError {
     }
 }
 
+/// Whether a browser's URL parser reads `name`, a host name whose
+/// labels are all non-empty, as an IPv4 address: its last label is
+/// decimal digits, or `0x` (any case) then hex digits, or `0` then
+/// octal digits (the URL Standard's "ends in a number").
+///
+/// The rule is `lorica_config::host_shape`'s, the one every other
+/// surface asks; this crate does not link `lorica-config`, so it holds
+/// this last-line copy, and `lorica-api/tests/ip_literal_fixture.rs`
+/// replays that module's vector set through [`build_csr`] so the two
+/// cannot drift apart.
+fn last_label_is_a_number(name: &str) -> bool {
+    let last: &str = name.rsplit('.').next().unwrap_or_default();
+    if last.is_empty() {
+        return false;
+    }
+    let (digits, radix): (&str, u32) =
+        match last.strip_prefix("0x").or_else(|| last.strip_prefix("0X")) {
+            Some(hex) => (hex, 16),
+            None if last.len() >= 2 && last.starts_with('0') => (&last[1..], 8),
+            None => (last, 10),
+        };
+    last.bytes().all(|b: u8| b.is_ascii_digit()) || digits.chars().all(|c: char| c.is_digit(radix))
+}
+
 /// Builds the request for `sans` under `template` (its common name),
 /// with a key of `key_type` and a subject of `subject` plus `CN` set to
 /// the first SAN.
 ///
 /// Refused before any key is generated: an empty SAN list, a wildcard
-/// SAN (D5), a SAN that is not a DNS host name, an empty or non-BMP
+/// SAN (D5), a SAN that is not a DNS host name (an IP address
+/// included), an empty or non-BMP
 /// template name, and malformed subject fields. The SANs travel only in
 /// the extension request; the `san:` name-value pair, which works only
 /// on an authority with `EDITF_ATTRIBUTESUBJECTALTNAME2` set (ESC6), is
@@ -156,6 +181,15 @@ pub fn build_csr(
         if let Some(problem) = dns_name_problem(san) {
             return Err(csr_error(format!(
                 "{san:?} is not a DNS host name: {problem}"
+            )));
+        }
+        // An IPv4 address in any spelling a browser reads as one
+        // (`192.0.2.10`, `010.0.0.1`, `0xc0.0.2.10`) passes the label
+        // check above, and would travel as a dNSName that no client
+        // matches an address against.
+        if last_label_is_a_number(san) {
+            return Err(csr_error(format!(
+                "{san:?} is an IP address, not a DNS host name"
             )));
         }
         let ia5: Ia5String = Ia5String::try_from(san.as_str())
@@ -531,6 +565,21 @@ mod tests {
             "WebServer"
         ));
         assert!(refused(&["web01 corp"], &subject, "WebServer"));
+        for address in [
+            "192.0.2.10",
+            "010.0.0.1",
+            "0xc0.0.2.10",
+            "3221225994",
+            "web.0x",
+        ] {
+            assert!(refused(&[address], &subject, "WebServer"), "{address}");
+        }
+        assert!(!refused(&["web.0xg"], &subject, "WebServer"));
+        assert!(refused(
+            &["web01.corp.example.org", "192.0.2.10"],
+            &subject,
+            "WebServer"
+        ));
         assert!(refused(
             &["web01.corp.example.org\n"],
             &subject,

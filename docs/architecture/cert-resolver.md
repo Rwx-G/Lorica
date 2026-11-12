@@ -48,12 +48,16 @@ owns a resolver (single-process, and each worker in worker mode). It:
 3. Fetches a fresh staple per certificate over the shared
    `lorica_tls::ocsp::OCSP_CLIENT` connection pool (redirects disabled -
    the responder URL comes from the attacker-influenced AIA extension).
-4. Calls `CertResolver::refresh_staples`, which rebuilds each affected
-   `CertifiedKey` with the new staple bytes by cloning the already
-   parsed cert chain and the `Arc`-shared signing key (no PEM re-parse),
-   then publishes the whole table with one `arc-swap`. A domain whose
-   fetch failed keeps its previous staple; a body-only reload with no
-   staple yet simply has none until the next successful fetch.
+4. Calls `CertResolver::refresh_staples` with the staples keyed by
+   certificate (`LeafFingerprint`, the SHA-256 of the leaf), never by
+   name, so two certificates sharing a name each keep their own
+   response. It builds one new `CertifiedKey` per stapled certificate
+   from the already parsed chain and the `Arc`-shared signing key (no
+   PEM re-parse), shared by every name and IP address that certificate
+   is served under, then publishes the whole table with one
+   `arc-swap`. A certificate whose fetch failed keeps its previous
+   staple; a body-only reload with no staple yet simply has none until
+   the next successful fetch.
 
 In-flight TLS handshakes are unaffected by either swap: they keep
 serving the `CertifiedKey` they already negotiated.

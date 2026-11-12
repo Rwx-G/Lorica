@@ -26,6 +26,9 @@ pub mod diff;
 pub mod error;
 /// TOML / JSON dump of the current config state.
 pub mod export;
+/// Whether a host name is an IP address, as a browser's URL parser
+/// reads it: the one rule routes, grants and AD CS suffixes share.
+pub mod host_shape;
 /// Import path complementing `export` (schema-validated, round-trip).
 pub mod import;
 /// Serialisable model types (routes, backends, certs, settings, ...).

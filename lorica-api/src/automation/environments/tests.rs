@@ -871,7 +871,16 @@ async fn a_listener_host_is_refused() {
     let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
     let token = writer(&state, "acme-ci").await;
-    for hostname in ["localhost", "api.localhost", "127.0.0.1", "10.0.0.1", "::1"] {
+    for hostname in [
+        "localhost",
+        "api.localhost",
+        "127.0.0.1",
+        "10.0.0.1",
+        "::1",
+        "010.0.0.1",
+        "0x7f.0.0.1",
+        "2130706433",
+    ] {
         let mut body = env_body();
         body["hostname"] = serde_json::json!(hostname);
         let response = put(&state, &token, "pr-42", body).await;

@@ -131,13 +131,58 @@ pub(crate) fn extract_host(req: &lorica_http::RequestHeader) -> &str {
         .unwrap_or("")
 }
 
+/// A `Host` (or URI authority) that is not a host followed by nothing or
+/// a port, or that opens an IPv6 literal with `[` and is not
+/// `[address]`. Refused with 400: routed by the host alone, it would
+/// reach that route's backend, and its forward-auth service as
+/// `X-Forwarded-Host`, carrying whatever followed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MalformedHost;
+
 /// The host a request names, as routes are looked up: [`extract_host`]
 /// without its port, in `route_selection::canonical_hostname` form.
-/// Borrowed, without an allocation, when the client sent it canonical,
-/// as browsers do. What is forwarded upstream is [`extract_host`],
-/// untouched.
-pub(crate) fn request_host(req: &lorica_http::RequestHeader) -> Cow<'_, str> {
-    lorica_config::route_selection::canonical_hostname(host_without_port(extract_host(req)))
+/// Borrowed when the client sent it canonical, as browsers do, and
+/// without an allocation for a DNS name. An IPv6 literal is reduced to
+/// its RFC 5952 spelling, the one a route stores it in. What is
+/// forwarded upstream is [`extract_host`], untouched.
+///
+/// `request_filter` computes it once and keeps it in
+/// `RequestCtx::request_host` for every later stage.
+///
+/// # Errors
+///
+/// [`MalformedHost`] when what follows the host is not nothing or `:`
+/// and a port from 1 to 65535 in decimal digits (`app.example.com:junk`,
+/// `192.0.2.10:443junk`, `host:`, `host:0`, `host:+80`), when a port
+/// follows no host (`:443`; an empty value still names no host and
+/// falls to the catch-all), or when the host starts with `[` and is not
+/// an IPv6 address in brackets (`[2001:db8::1]junk`,
+/// `[fe80::1%25eth0]`). The value is the `Host`
+/// header, or on HTTP/2 the `:authority` it must equal, as
+/// [`extract_host`] reads it.
+pub(crate) fn request_host(
+    req: &lorica_http::RequestHeader,
+) -> Result<Cow<'_, str>, MalformedHost> {
+    let authority = extract_host(req);
+    let host = host_without_port(authority);
+    let port_is_valid = match &authority[host.len()..] {
+        "" => true,
+        rest => rest.strip_prefix(':').is_some_and(|port| {
+            (1..=5).contains(&port.len())
+                && port.bytes().all(|b| b.is_ascii_digit())
+                && port.parse::<u16>().is_ok_and(|port| port != 0)
+        }),
+    };
+    let bracket_is_an_address = !host.starts_with('[')
+        || host
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .is_some_and(|inner| inner.parse::<std::net::Ipv6Addr>().is_ok());
+    let host_is_named = !host.is_empty() || authority.is_empty();
+    if !port_is_valid || !bracket_is_an_address || !host_is_named {
+        return Err(MalformedHost);
+    }
+    Ok(lorica_config::route_selection::canonical_hostname(host))
 }
 
 /// `path` as the backend receives it once `route.strip_path_prefix` is
@@ -166,7 +211,9 @@ pub(crate) fn path_after_strip<'a>(path: &'a str, route: &Route) -> Cow<'a, str>
 
 /// `authority` without its `:port`. An IPv6 literal keeps its brackets
 /// and every colon inside them (`[2001:db8::1]:8443` is
-/// `[2001:db8::1]`); a bracket left open is returned whole.
+/// `[2001:db8::1]`); a bracket left open is returned whole. Whatever
+/// follows the closing bracket is dropped unread: [`request_host`] is
+/// where a malformed one is refused.
 pub(crate) fn host_without_port(authority: &str) -> &str {
     if authority.starts_with('[') {
         return match authority.find(']') {
@@ -332,12 +379,39 @@ pub(crate) fn downstream_ssl_digest(
         .and_then(|d| d.ssl_digest.as_deref())
 }
 
+/// What the handshake of a request's downstream connection named, as
+/// [`mtls_refusal_status`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeName<'a> {
+    /// No TLS: the connection carries no certificate, and a new one
+    /// would carry none either.
+    Plaintext,
+    /// TLS without a server name: the client dialed an address.
+    NoServerName,
+    /// TLS naming this host.
+    ServerName(&'a str),
+}
+
+impl<'a> HandshakeName<'a> {
+    /// What `ssl`, the connection's digest (`None` on plaintext), says.
+    pub fn of(ssl: Option<&'a lorica_core::protocols::tls::SslDigest>) -> HandshakeName<'a> {
+        match ssl {
+            None => HandshakeName::Plaintext,
+            Some(digest) => digest
+                .server_name
+                .as_deref()
+                .map_or(HandshakeName::NoServerName, HandshakeName::ServerName),
+        }
+    }
+}
+
 /// The status a request is refused with on an mTLS route, or `None` when
 /// it passes: [`evaluate_mtls`], except that a refusal for want of a
 /// certificate from the route's CA (none presented, or one the CA did
-/// not issue) becomes 421 Misdirected Request when the connection's
-/// handshake named another host than `request_host` (canonical, as
-/// `request_host` gives it).
+/// not issue) becomes 421 Misdirected Request when the connection was
+/// not opened for `request_host` (canonical, as `request_host` gives
+/// it): its handshake named another host, or named none while the
+/// request names a DNS host.
 ///
 /// The certificate is fixed per connection and chosen by the client for
 /// the server name of its handshake. A browser coalescing this host onto
@@ -347,23 +421,36 @@ pub(crate) fn downstream_ssl_digest(
 /// section 15.5.20 has a client retry a 421 on a new connection, whose
 /// handshake names this host and can present this route's certificate;
 /// that retry is judged as any other request, so it gets the 495 or 496
-/// a wrong certificate earns. A connection without a server name, or
-/// with this host's, keeps 495 and 496: a new connection would carry the
-/// same certificate. An allowlist refusal of a certificate this route's
-/// CA did issue stays 495, the certificate being one meant for this
-/// route.
+/// a wrong certificate earns.
+///
+/// A connection without a server name was opened for an address, the
+/// one origin a client sends no SNI for, and served the certificate of
+/// the local address: a request on it naming a DNS host was coalesced
+/// from that origin, and a new connection for the host would name it and
+/// could present this route's certificate, so it gets 421 too. A request
+/// on it naming an address ([`lorica_config::host_shape::names_an_address`]),
+/// one on a connection that named this host, and one in plaintext keep
+/// 495 and 496: a new connection would carry the same certificate. An allowlist refusal of
+/// a certificate this route's CA did issue stays 495, the certificate
+/// being one meant for this route.
 pub fn mtls_refusal_status(
     enforcer: &MtlsEnforcer,
     client_cert: RouteClientCert<'_>,
-    connection_server_name: Option<&str>,
+    handshake: HandshakeName<'_>,
     request_host: &str,
 ) -> Option<u16> {
     let status = evaluate_mtls(enforcer, client_cert)?;
     let certificate_meant_for_another_host =
         !matches!(client_cert, RouteClientCert::Verified { .. })
-            && connection_server_name.is_some_and(|server_name| {
-                lorica_config::route_selection::canonical_hostname(server_name) != request_host
-            });
+            && match handshake {
+                HandshakeName::Plaintext => false,
+                HandshakeName::NoServerName => {
+                    !lorica_config::host_shape::names_an_address(request_host)
+                }
+                HandshakeName::ServerName(server_name) => {
+                    lorica_config::route_selection::canonical_hostname(server_name) != request_host
+                }
+            };
     Some(if certificate_meant_for_another_host {
         421
     } else {

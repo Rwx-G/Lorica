@@ -164,7 +164,44 @@ its port, an IPv6 literal keeping its brackets (`[2001:db8::1]:8443` is
 (`route_selection::canonical_hostname` in `lorica-config`), the form
 route names are stored in. `Host: App.Example.COM.` therefore reaches
 the route `app.example.com` and its controls rather than a wildcard or
-the catch-all. The `Host` sent to the backend is the client's, unchanged.
+the catch-all. Since v1.10.5 an IPv6 literal is also written in its
+RFC 5952 spelling on both sides, so a route stored as
+`[2001:DB8:0:0::1]` and a client sending `[2001:db8::1]` name one host;
+migration 70 rewrites the names stored before. An IPv4-mapped literal
+stays an IPv6 name, apart from the dotted IPv4 one, and a literal with
+a zone id is refused as a route name. The `Host` sent to the backend is
+the client's, unchanged.
+
+A `Host` (or HTTP/2 `:authority`) must be a host optionally followed by
+`:` and a port of decimal digits from 1 to 65535, and a bracketed host
+must be an IPv6 address (v1.10.5). Anything else (`app.example.com:junk`,
+`192.0.2.10:443junk`, `host:`, `host:0`, `[2001:db8::1]junk`, a zone id,
+bracketed text that is not an address) is answered 400, like the other
+malformed hosts above: routed by its host alone, it would reach that
+route's backend, and its forward-auth service as `X-Forwarded-Host`,
+carrying what followed.
+
+**Addresses as route names (v1.10.5).** A browser's URL parser reads a
+name whose last label is a number (decimal, hex `0x..` or octal `0..`)
+as an IPv4 address and sends it as four decimal numbers: `010.0.0.1`
+goes out as `8.0.0.1`, `0xc0.0.2.10` and `3221225994` as `192.0.2.10`,
+and `1.2.3.256` is refused. A route stored under such a spelling could
+never match, so a route hostname, alias or `redirect_hostname`, an
+automation token or OIDC issuer `allowed_hostnames` entry, a
+certificate export ACL pattern and a configuration import accept an
+IPv4 address only as dotted decimal without leading zeros, and refuse
+the other spellings. A wildcard never covers an address: `*.0.2.10` is
+refused at save, and a wildcard route or grant stored before (and so
+still on disk) never matches a request or a route named by an address,
+in route selection, token grants and the certificate export ACL. Such
+a host now falls to the next rule: an exact route or the catch-all
+route under its own controls, or the next export ACL (a `*` one, if
+any). The upgrade (migration 70) keeps those rows and names each one in
+a warning (table, row id, pattern) so an operator can replace it with
+exact names. A route already stored under another spelling of an address is left as it
+is; it never matched a browser request, and it still does not. The rule
+is `lorica_config::host_shape`; the dashboard replays its vector set
+(`ip-literal.generated.ts`).
 
 ### Request path validation (v1.10.3)
 
@@ -259,6 +296,42 @@ There is no switch to turn the check off: a request it refuses is one
 a normalising backend would serve as a resource whose route or rule
 the proxy did not apply.
 
+### Certificates for an IP address
+
+A client dialing `https://192.0.2.10` sends no SNI: RFC 6066 forbids an
+IP literal there. The HTTPS listener then picks the certificate whose
+leaf lists, as an `IP Address` SAN entry, the local address the
+connection arrived on; when several do, the one that expires last. The
+address is read from the certificate itself, so a certificate stored
+before v1.10.5 needs no re-upload. A route whose hostname is that IP
+(`192.0.2.10`, or `[2001:db8::1]` for IPv6) then serves the request.
+
+- **Only without SNI.** A client that sends SNI is served by name as
+  before; a name no certificate covers fails the handshake and never
+  falls back to the address.
+- **The local address, not the dialed one.** Behind NAT, for example a
+  Docker bridge with published ports, the address the connection
+  arrives on is the container's, not the one the client dialed, so the
+  certificate for the dialed address is not found. Put the address the
+  listener sees in the certificate, or run Lorica on the host network.
+  A dual-stack listener's IPv4 clients are matched by their IPv4
+  address.
+- **An address in the family it is written in.** An IPv4-mapped SAN
+  such as `::ffff:192.0.2.10` is an IPv6 entry: no IPv4 client is
+  served that certificate, since a browser that dialed `192.0.2.10`
+  refuses it. Put an IPv4 address in the certificate as IPv4.
+- **Exposure.** Anyone who reaches the address without SNI, a scanner
+  sweeping IP ranges included, now receives that certificate and so
+  learns every name in its SAN list. Before, such a handshake failed.
+  Keep names you do not want disclosed out of a certificate that
+  carries an IP.
+- **Display only in the API.** The management API's certificate views
+  list these entries as `san_ips`. They are never part of
+  `san_domains`, which ACME and AD CS renewal and automation token
+  grants read as DNS names, and the automation plane and the MCP
+  server do not answer them: a grant is checked against DNS names
+  only.
+
 ### mTLS client verification
 
 A route with mTLS checks the client certificate against its own CA
@@ -282,7 +355,12 @@ bundle (`mtls.ca_cert_pem`), on top of the HTTPS listener's handshake.
   the TLS handshake of its connection did, which happens when a browser
   coalesces two hosts on one HTTP/2 connection or reuses one: the
   client retries on a new connection, opened for this host, and can
-  present the certificate meant for it. Off, both pass as anonymous.
+  present the certificate meant for it. A handshake without a server
+  name counts as one for another host when the request names a DNS
+  host (v1.10.5): such a connection was opened for an address and given
+  the certificate of the local address, and a request for a DNS name
+  coalesced onto it would otherwise be locked out for the connection's
+  life. Off, both pass as anonymous.
 - **`allowed_organizations`.** Matched against each `O=` value of the
   certificate subject, whole and case-sensitively; a subject with
   several matches when one of them is listed. It applies only to a

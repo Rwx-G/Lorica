@@ -566,3 +566,68 @@ fn an_upgrade_canonicalises_route_and_record_names_and_keeps_a_colliding_twin_as
         .delete_route("r-b2")
         .expect("a twin is deleted as any route");
 }
+
+/// IPv6 literals as a node before 1.10.5 could store them: lowercased
+/// and without a root dot, which was all 68 did, but each address in the
+/// spelling it was written in. `r-v6-long` and `r-v6-short` are one
+/// address, the second already spelled as RFC 5952 writes it.
+const IPV6_SPELLED_AS_WRITTEN: &str = r#"
+    INSERT INTO routes (id, hostname, hostname_aliases, created_at, updated_at) VALUES
+        ('r-v6-only', '[2001:db8:0:0::0010]', '[]', '2026-01-01T00:00:00+00:00',
+            '2026-01-01T00:00:00+00:00'),
+        ('r-v6-long', '[2001:db8:0:0:0:0:0:1]', '[]', '2026-01-01T00:00:00+00:00',
+            '2026-01-01T00:00:00+00:00'),
+        ('r-v6-short', '[2001:db8::1]', '[]', '2026-01-01T00:00:00+00:00',
+            '2026-01-01T00:00:00+00:00');
+    INSERT INTO route_protection_records (id, route_id, path_prefix, route_json, deleted_by,
+        deleted_at)
+    VALUES ('rec-v6', 'r-gone', '/', '{}', 'ci (0123)', '2026-01-02T00:00:00+00:00');
+    INSERT INTO route_protection_record_names (record_id, position, name) VALUES
+        ('rec-v6', 0, '[2001:db8:0:0::0020]');
+"#;
+
+/// Migration 70 on a node that ran 1.10.4: the file is rewound to
+/// version 69 and holds IPv6 route and record names in non-canonical
+/// spellings. Each is rewritten to the spelling a request is looked up
+/// in, the record is found by it, and a pair of routes on one address
+/// is settled as 68 settles two spellings of one DNS name.
+#[test]
+fn an_upgrade_from_version_69_writes_ipv6_names_in_their_canonical_spelling() {
+    let dir = tempfile::tempdir().expect("test setup: tempdir");
+    let path = dir.path().join("lorica.db");
+    drop(ConfigStore::open(&path, None).expect("test setup: fresh store"));
+    let conn = Connection::open(&path).expect("test setup: raw open");
+    let head: i64 = conn
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .expect("test setup: version");
+    conn.execute_batch("DELETE FROM schema_migrations WHERE version >= 70;")
+        .expect("test setup: rewound to version 69");
+    conn.execute_batch(IPV6_SPELLED_AS_WRITTEN)
+        .expect("test setup: names as written");
+    drop(conn);
+
+    let store = ConfigStore::open(&path, None).expect("the file opens");
+    assert_eq!(store.schema_version().expect("version"), head);
+    assert_eq!(names_of(&store, "r-v6-only").0, "[2001:db8::10]");
+    assert_eq!(names_of(&store, "r-v6-short").0, "[2001:db8::1]");
+    assert_eq!(
+        names_of(&store, "r-v6-long").0,
+        "[2001:db8:0:0:0:0:0:1]",
+        "the twin of a canonically spelled name is kept as stored"
+    );
+    assert!(
+        store
+            .get_route("r-v6-long")
+            .expect("reads")
+            .expect("kept")
+            .enabled
+    );
+
+    let records = store
+        .route_protection_records_naming(&["[2001:db8::20]"])
+        .expect("records read");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].hostname, "[2001:db8::20]");
+}

@@ -11,10 +11,12 @@
   import { ROUTE_DEFAULTS } from '../../lib/route-form';
   import { findUncoveredHostnames } from '../../lib/cert-san-match';
   import {
+    adcsIpHostnameNotice,
     adcsIssuanceBlocker,
     adcsIssueOutcome,
     adcsTemplateOptions,
     hostnamesWithoutCertificate,
+    ipHostnamesWithoutCertificate,
     type AdcsIssueOutcome,
   } from '../../lib/adcs-issuance';
   import { canWriteRole } from '../../lib/auth';
@@ -106,23 +108,32 @@
     ].filter((s) => s.length > 0),
   );
   let uncoveredByCert = $derived(
-    selectedCert ? findUncoveredHostnames(routeHostnames, selectedCert.san_domains) : [],
+    selectedCert
+      ? findUncoveredHostnames(routeHostnames, selectedCert.san_domains, selectedCert.san_ips)
+      : [],
+  );
+  let selectedCertSans = $derived(
+    selectedCert ? [...selectedCert.san_domains, ...selectedCert.san_ips] : [],
   );
 
   // Story 13.3: names no stored certificate covers drive the one-click
   // AD CS issuance. Gated like the certificate page: Operator role, not
   // a follower, an authority configured and not in the failed state.
+  // An IP literal is never offered: AD CS issuance requests DNS names
+  // only, so it is named in a notice instead.
   let hostnamesNeedingCert = $derived(hostnamesWithoutCertificate(routeHostnames, certificates));
+  let ipsNeedingCert = $derived(ipHostnamesWithoutCertificate(routeHostnames, certificates));
   let adcsState = $state<AdcsAuthorityState | null>(null);
-  let adcsOffered = $derived(
+  let adcsAvailable = $derived(
     adcsState !== null &&
-      hostnamesNeedingCert.length > 0 &&
       adcsIssuanceBlocker({
         canIssue: $canWriteRole,
         follower: $nodeRole === 'follower',
         state: adcsState,
       }) === null,
   );
+  let adcsOffered = $derived(adcsAvailable && hostnamesNeedingCert.length > 0);
+  let adcsIpNotice = $derived(adcsAvailable ? adcsIpHostnameNotice(ipsNeedingCert) : null);
   let adcsTemplates = $derived(adcsState?.authority ? adcsTemplateOptions(adcsState.authority) : []);
   let adcsTemplate = $state('');
   let adcsRequest = $state<AdcsIssueRequest | null>(null);
@@ -224,7 +235,7 @@
         </select>
         <span class="hint">TLS certificate presented to clients on port 443 for this hostname.</span>
         {#if selectedCert && uncoveredByCert.length > 0}
-          <div class="warn-banner" role="note">
+          <div class="warn-banner" role="note" data-testid="cert-uncovered-warning">
             <strong>
               Certificate does not cover {uncoveredByCert.length === 1 ? 'this hostname' : 'these hostnames'}:
             </strong>
@@ -233,7 +244,7 @@
             handshake error (SAN mismatch). Pick a cert whose SAN list
             includes the hostname (or a wildcard that covers it).
             Cert SAN list:
-            {selectedCert.san_domains.length > 0 ? selectedCert.san_domains.join(', ') : '(empty)'}.
+            {selectedCertSans.length > 0 ? selectedCertSans.join(', ') : '(empty)'}.
           </div>
         {/if}
         {#if adcsOffered}
@@ -253,6 +264,9 @@
               <button type="button" class="btn-adcs" onclick={openAdcsConfirm}>Issue from AD CS</button>
             </span>
           </div>
+        {/if}
+        {#if adcsIpNotice}
+          <div class="adcs-offer" role="note" data-testid="adcs-route-ip-notice">{adcsIpNotice}</div>
         {/if}
         {#if adcsOutcome?.kind === 'issued'}
           <div class="adcs-result ok" role="status" data-testid="adcs-route-outcome">

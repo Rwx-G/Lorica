@@ -27,7 +27,7 @@ use super::ai_bot_merged::{self, MergedCrawler, MergedVerification};
 use super::{
     bot_handlers, build_mirror_forward_headers, canary_bucket, downstream_ssl_digest, extract_host,
     host_without_port, mirror_sample_hit, mtls_refusal_status, render_error_body, request_has_body,
-    request_host, route_client_cert, run_forward_auth_keyed, spawn_mirrors, ForwardAuthOutcome,
+    route_client_cert, run_forward_auth_keyed, spawn_mirrors, ForwardAuthOutcome, HandshakeName,
     LoricaProxy, MirrorBodyState, MirrorPending, ProxyConfig, RequestCtx, RouteEntry,
     VerdictCacheEngine, WAF_BODY_SCAN_DEFAULT,
 };
@@ -730,14 +730,16 @@ impl LoricaProxy {
 
     /// Stage: route-level redirects. Covers the force-HTTPS redirect
     /// (skipped for ACME challenge paths, which must stay on HTTP) and
-    /// the hostname redirect (`redirect_hostname`). Terminal: 301.
+    /// the hostname redirect (`redirect_hostname`), which `host`, the
+    /// request's host as routes are looked up, already names or not.
+    /// Terminal: 301.
     pub(super) async fn check_route_redirects(
         &self,
         session: &mut Session,
         entry: &RouteEntry,
+        host: &str,
     ) -> Result<Option<bool>> {
         let req = session.req_header();
-        let host = request_host(req);
         let path = req.uri.path();
 
         // Force HTTPS redirect (skip for ACME challenges - must stay HTTP)
@@ -770,7 +772,7 @@ impl LoricaProxy {
 
         // Hostname redirect
         if let Some(ref target) = entry.route.redirect_hostname {
-            if !lorica_config::route_selection::same_name(&host, target) {
+            if !lorica_config::route_selection::same_name(host, target) {
                 let redir_path = req.uri.path();
                 let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
                 let scheme = req
@@ -966,8 +968,8 @@ impl LoricaProxy {
                 mtls_refusal_status(
                     enforcer,
                     route_client_cert(ssl, enforcer),
-                    ssl.and_then(|digest| digest.server_name.as_deref()),
-                    &request_host(session.req_header()),
+                    HandshakeName::of(ssl),
+                    &ctx.request_host,
                 )
             };
             if let Some(status) = verdict {

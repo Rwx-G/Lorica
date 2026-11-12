@@ -1343,14 +1343,11 @@ created_at = "2026-01-01T00:00:00Z"
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        // 69 is the current head of the tracked MIGRATIONS table (every
-        // schema change now carries a distinct version, including the
-        // former post-v22 unconditional ALTER blocks).
         assert_eq!(
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            69
+            crate::store::SCHEMA_HEAD
         );
     }
 
@@ -1368,7 +1365,7 @@ created_at = "2026-01-01T00:00:00Z"
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                69
+                crate::store::SCHEMA_HEAD
             );
         }
     }
@@ -3117,6 +3114,23 @@ cert_critical_days = 3
             .expect("route kept");
         assert_eq!(stored.hostname, "other.example.com");
         assert_eq!(stored.hostname_aliases, vec!["*.example.com".to_string()]);
+
+        route.hostname = "[2001:DB8:0:0::0001]".into();
+        route.hostname_aliases = vec![];
+        store.update_route(&route).expect("an IPv6 literal lands");
+        let stored = store
+            .get_route(&route.id)
+            .expect("route reads")
+            .expect("route kept");
+        assert_eq!(stored.hostname, "[2001:db8::1]");
+
+        let mut twin = make_route();
+        twin.hostname = "[2001:db8:0::1]".into();
+        let err = store
+            .create_route(&twin)
+            .expect_err("another spelling of the same address")
+            .to_string();
+        assert!(err.contains("already used"), "{err}");
     }
 
     #[test]
@@ -3189,6 +3203,62 @@ cert_critical_days = 3
             .expect_err("two spellings of one name are one name")
             .to_string();
         assert!(err.contains("already used"), "{err}");
+    }
+
+    /// An address a browser would rewrite, or a wildcard over an
+    /// address tail, is refused on import as on every route write, on a
+    /// primary hostname and on an alias alike.
+    #[test]
+    fn test_import_refuses_an_address_spelled_otherwise_or_under_a_wildcard() {
+        let source = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut route = make_route();
+        route.hostname = "a.example.com".into();
+        route.hostname_aliases = vec!["www.a.example.com".into()];
+        source.create_route(&route).expect("test setup: route");
+        let exported = export_to_toml(&source).expect("test setup: export");
+        for (field, spelled) in [
+            ("a.example.com", "010.0.0.1"),
+            ("a.example.com", "*.0.2.10"),
+            ("www.a.example.com", "0xc0.0.2.10"),
+            ("www.a.example.com", "*.2.10"),
+        ] {
+            let edited = exported.replace(&format!("\"{field}\""), &format!("\"{spelled}\""));
+            assert_ne!(edited, exported, "test setup: the export names {field}");
+            let err = parse_toml(&edited).expect_err(spelled).to_string();
+            assert!(err.contains(&format!("route '{}'", route.id)), "{err}");
+        }
+        let address = exported.replace("\"www.a.example.com\"", "\"192.0.2.10\"");
+        parse_toml(&address).expect("an address alias in the dotted spelling imports");
+    }
+
+    /// The redirect host is checked on import as the route API checks
+    /// it: `0x7f.1` would send browsers to 127.0.0.1.
+    #[test]
+    fn test_import_checks_the_redirect_host_as_the_api_does() {
+        let source = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut route = make_route();
+        route.hostname = "a.example.com".into();
+        route.redirect_hostname = Some("www.example.com".into());
+        source.create_route(&route).expect("test setup: route");
+        let exported = export_to_toml(&source).expect("test setup: export");
+        parse_toml(&exported).expect("a DNS redirect host imports");
+        for target in [
+            "0x7f.1",
+            "010.0.0.1",
+            "evil.example/x",
+            "evil.example:8443",
+            "*.example.com",
+            "[2001:db8::1]",
+        ] {
+            let edited = exported.replace("\"www.example.com\"", &format!("\"{target}\""));
+            assert_ne!(edited, exported, "test setup: the export names the target");
+            let err = parse_toml(&edited).expect_err(target).to_string();
+            assert!(err.contains("redirect_hostname"), "{target}: {err}");
+        }
+        for target in ["192.0.2.10", ""] {
+            let edited = exported.replace("\"www.example.com\"", &format!("\"{target}\""));
+            parse_toml(&edited).expect(target);
+        }
     }
 
     #[test]

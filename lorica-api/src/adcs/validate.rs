@@ -84,7 +84,10 @@ pub struct AdcsAuthorityRequest {
     /// The fixed part of every subject.
     #[serde(default)]
     pub subject: AdcsSubjectDefaults,
-    /// DNS suffixes Lorica may request names under; at least one.
+    /// DNS suffixes Lorica may request names under; at least one,
+    /// unless the stored authority's list is empty already (an upgrade
+    /// removed every entry that named an address), which saves as it
+    /// stands and permits nothing.
     pub allowed_suffixes: Vec<String>,
     /// The auto-renew setting a newly issued certificate starts with.
     pub auto_renew_default: bool,
@@ -258,11 +261,8 @@ impl AdcsAuthorityRequest {
         validate_template_name("default_template", &default_template)?;
         let allowed_templates: Vec<String> =
             allowed_template_list(&default_template, &self.allowed_templates)?;
-        if self.allowed_suffixes.is_empty() {
-            return Err(refuse(
-                "allowed_suffixes: at least one DNS suffix is required".to_string(),
-            ));
-        }
+        // An empty list is the store's call: it is refused unless the
+        // stored one is empty already (`ConfigStore::upsert_adcs_authority`).
         let allowed_suffixes: Vec<AllowedSuffix> = self
             .allowed_suffixes
             .iter()

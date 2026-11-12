@@ -140,11 +140,24 @@ pub(in crate::adcs) async fn fixture(
     client: Arc<impl AdcsClient + 'static>,
     alerts: Option<lorica_notify::AlertSender>,
 ) -> Fixture {
-    let (mut state, _, rate_limiter) = test_state().await;
     let key: EncryptionKey = EncryptionKey::generate().expect("test setup: key");
-    let store = Arc::new(Mutex::new(
+    fixture_on(
         ConfigStore::open_in_memory_with_key(key).expect("test setup: keyed store"),
-    ));
+        client,
+        alerts,
+    )
+    .await
+}
+
+/// [`fixture`] on `store`, for a test that also reaches the database
+/// file behind it.
+async fn fixture_on(
+    store: ConfigStore,
+    client: Arc<impl AdcsClient + 'static>,
+    alerts: Option<lorica_notify::AlertSender>,
+) -> Fixture {
+    let (mut state, _, rate_limiter) = test_state().await;
+    let store = Arc::new(Mutex::new(store));
     state.store = Arc::clone(&store);
     let session_store: SessionStore = SessionStore::new(store).await;
     let data_dir: tempfile::TempDir = tempfile::tempdir().expect("test setup: tempdir");
@@ -458,7 +471,7 @@ async fn every_invalid_field_is_refused_and_nothing_is_stored() {
     let too_many_templates: Vec<String> = (0..lorica_config::models::ADCS_ALLOWED_TEMPLATES_MAX)
         .map(|n| format!("Template{n}"))
         .collect();
-    let cases: [(&str, serde_json::Value); 17] = [
+    let cases: [(&str, serde_json::Value); 19] = [
         (
             "endpoint",
             serde_json::json!("http://ces.corp.example.org/CES"),
@@ -488,6 +501,11 @@ async fn every_invalid_field_is_refused_and_nothing_is_stored() {
             serde_json::json!(["*.corp.example.org"]),
         ),
         ("allowed_suffixes", serde_json::json!([])),
+        (
+            "allowed_suffixes",
+            serde_json::json!(["corp.example.org", "0.2.10"]),
+        ),
+        ("allowed_suffixes", serde_json::json!(["[2001:db8::1]"])),
         ("endpoint_ca_pem", serde_json::json!("not a certificate")),
         ("kdcs", serde_json::json!(too_many_kdcs)),
         ("allowed_templates", serde_json::json!(["Web\nServer"])),
@@ -604,6 +622,43 @@ async fn delete_is_refused_with_the_certificates_that_use_the_authority() {
         f.audit_actions().await,
         vec!["adcs.authority.create", "adcs.authority.delete"]
     );
+}
+
+/// Migration 70 leaves an empty allowlist when every stored suffix named
+/// an address. The PUT the settings page sends back then carries the
+/// empty list, and it saves (a new password included), while an empty
+/// list is still refused on an authority that holds a suffix.
+#[tokio::test]
+async fn an_authority_emptied_by_the_upgrade_saves_as_it_stands() {
+    let db_dir: tempfile::TempDir = tempfile::tempdir().expect("test setup: tempdir");
+    let db_path = db_dir.path().join("lorica.db");
+    let key: EncryptionKey = EncryptionKey::generate().expect("test setup: key");
+    let store = ConfigStore::open(&db_path, Some(key)).expect("test setup: file store");
+    let f = fixture_on(store, always_ok(), None).await;
+    f.create_authority().await;
+
+    let mut emptied = body(Some(NEW_PASSWORD));
+    emptied["allowed_suffixes"] = serde_json::json!([]);
+    let resp = f
+        .send("PUT", AUTHORITY, &f.admin, Some(emptied.clone()))
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a list that holds a suffix is not emptied by a save"
+    );
+
+    // What migration 70 writes for a list of addresses alone.
+    rusqlite::Connection::open(&db_path)
+        .expect("test setup: raw open")
+        .execute("UPDATE adcs_authority SET allowed_suffixes_json = '[]'", [])
+        .expect("test setup: list emptied");
+
+    let resp = f.send("PUT", AUTHORITY, &f.admin, Some(emptied)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["allowed_suffixes"], serde_json::json!([]));
+    assert_eq!(f.stored_password().await.as_deref(), Some(NEW_PASSWORD));
 }
 
 /// IV1, first half: every write refused to an Operator, the suffix

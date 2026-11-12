@@ -6,11 +6,11 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.10.4-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.10.5-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-3527-brightgreen.svg" alt="Lorica Tests">
-  <img src="https://img.shields.io/badge/Pingora%20Tests-813-blue.svg" alt="Inherited Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-3702-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Pingora%20Tests-876-blue.svg" alt="Inherited Tests">
 </p>
 
 ---
@@ -29,7 +29,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **Canary traffic split** - send `X%` of requests to an alternate backend group with sticky-per-IP deterministic bucketing. Multiple splits per route; weights capped at 100 cumulative
 - **Response body rewriting** - ordered search-and-replace rules (literal or regex with capture groups) applied to upstream response bodies. Configurable content-type filter, max body cap, streams verbatim over the cap
 - TLS termination via rustls (no OpenSSL dependency)
-- SNI-based certificate selection with wildcard domain support (`*.example.com`)
+- SNI-based certificate selection with wildcard domain support (`*.example.com`); a client dialing an IP, which sends no SNI, gets the certificate whose `IP Address` SAN is the local address it arrived on (see `docs/security.md`, *Certificates for an IP address*)
 - Path rewriting (strip/add prefix, regex with capture groups), hostname aliases, HTTP-to-HTTPS redirect
 - Catch-all hostname (`_`) as last-resort fallback, `redirect_to` for domain redirects, `return_status` for direct responses
 - **gRPC-Web bridge** - transparently converts HTTP/1.1 gRPC-web requests to HTTP/2 gRPC for upstream backends
@@ -747,15 +747,15 @@ cargo test -p lorica-cluster --tests
 cd lorica-dashboard/frontend && pnpm install --frozen-lockfile && pnpm run check && pnpm run lint && pnpm exec vitest run
 ```
 
-At 1.10.2 the two product-crate steps run 3527 Rust tests and the
-forked-crate step 813; the rustls build runs 492 more, most of them the
+At 1.10.5 the two product-crate steps run 3702 Rust tests and the
+forked-crate step 876; the rustls build runs 539 more, most of them the
 default-feature tests of `lorica-core` and `lorica-lb` again with TLS on,
-so they are left out of the forked figure. The frontend suite is 762
-Vitest cases across 44 files.
+so they are left out of the forked figure. The frontend suite is 794
+Vitest cases across 45 files.
 
-The `lorica` binary crate carries 24 end-to-end binaries under
+The `lorica` binary crate carries 25 end-to-end binaries under
 `lorica/tests/` that drive a real Pingora `Server` against mock backends
-(mTLS, response rewriting, mirroring, forward auth, stale-while-revalidate,
+(mTLS, the certificate for a client dialing an IP, response rewriting, mirroring, forward auth, stale-while-revalidate,
 the connection pre-filter, canary and header routing, config reload, rate
 limits and their cross-worker sync, the circuit breaker, the downstream
 idle timeout and the RPC plane). They run as part of `cargo test -p lorica`.

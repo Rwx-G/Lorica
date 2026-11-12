@@ -19,9 +19,9 @@ use crate::protocols::tls::{server::handshake, server::handshake_with_callback, 
 use log::debug;
 use lorica_error::ErrorType::InternalError;
 use lorica_error::{Error, OrErr, Result};
+use lorica_tls::cert_resolver::{LocalIpConfigs, ResolvesServerCertByLocalIp};
 use lorica_tls::load_certs_and_key_files;
 use lorica_tls::ClientCertVerifier;
-use lorica_tls::ResolvesServerCert;
 use lorica_tls::ServerConfig;
 use lorica_tls::{version, TlsAcceptor as RusTlsAcceptor};
 
@@ -31,8 +31,9 @@ use crate::protocols::{ALPN, IO};
 enum CertSource {
     /// Single certificate from file paths (original behavior).
     Files { cert_path: String, key_path: String },
-    /// Dynamic certificate resolver (SNI-based, supports hot-swap).
-    Resolver(Arc<dyn ResolvesServerCert>),
+    /// Dynamic certificate resolver (SNI-based, supports hot-swap), which
+    /// also answers a ClientHello without SNI by the local address.
+    Resolver(Arc<dyn ResolvesServerCertByLocalIp>),
 }
 
 /// The TLS settings of a listening endpoint
@@ -45,6 +46,9 @@ pub struct TlsSettings {
 pub struct Acceptor {
     pub acceptor: RusTlsAcceptor,
     callbacks: Option<TlsAcceptCallbacks>,
+    /// Lorica: the configs for a connection to an address a certificate
+    /// carries (see `LocalIpConfigs`).
+    local_ip_configs: Option<LocalIpConfigs>,
 }
 
 impl TlsSettings {
@@ -64,6 +68,8 @@ impl TlsSettings {
             builder.with_no_client_auth()
         };
 
+        // Lorica: the resolver, kept for the per-local-address configs.
+        let mut ip_resolver = None;
         let mut config = match self.cert_source {
             CertSource::Files {
                 cert_path,
@@ -81,16 +87,21 @@ impl TlsSettings {
                     })
                     .unwrap()
             }
-            CertSource::Resolver(resolver) => builder.with_cert_resolver(resolver),
+            CertSource::Resolver(resolver) => {
+                ip_resolver = Some(Arc::clone(&resolver));
+                builder.with_cert_resolver(resolver)
+            }
         };
 
         if let Some(alpn_protocols) = self.alpn_protocols {
             config.alpn_protocols = alpn_protocols;
         }
 
+        let config = Arc::new(config);
         Acceptor {
-            acceptor: RusTlsAcceptor::from(Arc::new(config)),
+            acceptor: RusTlsAcceptor::from(Arc::clone(&config)),
             callbacks: None,
+            local_ip_configs: ip_resolver.map(|resolver| LocalIpConfigs::new(config, resolver)),
         }
     }
 
@@ -126,8 +137,10 @@ impl TlsSettings {
     /// Create TLS settings with a dynamic certificate resolver.
     ///
     /// The resolver is called during each TLS handshake to select the
-    /// appropriate certificate based on the SNI hostname.
-    pub fn with_resolver(resolver: Arc<dyn ResolvesServerCert>) -> Self {
+    /// appropriate certificate based on the SNI hostname. A ClientHello
+    /// without SNI, on a connection whose local address the resolver has
+    /// a certificate for, gets that certificate.
+    pub fn with_resolver(resolver: Arc<dyn ResolvesServerCertByLocalIp>) -> Self {
         TlsSettings {
             alpn_protocols: None,
             cert_source: CertSource::Resolver(resolver),
@@ -150,11 +163,102 @@ impl TlsSettings {
 impl Acceptor {
     pub async fn tls_handshake<S: IO>(&self, stream: S) -> Result<TlsStream<S>> {
         debug!("new tls session");
+        // Lorica: a connection to an address a certificate carries gets
+        // that address's config (see `LocalIpConfigs`).
+        let local_ip_acceptor = self.local_ip_acceptor(&stream);
+        let acceptor = local_ip_acceptor.as_ref().unwrap_or(self);
         // TODO: be able to offload this handshake in a thread pool
         if let Some(cb) = self.callbacks.as_ref() {
-            handshake_with_callback(self, stream, cb).await
+            handshake_with_callback(acceptor, stream, cb).await
         } else {
-            handshake(self, stream).await
+            handshake(acceptor, stream).await
         }
+    }
+
+    /// Lorica: the acceptor for the local address `stream` was accepted
+    /// on, when a certificate carries that address. The local address
+    /// is a lazy `getsockname` in the socket digest, read only while some
+    /// loaded certificate carries an address.
+    fn local_ip_acceptor<S: IO>(&self, stream: &S) -> Option<Acceptor> {
+        let config = self
+            .local_ip_configs
+            .as_ref()?
+            .for_connection(|| Some(stream.get_socket_digest()?.local_addr()?.as_inet()?.ip()))?;
+        Some(Acceptor {
+            acceptor: RusTlsAcceptor::from(config),
+            callbacks: None,
+            local_ip_configs: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::l4::stream::Stream;
+    use crate::protocols::{GetSocketDigest, SocketDigest};
+    use rustls::server::ClientHello;
+    use rustls::sign::CertifiedKey;
+    use std::net::IpAddr;
+    use std::os::unix::io::AsRawFd;
+
+    /// A resolver that serves nothing and reports whether it holds an IP
+    /// certificate as told.
+    #[derive(Debug)]
+    struct StubResolver {
+        has_local_ip_certs: bool,
+    }
+
+    impl lorica_tls::ResolvesServerCert for StubResolver {
+        fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            None
+        }
+    }
+
+    impl ResolvesServerCertByLocalIp for StubResolver {
+        fn resolve_by_local_ip(&self, _local_ip: IpAddr) -> Option<Arc<CertifiedKey>> {
+            None
+        }
+
+        fn has_local_ip_certs(&self) -> bool {
+            self.has_local_ip_certs
+        }
+    }
+
+    /// An accepted TCP stream carrying a fresh socket digest, as the
+    /// listener hands it to `tls_handshake`, and that digest.
+    async fn accepted_stream() -> (Stream, Arc<SocketDigest>, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test setup: bind");
+        let client = tokio::net::TcpStream::connect(listener.local_addr().expect("test setup"))
+            .await
+            .expect("test setup: connect");
+        let (accepted, _) = listener.accept().await.expect("test setup: accept");
+        let mut stream: Stream = accepted.into();
+        stream.set_socket_digest(SocketDigest::from_raw_fd(stream.as_raw_fd()));
+        let digest = stream.get_socket_digest().expect("test setup: digest");
+        (stream, digest, client)
+    }
+
+    fn acceptor(has_local_ip_certs: bool) -> Acceptor {
+        TlsSettings::with_resolver(Arc::new(StubResolver { has_local_ip_certs })).build()
+    }
+
+    #[tokio::test]
+    async fn no_ip_certificate_leaves_the_local_address_unread() {
+        let (stream, digest, _client) = accepted_stream().await;
+        assert!(acceptor(false).local_ip_acceptor(&stream).is_none());
+        assert!(
+            digest.local_addr.get().is_none(),
+            "the getsockname behind local_addr() must not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ip_certificate_makes_the_listener_read_the_local_address() {
+        let (stream, digest, _client) = accepted_stream().await;
+        assert!(acceptor(true).local_ip_acceptor(&stream).is_none());
+        assert!(digest.local_addr.get().is_some());
     }
 }

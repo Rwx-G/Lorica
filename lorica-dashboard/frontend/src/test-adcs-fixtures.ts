@@ -92,6 +92,7 @@ export function testCertificate(
     id: `cert-${domain}`,
     domain,
     san_domains,
+    san_ips: [],
     fingerprint: 'ab',
     issuer: 'CN=Example Issuing CA',
     subject: `CN=${domain},O=Example Corp,C=FR`,

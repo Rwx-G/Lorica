@@ -31,7 +31,8 @@
 //!
 //! Every SAN, against the authority's allowlist with
 //! [`lorica_config::models::AllowedSuffix::permits`] (D5): names are
-//! trimmed, lowercased and deduplicated, a wildcard is refused, an empty
+//! trimmed, lowercased and deduplicated, a wildcard and an IP address
+//! are refused, an empty
 //! list and a list over [`MAX_SANS`] are refused. Then the template,
 //! against the authority's allowed templates (D17). A refusal names what
 //! it refused and costs no Kerberos attempt.
@@ -188,6 +189,9 @@ pub(crate) enum SanRefusal {
     TooMany,
     /// At least one wildcard name (D5).
     Wildcard,
+    /// At least one IP address: Lorica requests DNS names only, so an
+    /// address would reach the CSR as a DNS name.
+    IpAddress,
     /// At least one name under no allowed suffix, or not a DNS name.
     OutsideAllowlist,
 }
@@ -198,6 +202,7 @@ impl SanRefusal {
             SanRefusal::Empty => "san_empty",
             SanRefusal::TooMany => "san_too_many",
             SanRefusal::Wildcard => "san_wildcard",
+            SanRefusal::IpAddress => "san_ip_address",
             SanRefusal::OutsideAllowlist => "san_outside_allowlist",
         }
     }
@@ -433,6 +438,26 @@ pub(crate) fn check_sans(authority: &AdcsAuthority, sans: &[String]) -> Result<(
             SanRefusal::Wildcard,
             wildcards.clone(),
             format!("sans: wildcard names are refused: {}", quoted(&wildcards)),
+        ));
+    }
+    // Before the allowlist, so an address in any spelling a browser reads
+    // as one gets a refusal that says what to do instead. No allowlist
+    // permits one (`AllowedSuffix::new` refuses a numeric top label by
+    // the same rule), but the CSR must not depend on that alone.
+    let addresses: Vec<String> = sans
+        .iter()
+        .filter(|name: &&String| lorica_config::host_shape::names_an_address(name))
+        .cloned()
+        .collect();
+    if !addresses.is_empty() {
+        return Err(refused(
+            SanRefusal::IpAddress,
+            addresses.clone(),
+            format!(
+                "sans: IP addresses are refused, AD CS issuance requests DNS names only; \
+                 upload a certificate that carries the address as an IP address SAN: {}",
+                quoted(&addresses)
+            ),
         ));
     }
     // A name still ending in a dot had two root dots: `permits` would

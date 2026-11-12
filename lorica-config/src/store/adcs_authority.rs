@@ -33,7 +33,7 @@ use rusqlite::{params, OptionalExtension};
 use super::row_helpers::{json_column, parse_datetime, parse_optional_datetime};
 use super::{serialize_field, ConfigStore};
 use crate::error::{ConfigError, Result};
-use crate::models::{AdcsAuthority, AdcsKeyType, AdcsSubjectDefaults};
+use crate::models::{AdcsAuthority, AdcsKeyType, AdcsSubjectDefaults, AllowedSuffix};
 
 /// The column list every authority read binds, in the order
 /// [`row_to_adcs_authority`] expects. `password_enc` is deliberately
@@ -43,6 +43,38 @@ const ADCS_AUTHORITY_COLUMNS: &str = "id, endpoint, realm, kdcs_json, principal,
      subject_state, subject_locality, subject_organization, subject_organizational_unit, \
      subject_email, allowed_suffixes_json, auto_renew_default, failed_since, failed_step, \
      failed_kdc_code, created_at, updated_at, allowed_templates_json";
+
+/// The stored allowlist, each entry rebuilt through
+/// [`AllowedSuffix::new`].
+///
+/// A rule added to the constructor after entries were saved comes with
+/// a migration that removes what it refuses from the stored row, once
+/// and logged once (migration 70 for the numeric top label of v1.10.5).
+/// This read is the backstop for a row that migration did not see: an
+/// entry the constructor refuses is dropped with a warning and the rest
+/// kept. Dropping is the safe direction, an entry only grants names, so
+/// the list can only narrow; failing the read instead would take down
+/// every reader of the authority, the settings page an operator needs
+/// to fix it included. A column that is not a JSON list of strings is
+/// still corrupt and fails the read.
+fn stored_allowed_suffixes(row: &rusqlite::Row<'_>, index: usize) -> Result<Vec<AllowedSuffix>> {
+    let stored: Vec<String> = json_column(row, index, "adcs authority", "allowed_suffixes")?;
+    Ok(stored
+        .iter()
+        .filter_map(|entry: &String| match AllowedSuffix::new(entry) {
+            Ok(suffix) => Some(suffix),
+            Err(refusal) => {
+                tracing::warn!(
+                    suffix = %entry,
+                    error = %refusal,
+                    "stored AD CS allowed suffix no longer validates and is ignored; \
+                     save the authority to remove it"
+                );
+                None
+            }
+        })
+        .collect())
+}
 
 /// Decode one `adcs_authority` row.
 fn row_to_adcs_authority(row: &rusqlite::Row<'_>) -> Result<AdcsAuthority> {
@@ -70,9 +102,7 @@ fn row_to_adcs_authority(row: &rusqlite::Row<'_>) -> Result<AdcsAuthority> {
             organizational_unit: row.get(13)?,
             email: row.get(14)?,
         },
-        // A suffix that no longer validates fails the read: degrading
-        // the list would change which names Lorica may request.
-        allowed_suffixes: json_column(row, 15, "adcs authority", "allowed_suffixes")?,
+        allowed_suffixes: stored_allowed_suffixes(row, 15)?,
         auto_renew_default: row.get(16)?,
         failed_since: parse_optional_datetime(row.get(17)?)?,
         failed_step: row.get(18)?,
@@ -105,13 +135,33 @@ impl ConfigStore {
     /// [`ConfigStore::clear_adcs_failed`]), so an edit of the subject
     /// cannot reset the breaker by carrying a stale copy of it.
     ///
+    /// The allowlist needs at least one suffix, except on an update of
+    /// an authority whose stored list is empty already: migration 70
+    /// empties a list whose every entry named an address, and the
+    /// operator must still be able to save that authority as it stands
+    /// (a new password, say). An empty list permits no name, so such an
+    /// authority issues and renews nothing until a suffix is added.
+    ///
     /// # Errors
     ///
     /// [`ConfigError::Validation`] when [`AdcsAuthority::validate`]
-    /// fails, or when another authority already exists (at most one,
-    /// PRD D10).
+    /// fails, when the allowlist is empty and the stored one is not (or
+    /// nothing is stored), or when another authority already exists (at
+    /// most one, PRD D10).
     pub fn upsert_adcs_authority(&self, authority: &AdcsAuthority) -> Result<()> {
         authority.validate()?;
+        if authority.allowed_suffixes.is_empty() {
+            let stored_list_is_empty: bool =
+                self.get_adcs_authority()?
+                    .is_some_and(|stored: AdcsAuthority| {
+                        stored.id == authority.id && stored.allowed_suffixes.is_empty()
+                    });
+            if !stored_list_is_empty {
+                return Err(ConfigError::Validation(
+                    "allowed_suffixes: at least one DNS suffix is required".to_string(),
+                ));
+            }
+        }
         let other: Option<String> = self
             .conn
             .query_row(
@@ -525,6 +575,45 @@ mod tests {
         assert_eq!(rows, 1);
     }
 
+    /// A list saved before a rule was added (here the all-numeric top
+    /// label of v1.10.5) still reads: the refused entry is dropped, the
+    /// rest kept, and a list left empty reads as one that permits
+    /// nothing. Text that is not a list of strings is still corrupt.
+    #[test]
+    fn a_stored_suffix_a_later_rule_refuses_is_dropped_on_read() {
+        let store = keyed_store();
+        let written = sample_adcs_authority("adcs-1");
+        store.upsert_adcs_authority(&written).expect("upsert");
+        let store_suffixes = |json: &str| {
+            store
+                .conn
+                .execute(
+                    "UPDATE adcs_authority SET allowed_suffixes_json = ?1",
+                    [json],
+                )
+                .expect("test setup: column written");
+        };
+
+        store_suffixes(r#"["corp.example.org","0.2.10"]"#);
+        let read = store.get_adcs_authority().expect("read").expect("row");
+        assert_eq!(
+            read.allowed_suffixes,
+            vec![AllowedSuffix::new("corp.example.org").expect("test setup: suffix")]
+        );
+        assert!(!read.permits("web.0.2.10"));
+
+        store_suffixes(r#"["192.0.2.10"]"#);
+        let read = store.get_adcs_authority().expect("read").expect("row");
+        assert!(read.allowed_suffixes.is_empty());
+        assert!(!read.permits("192.0.2.10"));
+
+        store_suffixes(r#"{"not":"a list"}"#);
+        assert!(matches!(
+            store.get_adcs_authority(),
+            Err(ConfigError::Corrupt(_))
+        ));
+    }
+
     #[test]
     fn an_invalid_authority_is_not_persisted() {
         let store = keyed_store();
@@ -532,6 +621,65 @@ mod tests {
         no_suffix.allowed_suffixes.clear();
         assert!(store.upsert_adcs_authority(&no_suffix).is_err());
         assert!(store.get_adcs_authority().expect("read").is_none());
+    }
+
+    /// Migration 70 removes each suffix that names an address from the
+    /// stored row, once, and keeps the rest; run again it changes
+    /// nothing. A list it empties is saved as it stands, and a list that
+    /// still holds a suffix cannot be emptied.
+    #[test]
+    fn migration_70_removes_address_suffixes_and_an_emptied_list_still_saves() {
+        let store = keyed_store();
+        let written = sample_adcs_authority("adcs-1");
+        store.upsert_adcs_authority(&written).expect("upsert");
+        let stored_json = || -> String {
+            store
+                .conn
+                .query_row(
+                    "SELECT allowed_suffixes_json FROM adcs_authority",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("test setup: column read")
+        };
+        let store_suffixes = |json: &str| {
+            store
+                .conn
+                .execute(
+                    "UPDATE adcs_authority SET allowed_suffixes_json = ?1",
+                    [json],
+                )
+                .expect("test setup: column written");
+        };
+
+        store_suffixes(r#"["corp.example.org","0.2.10","0x2.0xa","lab.010"]"#);
+        crate::store::drop_address_suffixes_from_adcs_allowlist(&store.conn, 70)
+            .expect("the migration runs");
+        assert_eq!(stored_json(), r#"["corp.example.org"]"#);
+        crate::store::drop_address_suffixes_from_adcs_allowlist(&store.conn, 70)
+            .expect("the migration runs again");
+        assert_eq!(stored_json(), r#"["corp.example.org"]"#);
+
+        let mut emptied = store.get_adcs_authority().expect("read").expect("row");
+        emptied.allowed_suffixes.clear();
+        assert!(
+            store.upsert_adcs_authority(&emptied).is_err(),
+            "a list that holds a suffix is not emptied by a save"
+        );
+
+        store_suffixes(r#"["192.0.2.10","0.2.10"]"#);
+        crate::store::drop_address_suffixes_from_adcs_allowlist(&store.conn, 70)
+            .expect("the migration runs");
+        assert_eq!(stored_json(), "[]");
+        let mut as_it_stands = store.get_adcs_authority().expect("read").expect("row");
+        assert!(as_it_stands.allowed_suffixes.is_empty());
+        as_it_stands.subject.organization = Some("Renamed".to_string());
+        store
+            .upsert_adcs_authority(&as_it_stands)
+            .expect("an authority emptied by the migration saves as it stands");
+        let read = store.get_adcs_authority().expect("read").expect("row");
+        assert_eq!(read.subject.organization.as_deref(), Some("Renamed"));
+        assert!(!read.permits("web.corp.example.org"));
     }
 
     #[test]

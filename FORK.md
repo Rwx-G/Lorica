@@ -409,6 +409,29 @@ lives in.
   coalescing, a reused connection); Lorica's mTLS check answers 421
   rather than 495 or 496 in that case, so the client retries on a new
   connection for the right host. `SslDigest::new` starts it `None`.
+- **`lorica-core`, a certificate for a client that sends no SNI
+  (v1.10.5, issue #53).** Site: `lorica-core/src/listeners/tls/rustls/mod.rs`
+  (`TlsSettings::with_resolver`, `TlsSettings::build`, the
+  `local_ip_configs` field of `Acceptor`, and `Acceptor::tls_handshake`
+  with its helper `local_ip_acceptor`). rustls chooses the certificate
+  from the ClientHello alone, and a client dialing an IP sends no SNI
+  (RFC 6066), so Lorica's resolver cannot answer it. `with_resolver`,
+  Lorica's constructor for its hot-swapped resolver, now takes a
+  `lorica_tls::cert_resolver::ResolvesServerCertByLocalIp` (a Lorica
+  trait, beside `CertResolver` in `lorica-tls`), and `build` hands the
+  listener's `ServerConfig` and that resolver to a
+  `lorica_tls::cert_resolver::LocalIpConfigs`. Before the handshake,
+  `tls_handshake` asks it for a config, giving it a closure that reads
+  the local address from the stream's socket digest; when it answers,
+  the handshake runs on that config, otherwise on the listener's own,
+  as upstream. Which config, when the local address is read (the
+  digest's `local_addr` is a lazy `getsockname`, read only while some
+  loaded certificate carries an address), the caching and what the
+  copy keeps all live in `lorica-tls`, so a stream TLS terminator
+  outside Pingora's listeners can use the same type. No
+  `LazyConfigAcceptor`. On an upstream sync, keep the extra `Acceptor`
+  field and its fill in `build`, and keep `tls_handshake` choosing the
+  acceptor before it calls `handshake` or `handshake_with_callback`.
 - **`lorica-core`, a certificate x509-parser refuses is an error
   (v1.10.3).** Site: `parse_der_reporting_errors` in
   `lorica-core/src/utils/tls/rustls.rs`, behind
@@ -417,6 +440,71 @@ lives in.
   still `expect`s the parse, so a peer certificate the handshake
   accepted and x509-parser refused would panic the connection task; its
   caller in `from_stream` already treats an error as "no organization".
+- **`lorica-core`, `HttpPeer::new` refuses an address that yields no
+  socket address (v1.4.0, folded into `new` in v1.10.5).** Site:
+  `HttpPeer::new` in `lorica-core/src/upstreams/peer.rs`. Upstream made
+  `new` return a `Result` in `b44baef4` but still panics when the address
+  converts and yields no socket address; Lorica returns a `SocketError`
+  there too, because the address comes from an operator's backend
+  configuration and a panic would take down the proxy task serving it.
+  Until 1.10.5 this lived in a Lorica-only `HttpPeer::try_new` beside a
+  panicking `new`. On an upstream sync, keep the second `or_err` in `new`
+  and leave out upstream's `# Panics` section.
+- **`lorica-core`, the HTTP/1 body reader carries half of `bd054bad`
+  (v1.10.5).** Sites: `lorica-core/src/protocols/http/v1/body.rs`
+  (`BodyReader::prepare_buf` through `release_completed_buf`,
+  `convert_to_close_delimited`, the excess warning in `do_read_body`,
+  the partial chunk head and last-chunk split in `do_read_chunked_body`,
+  the split-tail parse in `do_read_chunked_body_final`),
+  `lorica-core/src/protocols/l4/stream.rs` (`BUF_READ_SIZE` and
+  `Stream::set_buffer_capacity`) and the tests built on them
+  (`http/v1/body_fuzz.rs`, which reads through `set_buffer_capacity`).
+  Upstream's `f8ecae90` (release empty read buffers, 1.10.5 row below)
+  is written on the buffer handling of `bd054bad`, which belongs to
+  HTTP/1 request pipelining, a feature the fork does not take (`4a9a34c5`,
+  1.7.0 row). The port brings the half `f8ecae90` needs, as upstream
+  wrote it: the body buffer holds only the bytes read and is filled by
+  `read_buf`, the partial chunk head is compacted in place with its
+  offsets committed before the await so a cancelled read resumes, and
+  the bytes after the last chunk are split off rather than copied and
+  parsed in place for the trailers. The other half is absent:
+  `prepare_owned_buf` and `init_chunked_owned`,
+  `init_content_length_owned`, `init_close_delimited_owned` (adopting
+  the header parser's allocation instead of copying the preread),
+  `take_body_overread` and `push_body_overread` (handing the excess to
+  the next pipelined session), and the downgrade of downstream excess
+  from a warning to debug. So every init copies its preread,
+  `convert_to_close_delimited` copies the overread, and downstream excess
+  still warns. On the transport side the fork has no `L4BufferSettings`
+  (`c0845a86`, per-listener buffer sizes, never taken): `set_buffer`
+  keeps fixed sizes and `set_buffer_capacity` stands in for upstream's
+  `set_buffer(L4BufferSettings)` for the tests that vary the read-ahead
+  capacity. Each site carries a `Lorica:` comment. On an upstream sync,
+  a change to these functions is ported onto this shape, checked by
+  `body_reader_fuzz_fixed_seeds` (and the ignored soak for a longer run).
+  A port of `bd054bad` proper, with pipelining, replaces the copies by
+  the owned variants and the overread hand-off, restores upstream's
+  debug log, and drops this entry; taking `L4BufferSettings` replaces
+  `set_buffer_capacity` and `BUF_READ_SIZE` with upstream's settings and
+  `DEFAULT_L4_READ_BUFFER_SIZE`.
+- **`lorica-core`, 64 KiB read buffers where upstream uses 32 KiB
+  (v1.10.5).** Sites: `BODY_BUFFER_SIZE` in
+  `lorica-core/src/protocols/http/v1/body.rs` and `BUF_READ_SIZE` in
+  `lorica-core/src/protocols/l4/stream.rs`. Upstream's `f8ecae90` halves
+  both to fit jemalloc's default tcache; no Lorica binary sets a global
+  allocator, so production runs on glibc malloc, where that reason does
+  not hold. Measured on the 1.10.5 branch (one host, WSL2, a worker on
+  two pinned vCPUs, 100 MiB transfers through the proxy to nginx, nine
+  runs per cell, 2,000 idle connections for memory): at 64 KiB,
+  chunked uploads ran 65 to 113 % faster, plaintext downloads 10 to
+  16 % faster and the other transfers up to 11 % faster or within
+  noise, for idle memory within 0.6 KiB per connection of 32 KiB.
+  Upstream's release of empty read storage while a connection waits is
+  kept: against 1.10.4 it saves 24 and 22 KiB per idle plaintext
+  connection (keep-alive, stalled upload) and 10 and 17 KiB over TLS,
+  with worker CPU per GiB never more than 4.7 % worse. On an upstream
+  sync, keep both constants at 64 KiB; taking `L4BufferSettings` makes
+  the read-ahead a setting whose Lorica default is 64 KiB.
 
 ## Upstream sync record
 
@@ -427,6 +515,7 @@ commit; the `[1.7.0]` CHANGELOG entries describe the user-visible effect.
 
 | Cycle | Upstream range | Ported | Not ported (deliberate) |
 |-------|----------------|--------|-------------------------|
+| 1.10.5 (2026-11-12) | `1adcb381`..`3f87e92c` | `0358ae7f` (rand 0.10 calls; its test keeps a file of its own, as upstream's), `790916e1` (moves `thread_local` from a dependency of `lorica-runtime` to a dev-dependency, as upstream does), `47613cc8`, `b44baef4` + `c261234c` (by hand: the fork already had the fallible constructor as the Lorica-only `HttpPeer::try_new`, with `new` panicking on it; `try_new` is folded into `new`, which keeps its stricter refusal of an address that yields no socket address, where upstream still panics, so the `# Panics` section of `c261234c` is not carried; the docs/ and example hunks touch files the fork does not carry), `f8ecae90` (by hand: its `body.rs` hunks sit on the buffer handling of `bd054bad`, HTTP/1 pipelining without copies, which no pass took since it serves the pipelining feature `4a9a34c5` ruled out in the 1.7.0 row; the port brings the part of `bd054bad` the commit needs, a `BytesMut` holding only the bytes read and filled by `read_buf`, the partial chunk head compacted with its offsets committed before the await, the tail after the last chunk split off rather than copied, and leaves out its owned-preread init variants and overread hand-off, so upstream's tests run their borrowed-preread half; `stream.rs` has no `L4BufferSettings`, so `set_buffer` keeps its fixed sizes through a new `set_buffer_capacity`; recorded as a divergence above), `f2fca311` (by hand: borrowed prereads only, the L4 transport through `set_buffer_capacity`, rand 0.10, so its seeds do not replay upstream's cases), `8b91e00c` (it rewrites `FixedBuffer` whole and so also brings `b1572eee`, the release of a truncated retry buffer, an earlier upstream commit no pass recorded) | Deferred to Epic 12: `5104a3e0` (opt-in accept limits per listening endpoint: handshake timeout, open-connection and pending-handshake caps, closing peers that already left) and `4a9d66d8` (a listener `Tracer` reporting downstream connection lifetime from accept). Both act on Pingora's listeners, which here serve HTTP only, and have no consumer today; Epic 12's stream accept loop runs outside them (`docs/prd/epic-12-v1.11.0.md`, Architecture), but its connection budgets and fd reserve for HTTP are where caps on the HTTP listeners get decided, beside the fork's own per-IP accept permit (Story 8.9). `5104a3e0` also lands on `listeners/tls/rustls/mod.rs` and `l4/stream.rs`. `33a9e210` (abandon unfinished custom upstream responses): it extends the custom-session abandonment of the cache-fill opt-in `989ed973`, ruled out in the 1.10.0 row, so `proxy_custom.rs` here has nothing to extend, and Lorica does not wire the custom-protocol path; the same reason as `7de472d2` there. `2578e3a2` + `9c7b63ce` (`WrappedX509::parse` and its refusal of trailing bytes): additive API, and nothing in the workspace builds a `WrappedX509` outside `utils/tls`. `4f203931` (despite its title, wires `upgrade_sock_connect_accept_max_retries` into Pingora's own graceful upgrade): Lorica never sets the field (`ServerConf::new` leaves it `None`), with `None` the wired path behaves as it does now, and Lorica's hot upgrade calls `Fds::send_to_sock` and `get_from_sock` directly. CI only: `3f87e92c` (cargo nextest), `b5592940` (a soak step for the body reader fuzz in upstream's CI; the soak is ported as the ignored `body_reader_fuzz_soak`) |
 | 1.10.2 (2026-11-04) | `84f21ee9`..`1adcb381` | `80b68c34` + `56965c34` (by hand: neither connector hunk applied, the fork's `reused_stream` calls `matches_fd` without the `cfg(unix)` and its imports differ; the `idle_poll` signature change in `lorica-pool` came over as upstream wrote it, the `RwLock` pool itself is untouched; the hand-off race test sits in its own `reuse_race_tests` module rather than upstream's `any_tls`-gated `tests`, so that it also runs in the forked-crate test job's default-feature build; the gated module itself runs in that job's rustls step since the same cycle), `b5dea5a6` (with its strict round-trip tests), `1adcb381`, `a7106806` | early request body buffering before peer selection `da2af11e`, `23d43604`, `9836342e`, `7b709f12` (a new opt-in feature, its phase docs, and a fix to its `body_routing` example, an example binary the fork does not carry); it lands on exactly the sites of the initial body send divergence in `proxy_h1.rs`, `proxy_h2.rs` and `proxy_custom.rs`, which the WAF body hold depends on. `cb16c871` (TLS verify callback for upstream connections) and `b0c6e442` (vectored TLS write coalescing), both OpenSSL/BoringSSL-only; the fork is rustls-only. `95857fe8` (illumos and Solaris builds; Linux-only project). `e479d66c` (docs.rs metadata). `6502a633` (audit ignore for `crypto-bigint` 0.5.5, absent from Lorica's lockfile). `8d1adda2` (zstd 0.14.3, which Lorica's lockfile already resolves) |
 | 1.10.0 (2026-10-27) | `4487f7b2`..`84f21ee9` | `b62452fc` (by hand: the completion sync lands in the inlined upstream task branch, no `PipeState` assertions in its tests), `81463f8a` (by hand: `read_body_or_idle` stays an `async_trait` method on the dyn custom session, `custom_session_tests.rs` adapted), `10a83456` (the `do_write_chunked_body` hunk and its unit test; the body-task hunk patches the proxy task API path the fork lacks, and the `test_basic.rs` test needs the upstream `HttpOrigin` utilities), `c1c4a0da`, `a554e713` (with `read_response_header_non_utf8`, not the HEAD-response tests that rode along in the conflicting hunk), `5b30d71d` (by hand: no `L4BufferSettings` here, so a stream-level zero-capacity test replaces the listener one) | `7de472d2` (custom upload failure handling): its fix is written against `PipeState` and the producer/delivery split of `ResponseStateMachine` from `7142ad46`, part of the proxy task API family deferred in the 1.7.0 row (backlog #83), and its tests sit on the `989ed973` cache-fill abandonment harness and `tokio` `test-util`; Lorica does not wire the custom-protocol path it fixes. Features: `5641e50c` (configurable HTTP/1 response parser; this fork already normalises obsolete line folding since 1.7.0 and keeps its lenient defaults), `5dc98c41` (runtime groups shared across services; Lorica runs one proxy service per worker), `62b3227e` (Dial9 profiling runtime options, no Dial9 here), `42df06a3` (downstream fd in the TLS certificate callback, an OpenSSL/BoringSSL-only change; the fork is rustls-only). Cache opt-ins `989ed973`, `0741cf08`, `565ec1ef`, `ac7cf04e` (downstream abandonment of a cache fill, early cancellation, client watch during a stalled hit or a subrequest pipe: new opt-in APIs, defaults unchanged). LRU and storage `9c589336`, `11b9eb3c`, `327cc69c` (new conditional and paired LRU mutations, eviction-accounting hooks for out-of-band storage, a data-peek helper), `27e90f93`, `1f59e578` (an `unwrap` on a write into a `Vec` turned into an error, and its message). CI and test-only: `84f21ee9`, `1b0a4b97`, `d316bab1`, `9b88c0ff`, `623e163d`, `3e204141`, `952b5caa`, `a884c5b3`, `962a6b63`, `7010f0d5`, `3658dafb` |
 | 1.9.2 (2026-10-14) | commits deferred by the `4487f7b2` pass | `b01edce5` (sharded shutdown `Notify`, which also closes a lost wakeup: a request that started waiting for its header after `http_cleanup()` had fired waited out the grace period; both tests in `lorica-proxy/src/lib.rs`, not the `benches/shutdown_signal.rs` benchmark, which mirrors private types) | the request-target chain, upstream order `ffab8302` -> `1e551289` -> `baf4fe5c` -> `ee78ceb6`. Only the authority checks of `ffab8302` were ported (1.7.2); its absolute-form and CONNECT classifier, its H2 egress rewrite and the three commits after it were not. Together they make absolute-form, authority-form CONNECT and non-UTF-8 targets parse, then fix how they are stored, fragment-stripped and forwarded. None of those shapes reach a header here, whatever the method (`non_origin_form_targets_do_not_reach_the_header` in `lorica-core/src/protocols/http/v1/server.rs`, which sends authority-form as both `GET` and `CONNECT`, and `absolute_form_targets_do_not_survive_header_parsing` in `authority.rs`), so for this fork the chain is a feature: RFC 9112 absolute-form acceptance |

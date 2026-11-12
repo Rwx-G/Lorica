@@ -44,6 +44,7 @@ use lorica_api::middleware::rate_limit::RateLimiter;
 use lorica_api::server::AppState;
 use lorica_config::store::TelemetryCursor;
 use lorica_config::ConfigStore;
+use lorica_tls::cert_resolver::LeafFingerprint;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -671,7 +672,9 @@ pub(crate) fn spawn_ocsp_refresh_loop(
             let responses = futures_util::future::join_all(fetches).await;
 
             let now = std::time::Instant::now();
-            let mut staples: std::collections::HashMap<String, Vec<u8>> =
+            // By certificate, not by name: two certificates sharing a
+            // name must each keep their own response.
+            let mut staples: std::collections::HashMap<LeafFingerprint, Vec<u8>> =
                 std::collections::HashMap::new();
             let mut ok: u64 = 0;
             let mut fail: u64 = 0;
@@ -684,9 +687,11 @@ pub(crate) fn spawn_ocsp_refresh_loop(
                     Some(bytes) => {
                         ok += 1;
                         for d in domains {
-                            last_ok.insert(d.clone(), now);
                             lorica_api::metrics::set_cert_resolver_pending_ocsp_seconds(&d, 0.0);
-                            staples.insert(d, bytes.clone());
+                            last_ok.insert(d, now);
+                        }
+                        if let Some(leaf) = LeafFingerprint::of_pem(&c.cert_pem) {
+                            staples.insert(leaf, bytes);
                         }
                     }
                     None => {

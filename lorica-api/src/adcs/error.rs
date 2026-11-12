@@ -109,8 +109,8 @@ pub const BUSY: AdcsCode = AdcsCode {
 pub const SAN_REFUSED: AdcsCode = AdcsCode {
     code: "adcs_san_refused",
     status: StatusCode::UNPROCESSABLE_ENTITY,
-    meaning: "A requested name is a wildcard, is not under an allowed suffix, or the list is \
-              empty or too long",
+    meaning: "A requested name is a wildcard or an IP address, is not under an allowed suffix, \
+              or the list is empty or too long",
 };
 
 /// The template of the request is not one the authority allows (D17).

@@ -15,6 +15,8 @@
 //! HTTP/1.x implementation
 
 pub(crate) mod body;
+#[cfg(test)]
+mod body_fuzz;
 pub mod client;
 pub mod common;
 pub mod server;

@@ -51,7 +51,9 @@ pub struct AclResponse {
 /// Shape-check an ACL pattern. Accepts `*`, `*.<label>...`, or an
 /// exact hostname. Same alphabet as `validate_hostname_alias`
 /// (ASCII letters, digits, `-`, `.`) with the additional `*`
-/// allowed on the first two characters.
+/// allowed on the first two characters, and the same rule on
+/// addresses: a wildcard ending in a number, or an IPv4 address in a
+/// spelling other than dotted decimal, is refused.
 fn validate_pattern(raw: &str) -> Result<String, ApiError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -98,6 +100,28 @@ fn validate_pattern(raw: &str) -> Result<String, ApiError> {
                 "cert export ACL hostname_pattern may only contain ASCII letters, digits, `-`, `.`, and a leading `*.`".into(),
             ));
         }
+    }
+    // The rule routes and token grants apply (`lorica_config::host_shape`):
+    // a wildcard never covers an address, and an address is named only
+    // in the dotted spelling a route can carry.
+    match lorica_config::host_shape::host_shape(body) {
+        lorica_config::host_shape::HostShape::NotAnAddress => {}
+        _ if body.len() != trimmed.len() => {
+            return Err(ApiError::BadRequest(
+                "cert export ACL hostname_pattern is a wildcard whose last label is a number: it \
+                 would stand for IP addresses, which a wildcard never covers"
+                    .into(),
+            ));
+        }
+        lorica_config::host_shape::HostShape::NonCanonicalIpv4 => {
+            return Err(ApiError::BadRequest(
+                "cert export ACL hostname_pattern is read by browsers as an IPv4 address spelled \
+                 another way; write an address as four decimal numbers without leading zeros"
+                    .into(),
+            ));
+        }
+        lorica_config::host_shape::HostShape::Ipv4(_)
+        | lorica_config::host_shape::HostShape::Ipv6(_) => {}
     }
     Ok(trimmed.to_string())
 }
@@ -364,6 +388,24 @@ mod tests {
     fn rejects_non_ascii_and_underscore() {
         assert!(expect_err("my_group.com").contains("ASCII"));
         assert!(expect_err("café.com").contains("ASCII"));
+    }
+
+    #[test]
+    fn refuses_an_address_spelled_otherwise_or_under_a_wildcard() {
+        for wildcard in ["*.0.2.10", "*.10", "*.2.0xa", "*.corp.010"] {
+            assert!(
+                expect_err(wildcard).contains("wildcard whose last label is a number"),
+                "{wildcard}"
+            );
+        }
+        for spelled_otherwise in ["010.0.0.1", "0xc0.0.2.10", "3221225994", "example.123"] {
+            assert!(
+                expect_err(spelled_otherwise).contains("IPv4 address spelled another way"),
+                "{spelled_otherwise}"
+            );
+        }
+        assert_eq!(validate_pattern("192.0.2.10").unwrap(), "192.0.2.10");
+        assert_eq!(validate_pattern("*.v10.example").unwrap(), "*.v10.example");
     }
 
     #[test]

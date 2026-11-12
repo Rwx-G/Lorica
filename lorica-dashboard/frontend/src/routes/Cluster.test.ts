@@ -78,6 +78,7 @@ function certificate(id: string, domain: string) {
     id,
     domain,
     san_domains: [],
+    san_ips: [],
     fingerprint: 'ab',
     issuer: 'Test CA',
     subject: `CN=${domain}`,

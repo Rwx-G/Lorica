@@ -171,7 +171,9 @@ impl AdcsSubjectDefaults {
 /// a lowercase DNS name of at least two LDH labels with no wildcard, and
 /// [`AllowedSuffix::permits`] never has to reason about a malformed
 /// suffix. Deserialisation goes through the same constructor, so a
-/// stored list that no longer validates is refused rather than widened.
+/// list that does not validate is refused rather than widened; the
+/// store, reading a list saved before a rule was added, drops the
+/// entries the rule refuses instead (`ConfigStore::get_adcs_authority`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct AllowedSuffix(String);
@@ -187,14 +189,22 @@ impl AllowedSuffix {
     /// [`ConfigError::Validation`] for an empty value, a wildcard, a
     /// leading dot, an empty label, a label outside RFC 1123 (LDH, 1 to
     /// 63 characters, no hyphen at either end), a name over 253
-    /// characters, or a single label: a bare TLD as an allowlist entry
-    /// would let Lorica request any name under it.
+    /// characters, a single label (a bare TLD as an allowlist entry would
+    /// let Lorica request any name under it), or a last label a browser
+    /// reads as a number: decimal digits, or a hex (`0x`) or octal
+    /// (leading `0`) number ([`crate::host_shape`]). A top-level domain
+    /// is never numeric (RFC 3696 section 2), so such a suffix names no
+    /// DNS zone: it is the tail of an IPv4 address in some spelling
+    /// (`0.2.10`, `0x2.0xa`, or `192.0.2.10` whole), and would let an
+    /// address pass for a name under it. An IPv6 address or fragment is
+    /// refused as not LDH.
     ///
     /// ```
     /// use lorica_config::models::AllowedSuffix;
     /// let suffix = AllowedSuffix::new("Corp.Example.ORG").expect("valid suffix");
     /// assert_eq!(suffix.as_str(), "corp.example.org");
     /// assert!(AllowedSuffix::new("*.corp.example.org").is_err());
+    /// assert!(AllowedSuffix::new("0.2.10").is_err());
     /// ```
     pub fn new(raw: &str) -> Result<Self> {
         if raw.contains('*') {
@@ -217,6 +227,12 @@ impl AllowedSuffix {
         if !name.contains('.') {
             return Err(ConfigError::Validation(format!(
                 "allowed suffix {raw:?}: at least two labels are required"
+            )));
+        }
+        if crate::host_shape::names_an_address(&name) {
+            return Err(ConfigError::Validation(format!(
+                "allowed suffix {raw:?}: a numeric top-level label makes it an IP address \
+                 or its tail, not a DNS zone; AD CS issuance requests DNS names only"
             )));
         }
         Ok(Self(name))
@@ -422,8 +438,9 @@ impl AdcsAuthority {
     }
 
     /// The invariants the store refuses to persist without: an
-    /// `https://` endpoint with a host, a principal, valid template
-    /// names, and at least one allowed suffix.
+    /// `https://` endpoint with a host, a principal and valid template
+    /// names. Whether the allowlist may be empty depends on what is
+    /// stored, so `ConfigStore::upsert_adcs_authority` decides that.
     ///
     /// The endpoint check is coarse on purpose: this crate does not link
     /// `lorica-adcs` (see the module doc), whose `CesEndpoint` the API
@@ -462,11 +479,6 @@ impl AdcsAuthority {
         }
         for template in &self.allowed_templates {
             validate_template_name("allowed_templates", template)?;
-        }
-        if self.allowed_suffixes.is_empty() {
-            return Err(ConfigError::Validation(
-                "AD CS authority needs at least one allowed DNS suffix".to_string(),
-            ));
         }
         Ok(())
     }
@@ -536,6 +548,9 @@ mod tests {
             ("corp.example.org.", "corp.example.org"),
             ("xn--bcher-kva.example.org", "xn--bcher-kva.example.org"),
             ("a-1.example.org", "a-1.example.org"),
+            // Digits are fine anywhere but the top-level label.
+            ("10.0.corp.example.org", "10.0.corp.example.org"),
+            ("192.example.org", "192.example.org"),
         ];
         for (raw, expected) in cases {
             assert_eq!(suffix(raw).as_str(), *expected, "input {raw:?}");
@@ -551,6 +566,22 @@ mod tests {
             ".",
             "*.corp.example.org",
             "*",
+            // An IPv4 address, its tail, or any numeric top label, in
+            // any spelling a browser reads as a number.
+            "0.2.10",
+            "192.0.2.10",
+            "192.0.2.10.",
+            "corp.10",
+            "0x2.0xa",
+            "corp.0XA",
+            "corp.010",
+            "corp.0x",
+            "010.0.0.1",
+            // An IPv6 address or fragment, bracketed or not.
+            "2001:db8::1",
+            "[2001:db8::1]",
+            "db8::1",
+            "::ffff:192.0.2.10",
             "corp.*.org",
             ".corp.example.org",
             "corp..example.org",
@@ -689,8 +720,6 @@ mod tests {
         no_principal.principal = " ".to_string();
         let mut no_template = authority();
         no_template.default_template = String::new();
-        let mut no_suffix = authority();
-        no_suffix.allowed_suffixes.clear();
         let mut control_template = authority();
         control_template.default_template = "Web\u{7}Server".to_string();
         let mut empty_allowed = authority();
@@ -709,7 +738,6 @@ mod tests {
             no_realm,
             no_principal,
             no_template,
-            no_suffix,
             control_template,
             empty_allowed,
             too_many_allowed,
@@ -721,6 +749,13 @@ mod tests {
         let mut upper_scheme = authority();
         upper_scheme.endpoint = "HTTPS://ces.corp.example.org/".to_string();
         assert!(upper_scheme.validate().is_ok());
+
+        // The store, which knows what is stored, decides on an empty
+        // allowlist (`ConfigStore::upsert_adcs_authority`).
+        let mut no_suffix = authority();
+        no_suffix.allowed_suffixes.clear();
+        assert!(no_suffix.validate().is_ok());
+        assert!(!no_suffix.permits("web.corp.example.org"));
     }
 
     #[test]

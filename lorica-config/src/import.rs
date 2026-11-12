@@ -4,7 +4,10 @@ use serde::Deserialize;
 
 use crate::error::{ConfigError, Result};
 use crate::models::*;
-use crate::route_selection::{canonical_hostname, validate_hostname_syntax, ROUTE_HOSTNAME_SHAPE};
+use crate::route_selection::{
+    canonical_hostname, validate_hostname_syntax, ROUTE_ALIAS_SHAPE, ROUTE_HOSTNAME_SHAPE,
+    ROUTE_REDIRECT_HOSTNAME_SHAPE,
+};
 use crate::store::ConfigStore;
 
 /// Deserialized counterpart of [`crate::export::ExportData`]. Each
@@ -82,14 +85,23 @@ fn validate_structure(data: &ImportData) -> Result<()> {
         }
     }
 
-    // Every primary hostname as a route write sets it; the store makes
-    // it canonical on the way in.
+    // Every primary hostname, alias and redirect host as a route write
+    // sets it; the store makes the names canonical on the way in.
     for route in &data.routes {
+        let refused =
+            |reason: String| ConfigError::Validation(format!("route '{}': {reason}", route.id));
         validate_hostname_syntax(
             &canonical_hostname(route.hostname.trim()),
             ROUTE_HOSTNAME_SHAPE,
         )
-        .map_err(|reason| ConfigError::Validation(format!("route '{}': {reason}", route.id)))?;
+        .map_err(refused)?;
+        for alias in &route.hostname_aliases {
+            validate_hostname_syntax(&canonical_hostname(alias.trim()), ROUTE_ALIAS_SHAPE)
+                .map_err(refused)?;
+        }
+        if let Some(target) = &route.redirect_hostname {
+            validate_hostname_syntax(target, ROUTE_REDIRECT_HOSTNAME_SHAPE).map_err(refused)?;
+        }
     }
 
     Ok(())

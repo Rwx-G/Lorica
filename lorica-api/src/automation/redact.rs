@@ -46,13 +46,14 @@
 //!   every field the environment resource derives from that name
 //!   ([`ENVIRONMENT_NAMED_FIELDS`]).
 //!
-//! One thing is withheld whole, key and value: a certificate's
+//! Two things are withheld whole, key and value. A certificate's
 //! [`ADCS_INTERNAL_FIELDS`], the authority id, the template and the
 //! authority's request identifier (Epic 13). They are internal PKI
 //! detail no token caller needs: a token cannot issue or renew an AD
 //! CS certificate, and `source` and `subject`, which stay, say what a
 //! certificate is. A field that answers no caller's need is not
-//! published (the Epic 10 and 11 rule).
+//! published (the Epic 10 and 11 rule). And a certificate's
+//! [`DASHBOARD_ONLY_CERTIFICATE_FIELDS`], its IP address SANs.
 //!
 //! The mask applies wherever the automation plane or the MCP server
 //! answers such a row: the read listings, and every write answer and
@@ -321,11 +322,22 @@ pub const ADCS_INTERNAL_FIELDS: &[&str] = &[
     "adcs_request_id",
 ];
 
+/// The certificate view's fields derived for the dashboard alone: the
+/// leaf's IP address SANs (issue #53), which it checks a route whose
+/// hostname is an IP against. A grant bounds which certificates a token
+/// sees by DNS names, the `domain` and `san_domains` against
+/// `allowed_hostnames`, and says nothing of addresses, so answering them
+/// would show a token addresses no grant was checked against.
+pub const DASHBOARD_ONLY_CERTIFICATE_FIELDS: &[&str] = &["san_ips"];
+
 /// A certificate row as the automation plane may answer it: without
-/// [`ADCS_INTERNAL_FIELDS`].
+/// [`ADCS_INTERNAL_FIELDS`] and [`DASHBOARD_ONLY_CERTIFICATE_FIELDS`].
 pub fn certificate_row(row: &mut Value) {
     if let Some(fields) = row.as_object_mut() {
-        for field in ADCS_INTERNAL_FIELDS {
+        for field in ADCS_INTERNAL_FIELDS
+            .iter()
+            .chain(DASHBOARD_ONLY_CERTIFICATE_FIELDS)
+        {
             fields.remove(*field);
         }
     }
@@ -386,6 +398,116 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_certificate_row_loses_the_withheld_fields_and_keeps_the_rest() {
+        let mut row = json!({
+            "domain": "localhost",
+            "san_domains": ["localhost"],
+            "subject": "CN=localhost",
+        });
+        let withheld = ADCS_INTERNAL_FIELDS
+            .iter()
+            .chain(DASHBOARD_ONLY_CERTIFICATE_FIELDS);
+        for field in withheld.clone() {
+            row[*field] = json!(["192.0.2.10"]);
+        }
+        certificate_row(&mut row);
+        for field in withheld {
+            assert!(row.get(*field).is_none(), "{field} answered: {row}");
+        }
+        assert_eq!(
+            row,
+            json!({
+                "domain": "localhost",
+                "san_domains": ["localhost"],
+                "subject": "CN=localhost",
+            })
+        );
+    }
+
+    /// Every key an automation certificate row carries, each one decided
+    /// for the automation plane and the MCP server. [`certificate_row`]
+    /// removes the withheld fields by name, so a field added to the
+    /// certificate view would otherwise reach tokens unseen.
+    const AUTOMATION_CERTIFICATE_KEYS: &[&str] = &[
+        "acme_auto_renew",
+        "acme_dns_provider_id",
+        "acme_method",
+        "created_at",
+        "domain",
+        "fingerprint",
+        "id",
+        "is_acme",
+        "issuer",
+        "not_after",
+        "not_before",
+        "san_domains",
+        "source",
+        "subject",
+    ];
+
+    #[test]
+    fn an_automation_certificate_row_carries_exactly_the_fields_decided_for_it() {
+        // Every field set, by a struct literal without `..`: a field added
+        // to the view fails to compile here, and once given a value it is
+        // serialised below and must be listed as answered or withheld.
+        let full = crate::certificates::CertificateResponse {
+            id: "cert-1".to_string(),
+            domain: "app.example.com".to_string(),
+            san_domains: vec!["app.example.com".to_string()],
+            san_ips: vec!["192.0.2.10".to_string()],
+            fingerprint: "00".to_string(),
+            issuer: "CN=Example CA".to_string(),
+            not_before: "2026-01-01T00:00:00Z".to_string(),
+            not_after: "2027-01-01T00:00:00Z".to_string(),
+            is_acme: true,
+            acme_auto_renew: true,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            acme_method: Some("http01".to_string()),
+            acme_dns_provider_id: Some("dns-1".to_string()),
+            subject: "CN=app.example.com".to_string(),
+            source: lorica_config::models::CertificateSource::Acme,
+            adcs: crate::certificates::AdcsCertificateFields {
+                adcs_authority_id: Some("adcs-1".to_string()),
+                adcs_template: Some("LoricaWebServer".to_string()),
+                adcs_template_oid: Some("1.3.6.1.4.1.311.21.7".to_string()),
+                adcs_request_id: Some("4711".to_string()),
+            },
+        };
+        let mut row = serde_json::to_value(&full).expect("the view serialises");
+        let serialised: std::collections::BTreeSet<String> = row
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect();
+        certificate_row(&mut row);
+        let answered: std::collections::BTreeSet<&str> = row
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let decided: std::collections::BTreeSet<&str> =
+            AUTOMATION_CERTIFICATE_KEYS.iter().copied().collect();
+        assert_eq!(
+            answered, decided,
+            "\nThe automation plane answers a certificate field nobody decided on, or no longer \
+             answers one that was. Add a new field either to AUTOMATION_CERTIFICATE_KEYS (tokens \
+             and the MCP server may read it) or to DASHBOARD_ONLY_CERTIFICATE_FIELDS / \
+             ADCS_INTERNAL_FIELDS (they may not).\n"
+        );
+        for withheld in ADCS_INTERNAL_FIELDS
+            .iter()
+            .chain(DASHBOARD_ONLY_CERTIFICATE_FIELDS)
+        {
+            assert!(
+                serialised.contains(*withheld),
+                "{withheld} is withheld but the view has no such field"
+            );
+        }
+    }
 
     #[test]
     fn a_query_value_is_withheld_and_its_name_kept_whatever_the_shape() {
