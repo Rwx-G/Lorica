@@ -438,6 +438,16 @@ lives in.
   still `expect`s the parse, so a peer certificate the handshake
   accepted and x509-parser refused would panic the connection task; its
   caller in `from_stream` already treats an error as "no organization".
+- **`lorica-core`, `HttpPeer::new` refuses an address that yields no
+  socket address (v1.4.0, folded into `new` in v1.10.5).** Site:
+  `HttpPeer::new` in `lorica-core/src/upstreams/peer.rs`. Upstream made
+  `new` return a `Result` in `b44baef4` but still panics when the address
+  converts and yields no socket address; Lorica returns a `SocketError`
+  there too, because the address comes from an operator's backend
+  configuration and a panic would take down the proxy task serving it.
+  Until 1.10.5 this lived in a Lorica-only `HttpPeer::try_new` beside a
+  panicking `new`. On an upstream sync, keep the second `or_err` in `new`
+  and leave out upstream's `# Panics` section.
 
 ## Upstream sync record
 

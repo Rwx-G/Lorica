@@ -13,6 +13,8 @@ Author: Rwx-G
 
 ### Changed
 
+- **Idle connections hold less memory.** An HTTP/1 connection waiting for its next request or for more of a body releases its empty read buffer instead of keeping it allocated, the default read-ahead and body buffers are 32 KiB instead of 64 KiB, and a body read from a backend that announced its length asks for at most what remains plus 1 KiB. The request retry buffer keeps the body as the chunks it arrived in instead of copying it into one block. Ported from upstream Pingora; the full record of the 1.10.5 upstream sync is in `FORK.md`.
+
 ### Fixed
 
 - **A route whose hostname is an IP address can be served over HTTPS with a certificate carrying that address as an IP SAN** ([#53](https://github.com/Rwx-G/Lorica/issues/53)). A client dialing an IP sends no SNI (RFC 6066 forbids an address there), and the certificate resolver selected by SNI alone, so the handshake failed with no certificate to present (`ERR_SSL_PROTOCOL_ERROR` in Chrome). A ClientHello without SNI now gets the certificate whose IP SAN is the local address the connection arrived on; certificates already uploaded need no re-upload. Behind NAT, such as Docker with published ports, the local address is not the one the client dialed and nothing matches. A client that sends an SNI is served exactly as before. `docs/security.md` describes the behaviour, including what a scanner sweeping addresses now sees.
