@@ -21,9 +21,12 @@
 //! - Wildcard matching (`*.example.com`)
 //! - Multiple certificates per domain, sorted by expiration (longest-lived first)
 //! - Atomic hot-swap via `arc-swap` - no downtime during certificate rotation
+//! - A ClientHello without SNI, answered by the `iPAddress` SAN matching the
+//!   local address the connection arrived on (see [`ResolvesServerCertByLocalIp`])
 
 use std::collections::HashMap;
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -41,6 +44,7 @@ use rustls::sign::CertifiedKey;
 // per-call pattern.
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use x509_parser::extensions::GeneralName;
 
 use crate::load_first_private_key;
 
@@ -66,12 +70,36 @@ pub struct CertData {
 struct CertEntry {
     key: Arc<CertifiedKey>,
     not_after_epoch: i64,
+    /// The lowercased primary domain of the [`CertData`] this entry was
+    /// built from: the key the OCSP loop always staples a certificate
+    /// under, so [`CertResolver::refresh_staples`] can staple the entries
+    /// of the IP index, which are not keyed by any domain.
+    primary_domain: Arc<str>,
+}
+
+impl CertEntry {
+    /// This entry with `ocsp` as its staple, sharing the parsed chain and
+    /// the signing key.
+    fn with_staple(&self, ocsp: &[u8]) -> CertEntry {
+        let mut ck = CertifiedKey::new(self.key.cert.clone(), Arc::clone(&self.key.key));
+        ck.ocsp = Some(ocsp.to_vec());
+        CertEntry {
+            key: Arc::new(ck),
+            not_after_epoch: self.not_after_epoch,
+            primary_domain: Arc::clone(&self.primary_domain),
+        }
+    }
 }
 
 /// Inner state of the resolver, atomically swapped on reload.
 struct CertResolverInner {
     /// Maps lowercase domain -> certs sorted by expiry (longest-lived first).
     certs: HashMap<String, Vec<CertEntry>>,
+    /// Maps a canonical IP address (IPv4-mapped IPv6 folded to IPv4) carried
+    /// as an `iPAddress` SAN of a leaf -> certs sorted like `certs`. Read
+    /// only for a ClientHello without SNI, never as a fallback for an SNI
+    /// the domain map does not know.
+    certs_by_ip: HashMap<IpAddr, Vec<CertEntry>>,
 }
 
 /// SNI-based certificate resolver with atomic hot-swap.
@@ -87,6 +115,7 @@ impl fmt::Debug for CertResolver {
         let inner = self.inner.load();
         f.debug_struct("CertResolver")
             .field("domains", &inner.certs.keys().collect::<Vec<_>>())
+            .field("ips", &inner.certs_by_ip.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -124,6 +153,7 @@ impl CertResolver {
         Self {
             inner: ArcSwap::from_pointee(CertResolverInner {
                 certs: HashMap::new(),
+                certs_by_ip: HashMap::new(),
             }),
         }
     }
@@ -142,8 +172,14 @@ impl CertResolver {
     /// latter is what `lorica` feeds into the
     /// `lorica_certificates_invalid_bundle_total{source="reload"}`
     /// Prometheus counter.
+    ///
+    /// The IP index is derived from each leaf's own `iPAddress` SAN
+    /// entries, never from [`CertData::san_domains`], so a certificate
+    /// stored before the index existed is served by IP without a
+    /// re-upload.
     pub fn reload(&self, certs: Vec<CertData>) -> Result<ReloadStats> {
         let mut map: HashMap<String, Vec<CertEntry>> = HashMap::new();
+        let mut by_ip: HashMap<IpAddr, Vec<CertEntry>> = HashMap::new();
         let total = certs.len();
         let mut skipped_domains: Vec<String> = Vec::new();
 
@@ -165,13 +201,15 @@ impl CertResolver {
                     continue;
                 }
             };
+            let ip_sans: Vec<IpAddr> = leaf_ip_sans(&certified_key.cert);
+            let domain = cert_data.domain.to_lowercase();
             let entry = CertEntry {
                 key: Arc::new(certified_key),
                 not_after_epoch: cert_data.not_after_epoch,
+                primary_domain: Arc::from(domain.as_str()),
             };
 
             // Register for primary domain
-            let domain = cert_data.domain.to_lowercase();
             map.entry(domain).or_default().push(entry.clone());
 
             // Register for each SAN domain
@@ -179,10 +217,15 @@ impl CertResolver {
                 let san_lower = san.to_lowercase();
                 map.entry(san_lower).or_default().push(entry.clone());
             }
+
+            for ip in ip_sans {
+                by_ip.entry(ip).or_default().push(entry.clone());
+            }
         }
 
-        // Sort each domain's certs by expiry descending (longest-lived first)
-        for entries in map.values_mut() {
+        // Sort each domain's (and each address's) certs by expiry
+        // descending (longest-lived first)
+        for entries in map.values_mut().chain(by_ip.values_mut()) {
             entries.sort_by_key(|e| std::cmp::Reverse(e.not_after_epoch));
         }
 
@@ -192,7 +235,10 @@ impl CertResolver {
         }
 
         let domains = map.len();
-        self.inner.store(Arc::new(CertResolverInner { certs: map }));
+        self.inner.store(Arc::new(CertResolverInner {
+            certs: map,
+            certs_by_ip: by_ip,
+        }));
         Ok(ReloadStats {
             total,
             skipped,
@@ -204,6 +250,24 @@ impl CertResolver {
     /// Number of unique domains currently registered.
     pub fn domain_count(&self) -> usize {
         self.inner.load().certs.len()
+    }
+
+    /// The certificate for a connection accepted on `local_ip` whose
+    /// ClientHello carries no SNI: the longest-lived certificate whose
+    /// leaf lists `local_ip` as an `iPAddress` SAN, or `None`.
+    ///
+    /// RFC 6066 forbids an IP literal in SNI, so a client dialing
+    /// `https://192.0.2.10` sends none, and the local address is the only
+    /// name left to choose by. `local_ip` is canonicalised first: a
+    /// dual-stack `[::]` listener reports an IPv4 client's local address
+    /// as `::ffff:a.b.c.d`.
+    pub fn resolve_by_local_ip(&self, local_ip: IpAddr) -> Option<Arc<CertifiedKey>> {
+        self.inner
+            .load()
+            .certs_by_ip
+            .get(&local_ip.to_canonical())
+            .and_then(|entries| entries.first())
+            .map(|entry| Arc::clone(&entry.key))
     }
 
     /// Atomically replace the OCSP staple bytes on already-loaded
@@ -221,6 +285,13 @@ impl CertResolver {
     /// `CertifiedKey` (Story 8.5 AC #2 / AC #6). This is the OCSP-only
     /// counterpart to [`Self::reload`]: reload swaps cert bodies, this
     /// swaps staples, and the two never block each other on the network.
+    ///
+    /// The IP index carries no domain key, so each of its entries takes
+    /// the staple listed under the primary domain of the certificate it
+    /// was built from: the key the OCSP loop staples every certificate
+    /// under. A certificate served without SNI thus carries the staple
+    /// it carries when its primary domain is named. The counts cover
+    /// domain keys only.
     pub fn refresh_staples(&self, staples: &HashMap<String, Vec<u8>>) -> RefreshStats {
         let current = self.inner.load();
         let mut map: HashMap<String, Vec<CertEntry>> = HashMap::with_capacity(current.certs.len());
@@ -229,17 +300,7 @@ impl CertResolver {
 
         for (domain, entries) in current.certs.iter() {
             if let Some(ocsp) = staples.get(domain) {
-                let rebuilt: Vec<CertEntry> = entries
-                    .iter()
-                    .map(|e| {
-                        let mut ck = CertifiedKey::new(e.key.cert.clone(), Arc::clone(&e.key.key));
-                        ck.ocsp = Some(ocsp.clone());
-                        CertEntry {
-                            key: Arc::new(ck),
-                            not_after_epoch: e.not_after_epoch,
-                        }
-                    })
-                    .collect();
+                let rebuilt: Vec<CertEntry> = entries.iter().map(|e| e.with_staple(ocsp)).collect();
                 map.insert(domain.clone(), rebuilt);
                 refreshed += 1;
             } else {
@@ -248,7 +309,25 @@ impl CertResolver {
             }
         }
 
-        self.inner.store(Arc::new(CertResolverInner { certs: map }));
+        let by_ip: HashMap<IpAddr, Vec<CertEntry>> = current
+            .certs_by_ip
+            .iter()
+            .map(|(ip, entries)| {
+                let rebuilt: Vec<CertEntry> = entries
+                    .iter()
+                    .map(|e| match staples.get(&*e.primary_domain) {
+                        Some(ocsp) => e.with_staple(ocsp),
+                        None => e.clone(),
+                    })
+                    .collect();
+                (*ip, rebuilt)
+            })
+            .collect();
+
+        self.inner.store(Arc::new(CertResolverInner {
+            certs: map,
+            certs_by_ip: by_ip,
+        }));
         RefreshStats {
             refreshed,
             unchanged,
@@ -274,6 +353,101 @@ impl CertResolver {
             .get(domain)
             .and_then(|entries| entries.first())
             .and_then(|entry| entry.key.ocsp.clone())
+    }
+
+    /// [`Self::staple_for`] on the IP index.
+    #[cfg(test)]
+    fn ip_staple_for(&self, ip: IpAddr) -> Option<Vec<u8>> {
+        self.resolve_by_local_ip(ip)
+            .and_then(|key: Arc<CertifiedKey>| key.ocsp.clone())
+    }
+}
+
+/// The canonical `iPAddress` entries of the subjectAltName of `chain`'s
+/// leaf, without duplicates; empty when the leaf cannot be parsed or
+/// lists none. An entry of any length but 4 or 16 octets is not an
+/// address (RFC 5280 section 4.2.1.6) and is skipped.
+fn leaf_ip_sans(chain: &[CertificateDer<'_>]) -> Vec<IpAddr> {
+    let Some(leaf) = chain.first() else {
+        return Vec::new();
+    };
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(leaf.as_ref()) else {
+        return Vec::new();
+    };
+    let Ok(Some(san)) = cert.subject_alternative_name() else {
+        return Vec::new();
+    };
+    let mut ips: Vec<IpAddr> = san
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name: &GeneralName<'_>| match name {
+            GeneralName::IPAddress(octets) => ip_from_san_octets(octets),
+            _ => None,
+        })
+        .collect();
+    ips.sort_unstable();
+    ips.dedup();
+    ips
+}
+
+fn ip_from_san_octets(octets: &[u8]) -> Option<IpAddr> {
+    if let Ok(v4) = <[u8; 4]>::try_from(octets) {
+        return Some(IpAddr::from(v4));
+    }
+    <[u8; 16]>::try_from(octets)
+        .ok()
+        .map(|v6: [u8; 16]| IpAddr::from(v6).to_canonical())
+}
+
+/// A certificate resolver that can also answer a ClientHello carrying no
+/// SNI, by the local IP address the connection was accepted on.
+///
+/// rustls hands [`ResolvesServerCert::resolve`] the ClientHello alone, so
+/// a listener that serves this path learns the local address before the
+/// handshake and gives that connection a [`LocalIpResolver`].
+pub trait ResolvesServerCertByLocalIp: ResolvesServerCert {
+    /// The certificate for a connection accepted on `local_ip` whose
+    /// ClientHello names no server, `None` when none carries that address.
+    fn resolve_by_local_ip(&self, local_ip: IpAddr) -> Option<Arc<CertifiedKey>>;
+}
+
+impl ResolvesServerCertByLocalIp for CertResolver {
+    fn resolve_by_local_ip(&self, local_ip: IpAddr) -> Option<Arc<CertifiedKey>> {
+        CertResolver::resolve_by_local_ip(self, local_ip)
+    }
+}
+
+/// The resolver of the connections accepted on one local address.
+///
+/// A ClientHello with SNI goes to the shared resolver's SNI lookup,
+/// exactly as on a listener without IP certificates: an SNI the resolver
+/// does not know fails the handshake rather than falling back to the
+/// address. A ClientHello without SNI (rustls also reports none for an
+/// IP literal sent as SNI) gets the certificate for the address. Both
+/// lookups go to the shared resolver on every handshake, so a reload or
+/// a staple refresh is seen at once.
+#[derive(Debug)]
+pub struct LocalIpResolver {
+    shared: Arc<dyn ResolvesServerCertByLocalIp>,
+    local_ip: IpAddr,
+}
+
+impl LocalIpResolver {
+    /// The resolver for connections accepted on `local_ip`, backed by
+    /// `shared`.
+    pub fn new(shared: Arc<dyn ResolvesServerCertByLocalIp>, local_ip: IpAddr) -> LocalIpResolver {
+        LocalIpResolver { shared, local_ip }
+    }
+}
+
+impl ResolvesServerCert for LocalIpResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        if client_hello.server_name().is_some() {
+            self.shared.resolve(client_hello)
+        } else {
+            self.shared.resolve_by_local_ip(self.local_ip)
+        }
     }
 }
 
@@ -815,5 +989,171 @@ mod tests {
             Some(vec![0xBB]),
             "an unlisted domain keeps its prior staple"
         );
+    }
+
+    /// A self-signed certificate, its key, and the leaf's DER, for the
+    /// IP index tests: `dns` and `ips` as its SAN entries.
+    struct IpCert {
+        data: CertData,
+        der: Vec<u8>,
+    }
+
+    fn ip_cert(domain: &str, dns: &[&str], ips: &[IpAddr], not_after_epoch: i64) -> IpCert {
+        let key: rcgen::KeyPair = rcgen::KeyPair::generate().expect("test setup: key");
+        let mut params: rcgen::CertificateParams = rcgen::CertificateParams::new(
+            dns.iter()
+                .map(|d: &&str| d.to_string())
+                .collect::<Vec<String>>(),
+        )
+        .expect("test setup: params");
+        params
+            .subject_alt_names
+            .extend(ips.iter().map(|ip: &IpAddr| rcgen::SanType::IpAddress(*ip)));
+        let cert: rcgen::Certificate = params.self_signed(&key).expect("test setup: certificate");
+        IpCert {
+            der: cert.der().to_vec(),
+            data: CertData {
+                domain: domain.to_string(),
+                san_domains: dns.iter().map(|d: &&str| d.to_string()).collect(),
+                cert_pem: cert.pem(),
+                key_pem: key.serialize_pem(),
+                not_after_epoch,
+                ocsp_response: None,
+            },
+        }
+    }
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().expect("test setup: address")
+    }
+
+    fn served_der(resolver: &CertResolver, local_ip: IpAddr) -> Option<Vec<u8>> {
+        resolver
+            .resolve_by_local_ip(local_ip)
+            .map(|key: Arc<CertifiedKey>| key.cert[0].to_vec())
+    }
+
+    #[test]
+    fn an_ipv4_san_is_served_on_that_local_address_only() {
+        let cert: IpCert = ip_cert(
+            "localhost",
+            &["localhost"],
+            &[ip("192.0.2.10")],
+            9_999_999_999,
+        );
+        let resolver = CertResolver::new();
+        resolver.reload(vec![cert.data.clone()]).unwrap();
+
+        assert_eq!(served_der(&resolver, ip("192.0.2.10")), Some(cert.der));
+        assert_eq!(served_der(&resolver, ip("192.0.2.11")), None);
+        assert_eq!(
+            resolver.domain_count(),
+            1,
+            "an IP SAN never enters the domain map"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_san_is_served_on_that_local_address() {
+        let cert: IpCert = ip_cert("localhost", &[], &[ip("2001:db8::1")], 9_999_999_999);
+        let resolver = CertResolver::new();
+        resolver.reload(vec![cert.data.clone()]).unwrap();
+
+        assert_eq!(served_der(&resolver, ip("2001:db8::1")), Some(cert.der));
+        assert_eq!(served_der(&resolver, ip("2001:db8::2")), None);
+    }
+
+    /// A dual-stack `[::]` listener reports an IPv4 client's local
+    /// address as `::ffff:a.b.c.d`; it must find the IPv4 SAN.
+    #[test]
+    fn an_ipv4_mapped_local_address_finds_the_ipv4_san() {
+        let cert: IpCert = ip_cert("localhost", &[], &[ip("192.0.2.10")], 9_999_999_999);
+        let resolver = CertResolver::new();
+        resolver.reload(vec![cert.data.clone()]).unwrap();
+
+        assert_eq!(
+            served_der(&resolver, ip("::ffff:192.0.2.10")),
+            Some(cert.der)
+        );
+    }
+
+    #[test]
+    fn no_certificate_for_an_address_no_certificate_carries() {
+        let dns_only: IpCert = ip_cert("example.com", &["example.com"], &[], 9_999_999_999);
+        let resolver = CertResolver::new();
+        resolver.reload(vec![dns_only.data]).unwrap();
+
+        assert_eq!(served_der(&resolver, ip("127.0.0.1")), None);
+        assert_eq!(served_der(&resolver, ip("::1")), None);
+    }
+
+    /// The IP index comes from the leaf, not from `san_domains`: an
+    /// address string in `san_domains` (which no part of Lorica writes
+    /// there) does not make a certificate servable by IP.
+    #[test]
+    fn the_ip_index_is_derived_from_the_certificate_not_from_san_domains() {
+        let mut cert: IpCert = ip_cert("localhost", &["localhost"], &[], 9_999_999_999);
+        cert.data.san_domains.push("192.0.2.99".to_string());
+        let resolver = CertResolver::new();
+        resolver.reload(vec![cert.data]).unwrap();
+
+        assert_eq!(served_der(&resolver, ip("192.0.2.99")), None);
+    }
+
+    #[test]
+    fn the_longest_lived_certificate_for_an_address_is_served_first() {
+        let address: IpAddr = ip("192.0.2.10");
+        let short: IpCert = ip_cert("short.example", &[], &[address], 1_000);
+        let long: IpCert = ip_cert("long.example", &[], &[address], 9_000);
+        let resolver = CertResolver::new();
+        resolver
+            .reload(vec![short.data.clone(), long.data.clone()])
+            .unwrap();
+        assert_eq!(served_der(&resolver, address), Some(long.der.clone()));
+
+        resolver.reload(vec![long.data, short.data]).unwrap();
+        assert_eq!(
+            served_der(&resolver, address),
+            Some(long.der),
+            "the order of the rows does not decide"
+        );
+    }
+
+    /// The OCSP loop staples under every name of a certificate, its
+    /// primary domain first among them; a certificate served by IP must
+    /// carry the same fresh staple as when its name is sent as SNI, and a
+    /// certificate whose staple is missing keeps the one it had.
+    #[test]
+    fn a_staple_refresh_reaches_the_ip_index() {
+        let stapled: IpCert = ip_cert(
+            "stapled.example.com",
+            &[],
+            &[ip("192.0.2.10")],
+            9_999_999_999,
+        );
+        let mut kept: IpCert =
+            ip_cert("kept.example.com", &[], &[ip("2001:db8::1")], 9_999_999_999);
+        kept.data.ocsp_response = Some(vec![0xBB]);
+        let resolver = CertResolver::new();
+        resolver.reload(vec![stapled.data, kept.data]).unwrap();
+        assert_eq!(resolver.ip_staple_for(ip("192.0.2.10")), None);
+
+        let fresh: Vec<u8> = vec![0x30, 0x03, 0x0A, 0x01, 0x00];
+        let mut staples: HashMap<String, Vec<u8>> = HashMap::new();
+        staples.insert("stapled.example.com".to_string(), fresh.clone());
+        let stats: RefreshStats = resolver.refresh_staples(&staples);
+
+        assert_eq!(stats.refreshed, 1);
+        assert_eq!(stats.unchanged, 1);
+        assert_eq!(
+            resolver.ip_staple_for(ip("192.0.2.10")),
+            Some(fresh.clone())
+        );
+        assert_eq!(
+            resolver.ip_staple_for(ip("192.0.2.10")),
+            resolver.staple_for("stapled.example.com"),
+            "the IP path and the SNI path serve the same staple"
+        );
+        assert_eq!(resolver.ip_staple_for(ip("2001:db8::1")), Some(vec![0xBB]));
     }
 }
