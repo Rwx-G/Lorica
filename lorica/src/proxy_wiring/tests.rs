@@ -965,6 +965,13 @@ fn the_request_host_drops_its_port_and_is_looked_up_canonical() {
         ("app.example.com.:443", "app.example.com", Some("exact")),
         ("[2001:DB8::1]:8443", "[2001:db8::1]", Some("v6")),
         ("[2001:db8::1]", "[2001:db8::1]", Some("v6")),
+        ("[2001:db8:0:0::0001]:443", "[2001:db8::1]", Some("v6")),
+        (
+            "[2001:0DB8:0000:0000:0000:0000:0000:0001]",
+            "[2001:db8::1]",
+            Some("v6"),
+        ),
+        ("[2001:db8::2]", "[2001:db8::2]", None),
         ("[2001:db8::1", "[2001:db8::1", None),
     ] {
         let mut req = lorica_http::RequestHeader::build("GET", b"/", None).unwrap();

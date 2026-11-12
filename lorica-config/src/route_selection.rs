@@ -34,7 +34,8 @@
 //! absolute name carrying its root dot is the same host. Every name is
 //! therefore compared, keyed and stored in the form
 //! [`canonical_hostname`] gives it: ASCII lowercase, one trailing dot
-//! dropped. A name compared in any other form is a second name to that
+//! dropped, an IPv6 literal in its RFC 5952 spelling. A name compared in
+//! any other form is a second name to that
 //! comparison and the same host to every client, which is how a route
 //! could take a host from a protected one without any guard seeing a
 //! conflict.
@@ -54,17 +55,30 @@ use crate::models::Route;
 pub const CATCH_ALL_HOSTNAME: &str = "_";
 
 /// `name` in the one form names are compared, keyed and stored in:
-/// ASCII letters lowercased and at most one trailing dot removed.
+/// ASCII letters lowercased and at most one trailing dot removed, and a
+/// bracketed IPv6 literal written as RFC 5952 writes the address
+/// (lowercase hex, leading zeros dropped, the longest run of zero groups
+/// compressed to `::`), which is how [`std::net::Ipv6Addr`] displays it.
 ///
 /// It applies to exact names and to wildcard patterns alike. No IDNA
 /// mapping is applied: a request carries A-labels, and a byte outside
-/// ASCII is left as it is. Borrowed, without an allocation, when `name`
-/// is already canonical, which is every request a browser sends.
+/// ASCII is left as it is. An IPv6 literal is one address under many
+/// spellings (`[2001:DB8:0:0::0001]` is `[2001:db8::1]`), so both the
+/// stored name and the request's are reduced to one. An IPv4-mapped
+/// literal stays an IPv6 literal, a name of its own beside the dotted
+/// IPv4 one, as its client wrote it. A bracketed text that is not an
+/// address, a zone id (`[fe80::1%25eth0]`) included, is only lowercased:
+/// no route can be stored under it ([`validate_hostname_syntax`]).
+///
+/// Borrowed, without an allocation, when `name` is already canonical,
+/// which is every request a browser sends by DNS name. An IPv6 literal
+/// costs one small allocation to check.
 ///
 /// ```
 /// use lorica_config::route_selection::canonical_hostname;
 /// assert_eq!(canonical_hostname("App.Example.COM."), "app.example.com");
 /// assert_eq!(canonical_hostname("*.Example.com"), "*.example.com");
+/// assert_eq!(canonical_hostname("[2001:DB8:0:0::0001]"), "[2001:db8::1]");
 /// assert!(matches!(
 ///     canonical_hostname("app.example.com"),
 ///     std::borrow::Cow::Borrowed(_)
@@ -72,6 +86,18 @@ pub const CATCH_ALL_HOSTNAME: &str = "_";
 /// ```
 pub fn canonical_hostname(name: &str) -> Cow<'_, str> {
     let name = name.strip_suffix('.').unwrap_or(name);
+    if let Some(address) = name
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .and_then(|inner| inner.parse::<std::net::Ipv6Addr>().ok())
+    {
+        let literal = format!("[{address}]");
+        return if literal == name {
+            Cow::Borrowed(name)
+        } else {
+            Cow::Owned(literal)
+        };
+    }
     if name.bytes().any(|b| b.is_ascii_uppercase()) {
         Cow::Owned(name.to_ascii_lowercase())
     } else {
@@ -411,8 +437,8 @@ impl<E: Clone> HostIndex<E> {
 /// The route that serves `host` and `path` from an index built by
 /// [`HostIndex::new`], held as its two parts so the proxy's snapshot
 /// can keep them as fields of its own. `host` is looked up in
-/// [`canonical_hostname`] form, without an allocation when it is in it
-/// already.
+/// [`canonical_hostname`] form, without an allocation when it is a DNS
+/// name in it already.
 pub fn select<'a, E, F>(
     exact: &'a HashMap<String, Vec<E>>,
     wildcards: &'a [(String, Vec<E>)],
@@ -1446,6 +1472,87 @@ mod tests {
         assert!(!same_name("app.example.com", "app.example.org"));
         assert!(wildcard_covers("*.Example.com", "A.EXAMPLE.com."));
         assert_eq!(keys_reaching("A.Example.com.")[0], "a.example.com");
+    }
+
+    #[test]
+    fn an_ipv6_literal_is_one_name_under_every_spelling_of_its_address() {
+        for (name, canonical) in [
+            ("[2001:db8::1]", "[2001:db8::1]"),
+            ("[2001:DB8::1]", "[2001:db8::1]"),
+            ("[2001:db8:0:0::1]", "[2001:db8::1]"),
+            ("[2001:0db8:0000:0000:0000:0000:0000:0001]", "[2001:db8::1]"),
+            ("[2001:DB8::0001]", "[2001:db8::1]"),
+            ("[2001:db8::1].", "[2001:db8::1]"),
+            ("[2001:db8:0:0:1:0:0:1]", "[2001:db8::1:0:0:1]"),
+            ("[0:0:0:0:0:0:0:1]", "[::1]"),
+            ("[::]", "[::]"),
+        ] {
+            assert_eq!(canonical_hostname(name), canonical, "{name}");
+            assert!(same_name(name, canonical), "{name}");
+        }
+        assert!(matches!(
+            canonical_hostname("[2001:db8::1]"),
+            Cow::Borrowed(_)
+        ));
+        assert!(!same_name("[2001:db8::1]", "[2001:db8::2]"));
+    }
+
+    /// An IPv4-mapped literal is reduced among its own spellings, never
+    /// folded onto the dotted IPv4 name: a client writing it sends it, and
+    /// a route on `192.0.2.10` is another name.
+    #[test]
+    fn an_ipv4_mapped_literal_stays_an_ipv6_name() {
+        let canonical = canonical_hostname("[::ffff:192.0.2.10]").into_owned();
+        assert_eq!(canonical_hostname("[::FFFF:C000:20A]"), canonical);
+        assert!(canonical.starts_with('[') && canonical.ends_with(']'));
+        assert!(!same_name("[::ffff:192.0.2.10]", "192.0.2.10"));
+    }
+
+    /// A bracketed text that is not an address is lowercased only, as
+    /// before, and a route cannot be stored under it.
+    #[test]
+    fn a_zone_id_or_a_bracketed_non_address_is_only_lowercased_and_refused() {
+        for name in ["[fe80::1%25eth0]", "[fe80::1%eth0]", "[not-an-address]"] {
+            assert_eq!(canonical_hostname(name), name, "{name}");
+            assert!(
+                validate_hostname_syntax(&canonical_hostname(name), ROUTE_HOSTNAME_SHAPE).is_err(),
+                "{name}"
+            );
+        }
+        assert_eq!(canonical_hostname("[FE80::1%25ETH0]"), "[fe80::1%25eth0]");
+    }
+
+    #[test]
+    fn a_request_naming_an_ipv6_route_under_another_spelling_is_served_by_it() {
+        let routes = [
+            route("v6", "[2001:DB8:0:0::0001]", "/"),
+            route("other", "app.example.com", "/"),
+        ];
+        let index = HostIndex::new(routes.iter(), |r| *r);
+        assert!(index.collisions.is_empty());
+        for host in ["[2001:db8::1]", "[2001:DB8::1]", "[2001:db8:0::1]"] {
+            assert_eq!(served(&index, host, "/x"), Some("v6"), "{host}");
+        }
+        assert_eq!(served(&index, "[2001:db8::2]", "/x"), None);
+    }
+
+    #[test]
+    fn two_routes_on_spellings_of_one_ipv6_address_collide_as_dns_spellings_do() {
+        let routes = [
+            route("a", "[2001:DB8::1]", "/"),
+            route("b", "[2001:db8::1]", "/"),
+        ];
+        let index = HostIndex::new(routes.iter(), |r| *r);
+        assert_eq!(served(&index, "[2001:db8::1]", "/"), Some("b"));
+        assert_eq!(
+            index.collisions,
+            vec![NameCollision {
+                name: "[2001:db8::1]".to_string(),
+                served_route_id: "b".to_string(),
+                shadowed_route_id: "a".to_string(),
+                shadowed_spelling: "[2001:DB8::1]".to_string(),
+            }]
+        );
     }
 
     #[test]

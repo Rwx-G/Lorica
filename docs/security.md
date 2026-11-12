@@ -164,7 +164,13 @@ its port, an IPv6 literal keeping its brackets (`[2001:db8::1]:8443` is
 (`route_selection::canonical_hostname` in `lorica-config`), the form
 route names are stored in. `Host: App.Example.COM.` therefore reaches
 the route `app.example.com` and its controls rather than a wildcard or
-the catch-all. The `Host` sent to the backend is the client's, unchanged.
+the catch-all. Since v1.10.5 an IPv6 literal is also written in its
+RFC 5952 spelling on both sides, so a route stored as
+`[2001:DB8:0:0::1]` and a client sending `[2001:db8::1]` name one host;
+migration 70 rewrites the names stored before. An IPv4-mapped literal
+stays an IPv6 name, apart from the dotted IPv4 one, and a literal with
+a zone id is refused as a route name. The `Host` sent to the backend is
+the client's, unchanged.
 
 ### Request path validation (v1.10.3)
 

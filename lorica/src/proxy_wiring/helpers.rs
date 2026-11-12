@@ -133,9 +133,10 @@ pub(crate) fn extract_host(req: &lorica_http::RequestHeader) -> &str {
 
 /// The host a request names, as routes are looked up: [`extract_host`]
 /// without its port, in `route_selection::canonical_hostname` form.
-/// Borrowed, without an allocation, when the client sent it canonical,
-/// as browsers do. What is forwarded upstream is [`extract_host`],
-/// untouched.
+/// Borrowed when the client sent it canonical, as browsers do, and
+/// without an allocation for a DNS name. An IPv6 literal is reduced to
+/// its RFC 5952 spelling, the one a route stores it in. What is
+/// forwarded upstream is [`extract_host`], untouched.
 pub(crate) fn request_host(req: &lorica_http::RequestHeader) -> Cow<'_, str> {
     lorica_config::route_selection::canonical_hostname(host_without_port(extract_host(req)))
 }

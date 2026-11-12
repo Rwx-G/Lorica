@@ -196,6 +196,7 @@ const MIGRATIONS: &[Migration] = &[
     (67, migrate_route_protection_records),
     (68, migrate_canonical_route_names),
     (69, migrate_route_case_insensitive_paths),
+    (70, migrate_canonical_ipv6_route_names),
 ];
 
 /// Which telemetry fan-in cursor a follower is reading or advancing
@@ -1516,6 +1517,21 @@ fn migrate_route_case_insensitive_paths(conn: &Connection) -> rusqlite::Result<(
         "case_insensitive_paths",
         "INTEGER NOT NULL DEFAULT 0",
     )
+}
+
+/// Migration 68 run again, now that `route_selection::canonical_hostname`
+/// also writes a bracketed IPv6 literal in its RFC 5952 spelling: a route
+/// or record name stored as `[2001:DB8:0:0::1]` becomes `[2001:db8::1]`,
+/// the form a request is looked up in and a record lookup binds.
+///
+/// The same body, so the same policy: a name two routes hold under two
+/// spellings of one address is rewritten on the route the selection
+/// serves it from and kept as stored on the other, nothing deleted or
+/// switched off. Every name 68 already rewrote is canonical and stays as
+/// it is, and so does every twin it kept, since the spelling the
+/// selection serves has not changed for it.
+fn migrate_canonical_ipv6_route_names(conn: &Connection) -> rusqlite::Result<()> {
+    migrate_canonical_route_names(conn)
 }
 
 fn migrate_acme_challenge_expiry(conn: &Connection) -> rusqlite::Result<()> {

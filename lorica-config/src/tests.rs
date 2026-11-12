@@ -1343,14 +1343,14 @@ created_at = "2026-01-01T00:00:00Z"
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        // 69 is the current head of the tracked MIGRATIONS table (every
+        // 70 is the current head of the tracked MIGRATIONS table (every
         // schema change now carries a distinct version, including the
         // former post-v22 unconditional ALTER blocks).
         assert_eq!(
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            69
+            70
         );
     }
 
@@ -1368,7 +1368,7 @@ created_at = "2026-01-01T00:00:00Z"
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                69
+                70
             );
         }
     }
@@ -3117,6 +3117,23 @@ cert_critical_days = 3
             .expect("route kept");
         assert_eq!(stored.hostname, "other.example.com");
         assert_eq!(stored.hostname_aliases, vec!["*.example.com".to_string()]);
+
+        route.hostname = "[2001:DB8:0:0::0001]".into();
+        route.hostname_aliases = vec![];
+        store.update_route(&route).expect("an IPv6 literal lands");
+        let stored = store
+            .get_route(&route.id)
+            .expect("route reads")
+            .expect("route kept");
+        assert_eq!(stored.hostname, "[2001:db8::1]");
+
+        let mut twin = make_route();
+        twin.hostname = "[2001:db8:0::1]".into();
+        let err = store
+            .create_route(&twin)
+            .expect_err("another spelling of the same address")
+            .to_string();
+        assert!(err.contains("already used"), "{err}");
     }
 
     #[test]

@@ -97,6 +97,10 @@
 >   (`route_selection::canonical_hostname`).
 > - v1.10.3 (migration 69): `routes.case_insensitive_paths`, default 0,
 >   replicated with the route.
+> - v1.10.5 (migration 70): no table, no column. It runs 68's rewrite
+>   again, now that the canonical form writes a bracketed IPv6 literal
+>   in its RFC 5952 spelling, with 68's policy for two routes holding
+>   spellings of one address.
 >
 > The `Route` table grew from 9 columns to 30+ (basic-auth,
 > stale-while-revalidate, rate-limit struct, geoip, mTLS, forward-auth,

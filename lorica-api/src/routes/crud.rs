@@ -1540,6 +1540,11 @@ mod route_name_patch_tests {
             validate_route_hostname("[2001:DB8::1]").expect("an IPv6 literal"),
             "[2001:db8::1]"
         );
+        assert_eq!(
+            validate_route_hostname("[2001:db8:0:0::0001]").expect("an uncompressed literal"),
+            "[2001:db8::1]"
+        );
+        assert!(validate_route_hostname("[fe80::1%25eth0]").is_err());
         assert!(validate_hostname_alias("_", "f").is_err());
         assert!(validate_hostname_alias("[2001:db8::1]", "f").is_err());
     }
