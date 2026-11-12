@@ -28,7 +28,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::protocols::l4::stream::AsyncWriteVec;
 use crate::utils::BufRef;
 
-// Match the default transport read buffer and fit jemalloc's default tcache limit.
+// Upstream (f8ecae90) matches the default transport read buffer and sizes both to fit
+// jemalloc's default tcache limit. Lorica: no binary of the workspace sets a global
+// allocator, so production runs on glibc malloc, where that limit does not apply:
+// with its default tunables glibc's tcache holds chunks of up to 1032 bytes only, and
+// 32 KiB and 64 KiB are both below its default mmap threshold (128 KiB), so either size
+// comes from and returns to the malloc arenas. The value is upstream's, kept until a
+// benchmark settles it against the former 64 KiB.
 const BODY_BUFFER_SIZE: usize = 32 * 1024;
 // limit how much incomplete chunk-size and chunk-ext to buffer
 const PARTIAL_CHUNK_HEAD_LIMIT: usize = 1024 * 8;
@@ -174,6 +180,11 @@ impl BodyReader {
         self.body_state = PS::ToStart;
     }
 
+    // Lorica: the buffer handling from here to `release_completed_buf`, and at the read sites
+    // marked below, is upstream's from bd054bad and f8ecae90, ported without the HTTP/1
+    // pipelining half of bd054bad (FORK.md, divergences). Upstream also has
+    // `prepare_owned_buf` and the `init_*_owned` variants, which adopt the header parser's
+    // allocation instead of copying the preread; every init here copies it.
     fn prepare_buf(&mut self, buf_to_rewind: &[u8]) {
         self.rewind_buf_len = buf_to_rewind.len();
         self.body_buf = Some(BytesMut::from(buf_to_rewind));
@@ -206,7 +217,8 @@ impl BodyReader {
             let body_buf = self.body_buf.get_or_insert_default();
             if body_buf.capacity() - body_buf.len() < read_size {
                 // BytesMut::reserve can double a preread allocation past the
-                // requested size and out of the allocator's thread cache.
+                // requested size and, upstream reasons, out of jemalloc's
+                // thread cache (see BODY_BUFFER_SIZE for Lorica's allocator).
                 let mut storage = BytesMut::with_capacity(body_buf.len() + read_size);
                 storage.extend_from_slice(body_buf);
                 *body_buf = storage;
@@ -277,6 +289,8 @@ impl BodyReader {
         if self.rewind_buf_len == 0 {
             // take any extra bytes and send them as-is,
             // reset body counter
+            // Lorica: copied through `prepare_buf`; upstream adopts the overread
+            // allocation with `prepare_owned_buf` (bd054bad), which the fork lacks.
             let extra = self.body_buf_overread.take();
             let buf = extra.as_deref().unwrap_or_default();
             self.prepare_buf(buf);
@@ -377,6 +391,9 @@ impl BodyReader {
                     ))
                 } else if n >= to_read {
                     if n > to_read {
+                        // Lorica: upstream logs downstream excess at debug since bd054bad,
+                        // where it is the start of a pipelined request handed to the next
+                        // session. The fork does not pipeline, so it stays a warning.
                         warn!(
                             "Peer sent more data then expected: extra {}\
                                bytes, discarding them",
@@ -451,6 +468,8 @@ impl BodyReader {
                          * to the front and read more to form a valid chunk head.
                          * existing_buf_end is the end of the partial head and
                          * expecting_from_io is the len of it.
+                         * Lorica: compaction and offset commit from bd054bad, see
+                         * prepare_buf.
                          * The head is capped at PARTIAL_CHUNK_HEAD_LIMIT and is normally a few
                          * bytes, so the move is bounded and cheap. The read helper reserves
                          * space only for the read attempt, retaining just this prefix if the
@@ -567,6 +586,7 @@ impl BodyReader {
                     if buf_res.is_some() {
                         if let Some(idx) = last_chunk_size_end {
                             // just read the last 0 + CRLF, but not final end CRLF
+                            // Lorica: split from bd054bad, see prepare_buf.
                             // Split the rest of the buffer to the start in O(1) so the trailers
                             // and any bytes past the message stay in the same allocation.
                             // `do_read_chunked_body_final` must not reset this buffer, see the
@@ -751,6 +771,7 @@ impl BodyReader {
         match self.body_state {
             PS::ChunkedFinal(read, trailers_read, existing_buf_end, end_read) => {
                 let n = if existing_buf_end != 0 {
+                    // Lorica: in-place parse of the split tail from bd054bad, see prepare_buf.
                     // Finish the rest of the buf that was read while in the Chunked state.
                     // `do_read_chunked_body` split that tail to the front of `body_buf`, so it
                     // must be parsed in place: resetting the buffer here would discard both the

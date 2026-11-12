@@ -334,8 +334,15 @@ impl AsRawFd for RawStreamWrapper {
 
 // Large read buffering helps reducing syscalls with little trade-off
 // Ssl layer always does "small" reads in 16k (TLS record size) so L4 read buffer helps a lot.
-// The 32 KiB default fits jemalloc's default tcache limit and matches the HTTP/1 body read
-// buffer.
+// Upstream (f8ecae90) picks 32 KiB to fit jemalloc's default tcache limit and to match the
+// HTTP/1 body read buffer. Lorica: no binary of the workspace sets a global allocator, so
+// production runs on glibc malloc, where that limit does not apply:
+// with its default tunables glibc's tcache holds chunks of up to 1032 bytes only, and
+// 32 KiB and 64 KiB are both below its default mmap threshold (128 KiB), so either size
+// comes from and returns to the malloc arenas. The value is upstream's, kept until a
+// benchmark settles it against the former 64 KiB, as is the release of empty read-ahead
+// storage below.
+// Lorica: fixed sizes here where upstream reads them from `L4BufferSettings`.
 pub(crate) const BUF_READ_SIZE: usize = 32 * 1024;
 // Small write buf to match MSS. Too large write buf delays real time communication.
 // This buffering effectively implements something similar to Nagle's algorithm.
@@ -610,6 +617,9 @@ impl Stream {
 
     /// [`Self::set_buffer`] with explicit read and write capacities, zero disabling buffering
     /// in that direction. The body reader's randomized tests vary the read-ahead capacity.
+    ///
+    /// Lorica: upstream's `set_buffer` takes an `L4BufferSettings`, which the fork lacks;
+    /// this is its stand-in (FORK.md, divergences).
     pub(crate) fn set_buffer_capacity(&mut self, read: usize, write: usize) {
         use std::mem;
         // Since the buffers can't be resized in place,
