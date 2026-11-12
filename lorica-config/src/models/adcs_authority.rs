@@ -171,7 +171,9 @@ impl AdcsSubjectDefaults {
 /// a lowercase DNS name of at least two LDH labels with no wildcard, and
 /// [`AllowedSuffix::permits`] never has to reason about a malformed
 /// suffix. Deserialisation goes through the same constructor, so a
-/// stored list that no longer validates is refused rather than widened.
+/// list that does not validate is refused rather than widened; the
+/// store, reading a list saved before a rule was added, drops the
+/// entries the rule refuses instead (`ConfigStore::get_adcs_authority`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct AllowedSuffix(String);
@@ -187,14 +189,20 @@ impl AllowedSuffix {
     /// [`ConfigError::Validation`] for an empty value, a wildcard, a
     /// leading dot, an empty label, a label outside RFC 1123 (LDH, 1 to
     /// 63 characters, no hyphen at either end), a name over 253
-    /// characters, or a single label: a bare TLD as an allowlist entry
-    /// would let Lorica request any name under it.
+    /// characters, a single label (a bare TLD as an allowlist entry would
+    /// let Lorica request any name under it), or a last label of digits
+    /// alone. A top-level domain is never all-numeric (RFC 3696 section
+    /// 2), so such a suffix names no DNS zone: it is the tail of an IPv4
+    /// address (`0.2.10`, or `192.0.2.10` whole), and would let a dotted
+    /// address pass for a name under it. An IPv6 address or fragment is
+    /// refused as not LDH.
     ///
     /// ```
     /// use lorica_config::models::AllowedSuffix;
     /// let suffix = AllowedSuffix::new("Corp.Example.ORG").expect("valid suffix");
     /// assert_eq!(suffix.as_str(), "corp.example.org");
     /// assert!(AllowedSuffix::new("*.corp.example.org").is_err());
+    /// assert!(AllowedSuffix::new("0.2.10").is_err());
     /// ```
     pub fn new(raw: &str) -> Result<Self> {
         if raw.contains('*') {
@@ -217,6 +225,13 @@ impl AllowedSuffix {
         if !name.contains('.') {
             return Err(ConfigError::Validation(format!(
                 "allowed suffix {raw:?}: at least two labels are required"
+            )));
+        }
+        let top_level: &str = name.rsplit('.').next().unwrap_or_default();
+        if top_level.bytes().all(|b: u8| b.is_ascii_digit()) {
+            return Err(ConfigError::Validation(format!(
+                "allowed suffix {raw:?}: an all-numeric top-level label is an IP address, \
+                 not a DNS zone; AD CS issuance requests DNS names only"
             )));
         }
         Ok(Self(name))
@@ -536,6 +551,9 @@ mod tests {
             ("corp.example.org.", "corp.example.org"),
             ("xn--bcher-kva.example.org", "xn--bcher-kva.example.org"),
             ("a-1.example.org", "a-1.example.org"),
+            // Digits are fine anywhere but the top-level label.
+            ("10.0.corp.example.org", "10.0.corp.example.org"),
+            ("192.example.org", "192.example.org"),
         ];
         for (raw, expected) in cases {
             assert_eq!(suffix(raw).as_str(), *expected, "input {raw:?}");
@@ -551,6 +569,16 @@ mod tests {
             ".",
             "*.corp.example.org",
             "*",
+            // An IPv4 address, its tail, or any all-numeric top label.
+            "0.2.10",
+            "192.0.2.10",
+            "192.0.2.10.",
+            "corp.10",
+            // An IPv6 address or fragment, bracketed or not.
+            "2001:db8::1",
+            "[2001:db8::1]",
+            "db8::1",
+            "::ffff:192.0.2.10",
             "corp.*.org",
             ".corp.example.org",
             "corp..example.org",

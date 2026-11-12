@@ -573,23 +573,13 @@ async fn names_outside_the_allowlist_are_refused_before_the_authority_is_contact
 }
 
 /// Lorica requests DNS names only, so an IP address is refused as one,
-/// whatever the allowlist: a suffix of digits permits a dotted IPv4
-/// address as LDH labels, and the CSR would then carry it as a DNS name.
+/// with its own refusal rather than as a name outside the allowlist. No
+/// allowlist can permit one: a suffix with an all-numeric top label is
+/// refused when the authority is configured.
 #[tokio::test]
 async fn an_ip_address_is_refused_before_the_authority_is_contacted() {
     let stub = StubAuthority::new(issue_v2());
-    let f = fixture(Arc::clone(&stub), None).await;
-    let mut digits_too = body(Some(super::super::tests::PASSWORD));
-    digits_too["allowed_suffixes"] = serde_json::json!(["corp.example.org", "0.2.10"]);
-    let resp = f
-        .send(
-            "PUT",
-            super::super::tests::AUTHORITY,
-            &f.admin,
-            Some(digits_too),
-        )
-        .await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    let f = issuing(&stub, None).await;
 
     let cases: Vec<(serde_json::Value, Vec<&str>)> = vec![
         (

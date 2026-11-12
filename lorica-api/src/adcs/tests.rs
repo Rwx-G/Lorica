@@ -458,7 +458,7 @@ async fn every_invalid_field_is_refused_and_nothing_is_stored() {
     let too_many_templates: Vec<String> = (0..lorica_config::models::ADCS_ALLOWED_TEMPLATES_MAX)
         .map(|n| format!("Template{n}"))
         .collect();
-    let cases: [(&str, serde_json::Value); 17] = [
+    let cases: [(&str, serde_json::Value); 19] = [
         (
             "endpoint",
             serde_json::json!("http://ces.corp.example.org/CES"),
@@ -488,6 +488,11 @@ async fn every_invalid_field_is_refused_and_nothing_is_stored() {
             serde_json::json!(["*.corp.example.org"]),
         ),
         ("allowed_suffixes", serde_json::json!([])),
+        (
+            "allowed_suffixes",
+            serde_json::json!(["corp.example.org", "0.2.10"]),
+        ),
+        ("allowed_suffixes", serde_json::json!(["[2001:db8::1]"])),
         ("endpoint_ca_pem", serde_json::json!("not a certificate")),
         ("kdcs", serde_json::json!(too_many_kdcs)),
         ("allowed_templates", serde_json::json!(["Web\nServer"])),

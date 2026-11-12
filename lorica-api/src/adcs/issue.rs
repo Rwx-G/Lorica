@@ -402,16 +402,6 @@ pub(crate) fn normalize_sans(raw: &[String]) -> Vec<String> {
     names
 }
 
-/// Whether `name` is an IP address rather than a DNS name: dotted IPv4,
-/// or IPv6 with or without the brackets a URL host carries it in.
-fn is_ip_literal(name: &str) -> bool {
-    let unbracketed: &str = name
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or(name);
-    unbracketed.parse::<std::net::IpAddr>().is_ok()
-}
-
 /// Refuse `sans` (already normalised) unless every name may be
 /// requested from `authority` (D5).
 pub(crate) fn check_sans(authority: &AdcsAuthority, sans: &[String]) -> Result<(), IssueError> {
@@ -450,12 +440,13 @@ pub(crate) fn check_sans(authority: &AdcsAuthority, sans: &[String]) -> Result<(
             format!("sans: wildcard names are refused: {}", quoted(&wildcards)),
         ));
     }
-    // Before the allowlist: an IPv4 address is LDH labels of digits, so
-    // a suffix of digits would permit it, and its own refusal says what
-    // to do instead.
+    // Before the allowlist, so an address gets a refusal that says what
+    // to do instead. No allowlist permits one (`AllowedSuffix::new`
+    // refuses an all-numeric top label), but the CSR must not depend on
+    // that alone.
     let addresses: Vec<String> = sans
         .iter()
-        .filter(|name: &&String| is_ip_literal(name))
+        .filter(|name: &&String| lorica_config::route_selection::is_ip_literal(name))
         .cloned()
         .collect();
     if !addresses.is_empty() {

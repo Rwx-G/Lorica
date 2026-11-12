@@ -253,6 +253,26 @@ pub fn validate_hostname_syntax(raw: &str, shape: HostnameShape<'_>) -> Result<S
     Ok(trimmed.to_string())
 }
 
+/// Whether `name` is an IP address rather than a DNS name: dotted IPv4,
+/// or IPv6 with or without the brackets a `Host` header carries it in.
+/// Such a name is served by an `iPAddress` SAN, never by a DNS name or
+/// a wildcard.
+///
+/// ```
+/// use lorica_config::route_selection::is_ip_literal;
+/// assert!(is_ip_literal("192.0.2.10"));
+/// assert!(is_ip_literal("[2001:db8::1]"));
+/// assert!(is_ip_literal("2001:db8::1"));
+/// assert!(!is_ip_literal("192.0.2.10.example.org"));
+/// ```
+pub fn is_ip_literal(name: &str) -> bool {
+    let unbracketed: &str = name
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(name);
+    unbracketed.parse::<std::net::IpAddr>().is_ok()
+}
+
 /// Whether two names are the same name to the selection.
 ///
 /// The one comparison of two route names outside the index, which keys

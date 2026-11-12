@@ -381,6 +381,13 @@ lowercased, stripped of a trailing dot and deduplicated. An entry permits
 that name and every name under it, at any depth; matching is on whole
 DNS labels, case-insensitive, never on a string suffix.
 
+An entry is a DNS zone of at least two labels. Since v1.10.5 an entry
+whose top-level label is all digits (`0.2.10`, `192.0.2.10`) is refused
+when the authority is saved: no top-level domain is numeric, so such an
+entry is the tail of an IPv4 address and would let an address pass for
+a name under it. An authority saved before keeps loading; the refused
+entry is ignored, with a warning in the log, and the next save drops it.
+
 With `corp.example.org` allowed:
 
 | Name | Result |
