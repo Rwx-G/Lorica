@@ -75,6 +75,13 @@ pub const CATCH_ALL_HOSTNAME: &str = "_";
 /// which is every request a browser sends by DNS name. An IPv6 literal
 /// costs one small allocation to check.
 ///
+/// Every stored route name and protection record name is in this form,
+/// rewritten by migrations 68 and 70 when the form changed. A change to
+/// what this function answers therefore needs a new migration that
+/// rewrites the stored names again, or they stop matching the requests
+/// that name them; `store::tests` pins the answers with the migration
+/// that last rewrote names, and fails until both move together.
+///
 /// ```
 /// use lorica_config::route_selection::canonical_hostname;
 /// assert_eq!(canonical_hostname("App.Example.COM."), "app.example.com");

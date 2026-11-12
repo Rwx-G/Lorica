@@ -196,8 +196,12 @@ const MIGRATIONS: &[Migration] = &[
     (67, migrate_route_protection_records),
     (68, migrate_canonical_route_names),
     (69, migrate_route_case_insensitive_paths),
-    (70, migrate_canonical_ipv6_route_names),
+    (70, migrate_address_spellings),
 ];
+
+/// The newest schema version, the last entry of [`MIGRATIONS`].
+#[cfg(test)]
+pub(crate) const SCHEMA_HEAD: i64 = MIGRATIONS[MIGRATIONS.len() - 1].0;
 
 /// Which telemetry fan-in cursor a follower is reading or advancing
 /// (Story 9.6 AC #5).
@@ -1402,6 +1406,22 @@ fn migrate_route_protection_records(conn: &Connection) -> rusqlite::Result<()> {
 /// Its own version rather than part of 67, which only adds the record
 /// tables: this one rewrites rows, and a test rewinds it alone.
 fn migrate_canonical_route_names(conn: &Connection) -> rusqlite::Result<()> {
+    rewrite_canonical_route_names(conn, 68, |_| true)
+}
+
+/// The body of every migration that rewrites stored route and record
+/// names to `route_selection::canonical_hostname` form (68, 70): it runs
+/// the function as this binary has it, so each such migration exists
+/// because that function changed, and a change to it needs one more.
+///
+/// `migration` tags every line it logs. `reports` picks the collisions
+/// worth a warning: a re-run reports only those its own change can have
+/// created, not the ones an earlier run already reported.
+fn rewrite_canonical_route_names(
+    conn: &Connection,
+    migration: i64,
+    reports: impl Fn(&crate::route_selection::NameCollision) -> bool,
+) -> rusqlite::Result<()> {
     use crate::route_selection::{canonical_names, canonicalise_route_names, RouteNames};
 
     let mut routes: Vec<RouteNames> = Vec::new();
@@ -1438,8 +1458,12 @@ fn migrate_canonical_route_names(conn: &Connection) -> rusqlite::Result<()> {
         }
     }
     let stored = routes.clone();
-    for collision in canonicalise_route_names(&mut routes) {
+    for collision in canonicalise_route_names(&mut routes)
+        .into_iter()
+        .filter(|collision| reports(collision))
+    {
         tracing::warn!(
+            migration,
             name = %collision.name,
             served_route_id = %collision.served_route_id,
             shadowed_route_id = %collision.shadowed_route_id,
@@ -1519,19 +1543,86 @@ fn migrate_route_case_insensitive_paths(conn: &Connection) -> rusqlite::Result<(
     )
 }
 
-/// Migration 68 run again, now that `route_selection::canonical_hostname`
-/// also writes a bracketed IPv6 literal in its RFC 5952 spelling: a route
-/// or record name stored as `[2001:DB8:0:0::1]` becomes `[2001:db8::1]`,
-/// the form a request is looked up in and a record lookup binds.
+/// The two 1.10.5 rules about addresses, applied to what is stored.
 ///
-/// The same body, so the same policy: a name two routes hold under two
-/// spellings of one address is rewritten on the route the selection
-/// serves it from and kept as stored on the other, nothing deleted or
-/// switched off. Every name 68 already rewrote is canonical and stays as
-/// it is, and so does every twin it kept, since the spelling the
-/// selection serves has not changed for it.
-fn migrate_canonical_ipv6_route_names(conn: &Connection) -> rusqlite::Result<()> {
-    migrate_canonical_route_names(conn)
+/// Migration 68's rewrite run again, now that
+/// `route_selection::canonical_hostname` also writes a bracketed IPv6
+/// literal in its RFC 5952 spelling: a route or record name stored as
+/// `[2001:DB8:0:0::1]` becomes `[2001:db8::1]`, the form a request is
+/// looked up in and a record lookup binds. The same body, so the same
+/// policy: a name two routes hold under two spellings of one address is
+/// rewritten on the route the selection serves it from and kept as
+/// stored on the other, nothing deleted or switched off. Every name 68
+/// already rewrote is canonical and stays as it is, and so does every
+/// twin it kept. Only collisions on IPv6 literal names are reported,
+/// the only names whose form this run changed; a pair 68 already
+/// reported on a DNS name is not reported twice.
+///
+/// Then each AD CS allowed suffix that names an IP address or its tail
+/// (`crate::host_shape::names_an_address`) is removed from the stored
+/// allowlist, with one warning per entry: such a suffix names no DNS
+/// zone, and `AllowedSuffix::new` refuses it from 1.10.5 on. A list left
+/// empty permits nothing, and the store still saves it as it stands
+/// (`ConfigStore::upsert_adcs_authority`).
+///
+/// Unreleased when it was last changed: no node ran an earlier shape of
+/// this migration outside a development tree.
+fn migrate_address_spellings(conn: &Connection) -> rusqlite::Result<()> {
+    rewrite_canonical_route_names(conn, 70, |collision| collision.name.starts_with('['))?;
+    drop_address_suffixes_from_adcs_allowlist(conn, 70)
+}
+
+/// Remove every allowed suffix that names an address from the stored AD
+/// CS authority, logging each one. A column that does not parse is left
+/// for the read to report as corrupt; a table without the column is a
+/// hand-built test schema.
+fn drop_address_suffixes_from_adcs_allowlist(
+    conn: &Connection,
+    migration: i64,
+) -> rusqlite::Result<()> {
+    if !column_exists(conn, "adcs_authority", "allowed_suffixes_json")? {
+        return Ok(());
+    }
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn.prepare("SELECT id, allowed_suffixes_json FROM adcs_authority")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<(String, String)>>>()?
+    };
+    for (authority_id, json) in rows {
+        let Ok(stored) = serde_json::from_str::<Vec<String>>(&json) else {
+            continue;
+        };
+        let (dropped, kept): (Vec<String>, Vec<String>) = stored
+            .into_iter()
+            .partition(|suffix: &String| crate::host_shape::names_an_address(suffix));
+        if dropped.is_empty() {
+            continue;
+        }
+        for suffix in &dropped {
+            tracing::warn!(
+                migration,
+                authority_id = %authority_id,
+                suffix = %suffix,
+                "AD CS allowed suffix names an IP address, not a DNS zone, and was removed \
+                 from the allowlist; AD CS issuance requests DNS names only"
+            );
+        }
+        if kept.is_empty() {
+            tracing::warn!(
+                migration,
+                authority_id = %authority_id,
+                "the AD CS allowlist is now empty: the authority issues and renews nothing \
+                 until a DNS suffix is added under Settings"
+            );
+        }
+        let kept_json = serde_json::to_string(&kept)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        conn.execute(
+            "UPDATE adcs_authority SET allowed_suffixes_json = ?1 WHERE id = ?2",
+            params![kept_json, authority_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn migrate_acme_challenge_expiry(conn: &Connection) -> rusqlite::Result<()> {
@@ -2632,5 +2723,120 @@ mod migration_tests {
                 .expect("purge succeeds"),
             1
         );
+    }
+
+    /// Spellings of every class of name `canonical_hostname` handles:
+    /// case, root dots, wildcards, the catch-all, IPv4 and its other
+    /// spellings, IPv6 under several spellings, mapped, zoned or not an
+    /// address at all, and text outside ASCII.
+    const CANONICAL_FORM_PROBES: &[&str] = &[
+        "",
+        ".",
+        "_",
+        "app.example.com",
+        "App.Example.COM",
+        "app.example.com.",
+        "app.example.com..",
+        "*.Example.com.",
+        "Bücher.Example",
+        "192.0.2.10",
+        "192.0.2.10.",
+        "010.0.0.1",
+        "0XC0.0.2.10",
+        "[2001:db8::1]",
+        "[2001:DB8:0:0::0001]",
+        "[2001:db8::1].",
+        "[0:0:0:0:0:0:0:1]",
+        "[::FFFF:C000:20A]",
+        "[::ffff:192.0.2.10]",
+        "[FE80::1%25ETH0]",
+        "[Not-An-Address]",
+        "2001:DB8::1",
+        "[2001:db8::1]:443",
+    ];
+
+    /// The migration that last rewrote the stored names, and the digest
+    /// of what `canonical_hostname` answered for
+    /// [`CANONICAL_FORM_PROBES`] when it did.
+    const CANONICAL_FORM_PIN: (i64, u64) = (70, 0x1f23_fb53_d398_7d28);
+
+    /// FNV-1a over each probe and its canonical form: a fixed function
+    /// of the answers, the same on every platform and toolchain.
+    fn canonical_form_digest() -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut digest = FNV_OFFSET;
+        for probe in CANONICAL_FORM_PROBES {
+            let canonical = crate::route_selection::canonical_hostname(probe);
+            for byte in probe
+                .bytes()
+                .chain([0])
+                .chain(canonical.bytes())
+                .chain(*b"\n")
+            {
+                digest ^= u64::from(byte);
+                digest = digest.wrapping_mul(FNV_PRIME);
+            }
+        }
+        digest
+    }
+
+    /// Stored names are in `canonical_hostname` form, and the proxy
+    /// looks a request up in it: the function cannot change what it
+    /// answers unless a migration rewrites the stored names under the
+    /// new answers.
+    #[test]
+    fn canonical_hostname_changes_only_with_a_migration_that_rewrites_stored_names() {
+        let (migration, pinned) = CANONICAL_FORM_PIN;
+        let digest = canonical_form_digest();
+        assert_eq!(
+            digest, pinned,
+            "\n`route_selection::canonical_hostname` answers differently than when migration \
+             {migration} last rewrote the stored route and record names, so names stored \
+             under the old form no longer match the requests that name them. Add a \
+             migration that calls `rewrite_canonical_route_names`, then pin it here as \
+             ({{its version}}, {digest:#x}).\n"
+        );
+        assert!(
+            migration <= SCHEMA_HEAD,
+            "the pinned migration {migration} is not in MIGRATIONS"
+        );
+    }
+
+    /// The pinned migration is one that rewrites stored names: run on
+    /// rows spelled otherwise, it leaves each canonical.
+    #[test]
+    fn the_pinned_migration_rewrites_stored_names_to_the_canonical_form() {
+        let (migration, _) = CANONICAL_FORM_PIN;
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO routes (id, hostname, hostname_aliases, created_at, updated_at)
+                 VALUES ('r-1', 'App.Example.COM.', '[\"WWW.Example.com\"]',
+                     '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+                 ('r-2', '[2001:DB8:0:0::0001]', '[]',
+                     '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');",
+            )
+            .expect("test setup: names as written");
+        let (_, rewrite) = MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == migration)
+            .expect("the pinned migration is in MIGRATIONS");
+        rewrite(&store.conn).expect("the migration runs");
+        for (id, hostname, aliases) in [
+            ("r-1", "app.example.com", "[\"www.example.com\"]"),
+            ("r-2", "[2001:db8::1]", "[]"),
+        ] {
+            let stored: (String, String) = store
+                .conn
+                .query_row(
+                    "SELECT hostname, hostname_aliases FROM routes WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("the row reads");
+            assert_eq!(stored, (hostname.to_string(), aliases.to_string()), "{id}");
+        }
     }
 }

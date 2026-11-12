@@ -382,11 +382,20 @@ that name and every name under it, at any depth; matching is on whole
 DNS labels, case-insensitive, never on a string suffix.
 
 An entry is a DNS zone of at least two labels. Since v1.10.5 an entry
-whose top-level label is all digits (`0.2.10`, `192.0.2.10`) is refused
-when the authority is saved: no top-level domain is numeric, so such an
-entry is the tail of an IPv4 address and would let an address pass for
-a name under it. An authority saved before keeps loading; the refused
-entry is ignored, with a warning in the log, and the next save drops it.
+whose top-level label a browser reads as a number is refused when the
+authority is saved: decimal digits (`0.2.10`, `192.0.2.10`), or a hex
+(`0x2.0xa`) or octal (`corp.010`) number. No top-level domain is
+numeric, so such an entry is the tail of an IPv4 address in some
+spelling and would let an address pass for a name under it. The rule is
+`lorica_config::host_shape`, the one route names and token grants use.
+
+An authority saved before v1.10.5 is cleaned once, by the upgrade
+(schema migration 70): each such entry is removed from the stored
+allowlist and named in one warning in the log. If every entry was one,
+the allowlist is left empty and the authority issues and renews
+nothing; it still saves as it stands, a new password for instance, and
+issuance resumes once a DNS suffix is added. Outside that case an
+allowlist needs at least one suffix.
 
 With `corp.example.org` allowed:
 

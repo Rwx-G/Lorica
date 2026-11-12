@@ -438,8 +438,9 @@ impl AdcsAuthority {
     }
 
     /// The invariants the store refuses to persist without: an
-    /// `https://` endpoint with a host, a principal, valid template
-    /// names, and at least one allowed suffix.
+    /// `https://` endpoint with a host, a principal and valid template
+    /// names. Whether the allowlist may be empty depends on what is
+    /// stored, so `ConfigStore::upsert_adcs_authority` decides that.
     ///
     /// The endpoint check is coarse on purpose: this crate does not link
     /// `lorica-adcs` (see the module doc), whose `CesEndpoint` the API
@@ -478,11 +479,6 @@ impl AdcsAuthority {
         }
         for template in &self.allowed_templates {
             validate_template_name("allowed_templates", template)?;
-        }
-        if self.allowed_suffixes.is_empty() {
-            return Err(ConfigError::Validation(
-                "AD CS authority needs at least one allowed DNS suffix".to_string(),
-            ));
         }
         Ok(())
     }
@@ -724,8 +720,6 @@ mod tests {
         no_principal.principal = " ".to_string();
         let mut no_template = authority();
         no_template.default_template = String::new();
-        let mut no_suffix = authority();
-        no_suffix.allowed_suffixes.clear();
         let mut control_template = authority();
         control_template.default_template = "Web\u{7}Server".to_string();
         let mut empty_allowed = authority();
@@ -744,7 +738,6 @@ mod tests {
             no_realm,
             no_principal,
             no_template,
-            no_suffix,
             control_template,
             empty_allowed,
             too_many_allowed,
@@ -756,6 +749,13 @@ mod tests {
         let mut upper_scheme = authority();
         upper_scheme.endpoint = "HTTPS://ces.corp.example.org/".to_string();
         assert!(upper_scheme.validate().is_ok());
+
+        // The store, which knows what is stored, decides on an empty
+        // allowlist (`ConfigStore::upsert_adcs_authority`).
+        let mut no_suffix = authority();
+        no_suffix.allowed_suffixes.clear();
+        assert!(no_suffix.validate().is_ok());
+        assert!(!no_suffix.permits("web.corp.example.org"));
     }
 
     #[test]
