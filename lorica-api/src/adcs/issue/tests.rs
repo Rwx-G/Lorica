@@ -572,6 +572,51 @@ async fn names_outside_the_allowlist_are_refused_before_the_authority_is_contact
     assert_eq!(f.audit_actions().await, expected_audit);
 }
 
+/// Lorica requests DNS names only, so an IP address is refused as one,
+/// whatever the allowlist: a suffix of digits permits a dotted IPv4
+/// address as LDH labels, and the CSR would then carry it as a DNS name.
+#[tokio::test]
+async fn an_ip_address_is_refused_before_the_authority_is_contacted() {
+    let stub = StubAuthority::new(issue_v2());
+    let f = fixture(Arc::clone(&stub), None).await;
+    let mut digits_too = body(Some(super::super::tests::PASSWORD));
+    digits_too["allowed_suffixes"] = serde_json::json!(["corp.example.org", "0.2.10"]);
+    let resp = f
+        .send(
+            "PUT",
+            super::super::tests::AUTHORITY,
+            &f.admin,
+            Some(digits_too),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let cases: Vec<(serde_json::Value, Vec<&str>)> = vec![
+        (
+            serde_json::json!(["web01.corp.example.org", "192.0.2.10"]),
+            vec!["192.0.2.10"],
+        ),
+        (serde_json::json!(["[2001:db8::1]"]), vec!["[2001:db8::1]"]),
+        (serde_json::json!(["2001:DB8::1"]), vec!["2001:db8::1"]),
+    ];
+    let mut expected_audit: Vec<String> = vec!["adcs.authority.create".to_string()];
+    for (sans, named) in &cases {
+        let resp = f.issue(serde_json::json!({ "sans": sans })).await;
+        let (status, error) = error_of(resp).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{sans}");
+        assert_eq!(error["code"], "adcs_san_refused", "{sans}");
+        let message = error["message"].as_str().unwrap_or_default();
+        assert!(message.contains("IP address"), "{message}");
+        for name in named {
+            assert!(message.contains(name), "{message}");
+        }
+        expected_audit.push("adcs.certificate.issue.refused:san_ip_address".to_string());
+    }
+    assert_eq!(stub.calls(), 0, "no request reached the authority");
+    assert!(f.certificates().await.is_empty());
+    assert_eq!(f.audit_actions().await, expected_audit);
+}
+
 /// AC #6 pending, AC #7: nothing stored, the identifier shown, audited
 /// and alerted.
 #[tokio::test]

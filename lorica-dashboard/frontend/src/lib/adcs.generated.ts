@@ -125,7 +125,7 @@ export const ADCS_ERROR_CODES: readonly AdcsErrorCodeDefinition[] = [
   { code: 'adcs_no_issuing_ca', status: 409, meaning: 'The authority does not know its issuing CA certificate, so no certificate can be verified as its own' },
   { code: 'adcs_failed_state', status: 409, meaning: 'The KDC rejected the service account\'s credential; every AD CS operation is suspended until a SuperAdmin saves a new password' },
   { code: 'adcs_busy', status: 409, meaning: 'Another AD CS operation is running' },
-  { code: 'adcs_san_refused', status: 422, meaning: 'A requested name is a wildcard, is not under an allowed suffix, or the list is empty or too long' },
+  { code: 'adcs_san_refused', status: 422, meaning: 'A requested name is a wildcard or an IP address, is not under an allowed suffix, or the list is empty or too long' },
   { code: 'adcs_template_refused', status: 422, meaning: 'The requested template is not one the authority allows' },
   { code: 'adcs_denied', status: 422, meaning: 'The authority denied the request under its policy' },
   { code: 'adcs_error', status: 502, meaning: 'The authority answered with a fault, a step of the exchange failed, or the issued certificate was refused; error.step names the step' },

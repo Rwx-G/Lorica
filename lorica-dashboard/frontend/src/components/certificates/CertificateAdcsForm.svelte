@@ -187,6 +187,12 @@
             Wildcards are refused: {hints.wildcards.join(', ')}.
           </span>
         {/if}
+        {#if hints.ipLiterals.length > 0}
+          <span class="name-hint" role="status" data-testid="adcs-hint-ip">
+            IP addresses are refused, AD CS issuance requests DNS names only:
+            {hints.ipLiterals.join(', ')}. Upload a certificate that carries an address as an IP address SAN.
+          </span>
+        {/if}
         {#if hints.outsideSuffixes.length > 0}
           <span class="name-hint" role="status" data-testid="adcs-hint-suffix">
             Outside the allowed DNS suffixes, so the API will refuse:

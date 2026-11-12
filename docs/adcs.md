@@ -393,6 +393,7 @@ With `corp.example.org` allowed:
 | `corp.example.org.attacker.test` | Refused |
 | `example.org` | Refused: a parent is not under its child |
 | `*.corp.example.org` | Refused: wildcards are refused, whatever the allowlist |
+| `192.0.2.10`, `[2001:db8::1]` | Refused: Lorica requests DNS names only, whatever the allowlist (since v1.10.5); a certificate carrying an address as an IP SAN is uploaded |
 
 A request may carry at most 100 names. A refusal answers 422
 `adcs_san_refused` and names the offending names.

@@ -1716,8 +1716,9 @@ paths:
         lowercased and deduplicated (the first one is the `CN` and the
         stored `domain`), then checked against the authority's allowed DNS
         suffixes on whole labels before anything is sent: a name outside
-        them, a wildcard, an empty list or more than 100 names is refused
-        with 422 `adcs_san_refused` naming the offending names. The subject
+        them, a wildcard, an IP address, an empty list or more than 100
+        names is refused with 422 `adcs_san_refused` naming the offending
+        names. The subject
         is the authority's defaults with the request's set fields over
         them; the template and key type default to the authority's. The
         template must be the authority's default or one of its

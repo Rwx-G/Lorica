@@ -31,7 +31,8 @@
 //!
 //! Every SAN, against the authority's allowlist with
 //! [`lorica_config::models::AllowedSuffix::permits`] (D5): names are
-//! trimmed, lowercased and deduplicated, a wildcard is refused, an empty
+//! trimmed, lowercased and deduplicated, a wildcard and an IP address
+//! are refused, an empty
 //! list and a list over [`MAX_SANS`] are refused. Then the template,
 //! against the authority's allowed templates (D17). A refusal names what
 //! it refused and costs no Kerberos attempt.
@@ -188,6 +189,9 @@ pub(crate) enum SanRefusal {
     TooMany,
     /// At least one wildcard name (D5).
     Wildcard,
+    /// At least one IP address: Lorica requests DNS names only, so an
+    /// address would reach the CSR as a DNS name.
+    IpAddress,
     /// At least one name under no allowed suffix, or not a DNS name.
     OutsideAllowlist,
 }
@@ -198,6 +202,7 @@ impl SanRefusal {
             SanRefusal::Empty => "san_empty",
             SanRefusal::TooMany => "san_too_many",
             SanRefusal::Wildcard => "san_wildcard",
+            SanRefusal::IpAddress => "san_ip_address",
             SanRefusal::OutsideAllowlist => "san_outside_allowlist",
         }
     }
@@ -397,6 +402,16 @@ pub(crate) fn normalize_sans(raw: &[String]) -> Vec<String> {
     names
 }
 
+/// Whether `name` is an IP address rather than a DNS name: dotted IPv4,
+/// or IPv6 with or without the brackets a URL host carries it in.
+fn is_ip_literal(name: &str) -> bool {
+    let unbracketed: &str = name
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(name);
+    unbracketed.parse::<std::net::IpAddr>().is_ok()
+}
+
 /// Refuse `sans` (already normalised) unless every name may be
 /// requested from `authority` (D5).
 pub(crate) fn check_sans(authority: &AdcsAuthority, sans: &[String]) -> Result<(), IssueError> {
@@ -433,6 +448,25 @@ pub(crate) fn check_sans(authority: &AdcsAuthority, sans: &[String]) -> Result<(
             SanRefusal::Wildcard,
             wildcards.clone(),
             format!("sans: wildcard names are refused: {}", quoted(&wildcards)),
+        ));
+    }
+    // Before the allowlist: an IPv4 address is LDH labels of digits, so
+    // a suffix of digits would permit it, and its own refusal says what
+    // to do instead.
+    let addresses: Vec<String> = sans
+        .iter()
+        .filter(|name: &&String| is_ip_literal(name))
+        .cloned()
+        .collect();
+    if !addresses.is_empty() {
+        return Err(refused(
+            SanRefusal::IpAddress,
+            addresses.clone(),
+            format!(
+                "sans: IP addresses are refused, AD CS issuance requests DNS names only; \
+                 upload a certificate that carries the address as an IP address SAN: {}",
+                quoted(&addresses)
+            ),
         ));
     }
     // A name still ending in a dot had two root dots: `permits` would

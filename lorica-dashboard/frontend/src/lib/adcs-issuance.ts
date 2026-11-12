@@ -33,7 +33,7 @@ import {
   ADCS_SUBJECT_FIELD_LABELS,
   type AdcsSubjectField,
 } from './adcs.generated';
-import { findUncoveredHostnames } from './cert-san-match';
+import { canonicalIp, findUncoveredHostnames } from './cert-san-match';
 
 export const ADCS_KEY_TYPES = Object.keys(ADCS_KEY_TYPE_LABELS) as AdcsKeyType[];
 export const ADCS_SUBJECT_FIELDS = Object.keys(ADCS_SUBJECT_FIELD_LABELS) as AdcsSubjectField[];
@@ -89,33 +89,78 @@ export function nameUnderSuffix(name: string, suffix: string): boolean {
 
 export interface SanHints {
   wildcards: string[];
+  /** IP literals, which the API refuses: Lorica requests DNS names only. */
+  ipLiterals: string[];
   outsideSuffixes: string[];
 }
 
 export function adcsSanHints(sans: readonly string[], allowedSuffixes: readonly string[]): SanHints {
   const wildcards = sans.filter(isWildcardName);
+  const ipLiterals = sans.filter((name) => !isWildcardName(name) && canonicalIp(name) !== null);
   const outsideSuffixes = sans.filter(
-    (name) => !isWildcardName(name) && !allowedSuffixes.some((suffix) => nameUnderSuffix(name, suffix)),
+    (name) =>
+      !isWildcardName(name) &&
+      canonicalIp(name) === null &&
+      !allowedSuffixes.some((suffix) => nameUnderSuffix(name, suffix)),
   );
-  return { wildcards, outsideSuffixes };
+  return { wildcards, ipLiterals, outsideSuffixes };
 }
 
 /**
  * The route's names that no stored certificate covers, by its `domain`
- * or any SAN, in RFC 6125 terms (an IP literal by the IP SANs alone). Wildcard names are dropped first:
- * AD CS issuance refuses them (Epic 13 D5), so offering them would
- * only produce a refusal.
+ * or any SAN, in RFC 6125 terms (an IP literal by the IP SANs alone).
  */
-export function hostnamesWithoutCertificate(
+function uncoveredByStoredCertificates(
   hostnames: readonly string[],
   certificates: readonly CertificateResponse[],
 ): string[] {
   const names = certificates.flatMap((cert) => [cert.domain, ...cert.san_domains]);
   const ips = certificates.flatMap((cert) => cert.san_ips);
-  return findUncoveredHostnames(
-    hostnames.filter((name) => !isWildcardName(name)),
-    names,
-    ips,
+  return findUncoveredHostnames(hostnames, names, ips);
+}
+
+/**
+ * The route's DNS names that no stored certificate covers: the names an
+ * AD CS issuance can be offered for. Wildcard names are dropped, since
+ * AD CS issuance refuses them (Epic 13 D5), and so are IP literals,
+ * since Lorica requests DNS names only and the API refuses an address
+ * (see {@link ipHostnamesWithoutCertificate}).
+ */
+export function hostnamesWithoutCertificate(
+  hostnames: readonly string[],
+  certificates: readonly CertificateResponse[],
+): string[] {
+  return uncoveredByStoredCertificates(
+    hostnames.filter((name) => !isWildcardName(name) && canonicalIp(name) === null),
+    certificates,
+  );
+}
+
+/**
+ * The route's IP literals that no stored certificate carries as an IP
+ * address SAN. AD CS issuance is never offered for them: such a
+ * certificate is issued elsewhere and uploaded.
+ */
+export function ipHostnamesWithoutCertificate(
+  hostnames: readonly string[],
+  certificates: readonly CertificateResponse[],
+): string[] {
+  return uncoveredByStoredCertificates(
+    hostnames.filter((name) => canonicalIp(name) !== null),
+    certificates,
+  );
+}
+
+/**
+ * What the route editor says beside the AD CS offer about the IP
+ * literals it leaves out, or `null` when there are none.
+ */
+export function adcsIpHostnameNotice(ips: readonly string[]): string | null {
+  if (ips.length === 0) return null;
+  const one = ips.length === 1;
+  return (
+    `AD CS issuance requests DNS names only, so it is not offered for ${one ? 'this address' : 'these addresses'}: ` +
+    `${ips.join(', ')}. Upload a certificate that carries ${one ? 'it' : 'them'} as an IP address SAN.`
   );
 }
 

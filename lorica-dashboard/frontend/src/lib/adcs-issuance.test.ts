@@ -8,6 +8,7 @@ import {
   ADCS_STILL_FINISHING,
   ADCS_SUBJECT_FIELDS,
   adcsErrorMessage,
+  adcsIpHostnameNotice,
   adcsIssuanceBlocker,
   adcsIssueOutcome,
   adcsRenewalOffered,
@@ -19,6 +20,7 @@ import {
   ADCS_KEY_NOT_EXPORTABLE_HINT,
   downloadPartRefusal,
   hostnamesWithoutCertificate,
+  ipHostnamesWithoutCertificate,
   isAdcsFollower,
   nameUnderSuffix,
   parseSanList,
@@ -62,6 +64,51 @@ describe('hostnamesWithoutCertificate', () => {
       'b.corp.example.org',
     ]);
   });
+
+  it('drops IP literals, which AD CS issuance in Lorica cannot request', () => {
+    expect(
+      hostnamesWithoutCertificate(['192.0.2.10', '[2001:db8::1]', '2001:db8::2', 'app.corp.example.org'], []),
+    ).toEqual(['app.corp.example.org']);
+    expect(hostnamesWithoutCertificate(['192.0.2.10', '[2001:db8::1]'], [])).toEqual([]);
+  });
+});
+
+describe('ipHostnamesWithoutCertificate', () => {
+  it('names the IP literals no certificate carries as an IP SAN, and no DNS name', () => {
+    expect(
+      ipHostnamesWithoutCertificate(['192.0.2.10', '[2001:db8::1]', 'app.corp.example.org', '*.corp.example.org'], []),
+    ).toEqual(['192.0.2.10', '[2001:db8::1]']);
+  });
+
+  it('counts an IP SAN of any stored certificate as covering, in any spelling', () => {
+    expect(
+      ipHostnamesWithoutCertificate(
+        ['192.0.2.10', '[2001:db8::1]'],
+        [cert('a.corp.example.org', [], { san_ips: ['2001:DB8:0:0::1'] }), cert('b.corp.example.org')],
+      ),
+    ).toEqual(['192.0.2.10']);
+  });
+
+  it('never counts a DNS SAN spelling the address as covering', () => {
+    expect(ipHostnamesWithoutCertificate(['192.0.2.10'], [cert('192.0.2.10', ['192.0.2.10'])])).toEqual([
+      '192.0.2.10',
+    ]);
+  });
+});
+
+describe('adcsIpHostnameNotice', () => {
+  it('says nothing without an address', () => {
+    expect(adcsIpHostnameNotice([])).toBeNull();
+  });
+
+  it('names each address and asks for an upload with an IP SAN', () => {
+    const one = adcsIpHostnameNotice(['192.0.2.10']);
+    expect(one).toContain('this address: 192.0.2.10');
+    expect(one).toContain('IP address SAN');
+    expect(adcsIpHostnameNotice(['192.0.2.10', '[2001:db8::1]'])).toContain(
+      'these addresses: 192.0.2.10, [2001:db8::1]',
+    );
+  });
 });
 
 describe('nameUnderSuffix', () => {
@@ -87,7 +134,15 @@ describe('parseSanList and adcsSanHints', () => {
   it('flags wildcards and names outside the suffixes separately', () => {
     expect(
       adcsSanHints(['*.corp.example.org', 'evilcorp.example.org', 'ok.corp.example.org'], ['corp.example.org']),
-    ).toEqual({ wildcards: ['*.corp.example.org'], outsideSuffixes: ['evilcorp.example.org'] });
+    ).toEqual({ wildcards: ['*.corp.example.org'], ipLiterals: [], outsideSuffixes: ['evilcorp.example.org'] });
+  });
+
+  it('flags IP literals on their own, not as names outside the suffixes', () => {
+    expect(adcsSanHints(['192.0.2.10', '[2001:db8::1]', 'ok.corp.example.org'], ['corp.example.org'])).toEqual({
+      wildcards: [],
+      ipLiterals: ['192.0.2.10', '[2001:db8::1]'],
+      outsideSuffixes: [],
+    });
   });
 });
 

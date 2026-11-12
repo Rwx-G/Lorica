@@ -121,7 +121,8 @@ fn csr_error(reason: impl Into<String>) -> AdcsError {
 /// the first SAN.
 ///
 /// Refused before any key is generated: an empty SAN list, a wildcard
-/// SAN (D5), a SAN that is not a DNS host name, an empty or non-BMP
+/// SAN (D5), a SAN that is not a DNS host name (an IP address
+/// included), an empty or non-BMP
 /// template name, and malformed subject fields. The SANs travel only in
 /// the extension request; the `san:` name-value pair, which works only
 /// on an authority with `EDITF_ATTRIBUTESUBJECTALTNAME2` set (ESC6), is
@@ -156,6 +157,13 @@ pub fn build_csr(
         if let Some(problem) = dns_name_problem(san) {
             return Err(csr_error(format!(
                 "{san:?} is not a DNS host name: {problem}"
+            )));
+        }
+        // A dotted IPv4 address passes the label check above, and would
+        // travel as a dNSName that no client matches an address against.
+        if san.parse::<std::net::Ipv4Addr>().is_ok() {
+            return Err(csr_error(format!(
+                "{san:?} is an IP address, not a DNS host name"
             )));
         }
         let ia5: Ia5String = Ia5String::try_from(san.as_str())
@@ -531,6 +539,12 @@ mod tests {
             "WebServer"
         ));
         assert!(refused(&["web01 corp"], &subject, "WebServer"));
+        assert!(refused(&["192.0.2.10"], &subject, "WebServer"));
+        assert!(refused(
+            &["web01.corp.example.org", "192.0.2.10"],
+            &subject,
+            "WebServer"
+        ));
         assert!(refused(
             &["web01.corp.example.org\n"],
             &subject,

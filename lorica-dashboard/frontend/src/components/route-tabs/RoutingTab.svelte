@@ -11,10 +11,12 @@
   import { ROUTE_DEFAULTS } from '../../lib/route-form';
   import { findUncoveredHostnames } from '../../lib/cert-san-match';
   import {
+    adcsIpHostnameNotice,
     adcsIssuanceBlocker,
     adcsIssueOutcome,
     adcsTemplateOptions,
     hostnamesWithoutCertificate,
+    ipHostnamesWithoutCertificate,
     type AdcsIssueOutcome,
   } from '../../lib/adcs-issuance';
   import { canWriteRole } from '../../lib/auth';
@@ -117,17 +119,21 @@
   // Story 13.3: names no stored certificate covers drive the one-click
   // AD CS issuance. Gated like the certificate page: Operator role, not
   // a follower, an authority configured and not in the failed state.
+  // An IP literal is never offered: AD CS issuance requests DNS names
+  // only, so it is named in a notice instead.
   let hostnamesNeedingCert = $derived(hostnamesWithoutCertificate(routeHostnames, certificates));
+  let ipsNeedingCert = $derived(ipHostnamesWithoutCertificate(routeHostnames, certificates));
   let adcsState = $state<AdcsAuthorityState | null>(null);
-  let adcsOffered = $derived(
+  let adcsAvailable = $derived(
     adcsState !== null &&
-      hostnamesNeedingCert.length > 0 &&
       adcsIssuanceBlocker({
         canIssue: $canWriteRole,
         follower: $nodeRole === 'follower',
         state: adcsState,
       }) === null,
   );
+  let adcsOffered = $derived(adcsAvailable && hostnamesNeedingCert.length > 0);
+  let adcsIpNotice = $derived(adcsAvailable ? adcsIpHostnameNotice(ipsNeedingCert) : null);
   let adcsTemplates = $derived(adcsState?.authority ? adcsTemplateOptions(adcsState.authority) : []);
   let adcsTemplate = $state('');
   let adcsRequest = $state<AdcsIssueRequest | null>(null);
@@ -258,6 +264,9 @@
               <button type="button" class="btn-adcs" onclick={openAdcsConfirm}>Issue from AD CS</button>
             </span>
           </div>
+        {/if}
+        {#if adcsIpNotice}
+          <div class="adcs-offer" role="note" data-testid="adcs-route-ip-notice">{adcsIpNotice}</div>
         {/if}
         {#if adcsOutcome?.kind === 'issued'}
           <div class="adcs-result ok" role="status" data-testid="adcs-route-outcome">
