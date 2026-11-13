@@ -21,6 +21,8 @@ Author: Rwx-G
 
 ### Security
 
+- ammonia 4.2.5 ([RUSTSEC-2026-0533](https://rustsec.org/advisories/RUSTSEC-2026-0533), mutation XSS when an element across an SVG / MathML switch and a raw-text element are both allowed). Lorica's error-page sanitizer was not in the affected configuration: it keeps no `svg`, `foreignObject`, `math` or MathML text integration point, and strips comments. A test now fails if it ever does.
+
 ## [1.10.5] - 2026-11-12
 
 Routes named by an IP address work over HTTPS ([#53](https://github.com/Rwx-G/Lorica/issues/53)), host names are read the way browsers read them, and the upstream Pingora sync and dependencies are current. Schema migration 70: upgrade followers before the control plane.

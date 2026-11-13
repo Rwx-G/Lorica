@@ -1978,6 +1978,21 @@ fn test_sanitize_html_encoded_javascript_bypass() {
     assert!(!sanitized.contains("javascript"));
 }
 
+#[test]
+fn test_sanitize_html_keeps_no_namespace_switch_nor_comment() {
+    // The mutation XSS classes ammonia has fixed (RUSTSEC-2026-0533 the
+    // latest) are reached only through an element kept across an HTML /
+    // SVG / MathML switch (`math` + a MathML text integration point,
+    // `svg` + `foreignObject`), with comments kept. This sanitizer keeps
+    // none of them; allowing one puts the error page back in that class.
+    let input = "<svg><foreignObject><p>a</p></foreignObject></svg>\
+                 <math><mi>b</mi><mtext>c</mtext></math><!--d-->";
+    let sanitized = sanitize_html(input);
+    for kept in ["<svg", "<foreignObject", "<math", "<mi", "<mtext", "<!--"] {
+        assert!(!sanitized.contains(kept), "{kept} survived: {sanitized}");
+    }
+}
+
 // ---- Basic auth credential cache ----
 
 #[test]
