@@ -11,6 +11,20 @@ Author: Rwx-G
 
 ### Added
 
+### Changed
+
+### Fixed
+
+### Removed
+
+### Security
+
+## [1.10.6] - 2026-11-14
+
+Lorica installs and upgrades from signed apt and dnf repositories, and the `.rpm` carries a signature RHEL 9 reads again. No schema migration.
+
+### Added
+
 - **Signed apt and dnf repositories.** Each release is published at `https://rwx-g.github.io/Lorica/` as an apt repository (`apt/`, suite `stable`) and a dnf repository (`rpm/`), so `apt upgrade` and `dnf upgrade` see new versions; the README and `docs/installation.md` give the setup. Their index metadata (`InRelease`, `Release.gpg`, `repomd.xml.asc`) is signed with the project key by the release job and verified against `docs/lorica-signing-key.asc` before anything is published. Both clients trust a local copy of the key, checked once by the operator: apt through `Signed-By`, dnf through `gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-lorica`, so the site cannot swap the key it signs with. The repositories hold the latest release only, and a release on an older line or a pre-release leaves them untouched. CI builds them from every pipeline's packages with a throwaway key: apt on Ubuntu 22.04 fetches the very `.deb` built, dnf installs on Fedora and Rocky Linux 9, and both refuse the repositories under any other key.
 
 ### Changed
@@ -20,8 +34,6 @@ Author: Rwx-G
 ### Fixed
 
 - **The `.rpm` is signed in a form RHEL 9 reads.** Since 1.10.1 the release runner's rpm 6 signed the package with a v6 header signature alone, which rpm 4.16 (RHEL 9, Rocky, Alma) does not read: there, the `.rpm` of 1.10.1 to 1.10.5 shows no signature, `rpm --checksig` reports its digests only, and `dnf` refuses it whenever `gpgcheck` applies. The release now signs with `rpmsign --rpmv4`, adding the v4 header signature beside the v6 one, and fails if a package lacks it. Published releases are never replaced: verify those five on an rpm 6 host (README, Package Verification, which now uses a check that fails on a package without signature).
-
-### Removed
 
 ### Security
 

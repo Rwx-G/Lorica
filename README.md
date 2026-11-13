@@ -6,10 +6,10 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.10.5-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.10.6-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-3702-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-3703-brightgreen.svg" alt="Lorica Tests">
   <img src="https://img.shields.io/badge/Pingora%20Tests-876-blue.svg" alt="Inherited Tests">
 </p>
 
@@ -768,7 +768,7 @@ cargo test -p lorica-cluster --tests
 cd lorica-dashboard/frontend && pnpm install --frozen-lockfile && pnpm run check && pnpm run lint && pnpm exec vitest run
 ```
 
-At 1.10.5 the two product-crate steps run 3702 Rust tests and the
+At 1.10.6 the two product-crate steps run 3703 Rust tests and the
 forked-crate step 876; the rustls build runs 539 more, most of them the
 default-feature tests of `lorica-core` and `lorica-lb` again with TLS on,
 so they are left out of the forked figure. The frontend suite is 794

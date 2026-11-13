@@ -1,6 +1,6 @@
 # Lorica - Competitive Feature Comparison
 
-> Last updated: 2026-11-12 | Lorica v1.10.5
+> Last updated: 2026-11-14 | Lorica v1.10.6
 >
 > **Legend:** Y = Yes | N = No | P = Partial | Paid = Paid/Enterprise only | Plug = Plugin, third-party module or external agent (not built-in) | ? = not verified | - = not applicable
 >
@@ -322,6 +322,7 @@
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | .deb package | Y | N | N | Y | N | Y | Y | Y |
 | .rpm package | Y | N | N | Y | N | Y | Y | Y |
+| Signed apt / dnf repository | Y | N | N | Y | N | ? | Y | ? |
 | Docker image | P | N | Y | Y | Y | Y | Y | Y |
 | Systemd hardened unit | Y | N | P | N | N | N | Y | P |
 | Single binary | Y | N | Y | Y | Y | N | Y | Y |
@@ -331,6 +332,7 @@
 ### Lorica Notes
 
 - **Single binary** - `lorica` holds the proxy, the API and the dashboard; the packages also ship the optional `lorica-mcp` binary.
+- **Package repositories** (v1.10.6) - each release is also published as a signed apt repository and a signed dnf repository on GitHub Pages, holding the latest release only; both clients trust a local copy of the project key, never one fetched again from the site.
 
 ### Gaps for Lorica
 
