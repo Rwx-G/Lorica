@@ -863,6 +863,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y apt-utils createrepo-c rpm
       # The agent is restarted before each use of the key, so nothing signs
       # from a cached passphrase: the passphrase file is what is tested.
+      # Signed as the release job signs, --rpmv4 included: dnf 4 on Rocky
+      # Linux 9 below is what proves RHEL 9 reads the signature.
       - name: Sign the .rpm with a throwaway key
         run: |
           set -euo pipefail
@@ -873,9 +875,9 @@ jobs:
           echo "THROWAWAY_KEY=$key" >> "$GITHUB_ENV"
           gpg --armor --export "$key" > "$RUNNER_TEMP/throwaway.asc"
           gpgconf --kill gpg-agent
-          rpm --define "_gpg_name $key" --define "__gpg /usr/bin/gpg" \
+          rpmsign --define "_gpg_name $key" --define "__gpg /usr/bin/gpg" \
             --define "_gpg_sign_cmd_extra_args --pinentry-mode loopback --passphrase-file $RUNNER_TEMP/gpg-pass" \
-            --addsign pkg/*.rpm
+            --addsign --rpmv4 pkg/*.rpm
           gpgconf --kill gpg-agent
       - name: Build the repositories
         run: |
@@ -1039,10 +1041,15 @@ jobs:
             echo "Signed: ${deb}.asc"
           done
           # rpm looks for gpg2 by default, which not every image carries.
+          # The runner's rpm 6 writes a v6 package, which it signs with a
+          # v6 header signature alone: rpm 4.16 (RHEL 9) does not read it
+          # and sees no signature at all, as on every .rpm from 1.10.1 to
+          # 1.10.5. --rpmv4 adds the v4 header signature beside it, and
+          # only rpmsign takes it, not `rpm --addsign`.
           for rpm_file in release-assets/*.rpm; do
-            rpm --define "_gpg_name $SIGNING_KEY" --define "__gpg /usr/bin/gpg" \
+            rpmsign --define "_gpg_name $SIGNING_KEY" --define "__gpg /usr/bin/gpg" \
               --define "_gpg_sign_cmd_extra_args --pinentry-mode loopback --passphrase-file $RUNNER_TEMP/gpg-pass" \
-              --addsign "$rpm_file"
+              --addsign --rpmv4 "$rpm_file"
             echo "Signed: $rpm_file"
           done
 
@@ -1061,6 +1068,14 @@ jobs:
             --import docs/lorica-signing-key.asc
           rpmkeys --dbpath "$keyring/rpmdb" --define "_keyringpath $keyring/pubkeys" \
             --define "_pkgverify_level signature" --checksig release-assets/*.rpm
+          # The check above runs on rpm 6, which a v6 signature alone
+          # satisfies. RHEL 9 reads the v4 header signature only.
+          for rpm_file in release-assets/*.rpm; do
+            if [ "$(rpm -qp --qf '%{RSAHEADER}' "$rpm_file")" = "(none)" ]; then
+              echo "::error::$rpm_file carries no v4 header signature: RHEL 9 sees it unsigned"
+              exit 1
+            fi
+          done
 
       # The package repositories hold one release, the highest published
       # (dist/is-highest-release.sh). A fix on an older line is released as

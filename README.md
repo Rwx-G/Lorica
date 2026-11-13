@@ -930,10 +930,17 @@ curl -fsSL https://github.com/Rwx-G/Lorica/raw/main/docs/lorica-signing-key.asc 
 gpg --dearmor < lorica-signing-key.asc > lorica.gpg
 gpgv --keyring ./lorica.gpg lorica_<version>_amd64.deb.asc lorica_<version>_amd64.deb
 
-# .rpm
+# .rpm; the define makes a package with no signature fail instead of
+# passing on its digests alone
 sudo rpm --import lorica-signing-key.asc
-rpm --checksig lorica-<version>-1.x86_64.rpm
+rpmkeys --define '_pkgverify_level signature' --checksig lorica-<version>-1.x86_64.rpm
 ```
+
+The `.rpm` of 1.10.1 to 1.10.5 carries a signature only rpm 6 reads (a
+current Fedora, `rpm --version`): on RHEL 9 the command above fails on them,
+and a plain `rpm --checksig` reports their digests alone. Verify those on an
+rpm 6 host. From 1.10.6 on, every `.rpm` carries a signature RHEL 9 reads as
+well.
 
 The package repositories need no manual step: apt checks the signed
 `InRelease` against the key named by `Signed-By` in `lorica.sources`, and dnf

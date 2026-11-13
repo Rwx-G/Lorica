@@ -19,6 +19,8 @@ Author: Rwx-G
 
 ### Fixed
 
+- **The `.rpm` is signed in a form RHEL 9 reads.** Since 1.10.1 the release runner's rpm 6 signed the package with a v6 header signature alone, which rpm 4.16 (RHEL 9, Rocky, Alma) does not read: there, the `.rpm` of 1.10.1 to 1.10.5 shows no signature, `rpm --checksig` reports its digests only, and `dnf` refuses it whenever `gpgcheck` applies. The release now signs with `rpmsign --rpmv4`, adding the v4 header signature beside the v6 one, and fails if a package lacks it. Published releases are never replaced: verify those five on an rpm 6 host (README, Package Verification, which now uses a check that fails on a package without signature).
+
 ### Removed
 
 ### Security
