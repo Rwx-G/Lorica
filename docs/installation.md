@@ -9,7 +9,40 @@ over stdio for one session (`docs/mcp.md`). They install the unit at
 `/usr/lib/systemd/system/lorica.service`), create a dedicated unprivileged
 `lorica` user, and own the data directory `/var/lib/lorica`.
 
-## Install from a package
+## Install from the package repository
+
+From 1.10.6 on, each release is also published as a signed apt
+repository and a signed dnf repository on GitHub Pages, so `apt upgrade`
+and `dnf upgrade` see new versions:
+
+```bash
+# Debian / Ubuntu
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSL https://rwx-g.github.io/Lorica/lorica-signing-key.asc -o /etc/apt/keyrings/lorica.asc
+sudo curl -fsSL https://rwx-g.github.io/Lorica/apt/lorica.sources -o /etc/apt/sources.list.d/lorica.sources
+sudo apt update && sudo apt install lorica
+
+# Fedora / RHEL
+sudo curl -fsSL https://rwx-g.github.io/Lorica/lorica-signing-key.asc -o /etc/pki/rpm-gpg/RPM-GPG-KEY-lorica
+sudo curl -fsSL https://rwx-g.github.io/Lorica/rpm/lorica.repo -o /etc/yum.repos.d/lorica.repo
+sudo dnf install lorica
+```
+
+The key at the site root is the project key, `docs/lorica-signing-key.asc`.
+Check its fingerprint once, after downloading it:
+`gpg --show-keys /etc/apt/keyrings/lorica.asc` (or
+`/etc/pki/rpm-gpg/RPM-GPG-KEY-lorica`) must show
+`A7AC4E3D0C999B6DFBA30059B6E37EA916841674`. From then on only that local
+copy is trusted, never a key fetched again from the site: apt holds the
+repository to it through `Signed-By`, and dnf checks both the repository
+metadata and each package against it (`gpgkey=file://...`,
+`repo_gpgcheck=1`, `gpgcheck=1`).
+
+The repositories hold the latest release only. A fix released on an
+older line, or any earlier version, is installed from its release page
+as below.
+
+## Install a downloaded package
 
 ```bash
 # Debian / Ubuntu
@@ -21,8 +54,8 @@ sudo dnf install ./lorica-<version>-1.x86_64.rpm
 
 Since 1.10.1 the packages require the GSS-API runtime library
 (`libgssapi-krb5-2`, `krb5-libs`), which `apt` and `dnf` install with
-them. `dpkg -i` and `rpm -i` do not resolve dependencies and refuse the
-package on a host that lacks it.
+them, from either source. `dpkg -i` and `rpm -i` do not resolve
+dependencies and refuse the package on a host that lacks it.
 
 Releases after 1.10.3 need glibc 2.34 or later, and the packages
 declare it: CI starts the binaries on Debian 12, Ubuntu 22.04 and

@@ -11,6 +11,8 @@ Author: Rwx-G
 
 ### Added
 
+- **Signed apt and dnf repositories.** Each release is published at `https://rwx-g.github.io/Lorica/` as an apt repository (`apt/`, suite `stable`) and a dnf repository (`rpm/`), so `apt upgrade` and `dnf upgrade` see new versions; the README and `docs/installation.md` give the setup. Their index metadata (`InRelease`, `Release.gpg`, `repomd.xml.asc`) is signed with the project key by the release job and verified against `docs/lorica-signing-key.asc` before anything is published. Both clients trust a local copy of the key, checked once by the operator: apt through `Signed-By`, dnf through `gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-lorica`, so the site cannot swap the key it signs with. The repositories hold the latest release only, and a release on an older line or a pre-release leaves them untouched. CI builds them from every pipeline's packages with a throwaway key: apt on Ubuntu 22.04 fetches the very `.deb` built, dnf installs on Fedora and Rocky Linux 9, and both refuse the repositories under any other key.
+
 ### Changed
 
 ### Fixed
