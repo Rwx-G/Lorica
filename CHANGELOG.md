@@ -15,6 +15,8 @@ Author: Rwx-G
 
 ### Changed
 
+- Dependencies refreshed: mio 1.2.5, cc 1.11.2, bumpalo 3.20.4, the AWS Route 53 client.
+
 ### Fixed
 
 ### Removed
