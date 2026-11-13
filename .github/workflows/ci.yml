@@ -814,12 +814,147 @@ jobs:
           fi
           echo ".rpm installation verified OK"
 
+  # The apt and dnf repositories the release job publishes on GitHub Pages,
+  # built by the same script from the packages this run built, then used by
+  # the oldest apt supported, dnf 4 on Rocky Linux 9 and dnf 5 on Fedora
+  # through the client files an operator downloads. The key is a throwaway
+  # one with a passphrase, signing as the release job signs: the project
+  # key never leaves that job. The throwaway key plays the published one,
+  # and the published key in its place must be refused by apt and dnf,
+  # which proves each holds the repository to the key it was given.
+  test-package-repo:
+    name: Test package repositories
+    timeout-minutes: 25
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: lorica-deb
+          path: pkg/
+      - uses: actions/download-artifact@v8
+        with:
+          name: lorica-rpm
+          path: pkg/
+      - name: The highest-release guard
+        run: |
+          set -euo pipefail
+          # expected exit, tag, published tags
+          check() {
+            local expected=$1 tag=$2 rc=0
+            shift 2
+            printf '%s\n' "$@" | bash dist/is-highest-release.sh "$tag" || rc=$?
+            if [ "$rc" != "$expected" ]; then
+              echo "FAIL: $tag against [$*] exited $rc, expected $expected"
+              exit 1
+            fi
+          }
+          check 1 v1.9.4 v1.10.5 v1.9.3
+          check 0 v1.10.5 v1.10.5 v1.9.3
+          check 0 v1.10.6 v1.10.5 v1.9.3
+          check 0 v1.10.10 v1.10.9
+          check 0 v1.10.6
+          check 1 v1.11.0-rc.1 v1.10.5
+          check 0 v1.11.0 v1.10.5 v1.11.1-rc.1
+      - name: Install the repository tools
+        run: sudo apt-get update && sudo apt-get install -y apt-utils createrepo-c rpm
+      # The agent is restarted before each use of the key, so nothing signs
+      # from a cached passphrase: the passphrase file is what is tested.
+      # Signed as the release job signs, --rpmv4 included: dnf 4 on Rocky
+      # Linux 9 below is what proves RHEL 9 reads the signature.
+      - name: Sign the .rpm with a throwaway key
+        run: |
+          set -euo pipefail
+          (umask 077 && openssl rand -hex 16 > "$RUNNER_TEMP/gpg-pass")
+          gpg --batch --pinentry-mode loopback --passphrase-file "$RUNNER_TEMP/gpg-pass" \
+            --quick-gen-key 'Lorica CI throwaway <ci@example.invalid>' rsa3072 sign 1d
+          key=$(gpg --list-secret-keys --with-colons | awk -F: '$1 == "fpr" {print $10; exit}')
+          echo "THROWAWAY_KEY=$key" >> "$GITHUB_ENV"
+          gpg --armor --export "$key" > "$RUNNER_TEMP/throwaway.asc"
+          gpgconf --kill gpg-agent
+          rpmsign --define "_gpg_name $key" --define "__gpg /usr/bin/gpg" \
+            --define "_gpg_sign_cmd_extra_args --pinentry-mode loopback --passphrase-file $RUNNER_TEMP/gpg-pass" \
+            --addsign --rpmv4 pkg/*.rpm
+          gpgconf --kill gpg-agent
+      - name: Build the repositories
+        run: |
+          GPG_PASSPHRASE_FILE="$RUNNER_TEMP/gpg-pass" bash dist/build-package-repo.sh \
+            site http://127.0.0.1:8000 "$THROWAWAY_KEY" "$RUNNER_TEMP/throwaway.asc" pkg/*.deb pkg/*.rpm
+      - name: Serve the site
+        run: |
+          nohup python3 -m http.server 8000 --bind 127.0.0.1 --directory site > http.log 2>&1 &
+          for _ in $(seq 1 20); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8000/apt/dists/stable/InRelease; then
+              exit 0
+            fi
+            sleep 0.5
+          done
+          cat http.log
+          echo "FAIL: the site is not served"
+          exit 1
+      # Download only: the install itself is test-deb-install's. What is
+      # fetched must be the very package this run built.
+      - name: apt on Ubuntu 22.04 fetches lorica from the repository
+        run: |
+          docker run --rm --network host -v "$PWD/site:/site:ro" -v "$PWD/pkg:/pkg:ro" ubuntu:22.04 bash -euxc '
+            install -d -m 0755 /etc/apt/keyrings
+            cp /site/lorica-signing-key.asc /etc/apt/keyrings/lorica.asc
+            cp /site/apt/lorica.sources /etc/apt/sources.list.d/lorica.sources
+            apt-get update
+            apt-get install -y --download-only lorica
+            cmp /var/cache/apt/archives/lorica_*_amd64.deb /pkg/lorica_*_amd64.deb'
+      # The distribution's own sources are dropped, so the failure can only
+      # come from the Lorica repository.
+      - name: apt refuses the repository with another key in Signed-By
+        run: |
+          docker run --rm --network host -v "$PWD/site:/site:ro" -v "$PWD/docs:/docs:ro" ubuntu:22.04 bash -euc '
+            rm -f /etc/apt/sources.list
+            install -d -m 0755 /etc/apt/keyrings
+            cp /docs/lorica-signing-key.asc /etc/apt/keyrings/lorica.asc
+            cp /site/apt/lorica.sources /etc/apt/sources.list.d/lorica.sources
+            if apt-get update > /tmp/update.log 2>&1; then
+              cat /tmp/update.log
+              echo "FAIL: apt-get update accepted a repository signed by another key"
+              exit 1
+            fi
+            cat /tmp/update.log
+            grep -q NO_PUBKEY /tmp/update.log'
+      # gpgcheck and repo_gpgcheck are on in the client file: the package
+      # and repomd.xml are both checked against the local key file it
+      # names, placed first as the operator places it.
+      - name: dnf installs lorica from the repository
+        run: |
+          for image in fedora:latest rockylinux:9; do
+            docker run --rm --network host -v "$PWD/site:/site:ro" -v "$PWD/pkg:/pkg:ro" "$image" bash -euxc '
+              install -D -m 0644 /site/lorica-signing-key.asc /etc/pki/rpm-gpg/RPM-GPG-KEY-lorica
+              cp /site/rpm/lorica.repo /etc/yum.repos.d/lorica.repo
+              dnf install -y lorica
+              test "$(rpm -q lorica)" = "$(rpm -qp /pkg/lorica-*.x86_64.rpm)"'
+          done
+      # Only the Lorica repository is enabled, so the failure can only come
+      # from it.
+      - name: dnf refuses the repository with another key
+        run: |
+          docker run --rm --network host -v "$PWD/site:/site:ro" -v "$PWD/docs:/docs:ro" fedora:latest bash -euc '
+            install -D -m 0644 /docs/lorica-signing-key.asc /etc/pki/rpm-gpg/RPM-GPG-KEY-lorica
+            cp /site/rpm/lorica.repo /etc/yum.repos.d/lorica.repo
+            if dnf install -y --disablerepo="*" --enablerepo=lorica lorica > /tmp/install.log 2>&1; then
+              cat /tmp/install.log
+              echo "FAIL: dnf installed from a repository signed by another key"
+              exit 1
+            fi
+            cat /tmp/install.log
+            grep -q "repomd.xml GPG signature verification error" /tmp/install.log'
+
   # Last, so a package is only ever signed for a tag that proved its own
   # signature, after every test passed on exactly those packages.
   verify-tag:
     name: Verify tag signature
     timeout-minutes: 10
-    needs: [run-on-oldest, test-deb-install, test-rpm-install, test-deb-upgrade, test-rpm-upgrade, e2e-docker, adcs-harness]
+    needs: [run-on-oldest, test-deb-install, test-rpm-install, test-deb-upgrade, test-rpm-upgrade, test-package-repo, e2e-docker, adcs-harness]
     # Only a tag push reaches this. A branch build has no tag to verify.
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -857,6 +992,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      publish-site: ${{ steps.guard.outputs.publish }}
+      pages-artifact: ${{ steps.guard.outputs.artifact }}
     env:
       SIGNING_KEY: B6E37EA916841674
       TAG: ${{ github.ref_name }}
@@ -881,8 +1019,8 @@ jobs:
           name: lorica-sbom
           path: release-assets/
 
-      - name: Install rpm tools
-        run: sudo apt-get update && sudo apt-get install -y rpm
+      - name: Install rpm and repository tools
+        run: sudo apt-get update && sudo apt-get install -y rpm apt-utils createrepo-c
 
       - name: Import the signing key
         env:
@@ -903,10 +1041,15 @@ jobs:
             echo "Signed: ${deb}.asc"
           done
           # rpm looks for gpg2 by default, which not every image carries.
+          # The runner's rpm 6 writes a v6 package, which it signs with a
+          # v6 header signature alone: rpm 4.16 (RHEL 9) does not read it
+          # and sees no signature at all, as on every .rpm from 1.10.1 to
+          # 1.10.5. --rpmv4 adds the v4 header signature beside it, and
+          # only rpmsign takes it, not `rpm --addsign`.
           for rpm_file in release-assets/*.rpm; do
-            rpm --define "_gpg_name $SIGNING_KEY" --define "__gpg /usr/bin/gpg" \
+            rpmsign --define "_gpg_name $SIGNING_KEY" --define "__gpg /usr/bin/gpg" \
               --define "_gpg_sign_cmd_extra_args --pinentry-mode loopback --passphrase-file $RUNNER_TEMP/gpg-pass" \
-              --addsign "$rpm_file"
+              --addsign --rpmv4 "$rpm_file"
             echo "Signed: $rpm_file"
           done
 
@@ -925,6 +1068,84 @@ jobs:
             --import docs/lorica-signing-key.asc
           rpmkeys --dbpath "$keyring/rpmdb" --define "_keyringpath $keyring/pubkeys" \
             --define "_pkgverify_level signature" --checksig release-assets/*.rpm
+          # The check above runs on rpm 6, which a v6 signature alone
+          # satisfies. RHEL 9 reads the v4 header signature only.
+          for rpm_file in release-assets/*.rpm; do
+            if [ "$(rpm -qp --qf '%{RSAHEADER}' "$rpm_file")" = "(none)" ]; then
+              echo "::error::$rpm_file carries no v4 header signature: RHEL 9 sees it unsigned"
+              exit 1
+            fi
+          done
+
+      # The package repositories hold one release, the highest published
+      # (dist/is-highest-release.sh). A fix on an older line is released as
+      # usual and leaves them alone, or they would go back to that line.
+      # Drafts do not count: a failed run of this very tag leaves one.
+      # deploy-pages asks again at deploy time. The site's artifact is
+      # named after the attempt: a re-run of this job would otherwise
+      # collide with the one its failed attempt uploaded, as artifact names
+      # are unique within a run.
+      - name: Is this the highest release
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          echo "artifact=package-repositories-$ATTEMPT" >> "$GITHUB_OUTPUT"
+          published=$(gh release list --exclude-drafts --limit 1000 --json tagName --jq '.[].tagName')
+          rc=0
+          printf '%s\n' "$published" | bash dist/is-highest-release.sh "$TAG" || rc=$?
+          case "$rc" in
+            0) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
+            1) echo "publish=false" >> "$GITHUB_OUTPUT" ;;
+            *) exit "$rc" ;;
+          esac
+
+      # Outside release-assets/, whose every file is published. The index
+      # metadata is signed here, the one job holding the key.
+      - name: Build the package repositories
+        if: steps.guard.outputs.publish == 'true'
+        run: |
+          GPG_PASSPHRASE_FILE="$RUNNER_TEMP/gpg-pass" bash dist/build-package-repo.sh \
+            "$RUNNER_TEMP/pages" https://rwx-g.github.io/Lorica "$SIGNING_KEY" docs/lorica-signing-key.asc \
+            release-assets/lorica_*_amd64.deb release-assets/lorica-*.x86_64.rpm
+
+      # The same keyring of the published key alone as the packages above.
+      # Each repository must hold exactly this release, and the client files
+      # must point at the production site.
+      - name: The package repositories verify against the published key
+        if: steps.guard.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          site="$RUNNER_TEMP/pages"
+          version=${TAG#v}
+          keyring=$(mktemp -d)
+          gpg --dearmor < docs/lorica-signing-key.asc > "$keyring/published.gpg"
+          gpgv --keyring "$keyring/published.gpg" "$site/apt/dists/stable/InRelease"
+          gpgv --keyring "$keyring/published.gpg" "$site/apt/dists/stable/Release.gpg" "$site/apt/dists/stable/Release"
+          gpgv --keyring "$keyring/published.gpg" "$site/rpm/repodata/repomd.xml.asc" "$site/rpm/repodata/repomd.xml"
+          packages="$site/apt/dists/stable/main/binary-amd64/Packages"
+          if [ "$(grep -c '^Package: ' "$packages")" != 1 ] || ! grep -qx "Version: $version" "$packages"; then
+            echo "::error::the apt index does not list $version alone"
+            cat "$packages"
+            exit 1
+          fi
+          mapfile -t rpms < <(find "$site/rpm" -maxdepth 1 -name '*.rpm')
+          if [ "${#rpms[@]}" != 1 ] || [ "$(rpm -qp --qf '%{VERSION}' "${rpms[0]}")" != "$version" ]; then
+            echo "::error::the dnf repository does not hold $version alone: ${rpms[*]}"
+            exit 1
+          fi
+          grep -qx 'URIs: https://rwx-g.github.io/Lorica/apt' "$site/apt/lorica.sources"
+          grep -qx 'baseurl=https://rwx-g.github.io/Lorica/rpm' "$site/rpm/lorica.repo"
+
+      - name: Upload the package repositories
+        if: steps.guard.outputs.publish == 'true'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          name: ${{ steps.guard.outputs.artifact }}
+          path: ${{ runner.temp }}/pages
+          retention-days: 30
 
       # A draft is what a failed run leaves behind and may be completed. A
       # published release is never replaced, as a release tag is never moved.
@@ -944,3 +1165,58 @@ jobs:
           else
             gh release create "$TAG" "${assets[@]}" --title "Lorica $TAG" --generate-notes
           fi
+
+  # Deploys what the release job built, signed and verified, and holds no
+  # key: Pages takes the job's OIDC identity, not a token. A failed
+  # deployment is re-run alone: the artifact stays with the run, and its
+  # name comes from the release attempt that uploaded it. Two
+  # repository settings, made once, are what let it through: Pages built
+  # from "GitHub Actions", and a `v*` tag rule on the `github-pages`
+  # environment, which otherwise allows the default branch only and so
+  # refuses a deployment from a tag.
+  deploy-pages:
+    name: Deploy package repositories
+    timeout-minutes: 10
+    needs: release
+    if: needs.release.outputs.publish-site == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Asked again here, under the `pages` group: the release job's guard
+      # ran before either of two close tags was published, and the group
+      # queues deployments without ordering them. A higher release
+      # published since then means its site stays.
+      - name: Is this still the highest release
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          published=$(gh release list --exclude-drafts --limit 1000 --json tagName --jq '.[].tagName')
+          rc=0
+          printf '%s\n' "$published" | bash dist/is-highest-release.sh "$TAG" || rc=$?
+          case "$rc" in
+            0) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
+            1) echo "publish=false" >> "$GITHUB_OUTPUT" ;;
+            *) exit "$rc" ;;
+          esac
+      - name: Deploy to GitHub Pages
+        id: deployment
+        if: steps.guard.outputs.publish == 'true'
+        uses: actions/deploy-pages@v5
+        with:
+          artifact_name: ${{ needs.release.outputs.pages-artifact }}
