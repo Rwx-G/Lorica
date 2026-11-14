@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use futures_util::stream::StreamExt;
-use lorica_config::models::{Backend, HealthStatus, LifecycleState};
+use lorica_config::models::{Backend, HealthCheck, HealthStatus, LifecycleState};
 use lorica_config::ConfigStore;
 use once_cell::sync::Lazy;
 use tokio::net::TcpStream;
@@ -222,16 +222,9 @@ pub async fn health_check_loop(
             .collect();
         let probe_results: Vec<(Backend, HealthStatus)> = futures_util::stream::iter(eligible)
             .map(|backend| async move {
-                let probe = if let Some(ref path) = backend.health_check_path {
-                    let scheme = if backend.tls_upstream {
-                        "https"
-                    } else {
-                        "http"
-                    };
-                    let url = format!("{scheme}://{}{path}", backend.address);
-                    http_probe(&url).await
-                } else {
-                    tcp_probe(&backend.address).await
+                let probe = match probe_for(&backend) {
+                    ProbeTarget::Http { url } => http_probe(&url).await,
+                    ProbeTarget::TcpConnect { address } => tcp_probe(&address).await,
                 };
                 (backend, probe.to_health_status())
             })
@@ -309,6 +302,46 @@ pub async fn health_check_loop(
                 let _ = tx.send(0);
             }
         }
+    }
+}
+
+/// What one active probe of a backend reaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeTarget {
+    /// A GET of this URL; a 2xx answer is healthy.
+    Http {
+        /// `http://` or `https://` (after `tls_upstream`), the address,
+        /// then the check's path.
+        url: String,
+    },
+    /// A TCP connection to this `host:port`.
+    TcpConnect {
+        /// The backend's address.
+        address: String,
+    },
+}
+
+/// The probe `backend`'s typed check asks for (Story 12.1, D-2).
+///
+/// Read from `health_check` and never from the deprecated
+/// `health_check_path`: the store reconciles the two on read, so for a
+/// backend with a path set this is the URL the loop built from the path
+/// before 1.11.0, byte for byte.
+fn probe_for(backend: &Backend) -> ProbeTarget {
+    match &backend.health_check {
+        HealthCheck::Http { path } => {
+            let scheme = if backend.tls_upstream {
+                "https"
+            } else {
+                "http"
+            };
+            ProbeTarget::Http {
+                url: format!("{scheme}://{}{path}", backend.address),
+            }
+        }
+        HealthCheck::TcpConnect => ProbeTarget::TcpConnect {
+            address: backend.address.clone(),
+        },
     }
 }
 
@@ -519,6 +552,85 @@ mod tests {
     async fn test_http_probe_invalid_url() {
         let result = http_probe("not-a-url").await;
         assert_eq!(result, ProbeResult::Down);
+    }
+
+    // ---- Probe selection ----
+
+    fn backend_checked_by(path: Option<&str>, tls_upstream: bool) -> Backend {
+        let mut backend: Backend = serde_json::from_value(serde_json::json!({
+            "id": "b-1",
+            "address": "192.0.2.10:8080",
+            "weight": 100,
+            "health_status": "healthy",
+            "health_check_enabled": true,
+            "health_check_interval_s": 10,
+            "lifecycle_state": "normal",
+            "active_connections": 0,
+            "tls_upstream": tls_upstream,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        }))
+        .expect("test setup: a backend");
+        backend.set_health_check(HealthCheck::reconcile(None, path));
+        backend
+    }
+
+    /// The URL the loop built before 1.11.0 from `health_check_path`,
+    /// kept as the reference the typed probe must reproduce.
+    fn url_before_1_11_0(backend: &Backend) -> Option<String> {
+        let path = backend.health_check_path.as_ref()?;
+        let scheme = if backend.tls_upstream {
+            "https"
+        } else {
+            "http"
+        };
+        Some(format!("{scheme}://{}{path}", backend.address))
+    }
+
+    #[test]
+    fn a_backend_read_with_a_path_is_probed_at_the_url_the_path_gave_before() {
+        for tls_upstream in [false, true] {
+            for path in ["/healthz", "/ready?deep=1", "/"] {
+                let backend = backend_checked_by(Some(path), tls_upstream);
+                let expected = url_before_1_11_0(&backend).expect("a path is set");
+                assert_eq!(
+                    probe_for(&backend),
+                    ProbeTarget::Http { url: expected },
+                    "path {path}, tls_upstream {tls_upstream}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_backend_with_no_path_is_probed_by_tcp_connect() {
+        let backend = backend_checked_by(None, false);
+        assert_eq!(url_before_1_11_0(&backend), None);
+        assert_eq!(
+            probe_for(&backend),
+            ProbeTarget::TcpConnect {
+                address: "192.0.2.10:8080".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn the_typed_check_decides_the_probe() {
+        let mut backend = backend_checked_by(None, false);
+        backend.set_health_check(HealthCheck::Http {
+            path: "/typed".to_string(),
+        });
+        assert_eq!(
+            probe_for(&backend),
+            ProbeTarget::Http {
+                url: "http://192.0.2.10:8080/typed".to_string()
+            }
+        );
+        backend.set_health_check(HealthCheck::TcpConnect);
+        assert!(matches!(
+            probe_for(&backend),
+            ProbeTarget::TcpConnect { .. }
+        ));
     }
 
     // ---- Flip hysteresis ----
