@@ -30,6 +30,7 @@ use nix::unistd::{execv, fork, ForkResult, Pid};
 use tracing::{info, warn};
 
 use crate::fd_passing::{self, FdEntry, FdKind};
+use crate::stream_ctl;
 use crate::WorkerError;
 
 /// Maximum backoff delay between restarts.
@@ -93,6 +94,11 @@ pub struct WorkerHandle {
     /// token-bucket sync, verdict cache, breaker state, etc. `None`
     /// after the FD has been taken via [`take_rpc_fd`].
     rpc_fd: Option<OwnedFd>,
+    /// Supervisor end of the `SOCK_SEQPACKET` stream control channel
+    /// ([`crate::stream_ctl`]), over which stream sockets are attached
+    /// and detached at runtime. `None` after the FD has been taken via
+    /// [`take_stream_ctl_fd`](Self::take_stream_ctl_fd).
+    stream_ctl_fd: Option<OwnedFd>,
     /// When this worker was last spawned (for backoff calculation).
     spawned_at: Instant,
     /// Consecutive restart count (resets after stable run).
@@ -120,6 +126,12 @@ impl WorkerHandle {
     /// Returns `None` if already taken.
     pub fn take_rpc_fd(&mut self) -> Option<OwnedFd> {
         self.rpc_fd.take()
+    }
+
+    /// Take ownership of the stream control channel FD.
+    /// Returns `None` if already taken.
+    pub fn take_stream_ctl_fd(&mut self) -> Option<OwnedFd> {
+        self.stream_ctl_fd.take()
     }
 }
 
@@ -278,15 +290,18 @@ impl WorkerManager {
 
     /// Fork+exec a single worker process and send it the listening FDs.
     fn spawn_worker(&mut self, id: u32, restart_count: u32) -> Result<(), WorkerError> {
-        // Two socketpairs per worker: the legacy `cmd` channel and the
-        // new pipelined `rpc` channel. Each side retains one end.
+        // Three socketpairs per worker: the legacy `cmd` channel, the
+        // pipelined `rpc` channel and the `SOCK_SEQPACKET` stream control
+        // channel. Each side retains one end.
         let (supervisor_cmd, worker_cmd) = fd_passing::create_socketpair()?;
         let (supervisor_rpc, worker_rpc) = fd_passing::create_socketpair()?;
+        let (supervisor_stream_ctl, worker_stream_ctl) = stream_ctl::create_seqpacket_pair()?;
 
         match unsafe { fork() }.map_err(WorkerError::Fork)? {
             ForkResult::Parent { child } => {
-                // Parent: close worker ends, send FDs (both listener + the
-                // worker's RPC end) via SCM_RIGHTS, record handle.
+                // Parent: close worker ends, send FDs (listeners, the
+                // worker's RPC end and its stream control end) via
+                // SCM_RIGHTS, record handle.
                 drop(worker_cmd);
 
                 let mut entries: Vec<FdEntry> = Vec::new();
@@ -300,6 +315,10 @@ impl WorkerManager {
                     fd: worker_rpc.as_raw_fd(),
                     kind: FdKind::Rpc,
                 });
+                entries.push(FdEntry {
+                    fd: worker_stream_ctl.as_raw_fd(),
+                    kind: FdKind::StreamCtl,
+                });
                 for (fd, addr) in self.listen_fds.iter().zip(&self.listen_addrs) {
                     entries.push(FdEntry {
                         fd: *fd,
@@ -307,9 +326,11 @@ impl WorkerManager {
                     });
                 }
                 fd_passing::send_worker_fds(supervisor_cmd.as_raw_fd(), &entries)?;
-                // Supervisor no longer needs its copy of the worker's RPC
-                // FD - it was duplicated into the worker's table via SCM_RIGHTS.
+                // Supervisor no longer needs its copies of the worker's
+                // ends - they were duplicated into the worker's table via
+                // SCM_RIGHTS.
                 drop(worker_rpc);
+                drop(worker_stream_ctl);
 
                 info!(worker_id = id, pid = child.as_raw(), "worker spawned");
 
@@ -318,6 +339,7 @@ impl WorkerManager {
                     pid: child,
                     cmd_fd: Some(supervisor_cmd),
                     rpc_fd: Some(supervisor_rpc),
+                    stream_ctl_fd: Some(supervisor_stream_ctl),
                     spawned_at: Instant::now(),
                     restart_count,
                 });
@@ -326,12 +348,14 @@ impl WorkerManager {
             }
             ForkResult::Child => {
                 // Child: close supervisor ends, prepare for exec. The worker's
-                // RPC FD is received via SCM_RIGHTS (inside `recv_worker_fds`),
-                // so the direct `worker_rpc` handle here is redundant - drop it
-                // so the child's fd table stays clean.
+                // RPC and stream control FDs are received via SCM_RIGHTS
+                // (inside `recv_worker_fds`), so the direct handles here are
+                // redundant - drop them so the child's fd table stays clean.
                 drop(supervisor_cmd);
                 drop(supervisor_rpc);
+                drop(supervisor_stream_ctl);
                 drop(worker_rpc);
+                drop(worker_stream_ctl);
 
                 // Clear CLOEXEC on the worker socketpair FD so it survives exec
                 let cmd_fd_raw = worker_cmd.into_raw_fd();
@@ -437,6 +461,11 @@ impl WorkerManager {
     /// only carried the cmd_fd, so the supervisor never re-registered
     /// the respawned worker's RPC endpoint and subsequent two-phase
     /// config reloads silently skipped it).
+    ///
+    /// The new worker's stream control end is not returned: it stays on
+    /// its [`WorkerHandle`] for the caller to take with
+    /// [`WorkerHandle::take_stream_ctl_fd`] (through
+    /// [`Self::workers_mut`]) before replaying the live stream bindings.
     ///
     /// **The caller must sleep `self.restart_backoff(id)` BEFORE
     /// calling this function** - audit M-26 closure. The previous
