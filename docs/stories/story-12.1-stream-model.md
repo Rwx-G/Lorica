@@ -1,7 +1,7 @@
 # Story 12.1: The Stream Model, Shared Backends and the Release's Schema Decisions
 
 **Epic:** [Epic 12 - TCP and UDP Stream Proxying (v1.11.0 and v1.12.0)](../prd/epic-12-v1.11.0.md)
-**Status:** InProgress
+**Status:** Review
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** the `lorica-fleet` extraction (backlog #52, "The cycle's
@@ -826,7 +826,7 @@ schemas).
 Allowlist: `docs/cluster.md`, `CHANGELOG.md`, `docs/hot-upgrade.md`,
 `docs/architecture/source-tree.md`.
 
-- [ ] `docs/cluster.md` "Running a Mixed-Version Fleet": the 1.10.6 to
+- [x] `docs/cluster.md` "Running a Mixed-Version Fleet": the 1.10.6 to
       1.11.0 step of D-3 (followers first, control plane at once, the
       configuration freeze and why, the control-plane rollback state);
       "Targeting a subset": streams and their links are cut per
@@ -834,17 +834,17 @@ Allowlist: `docs/cluster.md`, `CHANGELOG.md`, `docs/hot-upgrade.md`,
       streams with an empty selector, unlike routes, and why);
       "What may ride the heartbeat":
       the "Node fact" class (reserved ports, persisted).
-- [ ] `docs/hot-upgrade.md`: a rollback from 1.11.0 to 1.10.6 opens the
+- [x] `docs/hot-upgrade.md`: a rollback from 1.11.0 to 1.10.6 opens the
       database and serves HTTP as before; streams are not served by
       1.10.6.
-- [ ] `CHANGELOG.md` `[Unreleased]`: Added (stream model and API,
+- [x] `CHANGELOG.md` `[Unreleased]`: Added (stream model and API,
       reserved ports in the heartbeat, portless backends for range
       streams), Changed (typed health check, `health_check_path`
       deprecated, the enrollment-port refusal at startup), and the
       migration line "Schema migrations 71 to 73: upgrade followers
       first and the control plane immediately after; configuration
       changes do not replicate in between."
-- [ ] `docs/architecture/source-tree.md`: the new files.
+- [x] `docs/architecture/source-tree.md`: the new files.
 
 ## Dev Notes
 
@@ -1191,7 +1191,54 @@ Lot 1 (schema, models, store, shared rules, shape changes) and Lot 2
 (replication, cut, export, import, diff) are done, Lot 4 (the typed
 health check on every surface), Lot 5 (the stream management API
 and the conflict checks), and Lot 3 (reserved ports on the wire,
-persisted, and the selector warning); Lot 6 is handled separately.
+persisted, and the selector warning), and Lot 6 (documentation).
+
+Lot 6:
+
+- `docs/cluster.md`: "The two phases" lists the stream refusals of
+  `prepare_replica`; "Targeting a subset" adds streams and their links
+  to the per-recipient cut (a backend travels with a kept route or a
+  kept stream), a table of where each role serves routes and binds
+  streams (`binds_here`, D-8, and why the control plane differs), and
+  the per-node port check with its `stream_port_conflict` `409` and the
+  never-reported refusal; "What may ride the heartbeat" adds the
+  reserved ports and the "Node fact" class row (persisted by the
+  30-second flush, `COALESCE`, the whole-report drop); "Running a
+  Mixed-Version Fleet" adds the canonical format version as what
+  decides whether configuration replicates, and a "From 1.10.x to
+  1.11.0" subsection (D-3: format 3, followers first, the freeze and
+  why, the rejected two-version decoder, the control-plane rollback
+  state).
+- `docs/hot-upgrade.md` "Rollback": from 1.11.0 back to 1.10.6, the
+  database opens and HTTP is served (migrations 71 to 73 additive,
+  `migrations_after_1_10_6_are_additive`), no stream is served, the
+  legacy path decides the probe and a path edited under 1.10.6 wins on
+  return, a 1.10.6 import drops stream links, a 1.11.0 export does not
+  import into 1.10.6; the fleet case points at `docs/cluster.md`.
+- `CHANGELOG.md` `[Unreleased]`: the migration line as the release
+  paragraph; Added (the stream model and API, the per-node port check,
+  reserved ports in the heartbeat, portless backends); Changed (the
+  typed health check with `health_check_path` deprecated, the
+  enrollment-port refusal at startup). The existing Fixed lines are
+  untouched. Nothing about binding or forwarding: those are Stories
+  12.2 and 12.3. Status codes as built, not as D-10 drafted them (`422`
+  for a model rule, `400` for the two shapes disagreeing).
+- `docs/architecture/source-tree.md`: `CANONICAL_FORMAT_VERSION = 3`,
+  the cut by routes and streams, `models/stream.rs`,
+  `models/health_check.rs`, `listen_ports.rs`, `store/streams.rs` in the
+  `lorica-config` row and `streams.rs` in the `lorica-api` row.
+- Handed over by Lot 4, outside the Lot 6 allowlist as drafted:
+  `docs/automation.md` and `docs/mcp.md` now mask and restore the probe
+  path in both shapes (`health_check.path` and `health_check_path`),
+  describe the typed `health_check` on the backend writes with the
+  deprecated path, and state that streams are on neither surface (D9).
+- Not documented, because no test shows the code does it:
+  `HealthCheck` is `deny_unknown_fields`, but the refusal of an extra
+  key is tested for the `http` variant only
+  (`the_wire_shape_is_tagged_by_kind`). Serde ignores extra keys on a
+  unit variant of an internally tagged enum, so
+  `{"kind": "tcp_connect", "path": "/x"}` is probably accepted as a TCP
+  connect. The docs claim the refusal for `http` only.
 
 Lot 3:
 
@@ -1554,6 +1601,10 @@ preview's `409`), `docs/stories/story-12.1-stream-model.md`.
 
 Lot 5, new: `lorica-api/src/streams.rs`, `lorica-api/src/streams/tests.rs`.
 
+Lot 6, modified: `docs/cluster.md`, `docs/hot-upgrade.md`,
+`CHANGELOG.md`, `docs/architecture/source-tree.md`, `docs/automation.md`,
+`docs/mcp.md`, `docs/stories/story-12.1-stream-model.md`.
+
 Lot 5, modified: `lorica-api/src/lib.rs`, `lorica-api/src/server.rs`
 (routes), `lorica-api/src/middleware/authorize.rs` (table test),
 `lorica-api/src/routes/crud.rs` (two visibilities),
@@ -1576,3 +1627,4 @@ schemas, the import `409`), `lorica-config/src/models/{stream,mod}.rs`
 | 2026-11-14 | 0.6 | Lot 4 implemented: the typed health check on every surface (health loop through `probe_for`, management API with both shapes and the disagreement refusal, redaction of the typed path, MCP backend fields, both OpenAPI documents with `health_check_path` deprecated, dashboard form and `api.ts`). Status InProgress. | Romain G. |
 | 2026-11-14 | 0.7 | Lot 5 implemented: the stream management API (CRUD at the route floors, audit, `streams_cud` budget), the per-node port check with its `stream_port_conflict` 409 on every write and on import, IV2 automated, and stream ids held to the canonical UUID form in `Stream::validate`. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.8 | Lot 3 implemented: `ReservedPortsReport` in the heartbeat under tag 6, tested both ways against the v1.10.6 shape, checked at the decode boundary and dropped whole on an impossible port, held on the session and persisted by the flush with `COALESCE`, reported by `ReplicaHandler`; the apply log line prints the stream counts; the selector WARN covers streams. The import preview runs the import's port check (Lot 5 follow-up). Status InProgress. | Romain G. |
+| 2026-11-14 | 0.9 | Lot 6 implemented: `docs/cluster.md` (streams in the cut, where each role binds, the port check, the Node fact class, the 1.10.x to 1.11.0 step with its replication freeze), `docs/hot-upgrade.md` (rollback to 1.10.6), `CHANGELOG.md` `[Unreleased]`, `docs/architecture/source-tree.md`, and the typed probe path in `docs/automation.md` and `docs/mcp.md`. Every Lot done. Status Review. | Romain G. |

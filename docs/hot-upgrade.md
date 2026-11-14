@@ -133,6 +133,39 @@ port: the failure is closed, and the message blames another process.
 Delete `served-cert.pem` in that case; the CLI then pins what the older
 node serves, as above. A token minted by 1.9.0 is unreadable by 1.8.0.
 
+**From 1.11.0 back to 1.10.6.** The new supervisor runs the database
+migrations before it forks its workers, so a 1.11.0 process that is
+rolled back has usually already taken `lorica.db` to schema 73, and a
+package downgrade always finds it there. 1.10.6 opens that database
+and serves HTTP as before. Its migration runner applies nothing above
+its own last migration (70), and migrations 71 to 73 are additive by
+construction: two new tables (`streams`, `stream_backends`) and two
+nullable columns (`backends.health_check_json`,
+`cluster_nodes.reserved_ports_json`) that 1.10.6 never names, with no
+`UNIQUE` index, trigger or `NOT NULL` column added to a table it writes.
+A test (`migrations_after_1_10_6_are_additive`) holds every later
+migration to that.
+
+What the rolled-back node does not do:
+
+- **It serves no stream.** The stream rows stay in the database
+  untouched, and 1.11.0 finds them again on the next upgrade.
+- **It reads a backend's active check from `health_check_path` only**:
+  a path is an HTTP check, no path a TCP connect. 1.11.0 keeps writing
+  that column beside the typed `health_check` for exactly this case.
+  A probe path edited under 1.10.6 is the one 1.11.0 honours when it
+  comes back: the typed definition is trusted only while it still
+  agrees with `health_check_path`.
+- **A configuration import run under 1.10.6** deletes every backend,
+  which removes the streams' backend links with them; the streams
+  remain, without backends. And a 1.11.0 export is refused by 1.10.6,
+  which does not know the `health_check` field it carries.
+
+In a fleet, rolling the control plane alone back to 1.10.6 stops
+configuration replication until it runs 1.11.0 again; the nodes keep
+serving. `docs/cluster.md`, "From 1.10.x to 1.11.0", has the reason
+and the upgrade order.
+
 ## Metrics to watch
 
 - `lorica_hot_upgrade_total{outcome="ok"}` - a successful verify + stage.

@@ -333,7 +333,8 @@ its hash, and fans out a Prepare to every connected active node under a
 per-node ten-second deadline. A node that stages it answers prepared; a
 node that refuses the blob **semantically** (an unknown field, a
 version or hash mismatch, a malformed CIDR in a replicated setting, an
-invalid `node_selector`) aborts the round fleet-wide and raises an
+invalid `node_selector`, a stream that breaks its own rules or a backend
+shared in a way the stream attachment rule forbids) aborts the round fleet-wide and raises an
 alert on the follower that refused it. A node that fails Prepare on
 **transport** is evicted from the commit set and the commit proceeds
 without it: a wedged or hostile follower cannot veto every
@@ -405,13 +406,30 @@ re-learned within one interval after a reconnect, and a figure from
 before a restart would look live while describing a process that no
 longer runs.
 
-Four kinds of payload cross the plane from a follower, and the rule
+Since 1.11.0 the heartbeat also carries the follower's reserved ports
+(`ReservedPortsReport`, tag 6): its management, HTTP and HTTPS ports,
+and its cluster, enrollment and automation ports when those listeners
+are on. They pass the rule above on size and cost, but they are not a
+gauge: the control plane checks every stream write against them,
+including for a node that is offline at that moment and after a
+control-plane restart. So they are a node fact, persisted like
+`applied_config_generation`: the session keeps the last valid report,
+and the periodic session-facts flush (every 30 seconds) writes it to
+`cluster_nodes.reserved_ports_json`. A session that has sent no report
+leaves the stored value as it was. A report holding a port of 0 or one
+above 65535 is dropped whole, never clamped or kept in part, with one
+WARN per session naming the node; the session stays up and the node
+counts as not reported until a valid report arrives. The field is not
+in the node's API view.
+
+Five kinds of payload cross the plane from a follower, and the rule
 above sorts them. Written out so the next payload lands in a class
 rather than as an exception:
 
 | Class | Example | Channel | Progress marker | Bounded by | Loss semantics | Survives a restart |
 |-------|---------|---------|-----------------|------------|----------------|--------------------|
 | Gauge | CPU, memory, disk | heartbeat | none, replaced each beat | its own fixed shape | superseded within one beat | no, session state by design |
+| Node fact | reserved ports | heartbeat | none, replaced each beat | its own fixed shape | the last valid report stands until a newer one | yes, persisted on the node's `cluster_nodes` row |
 | Sheddable series | access rows, WAF events | fan-in, with cursors | rowid cursor, advanced per class on what was accepted | local retention, per-node quota, storage watermark | dropped and counted; the cursor holds | the cursor is persisted |
 | Durable series | audit rows | fan-in, with a cursor | rowid cursor, all-or-nothing per batch | charged to the quota but exempt from its verdict; a per-session push rate; retention by arrival time; a per-node row ceiling | never shed on the way in; past the ceiling the oldest stored rows are cut, sealed; a short count means storage failed | the cursor is persisted |
 | Live-state snapshot | bans | fan-in, no cursor | none, replaced wholesale | the storage watermark only | lossy by construction | no |
@@ -446,13 +464,55 @@ route to whoever happens to answer to the name. The management API
 refuses such an entry at write time on a control plane, and the
 replicator logs it at WARN when it encounters one anyway.
 
-What is cut per recipient: routes, route-to-backend links, backends, and
-certificates. What every payload still carries in full: global settings,
+What is cut per recipient: routes, route-to-backend links, streams,
+stream-to-backend links, backends, and certificates. A backend travels
+when a route or a stream the recipient keeps links it, so a node that
+serves only a stream still receives that stream's backends. What every
+payload still carries in full: global settings,
 WAF custom rules and disabled rule ids, certificate export ACL patterns,
 AI crawler entries, probe definitions, SLA targets, notification channels
 and DNS providers. Fleet policy stays fleet-wide on purpose. A node that
 cannot see the policy it is judged against cannot tell whether it is
 behind, and none of it names another node.
+
+**Streams are targeted like routes, and bound differently.** A stream
+(`/api/v1/streams`, since 1.11.0) carries the same `node_selector`, with
+the same rule: the management API refuses an entry that names no single
+node on a control plane, the round's WARN covers streams too, and a
+stream travels with its links only in the payloads of the nodes it
+targets. A disabled stream is cut, sent and applied exactly like an
+enabled one; `enabled` decides where it is bound, never where it is
+replicated.
+
+Where a stream is bound is decided by one function, `binds_here`
+(`lorica-config/src/models/stream.rs`), and it deliberately differs from
+where a route is served:
+
+| Node | Routes it serves | Streams it binds |
+|------|------------------|------------------|
+| Standalone | every route it holds | every enabled stream |
+| Follower | the routes its cut holds | the enabled streams its selector targets (an empty selector targets every node) |
+| Control plane | every route it holds, whatever the selector | the enabled streams with an EMPTY selector only |
+
+The control plane holds every stream, because it replicates them, and
+has no roster name a selector could name. For a route that is harmless:
+a route only answers the names clients send. A stream opens a port, so
+holding a stream to replicate it must not open that port on the control
+plane. The cost: a stream meant for the control plane itself needs an
+empty selector, which also opens it on every follower.
+
+The same function decides which nodes a stream's ports are checked on
+before it is written. A stream create, update or import is checked
+against the reserved listeners and the other streams of every active
+node its selector targets, using the ports that node reported in its
+heartbeat (see "What may ride the heartbeat"), and against this node's
+own listeners and streams whenever `binds_here` would bind it here,
+disabled streams included in both, since a disabled stream keeps its
+ports. A conflict is a `409` with `error.code` `stream_port_conflict`
+naming the node and what the port collides with. An active node that
+has never reported its ports refuses every stream targeting it until it
+connects once: accepting the stream would only defer the failure to
+that node's bind.
 
 **The hash is per node; the generation is not.** Two nodes correctly
 converged on the same generation legitimately hold different bytes, so
@@ -1246,6 +1306,65 @@ it, a newer one sees it absent); a field whose meaning changed is what
 the corpus exists to make visible. The telemetry cursors advance per
 class for the same reason: a class an older control plane does not
 know blocks only itself.
+
+**Canonical format version** does not decide whether they talk, but
+whether configuration still replicates while they differ. The decoder is strict: a blob is accepted only at exactly the version
+the receiving build stamps, and an unknown field is refused. A build
+that moves `CANONICAL_FORMAT_VERSION` therefore refuses every blob of
+the previous version, and a semantic refusal aborts the round
+fleet-wide ("The two phases"). The protocol and the schema gate do not
+see this: the sessions stay up, and only the rounds fail.
+
+### From 1.10.x to 1.11.0
+
+1.11.0 carries schema migrations 71 to 73 (streams and their backend
+links, the typed health check, the reserved ports on `cluster_nodes`)
+and moves the canonical format from version 2 to 3, once for the whole
+release: the blob gains `streams` and `stream_backends`, and every
+backend gains `health_check`, all of them unknown fields to a 1.10.x
+decoder. The order is the usual one, **followers first, the control
+plane last**, because the schema gate refuses a follower behind the
+control plane.
+
+What is new is the window between the two. As long as the control plane
+runs 1.10.x it stamps version 2, and every upgraded follower refuses
+that blob by version. One refusal aborts the round for the whole fleet,
+1.10.x followers included, and the pull a follower runs to catch up
+gets the same blob and the same refusal. So **from the first follower's
+upgrade to the control plane's, no configuration change reaches any
+node.** Traffic is unaffected: every node keeps serving what it applied
+last. The procedure:
+
+1. Freeze configuration changes (dashboard, API, automation tokens,
+   pipelines).
+2. Upgrade the followers, one at a time.
+3. Upgrade the control plane immediately after the last follower.
+4. Resume changes. Each follower then pulls the version 3 blob of the
+   current generation on its reconnect, and reports its reserved ports
+   in its first heartbeat; a stream targeting a follower is refused
+   until that report has been persisted (within 30 seconds, see "What
+   may ride the heartbeat").
+
+A change made during the window anyway is not lost: it is stored on the
+control plane and reaches the fleet once the control plane runs 1.11.0.
+It is the freeze that keeps the fleet from silently serving something
+other than what the dashboard shows for the length of the rollout. The 1.8.0 upgrade (version 1 to 2)
+had the same window.
+
+Why the 1.11.0 decoder does not also accept version 2 as "no streams",
+which would remove the window: a control plane rolled back to 1.10.x
+would then push a configuration without streams to every 1.11.0
+follower, and each would delete its streams. A rollback of one node
+would remove listeners fleet-wide. Strict refusal keeps every follower
+on the configuration it holds instead.
+
+**Rolling the control plane alone back to 1.10.6** (a hot-upgrade
+rollback, `docs/hot-upgrade.md`) is a documented state, not an outage.
+1.10.6 opens the migrated database, keeps the stream rows it cannot
+see, and admits the 1.11.0 followers, whose schema is ahead. Every round
+then aborts on their version refusal, so configuration changes stop
+replicating again until the control plane runs 1.11.0, while every node
+keeps serving.
 
 ## Failure Modes
 
