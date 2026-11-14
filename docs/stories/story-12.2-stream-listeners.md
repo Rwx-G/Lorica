@@ -771,40 +771,41 @@ resolution) and the shared reserved-port rule. `lorica-core` is not
 in the allowlist: the 300 s fix uses the fork's existing
 `Server::new_with_opt_and_conf`.
 
-- [ ] `stream_plane.rs`: the supervisor driver (registry, `bind_gen`
+- [x] `stream_plane.rs`: the supervisor driver (registry, `bind_gen`
       counter, per-worker stop-and-wait senders, the three steps of D-d,
       node backstop, retry tick, audit rows and the alert of D-h through
       handles passed in) and the single-process driver over `mpsc`
       (D-k). The transport is a trait so the driver is unit-tested with
-      a fake worker that acks, nacks and times out.
-- [ ] `drain.rs`: `pingora_server_conf(base)` (sets
+      a fake worker that acks, nacks and times out. (The alert itself
+      waits for Lot E1's `AlertType`; see the Completion Notes.)
+- [x] `drain.rs`: `pingora_server_conf(base)` (sets
       `grace_period_seconds = WORKER_DRAIN_TIMEOUT_MAX_S` and
       `graceful_shutdown_timeout_seconds = 5`), the drain watcher of D-f
       (idle check on `active_connections` and the tracker, deadline,
       OTel flush, exit through an injected function so tests do not
       exit), and the stop keepalive thread (`EXTEND_TIMEOUT_USEC=30000000`
       every 10 s, target socket injected for tests).
-- [ ] `hot_upgrade.rs`: `sd_notify(payload)` with `sd_notify_ready` on
+- [x] `hot_upgrade.rs`: `sd_notify(payload)` with `sd_notify_ready` on
       top of it and `extend_timeout_payload(usec)`; the `stream-tcp:` key
       family of D-j, its arm above the catch-all, adoption into the
       registry; pure tests that a `stream-tcp:` key never lands in
       `proxy`.
-- [ ] `worker.rs`: build the `Server` with `new_with_opt_and_conf(None,
+- [x] `worker.rs`: build the `Server` with `new_with_opt_and_conf(None,
       pingora_server_conf(...))`; start `StreamRuntime` on its thread with
       the stream-ctl fd, the store and `server.watch_execution_phase()`;
       arm the drain watcher on `quiesce` or `GracefulTerminate`.
-- [ ] `supervisor.rs`: take each worker's stream-ctl end at start and in
+- [x] `supervisor.rs`: take each worker's stream-ctl end at start and in
       the monitor's respawn branch (replay of D-a); the three steps
       inside `ConfigReloadBridge::apply_config_change`; first reconcile
       before `sd_notify READY=1`; the stop path of D-f (keepalive,
       `quiesce`, `shutdown_all(D + 10 s)`, `stream.release` rows with
       cause `shutdown`); the registry handed to `AppState` in Lot E3.
       `drain_for_handoff` is left to Story 12.11.
-- [ ] `single.rs`: `new_with_opt_and_conf`, `server.run` instead of
+- [x] `single.rs`: `new_with_opt_and_conf`, `server.run` instead of
       `run_forever`, runtime and driver, the three steps in the reload
       task, the single-process stop path of D-f.
-- [ ] `manager.rs`: `shutdown_all(drain: Duration)`.
-- [ ] Tests: `pingora_server_conf` sets both fields (and a test that
+- [x] `manager.rs`: `shutdown_all(drain: Duration)`.
+- [x] Tests: `pingora_server_conf` sets both fields (and a test that
       greps `lorica/src` for `Server::new(` so no `Server` is built
       without Lorica's conf again); the watcher exits at once when idle,
       waits while a request or a tracked connection is in flight, and
@@ -1162,6 +1163,17 @@ the budget view stays Operator and SuperAdmin.
   The stream control end is an `OwnedFd`, which meets the contract by
   construction, so `transport.rs` carries the crate's one `unsafe` block
   with its `SAFETY` comment under `#![deny(unsafe_code)]`.
+- Lot D, the zombie wait: `WorkerManager::shutdown_all_with_timeout`
+  probed liveness with `kill(pid, 0)`, which succeeds on a zombie, and
+  the monitor that reaps is stopped before any drain starts. Every stop
+  and every upgrade drain therefore waited its whole bound and then
+  "SIGKILLed" zombies, whatever the workers did: with Pingora's 300 s
+  gone, a stop would still have taken `D + 10 s`. The probe now reaps
+  (`lorica_worker::hot_upgrade::child_exited`), and a reaped pid is never
+  signalled again, since the kernel may have reused it. Pinned by
+  `shutdown_returns_once_the_workers_exited_without_waiting_out_the_bound`.
+  This goes past "the signature only" of the allowlist for `manager.rs`;
+  AC #7 cannot hold without it.
 
 ### Completion Notes
 
@@ -1282,6 +1294,91 @@ the budget view stays Operator and SuperAdmin.
   imported or replicated id the channel cannot carry fails `encode`
   (`StreamCtlError::Invalid`), which Lot D must report as a failed bind,
   not drop.
+- Lot D done. `lorica/src/startup/stream_plane.rs`: `StreamPlane<L:
+  WorkerLink>` (bindings, `bind_gen` and `seq` counters, the registry,
+  the D-c/D-e node backstop, stop-and-wait per worker with every worker
+  served at once), `StreamPlaneHandle` (the three steps of D-d as
+  `before_commit` / the commit / `after_commit`, the 10 s retry loop,
+  respawn `replay`, `quiesce`, the D-j handoff list, audit rows),
+  `SeqpacketLink` (supervisor), `InProcessLink` (single-process, `W =
+  1`), `StoreStreamTable`, `PlaneRole`. `lorica/src/startup/drain.rs`:
+  `pingora_server_conf`, `wait_for_drain` / `arm_worker_drain` (the
+  watcher), `start_stop_keepalive`, `stored_drain_timeout`.
+- The stop path as built. Supervisor: SIGTERM starts the keepalive
+  (`EXTEND_TIMEOUT_USEC=30000000` every 10 s while `$NOTIFY_SOCKET` is
+  a path, nothing otherwise), shuts the cluster planes, stops the
+  monitor, reads `D`, sends `quiesce drain_ms=D` to every worker (2 s
+  ack bound each, all at once), writes `stream.release` with cause
+  `shutdown`, then `shutdown_all(D + 10 s)`, which returns as soon as
+  every worker exited. Each worker's watcher (armed by the `quiesce`,
+  or by Pingora's graceful-terminate phase with the stored setting)
+  exits as soon as `active_connections` is 0 and the tracker is empty,
+  or at `D` after closing what is left with `node_shutdown` and 1 s for
+  the engines to write it. Pingora's grace is now the setting's hard
+  maximum (3,600 s), a backstop the watcher always beats. Single
+  process: the same keepalive, `quiesce` of its own runtime, the
+  watcher in the stop path itself, then `drain_for_exit`; Pingora runs
+  with `server.run` and in-flight HTTP is drained, which it was not.
+  Without systemd the drain is bounded by whoever stops the process.
+- Hand-off 1: Pingora's phases reach `StreamRuntimeHandle::terminate`
+  through `arm_worker_drain`, which also takes the second phase it may
+  see (`ShutdownStarted`, `ShutdownGracePeriod`) in case the broadcast
+  lagged past `GracefulTerminate`; the watcher arms on `quiesced()`. The
+  worker holds the handle in an `Arc` for its life.
+- Hand-off 2: `NackReason::TableUnavailable` (`table_unavailable`) in
+  `lorica-worker/src/stream_ctl.rs`, answered by the runtime's `refresh`
+  when the table cannot load. Using it meant one change in
+  `lorica-stream/src/runtime.rs` and a test in
+  `lorica-stream/tests/runtime.rs`, outside the Lot D allowlist.
+- Hand-off 3, deviation: `StoreStreamTable` does not filter by role. A
+  worker cannot know whether it runs on the control plane (that is the
+  supervisor's `--cluster-listen`, not in the store), and a table that
+  guessed differently from the supervisor would close every accept of a
+  binding the supervisor attached. Which bindings a node serves is the
+  driver's `binds_here` over `PlaneRole`, carried by `attach` and
+  `detach`; a stream this node stops binding is drained by its
+  `detach` with `config_removed`, so filtering the table as well would
+  change nothing. The table opens its own store connection: the runtime
+  loads it from inside its tokio runtime, where `blocking_lock` on the
+  shared `tokio::sync::Mutex` store panics.
+- Hand-off 4: `stream_ctl::check_stream_id` is now public (the same
+  rule `encode` applies), and the driver refuses an id it fails before
+  binding anything: `failed`, kind `other`, "the stream id cannot be
+  sent to the workers: ...". Tested with a 65-byte id.
+- Hand-off 5: no engine is installed (`Engines::default()`), so an
+  accepted connection closes at once and a datagram is dropped, as Lot
+  B built; the driver plugs nothing into the receive loop.
+- The role is read once at startup from the cluster runtime. A node
+  that changes role at runtime (enrolls or leaves) binds by its old role
+  until it restarts, as its cluster runtime already does.
+- An `attach` answered after its 2 s timeout is credited when its
+  answer is read during a later exchange (`workers_serving` corrects
+  itself); a late `nack` is dropped.
+- Not done here, owed elsewhere: the `stream_bind_failed` alert waits
+  for Lot E1's `AlertType::StreamBindFailed`; it plugs in where
+  `StreamPlaneHandle::record` handles `PlaneEvent::BindFailed`, which
+  already writes the audit row once per entry. `AppState` gets the
+  registry in Lot E3 (`stream_states` in both startup modes). The
+  systemd half of AC #7 (seccomp lets `getrlimit` through, systemd
+  honours the extension) is unverified here: no systemd in the test
+  containers.
+- Smoke run (debug build in `rust:1-bookworm`, no stream, no traffic,
+  SIGTERM after start): single process 10.0 s, two workers 10.2 s, both
+  exit 0. The workers' watchers exit at once ("drain finished") and
+  `shutdown_all` returns as soon as they are gone; the remaining 10 s is
+  `drain_for_exit` (`startup/mod.rs`) waiting out its fixed
+  `BACKGROUND_TASK_DRAIN_TIMEOUT`, because periodic loops spawned on the
+  task tracker (`spawn_blocklist_refresh`, the cert expiry check, the
+  auth and bucket prunes, ...) never end on `close()`, so
+  `tracker.wait()` never completes. That wait predates this story; D-f
+  keeps `drain_for_exit` "as today", but AC #7 ("no stop path waits on a
+  hard-coded delay") and Lot H's "under 10 s" do not hold until those
+  loops stop on shutdown. The fix sits in `startup/mod.rs` and
+  `lorica-api`, outside Lot D's allowlist: open, for the orchestrator to
+  assign.
+- `ServerConf` for the proxy service is now built from
+  `ServerConf::new()` (`version: 1`) instead of `Default` (`version: 0`),
+  the same value the `Server` gets; nothing in the fork reads `version`.
 
 ## File List
 
@@ -1303,6 +1400,12 @@ the budget view stays Operator and SuperAdmin.
 - `.github/workflows/ci.yml` (product test list and coverage list)
 - `docs/BUMP-CHECKLIST.md`, `docs/architecture/source-tree.md` (the new crate)
 - `docs/stories/story-12.2-stream-listeners.md` (D-c amended for the UDP backstop)
+- `lorica/src/startup/stream_plane.rs` (new), `lorica/src/startup/drain.rs` (new)
+- `lorica/src/startup/supervisor.rs`, `lorica/src/startup/worker.rs`, `lorica/src/startup/single.rs`, `lorica/src/startup/hot_upgrade.rs`, `lorica/src/startup/mod.rs`
+- `lorica/Cargo.toml` (`lorica-stream`), `Cargo.lock`
+- `lorica-worker/src/manager.rs` (`shutdown_all(drain)` and the zombie reap)
+- `lorica-worker/src/stream_ctl.rs` (`NackReason::TableUnavailable`, `check_stream_id` public)
+- `lorica-stream/src/runtime.rs`, `lorica-stream/tests/runtime.rs` (the `table_unavailable` nack)
 
 ## Change Log
 
@@ -1313,3 +1416,4 @@ the budget view stays Operator and SuperAdmin.
 | 2026-11-14 | 0.3 | Lot A implemented: stream control channel, stream socket binding, third socketpair per worker; `MSG_CTRUNC` fd leak fixed; UDP kernel-backstop gap recorded for Lot D. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.4 | Lot C1 implemented: `worker_drain_timeout_s` and `stream_listen_socket_cap` on `GlobalSettings`, the store and `PUT /api/v1/settings`. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.5 | Lot B implemented: the `lorica-stream` crate (stream runtime, accept and receive loops, connection tracker, engine traits, fd budget, bind state, reconcile diff). D-c amended: the reconcile diff refuses overlapping UDP bindings, which the kernel does not. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.6 | Lot D implemented: the stream plane driver in the supervisor and single-process mode, the stream runtime in each worker, respawn replay, TCP stream listeners across a hot upgrade, the stop path (drain watcher, `EXTEND_TIMEOUT_USEC` keepalive, Pingora's waits from the setting); a stop no longer waits out its bound on zombie workers. Status InProgress. | Romain G. |
