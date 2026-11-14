@@ -118,6 +118,20 @@ impl ConfigStore {
                         ))
                     })?;
                 }
+                "worker_drain_timeout_s" => {
+                    settings.worker_drain_timeout_s = value.parse().map_err(|e| {
+                        ConfigError::Corrupt(format!(
+                            "stored worker_drain_timeout_s {value:?} is not a number: {e}"
+                        ))
+                    })?;
+                }
+                "stream_listen_socket_cap" => {
+                    settings.stream_listen_socket_cap = value.parse().map_err(|e| {
+                        ConfigError::Corrupt(format!(
+                            "stored stream_listen_socket_cap {value:?} is not a number: {e}"
+                        ))
+                    })?;
+                }
                 "waf_ban_threshold" => {
                     settings.waf_ban_threshold = value.parse().map_err(|e| {
                         ConfigError::Corrupt(format!(
@@ -457,6 +471,14 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('downstream_idle_timeout_s', ?1)",
             params![settings.downstream_idle_timeout_s.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('worker_drain_timeout_s', ?1)",
+            params![settings.worker_drain_timeout_s.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('stream_listen_socket_cap', ?1)",
+            params![settings.stream_listen_socket_cap.to_string()],
         )?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('waf_ban_threshold', ?1)",
@@ -852,5 +874,58 @@ mod read_only_tests {
         let link = dir.path().join("link.db");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
         ConfigStore::read_global_settings_read_only(&link).expect_err("a link is refused");
+    }
+}
+
+#[cfg(test)]
+mod stream_settings_tests {
+    use super::*;
+
+    #[test]
+    fn the_stream_settings_read_as_their_defaults_until_written_then_round_trip() {
+        let store = ConfigStore::open_in_memory().expect("in-memory store");
+        let settings = store.get_global_settings().expect("settings");
+        assert_eq!(
+            settings.worker_drain_timeout_s,
+            GlobalSettings::DEFAULT_WORKER_DRAIN_TIMEOUT_S
+        );
+        assert_eq!(
+            settings.stream_listen_socket_cap,
+            GlobalSettings::DEFAULT_STREAM_LISTEN_SOCKET_CAP
+        );
+
+        let mut updated = settings;
+        updated.worker_drain_timeout_s = GlobalSettings::WORKER_DRAIN_TIMEOUT_MAX_S;
+        updated.stream_listen_socket_cap = GlobalSettings::STREAM_LISTEN_SOCKET_CAP_MAX;
+        store.update_global_settings(&updated).expect("write");
+
+        let fetched = store.get_global_settings().expect("settings");
+        assert_eq!(
+            fetched.worker_drain_timeout_s,
+            GlobalSettings::WORKER_DRAIN_TIMEOUT_MAX_S
+        );
+        assert_eq!(
+            fetched.stream_listen_socket_cap,
+            GlobalSettings::STREAM_LISTEN_SOCKET_CAP_MAX
+        );
+    }
+
+    #[test]
+    fn a_stored_stream_setting_that_is_not_a_number_is_reported_as_corrupt() {
+        for key in ["worker_drain_timeout_s", "stream_listen_socket_cap"] {
+            let store = ConfigStore::open_in_memory().expect("in-memory store");
+            store
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO global_settings (key, value) VALUES (?1, 'soon')",
+                    params![key],
+                )
+                .expect("row");
+            let err = store.get_global_settings().expect_err(key);
+            assert!(
+                matches!(&err, ConfigError::Corrupt(message) if message.contains(key)),
+                "{key}: {err}"
+            );
+        }
     }
 }

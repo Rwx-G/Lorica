@@ -2173,6 +2173,8 @@ fleet_bytes={fleet_bytes} per_recipient_mean_bytes={mean_bytes}",
             bot_stash_per_prefix_max: _,
             mirror_max_concurrent_per_route: _,
             mirror_max_concurrent_global: _,
+            worker_drain_timeout_s: _,
+            stream_listen_socket_cap: _,
             // Node-local by decision (module doc lists the rationale).
             management_port: _,
             log_level: _,

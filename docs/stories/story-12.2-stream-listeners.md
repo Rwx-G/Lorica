@@ -732,12 +732,12 @@ Allowlist: `lorica-config/src/models/settings.rs`,
 `lorica-config/src/store/settings.rs`, `lorica-api/src/settings.rs`.
 Depends on: nothing. Before 12.1.
 
-- [ ] `worker_drain_timeout_s` (default 30, `WORKER_DRAIN_TIMEOUT_MAX_S`
+- [x] `worker_drain_timeout_s` (default 30, `WORKER_DRAIN_TIMEOUT_MAX_S`
       = 3,600 next to it with the reason of D-f) and
       `stream_listen_socket_cap` (default 2,048, range 1 to 16,384) on
       `GlobalSettings`, read and written by the store like
       `downstream_idle_timeout_s`.
-- [ ] `lorica-api/src/settings.rs`: both fields in GET (defaults block)
+- [x] `lorica-api/src/settings.rs`: both fields in GET (defaults block)
       and PUT (`apply_ranged`), tests at both bounds and one past each.
 
 ### Lot C2: the settings in the canonical config - cargo
@@ -1179,6 +1179,25 @@ the budget view stays Operator and SuperAdmin.
   stays on the `WorkerHandle`.
 - `recv_listener_fds` (test wrapper) now closes the fds of the entries it
   filters out instead of dropping the raw numbers.
+- Lot C1 done. `GlobalSettings::worker_drain_timeout_s` (seconds,
+  default 30, 1 to 3,600) and `GlobalSettings::stream_listen_socket_cap`
+  (listening sockets per node, default 2,048, 1 to 16,384), stored as
+  key/value rows like `downstream_idle_timeout_s` (no migration; an
+  unparseable stored value is `ConfigError::Corrupt`). The bounds are
+  associated constants, `GlobalSettings::{DEFAULT_WORKER_DRAIN_TIMEOUT_S,
+  WORKER_DRAIN_TIMEOUT_MAX_S, DEFAULT_STREAM_LISTEN_SOCKET_CAP,
+  STREAM_LISTEN_SOCKET_CAP_MAX}`, not free ones: the free-constant
+  re-export list is in `models/mod.rs`, a Story 12.1 file, and the type
+  is already exported. Lot D builds `grace_period_seconds` from
+  `GlobalSettings::WORKER_DRAIN_TIMEOUT_MAX_S`.
+- The story gives no reason for the socket cap's 16,384 ceiling; its
+  doc comment calls it a sanity bound on operator input, since the fd
+  budget of D-e is what decides what a node can hold.
+- `canonical.rs`'s `every_global_setting_is_explicitly_routed` is an
+  exhaustive destructure, so `lorica-config`'s tests did not compile
+  without the two fields. They are listed there on the replicated side,
+  as D-f decides; Lot C2 still owes them in `CanonicalGlobalSettings`
+  and `diff.rs`. Not on the automation admin tier (D-f).
 
 ## File List
 
@@ -1190,6 +1209,10 @@ the budget view stays Operator and SuperAdmin.
 - `lorica-worker/src/stream_sockets.rs` (new)
 - `lorica-worker/tests/stream_ctl.rs` (new)
 - `lorica/src/startup/worker.rs` (the `StreamCtl` and `StreamSocket` arms)
+- `lorica-config/src/models/settings.rs`
+- `lorica-config/src/store/settings.rs`
+- `lorica-config/src/canonical.rs` (the routing test's destructure only)
+- `lorica-api/src/settings.rs`
 
 ## Change Log
 
@@ -1198,3 +1221,4 @@ the budget view stays Operator and SuperAdmin.
 | 2026-11-14 | 0.1 | Story drafted from the Epic 12 PRD. Status Draft. | Romain G. |
 | 2026-11-14 | 0.2 | Maintainer answers folded in: AC #7 as amended, `EXTEND_TIMEOUT_USEC` stop path, the 300 s fix through Lorica's `ServerConf`, the drain watcher, the dual-stack rule, a generic per-session fd input, paths re-checked after `4e864593`. Status Draft. | Romain G. |
 | 2026-11-14 | 0.3 | Lot A implemented: stream control channel, stream socket binding, third socketpair per worker; `MSG_CTRUNC` fd leak fixed; UDP kernel-backstop gap recorded for Lot D. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.4 | Lot C1 implemented: `worker_drain_timeout_s` and `stream_listen_socket_cap` on `GlobalSettings`, the store and `PUT /api/v1/settings`. Status InProgress. | Romain G. |

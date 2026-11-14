@@ -564,6 +564,73 @@ pub struct GlobalSettings {
     /// the effective ceiling by the worker count.
     #[serde(default = "default_waf_body_scan_max_inflight_bytes")]
     pub waf_body_scan_max_inflight_bytes: u64,
+    /// How long (seconds) established stream connections and sessions
+    /// are drained before they are closed: on a plain stop, when a
+    /// stream, a stream backend or a listen address is removed or
+    /// changed, and when a worker generation is replaced. A drain ends
+    /// as soon as the traffic is gone; this is its deadline, not its
+    /// length. Read at the moment a drain starts, so an edit applies
+    /// to the next drain without restarting workers.
+    ///
+    /// Default [`Self::DEFAULT_WORKER_DRAIN_TIMEOUT_S`], bounded 1 to
+    /// [`Self::WORKER_DRAIN_TIMEOUT_MAX_S`]. Never 0: a drain that closes
+    /// everything at once is a cut, which is what the setting exists
+    /// to avoid. Replicated fleet policy.
+    #[serde(default = "default_worker_drain_timeout_s")]
+    pub worker_drain_timeout_s: u32,
+    /// Ceiling on the stream listening sockets one node holds, summed
+    /// over every stream bound on it (Story 12.2's fd budget counts
+    /// them). A stream create or update that would take a node past it
+    /// is refused. Default [`Self::DEFAULT_STREAM_LISTEN_SOCKET_CAP`],
+    /// bounded 1 to [`Self::STREAM_LISTEN_SOCKET_CAP_MAX`]. Never 0: a node
+    /// that may hold no stream socket is expressed by its node
+    /// selector, not by a cap that refuses every stream. Replicated
+    /// fleet policy.
+    #[serde(default = "default_stream_listen_socket_cap")]
+    pub stream_listen_socket_cap: u32,
+}
+
+// The stream settings' bounds are associated constants rather than
+// free ones so they reach other crates through `GlobalSettings`, which
+// `models` already re-exports.
+impl GlobalSettings {
+    /// The shipped [`GlobalSettings::worker_drain_timeout_s`], in seconds.
+    pub const DEFAULT_WORKER_DRAIN_TIMEOUT_S: u32 = 30;
+
+    /// The largest [`GlobalSettings::worker_drain_timeout_s`] the API
+    /// accepts, in seconds (one hour).
+    ///
+    /// A hard maximum because a draining generation holds its file
+    /// descriptors and memory next to the live one for as long as it
+    /// drains. A stop or an upgrade that needs longer is a
+    /// session-transfer problem, not a drain problem. One hour is also
+    /// the ceiling [`MAX_HEADER_TIMEOUT_S`] and the downstream idle
+    /// timeout already use. It is the bound the worker's own shutdown
+    /// grace is built from, since that grace is fixed at worker start
+    /// while the setting changes at runtime.
+    pub const WORKER_DRAIN_TIMEOUT_MAX_S: u32 = 3600;
+
+    /// The shipped [`GlobalSettings::stream_listen_socket_cap`], in
+    /// listening sockets per node.
+    pub const DEFAULT_STREAM_LISTEN_SOCKET_CAP: u32 = 2048;
+
+    /// The largest [`GlobalSettings::stream_listen_socket_cap`] the API
+    /// accepts, in listening sockets per node.
+    ///
+    /// A sanity bound on an operator input, not a capacity figure: what
+    /// a node can actually hold is decided by its file-descriptor
+    /// budget, which refuses a binding the process limit cannot honour
+    /// whatever the cap says. The ceiling keeps a mistyped value from
+    /// turning the per-node limit into one nobody chose.
+    pub const STREAM_LISTEN_SOCKET_CAP_MAX: u32 = 16_384;
+}
+
+fn default_worker_drain_timeout_s() -> u32 {
+    GlobalSettings::DEFAULT_WORKER_DRAIN_TIMEOUT_S
+}
+
+fn default_stream_listen_socket_cap() -> u32 {
+    GlobalSettings::DEFAULT_STREAM_LISTEN_SOCKET_CAP
 }
 
 /// `true` since v1.7.0. See the field doc on
@@ -861,6 +928,8 @@ impl Default for GlobalSettings {
             otlp_logs_audit_enabled: true,
             otlp_logs_capture_enabled: true,
             waf_body_scan_max_inflight_bytes: default_waf_body_scan_max_inflight_bytes(),
+            worker_drain_timeout_s: default_worker_drain_timeout_s(),
+            stream_listen_socket_cap: default_stream_listen_socket_cap(),
         }
     }
 }

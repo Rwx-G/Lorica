@@ -44,6 +44,16 @@ const HEADER_TIMEOUT_S_MAX: u32 = lorica_config::models::MAX_HEADER_TIMEOUT_S;
 // keepalive saves no handshake anyone notices.
 const DOWNSTREAM_IDLE_TIMEOUT_S_MIN: u32 = 1;
 const DOWNSTREAM_IDLE_TIMEOUT_S_MAX: u32 = 3600;
+// Story 12.2. No 0 for either: a drain of 0 cuts every connection at
+// once, and a cap of 0 refuses every stream on every node, which a node
+// selector says better. The ceilings and their reasons live with the
+// settings in `lorica-config`.
+const WORKER_DRAIN_TIMEOUT_S_MIN: u32 = 1;
+const WORKER_DRAIN_TIMEOUT_S_MAX: u32 =
+    lorica_config::models::GlobalSettings::WORKER_DRAIN_TIMEOUT_MAX_S;
+const STREAM_LISTEN_SOCKET_CAP_MIN: u32 = 1;
+const STREAM_LISTEN_SOCKET_CAP_MAX: u32 =
+    lorica_config::models::GlobalSettings::STREAM_LISTEN_SOCKET_CAP_MAX;
 const WAF_BAN_THRESHOLD_MIN: i32 = 0;
 const WAF_BAN_DURATION_S_MIN: i32 = 0;
 // Thirty days. Each ban copies the duration when it is issued, so
@@ -183,6 +193,18 @@ pub fn settings_schema() -> serde_json::Value {
             "min": DOWNSTREAM_IDLE_TIMEOUT_S_MIN,
             "max": DOWNSTREAM_IDLE_TIMEOUT_S_MAX,
             "default": d.downstream_idle_timeout_s,
+        },
+        "worker_drain_timeout_s": {
+            "type": "integer",
+            "min": WORKER_DRAIN_TIMEOUT_S_MIN,
+            "max": WORKER_DRAIN_TIMEOUT_S_MAX,
+            "default": d.worker_drain_timeout_s,
+        },
+        "stream_listen_socket_cap": {
+            "type": "integer",
+            "min": STREAM_LISTEN_SOCKET_CAP_MIN,
+            "max": STREAM_LISTEN_SOCKET_CAP_MAX,
+            "default": d.stream_listen_socket_cap,
         },
         "max_active_probes": {
             "type": "integer",
@@ -471,6 +493,10 @@ pub struct UpdateSettingsRequest {
     /// Downstream idle timeout in seconds, HTTP/1.1 keepalive and
     /// HTTP/2 (backlog #82).
     pub downstream_idle_timeout_s: Option<u32>,
+    /// Deadline (s) of a stream connection drain (Story 12.2).
+    pub worker_drain_timeout_s: Option<u32>,
+    /// Stream listening sockets allowed per node (Story 12.2).
+    pub stream_listen_socket_cap: Option<u32>,
     /// Cap on concurrent synthetic probes (backlog #89).
     pub max_active_probes: Option<i32>,
     /// Load-test concurrency above which a run asks for confirmation
@@ -838,6 +864,18 @@ pub(crate) async fn update_settings_as(
             &mut settings.downstream_idle_timeout_s,
             DOWNSTREAM_IDLE_TIMEOUT_S_MIN..=DOWNSTREAM_IDLE_TIMEOUT_S_MAX,
             "downstream_idle_timeout_s",
+        )?;
+        apply_ranged(
+            body.worker_drain_timeout_s,
+            &mut settings.worker_drain_timeout_s,
+            WORKER_DRAIN_TIMEOUT_S_MIN..=WORKER_DRAIN_TIMEOUT_S_MAX,
+            "worker_drain_timeout_s",
+        )?;
+        apply_ranged(
+            body.stream_listen_socket_cap,
+            &mut settings.stream_listen_socket_cap,
+            STREAM_LISTEN_SOCKET_CAP_MIN..=STREAM_LISTEN_SOCKET_CAP_MAX,
+            "stream_listen_socket_cap",
         )?;
         apply_ranged(
             body.max_active_probes,
@@ -2416,11 +2454,22 @@ mod tests {
         "downstream_idle_timeout_s",
     ];
 
+    /// The Story 12.2 stream settings, new in 1.11.0.
+    const STREAM_SETTINGS_SINCE_1_11: [&str; 2] =
+        ["worker_drain_timeout_s", "stream_listen_socket_cap"];
+
+    /// Every setting the bound and write-back tests below sweep.
+    fn ranged_settings() -> impl Iterator<Item = &'static str> {
+        FORM_WRITTEN_SINCE_1_9
+            .into_iter()
+            .chain(STREAM_SETTINGS_SINCE_1_11)
+    }
+
     #[tokio::test]
     async fn each_setting_is_written_inside_the_bounds_the_schema_publishes_and_refused_past_them()
     {
         let schema = super::settings_schema();
-        for field in FORM_WRITTEN_SINCE_1_9 {
+        for field in ranged_settings() {
             // A node per field: the settings writes of one session share
             // a rate budget the whole sweep would exhaust.
             let (state, sessions, limiter) = test_state().await;
@@ -2530,7 +2579,7 @@ mod tests {
         .await;
         let mut document = parse_data(read).await;
         let schema = super::settings_schema();
-        for field in FORM_WRITTEN_SINCE_1_9 {
+        for field in ranged_settings() {
             document[field] = schema[field]["max"].clone();
         }
         let written = send(
@@ -2545,7 +2594,7 @@ mod tests {
         .await;
         assert_eq!(written.status(), StatusCode::OK);
         let stored = parse_data(written).await;
-        for field in FORM_WRITTEN_SINCE_1_9 {
+        for field in ranged_settings() {
             assert_eq!(stored[field], schema[field]["max"], "{field}");
         }
     }
