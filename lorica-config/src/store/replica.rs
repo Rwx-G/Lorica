@@ -22,9 +22,21 @@
 //! backends, route_backends, certificates (metadata only, see D3),
 //! waf_custom_rules, waf_disabled_rules, cert_export_acls,
 //! ai_crawlers_custom (keyed on its UNIQUE `name`, not its
-//! autoincrement id), probe_configs, sla_configs, capture_rules and
-//! automation_environments. Rows absent from the blob are deleted in
-//! exactly those tables.
+//! autoincrement id), probe_configs, sla_configs, capture_rules,
+//! automation_environments, streams and stream_backends. Rows absent
+//! from the blob are deleted in exactly those tables.
+//!
+//! # One check on the snapshot, unchecked writes (Story 12.1, D-6)
+//!
+//! The stream attachment rule (`check_backend_attachments`) runs once,
+//! on the whole decoded blob, in [`ConfigStore::prepare_replica`], as a
+//! semantic refusal. The apply then writes backends, route links,
+//! streams and stream links through the store's unchecked writers: a
+//! consistent snapshot applied row by row can pass through a transient
+//! violation (a backend moving from a UDP stream to a route), which the
+//! checked management writers would refuse half way through a valid
+//! generation. Same argument as the hostname uniqueness the route pass
+//! skips.
 //!
 //! A capture rule's two counters are the one thing the blob does not
 //! carry (Story 10.1): they count what THIS node recorded and dropped,
@@ -71,7 +83,7 @@ use crate::canonical::{
     decode_canonical, key_material_digest, secret_digest, sha256_hex, CanonicalConfig,
 };
 use crate::error::{ConfigError, Result};
-use crate::models::{Certificate, Route};
+use crate::models::{check_backend_attachments, AttachmentSnapshot, Certificate, Route, Stream};
 use crate::route_selection::{self, RouteNames};
 
 /// Why a replica could not be applied.
@@ -136,6 +148,13 @@ pub struct ReplicaOutcome {
     /// Environments in the blob naming a route this node does not
     /// serve, dropped for the same reason as `capture_rules_dropped`.
     pub automation_environments_dropped: usize,
+    /// Streams written (Story 12.1), enabled or not.
+    pub streams: usize,
+    /// Streams in the blob whose `node_selector` does not name this
+    /// node. They are not written, and any local copy is deleted.
+    pub streams_skipped_by_selector: usize,
+    /// Stream-to-backend links written.
+    pub stream_backends: usize,
     /// Whether any fleet-policy global setting differed from the
     /// local value and was overwritten.
     pub global_fields_changed: bool,
@@ -156,8 +175,12 @@ impl ConfigStore {
     /// [`ReplicaError::Refused`] on a hash mismatch, on any
     /// [`decode_canonical`] failure (unknown field, wrong format
     /// version, malformed shape), on a global setting carrying a
-    /// malformed CIDR entry, and on a route whose `node_selector`
-    /// breaks [`Route::validate_node_selector`].
+    /// malformed CIDR entry, on a route whose `node_selector` breaks
+    /// [`Route::validate_node_selector`], on a stream that breaks
+    /// [`Stream::validate`] (selector included), and on a snapshot whose
+    /// backends break the stream attachment rule
+    /// ([`check_backend_attachments`]). A stream refusal names the
+    /// stream's id.
     pub fn prepare_replica(
         blob: &[u8],
         expected_hash: &str,
@@ -182,6 +205,31 @@ impl ConfigStore {
                 .validate_node_selector()
                 .map_err(|reason| ReplicaError::Refused(format!("route {}: {reason}", route.id)))?;
         }
+        for stream in &config.streams {
+            stream.validate().map_err(|reason| {
+                ReplicaError::Refused(format!("stream {}: {reason}", stream.id))
+            })?;
+        }
+        // Once, on the whole snapshot (D-6): the apply below writes row
+        // by row through the unchecked writers, which is only sound
+        // because the set it converges to was checked here.
+        check_backend_attachments(&AttachmentSnapshot {
+            backends: &config.backends,
+            streams: &config.streams,
+            stream_backends: &config.stream_backends,
+            route_backends: &config.route_backends,
+        })
+        .map_err(|conflict| {
+            let subject = conflict
+                .stream
+                .as_deref()
+                .and_then(|name| config.streams.iter().find(|s| s.name == name))
+                .map_or_else(
+                    || format!("backend {}", conflict.backend_id),
+                    |stream| format!("stream {}", stream.id),
+                );
+            ReplicaError::Refused(format!("{subject}: {conflict}"))
+        })?;
         Ok(config)
     }
 
@@ -278,7 +326,22 @@ impl ConfigStore {
         let kept_ids: HashSet<&str> = kept.iter().map(|r| r.id.as_str()).collect();
         outcome.route_backends = self.apply_replica_route_backends(config, &kept_ids)?;
 
-        // 6. WAF: both sets are wholesale replacements.
+        // 6. Streams and their links, after the backends they reference,
+        //    scoped by `node_selector` exactly as routes are. The control
+        //    plane already cut the payload (Story 12.1), so this filter
+        //    is the assertion that the cut was right, not the targeting.
+        //    A disabled stream is applied like an enabled one: only the
+        //    bind reads `enabled`.
+        let kept_streams: Vec<&Stream> = config
+            .streams
+            .iter()
+            .filter(|s| s.applies_to_node(local_node_name))
+            .collect();
+        outcome.streams = kept_streams.len();
+        outcome.streams_skipped_by_selector = config.streams.len() - kept_streams.len();
+        outcome.stream_backends = self.apply_replica_streams(config, &kept_streams)?;
+
+        // 7. WAF: both sets are wholesale replacements.
         self.conn.execute("DELETE FROM waf_custom_rules", [])?;
         for rule in &config.waf_custom_rules {
             self.save_waf_custom_rule(
@@ -294,7 +357,7 @@ impl ConfigStore {
         self.save_waf_disabled_rules(&config.waf_disabled_rules)?;
         outcome.waf_disabled_rules = config.waf_disabled_rules.len();
 
-        // 7. Certificate-export ACLs: the pattern policy is fleet
+        // 8. Certificate-export ACLs: the pattern policy is fleet
         //    policy; the export directory and its ownership stay
         //    node-local and are not in the blob at all.
         let acl_ids: HashSet<&str> = config
@@ -316,22 +379,22 @@ impl ConfigStore {
         }
         outcome.cert_export_acls = config.cert_export_acls.len();
 
-        // 8. AI crawlers, keyed on the UNIQUE `name` (D2).
+        // 9. AI crawlers, keyed on the UNIQUE `name` (D2).
         outcome.ai_crawlers_custom = self.apply_replica_crawlers(config)?;
 
-        // 9. Probes and SLA targets. Both reference `routes(id)`, so
-        //    an entry whose route this node does not serve is skipped:
-        //    the row has nowhere to attach and the cascade would have
-        //    removed it anyway.
+        // 10. Probes and SLA targets. Both reference `routes(id)`, so
+        //     an entry whose route this node does not serve is skipped:
+        //     the row has nowhere to attach and the cascade would have
+        //     removed it anyway.
         outcome.probe_configs = self.apply_replica_probes(config, &kept_ids)?;
         outcome.sla_configs = self.apply_replica_sla(config, &kept_ids)?;
 
-        // 10. Capture rules, after the routes they cascade from.
+        // 11. Capture rules, after the routes they cascade from.
         let (written, dropped) = self.apply_replica_capture_rules(config, &kept_ids)?;
         outcome.capture_rules = written;
         outcome.capture_rules_dropped = dropped;
 
-        // 11. Automation environments, after the routes they cascade
+        // 12. Automation environments, after the routes they cascade
         //     from (Story 10.4).
         let (written, dropped) = self.apply_replica_automation_environments(config, &kept_ids)?;
         outcome.automation_environments = written;
@@ -410,16 +473,19 @@ impl ConfigStore {
     }
 
     /// Backends: upsert by id, then delete the ones the blob dropped.
-    /// Deleting a backend cascades its `route_backends` rows, which the
-    /// link pass rewrites anyway.
+    /// Deleting a backend cascades its `route_backends` and
+    /// `stream_backends` rows, which the link passes rewrite anyway.
+    /// Unchecked writers: the attachment rule was checked on the whole
+    /// snapshot in [`ConfigStore::prepare_replica`], and the links still
+    /// on this node are the previous generation's.
     fn apply_replica_backends(&self, config: &CanonicalConfig) -> Result<()> {
         let local_ids: HashSet<String> = self.list_backends()?.into_iter().map(|b| b.id).collect();
         let blob_ids: HashSet<&str> = config.backends.iter().map(|b| b.id.as_str()).collect();
         for backend in &config.backends {
             if local_ids.contains(&backend.id) {
-                self.update_backend(backend)?;
+                self.update_backend_unchecked(backend)?;
             } else {
-                self.create_backend(backend)?;
+                self.create_backend_unchecked(backend)?;
             }
         }
         for id in &local_ids {
@@ -479,7 +545,8 @@ impl ConfigStore {
         Ok(ids)
     }
 
-    /// Route-to-backend links for the kept routes, replaced wholesale.
+    /// Route-to-backend links for the kept routes, replaced wholesale,
+    /// through the unchecked writer (the snapshot was checked whole).
     /// Returns how many links were written.
     fn apply_replica_route_backends(
         &self,
@@ -495,7 +562,34 @@ impl ConfigStore {
         let mut written = 0usize;
         for link in &config.route_backends {
             if kept_ids.contains(link.route_id.as_str()) {
-                self.link_route_backend(&link.route_id, &link.backend_id)?;
+                self.link_route_backend_unchecked(&link.route_id, &link.backend_id)?;
+                written += 1;
+            }
+        }
+        Ok(written)
+    }
+
+    /// Streams and their links: every local stream deleted, then every
+    /// kept stream inserted and its links written. Returns how many links
+    /// were written.
+    ///
+    /// Delete-then-insert rather than an upsert: `streams.name` is
+    /// UNIQUE, and a generation that swaps two names would trip it on
+    /// the first row of a row-by-row update. Deleting cascades every
+    /// stream link, which this pass rewrites for the kept streams. The
+    /// rows carry the blob's timestamps, so a re-encode on this node
+    /// reproduces the control plane's bytes. Unchecked writers, for the
+    /// reason [`ConfigStore::apply_replica_backends`] gives.
+    fn apply_replica_streams(&self, config: &CanonicalConfig, kept: &[&Stream]) -> Result<usize> {
+        self.conn.execute("DELETE FROM streams", [])?;
+        for stream in kept {
+            self.create_stream_unchecked(stream)?;
+        }
+        let kept_ids: HashSet<&str> = kept.iter().map(|s| s.id.as_str()).collect();
+        let mut written = 0usize;
+        for link in &config.stream_backends {
+            if kept_ids.contains(link.stream_id.as_str()) {
+                self.link_stream_backend_unchecked(&link.stream_id, &link.backend_id)?;
                 written += 1;
             }
         }
@@ -702,11 +796,13 @@ mod tests {
 
     use super::*;
     use crate::canonical::{canonical_bytes, canonical_hash, CanonicalCaptureRule};
+    use crate::models::{binds_here, sample_stream, sample_stream_backend, NodeRole};
     use crate::models::{
         AutomationEnvironment, Backend, CaptureEmit, CaptureLimits, CaptureMatch, CaptureOutput,
         CaptureRedaction, CaptureRule, CaptureScope, CertExportAcl, CertificateMode, CustomCrawler,
         CustomVerification, EnvironmentOwner, GlobalSettings, HealthStatus, LifecycleState,
-        LoadBalancing, ManagedBy, OwnerKind, ProbeConfig, SlaConfig, StatusMatch, WafMode,
+        LoadBalancing, ManagedBy, OwnerKind, ProbeConfig, SlaConfig, StatusMatch, StreamProtocol,
+        WafMode,
     };
     use crate::store::new_id;
 
@@ -908,8 +1004,10 @@ mod tests {
     }
 
     /// The control plane's configuration: two routes (one of them
-    /// pinned to `edge-1`), two backends and every table the replica
-    /// apply owns. The fleet route and its first backend are
+    /// pinned to `edge-1`), three backends and every table the replica
+    /// apply owns, a TCP stream pinned to `edge-1` included: it reaches
+    /// `backend-2`, which a route shares, and `backend-3`, which only
+    /// the stream references. The fleet route and its first backend are
     /// automation-managed by `env-1`. Deliberately no notification
     /// channel and no DNS provider: those ride the blob for drift
     /// detection but are never applied (D2), so a fixture carrying them
@@ -921,7 +1019,11 @@ mod tests {
             .expect("test setup: certificate");
         let mut managed_backend = make_backend("backend-1", "10.0.0.10:8080");
         managed_backend.managed_by = automation_mark("env-1");
-        for backend in [managed_backend, make_backend("backend-2", "10.0.0.11:8080")] {
+        for backend in [
+            managed_backend,
+            make_backend("backend-2", "10.0.0.11:8080"),
+            make_backend("backend-3", "192.0.2.30:5432"),
+        ] {
             store.create_backend(&backend).expect("test setup: backend");
         }
         let mut managed_route = make_route("route-fleet", "fleet.example.com", &[]);
@@ -944,6 +1046,17 @@ mod tests {
                 .link_route_backend(route_id, backend_id)
                 .expect("test setup: link");
         }
+        let mut stream = sample_stream("stream-edge", "edge-postgres", StreamProtocol::Tcp, 5432);
+        stream.node_selector = vec!["edge-1".to_string()];
+        stream.created_at = now;
+        stream.updated_at = now;
+        store.create_stream(&stream).expect("test setup: stream");
+        store
+            .set_stream_backends(
+                "stream-edge",
+                &["backend-2".to_string(), "backend-3".to_string()],
+            )
+            .expect("test setup: stream links");
         store
             .save_waf_custom_rule(9001, "block", "custom", "evil", 5, true)
             .expect("test setup: waf rule");
@@ -1060,8 +1173,11 @@ mod tests {
 
         assert_eq!(outcome.routes, 2);
         assert_eq!(outcome.routes_skipped_by_selector, 0);
-        assert_eq!(outcome.backends, 2);
+        assert_eq!(outcome.backends, 3);
         assert_eq!(outcome.route_backends, 3);
+        assert_eq!(outcome.streams, 1);
+        assert_eq!(outcome.streams_skipped_by_selector, 0);
+        assert_eq!(outcome.stream_backends, 2);
         assert_eq!(outcome.certificates, 1);
         assert_eq!(outcome.certificates_without_key, 0);
         assert_eq!(outcome.waf_custom_rules, 1);
@@ -1240,6 +1356,11 @@ mod tests {
         );
         // Only the fleet route's two links survive.
         assert_eq!(outcome.route_backends, 2);
+        // The stream pinned to edge-1 is scoped the same way.
+        assert_eq!(outcome.streams, 0);
+        assert_eq!(outcome.streams_skipped_by_selector, 1);
+        assert_eq!(outcome.stream_backends, 0);
+        assert!(target.list_streams().expect("streams").is_empty());
     }
 
     #[test]
@@ -1404,6 +1525,16 @@ mod tests {
             .expect("second apply");
 
         assert_eq!(after_first, canonical_hash(&target).expect("hash"));
+        // Every count matches; only `global_fields_changed` may differ.
+        assert_eq!(
+            first,
+            ReplicaOutcome {
+                global_fields_changed: first.global_fields_changed,
+                ..second.clone()
+            }
+        );
+        assert_eq!(first.streams, 1, "the fixture carries a stream");
+        assert_eq!(first.stream_backends, 2, "and its two links");
         assert_eq!(first.routes, second.routes);
         assert_eq!(first.backends, second.backends);
         assert_eq!(first.route_backends, second.route_backends);
@@ -1754,6 +1885,340 @@ mod tests {
             .get_automation_environment("env-1")
             .expect("environment read")
             .is_some());
+    }
+
+    // -----------------------------------------------------------------
+    // Story 12.1: streams, cut per recipient and applied
+    // -----------------------------------------------------------------
+
+    /// The e2e `cluster` profile's shape: a control plane holding a TCP
+    /// stream targeted at `edge-1` and a UDP stream with an empty
+    /// selector, each reaching a backend no route references.
+    fn seed_stream_fleet(control_plane: &ConfigStore, targeted_enabled: bool) {
+        control_plane
+            .create_backend(&sample_stream_backend("b-pg", "192.0.2.10:5432"))
+            .expect("test setup: backend");
+        control_plane
+            .create_backend(&sample_stream_backend("b-dns", "192.0.2.20:53"))
+            .expect("test setup: backend");
+        let mut targeted = sample_stream("s-targeted", "postgres", StreamProtocol::Tcp, 5432);
+        targeted.node_selector = vec!["edge-1".to_string()];
+        targeted.enabled = targeted_enabled;
+        let fleet_wide = sample_stream("s-fleet", "dns", StreamProtocol::Udp, 53);
+        for (stream, backend) in [(&targeted, "b-pg"), (&fleet_wide, "b-dns")] {
+            control_plane
+                .create_stream(stream)
+                .expect("test setup: stream");
+            control_plane
+                .set_stream_backends(&stream.id, &[backend.to_string()])
+                .expect("test setup: stream link");
+        }
+    }
+
+    /// The two followers' roster rows, as the control plane resolves
+    /// selectors against them.
+    const FOLLOWERS: [(&str, &str); 2] = [("edge-1", "id-1"), ("edge-2", "id-2")];
+
+    /// Cut the control plane's configuration for each follower, send it
+    /// through prepare and apply on that follower's own store, and
+    /// return each follower's store with the payload it received.
+    fn replicate_to_followers(
+        control_plane: &ConfigStore,
+    ) -> Vec<(&'static str, ConfigStore, CanonicalConfig)> {
+        let fleet = crate::canonical::canonical_config(control_plane).expect("canonical config");
+        let resolution = crate::canonical::SelectorResolution::from_rows(
+            FOLLOWERS.map(|(name, id)| (name.to_string(), id.to_string())),
+        );
+        FOLLOWERS
+            .iter()
+            .map(|(name, id)| {
+                let cut = crate::canonical::restrict_for_recipient(&fleet, id, &resolution);
+                let blob = crate::canonical::encode_canonical(&cut).expect("encode");
+                let hash = sha256_hex(&blob);
+                let config = ConfigStore::prepare_replica(&blob, &hash).expect("prepare");
+                let follower = ConfigStore::open_in_memory().expect("follower opens");
+                follower
+                    .apply_replica(&config, name, 1, &hash)
+                    .expect("apply");
+                assert_eq!(
+                    canonical_bytes(&follower).expect("re-encode"),
+                    blob,
+                    "{name} re-encodes the payload it was sent"
+                );
+                (*name, follower, cut)
+            })
+            .collect()
+    }
+
+    /// The names of the streams `store` holds that a node in `role`
+    /// binds, sorted.
+    fn bound(store: &ConfigStore, role: NodeRole<'_>) -> Vec<String> {
+        store
+            .list_streams()
+            .expect("streams")
+            .iter()
+            .filter(|s| binds_here(s, role))
+            .map(|s| s.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn iv1_a_targeted_stream_reaches_and_binds_on_its_follower_only() {
+        let control_plane = ConfigStore::open_in_memory().expect("control plane opens");
+        seed_stream_fleet(&control_plane, true);
+        let followers = replicate_to_followers(&control_plane);
+
+        let (_, edge_1, edge_1_payload) = &followers[0];
+        let (_, edge_2, edge_2_payload) = &followers[1];
+        let ids = |cut: &CanonicalConfig| -> Vec<String> {
+            let mut ids: Vec<String> = cut.streams.iter().map(|s| s.id.clone()).collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(ids(edge_1_payload), vec!["s-fleet", "s-targeted"]);
+        assert_eq!(ids(edge_2_payload), vec!["s-fleet"]);
+        assert!(
+            !edge_2_payload.backends.iter().any(|b| b.id == "b-pg"),
+            "edge-2 never receives the targeted stream's upstream"
+        );
+        assert!(
+            !edge_2_payload
+                .stream_backends
+                .iter()
+                .any(|l| l.stream_id == "s-targeted"),
+            "nor its link"
+        );
+        // A follower serving only streams still receives their backends,
+        // and keeps them after the apply.
+        assert!(edge_1.get_backend("b-pg").expect("read").is_some());
+        assert_eq!(
+            edge_1
+                .list_backends_for_stream("s-targeted")
+                .expect("links"),
+            vec!["b-pg"]
+        );
+
+        // Where each node binds, through the one predicate 12.2 binds by.
+        assert_eq!(
+            bound(&control_plane, NodeRole::ControlPlane),
+            vec!["dns"],
+            "the control plane holds the targeted stream to replicate it and does not bind it"
+        );
+        assert_eq!(
+            bound(
+                edge_1,
+                NodeRole::Follower {
+                    node_name: "edge-1"
+                }
+            ),
+            vec!["dns", "postgres"]
+        );
+        assert_eq!(
+            bound(
+                edge_2,
+                NodeRole::Follower {
+                    node_name: "edge-2"
+                }
+            ),
+            vec!["dns"]
+        );
+        assert!(
+            edge_2.get_stream("s-targeted").expect("read").is_none(),
+            "edge-2 does not hold it either"
+        );
+    }
+
+    #[test]
+    fn a_disabled_stream_is_cut_and_applied_like_an_enabled_one() {
+        let enabled_plane = ConfigStore::open_in_memory().expect("control plane opens");
+        seed_stream_fleet(&enabled_plane, true);
+        let disabled_plane = ConfigStore::open_in_memory().expect("control plane opens");
+        seed_stream_fleet(&disabled_plane, false);
+
+        let enabled = replicate_to_followers(&enabled_plane);
+        let disabled = replicate_to_followers(&disabled_plane);
+        for ((name, _, on), (_, follower, off)) in enabled.iter().zip(&disabled) {
+            let shape = |cut: &CanonicalConfig| {
+                let mut streams = cut.streams.clone();
+                for stream in &mut streams {
+                    stream.enabled = true;
+                }
+                // The canonical sort key includes `enabled`, so the
+                // flag may reorder the list; the set is what must match.
+                streams.sort_by(|a, b| a.id.cmp(&b.id));
+                let backend_ids: Vec<String> = cut.backends.iter().map(|b| b.id.clone()).collect();
+                (streams, cut.stream_backends.clone(), backend_ids)
+            };
+            assert_eq!(shape(on), shape(off), "{name}: only the flag differs");
+            assert_eq!(
+                follower.list_streams().expect("streams").len(),
+                off.streams.len(),
+                "{name}: a disabled stream is stored like an enabled one"
+            );
+        }
+        let (_, edge_1, _) = &disabled[0];
+        let held = edge_1
+            .get_stream("s-targeted")
+            .expect("read")
+            .expect("edge-1 holds the disabled stream");
+        assert!(!held.enabled);
+        assert_eq!(
+            bound(
+                edge_1,
+                NodeRole::Follower {
+                    node_name: "edge-1"
+                }
+            ),
+            vec!["dns"],
+            "and binds it nowhere"
+        );
+    }
+
+    /// Prepare `blob` after `edit`, expecting a refusal; returns its
+    /// message.
+    fn refusal_after(blob: &[u8], edit: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut root: serde_json::Value = serde_json::from_slice(blob).expect("json");
+        edit(&mut root);
+        let edited = serde_json::to_vec(&root).expect("re-encode");
+        match ConfigStore::prepare_replica(&edited, &sha256_hex(&edited)) {
+            Err(ReplicaError::Refused(message)) => message,
+            Err(ReplicaError::Store(e)) => panic!("a refusal on the blob's merits, not {e}"),
+            Ok(_) => panic!("the edited blob was accepted"),
+        }
+    }
+
+    #[test]
+    fn a_blob_breaking_a_stream_rule_is_refused_naming_the_stream_and_the_store_is_untouched() {
+        let source = ConfigStore::open_in_memory().expect("source opens");
+        let target = ConfigStore::open_in_memory().expect("target opens");
+        seed_source(&source);
+        source
+            .create_backend(&sample_stream_backend("b-dns", "192.0.2.20:53"))
+            .expect("test setup: backend");
+        source
+            .create_stream(&sample_stream("s-dns", "dns", StreamProtocol::Udp, 53))
+            .expect("test setup: stream");
+        source
+            .set_stream_backends("s-dns", &["b-dns".to_string()])
+            .expect("test setup: link");
+        target
+            .apply_replica(&prepared(&source).expect("prepare"), "edge-1", 1, "h1")
+            .expect("first apply");
+        let baseline = canonical_hash(&target).expect("baseline hash");
+        let blob = canonical_bytes(&source).expect("encode");
+        let index = |root: &serde_json::Value| -> usize {
+            root["streams"]
+                .as_array()
+                .expect("streams array")
+                .iter()
+                .position(|s| s["id"] == "s-dns")
+                .expect("the UDP stream is in the blob")
+        };
+
+        // A backend of the UDP stream also linked to a route.
+        let message = refusal_after(&blob, |root| {
+            root["route_backends"]
+                .as_array_mut()
+                .expect("links array")
+                .push(serde_json::json!({"route_id": "route-fleet", "backend_id": "b-dns"}));
+        });
+        assert!(message.contains("stream s-dns"), "{message}");
+
+        // A stream whose selector breaks the route rule.
+        let message = refusal_after(&blob, |root| {
+            let i = index(root);
+            root["streams"][i]["node_selector"] = serde_json::json!(["Not A Node Name"]);
+        });
+        assert!(message.contains("stream s-dns"), "{message}");
+
+        // A range one port wider than the cap.
+        let message = refusal_after(&blob, |root| {
+            let i = index(root);
+            root["streams"][i]["port_last"] =
+                serde_json::json!(53 + u32::from(crate::models::STREAM_PORT_RANGE_MAX));
+        });
+        assert!(message.contains("stream s-dns"), "{message}");
+
+        assert_eq!(
+            canonical_hash(&target).expect("post-refusal hash"),
+            baseline,
+            "prepare must not touch the store"
+        );
+    }
+
+    #[test]
+    fn a_generation_moving_a_backend_from_a_udp_stream_to_a_route_applies() {
+        // The transient violation the checked writers would refuse: the
+        // new links are written while the old stream link is still on
+        // this node. The snapshot itself is sound.
+        let source = ConfigStore::open_in_memory().expect("source opens");
+        let target = ConfigStore::open_in_memory().expect("target opens");
+        seed_source(&source);
+        source
+            .create_backend(&sample_stream_backend("b-moving", "192.0.2.50:53"))
+            .expect("test setup: backend");
+        source
+            .create_stream(&sample_stream("s-dns", "dns", StreamProtocol::Udp, 53))
+            .expect("test setup: stream");
+        source
+            .set_stream_backends("s-dns", &["b-moving".to_string()])
+            .expect("test setup: link");
+        target
+            .create_certificate(&make_certificate("cert-1", CERT_KEY))
+            .expect("target holds the key");
+        target
+            .apply_replica(&prepared(&source).expect("prepare"), "edge-1", 1, "h1")
+            .expect("first apply");
+
+        source
+            .set_stream_backends("s-dns", &[])
+            .expect("test setup: unlinked");
+        source
+            .link_route_backend("route-fleet", "b-moving")
+            .expect("test setup: now a route backend");
+        target
+            .apply_replica(&prepared(&source).expect("prepare"), "edge-1", 2, "h2")
+            .expect("the second generation applies");
+        assert_eq!(
+            canonical_hash(&source).expect("source hash"),
+            canonical_hash(&target).expect("target hash")
+        );
+    }
+
+    #[test]
+    fn a_generation_swapping_two_stream_names_applies() {
+        let source = ConfigStore::open_in_memory().expect("source opens");
+        let target = ConfigStore::open_in_memory().expect("target opens");
+        let mut alpha = sample_stream("s-1", "alpha", StreamProtocol::Tcp, 7001);
+        let mut beta = sample_stream("s-2", "beta", StreamProtocol::Tcp, 7002);
+        source.create_stream(&alpha).expect("test setup: stream");
+        source.create_stream(&beta).expect("test setup: stream");
+        target
+            .apply_replica(&prepared(&source).expect("prepare"), "edge-1", 1, "h1")
+            .expect("first apply");
+
+        alpha.name = "swap-tmp".to_string();
+        source.update_stream(&alpha).expect("test setup: rename");
+        beta.name = "alpha".to_string();
+        source.update_stream(&beta).expect("test setup: rename");
+        alpha.name = "beta".to_string();
+        source.update_stream(&alpha).expect("test setup: rename");
+
+        target
+            .apply_replica(&prepared(&source).expect("prepare"), "edge-1", 2, "h2")
+            .expect("a swap of two UNIQUE names applies");
+        assert_eq!(
+            target.get_stream("s-1").expect("read").expect("held").name,
+            "beta"
+        );
+        assert_eq!(
+            target.get_stream("s-2").expect("read").expect("held").name,
+            "alpha"
+        );
+        assert_eq!(
+            canonical_hash(&source).expect("source hash"),
+            canonical_hash(&target).expect("target hash")
+        );
     }
 
     #[test]

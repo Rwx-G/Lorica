@@ -69,7 +69,7 @@ use crate::models::{
     AutomationEnvironment, Backend, CaptureEmit, CaptureLimits, CaptureMatch, CaptureOutput,
     CaptureRedaction, CaptureRule, CaptureScope, CertExportAcl, Certificate, CustomCrawler,
     DnsProvider, GlobalSettings, NotificationConfig, ProbeConfig, Route, RouteBackend,
-    SecurityHeaderPreset, SlaConfig, SpoofedFallback,
+    SecurityHeaderPreset, SlaConfig, SpoofedFallback, Stream, StreamBackend,
 };
 use crate::store::ConfigStore;
 
@@ -83,14 +83,24 @@ use crate::store::ConfigStore;
 /// tolerant peek in [`decode_canonical`] is what makes that the
 /// reported reason.
 ///
-/// Story 10.4 adds `managed_by` on routes and backends and the
-/// `automation_environments` table WITHOUT moving this number: 2 is
-/// the shape of the 1.8.0 blob, and everything that release adds rides
-/// it. A second bump inside one release would tell a mixed-version
-/// fleet that two incompatible things happened when only one did. If
-/// 10.1 and 10.4 ever ship in different releases, that changes, and
-/// `story_10_4_rides_format_version_two_without_a_second_bump` is the
-/// test to revisit.
+/// Raised to 3 by Story 12.1 (1.11.0, decision D-3), which adds
+/// `streams` and `stream_backends` to [`CanonicalConfig`] and
+/// `health_check` to [`Backend`]. All three are unknown fields to a
+/// 1.10.x decoder, so a 1.10.x node must refuse a 1.11.0 blob by
+/// version. The number moves once per release, not once per field:
+/// every later 1.11.0 stream field rides 3, which
+/// `every_1_11_0_shape_rides_format_version_three` records.
+///
+/// What the strict equality costs during a rollout, upgraded followers
+/// first and the control plane last: between the first follower's
+/// upgrade and the control plane's, the control plane still stamps 2,
+/// each upgraded follower refuses that blob semantically, and a
+/// semantic refusal aborts the round fleet-wide. Configuration changes
+/// therefore do not replicate during that window, while every node keeps
+/// serving what it holds. Accepting 2 as "no streams" would remove the
+/// window, but a control plane rolled back to 1.10.x would then push
+/// "no streams" to every 1.11.0 follower and unbind their listeners
+/// fleet-wide; refusing keeps them serving until it is upgraded again.
 ///
 /// This integer names a SHAPE, and nothing about the integer enforces
 /// that. Four migrations (56 to 59) changed [`CanonicalConfig`] under
@@ -100,7 +110,7 @@ use crate::store::ConfigStore;
 /// it digests the field-name set of the blob's whole type inventory,
 /// so a shape change that leaves this number alone fails there and the
 /// decision has to be taken deliberately.
-pub const CANONICAL_FORMAT_VERSION: u32 = 2;
+pub const CANONICAL_FORMAT_VERSION: u32 = 3;
 
 fn default_downstream_idle_timeout_s() -> u32 {
     crate::models::DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S
@@ -494,6 +504,13 @@ pub struct CanonicalConfig {
     /// name and the expiry, and refuses the in-place edit the next
     /// pipeline `PUT` would overwrite.
     pub automation_environments: Vec<AutomationEnvironment>,
+    /// Layer-4 streams (Story 12.1), cut per recipient by their
+    /// `node_selector` whatever their `enabled` value: a disabled
+    /// stream is held and bound nowhere, and enabling it must not need
+    /// the payload to change shape.
+    pub streams: Vec<Stream>,
+    /// Stream-to-backend links, cut with their stream.
+    pub stream_backends: Vec<StreamBackend>,
 }
 
 /// Recursively rewrite every JSON object with its keys in sorted
@@ -665,6 +682,8 @@ pub fn canonical_config(store: &ConfigStore) -> Result<CanonicalConfig> {
             .map(CanonicalCaptureRule::from)
             .collect(),
         automation_environments: store.list_automation_environments()?,
+        streams: store.list_streams()?,
+        stream_backends: store.list_stream_backends()?,
     };
 
     // Replace secret material with digests BEFORE sorting so the
@@ -696,6 +715,8 @@ pub fn canonical_config(store: &ConfigStore) -> Result<CanonicalConfig> {
     sort_by_canonical_repr(&mut cfg.sla_configs);
     sort_by_canonical_repr(&mut cfg.capture_rules);
     sort_by_canonical_repr(&mut cfg.automation_environments);
+    sort_by_canonical_repr(&mut cfg.streams);
+    sort_by_canonical_repr(&mut cfg.stream_backends);
 
     Ok(cfg)
 }
@@ -797,6 +818,13 @@ impl SelectorResolution {
 /// Automation environments are cut the same way (Story 10.4): the row
 /// names its route and carries the owner principal and the labels,
 /// which a node not serving the route has no reason to hold.
+///
+/// Streams are cut by their own `node_selector` with the route
+/// predicate, enabled or not (Story 12.1, D-8: only the bind reads
+/// `enabled`), their links travel with them, and the backends are the
+/// union of what the kept routes and the kept streams reference. A
+/// node serving only a stream would otherwise receive the stream and
+/// none of its backends, and the apply would delete them.
 pub fn restrict_for_recipient(
     cfg: &CanonicalConfig,
     node_id: &str,
@@ -816,9 +844,25 @@ pub fn restrict_for_recipient(
         .filter(|rb| kept.contains(rb.route_id.as_str()))
         .cloned()
         .collect();
+    let streams: Vec<Stream> = cfg
+        .streams
+        .iter()
+        .filter(|s| resolution.targets(&s.node_selector, node_id))
+        .cloned()
+        .collect();
+    let kept_streams: std::collections::HashSet<&str> =
+        streams.iter().map(|s| s.id.as_str()).collect();
+    let stream_backends: Vec<StreamBackend> = cfg
+        .stream_backends
+        .iter()
+        .filter(|sb| kept_streams.contains(sb.stream_id.as_str()))
+        .cloned()
+        .collect();
+
     let backend_ids: std::collections::HashSet<&str> = route_backends
         .iter()
         .map(|rb| rb.backend_id.as_str())
+        .chain(stream_backends.iter().map(|sb| sb.backend_id.as_str()))
         .collect();
     let backends: Vec<Backend> = cfg
         .backends
@@ -852,10 +896,10 @@ pub fn restrict_for_recipient(
 
     // Every fleet-wide field is listed rather than filled from
     // `..cfg.clone()`: the struct update syntax clones the WHOLE
-    // source first, six large tables included, and then drops the six
+    // source first, every large table included, and then drops the ones
     // the literal above already replaced. At 50 nodes that is 50
     // pointless deep clones of the fleet's routes, backends, links,
-    // certificates, capture rules and environments per round. The cost
+    // certificates, capture rules, environments and streams per round. The cost
     // of spelling the fleet-wide half out is that a new field must be
     // added here; that is the right place to be asked "is this one
     // fleet-wide or is it cut with the route?".
@@ -876,6 +920,8 @@ pub fn restrict_for_recipient(
         sla_configs: cfg.sla_configs.clone(),
         capture_rules,
         automation_environments,
+        streams,
+        stream_backends,
     }
 }
 
@@ -1186,9 +1232,30 @@ mod tests {
         }
     }
 
+    /// A disabled TCP stream pinned to `edge-b` and its one backend,
+    /// which no route references.
+    fn edge_b_stream() -> (Stream, Backend, StreamBackend) {
+        let mut stream = crate::models::sample_stream(
+            "s-b",
+            "edge-b-postgres",
+            crate::models::StreamProtocol::Tcp,
+            5432,
+        );
+        stream.node_selector = vec!["edge-b".to_string()];
+        stream.enabled = false;
+        let backend = make_backend("b-s", "192.0.2.40:5432");
+        let link = StreamBackend {
+            stream_id: stream.id.clone(),
+            backend_id: backend.id.clone(),
+        };
+        (stream, backend, link)
+    }
+
     /// Three routes: one fleet-wide, one for each edge, each with its
     /// own backend and certificate. The two edge routes and their
     /// backends are automation-managed, each by its own environment.
+    /// One disabled stream, pinned to `edge-b`, reaches a backend of its
+    /// own ([`edge_b_stream`]).
     fn fleet_config() -> CanonicalConfig {
         let mut fleet = make_route("r-fleet", "fleet.example");
         fleet.node_selector = Vec::new();
@@ -1213,12 +1280,13 @@ mod tests {
         backend_b.managed_by = Some(ManagedBy::Automation {
             environment: "env-b".to_string(),
         });
+        let (stream, stream_backend, stream_link) = edge_b_stream();
 
         CanonicalConfig {
             version: CANONICAL_FORMAT_VERSION,
             global: CanonicalGlobalSettings::from(&GlobalSettings::default()),
             routes: vec![fleet, a, b],
-            backends: vec![backend_a, backend_b],
+            backends: vec![backend_a, backend_b, stream_backend],
             route_backends: vec![
                 RouteBackend {
                     route_id: "r-a".to_string(),
@@ -1249,7 +1317,60 @@ mod tests {
                 make_environment("env-a", "r-a"),
                 make_environment("env-b", "r-b"),
             ],
+            streams: vec![stream],
+            stream_backends: vec![stream_link],
         }
+    }
+
+    #[test]
+    fn a_stream_is_cut_by_its_selector_with_its_links_and_its_backends() {
+        let cut = restrict_for_recipient(&fleet_config(), "id-b", &resolution());
+        let streams: Vec<&str> = cut.streams.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(streams, vec!["s-b"]);
+        assert!(
+            !cut.streams[0].enabled,
+            "a disabled stream is cut like an enabled one"
+        );
+        assert_eq!(cut.stream_backends, fleet_config().stream_backends);
+        assert!(
+            cut.backends.iter().any(|b| b.id == "b-s"),
+            "a backend only a stream references still reaches the node serving the stream"
+        );
+        assert!(
+            cut.backends.iter().any(|b| b.id == "b-b"),
+            "and the route backends are kept beside it"
+        );
+
+        let other = restrict_for_recipient(&fleet_config(), "id-a", &resolution());
+        assert!(other.streams.is_empty(), "edge-a is not targeted");
+        assert!(other.stream_backends.is_empty());
+        assert!(
+            !other.backends.iter().any(|b| b.id == "b-s"),
+            "another node's stream upstream address"
+        );
+    }
+
+    #[test]
+    fn a_fleet_wide_stream_reaches_every_recipient() {
+        let mut cfg = fleet_config();
+        cfg.streams[0].node_selector.clear();
+        for node_id in ["id-a", "id-b", "a-node-that-just-joined"] {
+            let cut = restrict_for_recipient(&cfg, node_id, &resolution());
+            assert_eq!(cut.streams.len(), 1, "{node_id}");
+            assert_eq!(cut.stream_backends.len(), 1, "{node_id}");
+            assert!(cut.backends.iter().any(|b| b.id == "b-s"), "{node_id}");
+        }
+    }
+
+    #[test]
+    fn a_stream_survives_an_encode_decode_round_trip_byte_identically() {
+        let cfg = restrict_for_recipient(&fleet_config(), "id-b", &resolution());
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let decoded = decode_canonical(&bytes).expect("test setup: decode");
+        assert_eq!(decoded.streams, cfg.streams);
+        assert_eq!(decoded.stream_backends, cfg.stream_backends);
+        let again = encode_canonical(&decoded).expect("test setup: re-encode");
+        assert_eq!(bytes, again);
     }
 
     #[test]
@@ -1425,12 +1546,12 @@ mod tests {
     }
 
     #[test]
-    fn the_canonical_format_version_is_two() {
+    fn the_canonical_format_version_is_three() {
         let bytes = encode_canonical(&fleet_config()).expect("test setup: encode");
         let peek: serde_json::Value =
             serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
-        assert_eq!(peek["version"], 2);
-        assert_eq!(CANONICAL_FORMAT_VERSION, 2);
+        assert_eq!(peek["version"], 3);
+        assert_eq!(CANONICAL_FORMAT_VERSION, 3);
     }
 
     /// The field-name set of every type the canonical blob carries,
@@ -1479,14 +1600,21 @@ mod tests {
     /// The version stays at 2. Pinned by
     /// `a_1_10_2_blob_without_case_insensitive_paths_decodes_to_case_sensitive_routes`.
     ///
-    /// Story 12.1 (1.11.0) moved it: `Backend` gained `health_check`
-    /// (D-2), with a serde default. No peer on the old shape can receive
-    /// it: migrations 71 to 73 put a 1.10.x follower behind on schema and
-    /// the handshake refuses it first. The version step of 1.11.0 is
-    /// taken once, in the change that brings streams into the blob
-    /// (Story 12.1, D-3), and later 1.11.0 shapes ride it.
+    /// Story 12.1 (1.11.0) moved it twice inside one unreleased cycle:
+    /// `Backend` gained `health_check` (D-2), then `CanonicalConfig`
+    /// gained `streams` and `stream_backends` with `Stream` and
+    /// `StreamBackend` joining the inventory. This time
+    /// `CANONICAL_FORMAT_VERSION` moves, from 2 to 3 (D-3): none of the
+    /// three new fields can be defaulted into meaning, because a 1.11.0
+    /// follower reading a blob without `streams` as "no streams" would
+    /// delete its listeners the moment a control plane rolls back to
+    /// 1.10.x. Every later 1.11.0 stream field updates this digest and
+    /// rides 3. The serde-default tests above (`a_1_8_0_blob_...`,
+    /// `a_1_9_blob_...`, `a_1_10_2_blob_...`) now pin only those
+    /// defaults: the blobs they are named after are stamped 2 and are
+    /// refused by version before any field is read.
     const CANONICAL_SHAPE_DIGEST: &str =
-        "92d205c651909c1dd56ef9b763db69c609699ff328bf759a89672ef58d81d9d6";
+        "ce8c4972a287cb69b7f355287495fe334ba6f57b85d409ebe8e129c2ddb5b76d";
 
     /// Every field name `T` accepts, read from the type itself rather
     /// than from the JSON of some fixture.
@@ -1573,6 +1701,8 @@ mod tests {
             crate::models::CaptureLimits,
             crate::models::CaptureOutput,
             crate::models::CaptureRedaction,
+            crate::models::Stream,
+            crate::models::StreamBackend,
         ]
     }
 
@@ -1638,29 +1768,42 @@ mod tests {
     // Story 10.4: ownership marks and the environment row
     // -----------------------------------------------------------------
 
-    /// A GUARD, not an accident: Story 10.4 adds `managed_by` and
-    /// `automation_environments` to the blob under the SAME version
-    /// Story 10.1 set, because both ship in 1.8.0 and a second bump
-    /// inside one release would lie to a mixed-version fleet. A future
-    /// change that moves this number must be deliberate about it; this
-    /// test is where that deliberation gets recorded.
+    /// A GUARD, not an accident: Story 12.1 takes the one version step
+    /// of 1.11.0 (D-3), and every 1.11.0 shape rides it. Stories 12.2
+    /// to 12.11 add stream fields inside version 3 and update
+    /// `CANONICAL_SHAPE_DIGEST`; a second bump inside one release would
+    /// tell a mixed-version fleet that two incompatible things happened
+    /// when only one did. A change that moves this number must be
+    /// deliberate about it; this test is where that deliberation gets
+    /// recorded. It replaces the 1.8.0 guard of the same kind (Story
+    /// 10.4 rode version 2 beside Story 10.1).
     #[test]
-    fn story_10_4_rides_format_version_two_without_a_second_bump() {
-        assert_eq!(CANONICAL_FORMAT_VERSION, 2);
-        let cfg = fleet_config();
+    fn every_1_11_0_shape_rides_format_version_three() {
+        assert_eq!(CANONICAL_FORMAT_VERSION, 3);
+        let mut cfg = fleet_config();
+        cfg.backends[0].health_check = crate::models::HealthCheck::Http {
+            path: "/healthz".to_string(),
+        };
+        cfg.backends[0].health_check_path = Some("/healthz".to_string());
+        assert!(!cfg.streams.is_empty(), "the fixture carries a stream");
         assert!(
-            cfg.routes.iter().any(|r| r.managed_by.is_some()),
-            "the fixture carries a managed_by mark"
-        );
-        assert!(
-            !cfg.automation_environments.is_empty(),
-            "the fixture carries an environment row"
+            !cfg.stream_backends.is_empty(),
+            "the fixture carries a stream link"
         );
         let bytes = encode_canonical(&cfg).expect("test setup: encode");
         let peek: serde_json::Value =
             serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
-        assert_eq!(peek["version"], 2, "a 10.4 blob is still a version-2 blob");
-        decode_canonical(&bytes).expect("a version-2 decoder accepts a 10.4 blob");
+        assert_eq!(peek["version"], 3, "a 1.11.0 blob is a version-3 blob");
+        for field in ["streams", "stream_backends"] {
+            assert!(peek.get(field).is_some(), "{field} is on the wire");
+        }
+        assert_eq!(peek["backends"][0]["health_check"]["kind"], "http");
+        let decoded = decode_canonical(&bytes).expect("a version-3 decoder accepts it");
+        assert_eq!(decoded.streams, cfg.streams);
+        assert_eq!(
+            decoded.backends[0].health_check,
+            cfg.backends[0].health_check
+        );
     }
 
     #[test]
@@ -1750,17 +1893,48 @@ mod tests {
     }
 
     #[test]
+    fn a_blob_stamped_version_two_is_refused_by_version() {
+        // A 1.10.x control plane encodes version 2, without `streams`,
+        // `stream_backends` or `Backend.health_check`. The refusal must
+        // name the version, not whichever missing or unknown field the
+        // strict decoder would otherwise reach first, and it must be a
+        // refusal: read as "no streams", it would unbind every stream
+        // of an upgraded follower (D-3).
+        let bytes = encode_canonical(&fleet_config()).expect("test setup: encode");
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
+        let object = root
+            .as_object_mut()
+            .expect("test setup: the blob is an object");
+        object.insert("version".to_string(), serde_json::json!(2));
+        object.remove("streams");
+        object.remove("stream_backends");
+        for backend in object["backends"]
+            .as_array_mut()
+            .expect("test setup: backends is an array")
+        {
+            backend
+                .as_object_mut()
+                .expect("test setup: a backend is an object")
+                .remove("health_check");
+        }
+        let older = serde_json::to_vec(&root).expect("test setup: re-encode");
+        let err = decode_canonical(&older).expect_err("a version 2 blob is refused");
+        let message = err.to_string();
+        assert!(message.contains("format version 2"), "{message}");
+        assert!(message.contains("supports 3"), "{message}");
+    }
+
+    #[test]
     fn a_blob_stamped_version_one_is_refused_by_version() {
-        // A 1.7.x node encodes version 1. The refusal must name the
-        // version, not whichever unknown field the strict decoder would
-        // otherwise reach first.
+        // A 1.7.x node encodes version 1.
         let mut cfg = fleet_config();
         cfg.version = 1;
         let bytes = encode_canonical(&cfg).expect("test setup: encode");
         let err = decode_canonical(&bytes).expect_err("a version 1 blob is refused");
         let message = err.to_string();
         assert!(message.contains("format version 1"), "{message}");
-        assert!(message.contains("supports 2"), "{message}");
+        assert!(message.contains("supports 3"), "{message}");
     }
 
     #[test]
@@ -1873,6 +2047,8 @@ mod tests {
                 sla_configs: Vec::new(),
                 capture_rules: Vec::new(),
                 automation_environments: Vec::new(),
+                streams: Vec::new(),
+                stream_backends: Vec::new(),
             };
             let resolution = SelectorResolution::from_rows(rows.clone());
 
@@ -2033,6 +2209,31 @@ fleet_bytes={fleet_bytes} per_recipient_mean_bytes={mean_bytes}",
             store
                 .link_route_backend(rid, bid)
                 .expect("test setup: link inserts");
+        }
+        let mut streams = vec![
+            crate::models::sample_stream(
+                "s1-fixed",
+                "ldap",
+                crate::models::StreamProtocol::Tcp,
+                389,
+            ),
+            crate::models::sample_stream(
+                "s2-fixed",
+                "ldaps",
+                crate::models::StreamProtocol::Tcp,
+                636,
+            ),
+        ];
+        let mut stream_links: Vec<String> = backends.iter().map(|b| b.id.clone()).collect();
+        if reversed {
+            streams.reverse();
+            stream_links.reverse();
+        }
+        for s in &streams {
+            store.create_stream(s).expect("test setup: stream inserts");
+            store
+                .set_stream_backends(&s.id, &stream_links)
+                .expect("test setup: stream links insert");
         }
         for c in &certs {
             store
