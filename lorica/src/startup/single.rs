@@ -428,6 +428,25 @@ pub(crate) fn run_single_process(cli: Cli) {
                 .as_deref()
                 .and_then(crate::cli::requested_port),
         };
+        // The stream plane's registry and budget inputs (Story 12.2):
+        // read here, ahead of the cluster runtime, because a follower
+        // reports them in its heartbeat (D-i); the driver that writes
+        // the registry is built further down, once the role is known.
+        let stream_states = lorica_stream::StreamBindStates::new();
+        let fd_limit = match lorica_worker::stream_sockets::process_fd_limit() {
+            Ok(limit) => {
+                info!(fd_limit = limit, "process fd limit");
+                limit
+            }
+            Err(e) => {
+                // A zero budget refuses every stream with `fd_budget` and
+                // the reason, rather than guessing a limit.
+                error!(error = %e, "process fd limit unreadable; no stream can bind");
+                0
+            }
+        };
+        let api_stream_plane =
+            lorica_api::stream_budget::StreamPlaneState::new(stream_states.clone(), fd_limit, 1);
         // The fleet role (control plane, follower or standalone), shared
         // by both startup modes: see `startup::spawn_cluster_runtime`.
         // Spawned BEFORE the API so AppState carries it.
@@ -459,6 +478,7 @@ pub(crate) fn run_single_process(cli: Cli) {
                 data_dir: data_dir.clone(),
             },
             listener_ports,
+            api_stream_plane.clone(),
             &store,
             // Single-process: a fleet-wide ban writes the shared
             // data-plane map the request path already reads.
@@ -502,8 +522,8 @@ pub(crate) fn run_single_process(cli: Cli) {
         // The stream plane, single-process (D-k): the supervisor's
         // reconcile code driving this process's own stream runtime over
         // an in-process channel, one worker slot. The registry and the
-        // budget inputs are the ones the API reads.
-        let stream_states = lorica_stream::StreamBindStates::new();
+        // budget inputs are the ones read above, which the API and the
+        // follower's heartbeat read too.
         let stream_source = match StoreStreamTable::open(&db_path, Some(encryption_key)) {
             Ok(source) => Arc::new(source),
             Err(e) => {
@@ -525,18 +545,6 @@ pub(crate) fn run_single_process(cli: Cli) {
                 std::process::exit(1);
             }
         };
-        let fd_limit = match lorica_worker::stream_sockets::process_fd_limit() {
-            Ok(limit) => {
-                info!(fd_limit = limit, "process fd limit");
-                limit
-            }
-            Err(e) => {
-                // A zero budget refuses every stream with `fd_budget` and
-                // the reason, rather than guessing a limit.
-                error!(error = %e, "process fd limit unreadable; no stream can bind");
-                0
-            }
-        };
         let stream_plane = StreamPlaneHandle::new(
             StreamPlane::new(
                 vec![(0, InProcessLink(stream_peer))],
@@ -551,8 +559,6 @@ pub(crate) fn run_single_process(cli: Cli) {
             Some(log_store.clone()),
             alert_sender.clone(),
         );
-        let api_stream_plane =
-            lorica_api::stream_budget::StreamPlaneState::new(stream_states.clone(), fd_limit, 1);
 
         let api_handle = tokio::spawn(async move {
             let state = AppState {

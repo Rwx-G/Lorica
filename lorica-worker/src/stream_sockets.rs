@@ -66,6 +66,23 @@ pub enum BindFailureKind {
 }
 
 impl BindFailureKind {
+    /// Every kind, in declaration order.
+    pub const ALL: [BindFailureKind; 6] = [
+        BindFailureKind::AddressInUse,
+        BindFailureKind::PermissionDenied,
+        BindFailureKind::AddressNotAvailable,
+        BindFailureKind::ReservedPort,
+        BindFailureKind::FdBudget,
+        BindFailureKind::Other,
+    ];
+
+    /// The kind whose [`Self::as_str`] spelling is `name`, `None` for a
+    /// spelling no kind has (a newer peer's, read by an older control
+    /// plane).
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == name)
+    }
+
     /// Classify a bind error by its errno.
     pub fn from_io_error(err: &io::Error) -> Self {
         match err.raw_os_error().map(Errno::from_raw) {
@@ -243,7 +260,10 @@ mod tests {
         for (kind, spelling) in contract {
             assert_eq!(kind.as_str(), spelling);
             assert_eq!(kind.to_string(), spelling);
+            assert_eq!(BindFailureKind::from_name(spelling), Some(kind));
         }
+        assert_eq!(BindFailureKind::ALL.len(), contract.len());
+        assert_eq!(BindFailureKind::from_name("no_such_kind"), None);
     }
 
     #[test]

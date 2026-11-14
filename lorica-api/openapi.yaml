@@ -1577,9 +1577,11 @@ paths:
         it binds, disabled ones included. The same nodes are then checked
         against their fd budget (`GET /api/v1/streams/budget`), counting
         the enabled streams each binds: a stream that would break one is
-        refused `422` with `error.code` `stream_fd_budget`. A targeted
-        node whose fd limit is not known here is named in `warnings`
-        instead, and refuses the stream when it binds it.
+        refused `422` with `error.code` `stream_fd_budget`. An enrolled
+        node is checked on the fd limit and worker count its heartbeat
+        reported on its open session; a targeted node with no such report
+        (offline, or not reported yet) is named in `warnings` instead,
+        and refuses the stream when it binds it.
       security:
         - sessionCookie: []
       requestBody:
@@ -1625,9 +1627,15 @@ paths:
         its share within `S` too; and the node's listening sockets stay
         within `stream_listen_socket_cap`. Operator and above: a Viewer
         does not get node capacity. Standalone and on a follower the
-        answer is the node itself; a control plane answers its own node,
-        and the nodes that report their budget in their heartbeat beside
-        it.
+        answer is the node itself. A control plane answers its own node
+        first, then, by name, every active enrolled node whose open
+        session carried a stream plane report in its heartbeat (Story
+        12.2 D-i): its fd limit, worker count and committed totals as the
+        node reported them, and each stream this control plane expects it
+        to bind, `bound` unless the node lists it as `pending` or
+        `failed`, and `unknown` while the node drifts from this control
+        plane's configuration or its list was cut. A node that is offline
+        or has not reported is absent.
       security:
         - sessionCookie: []
       responses:

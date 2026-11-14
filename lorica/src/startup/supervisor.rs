@@ -875,6 +875,28 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 .as_deref()
                 .and_then(crate::cli::requested_port),
         };
+        // The stream plane's registry and budget inputs (Story 12.2):
+        // read here, ahead of the cluster runtime, because a follower
+        // reports them in its heartbeat (D-i); the driver that writes
+        // the registry is built further down, once the role is known.
+        let stream_states = lorica_stream::StreamBindStates::new();
+        let fd_limit = match lorica_worker::stream_sockets::process_fd_limit() {
+            Ok(limit) => {
+                info!(fd_limit = limit, "process fd limit");
+                limit
+            }
+            Err(e) => {
+                // A zero budget refuses every stream with `fd_budget`
+                // and the reason, rather than guessing a limit.
+                error!(error = %e, "process fd limit unreadable; no stream can bind");
+                0
+            }
+        };
+        let api_stream_plane = lorica_api::stream_budget::StreamPlaneState::new(
+            stream_states.clone(),
+            fd_limit,
+            u32::try_from(worker_count).unwrap_or(u32::MAX),
+        );
         let startup::ClusterStartup {
             plane: mut cluster_plane,
             follower: mut follower_plane,
@@ -901,6 +923,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 data_dir: PathBuf::from(&hu_cli.data_dir),
             },
             listener_ports,
+            api_stream_plane.clone(),
             &store,
             // Supervisor mode: the ban map lives in each worker, so a
             // fleet-wide ban rides the same broadcast the local WAF
@@ -965,25 +988,8 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // stream socket and attaches it to the workers over their stream
         // control channels. Built once the role and this process's own
         // ports are known, before the reload bridge that drives it. The
-        // registry and the budget inputs are the ones the API reads.
-        let stream_states = lorica_stream::StreamBindStates::new();
-        let fd_limit = match lorica_worker::stream_sockets::process_fd_limit() {
-            Ok(limit) => {
-                info!(fd_limit = limit, "process fd limit");
-                limit
-            }
-            Err(e) => {
-                // A zero budget refuses every stream with `fd_budget`
-                // and the reason, rather than guessing a limit.
-                error!(error = %e, "process fd limit unreadable; no stream can bind");
-                0
-            }
-        };
-        let api_stream_plane = lorica_api::stream_budget::StreamPlaneState::new(
-            stream_states.clone(),
-            fd_limit,
-            u32::try_from(worker_count).unwrap_or(u32::MAX),
-        );
+        // registry and the budget inputs are the ones read above, which
+        // the API and the follower's heartbeat read too.
         let stream_plane = {
             let links: Vec<(u32, stream_plane::SeqpacketLink)> = stream_ctl_fds
                 .into_iter()

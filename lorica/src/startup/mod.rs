@@ -1087,10 +1087,12 @@ pub(crate) struct ClusterStartup {
 /// `listener_ports` are the ports this process's own listeners hold
 /// outside the cluster plane, which a follower reports to its control
 /// plane. A follower runs no cluster plane, so for it they are the whole
-/// process's reserved ports.
+/// process's reserved ports. `stream_plane` is this process's stream
+/// plane, which a follower reports in its heartbeat (Story 12.2 D-i).
 pub(crate) async fn spawn_cluster_runtime(
     opts: cluster_plane::ClusterPlaneOptions,
     listener_ports: crate::cli::ReservedPorts,
+    stream_plane: lorica_api::stream_budget::StreamPlaneState,
     store: &Arc<Mutex<ConfigStore>>,
     bans: cluster_follower::BanApplier,
 ) -> ClusterStartup {
@@ -1128,6 +1130,7 @@ pub(crate) async fn spawn_cluster_runtime(
             data_dir: follower_data_dir,
             log_store: follower_log_store,
             reserved_ports: listener_ports,
+            stream_plane,
         },
         store,
     )

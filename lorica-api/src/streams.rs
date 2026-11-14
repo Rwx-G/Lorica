@@ -45,7 +45,7 @@ use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
 use crate::routes::crud::{selector_roster, validate_group_name, validate_node_selector};
 use crate::server::AppState;
-use crate::stream_budget::{check_write, BudgetNode, StreamPlaneState};
+use crate::stream_budget::{check_write, reported_fds, BudgetNode, NodeFds, StreamPlaneState};
 
 #[cfg(test)]
 mod tests;
@@ -295,16 +295,46 @@ pub(crate) fn first_port_conflict(
         .next())
 }
 
+/// What the fd budget check of a stream write reads besides the store:
+/// this node's figures and, on a control plane, the figures each
+/// enrolled node reported in its heartbeat (D-i), taken before the
+/// store lock.
+#[derive(Debug, Clone)]
+pub(crate) struct BudgetInputs {
+    /// This process's own listeners, which decide whether it binds the
+    /// candidate.
+    pub(crate) reserved: ReservedPorts,
+    /// This process's stream plane.
+    pub(crate) plane: StreamPlaneState,
+    /// Reported figures by node id; empty off a control plane.
+    pub(crate) reported: HashMap<String, NodeFds>,
+}
+
+impl BudgetInputs {
+    /// The inputs of the process `state` runs in.
+    pub(crate) fn of(state: &AppState) -> Self {
+        BudgetInputs {
+            reserved: state.reserved_ports,
+            plane: state.stream_plane.clone(),
+            reported: reported_fds(state),
+        }
+    }
+}
+
 /// The fd budget check of D-e for a write of `candidate` replacing
 /// `stored`, on the nodes [`first_port_conflict`] checks: this node with
 /// its own figures, and on a control plane every active node the
-/// selector targets. Reads the roster and the cap from `store`, under
-/// the caller's lock.
+/// selector targets, with the figures its heartbeat reported. Reads the
+/// roster from `store`, under the caller's lock; `listen_socket_cap` is
+/// the setting the write will run under.
 ///
-/// No enrolled node reports its fd limit and worker count to the
-/// control plane yet: they ride the heartbeat's stream plane report,
-/// which Lot E2 of Story 12.2 adds. Until then each targeted node is
-/// named in a warning here and refuses at bind with `fd_budget`.
+/// A targeted node with no report on an open session (offline, a
+/// 1.10.x follower, or connected and not reported yet) cannot be
+/// checked here: it is named in a warning and refuses at bind with
+/// `fd_budget`.
+///
+/// One function for every stream write: create, update, and the config
+/// import and its preview, so none of them accepts what another refuses.
 ///
 /// # Errors
 ///
@@ -313,8 +343,8 @@ pub(crate) fn first_port_conflict(
 pub(crate) fn budget_warnings(
     store: &ConfigStore,
     role: &LocalRole,
-    reserved: ReservedPorts,
-    plane: &StreamPlaneState,
+    inputs: &BudgetInputs,
+    listen_socket_cap: u32,
     candidate: &Stream,
     stored: Option<&Stream>,
     others: &[Stream],
@@ -324,19 +354,25 @@ pub(crate) fn budget_warnings(
     } else {
         Vec::new()
     };
-    let nodes: Vec<BudgetNode<'_>> = nodes_checking(candidate, role, reserved, &roster)
+    let ids: HashMap<&str, &str> = roster
+        .iter()
+        .map(|n| (n.name.as_str(), n.node_id.as_str()))
+        .collect();
+    let nodes: Vec<BudgetNode<'_>> = nodes_checking(candidate, role, inputs.reserved, &roster)
         .into_iter()
         .map(|node| BudgetNode {
-            fds: match node.label {
-                NodeLabel::ThisNode => Some(plane.fds()),
-                NodeLabel::Named(_) => None,
+            fds: match &node.label {
+                NodeLabel::ThisNode => Some(inputs.plane.fds()),
+                NodeLabel::Named(name) => ids
+                    .get(name.as_str())
+                    .and_then(|id| inputs.reported.get(*id))
+                    .copied(),
             },
             label: node.label,
             role: node.role,
         })
         .collect();
-    let cap = store.get_global_settings()?.stream_listen_socket_cap;
-    check_write(candidate, stored, others, &nodes, cap)
+    check_write(candidate, stored, others, &nodes, listen_socket_cap)
         .map_err(|refusal| refusal.into_error(candidate))
 }
 
@@ -462,18 +498,20 @@ pub(crate) async fn create_stream_as(
     validated(&stream)?;
     let backend_ids = body.backend_ids.unwrap_or_default();
     let role = LocalRole::of(state);
-    let reserved = state.reserved_ports;
-    let plane = state.stream_plane.clone();
+    let budget = BudgetInputs::of(state);
 
     let (stream, backend_ids, warnings) = db_blocking(&state.store, move |store| {
         refuse_unknown_backends(store, &backend_ids)?;
         // Under the lock that writes, so two creates on one port cannot
         // both pass, nor two creates that each fit the budget alone.
         let others = store.list_streams()?;
-        if let Some(conflict) = first_port_conflict(store, &role, reserved, &stream, &others)? {
+        if let Some(conflict) =
+            first_port_conflict(store, &role, budget.reserved, &stream, &others)?
+        {
             return Err(port_conflict_error(&stream, &conflict));
         }
-        let warnings = budget_warnings(store, &role, reserved, &plane, &stream, None, &others)?;
+        let cap = store.get_global_settings()?.stream_listen_socket_cap;
+        let warnings = budget_warnings(store, &role, &budget, cap, &stream, None, &others)?;
         store.in_transaction(|store| {
             store.create_stream(&stream)?;
             store.set_stream_backends(&stream.id, &backend_ids)
@@ -539,8 +577,7 @@ pub(crate) async fn update_stream_as(
         .map(validate_group_name)
         .transpose()?;
     let role = LocalRole::of(state);
-    let reserved = state.reserved_ports;
-    let plane = state.stream_plane.clone();
+    let budget = BudgetInputs::of(state);
 
     let (before, after, warnings) = db_blocking(&state.store, move |store| {
         let stored = store
@@ -582,18 +619,14 @@ pub(crate) async fn update_stream_as(
         }
 
         let others = store.list_streams()?;
-        if let Some(conflict) = first_port_conflict(store, &role, reserved, &stream, &others)? {
+        if let Some(conflict) =
+            first_port_conflict(store, &role, budget.reserved, &stream, &others)?
+        {
             return Err(port_conflict_error(&stream, &conflict));
         }
-        let warnings = budget_warnings(
-            store,
-            &role,
-            reserved,
-            &plane,
-            &stream,
-            Some(&stored),
-            &others,
-        )?;
+        let cap = store.get_global_settings()?.stream_listen_socket_cap;
+        let warnings =
+            budget_warnings(store, &role, &budget, cap, &stream, Some(&stored), &others)?;
         // The new links before the row: the attachment rule then judges
         // the row as written against the links as they will stand,
         // whichever of the two the patch changed.

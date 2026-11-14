@@ -1,6 +1,8 @@
 //! The cluster mutation handlers under cancellation: a handler dropped
 //! after its commit (a client that disconnected) still leaves the audit
-//! row and the journal line that commit is owed.
+//! row and the journal line that commit is owed. And the stream plane on
+//! the fleet view (Story 12.2 Lot E2): the enrollment preview's
+//! `stream_ports`, each node's bind states, and the activation row.
 
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -9,6 +11,7 @@ use axum::extract::{Extension, Path};
 use chrono::Utc;
 use lorica_cluster::NodeState;
 use lorica_config::models::{ClusterNode, NodeStatus, Role};
+use lorica_stream::BindStateKind;
 
 use crate::cluster::{ClusterRuntime, ControlPlaneRuntime};
 use crate::middleware::auth::Session;
@@ -454,4 +457,300 @@ async fn a_break_glass_window_that_fails_to_persist_opens_nothing_and_leaves_the
         .is_some());
     assert!(follower.break_glass_until().is_some());
     assert!(break_glass_audited(&state).await);
+}
+
+// ---- The stream plane on the fleet view (Story 12.2 Lot E2) ----
+
+fn stream(name: &str, port: u16, selector: &[&str]) -> lorica_config::models::Stream {
+    let now = Utc::now();
+    lorica_config::models::Stream {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: name.to_string(),
+        group_name: String::new(),
+        protocol: lorica_config::models::StreamProtocol::Tcp,
+        enabled: true,
+        listen_address: "0.0.0.0".parse().expect("an address"),
+        port_first: port,
+        port_last: port,
+        node_selector: selector.iter().map(|s| s.to_string()).collect(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn node_row(name: &str, status: NodeStatus) -> ClusterNode {
+    let now = Utc::now();
+    ClusterNode {
+        node_id: format!("id-{name}"),
+        name: name.to_string(),
+        cert_fingerprint: format!("fp-{name}"),
+        cert_serial: "0a00".to_string(),
+        prev_cert_fingerprint: None,
+        prev_cert_serial: None,
+        address: String::new(),
+        version: String::new(),
+        schema_version: 0,
+        status,
+        enrolled_at: now,
+        last_seen_at: None,
+        applied_config_generation: 0,
+        applied_config_hash: String::new(),
+        cert_not_after: now + chrono::Duration::days(30),
+        revoked_at: None,
+        reserved_ports: None,
+    }
+}
+
+#[test]
+fn stream_ports_lists_the_selected_and_the_fleet_wide_streams_a_node_will_bind() {
+    let selected = stream("pg", 5432, &["edge-1"]);
+    let fleet_wide = stream("dns", 53, &[]);
+    let elsewhere = stream("smtp", 2525, &["edge-2"]);
+    let disabled = lorica_config::models::Stream {
+        enabled: false,
+        ..stream("off", 6000, &["edge-1"])
+    };
+    let mut range = stream("range", 20_000, &[]);
+    range.port_last = 20_009;
+    let streams = [
+        selected.clone(),
+        fleet_wide.clone(),
+        elsewhere,
+        disabled,
+        range.clone(),
+    ];
+
+    let pending = node_row("edge-1", NodeStatus::Pending);
+    let ports = super::stream_ports(&pending, &streams);
+    let named: Vec<(&str, u16, u16)> = ports
+        .iter()
+        .map(|p| (p.name.as_str(), p.port_first, p.port_last))
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            ("pg", 5432, 5432),
+            ("dns", 53, 53),
+            ("range", 20_000, 20_009)
+        ],
+        "the selected and the fleet-wide streams, enabled ones only"
+    );
+    assert_eq!(ports[0].id, selected.id);
+    assert_eq!(
+        serde_json::to_value(&ports[2]).expect("serialises"),
+        serde_json::json!({
+            "id": range.id,
+            "name": "range",
+            "protocol": "tcp",
+            "listen_address": "0.0.0.0",
+            "port_first": 20_000,
+            "port_last": 20_009,
+        }),
+        "the shape `openapi.yaml` documents as `StreamPortsEntry`"
+    );
+    assert_eq!(
+        super::stream_ports(&node_row("edge-1", NodeStatus::Active), &streams),
+        ports,
+        "the same list once active"
+    );
+    assert!(super::stream_ports(&node_row("edge-1", NodeStatus::Revoked), &streams).is_empty());
+    assert_eq!(
+        super::stream_ports(&node_row("edge-3", NodeStatus::Pending), &streams).len(),
+        2,
+        "a node no selector names still opens every fleet-wide port"
+    );
+}
+
+fn report(bindings: Vec<lorica_cluster::StreamBindingReport>) -> lorica_cluster::StreamPlaneReport {
+    lorica_cluster::StreamPlaneReport {
+        fd_limit: 65_536,
+        worker_count: 4,
+        listen_sockets_used: 3,
+        worker_fds_committed: 3,
+        supervisor_fds_committed: 5,
+        bound_count: 1,
+        bindings,
+        truncated: false,
+    }
+}
+
+fn failed_binding(stream_id: &str, kind: &str) -> lorica_cluster::StreamBindingReport {
+    lorica_cluster::StreamBindingReport {
+        stream_id: stream_id.to_string(),
+        state: lorica_cluster::StreamBindingState::Failed as i32,
+        kind: kind.to_string(),
+        os_error: "Address already in use (os error 98)".to_string(),
+        port: 6000,
+        failed_since_ms: 1_763_100_000_000,
+    }
+}
+
+#[test]
+fn the_fleet_view_renders_a_nodes_bindings_and_withholds_its_figures_from_viewers() {
+    let pg = stream("pg", 5432, &[]);
+    let dns = stream("dns", 6000, &[]);
+    let targeted = super::stream_ports(
+        &node_row("edge-1", NodeStatus::Active),
+        &[pg.clone(), dns.clone()],
+    );
+    let reported = report(vec![failed_binding(&dns.id, "address_in_use")]);
+
+    let operator = super::stream_plane_view(&reported, &targeted, false, Role::Operator);
+    assert_eq!(
+        serde_json::to_value(&operator).expect("serialises"),
+        serde_json::json!({
+            "bound_count": 1,
+            "listen_sockets_used": 3,
+            "bindings": [{
+                "stream_id": dns.id,
+                "state": "failed",
+                "kind": "address_in_use",
+                "os_error": "Address already in use (os error 98)",
+                "port": 6000,
+                "since": chrono::DateTime::<Utc>::from_timestamp_millis(1_763_100_000_000)
+                    .expect("a time"),
+            }],
+            "truncated": false,
+            "fd_limit": 65_536,
+            "worker_count": 4,
+        }),
+        "pg is not listed and the node is in sync: bound"
+    );
+
+    let viewer = super::stream_plane_view(&reported, &targeted, false, Role::Viewer);
+    let viewer = serde_json::to_value(&viewer).expect("serialises");
+    assert!(viewer.get("fd_limit").is_none(), "{viewer}");
+    assert!(viewer.get("worker_count").is_none(), "{viewer}");
+    assert_eq!(
+        viewer["bindings"][0]["state"], "failed",
+        "bind states are not withheld"
+    );
+}
+
+#[test]
+fn under_drift_a_targeted_stream_the_node_does_not_list_is_unknown() {
+    let pg = stream("pg", 5432, &[]);
+    let dns = stream("dns", 6000, &[]);
+    let targeted = super::stream_ports(
+        &node_row("edge-1", NodeStatus::Active),
+        &[pg.clone(), dns.clone()],
+    );
+    let reported = report(vec![failed_binding(&dns.id, "fd_budget")]);
+    let view = super::stream_plane_view(&reported, &targeted, true, Role::Operator);
+    let states: Vec<(&str, BindStateKind)> = view
+        .bindings
+        .iter()
+        .map(|b| (b.stream_id.as_str(), b.state))
+        .collect();
+    assert_eq!(
+        states,
+        vec![
+            (dns.id.as_str(), BindStateKind::Failed),
+            (pg.id.as_str(), BindStateKind::Unknown),
+        ]
+    );
+    assert_eq!(view.bindings[1].kind, None);
+}
+
+#[test]
+fn a_kind_or_a_state_only_a_newer_node_knows_reads_as_other_and_unknown() {
+    let newer = report(vec![
+        failed_binding("a", "quantum_entanglement"),
+        lorica_cluster::StreamBindingReport {
+            stream_id: "b".to_string(),
+            state: 9,
+            ..lorica_cluster::StreamBindingReport::default()
+        },
+    ]);
+    let view = super::stream_plane_view(&newer, &[], false, Role::Operator);
+    assert_eq!(view.bindings[0].kind, Some("other"));
+    assert_eq!(view.bindings[1].state, BindStateKind::Unknown);
+}
+
+#[test]
+fn unknown_entries_past_the_bound_cut_the_list_and_say_so() {
+    let streams: Vec<lorica_config::models::Stream> = (0
+        ..=lorica_cluster::MAX_STREAM_PLANE_BINDINGS)
+        .map(|n| {
+            stream(
+                &format!("s{n}"),
+                1000 + u16::try_from(n).expect("port"),
+                &[],
+            )
+        })
+        .collect();
+    let targeted = super::stream_ports(&node_row("edge-1", NodeStatus::Active), &streams);
+    let view = super::stream_plane_view(&report(vec![]), &targeted, true, Role::Operator);
+    assert_eq!(
+        view.bindings.len(),
+        lorica_cluster::MAX_STREAM_PLANE_BINDINGS
+    );
+    assert!(view.truncated);
+}
+
+/// Story 12.2 AC #9: a node that matches a stream's selector at
+/// enrollment starts binding it at activation, and the control plane's
+/// own chain records which ports that approval opened.
+#[tokio::test(flavor = "current_thread")]
+async fn an_activation_records_the_stream_ports_the_node_starts_binding() {
+    let fixture = Fixture::new().await;
+    fixture.seed("n0", NodeStatus::Pending).await;
+    let selected = stream("pg", 5432, &["n0"]);
+    let fleet_wide = stream("dns", 53, &[]);
+    let elsewhere = stream("smtp", 2525, &["n1"]);
+    {
+        let store = fixture.state.store.lock().await;
+        for s in [&selected, &fleet_wide, &elsewhere] {
+            store.create_stream(s).expect("test setup: stream");
+        }
+    }
+
+    let response = super::activate_node(
+        crate::audit::ClientConnectInfo(None),
+        http::HeaderMap::new(),
+        Extension(fixture.state.clone()),
+        Extension(super_admin()),
+        Path("n0".to_string()),
+    )
+    .await
+    .expect("activated");
+    let body = crate::tests::body_json(axum::response::IntoResponse::into_response(response)).await;
+    let ports: Vec<&str> = body["data"]["stream_ports"]
+        .as_array()
+        .expect("stream_ports")
+        .iter()
+        .map(|p| p["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(ports, vec!["dns", "pg"], "by name, as the store lists them");
+
+    eventually_audited(&fixture, "cluster.node.activate").await;
+    let log_store = fixture.state.log_store.clone().expect("log store");
+    let (rows, _) = log_store
+        .query_audit(&crate::audit::AuditQuery {
+            action_prefix: Some("cluster.node.activate".to_string()),
+            limit: 10,
+            ..Default::default()
+        })
+        .expect("audit query");
+    let row = rows.first().expect("the activation row");
+    let entry = |s: &lorica_config::models::Stream| {
+        serde_json::json!({
+            "id": s.id,
+            "name": s.name,
+            "protocol": "tcp",
+            "listen_address": "0.0.0.0",
+            "port_first": s.port_first,
+            "port_last": s.port_last,
+        })
+    };
+    let expected = serde_json::json!({
+        "status": "active",
+        "name": "n0",
+        "stream_ports": [entry(&fleet_wide), entry(&selected)],
+    });
+    assert_eq!(
+        row.after_payload_hash,
+        crate::audit::hash_payload(Some(&expected)),
+        "the row's hashed payload names every port the activation opened"
+    );
 }

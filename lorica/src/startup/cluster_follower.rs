@@ -88,6 +88,15 @@ const KEY_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 /// faster than it is sent is work nobody sees.
 const RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
 
+/// How often the follower recomputes what its streams commit against its
+/// fd budget for the heartbeat (Story 12.2 D-i).
+///
+/// The heartbeat interval, as for the gauges. The figures move only with
+/// a configuration change, and the control plane checks a stream write
+/// against the limit and worker count, which never move at runtime; the
+/// bind states are read fresh at every beat.
+const STREAM_USAGE_INTERVAL: Duration = Duration::from_secs(15);
+
 /// How this process reaches its data-plane ban map (Story 9.6 AC #10).
 ///
 /// Two shapes because the two process modes genuinely differ, and both
@@ -185,6 +194,10 @@ pub(crate) struct FollowerOptions {
     /// reports in its heartbeat so the control plane can refuse a
     /// stream that would collide with them (Story 12.1, D-4).
     pub reserved_ports: crate::cli::ReservedPorts,
+    /// This process's stream plane, which the follower reports in its
+    /// heartbeat so the control plane shows its bind states and checks
+    /// stream writes against its fd budget (Story 12.2 D-i).
+    pub stream_plane: lorica_api::stream_budget::StreamPlaneState,
 }
 
 /// Live handles for a running follower.
@@ -316,6 +329,16 @@ struct ReplicaHandler {
     /// (Story 12.1, D-4). Fixed for the life of the process: a listener
     /// moves only with a restart.
     reserved_ports: lorica_cluster::ReservedPortsReport,
+    /// This process's stream plane: its registry is read at every
+    /// heartbeat, so a bind state reaches the control plane one
+    /// interval after it changes (Story 12.2 D-i).
+    stream_plane: lorica_api::stream_budget::StreamPlaneState,
+    /// What the streams this node binds commit against its fd budget,
+    /// published by a background task for the same reason as `reading`:
+    /// it needs the store, and the heartbeat's task must not wait on it.
+    /// `None` until the first computation lands, and the heartbeat then
+    /// carries no report.
+    stream_usage: StdMutex<Option<lorica_stream::BudgetUsage>>,
 }
 
 impl ReplicaHandler {
@@ -347,6 +370,30 @@ impl ReplicaHandler {
     /// Publish a fresh resource reading for the next heartbeat.
     fn publish_reading(&self, reading: lorica_cluster::NodeResources) {
         *self.reading.lock().unwrap_or_else(|p| p.into_inner()) = Some(reading);
+    }
+
+    /// Recompute what this node's streams commit against its fd budget
+    /// and publish it for the heartbeat (Story 12.2 D-i). A store that
+    /// cannot be read keeps the previous figures: the bind states the
+    /// heartbeat carries come from the registry either way.
+    async fn publish_stream_usage(&self) {
+        let streams = {
+            let store = self.store.lock().await;
+            store.list_streams()
+        };
+        match streams {
+            Ok(streams) => {
+                let usage = lorica_api::stream_budget::committed(
+                    &self.stream_plane,
+                    lorica_config::models::NodeRole::Follower {
+                        node_name: &self.node_name,
+                    },
+                    &streams,
+                );
+                *self.stream_usage.lock().unwrap_or_else(|p| p.into_inner()) = Some(usage);
+            }
+            Err(e) => warn!(error = %e, "follower: streams unreadable; fd budget figures kept"),
+        }
     }
 
     /// Whether an operator's break-glass window is open right now.
@@ -834,6 +881,14 @@ impl FollowerHandler for ReplicaHandler {
         Some(self.reserved_ports)
     }
 
+    fn stream_plane(&self) -> Option<lorica_cluster::StreamPlaneReport> {
+        let usage = (*self.stream_usage.lock().unwrap_or_else(|p| p.into_inner()))?;
+        Some(lorica_api::stream_budget::heartbeat_report(
+            &self.stream_plane,
+            usage,
+        ))
+    }
+
     fn on_prepare(&self, payload: ConfigPayload) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
             let generation = payload.generation;
@@ -1111,6 +1166,8 @@ pub(crate) async fn spawn_follower(
         reading: StdMutex::new(None),
         log_store: opts.log_store,
         reserved_ports: reserved_ports_report(&opts.reserved_ports),
+        stream_plane: opts.stream_plane,
+        stream_usage: StdMutex::new(None),
     });
 
     let mut config = DialerConfig::new(
@@ -1195,6 +1252,18 @@ pub(crate) async fn spawn_follower(
                     return;
                 }
             }
+        }
+    });
+
+    // Stream plane figures (Story 12.2 D-i). Off the heartbeat's task
+    // because they need the store; the bind states the heartbeat carries
+    // are read from the registry at every beat and do not wait on this.
+    let usage_replica = Arc::clone(&replica);
+    let stream_usage_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(STREAM_USAGE_INTERVAL);
+        loop {
+            ticker.tick().await;
+            usage_replica.publish_stream_usage().await;
         }
     });
 
@@ -1311,7 +1380,13 @@ pub(crate) async fn spawn_follower(
     Ok(Some(FollowerPlane {
         runtime,
         dialer,
-        tasks: vec![sampler_task, leave_task, renewal_task, key_reconciler],
+        tasks: vec![
+            sampler_task,
+            stream_usage_task,
+            leave_task,
+            renewal_task,
+            key_reconciler,
+        ],
         extra: StdMutex::new(Vec::new()),
     }))
 }

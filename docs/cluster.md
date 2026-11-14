@@ -422,6 +422,36 @@ WARN per session naming the node; the session stays up and the node
 counts as not reported until a valid report arrives. The field is not
 in the node's API view.
 
+It also carries the follower's stream plane (`StreamPlaneReport`, tag
+7): its fd limit and worker count, what its streams commit against its
+fd budget, how many bindings it holds bound, and every binding that is
+not bound (`pending`, or `failed` with its kind, OS error, port and
+since), failures first, at most 256 with `truncated` past that. Bound
+bindings are not listed, so the report does not grow with the stream
+count. Unlike the reserved ports this is session state, like the
+gauges: a bind state from before a reconnect would describe a process
+that may no longer run. The bind states are read from the node's
+registry at every beat; the committed totals need the store and are
+recomputed off the heartbeat's task on the same interval. A malformed
+report (a binding over its bounds, a control character in an OS error,
+a port above 65535) is dropped whole with one WARN per session; the
+session stays up and the node shows as not reported.
+
+The control plane uses it twice. The cluster node view gains
+`stream_plane` (Operator and above also see the fd limit and worker
+count) and `stream_ports`, every enabled stream the node binds once
+active, fleet-wide ones included: a targeted stream the node does not
+list is bound while the node is in sync, and `unknown` while it drifts
+or when its list was cut. On a pending node, `stream_ports` is the
+enrollment preview: the ports approving it opens, and the activation's
+`cluster.node.activate` row records them. And a stream write (create,
+update, config import and its preview) is checked against the fd budget
+of each targeted node with the figures its open session reported;
+`GET /api/v1/streams/budget` lists those nodes after the control
+plane's own. A targeted node with no report is not checked at the API:
+the write names it in `warnings`, and the node refuses the stream at
+bind with `fd_budget`.
+
 Five kinds of payload cross the plane from a follower, and the rule
 above sorts them. Written out so the next payload lands in a class
 rather than as an exception:
@@ -1202,7 +1232,7 @@ identity, role and source address where there is an operator, and a
 |---|---|---|
 | Join-token mint, revoke | `cluster.token.mint`, `.revoke` | control plane |
 | Enrolment, with its certificate | `cluster.node.enroll` | control plane |
-| Activation | `cluster.node.activate` | control plane |
+| Activation, with the stream ports it opens | `cluster.node.activate` | control plane |
 | Certificate renewal | `cluster.node.renew` | control plane |
 | Revocation | `cluster.node.revoke` | control plane |
 | Leaving the fleet | `cluster.node.leave` | both |
@@ -1211,6 +1241,7 @@ identity, role and source address where there is an operator, and a
 | Configuration apply | `cluster.config.apply` | follower |
 | Refused identity, protocol violation | `cluster.identity.refused`, `cluster.protocol.violation` | control plane |
 | A follower's audit chain cut by the per-node ceiling | `cluster.audit.cap_cut` | control plane |
+| A stream bound, released, or failing to bind | `stream.bind`, `stream.release`, `stream.bind_failed` | the node that binds it |
 
 `cluster.config.apply` records BOTH outcomes. A refusal is the more
 interesting one: it is the case where a node is knowingly serving
@@ -1219,6 +1250,13 @@ recorded only successful applies would show a converged fleet on a node
 that never converged. Because it is the follower's own row, it fans
 back up on the next drain, which is what links an operator's single
 record of a fleet-wide mutation to each node's outcome.
+
+The `stream.*` rows are written by each node's stream plane (actor
+`stream-plane`) and fan in the same way, so every bind and release is in
+the fleet's trail per node. A node that matches a stream's selector at
+enrollment starts binding it when it is activated: the control plane's
+`cluster.node.activate` row lists the streams it will bind, and the
+node's own `stream.bind` rows follow on its next drain.
 
 ## Fleet Metrics
 

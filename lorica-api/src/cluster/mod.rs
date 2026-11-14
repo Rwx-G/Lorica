@@ -13,6 +13,7 @@ pub mod boundary;
 mod tests;
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,14 +22,22 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
-use lorica_cluster::{leaf_spki_sha256, token, ClusterRequest, ControlPlane, LiveSessionSnapshot};
-use lorica_config::models::{ClusterNode, JoinToken, NodeStatus, Role, TokenState};
+use lorica_cluster::{
+    leaf_spki_sha256, token, ClusterRequest, ControlPlane, LiveSessionSnapshot, StreamPlaneReport,
+    MAX_STREAM_PLANE_BINDINGS,
+};
+use lorica_config::models::{
+    binds_here, ClusterNode, JoinToken, NodeRole, NodeStatus, Role, Stream, StreamProtocol,
+    TokenState,
+};
+use lorica_stream::{BindFailureKind, BindStateKind};
 use serde::{Deserialize, Serialize};
 
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
 use crate::server::AppState;
+use crate::stream_budget::{listed_state, ReportedBindings};
 use lorica_fleet::telemetry_store::{FleetQuery, DEFAULT_PAGE, MAX_PAGE};
 
 pub use lorica_fleet::{ClusterRuntime, ControlPlaneRuntime, FollowerRuntime};
@@ -348,6 +357,200 @@ impl From<&lorica_cluster::NodeResources> for NodeResourcesResponse {
     }
 }
 
+/// A stream a node binds once it is active (Story 12.2 D-i): the
+/// enrollment preview's `stream_ports`, and the stream list the fleet
+/// view's bind states are read against.
+///
+/// `port_first` and `port_last`, as the stream resource carries them,
+/// rather than a list of ports: a range is up to 1,024 ports and its
+/// two ends say all of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StreamPortsEntry {
+    /// The stream's id.
+    pub id: String,
+    /// The stream's name.
+    pub name: String,
+    /// `tcp` or `udp`.
+    pub protocol: StreamProtocol,
+    /// The address the node will listen on.
+    pub listen_address: IpAddr,
+    /// First port of the range.
+    pub port_first: u16,
+    /// Last port of the range, `port_first` for a single port.
+    pub port_last: u16,
+}
+
+impl StreamPortsEntry {
+    fn of(stream: &Stream) -> Self {
+        StreamPortsEntry {
+            id: stream.id.clone(),
+            name: stream.name.clone(),
+            protocol: stream.protocol,
+            listen_address: stream.listen_address,
+            port_first: stream.port_first,
+            port_last: stream.port_last,
+        }
+    }
+}
+
+/// Every stream `node` binds once active: the enabled streams its
+/// selector names and the fleet-wide ones, by `binds_here`, the rule
+/// the node's own stream plane binds by. Empty for a revoked node,
+/// which binds nothing the fleet gives it.
+///
+/// Fleet-wide streams are listed, unlike in `selected_for_hostnames`:
+/// a port a node opens is a perimeter change whether one node or all of
+/// them open it, and that is what an operator approving a node decides.
+pub(crate) fn stream_ports(node: &ClusterNode, streams: &[Stream]) -> Vec<StreamPortsEntry> {
+    if node.status == NodeStatus::Revoked {
+        return Vec::new();
+    }
+    let role = NodeRole::Follower {
+        node_name: &node.name,
+    };
+    streams
+        .iter()
+        .filter(|s| binds_here(s, role))
+        .map(StreamPortsEntry::of)
+        .collect()
+}
+
+/// One binding that is not bound on a node, as the fleet view shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NodeStreamBinding {
+    /// The stream's id.
+    pub stream_id: String,
+    /// `pending` or `failed` as the node reported it, `unknown` for a
+    /// stream the node did not list while it drifts, or a state only a
+    /// newer node knows.
+    pub state: BindStateKind,
+    /// `failed` only: why. A kind this build does not know is `other`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
+    /// `failed` only: the OS error's text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os_error: Option<String>,
+    /// `failed` only: the port that failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// `failed` only: when the binding entered the failed state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+}
+
+impl NodeStreamBinding {
+    fn unknown(stream_id: &str) -> Self {
+        NodeStreamBinding {
+            stream_id: stream_id.to_string(),
+            state: BindStateKind::Unknown,
+            kind: None,
+            os_error: None,
+            port: None,
+            since: None,
+        }
+    }
+
+    fn listed(binding: &lorica_cluster::StreamBindingReport) -> Self {
+        let state = listed_state(binding);
+        if state != BindStateKind::Failed {
+            return NodeStreamBinding {
+                state,
+                ..Self::unknown(&binding.stream_id)
+            };
+        }
+        NodeStreamBinding {
+            stream_id: binding.stream_id.clone(),
+            state,
+            kind: Some(
+                BindFailureKind::from_name(&binding.kind)
+                    .unwrap_or(BindFailureKind::Other)
+                    .as_str(),
+            ),
+            os_error: Some(binding.os_error.clone()),
+            port: u16::try_from(binding.port).ok().filter(|p| *p != 0),
+            since: i64::try_from(binding.failed_since_ms)
+                .ok()
+                .and_then(DateTime::<Utc>::from_timestamp_millis),
+        }
+    }
+}
+
+/// A node's stream plane as the fleet view shows it (Story 12.2 D-i,
+/// Story 12.10 AC #4): with `stream_ports`, each stream's bind state on
+/// the node. A stream of `stream_ports` absent from `bindings` is bound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NodeStreamPlane {
+    /// Bindings the node holds bound.
+    pub bound_count: u32,
+    /// The node's stream listening sockets, one per port.
+    pub listen_sockets_used: u64,
+    /// Every binding that is not bound, at most
+    /// [`MAX_STREAM_PLANE_BINDINGS`]: what the node reported, and while
+    /// the node drifts, `unknown` for each stream it should bind and
+    /// did not list.
+    pub bindings: Vec<NodeStreamBinding>,
+    /// More bindings were not bound than `bindings` holds.
+    pub truncated: bool,
+    /// The node's fd limit; withheld from Viewers, like `resources`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fd_limit: Option<u64>,
+    /// Workers on the node; withheld from Viewers, like `resources`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_count: Option<u32>,
+}
+
+/// The fleet view of a node's `report`, against the streams this
+/// control plane expects it to bind (`targeted`, its `stream_ports`),
+/// `drifted` its drift verdict, as `role` may see it.
+///
+/// Under drift a targeted stream the node did not list cannot be
+/// vouched for: the node may not hold it yet. It is listed `unknown`
+/// rather than read as bound.
+pub(crate) fn stream_plane_view(
+    report: &StreamPlaneReport,
+    targeted: &[StreamPortsEntry],
+    drifted: bool,
+    role: Role,
+) -> NodeStreamPlane {
+    let reported = ReportedBindings::new(report, drifted);
+    let mut bindings: Vec<NodeStreamBinding> = report
+        .bindings
+        .iter()
+        .map(NodeStreamBinding::listed)
+        .collect();
+    if drifted {
+        bindings.extend(
+            targeted
+                .iter()
+                .filter(|s| reported.listed(&s.id).is_none())
+                .map(|s| NodeStreamBinding::unknown(&s.id)),
+        );
+    }
+    let truncated = report.truncated || bindings.len() > MAX_STREAM_PLANE_BINDINGS;
+    bindings.truncate(MAX_STREAM_PLANE_BINDINGS);
+    let budget = role >= Role::Operator;
+    NodeStreamPlane {
+        bound_count: report.bound_count,
+        listen_sockets_used: report.listen_sockets_used,
+        bindings,
+        truncated,
+        fd_limit: budget.then_some(report.fd_limit),
+        worker_count: budget.then_some(report.worker_count),
+    }
+}
+
+/// The stored streams, for the fleet view and the enrollment preview.
+///
+/// A read failure degrades both to "no stream" rather than failing the
+/// roster, as `selected_hostnames` does, and says so in the journal,
+/// since an empty `stream_ports` reads as a node that opens no port.
+fn streams_for_review(store: &lorica_config::ConfigStore) -> Vec<Stream> {
+    store.list_streams().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "cluster roster: streams unreadable; stream_ports shown empty");
+        Vec::new()
+    })
+}
+
 /// JSON shape of a registered node: the registry row plus the live
 /// session facts.
 #[derive(Debug, Serialize)]
@@ -412,6 +615,15 @@ pub struct NodeResponse {
     /// house convention that carries the roster's other columns does
     /// not carry it by default.
     pub resources: Option<NodeResourcesResponse>,
+    /// The node's stream plane as its heartbeat last reported it, or
+    /// `null` from a node that has sent no report on its current
+    /// session (Story 12.2 D-i). Session state, like `resources`; its
+    /// fd figures are withheld from a Viewer for the same reason.
+    pub stream_plane: Option<NodeStreamPlane>,
+    /// Every stream this node binds once active (Story 12.2 D-i, AC #9):
+    /// the ports approving a pending node opens on it, and the streams
+    /// the fleet view reads `stream_plane` against.
+    pub stream_ports: Vec<StreamPortsEntry>,
 }
 
 fn node_responses(
@@ -419,6 +631,7 @@ fn node_responses(
     nodes: Vec<ClusterNode>,
     selected: &HashMap<String, Vec<String>>,
     certificates: &BTreeMap<String, Vec<String>>,
+    streams: &[Stream],
     role: Role,
 ) -> Vec<NodeResponse> {
     let live: HashMap<String, LiveSessionSnapshot> = control
@@ -438,8 +651,13 @@ fn node_responses(
                 &node.applied_config_hash,
                 session.map(|s| &s.applied),
             );
+            let stream_ports = stream_ports(&node, streams);
             NodeResponse {
                 connected: session.is_some(),
+                stream_plane: session
+                    .and_then(|s| s.stream_plane.as_ref())
+                    .map(|report| stream_plane_view(report, &stream_ports, drift.drifted, role)),
+                stream_ports,
                 drift,
                 session_peer: session.map(|s| s.peer_addr.to_string()),
                 session_last_seen_unix: session.map(|s| s.last_seen_unix),
@@ -489,7 +707,7 @@ fn selected_hostnames(
 /// `Conflict` off a control plane, or the store's error.
 pub(crate) async fn roster(state: &AppState, role: Role) -> Result<Vec<NodeResponse>, ApiError> {
     let control = control_plane(state)?;
-    let (nodes, selected, certificates) = db_blocking(&state.store, |store| {
+    let (nodes, selected, certificates, streams) = db_blocking(&state.store, |store| {
         let nodes = store
             .list_cluster_nodes()
             .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -501,7 +719,7 @@ pub(crate) async fn roster(state: &AppState, role: Role) -> Result<Vec<NodeRespo
         // whose advisory column is short. The list is advisory; the
         // push path resolves entitlement itself.
         let certificates = store.certificates_by_node().unwrap_or_default();
-        Ok::<_, ApiError>((nodes, selected, certificates))
+        Ok::<_, ApiError>((nodes, selected, certificates, streams_for_review(store)))
     })
     .await?;
     Ok(node_responses(
@@ -509,6 +727,7 @@ pub(crate) async fn roster(state: &AppState, role: Role) -> Result<Vec<NodeRespo
         nodes,
         &selected,
         &certificates,
+        &streams,
         role,
     ))
 }
@@ -526,17 +745,24 @@ pub(crate) async fn one_node(
     id: String,
 ) -> Result<NodeResponse, ApiError> {
     let control = control_plane(state)?;
-    let (node, selected, certificates) = db_blocking(&state.store, move |store| {
+    let (node, selected, certificates, streams) = db_blocking(&state.store, move |store| {
         let node = store
             .get_cluster_node(&id)
             .map_err(|e| ApiError::Internal(e.to_string()))?
             .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
         let selected = selected_hostnames(store, std::slice::from_ref(&node));
         let certificates = store.certificates_by_node().unwrap_or_default();
-        Ok::<_, ApiError>((node, selected, certificates))
+        Ok::<_, ApiError>((node, selected, certificates, streams_for_review(store)))
     })
     .await?;
-    let mut responses = node_responses(&control, vec![node], &selected, &certificates, role);
+    let mut responses = node_responses(
+        &control,
+        vec![node],
+        &selected,
+        &certificates,
+        &streams,
+        role,
+    );
     Ok(responses.remove(0))
 }
 
@@ -575,10 +801,10 @@ pub async fn activate_node(
     // row accounts for.
     const ACTION: &str = "cluster.node.activate";
     let owed = owed_audit(&state, &audit_ctx, ACTION, ("cluster_node", id.clone()));
-    let (node, selected, certificates) =
+    let (node, selected, certificates, streams) =
         boundary::detached_audited("activation", owed, async move {
             let node_id = id.clone();
-            let (node, selected, certificates) = db_blocking(&state.store, move |store| {
+            let (node, selected, certificates, streams) = db_blocking(&state.store, move |store| {
                 let before = store
                     .get_cluster_node(&node_id)
                     .map_err(|e| ApiError::Internal(e.to_string()))?
@@ -598,7 +824,7 @@ pub async fn activate_node(
                     .ok_or_else(|| ApiError::NotFound("node not found".into()))?;
                 let selected = selected_hostnames(store, std::slice::from_ref(&node));
                 let certificates = store.certificates_by_node().unwrap_or_default();
-                Ok::<_, ApiError>((node, selected, certificates))
+                Ok::<_, ApiError>((node, selected, certificates, streams_for_review(store)))
             })
             .await?;
             // Awaited: the response says `active`, and a pending session must
@@ -606,22 +832,44 @@ pub async fn activate_node(
             let refreshed = runtime.refresh(&state.store).await;
             // Recorded before a refresh failure is surfaced: the row is
             // active either way, and the next refresh admits the node.
+            //
+            // The streams the node starts binding ride the row (Story
+            // 12.2 AC #9): activation is when a node that matches a
+            // stream's selector at enrollment starts receiving it, so the
+            // control plane's own chain says which ports the operator
+            // approved, before the node's `stream.bind` rows fan in.
             crate::audit::record(
                 &state,
                 &audit_ctx,
                 ACTION,
                 ("cluster_node", &id),
                 None,
-                Some(&serde_json::json!({ "status": "active", "name": node.name })),
+                Some(&activation_payload(&node, &streams)),
             )
             .await;
             refreshed?;
-            Ok::<_, ApiError>((node, selected, certificates))
+            Ok::<_, ApiError>((node, selected, certificates, streams))
         })
         .await??;
-    let mut responses =
-        node_responses(&control, vec![node], &selected, &certificates, session.role);
+    let mut responses = node_responses(
+        &control,
+        vec![node],
+        &selected,
+        &certificates,
+        &streams,
+        session.role,
+    );
     Ok(json_data(responses.remove(0)))
+}
+
+/// The `after` of a `cluster.node.activate` row: the new status, the
+/// node's name, and the streams it binds from now on.
+fn activation_payload(node: &ClusterNode, streams: &[Stream]) -> serde_json::Value {
+    serde_json::json!({
+        "status": "active",
+        "name": node.name,
+        "stream_ports": stream_ports(node, streams),
+    })
 }
 
 /// What `DELETE /api/v1/cluster/nodes/{id}` answers.
@@ -834,12 +1082,14 @@ pub async fn get_status(
             // column, so the status summary skips the store passes the
             // roster does.
             // `FleetEntry` carries no resource column either, so the
-            // role passed here decides nothing.
+            // role passed here decides nothing, and no stream column, so
+            // the streams are not read.
             let fleet = node_responses(
                 control,
                 nodes,
                 &HashMap::new(),
                 &BTreeMap::new(),
+                &[],
                 Role::Viewer,
             )
             .into_iter()
