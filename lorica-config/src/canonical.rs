@@ -116,6 +116,14 @@ fn default_downstream_idle_timeout_s() -> u32 {
     crate::models::DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S
 }
 
+fn default_worker_drain_timeout_s() -> u32 {
+    GlobalSettings::DEFAULT_WORKER_DRAIN_TIMEOUT_S
+}
+
+fn default_stream_listen_socket_cap() -> u32 {
+    GlobalSettings::DEFAULT_STREAM_LISTEN_SOCKET_CAP
+}
+
 /// One WAF custom rule in canonical form. The store keeps these as
 /// bare tuples; the blob needs a named, strict shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -274,7 +282,7 @@ pub struct CanonicalGlobalSettings {
     pub header_timeout_s: u32,
     /// Downstream idle timeout (s), HTTP/1.1 keepalive and HTTP/2.
     ///
-    /// The one field of this struct with a serde default, and on
+    /// The first field of this struct with a serde default, and on
     /// purpose: it joined the blob in 1.9.0 under format version 2,
     /// which 1.8.0 already shipped. Followers are upgraded first, so a
     /// 1.9.0 follower decodes a 1.8.0 control plane's blob, which lacks
@@ -329,6 +337,22 @@ pub struct CanonicalGlobalSettings {
     pub mirror_max_concurrent_per_route: u32,
     /// Global mirror concurrency cap.
     pub mirror_max_concurrent_global: u32,
+    /// How long a configuration change or a stop drains established
+    /// stream connections and in-flight requests (s), Story 12.2.
+    ///
+    /// Replicated because it decides when a fleet-wide edit cuts
+    /// connections, which must not differ between the nodes serving
+    /// it. The serde default is not a version argument (the field joined
+    /// under format version 3, the one version step of 1.11.0, and no
+    /// released blob lacks it): it keeps a 1.11.0 blob encoded before
+    /// the field existed decodable to the shipped default rather than
+    /// to 0, which the API refuses.
+    #[serde(default = "default_worker_drain_timeout_s")]
+    pub worker_drain_timeout_s: u32,
+    /// Per-node cap on stream listening sockets, Story 12.2. Replicated
+    /// and defaulted on the same reasoning as `worker_drain_timeout_s`.
+    #[serde(default = "default_stream_listen_socket_cap")]
+    pub stream_listen_socket_cap: u32,
 }
 
 impl From<&GlobalSettings> for CanonicalGlobalSettings {
@@ -370,6 +394,8 @@ impl From<&GlobalSettings> for CanonicalGlobalSettings {
             bot_stash_per_prefix_max: s.bot_stash_per_prefix_max,
             mirror_max_concurrent_per_route: s.mirror_max_concurrent_per_route,
             mirror_max_concurrent_global: s.mirror_max_concurrent_global,
+            worker_drain_timeout_s: s.worker_drain_timeout_s,
+            stream_listen_socket_cap: s.stream_listen_socket_cap,
         }
     }
 }
@@ -422,6 +448,8 @@ impl CanonicalGlobalSettings {
         settings.bot_stash_per_prefix_max = self.bot_stash_per_prefix_max;
         settings.mirror_max_concurrent_per_route = self.mirror_max_concurrent_per_route;
         settings.mirror_max_concurrent_global = self.mirror_max_concurrent_global;
+        settings.worker_drain_timeout_s = self.worker_drain_timeout_s;
+        settings.stream_listen_socket_cap = self.stream_listen_socket_cap;
         before != *self
     }
 
@@ -1546,6 +1574,52 @@ mod tests {
     }
 
     #[test]
+    fn a_blob_without_the_stream_plane_settings_decodes_to_their_defaults() {
+        const STREAM_PLANE_SETTINGS: [&str; 2] =
+            ["worker_drain_timeout_s", "stream_listen_socket_cap"];
+        let mut cfg = fleet_config();
+        cfg.global.worker_drain_timeout_s = 120;
+        cfg.global.stream_listen_socket_cap = 64;
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
+        let global = root["global"]
+            .as_object_mut()
+            .expect("test setup: global is an object");
+        for field in STREAM_PLANE_SETTINGS {
+            assert!(global.remove(field).is_some(), "{field} is on the wire");
+        }
+        let older = serde_json::to_vec(&root).expect("test setup: re-encode");
+        let decoded = decode_canonical(&older).expect("a blob without them still decodes");
+        assert_eq!(
+            decoded.global.worker_drain_timeout_s,
+            GlobalSettings::DEFAULT_WORKER_DRAIN_TIMEOUT_S
+        );
+        assert_eq!(
+            decoded.global.stream_listen_socket_cap,
+            GlobalSettings::DEFAULT_STREAM_LISTEN_SOCKET_CAP
+        );
+    }
+
+    #[test]
+    fn the_stream_plane_settings_replicate_through_apply_to() {
+        let source = GlobalSettings {
+            worker_drain_timeout_s: 600,
+            stream_listen_socket_cap: 256,
+            ..GlobalSettings::default()
+        };
+        let canonical = CanonicalGlobalSettings::from(&source);
+        let mut target = GlobalSettings::default();
+        assert!(canonical.apply_to(&mut target), "both fields changed");
+        assert_eq!(target.worker_drain_timeout_s, 600);
+        assert_eq!(target.stream_listen_socket_cap, 256);
+        assert!(
+            !canonical.apply_to(&mut target),
+            "a second apply is no change"
+        );
+    }
+
+    #[test]
     fn the_canonical_format_version_is_three() {
         let bytes = encode_canonical(&fleet_config()).expect("test setup: encode");
         let peek: serde_json::Value =
@@ -1613,8 +1687,18 @@ mod tests {
     /// `a_1_9_blob_...`, `a_1_10_2_blob_...`) now pin only those
     /// defaults: the blobs they are named after are stamped 2 and are
     /// refused by version before any field is read.
+    ///
+    /// Story 12.2 (1.11.0) moved it again inside the same cycle:
+    /// `CanonicalGlobalSettings` gained `worker_drain_timeout_s` and
+    /// `stream_listen_socket_cap`, each with a serde default to its
+    /// shipped value. No further version step: Story 12.1 already moved
+    /// the version to 3 in this unreleased release, no released blob is
+    /// stamped 3, and a 1.10.x peer is refused by version and by schema
+    /// before it could meet the new fields. Pinned by
+    /// `a_blob_without_the_stream_plane_settings_decodes_to_their_defaults`
+    /// and `every_1_11_0_shape_rides_format_version_three`.
     const CANONICAL_SHAPE_DIGEST: &str =
-        "ce8c4972a287cb69b7f355287495fe334ba6f57b85d409ebe8e129c2ddb5b76d";
+        "872748f6bfae8aec4d4e13c79747b66e75ff15d276fb83ed40c354f85a425b0d";
 
     /// Every field name `T` accepts, read from the type itself rather
     /// than from the JSON of some fixture.

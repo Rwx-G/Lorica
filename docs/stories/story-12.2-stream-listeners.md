@@ -753,7 +753,7 @@ Depends on: nothing. Before 12.1.
 Allowlist: `lorica-config/src/canonical.rs`, `lorica-config/src/diff.rs`.
 Depends on: C1; 12.1's canonical Lot (same file).
 
-- [ ] Both settings in `CanonicalGlobalSettings` with `#[serde(default)]`,
+- [x] Both settings in `CanonicalGlobalSettings` with `#[serde(default)]`,
       `CANONICAL_SHAPE_DIGEST` updated, a test decoding a blob without
       them; `diff.rs` reports their changes.
 
@@ -1383,6 +1383,17 @@ the budget view stays Operator and SuperAdmin.
 - `ServerConf` for the proxy service is now built from
   `ServerConf::new()` (`version: 1`) instead of `Default` (`version: 0`),
   the same value the `Server` gets; nothing in the fork reads `version`.
+- Lot C2 done. `CanonicalGlobalSettings` carries
+  `worker_drain_timeout_s` and `stream_listen_socket_cap`, both in
+  `From<&GlobalSettings>` and `apply_to`, each with a serde default to
+  its shipped value (`GlobalSettings::DEFAULT_*`) rather than a bare
+  `#[serde(default)]`, whose 0 is a value the API refuses for both.
+  `CANONICAL_SHAPE_DIGEST` moved; the format version stays at 3, Story
+  12.1's one step for 1.11.0, and the digest comment records why.
+  Pinned by `a_blob_without_the_stream_plane_settings_decodes_to_their_defaults`
+  and `the_stream_plane_settings_replicate_through_apply_to`. The routing
+  test's two lines are C1's, unchanged. `diff.rs` reports both keys in
+  the import preview (`compute_diff_reports_the_stream_plane_settings`).
 
 ## File List
 
@@ -1410,6 +1421,7 @@ the budget view stays Operator and SuperAdmin.
 - `lorica-worker/src/manager.rs` (`shutdown_all(drain)` and the zombie reap)
 - `lorica-worker/src/stream_ctl.rs` (`NackReason::TableUnavailable`, `check_stream_id` public)
 - `lorica-stream/src/runtime.rs`, `lorica-stream/tests/runtime.rs` (the `table_unavailable` nack)
+- `lorica-config/src/canonical.rs` (Lot C2: both settings in `CanonicalGlobalSettings`, the shape digest), `lorica-config/src/diff.rs`
 
 ## Change Log
 
@@ -1421,3 +1433,4 @@ the budget view stays Operator and SuperAdmin.
 | 2026-11-14 | 0.4 | Lot C1 implemented: `worker_drain_timeout_s` and `stream_listen_socket_cap` on `GlobalSettings`, the store and `PUT /api/v1/settings`. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.5 | Lot B implemented: the `lorica-stream` crate (stream runtime, accept and receive loops, connection tracker, engine traits, fd budget, bind state, reconcile diff). D-c amended: the reconcile diff refuses overlapping UDP bindings, which the kernel does not. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.6 | Lot D implemented: the stream plane driver in the supervisor and single-process mode, the stream runtime in each worker, respawn replay, TCP stream listeners across a hot upgrade, the stop path (drain watcher, `EXTEND_TIMEOUT_USEC` keepalive, Pingora's waits from the setting); a stop no longer waits out its bound on zombie workers. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.7 | Lot C2 implemented: `worker_drain_timeout_s` and `stream_listen_socket_cap` replicate through the canonical config inside format version 3, and the import preview reports them. Status InProgress. | Romain G. |

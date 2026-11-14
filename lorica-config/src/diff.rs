@@ -326,6 +326,20 @@ fn diff_settings(current: &GlobalSettings, incoming: &GlobalSettings) -> Setting
             new_value: incoming.downstream_idle_timeout_s.to_string(),
         });
     }
+    if current.worker_drain_timeout_s != incoming.worker_drain_timeout_s {
+        changes.push(SettingChange {
+            key: "worker_drain_timeout_s".to_string(),
+            old_value: current.worker_drain_timeout_s.to_string(),
+            new_value: incoming.worker_drain_timeout_s.to_string(),
+        });
+    }
+    if current.stream_listen_socket_cap != incoming.stream_listen_socket_cap {
+        changes.push(SettingChange {
+            key: "stream_listen_socket_cap".to_string(),
+            old_value: current.stream_listen_socket_cap.to_string(),
+            new_value: incoming.stream_listen_socket_cap.to_string(),
+        });
+    }
     SettingsDiff { changes }
 }
 
@@ -453,6 +467,33 @@ mod tests {
             vec![format!("{} -> b-1", sid("s-kept"))]
         );
         assert!(!diff.is_empty());
+    }
+
+    #[test]
+    fn compute_diff_reports_the_stream_plane_settings() {
+        let store = ConfigStore::open_in_memory().expect("test setup: store");
+        let mut incoming = parse_toml_for_preview(&export_to_toml(&store).expect("export"))
+            .expect("the export parses");
+        assert!(compute_diff(&store, &incoming).expect("diff").is_empty());
+
+        incoming.global_settings.worker_drain_timeout_s = 120;
+        incoming.global_settings.stream_listen_socket_cap = 64;
+        let diff = compute_diff(&store, &incoming).expect("diff");
+        let changed: Vec<(&str, &str, &str)> = diff
+            .global_settings
+            .changes
+            .iter()
+            .map(|c| (c.key.as_str(), c.old_value.as_str(), c.new_value.as_str()))
+            .collect();
+        let drain_default = GlobalSettings::DEFAULT_WORKER_DRAIN_TIMEOUT_S.to_string();
+        let cap_default = GlobalSettings::DEFAULT_STREAM_LISTEN_SOCKET_CAP.to_string();
+        assert_eq!(
+            changed,
+            vec![
+                ("worker_drain_timeout_s", drain_default.as_str(), "120"),
+                ("stream_listen_socket_cap", cap_default.as_str(), "64"),
+            ]
+        );
     }
 
     #[test]
