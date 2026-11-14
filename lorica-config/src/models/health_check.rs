@@ -9,7 +9,7 @@
 //! hot-upgrade rollback reads and writes that column only.
 //! [`HealthCheck::reconcile`] is the one place the two are made to agree.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::backend::Backend;
 
@@ -18,8 +18,13 @@ use super::backend::Backend;
 /// Whether it probes at all is `Backend::health_check_enabled`, and how
 /// often is `Backend::health_check_interval_s`; this type only says
 /// what one probe is.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+///
+/// Every kind refuses a field it does not have, the field-less ones
+/// included: decoding goes through [`HealthCheckWire`], because serde
+/// lets an internally tagged unit variant ignore extra keys whatever
+/// `deny_unknown_fields` says.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HealthCheck {
     /// An HTTP GET of `path` on the backend; a 2xx or 3xx answer is
     /// healthy. HTTP routes only: a stream never speaks HTTP to its
@@ -32,6 +37,26 @@ pub enum HealthCheck {
     /// what every backend without a path was probed by before 1.11.0.
     #[default]
     TcpConnect,
+}
+
+/// The decode shape of [`HealthCheck`]: the same tags and fields, with
+/// every kind a struct variant so `deny_unknown_fields` reaches it.
+/// `{"kind":"tcp_connect","path":"/x"}` is a definition this release
+/// cannot honour (a 1.10.6 rollback could not either), not a TCP connect.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum HealthCheckWire {
+    Http { path: String },
+    TcpConnect {},
+}
+
+impl<'de> Deserialize<'de> for HealthCheck {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match HealthCheckWire::deserialize(deserializer)? {
+            HealthCheckWire::Http { path } => Self::Http { path },
+            HealthCheckWire::TcpConnect {} => Self::TcpConnect,
+        })
+    }
 }
 
 impl HealthCheck {
@@ -145,6 +170,115 @@ mod tests {
             "an unknown field is refused"
         );
         assert!(serde_json::from_str::<HealthCheck>(r#"{"kind":"icmp"}"#).is_err());
+    }
+
+    /// One value of each kind.
+    fn samples() -> Vec<HealthCheck> {
+        vec![http("/healthz"), HealthCheck::TcpConnect]
+    }
+
+    /// Every `kind` tag the type accepts, read from serde's refusal of an
+    /// unknown one rather than typed again here.
+    fn accepted_kinds() -> Vec<String> {
+        const PROBE: &str = "__lorica_kind_probe__";
+        let error = serde_json::from_value::<HealthCheck>(serde_json::json!({ "kind": PROBE }))
+            .expect_err("an unknown kind is refused");
+        // "unknown variant `X`, expected `a` or `b`": every odd-indexed
+        // split on a backtick is a quoted name, the first is the probe.
+        let message = error.to_string();
+        let mut kinds: Vec<String> = message
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        assert_eq!(kinds.first().map(String::as_str), Some(PROBE), "{message}");
+        kinds.remove(0);
+        kinds.sort();
+        kinds
+    }
+
+    #[test]
+    fn the_samples_cover_every_kind() {
+        let mut sampled: Vec<String> = samples()
+            .iter()
+            .map(|check| {
+                serde_json::to_value(check).expect("serialize")["kind"]
+                    .as_str()
+                    .expect("the tag is a string")
+                    .to_string()
+            })
+            .collect();
+        sampled.sort();
+        assert_eq!(sampled, accepted_kinds(), "add a sample for the new kind");
+    }
+
+    #[test]
+    fn every_kind_refuses_an_unknown_field() {
+        for check in samples() {
+            let mut value = serde_json::to_value(&check).expect("serialize");
+            let parsed: HealthCheck =
+                serde_json::from_value(value.clone()).expect("the kind's own shape parses");
+            assert_eq!(parsed, check);
+            value
+                .as_object_mut()
+                .expect("a health check is an object")
+                .insert("timeout_ms".to_string(), serde_json::json!(500));
+            assert!(
+                serde_json::from_value::<HealthCheck>(value.clone()).is_err(),
+                "{value} carries a field its kind does not have and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tcp_connect_carrying_an_http_path_is_refused() {
+        assert!(
+            serde_json::from_str::<HealthCheck>(r#"{"kind":"tcp_connect","path":"/x"}"#).is_err()
+        );
+    }
+
+    /// What a newer release might store, read back by this one: the
+    /// definition it cannot parse reads as absent (a WARN, never
+    /// `Corrupt`), and the legacy path decides, as for a 1.10.6 rollback.
+    #[test]
+    fn a_stored_definition_this_release_refuses_reads_by_the_legacy_path() {
+        let store = crate::store::ConfigStore::open_in_memory().expect("test setup: store");
+        let mut backend = crate::models::sample_stream_backend("b-1", "192.0.2.10:80");
+        backend.set_health_check(http("/ready"));
+        store.create_backend(&backend).expect("test setup: backend");
+        for (stored, path, read_as) in [
+            (
+                r#"{"kind":"tcp_connect","timeout_ms":500}"#,
+                None,
+                HealthCheck::TcpConnect,
+            ),
+            (
+                r#"{"kind":"http","path":"/ready","expect_status":204}"#,
+                Some("/ready"),
+                http("/ready"),
+            ),
+            (
+                r#"{"kind":"udp_probe","payload":"ping"}"#,
+                None,
+                HealthCheck::TcpConnect,
+            ),
+        ] {
+            store
+                .conn
+                .execute(
+                    "UPDATE backends SET health_check_json = ?1, health_check_path = ?2 \
+                     WHERE id = 'b-1'",
+                    rusqlite::params![stored, path],
+                )
+                .expect("test setup: a newer release's row");
+            let read = store
+                .get_backend("b-1")
+                .expect("an unknown definition is not a corrupt row")
+                .expect("the backend is there");
+            assert_eq!(read.health_check, read_as, "stored {stored}");
+            assert_eq!(read.health_check_path.as_deref(), path);
+        }
     }
 
     #[test]
