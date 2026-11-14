@@ -276,8 +276,16 @@ handlers in the same cycle; no release carries the interim (Resolved
 - **One listen address per stream** (12.1). **`[::]` binds dual-stack**
   (`IPV6_V6ONLY` off) and so takes every IPv4 and IPv6 address on that
   port and protocol: it conflicts with any other stream there, which
-  12.1's control-plane rule refuses and the kernel refuses at bind as
-  the backstop (`EADDRINUSE`). **Any other IPv6 literal binds with
+  12.1's control-plane rule refuses. The node-side backstop differs by
+  protocol. For TCP it is the kernel, which refuses the second bind
+  (`EADDRINUSE`). For UDP there is none in the kernel: a same-user
+  `SO_REUSEPORT` socket joins or shadows an existing group on `0.0.0.0`,
+  `127.0.0.1` or `[::]` without error (verified in Lot A), so the
+  reconcile diff (`lorica_stream::reconcile::diff`) refuses any UDP
+  binding that overlaps, by port and `listen_addresses_conflict`, one
+  this node keeps or binds earlier in the same pass, before asking for
+  a bind; the refusal is reported as `address_in_use` so the 10 s retry
+  binds it once the other stream lets go. **Any other IPv6 literal binds with
   `IPV6_V6ONLY` on**, so it never takes IPv4 by accident whatever
   `net.ipv6.bindv6only` says. `0.0.0.0` behaves as the kernel says: it
   conflicts with every IPv4 address on the port. The option is set
@@ -692,27 +700,27 @@ Allowlist: `lorica-stream/**` (new), `Cargo.toml` (workspace members),
 Depends on: A; 12.1's model Lot (`Stream` with `enabled`, the
 end-reason enum with `config_removed` and `node_shutdown`).
 
-- [ ] `state.rs`: `BindState`, `BindFailureKind` re-export, `StreamBindStates`
+- [x] `state.rs`: `BindState`, `BindFailureKind` re-export, `StreamBindStates`
       (the supervisor registry: snapshot for readers, transitions with
       `since`).
-- [ ] `budget.rs`: the D-e arithmetic as pure functions
+- [x] `budget.rs`: the D-e arithmetic as pure functions
       (`FdBudget::from_limit`, `check(desired, workers, cap)` returning
       the violated constraint with its numbers), the generic
       `ceiling x fds_per_unit` input, and the serde view types of the
       budget endpoint.
-- [ ] `reconcile.rs`: pure `diff(desired, bound) -> Actions { detach,
+- [x] `reconcile.rs`: pure `diff(desired, bound) -> Actions { detach,
       bind }` keyed by the bind key of D-d.
-- [ ] `tracker.rs`: registration with snapshot `Arc` and backend id,
+- [x] `tracker.rs`: registration with snapshot `Arc` and backend id,
       `drain_binding`, `drain_where`, `drain_all`, each with a pending
       end reason; deadline close with it; natural end keeps its reason;
       `is_empty()` for the drain watcher.
-- [ ] `handler.rs`: `StreamHandler` (accepted `TcpStream`, peer, snapshot,
+- [x] `handler.rs`: `StreamHandler` (accepted `TcpStream`, peer, snapshot,
       tracker entry) and `DatagramHandler` (datagram, source, socket).
-- [ ] `listener.rs` / `runtime.rs`: `StreamRuntime` on its own thread and
+- [x] `listener.rs` / `runtime.rs`: `StreamRuntime` on its own thread and
       runtime (D-b), applying the four messages, acking each, accept and
       receive loops per socket, stop on `detach` / `quiesce` /
       `GracefulTerminate`, the interim no-engine behaviour of D-b.
-- [ ] Unit and integration tests (Linux): budget arithmetic at the
+- [x] Unit and integration tests (Linux): budget arithmetic at the
       packaged limit, at 4,096 and with W = 64 hitting the supervisor
       constraint, and with a declared `fds_per_unit` of 1, 2 and 3
       (the accountant assumes none); diff: backend-only edit is no
@@ -1149,6 +1157,11 @@ the budget view stays Operator and SuperAdmin.
   `udp_reuseport_groups_of_one_user_are_not_refused_by_the_kernel` pins
   that fact; the `[::]` refusal test covers TCP and, for UDP, a plain
   socket.
+- Lot B, tokio 1.54 deprecates `AsyncFd::new` as unsound for an
+  arbitrary `AsRawFd`; its replacement `AsyncFd::register` is `unsafe`.
+  The stream control end is an `OwnedFd`, which meets the contract by
+  construction, so `transport.rs` carries the crate's one `unsafe` block
+  with its `SAFETY` comment under `#![deny(unsafe_code)]`.
 
 ### Completion Notes
 
@@ -1198,6 +1211,77 @@ the budget view stays Operator and SuperAdmin.
   without the two fields. They are listed there on the replicated side,
   as D-f decides; Lot C2 still owes them in `CanonicalGlobalSettings`
   and `diff.rs`. Not on the automation admin tier (D-f).
+- Lot B done: the `lorica-stream` crate (1.10.6, product line), with
+  the workspace member, the three Dockerfiles, the CI test and coverage
+  lists, `docs/BUMP-CHECKLIST.md` and `docs/architecture/source-tree.md`.
+  The rest of D-b's crate lists is Lot G's. Public API:
+  `state::{BindState, BindStateKind, BindFailure, BindFailureKind,
+  StreamBindStates}`; `budget::{FdBudget, BASE_RESERVE, HeldFds,
+  StreamDemand, BudgetUsage, BudgetViolation, BudgetView, NodeBudgetView,
+  StreamBudgetView, NodeBudgetInputs}`; `reconcile::{diff,
+  desired_bindings, Actions, BindKey, BoundBinding, Detach, ReleaseCause,
+  UdpOverlap}`; `tracker::{ConnectionTracker, TrackedConnection,
+  EntryView}`; `handler::{StreamHandler, DatagramHandler,
+  AcceptedConnection, Datagram, Engines, HandlerFuture}`;
+  `table::{StreamTable, StreamTableSource}`; `transport::{ControlTransport,
+  InProcessPeer}`; `runtime::{StreamRuntime, StreamRuntimeHandle,
+  StreamRuntimeError, STREAM_THREAD_NAME}`.
+- The UDP overlap rule (D-c as amended) is in `reconcile::diff`: a
+  desired UDP binding that overlaps, by port intersection and
+  `listen_addresses_conflict`, a kept UDP binding or one the same pass
+  binds earlier (stream id order) is returned in `Actions::refused` as a
+  `UdpOverlap` and never asked for; `UdpOverlap::kind()` is
+  `address_in_use`, so the 10 s retry of D-d binds it once the other
+  stream lets go. A binding detached in the same pass does not count.
+  TCP is left to the kernel, whose `EADDRINUSE` carries the OS error.
+- `diff` takes the streams, the node's `NodeRole` and the held bindings,
+  and computes the desired set itself through 12.1's `binds_here`, so it
+  also names each release's audit cause (`deleted`, `disabled`, `rebind`,
+  `node_deselected`; `shutdown` is the stop path's).
+- `GracefulTerminate` is not subscribed inside the crate, which does not
+  depend on `lorica-core`: `StreamRuntimeHandle::terminate(drain)` is the
+  hook, and `quiesced()` turns `Some(drain)` on a `quiesce` or a
+  terminate. Lot D adapts `Server::watch_execution_phase()` to the first
+  and arms the drain watcher on the second (with `tracker().is_empty()`).
+  Dropping the handle stops the runtime, so the worker keeps it.
+- The worker's table comes through the `StreamTableSource` trait, which
+  Lot D implements over the store. An `attach` for a stream the table does
+  not hold reloads it first: D-d step 3 attaches before the `refresh`
+  that would bring a new stream in.
+- A `refresh` whose table load fails keeps the previous table, logs at
+  error and answers `ack <seq> 0`. `NackReason` has no variant for it and
+  `lorica-worker` is outside Lot B's allowlist; a `nack` reason for it
+  (for instance `table_unavailable`) is Lot D's call.
+- `ack` counts: sockets adopted (`attach`), sockets closed (`detach`, sent
+  once they are closed, so the port is free in this worker when the
+  supervisor reads it), connections newly draining (`refresh`), bindings
+  stopped (`quiesce`). Every `drain_ms` is capped at
+  `GlobalSettings::WORKER_DRAIN_TIMEOUT_MAX_S`, which also keeps a hostile
+  `u64` from overflowing the deadline.
+- A socket is adopted only if the kernel agrees on its type
+  (`SO_TYPE`): a datagram socket under a TCP token would fail every
+  accept and spin, so the whole `attach` is refused `adopt_failed`.
+- Tracker: `register(bind_gen, snapshot)` takes the stream id from the
+  snapshot. An entry drained twice keeps its first reason and the earlier
+  deadline, so a connection the configuration removed stays
+  `config_removed` if the node then stops. The tracker signals the close;
+  the engine closes the socket on `TrackedConnection::closed()` and ends
+  with `finish(natural)`.
+- `DatagramHandler::handle` is awaited inline by the receive loop, so an
+  engine must hand off rather than wait on a backend; Story 12.5 may
+  revisit.
+- Budget: the per-node cap counts listening sockets as one per port (the
+  view's `listen_sockets`), not one per UDP slot. `node_id` and
+  `node_name` in the view are optional, `null` on a standalone node.
+  `BindState` serialises but does not deserialise: the heartbeat carries
+  it as protobuf (Lot E2).
+- `MAX_STREAM_ID_LEN`: 12.1 Lot 1 left `Stream.id` an unvalidated
+  `String` (no format check in `Stream::validate` or the store; 12.1's
+  CRUD Lot generates UUIDs). No bound can be derived from the type today,
+  so 64 stays; if 12.1 validates ids as UUIDs, the bound becomes 36. An
+  imported or replicated id the channel cannot carry fails `encode`
+  (`StreamCtlError::Invalid`), which Lot D must report as a failed bind,
+  not drop.
 
 ## File List
 
@@ -1213,6 +1297,12 @@ the budget view stays Operator and SuperAdmin.
 - `lorica-config/src/store/settings.rs`
 - `lorica-config/src/canonical.rs` (the routing test's destructure only)
 - `lorica-api/src/settings.rs`
+- `lorica-stream/**` (new: `Cargo.toml`, `src/{lib,budget,handler,listener,reconcile,runtime,state,table,tracker,transport}.rs`, `tests/runtime.rs`)
+- `Cargo.toml` (workspace member), `Cargo.lock`
+- `Dockerfile`, `Dockerfile.dev`, `tests-e2e-docker/Dockerfile` (the crate `COPY` line)
+- `.github/workflows/ci.yml` (product test list and coverage list)
+- `docs/BUMP-CHECKLIST.md`, `docs/architecture/source-tree.md` (the new crate)
+- `docs/stories/story-12.2-stream-listeners.md` (D-c amended for the UDP backstop)
 
 ## Change Log
 
@@ -1222,3 +1312,4 @@ the budget view stays Operator and SuperAdmin.
 | 2026-11-14 | 0.2 | Maintainer answers folded in: AC #7 as amended, `EXTEND_TIMEOUT_USEC` stop path, the 300 s fix through Lorica's `ServerConf`, the drain watcher, the dual-stack rule, a generic per-session fd input, paths re-checked after `4e864593`. Status Draft. | Romain G. |
 | 2026-11-14 | 0.3 | Lot A implemented: stream control channel, stream socket binding, third socketpair per worker; `MSG_CTRUNC` fd leak fixed; UDP kernel-backstop gap recorded for Lot D. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.4 | Lot C1 implemented: `worker_drain_timeout_s` and `stream_listen_socket_cap` on `GlobalSettings`, the store and `PUT /api/v1/settings`. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.5 | Lot B implemented: the `lorica-stream` crate (stream runtime, accept and receive loops, connection tracker, engine traits, fd budget, bind state, reconcile diff). D-c amended: the reconcile diff refuses overlapping UDP bindings, which the kernel does not. Status InProgress. | Romain G. |
