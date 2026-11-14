@@ -22,6 +22,7 @@ When bumping the version, update ALL of these files:
 - [ ] `lorica-automation-policy/Cargo.toml` - `version` (first-party; follows product since v1.9.0)
 - [ ] `lorica-adcs/Cargo.toml` - `version` (first-party; follows product since v1.10.0)
 - [ ] `lorica-fleet/Cargo.toml` - `version` (first-party; follows product since v1.11.0)
+- [ ] `lorica-stream/Cargo.toml` - `version` (first-party; follows product since v1.11.0)
 
 ## Internal dependency references (cross-crate deps)
 - [ ] `lorica/Cargo.toml` - lorica-config, lorica-api, lorica-bench, lorica-worker, lorica-command, lorica-cluster, lorica-fleet, lorica-shmem, lorica-geoip, lorica-challenge, lorica-waf, lorica-notify, lorica-mcp, lorica-automation-policy versions
@@ -29,6 +30,7 @@ When bumping the version, update ALL of these files:
 - [ ] `lorica-config/Cargo.toml` - lorica-automation-policy version
 - [ ] `lorica-mcp/Cargo.toml` - lorica-automation-policy version
 - [ ] `lorica-fleet/Cargo.toml` - lorica-cluster, lorica-config versions
+- [ ] `lorica-stream/Cargo.toml` - lorica-config, lorica-worker versions
 - [ ] `lorica-bench/Cargo.toml` - lorica-config, lorica-metrics, lorica-notify versions
 - [ ] `lorica-notify/Cargo.toml` - lorica-metrics version
 

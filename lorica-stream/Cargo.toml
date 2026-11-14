@@ -1,0 +1,29 @@
+[package]
+name = "lorica-stream"
+version = "1.10.6"
+authors = ["Romain G."]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+description = "Stream data plane for Lorica: the worker-side stream runtime, its accept and receive loops, the connection tracker, the fd budget, bind state and the reconcile diff"
+
+# The layer-4 data plane runs beside Pingora, not inside it: no listener
+# in Pingora's set and no task on Pingora's runtimes. It depends on
+# `lorica-worker` for the stream control messages, so a worker and
+# single-process mode speak one type, and on `lorica-config` for the
+# stream model and its end reasons. `lorica-api` reads the bind-state and
+# budget types from here without depending on the binary.
+[dependencies]
+lorica-config = { version = "1.10.6", path = "../lorica-config" }
+lorica-worker = { version = "1.10.6", path = "../lorica-worker" }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+# Puts the stream control end in non-blocking mode for `AsyncFd`.
+socket2 = { version = "0.6", features = ["all"] }
+thiserror = "2"
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
+tracing = "0.1"
+
+[dev-dependencies]
+serde_json = "1.0"
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "test-util"] }

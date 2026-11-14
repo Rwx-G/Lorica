@@ -3356,6 +3356,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lorica-stream"
+version = "1.10.6"
+dependencies = [
+ "chrono",
+ "lorica-config",
+ "lorica-worker",
+ "serde",
+ "serde_json",
+ "socket2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "lorica-timeout"
 version = "0.1.0"
 dependencies = [

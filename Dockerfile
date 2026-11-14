@@ -68,6 +68,7 @@ COPY lorica-mcp/ lorica-mcp/
 COPY lorica-automation-policy/ lorica-automation-policy/
 COPY lorica-adcs/ lorica-adcs/
 COPY lorica-fleet/ lorica-fleet/
+COPY lorica-stream/ lorica-stream/
 COPY tinyufo/ tinyufo/
 
 # Copy pre-built frontend
