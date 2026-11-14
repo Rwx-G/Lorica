@@ -42,6 +42,7 @@ pub(crate) fn run_worker(
     use lorica_command::{Command, CommandChannel, CommandType, Response};
     use lorica_core::server::Fds;
     use lorica_worker::fd_passing;
+    use std::os::fd::{FromRawFd, OwnedFd};
 
     info!(worker_id = id, cmd_fd = cmd_fd, "worker starting");
 
@@ -60,6 +61,7 @@ pub(crate) fn run_worker(
     let mut listener_addrs: Vec<String> = Vec::new();
     let mut shmem_region: Option<&'static lorica_shmem::SharedRegion> = None;
     let mut rpc_fd: Option<i32> = None;
+    let mut stream_ctl_fd: Option<OwnedFd> = None;
     let mut listener_count = 0usize;
     for entry in entries {
         match entry.kind {
@@ -85,6 +87,19 @@ pub(crate) fn run_worker(
                 rpc_fd = Some(entry.fd);
                 info!(worker_id = id, fd = entry.fd, "adopted RPC channel FD");
             }
+            fd_passing::FdKind::StreamCtl => {
+                // SAFETY: `recv_worker_fds` hands each received FD over
+                // with exclusive ownership; nothing else refers to it.
+                stream_ctl_fd = Some(unsafe { OwnedFd::from_raw_fd(entry.fd) });
+                info!(worker_id = id, fd = entry.fd, "adopted stream control FD");
+            }
+            fd_passing::FdKind::StreamSocket { proto, addr, .. } => {
+                // Stream sockets only travel over the stream control
+                // channel; one in the fork bundle is closed, not served.
+                // SAFETY: as above, the FD is exclusively ours.
+                drop(unsafe { OwnedFd::from_raw_fd(entry.fd) });
+                warn!(worker_id = id, %proto, %addr, "closed a stream socket sent in the fork bundle");
+            }
         }
     }
 
@@ -93,6 +108,7 @@ pub(crate) fn run_worker(
         listener_count,
         shmem = shmem_region.is_some(),
         rpc = rpc_fd.is_some(),
+        stream_ctl = stream_ctl_fd.is_some(),
         "received worker FDs"
     );
 

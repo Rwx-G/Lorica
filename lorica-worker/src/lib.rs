@@ -16,7 +16,9 @@
 //!
 //! This crate implements a supervisor/worker model where the main process
 //! forks worker processes that each run the proxy engine independently.
-//! Listening socket FDs are passed to workers via SCM_RIGHTS.
+//! Listening socket FDs are passed to workers via SCM_RIGHTS, at fork
+//! for the HTTP listeners and at runtime over the stream control channel
+//! ([`stream_ctl`]) for the stream sockets ([`stream_sockets`]).
 
 #![warn(clippy::all)]
 #![cfg(unix)]
@@ -24,6 +26,8 @@
 pub mod fd_passing;
 pub mod hot_upgrade;
 pub mod manager;
+pub mod stream_ctl;
+pub mod stream_sockets;
 
 /// Re-export the process identifier type so callers (e.g. the `lorica`
 /// binary's hot-upgrade orchestration) can hold a child PID returned by
@@ -68,6 +72,9 @@ pub enum WorkerError {
 
     #[error("exec argument contained an interior NUL byte")]
     InvalidExecArg,
+
+    #[error(transparent)]
+    StreamCtl(#[from] stream_ctl::StreamCtlError),
 
     #[error("failed to get current executable path: {0}")]
     CurrentExe(std::io::Error),

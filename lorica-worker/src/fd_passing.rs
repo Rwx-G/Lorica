@@ -24,8 +24,14 @@
 //!
 //! - `listener:0.0.0.0:8080`: a TCP listener
 //! - `shmem`: the anonymous memfd holding the `SharedRegion`
+//! - `rpc`: the worker end of the pipelined RPC socketpair
+//! - `stream-ctl`: the worker end of the stream control channel
+//!   ([`crate::stream_ctl`])
+//! - `stream:<tcp|udp>:<bind_gen>:<addr>`: a stream socket, sent only
+//!   over the stream control channel, never in the fork bundle
 
 use std::io::{IoSlice, IoSliceMut};
+use std::net::SocketAddr;
 use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
@@ -34,29 +40,84 @@ use nix::sys::socket::{
     UnixAddr,
 };
 
+use crate::stream_ctl::ATTACH_HEADER_MAX_LEN;
 use crate::WorkerError;
 
-/// Maximum number of FDs that can be passed in a single message. Covers
-/// the worst case: one HTTP listener + one HTTPS listener + one shmem
-/// memfd + headroom for future RPC / shared-state descriptors.
-const MAX_FDS: usize = 32;
+/// Maximum number of FDs that can be passed in a single message, on the
+/// fork bundle and on one stream control `attach` alike. The kernel's own
+/// ceiling (`SCM_MAX_FD`, 253) is far above; keeping it at 32 also bounds
+/// the fds in flight per worker on the stream control channel, which the
+/// kernel charges to the sender's `RLIMIT_NOFILE` (`ETOOMANYREFS`).
+pub(crate) const MAX_FDS: usize = 32;
 
-/// Upper bound on one wire token's encoded size. The longest token today
-/// is `listener:[2001:db8:ffff:ffff:ffff:ffff:ffff:ffff]:65535` which is
-/// under 60 bytes; we give it 128 B of headroom for future schemes.
-const MAX_TOKEN_LEN: usize = 128;
+/// Upper bound on one wire token's encoded size. The longest token is a
+/// stream socket token, bounded by [`STREAM_SOCKET_TOKEN_MAX_LEN`]; the
+/// rest is headroom for future schemes.
+pub(crate) const MAX_TOKEN_LEN: usize = 128;
 
-/// Maximum size of the tag payload buffer. Must be large enough to hold
-/// `MAX_FDS` space-separated tokens (each up to `MAX_TOKEN_LEN`). The
-/// compile-time assertion below enforces that invariant so future
+/// Maximum size of the tag payload buffer, on the fork bundle and on the
+/// stream control channel. It must hold the longest `attach` header plus
+/// `MAX_FDS` space-separated tokens of up to `MAX_TOKEN_LEN` bytes each.
+/// The compile-time assertion below enforces that invariant so future
 /// `FdKind` variants with longer tokens trip the build instead of
 /// producing silent `MSG_TRUNC` on the wire (audit L-2).
-const PAYLOAD_BUF_SIZE: usize = 4096;
+pub(crate) const PAYLOAD_BUF_SIZE: usize = 8192;
+
+/// Longest decimal rendering of a `u64`.
+pub(crate) const U64_MAX_DIGITS: usize = 20;
+
+/// Longest text form of a `SocketAddr`: an IPv6 address of eight full
+/// groups (39 bytes), a scope id of up to ten digits after `%`, the
+/// brackets and a five-digit port.
+const SOCKET_ADDR_MAX_LEN: usize = 1 + 39 + 1 + 10 + 2 + 5;
+
+/// Longest stream socket token: `stream:udp:<u64>:<addr>`.
+pub(crate) const STREAM_SOCKET_TOKEN_MAX_LEN: usize =
+    "stream:udp:".len() + U64_MAX_DIGITS + 1 + SOCKET_ADDR_MAX_LEN;
 
 const _: () = assert!(
-    MAX_FDS * MAX_TOKEN_LEN <= PAYLOAD_BUF_SIZE,
-    "PAYLOAD_BUF_SIZE must fit MAX_FDS tokens of MAX_TOKEN_LEN bytes each"
+    STREAM_SOCKET_TOKEN_MAX_LEN <= MAX_TOKEN_LEN,
+    "a stream socket token must fit MAX_TOKEN_LEN"
 );
+
+const _: () = assert!(
+    ATTACH_HEADER_MAX_LEN + MAX_FDS * (1 + MAX_TOKEN_LEN) <= PAYLOAD_BUF_SIZE,
+    "PAYLOAD_BUF_SIZE must fit the attach header plus MAX_FDS separated tokens of MAX_TOKEN_LEN"
+);
+
+/// Transport protocol of a stream socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamProto {
+    /// A listening TCP socket, shared by every worker.
+    Tcp,
+    /// A UDP socket, one per worker slot in a `SO_REUSEPORT` group.
+    Udp,
+}
+
+impl StreamProto {
+    /// The wire and API spelling: `tcp` or `udp`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StreamProto::Tcp => "tcp",
+            StreamProto::Udp => "udp",
+        }
+    }
+
+    /// Parse the spelling produced by [`Self::as_str`].
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "tcp" => Some(StreamProto::Tcp),
+            "udp" => Some(StreamProto::Udp),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for StreamProto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// What a passed file descriptor is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,27 +132,55 @@ pub enum FdKind {
     /// verdict caches, and breaker state with the supervisor. See
     /// `docs/architecture/worker-shared-state.md` § 4.
     Rpc,
+    /// The worker's end of the `SOCK_SEQPACKET` stream control channel
+    /// ([`crate::stream_ctl`]), over which the supervisor attaches and
+    /// detaches stream sockets at runtime.
+    StreamCtl,
+    /// One socket of a stream binding, sent in a stream control `attach`.
+    /// `bind_gen` names the binding (all its sockets); `addr` is the
+    /// socket's bind address.
+    StreamSocket {
+        proto: StreamProto,
+        bind_gen: u64,
+        addr: SocketAddr,
+    },
 }
 
 impl FdKind {
     /// Serialise as a wire token (one space-separated item in the payload).
-    fn to_token(&self) -> String {
+    pub(crate) fn to_token(&self) -> String {
         match self {
             FdKind::Listener { addr } => format!("listener:{addr}"),
             FdKind::Shmem => "shmem".to_string(),
             FdKind::Rpc => "rpc".to_string(),
+            FdKind::StreamCtl => "stream-ctl".to_string(),
+            FdKind::StreamSocket {
+                proto,
+                bind_gen,
+                addr,
+            } => format!("stream:{proto}:{bind_gen}:{addr}"),
         }
     }
 
     /// Parse a wire token produced by [`Self::to_token`].
-    fn from_token(tok: &str) -> Result<Self, WorkerError> {
+    pub(crate) fn from_token(tok: &str) -> Result<Self, WorkerError> {
         if tok == "shmem" {
             Ok(FdKind::Shmem)
         } else if tok == "rpc" {
             Ok(FdKind::Rpc)
+        } else if tok == "stream-ctl" {
+            Ok(FdKind::StreamCtl)
         } else if let Some(addr) = tok.strip_prefix("listener:") {
             Ok(FdKind::Listener {
                 addr: addr.to_string(),
+            })
+        } else if let Some(rest) = tok.strip_prefix("stream:") {
+            let (proto, rest) = rest.split_once(':').ok_or(WorkerError::InvalidPayload)?;
+            let (bind_gen, addr) = rest.split_once(':').ok_or(WorkerError::InvalidPayload)?;
+            Ok(FdKind::StreamSocket {
+                proto: StreamProto::from_wire(proto).ok_or(WorkerError::InvalidPayload)?,
+                bind_gen: bind_gen.parse().map_err(|_| WorkerError::InvalidPayload)?,
+                addr: addr.parse().map_err(|_| WorkerError::InvalidPayload)?,
             })
         } else {
             Err(WorkerError::InvalidPayload)
@@ -308,14 +397,19 @@ pub fn send_listener_fds(sock: RawFd, fds: &[RawFd], addrs: &[String]) -> Result
 }
 
 /// Backwards-compatible wrapper: drops non-listener entries so callers
-/// that only need listeners stay simple.
+/// that only need listeners stay simple. A dropped entry's FD is closed.
 pub fn recv_listener_fds(sock: RawFd) -> Result<Vec<(RawFd, String)>, WorkerError> {
     let entries = recv_worker_fds(sock)?;
     Ok(entries
         .into_iter()
         .filter_map(|e| match e.kind {
             FdKind::Listener { addr } => Some((e.fd, addr)),
-            FdKind::Shmem | FdKind::Rpc => None,
+            FdKind::Shmem | FdKind::Rpc | FdKind::StreamCtl | FdKind::StreamSocket { .. } => {
+                // SAFETY: `recv_worker_fds` handed this FD over with
+                // exclusive ownership and nothing else refers to it.
+                unsafe { close_fd(e.fd) };
+                None
+            }
         })
         .collect())
 }
@@ -578,9 +672,28 @@ mod tests {
             FdKind::Listener {
                 addr: "[::]:443".to_string(),
             },
+            FdKind::StreamCtl,
+            FdKind::StreamSocket {
+                proto: StreamProto::Tcp,
+                bind_gen: 0,
+                addr: "0.0.0.0:5432".parse().unwrap(),
+            },
+            FdKind::StreamSocket {
+                proto: StreamProto::Udp,
+                bind_gen: 7,
+                addr: "[::]:53".parse().unwrap(),
+            },
+            FdKind::StreamSocket {
+                proto: StreamProto::Udp,
+                bind_gen: u64::MAX,
+                addr: "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535"
+                    .parse()
+                    .unwrap(),
+            },
         ];
         for k in cases {
             let t = k.to_token();
+            assert!(t.len() <= MAX_TOKEN_LEN, "{t} exceeds MAX_TOKEN_LEN");
             let back = FdKind::from_token(&t).unwrap();
             assert_eq!(back, k);
         }
@@ -631,5 +744,107 @@ mod tests {
                 .count();
             assert_eq!(open, 1, "a received copy of {target} leaked");
         }
+    }
+
+    #[test]
+    fn test_stream_ctl_and_stream_socket_tokens() {
+        assert_eq!(FdKind::StreamCtl.to_token(), "stream-ctl");
+        let longest = FdKind::StreamSocket {
+            proto: StreamProto::Udp,
+            bind_gen: u64::MAX,
+            addr: "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535"
+                .parse()
+                .unwrap(),
+        };
+        assert_eq!(
+            longest.to_token(),
+            "stream:udp:18446744073709551615:[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535"
+        );
+    }
+
+    #[test]
+    fn test_stream_socket_token_bound_matches_the_worst_case() {
+        // The constant is arithmetic; this pins it to what `Display`
+        // really renders for the longest address, scope id included.
+        let worst = FdKind::StreamSocket {
+            proto: StreamProto::Udp,
+            bind_gen: u64::MAX,
+            addr: SocketAddr::V6(std::net::SocketAddrV6::new(
+                "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(),
+                65535,
+                0,
+                u32::MAX,
+            )),
+        };
+        let token = worst.to_token();
+        assert_eq!(token.len(), STREAM_SOCKET_TOKEN_MAX_LEN, "{token}");
+        assert_eq!(FdKind::from_token(&token).unwrap(), worst);
+    }
+
+    #[test]
+    fn test_stream_socket_token_rejects_malformed_forms() {
+        for bad in [
+            "stream:",
+            "stream:tcp",
+            "stream:tcp:1",
+            "stream:sctp:1:127.0.0.1:80",
+            "stream:tcp:x:127.0.0.1:80",
+            "stream:tcp:-1:127.0.0.1:80",
+            "stream:tcp:1:127.0.0.1",
+            "stream:tcp:1:localhost:80",
+            "stream:udp:1:[::1]:70000",
+        ] {
+            assert!(FdKind::from_token(bad).is_err(), "{bad} was accepted");
+        }
+    }
+
+    #[test]
+    fn test_legacy_listener_wrapper_filters_out_stream_kinds() {
+        let (parent_fd, child_fd) = create_socketpair().expect("socketpair failed");
+        let ctl = socket::socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+        let stream_sock = socket::socket(
+            AddressFamily::Inet,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+        let listener = socket::socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+        let entries = [
+            FdEntry {
+                fd: ctl.as_raw_fd(),
+                kind: FdKind::StreamCtl,
+            },
+            FdEntry {
+                fd: stream_sock.as_raw_fd(),
+                kind: FdKind::StreamSocket {
+                    proto: StreamProto::Tcp,
+                    bind_gen: 3,
+                    addr: "127.0.0.1:5432".parse().unwrap(),
+                },
+            },
+            FdEntry {
+                fd: listener.as_raw_fd(),
+                kind: FdKind::Listener {
+                    addr: "127.0.0.1:9000".to_string(),
+                },
+            },
+        ];
+        send_worker_fds(parent_fd.as_raw_fd(), &entries).unwrap();
+        let pairs = recv_listener_fds(child_fd.as_raw_fd()).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].1, "127.0.0.1:9000");
     }
 }
