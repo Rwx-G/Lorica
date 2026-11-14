@@ -317,7 +317,8 @@ sees that a route sends one), the match `value` of each of a route's
 `header_rules` (where a secret shared between a client and its canary
 goes; the header name, match type and backends stay), the userinfo and
 query values of a route's `forward_auth` address, the query values of a
-backend's `health_check_path`, and the query values and fragment of an
+backend's probe path in both shapes (the typed `health_check.path` and
+the deprecated `health_check_path`), and the query values and fragment of an
 access-log row's `path`. It does so wherever it answers such a row: the
 listings, every write answer and every preview. A preview's list of
 changed fields is computed on the masked views, so a change confined to
@@ -328,12 +329,12 @@ back, and a rule returned with the `[redacted]` value it was read with
 keeps the value stored for the rule at the same position with the same
 header name and match type; a marker the node cannot place that way, on
 a rule added, moved, renamed or retyped, is refused and names the rule
-by position, and the marker is never stored. A backend's
-`health_check_path` read back with its `[redacted]` query values and
-sent unchanged keeps the stored path; one whose masked form differs
-from the stored path's is refused, and a create carrying the marker is
-refused, so a read-modify-write cannot replace a probe credential with
-the marker. The environment a route or
+by position, and the marker is never stored. A backend's probe path,
+`health_check.path` or `health_check_path`, read back with its
+`[redacted]` query values and sent unchanged keeps the stored path in
+both fields; one whose masked form differs from the stored path's is
+refused, and a create carrying the marker is refused, so a
+read-modify-write cannot replace a probe credential with the marker. The environment a route or
 backend belongs to (its `managed_by` mark) is named only to a token the
 environment endpoint would answer for that environment; every other
 token reads the mark with the name `[redacted]`, so the row still says
@@ -427,6 +428,16 @@ a mistyped nested key that reached the plane would be dropped there
 with nothing said. The one query the plane reads on a write,
 `?dry_run`, is strict on its side: a key it does not declare is a 400,
 so `?dryrun=true` typed into a direct client is not an apply.
+
+A backend's `health_check` is the one nested value the plane checks
+itself rather than the tool: it is `{"kind": "http", "path": "..."}` or
+`{"kind": "tcp_connect"}`, a closed set the node refuses (`422`) on an
+unknown kind or on a key an `http` check does not have, so the tool
+declares no vocabulary for it and a mistyped `path` is refused rather
+than dropped. The deprecated
+`health_check_path` is still accepted beside it and must then be the
+same path. Streams (v1.11.0) are not on this server: no read tool and
+no mutation names them.
 
 **The token's grants bound what a write claims and what it targets.**
 A hostname and every alias a route write claims must be inside the

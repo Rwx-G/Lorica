@@ -905,8 +905,10 @@ dashboard's sake, this plane withholds, replacing each value with
 (where an upstream credential goes), each of its `header_rules`' match
 `value` (where a secret shared between a client and its canary goes),
 the userinfo and query values of a
-route's `forward_auth` address, the query values of a backend's
-`health_check_path`, and the query values and fragment of an access-log
+route's `forward_auth` address, the query values of a backend's probe
+path in both of the shapes it is answered in (the typed
+`health_check.path` and the deprecated `health_check_path`, which carry
+the same string), and the query values and fragment of an access-log
 row's `path` (the proxy records the path without its query string, so
 that last one is a guard for rows from any other producer). The same
 holds on every write answer and preview (`lorica-api/src/automation/redact.rs`),
@@ -1061,6 +1063,17 @@ behind the write scope beside it:
 | `DELETE /automation/v1/backends/{id}` | `backends:write` | Delete one backend, with the graceful drain. |
 | `POST /automation/v1/certificates/{id}/renew` | `certificates:write` | Renew one ACME certificate in place. |
 
+A backend's active check is `health_check` since v1.11.0, as on the
+management API: `{"kind": "http", "path": "/healthz"}` or
+`{"kind": "tcp_connect"}`, replaced whole by an update. The older
+`health_check_path` is deprecated and still accepted: alone, a path is
+an `http` check and the empty string a `tcp_connect`; beside
+`health_check`, it must be the same path (empty for `tcp_connect`) or
+the write is a `400` naming both fields. Every backend answer carries
+both. An unknown `kind`, an `http` check without a path, or a key an
+`http` check does not have is a `422`. Streams (v1.11.0) are
+not on this plane, for reading or writing.
+
 **Each one is the management handler itself, run as the token.** The
 management handlers were split into the axum wrapper that reads the
 session and a body that takes an actor; the automation handler calls
@@ -1144,10 +1157,12 @@ test one header; the match type is in the identity because the value is
 validated against it. A marker no stored rule answers to (a create, a
 rule added, moved, renamed or retyped) is a `400` naming the rule by
 its position, and nothing is written: send the value itself. A real
-value is stored as sent. A backend's `health_check_path` follows the
-same rule: sent back exactly as it was read, with `[redacted]` query
-values, it keeps the stored path; a marker in any other path, or on a
-create, is a `400`, so a probe credential is never replaced by the
+value is stored as sent. A backend's probe path follows the same rule,
+in either shape: an `http` `health_check` whose `path`, or a
+`health_check_path`, is sent back exactly as it was read, with
+`[redacted]` query values, keeps the stored path, and both fields are
+put back to it; a marker in any other path, or on a create, is a `400`
+naming both fields, so a probe credential is never replaced by the
 marker. The dashboard reads the values and is not subject to any of
 this.
 
