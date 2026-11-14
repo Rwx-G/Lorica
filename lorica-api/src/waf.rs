@@ -659,6 +659,7 @@ pub async fn reload_blocklist(
 ///
 /// Default interval: 6 hours (matching the Data-Shield update frequency).
 /// Only fetches if the blocklist is enabled. Failures are logged, never fatal.
+/// Ends when the process's shutdown begins ([`crate::shutdown`]).
 pub fn spawn_blocklist_refresh(
     engine: std::sync::Arc<lorica_waf::WafEngine>,
     interval: std::time::Duration,
@@ -677,9 +678,7 @@ pub fn spawn_blocklist_refresh(
             }
         }
 
-        loop {
-            tokio::time::sleep(interval).await;
-
+        while crate::shutdown::sleep(interval).await {
             if !engine.ip_blocklist().is_enabled() {
                 tracing::debug!("IP blocklist disabled, skipping refresh");
                 continue;

@@ -1260,11 +1260,16 @@ pub(crate) async fn shutdown_signal() {
             warn!("Received SIGINT");
         }
     }
-    // Here rather than at each caller, so no mode can forget it.
-    log_store_health::begin_shutdown();
+    // Here rather than at each caller, so no mode can forget it: the
+    // periodic loops (log-store retry and watch, prunes, certificate
+    // checks) stop as the stop starts.
+    lorica_api::shutdown::begin();
 }
 
-/// How long the exit path waits for the tracked background tasks.
+/// How long the exit path waits at most for the tracked background
+/// tasks. A backstop: the wait ends as soon as the work in flight is
+/// done, since every periodic loop on the tracker ends on the shutdown
+/// signal (`lorica_api::shutdown`).
 pub(crate) const BACKGROUND_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the exit path waits for cluster units in flight
@@ -1286,7 +1291,13 @@ pub(crate) struct ExitDrain {
 /// flight, concurrently and each within its own bound, before the
 /// process exits. Called once the cluster plane is shut down, so no
 /// fleet session can start a new unit while this waits.
+///
+/// It begins the process's shutdown itself, so the periodic loops on
+/// `tracker` end on every exit path, the hot-upgrade drain included,
+/// which has no shutdown signal: while they ran, `tracker.wait()` never
+/// returned and every exit waited out [`BACKGROUND_TASK_DRAIN_TIMEOUT`].
 pub(crate) async fn drain_for_exit(tracker: &tokio_util::task::TaskTracker) -> ExitDrain {
+    lorica_api::shutdown::begin();
     tracker.close();
     let (background_tasks, cluster_units) = tokio::join!(
         async {
@@ -1454,6 +1465,79 @@ mod tests {
             finished.load(Ordering::Acquire),
             "shutdown returned only after the unit finished"
         );
+    }
+
+    /// An idle periodic loop on the tracker no longer holds the exit:
+    /// before, `tracker.wait()` never returned while one ran and every
+    /// stop waited out the whole `BACKGROUND_TASK_DRAIN_TIMEOUT`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_exit_drain_does_not_wait_on_idle_periodic_loops() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Mutex;
+
+        const IDLE: Duration = Duration::from_secs(3600);
+        let tracker = tokio_util::task::TaskTracker::new();
+        let store = Arc::new(Mutex::new(
+            lorica_config::ConfigStore::open_in_memory().expect("test setup: store"),
+        ));
+        let blocklist = lorica_api::waf::spawn_blocklist_refresh(
+            Arc::new(lorica_waf::WafEngine::new()),
+            IDLE,
+            &tracker,
+        );
+        let sessions = lorica_api::middleware::auth::SessionStore::new(Arc::clone(&store))
+            .await
+            .with_task_tracker(tracker.clone())
+            .spawn_gc(IDLE);
+        let capture = lorica::capture::spawn_capture_disable_task(
+            Arc::clone(lorica::capture::node_budgets()),
+            Arc::clone(&store),
+            lorica_api::server::LogStoreSlot::default(),
+            &tracker,
+            IDLE,
+        );
+        let (reload, _reload_rx) = tokio::sync::watch::channel(0u64);
+        let reaper = super::environment_reaper::spawn_environment_reaper(
+            &lorica_fleet::ClusterRuntime::Standalone,
+            Arc::clone(&store),
+            lorica_api::server::LogStoreSlot::default(),
+            reload,
+            &tracker,
+            IDLE,
+        )
+        .expect("a standalone node spawns the reaper");
+        let proxy = lorica::proxy_wiring::LoricaProxy::new(
+            Arc::new(arc_swap::ArcSwap::from_pointee(
+                lorica::proxy_wiring::ProxyConfig::default(),
+            )),
+            Arc::new(lorica_api::logs::LogBuffer::new(16)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(lorica_bench::SlaCollector::new()),
+        );
+        let prunes = [
+            proxy.spawn_basic_auth_cache_prune(&tracker, IDLE),
+            proxy.spawn_rate_limit_prune(&tracker, IDLE, IDLE),
+            proxy.spawn_bot_stash_prune(&tracker),
+        ];
+        // Every loop is parked on its timer before the stop starts.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let start = std::time::Instant::now();
+        let drained = super::drain_for_exit(&tracker).await;
+
+        assert!(drained.background_tasks);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the exit drain took {:?}",
+            start.elapsed()
+        );
+        for handle in [blocklist, sessions, capture, reaper]
+            .into_iter()
+            .chain(prunes)
+        {
+            assert!(handle.is_finished());
+        }
     }
 
     /// Every exit path goes through the drain: `drain_detached` shipped

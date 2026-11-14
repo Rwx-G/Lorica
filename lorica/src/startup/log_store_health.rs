@@ -38,7 +38,7 @@
 //!   persistence resumes without a restart.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lorica_api::log_store::LogStore;
@@ -72,16 +72,6 @@ const UNDELIVERED_ALERT_RETRY: Duration = Duration::from_secs(60);
 /// `REMINDER_EVERY_ATTEMPTS` retry intervals rather than a line per
 /// retry.
 const REMINDER_EVERY_ATTEMPTS: u64 = 15;
-
-/// Fired when the process starts shutting down: the retry and watch
-/// loops stop at once instead of holding the shutdown up.
-static SHUTDOWN: LazyLock<CancellationToken> = LazyLock::new(CancellationToken::new);
-
-/// Stop every log-store retry and watch loop of this process. Called
-/// when the shutdown signal arrives.
-pub(crate) fn begin_shutdown() {
-    SHUTDOWN.cancel();
-}
 
 /// Which kind of process holds the store, for the logs and the gauge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -259,7 +249,13 @@ pub(crate) fn spawn_log_store_retry(
     role: LogStoreRole,
     interval: Duration,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    spawn_log_store_retry_until(slot, data_dir, role, interval, SHUTDOWN.clone())
+    spawn_log_store_retry_until(
+        slot,
+        data_dir,
+        role,
+        interval,
+        lorica_api::shutdown::token(),
+    )
 }
 
 fn spawn_log_store_retry_until(
@@ -406,7 +402,7 @@ pub(crate) fn spawn_log_store_watch(
     alert_sender: lorica_notify::AlertSender,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    let shutdown = SHUTDOWN.clone();
+    let shutdown = lorica_api::shutdown::token();
     tokio::spawn(async move {
         let mut alerts = LogStoreAlerts::default();
         let mut ticker = tokio::time::interval(interval);

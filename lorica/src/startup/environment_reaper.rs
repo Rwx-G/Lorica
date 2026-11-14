@@ -46,7 +46,8 @@ use tracing::{info, warn};
 /// removal is invisible to it and cheap for the store.
 pub const ENVIRONMENT_REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Spawn the reaper, or return `None` on a follower.
+/// Spawn the reaper, or return `None` on a follower. It ends when the
+/// process's shutdown begins (`lorica_api::shutdown`).
 ///
 /// `config_reload` is bumped after a sweep that removed something, so
 /// the proxy drops the routes and, on a control plane, the fleet gets
@@ -66,8 +67,7 @@ pub fn spawn_environment_reaper(
     Some(tracker.spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await; // skip the immediate tick
-        loop {
-            ticker.tick().await;
+        while lorica_api::shutdown::tick(&mut ticker).await {
             if is_follower_now(&store).await {
                 continue;
             }

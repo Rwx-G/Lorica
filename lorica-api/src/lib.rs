@@ -53,6 +53,7 @@ pub mod routes;
 /// Axum router + shared `AppState` construction.
 pub mod server;
 pub mod settings;
+pub mod shutdown;
 pub mod sla;
 pub mod status;
 pub mod streams;

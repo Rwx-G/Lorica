@@ -316,7 +316,8 @@ use super::dns01::provision_with_acme_dns;
 use super::http01::provision_with_acme;
 
 /// Spawn a background task that checks ACME and AD CS certificates
-/// for renewal, every `check_interval`; see [`renewal_tick`].
+/// for renewal, every `check_interval`; see [`renewal_tick`]. Ends when
+/// the process's shutdown begins ([`crate::shutdown`]).
 pub fn spawn_renewal_task(
     state: AppState,
     check_interval: std::time::Duration,
@@ -329,8 +330,7 @@ pub fn spawn_renewal_task(
         // `state.renewals`, shared with the manual renewal path, so a
         // token asking for a certificate this loop is ordering or the
         // CA has refused is told so. Not persisted across restarts.
-        loop {
-            tokio::time::sleep(check_interval).await;
+        while crate::shutdown::sleep(check_interval).await {
             renewal_tick(&state, renewal_threshold_days, alert_sender.as_ref()).await;
         }
     })

@@ -93,10 +93,16 @@ pub fn spawn_capture_disable_task(
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await; // skip the immediate tick
         loop {
-            ticker.tick().await;
+            // Once the process's shutdown begins, what the request path
+            // queued is written one last time and the task ends, so the
+            // exit drain waits for that write and not for the next tick.
+            let running = lorica_api::shutdown::tick(&mut ticker).await;
             flush_counters(&store, budgets.take_pending_counters()).await;
             for pending in budgets.take_pending_disables() {
                 disable_one(&store, log_store.store(), &pending).await;
+            }
+            if !running {
+                break;
             }
             disable_expired(&store, log_store.store(), Utc::now()).await;
         }

@@ -2050,16 +2050,18 @@ mod tests {
         use lorica_stream::StreamTableSource;
         let dir = tempfile::tempdir().expect("test setup: tempdir");
         let db = dir.path().join("lorica.db");
+        // The store holds stream ids to the canonical UUID form.
+        let id = "6f1c1a52-5b0e-4f7e-9a51-1a7c5a1b2c3d";
         let writer = ConfigStore::open(&db, None).expect("test setup: store");
         writer
-            .create_stream(&tcp("s1", 5432))
+            .create_stream(&tcp(id, 5432))
             .expect("test setup: stream");
 
         let source = StoreStreamTable::open(&db, None).expect("a second connection opens");
         let table = source.load().expect("the table loads");
 
-        assert!(table.stream("s1").is_some());
-        assert!(table.holds("s1", None));
+        assert!(table.stream(id).is_some());
+        assert!(table.holds(id, None));
         assert_eq!(
             source.drain_timeout(),
             Duration::from_secs(u64::from(GlobalSettings::DEFAULT_WORKER_DRAIN_TIMEOUT_S))

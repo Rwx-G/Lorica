@@ -1373,9 +1373,13 @@ the budget view stays Operator and SuperAdmin.
   `tracker.wait()` never completes. That wait predates this story; D-f
   keeps `drain_for_exit` "as today", but AC #7 ("no stop path waits on a
   hard-coded delay") and Lot H's "under 10 s" do not hold until those
-  loops stop on shutdown. The fix sits in `startup/mod.rs` and
-  `lorica-api`, outside Lot D's allowlist: open, for the orchestrator to
-  assign.
+  loops stop on shutdown. Fixed in the same cycle: every periodic loop
+  on the task tracker waits on `lorica_api::shutdown` (one process-wide
+  signal, which also replaced the log-store loops' own), begun by the
+  shutdown signal and by `drain_for_exit` itself, so the upgrade drain
+  is covered too; the 10 s stays as the backstop. The same smoke then
+  stopped in 17 ms (single process) and 215 ms (two workers). Pinned by
+  `the_exit_drain_does_not_wait_on_idle_periodic_loops`.
 - `ServerConf` for the proxy service is now built from
   `ServerConf::new()` (`version: 1`) instead of `Default` (`version: 0`),
   the same value the `Server` gets; nothing in the fork reads `version`.

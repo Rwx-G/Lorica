@@ -304,13 +304,13 @@ impl SessionStore {
         purged
     }
 
-    /// Spawn a background task that purges expired sessions at a fixed interval.
+    /// Spawn a background task that purges expired sessions at a fixed
+    /// interval, until the process's shutdown begins ([`crate::shutdown`]).
     pub fn spawn_gc(self, interval: std::time::Duration) -> tokio::task::JoinHandle<()> {
         let tracker = self.task_tracker.clone();
         tracker.spawn(async move {
             let mut ticker = tokio::time::interval(interval);
-            loop {
-                ticker.tick().await;
+            while crate::shutdown::tick(&mut ticker).await {
                 let purged = self.purge_expired().await;
                 if purged > 0 {
                     tracing::debug!(purged, "session GC: removed expired sessions");

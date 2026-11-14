@@ -381,7 +381,9 @@ impl LoricaProxy {
     /// inserts a new entry (which is when `retain` runs); under a
     /// sustained password-spray with no successful logins the cache
     /// would grow until process restart. The task is registered with
-    /// the supplied `TaskTracker` so it drains on graceful shutdown.
+    /// the supplied `TaskTracker` and, like every periodic task here,
+    /// ends when the process's shutdown begins (`lorica_api::shutdown`),
+    /// so the exit drain does not wait on it.
     pub fn spawn_basic_auth_cache_prune(
         &self,
         tracker: &tokio_util::task::TaskTracker,
@@ -392,8 +394,7 @@ impl LoricaProxy {
         tracker.spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await; // skip the immediate tick
-            loop {
-                ticker.tick().await;
+            while lorica_api::shutdown::tick(&mut ticker).await {
                 cache.retain(|_, t| t.elapsed() < AUTH_CACHE_TTL);
             }
         })
@@ -414,8 +415,7 @@ impl LoricaProxy {
         tracker.spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
             ticker.tick().await; // skip the immediate tick
-            loop {
-                ticker.tick().await;
+            while lorica_api::shutdown::tick(&mut ticker).await {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
@@ -447,8 +447,7 @@ impl LoricaProxy {
         tracker.spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await; // skip the immediate tick
-            loop {
-                ticker.tick().await;
+            while lorica_api::shutdown::tick(&mut ticker).await {
                 engine.prune_idle(lorica_shmem::now_ns(), idle_ttl_ns);
             }
         })
@@ -485,8 +484,7 @@ impl LoricaProxy {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await; // skip the immediate tick
             let mut cursor = 0usize;
-            loop {
-                ticker.tick().await;
+            while lorica_api::shutdown::tick(&mut ticker).await {
                 let entries = rate_limit::collect_sync_batch(
                     &buckets,
                     &mut cursor,

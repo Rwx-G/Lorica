@@ -98,7 +98,8 @@ pub async fn check_cert_expiry(state: &AppState, alert_sender: &lorica_notify::A
 ///
 /// Unlike `spawn_renewal_task` which only handles ACME auto-renew certs, this task
 /// alerts on every certificate (ACME or manual) that is within the warning/critical
-/// thresholds defined in `GlobalSettings`.
+/// thresholds defined in `GlobalSettings`. Ends when the process's
+/// shutdown begins ([`crate::shutdown`]).
 pub fn spawn_cert_expiry_check_task(
     state: AppState,
     check_interval: std::time::Duration,
@@ -107,8 +108,7 @@ pub fn spawn_cert_expiry_check_task(
     let tracker = state.task_tracker.clone();
     tracker.spawn(async move {
         check_cert_expiry(&state, &alert_sender).await;
-        loop {
-            tokio::time::sleep(check_interval).await;
+        while crate::shutdown::sleep(check_interval).await {
             check_cert_expiry(&state, &alert_sender).await;
         }
     })
