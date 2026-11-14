@@ -29,6 +29,7 @@ use lorica::reload::reload_proxy_config;
 
 use crate::cli::Cli;
 use crate::startup;
+use crate::startup::stream_plane;
 use crate::startup::{
     persist_initial_password, restrict_key_permissions, shutdown_signal,
     try_init_otel_from_settings,
@@ -84,7 +85,7 @@ fn capture_gauges_from(
 pub(crate) fn run_supervisor(cli: Cli) {
     use lorica_command::CommandChannel;
     use lorica_worker::manager::{WorkerConfig, WorkerEvent, WorkerManager};
-    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
     use tokio::sync::broadcast;
@@ -290,6 +291,13 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 rpc.into_raw_fd(),
             ))
         })
+        .collect();
+    // The third channel of each worker, the stream control one (Story
+    // 12.2 D-a), registered with the runtime below.
+    let stream_ctl_fds: Vec<(u32, OwnedFd)> = manager
+        .workers_mut()
+        .iter_mut()
+        .filter_map(|w| Some((w.id(), w.take_stream_ctl_fd()?)))
         .collect();
 
     // Now start the async runtime for API server + worker monitoring
@@ -766,39 +774,6 @@ pub(crate) fn run_supervisor(cli: Cli) {
             startup::log_store_health::LOG_STORE_WATCH_INTERVAL,
         );
 
-        // Config-change bridge: every change signalled on the watch
-        // channel (API, environment reaper, GeoIP updater, cluster
-        // replication) reaches the workers and the supervisor's own
-        // state through `ConfigReloadBridge::apply_config_change`. A
-        // change already pending when this spawns is not lost: the
-        // watch receiver still reports it.
-        let reload_bridge = ConfigReloadBridge::new(
-            Arc::clone(&worker_rpc_endpoints),
-            Arc::clone(&reload_generation),
-            Arc::clone(&sequence),
-            Arc::clone(&rate_limits),
-            reload_bc_tx.clone(),
-            SupervisorReloadTargets {
-                store: Arc::clone(&store),
-                proxy_config: Arc::clone(&proxy_config),
-                probe_scheduler: Arc::clone(&probe_scheduler),
-                sla_collector: Arc::clone(&sla_collector),
-                notify_dispatcher: Arc::clone(&notify_dispatcher),
-            },
-        );
-        let supervisor_reload_store = Arc::clone(&store);
-        tokio::spawn(async move {
-            while config_reload_rx.changed().await.is_ok() {
-                // Per-process hot-reload hooks (GeoIP / ASN updater
-                // lifecycle, OTel exporter, log sinks, bot HMAC secret)
-                // on the SUPERVISOR side; without this they would only
-                // refresh at boot.
-                lorica::reload::apply_supervisor_settings_from_store(&supervisor_reload_store)
-                    .await;
-                reload_bridge.apply_config_change().await;
-            }
-        });
-
         // Start API server
         let api_store = Arc::clone(&store);
         let api_log_buffer = Arc::clone(&log_buffer);
@@ -986,6 +961,103 @@ pub(crate) fn run_supervisor(cli: Cli) {
         };
         let oidc_verifier = super::single::build_oidc_verifier();
 
+        // The stream plane (Story 12.2): this supervisor binds every
+        // stream socket and attaches it to the workers over their stream
+        // control channels. Built once the role and this process's own
+        // ports are known, before the reload bridge that drives it. The
+        // registry is the one the API reads (Lot E3).
+        let stream_states = lorica_stream::StreamBindStates::new();
+        let stream_plane = {
+            let fd_limit = match lorica_worker::stream_sockets::process_fd_limit() {
+                Ok(limit) => {
+                    info!(fd_limit = limit, "process fd limit");
+                    limit
+                }
+                Err(e) => {
+                    // A zero budget refuses every stream with `fd_budget`
+                    // and the reason, rather than guessing a limit.
+                    error!(error = %e, "process fd limit unreadable; no stream can bind");
+                    0
+                }
+            };
+            let links: Vec<(u32, stream_plane::SeqpacketLink)> = stream_ctl_fds
+                .into_iter()
+                .filter_map(|(id, fd)| match stream_plane::SeqpacketLink::new(fd) {
+                    Ok(link) => Some((id, link)),
+                    Err(e) => {
+                        error!(worker_id = id, error = %e,
+                               "stream control channel not registered; this worker serves no stream");
+                        None
+                    }
+                })
+                .collect();
+            let mut plane = stream_plane::StreamPlane::new(
+                links,
+                u32::try_from(worker_count).unwrap_or(u32::MAX),
+                lorica_stream::FdBudget::from_limit(fd_limit),
+                process_reserved_ports,
+                stream_states.clone(),
+                stream_plane::STREAM_CTL_ACK_TIMEOUT,
+            );
+            // D-j: the TCP stream listeners of the outgoing supervisor,
+            // adopted before the first reconcile.
+            if let Some(inherited) = inherited.as_ref() {
+                plane.adopt_inherited(
+                    inherited
+                        .stream_tcp
+                        .iter()
+                        .map(|entry| {
+                            // SAFETY: received via SCM_RIGHTS in
+                            // `pull_inherited_listeners` and owned by
+                            // nothing else; the plane adopts or closes it.
+                            (entry.clone(), unsafe { OwnedFd::from_raw_fd(entry.fd) })
+                        })
+                        .collect(),
+                );
+            }
+            stream_plane::StreamPlaneHandle::new(
+                plane,
+                Arc::clone(&store),
+                stream_plane::PlaneRole::of(&cluster_runtime),
+                Some(log_store.clone()),
+            )
+        };
+
+        // Config-change bridge: every change signalled on the watch
+        // channel (API, environment reaper, GeoIP updater, cluster
+        // replication) reaches the stream plane, the workers and the
+        // supervisor's own state through
+        // `ConfigReloadBridge::apply_config_change`. A change already
+        // pending when this spawns is not lost: the watch receiver still
+        // reports it.
+        let reload_bridge = ConfigReloadBridge::new(
+            Arc::clone(&worker_rpc_endpoints),
+            Arc::clone(&reload_generation),
+            Arc::clone(&sequence),
+            Arc::clone(&rate_limits),
+            reload_bc_tx.clone(),
+            SupervisorReloadTargets {
+                store: Arc::clone(&store),
+                proxy_config: Arc::clone(&proxy_config),
+                probe_scheduler: Arc::clone(&probe_scheduler),
+                sla_collector: Arc::clone(&sla_collector),
+                notify_dispatcher: Arc::clone(&notify_dispatcher),
+            },
+            Some(stream_plane.clone()),
+        );
+        let supervisor_reload_store = Arc::clone(&store);
+        tokio::spawn(async move {
+            while config_reload_rx.changed().await.is_ok() {
+                // Per-process hot-reload hooks (GeoIP / ASN updater
+                // lifecycle, OTel exporter, log sinks, bot HMAC secret)
+                // on the SUPERVISOR side; without this they would only
+                // refresh at boot.
+                lorica::reload::apply_supervisor_settings_from_store(&supervisor_reload_store)
+                    .await;
+                reload_bridge.apply_config_change().await;
+            }
+        });
+
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store,
@@ -1090,6 +1162,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
         let monitor_store = Arc::clone(&store);
         let monitor_verdict_cache = Arc::clone(&verdict_cache);
         let monitor_breaker_registry = Arc::clone(&breaker_registry);
+        let monitor_stream_plane = stream_plane.clone();
         // `shutting_down` is declared above, shared with the per-worker
         // heartbeat tasks. The monitor short-circuits on the same flag
         // so shutdown-driven worker SIGKILLs don't trigger a respawn:
@@ -1098,7 +1171,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // `std::sync::Mutex`, not a tokio one), so abort cannot fire
         // while the supervisor is holding that mutex inside
         // `manager.shutdown_all()`. The monitor would then unblock
-        // 30 s later, see the SIGKILL'd workers as crashed, and
+        // once the drain ended, see the SIGKILL'd workers as crashed, and
         // respawn them - the exact race that drove systemd to SIGKILL
         // the whole service group past `TimeoutStopSec`.
         let monitor_shutting_down = Arc::clone(&shutting_down);
@@ -1117,7 +1190,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     });
                     // Re-check after acquiring the mutex: shutdown may have
                     // grabbed the mutex while we waited (the supervisor
-                    // shutdown path holds it for the full ~30 s drain). If
+                    // shutdown path holds it for the whole drain). If
                     // we observe the flag now, the workers we are about to
                     // see as "crashed" were actually SIGKILL'd by us and
                     // must not be respawned.
@@ -1194,7 +1267,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                         }
                     }
 
-                    let (restart_result, new_pid) = {
+                    let (restart_result, new_pid, new_stream_ctl) = {
                         let mut mgr = monitor_mgr.lock().unwrap_or_else(|e| {
                             warn!("worker monitor mutex poisoned, recovering");
                             e.into_inner()
@@ -1206,8 +1279,26 @@ pub(crate) fn run_supervisor(cli: Cli) {
                             .find(|(wid, _)| *wid == id)
                             .map(|(_, pid)| pid.as_raw())
                             .unwrap_or(0);
-                        (result, pid)
+                        let stream_ctl = mgr
+                            .workers_mut()
+                            .iter_mut()
+                            .find(|w| w.id() == id)
+                            .and_then(|w| w.take_stream_ctl_fd());
+                        (result, pid, stream_ctl)
                     };
+
+                    // Replay every live stream binding to the new worker
+                    // (D-a). Its UDP slot sockets never closed: the
+                    // supervisor kept them through the crash, so the
+                    // group, and every other client's worker, is
+                    // unchanged.
+                    if let Some(fd) = new_stream_ctl {
+                        match stream_plane::SeqpacketLink::new(fd) {
+                            Ok(link) => monitor_stream_plane.replay(id, link).await,
+                            Err(e) => error!(worker_id = id, error = %e,
+                                             "stream control channel of the restarted worker not registered"),
+                        }
+                    }
 
                     match restart_result {
                         Ok(Some((new_cmd_fd, new_rpc_fd))) => {
@@ -1273,6 +1364,13 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 }
             }
         });
+
+        // The first stream reconcile runs before READY (D-a), so a start
+        // returns with the stream ports listening. Each worker's answer
+        // is bounded by the ack timeout, and a bind failure is a state,
+        // never a delay.
+        stream_plane.after_commit().await;
+        let _stream_bind_retry = stream_plane.spawn_retry_loop();
 
         // Hot upgrade (Story 8.4), NEW supervisor side: now that workers
         // are forked from the inherited sockets and the API task is
@@ -1340,6 +1438,11 @@ pub(crate) fn run_supervisor(cli: Cli) {
             tokio::select! {
                 _ = shutdown_signal() => {
                     info!("supervisor shutting down");
+                    // First, so systemd's stop timeout never cuts the
+                    // drain below short (D-f). Never stopped: it renews
+                    // until the process exits.
+                    let _stop_keepalive =
+                        startup::drain::start_stop_keepalive(hot_upgrade::notify_socket());
                     // Stop accepting cluster sessions and tear down the
                     // established ones before the workers drain.
                     if let Some(plane) = cluster_plane.take() {
@@ -1358,13 +1461,19 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     // backstop.
                     shutting_down.store(true, std::sync::atomic::Ordering::Release);
                     monitor_handle.abort();
+                    // The drain is the setting as it is now. Each worker's
+                    // watcher ends it as soon as its traffic is gone, so
+                    // the SIGKILL past the margin only meets a worker
+                    // whose watcher failed.
+                    let drain = startup::drain::stored_drain_timeout(&*store.lock().await);
+                    stream_plane.quiesce(drain).await;
                     manager
                         .lock()
                         .unwrap_or_else(|e| {
                             warn!("worker manager mutex poisoned during shutdown, recovering");
                             e.into_inner()
                         })
-                        .shutdown_all();
+                        .shutdown_all(drain + startup::drain::WORKER_KILL_MARGIN);
                     startup::drain_for_exit(&shutdown_task_tracker).await;
                     api_handle.abort();
                     health_handle.abort();
@@ -1435,6 +1544,10 @@ pub(crate) fn run_supervisor(cli: Cli) {
                         // `--automation-listen`, in which case the new
                         // side binds nothing either.
                         automation_fds: automation_handoff.fds(),
+                        // TCP stream listeners hold their ports without
+                        // SO_REUSEPORT: the new generation inherits them
+                        // or meets EADDRINUSE until this one exits (D-j).
+                        stream_tcp_fds: stream_plane.tcp_handoff_fds().await,
                         child_argv,
                     })
                     .await;
@@ -2362,6 +2475,7 @@ struct ConfigReloadBridge {
     rate_limits: Arc<lorica::proxy_wiring::SupervisorRateLimits>,
     legacy_broadcast: tokio::sync::broadcast::Sender<u64>,
     supervisor_state: SupervisorReloadTargets,
+    stream_plane: Option<stream_plane::StreamPlaneHandle<stream_plane::SeqpacketLink>>,
 }
 
 impl ConfigReloadBridge {
@@ -2372,6 +2486,7 @@ impl ConfigReloadBridge {
         rate_limits: Arc<lorica::proxy_wiring::SupervisorRateLimits>,
         legacy_broadcast: tokio::sync::broadcast::Sender<u64>,
         supervisor_state: SupervisorReloadTargets,
+        stream_plane: Option<stream_plane::StreamPlaneHandle<stream_plane::SeqpacketLink>>,
     ) -> Self {
         Self {
             worker_endpoints,
@@ -2380,11 +2495,23 @@ impl ConfigReloadBridge {
             rate_limits,
             legacy_broadcast,
             supervisor_state,
+            stream_plane,
         }
     }
 
+    /// The three steps of Story 12.2 D-d around the workers' commit:
+    /// stream bindings no longer desired are detached before it, so an
+    /// accept never meets a stream the committed config no longer has;
+    /// new ones are bound and attached after it, then every worker
+    /// refreshes its stream table.
     async fn apply_config_change(&self) {
+        if let Some(plane) = &self.stream_plane {
+            plane.before_commit().await;
+        }
         self.reload_workers().await;
+        if let Some(plane) = &self.stream_plane {
+            plane.after_commit().await;
+        }
         // Route policies may have changed whichever way the workers
         // reloaded: the next RateLimitDelta re-reads them (audit M-4).
         self.rate_limits.invalidate_policies();
@@ -3064,6 +3191,7 @@ mod supervisor_tests {
                 sla_collector: Arc::new(lorica_bench::SlaCollector::new()),
                 notify_dispatcher: Arc::clone(&dispatcher),
             },
+            None,
         );
         BridgeFixture {
             bridge,

@@ -26,6 +26,7 @@ use lorica::proxy_wiring::{LoricaProxy, ProxyConfig};
 use lorica::reload::reload_proxy_config;
 
 use crate::startup;
+use crate::startup::stream_plane::StoreStreamTable;
 use crate::startup::try_init_otel_from_settings;
 
 // ---------------------------------------------------------------------------
@@ -127,13 +128,46 @@ pub(crate) fn run_worker(
         }
     };
     let db_path = data_dir.join("lorica.db");
-    let store = match ConfigStore::open(&db_path, encryption_key) {
+    let store = match ConfigStore::open(&db_path, encryption_key.clone()) {
         Ok(s) => s,
         Err(e) => {
             error!(error = %e, "worker failed to open database");
             std::process::exit(1);
         }
     };
+
+    // The stream runtime (Story 12.2 D-b), started as soon as the store
+    // opens so the supervisor's first `attach` is answered well inside
+    // its ack timeout. The handle lives as long as the worker: dropping
+    // it stops the runtime.
+    let Some(stream_ctl_fd) = stream_ctl_fd else {
+        error!(worker_id = id, "worker received no stream control FD");
+        std::process::exit(1);
+    };
+    let stream_source = match StoreStreamTable::open(&db_path, encryption_key) {
+        Ok(source) => Arc::new(source),
+        Err(e) => {
+            error!(error = %e, "worker failed to open the stream table");
+            std::process::exit(1);
+        }
+    };
+    let stream_runtime = match lorica_stream::StreamRuntime::spawn(
+        lorica_stream::ControlTransport::Seqpacket(stream_ctl_fd),
+        // No engine until Stories 12.3 and 12.5: an accepted connection
+        // is closed at once and a datagram dropped (D-b, Resolved #6).
+        lorica_stream::Engines::default(),
+        Arc::clone(&stream_source) as Arc<dyn lorica_stream::StreamTableSource>,
+    ) {
+        Ok(handle) => Arc::new(handle),
+        Err(e) => {
+            error!(worker_id = id, error = %e, "worker failed to start the stream runtime");
+            std::process::exit(1);
+        }
+    };
+    match lorica_worker::stream_sockets::process_fd_limit() {
+        Ok(limit) => info!(worker_id = id, fd_limit = limit, "process fd limit"),
+        Err(e) => warn!(worker_id = id, error = %e, "process fd limit unreadable"),
+    }
 
     let store = Arc::new(Mutex::new(store));
     let log_buffer = Arc::new(LogBuffer::new(10_000));
@@ -798,11 +832,16 @@ pub(crate) fn run_worker(
         lorica::proxy_wiring::compute_pool_size(backend_count)
     };
     info!(pool_size, "upstream keepalive pool size");
-    let server_conf = Arc::new(lorica_core::server::configuration::ServerConf {
-        upstream_crl_file: upstream_crl_file.map(|s| s.to_string()),
-        upstream_keepalive_pool_size: pool_size,
-        ..Default::default()
-    });
+    // One configuration for the proxy service and the `Server` that runs
+    // it, so Pingora's shutdown waits are Lorica's (Story 12.2 D-f).
+    let lorica_server_conf = || {
+        startup::drain::pingora_server_conf(lorica_core::server::configuration::ServerConf {
+            upstream_crl_file: upstream_crl_file.map(|s| s.to_string()),
+            upstream_keepalive_pool_size: pool_size,
+            ..lorica_core::server::configuration::ServerConf::new()
+        })
+    };
+    let server_conf = Arc::new(lorica_server_conf());
     let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
     // Install the TCP-level pre-filter. Held by Arc inside the listener, so
     // subsequent reloads take effect without rebuilding endpoints.
@@ -859,9 +898,32 @@ pub(crate) fn run_worker(
     // AFTER the worker finishes serving and BEFORE the process
     // exits, so a SIGTERM mid-export does not lose the last N
     // seconds of spans.
-    let mut server = lorica_core::server::Server::new(None).expect("failed to create proxy server");
+    let mut server = lorica_core::server::Server::new_with_opt_and_conf(None, lorica_server_conf());
     server.set_listen_fds(fds);
     server.add_service(proxy_service);
+    // The drain watcher ends this worker as soon as a stop has no
+    // traffic left, long before Pingora's grace (the setting's hard
+    // maximum) would: armed by the supervisor's `quiesce`, or by
+    // Pingora's graceful-terminate phase with the stored setting when a
+    // SIGTERM arrives without one.
+    let drain_source = Arc::clone(&stream_source);
+    if let Err(e) = startup::drain::arm_worker_drain(
+        Arc::clone(&stream_runtime),
+        server.watch_execution_phase(),
+        Arc::clone(&active_connections),
+        move || drain_source.drain_timeout(),
+        move |end| {
+            info!(
+                worker_id = id,
+                ?end,
+                "drain finished; flushing OTel spans and exiting"
+            );
+            lorica::otel::shutdown();
+            std::process::exit(0);
+        },
+    ) {
+        warn!(worker_id = id, error = %e, "drain watcher not started; Pingora's grace bounds the stop");
+    }
     server.run(lorica_core::server::RunArgs::default());
     info!(worker_id = id, "proxy engine drained; flushing OTel spans");
     lorica::otel::shutdown();

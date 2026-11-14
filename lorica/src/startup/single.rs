@@ -30,6 +30,14 @@ use lorica::reload::reload_proxy_config;
 use crate::cli::Cli;
 use crate::startup;
 use crate::startup::log_store_health::LogStoreRole;
+use crate::startup::stream_plane::{
+    InProcessLink, PlaneRole, StoreStreamTable, StreamPlane, StreamPlaneHandle,
+    STREAM_CTL_ACK_TIMEOUT,
+};
+
+/// Messages the in-process stream control channel holds each way. The
+/// driver is stop-and-wait, so one is ever in flight; the rest is slack.
+const STREAM_CHANNEL_CAPACITY: usize = 4;
 use crate::startup::{
     persist_initial_password, restrict_key_permissions, shutdown_signal,
     try_init_otel_from_settings,
@@ -77,7 +85,7 @@ pub(crate) fn run_single_process(cli: Cli) {
 
         // Open the configuration database
         let db_path = data_dir.join("lorica.db");
-        let store = match ConfigStore::open(&db_path, Some(encryption_key)) {
+        let store = match ConfigStore::open(&db_path, Some(encryption_key.clone())) {
             Ok(s) => s,
             Err(e) => {
                 error!(error = %e, "failed to open configuration database");
@@ -294,11 +302,18 @@ pub(crate) fn run_single_process(cli: Cli) {
             lorica::proxy_wiring::compute_pool_size(backend_count)
         };
         info!(pool_size, "upstream keepalive pool size");
-        let server_conf = Arc::new(lorica_core::server::configuration::ServerConf {
-            upstream_crl_file: cli.upstream_crl_file.clone(),
-            upstream_keepalive_pool_size: pool_size,
-            ..Default::default()
-        });
+        // One configuration for the proxy service and the `Server` that
+        // runs it, so Pingora's shutdown waits are Lorica's (Story 12.2
+        // D-f).
+        let lorica_server_conf = || {
+            startup::drain::pingora_server_conf(lorica_core::server::configuration::ServerConf {
+                upstream_crl_file: cli.upstream_crl_file.clone(),
+                upstream_keepalive_pool_size: pool_size,
+                ..lorica_core::server::configuration::ServerConf::new()
+            })
+        };
+        let server_conf = Arc::new(lorica_server_conf());
+        let pingora_conf = lorica_server_conf();
         let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
         proxy_service.set_connection_filter(
             connection_filter.clone() as Arc<dyn lorica_core::listeners::ConnectionFilter>
@@ -484,6 +499,58 @@ pub(crate) fn run_single_process(cli: Cli) {
         };
         let oidc_verifier = build_oidc_verifier();
 
+        // The stream plane, single-process (D-k): the supervisor's
+        // reconcile code driving this process's own stream runtime over
+        // an in-process channel, one worker slot. The registry is the
+        // one the API reads (Lot E3).
+        let stream_states = lorica_stream::StreamBindStates::new();
+        let stream_source = match StoreStreamTable::open(&db_path, Some(encryption_key)) {
+            Ok(source) => Arc::new(source),
+            Err(e) => {
+                error!(error = %e, "failed to open the stream table");
+                std::process::exit(1);
+            }
+        };
+        let (stream_peer, stream_transport) =
+            lorica_stream::ControlTransport::in_process_pair(STREAM_CHANNEL_CAPACITY);
+        let stream_runtime = match lorica_stream::StreamRuntime::spawn(
+            stream_transport,
+            // No engine until Stories 12.3 and 12.5 (D-b, Resolved #6).
+            lorica_stream::Engines::default(),
+            stream_source as Arc<dyn lorica_stream::StreamTableSource>,
+        ) {
+            Ok(handle) => handle,
+            Err(e) => {
+                error!(error = %e, "failed to start the stream runtime");
+                std::process::exit(1);
+            }
+        };
+        let fd_limit = match lorica_worker::stream_sockets::process_fd_limit() {
+            Ok(limit) => {
+                info!(fd_limit = limit, "process fd limit");
+                limit
+            }
+            Err(e) => {
+                // A zero budget refuses every stream with `fd_budget` and
+                // the reason, rather than guessing a limit.
+                error!(error = %e, "process fd limit unreadable; no stream can bind");
+                0
+            }
+        };
+        let stream_plane = StreamPlaneHandle::new(
+            StreamPlane::new(
+                vec![(0, InProcessLink(stream_peer))],
+                1,
+                lorica_stream::FdBudget::from_limit(fd_limit),
+                process_reserved_ports,
+                stream_states.clone(),
+                STREAM_CTL_ACK_TIMEOUT,
+            ),
+            Arc::clone(&store),
+            PlaneRole::of(&cluster_runtime),
+            Some(log_store.clone()),
+        );
+
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store.clone(),
@@ -584,8 +651,13 @@ pub(crate) fn run_single_process(cli: Cli) {
         let reload_connection_filter = Arc::clone(&connection_filter);
         let reload_mtls_fp = Arc::clone(&mtls_installed_fingerprint);
         let reload_notify_dispatcher = Arc::clone(&notify_dispatcher);
+        let reload_stream_plane = stream_plane.clone();
         let _reload_handle = tokio::spawn(async move {
             while config_reload_rx.changed().await.is_ok() {
+                // D-d around this process's commit: stream bindings no
+                // longer desired are detached before it, new ones bound
+                // after it.
+                reload_stream_plane.before_commit().await;
                 if let Err(e) = lorica::reload::reload_proxy_config_with_mtls(
                     &reload_store,
                     &reload_config,
@@ -600,6 +672,7 @@ pub(crate) fn run_single_process(cli: Cli) {
                 reload_probe_scheduler.reload().await;
                 reload_sla_collector.load_configs(&*reload_store.lock().await);
                 startup::reload_notify_dispatcher(&reload_store, &reload_notify_dispatcher).await;
+                reload_stream_plane.after_commit().await;
             }
         });
 
@@ -617,14 +690,21 @@ pub(crate) fn run_single_process(cli: Cli) {
         )
         .await;
 
-        // Run the proxy engine in a dedicated thread
+        // Run the proxy engine in a dedicated thread. `run`, not
+        // `run_forever`: the latter's `exit(0)` at the end of Pingora's
+        // grace would race the stop path below, which owns the exit.
         let _proxy_thread = std::thread::spawn(move || {
-            let mut server =
-                lorica_core::server::Server::new(None).expect("failed to create proxy server");
+            let mut server = lorica_core::server::Server::new_with_opt_and_conf(None, pingora_conf);
             server.bootstrap();
             server.add_service(proxy_service);
-            server.run_forever();
+            server.run(lorica_core::server::RunArgs::default());
         });
+
+        // The first stream reconcile runs before READY (D-a), so a start
+        // returns with the stream ports listening; a bind failure is a
+        // state, never a delay.
+        stream_plane.after_commit().await;
+        let _stream_bind_retry = stream_plane.spawn_retry_loop();
 
         // Tell systemd we are accepting. REQUIRED for `Type=notify` or
         // systemd times the unit out and marks the start failed. No-op
@@ -642,6 +722,11 @@ pub(crate) fn run_single_process(cli: Cli) {
         shutdown_signal().await;
 
         info!("Lorica shutting down gracefully");
+        // First, so systemd's stop timeout never cuts the drain below
+        // short (D-f). It renews until the process exits.
+        let _stop_keepalive = startup::drain::start_stop_keepalive(
+            crate::startup::hot_upgrade::notify_socket(),
+        );
 
         // Stop accepting cluster sessions and tear down the established
         // ones before the rest of the process winds down.
@@ -651,6 +736,26 @@ pub(crate) fn run_single_process(cli: Cli) {
         if let Some(follower) = follower_plane.take() {
             follower.shutdown();
         }
+
+        // Drain (D-f): Pingora stopped accepting on the same signal and
+        // finishes the requests in flight; the stream runtime stops its
+        // loops and drains with `node_shutdown`. The stop waits for both
+        // to be idle, for the setting as it is now at most.
+        let drain = startup::drain::stored_drain_timeout(&*store.lock().await);
+        stream_plane.quiesce(drain).await;
+        let probe = startup::drain::DrainProbe {
+            http_in_flight: Arc::clone(&active_connections),
+            streams: stream_runtime.tracker().clone(),
+        };
+        match tokio::task::spawn_blocking(move || {
+            startup::drain::wait_for_drain(&probe, drain, startup::drain::DRAIN_POLL_INTERVAL)
+        })
+        .await
+        {
+            Ok(end) => info!(?end, "drain finished"),
+            Err(e) => warn!(error = %e, "drain watcher failed; stopping without it"),
+        }
+        stream_runtime.stop();
 
         // Drain tracked background tasks and cluster units in flight
         // before tearing down the API server, each bounded so a hung

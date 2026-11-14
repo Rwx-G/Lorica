@@ -564,10 +564,15 @@ impl WorkerManager {
 
     /// Send SIGTERM to all workers for graceful shutdown.
     /// Graceful shutdown: send SIGTERM so workers stop accepting new connections
-    /// and drain active ones. After the drain timeout, send SIGKILL to any
+    /// and drain active ones. After `drain`, send SIGKILL to any
     /// workers still alive. Follows the Sozu soft-stop pattern.
-    pub fn shutdown_all(&self) {
-        self.shutdown_all_with_timeout(Duration::from_secs(30));
+    ///
+    /// `drain` is the stop's own bound (the drain setting plus a margin,
+    /// Story 12.2 D-f): a worker's drain watcher ends it as soon as its
+    /// traffic is gone, so the SIGKILL only meets a worker whose watcher
+    /// failed. Returns as soon as every worker has exited.
+    pub fn shutdown_all(&self, drain: Duration) {
+        self.shutdown_all_with_timeout(drain);
     }
 
     /// Drain workers for a hot upgrade and report whether the drain
@@ -598,14 +603,21 @@ impl WorkerManager {
             );
         }
 
-        // Wait for workers to drain active connections and exit
+        // Wait for workers to drain active connections and exit. An
+        // exited worker is a zombie until it is reaped, and `kill(pid, 0)`
+        // succeeds on a zombie: probing with it waited out the whole
+        // timeout on every stop. `child_exited` reaps instead, which is
+        // safe here because the monitor that reaps otherwise is stopped
+        // before any drain starts.
+        let mut exited = vec![false; self.workers.len()];
         let deadline = Instant::now() + drain_timeout;
         loop {
-            let all_dead = self
-                .workers
-                .iter()
-                .all(|h| signal::kill(h.pid, None).is_err());
-            if all_dead {
+            for (gone, handle) in exited.iter_mut().zip(&self.workers) {
+                if !*gone {
+                    *gone = crate::hot_upgrade::child_exited(handle.pid);
+                }
+            }
+            if exited.iter().all(|gone| *gone) {
                 info!("all workers exited after draining connections");
                 return true;
             }
@@ -615,11 +627,13 @@ impl WorkerManager {
             std::thread::sleep(Duration::from_millis(200));
         }
 
-        // Drain timeout exceeded - force kill remaining workers
+        // Drain timeout exceeded - force kill remaining workers. A reaped
+        // pid is never signalled: the kernel may have reused it.
         warn!("drain timeout exceeded, sending SIGKILL to remaining workers");
-        for handle in &self.workers {
-            if signal::kill(handle.pid, None).is_ok() {
+        for (gone, handle) in exited.iter().zip(&self.workers) {
+            if !*gone {
                 let _ = signal::kill(handle.pid, Signal::SIGKILL);
+                let _ = waitpid(handle.pid, None);
                 warn!(worker_id = handle.id, "SIGKILL sent to worker");
             }
         }
@@ -759,5 +773,46 @@ mod tests {
         assert_eq!(backoff(4), 16);
         assert_eq!(backoff(5), 30);
         assert_eq!(backoff(6), 30);
+    }
+
+    #[test]
+    // The child is left un-waited on purpose: it stands for a worker,
+    // and reaping it is what `shutdown_all` is under test for.
+    #[allow(clippy::zombie_processes)]
+    fn shutdown_returns_once_the_workers_exited_without_waiting_out_the_bound() {
+        // A worker that has exited stays a zombie until reaped, and a
+        // zombie answers `kill(pid, 0)`: the probe the drain used to rely
+        // on, which made every stop wait the whole bound.
+        let config = WorkerConfig {
+            worker_count: 1,
+            data_dir: "/tmp".to_string(),
+            log_level: "info".to_string(),
+            log_format: "json".to_string(),
+            log_file: None,
+            http_addr: "127.0.0.1:0".to_string(),
+            https_addr: None,
+            https_port: 0,
+            upstream_crl_file: None,
+        };
+        let mut mgr = WorkerManager::new(config);
+        let child = std::process::Command::new("true")
+            .spawn()
+            .expect("test setup: spawn a short-lived child");
+        mgr.workers.push(WorkerHandle {
+            id: 0,
+            pid: Pid::from_raw(child.id() as i32),
+            cmd_fd: None,
+            rpc_fd: None,
+            stream_ctl_fd: None,
+            spawned_at: Instant::now(),
+            restart_count: 0,
+        });
+        let start = Instant::now();
+        mgr.shutdown_all(Duration::from_secs(20));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "shutdown waited {:?} for a worker that had exited",
+            start.elapsed()
+        );
     }
 }

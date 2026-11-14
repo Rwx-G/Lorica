@@ -24,10 +24,12 @@
 pub(crate) mod automation;
 pub(crate) mod cluster_follower;
 pub(crate) mod cluster_plane;
+pub(crate) mod drain;
 pub(crate) mod environment_reaper;
 pub(crate) mod hot_upgrade;
 pub(crate) mod log_store_health;
 pub(crate) mod single;
+pub(crate) mod stream_plane;
 pub(crate) mod supervisor;
 pub(crate) mod telemetry_drain;
 pub(crate) mod waf_forward;

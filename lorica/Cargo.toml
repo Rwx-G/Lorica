@@ -58,6 +58,9 @@ lorica-command = { version = "1.10.6", path = "../lorica-command" }
 lorica-cluster = { version = "1.10.6", path = "../lorica-cluster" }
 # The fleet runtime the cluster plane composes (backlog #52).
 lorica-fleet = { version = "1.10.6", path = "../lorica-fleet" }
+# The stream data plane: the worker-side runtime and the supervisor's
+# reconcile, budget and bind-state types (Story 12.2).
+lorica-stream = { version = "1.10.6", path = "../lorica-stream" }
 lorica-shmem = { version = "1.10.6", path = "../lorica-shmem" }
 lorica-waf = { version = "1.10.6", path = "../lorica-waf" }
 lorica-notify = { version = "1.10.6", path = "../lorica-notify" }

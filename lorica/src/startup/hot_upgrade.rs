@@ -49,6 +49,7 @@
 //!    until the old has committed to draining is what prevents a lost
 //!    readiness datagram from stranding systemd on a killed PID (H3).
 
+use std::net::SocketAddr;
 use std::os::fd::RawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -115,6 +116,15 @@ const CLUSTER_KEY_PREFIX: &str = "cluster:";
 /// first hot upgrade, silently, with no error anywhere.
 const AUTOMATION_KEY_PREFIX: &str = "automation:";
 
+/// `Fds` table key prefix for the TCP stream listeners (Story 12.2 D-j),
+/// keyed `stream-tcp:<stream_id>:<bind_gen>:<addr>`.
+///
+/// A TCP stream listener holds its port without `SO_REUSEPORT`, so the
+/// new generation cannot bind it while the old one holds it: it must
+/// inherit the socket. Like the automation family, it needs its arm
+/// above the proxy catch-all of `partition_inherited_fds`.
+const STREAM_TCP_KEY_PREFIX: &str = "stream-tcp:";
+
 /// Role of a cluster-plane listener in the FD-handoff table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterListenerRole {
@@ -146,6 +156,43 @@ impl ClusterListenerRole {
 /// `bind_addr`: `cluster:<role>:<bind>`.
 pub fn cluster_fds_key(role: ClusterListenerRole, bind_addr: &str) -> String {
     format!("{CLUSTER_KEY_PREFIX}{}:{bind_addr}", role.key_part())
+}
+
+/// `Fds` table key of a TCP stream listener.
+pub fn stream_tcp_fds_key(stream_id: &str, bind_gen: u64, addr: SocketAddr) -> String {
+    format!("{STREAM_TCP_KEY_PREFIX}{stream_id}:{bind_gen}:{addr}")
+}
+
+/// Split the part of a `stream-tcp:` key after its prefix into stream id,
+/// `bind_gen` and address. The stream id is an unvalidated string that
+/// may itself hold colons, so the first split that leaves a well-formed
+/// `<bind_gen>:<addr>` tail wins.
+fn parse_stream_tcp_key(rest: &str) -> Option<(String, u64, SocketAddr)> {
+    rest.match_indices(':').find_map(|(i, _)| {
+        let (stream_id, tail) = (&rest[..i], &rest[i + 1..]);
+        let (bind_gen, addr) = tail.split_once(':')?;
+        if stream_id.is_empty() || !bind_gen.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some((
+            stream_id.to_string(),
+            bind_gen.parse().ok()?,
+            addr.parse().ok()?,
+        ))
+    })
+}
+
+/// One TCP stream listener crossing a hot upgrade.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamTcpFd {
+    /// The stream it listens for.
+    pub stream_id: String,
+    /// The outgoing supervisor's generation of the binding.
+    pub bind_gen: u64,
+    /// The bound address and port.
+    pub addr: SocketAddr,
+    /// The listening socket.
+    pub fd: RawFd,
 }
 
 /// `Fds` table key for the automation listener bound at `bind_addr`:
@@ -255,6 +302,14 @@ pub fn notify_payload(main_pid: i32) -> String {
     format!("READY=1\nMAINPID={main_pid}\n")
 }
 
+/// `sd_notify` payload asking systemd for `usec` more microseconds on the
+/// job in progress (`EXTEND_TIMEOUT_USEC`, systemd 236 and later). Sent
+/// during a stop, it extends the stop job past `TimeoutStopSec` for as
+/// long as the sender keeps renewing it (Story 12.2 D-f).
+pub fn extend_timeout_payload(usec: u64) -> String {
+    format!("EXTEND_TIMEOUT_USEC={usec}\n")
+}
+
 /// Listener FDs pulled from an outgoing supervisor during a hot upgrade.
 #[derive(Debug)]
 pub struct InheritedListeners {
@@ -269,19 +324,24 @@ pub struct InheritedListeners {
     /// Automation-API listeners (bind address, FD), if the outgoing
     /// supervisor ran with `--automation-listen` (Story 10.3).
     pub automation: Vec<(String, RawFd)>,
+    /// TCP stream listeners (Story 12.2 D-j), adopted by the stream
+    /// plane before its first reconcile.
+    pub stream_tcp: Vec<StreamTcpFd>,
 }
 
 /// Build the `Fds` table the old supervisor serves: every proxy listener
 /// keyed by its bind address, the management listener under the
 /// [`MANAGEMENT_KEY_PREFIX`] key, each cluster listener (when present)
 /// under its role-qualified [`CLUSTER_KEY_PREFIX`] key, and the
-/// automation listener under its [`AUTOMATION_KEY_PREFIX`] key.
+/// automation listener under its [`AUTOMATION_KEY_PREFIX`] key, and each
+/// TCP stream listener under its [`STREAM_TCP_KEY_PREFIX`] key.
 fn build_fds_table(
     proxy: &[(String, RawFd)],
     management_fd: RawFd,
     management_port: u16,
     cluster: &[(ClusterListenerRole, String, RawFd)],
     automation: &[(String, RawFd)],
+    stream_tcp: &[StreamTcpFd],
 ) -> Fds {
     let mut fds = Fds::new();
     for (addr, fd) in proxy {
@@ -293,6 +353,9 @@ fn build_fds_table(
     }
     for (bind, fd) in automation {
         fds.add(automation_fds_key(bind), *fd);
+    }
+    for s in stream_tcp {
+        fds.add(stream_tcp_fds_key(&s.stream_id, s.bind_gen, s.addr), s.fd);
     }
     fds
 }
@@ -309,8 +372,16 @@ pub fn serve_listener_fds_blocking(
     management_port: u16,
     cluster: &[(ClusterListenerRole, String, RawFd)],
     automation: &[(String, RawFd)],
+    stream_tcp: &[StreamTcpFd],
 ) -> Result<(), String> {
-    let table = build_fds_table(proxy, management_fd, management_port, cluster, automation);
+    let table = build_fds_table(
+        proxy,
+        management_fd,
+        management_port,
+        cluster,
+        automation,
+        stream_tcp,
+    );
     let sock = transfer_sock_path(data_dir);
     let sock_str = sock.to_string_lossy().into_owned();
     table
@@ -366,6 +437,7 @@ fn partition_inherited_fds(
     let mut management: Option<RawFd> = None;
     let mut cluster: Vec<(ClusterListenerRole, String, RawFd)> = Vec::new();
     let mut automation: Vec<(String, RawFd)> = Vec::new();
+    let mut stream_tcp: Vec<StreamTcpFd> = Vec::new();
     for (key, fd) in keys.into_iter().zip(fds) {
         if key.starts_with(MANAGEMENT_KEY_PREFIX) {
             if management.is_some() {
@@ -402,6 +474,24 @@ fn partition_inherited_fds(
                 ));
             }
             automation.push((bind.to_string(), fd));
+        } else if let Some(rest) = key.strip_prefix(STREAM_TCP_KEY_PREFIX) {
+            let (stream_id, bind_gen, addr) = parse_stream_tcp_key(rest).ok_or_else(|| {
+                format!("inherited FD table carries a malformed stream key `{key}`")
+            })?;
+            if stream_tcp
+                .iter()
+                .any(|s| s.stream_id == stream_id && s.bind_gen == bind_gen && s.addr == addr)
+            {
+                return Err(format!(
+                    "inherited FD table carries a duplicate stream key `{key}`"
+                ));
+            }
+            stream_tcp.push(StreamTcpFd {
+                stream_id,
+                bind_gen,
+                addr,
+                fd,
+            });
         } else {
             proxy.push((key, fd));
         }
@@ -411,6 +501,7 @@ fn partition_inherited_fds(
         management,
         cluster,
         automation,
+        stream_tcp,
     })
 }
 
@@ -472,25 +563,40 @@ async fn send_ack_burst(ack_target: &Path) {
     }
 }
 
-/// Send the `sd_notify` `READY=1` + `MAINPID` datagram to `$NOTIFY_SOCKET`
-/// (NEW side). Returns `Ok(true)` when sent, `Ok(false)` when
-/// `$NOTIFY_SOCKET` is unset (not under systemd: Docker, manual run) so
-/// the caller can log "skipped" rather than error.
-///
-/// Abstract sockets (`$NOTIFY_SOCKET` beginning with `@`) are not
-/// supported on stable std and are skipped with `Ok(false)`; systemd's
-/// default is a filesystem path, which is handled.
-pub fn sd_notify_ready(main_pid: i32) -> std::io::Result<bool> {
-    let Some(socket_path) = std::env::var_os("NOTIFY_SOCKET") else {
+/// The socket `sd_notify` datagrams go to: `$NOTIFY_SOCKET`, or `None`
+/// when it is unset (not under systemd: Docker, a manual run) or names
+/// an abstract socket (`@` prefix), which stable std cannot address;
+/// systemd's default is a filesystem path.
+pub fn notify_socket() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("NOTIFY_SOCKET")?);
+    if path.as_os_str().to_string_lossy().starts_with('@') {
+        return None;
+    }
+    Some(path)
+}
+
+/// Send one `sd_notify` datagram carrying `payload` to `socket`.
+pub fn sd_notify_to(socket: &Path, payload: &str) -> std::io::Result<()> {
+    let dgram = std::os::unix::net::UnixDatagram::unbound()?;
+    dgram.send_to(payload.as_bytes(), socket)?;
+    Ok(())
+}
+
+/// Send `payload` to [`notify_socket`]. Returns `Ok(true)` when sent,
+/// `Ok(false)` when there is no socket to send to, so the caller can log
+/// "skipped" rather than error.
+pub fn sd_notify(payload: &str) -> std::io::Result<bool> {
+    let Some(socket) = notify_socket() else {
         return Ok(false);
     };
-    let path = PathBuf::from(&socket_path);
-    if path.as_os_str().to_string_lossy().starts_with('@') {
-        return Ok(false);
-    }
-    let dgram = std::os::unix::net::UnixDatagram::unbound()?;
-    dgram.send_to(notify_payload(main_pid).as_bytes(), &path)?;
+    sd_notify_to(&socket, payload)?;
     Ok(true)
+}
+
+/// Send the `sd_notify` `READY=1` + `MAINPID` datagram (NEW side, and
+/// every cold start), through [`sd_notify`].
+pub fn sd_notify_ready(main_pid: i32) -> std::io::Result<bool> {
+    sd_notify(&notify_payload(main_pid))
 }
 
 /// Quarantine a staged binary whose handoff failed by renaming it to
@@ -567,6 +673,8 @@ pub struct HandoffArgs {
     /// Automation-API listeners (bind address, FD) to hand over, when
     /// the node runs with `--automation-listen` (Story 10.3).
     pub automation_fds: Vec<(String, RawFd)>,
+    /// TCP stream listeners to hand over (Story 12.2 D-j).
+    pub stream_tcp_fds: Vec<StreamTcpFd>,
     /// Full argv for the new binary, `argv[0]` first.
     pub child_argv: Vec<String>,
 }
@@ -623,6 +731,7 @@ pub async fn run_old_side_handoff(args: HandoffArgs) -> HandoffRun {
     let serve_port = args.management_port;
     let serve_cluster = args.cluster_fds.clone();
     let serve_automation = args.automation_fds.clone();
+    let serve_stream_tcp = args.stream_tcp_fds.clone();
     let serve_task = tokio::task::spawn_blocking(move || {
         serve_listener_fds_blocking(
             &serve_data_dir,
@@ -631,6 +740,7 @@ pub async fn run_old_side_handoff(args: HandoffArgs) -> HandoffRun {
             serve_port,
             &serve_cluster,
             &serve_automation,
+            &serve_stream_tcp,
         )
     });
 
@@ -773,6 +883,7 @@ mod tests {
             9443,
             &[],
             &automation,
+            &[],
         );
         let (keys, fds) = table.serialize();
         let mut inherited = partition_inherited_fds(keys, fds, 9443).expect("partition succeeds");
@@ -801,7 +912,7 @@ mod tests {
         assert_eq!(produced.len(), 1);
         assert_eq!(produced[0].0, bind.to_string());
 
-        let table = build_fds_table(&[], 12, 9443, &[], &produced);
+        let table = build_fds_table(&[], 12, 9443, &[], &produced, &[]);
         let (keys, fds) = table.serialize();
         let inherited = partition_inherited_fds(keys, fds, 9443).expect("partition succeeds");
         assert_eq!(inherited.automation, produced);
@@ -828,7 +939,14 @@ mod tests {
                 32,
             ),
         ];
-        let table = build_fds_table(&[("0.0.0.0:8080".to_string(), 10)], 12, 9443, &cluster, &[]);
+        let table = build_fds_table(
+            &[("0.0.0.0:8080".to_string(), 10)],
+            12,
+            9443,
+            &cluster,
+            &[],
+            &[],
+        );
         let (keys, fds) = table.serialize();
         let mut inherited = partition_inherited_fds(keys, fds, 9443).expect("partition succeeds");
         assert_eq!(inherited.proxy, vec![("0.0.0.0:8080".to_string(), 10)]);
@@ -873,6 +991,69 @@ mod tests {
     #[test]
     fn notify_payload_is_well_formed() {
         assert_eq!(notify_payload(4321), "READY=1\nMAINPID=4321\n");
+    }
+
+    #[test]
+    fn extend_timeout_payload_is_well_formed() {
+        assert_eq!(
+            extend_timeout_payload(30_000_000),
+            "EXTEND_TIMEOUT_USEC=30000000\n"
+        );
+    }
+
+    #[test]
+    fn a_stream_tcp_key_never_falls_into_the_proxy_set() {
+        // Same silent failure as the automation family: without its arm
+        // above the catch-all, a stream listener would be adopted as an
+        // HTTP proxy listener on the first hot upgrade.
+        let streams = vec![
+            StreamTcpFd {
+                stream_id: "6f1c1a52-5b0e-4f7e-9a51-1a7c5a1b2c3d".to_string(),
+                bind_gen: 7,
+                addr: "0.0.0.0:5432".parse().unwrap(),
+                fd: 60,
+            },
+            // An IPv6 address carries colons of its own, and the stream
+            // id is not validated: neither may confuse the split.
+            StreamTcpFd {
+                stream_id: "odd:id".to_string(),
+                bind_gen: u64::MAX,
+                addr: "[2001:db8::1]:6000".parse().unwrap(),
+                fd: 61,
+            },
+        ];
+        let table = build_fds_table(
+            &[("0.0.0.0:8080".to_string(), 10)],
+            12,
+            9443,
+            &[],
+            &[],
+            &streams,
+        );
+        let (keys, fds) = table.serialize();
+        let mut inherited = partition_inherited_fds(keys, fds, 9443).expect("partition succeeds");
+        assert_eq!(inherited.proxy, vec![("0.0.0.0:8080".to_string(), 10)]);
+        inherited.stream_tcp.sort_by_key(|s| s.fd);
+        assert_eq!(inherited.stream_tcp, streams);
+    }
+
+    #[test]
+    fn a_malformed_or_duplicate_stream_tcp_key_fails_the_pull() {
+        for bad in [
+            "stream-tcp:",
+            "stream-tcp:s1",
+            "stream-tcp:s1:notanumber:0.0.0.0:5432",
+            "stream-tcp:s1:7:not-an-address",
+            "stream-tcp::7:0.0.0.0:5432",
+        ] {
+            let err = partition_inherited_fds(vec![bad.to_string()], vec![70], 9443)
+                .expect_err("a malformed stream key must fail");
+            assert!(err.contains("malformed stream key"), "{bad}: {err}");
+        }
+        let key = stream_tcp_fds_key("s1", 7, "0.0.0.0:5432".parse().unwrap());
+        let err = partition_inherited_fds(vec![key.clone(), key], vec![71, 72], 9443)
+            .expect_err("duplicate stream key must fail");
+        assert!(err.contains("duplicate stream key"), "{err}");
     }
 
     #[test]

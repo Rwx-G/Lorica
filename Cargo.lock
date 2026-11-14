@@ -2782,6 +2782,7 @@ dependencies = [
  "lorica-notify",
  "lorica-proxy",
  "lorica-shmem",
+ "lorica-stream",
  "lorica-timeout",
  "lorica-tls",
  "lorica-waf",
