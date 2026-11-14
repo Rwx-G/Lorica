@@ -548,6 +548,33 @@ paths:
                     no `0`. Applies to connections and keepalive waits that
                     start after the save. Bounds:
                     `GET /api/v1/settings/schema`.
+                worker_drain_timeout_s:
+                  type: integer
+                  minimum: 1
+                  maximum: 3600
+                  default: 30
+                  description: >-
+                    Seconds established stream connections and in-flight
+                    HTTP requests are given to finish when a stop, or a
+                    stream that is removed, disabled or moved, ends them
+                    (Story 12.2). What is left at the deadline is closed,
+                    a stream connection with the end reason
+                    `node_shutdown` or `config_removed`. A stop takes as
+                    long as the traffic needs and no longer, and under
+                    systemd extends the unit's stop timeout while it
+                    drains. The hard maximum is one hour. Replicated to
+                    every node.
+                stream_listen_socket_cap:
+                  type: integer
+                  minimum: 1
+                  maximum: 16384
+                  default: 2048
+                  description: >-
+                    Listening sockets the streams of one node may hold in
+                    all, one per port (Story 12.2). A stream write that
+                    would take a node past it is refused `422`
+                    (`stream_fd_budget`); see `GET /api/v1/streams/budget`.
+                    Replicated to every node.
                 max_active_probes:
                   type: integer
                   description: >-
@@ -1487,7 +1514,9 @@ paths:
         - sessionCookie: []
       responses:
         "200":
-          description: Every stream, ordered by name, with its backend ids
+          description: >-
+            Every stream, ordered by name, with its backend ids and this
+            node's bind state of it
           content:
             application/json:
               schema:
@@ -1499,7 +1528,7 @@ paths:
                       streams:
                         type: array
                         items:
-                          $ref: "#/components/schemas/StreamResponse"
+                          $ref: "#/components/schemas/StreamReadResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
     post:
@@ -1511,7 +1540,12 @@ paths:
         stream, a control plane only those with an empty selector), and
         on a control plane every active enrolled node the selector
         targets, against that node's reserved ports and the other streams
-        it binds, disabled ones included.
+        it binds, disabled ones included. The same nodes are then checked
+        against their fd budget (`GET /api/v1/streams/budget`), counting
+        the enabled streams each binds: a stream that would break one is
+        refused `422` with `error.code` `stream_fd_budget`. A targeted
+        node whose fd limit is not known here is named in `warnings`
+        instead, and refuses the stream when it binds it.
       security:
         - sessionCookie: []
       requestBody:
@@ -1529,7 +1563,7 @@ paths:
                 type: object
                 properties:
                   data:
-                    $ref: "#/components/schemas/StreamResponse"
+                    $ref: "#/components/schemas/StreamWriteResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1539,7 +1573,43 @@ paths:
         "409":
           $ref: "#/components/responses/StreamConflict"
         "422":
-          $ref: "#/components/responses/Unprocessable"
+          $ref: "#/components/responses/StreamUnprocessable"
+
+  /api/v1/streams/budget:
+    get:
+      tags: [Streams]
+      summary: The stream fd budget of the node answering
+      description: >-
+        The fd budget the stream plane works within (Story 12.2 D-e), so
+        an operator sees the contention between streams before it shows
+        up as refused sessions. From the process's soft `RLIMIT_NOFILE`
+        `L`: a base reserve `B` of 1024, an HTTP reserve `H` of `L / 2`
+        that streams never use, and a stream budget `S = L - B - H`. One
+        worker holds its listening sockets plus what each stream's engine
+        declares at its ceiling within `S`; the supervisor, which keeps
+        one socket per TCP port and one per worker per UDP port, holds
+        its share within `S` too; and the node's listening sockets stay
+        within `stream_listen_socket_cap`. Operator and above: a Viewer
+        does not get node capacity. Standalone and on a follower the
+        answer is the node itself; a control plane answers its own node,
+        and the nodes that report their budget in their heartbeat beside
+        it.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: One entry per node
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/StreamBudgetView"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
 
   /api/v1/streams/{id}:
     parameters:
@@ -1551,14 +1621,14 @@ paths:
         - sessionCookie: []
       responses:
         "200":
-          description: The stream with its backend ids
+          description: The stream with its backend ids and this node's bind state of it
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   data:
-                    $ref: "#/components/schemas/StreamResponse"
+                    $ref: "#/components/schemas/StreamReadResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -1571,7 +1641,10 @@ paths:
         The ports move together: `port_first` without `port_last` makes
         the stream a single port, `port_last` alone moves the end of the
         range. `backend_ids` replaces the whole set. The result is
-        checked as on create.
+        checked as on create, except that an update adding nothing to
+        what a node already binds (the same protocol, no more ports) is
+        never refused for that node's fd budget, so a stream on a node
+        over its budget can still be renamed, narrowed or disabled.
       security:
         - sessionCookie: []
       requestBody:
@@ -1589,7 +1662,7 @@ paths:
                 type: object
                 properties:
                   data:
-                    $ref: "#/components/schemas/StreamResponse"
+                    $ref: "#/components/schemas/StreamWriteResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1601,7 +1674,7 @@ paths:
         "409":
           $ref: "#/components/responses/StreamConflict"
         "422":
-          $ref: "#/components/responses/Unprocessable"
+          $ref: "#/components/responses/StreamUnprocessable"
     delete:
       tags: [Streams]
       summary: Delete a stream
@@ -5926,6 +5999,23 @@ components:
           nullable: true
           allOf:
             - $ref: "#/components/schemas/NodeResources"
+        stream_plane:
+          nullable: true
+          description: >-
+            The node's stream bindings (Story 12.2 D-i); `null` while the
+            node has sent no report on its current session.
+          allOf:
+            - $ref: "#/components/schemas/NodeStreamPlane"
+        stream_ports:
+          type: array
+          description: >-
+            Every stream this node binds once active, those its selector
+            names and the fleet-wide ones (Story 12.2 D-i). Unlike
+            `selected_for_hostnames`, fleet-wide entries are listed: a
+            port a node opens is a perimeter change whether one node or
+            all of them open it.
+          items:
+            $ref: "#/components/schemas/StreamPortsEntry"
     NodeVerifyResult:
       type: object
       description: One audit chain's verdict (Story 9.9 AC #3).
@@ -7471,6 +7561,295 @@ components:
           type: string
           format: date-time
 
+    StreamReadResponse:
+      description: A stream as the reads answer it, with this node's bind state of it.
+      allOf:
+        - $ref: "#/components/schemas/StreamResponse"
+        - type: object
+          required: [bind]
+          properties:
+            bind:
+              nullable: true
+              description: >-
+                This node's bind state, `null` when this node does not
+                bind the stream (disabled, not targeted, or not reconciled
+                yet). The other nodes' states are on the cluster node
+                view (`stream_plane`).
+              allOf:
+                - $ref: "#/components/schemas/StreamBindState"
+
+    StreamWriteResponse:
+      description: A stream as a create or an update answers it.
+      allOf:
+        - $ref: "#/components/schemas/StreamResponse"
+        - type: object
+          properties:
+            warnings:
+              type: array
+              items:
+                type: string
+              description: >-
+                One sentence per targeted node whose fd budget could not
+                be checked here, because it has not reported it. Absent
+                when every node was checked.
+
+    StreamBindState:
+      type: object
+      description: >-
+        The bind state of one stream on one node (Story 12.2 D-h).
+        `pending`: desired and not bound yet. `bound`: the node holds the
+        sockets, and `workers_serving` of its `workers` acknowledged them.
+        `failed`: the last attempt failed; `address_in_use` and
+        `address_not_available` are retried every 10 s, the other kinds
+        on the next configuration change.
+      required: [state]
+      properties:
+        state:
+          type: string
+          enum: [pending, bound, failed]
+        workers_serving:
+          type: integer
+          description: "`bound` only."
+        workers:
+          type: integer
+          description: "`bound` only."
+        kind:
+          $ref: "#/components/schemas/StreamBindFailureKind"
+        os_error:
+          type: string
+          description: >-
+            `failed` only: the OS error's text (`Address already in use
+            (os error 98)`), or the node's own sentence for a refusal no
+            system call made (`reserved_port`, `fd_budget`).
+        port:
+          type: integer
+          description: "`failed` only: the port that failed; for a range, the first that did."
+        since:
+          type: string
+          format: date-time
+          description: "`failed` only: when the stream entered the failed state; a retry that fails again keeps it."
+
+    StreamBindFailureKind:
+      type: string
+      description: >-
+        Why a bind failed: `address_in_use` (`EADDRINUSE`, or a UDP stream
+        overlapping another on the node), `permission_denied` (`EACCES`,
+        `EPERM`), `address_not_available` (`EADDRNOTAVAIL`),
+        `reserved_port` (one of the node's own listeners), `fd_budget`
+        (the node's fd budget), `other`.
+      enum:
+        - address_in_use
+        - permission_denied
+        - address_not_available
+        - reserved_port
+        - fd_budget
+        - other
+
+    StreamBudgetView:
+      type: object
+      required: [nodes]
+      properties:
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/NodeStreamBudget"
+
+    NodeStreamBudget:
+      type: object
+      description: One node's stream fd budget (Story 12.2 D-e).
+      required:
+        - node_id
+        - node_name
+        - reported_at
+        - fd_limit
+        - base_reserve
+        - http_reserve
+        - stream_budget
+        - worker_count
+        - listen_socket_cap
+        - listen_sockets_used
+        - worker_fds_committed
+        - supervisor_fds_committed
+        - worker_drain_timeout_s
+        - streams
+      properties:
+        node_id:
+          type: string
+          nullable: true
+          description: The node's cluster id; `null` for a node with no roster row (standalone, the control plane).
+        node_name:
+          type: string
+          nullable: true
+          description: The node's roster name; `null` as `node_id`.
+        reported_at:
+          type: string
+          format: date-time
+          description: When the figures were taken.
+        fd_limit:
+          type: integer
+          format: int64
+          description: >-
+            `L`, the process's soft `RLIMIT_NOFILE` (65536 under the
+            packaged unit). `0` when it could not be read, which leaves no
+            stream budget. Raise `LimitNOFILE` to grow it.
+        base_reserve:
+          type: integer
+          format: int64
+          description: "`B`, 1024: the process's own plumbing."
+        http_reserve:
+          type: integer
+          format: int64
+          description: "`H`, `L / 2`: never usable by streams."
+        stream_budget:
+          type: integer
+          format: int64
+          description: "`S`, `L - B - H`: what the stream plane may use in one process."
+        worker_count:
+          type: integer
+          description: Workers on the node, 1 in single-process mode.
+        listen_socket_cap:
+          type: integer
+          description: The `stream_listen_socket_cap` setting.
+        listen_sockets_used:
+          type: integer
+          format: int64
+          description: The node's streams' listening sockets, one per port, against `listen_socket_cap`.
+        worker_fds_committed:
+          type: integer
+          format: int64
+          description: >-
+            What one worker holds with every stream at its ceiling, against
+            `stream_budget`: the worst case, since the caps are per node.
+        supervisor_fds_committed:
+          type: integer
+          format: int64
+          description: TCP ports plus UDP ports times `worker_count`, against `stream_budget`.
+        worker_drain_timeout_s:
+          type: integer
+          description: The `worker_drain_timeout_s` setting.
+        streams:
+          type: array
+          description: Every stream the node binds, by name.
+          items:
+            $ref: "#/components/schemas/StreamBudgetShare"
+
+    StreamBudgetShare:
+      type: object
+      required:
+        - id
+        - name
+        - protocol
+        - listen_sockets
+        - ceiling
+        - fds_per_unit
+        - fds_committed
+        - bind_state
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        protocol:
+          $ref: "#/components/schemas/StreamProtocol"
+        listen_sockets:
+          type: integer
+          format: int64
+          description: One per port.
+        ceiling:
+          type: integer
+          format: int64
+          nullable: true
+          description: >-
+            The connection cap of a TCP stream or the session ceiling of a
+            UDP one; `null` while the stream's engine declares none, which
+            counts nothing beyond the listening sockets.
+        fds_per_unit:
+          type: integer
+          format: int64
+          nullable: true
+          description: Fds each connection or session holds; `null` as `ceiling`.
+        fds_committed:
+          type: integer
+          format: int64
+          description: "`listen_sockets + ceiling x fds_per_unit`, what the stream costs one worker."
+        bind_state:
+          type: string
+          enum: [pending, bound, failed, unknown]
+          description: The stream's bind state on the node; `unknown` when the node's state cannot be vouched for.
+
+    StreamPortsEntry:
+      type: object
+      description: A stream a node will bind once active.
+      required: [id, name, protocol, listen_address, port_first, port_last]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        protocol:
+          $ref: "#/components/schemas/StreamProtocol"
+        listen_address:
+          type: string
+        port_first:
+          type: integer
+        port_last:
+          type: integer
+
+    NodeStreamPlane:
+      type: object
+      description: >-
+        A node's stream plane as its heartbeat last reported it (Story
+        12.2 D-i). Session state, like `resources`. The heartbeat lists
+        the bindings that are not bound, so a node's report does not grow
+        with its stream count: a targeted stream the node does not list
+        is bound while the node is in sync with the control plane, and
+        `unknown` while it drifts.
+      properties:
+        bound_count:
+          type: integer
+          description: Bindings the node holds bound.
+        listen_sockets_used:
+          type: integer
+          description: The node's stream listening sockets, one per port.
+        bindings:
+          type: array
+          description: Every binding of the node that is not bound, at most 256.
+          items:
+            $ref: "#/components/schemas/NodeStreamBinding"
+        truncated:
+          type: boolean
+          description: More bindings were not bound than `bindings` holds.
+        fd_limit:
+          type: integer
+          format: int64
+          description: The node's fd limit. Withheld from Viewers, like `resources`.
+        worker_count:
+          type: integer
+          description: Workers on the node. Withheld from Viewers, like `resources`.
+
+    NodeStreamBinding:
+      type: object
+      description: One binding that is not bound on a node.
+      required: [stream_id, state]
+      properties:
+        stream_id:
+          type: string
+        state:
+          type: string
+          enum: [pending, failed, unknown]
+        kind:
+          $ref: "#/components/schemas/StreamBindFailureKind"
+        os_error:
+          type: string
+          description: "`failed` only, as on `StreamBindState`."
+        port:
+          type: integer
+          description: "`failed` only."
+        since:
+          type: string
+          format: date-time
+          description: "`failed` only."
+
     CreateStreamRequest:
       type: object
       additionalProperties: false
@@ -8236,6 +8615,17 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     RateLimited:
       description: Too many requests
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    StreamUnprocessable:
+      description: >-
+        The body parsed but a model rule refuses its content, or a node
+        that would bind the stream cannot hold it: then `error.code` is
+        `stream_fd_budget` and the message names the stream, the node,
+        the constraint (`listen_socket_cap`, `worker_fds` or
+        `supervisor_fds`) and its numbers.
       content:
         application/json:
           schema:

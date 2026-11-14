@@ -501,8 +501,8 @@ pub(crate) fn run_single_process(cli: Cli) {
 
         // The stream plane, single-process (D-k): the supervisor's
         // reconcile code driving this process's own stream runtime over
-        // an in-process channel, one worker slot. The registry is the
-        // one the API reads (Lot E3).
+        // an in-process channel, one worker slot. The registry and the
+        // budget inputs are the ones the API reads.
         let stream_states = lorica_stream::StreamBindStates::new();
         let stream_source = match StoreStreamTable::open(&db_path, Some(encryption_key)) {
             Ok(source) => Arc::new(source),
@@ -551,6 +551,8 @@ pub(crate) fn run_single_process(cli: Cli) {
             Some(log_store.clone()),
             alert_sender.clone(),
         );
+        let api_stream_plane =
+            lorica_api::stream_budget::StreamPlaneState::new(stream_states.clone(), fd_limit, 1);
 
         let api_handle = tokio::spawn(async move {
             let state = AppState {
@@ -593,6 +595,7 @@ pub(crate) fn run_single_process(cli: Cli) {
                 renewals: Arc::new(lorica_api::acme::RenewalLedger::new()),
                 automation_writes: lorica_api::middleware::rate_limit::RateLimiter::new(),
                 adcs: lorica_api::adcs::AdcsRuntime::new(Some(alert_sender.clone())),
+                stream_plane: api_stream_plane,
             };
 
             // The automation API rides the same `AppState` as the

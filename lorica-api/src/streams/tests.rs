@@ -1,6 +1,8 @@
 //! The stream management API (Story 12.1 Lot 5): CRUD, validation,
 //! audit, the role floors, the follower gate and the per-node port
-//! conflict check, IV2 included.
+//! conflict check, IV2 included; and its stream plane surfaces (Story
+//! 12.2 Lot E3): the bind state on the reads, the fd budget check of
+//! the writes and the budget view.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -13,6 +15,7 @@ use serde_json::{json, Value};
 
 use super::{StreamResponse, STREAM_PORT_CONFLICT_CODE, STREAM_WITHHELD_FIELDS};
 use crate::server::AppState;
+use crate::stream_budget::{StreamPlaneState, STREAM_FD_BUDGET_CODE};
 use crate::tests::{
     body_json, create_user_and_login, send, setup_admin_and_login, test_control_plane,
     test_follower_runtime, test_state,
@@ -204,6 +207,16 @@ fn tcp(name: &str, port: u16) -> Value {
     })
 }
 
+/// A stream as a read answers it, less its `bind`, which only the reads
+/// carry: what a write answered for the same row.
+fn without_bind(read: &Value) -> Value {
+    let mut view = read.clone();
+    let object = view.as_object_mut().expect("an object");
+    assert!(object.contains_key("bind"), "a read carries bind: {read}");
+    object.remove("bind");
+    view
+}
+
 /// The `409` of a port conflict, with its message.
 fn port_conflict(status: StatusCode, answer: &Value) -> String {
     assert_eq!(status, StatusCode::CONFLICT, "{answer}");
@@ -242,10 +255,12 @@ async fn a_stream_round_trips_through_every_operation_with_its_audit_rows() {
         .call("GET", &format!("/api/v1/streams/{id}"), None)
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(read["data"], created);
+    assert_eq!(without_bind(&read["data"]), created);
+    assert_eq!(read["data"]["bind"], Value::Null, "nothing bound it yet");
     let (status, listed) = node.call("GET", "/api/v1/streams", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(listed["data"]["streams"], json!([created]));
+    assert_eq!(without_bind(&listed["data"]["streams"][0]), created);
+    assert_eq!(listed["data"]["streams"].as_array().map(Vec::len), Some(1));
 
     let (status, disabled) = node.update(&id, json!({ "enabled": false })).await;
     assert_eq!(status, StatusCode::OK, "{disabled}");
@@ -484,7 +499,11 @@ async fn every_validation_refuses_with_its_status_and_nothing_is_stored() {
     let (_, read) = node
         .call("GET", &format!("/api/v1/streams/{id}"), None)
         .await;
-    assert_eq!(read["data"], first, "no refused update moved the row");
+    assert_eq!(
+        without_bind(&read["data"]),
+        first,
+        "no refused update moved the row"
+    );
 }
 
 #[tokio::test]
@@ -770,11 +789,13 @@ async fn an_import_with_a_stream_on_a_reserved_port_is_refused_before_the_store_
         "{message}"
     );
     let (_, listed) = node.call("GET", "/api/v1/streams", None).await;
-    assert_eq!(
-        listed["data"]["streams"],
-        json!([kept]),
-        "nothing was cleared"
-    );
+    let listed: Vec<Value> = listed["data"]["streams"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(without_bind)
+        .collect();
+    assert_eq!(listed, vec![kept], "nothing was cleared");
 
     // Two imported streams colliding with each other.
     let toml_content = {
@@ -885,4 +906,242 @@ fn source_stream(name: &str, port: u16) -> lorica_config::models::Stream {
         created_at: now,
         updated_at: now,
     }
+}
+
+// ---- The stream plane surfaces (Story 12.2 Lot E3) ----
+
+/// The `422` of a write a node's fd budget cannot hold, with its
+/// message.
+fn budget_refusal(status: StatusCode, answer: &Value) -> String {
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["error"]["code"], STREAM_FD_BUDGET_CODE, "{answer}");
+    answer["error"]["message"]
+        .as_str()
+        .expect("a message")
+        .to_string()
+}
+
+#[tokio::test]
+async fn the_reads_carry_this_nodes_bind_state_of_each_stream() {
+    let mut node = Node::standalone().await;
+    let states = lorica_stream::StreamBindStates::new();
+    node.state.stream_plane = StreamPlaneState::new(states.clone(), 65_536, 2);
+    let pg = node.created(tcp("pg", 5432)).await;
+    let pg_id = pg["id"].as_str().expect("an id");
+    let smtp = node.created(tcp("smtp", 2525)).await;
+    let smtp_id = smtp["id"].as_str().expect("an id");
+    assert!(
+        pg.get("bind").is_none(),
+        "a write answers the configuration only: {pg}"
+    );
+
+    states.set_bound(pg_id, 1, 2);
+    states.set_failed(
+        smtp_id,
+        lorica_stream::BindFailureKind::AddressInUse,
+        "Address already in use (os error 98)".into(),
+        2525,
+        Utc::now(),
+    );
+
+    let (status, read) = node
+        .call("GET", &format!("/api/v1/streams/{pg_id}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(
+        read["data"]["bind"],
+        json!({ "state": "bound", "workers_serving": 1, "workers": 2 })
+    );
+    let (_, listed) = node.call("GET", "/api/v1/streams", None).await;
+    let failed = listed["data"]["streams"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .find(|s| s["id"] == smtp_id)
+        .expect("smtp listed")
+        .clone();
+    assert_eq!(failed["bind"]["state"], "failed");
+    assert_eq!(failed["bind"]["kind"], "address_in_use");
+    assert_eq!(
+        failed["bind"]["os_error"],
+        "Address already in use (os error 98)"
+    );
+    assert_eq!(failed["bind"]["port"], 2525);
+    assert!(failed["bind"]["since"].is_string(), "{failed}");
+}
+
+#[tokio::test]
+async fn a_create_or_update_the_budget_cannot_hold_is_refused_naming_node_and_constraint() {
+    // 4,096 fds leave a stream budget of 1,024; the supervisor holds a
+    // socket per worker per UDP port.
+    let mut node = Node::standalone().await;
+    node.state.stream_plane =
+        StreamPlaneState::new(lorica_stream::StreamBindStates::new(), 4096, 2);
+    let mut range = tcp("dns", 20_000);
+    range["protocol"] = json!("udp");
+    range["port_last"] = json!(20_999);
+
+    let (status, answer) = node.create(range.clone()).await;
+    let message = budget_refusal(status, &answer);
+    for part in [
+        "`dns`",
+        "this node",
+        "supervisor_fds",
+        "2000",
+        "1024",
+        "4096",
+    ] {
+        assert!(message.contains(part), "{part}: {message}");
+    }
+    assert!(
+        node.state
+            .store
+            .lock()
+            .await
+            .list_streams()
+            .expect("list")
+            .is_empty(),
+        "a refused create leaves no row"
+    );
+
+    // Half the range fits one worker's share; widening it again is
+    // refused and leaves the row as it stood.
+    range["port_last"] = json!(20_499);
+    let created = node.created(range).await;
+    let id = created["id"].as_str().expect("an id");
+    let (status, answer) = node.update(id, json!({ "port_last": 20_999 })).await;
+    budget_refusal(status, &answer);
+    let (_, read) = node
+        .call("GET", &format!("/api/v1/streams/{id}"), None)
+        .await;
+    assert_eq!(without_bind(&read["data"]), created);
+
+    // The per-node listening-socket cap is the stored setting: the
+    // range's 500 ports fill it.
+    {
+        let store = node.state.store.lock().await;
+        let mut settings = store.get_global_settings().expect("settings");
+        settings.stream_listen_socket_cap = 500;
+        store
+            .update_global_settings(&settings)
+            .expect("test setup: cap");
+    }
+    let (status, answer) = node.create(tcp("pg", 5432)).await;
+    assert!(budget_refusal(status, &answer).contains("listen_socket_cap"));
+    // A write that adds nothing on the node is never refused for it.
+    let (status, answer) = node.update(id, json!({ "name": "dns-renamed" })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+}
+
+#[tokio::test]
+async fn a_control_plane_warns_for_each_targeted_node_whose_budget_it_cannot_see() {
+    let node = Node::control_plane().await;
+    node.enrol("edge-1", NodeStatus::Active, Some(EDGE_1)).await;
+
+    let mut pinned = tcp("pinned", 5432);
+    pinned["node_selector"] = json!(["edge-1"]);
+    let created = node.created(pinned).await;
+    let warnings = created["warnings"].as_array().expect("warnings");
+    assert_eq!(warnings.len(), 1, "{created}");
+    assert!(
+        warnings[0]
+            .as_str()
+            .is_some_and(|w| w.contains("node `edge-1`") && w.contains("fd_budget")),
+        "{created}"
+    );
+
+    let standalone = Node::standalone().await;
+    let created = standalone.created(tcp("pg", 5432)).await;
+    assert!(
+        created.get("warnings").is_none(),
+        "a node that checks every target warns of nothing: {created}"
+    );
+}
+
+#[tokio::test]
+async fn the_budget_view_answers_this_node_to_operators_and_above() {
+    let mut node = Node::standalone().await;
+    let states = lorica_stream::StreamBindStates::new();
+    node.state.stream_plane = StreamPlaneState::new(states.clone(), 65_536, 4);
+    let pg = node.created(tcp("pg", 5432)).await;
+    states.set_bound(pg["id"].as_str().expect("an id"), 4, 4);
+    let mut dns = tcp("dns", 53);
+    dns["protocol"] = json!("udp");
+    dns["port_last"] = json!(54);
+    node.created(dns).await;
+    let mut off = tcp("off", 6000);
+    off["enabled"] = json!(false);
+    node.created(off).await;
+
+    let (status, answer) = node.call("GET", "/api/v1/streams/budget", None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let view = &answer["data"]["nodes"][0];
+    assert_eq!(answer["data"]["nodes"].as_array().map(Vec::len), Some(1));
+    assert_eq!(view["node_id"], Value::Null);
+    assert_eq!(view["node_name"], Value::Null);
+    assert!(view["reported_at"].is_string(), "{view}");
+    assert_eq!(view["fd_limit"], 65_536);
+    assert_eq!(view["base_reserve"], 1024);
+    assert_eq!(view["http_reserve"], 32_768);
+    assert_eq!(view["stream_budget"], 31_744);
+    assert_eq!(view["worker_count"], 4);
+    assert_eq!(view["listen_socket_cap"], 2048);
+    assert_eq!(view["worker_drain_timeout_s"], 30);
+    assert_eq!(view["listen_sockets_used"], 3);
+    assert_eq!(view["worker_fds_committed"], 3);
+    assert_eq!(view["supervisor_fds_committed"], 1 + 2 * 4);
+    let shares: Vec<(&str, &str)> = view["streams"]
+        .as_array()
+        .expect("streams")
+        .iter()
+        .map(|s| {
+            assert_eq!(s["ceiling"], Value::Null, "no engine declares one yet");
+            assert_eq!(s["fds_per_unit"], Value::Null);
+            (
+                s["name"].as_str().expect("a name"),
+                s["bind_state"].as_str().expect("a state"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shares,
+        vec![("dns", "pending"), ("pg", "bound")],
+        "a disabled stream holds no share"
+    );
+
+    let viewer = create_user_and_login(
+        &node.state,
+        &node.sessions,
+        &node.limiter,
+        "viewer-budget",
+        Role::Viewer,
+    )
+    .await;
+    let operator = create_user_and_login(
+        &node.state,
+        &node.sessions,
+        &node.limiter,
+        "operator-budget",
+        Role::Operator,
+    )
+    .await;
+    let (status, answer) = node
+        .call_as(&viewer, "GET", "/api/v1/streams/budget", None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
+    let (status, answer) = node
+        .call_as(&operator, "GET", "/api/v1/streams/budget", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+}
+
+#[tokio::test]
+async fn a_follower_answers_the_budget_view_for_its_own_node() {
+    let node = Node::follower().await;
+    let (status, answer) = node.call("GET", "/api/v1/streams/budget", None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let follower = test_follower_runtime();
+    let view = &answer["data"]["nodes"][0];
+    assert_eq!(view["node_id"], follower.node_id.as_str());
+    assert_eq!(view["node_name"], follower.node_name.as_str());
 }

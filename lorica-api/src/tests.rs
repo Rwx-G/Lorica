@@ -68,6 +68,7 @@ pub(crate) async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         renewals: Arc::new(crate::acme::RenewalLedger::new()),
         automation_writes: crate::middleware::rate_limit::RateLimiter::new(),
         adcs: crate::adcs::AdcsRuntime::new(None),
+        stream_plane: crate::stream_budget::StreamPlaneState::unbound_at_packaged_limit(),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -5407,6 +5408,7 @@ async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         renewals: Arc::new(crate::acme::RenewalLedger::new()),
         automation_writes: crate::middleware::rate_limit::RateLimiter::new(),
         adcs: crate::adcs::AdcsRuntime::new(None),
+        stream_plane: crate::stream_budget::StreamPlaneState::unbound_at_packaged_limit(),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -5460,6 +5462,7 @@ async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         renewals: Arc::new(crate::acme::RenewalLedger::new()),
         automation_writes: crate::middleware::rate_limit::RateLimiter::new(),
         adcs: crate::adcs::AdcsRuntime::new(None),
+        stream_plane: crate::stream_budget::StreamPlaneState::unbound_at_packaged_limit(),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();

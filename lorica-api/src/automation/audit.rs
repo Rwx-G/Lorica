@@ -1600,6 +1600,7 @@ mod tests {
             renewals: Arc::new(crate::acme::RenewalLedger::new()),
             automation_writes: crate::middleware::rate_limit::RateLimiter::new(),
             adcs: crate::adcs::AdcsRuntime::new(None),
+            stream_plane: crate::stream_budget::StreamPlaneState::unbound_at_packaged_limit(),
         }
     }
 

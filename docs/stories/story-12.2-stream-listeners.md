@@ -841,17 +841,17 @@ Allowlist: the stream handlers module 12.1 creates (expected
 (the `AppState` field initialisation only), `Cargo.lock`.
 Depends on: D, C2, E1; 12.1's CRUD Lot.
 
-- [ ] `AppState` gains the stream-plane handle (registry snapshot, budget
+- [x] `AppState` gains the stream-plane handle (registry snapshot, budget
       inputs); every construction site updated.
-- [ ] `bind` on the stream GET and list responses.
-- [ ] Budget check of D-e on stream create and update, which are
+- [x] `bind` on the stream GET and list responses.
+- [x] Budget check of D-e on stream create and update, which are
       Operator writes like routes (12.1's `required_role` rule, unchanged
       here): the local node, and every reporting targeted node on a
       control plane, a warning for the others; the refusal names node,
       constraint and numbers.
-- [ ] `GET /api/v1/streams/budget`, Operator and SuperAdmin, with a
+- [x] `GET /api/v1/streams/budget`, Operator and SuperAdmin, with a
       `required_role` table test; a follower answers its own node.
-- [ ] `openapi.yaml`: the budget path, `bind` on the stream schema, both
+- [x] `openapi.yaml`: the budget path, `bind` on the stream schema, both
       settings with their bounds, `stream_bind_failed` in the alert enum,
       the `stream_plane` and `stream_ports` fields of Lot E2. Contract
       test green.
@@ -1423,6 +1423,72 @@ the budget view stays Operator and SuperAdmin.
   which `BindKey` does not carry: `AlertEvent::new(AlertType::StreamBindFailed,
   summary)` with the details `stream_id`, `stream_name`, `node`, `kind`
   (`kind.as_str()`), `os_error` and `port`.
+- The alert is raised. `PlaneEvent::BindFailed` carries the stream's
+  name (`StreamPlane::fail` takes it from the pass's stream list), and
+  `StreamPlaneHandle::new` takes a `lorica_notify::AlertSender`, the
+  process's `alert_sender` in both startup modes. `record` sends
+  `stream_bind_failed` beside the `stream.bind_failed` audit row, so
+  once per entry into `failed` and never per retry; `node` is the label
+  the audit rows use (`standalone`, `control_plane` or the follower's
+  roster name). The audit payload is unchanged. Pinned by
+  `a_failed_bind_raises_one_alert_per_entry_never_per_retry` (a squatted
+  port: one alert across a change, a retry tick and a second change;
+  after a recovery, a move onto a reserved port alerts again).
+- Lot E3 done. `lorica-api/src/stream_budget.rs`: `StreamPlaneState`
+  (the registry, the fd limit and the worker count, on
+  `AppState::stream_plane`, built from the same `fd_limit` the driver
+  uses, now read once ahead of the driver in `supervisor.rs`), the
+  pure `check_write` over `BudgetNode`s, `local_view` and
+  `get_stream_budget`. `lorica-api` depends on `lorica-stream`.
+- Reads: `GET /api/v1/streams` and `/{id}` answer each stream with
+  `bind`, this node's `BindState` or `null`. The writes and the audit
+  rows keep the configuration view without `bind`: bind state is
+  runtime, and putting it in a hashed `before`/`after` would record
+  whatever the reconcile had reached at that instant.
+- The budget check runs under the store lock that writes, after the
+  port check, on the nodes the port check uses (`nodes_checking`): this
+  node with its own figures when it binds the candidate, and on a
+  control plane every active node the selector targets. The demand is
+  every enabled stream the node binds, the candidate replacing its own
+  row, through `FdBudget::check`, so the API refuses what the node
+  refuses at bind. A refusal is `422`, `error.code`
+  `stream_fd_budget` (a cap over its limit, `ApiError::Unprocessable`'s
+  rule; the port conflict stays `409`), message
+  ``stream `<name>` would break the fd budget on <node> (<constraint>):
+  <numbers>``. A write that adds nothing on a node (the same protocol,
+  no more ports, already bound there) is never refused for it, so a
+  node pushed over its budget by a lowered cap can still have its
+  streams renamed, narrowed or disabled. The config import is not
+  budget-checked (the task names create and update); its streams are
+  refused at bind with `fd_budget`.
+- Deviation, owed to Lot E2: no follower reports its fd limit and
+  worker count yet (the heartbeat's `StreamPlaneReport` is E2's), so on
+  a control plane every targeted node is unchecked and named in the
+  write's `warnings`. `budget_warnings` in `streams.rs` sets each
+  named node's `fds` to `None`; E2 fills it from the roster's report,
+  and `check_write` already checks a node with figures (unit-tested).
+  Likewise `GET /api/v1/streams/budget` answers only the node it runs
+  on; on a control plane E2 adds the reporting nodes, as
+  `openapi.yaml` already documents.
+- `openapi.yaml` also documents E2's `stream_plane` and `stream_ports`
+  on `ClusterNode` (E2 does not own the file): `NodeStreamPlane`
+  (`bound_count`, `listen_sockets_used`, `bindings` of
+  `NodeStreamBinding` for every non-bound binding, `unknown` under
+  drift, `truncated`, and `fd_limit` / `worker_count` withheld from
+  Viewers) and `StreamPortsEntry`. Deviation from D-i's
+  `{ id, name, protocol, listen_address, ports }`: the entry carries
+  `port_first` and `port_last`, as the stream resource does. E2 builds
+  to this shape or amends it.
+- The two settings are documented on `PUT /api/v1/settings` with their
+  bounds; the alert enum is the `alert_types` description line Lot E1
+  already extended.
+- Outside the allowlist, each needed by "every construction site
+  updated": the `AppState` literals of `lorica-api/src/acme/tests.rs`,
+  `automation/audit.rs` (its test module), `automation_tokens/tests.rs`
+  and `oidc_issuers/tests.rs`, one line each through
+  `StreamPlaneState::unbound_at_packaged_limit()`. Also
+  `lorica-api/src/streams/tests.rs`, the handlers module's own tests:
+  three comparisons of a read with a write now strip `bind`.
 
 ## File List
 
@@ -1454,6 +1520,9 @@ the budget view stays Operator and SuperAdmin.
 - `lorica-notify/src/events.rs`, `lorica-notify/src/channels/slack.rs` (Lot E1: `StreamBindFailed`)
 - `lorica-config/src/store/mod.rs` (Lot E1: migration 74), `lorica-config/tests/config_db_upgrade.rs`
 - `lorica-api/src/vocabulary.rs`, `lorica-api/openapi.yaml` (the `alert_types` description line), `lorica-dashboard/frontend/src/lib/adcs.generated.ts` (regenerated)
+- `lorica/src/startup/stream_plane.rs` (the `stream_bind_failed` alert), `lorica/src/startup/supervisor.rs`, `lorica/src/startup/single.rs` (the alert sender, `AppState::stream_plane`)
+- `lorica-api/src/stream_budget.rs` (new), `lorica-api/src/streams.rs`, `lorica-api/src/streams/tests.rs`, `lorica-api/src/server.rs`, `lorica-api/src/middleware/authorize.rs`, `lorica-api/src/lib.rs`, `lorica-api/Cargo.toml` (`lorica-stream`), `Cargo.lock`, `lorica-api/openapi.yaml` (Lot E3)
+- `lorica-api/src/tests.rs`, `lorica-api/src/acme/tests.rs`, `lorica-api/src/automation/audit.rs`, `lorica-api/src/automation_tokens/tests.rs`, `lorica-api/src/oidc_issuers/tests.rs` (the test `AppState`s)
 
 ## Change Log
 
@@ -1467,3 +1536,4 @@ the budget view stays Operator and SuperAdmin.
 | 2026-11-14 | 0.6 | Lot D implemented: the stream plane driver in the supervisor and single-process mode, the stream runtime in each worker, respawn replay, TCP stream listeners across a hot upgrade, the stop path (drain watcher, `EXTEND_TIMEOUT_USEC` keepalive, Pingora's waits from the setting); a stop no longer waits out its bound on zombie workers. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.7 | Lot C2 implemented: `worker_drain_timeout_s` and `stream_listen_socket_cap` replicate through the canonical config inside format version 3, and the import preview reports them. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.8 | Lot E1 implemented: the `stream_bind_failed` alert type and migration 74 subscribing explicit channels to it. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.9 | Lot E3 implemented: `bind` on the stream reads, the fd budget check of stream writes, `GET /api/v1/streams/budget`, the stream plane on `AppState`, the OpenAPI document; the `stream_bind_failed` alert is raised once per failed bind. Status InProgress. | Romain G. |

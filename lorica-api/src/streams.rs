@@ -9,14 +9,19 @@
 //! import is checked against the reserved ports and the other streams
 //! of each node that would bind it, under the store lock that writes,
 //! and refused `409` naming the node and the object
-//! ([`STREAM_PORT_CONFLICT_CODE`]).
+//! ([`STREAM_PORT_CONFLICT_CODE`]). Under the same lock a create or an
+//! update is checked against the fd budget of each node that would bind
+//! it (Story 12.2 D-e, [`crate::stream_budget`]), and the reads carry
+//! this node's bind state of each stream.
 //!
 //! Status codes: `400` for a body this API's shared route validators
 //! refuse (group name, selector) and for a body that does not parse;
 //! `422` for a body that parses and breaks a model rule
 //! (`Stream::validate`, a backend id naming no backend, a name already
 //! taken, the attachment rule of D-6), the rule `ApiError::Unprocessable`
-//! documents; `404` for an unknown id; `409` for a port conflict and,
+//! documents, and a write a node's fd budget cannot hold
+//! ([`crate::stream_budget::STREAM_FD_BUDGET_CODE`]); `404` for an
+//! unknown id; `409` for a port conflict and,
 //! on a follower outside break-glass, for every write.
 
 use std::collections::HashMap;
@@ -40,6 +45,7 @@ use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
 use crate::routes::crud::{selector_roster, validate_group_name, validate_node_selector};
 use crate::server::AppState;
+use crate::stream_budget::{check_write, BudgetNode, StreamPlaneState};
 
 #[cfg(test)]
 mod tests;
@@ -84,6 +90,41 @@ pub struct StreamResponse {
     pub created_at: String,
     /// RFC 3339 last-write timestamp.
     pub updated_at: String,
+}
+
+/// What `GET /api/v1/streams` and `GET /api/v1/streams/{id}` answer
+/// per stream: the view, and this node's bind state of it (Story 12.2
+/// D-h). The state is runtime, not configuration, so the view the
+/// writes answer and audit does not carry it.
+#[derive(Debug, Serialize)]
+pub struct StreamReadResponse {
+    /// The stream's configuration.
+    #[serde(flatten)]
+    pub stream: StreamResponse,
+    /// This node's bind state (`pending`, `bound` or `failed` with its
+    /// kind and OS error), `null` when this node does not bind the
+    /// stream.
+    pub bind: Option<lorica_stream::BindState>,
+}
+
+/// What a stream create or update answers: the view, and the nodes the
+/// fd budget check could not reach (Story 12.2 D-e).
+#[derive(Debug, Serialize)]
+pub struct StreamWriteResponse {
+    /// The stream as written.
+    #[serde(flatten)]
+    pub stream: StreamResponse,
+    /// One sentence per targeted node whose budget is unknown here;
+    /// absent when there is none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+fn with_bind(state: &AppState, stream: StreamResponse) -> StreamReadResponse {
+    StreamReadResponse {
+        bind: state.stream_plane.bind_state(&stream.id),
+        stream,
+    }
 }
 
 /// The view of `stream` with the backends it links.
@@ -182,7 +223,7 @@ impl LocalRole {
         }
     }
 
-    fn node_role(&self) -> NodeRole<'_> {
+    pub(crate) fn node_role(&self) -> NodeRole<'_> {
         match self {
             LocalRole::Standalone => NodeRole::Standalone,
             LocalRole::ControlPlane => NodeRole::ControlPlane,
@@ -254,6 +295,51 @@ pub(crate) fn first_port_conflict(
         .next())
 }
 
+/// The fd budget check of D-e for a write of `candidate` replacing
+/// `stored`, on the nodes [`first_port_conflict`] checks: this node with
+/// its own figures, and on a control plane every active node the
+/// selector targets. Reads the roster and the cap from `store`, under
+/// the caller's lock.
+///
+/// No enrolled node reports its fd limit and worker count to the
+/// control plane yet: they ride the heartbeat's stream plane report,
+/// which Lot E2 of Story 12.2 adds. Until then each targeted node is
+/// named in a warning here and refuses at bind with `fd_budget`.
+///
+/// # Errors
+///
+/// The `422` of the first node whose budget the write breaks, or a
+/// store read failure.
+pub(crate) fn budget_warnings(
+    store: &ConfigStore,
+    role: &LocalRole,
+    reserved: ReservedPorts,
+    plane: &StreamPlaneState,
+    candidate: &Stream,
+    stored: Option<&Stream>,
+    others: &[Stream],
+) -> Result<Vec<String>, ApiError> {
+    let roster = if matches!(role, LocalRole::ControlPlane) {
+        store.list_cluster_nodes()?
+    } else {
+        Vec::new()
+    };
+    let nodes: Vec<BudgetNode<'_>> = nodes_checking(candidate, role, reserved, &roster)
+        .into_iter()
+        .map(|node| BudgetNode {
+            fds: match node.label {
+                NodeLabel::ThisNode => Some(plane.fds()),
+                NodeLabel::Named(_) => None,
+            },
+            label: node.label,
+            role: node.role,
+        })
+        .collect();
+    let cap = store.get_global_settings()?.stream_listen_socket_cap;
+    check_write(candidate, stored, others, &nodes, cap)
+        .map_err(|refusal| refusal.into_error(candidate))
+}
+
 /// The `409` refusing `stream` for `conflict`.
 pub(crate) fn port_conflict_error(stream: &Stream, conflict: &PortConflict) -> ApiError {
     ApiError::coded(
@@ -304,6 +390,10 @@ pub async fn list_streams(
         )
     })
     .await?;
+    let streams: Vec<StreamReadResponse> = streams
+        .into_iter()
+        .map(|stream| with_bind(&state, stream))
+        .collect();
     Ok(json_data(serde_json::json!({ "streams": streams })))
 }
 
@@ -320,7 +410,7 @@ pub async fn get_stream(
         Ok::<_, ApiError>(stream_to_response(&stream, backend_ids))
     })
     .await?;
-    Ok(json_data(response))
+    Ok(json_data(with_bind(&state, response)))
 }
 
 /// POST /api/v1/streams - create a stream.
@@ -373,21 +463,23 @@ pub(crate) async fn create_stream_as(
     let backend_ids = body.backend_ids.unwrap_or_default();
     let role = LocalRole::of(state);
     let reserved = state.reserved_ports;
+    let plane = state.stream_plane.clone();
 
-    let (stream, backend_ids) = db_blocking(&state.store, move |store| {
+    let (stream, backend_ids, warnings) = db_blocking(&state.store, move |store| {
         refuse_unknown_backends(store, &backend_ids)?;
         // Under the lock that writes, so two creates on one port cannot
-        // both pass.
+        // both pass, nor two creates that each fit the budget alone.
         let others = store.list_streams()?;
         if let Some(conflict) = first_port_conflict(store, &role, reserved, &stream, &others)? {
             return Err(port_conflict_error(&stream, &conflict));
         }
+        let warnings = budget_warnings(store, &role, reserved, &plane, &stream, None, &others)?;
         store.in_transaction(|store| {
             store.create_stream(&stream)?;
             store.set_stream_backends(&stream.id, &backend_ids)
         })?;
         let backend_ids = store.list_backends_for_stream(&stream.id)?;
-        Ok::<_, ApiError>((stream, backend_ids))
+        Ok::<_, ApiError>((stream, backend_ids, warnings))
     })
     .await?;
     state.notify_config_changed();
@@ -403,7 +495,13 @@ pub(crate) async fn create_stream_as(
         after.as_ref(),
     )
     .await;
-    Ok(json_data_with_status(StatusCode::CREATED, response))
+    Ok(json_data_with_status(
+        StatusCode::CREATED,
+        StreamWriteResponse {
+            stream: response,
+            warnings,
+        },
+    ))
 }
 
 /// PUT /api/v1/streams/{id} - patch a stream.
@@ -442,14 +540,15 @@ pub(crate) async fn update_stream_as(
         .transpose()?;
     let role = LocalRole::of(state);
     let reserved = state.reserved_ports;
+    let plane = state.stream_plane.clone();
 
-    let (before, after) = db_blocking(&state.store, move |store| {
+    let (before, after, warnings) = db_blocking(&state.store, move |store| {
         let stored = store
             .get_stream(&id)?
             .ok_or_else(|| ApiError::NotFound(format!("stream {id}")))?;
         let before = stream_to_response(&stored, store.list_backends_for_stream(&id)?);
 
-        let mut stream = stored;
+        let mut stream = stored.clone();
         if let Some(name) = body.name {
             stream.name = name;
         }
@@ -486,6 +585,15 @@ pub(crate) async fn update_stream_as(
         if let Some(conflict) = first_port_conflict(store, &role, reserved, &stream, &others)? {
             return Err(port_conflict_error(&stream, &conflict));
         }
+        let warnings = budget_warnings(
+            store,
+            &role,
+            reserved,
+            &plane,
+            &stream,
+            Some(&stored),
+            &others,
+        )?;
         // The new links before the row: the attachment rule then judges
         // the row as written against the links as they will stand,
         // whichever of the two the patch changed.
@@ -496,7 +604,7 @@ pub(crate) async fn update_stream_as(
             store.update_stream(&stream)
         })?;
         let after = stream_to_response(&stream, store.list_backends_for_stream(&stream.id)?);
-        Ok::<_, ApiError>((before, after))
+        Ok::<_, ApiError>((before, after, warnings))
     })
     .await?;
     state.notify_config_changed();
@@ -512,7 +620,10 @@ pub(crate) async fn update_stream_as(
         after_json.as_ref(),
     )
     .await;
-    Ok(json_data(after))
+    Ok(json_data(StreamWriteResponse {
+        stream: after,
+        warnings,
+    }))
 }
 
 /// DELETE /api/v1/streams/{id} - delete a stream; its backend links go

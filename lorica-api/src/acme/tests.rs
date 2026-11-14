@@ -295,6 +295,7 @@ async fn test_check_cert_expiry_dispatches_alerts() {
         renewals: Arc::new(crate::acme::RenewalLedger::new()),
         automation_writes: crate::middleware::rate_limit::RateLimiter::new(),
         adcs: crate::adcs::AdcsRuntime::new(None),
+        stream_plane: crate::stream_budget::StreamPlaneState::unbound_at_packaged_limit(),
     };
 
     let alert_sender = lorica_notify::AlertSender::new(64);

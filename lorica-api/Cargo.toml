@@ -29,6 +29,10 @@ lorica-cluster = { version = "1.10.6", path = "../lorica-cluster" }
 # The fleet runtime the cluster handlers act through (backlog #52).
 # It must not depend back on this crate.
 lorica-fleet = { version = "1.10.6", path = "../lorica-fleet" }
+# The bind-state and fd budget types of the stream plane (Story 12.2):
+# the API reads the registry its reconcile driver writes and refuses
+# what the node would refuse at bind.
+lorica-stream = { version = "1.10.6", path = "../lorica-stream" }
 # The shared MCP core (Story 11.1 AC #9 and AC #10). The Streamable
 # HTTP binding is a path on the automation listener rather than a
 # second process, so the adapter runs here and reaches the protocol

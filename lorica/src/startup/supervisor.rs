@@ -965,21 +965,26 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // stream socket and attaches it to the workers over their stream
         // control channels. Built once the role and this process's own
         // ports are known, before the reload bridge that drives it. The
-        // registry is the one the API reads (Lot E3).
+        // registry and the budget inputs are the ones the API reads.
         let stream_states = lorica_stream::StreamBindStates::new();
+        let fd_limit = match lorica_worker::stream_sockets::process_fd_limit() {
+            Ok(limit) => {
+                info!(fd_limit = limit, "process fd limit");
+                limit
+            }
+            Err(e) => {
+                // A zero budget refuses every stream with `fd_budget`
+                // and the reason, rather than guessing a limit.
+                error!(error = %e, "process fd limit unreadable; no stream can bind");
+                0
+            }
+        };
+        let api_stream_plane = lorica_api::stream_budget::StreamPlaneState::new(
+            stream_states.clone(),
+            fd_limit,
+            u32::try_from(worker_count).unwrap_or(u32::MAX),
+        );
         let stream_plane = {
-            let fd_limit = match lorica_worker::stream_sockets::process_fd_limit() {
-                Ok(limit) => {
-                    info!(fd_limit = limit, "process fd limit");
-                    limit
-                }
-                Err(e) => {
-                    // A zero budget refuses every stream with `fd_budget`
-                    // and the reason, rather than guessing a limit.
-                    error!(error = %e, "process fd limit unreadable; no stream can bind");
-                    0
-                }
-            };
             let links: Vec<(u32, stream_plane::SeqpacketLink)> = stream_ctl_fds
                 .into_iter()
                 .filter_map(|(id, fd)| match stream_plane::SeqpacketLink::new(fd) {
@@ -1099,6 +1104,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 renewals: Arc::new(lorica_api::acme::RenewalLedger::new()),
                 automation_writes: lorica_api::middleware::rate_limit::RateLimiter::new(),
                 adcs: lorica_api::adcs::AdcsRuntime::new(Some(api_alert_sender.clone())),
+                stream_plane: api_stream_plane,
             };
             // The automation API rides the same `AppState` as the
             // management API and starts before it, so a refused

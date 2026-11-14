@@ -297,6 +297,12 @@ pub struct AppState {
     /// call, and the channel the breaker's alert goes to. One for the
     /// process, since the breaker protects one service account.
     pub adcs: crate::adcs::AdcsRuntime,
+    /// This process's stream plane (Story 12.2): the bind-state
+    /// registry its reconcile driver writes, read for each stream's
+    /// `bind`, and the fd limit and worker count its budget is computed
+    /// from, read by the budget check of stream writes and the budget
+    /// view.
+    pub stream_plane: crate::stream_budget::StreamPlaneState,
 }
 
 impl AppState {
@@ -837,6 +843,12 @@ pub fn build_router(
         // Streams (Story 12.1, D-10): the route's floors, body cap and
         // write budget, in a bucket of their own.
         .route("/api/v1/streams", get(crate::streams::list_streams))
+        // The fd budget view (Story 12.2 D-e), Operator and above. A
+        // static segment, so it wins over `{id}` below.
+        .route(
+            "/api/v1/streams/budget",
+            get(crate::stream_budget::get_stream_budget),
+        )
         .route(
             "/api/v1/streams",
             post(crate::streams::create_stream)

@@ -168,6 +168,14 @@ pub fn required_role(method: &http::Method, path: &str) -> Role {
         return Role::Operator;
     }
 
+    // The stream fd budget view (Story 12.2 D-e) is Operator+, the
+    // Story 9.7 reasoning for a node's `resources`: a Viewer does not
+    // get node capacity. Stated because the GET default is Viewer and
+    // the path would otherwise read as a stream id.
+    if path == "/api/v1/streams/budget" {
+        return Role::Operator;
+    }
+
     if method == http::Method::GET || method == http::Method::HEAD {
         // `format=key` / `format=full` return the private key; the
         // whole download endpoint is treated as secret material
@@ -666,6 +674,25 @@ mod tests {
                 "{method} {stream_path}"
             );
         }
+    }
+
+    #[test]
+    fn the_stream_budget_view_is_operator_and_never_viewer() {
+        // Story 12.2 D-e: node capacity is withheld from Viewers, while
+        // a stream read beside it stays Viewer.
+        assert_eq!(
+            required_role(&Method::GET, "/api/v1/streams/budget"),
+            Role::Operator
+        );
+        assert_eq!(
+            required_role(&Method::GET, "/api/v1/streams/abc"),
+            Role::Viewer
+        );
+        // A read: a follower answers it for its own node.
+        assert!(follower_local_request(
+            &Method::GET,
+            "/api/v1/streams/budget"
+        ));
     }
 
     #[test]

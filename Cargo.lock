@@ -2895,6 +2895,7 @@ dependencies = [
  "lorica-mcp",
  "lorica-metrics",
  "lorica-notify",
+ "lorica-stream",
  "lorica-tls",
  "lorica-waf",
  "nix",
