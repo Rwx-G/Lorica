@@ -284,6 +284,19 @@ describe('Cluster page, button styles', () => {
     expect(screen.getByRole('button', { name: 'Leave the fleet' })).toHaveClass('btn', 'btn-danger');
     expectVariantButtonsHaveBase();
   });
+
+  it('renders the node status and connection as the shared badges', async () => {
+    clusterStatus.set(status('control_plane'));
+    vi.spyOn(api, 'listClusterNodes').mockResolvedValue({
+      data: [{ ...node('id-a', 'edge-a'), status: 'pending', connected: false }],
+    });
+
+    render(Cluster);
+    await waitFor(() => expect(screen.getByText('edge-a')).toBeInTheDocument());
+
+    expect(screen.getByText('pending')).toHaveClass('badge', 'badge-orange');
+    expect(screen.getByText('offline')).toHaveClass('badge', 'badge-gray');
+  });
 });
 
 describe('Cluster page, follower controls', () => {
