@@ -1,7 +1,7 @@
 # Story 12.8: PROXY Protocol on the HTTP Listeners
 
 **Epic:** [Epic 12 - TCP and UDP Stream Proxying (v1.11.0 and v1.12.0)](../prd/epic-12-v1.11.0.md)
-**Status:** Draft
+**Status:** InProgress
 **Priority:** P1
 **Author:** Romain G.
 **Depends on:** nothing from the stream plane. This story touches the
@@ -589,19 +589,20 @@ Allowlist: `.github/workflows/ci.yml` (one `cargo test` line).
 Depends on: nothing. Before every other Lot, since Lot B's tests are
 `connection_filter` tests and must run in CI from the start.
 
-- [ ] Confirm, by reading every `cargo test` line of `ci.yml` and the
+- [x] Confirm, by reading every `cargo test` line of `ci.yml` and the
       feature lists of the packages each selects, whether any CI run
       builds `lorica-core`'s own tests with `lorica-core/connection_filter`.
       Record the answer and its evidence in the Debug Log.
-- [ ] If none does: add `lorica-core/connection_filter` to the rustls
+- [x] If none does: add `lorica-core/connection_filter` to the rustls
       test line (`--features lorica-core/rustls,lorica-core/integration-tests,...`),
       run that exact line in Docker with `CARGO_BUILD_WARNINGS=deny`,
       and confirm the existing `cfg(feature = "connection_filter")`
       tests (`test_connection_filter_inheritance` among them) are listed
       and pass. A test that fails here is a pre-existing defect: stop and
       report it, do not fix it under this commit.
-- [ ] Commit alone as `fix(ci): ...`, before any fork change.
-- [ ] If one already does: no change, and the Debug Log says which line.
+- [x] Commit alone as `fix(ci): ...`, before any fork change.
+- [x] If one already does: no change, and the Debug Log says which line.
+      (Not the case: none did, see the Debug Log.)
 
 ### Lot A: the parser in `lorica-core` - cargo
 
@@ -915,9 +916,30 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 
 ### Debug Log
 
+- **Lot 0, the CI gap was real (read, then run).** Read: of the four
+  `cargo test` lines of `ci.yml`, the forked-crate line selects
+  `lorica-core`, `lorica-proxy`, `lorica-lb`, `lorica-cache` and the
+  other forks with default features, and none of them enables
+  `lorica-core/connection_filter` by default (`lorica-proxy` exposes it
+  only as its own opt-in `connection_filter` feature); the rustls line
+  adds `rustls` and `integration-tests`; `-p lorica --features otel`
+  builds `lorica-core` with the feature through `lorica`'s defaults but
+  runs `lorica`'s tests. Only the workspace clippy compiled the gated
+  tests. Run: the full gate chain on `a3bdcaf3` printed no
+  `test_connection_filter` line in any test step. With
+  `lorica-core/connection_filter` added to the rustls line, that exact
+  line (Docker, `CARGO_BUILD_WARNINGS=deny`) lists and passes
+  `listeners::test::test_connection_filter_inheritance`,
+  `listeners::l4::test::test_connection_filter_accept` and
+  `listeners::l4::test::test_connection_filter_blocks_all` (512
+  `lorica-core` unit tests passed, 0 failed). No pre-existing defect
+  surfaced.
+
 ### Completion Notes
 
 ## File List
+
+- `.github/workflows/ci.yml` (Lot 0: the rustls test line and its comment)
 
 ## Change Log
 
@@ -925,3 +947,4 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 |------|---------|-------------|--------|
 | 2026-11-14 | 0.1 | Story drafted from the Epic 12 PRD. Status Draft. | Romain G. |
 | 2026-11-14 | 0.2 | Maintainer answers folded in: the parser moves into `lorica-core` as an additive module (no new crate), Lot 0 for the CI feature gap, `X-Forwarded-For` reasoning stated, open questions resolved. Status Draft. | Romain G. |
+| 2026-11-14 | 0.3 | Lot 0: the rustls test line of CI enables `lorica-core/connection_filter`, so the gated listener tests run. Status InProgress. | Romain G. |
