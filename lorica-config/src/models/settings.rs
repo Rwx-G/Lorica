@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::enums::ProxyProtocolMode;
 use super::route::SpoofedFallback;
 
 // --- Security Header Presets ---
@@ -202,6 +203,21 @@ pub struct GlobalSettings {
     /// Examples: `["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"]`.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// Whether the HTTP listener reads a PROXY protocol header from the
+    /// peers in `proxy_protocol_trusted_cidrs` (Story 12.8). Node-local,
+    /// like `trusted_proxies`. Default: off.
+    #[serde(default)]
+    pub proxy_protocol_http: ProxyProtocolMode,
+    /// The same for the HTTPS listener. Default: off.
+    #[serde(default)]
+    pub proxy_protocol_https: ProxyProtocolMode,
+    /// The peers allowed to send a PROXY protocol header, typically the
+    /// load balancers in front of the node. Separate from
+    /// `trusted_proxies`: a connection whose client address came from a
+    /// header never has its `X-Forwarded-For` read. Node-local; never
+    /// `/0`, and not empty while either listener's mode is on.
+    #[serde(default)]
+    pub proxy_protocol_trusted_cidrs: Vec<String>,
     /// IP addresses or CIDR ranges that bypass WAF evaluation, rate limiting,
     /// and auto-ban entirely. Use for admin/operator IPs to prevent self-blocking.
     /// Examples: `["203.0.113.50", "10.0.0.0/8"]`.
@@ -822,9 +838,13 @@ impl GlobalSettings {
     /// else (backlog #88). The
     /// `every_cidr_bearing_setting_is_enumerated` test fails when a new
     /// list-shaped setting is added without a decision here.
-    pub fn cidr_lists(&self) -> [(&'static str, &[String]); 5] {
+    pub fn cidr_lists(&self) -> [(&'static str, &[String]); 6] {
         [
             ("trusted_proxies", &self.trusted_proxies),
+            (
+                "proxy_protocol_trusted_cidrs",
+                &self.proxy_protocol_trusted_cidrs,
+            ),
             ("waf_whitelist_ips", &self.waf_whitelist_ips),
             ("connection_deny_cidrs", &self.connection_deny_cidrs),
             ("connection_allow_cidrs", &self.connection_allow_cidrs),
@@ -842,6 +862,22 @@ impl GlobalSettings {
             crate::connection_filter::validate_cidr_list(entries, field)?;
         }
         Ok(())
+    }
+
+    /// Refuse a PROXY protocol configuration that trusts every address
+    /// or turns a listener on with no peer allowed to send a header
+    /// (Story 12.8). Checked on the merged result of a write, so a
+    /// partial update that leaves the pair inconsistent is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operator-facing reason, naming the settings.
+    pub fn validate_proxy_protocol(&self) -> Result<(), String> {
+        crate::connection_filter::validate_proxy_protocol(
+            self.proxy_protocol_http,
+            self.proxy_protocol_https,
+            &self.proxy_protocol_trusted_cidrs,
+        )
     }
 }
 
@@ -873,6 +909,9 @@ impl Default for GlobalSettings {
             sla_purge_retention_days: default_sla_purge_retention_days(),
             sla_purge_schedule: default_sla_purge_schedule(),
             trusted_proxies: Vec::new(),
+            proxy_protocol_http: ProxyProtocolMode::default(),
+            proxy_protocol_https: ProxyProtocolMode::default(),
+            proxy_protocol_trusted_cidrs: Vec::new(),
             waf_whitelist_ips: Vec::new(),
             connection_deny_cidrs: Vec::new(),
             connection_allow_cidrs: Vec::new(),

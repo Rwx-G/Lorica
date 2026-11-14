@@ -695,15 +695,15 @@ Allowlist: `lorica-config/src/models/settings.rs`,
 `lorica-api/src/tests.rs`.
 Depends on: nothing. Parallel with A.
 
-- [ ] The three fields and the enum (D-d), load and save arms, an
+- [x] The three fields and the enum (D-d), load and save arms, an
       unparseable stored value is `ConfigError::Corrupt`.
-- [ ] Node-local in `canonical.rs`, with no `CanonicalGlobalSettings`
+- [x] Node-local in `canonical.rs`, with no `CanonicalGlobalSettings`
       field.
-- [ ] `validate_proxy_protocol` beside `validate_cidr_list` (D-d), used
+- [x] `validate_proxy_protocol` beside `validate_cidr_list` (D-d), used
       by the API handler and by import.
-- [ ] `UpdateSettingsRequest`, `GET` and `PUT /api/v1/settings`,
+- [x] `UpdateSettingsRequest`, `GET` and `PUT /api/v1/settings`,
       `openapi.yaml`.
-- [ ] Tests: round trip of each field; the defaults; `/0` refused for
+- [x] Tests: round trip of each field; the defaults; `/0` refused for
       both families; a mode on with an empty list refused, in one
       request and across two; clearing the list while a mode is on
       refused; TOML export and import round trip, and an export without
@@ -950,6 +950,12 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
   the timeout case included) beside the 536 `lorica-core` unit tests,
   among them the pre-existing listener tests that pin the default path.
 
+- **Lot C1 gates.** On the Lot C1 tree, the same full chain and
+  `cargo audit`, all green, the `lorica-config` doc test of
+  `validate_proxy_protocol` and the existing
+  `every_cidr_bearing_setting_is_enumerated` and
+  `every_global_setting_is_explicitly_routed` included.
+
 ### Completion Notes
 
 - **Lot 0** (`fix(ci)`): the gap was real; see the Debug Log.
@@ -1048,6 +1054,37 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
   returns could not be named outside the crate). `stream.rs` needed
   nothing: `rewind` is `pub(crate)` and the stage rides on
   `UninitializedStream`.
+- **Lot C1** (`feat(config)`): `GlobalSettings` gains
+  `proxy_protocol_http`, `proxy_protocol_https`
+  (`lorica_config::models::ProxyProtocolMode`, `off` / `required` /
+  `optional`, default `off`) and `proxy_protocol_trusted_cidrs` (empty
+  by default), stored as key/value rows with no migration. A stored mode
+  outside the enum is `ConfigError::Corrupt` rather than read as off. The
+  three join the node-local arm of the routing destructure in
+  `canonical.rs` and have no `CanonicalGlobalSettings` field.
+- `lorica_config::connection_filter::validate_proxy_protocol(http,
+  https, trusted_cidrs)` refuses a malformed entry, a `/0` of either
+  family (any spelling the parser accepts, `10.0.0.0/0` included), and
+  a mode other than off while the list holds no non-blank entry, naming
+  the settings. `GlobalSettings::validate_proxy_protocol` applies it to
+  a whole document; the management API runs it on the merged result
+  (beside `validate_cross_fields`, answering 400) and import runs it
+  after `validate_cidr_lists`. The trust list also joins
+  `GlobalSettings::cidr_lists`, so every writer that validates address
+  lists covers it.
+- `PUT /api/v1/settings` takes the three fields (a mode outside the
+  enum is refused by serde, before the handler); `GET` returns them as
+  part of the settings document. `openapi.yaml` documents them on the
+  `PUT` body; the `GET` document is an untyped object there, so it has
+  no second schema to extend. They are not in `SETTINGS_ALLOWLIST`, so
+  the automation tier and MCP refuse them (Lot C2 adds the tests).
+- Two files outside the C1 allowlist, one line each:
+  `lorica-config/src/models/mod.rs` (`ProxyProtocolMode` in the
+  `enums` re-export, which `enums` being private requires) and
+  `lorica-config/src/import.rs` (the `validate_proxy_protocol` call, the
+  "used by import" of the task). The node-local list in the
+  `CanonicalGlobalSettings` doc comment is left as it was: the Lot
+  allowlists the routing destructure only.
 
 ## File List
 
@@ -1069,6 +1106,17 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 - `lorica-core/tests/proxy_protocol.rs` (Lot B, new)
 - `FORK.md` (Lot B: the accept-path divergence entry)
 - `docs/backlog.md` (Lot B: the #81 sentence)
+- `lorica-config/src/models/enums.rs` (Lot C1: `ProxyProtocolMode`)
+- `lorica-config/src/models/mod.rs` (Lot C1: the re-export)
+- `lorica-config/src/models/settings.rs` (Lot C1: the three fields, `cidr_lists`, `validate_proxy_protocol`)
+- `lorica-config/src/store/settings.rs` (Lot C1: load and save arms)
+- `lorica-config/src/canonical.rs` (Lot C1: three lines in the node-local arm)
+- `lorica-config/src/connection_filter.rs` (Lot C1: `validate_proxy_protocol` and its tests)
+- `lorica-config/src/import.rs` (Lot C1: the validator call)
+- `lorica-config/src/tests.rs` (Lot C1)
+- `lorica-api/src/settings.rs` (Lot C1: `UpdateSettingsRequest`, the handler)
+- `lorica-api/openapi.yaml` (Lot C1: the `PUT /api/v1/settings` body)
+- `lorica-api/src/tests.rs` (Lot C1)
 
 ## Change Log
 
@@ -1079,3 +1127,4 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 | 2026-11-14 | 0.3 | Lot 0: the rustls test line of CI enables `lorica-core/connection_filter`, so the gated listener tests run. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.4 | Lot A: the PROXY protocol parser in `lorica-core`, its fuzz target and its `FORK.md` entry. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.5 | Lot B: PROXY protocol accept in the forked listener, the reordered connection filter, `SocketDigest::proxied_from`, the `FORK.md` entry and the #81 sentence. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.6 | Lot C1: the three node-local PROXY protocol settings, their validation at the API and at import, the OpenAPI entry. Status InProgress. | Romain G. |

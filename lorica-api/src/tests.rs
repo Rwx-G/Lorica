@@ -2903,6 +2903,198 @@ async fn test_update_settings() {
     assert_eq!(json["data"]["management_port"], 9443);
 }
 
+// ---- PROXY protocol settings (Story 12.8) ----
+
+/// `PUT /api/v1/settings` with `body`, answering the status and the raw
+/// response body.
+async fn put_settings(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    cookie: &str,
+    body: serde_json::Value,
+) -> (StatusCode, String) {
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", cookie)
+        .body(Body::from(body.to_string()))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tokio::test]
+async fn test_proxy_protocol_settings_default_off_on_get() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/settings")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(json["data"]["proxy_protocol_http"], "off");
+    assert_eq!(json["data"]["proxy_protocol_https"], "off");
+    assert_eq!(
+        json["data"]["proxy_protocol_trusted_cidrs"],
+        serde_json::json!([])
+    );
+}
+
+#[tokio::test]
+async fn test_proxy_protocol_settings_are_written_together_and_read_back() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let (status, body) = put_settings(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        serde_json::json!({
+            "proxy_protocol_http": "optional",
+            "proxy_protocol_https": "required",
+            "proxy_protocol_trusted_cidrs": ["10.0.0.0/24", "192.0.2.10"],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("test setup");
+    assert_eq!(json["data"]["proxy_protocol_http"], "optional");
+    assert_eq!(json["data"]["proxy_protocol_https"], "required");
+
+    let stored = state
+        .store
+        .lock()
+        .await
+        .get_global_settings()
+        .expect("test setup");
+    assert_eq!(
+        stored.proxy_protocol_http,
+        lorica_config::models::ProxyProtocolMode::Optional
+    );
+    assert_eq!(
+        stored.proxy_protocol_https,
+        lorica_config::models::ProxyProtocolMode::Required
+    );
+    assert_eq!(
+        stored.proxy_protocol_trusted_cidrs,
+        ["10.0.0.0/24", "192.0.2.10"]
+    );
+}
+
+#[tokio::test]
+async fn test_proxy_protocol_trust_list_refuses_a_slash_zero_of_either_family() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    for slash_zero in ["0.0.0.0/0", "::/0"] {
+        let (status, body) = put_settings(
+            &state,
+            &session_store,
+            &rate_limiter,
+            &cookie,
+            serde_json::json!({ "proxy_protocol_trusted_cidrs": ["192.0.2.10", slash_zero] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{slash_zero}: {body}");
+        assert!(body.contains("proxy_protocol_trusted_cidrs"), "{body}");
+    }
+    let stored = state
+        .store
+        .lock()
+        .await
+        .get_global_settings()
+        .expect("test setup");
+    assert!(stored.proxy_protocol_trusted_cidrs.is_empty());
+}
+
+#[tokio::test]
+async fn test_proxy_protocol_mode_on_with_no_trusted_peer_is_refused() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let put = |body: serde_json::Value| {
+        let (state, session_store, rate_limiter, cookie) = (
+            state.clone(),
+            session_store.clone(),
+            rate_limiter.clone(),
+            cookie.clone(),
+        );
+        async move { put_settings(&state, &session_store, &rate_limiter, &cookie, body).await }
+    };
+
+    // In one request: a mode on, the list left empty.
+    for field in ["proxy_protocol_http", "proxy_protocol_https"] {
+        for mode in ["required", "optional"] {
+            let (status, body) = put(serde_json::json!({ field: mode })).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}={mode}: {body}");
+            assert!(body.contains("proxy_protocol_trusted_cidrs"), "{body}");
+            assert!(body.contains(field), "{body}");
+        }
+    }
+    // In one request, a mode on with a list that holds only blanks.
+    let (status, _) = put(serde_json::json!({
+        "proxy_protocol_https": "required",
+        "proxy_protocol_trusted_cidrs": ["  "],
+    }))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Across two requests: the list first, then the mode, is accepted.
+    let (status, body) =
+        put(serde_json::json!({ "proxy_protocol_trusted_cidrs": ["10.0.0.0/24"] })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = put(serde_json::json!({ "proxy_protocol_https": "required" })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Clearing the list while a mode is on is refused, and nothing moves.
+    let (status, body) = put(serde_json::json!({ "proxy_protocol_trusted_cidrs": [] })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let stored = state
+        .store
+        .lock()
+        .await
+        .get_global_settings()
+        .expect("test setup");
+    assert_eq!(stored.proxy_protocol_trusted_cidrs, ["10.0.0.0/24"]);
+
+    // Turning the mode off and clearing the list in one request is fine.
+    let (status, body) = put(serde_json::json!({
+        "proxy_protocol_https": "off",
+        "proxy_protocol_trusted_cidrs": [],
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn test_proxy_protocol_mode_outside_the_enum_is_refused() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let (status, body) = put_settings(
+        &state,
+        &session_store,
+        &rate_limiter,
+        &cookie,
+        serde_json::json!({ "proxy_protocol_http": "sometimes" }),
+    )
+    .await;
+    assert!(status.is_client_error(), "{status}: {body}");
+}
+
 #[tokio::test]
 async fn test_get_settings_scrubs_bot_hmac_secret_hex_when_set() {
     // v1.5.1 audit H-1 + followup : when the bot HMAC secret is

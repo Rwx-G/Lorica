@@ -1187,6 +1187,149 @@ created_at = "2026-01-01T00:00:00Z"
         assert_eq!(fetched.trusted_proxies[1], "10.0.0.1");
     }
 
+    // ---- PROXY protocol settings (Story 12.8) ----
+
+    const PROXY_PROTOCOL_MODES: [ProxyProtocolMode; 3] = [
+        ProxyProtocolMode::Off,
+        ProxyProtocolMode::Required,
+        ProxyProtocolMode::Optional,
+    ];
+
+    #[test]
+    fn test_proxy_protocol_settings_default_off_and_empty() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let settings = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
+        assert_eq!(settings.proxy_protocol_http, ProxyProtocolMode::Off);
+        assert_eq!(settings.proxy_protocol_https, ProxyProtocolMode::Off);
+        assert!(settings.proxy_protocol_trusted_cidrs.is_empty());
+        assert!(settings.validate_proxy_protocol().is_ok());
+    }
+
+    #[test]
+    fn test_proxy_protocol_settings_round_trip() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        for http in PROXY_PROTOCOL_MODES {
+            for https in PROXY_PROTOCOL_MODES {
+                let settings = GlobalSettings {
+                    proxy_protocol_http: http,
+                    proxy_protocol_https: https,
+                    proxy_protocol_trusted_cidrs: vec![
+                        "10.0.0.0/24".to_string(),
+                        "2001:db8::1".to_string(),
+                    ],
+                    ..GlobalSettings::default()
+                };
+                store
+                    .update_global_settings(&settings)
+                    .expect("test setup: global settings update");
+                let fetched = store
+                    .get_global_settings()
+                    .expect("test setup: global settings fetch");
+                assert_eq!(fetched.proxy_protocol_http, http);
+                assert_eq!(fetched.proxy_protocol_https, https);
+                assert_eq!(
+                    fetched.proxy_protocol_trusted_cidrs,
+                    settings.proxy_protocol_trusted_cidrs
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_an_unknown_stored_proxy_protocol_mode_is_corrupt() {
+        for key in ["proxy_protocol_http", "proxy_protocol_https"] {
+            let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+            store
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO global_settings (key, value) VALUES (?1, 'sometimes')",
+                    rusqlite::params![key],
+                )
+                .expect("test setup: raw row");
+            let err = store
+                .get_global_settings()
+                .expect_err("an unknown mode is not read as off");
+            assert!(
+                matches!(err, crate::error::ConfigError::Corrupt(_)),
+                "{err:?}"
+            );
+            assert!(err.to_string().contains(key), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_proxy_protocol_settings_survive_export_and_import() {
+        let store1 = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let settings = GlobalSettings {
+            proxy_protocol_http: ProxyProtocolMode::Optional,
+            proxy_protocol_https: ProxyProtocolMode::Required,
+            proxy_protocol_trusted_cidrs: vec!["192.0.2.0/28".to_string()],
+            ..GlobalSettings::default()
+        };
+        store1
+            .update_global_settings(&settings)
+            .expect("test setup: global settings update");
+        let toml_str = export_to_toml(&store1).expect("test setup: toml export succeeds");
+
+        let store2 = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let data = parse_toml(&toml_str).expect("the export imports");
+        import_to_store(&store2, &data).expect("test setup: import succeeds");
+        let fetched = store2
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
+        assert_eq!(fetched.proxy_protocol_http, ProxyProtocolMode::Optional);
+        assert_eq!(fetched.proxy_protocol_https, ProxyProtocolMode::Required);
+        assert_eq!(fetched.proxy_protocol_trusted_cidrs, ["192.0.2.0/28"]);
+    }
+
+    #[test]
+    fn test_an_export_without_proxy_protocol_settings_imports_with_it_off() {
+        let toml_str = "version = 1\n\n\
+                        [global_settings]\n\
+                        management_port = 9443\n\
+                        log_level = \"info\"\n\
+                        default_health_check_interval_s = 10\n";
+        let data = parse_toml(toml_str).expect("an older export imports");
+        assert_eq!(
+            data.global_settings.proxy_protocol_http,
+            ProxyProtocolMode::Off
+        );
+        assert_eq!(
+            data.global_settings.proxy_protocol_https,
+            ProxyProtocolMode::Off
+        );
+        assert!(data.global_settings.proxy_protocol_trusted_cidrs.is_empty());
+    }
+
+    #[test]
+    fn test_import_refuses_an_unusable_proxy_protocol_configuration() {
+        for (extra, reason) in [
+            ("proxy_protocol_trusted_cidrs = [\"0.0.0.0/0\"]", "a v4 /0"),
+            ("proxy_protocol_trusted_cidrs = [\"::/0\"]", "a v6 /0"),
+            (
+                "proxy_protocol_https = \"required\"",
+                "a mode on with no peer",
+            ),
+            (
+                "proxy_protocol_http = \"optional\"",
+                "a mode on with no peer",
+            ),
+        ] {
+            let toml_str = format!(
+                "version = 1\n\n\
+                 [global_settings]\n\
+                 management_port = 9443\n\
+                 log_level = \"info\"\n\
+                 default_health_check_interval_s = 10\n\
+                 {extra}\n"
+            );
+            let err = parse_toml(&toml_str).expect_err(reason).to_string();
+            assert!(err.contains("proxy_protocol_trusted_cidrs"), "{err}");
+        }
+    }
+
     #[test]
     fn test_global_settings_otlp_round_trip() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");

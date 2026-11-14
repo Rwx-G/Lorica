@@ -70,7 +70,7 @@ pub use certificate::{
 pub use cluster::{ClusterIdentity, ClusterNode, JoinToken, NodeStatus, RevokedSerial, TokenState};
 pub use enums::{
     HeaderMatchType, HealthStatus, LifecycleState, LoadBalancing, NotificationChannel,
-    PathMatchType, PreferenceValue, Role, WafMode,
+    PathMatchType, PreferenceValue, ProxyProtocolMode, Role, WafMode,
 };
 pub use health_check::HealthCheck;
 pub use hostname_pattern::{matches_any_depth, matches_one_label, specificity};

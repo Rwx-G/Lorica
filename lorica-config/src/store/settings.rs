@@ -186,6 +186,27 @@ impl ConfigStore {
                         ConfigError::Corrupt(format!("invalid trusted_proxies JSON: {e}"))
                     })?;
                 }
+                // Story 12.8. A mode nobody wrote is refused rather than
+                // read as off: guessing would silently change which client
+                // address every control of that listener sees.
+                "proxy_protocol_http" | "proxy_protocol_https" => {
+                    let mode: ProxyProtocolMode = value.parse().map_err(|e| {
+                        ConfigError::Corrupt(format!("stored {key} {value:?} is not a mode: {e}"))
+                    })?;
+                    if key == "proxy_protocol_http" {
+                        settings.proxy_protocol_http = mode;
+                    } else {
+                        settings.proxy_protocol_https = mode;
+                    }
+                }
+                "proxy_protocol_trusted_cidrs" => {
+                    settings.proxy_protocol_trusted_cidrs =
+                        serde_json::from_str(&value).map_err(|e| {
+                            ConfigError::Corrupt(format!(
+                                "invalid proxy_protocol_trusted_cidrs JSON: {e}"
+                            ))
+                        })?;
+                }
                 "waf_whitelist_ips" => {
                     settings.waf_whitelist_ips = serde_json::from_str(&value).map_err(|e| {
                         ConfigError::Corrupt(format!("invalid waf_whitelist_ips JSON: {e}"))
@@ -523,6 +544,24 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('trusted_proxies', ?1)",
             params![trusted_proxies_json],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('proxy_protocol_http', ?1)",
+            params![settings.proxy_protocol_http.as_str()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('proxy_protocol_https', ?1)",
+            params![settings.proxy_protocol_https.as_str()],
+        )?;
+        let proxy_protocol_trusted_json =
+            serde_json::to_string(&settings.proxy_protocol_trusted_cidrs).map_err(|e| {
+                ConfigError::Validation(format!(
+                    "failed to serialize proxy_protocol_trusted_cidrs: {e}"
+                ))
+            })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('proxy_protocol_trusted_cidrs', ?1)",
+            params![proxy_protocol_trusted_json],
         )?;
         let waf_whitelist_json =
             serde_json::to_string(&settings.waf_whitelist_ips).map_err(|e| {

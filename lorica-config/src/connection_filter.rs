@@ -48,6 +48,8 @@ use std::net::IpAddr;
 use ipnet::IpNet;
 use tracing::warn;
 
+use crate::models::ProxyProtocolMode;
+
 /// Parse one address entry into a network.
 ///
 /// Accepts a CIDR (`10.0.0.0/8`, `2001:db8::/32`) and a bare address,
@@ -110,6 +112,72 @@ pub fn validate_cidr_list(entries: &[String], field: &str) -> std::result::Resul
             continue;
         }
         validate_cidr(entry, field)?;
+    }
+    Ok(())
+}
+
+/// Refuse a PROXY protocol configuration (Story 12.8) that cannot be
+/// what the operator meant.
+///
+/// - Every entry of the trust list parses, as [`validate_cidr_list`]
+///   says.
+/// - No entry is a `/0`, of either family: trusting every address to
+///   name its own client is the same as having no trust check, and it
+///   would let anyone defeat every IP allowlist the node has.
+/// - A listener mode other than off needs at least one trusted entry:
+///   with none, no peer could ever send a header, and `required` would
+///   mean nothing.
+///
+/// Import and the management API both call it, on the whole settings
+/// document they are about to store.
+///
+/// # Errors
+///
+/// Returns the operator-facing reason, naming the settings involved.
+///
+/// ```rust
+/// use lorica_config::connection_filter::validate_proxy_protocol;
+/// use lorica_config::models::ProxyProtocolMode::{Off, Required};
+///
+/// let lb = vec!["10.0.0.0/24".to_string()];
+/// assert!(validate_proxy_protocol(Off, Off, &[]).is_ok());
+/// assert!(validate_proxy_protocol(Off, Required, &lb).is_ok());
+/// assert!(validate_proxy_protocol(Off, Required, &[]).is_err());
+/// assert!(validate_proxy_protocol(Off, Off, &["::/0".to_string()]).is_err());
+/// ```
+pub fn validate_proxy_protocol(
+    http: ProxyProtocolMode,
+    https: ProxyProtocolMode,
+    trusted_cidrs: &[String],
+) -> std::result::Result<(), String> {
+    const FIELD: &str = "proxy_protocol_trusted_cidrs";
+    validate_cidr_list(trusted_cidrs, FIELD)?;
+    let mut trusted_entries: usize = 0;
+    for entry in trusted_cidrs {
+        if entry.trim().is_empty() {
+            continue;
+        }
+        trusted_entries += 1;
+        if parse_cidr(entry).is_ok_and(|net| net.prefix_len() == 0) {
+            return Err(format!(
+                "`{entry}` in {FIELD} trusts every address to name its own client; \
+                 list the load balancers that send the header"
+            ));
+        }
+    }
+    if trusted_entries == 0 {
+        for (field, mode) in [
+            ("proxy_protocol_http", http),
+            ("proxy_protocol_https", https),
+        ] {
+            if mode != ProxyProtocolMode::Off {
+                return Err(format!(
+                    "{field} is {} but {FIELD} is empty: no peer could send a PROXY header; \
+                     list the load balancers first, or set {field} to off",
+                    mode.as_str()
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -335,5 +403,69 @@ mod tests {
                 "the validator disagrees on {entry:?}"
             );
         }
+    }
+
+    const MODES: [ProxyProtocolMode; 3] = [
+        ProxyProtocolMode::Off,
+        ProxyProtocolMode::Required,
+        ProxyProtocolMode::Optional,
+    ];
+
+    fn list(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|e| (*e).to_string()).collect()
+    }
+
+    #[test]
+    fn a_proxy_protocol_trust_list_never_holds_a_slash_zero() {
+        // Every corpus entry the parser reads as a /0, of either family,
+        // in any spelling the parser accepts.
+        let slash_zeros: Vec<&str> = CORPUS
+            .iter()
+            .filter(|(entry, _)| parse_cidr(entry).is_ok_and(|net| net.prefix_len() == 0))
+            .map(|(entry, _)| *entry)
+            .chain(["10.0.0.0/0", " ::/0 "])
+            .collect();
+        assert!(slash_zeros.iter().any(|e| e.contains(':')));
+        assert!(slash_zeros.iter().any(|e| e.contains('.')));
+        for entry in slash_zeros {
+            let lb = list(&["192.0.2.10", entry]);
+            for mode in MODES {
+                let err = validate_proxy_protocol(mode, mode, &lb).expect_err(entry);
+                assert!(err.contains("proxy_protocol_trusted_cidrs"), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_listener_mode_on_needs_a_trusted_peer() {
+        for empty in [list(&[]), list(&["", "  "])] {
+            for http in MODES {
+                for https in MODES {
+                    let on = http != ProxyProtocolMode::Off || https != ProxyProtocolMode::Off;
+                    let verdict = validate_proxy_protocol(http, https, &empty);
+                    assert_eq!(verdict.is_err(), on, "{http:?} {https:?} {empty:?}");
+                    if let Err(err) = verdict {
+                        assert!(err.contains("proxy_protocol_trusted_cidrs"), "{err}");
+                        assert!(err.contains("proxy_protocol_http"), "{err}");
+                    }
+                }
+            }
+        }
+        for http in MODES {
+            for https in MODES {
+                assert!(validate_proxy_protocol(http, https, &list(&["10.0.0.0/24"])).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn a_malformed_proxy_protocol_trust_entry_is_refused() {
+        let err = validate_proxy_protocol(
+            ProxyProtocolMode::Off,
+            ProxyProtocolMode::Off,
+            &list(&["10.0.0.0/33"]),
+        )
+        .expect_err("a /33 is not a v4 network");
+        assert!(err.contains("proxy_protocol_trusted_cidrs"), "{err}");
     }
 }

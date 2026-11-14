@@ -540,6 +540,15 @@ pub struct UpdateSettingsRequest {
     pub custom_security_presets: Option<Vec<lorica_config::models::SecurityHeaderPreset>>,
     /// CIDRs of trusted reverse proxies (XFF parsing gate).
     pub trusted_proxies: Option<Vec<String>>,
+    /// Story 12.8. PROXY protocol mode of the HTTP listener (`off`,
+    /// `required`, `optional`). Node-local; applies to connections
+    /// accepted after the save.
+    pub proxy_protocol_http: Option<lorica_config::models::ProxyProtocolMode>,
+    /// Story 12.8. PROXY protocol mode of the HTTPS listener.
+    pub proxy_protocol_https: Option<lorica_config::models::ProxyProtocolMode>,
+    /// Story 12.8. Peers allowed to send a PROXY header. Never `/0`, and
+    /// not empty while either mode is on (checked on the merged result).
+    pub proxy_protocol_trusted_cidrs: Option<Vec<String>>,
     /// IPs / CIDRs that bypass WAF + rate-limit + auto-ban.
     pub waf_whitelist_ips: Option<Vec<String>>,
     /// CIDRs denied at TCP accept time.
@@ -997,6 +1006,16 @@ pub(crate) async fn update_settings_as(
             &mut settings.trusted_proxies,
             "trusted_proxies",
         )?;
+        // Story 12.8. Serde already refused a mode outside the enum; the
+        // `/0` and "on with nobody trusted" rules are checked on the
+        // merged result below.
+        apply_plain(body.proxy_protocol_http, &mut settings.proxy_protocol_http);
+        apply_plain(body.proxy_protocol_https, &mut settings.proxy_protocol_https);
+        apply_cidr_list(
+            body.proxy_protocol_trusted_cidrs,
+            &mut settings.proxy_protocol_trusted_cidrs,
+            "proxy_protocol_trusted_cidrs",
+        )?;
         apply_cidr_list(
             body.waf_whitelist_ips,
             &mut settings.waf_whitelist_ips,
@@ -1177,6 +1196,10 @@ pub(crate) async fn update_settings_as(
         // (e.g. cert warning <= critical) on the merged result.
         settings
             .validate_cross_fields()
+            .map_err(ApiError::BadRequest)?;
+        // Story 12.8, the shared validator import runs too.
+        settings
+            .validate_proxy_protocol()
             .map_err(ApiError::BadRequest)?;
         // Story 9.8 QA: validate syslog TLS material by building the
         // exact connector the sink will use, so a bad pasted PEM is a

@@ -253,6 +253,11 @@ fn validate(data: &ImportData) -> Result<()> {
     data.global_settings
         .validate_cidr_lists()
         .map_err(|reason| ConfigError::Validation(format!("global_settings: {reason}")))?;
+    // Story 12.8: the PROXY protocol trust list and the listener modes
+    // are refused here on the same terms as at the management API.
+    data.global_settings
+        .validate_proxy_protocol()
+        .map_err(|reason| ConfigError::Validation(format!("global_settings: {reason}")))?;
 
     // Validate certificate references in routes
     for route in &data.routes {

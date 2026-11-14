@@ -110,6 +110,33 @@ impl WafMode {
     }
 }
 
+/// Whether an HTTP or HTTPS listener reads a PROXY protocol header from
+/// the peers in `proxy_protocol_trusted_cidrs` (Story 12.8). One field
+/// per listener; a peer outside the list is always a direct client.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, EnumString, IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ProxyProtocolMode {
+    /// No header is read: the listener behaves as it always has.
+    #[default]
+    Off,
+    /// A trusted peer must send a header, or its connection is closed.
+    Required,
+    /// A trusted peer may send a header; one that sends none (a load
+    /// balancer health check) is served on its socket address.
+    Optional,
+}
+
+impl ProxyProtocolMode {
+    /// Snake_case wire representation of the variant (matches the
+    /// `serde` and `FromStr` form).
+    pub fn as_str(&self) -> &'static str {
+        self.into()
+    }
+}
+
 /// Last observed health probe outcome for a backend. `Unknown` is the
 /// pre-probe / probing-disabled default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumString, IntoStaticStr)]

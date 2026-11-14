@@ -460,6 +460,40 @@ paths:
                     type: string
                   description: CIDR ranges or IPs of trusted reverse proxies
                   example: ["192.168.0.0/16", "10.0.0.0/8"]
+                proxy_protocol_http:
+                  type: string
+                  enum: [off, required, optional]
+                  default: "off"
+                  description: >-
+                    Whether the HTTP listener reads a PROXY protocol header (v1
+                    or v2) from the peers in `proxy_protocol_trusted_cidrs`
+                    (Story 12.8). `required` closes a trusted peer that sends
+                    none; `optional` serves it on its socket address (load
+                    balancer health checks). A peer outside the list is always
+                    a direct client, and a header from it closes the
+                    connection. Node-local, never replicated; applies to
+                    connections accepted after the save. Refused on the
+                    automation API and MCP.
+                proxy_protocol_https:
+                  type: string
+                  enum: [off, required, optional]
+                  default: "off"
+                  description: >-
+                    The same for the HTTPS listener (Story 12.8).
+                proxy_protocol_trusted_cidrs:
+                  type: array
+                  items:
+                    type: string
+                  description: >-
+                    Peers allowed to send a PROXY protocol header, typically the
+                    load balancers in front of the node (Story 12.8). Separate
+                    from `trusted_proxies`: a connection whose client address
+                    came from a header never has its `X-Forwarded-For` read.
+                    A `/0` of either family is refused, and so is an empty list
+                    while either listener's mode is not `off` (checked on the
+                    merged settings, so clearing the list while a mode is on is
+                    refused too). Node-local, never replicated.
+                  example: ["10.0.0.0/24"]
                 waf_whitelist_ips:
                   type: array
                   items:
