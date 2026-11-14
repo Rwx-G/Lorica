@@ -764,32 +764,32 @@ Allowlist: `lorica/src/health.rs`, `lorica-api/src/backends.rs`,
 `lorica-dashboard/frontend/src/routes/Backends.svelte`,
 `lorica-dashboard/frontend/src/routes/Backends.test.ts`.
 
-- [ ] `health.rs`: probe chosen from `backend.health_check`, through a
+- [x] `health.rs`: probe chosen from `backend.health_check`, through a
       pure `fn probe_for(&Backend) -> ProbeTarget` the test can call;
       HTTP behaviour byte-identical for every backend whose path is set.
-- [ ] `backends.rs`: `CreateBackendRequest` and `UpdateBackendRequest`
+- [x] `backends.rs`: `CreateBackendRequest` and `UpdateBackendRequest`
       gain `health_check: Option<HealthCheck>`; `health_check_path`
       still accepted and documented deprecated; both given and
       disagreeing is `400` naming both fields; the response carries both.
       Enabling checks on a UDP-attached or portless backend is refused by
       the store (Lot 1) with the stream named; the handler test proves it.
-- [ ] `redact.rs`: the query values of `health_check.path` masked
+- [x] `redact.rs`: the query values of `health_check.path` masked
       exactly as `health_check_path`'s are, and
       `restore_health_check_path` restores both fields from one stored
       path, so a typed path sent back as read keeps the stored one.
-- [ ] `lorica-mcp/src/tools.rs`: `BACKEND_FIELDS` gains `health_check`;
+- [x] `lorica-mcp/src/tools.rs`: `BACKEND_FIELDS` gains `health_check`;
       the backend tools' summaries mention the typed shape and the
       deprecated path.
-- [ ] Both OpenAPI documents: `HealthCheck` schema (`oneOf` by `kind`),
+- [x] Both OpenAPI documents: `HealthCheck` schema (`oneOf` by `kind`),
       `health_check` on `Backend`, `CreateBackendRequest`,
       `UpdateBackendRequest`, `health_check_path` marked
       `deprecated: true`; the D-11 fields described HTTP-only; the
       portless address form described on `address`.
-- [ ] Dashboard: `api.ts` types (`HealthCheck` union, the deprecated
+- [x] Dashboard: `api.ts` types (`HealthCheck` union, the deprecated
       field kept); the backend form picks the kind (HTTP path or TCP
       connect) and sends `health_check`; Vitest covers both kinds and
       the edit of a backend read with only a legacy path.
-- [ ] Tests listed under Dev Notes, Lot 4.
+- [x] Tests listed under Dev Notes, Lot 4.
 
 ### Lot 5: stream management API and conflict checks (after Lots 2 and 4; cargo)
 
@@ -1175,12 +1175,16 @@ the per-commit guard. Story 12.12's file must list this scenario by name.
   first compared the cut's stream lists in order: the canonical sort key
   includes `enabled`, so flipping the flag can reorder them. The test
   compares them as a set.
+- Lot 4, first `lorica-api` run: the empty-path refusal test asserted
+  the message started with the field name; the error envelope prefixes
+  it, so the test checks that it contains the sentence instead.
 
 ### Completion Notes
 
 Lot 1 (schema, models, store, shared rules, shape changes) and Lot 2
-(replication, cut, export, import, diff) are done; Lots 3 to 6 are
-handled separately.
+(replication, cut, export, import, diff) are done, and Lot 4 (the
+typed health check on every surface); Lots 3, 5 and 6 are handled
+separately.
 
 Lot 2:
 
@@ -1230,6 +1234,63 @@ Lot 2:
 - The follower's apply log line (`lorica/src/startup/cluster_follower.rs`,
   Lot 3's file) does not print the three new `ReplicaOutcome` counts;
   left to that lot.
+
+Lot 4:
+
+- Wire shape, the same on the management API, the automation plane
+  and the MCP tools (whose bodies are the management bodies):
+  `health_check: {"kind": "http", "path": "/healthz"}` or
+  `{"kind": "tcp_connect"}`, the model's own serde form. Every answer
+  carries `health_check` and the deprecated `health_check_path`, the
+  latter computed from the former (`HealthCheck::legacy_path`).
+- Input rule, one function (`requested_health_check`,
+  `lorica-api/src/backends.rs`): the typed check alone; the path alone,
+  read as before (a path is `http`, the empty string `tcp_connect`);
+  both, compared through the projection rather than as checks, so a
+  later kind without a path agrees with an empty legacy path. Both
+  disagreeing is `400` naming both fields; an `http` check with an
+  empty path is `422`. Neither on create is `tcp_connect`, neither on
+  update keeps the stored check. The handler always goes through
+  `Backend::set_health_check`, so the store's reconcile never sees a
+  disagreeing pair from the API.
+- Deprecation is expressed as `deprecated: true` on
+  `health_check_path` in both OpenAPI documents, `@deprecated` on the
+  TypeScript fields, and the doc comments of the request and response
+  structs and the MCP tool summaries.
+- The store's attachment refusals (UDP-attached with checks on,
+  portless with checks on) reach the API as `ConfigError::Validation`,
+  which `ApiError` maps to `422`, not `400` as D-6 says; the handler
+  tests pin `422` and the stream's name in the message.
+- `restore_health_check_path` reads the sent path from the typed check
+  (which the handler already set from whichever shape was sent) and
+  puts the stored path back through `set_health_check`, so both fields
+  are restored. Its refusal now reads
+  "health_check_path and health_check.path: ...". `backend_row` masks
+  the query values of `health_check.path` as well.
+- The automation document keeps its rule of not restating management
+  bodies: `ManagementBackendCreate` and `ManagementBackendUpdate` gain
+  only `health_check` and the deprecated `health_check_path`, beside a
+  `HealthCheck` schema of its own; the management document carries
+  `HealthCheck` with a `discriminator` over `HttpHealthCheck` and
+  `TcpConnectHealthCheck`, and the D-11 fields described HTTP-only.
+- No nested MCP vocabulary for `health_check`: `HealthCheck` is an enum
+  with `deny_unknown_fields`, so the plane refuses a mistyped key itself
+  (Axum's `422`) rather than dropping it, and `pin_nested` only
+  requires a vocabulary for a struct.
+- The automation read pin (`AUTOMATION_READ_FIELD_NAMES`) gains
+  `health_check` and `kind`, the typed check's tag.
+- The dashboard form sends the typed shape only, never
+  `health_check_path`; the kind is a select (TCP connect, HTTP GET), the
+  path field shows for `http` only, and a new kind is one more option
+  and one more `switch` arm in `formHealthCheck` and
+  `describeHealthCheck`. The address field still requires `host:port`:
+  portless backends are for range streams, whose dashboard is
+  Story 12.10.
+- `lorica-api/src/automation/write.rs` needed no change: the call site
+  of `restore_health_check_path` is unchanged.
+- Outside the allowlist, not edited: `docs/automation.md` and
+  `docs/mcp.md` describe the masking of `health_check_path` only and
+  should name `health_check.path` too; no lot of this story owns them.
 
 - `Stream.listen_address` is an `IpAddr`, not a `String`: the canonical
   RFC 5952 form is then true by construction (serde parses any spelling
@@ -1319,6 +1380,17 @@ Lot 2, modified: `lorica-config/src/canonical.rs`,
 `lorica-config/src/store/adcs_authority.rs` (test fixture),
 `docs/stories/story-12.1-stream-model.md`.
 
+Lot 4, modified: `lorica/src/health.rs`, `lorica-api/src/backends.rs`,
+`lorica-api/src/automation/redact.rs`,
+`lorica-api/src/automation/read/plane_tests.rs`,
+`lorica-api/src/automation/write/plane_tests.rs`,
+`lorica-api/openapi.yaml` (backend schemas and `HealthCheck`),
+`lorica-api/openapi-automation.yaml`, `lorica-api/tests/openapi_contract.rs`,
+`lorica-mcp/src/tools.rs`, `lorica-dashboard/frontend/src/lib/api.ts`,
+`lorica-dashboard/frontend/src/routes/Backends.svelte`,
+`lorica-dashboard/frontend/src/routes/Backends.test.ts`,
+`docs/stories/story-12.1-stream-model.md`.
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1328,3 +1400,4 @@ Lot 2, modified: `lorica-config/src/canonical.rs`,
 | 2026-11-14 | 0.3 | AC #6 amended: the control plane binds only streams with an empty selector; `binds_here` and `NodeRole` (D-8); the "this node" conflict rule and IV1 test rewritten for the control plane and two followers. Status Draft. | Romain G. |
 | 2026-11-14 | 0.4 | Lot 1 implemented: migrations 71 to 73, `Stream`, `HealthCheck`, `listen_ports`, the stream store, the attachment rule on every management write, reserved ports on `cluster_nodes` and in `AppState`, every construction site. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.5 | Lot 2 implemented: `CANONICAL_FORMAT_VERSION` 3 with streams and stream links in the blob, the per-recipient cut of streams and their backends, the whole-snapshot attachment check in `prepare_replica`, the apply and the import on the unchecked writers, streams in TOML export, import and diff, IV1 in the `cluster` shape. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.6 | Lot 4 implemented: the typed health check on every surface (health loop through `probe_for`, management API with both shapes and the disagreement refusal, redaction of the typed path, MCP backend fields, both OpenAPI documents with `health_check_path` deprecated, dashboard form and `api.ts`). Status InProgress. | Romain G. |
