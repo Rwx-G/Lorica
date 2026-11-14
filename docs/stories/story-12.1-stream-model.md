@@ -732,23 +732,23 @@ Allowlist: `lorica-cluster/proto/cluster.proto`,
 (their `Heartbeat` literals only), `lorica/src/startup/cluster_follower.rs`,
 `lorica/src/startup/cluster_plane.rs`.
 
-- [ ] `ReservedPortsReport` message and `Heartbeat.reserved_ports`
+- [x] `ReservedPortsReport` message and `Heartbeat.reserved_ports`
       (tag 6) in the proto and in `messages.rs`; the field-number test in
       `messages.rs` extended; the frozen corpus unchanged and green.
-- [ ] `InPlaneAction::Heartbeat` carries it (`bridge.rs`);
+- [x] `InPlaneAction::Heartbeat` carries it (`bridge.rs`);
       `FollowerHandler::reserved_ports` defaulted (`dialer.rs`) and sent
       in every heartbeat (`node_resources` sibling); `record_reserved_ports`
       on the session entry (`roster.rs`), called in `serve_request`.
-- [ ] A report with a zero port or a port above 65535 is dropped as
+- [x] A report with a zero port or a port above 65535 is dropped as
       not reported, with a WARN naming the node (never the values of
       other fields).
-- [ ] `ReplicaHandler::reserved_ports` from `FollowerOptions.reserved_ports`.
-- [ ] The flush in `cluster_plane.rs` builds `LiveNodeFacts.reserved_ports`
+- [x] `ReplicaHandler::reserved_ports` from `FollowerOptions.reserved_ports`.
+- [x] The flush in `cluster_plane.rs` builds `LiveNodeFacts.reserved_ports`
       from the session.
-- [ ] The unresolvable-selector WARN of the round
+- [x] The unresolvable-selector WARN of the round
       (`resolution.unresolvable(&route.node_selector)` in
       `cluster_plane.rs`) also runs over streams.
-- [ ] Tests listed under Dev Notes, Lot 3.
+- [x] Tests listed under Dev Notes, Lot 3.
 
 ### Lot 4: the typed health check on every surface (after Lot 1; parallel with 2 and 3; cargo and frontend)
 
@@ -1189,8 +1189,78 @@ the per-commit guard. Story 12.12's file must list this scenario by name.
 
 Lot 1 (schema, models, store, shared rules, shape changes) and Lot 2
 (replication, cut, export, import, diff) are done, Lot 4 (the typed
-health check on every surface), and Lot 5 (the stream management API
-and the conflict checks); Lots 3 and 6 are handled separately.
+health check on every surface), Lot 5 (the stream management API
+and the conflict checks), and Lot 3 (reserved ports on the wire,
+persisted, and the selector warning); Lot 6 is handled separately.
+
+Lot 3:
+
+- Wire: `ReservedPortsReport` (`management`, `http`, `https` as
+  `uint32`; `cluster`, `enrollment`, `automation` as `optional uint32`,
+  absent when the listener is off) and `Heartbeat.reserved_ports` under
+  tag 6, in `cluster.proto` and `messages.rs`. Compatibility is tested
+  both ways against a frozen copy of the v1.10.6 `Heartbeat` (from the
+  tag, in the `messages.rs` tests): a 1.10.6 decoder reads a 1.11.0
+  heartbeat carrying a report with every field it knows intact, a
+  1.11.0 decoder reads a 1.10.6 heartbeat as not reported, and a
+  1.11.0 heartbeat without a report is byte-identical to the 1.10.6
+  one. The frozen corpus passes with its fixture untouched (its
+  `Heartbeat` literal gains `reserved_ports: None`).
+- The decode-boundary check is `ReservedPortsReport::checked`, which
+  yields `ReportedPorts` (the same six fields as `u16`) or `None`. All
+  or nothing: one zero or one value above 65535 drops the whole report,
+  since a partial report would let a stream through on a port the node
+  holds, and clamping would check streams against a port the node does
+  not hold. The bridge carries the outcome as
+  `InPlaneAction::Heartbeat.reserved_ports: ReservedPortsClaim`
+  (`NotSent`, `Reported`, `Dropped`); `serve_request` records a
+  `Reported` value on the session entry and, for `Dropped`, warns once
+  per session with the peer, node id and node name only. A dropped
+  report is not a protocol violation and keeps the session.
+- `lorica-cluster` keeps its own `ReportedPorts` rather than
+  `lorica_config::listen_ports::ReservedPorts`, because it does not
+  depend on `lorica-config` (the dependency direction
+  `lorica-fleet/Cargo.toml` documents). The two conversions, in
+  `cluster_follower.rs` (`reserved_ports_report`) and `cluster_plane.rs`
+  (`reserved_ports_of`), destructure their source, so a listener added
+  on either side fails to compile until the other carries it.
+- The session entry holds the latest valid report of this session
+  (`LiveSession::record_reserved_ports`,
+  `LiveSessionSnapshot.reserved_ports`); a heartbeat without one, or
+  with a dropped one, leaves it as it was. The flush is now
+  `flush_session_facts` over a pure `live_node_facts`, so a test drives
+  one flush without the 30-second loop; a session with no report maps
+  to `None`, which the store's `COALESCE` turns into "keep the stored
+  value".
+- `ReplicaHandler` holds the report built once from
+  `FollowerOptions.reserved_ports` and returns it on every heartbeat;
+  the `#[allow(dead_code)]` Lot 1 put on that field is gone.
+- The follower's apply log line prints `streams`,
+  `streams_not_for_this_node` and `stream_backends` (Lot 2's hand-off).
+- The round's unresolvable-selector WARN runs over streams too, naming
+  the stream by id and name.
+- Outside the allowlist: `lorica-cluster/src/lib.rs` (re-exports of
+  `ReservedPortsReport`, `ReportedPorts` and `ReservedPortsClaim`, as
+  for `NodeResources`), and one new test in
+  `lorica-cluster/tests/enrollment.rs`
+  (`a_heartbeat_carries_the_node_s_reserved_ports_onto_its_session`),
+  beside the resource-reading test whose fleet harness it uses: the
+  `cluster_plane.rs` integration harness registers no sessions.
+- Not tested end to end: the dialer putting the follower's report on
+  the wire. It is one line beside `node_resources`, which has no such
+  test either; the `FollowerHandler` double in
+  `lorica-cluster/tests/replication.rs` would be the place.
+
+Follow-up from Lot 5, the import preview: `import_preview` now runs the
+same port check as `import_config`, through one function
+(`refuse_imported_port_conflicts`, `lorica-api/src/config.rs`) with
+the same role, the same reserved ports and the same node assembly
+(`first_port_conflict`). A file the import would refuse with the
+`stream_port_conflict` `409` is refused by the preview with the same
+`409` and the same message, rather than listed beside the diff: the
+preview already refuses on structure (`400`) what the import refuses,
+and the import itself stops at the first conflict. The
+`/config/import/preview` operation in `openapi.yaml` gains the `409`.
 
 Lot 5:
 
@@ -1246,7 +1316,8 @@ Lot 5:
   closure, before `import_to_store` clears anything. The nodes are
   assembled as for an API write, so on a control plane an import is
   also checked on the enrolled nodes its streams target, which D-9
-  leaves out and AC #7 asks for. The preview does not run it.
+  leaves out and AC #7 asks for. The preview does not run it (it
+  does since the follow-up recorded under Lot 3).
 - The stream id rule (decided by the orchestrator, outside D-1):
   `Stream::validate` refuses an id that is not a UUID in its canonical
   lowercase hyphenated form (`is_canonical_stream_id`,
@@ -1470,6 +1541,17 @@ Lot 4, modified: `lorica/src/health.rs`, `lorica-api/src/backends.rs`,
 `lorica-dashboard/frontend/src/routes/Backends.test.ts`,
 `docs/stories/story-12.1-stream-model.md`.
 
+Lot 3, modified: `lorica-cluster/proto/cluster.proto`,
+`lorica-cluster/src/{messages,bridge,roster,dialer,lib}.rs`,
+`lorica-cluster/src/listener/operational.rs`,
+`lorica-cluster/tests/{cluster_plane,enrollment,wire_corpus}.rs`,
+`lorica/src/startup/{cluster_follower,cluster_plane}.rs`,
+`docs/stories/story-12.1-stream-model.md`.
+
+Lot 5 follow-up (import preview), modified: `lorica-api/src/config.rs`,
+`lorica-api/src/streams/tests.rs`, `lorica-api/openapi.yaml` (the
+preview's `409`), `docs/stories/story-12.1-stream-model.md`.
+
 Lot 5, new: `lorica-api/src/streams.rs`, `lorica-api/src/streams/tests.rs`.
 
 Lot 5, modified: `lorica-api/src/lib.rs`, `lorica-api/src/server.rs`
@@ -1493,3 +1575,4 @@ schemas, the import `409`), `lorica-config/src/models/{stream,mod}.rs`
 | 2026-11-14 | 0.5 | Lot 2 implemented: `CANONICAL_FORMAT_VERSION` 3 with streams and stream links in the blob, the per-recipient cut of streams and their backends, the whole-snapshot attachment check in `prepare_replica`, the apply and the import on the unchecked writers, streams in TOML export, import and diff, IV1 in the `cluster` shape. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.6 | Lot 4 implemented: the typed health check on every surface (health loop through `probe_for`, management API with both shapes and the disagreement refusal, redaction of the typed path, MCP backend fields, both OpenAPI documents with `health_check_path` deprecated, dashboard form and `api.ts`). Status InProgress. | Romain G. |
 | 2026-11-14 | 0.7 | Lot 5 implemented: the stream management API (CRUD at the route floors, audit, `streams_cud` budget), the per-node port check with its `stream_port_conflict` 409 on every write and on import, IV2 automated, and stream ids held to the canonical UUID form in `Stream::validate`. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.8 | Lot 3 implemented: `ReservedPortsReport` in the heartbeat under tag 6, tested both ways against the v1.10.6 shape, checked at the decode boundary and dropped whole on an impossible port, held on the session and persisted by the flush with `COALESCE`, reported by `ReplicaHandler`; the apply log line prints the stream counts; the selector WARN covers streams. The import preview runs the import's port check (Lot 5 follow-up). Status InProgress. | Romain G. |
