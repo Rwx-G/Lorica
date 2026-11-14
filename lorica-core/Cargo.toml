@@ -114,6 +114,12 @@ required-features = ["integration-tests"]
 name = "server_phase_gracefulshutdown"
 required-features = ["integration-tests"]
 
+# Lorica: PROXY protocol accept (Story 12.8). Its TLS case also needs
+# `rustls`, and is compiled out without it.
+[[test]]
+name = "proxy_protocol"
+required-features = ["connection_filter"]
+
 [features]
 default = []
 integration-tests = []

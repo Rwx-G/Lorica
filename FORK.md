@@ -517,6 +517,43 @@ lives in.
   without `connection_filter`. An upstream sync leaves the file alone
   and keeps the `pub mod` line. Its fuzz target is
   `fuzz/fuzz_targets/fuzz_proxy_protocol.rs`.
+- **`lorica-core`, PROXY protocol accept and the reordered connection
+  filter (v1.11.0, Story 12.8).** Upstream runs the connection filter on
+  the socket peer in the accept loop and has no PROXY protocol accept.
+  An endpoint registered with
+  `Listeners::add_endpoint_with_proxy_protocol` holds a
+  `ProxyProtocolPolicy` whose mode it reads on every accept. With the
+  mode off, or on any endpoint registered the upstream way, the path is
+  upstream's. Otherwise a peer the policy trusts skips the filter at
+  accept; its connection task reads the header before `set_buffer`
+  (bounded by the parser's `MAX_HEADER_LEN` and `HEADER_READ_TIMEOUT`),
+  rewinds the bytes read past it, installs the carried addresses in a
+  new socket digest, and only then runs the filter, with its per-IP
+  permit, on the carried client address. Any other peer is filtered at
+  accept as upstream does, and its first bytes are sniffed: a PROXY
+  signature closes the connection. Sites, each marked `Lorica:`:
+  `listeners/proxy_protocol.rs` (new, additive: the policy trait, the
+  mode, the outcome enum, the header read and the sniff),
+  `listeners/l4.rs` (`ListenerEndpoint::accept_staged` beside an
+  unchanged-signature `accept`, the filter verdict moved into
+  `filter_on_socket_peer` and `proxy_protocol::apply_verdict`, the
+  builder's `proxy_protocol`), `listeners/mod.rs` (the policy on
+  `TransportStackBuilder`, `TransportStack::accept` through the staged
+  accept, the pending read on `UninitializedStream`, run first in
+  `handshake`, and `add_endpoint_with_proxy_protocol`),
+  `protocols/digest.rs` (`SocketDigest::proxied`, `proxied_from` and
+  `ProxiedFrom`, re-exported from `protocols/mod.rs`) and
+  `services/listening.rs` (`run_endpoint` logs a refusal the policy or
+  the filter already reported at debug level, not as a handshake
+  error). Everything but the digest field sits behind the existing
+  `connection_filter` feature. On an upstream sync, keep the staged
+  accept in `ListenerEndpoint`, the header read before `set_buffer` in
+  `UninitializedStream::handshake`, and the extra `SocketDigest` field.
+  Upstream `5104a3e0` (accept limits per endpoint, deferred in the
+  1.10.5 row and ruled out for these listeners by Story 12.2) lands on
+  this same accept path, so any later upstream commit building on it
+  conflicts here first. Tests: `lorica-core/tests/proxy_protocol.rs`,
+  run by the rustls line of CI.
 
 ## Upstream sync record
 

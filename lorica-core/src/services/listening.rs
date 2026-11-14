@@ -212,6 +212,15 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
                             Ok(handshake) => {
                                 match handshake {
                                     Ok(io) => Self::handle_event(io, app, shutdown).await,
+                                    // Lorica: a PROXY protocol refusal, or a
+                                    // rejection by the connection filter run
+                                    // after the header, was already reported
+                                    // by the policy or the filter, which
+                                    // rate-limit their own lines (Story 12.8).
+                                    #[cfg(feature = "connection_filter")]
+                                    Err(e) if crate::listeners::proxy_protocol::is_refusal(&e) => {
+                                        debug!("Downstream connection refused: {e}");
+                                    }
                                     Err(e) => {
                                         // TODO: Maybe IOApp trait needs a fn to handle/filter out this error
                                         if let Some(addr) = peer_addr {

@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "connection_filter")]
-use log::debug;
 use log::warn;
 use lorica_error::{
     ErrorType::{AcceptError, BindError},
@@ -30,6 +28,11 @@ use tokio::net::{TcpListener, TcpSocket};
 
 #[cfg(feature = "connection_filter")]
 use super::connection_filter::ConnectionFilter;
+// Lorica: the PROXY protocol accept (Story 12.8).
+#[cfg(feature = "connection_filter")]
+use super::proxy_protocol::{
+    apply_verdict, PendingProxyHeader, ProxyProtocolMode, ProxyProtocolPolicy,
+};
 #[cfg(feature = "connection_filter")]
 use crate::listeners::AcceptAllFilter;
 
@@ -275,6 +278,10 @@ pub struct ListenerEndpoint {
     listener: Arc<Listener>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Arc<dyn ConnectionFilter>,
+    /// Lorica: the PROXY protocol policy, `None` for an endpoint that
+    /// never reads a header (Story 12.8).
+    #[cfg(feature = "connection_filter")]
+    proxy_protocol: Option<Arc<dyn ProxyProtocolPolicy>>,
 }
 
 #[derive(Default)]
@@ -282,6 +289,9 @@ pub struct ListenerEndpointBuilder {
     listen_addr: Option<ServerAddress>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Option<Arc<dyn ConnectionFilter>>,
+    // Lorica: see `ListenerEndpoint::proxy_protocol`.
+    #[cfg(feature = "connection_filter")]
+    proxy_protocol: Option<Arc<dyn ProxyProtocolPolicy>>,
 }
 
 impl ListenerEndpointBuilder {
@@ -290,7 +300,17 @@ impl ListenerEndpointBuilder {
             listen_addr: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: None,
+            #[cfg(feature = "connection_filter")]
+            proxy_protocol: None,
         }
+    }
+
+    /// Lorica: read a PROXY header from the peers `policy` trusts, while
+    /// its mode is not `Off` (Story 12.8).
+    #[cfg(feature = "connection_filter")]
+    pub fn proxy_protocol(&mut self, policy: Arc<dyn ProxyProtocolPolicy>) -> &mut Self {
+        self.proxy_protocol = Some(policy);
+        self
     }
 
     pub fn listen_addr(&mut self, addr: ServerAddress) -> &mut Self {
@@ -338,6 +358,8 @@ impl ListenerEndpointBuilder {
             listener: Arc::new(listener),
             #[cfg(feature = "connection_filter")]
             connection_filter,
+            #[cfg(feature = "connection_filter")]
+            proxy_protocol: self.proxy_protocol,
         })
     }
 }
@@ -372,6 +394,29 @@ impl ListenerEndpoint {
         Ok(())
     }
 
+    /// Runs the connection filter on the socket peer of `stream`, attaching
+    /// its permit, and answers whether the connection goes on.
+    ///
+    /// Lorica: shared by `accept` and the staged accept of the PROXY
+    /// protocol (Story 12.8); the verdict handling moved to
+    /// `proxy_protocol::apply_verdict`, which the deferred filter uses too.
+    #[cfg(feature = "connection_filter")]
+    async fn filter_on_socket_peer(&self, stream: &mut Stream) -> bool {
+        // Performance: nested if-let avoids cloning/allocations on each connection accept
+        let verdict = if let Some(digest) = stream.get_socket_digest() {
+            if let Some(peer_addr) = digest.peer_addr() {
+                self.connection_filter.try_accept(peer_addr.as_inet()).await
+            } else {
+                // No peer address available - accept by default
+                super::AcceptVerdict::Accept(None)
+            }
+        } else {
+            // No socket digest available - accept by default
+            super::AcceptVerdict::Accept(None)
+        };
+        apply_verdict(stream, verdict)
+    }
+
     pub async fn accept(&self) -> Result<Stream> {
         #[cfg(feature = "connection_filter")]
         {
@@ -382,36 +427,12 @@ impl ListenerEndpoint {
                     .await
                     .or_err(AcceptError, "Fail to accept()")?;
 
-                // Performance: nested if-let avoids cloning/allocations on each connection accept
-                let verdict = if let Some(digest) = stream.get_socket_digest() {
-                    if let Some(peer_addr) = digest.peer_addr() {
-                        self.connection_filter.try_accept(peer_addr.as_inet()).await
-                    } else {
-                        // No peer address available - accept by default
-                        super::AcceptVerdict::Accept(None)
-                    }
-                } else {
-                    // No socket digest available - accept by default
-                    super::AcceptVerdict::Accept(None)
-                };
-
-                match verdict {
-                    super::AcceptVerdict::Reject => {
-                        debug!("Connection rejected by filter");
-                        drop(stream);
-                        continue;
-                    }
-                    super::AcceptVerdict::Accept(permit) => {
-                        // The permit rides on the stream so counting
-                        // filters decrement exactly when the
-                        // connection closes (RAII, Story 8.9 AC #5).
-                        if let Some(permit) = permit {
-                            stream.set_accept_permit(permit);
-                        }
-                        self.apply_stream_settings(&mut stream)?;
-                        return Ok(stream);
-                    }
+                if !self.filter_on_socket_peer(&mut stream).await {
+                    drop(stream);
+                    continue;
                 }
+                self.apply_stream_settings(&mut stream)?;
+                return Ok(stream);
             }
         }
         #[cfg(not(feature = "connection_filter"))]
@@ -423,6 +444,57 @@ impl ListenerEndpoint {
                 .or_err(AcceptError, "Fail to accept()")?;
             self.apply_stream_settings(&mut stream)?;
             Ok(stream)
+        }
+    }
+
+    /// Lorica: the staged accept of the PROXY protocol (Story 12.8).
+    ///
+    /// Without a policy, or with its mode `Off`, this is [`Self::accept`]
+    /// and returns no pending header. Otherwise a peer the policy trusts is
+    /// handed on with the connection filter skipped, and any other peer is
+    /// filtered on its socket address as `accept` does; both come back with
+    /// the header read or the signature sniff their connection task owes.
+    /// Nothing here waits on the peer: the reads happen in that task.
+    #[cfg(feature = "connection_filter")]
+    pub(crate) async fn accept_staged(&self) -> Result<(Stream, Option<PendingProxyHeader>)> {
+        let Some(policy) = self.proxy_protocol.as_ref() else {
+            return Ok((self.accept().await?, None));
+        };
+        loop {
+            let mut stream = self
+                .listener
+                .accept()
+                .await
+                .or_err(AcceptError, "Fail to accept()")?;
+            let accepted_at = tokio::time::Instant::now();
+
+            let mode = policy.mode();
+            if mode != ProxyProtocolMode::Off {
+                let trusted_peer = stream
+                    .get_socket_digest()
+                    .and_then(|digest| digest.peer_addr().and_then(|a| a.as_inet()).copied())
+                    .filter(|peer| policy.is_trusted(peer));
+                if let Some(peer) = trusted_peer {
+                    self.apply_stream_settings(&mut stream)?;
+                    let pending = PendingProxyHeader::awaiting_header(
+                        Arc::clone(policy),
+                        Arc::clone(&self.connection_filter),
+                        peer,
+                        accepted_at,
+                    );
+                    return Ok((stream, Some(pending)));
+                }
+            }
+
+            if !self.filter_on_socket_peer(&mut stream).await {
+                drop(stream);
+                continue;
+            }
+            self.apply_stream_settings(&mut stream)?;
+            let pending = (mode != ProxyProtocolMode::Off).then(|| {
+                PendingProxyHeader::direct(Arc::clone(policy), Arc::clone(&self.connection_filter))
+            });
+            return Ok((stream, pending));
         }
     }
 }

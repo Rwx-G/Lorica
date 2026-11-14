@@ -49,6 +49,13 @@ pub mod connection_filter;
 #[cfg(feature = "connection_filter")]
 pub use connection_filter::{AcceptAllFilter, AcceptPermit, AcceptVerdict, ConnectionFilter};
 
+// Lorica: PROXY protocol accept on the listening endpoints (Story 12.8).
+#[cfg(feature = "connection_filter")]
+pub mod proxy_protocol;
+
+#[cfg(feature = "connection_filter")]
+pub use proxy_protocol::{ProxyHeaderOutcome, ProxyProtocolMode, ProxyProtocolPolicy};
+
 #[cfg(not(feature = "connection_filter"))]
 #[derive(Debug, Clone)]
 pub struct AcceptAllFilter;
@@ -125,6 +132,9 @@ struct TransportStackBuilder {
     tls: Option<TlsSettings>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Option<Arc<dyn ConnectionFilter>>,
+    // Lorica: the endpoint's PROXY protocol policy (Story 12.8).
+    #[cfg(feature = "connection_filter")]
+    proxy_protocol: Option<Arc<dyn ProxyProtocolPolicy>>,
 }
 
 impl TransportStackBuilder {
@@ -136,6 +146,11 @@ impl TransportStackBuilder {
         #[cfg(feature = "connection_filter")]
         if let Some(filter) = &self.connection_filter {
             builder.connection_filter(filter.clone());
+        }
+
+        #[cfg(feature = "connection_filter")]
+        if let Some(policy) = &self.proxy_protocol {
+            builder.proxy_protocol(policy.clone());
         }
 
         let l4 = builder.listen(upgrade_listeners).await?;
@@ -159,11 +174,26 @@ impl TransportStack {
     }
 
     pub async fn accept(&self) -> Result<UninitializedStream> {
-        let stream = self.l4.accept().await?;
-        Ok(UninitializedStream {
-            l4: stream,
-            tls: self.tls.clone(),
-        })
+        // Lorica: the staged accept of the PROXY protocol (Story 12.8),
+        // which is `ListenerEndpoint::accept` on an endpoint without a
+        // policy or with its mode off.
+        #[cfg(feature = "connection_filter")]
+        {
+            let (stream, proxy_header) = self.l4.accept_staged().await?;
+            Ok(UninitializedStream {
+                l4: stream,
+                tls: self.tls.clone(),
+                proxy_header,
+            })
+        }
+        #[cfg(not(feature = "connection_filter"))]
+        {
+            let stream = self.l4.accept().await?;
+            Ok(UninitializedStream {
+                l4: stream,
+                tls: self.tls.clone(),
+            })
+        }
     }
 
     pub fn cleanup(&mut self) {
@@ -174,10 +204,21 @@ impl TransportStack {
 pub(crate) struct UninitializedStream {
     l4: L4Stream,
     tls: Option<Arc<Acceptor>>,
+    // Lorica: the PROXY header read or signature sniff this connection
+    // owes before its handshake (Story 12.8).
+    #[cfg(feature = "connection_filter")]
+    proxy_header: Option<proxy_protocol::PendingProxyHeader>,
 }
 
 impl UninitializedStream {
     pub async fn handshake(mut self) -> Result<Stream> {
+        // Lorica: the PROXY header is read before `set_buffer`, which
+        // would drop what it buffered, and the bytes read past it are
+        // rewound (Story 12.8).
+        #[cfg(feature = "connection_filter")]
+        if let Some(proxy_header) = self.proxy_header.take() {
+            proxy_header.resolve(&mut self.l4).await?;
+        }
         self.l4.set_buffer();
         if let Some(tls) = self.tls {
             let tls_stream = tls.tls_handshake(self.l4).await?;
@@ -294,6 +335,31 @@ impl Listeners {
             tls,
             #[cfg(feature = "connection_filter")]
             connection_filter: self.connection_filter.clone(),
+            #[cfg(feature = "connection_filter")]
+            proxy_protocol: None,
+        })
+    }
+
+    /// Lorica: add an endpoint that reads a PROXY header from the peers
+    /// `policy` trusts, while the policy's mode is not off (Story 12.8).
+    ///
+    /// The mode is read on every accept, so the endpoint is registered
+    /// once and follows the policy. The connection filter set on `self`
+    /// applies as on any endpoint, except that for a trusted peer it runs
+    /// after the header, on the client address the header carried. See
+    /// [`proxy_protocol`] for the whole accept path.
+    #[cfg(feature = "connection_filter")]
+    pub fn add_endpoint_with_proxy_protocol(
+        &mut self,
+        l4: ServerAddress,
+        tls: Option<TlsSettings>,
+        policy: Arc<dyn ProxyProtocolPolicy>,
+    ) {
+        self.stacks.push(TransportStackBuilder {
+            l4,
+            tls,
+            connection_filter: self.connection_filter.clone(),
+            proxy_protocol: Some(policy),
         })
     }
 

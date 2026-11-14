@@ -653,22 +653,22 @@ met), `lorica-core/Cargo.toml`, `lorica-core/tests/proxy_protocol.rs`
 `docs/backlog.md` (#81 only).
 Depends on: Lot 0, A.
 
-- [ ] `ProxyProtocolPolicy`, `ProxyProtocolMode`, `ProxyHeaderOutcome`
+- [x] `ProxyProtocolPolicy`, `ProxyProtocolMode`, `ProxyHeaderOutcome`
       and the header read (D-k), the read bounded by
       `HEADER_READ_TIMEOUT` from accept and `MAX_HEADER_LEN`, excess
       rewound.
-- [ ] Staged accept in `l4.rs` and the stage, policy and filter carried
+- [x] Staged accept in `l4.rs` and the stage, policy and filter carried
       to `UninitializedStream` (D-b); `add_endpoint_with_proxy_protocol`.
-- [ ] `handshake`: header read or sniff before `set_buffer`; the
+- [x] `handshake`: header read or sniff before `set_buffer`; the
       deferred `try_accept` on the carried address with its permit; the
       digest swap (D-f).
-- [ ] `SocketDigest::proxied_from` and the pre-set constructor.
-- [ ] `Lorica:` markers at every site; the `FORK.md` entry and the #81
+- [x] `SocketDigest::proxied_from` and the pre-set constructor.
+- [x] `Lorica:` markers at every site; the `FORK.md` entry and the #81
       sentence (D-k).
-- [ ] `lorica-core/Cargo.toml` lists its integration tests as explicit
+- [x] `lorica-core/Cargo.toml` lists its integration tests as explicit
       `[[test]]` entries: the new file needs one, gated on
       `connection_filter` (and `rustls` for the TLS case).
-- [ ] Tests (Linux, real sockets): v1 and v2 accepted with the carried
+- [x] Tests (Linux, real sockets): v1 and v2 accepted with the carried
       address in `peer_addr` and `local_addr` and `proxied_from` set;
       `LOCAL` keeps the socket addresses; client bytes in the same
       segment as the header reach the HTTP parser; TLS completes after a
@@ -942,6 +942,14 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
   `cargo audit`, all green. The module's 22 unit tests and its doc test
   run in both forked-crate lines. Fuzz smoke run: `cargo +nightly fuzz run fuzz_proxy_protocol -- -max_total_time=180` on a copy of the tree, 47.9 million inputs in 181 s, no crash and no assertion failure.
 
+- **Lot B gates.** On the Lot B tree, through Docker (`rust:1-bookworm`,
+  `CARGO_BUILD_WARNINGS=deny`): the full cargo gate chain of `ci.yml`
+  and `cargo audit`, all green. The forked-crate default line builds
+  without `connection_filter` and skips `tests/proxy_protocol.rs`
+  (its `required-features`); the rustls line runs its 16 cases (5.2 s,
+  the timeout case included) beside the 536 `lorica-core` unit tests,
+  among them the pre-existing listener tests that pin the default path.
+
 ### Completion Notes
 
 - **Lot 0** (`fix(ci)`): the gap was real; see the Debug Log.
@@ -984,6 +992,62 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 - `fuzz/` keeps no `Cargo.lock` in the repository, so none moved. The
   root `Cargo.lock` did not move either: no dependency was added.
 - Not wired anywhere; Lots B and D consume it.
+- **Lot B** (`feat(proxy)`): the accept path of D-b, behind the
+  existing `connection_filter` feature, as `lorica_core::listeners`
+  exports `ProxyProtocolPolicy`, `ProxyProtocolMode` and
+  `ProxyHeaderOutcome` (module `listeners::proxy_protocol`), and
+  `Listeners::add_endpoint_with_proxy_protocol(l4, tls, policy)`.
+  Lot D reaches it through `Service::endpoints()`, which already
+  returns the service's `Listeners`; no `Service` method was added.
+- **The default path is unchanged.** An endpoint added the upstream way
+  carries no policy, and `ListenerEndpoint::accept_staged` then returns
+  `accept()` itself with no pending read; `UninitializedStream` with no
+  pending read runs `handshake` as before. `accept()` keeps its
+  signature and its behaviour: its filter verdict moved, unchanged,
+  into `filter_on_socket_peer` and `proxy_protocol::apply_verdict`
+  (the latter shared with the deferred filter). Proved by every
+  pre-existing listener test passing on both forked-crate lines
+  (`test_connection_filter_accept`, `test_connection_filter_blocks_all`,
+  `test_connection_filter_inheritance`, `test_listen_tcp`,
+  `test_listen_tls`) and by two new end-to-end cases: an endpoint
+  without a policy, and one with the mode `Off`, each hand a PROXY
+  header to the HTTP parser as bytes, filtered at accept on the socket
+  peer, with no outcome recorded.
+- Choices inside the contract, each pinned by a test in
+  `lorica-core/tests/proxy_protocol.rs`:
+  - `ProxyProtocolPolicy::record` takes the outcome, the socket peer and
+    a static detail (`None` for an accepted outcome), not the outcome
+    alone as D-k sketched: D-j's log line names the peer and the
+    parser's detail, and the policy is where Lot D writes it.
+  - The staged accept returns `(Stream, Option<PendingProxyHeader>)`
+    rather than the `Accepted` enum D-b sketched; the pending read
+    carries the stage (`AwaitingHeader` with the peer and the accept
+    instant, or `Direct`), the policy and the filter. Same states, one
+    fewer type.
+  - A refusal, or a rejection by the filter run after the header,
+    returns a `RefusedBeforeHandshake` error from `handshake`, which
+    `run_endpoint` (`services/listening.rs`) logs at debug level instead
+    of as "Downstream handshake error". Without it every
+    `untrusted_peer` refusal would write an unthrottled `error` line,
+    defeating D-j's limiter, and a deferred filter rejection would be
+    louder than the same rejection at accept is today.
+  - Under `required`, bytes that do not open with a PROXY signature are
+    `missing`; a connection that closes before sending anything is
+    `missing` too, and one that closes inside a header `malformed`.
+    Under `optional` both the non-PROXY bytes and an immediate close
+    are `absent`, then filtered on the socket peer.
+  - `ProxiedFrom.local` is read with one `getsockname` per proxied
+    connection, when the digest is swapped.
+  - `ProxyHeaderOutcome::all()` iterates the enum (strum's `EnumIter`,
+    already a `lorica-core` dependency), so Lot D's counter table and
+    docs derive from it.
+- Two files outside the Lot B allowlist, each one marked line:
+  `lorica-core/src/services/listening.rs` (the debug-level refusal arm
+  above) and `lorica-core/src/protocols/mod.rs` (`ProxiedFrom` added to
+  the `digest` re-export, without which the type `proxied_from()`
+  returns could not be named outside the crate). `stream.rs` needed
+  nothing: `rewind` is `pub(crate)` and the stage rides on
+  `UninitializedStream`.
 
 ## File List
 
@@ -995,6 +1059,16 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 - `.github/workflows/fuzz.yml` (Lot A: the target matrix)
 - `docs/security.md` (Lot A: the "Fuzz Testing" list)
 - `FORK.md` (Lot A: the parser's divergence entry)
+- `lorica-core/src/listeners/proxy_protocol.rs` (Lot B, new)
+- `lorica-core/src/listeners/l4.rs` (Lot B: the staged accept)
+- `lorica-core/src/listeners/mod.rs` (Lot B: the policy, the pending read in `handshake`, `add_endpoint_with_proxy_protocol`)
+- `lorica-core/src/protocols/digest.rs` (Lot B: `ProxiedFrom`, `SocketDigest::proxied`, `proxied_from`)
+- `lorica-core/src/protocols/mod.rs` (Lot B: `ProxiedFrom` in the `digest` re-export)
+- `lorica-core/src/services/listening.rs` (Lot B: a refusal logged at debug level)
+- `lorica-core/Cargo.toml` (Lot B: the `proxy_protocol` `[[test]]` entry)
+- `lorica-core/tests/proxy_protocol.rs` (Lot B, new)
+- `FORK.md` (Lot B: the accept-path divergence entry)
+- `docs/backlog.md` (Lot B: the #81 sentence)
 
 ## Change Log
 
@@ -1004,3 +1078,4 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 | 2026-11-14 | 0.2 | Maintainer answers folded in: the parser moves into `lorica-core` as an additive module (no new crate), Lot 0 for the CI feature gap, `X-Forwarded-For` reasoning stated, open questions resolved. Status Draft. | Romain G. |
 | 2026-11-14 | 0.3 | Lot 0: the rustls test line of CI enables `lorica-core/connection_filter`, so the gated listener tests run. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.4 | Lot A: the PROXY protocol parser in `lorica-core`, its fuzz target and its `FORK.md` entry. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.5 | Lot B: PROXY protocol accept in the forked listener, the reordered connection filter, `SocketDigest::proxied_from`, the `FORK.md` entry and the #81 sentence. Status InProgress. | Romain G. |

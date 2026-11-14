@@ -22,9 +22,10 @@ pub mod proxy_protocol;
 pub mod raw_connect;
 pub mod tls;
 
+// Lorica: `ProxiedFrom` belongs to the PROXY protocol accept (Story 12.8).
 pub use digest::{
-    Digest, GetProxyDigest, GetSocketDigest, GetTimingDigest, ProtoDigest, SocketDigest,
-    TimingDigest,
+    Digest, GetProxyDigest, GetSocketDigest, GetTimingDigest, ProtoDigest, ProxiedFrom,
+    SocketDigest, TimingDigest,
 };
 pub use l4::ext::TcpKeepalive;
 pub use tls::ALPN;

@@ -21,6 +21,7 @@ use once_cell::sync::OnceCell;
 
 use super::l4::ext::{get_original_dest, get_recv_buf, get_snd_buf, get_tcp_info, TCP_INFO};
 use super::l4::socket::SocketAddr;
+use super::proxy_protocol::Version as ProxyProtocolVersion;
 use super::raw_connect::ProxyDigest;
 use super::tls::digest::SslDigest;
 
@@ -69,6 +70,23 @@ pub struct SocketDigest {
     pub local_addr: OnceCell<Option<SocketAddr>>,
     /// Original destination address
     pub original_dst: OnceCell<Option<SocketAddr>>,
+    /// Lorica: where the two address cells came from when a PROXY header
+    /// set them (Story 12.8), `None` on any other connection.
+    proxied_from: Option<ProxiedFrom>,
+}
+
+/// Lorica: the socket a connection was accepted on, when a trusted peer's
+/// PROXY header carried its addresses (Story 12.8). The digest's
+/// `peer_addr` and `local_addr` then hold the carried client and
+/// destination; this keeps what the socket itself said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxiedFrom {
+    /// The socket peer: the load balancer that sent the header.
+    pub peer: std::net::SocketAddr,
+    /// The socket's own local address, `None` when `getsockname` failed.
+    pub local: Option<std::net::SocketAddr>,
+    /// The PROXY protocol version of the header.
+    pub version: ProxyProtocolVersion,
 }
 
 impl SocketDigest {
@@ -78,7 +96,32 @@ impl SocketDigest {
             peer_addr: OnceCell::new(),
             local_addr: OnceCell::new(),
             original_dst: OnceCell::new(),
+            proxied_from: None,
         }
+    }
+
+    /// Lorica: a digest whose peer and local addresses are the ones a
+    /// trusted peer's PROXY header carried (Story 12.8). Both cells are
+    /// set here, so neither `getpeername` nor `getsockname` runs for them.
+    pub fn proxied(
+        raw_fd: std::os::unix::io::RawFd,
+        source: std::net::SocketAddr,
+        destination: std::net::SocketAddr,
+        proxied_from: ProxiedFrom,
+    ) -> SocketDigest {
+        SocketDigest {
+            raw_fd,
+            peer_addr: OnceCell::with_value(Some(SocketAddr::Inet(source))),
+            local_addr: OnceCell::with_value(Some(SocketAddr::Inet(destination))),
+            original_dst: OnceCell::new(),
+            proxied_from: Some(proxied_from),
+        }
+    }
+
+    /// Lorica: the socket behind the addresses of a connection whose
+    /// client address came from a PROXY header, `None` for any other.
+    pub fn proxied_from(&self) -> Option<&ProxiedFrom> {
+        self.proxied_from.as_ref()
     }
 
     pub fn peer_addr(&self) -> Option<&SocketAddr> {
