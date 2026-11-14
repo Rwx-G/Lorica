@@ -152,34 +152,15 @@ pub fn send_worker_fds(sock: RawFd, entries: &[FdEntry]) -> Result<(), WorkerErr
 /// leak on error paths) and M-6 (silent `MSG_TRUNC` truncation).
 pub fn recv_worker_fds(sock: RawFd) -> Result<Vec<FdEntry>, WorkerError> {
     let mut buf = [0u8; PAYLOAD_BUF_SIZE];
-    let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS]);
 
     // Collect OwnedFds up front. If the function returns Err anywhere
     // below, `drop` closes each FD. If it returns Ok we `into_raw_fd`
     // to hand ownership to the caller.
-    let (owned_fds, bytes, truncated) = {
-        let mut iov = [IoSliceMut::new(&mut buf)];
-        let msg =
-            socket::recvmsg::<UnixAddr>(sock, &mut iov, Some(&mut cmsg_buf), MsgFlags::empty())
-                .map_err(WorkerError::RecvFds)?;
+    let received =
+        recv_with_rights(sock, &mut buf, MsgFlags::empty()).map_err(WorkerError::RecvFds)?;
+    let (owned_fds, bytes) = (received.fds, received.bytes);
 
-        let mut owned = Vec::<OwnedFd>::new();
-        for cmsg in msg.cmsgs().map_err(WorkerError::RecvFds)? {
-            if let ControlMessageOwned::ScmRights(received) = cmsg {
-                for raw in received {
-                    // SAFETY: `ScmRights` yields fresh kernel FDs that the
-                    // kernel passed with exclusive ownership; wrapping them
-                    // in `OwnedFd` is the canonical close-on-drop idiom.
-                    owned.push(unsafe { OwnedFd::from_raw_fd(raw) });
-                }
-            }
-        }
-        let truncated =
-            msg.flags.contains(MsgFlags::MSG_TRUNC) || msg.flags.contains(MsgFlags::MSG_CTRUNC);
-        (owned, msg.bytes, truncated)
-    };
-
-    if truncated {
+    if received.truncated {
         // Payload or cmsg buffer was too small: the kernel silently
         // dropped bytes / FDs. Returning Err here also drops `owned_fds`
         // via `OwnedFd::drop` so no FD leak (audit H-2 / M-6).
@@ -212,6 +193,97 @@ pub fn recv_worker_fds(sock: RawFd) -> Result<Vec<FdEntry>, WorkerError> {
             kind,
         })
         .collect())
+}
+
+/// One `recvmsg` with its `SCM_RIGHTS` fds already owned.
+pub(crate) struct ReceivedRights {
+    /// Payload bytes written into the caller's buffer.
+    pub(crate) bytes: usize,
+    /// `MSG_TRUNC` or `MSG_CTRUNC`: payload or fds were lost.
+    pub(crate) truncated: bool,
+    /// Every fd the kernel installed, owned so any error path closes it.
+    pub(crate) fds: Vec<OwnedFd>,
+}
+
+/// `recvmsg` into `buf` with room for [`MAX_FDS`] passed fds, owning every
+/// fd the kernel installed, including on `MSG_CTRUNC`.
+///
+/// nix refuses to iterate a control buffer flagged `MSG_CTRUNC`
+/// (`ENOBUFS`), yet the kernel has installed the fds that fit into it
+/// (and, when the receiver runs out of descriptors, those it managed to
+/// install). Propagating that refusal would leak them, so a truncated
+/// buffer is read by [`salvage_rights`] instead.
+pub(crate) fn recv_with_rights(
+    sock: RawFd,
+    buf: &mut [u8],
+    flags: MsgFlags,
+) -> nix::Result<ReceivedRights> {
+    let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS]);
+    let (bytes, msg_flags, mut fds) = {
+        let mut iov = [IoSliceMut::new(buf)];
+        let msg = socket::recvmsg::<UnixAddr>(sock, &mut iov, Some(&mut cmsg_buf), flags)?;
+        let mut owned = Vec::<OwnedFd>::new();
+        if !msg.flags.contains(MsgFlags::MSG_CTRUNC) {
+            for cmsg in msg.cmsgs()? {
+                if let ControlMessageOwned::ScmRights(received) = cmsg {
+                    for raw in received {
+                        // SAFETY: `ScmRights` yields fresh kernel FDs that the
+                        // kernel passed with exclusive ownership; wrapping them
+                        // in `OwnedFd` is the canonical close-on-drop idiom.
+                        owned.push(unsafe { OwnedFd::from_raw_fd(raw) });
+                    }
+                }
+            }
+        }
+        (msg.bytes, msg.flags, owned)
+    };
+    if msg_flags.contains(MsgFlags::MSG_CTRUNC) {
+        fds = salvage_rights(&cmsg_buf);
+    }
+    Ok(ReceivedRights {
+        bytes,
+        truncated: msg_flags.intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC),
+        fds,
+    })
+}
+
+/// Own the fds of every `SCM_RIGHTS` header in a control buffer the
+/// kernel flagged `MSG_CTRUNC`. Linux writes only whole headers whose
+/// `cmsg_len` covers the fds it installed; the rest of the buffer is
+/// still zeroed, and a zero `cmsg_len` ends the walk.
+fn salvage_rights(control: &[u8]) -> Vec<OwnedFd> {
+    use nix::libc::{cmsghdr, CMSG_LEN, CMSG_SPACE, SCM_RIGHTS, SOL_SOCKET};
+
+    // SAFETY: `CMSG_LEN` is pure arithmetic on its argument.
+    let data_offset = unsafe { CMSG_LEN(0) } as usize;
+    let fd_size = std::mem::size_of::<RawFd>();
+    let mut fds = Vec::new();
+    let mut offset = 0usize;
+    while offset + std::mem::size_of::<cmsghdr>() <= control.len() {
+        // SAFETY: the bounds check above keeps the read inside `control`,
+        // and `read_unaligned` places no alignment requirement on it.
+        let header: cmsghdr =
+            unsafe { std::ptr::read_unaligned(control[offset..].as_ptr().cast::<cmsghdr>()) };
+        // `cmsg_len` is `size_t` on glibc and `socklen_t` on musl.
+        #[allow(clippy::unnecessary_cast)]
+        let len = header.cmsg_len as usize;
+        if len < data_offset || offset + len > control.len() {
+            break;
+        }
+        if header.cmsg_level == SOL_SOCKET && header.cmsg_type == SCM_RIGHTS {
+            for raw in control[offset + data_offset..offset + len].chunks_exact(fd_size) {
+                let mut bytes = [0u8; std::mem::size_of::<RawFd>()];
+                bytes.copy_from_slice(raw);
+                // SAFETY: the kernel installed this descriptor for this
+                // process alone while filling the header; nothing else
+                // owns it.
+                fds.push(unsafe { OwnedFd::from_raw_fd(RawFd::from_ne_bytes(bytes)) });
+            }
+        }
+        // SAFETY: `CMSG_SPACE` is pure arithmetic on its argument.
+        offset += unsafe { CMSG_SPACE((len - data_offset) as u32) } as usize;
+    }
+    fds
 }
 
 /// Backwards-compatible wrapper used by tests that only care about
@@ -514,5 +586,50 @@ mod tests {
         }
         // Unknown tag is an error.
         assert!(FdKind::from_token("wat:garbage").is_err());
+    }
+
+    #[test]
+    fn test_recv_worker_fds_closes_what_arrived_on_ctrunc() {
+        // One fd more than the control buffer holds: the kernel installs
+        // MAX_FDS of them and flags MSG_CTRUNC, which nix refuses to
+        // iterate. Every installed copy must still be closed.
+        let (parent_fd, child_fd) = create_socketpair().expect("socketpair failed");
+        let passed: Vec<OwnedFd> = (0..=MAX_FDS)
+            .map(|_| {
+                socket::socket(
+                    AddressFamily::Unix,
+                    SockType::Stream,
+                    SockFlag::empty(),
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        let entries: Vec<FdEntry> = passed
+            .iter()
+            .map(|fd| FdEntry {
+                fd: fd.as_raw_fd(),
+                kind: FdKind::Rpc,
+            })
+            .collect();
+        send_worker_fds(parent_fd.as_raw_fd(), &entries).unwrap();
+        assert!(matches!(
+            recv_worker_fds(child_fd.as_raw_fd()),
+            Err(WorkerError::InvalidPayload)
+        ));
+        for fd in &passed {
+            let ino = nix::sys::stat::fstat(fd).unwrap().st_ino;
+            let target = format!("socket:[{ino}]");
+            let open = std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    std::fs::read_link(e.path())
+                        .map(|l| l.to_string_lossy() == target)
+                        .unwrap_or(false)
+                })
+                .count();
+            assert_eq!(open, 1, "a received copy of {target} leaked");
+        }
     }
 }
