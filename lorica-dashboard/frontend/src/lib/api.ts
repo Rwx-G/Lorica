@@ -1013,6 +1013,10 @@ export interface GlobalSettingsResponse {
   header_timeout_s: number;
   // Downstream idle timeout (s), HTTP/1.1 keepalive and HTTP/2. Default 75; never 0.
   downstream_idle_timeout_s: number;
+  // Drain given to connections a stop or a stream removal ends (s), 1 to 3600 (Story 12.2).
+  worker_drain_timeout_s: number;
+  // Listening sockets the streams of one node may hold, 1 to 16384 (Story 12.2).
+  stream_listen_socket_cap: number;
   waf_ban_threshold: number;
   waf_ban_duration_s: number;
   // Process-wide ceiling on the bytes the WAF holds in body-scan
@@ -1100,6 +1104,8 @@ export interface UpdateSettingsRequest {
   flood_strict_rps?: number;
   header_timeout_s?: number;
   downstream_idle_timeout_s?: number;
+  worker_drain_timeout_s?: number;
+  stream_listen_socket_cap?: number;
   waf_ban_threshold?: number;
   waf_ban_duration_s?: number;
   waf_body_scan_max_inflight_bytes?: number;
@@ -2030,6 +2036,11 @@ export const api = {
   getWorkers: () =>
     request<{ workers: WorkerStatus[]; total: number }>('GET', '/workers'),
 
+  // Operator and above: a Viewer is refused, and a refusal raises the
+  // role toast, so callers gate on the role before asking.
+  getStreamBudget: () =>
+    request<StreamBudgetView>('GET', '/streams/budget'),
+
   // WAF
   getWafEvents: (params?: { limit?: number; category?: string }) => {
     const query = new URLSearchParams();
@@ -2589,6 +2600,105 @@ export interface WorkerStatus {
   last_heartbeat_ms: number;
   last_heartbeat_ago_s: number;
   healthy: boolean;
+}
+
+// --- Stream plane (Story 12.2) ---
+
+export type StreamProtocol = 'tcp' | 'udp';
+
+/**
+ * A stream's bind state on one node. `unknown` is the control plane's
+ * answer for a node whose state it cannot vouch for: the node drifts
+ * from its configuration, or its report was cut.
+ */
+export type StreamBindStateKind = 'pending' | 'bound' | 'failed' | 'unknown';
+
+/** Why a bind failed (`StreamBindFailureKind` in `openapi.yaml`). */
+export type StreamBindFailureKind =
+  | 'address_in_use'
+  | 'permission_denied'
+  | 'address_not_available'
+  | 'reserved_port'
+  | 'fd_budget'
+  | 'other';
+
+/** One stream's share of a node's fd budget. */
+export interface StreamBudgetShare {
+  id: string;
+  name: string;
+  protocol: StreamProtocol;
+  /** One per port. */
+  listen_sockets: number;
+  /**
+   * The connection cap of a TCP stream or the session ceiling of a UDP
+   * one. `null` while the stream's engine declares none, which is not a
+   * ceiling of 0: the stream then counts only its listening sockets.
+   */
+  ceiling: number | null;
+  /** Fds each connection or session holds; `null` as `ceiling`. */
+  fds_per_unit: number | null;
+  /** `listen_sockets + ceiling x fds_per_unit`, what the stream costs one worker. */
+  fds_committed: number;
+  bind_state: StreamBindStateKind;
+}
+
+/** One node's stream fd budget, `GET /api/v1/streams/budget`. */
+export interface NodeStreamBudget {
+  /** `null` for a node with no roster row: standalone, or the control plane itself. */
+  node_id: string | null;
+  node_name: string | null;
+  reported_at: string;
+  /** The process's soft `RLIMIT_NOFILE`; 0 when it could not be read. */
+  fd_limit: number;
+  base_reserve: number;
+  http_reserve: number;
+  stream_budget: number;
+  worker_count: number;
+  listen_socket_cap: number;
+  listen_sockets_used: number;
+  worker_fds_committed: number;
+  supervisor_fds_committed: number;
+  worker_drain_timeout_s: number;
+  streams: StreamBudgetShare[];
+}
+
+export interface StreamBudgetView {
+  nodes: NodeStreamBudget[];
+}
+
+/** A stream a node binds once active (the enrollment preview's `stream_ports`). */
+export interface StreamPortsEntry {
+  id: string;
+  name: string;
+  protocol: StreamProtocol;
+  listen_address: string;
+  port_first: number;
+  port_last: number;
+}
+
+/** One binding a node holds that is not bound. The `failed` fields are absent otherwise. */
+export interface NodeStreamBinding {
+  stream_id: string;
+  state: Exclude<StreamBindStateKind, 'bound'>;
+  kind?: StreamBindFailureKind;
+  os_error?: string;
+  port?: number;
+  since?: string;
+}
+
+/**
+ * A node's stream plane as its heartbeat last reported it, on the
+ * cluster node view. A stream of the node's `stream_ports` absent from
+ * `bindings` is bound. `fd_limit` and `worker_count` are withheld from
+ * Viewers.
+ */
+export interface NodeStreamPlane {
+  bound_count: number;
+  listen_sockets_used: number;
+  bindings: NodeStreamBinding[];
+  truncated: boolean;
+  fd_limit?: number;
+  worker_count?: number;
 }
 
 // --- SLA ---

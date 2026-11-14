@@ -1,8 +1,8 @@
-import { render, screen, waitFor } from '@testing-library/svelte';
+import { render, screen, waitFor, within } from '@testing-library/svelte';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import { auth } from '../lib/auth';
-import { api } from '../lib/api';
+import { api, type StreamPortsEntry } from '../lib/api';
 import {
   clusterStatus,
   type ClusterNodeResponse,
@@ -53,7 +53,22 @@ function node(id: string, name: string, certificateIds: string[] = []): ClusterN
     selected_for_hostnames: [],
     certificate_ids: certificateIds,
     resources: null,
+    stream_plane: null,
+    stream_ports: [],
   };
+}
+
+function streamPort(id: string, name: string, portFirst: number, listenAddress = '0.0.0.0'): StreamPortsEntry {
+  return { id, name, protocol: 'tcp', listen_address: listenAddress, port_first: portFirst, port_last: portFirst };
+}
+
+/** Open `name`'s drawer once the roster has loaded. */
+async function openDrawer(name: string) {
+  render(Cluster);
+  await waitFor(() => expect(screen.getByText(name)).toBeInTheDocument());
+  (screen.getAllByText(name)[0] as HTMLElement).click();
+  await waitFor(() => expect(screen.getByLabelText('Node detail')).toBeInTheDocument());
+  return screen.getByLabelText('Node detail');
 }
 
 function wafRow(nodeId: string, clientIp: string): FleetWafRow {
@@ -196,6 +211,120 @@ describe('Cluster page, node drawer', () => {
     await waitFor(() =>
       expect(screen.getByText(/the telemetry database is not open/)).toBeInTheDocument(),
     );
+  });
+});
+
+describe('Cluster page, stream bindings', () => {
+  beforeEach(() => {
+    clusterStatus.set(status('control_plane'));
+    vi.spyOn(api, 'getFleetWafEvents').mockResolvedValue({ data: { rows: [], next_cursor: null } });
+  });
+
+  it('shows a failed binding with its kind and OS error, and the rest as bound', async () => {
+    vi.spyOn(api, 'listClusterNodes').mockResolvedValue({
+      data: [
+        {
+          ...node('id-a', 'edge-a'),
+          stream_ports: [streamPort('s-pg', 'pg', 5432), streamPort('s-smtp', 'smtp', 6000)],
+          stream_plane: {
+            bound_count: 1,
+            listen_sockets_used: 1,
+            bindings: [
+              {
+                stream_id: 's-smtp',
+                state: 'failed',
+                kind: 'address_in_use',
+                os_error: 'Address already in use (os error 98)',
+                port: 6000,
+                since: '2026-11-14T10:00:00Z',
+              },
+            ],
+            truncated: false,
+            fd_limit: 65536,
+            worker_count: 4,
+          },
+        },
+      ],
+    });
+
+    const drawer = await openDrawer('edge-a');
+    const pgRow = within(drawer).getByText('pg').closest('tr') as HTMLElement;
+    expect(within(pgRow).getByText('bound')).toHaveClass('badge', 'badge-green');
+    const smtpRow = within(drawer).getByText('smtp').closest('tr') as HTMLElement;
+    expect(within(smtpRow).getByText('failed')).toHaveClass('badge', 'badge-red');
+    expect(within(drawer).getByText('address_in_use')).toBeInTheDocument();
+    expect(within(drawer).getByText('Address already in use (os error 98)')).toBeInTheDocument();
+    expect(within(drawer).getByText(/fd limit 65536, 4 workers/)).toBeInTheDocument();
+
+    // The fleet table counts it too, so a failure shows without opening a drawer.
+    const tableRow = screen.getAllByText('edge-a')[0].closest('tr') as HTMLElement;
+    expect(within(tableRow).getByText('1 failed')).toHaveClass('badge', 'badge-red');
+  });
+
+  it('reads the unknown the server sends under drift as unknown', async () => {
+    vi.spyOn(api, 'listClusterNodes').mockResolvedValue({
+      data: [
+        {
+          ...node('id-a', 'edge-a'),
+          drifted: true,
+          stream_ports: [streamPort('s-pg', 'pg', 5432)],
+          stream_plane: {
+            bound_count: 0,
+            listen_sockets_used: 0,
+            bindings: [{ stream_id: 's-pg', state: 'unknown' }],
+            truncated: false,
+          },
+        },
+      ],
+    });
+
+    const drawer = await openDrawer('edge-a');
+    const row = within(drawer).getByText('pg').closest('tr') as HTMLElement;
+    expect(within(row).getByText('unknown')).toHaveClass('badge', 'badge-gray');
+    expect(within(drawer).getByText(/cannot be vouched for/)).toBeInTheDocument();
+    // A Viewer's view carries no fd figures; the summary does not invent them.
+    expect(within(drawer).queryByText(/fd limit/)).toBeNull();
+  });
+
+  it('claims no state for a node that has not reported yet', async () => {
+    vi.spyOn(api, 'listClusterNodes').mockResolvedValue({
+      data: [{ ...node('id-a', 'edge-a'), stream_ports: [streamPort('s-pg', 'pg', 5432)] }],
+    });
+
+    const drawer = await openDrawer('edge-a');
+    expect(within(drawer).getByText('This node has not reported its stream bindings yet.')).toBeInTheDocument();
+    const row = within(drawer).getByText('pg').closest('tr') as HTMLElement;
+    expect(within(row).queryByText('bound')).toBeNull();
+  });
+
+  it('lists the stream ports a pending node will open, fleet-wide ones included', async () => {
+    vi.spyOn(api, 'listClusterNodes').mockResolvedValue({
+      data: [
+        {
+          ...node('id-a', 'edge-a'),
+          status: 'pending',
+          stream_ports: [
+            streamPort('s-pg', 'pg', 5432),
+            { ...streamPort('s-dns', 'dns-fleetwide', 53, '::'), protocol: 'udp' },
+          ],
+        },
+      ],
+    });
+
+    const drawer = await openDrawer('edge-a');
+    const ports = within(drawer).getByRole('list', { name: 'Stream ports' });
+    expect(within(ports).getByText(/TCP\s+0\.0\.0\.0:5432/)).toBeInTheDocument();
+    expect(within(ports).getByText(/UDP\s+\[::\]:53/)).toBeInTheDocument();
+    expect(within(ports).getByText(/dns-fleetwide/)).toBeInTheDocument();
+  });
+
+  it('says a pending node no stream targets opens no stream port', async () => {
+    vi.spyOn(api, 'listClusterNodes').mockResolvedValue({
+      data: [{ ...node('id-a', 'edge-a'), status: 'pending' }],
+    });
+
+    const drawer = await openDrawer('edge-a');
+    expect(within(drawer).getByText(/opens no stream port/)).toBeInTheDocument();
   });
 });
 

@@ -1,8 +1,10 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { api, type SystemResponse, type WorkerStatus } from '../lib/api';
+  import { api, type NodeStreamBudget, type SystemResponse, type WorkerStatus } from '../lib/api';
+  import { canWriteRole } from '../lib/auth';
   import { formatBytes } from '../lib/format';
   import Card from '../components/Card.svelte';
+  import StreamBudget from '../components/StreamBudget.svelte';
 
   let system: SystemResponse | null = $state(null);
   let workers: WorkerStatus[] = $state([]);
@@ -11,10 +13,28 @@
   let autoRefresh = $state(true);
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
 
+  // The stream fd budget (Story 12.2 D-e) is node capacity, which the
+  // server gives Operators and above only, the reasoning of the cluster
+  // view's `resources`. The role alone decides, not read-only mode: it
+  // is a read, and a follower answers it for its own node.
+  let budgetNodes: NodeStreamBudget[] = $state([]);
+  let budgetError = $state('');
+
+  async function loadBudget() {
+    const res = await api.getStreamBudget();
+    if (res.error) {
+      budgetError = res.error.message;
+    } else if (res.data) {
+      budgetNodes = res.data.nodes;
+      budgetError = '';
+    }
+  }
+
   async function loadSystem() {
     const [sysRes, workersRes] = await Promise.all([
       api.getSystem(),
       api.getWorkers(),
+      $canWriteRole ? loadBudget() : Promise.resolve(),
     ]);
     if (sysRes.error) {
       error = sysRes.error.message;
@@ -209,6 +229,15 @@
       <Card title="Process Memory" value={formatBytes(system.process.memory_bytes, { units: 'decimal' })} />
       <Card title="Process CPU" value="{system.process.cpu_usage_percent.toFixed(1)}%" />
     </div>
+
+    {#if $canWriteRole}
+      <h2>Stream fd budget</h2>
+      {#if budgetError}
+        <p class="error-text">Could not read the stream fd budget: {budgetError}</p>
+      {:else}
+        <StreamBudget nodes={budgetNodes} />
+      {/if}
+    {/if}
   {/if}
 </div>
 
@@ -337,6 +366,10 @@
   .workers-table th {
     color: var(--color-text-muted);
     font-weight: 500;
+  }
+
+  .error-text {
+    color: var(--color-red-text);
   }
 
   .status-dot {

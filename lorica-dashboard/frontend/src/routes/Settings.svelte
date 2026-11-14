@@ -49,6 +49,8 @@
     flood_strict_rps: 0,
     header_timeout_s: 10,
     downstream_idle_timeout_s: 75,
+    worker_drain_timeout_s: 30,
+    stream_listen_socket_cap: 2048,
     waf_ban_threshold: 5,
     waf_ban_duration_s: 3600,
     waf_body_scan_max_inflight_bytes: 268435456,

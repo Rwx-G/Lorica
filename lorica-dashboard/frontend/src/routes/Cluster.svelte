@@ -3,7 +3,7 @@
 
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import { api } from '../lib/api';
-  import type { CertificateResponse, MintedTokenResponse } from '../lib/api';
+  import type { CertificateResponse, MintedTokenResponse, NodeStreamPlane } from '../lib/api';
   import { isSuperAdmin, isSuperAdminRole } from '../lib/auth';
   import {
     clusterStatus,
@@ -16,6 +16,7 @@
     type FleetWafRow,
     type RevokeNodeResponse,
   } from '../lib/cluster';
+  import { BIND_STATE_BADGE, nodeStreamRows, streamEndpoint, unboundCounts } from '../lib/streams';
   import { showToast } from '../lib/toast';
 
   /** How often the roster refreshes while the page is open. */
@@ -301,6 +302,17 @@
     return node.status === 'active' && node.drifted;
   }
 
+  function plural(n: number, word: string): string {
+    return `${n} ${word}${n === 1 ? '' : 's'}`;
+  }
+
+  /** The heartbeat's totals; the fd figures are absent for a Viewer. */
+  function streamSummary(plane: NodeStreamPlane): string {
+    const totals = `${plane.bound_count} bound, ${plural(plane.listen_sockets_used, 'listening socket')}`;
+    if (plane.fd_limit === undefined || plane.worker_count === undefined) return totals;
+    return `${totals}; fd limit ${plane.fd_limit}, ${plural(plane.worker_count, 'worker')}`;
+  }
+
   function relative(iso: string | null): string {
     if (!iso) return 'never';
     const t = Date.parse(iso);
@@ -382,6 +394,7 @@
           <th>Version</th>
           <th>Schema</th>
           <th>Applied</th>
+          <th>Streams</th>
           <th>Last seen</th>
         </tr>
       </thead>
@@ -409,6 +422,23 @@
                 <span class="badge badge-orange" title="Behind the control plane's generation">
                   drift
                 </span>
+              {/if}
+            </td>
+            <td>
+              {#if n.stream_plane}
+                {@const counts = unboundCounts(n.stream_plane)}
+                {n.stream_plane.bound_count} bound
+                {#if counts.failed > 0}
+                  <span class="badge {BIND_STATE_BADGE.failed}">{counts.failed} failed</span>
+                {/if}
+                {#if counts.pending > 0}
+                  <span class="badge {BIND_STATE_BADGE.pending}">{counts.pending} pending</span>
+                {/if}
+                {#if counts.unknown > 0}
+                  <span class="badge {BIND_STATE_BADGE.unknown}">{counts.unknown} unknown</span>
+                {/if}
+              {:else}
+                -
               {/if}
             </td>
             <td>{relative(n.last_seen_at)}</td>
@@ -466,6 +496,29 @@
             No route selector names this node yet, so activating it sends no
             certificate keys until one does.
           </p>
+        {/if}
+        <!--
+          Fleet-wide streams included, unlike the hostnames above: a port
+          a node opens is a perimeter change whether one node or all of
+          them open it.
+        -->
+        {#if node.stream_ports.length > 0}
+          <p class="warn-text">
+            Activating it also makes it open these stream ports:
+          </p>
+          <ul class="hostnames" aria-label="Stream ports">
+            {#each node.stream_ports as entry (entry.id)}
+              <li>
+                <span class="mono">
+                  {entry.protocol.toUpperCase()}
+                  {streamEndpoint(entry.listen_address, entry.port_first, entry.port_last)}
+                </span>
+                ({entry.name})
+              </li>
+            {/each}
+          </ul>
+        {:else}
+          <p class="muted">No stream targets this node, so activating it opens no stream port.</p>
         {/if}
         {#if superAdmin}
           <button class="btn btn-primary" onclick={() => void activate(node)}>
@@ -531,6 +584,75 @@
           The data directory's filesystem, not the root one: what fills up on
           a proxy is where its logs and databases live.
         </p>
+      {/if}
+    </section>
+
+    <section class="drawer-section">
+      <h3>Streams</h3>
+      {#if node.stream_ports.length === 0 && (node.stream_plane?.bindings.length ?? 0) === 0}
+        <p class="muted">No stream binds on this node.</p>
+      {:else}
+        {@const plane = node.stream_plane}
+        {#if !plane}
+          <p class="muted">
+            {node.connected
+              ? 'This node has not reported its stream bindings yet.'
+              : 'Not connected: bind states are session state and are re-learned on reconnect.'}
+          </p>
+        {:else}
+          <p class="stream-summary">{streamSummary(plane)}</p>
+          {#if driftedFrom(node)}
+            <p class="muted">
+              This node drifts from the control plane's configuration, so a
+              stream it does not list cannot be vouched for and reads unknown.
+            </p>
+          {/if}
+        {/if}
+        <table class="mini-table">
+          <thead>
+            <tr><th>Stream</th><th>Listens on</th><th>State</th></tr>
+          </thead>
+          <tbody>
+            {#each nodeStreamRows(node.stream_ports, plane) as row (row.id)}
+              <tr>
+                <td>{row.name}</td>
+                <td class="mono">
+                  {#if row.port}
+                    {row.port.protocol.toUpperCase()}
+                    {streamEndpoint(row.port.listen_address, row.port.port_first, row.port.port_last)}
+                  {:else}
+                    -
+                  {/if}
+                </td>
+                <td>
+                  {#if row.state}
+                    <span class="badge {BIND_STATE_BADGE[row.state]}">{row.state}</span>
+                  {:else}
+                    -
+                  {/if}
+                </td>
+              </tr>
+              {#if row.binding?.state === 'failed'}
+                <tr class="bind-failure">
+                  <td colspan="3">
+                    <code>{row.binding.kind ?? 'other'}</code>
+                    {#if row.binding.port}on port {row.binding.port}{/if}:
+                    <span class="os-error">{row.binding.os_error ?? ''}</span>
+                    {#if row.binding.since}
+                      <span class="muted-inline">since {row.binding.since}</span>
+                    {/if}
+                  </td>
+                </tr>
+              {/if}
+            {/each}
+          </tbody>
+        </table>
+        {#if plane?.truncated}
+          <p class="muted">
+            More bindings are not bound on this node than its report carries;
+            a stream the report leaves out reads unknown.
+          </p>
+        {/if}
       {/if}
     </section>
 
@@ -825,6 +947,19 @@
   .mini-table td {
     padding: 0.2rem 0.4rem 0.2rem 0;
     border-top: 1px solid var(--color-border);
+  }
+  .stream-summary {
+    font-size: 0.85rem;
+    margin: 0 0 0.5rem;
+  }
+  .bind-failure td {
+    border-top: none;
+    padding-bottom: 0.4rem;
+    color: var(--color-red-text);
+    overflow-wrap: anywhere;
+  }
+  .muted-inline {
+    color: var(--color-text-muted);
   }
   .expiry-warn {
     color: var(--color-orange);

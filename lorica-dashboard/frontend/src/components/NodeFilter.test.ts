@@ -46,6 +46,8 @@ function node(id: string, name: string, state: 'pending' | 'active' | 'revoked')
     selected_for_hostnames: [],
     certificate_ids: [],
     resources: null,
+    stream_plane: null,
+    stream_ports: [],
   };
 }
 

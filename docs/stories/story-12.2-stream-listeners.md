@@ -893,15 +893,15 @@ and `components/settings-tabs/NotificationHistoryTab.svelte` (+ tests) if
 the new alert type needs a label.
 Depends on: E1, E2, E3.
 
-- [ ] Types and calls; `StreamBudget.svelte` (fd limit, reserves, each
+- [x] Types and calls; `StreamBudget.svelte` (fd limit, reserves, each
       stream's share; a `null` ceiling renders as a dash whose tooltip
       names it, never as 0), mounted on the System page for Operators
       and above.
-- [ ] Cluster node drawer: bound count, pending and failed bindings with
+- [x] Cluster node drawer: bound count, pending and failed bindings with
       kind and OS error, `unknown` under drift; `stream_ports` in the
       pending-node review.
-- [ ] Both settings in the global config tab with their bounds.
-- [ ] Vitest: role gating of the budget panel, failed binding rendering,
+- [x] Both settings in the global config tab with their bounds.
+- [x] Vitest: role gating of the budget panel, failed binding rendering,
       the drain field's bounds.
 
 ### Lot G: documentation and crate lists - no cargo
@@ -1178,6 +1178,11 @@ the budget view stays Operator and SuperAdmin.
   `shutdown_returns_once_the_workers_exited_without_waiting_out_the_bound`.
   This goes past "the signature only" of the allowlist for `manager.rs`;
   AC #7 cannot hold without it.
+- Lot F gates, in `node:22` with `CI=true` and `pnpm install
+  --frozen-lockfile` on a throwaway `node_modules` volume: `pnpm run
+  check` (0 errors, 0 warnings), `pnpm run lint`, `vitest run` (49
+  files, 852 tests, from 46 and 826). No lockfile or `package.json`
+  change.
 
 ### Completion Notes
 
@@ -1588,6 +1593,56 @@ the budget view stays Operator and SuperAdmin.
   `lorica-api/src/streams/tests.rs` (the import), `lorica-api/openapi.yaml`
   (budget and import text), `lorica/src/startup/{mod,supervisor,single}.rs`
   (the plane handed to the follower), `docs/cluster.md`.
+- Lot F done. `api.ts` gains the stream plane types as `openapi.yaml`
+  documents them (`StreamBudgetView`, `NodeStreamBudget`,
+  `StreamBudgetShare`, `NodeStreamPlane`, `NodeStreamBinding`,
+  `StreamPortsEntry`, the protocol, bind-state and failure-kind unions),
+  `getStreamBudget()`, and both settings on the settings read and write.
+  No alert label was needed: the notification tabs read
+  `stream_bind_failed` from the regenerated `adcs.generated.ts`.
+- System page: a "Stream fd budget" section renders
+  `StreamBudget.svelte` for every node the endpoint returns (this node
+  first, named "This node" when `node_name` is `null`): the six figures
+  of D-e, three gauges (listening sockets against the cap, one worker's
+  and the supervisor's committed fds against the stream budget), and a
+  table of each stream's share with its bind state as a shared badge. A
+  `null` ceiling or fds-per-unit is a `-` whose tooltip says no ceiling
+  is declared yet, never 0; an `fd_limit` of 0 says the node has no
+  stream budget. Gated on `canWriteRole` (the role alone): it is a read
+  a follower answers for its own node, and the call is not made for a
+  Viewer, whose 403 would raise the role toast on every 5 s refresh. A
+  failed read is said, not shown as an empty budget.
+- Cluster page: the roster gains a "Streams" column (`bound_count` and a
+  badge per non-zero failed, pending and unknown count, `-` before a
+  report). The node drawer gains a "Streams" section joining
+  `stream_ports` with `stream_plane.bindings`: each stream, its protocol
+  and endpoint (`[::]:7000`, ranges as `6000-6009`), and its state; a
+  failed one adds a line with the kind, the port, the OS error and since
+  when. The heartbeat totals head it, with the fd limit and worker count
+  when the role receives them; a drift note explains `unknown`. Before a
+  report no state is claimed. Two readings beyond the documented rule,
+  both in `lib/streams.ts` and tested: an unlisted targeted stream reads
+  `unknown` rather than `bound` when the report was cut (`truncated`),
+  as the budget view reads it; a reported binding for a stream the
+  control plane does not target there is kept, by id, not dropped. The
+  pending-node review lists `stream_ports`, fleet-wide ones included, or
+  says activating opens no stream port.
+- Global config tab: a "Draining and Streams" subsection with
+  `worker_drain_timeout_s` and `stream_listen_socket_cap`, bounds from
+  `GET /api/v1/settings/schema` with 1..3600 and 1..16384 as the
+  fallbacks before it loads.
+- Outside the allowlist, each needed: `lib/cluster.ts`
+  (`ClusterNodeResponse` gains `stream_plane` and `stream_ports`; the
+  type lives there, not in `api.ts`), `lib/streams.ts` and its test (the
+  badge map, the endpoint label and the binding join, shared by the
+  budget panel and the drawer, and by Story 12.10's Streams page next),
+  `routes/Settings.svelte` (the form's initial values for the two
+  settings, which the tab's prop type requires), and the
+  `ClusterNodeResponse` fixtures of `components/NodeFilter.test.ts` and
+  `routes/Security.test.ts`.
+- Not visually checked: no browser here. The System page budget section,
+  the Cluster roster column, the drawer's Streams section and the
+  pending-node review need a look in both themes.
 
 ## File List
 
@@ -1628,6 +1683,11 @@ the budget view stays Operator and SuperAdmin.
 - `lorica-api/src/stream_budget.rs`, `lorica-api/src/streams.rs`, `lorica-api/src/config.rs`, `lorica-api/src/streams/tests.rs`, `lorica-api/openapi.yaml` (Lot E2: reported budgets, the import's budget check)
 - `lorica/src/startup/cluster_follower.rs`, `lorica/src/startup/mod.rs`, `lorica/src/startup/supervisor.rs`, `lorica/src/startup/single.rs` (Lot E2: the follower's report)
 - `docs/cluster.md` (Lot E2: the heartbeat report, the fleet view, the `stream.*` audit rows)
+- `lorica-dashboard/frontend/src/lib/api.ts`, `lorica-dashboard/frontend/src/lib/cluster.ts`, `lorica-dashboard/frontend/src/lib/streams.ts` (new), `lorica-dashboard/frontend/src/lib/streams.test.ts` (new) (Lot F: types, the budget call, the bind-state helpers)
+- `lorica-dashboard/frontend/src/components/StreamBudget.svelte` (new), `lorica-dashboard/frontend/src/components/StreamBudget.test.ts` (new), `lorica-dashboard/frontend/src/routes/System.svelte`, `lorica-dashboard/frontend/src/routes/System.test.ts` (new) (Lot F: the budget view)
+- `lorica-dashboard/frontend/src/routes/Cluster.svelte`, `lorica-dashboard/frontend/src/routes/Cluster.test.ts` (Lot F: the roster column, the drawer's Streams section, the pending-node stream ports)
+- `lorica-dashboard/frontend/src/components/settings-tabs/GlobalConfigTab.svelte`, `lorica-dashboard/frontend/src/components/settings-tabs/GlobalConfigTab.test.ts`, `lorica-dashboard/frontend/src/routes/Settings.svelte` (Lot F: the two settings)
+- `lorica-dashboard/frontend/src/components/NodeFilter.test.ts`, `lorica-dashboard/frontend/src/routes/Security.test.ts` (Lot F: the node fixtures' two new fields)
 
 ## Change Log
 
@@ -1643,3 +1703,4 @@ the budget view stays Operator and SuperAdmin.
 | 2026-11-14 | 0.8 | Lot E1 implemented: the `stream_bind_failed` alert type and migration 74 subscribing explicit channels to it. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.9 | Lot E3 implemented: `bind` on the stream reads, the fd budget check of stream writes, `GET /api/v1/streams/budget`, the stream plane on `AppState`, the OpenAPI document; the `stream_bind_failed` alert is raised once per failed bind. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.10 | Lot E2 implemented: the heartbeat's stream plane report (tag 7, compatible with 1.10.6 both ways), each stream's bind state per node and `stream_ports` on the cluster node view, the activation row's stream ports, control-plane budget checks and budget view from reported figures, and the fd budget check on the config import and its preview. D-i amended: `stream_ports` carries `port_first`/`port_last`. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.11 | Lot F implemented: the stream fd budget on the System page for Operators and above, stream bind states in the Cluster roster and node drawer, the pending node's stream ports, `worker_drain_timeout_s` and `stream_listen_socket_cap` in the global config tab. Status InProgress. | Romain G. |

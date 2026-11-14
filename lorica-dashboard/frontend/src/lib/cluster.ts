@@ -1,5 +1,7 @@
 import { writable, derived, type Readable } from 'svelte/store';
 
+import type { NodeStreamPlane, StreamPortsEntry } from './api';
+
 /**
  * What this node is in the fleet (Story 9.7).
  *
@@ -141,6 +143,18 @@ export interface ClusterNodeResponse {
   certificate_ids: string[];
   /** Absent from a node that has sent no reading on this session. */
   resources: NodeResources | null;
+  /**
+   * The node's stream bindings as its heartbeat last reported them
+   * (Story 12.2 D-i); `null` while it has sent no report on its current
+   * session. Read against `stream_ports`.
+   */
+  stream_plane: NodeStreamPlane | null;
+  /**
+   * Every stream the node binds once active, fleet-wide ones included:
+   * a port a node opens is a perimeter change whether one node or all
+   * of them open it. Empty on a revoked node.
+   */
+  stream_ports: StreamPortsEntry[];
 }
 
 /**

@@ -42,6 +42,8 @@ function node(id: string, name: string): ClusterNodeResponse {
     selected_for_hostnames: [],
     certificate_ids: [],
     resources: null,
+    stream_plane: null,
+    stream_ports: [],
   };
 }
 

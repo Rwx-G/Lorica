@@ -15,6 +15,8 @@
     flood_strict_rps: number;
     header_timeout_s: number;
     downstream_idle_timeout_s: number;
+    worker_drain_timeout_s: number;
+    stream_listen_socket_cap: number;
     waf_ban_threshold: number;
     waf_ban_duration_s: number;
     waf_body_scan_max_inflight_bytes: number;
@@ -72,6 +74,8 @@
     floodStrict: bound('flood_strict_rps', 0, 10_000_000),
     headerTimeout: bound('header_timeout_s', 1, 3600),
     idleTimeout: bound('downstream_idle_timeout_s', 1, 3600),
+    drainTimeout: bound('worker_drain_timeout_s', 1, 3600),
+    streamSocketCap: bound('stream_listen_socket_cap', 1, 16_384),
     wafBanThreshold: bound('waf_ban_threshold', 0, 1000),
     wafBanDur: bound('waf_ban_duration_s', 0, 2_592_000),
     wafScanBudget: bound('waf_body_scan_max_inflight_bytes', 1_048_576, 17_179_869_184),
@@ -93,6 +97,8 @@
   let floodStrictErr = $state<string | null>(null);
   let headerTimeoutErr = $state<string | null>(null);
   let idleTimeoutErr = $state<string | null>(null);
+  let drainTimeoutErr = $state<string | null>(null);
+  let streamSocketCapErr = $state<string | null>(null);
   let wafBanThresholdErr = $state<string | null>(null);
   let wafBanDurErr = $state<string | null>(null);
   let wafScanBudgetErr = $state<string | null>(null);
@@ -127,6 +133,8 @@
   }
   function checkHeaderTimeout() { headerTimeoutErr = integerInRange(settingsForm.header_timeout_s, c.headerTimeout); }
   function checkIdleTimeout() { idleTimeoutErr = integerInRange(settingsForm.downstream_idle_timeout_s, c.idleTimeout); }
+  function checkDrainTimeout() { drainTimeoutErr = integerInRange(settingsForm.worker_drain_timeout_s, c.drainTimeout); }
+  function checkStreamSocketCap() { streamSocketCapErr = integerInRange(settingsForm.stream_listen_socket_cap, c.streamSocketCap); }
   function checkWafBanThreshold() { wafBanThresholdErr = integerInRange(settingsForm.waf_ban_threshold, c.wafBanThreshold); }
   function checkWafBanDur() { wafBanDurErr = integerInRange(settingsForm.waf_ban_duration_s, c.wafBanDur); }
   function checkWafScanBudget() { wafScanBudgetErr = integerInRange(settingsForm.waf_body_scan_max_inflight_bytes, c.wafScanBudget); }
@@ -245,6 +253,20 @@
         <input id="s-waf-retention" type="number" min={c.wafRet.min} max={c.wafRet.max} bind:value={settingsForm.waf_event_retention} onblur={checkWafRet} oninput={checkWafRet} />
         {#if wafRetErr}<span class="field-error" role="alert">{wafRetErr}</span>{/if}
         <span class="hint">Maximum WAF events in persistent store (0 = unlimited).</span>
+      </div>
+
+      <h3 class="subsection-title">Draining and Streams</h3>
+      <div class="settings-form-row">
+        <label for="worker-drain-timeout">Drain Timeout (seconds)</label>
+        <input id="worker-drain-timeout" type="number" bind:value={settingsForm.worker_drain_timeout_s} min={c.drainTimeout.min} max={c.drainTimeout.max} onblur={checkDrainTimeout} oninput={checkDrainTimeout} />
+        {#if drainTimeoutErr}<span class="field-error" role="alert">{drainTimeoutErr}</span>{/if}
+        <span class="hint">How long a stop, or a stream that is removed, disabled or moved, gives established connections and in-flight requests to finish before closing what is left (default 30, at most {c.drainTimeout.max}). A stop ends as soon as the traffic is gone; under systemd it extends the unit's stop timeout while it drains. Replicated to every node.</span>
+      </div>
+      <div class="settings-form-row">
+        <label for="stream-socket-cap">Stream Listening Socket Cap</label>
+        <input id="stream-socket-cap" type="number" bind:value={settingsForm.stream_listen_socket_cap} min={c.streamSocketCap.min} max={c.streamSocketCap.max} onblur={checkStreamSocketCap} oninput={checkStreamSocketCap} />
+        {#if streamSocketCapErr}<span class="field-error" role="alert">{streamSocketCapErr}</span>{/if}
+        <span class="hint">Listening sockets the streams of one node may hold in all, one per port (default 2048). A stream write that would take a node past it is refused; the System page shows each node's budget. Replicated to every node.</span>
       </div>
 
       <h3 class="subsection-title">Probes and Load Tests</h3>

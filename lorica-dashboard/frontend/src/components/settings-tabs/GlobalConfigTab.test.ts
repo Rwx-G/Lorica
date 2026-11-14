@@ -23,6 +23,8 @@ function form(overrides: Partial<FormShape> = {}): FormShape {
     flood_strict_rps: 0,
     header_timeout_s: 10,
     downstream_idle_timeout_s: 75,
+    worker_drain_timeout_s: 30,
+    stream_listen_socket_cap: 2048,
     waf_ban_threshold: 3,
     waf_ban_duration_s: 3600,
     waf_body_scan_max_inflight_bytes: 268435456,
@@ -157,6 +159,44 @@ describe('GlobalConfigTab, the settings backlog #89 added', () => {
     expect(row.querySelector('[role="alert"]')).not.toBeNull();
     await fireEvent.input(field, { target: { value: '75' } });
     expect(row.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it.each([
+    ['Drain Timeout (seconds)', 1, 3600],
+    ['Stream Listening Socket Cap', 1, 16_384],
+  ])('holds %s to %i..%i before the schema loads, refusing one past each bound', async (label, min, max) => {
+    // The server's bounds (Story 12.2 D-e and D-f); 0 is no drain and
+    // no listening socket, which neither setting has.
+    render(GlobalConfigTab, { props: props() });
+    const field = screen.getByLabelText(label) as HTMLInputElement;
+    expect(field.min).toBe(String(min));
+    expect(field.max).toBe(String(max));
+    const row = field.parentElement as HTMLElement;
+    for (const value of [min, max]) {
+      await fireEvent.input(field, { target: { value: String(value) } });
+      expect(row.querySelector('[role="alert"]'), `${value}`).toBeNull();
+    }
+    for (const value of [min - 1, max + 1]) {
+      await fireEvent.input(field, { target: { value: String(value) } });
+      expect(row.querySelector('[role="alert"]')?.textContent, `${value}`).toContain(`${min}..${max}`);
+    }
+  });
+
+  it('takes the drain and socket cap bounds from the server schema', async () => {
+    const schema = {
+      worker_drain_timeout_s: { type: 'integer' as const, min: 1, max: 600 },
+      stream_listen_socket_cap: { type: 'integer' as const, min: 1, max: 4096 },
+    };
+    const settingsForm = form({ worker_drain_timeout_s: 45, stream_listen_socket_cap: 512 });
+    render(GlobalConfigTab, { props: props({ schema, settingsForm }) });
+    const drain = screen.getByLabelText('Drain Timeout (seconds)') as HTMLInputElement;
+    expect(drain.value).toBe('45');
+    expect(drain.max).toBe('600');
+    expect((screen.getByLabelText('Stream Listening Socket Cap') as HTMLInputElement).max).toBe('4096');
+    await fireEvent.input(drain, { target: { value: '601' } });
+    expect(drain.parentElement?.querySelector('[role="alert"]')?.textContent).toContain('1..600');
+    await fireEvent.input(drain, { target: { value: '90' } });
+    expect(settingsForm.worker_drain_timeout_s).toBe(90);
   });
 
   it('states the WAF ban ceiling the schema publishes', () => {
