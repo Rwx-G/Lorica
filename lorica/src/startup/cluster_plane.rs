@@ -70,8 +70,8 @@ use lorica_cluster::IngestQuota;
 use lorica_cluster::{
     token, AppliedConfig, CertBundle, ClusterCa, ConfigPayload, ConfigVersion, ControlPlane,
     EnrollmentHandle, EnrollmentListener, EnrollmentStats, FleetHooks, HandshakeConfig, IssuedLeaf,
-    OperationalConfig, OperationalHandle, OperationalListener, OperationalStats, PayloadSource,
-    PreAuthBudgets, SwappableAcceptor,
+    LiveSessionSnapshot, OperationalConfig, OperationalHandle, OperationalListener,
+    OperationalStats, PayloadSource, PreAuthBudgets, ReportedPorts, SwappableAcceptor,
 };
 use lorica_config::canonical::{restrict_for_recipient, CanonicalConfig, SelectorResolution};
 use lorica_config::models::{ClusterNode, NodeStatus};
@@ -1516,6 +1516,19 @@ impl FleetPayloads {
                 );
             }
         }
+        // Streams are cut by the same resolution (Story 12.1), so an
+        // entry naming nobody is the same silent gap: a listener no
+        // node ever opens through it.
+        for stream in &config.streams {
+            for name in resolution.unresolvable(&stream.node_selector) {
+                warn!(
+                    stream_id = %stream.id,
+                    stream_name = %stream.name,
+                    selector_entry = %name,
+                    "node_selector entry resolves to no single node; this stream is delivered to nobody through it"
+                );
+            }
+        }
         Self {
             generation,
             fleet_hash,
@@ -1742,10 +1755,81 @@ fn spawn_liveness_publisher(
     })
 }
 
+/// The facts one flush persists for each live session.
+fn live_node_facts(sessions: Vec<LiveSessionSnapshot>) -> Vec<LiveNodeFacts> {
+    sessions
+        .into_iter()
+        .map(|s| LiveNodeFacts {
+            node_id: s.node_id,
+            address: s.peer_addr.to_string(),
+            version: s.build_version,
+            schema_version: i64::from(s.schema_version),
+            // Story 9.4: the generation each node reports is
+            // persisted here too, so the drift view survives a
+            // control-plane restart and a disconnected node
+            // still has a last-known applied version.
+            applied_config_generation: i64::try_from(s.applied.generation).unwrap_or(i64::MAX),
+            applied_config_hash: s.applied.hash,
+            last_seen_at: DateTime::<Utc>::from_timestamp(
+                i64::try_from(s.last_seen_unix).unwrap_or(0),
+                0,
+            )
+            .unwrap_or_else(Utc::now),
+            // Story 12.1 D-4: a node fact the stream conflict check
+            // reads for a node that is offline too. `None`, a session
+            // that has not reported this time, keeps the stored value
+            // (`COALESCE`).
+            reserved_ports: s.reserved_ports.map(reserved_ports_of),
+        })
+        .collect()
+}
+
+/// A follower's validated report as the store and the conflict check
+/// hold it. Destructured, so a listener added to the report fails to
+/// compile here until `ReservedPorts` carries it.
+fn reserved_ports_of(report: ReportedPorts) -> ReservedPorts {
+    let ReportedPorts {
+        management,
+        http,
+        https,
+        cluster,
+        enrollment,
+        automation,
+    } = report;
+    ReservedPorts {
+        management,
+        http,
+        https,
+        cluster,
+        enrollment,
+        automation,
+    }
+}
+
+/// One flush: persist every live session's facts in one transaction
+/// and prune revoked serials whose certificate expired. Returns how
+/// many serials were pruned.
+async fn flush_session_facts(
+    runtime: &ControlPlaneRuntime,
+    store: &Arc<Mutex<ConfigStore>>,
+) -> Result<u32, ApiError> {
+    let facts = live_node_facts(runtime.control.sessions.snapshot());
+    db_blocking(store, move |store| {
+        if !facts.is_empty() {
+            store.touch_cluster_nodes(&facts).map_err(internal)?;
+        }
+        store
+            .prune_cluster_revoked_serials(Utc::now())
+            .map_err(internal)
+    })
+    .await
+}
+
 /// Persist live-session facts every [`FLUSH_INTERVAL`] in one
 /// transaction (AC #9's `last_seen_at`, `address`, `version`,
-/// `schema_version`) and prune revoked serials whose certificate
-/// expired (the CRL stays bounded by the live certificates).
+/// `schema_version`, Story 12.1's reserved ports) and prune revoked
+/// serials whose certificate expired (the CRL stays bounded by the
+/// live certificates).
 fn spawn_session_flush(
     runtime: Arc<ControlPlaneRuntime>,
     store: Arc<Mutex<ConfigStore>>,
@@ -1753,43 +1837,7 @@ fn spawn_session_flush(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(FLUSH_INTERVAL).await;
-            let facts: Vec<LiveNodeFacts> = runtime
-                .control
-                .sessions
-                .snapshot()
-                .into_iter()
-                .map(|s| LiveNodeFacts {
-                    node_id: s.node_id,
-                    address: s.peer_addr.to_string(),
-                    version: s.build_version,
-                    schema_version: i64::from(s.schema_version),
-                    // Story 9.4: the generation each node reports is
-                    // persisted here too, so the drift view survives a
-                    // control-plane restart and a disconnected node
-                    // still has a last-known applied version.
-                    applied_config_generation: i64::try_from(s.applied.generation)
-                        .unwrap_or(i64::MAX),
-                    applied_config_hash: s.applied.hash,
-                    last_seen_at: DateTime::<Utc>::from_timestamp(
-                        i64::try_from(s.last_seen_unix).unwrap_or(0),
-                        0,
-                    )
-                    .unwrap_or_else(Utc::now),
-                    // The session does not carry the report yet; `None`
-                    // keeps the stored value (`COALESCE`).
-                    reserved_ports: None,
-                })
-                .collect();
-            let flushed = db_blocking(&store, move |store| {
-                if !facts.is_empty() {
-                    store.touch_cluster_nodes(&facts).map_err(internal)?;
-                }
-                store
-                    .prune_cluster_revoked_serials(Utc::now())
-                    .map_err(internal)
-            })
-            .await;
-            match flushed {
+            match flush_session_facts(&runtime, &store).await {
                 Ok(pruned) if pruned > 0 => {
                     info!(pruned, "expired revoked serials pruned from the CRL source");
                     if let Err(e) = runtime.refresh(&store).await {
@@ -2661,6 +2709,67 @@ mod tests {
             "the fleet identity is not any recipient's cut"
         );
         drop((a, b));
+    }
+
+    /// Story 12.1 D-4: the flush persists the reserved ports a session
+    /// holds, and a session that has not reported keeps the stored
+    /// value rather than erasing it, so a control-plane restart or a
+    /// reconnect never turns a reported node back into one the
+    /// conflict check refuses as unreported.
+    #[tokio::test]
+    async fn the_flush_persists_reported_ports_and_a_silent_session_keeps_them() {
+        let store = store_with_key();
+        let control = test_control(false);
+        let runtime = ControlPlaneRuntime::new(Arc::clone(&control));
+        add_node(&store, "id-a", "edge-a").await;
+        async fn stored_ports(store: &Arc<Mutex<ConfigStore>>) -> Option<ReservedPorts> {
+            store
+                .lock()
+                .await
+                .get_cluster_node("id-a")
+                .expect("read")
+                .expect("row")
+                .reserved_ports
+        }
+
+        let (session, far) = spawn_scripted_follower(&control, "id-a");
+        flush_session_facts(&runtime, &store).await.expect("flush");
+        assert_eq!(
+            stored_ports(&store).await,
+            None,
+            "nothing reported, nothing stored"
+        );
+
+        session.entry().record_reserved_ports(ReportedPorts {
+            management: 9443,
+            http: 8080,
+            https: 8443,
+            cluster: None,
+            enrollment: None,
+            automation: Some(9446),
+        });
+        flush_session_facts(&runtime, &store).await.expect("flush");
+        let expected = ReservedPorts {
+            management: 9443,
+            http: 8080,
+            https: 8443,
+            cluster: None,
+            enrollment: None,
+            automation: Some(9446),
+        };
+        assert_eq!(stored_ports(&store).await, Some(expected));
+
+        // A reconnect: the new session has not beaten yet.
+        drop((session, far));
+        let (session, far) = spawn_scripted_follower(&control, "id-a");
+        assert_eq!(session.entry().reserved_ports(), None);
+        flush_session_facts(&runtime, &store).await.expect("flush");
+        assert_eq!(
+            stored_ports(&store).await,
+            Some(expected),
+            "a session without a report keeps the stored ports"
+        );
+        drop((session, far));
     }
 
     /// The security half of the revocation contract under cancellation:

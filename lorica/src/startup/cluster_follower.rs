@@ -184,11 +184,6 @@ pub(crate) struct FollowerOptions {
     /// The ports this process's listeners hold, which the follower
     /// reports in its heartbeat so the control plane can refuse a
     /// stream that would collide with them (Story 12.1, D-4).
-    // Carried from startup in the commit that adds the shape; the
-    // heartbeat that reads it lands with the wire field (Story 12.1,
-    // Lot 3), and a never-read field fails the warnings-as-errors build
-    // in between.
-    #[allow(dead_code)]
     pub reserved_ports: crate::cli::ReservedPorts,
 }
 
@@ -317,6 +312,10 @@ struct ReplicaHandler {
     /// `None` until the first sample lands, which the wire and the
     /// dashboard both render as unknown rather than as an idle node.
     reading: StdMutex<Option<lorica_cluster::NodeResources>>,
+    /// The ports this process's listeners hold, sent in every heartbeat
+    /// (Story 12.1, D-4). Fixed for the life of the process: a listener
+    /// moves only with a restart.
+    reserved_ports: lorica_cluster::ReservedPortsReport,
 }
 
 impl ReplicaHandler {
@@ -474,6 +473,9 @@ impl ReplicaHandler {
             backends = outcome.backends,
             certificates = outcome.certificates,
             certificates_without_key = outcome.certificates_without_key,
+            streams = outcome.streams,
+            streams_not_for_this_node = outcome.streams_skipped_by_selector,
+            stream_backends = outcome.stream_backends,
             "applied a replicated configuration"
         );
         if outcome.certificates_without_key > 0 {
@@ -828,6 +830,10 @@ impl FollowerHandler for ReplicaHandler {
             .clone()
     }
 
+    fn reserved_ports(&self) -> Option<lorica_cluster::ReservedPortsReport> {
+        Some(self.reserved_ports)
+    }
+
     fn on_prepare(&self, payload: ConfigPayload) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
             let generation = payload.generation;
@@ -1104,6 +1110,7 @@ pub(crate) async fn spawn_follower(
         connection: std::sync::OnceLock::new(),
         reading: StdMutex::new(None),
         log_store: opts.log_store,
+        reserved_ports: reserved_ports_report(&opts.reserved_ports),
     });
 
     let mut config = DialerConfig::new(
@@ -1353,9 +1360,80 @@ async fn renew_once(
     Ok((ack.cert_pem, key_pem, not_after))
 }
 
+/// The wire form of this process's reserved ports. Destructured, so a
+/// listener added to `ReservedPorts` fails to compile here until the
+/// report carries it.
+fn reserved_ports_report(ports: &crate::cli::ReservedPorts) -> lorica_cluster::ReservedPortsReport {
+    let crate::cli::ReservedPorts {
+        management,
+        http,
+        https,
+        cluster,
+        enrollment,
+        automation,
+    } = *ports;
+    lorica_cluster::ReservedPortsReport::from(lorica_cluster::ReportedPorts {
+        management,
+        http,
+        https,
+        cluster,
+        enrollment,
+        automation,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_heartbeat_reports_every_reserved_listener_of_this_process() {
+        // Each listener on its own port, so a field mapped onto another
+        // comes back as a different value rather than passing by
+        // coincidence.
+        let ports = crate::cli::ReservedPorts {
+            management: 9443,
+            http: 8080,
+            https: 8443,
+            cluster: Some(9444),
+            enrollment: Some(9445),
+            automation: Some(9446),
+        };
+        let lorica_cluster::ReportedPorts {
+            management,
+            http,
+            https,
+            cluster,
+            enrollment,
+            automation,
+        } = reserved_ports_report(&ports)
+            .checked()
+            .expect("a process's own ports are ports");
+        assert_eq!(
+            crate::cli::ReservedPorts {
+                management,
+                http,
+                https,
+                cluster,
+                enrollment,
+                automation,
+            },
+            ports
+        );
+
+        let plane_off = crate::cli::ReservedPorts {
+            cluster: None,
+            enrollment: None,
+            automation: None,
+            ..ports
+        };
+        let report = reserved_ports_report(&plane_off);
+        assert_eq!(
+            (report.cluster, report.enrollment, report.automation),
+            (None, None, None),
+            "a listener that is off is absent, never zero"
+        );
+    }
 
     #[test]
     fn renewal_lead_stays_inside_the_jitter_band() {

@@ -68,10 +68,34 @@ use crate::challenge::challenge_defect;
 use crate::messages::{
     ban_duration_is_valid, ban_reason_is_valid, ban_target_is_valid, cert_id_is_valid,
     challenge_token_is_valid, cluster_request, config_hash_is_valid, sla_pull_defect,
-    telemetry_audit_row_defect, ClusterRequest, NodeResources, SlaPull, TelemetryPush,
-    MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
+    telemetry_audit_row_defect, ClusterRequest, NodeResources, ReportedPorts, ReservedPortsReport,
+    SlaPull, TelemetryPush, MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
 };
 use crate::replication::{AppliedConfig, ConfigPayload};
+
+/// What a heartbeat said about the follower's reserved ports
+/// (Story 12.1, D-4), after the decode-boundary check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservedPortsClaim {
+    /// The heartbeat carried no report: a 1.10.x follower, or a node
+    /// with no follower runtime.
+    NotSent,
+    /// Every port of the report is a port.
+    Reported(ReportedPorts),
+    /// The report held a zero or a value above 65535. It is dropped and
+    /// the node treated as not reported; the caller warns, naming the
+    /// node, since only it knows which node this is.
+    Dropped,
+}
+
+impl ReservedPortsClaim {
+    fn of(report: Option<&ReservedPortsReport>) -> Self {
+        match report {
+            None => Self::NotSent,
+            Some(report) => report.checked().map_or(Self::Dropped, Self::Reported),
+        }
+    }
+}
 
 /// The in-plane actions the control-plane whitelist admits (Story 9.2
 /// session traffic, Story 9.3 lifecycle, Story 9.4 convergence).
@@ -87,6 +111,8 @@ pub enum InPlaneAction {
         /// What the node reports it is using (Story 9.7 AC #3), or
         /// `None` from a node that installs no sampler.
         resources: Option<NodeResources>,
+        /// The ports the node's own listeners hold (Story 12.1, D-4).
+        reserved_ports: ReservedPortsClaim,
     },
     /// The follower asks for the current generation because what it
     /// runs may be stale (Story 9.4 AC #7).
@@ -266,6 +292,10 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
                     cpu_percent: r.cpu_percent.min(100),
                     ..r
                 }),
+                // Dropped rather than clamped, and not a violation
+                // either: a clamped port is a different port, which the
+                // control plane would then check streams against.
+                reserved_ports: ReservedPortsClaim::of(hb.reserved_ports.as_ref()),
             })
         }
         Some(cluster_request::Body::ConfigPull(pull)) => {
@@ -514,6 +544,7 @@ mod tests {
             applied_hash: String::new(),
             break_glass: false,
             resources: None,
+            reserved_ports: None,
         }
     }
 
@@ -562,6 +593,7 @@ mod tests {
             applied_hash: "abcdef".to_string(),
             break_glass: true,
             resources: None,
+            reserved_ports: None,
         });
         assert_eq!(
             translate_cluster_request(&req),
@@ -573,6 +605,7 @@ mod tests {
                     break_glass: true,
                 },
                 resources: None,
+                reserved_ports: ReservedPortsClaim::NotSent,
             })
         );
     }
@@ -591,6 +624,7 @@ mod tests {
                 disk_used_bytes: 1,
                 disk_total_bytes: 2,
             }),
+            reserved_ports: None,
         });
         let BridgeOutcome::InPlane(InPlaneAction::Heartbeat { resources, .. }) =
             translate_cluster_request(&req)
@@ -600,6 +634,72 @@ mod tests {
         let resources = resources.expect("the reading is kept, not dropped");
         assert_eq!(resources.cpu_percent, 100);
         assert_eq!(resources.memory_used_bytes, 7, "the rest passes through");
+    }
+
+    fn reserved_ports_claim(report: Option<ReservedPortsReport>) -> ReservedPortsClaim {
+        let req = ClusterRequest::heartbeat(Heartbeat {
+            reserved_ports: report,
+            ..heartbeat(1)
+        });
+        let BridgeOutcome::InPlane(InPlaneAction::Heartbeat { reserved_ports, .. }) =
+            translate_cluster_request(&req)
+        else {
+            panic!("a heartbeat is whitelisted whatever its ports report says");
+        };
+        reserved_ports
+    }
+
+    #[test]
+    fn a_reserved_ports_report_passes_through_the_heartbeat() {
+        let report = ReservedPortsReport {
+            management: 9443,
+            http: 8080,
+            https: 8443,
+            cluster: Some(9444),
+            enrollment: Some(9445),
+            automation: None,
+        };
+        assert_eq!(
+            reserved_ports_claim(Some(report)),
+            ReservedPortsClaim::Reported(ReportedPorts {
+                management: 9443,
+                http: 8080,
+                https: 8443,
+                cluster: Some(9444),
+                enrollment: Some(9445),
+                automation: None,
+            })
+        );
+        assert_eq!(reserved_ports_claim(None), ReservedPortsClaim::NotSent);
+    }
+
+    #[test]
+    fn an_impossible_reserved_port_drops_the_report_and_keeps_the_session() {
+        let valid = ReservedPortsReport {
+            management: 9443,
+            http: 8080,
+            https: 8443,
+            cluster: None,
+            enrollment: None,
+            automation: None,
+        };
+        for spoiled in [
+            ReservedPortsReport { https: 0, ..valid },
+            ReservedPortsReport {
+                management: 70_000,
+                ..valid
+            },
+            ReservedPortsReport {
+                automation: Some(0),
+                ..valid
+            },
+        ] {
+            assert_eq!(
+                reserved_ports_claim(Some(spoiled)),
+                ReservedPortsClaim::Dropped,
+                "{spoiled:?}"
+            );
+        }
     }
 
     #[test]
@@ -630,6 +730,7 @@ mod tests {
                 timestamp_ms: 1,
                 applied_generation: 1,
                 resources: None,
+                reserved_ports: None,
                 applied_hash: hash.to_string(),
                 break_glass: false,
             });

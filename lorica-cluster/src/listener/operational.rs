@@ -58,7 +58,7 @@ use tokio_rustls::TlsAcceptor;
 use lorica_command::{IncomingRequest, IncomingRequests, RpcEndpoint};
 
 use crate::admission::{AdmissionDecision, AdmissionGate};
-use crate::bridge::{translate_cluster_request, BridgeOutcome, InPlaneAction};
+use crate::bridge::{translate_cluster_request, BridgeOutcome, InPlaneAction, ReservedPortsClaim};
 use crate::certs::{CertBundle, MAX_CERT_BUNDLES};
 use crate::enroll::{RenewRequest, SessionHandler};
 use crate::handshake::{serve_hello, HandshakeConfig};
@@ -752,6 +752,10 @@ struct SessionTally {
     cert_pulls: u32,
     telemetry_pushes: u32,
     telemetry_window_started: Option<Instant>,
+    /// Whether this session already warned about a dropped reserved
+    /// ports report: a node that sends an impossible port sends it on
+    /// every beat, and one line per session says it.
+    reserved_ports_drop_warned: bool,
 }
 
 impl SessionTally {
@@ -817,6 +821,7 @@ async fn serve_request(
             timestamp_ms,
             applied,
             resources,
+            reserved_ports,
         }) => {
             stats.heartbeats_served.fetch_add(1, Ordering::Relaxed);
             // What the node runs, refreshed every interval: the drift
@@ -828,6 +833,27 @@ async fn serve_request(
             if let Some(guard) = guard {
                 guard.entry().record_applied(applied);
                 guard.entry().record_resources(resources);
+            }
+            // The reserved ports are a node fact (Story 12.1, D-4): the
+            // session holds the latest valid report and the control
+            // plane's flush persists it. A dropped report leaves the
+            // node as not reported, which fails a stream closed.
+            match reserved_ports {
+                ReservedPortsClaim::Reported(ports) => {
+                    if let Some(guard) = guard {
+                        guard.entry().record_reserved_ports(ports);
+                    }
+                }
+                ReservedPortsClaim::Dropped if !tally.reserved_ports_drop_warned => {
+                    tally.reserved_ports_drop_warned = true;
+                    tracing::warn!(
+                        peer = %ctx.peer_addr,
+                        node_id = ctx.node_id().unwrap_or("-"),
+                        node_name = ctx.node.as_ref().map_or("-", |n| n.name.as_str()),
+                        "reserved ports report dropped: a port is zero or above 65535; the node                          is treated as not reported and streams targeting it are refused"
+                    );
+                }
+                ReservedPortsClaim::Dropped | ReservedPortsClaim::NotSent => {}
             }
             let current = advertised_version(&shared.accepted, ctx.node.as_ref());
             let ack = HeartbeatAck {

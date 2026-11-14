@@ -122,6 +122,7 @@ fn heartbeat() -> Heartbeat {
         applied_hash: "sha256:ab12".to_string(),
         break_glass: true,
         resources: Some(resources()),
+        reserved_ports: None,
     }
 }
 

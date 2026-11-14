@@ -88,7 +88,7 @@ use crate::messages::{
     cluster_response, config_hash_is_valid, BanPushAck, CertPushAck, CertRefusal,
     ChallengePublishAck, ChallengeRetractAck, ClusterFrame, ClusterRequest, ClusterResponse,
     ClusterStatus, ConfigAbortAck, ConfigCommitAck, ConfigPrepareAck, Heartbeat, HelloAck,
-    NodeResources, SlaPull, SlaPullAck,
+    NodeResources, ReservedPortsReport, SlaPull, SlaPullAck,
 };
 use crate::replication::{AppliedConfig, ConfigPayload, ConfigVersion};
 use crate::tls::{client_config, negotiated_cluster_alpn, ClusterTlsError};
@@ -186,6 +186,16 @@ pub trait FollowerHandler: Send + Sync + 'static {
     /// and nothing downstream is misled. The transport-only tests want
     /// exactly that.
     fn resources(&self) -> Option<NodeResources> {
+        None
+    }
+
+    /// The ports this node's own listeners hold, for the control
+    /// plane's stream conflict check (Story 12.1, D-4).
+    ///
+    /// Defaulted for the same reason as [`FollowerHandler::resources`]:
+    /// a node that reports nothing is one the control plane refuses
+    /// streams for by name, which misleads nobody.
+    fn reserved_ports(&self) -> Option<ReservedPortsReport> {
         None
     }
 
@@ -365,6 +375,12 @@ impl DialerConfig {
 /// installed to sample it.
 fn node_resources(config: &DialerConfig) -> Option<NodeResources> {
     config.follower.as_ref().and_then(|f| f.resources())
+}
+
+/// The ports this node's listeners hold, or `None` when no follower
+/// runtime is installed to report them.
+fn node_reserved_ports(config: &DialerConfig) -> Option<ReservedPortsReport> {
+    config.follower.as_ref().and_then(|f| f.reserved_ports())
 }
 
 /// What this node runs, or the empty state when no follower runtime is
@@ -816,6 +832,7 @@ async fn heartbeat_until_dead(
             applied_hash: applied.hash.clone(),
             break_glass: applied.break_glass,
             resources: node_resources(config),
+            reserved_ports: node_reserved_ports(config),
         });
         match session
             .endpoint

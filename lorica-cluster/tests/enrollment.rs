@@ -636,6 +636,7 @@ async fn revoked_node_is_refused_at_tls_and_its_session_ends_synchronously() {
         applied_hash: String::new(),
         break_glass: false,
         resources: None,
+        reserved_ports: None,
     });
     assert!(session_a
         .request(probe, Duration::from_secs(2))
@@ -744,6 +745,7 @@ async fn a_heartbeat_carries_the_node_s_resource_reading_onto_its_session() {
         applied_hash: String::new(),
         break_glass: false,
         resources: Some(reading.clone()),
+        reserved_ports: None,
     });
     endpoint
         .request(probe, Duration::from_secs(2))
@@ -766,6 +768,7 @@ async fn a_heartbeat_carries_the_node_s_resource_reading_onto_its_session() {
         applied_hash: String::new(),
         break_glass: false,
         resources: None,
+        reserved_ports: None,
     });
     endpoint
         .request(silent, Duration::from_secs(2))
@@ -780,5 +783,105 @@ async fn a_heartbeat_carries_the_node_s_resource_reading_onto_its_session() {
     assert_eq!(held.resources.as_ref(), Some(&reading));
 
     drop(endpoint);
+    fleet.handle.shutdown();
+}
+
+/// Story 12.1 D-4: a follower's reserved ports ride the heartbeat onto
+/// its session, a heartbeat without a report keeps them, and a report
+/// holding an impossible port is dropped, so the node stays not
+/// reported, without ending the session.
+#[tokio::test]
+async fn a_heartbeat_carries_the_node_s_reserved_ports_onto_its_session() {
+    install_ring();
+    let pki = control_plane_pki();
+    let node = issue_node(&pki, "node-a");
+    let other = issue_node(&pki, "node-b");
+    let fleet = spawn_fleet(
+        &pki,
+        HashMap::from([
+            identity(&node, NodeState::Active),
+            identity(&other, NodeState::Active),
+        ]),
+    )
+    .await;
+    let session_ports = |node_id: &str| {
+        fleet
+            .sessions
+            .snapshot()
+            .into_iter()
+            .find(|s| s.node_id == node_id)
+            .and_then(|s| s.reserved_ports)
+    };
+    let beat = |timestamp_ms: u64, reserved_ports: Option<lorica_cluster::ReservedPortsReport>| {
+        ClusterRequest::heartbeat(lorica_cluster::Heartbeat {
+            timestamp_ms,
+            applied_generation: 0,
+            applied_hash: String::new(),
+            break_glass: false,
+            resources: None,
+            reserved_ports,
+        })
+    };
+    let report = lorica_cluster::ReservedPortsReport {
+        management: 9443,
+        http: 8080,
+        https: 8443,
+        cluster: None,
+        enrollment: None,
+        automation: Some(9446),
+    };
+
+    let endpoint = open_session(&pki, &node, fleet.addr)
+        .await
+        .expect("active node admitted");
+    eventually("session to register", || {
+        fleet.sessions.is_connected("node-a")
+    })
+    .await;
+    assert_eq!(session_ports("node-a"), None, "nothing reported yet");
+    endpoint
+        .request(beat(1, Some(report)), Duration::from_secs(2))
+        .await
+        .expect("heartbeat served");
+    eventually("the report to reach the session", || {
+        session_ports("node-a") == report.checked()
+    })
+    .await;
+    endpoint
+        .request(beat(2, None), Duration::from_secs(2))
+        .await
+        .expect("heartbeat served");
+    assert_eq!(
+        session_ports("node-a"),
+        report.checked(),
+        "a heartbeat without a report keeps the last one"
+    );
+
+    let spoiled = open_session(&pki, &other, fleet.addr)
+        .await
+        .expect("active node admitted");
+    eventually("second session to register", || {
+        fleet.sessions.is_connected("node-b")
+    })
+    .await;
+    spoiled
+        .request(
+            beat(
+                1,
+                Some(lorica_cluster::ReservedPortsReport { https: 0, ..report }),
+            ),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("an impossible port is no protocol violation");
+    assert!(fleet.sessions.is_connected("node-b"));
+    assert_eq!(
+        session_ports("node-b"),
+        None,
+        "a dropped report leaves the node not reported"
+    );
+    assert_eq!(fleet.stats.protocol_violations.load(Ordering::Relaxed), 0);
+
+    drop((endpoint, spoiled));
     fleet.handle.shutdown();
 }

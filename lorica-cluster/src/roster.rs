@@ -37,7 +37,7 @@ use lorica_command::RpcEndpoint;
 use crate::ca::{CaError, ClusterCa, IssuedLeaf, RevokedEntry};
 use crate::certs::{CertBundle, CertDistributor, CertPushReport};
 use crate::challenge::{ChallengeFanout, ChallengeReport};
-use crate::messages::{ClusterFrame, NodeResources};
+use crate::messages::{ClusterFrame, NodeResources, ReportedPorts};
 use crate::replication::{
     AcceptedConfig, AppliedConfig, ConfigVersion, PayloadSource, ReplicationReport, Replicator,
 };
@@ -184,6 +184,14 @@ pub struct LiveSession {
     /// a figure from before the restart would be worse than showing
     /// none.
     resources: Mutex<Option<NodeResources>>,
+    /// The ports the node last reported its own listeners hold
+    /// (Story 12.1, D-4).
+    ///
+    /// Unlike `resources`, a node fact: the session flush persists it
+    /// into `cluster_nodes`, so the stream conflict check still has it
+    /// for a node that is offline and after a control-plane restart.
+    /// Here it is only the latest value this session received.
+    reserved_ports: Mutex<Option<ReportedPorts>>,
     /// Flipped to `true` to end the session synchronously (revocation,
     /// supersession).
     kill: watch::Sender<bool>,
@@ -240,6 +248,27 @@ impl LiveSession {
         }
     }
 
+    /// Replace the ports the node reports its own listeners hold.
+    ///
+    /// Only a report that passed the decode-boundary check reaches
+    /// here; a heartbeat without one, or with one that was dropped,
+    /// leaves the previous value in place, and the flush keeps the
+    /// persisted one.
+    pub fn record_reserved_ports(&self, ports: ReportedPorts) {
+        *self
+            .reserved_ports
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(ports);
+    }
+
+    /// The ports the node last reported this session, if any.
+    pub fn reserved_ports(&self) -> Option<ReportedPorts> {
+        *self
+            .reserved_ports
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     /// The node's last reported resource reading, if it ever sent one.
     pub fn resources(&self) -> Option<NodeResources> {
         self.resources
@@ -280,6 +309,9 @@ pub struct LiveSessionSnapshot {
     /// The node's last reported resource reading, or `None` from a
     /// node that has not sent one this session (Story 9.7 AC #3).
     pub resources: Option<NodeResources>,
+    /// The ports the node reported this session, or `None` when it has
+    /// not sent a valid report since it connected (Story 12.1, D-4).
+    pub reserved_ports: Option<ReportedPorts>,
 }
 
 /// Node id -> live session, with per-session kill switches so a
@@ -370,6 +402,7 @@ impl SessionRegistry {
             endpoint,
             applied: Mutex::new(applied),
             resources: Mutex::new(None),
+            reserved_ports: Mutex::new(None),
             kill: kill_tx,
         });
         let previous = self
@@ -523,6 +556,7 @@ impl SessionRegistry {
                 state: s.state(),
                 applied: s.applied(),
                 resources: s.resources(),
+                reserved_ports: s.reserved_ports(),
             })
             .collect()
     }

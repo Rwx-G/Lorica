@@ -168,6 +168,112 @@ pub struct NodeResources {
     pub disk_total_bytes: u64,
 }
 
+/// The ports a follower's own listeners hold, reported in every
+/// heartbeat so the control plane can refuse a stream that would
+/// collide with them on that node (Story 12.1, D-4).
+///
+/// A node fact rather than a gauge: the control plane persists it,
+/// because it validates writes against it for a node that is offline at
+/// that moment and after its own restart.
+///
+/// `uint32` on the wire because protobuf has no 16-bit integer; a value
+/// of zero or above 65535 is no port, and [`ReservedPortsReport::checked`]
+/// refuses the whole report over one. The optional fields are listeners
+/// that may be off: absent means "not listening", never zero.
+#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
+pub struct ReservedPortsReport {
+    /// The management API port.
+    #[prost(uint32, tag = "1")]
+    pub management: u32,
+    /// The HTTP proxy listener port.
+    #[prost(uint32, tag = "2")]
+    pub http: u32,
+    /// The HTTPS proxy listener port.
+    #[prost(uint32, tag = "3")]
+    pub https: u32,
+    /// The cluster plane's operational port, when this node runs one.
+    #[prost(uint32, optional, tag = "4")]
+    pub cluster: Option<u32>,
+    /// The cluster plane's enrollment port, when this node runs one.
+    #[prost(uint32, optional, tag = "5")]
+    pub enrollment: Option<u32>,
+    /// The automation API's port, when it is on.
+    #[prost(uint32, optional, tag = "6")]
+    pub automation: Option<u32>,
+}
+
+/// A [`ReservedPortsReport`] whose every port passed the decode-boundary
+/// check: what the control plane records and persists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportedPorts {
+    /// The management API port.
+    pub management: u16,
+    /// The HTTP proxy listener port.
+    pub http: u16,
+    /// The HTTPS proxy listener port.
+    pub https: u16,
+    /// The cluster plane's operational port, when the node runs one.
+    pub cluster: Option<u16>,
+    /// The cluster plane's enrollment port, when the node runs one.
+    pub enrollment: Option<u16>,
+    /// The automation API's port, when it is on.
+    pub automation: Option<u16>,
+}
+
+impl ReservedPortsReport {
+    /// The report as ports, or `None` when any field holding a value
+    /// is zero or above 65535.
+    ///
+    /// All or nothing: a report with one impossible port says nothing
+    /// trustworthy about the others, and a partial report would let a
+    /// stream through on a port the node does hold.
+    pub fn checked(&self) -> Option<ReportedPorts> {
+        fn port(value: u32) -> Option<u16> {
+            u16::try_from(value).ok().filter(|p| *p != 0)
+        }
+        fn optional_port(value: Option<u32>) -> Option<Option<u16>> {
+            value.map_or(Some(None), |v| port(v).map(Some))
+        }
+        let Self {
+            management,
+            http,
+            https,
+            cluster,
+            enrollment,
+            automation,
+        } = *self;
+        Some(ReportedPorts {
+            management: port(management)?,
+            http: port(http)?,
+            https: port(https)?,
+            cluster: optional_port(cluster)?,
+            enrollment: optional_port(enrollment)?,
+            automation: optional_port(automation)?,
+        })
+    }
+}
+
+impl From<ReportedPorts> for ReservedPortsReport {
+    fn from(ports: ReportedPorts) -> Self {
+        let ReportedPorts {
+            management,
+            http,
+            https,
+            cluster,
+            enrollment,
+            automation,
+        } = ports;
+        Self {
+            management: u32::from(management),
+            http: u32::from(http),
+            https: u32::from(https),
+            cluster: cluster.map(u32::from),
+            enrollment: enrollment.map(u32::from),
+            automation: automation.map(u32::from),
+        }
+    }
+}
+
 /// Liveness probe, either direction.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Heartbeat {
@@ -189,6 +295,11 @@ pub struct Heartbeat {
     /// must render as unknown rather than as zero.
     #[prost(message, optional, tag = "5")]
     pub resources: Option<NodeResources>,
+    /// The ports the follower's own listeners hold (Story 12.1, D-4).
+    /// Absent from a 1.10.x follower and from a node with no follower
+    /// runtime; a 1.10.x control plane skips the unknown tag.
+    #[prost(message, optional, tag = "6")]
+    pub reserved_ports: Option<ReservedPortsReport>,
 }
 
 /// Answer to a [`Heartbeat`].
@@ -1893,6 +2004,7 @@ mod tests {
                         disk_used_bytes: 1,
                         disk_total_bytes: 1,
                     }),
+                    reserved_ports: Some(every_reserved_port()),
                 }
                 .encode_to_vec()
             ),
@@ -1902,6 +2014,36 @@ mod tests {
                 tag("Heartbeat", "applied_hash"),
                 tag("Heartbeat", "break_glass"),
                 tag("Heartbeat", "resources"),
+                tag("Heartbeat", "reserved_ports"),
+            ]
+        );
+        assert_eq!(
+            field_numbers(&every_reserved_port().encode_to_vec()),
+            vec![
+                tag("ReservedPortsReport", "management"),
+                tag("ReservedPortsReport", "http"),
+                tag("ReservedPortsReport", "https"),
+                tag("ReservedPortsReport", "cluster"),
+                tag("ReservedPortsReport", "enrollment"),
+                tag("ReservedPortsReport", "automation"),
+            ]
+        );
+        // A listener that is off is an absent field, not a zero: zero
+        // is no port, and the decode boundary refuses it.
+        assert_eq!(
+            field_numbers(
+                &ReservedPortsReport {
+                    cluster: None,
+                    enrollment: None,
+                    automation: None,
+                    ..every_reserved_port()
+                }
+                .encode_to_vec()
+            ),
+            vec![
+                tag("ReservedPortsReport", "management"),
+                tag("ReservedPortsReport", "http"),
+                tag("ReservedPortsReport", "https"),
             ]
         );
         assert_eq!(
@@ -1925,7 +2067,9 @@ mod tests {
         );
         // An absent sampler must encode as an absent field, not as a
         // present message full of zeros: the dashboard distinguishes
-        // "unknown" from "idle" on exactly this.
+        // "unknown" from "idle" on exactly this. The same holds for an
+        // absent ports report, which the control plane reads as "not
+        // reported" and never as a node holding no port.
         assert_eq!(
             field_numbers(
                 &Heartbeat {
@@ -1934,6 +2078,7 @@ mod tests {
                     applied_hash: "ab".to_string(),
                     break_glass: true,
                     resources: None,
+                    reserved_ports: None,
                 }
                 .encode_to_vec()
             ),
@@ -2568,5 +2713,159 @@ mod tests {
             "token\r\nInjected: 1"
         ));
         assert!(!challenge_key_authorization_is_valid("<script>"));
+    }
+
+    /// A report with every listener on, each on a distinct port.
+    fn every_reserved_port() -> ReservedPortsReport {
+        ReservedPortsReport {
+            management: 9443,
+            http: 8080,
+            https: 8443,
+            cluster: Some(9444),
+            enrollment: Some(9445),
+            automation: Some(9446),
+        }
+    }
+
+    /// The `Heartbeat` exactly as the v1.10.6 tag declares it
+    /// (`git show v1.10.6:lorica-cluster/src/messages.rs`), frozen here
+    /// as a released artefact: the peer a 1.11.0 node shares a fleet
+    /// with during a rolling upgrade (Story 12.1, D-4).
+    mod v1_10_6 {
+        use super::NodeResources;
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        pub struct Heartbeat {
+            #[prost(uint64, tag = "1")]
+            pub timestamp_ms: u64,
+            #[prost(uint64, tag = "2")]
+            pub applied_generation: u64,
+            #[prost(string, tag = "3")]
+            pub applied_hash: ::prost::alloc::string::String,
+            #[prost(bool, tag = "4")]
+            pub break_glass: bool,
+            #[prost(message, optional, tag = "5")]
+            pub resources: Option<NodeResources>,
+        }
+    }
+
+    fn reading() -> NodeResources {
+        NodeResources {
+            cpu_percent: 12,
+            memory_used_bytes: 34,
+            memory_total_bytes: 56,
+            disk_used_bytes: 78,
+            disk_total_bytes: 90,
+        }
+    }
+
+    #[test]
+    fn a_1_10_6_control_plane_decodes_a_heartbeat_carrying_reserved_ports() {
+        let new = Heartbeat {
+            timestamp_ms: 7,
+            applied_generation: 3,
+            applied_hash: "ab".to_string(),
+            break_glass: true,
+            resources: Some(reading()),
+            reserved_ports: Some(every_reserved_port()),
+        };
+        let old = v1_10_6::Heartbeat::decode(new.encode_to_vec().as_slice())
+            .expect("an unknown tag is skipped, never refused");
+        assert_eq!(
+            old,
+            v1_10_6::Heartbeat {
+                timestamp_ms: 7,
+                applied_generation: 3,
+                applied_hash: "ab".to_string(),
+                break_glass: true,
+                resources: Some(reading()),
+            },
+            "every field the old peer knows survives the new one"
+        );
+    }
+
+    #[test]
+    fn a_1_11_0_control_plane_reads_a_1_10_6_heartbeat_as_not_reported() {
+        let old = v1_10_6::Heartbeat {
+            timestamp_ms: 7,
+            applied_generation: 3,
+            applied_hash: "ab".to_string(),
+            break_glass: false,
+            resources: Some(reading()),
+        };
+        let new = Heartbeat::decode(old.encode_to_vec().as_slice()).expect("decodes");
+        assert_eq!(
+            new,
+            Heartbeat {
+                timestamp_ms: 7,
+                applied_generation: 3,
+                applied_hash: "ab".to_string(),
+                break_glass: false,
+                resources: Some(reading()),
+                reserved_ports: None,
+            }
+        );
+        // And a 1.11.0 heartbeat without a report is byte-identical to
+        // the 1.10.6 one: the new field costs an old peer nothing.
+        assert_eq!(new.encode_to_vec(), old.encode_to_vec());
+    }
+
+    #[test]
+    fn a_reserved_ports_report_round_trips_through_its_checked_form() {
+        let report = every_reserved_port();
+        let ports = report.checked().expect("every port is a port");
+        assert_eq!(ports.management, 9443);
+        assert_eq!(ports.enrollment, Some(9445));
+        assert_eq!(ReservedPortsReport::from(ports), report);
+        let decoded =
+            ReservedPortsReport::decode(report.encode_to_vec().as_slice()).expect("decodes");
+        assert_eq!(decoded, report);
+
+        let all_off = ReservedPortsReport {
+            cluster: None,
+            enrollment: None,
+            automation: None,
+            ..report
+        };
+        let ports = all_off
+            .checked()
+            .expect("a listener that is off is no defect");
+        assert_eq!(
+            (ports.cluster, ports.enrollment, ports.automation),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn a_report_with_any_impossible_port_is_refused_whole() {
+        type Spoil = fn(&mut ReservedPortsReport, u32);
+        let base = every_reserved_port();
+        let fields: [(&str, Spoil); 6] = [
+            ("management", |r, v| r.management = v),
+            ("http", |r, v| r.http = v),
+            ("https", |r, v| r.https = v),
+            ("cluster", |r, v| r.cluster = Some(v)),
+            ("enrollment", |r, v| r.enrollment = Some(v)),
+            ("automation", |r, v| r.automation = Some(v)),
+        ];
+        // Pinned against the encoded field count, so a field added to
+        // the report without a row here turns this test red.
+        assert_eq!(
+            field_numbers(&base.encode_to_vec()).len(),
+            fields.len(),
+            "every report field has a row"
+        );
+        for (name, spoil) in fields {
+            for bad in [0, 65_536, u32::MAX] {
+                let mut report = base;
+                spoil(&mut report, bad);
+                assert_eq!(report.checked(), None, "{name} = {bad}");
+            }
+            for edge in [1, 65_535] {
+                let mut report = base;
+                spoil(&mut report, edge);
+                assert!(report.checked().is_some(), "{name} = {edge} is a port");
+            }
+        }
     }
 }

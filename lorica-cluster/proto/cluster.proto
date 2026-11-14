@@ -574,12 +574,31 @@ message NodeResources {
   uint64 disk_total_bytes = 5;
 }
 
+// The ports a follower's own listeners hold (Story 12.1, D-4), so the
+// control plane refuses a stream that would collide with them on that
+// node. A node fact, persisted by the control plane, unlike the gauges
+// above. uint32 because protobuf has no 16-bit integer: a value of 0
+// or above 65535 is no port, and the control plane drops the whole
+// report over one, treating the node as not reported. A listener that
+// is off is an absent optional field, never 0.
+message ReservedPortsReport {
+  uint32 management = 1;
+  uint32 http = 2;
+  uint32 https = 3;
+  optional uint32 cluster = 4;     // Cluster plane, operational
+  optional uint32 enrollment = 5;  // Cluster plane, enrollment
+  optional uint32 automation = 6;
+}
+
 message Heartbeat {
   uint64 timestamp_ms = 1;
   uint64 applied_generation = 2;
   string applied_hash = 3;
   bool break_glass = 4;
   NodeResources resources = 5;    // Absent when the node has no sampler
+  // Story 12.1: absent from a 1.10.x follower, which a 1.11.0 control
+  // plane reads as "not reported"; a 1.10.x control plane skips it.
+  ReservedPortsReport reserved_ports = 6;
 }
 
 message HeartbeatAck {
