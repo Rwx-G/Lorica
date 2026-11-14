@@ -618,29 +618,29 @@ divergence entry only), `Cargo.lock` (only if `fuzz/` keeps one of its
 own and it moves).
 Depends on: Lot 0.
 
-- [ ] The module, marked `Lorica:` at its head, std only, not
+- [x] The module, marked `Lorica:` at its head, std only, not
       feature-gated: `parse`, `classify_prefix`, `Header`, `Command`,
       `Addresses`, the TLV iterator, `ParseError`, `MAX_HEADER_LEN`,
       `HEADER_READ_TIMEOUT` (D-a), with doc comments and one runnable
       example on `parse`.
-- [ ] v1 per D-e: both families, `UNKNOWN`, the 107-byte line limit,
+- [x] v1 per D-e: both families, `UNKNOWN`, the 107-byte line limit,
       strict spacing and port range, family mismatch refused.
-- [ ] v2 per D-e: signature, version, command, the four families,
+- [x] v2 per D-e: signature, version, command, the four families,
       `STREAM` and `DGRAM`, address-block length checks, TLV structure,
       the 4 KiB bound on the declared length, IPv4-mapped
       canonicalisation.
-- [ ] `classify_prefix` on every prefix length of both signatures, on
+- [x] `classify_prefix` on every prefix length of both signatures, on
       `GET`, `POST`, `PUT`, `PATCH`, a TLS record and a leading CRLF.
-- [ ] Tests: vectors for every accepted shape and every `ParseError`;
+- [x] Tests: vectors for every accepted shape and every `ParseError`;
       a header split at every byte boundary returns `Incomplete` until
       complete and the same `Complete` after; bytes after the header are
       never counted in `consumed`; randomized inputs (seeded `rand` 0.10,
       already a `lorica-core` dependency) never panic. Unit tests live in
       the module and run in the forked-crate CI line.
-- [ ] Fuzz target `fuzz_proxy_protocol` over `parse` and
+- [x] Fuzz target `fuzz_proxy_protocol` over `parse` and
       `classify_prefix`, in `fuzz/` beside the existing targets and in
       `fuzz.yml`'s matrix; `docs/security.md` lists it.
-- [ ] The `FORK.md` divergence entry for the parser (D-k).
+- [x] The `FORK.md` divergence entry for the parser (D-k).
 
 ### Lot B: the fork, `lorica-core` - cargo
 
@@ -935,11 +935,66 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
   `lorica-core` unit tests passed, 0 failed). No pre-existing defect
   surfaced.
 
+- **Lot A gates.** On the Lot A tree, through Docker
+  (`rust:1-bookworm`, `CARGO_BUILD_WARNINGS=deny`): the full cargo gate
+  chain of `ci.yml` (fmt, workspace clippy with `lorica/otel`, the four
+  test lines, the rustls line now with `connection_filter`) and
+  `cargo audit`, all green. The module's 22 unit tests and its doc test
+  run in both forked-crate lines. Fuzz smoke run: `cargo +nightly fuzz run fuzz_proxy_protocol -- -max_total_time=180` on a copy of the tree, 47.9 million inputs in 181 s, no crash and no assertion failure.
+
 ### Completion Notes
+
+- **Lot 0** (`fix(ci)`): the gap was real; see the Debug Log.
+- **Lot A** (`feat(proxy)`): `lorica_core::protocols::proxy_protocol`
+  exposes the D-a surface as named: `parse`, `classify_prefix`,
+  `Parsed::{Incomplete, Complete { header, consumed }}`,
+  `Prefix::{V1, V2, NotProxy, NeedMore}`,
+  `Header { version, command, addresses, tlvs }`, `Command`,
+  `Addresses::{Unspecified, Tcp, Udp, Unix}`, the `Tlvs` iterator of
+  `(u8, &[u8])`, `ParseError::{Malformed, Oversized, Unsupported}` with
+  `detail()`, `MAX_HEADER_LEN` and `HEADER_READ_TIMEOUT`. Additions the
+  contract did not name, all additive: a `Version` enum for the
+  `version` field, the public constants `V1_MAX_LEN`, `V1_SIGNATURE` and
+  `V2_SIGNATURE`, `Tlvs::is_empty`, and `Display` plus
+  `std::error::Error` on `ParseError`.
+- Choices inside D-e, each pinned by a test:
+  - The 4 KiB bound is on the whole header (16 fixed bytes plus the
+    declared length), and is refused as soon as the fixed 16 bytes are
+    read, before the rest arrives.
+  - A v2 `LOCAL` header has its whole protocol block discarded, family
+    byte included, as the specification asks: no family is refused and
+    no TLV is validated or exposed under `LOCAL`. Under `PROXY`, the
+    family byte must be one of the seven defined combinations
+    (`AF_UNSPEC` with `UNSPEC` transport, or `AF_INET`, `AF_INET6`,
+    `AF_UNIX` over `STREAM` or `DGRAM`); any other is `Unsupported`.
+  - An address block longer than its family needs is not an error: the
+    excess is the TLV area, validated structurally.
+  - A v1 line holding a byte outside printable ASCII, or a CR not
+    followed by LF, is `Malformed` as soon as that byte arrives, so
+    binary garbage does not wait for 107 bytes. Ports are digits only,
+    without a sign or a leading zero.
+  - A refusal is final: every prefix of an accepted or incomplete input
+    is `Incomplete`. The split-at-every-byte test and the fuzz target
+    both check it.
+- `docs/security.md`, "Fuzz Testing": the list named a
+  `fuzz_http_parse` target that does not exist and missed
+  `fuzz_ocsp_response`; it now lists the four targets `fuzz/` has, says
+  the `fuzz.yml` matrix is what runs, and its example runs the new
+  target.
+- `fuzz/` keeps no `Cargo.lock` in the repository, so none moved. The
+  root `Cargo.lock` did not move either: no dependency was added.
+- Not wired anywhere; Lots B and D consume it.
 
 ## File List
 
 - `.github/workflows/ci.yml` (Lot 0: the rustls test line and its comment)
+- `lorica-core/src/protocols/proxy_protocol.rs` (Lot A, new)
+- `lorica-core/src/protocols/mod.rs` (Lot A: the `pub mod` line)
+- `fuzz/Cargo.toml` (Lot A: the `lorica-core` dependency and the target)
+- `fuzz/fuzz_targets/fuzz_proxy_protocol.rs` (Lot A, new)
+- `.github/workflows/fuzz.yml` (Lot A: the target matrix)
+- `docs/security.md` (Lot A: the "Fuzz Testing" list)
+- `FORK.md` (Lot A: the parser's divergence entry)
 
 ## Change Log
 
@@ -948,3 +1003,4 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 | 2026-11-14 | 0.1 | Story drafted from the Epic 12 PRD. Status Draft. | Romain G. |
 | 2026-11-14 | 0.2 | Maintainer answers folded in: the parser moves into `lorica-core` as an additive module (no new crate), Lot 0 for the CI feature gap, `X-Forwarded-For` reasoning stated, open questions resolved. Status Draft. | Romain G. |
 | 2026-11-14 | 0.3 | Lot 0: the rustls test line of CI enables `lorica-core/connection_filter`, so the gated listener tests run. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.4 | Lot A: the PROXY protocol parser in `lorica-core`, its fuzz target and its `FORK.md` entry. Status InProgress. | Romain G. |

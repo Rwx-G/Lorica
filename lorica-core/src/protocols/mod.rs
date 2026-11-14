@@ -17,6 +17,8 @@
 mod digest;
 pub mod http;
 pub mod l4;
+// Lorica: the PROXY protocol parser, an additive Lorica-only module.
+pub mod proxy_protocol;
 pub mod raw_connect;
 pub mod tls;
 

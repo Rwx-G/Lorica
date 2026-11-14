@@ -621,20 +621,21 @@ companion `style-src-attr 'unsafe-inline'` keeps Svelte's runtime inline
 ## Fuzz Testing
 
 Fuzz targets are set up for:
-1. **HTTP request parsing** - malformed headers, oversized requests
-2. **API JSON input** - invalid JSON, extreme values, nested objects
-3. **WAF rule evaluation** - crafted attack payloads
+1. **API JSON input** (`fuzz_api_input`) - invalid JSON, extreme values, nested objects
+2. **WAF rule evaluation** (`fuzz_waf_evaluate`) - crafted attack payloads
+3. **OCSP response parsing** (`fuzz_ocsp_response`) - the hand-rolled DER decoding of a stapled response
+4. **PROXY protocol headers** (`fuzz_proxy_protocol`, v1.11.0) - the v1 and v2 parser and the signature check a listener runs on its first bytes: no panic, a header never longer than its input or the 4 KiB bound, and the same verdict however the bytes are split
+
+The `Fuzz Testing` workflow (`.github/workflows/fuzz.yml`) runs every
+target of its matrix weekly; that matrix, not this list, is what runs.
 
 Run fuzz tests (requires nightly Rust):
 ```bash
 # Install cargo-fuzz
 cargo install cargo-fuzz
 
-# Run HTTP parser fuzz target
-cargo +nightly fuzz run fuzz_http_parse -- -max_total_time=3600
-
-# Run API input fuzz target
-cargo +nightly fuzz run fuzz_api_input -- -max_total_time=3600
+# Run one target, for example the PROXY protocol parser
+cargo +nightly fuzz run fuzz_proxy_protocol -- -max_total_time=3600
 ```
 
 Fuzz targets are in `fuzz/` directory (not included in release builds).

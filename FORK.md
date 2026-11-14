@@ -506,6 +506,17 @@ lives in.
   with worker CPU per GiB never more than 4.7 % worse. On an upstream
   sync, keep both constants at 64 KiB; taking `L4BufferSettings` makes
   the read-ahead a setting whose Lorica default is 64 KiB.
+- **`lorica-core`, the PROXY protocol parser (v1.11.0, Story 12.8).**
+  Site: `lorica-core/src/protocols/proxy_protocol.rs`, an additive
+  Lorica-only file declared by one `pub mod` line in
+  `protocols/mod.rs`. Upstream has no PROXY protocol code at the fork's
+  last sync point (`3f87e92c`). The module is a sans-IO parser for v1 and
+  v2 (`parse`, `classify_prefix`) with the bounds both of Lorica's planes
+  apply (`MAX_HEADER_LEN`, `HEADER_READ_TIMEOUT`); it does no I/O, is
+  std only and sits behind no feature, so `lorica-stream` reaches it
+  without `connection_filter`. An upstream sync leaves the file alone
+  and keeps the `pub mod` line. Its fuzz target is
+  `fuzz/fuzz_targets/fuzz_proxy_protocol.rs`.
 
 ## Upstream sync record
 
