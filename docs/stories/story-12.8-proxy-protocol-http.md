@@ -716,7 +716,7 @@ a test), `lorica-api/src/automation/write.rs` (tests only),
 `lorica-mcp/src/tools.rs` (tests only), `docs/mcp.md` (the family line).
 Depends on: C1.
 
-- [ ] The three tests and the two doc lines of D-i.
+- [x] The three tests and the two doc lines of D-i.
 
 ### Lot D: Lorica wiring - cargo
 
@@ -960,6 +960,11 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
   --frozen-lockfile` on a throwaway `node_modules` volume: `pnpm run
   check` (0 errors, 0 warnings), `pnpm run lint`, `vitest run` (49
   files, 866 tests). No lockfile or `package.json` change.
+- **Lot C2 gates.** On the Lot C2 tree, the same full chain and
+  `cargo audit`, all green. The first run of the `lorica-api` test
+  showed that the MCP tool refuses an undeclared settings key as a
+  JSON-RPC invalid-params error (`-32602`), not as a tool result with
+  `isError`; the test asserts that.
 
 ### Completion Notes
 
@@ -1118,6 +1123,27 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
   take the node-local write (Resolved 2).
 - Not visually checked: no browser here. The Network tab's new
   subsection needs a look in both themes.
+- **Lot C2** (`test(mcp)`): three tests, no code. In
+  `lorica-automation-policy`, no allowlisted key starts with
+  `proxy_protocol_`, so the family stays out under any future name. In
+  `lorica-api` (`automation/write/admin_tier_tests.rs`, the admin-tier
+  test module of `write.rs`), every `proxy_protocol_*` key of
+  `GlobalSettings`, derived by serialising the default document and
+  filtering on the prefix, is sent with a value the dashboard accepts to
+  `PUT /automation/v1/settings` by a token holding every scope and by
+  the admin tier's own, and answers 403 naming the key; every tool of the
+  admin tier, taken from the catalogue rather than named, refuses the
+  same keys as invalid parameters before the plane is called; neither the
+  canonical document nor the three stored fields move, and no
+  `settings.*` audit row lands. In `lorica-mcp`, no admin tool's body
+  declares a key of the family and a body naming one is refused by
+  `call_for`. The family line of `SETTINGS_ALLOWLIST`'s doc comment and
+  of `docs/mcp.md` ("What it refuses, by family") names the PROXY
+  protocol listener settings beside the trusted proxies.
+- The `lorica-api` test lives in `admin_tier_tests.rs`, the file
+  `write.rs` declares its admin-tier tests in, rather than in `write.rs`
+  itself: the helpers it needs (`an_admin_tier_token`,
+  `stored_settings`) are private to that module.
 
 ## File List
 
@@ -1153,6 +1179,10 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 - `lorica-dashboard/frontend/src/components/settings-tabs/NetworkTab.svelte`, `lorica-dashboard/frontend/src/components/settings-tabs/NetworkTab.test.ts` (Lot E: the PROXY protocol section, its validation and payload)
 - `lorica-dashboard/frontend/src/lib/api.ts` (Lot E: `ProxyProtocolMode`, the three settings fields)
 - `lorica-dashboard/frontend/src/routes/Settings.svelte` (Lot E: the form fields and the save payload)
+- `lorica-automation-policy/src/settings.rs` (Lot C2: the family line and a test)
+- `lorica-api/src/automation/write/admin_tier_tests.rs` (Lot C2: a test)
+- `lorica-mcp/src/tools.rs` (Lot C2: a test)
+- `docs/mcp.md` (Lot C2: the family line)
 
 ## Change Log
 
@@ -1165,3 +1195,4 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 | 2026-11-14 | 0.5 | Lot B: PROXY protocol accept in the forked listener, the reordered connection filter, `SocketDigest::proxied_from`, the `FORK.md` entry and the #81 sentence. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.6 | Lot C1: the three node-local PROXY protocol settings, their validation at the API and at import, the OpenAPI entry. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.7 | Lot E: the PROXY protocol section of the dashboard's Network tab, the server's rules mirrored client-side, the three fields in the settings save. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.8 | Lot C2: the PROXY protocol settings refused on the automation plane and by the MCP tools, by test, and named in the refused family. Status InProgress. | Romain G. |

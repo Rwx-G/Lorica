@@ -606,3 +606,86 @@ async fn identity_and_fleet_paths_are_refused_at_the_scope_gate_for_every_token(
         }
     }
 }
+
+#[tokio::test]
+async fn every_proxy_protocol_setting_is_refused_by_the_plane_and_by_the_mcp_tool() {
+    // Story 12.8 AC #6. The PROXY protocol listener settings decide which
+    // client address every control judges, so they sit in the trusted
+    // proxies' family: a token holding every scope, and the admin tier's
+    // own, is refused each one at the plane with a 403 naming it, and the
+    // admin tier's tools refuse it before a request leaves. The keys are
+    // derived from the settings document by their prefix, never typed,
+    // and each is sent with a value the dashboard would accept, so the
+    // refusal is the allowlist's and not a validator's.
+    let f = a_node_with_something_to_write().await;
+    let (admin_bearer, _public_id) = an_admin_tier_token(&f).await;
+    let before = canonical_now(&f.state).await;
+    let before_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
+    let stored_before = serde_json::to_value(stored_settings(&f.state).await).expect("settings");
+    let document =
+        serde_json::to_value(lorica_config::models::GlobalSettings::default()).expect("settings");
+    let family: Vec<(String, serde_json::Value)> = document
+        .as_object()
+        .expect("an object")
+        .iter()
+        .filter(|(key, _)| key.starts_with("proxy_protocol_"))
+        .map(|(key, default)| {
+            let accepted = if default.is_array() {
+                serde_json::json!(["192.0.2.0/24"])
+            } else {
+                serde_json::json!("required")
+            };
+            (key.clone(), accepted)
+        })
+        .collect();
+    assert!(
+        !family.is_empty(),
+        "the settings document lost its PROXY protocol family"
+    );
+
+    for (key, value) in &family {
+        for bearer in [f.bearer.as_str(), admin_bearer.as_str()] {
+            let response = automation_call(
+                &f.state,
+                "PUT",
+                "/automation/v1/settings",
+                bearer,
+                Some(serde_json::json!({ key.clone(): value.clone() })),
+            )
+            .await;
+            assert_forbidden_naming(response, &format!("`{key}`"), key).await;
+        }
+        let admin_tools = lorica_mcp::tools::catalogue()
+            .iter()
+            .filter(|spec| spec.scope == lorica_config::models::AutomationScope::SettingsWrite);
+        for spec in admin_tools {
+            let argument = spec.body().expect("an admin tool carries a body").argument;
+            let answered = mcp_call(
+                &f.state,
+                &admin_bearer,
+                spec.name,
+                serde_json::json!({ argument: { key.clone(): value.clone() } }),
+            )
+            .await;
+            // Refused as invalid parameters, before the plane is called.
+            assert_eq!(
+                answered["error"]["code"],
+                serde_json::json!(-32602),
+                "{} accepted {key}: {answered}",
+                spec.name
+            );
+        }
+    }
+
+    let after = canonical_now(&f.state).await;
+    assert_eq!(
+        before_bytes,
+        lorica_config::canonical::encode_canonical(&after).expect("encodes"),
+        "a refused settings write changed the store"
+    );
+    let stored_after = serde_json::to_value(stored_settings(&f.state).await).expect("settings");
+    for (key, _) in &family {
+        assert_eq!(stored_before[key], stored_after[key], "{key} moved");
+    }
+    assert!(audit_rows_under(&f.state, "settings.").await.is_empty());
+}

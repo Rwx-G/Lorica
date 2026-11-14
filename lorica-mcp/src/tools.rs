@@ -1947,6 +1947,42 @@ mod tests {
     }
 
     #[test]
+    fn no_admin_tool_offers_or_carries_a_proxy_protocol_setting() {
+        // Story 12.8 AC #6: the PROXY protocol listener settings are in the
+        // trusted proxies' family, out of the admin tier. No admin tool
+        // declares a key of the family, and a body naming one is refused
+        // here, before a request leaves. Which keys the family holds is
+        // derived from `GlobalSettings` in `lorica-api`'s admin tier
+        // tests, which this crate cannot see; the key below stands for
+        // any of them.
+        let admin: Vec<&ToolSpec> = catalogue()
+            .iter()
+            .filter(|spec| spec.tier == Tier::Admin)
+            .collect();
+        assert!(!admin.is_empty());
+        for spec in admin {
+            let body = spec.body().expect("the admin tool carries the settings");
+            assert!(
+                body.fields
+                    .iter()
+                    .all(|field| !field.starts_with("proxy_protocol_")),
+                "{} offers a PROXY protocol setting",
+                spec.name
+            );
+            let refused = spec
+                .call_for(
+                    &json!({ body.argument: { "proxy_protocol_trusted_cidrs": ["192.0.2.0/24"] } }),
+                )
+                .expect_err("a PROXY protocol setting is refused");
+            assert!(
+                refused.message.contains(&format!("`{}`", body.argument)),
+                "{}",
+                refused.message
+            );
+        }
+    }
+
+    #[test]
     fn the_update_vocabulary_is_the_create_vocabulary_plus_what_only_a_patch_has() {
         // Two typed lists of one struct's fields each, pinned to their
         // structs by `lorica-api` but, until this, never to each other:

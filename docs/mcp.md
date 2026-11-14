@@ -904,8 +904,10 @@ the story that built the tier names every field:
 
 - **Anything that can lock the operator out of the management plane**:
   the management port and its TLS pair, the connection allow and deny
-  lists, the automation listener's own allowlist, the trusted proxies.
-  A wrong value there ends the session that would have fixed it.
+  lists, the automation listener's own allowlist, the trusted proxies
+  and the PROXY protocol listener settings. A wrong value there ends the
+  session that would have fixed it, or makes the edge accept forged
+  client addresses.
 - **Credentials and trust anchors**: the bot-protection HMAC secret,
   the metrics scrape credential and its switch, the upgrade signing
   key, the whole certificate export family, which writes key material

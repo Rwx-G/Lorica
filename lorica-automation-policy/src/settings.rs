@@ -181,7 +181,8 @@ pub const RETENTION_TIER_CEILING_ROWS: i64 = 1_000_000;
 /// (`docs/stories/story-11.3-admin-tier.md`) and in `docs/mcp.md`, by
 /// family: anything that can lock the operator out of the management
 /// plane (its port, its TLS pair, the connection and automation
-/// allowlists, the trusted proxies); credentials and trust anchors
+/// allowlists, the trusted proxies and the PROXY protocol listener
+/// settings); credentials and trust anchors
 /// (the bot HMAC secret, the scrape token and its switch, the upgrade
 /// signing key, the certificate export family); identity policy;
 /// data-plane capacity and mirroring concurrency, which are reversible
@@ -389,6 +390,22 @@ mod tests {
             assert_eq!(admin_setting(setting.name), Some(setting));
         }
         assert_eq!(admin_setting("log_level"), None);
+    }
+
+    #[test]
+    fn no_allowlisted_key_belongs_to_the_proxy_protocol_family() {
+        // Story 12.8 AC #6. Whether a listener reads a PROXY header, and
+        // from which peers, decides which client address every control
+        // judges: a model moving it could make every edge accept forged
+        // addresses. The family is held out by its prefix, so a later
+        // setting of it stays out under whatever name it is given.
+        for setting in SETTINGS_ALLOWLIST {
+            assert!(
+                !setting.name.starts_with("proxy_protocol_"),
+                "{} belongs to the PROXY protocol family, which no automation token may write",
+                setting.name
+            );
+        }
     }
 
     #[test]
