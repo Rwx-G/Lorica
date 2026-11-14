@@ -1074,6 +1074,8 @@ mod tests {
             routes: Vec::new(),
             backends: Vec::new(),
             route_backends: Vec::new(),
+            streams: Vec::new(),
+            stream_backends: Vec::new(),
             certificates,
             notification_configs: Vec::new(),
             user_preferences: Vec::new(),

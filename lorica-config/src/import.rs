@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -28,6 +29,13 @@ pub struct ImportData {
     /// All rows of the `route_backends` join table.
     #[serde(default)]
     pub route_backends: Vec<RouteBackend>,
+    /// All rows of the `streams` table (Story 12.1). Absent from every
+    /// export older than 1.11.0, which therefore still imports.
+    #[serde(default)]
+    pub streams: Vec<Stream>,
+    /// All rows of the `stream_backends` join table.
+    #[serde(default)]
+    pub stream_backends: Vec<StreamBackend>,
     /// All rows of the `certificates` table.
     #[serde(default)]
     pub certificates: Vec<Certificate>,
@@ -104,7 +112,52 @@ fn validate_structure(data: &ImportData) -> Result<()> {
         }
     }
 
-    Ok(())
+    validate_streams(data)
+}
+
+/// The stream half of [`validate_structure`] (Story 12.1, D-6 and D-9):
+/// each stream's own rules, unique names, links naming an imported
+/// stream and backend, and the attachment rule once on the whole file.
+///
+/// Checked here, before `clear_all`, because [`import_to_store`] writes
+/// through the store's unchecked writers: a consistent file written row
+/// by row can pass through a transient violation the checked writers
+/// would refuse, and a refusal half way through an import would leave
+/// the store cleared.
+fn validate_streams(data: &ImportData) -> Result<()> {
+    let mut names: HashSet<&str> = HashSet::new();
+    for stream in &data.streams {
+        stream.validate().map_err(|reason| {
+            ConfigError::Validation(format!("stream '{}': {reason}", stream.id))
+        })?;
+        if !names.insert(stream.name.as_str()) {
+            return Err(ConfigError::Validation(format!(
+                "stream '{}': the name `{}` is used by another stream of the file",
+                stream.id, stream.name
+            )));
+        }
+    }
+    for link in &data.stream_backends {
+        if !data.streams.iter().any(|s| s.id == link.stream_id) {
+            return Err(ConfigError::Validation(format!(
+                "stream_backend references unknown stream_id: {}",
+                link.stream_id
+            )));
+        }
+        if !data.backends.iter().any(|b| b.id == link.backend_id) {
+            return Err(ConfigError::Validation(format!(
+                "stream_backend references unknown backend_id: {}",
+                link.backend_id
+            )));
+        }
+    }
+    check_backend_attachments(&AttachmentSnapshot {
+        backends: &data.backends,
+        streams: &data.streams,
+        stream_backends: &data.stream_backends,
+        route_backends: &data.route_backends,
+    })
+    .map_err(|conflict| ConfigError::Validation(conflict.to_string()))
 }
 
 /// Validate import data for consistency (rejects redacted data).
@@ -226,7 +279,14 @@ fn validate(data: &ImportData) -> Result<()> {
 /// does not hold is imported as a manual certificate, with its
 /// `adcs_authority_id` cleared and a warning: kept as written, it would
 /// be an AD CS certificate whose renewals no authority can serve.
+///
+/// Backends, links and streams are written through the store's
+/// unchecked writers (Story 12.1, D-6): the attachment rule is checked
+/// once on the whole file. [`parse_toml`] already checked it; it is
+/// checked again here, before `clear_all`, so a caller holding an
+/// [`ImportData`] built any other way cannot skip it.
 pub fn import_to_store(store: &ConfigStore, data: &ImportData) -> Result<Vec<String>> {
+    validate_streams(data)?;
     let local_authority_id = store.get_adcs_authority()?.map(|authority| authority.id);
     let mut warnings = Vec::new();
 
@@ -252,13 +312,19 @@ pub fn import_to_store(store: &ConfigStore, data: &ImportData) -> Result<Vec<Str
         }
     }
     for backend in &data.backends {
-        store.create_backend(backend)?;
+        store.create_backend_unchecked(backend)?;
     }
     for route in &data.routes {
         store.create_route(route)?;
     }
     for rb in &data.route_backends {
-        store.link_route_backend(&rb.route_id, &rb.backend_id)?;
+        store.link_route_backend_unchecked(&rb.route_id, &rb.backend_id)?;
+    }
+    for stream in &data.streams {
+        store.create_stream_unchecked(stream)?;
+    }
+    for link in &data.stream_backends {
+        store.link_stream_backend_unchecked(&link.stream_id, &link.backend_id)?;
     }
     for nc in &data.notification_configs {
         store.create_notification_config(nc)?;
@@ -279,4 +345,136 @@ pub fn import_from_file(store: &ConfigStore, path: &Path) -> Result<Vec<String>>
     let content = std::fs::read_to_string(path)?;
     let data = parse_toml(&content)?;
     import_to_store(store, &data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::export::export_to_toml;
+    use crate::models::{sample_stream, sample_stream_backend};
+
+    /// A store holding a TCP single-port stream and a disabled UDP range
+    /// stream pinned to `edge-1`, each with its own backend.
+    fn store_with_streams() -> ConfigStore {
+        let store = ConfigStore::open_in_memory().expect("test setup: store");
+        store
+            .create_backend(&sample_stream_backend("b-smtp", "192.0.2.10:25"))
+            .expect("test setup: backend");
+        store
+            .create_backend(&sample_stream_backend("b-game", "game.example.com"))
+            .expect("test setup: portless backend");
+        store
+            .create_stream(&sample_stream("s-smtp", "smtp", StreamProtocol::Tcp, 25))
+            .expect("test setup: stream");
+        let mut game = sample_stream("s-game", "game", StreamProtocol::Udp, 27000);
+        game.port_last = 27015;
+        game.enabled = false;
+        game.listen_address = "2001:db8::10".parse().expect("test setup: address");
+        game.node_selector = vec!["edge-1".to_string()];
+        store.create_stream(&game).expect("test setup: stream");
+        store
+            .set_stream_backends("s-smtp", &["b-smtp".to_string()])
+            .expect("test setup: link");
+        store
+            .set_stream_backends("s-game", &["b-game".to_string()])
+            .expect("test setup: link");
+        store
+    }
+
+    /// The store's export, decoded as a TOML value to edit.
+    fn exported(store: &ConfigStore) -> toml::Value {
+        toml::from_str(&export_to_toml(store).expect("export")).expect("the export is TOML")
+    }
+
+    #[test]
+    fn streams_round_trip_through_export_and_import() {
+        let source = store_with_streams();
+        let toml_text = export_to_toml(&source).expect("export");
+        assert!(toml_text.contains("[[streams]]"), "{toml_text}");
+        assert!(toml_text.contains("[[stream_backends]]"), "{toml_text}");
+
+        let target = ConfigStore::open_in_memory().expect("target");
+        let data = parse_toml(&toml_text).expect("the export parses");
+        import_to_store(&target, &data).expect("the export imports");
+
+        assert_eq!(
+            target.list_streams().expect("streams"),
+            source.list_streams().expect("streams")
+        );
+        assert_eq!(
+            target.list_stream_backends().expect("links"),
+            source.list_stream_backends().expect("links")
+        );
+    }
+
+    #[test]
+    fn an_export_without_streams_still_imports() {
+        let mut value = exported(&store_with_streams());
+        let table = value.as_table_mut().expect("the export is a table");
+        assert!(table.remove("streams").is_some(), "test setup: on the file");
+        assert!(table.remove("stream_backends").is_some());
+        let older = toml::to_string(&value).expect("re-encode");
+
+        let target = ConfigStore::open_in_memory().expect("target");
+        let data = parse_toml(&older).expect("a pre-1.11.0 export parses");
+        assert!(data.streams.is_empty());
+        import_to_store(&target, &data).expect("and imports");
+        assert!(target.list_streams().expect("streams").is_empty());
+        assert_eq!(target.list_backends().expect("backends").len(), 2);
+    }
+
+    /// The export with one more stream link, from `stream_id` to
+    /// `backend_id`.
+    fn with_link(store: &ConfigStore, stream_id: &str, backend_id: &str) -> String {
+        let mut value = exported(store);
+        let links = value
+            .get_mut("stream_backends")
+            .and_then(toml::Value::as_array_mut)
+            .expect("test setup: links");
+        let mut link = toml::map::Map::new();
+        link.insert("stream_id".into(), toml::Value::String(stream_id.into()));
+        link.insert("backend_id".into(), toml::Value::String(backend_id.into()));
+        links.push(toml::Value::Table(link));
+        toml::to_string(&value).expect("re-encode")
+    }
+
+    #[test]
+    fn a_file_sharing_a_udp_backend_is_refused_before_the_store_is_cleared() {
+        // The UDP stream's backend, also on the TCP stream of the file.
+        let edited = with_link(&store_with_streams(), "s-smtp", "b-game");
+
+        let err = parse_toml(&edited).expect_err("refused at parse");
+        assert!(err.to_string().contains("`game`"), "{err}");
+
+        // A caller that skips the parser is refused the same way, and
+        // nothing was cleared.
+        let target = store_with_streams();
+        let data: ImportData = toml::from_str(&edited).expect("test setup: raw decode");
+        let err = import_to_store(&target, &data).expect_err("refused before clear_all");
+        assert!(err.to_string().contains("`game`"), "{err}");
+        assert_eq!(target.list_streams().expect("streams").len(), 2);
+    }
+
+    #[test]
+    fn a_stream_link_naming_nothing_in_the_file_is_refused() {
+        let store = store_with_streams();
+        let err = parse_toml(&with_link(&store, "s-ghost", "b-smtp")).expect_err("unknown stream");
+        assert!(err.to_string().contains("s-ghost"), "{err}");
+        let err = parse_toml(&with_link(&store, "s-smtp", "b-ghost")).expect_err("unknown backend");
+        assert!(err.to_string().contains("b-ghost"), "{err}");
+    }
+
+    #[test]
+    fn a_file_breaking_a_streams_own_rules_is_refused() {
+        let toml_text = export_to_toml(&store_with_streams()).expect("export");
+        let renamed = toml_text.replace("name = \"game\"", "name = \"smtp\"");
+        assert_ne!(renamed, toml_text, "test setup: the name is on the file");
+        let err = parse_toml(&renamed).expect_err("two streams named smtp");
+        assert!(err.to_string().contains("`smtp`"), "{err}");
+
+        let widened = toml_text.replace("port_last = 27015", "port_last = 29000");
+        assert_ne!(widened, toml_text, "test setup: the range is on the file");
+        let err = parse_toml(&widened).expect_err("a range above the cap");
+        assert!(err.to_string().contains("s-game"), "{err}");
+    }
 }

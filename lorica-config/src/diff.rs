@@ -18,6 +18,10 @@ pub struct ConfigDiff {
     pub certificates: EntityDiff,
     /// Per-entity diff for the `route_backends` join table.
     pub route_backends: EntityDiff,
+    /// Per-entity diff for the `streams` table (Story 12.1).
+    pub streams: EntityDiff,
+    /// Per-entity diff for the `stream_backends` join table.
+    pub stream_backends: EntityDiff,
     /// Per-entity diff for `notification_configs`.
     pub notification_configs: EntityDiff,
     /// Per-entity diff for `user_preferences`.
@@ -65,6 +69,8 @@ impl ConfigDiff {
             && self.backends.is_empty()
             && self.certificates.is_empty()
             && self.route_backends.is_empty()
+            && self.streams.is_empty()
+            && self.stream_backends.is_empty()
             && self.notification_configs.is_empty()
             && self.user_preferences.is_empty()
             && self.users.is_empty()
@@ -104,8 +110,25 @@ pub fn compute_diff(store: &ConfigStore, incoming: &ImportData) -> Result<Config
         |c| format!("{} ({})", c.domain, c.id),
     );
 
-    let route_backends =
-        diff_route_backends(&store.list_route_backends()?, &incoming.route_backends);
+    let route_backends = diff_links(
+        &store.list_route_backends()?,
+        &incoming.route_backends,
+        |rb| (rb.route_id.clone(), rb.backend_id.clone()),
+    );
+
+    let streams = diff_by_id(
+        &store.list_streams()?,
+        &incoming.streams,
+        |s| s.id.clone(),
+        stream_eq,
+        |s| format!("{} ({})", s.name, s.id),
+    );
+
+    let stream_backends = diff_links(
+        &store.list_stream_backends()?,
+        &incoming.stream_backends,
+        |sb| (sb.stream_id.clone(), sb.backend_id.clone()),
+    );
 
     let notification_configs = diff_by_id(
         &store.list_notification_configs()?,
@@ -138,6 +161,8 @@ pub fn compute_diff(store: &ConfigStore, incoming: &ImportData) -> Result<Config
         backends,
         certificates,
         route_backends,
+        streams,
+        stream_backends,
         notification_configs,
         user_preferences,
         users,
@@ -187,15 +212,14 @@ fn diff_by_id<T>(
     }
 }
 
-fn diff_route_backends(current: &[RouteBackend], incoming: &[RouteBackend]) -> EntityDiff {
-    let current_set: HashSet<(String, String)> = current
-        .iter()
-        .map(|rb| (rb.route_id.clone(), rb.backend_id.clone()))
-        .collect();
-    let incoming_set: HashSet<(String, String)> = incoming
-        .iter()
-        .map(|rb| (rb.route_id.clone(), rb.backend_id.clone()))
-        .collect();
+/// Diff two sets of join rows, each read as its `(owner, backend)` pair.
+fn diff_links<T>(
+    current: &[T],
+    incoming: &[T],
+    pair: impl Fn(&T) -> (String, String),
+) -> EntityDiff {
+    let current_set: HashSet<(String, String)> = current.iter().map(&pair).collect();
+    let incoming_set: HashSet<(String, String)> = incoming.iter().map(&pair).collect();
 
     let added: Vec<String> = incoming_set
         .difference(&current_set)
@@ -337,6 +361,16 @@ fn backend_eq(a: &Backend, b: &Backend) -> bool {
         && a.managed_by == b.managed_by
 }
 
+/// Whether an import would leave `a` as `b`: every field but the
+/// timestamps, which an export round trip carries and an edit moves.
+fn stream_eq(a: &Stream, b: &Stream) -> bool {
+    Stream {
+        created_at: b.created_at,
+        updated_at: b.updated_at,
+        ..a.clone()
+    } == *b
+}
+
 fn cert_eq(a: &Certificate, b: &Certificate) -> bool {
     a.domain == b.domain
         && a.san_domains == b.san_domains
@@ -360,4 +394,65 @@ fn user_eq(a: &User, b: &User) -> bool {
         && a.password_hash == b.password_hash
         && a.role == b.role
         && a.disabled_at.is_some() == b.disabled_at.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::export::export_to_toml;
+    use crate::import::parse_toml_for_preview;
+    use crate::models::{sample_stream, sample_stream_backend};
+
+    #[test]
+    fn compute_diff_reports_an_added_a_changed_and_a_removed_stream() {
+        let store = ConfigStore::open_in_memory().expect("test setup: store");
+        store
+            .create_backend(&sample_stream_backend("b-1", "192.0.2.10:25"))
+            .expect("test setup: backend");
+        for (id, name, port) in [("s-kept", "smtp", 25), ("s-gone", "submission", 587)] {
+            store
+                .create_stream(&sample_stream(id, name, StreamProtocol::Tcp, port))
+                .expect("test setup: stream");
+        }
+        store
+            .set_stream_backends("s-kept", &["b-1".to_string()])
+            .expect("test setup: link");
+        let unchanged = parse_toml_for_preview(&export_to_toml(&store).expect("export"))
+            .expect("the export parses");
+        assert!(
+            compute_diff(&store, &unchanged).expect("diff").is_empty(),
+            "an export diffs as no change against its own store"
+        );
+
+        let mut incoming = unchanged;
+        incoming.streams.retain(|s| s.id != "s-gone");
+        let kept = incoming
+            .streams
+            .iter_mut()
+            .find(|s| s.id == "s-kept")
+            .expect("test setup: the kept stream");
+        kept.enabled = false;
+        kept.updated_at = chrono::Utc::now();
+        incoming
+            .streams
+            .push(sample_stream("s-new", "imap", StreamProtocol::Tcp, 143));
+        incoming.stream_backends.clear();
+
+        let diff = compute_diff(&store, &incoming).expect("diff");
+        assert_eq!(diff.streams.added, vec!["imap (s-new)"]);
+        assert_eq!(diff.streams.modified, vec!["smtp (s-kept)"]);
+        assert_eq!(diff.streams.removed, vec!["submission (s-gone)"]);
+        assert_eq!(diff.stream_backends.removed, vec!["s-kept -> b-1"]);
+        assert!(!diff.is_empty());
+    }
+
+    #[test]
+    fn a_stream_differing_only_by_its_timestamps_is_unchanged() {
+        let a = sample_stream("s-1", "smtp", StreamProtocol::Tcp, 25);
+        let mut b = a.clone();
+        b.updated_at = chrono::Utc::now();
+        assert!(stream_eq(&a, &b));
+        b.port_last = 26;
+        assert!(!stream_eq(&a, &b));
+    }
 }

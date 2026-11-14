@@ -696,21 +696,21 @@ Allowlist: `lorica-config/src/canonical.rs`, `lorica-config/src/store/replica.rs
 `lorica-config/src/diff.rs`, `lorica-api/src/automation/test_support.rs`
 (its `CanonicalConfig` literal).
 
-- [ ] `CanonicalConfig` gains `streams` and `stream_backends`, filled in
+- [x] `CanonicalConfig` gains `streams` and `stream_backends`, filled in
       `canonical_config`, sorted with `sort_by_canonical_repr`;
       `CANONICAL_FORMAT_VERSION = 3` with its doc comment rewritten
       (D-3); `CANONICAL_SHAPE_DIGEST` updated; the version-two tests
       renamed and rewritten for three.
-- [ ] `restrict_for_recipient`: streams cut by
+- [x] `restrict_for_recipient`: streams cut by
       `resolution.targets(&stream.node_selector, node_id)` whatever
       their `enabled` value, their links kept with them, `backends` =
       the union of the backends the kept route links and the kept stream
       links reference. The struct literal at its end names the two new
       fields explicitly, as its comment requires.
-- [ ] `prepare_replica`: every stream's `validate()` and selector, and
+- [x] `prepare_replica`: every stream's `validate()` and selector, and
       `check_backend_attachments` on the whole blob, as refusals naming
       the stream id.
-- [ ] `apply_replica_tables`: streams scoped by `applies_to_node`
+- [x] `apply_replica_tables`: streams scoped by `applies_to_node`
       (the assertion the route pass keeps), applied after backends by
       delete-then-insert of every kept stream (the `UNIQUE(name)` index
       would refuse a row-by-row upsert of a blob that swaps two names),
@@ -720,8 +720,8 @@ Allowlist: `lorica-config/src/canonical.rs`, `lorica-config/src/store/replica.rs
       checked); `ReplicaOutcome` gains `streams`,
       `streams_skipped_by_selector`, `stream_backends`; the module doc's
       table list gains both tables.
-- [ ] Export, import and diff per D-9.
-- [ ] Tests listed under Dev Notes, Lot 2.
+- [x] Export, import and diff per D-9.
+- [x] Tests listed under Dev Notes, Lot 2.
 
 ### Lot 3: reserved ports on the wire, persisted, and the selector warning (after Lot 1; parallel with 2 and 4; cargo)
 
@@ -1169,11 +1169,67 @@ the per-commit guard. Story 12.12's file must list this scenario by name.
   `test_backend_address_missing_port_rejected` pinned the pre-D-6
   refusal of a portless address. That test now pins the D-6 rule
   (refused with checks on, stored with checks off).
+- Lot 2, first run: the shape digest guard failed as expected (`Stream`
+  and `StreamBackend` joined the inventory, `CanonicalConfig` gained two
+  fields); the digest moved with the version. The disabled-stream test
+  first compared the cut's stream lists in order: the canonical sort key
+  includes `enabled`, so flipping the flag can reorder them. The test
+  compares them as a set.
 
 ### Completion Notes
 
-Lot 1 (schema, models, store, shared rules, shape changes) is done; Lots
-2 to 6 are not started.
+Lot 1 (schema, models, store, shared rules, shape changes) and Lot 2
+(replication, cut, export, import, diff) are done; Lots 3 to 6 are
+handled separately.
+
+Lot 2:
+
+- `CANONICAL_FORMAT_VERSION` is 3. `the_canonical_format_version_is_three`
+  pins the number, `every_1_11_0_shape_rides_format_version_three`
+  replaces the 10.4 ride guard (a blob with a stream, a link and a typed
+  health check encodes at 3 and decodes), and
+  `a_blob_stamped_version_two_is_refused_by_version` builds the 1.10.x
+  shape (version 2, no `streams`, no `stream_backends`, no
+  `health_check`) and checks the refusal names both versions. The
+  older serde-default tests (`a_1_8_0_blob_...` and siblings) are kept:
+  they now pin only those defaults, which the digest paragraph says.
+- The whole-snapshot check is one call of `check_backend_attachments`
+  over the decoded blob's backends, streams and both link tables, in
+  `prepare_replica` after every stream's `validate()`. A conflict is
+  refused as `stream <id>: <conflict>`, the id looked up from the name
+  the conflict carries (or `backend <id>` when no stream is involved).
+  The apply then uses only unchecked writers for backends, route links,
+  streams and stream links; `apply_replica_backends` was also switched,
+  since `update_backend` is checked since Lot 1 and runs while the
+  previous generation's links are still on the node
+  (`a_generation_moving_a_backend_from_a_udp_stream_to_a_route_applies`
+  fails with the checked writers).
+- Streams are applied by deleting every local stream (which cascades
+  every stream link) and inserting the kept ones, one step after the
+  route links. Equivalent to "delete-then-insert of every kept stream"
+  plus the deletion of streams no longer kept, in one statement.
+- The import runs the stream check (`validate_streams`: each stream's
+  rules, name uniqueness inside the file, link references, the
+  attachment rule) from `validate_structure`, so both `parse_toml` and
+  the preview run it, and `import_to_store` runs it again before
+  `clear_all`, because it writes through the unchecked writers and is
+  public: a caller holding an `ImportData` built without the parser
+  cannot skip the check. A duplicate stream name inside the file is
+  refused there, before `clear_all`, rather than by the `UNIQUE` index
+  half way through the import.
+- `ConfigDiff` gains `stream_backends` beside `streams`, the counterpart
+  of `route_backends`, so a change of a stream's backends shows in the
+  preview. The two link diffs share one helper, `diff_links`.
+  `stream_eq` compares every field but the timestamps.
+- `lorica-api/src/automation/test_support.rs` needed no change: it
+  holds no `CanonicalConfig` literal on this tree, only a call to
+  `canonical_config`.
+- Outside the allowlist: `lorica-config/src/store/adcs_authority.rs`,
+  whose test fixture builds an `ImportData` literal and gains the two
+  empty stream fields (construction site only).
+- The follower's apply log line (`lorica/src/startup/cluster_follower.rs`,
+  Lot 3's file) does not print the three new `ReplicaOutcome` counts;
+  left to that lot.
 
 - `Stream.listen_address` is an `IpAddr`, not a `String`: the canonical
   RFC 5952 form is then true by construction (serde parses any spelling
@@ -1257,6 +1313,12 @@ suite holding a `Backend` literal),
 `lorica-api/src/oidc_issuers/tests.rs`,
 `docs/stories/story-12.1-stream-model.md`.
 
+Lot 2, modified: `lorica-config/src/canonical.rs`,
+`lorica-config/src/store/replica.rs`, `lorica-config/src/export.rs`,
+`lorica-config/src/import.rs`, `lorica-config/src/diff.rs`,
+`lorica-config/src/store/adcs_authority.rs` (test fixture),
+`docs/stories/story-12.1-stream-model.md`.
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1265,3 +1327,4 @@ suite holding a `Backend` literal),
 | 2026-11-14 | 0.2 | Open questions resolved and folded in (control plane binds as routes, `enabled`, no `managed_by`, `node_shutdown`, dual-stack rule, Operator floor, constant cap, portless backends, 1.10.6 binary scenario to 12.12); allowlists rechecked against `4e864593`. Status Draft. | Romain G. |
 | 2026-11-14 | 0.3 | AC #6 amended: the control plane binds only streams with an empty selector; `binds_here` and `NodeRole` (D-8); the "this node" conflict rule and IV1 test rewritten for the control plane and two followers. Status Draft. | Romain G. |
 | 2026-11-14 | 0.4 | Lot 1 implemented: migrations 71 to 73, `Stream`, `HealthCheck`, `listen_ports`, the stream store, the attachment rule on every management write, reserved ports on `cluster_nodes` and in `AppState`, every construction site. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.5 | Lot 2 implemented: `CANONICAL_FORMAT_VERSION` 3 with streams and stream links in the blob, the per-recipient cut of streams and their backends, the whole-snapshot attachment check in `prepare_replica`, the apply and the import on the unchecked writers, streams in TOML export, import and diff, IV1 in the `cluster` shape. Status InProgress. | Romain G. |

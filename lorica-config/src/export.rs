@@ -34,6 +34,11 @@ pub struct ExportData {
     pub backends: Vec<Backend>,
     /// All rows of the `route_backends` join table.
     pub route_backends: Vec<RouteBackend>,
+    /// All rows of the `streams` table (Story 12.1), `[[streams]]` in
+    /// the TOML. A stream carries no secret, so nothing is redacted.
+    pub streams: Vec<Stream>,
+    /// All rows of the `stream_backends` join table.
+    pub stream_backends: Vec<StreamBackend>,
     /// All rows of the `certificates` table (private keys redacted).
     pub certificates: Vec<Certificate>,
     /// All rows of `notification_configs`. Channel-specific secrets
@@ -145,6 +150,8 @@ pub fn export_to_toml(store: &ConfigStore) -> Result<String> {
         routes: store.list_routes()?,
         backends: store.list_backends()?,
         route_backends: store.list_route_backends()?,
+        streams: store.list_streams()?,
+        stream_backends: store.list_stream_backends()?,
         certificates,
         notification_configs,
         user_preferences: store.list_user_preferences()?,
