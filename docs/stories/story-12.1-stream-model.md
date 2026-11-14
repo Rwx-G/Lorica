@@ -801,25 +801,25 @@ and `selector_roster` to `pub(crate)`, nothing else),
 `lorica-api/src/config.rs`, `lorica-api/openapi.yaml` (stream paths and
 schemas).
 
-- [ ] Handlers per D-10 with `create_stream_as`, `update_stream_as`,
+- [x] Handlers per D-10 with `create_stream_as`, `update_stream_as`,
       `delete_stream_as`; validation through `Stream::validate()`, the
       roster check of `validate_node_selector`, `validate_group_name`,
       backend existence, and the store's attachment rule.
-- [ ] The port-conflict check (D-5): map `state.cluster` to a
+- [x] The port-conflict check (D-5): map `state.cluster` to a
       `NodeRole` (D-8); assemble `NodePorts` from `list_cluster_nodes()`
       (active rows) on a control plane, plus this node when
       `binds_here` holds for the candidate; call `stream_port_conflicts`
       with every other stored stream, disabled ones included; `409` with
       the node and the object named. Run inside the store closure that
       writes, so two concurrent creates cannot both pass.
-- [ ] `server.rs` routes with the `routes_cud` body and rate-limit
+- [x] `server.rs` routes with the `routes_cud` body and rate-limit
       layers; the `required_role` table test pinning Viewer reads and
       Operator writes.
-- [ ] `import_config`: the D-9 port check before `import_to_store`.
-- [ ] `openapi.yaml`: the five operations, `Stream`, `StreamResponse`,
+- [x] `import_config`: the D-9 port check before `import_to_store`.
+- [x] `openapi.yaml`: the five operations, `Stream`, `StreamResponse`,
       `CreateStreamRequest`, `UpdateStreamRequest`, the error codes;
       `openapi_spec_matches_routes` green.
-- [ ] Tests listed under Dev Notes, Lot 5.
+- [x] Tests listed under Dev Notes, Lot 5.
 
 ### Lot 6: documentation (last; no cargo)
 
@@ -1178,13 +1178,92 @@ the per-commit guard. Story 12.12's file must list this scenario by name.
 - Lot 4, first `lorica-api` run: the empty-path refusal test asserted
   the message started with the field name; the error envelope prefixes
   it, so the test checks that it contains the sentence instead.
+- Lot 5, the stream id rule: every Lot 1 and Lot 2 fixture built
+  stream ids such as `s-1`, which the new id check in
+  `Stream::validate` refuses wherever the store, the replica apply or
+  the import write them. `sample_stream` now derives a canonical id
+  from its label (`sample_stream_id`), and the tests that name a stream
+  by id read it through the same helper.
 
 ### Completion Notes
 
 Lot 1 (schema, models, store, shared rules, shape changes) and Lot 2
-(replication, cut, export, import, diff) are done, and Lot 4 (the
-typed health check on every surface); Lots 3, 5 and 6 are handled
-separately.
+(replication, cut, export, import, diff) are done, Lot 4 (the typed
+health check on every surface), and Lot 5 (the stream management API
+and the conflict checks); Lots 3 and 6 are handled separately.
+
+Lot 5:
+
+- Endpoints, in `lorica-api/src/streams.rs`: `GET /api/v1/streams`,
+  `POST /api/v1/streams`, `GET`, `PUT` and `DELETE /api/v1/streams/{id}`,
+  with `create_stream_as`, `update_stream_as` and `delete_stream_as`.
+  No rule in `required_role`: reads fall on the Viewer default, writes
+  on the Operator fall-through, pinned by
+  `streams_have_the_route_floors` against the route twins. Writes take
+  the route body cap and the route write budget in a bucket of their
+  own, `streams_cud`.
+- The `409` of a port conflict is `ApiError::Coded` with
+  `error.code` `stream_port_conflict` (`STREAM_PORT_CONFLICT_CODE`), so
+  a client tells it from the follower read-only `409` (`conflict`)
+  without reading the message. The message names the stream, then
+  carries the `PortConflict` display, which names the node ("this
+  node", or the node by its roster name) and the object
+  (the reserved listener with its phrase and its name, the other stream
+  with its address, ports and protocol, or "has not reported its
+  reserved ports yet").
+- Status codes deviate from D-10's "validation 400" on purpose, to
+  follow the rule `ApiError::Unprocessable` documents for new handlers
+  and that the store already applies: a body that parses and breaks a
+  model rule is `422` (`Stream::validate`, a backend id naming no
+  backend, a taken name, the attachment rule, and Axum's own refusal of
+  an unknown field, a hostname as listen address or an unknown
+  protocol). The two route validators the stream reuses unchanged,
+  `validate_group_name` and `validate_node_selector`, still answer
+  `400`. Unknown id `404`, port conflict `409`.
+- The check (D-5) is `first_port_conflict`, run inside the store
+  closure that writes, before the write: this node with
+  `AppState.reserved_ports` when `binds_here_when_enabled` holds for
+  its role, then on a control plane every `Active` roster row the
+  candidate's selector targets through `SelectorResolution` (built
+  from every row, as the replication cut builds it), each as
+  `NodeRole::Follower` with its persisted reserved ports. A revoked or
+  pending row is not checked. Every other stored stream is passed, the
+  disabled ones included; `stream_port_conflicts` skips the
+  candidate's own row by id and judges each node's streams by its role.
+- Update semantics: an absent field keeps its value; `port_first`
+  without `port_last` makes the stream a single port, so moving a
+  single-port stream never turns it into a range; `port_last` alone
+  moves the end of a range; `backend_ids` replaces the set. The new
+  links are written before the row in one transaction, so the
+  attachment rule judges the row as written against the links as they
+  will stand.
+- `StreamResponse` is built field by field and serialises
+  `listen_address` as `IpAddr` (its canonical text). The view test
+  compares its key set with the model's serialised key set minus
+  `STREAM_WITHHELD_FIELDS` (empty) plus `backend_ids`.
+- Import (D-9): `import_config` runs `first_port_conflict` on every
+  imported stream against the other imported streams, inside the store
+  closure, before `import_to_store` clears anything. The nodes are
+  assembled as for an API write, so on a control plane an import is
+  also checked on the enrolled nodes its streams target, which D-9
+  leaves out and AC #7 asks for. The preview does not run it.
+- The stream id rule (decided by the orchestrator, outside D-1):
+  `Stream::validate` refuses an id that is not a UUID in its canonical
+  lowercase hyphenated form (`is_canonical_stream_id`,
+  `STREAM_ID_LEN = 36`), so an id arriving by replication or by file is
+  held to the form the API mints (`Uuid::new_v4().to_string()`). The
+  refusal shows the id debug-quoted and cut. `lorica_worker::stream_ctl::MAX_STREAM_ID_LEN`
+  can drop from 64 to `STREAM_ID_LEN`; that file belongs to Story 12.2
+  and is not edited here.
+- OpenAPI: a `Streams` tag, the five operations, `StreamProtocol`,
+  `StreamResponse`, `CreateStreamRequest`, `UpdateStreamRequest` and a
+  `StreamConflict` response; no separate `Stream` schema, since the API
+  never answers the model itself. `/config/import` gains its `409`.
+- Outside the allowlist: `lorica-config/src/models/mod.rs` (the
+  re-export of the id rule and of the test helper), the Lot 1 and Lot 2
+  test fixtures of `lorica-config/src/{canonical,diff,import}.rs` and
+  `lorica-config/src/store/{replica,streams}.rs`, and the one stream
+  fixture of `lorica-api/src/backends.rs`, all for the id rule.
 
 Lot 2:
 
@@ -1391,6 +1470,18 @@ Lot 4, modified: `lorica/src/health.rs`, `lorica-api/src/backends.rs`,
 `lorica-dashboard/frontend/src/routes/Backends.test.ts`,
 `docs/stories/story-12.1-stream-model.md`.
 
+Lot 5, new: `lorica-api/src/streams.rs`, `lorica-api/src/streams/tests.rs`.
+
+Lot 5, modified: `lorica-api/src/lib.rs`, `lorica-api/src/server.rs`
+(routes), `lorica-api/src/middleware/authorize.rs` (table test),
+`lorica-api/src/routes/crud.rs` (two visibilities),
+`lorica-api/src/config.rs`, `lorica-api/openapi.yaml` (stream paths and
+schemas, the import `409`), `lorica-config/src/models/{stream,mod}.rs`
+(the id rule), the id fixtures of
+`lorica-config/src/{canonical,diff,import}.rs`,
+`lorica-config/src/store/{replica,streams}.rs` and
+`lorica-api/src/backends.rs`, `docs/stories/story-12.1-stream-model.md`.
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1401,3 +1492,4 @@ Lot 4, modified: `lorica/src/health.rs`, `lorica-api/src/backends.rs`,
 | 2026-11-14 | 0.4 | Lot 1 implemented: migrations 71 to 73, `Stream`, `HealthCheck`, `listen_ports`, the stream store, the attachment rule on every management write, reserved ports on `cluster_nodes` and in `AppState`, every construction site. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.5 | Lot 2 implemented: `CANONICAL_FORMAT_VERSION` 3 with streams and stream links in the blob, the per-recipient cut of streams and their backends, the whole-snapshot attachment check in `prepare_replica`, the apply and the import on the unchecked writers, streams in TOML export, import and diff, IV1 in the `cluster` shape. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.6 | Lot 4 implemented: the typed health check on every surface (health loop through `probe_for`, management API with both shapes and the disagreement refusal, redaction of the typed path, MCP backend fields, both OpenAPI documents with `health_check_path` deprecated, dashboard form and `api.ts`). Status InProgress. | Romain G. |
+| 2026-11-14 | 0.7 | Lot 5 implemented: the stream management API (CRUD at the route floors, audit, `streams_cud` budget), the per-node port check with its `stream_port_conflict` 409 on every write and on import, IV2 automated, and stream ids held to the canonical UUID form in `Stream::validate`. Status InProgress. | Romain G. |
