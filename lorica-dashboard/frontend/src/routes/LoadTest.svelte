@@ -662,8 +662,6 @@
 
   /* Config table extras */
   tr.selected td { background: var(--color-primary-subtle); }
-  .link-btn { background: none; border: none; color: var(--color-primary); font-weight: 600; cursor: pointer; font-size: var(--text-md); padding: 0; text-align: left; transition: color var(--transition-fast); }
-  .link-btn:hover { text-decoration: underline; }
   .btn-small { padding: var(--space-1) 0.625rem; border-radius: var(--radius-md); font-size: var(--text-base); font-weight: 500; border: 1px solid var(--color-border); background: transparent; color: var(--color-text); cursor: pointer; transition: background-color var(--transition-fast); }
   .btn-run { border-color: var(--color-green); color: var(--color-green); }
   .btn-run:hover { background: var(--color-green-subtle); }

@@ -367,6 +367,23 @@ tbody tr:hover td {
   color: var(--color-red);
 }
 
+/* A table cell's name that opens its detail view */
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--color-primary);
+  font-weight: 600;
+  font-size: var(--text-md);
+  text-align: left;
+  cursor: pointer;
+  transition: color var(--transition-fast);
+}
+
+.link-btn:hover {
+  text-decoration: underline;
+}
+
 /* Modals */
 .overlay {
   position: fixed;
