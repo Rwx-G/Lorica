@@ -351,7 +351,7 @@ pub fn import_from_file(store: &ConfigStore, path: &Path) -> Result<Vec<String>>
 mod tests {
     use super::*;
     use crate::export::export_to_toml;
-    use crate::models::{sample_stream, sample_stream_backend};
+    use crate::models::{sample_stream, sample_stream_backend, sample_stream_id as sid};
 
     /// A store holding a TCP single-port stream and a disabled UDP range
     /// stream pinned to `edge-1`, each with its own backend.
@@ -373,10 +373,10 @@ mod tests {
         game.node_selector = vec!["edge-1".to_string()];
         store.create_stream(&game).expect("test setup: stream");
         store
-            .set_stream_backends("s-smtp", &["b-smtp".to_string()])
+            .set_stream_backends(&sid("s-smtp"), &["b-smtp".to_string()])
             .expect("test setup: link");
         store
-            .set_stream_backends("s-game", &["b-game".to_string()])
+            .set_stream_backends(&sid("s-game"), &["b-game".to_string()])
             .expect("test setup: link");
         store
     }
@@ -441,7 +441,7 @@ mod tests {
     #[test]
     fn a_file_sharing_a_udp_backend_is_refused_before_the_store_is_cleared() {
         // The UDP stream's backend, also on the TCP stream of the file.
-        let edited = with_link(&store_with_streams(), "s-smtp", "b-game");
+        let edited = with_link(&store_with_streams(), &sid("s-smtp"), "b-game");
 
         let err = parse_toml(&edited).expect_err("refused at parse");
         assert!(err.to_string().contains("`game`"), "{err}");
@@ -460,7 +460,8 @@ mod tests {
         let store = store_with_streams();
         let err = parse_toml(&with_link(&store, "s-ghost", "b-smtp")).expect_err("unknown stream");
         assert!(err.to_string().contains("s-ghost"), "{err}");
-        let err = parse_toml(&with_link(&store, "s-smtp", "b-ghost")).expect_err("unknown backend");
+        let err =
+            parse_toml(&with_link(&store, &sid("s-smtp"), "b-ghost")).expect_err("unknown backend");
         assert!(err.to_string().contains("b-ghost"), "{err}");
     }
 
@@ -475,6 +476,16 @@ mod tests {
         let widened = toml_text.replace("port_last = 27015", "port_last = 29000");
         assert_ne!(widened, toml_text, "test setup: the range is on the file");
         let err = parse_toml(&widened).expect_err("a range above the cap");
-        assert!(err.to_string().contains("s-game"), "{err}");
+        assert!(err.to_string().contains(&sid("s-game")), "{err}");
+    }
+
+    #[test]
+    fn a_file_carrying_a_non_canonical_stream_id_is_refused() {
+        let toml_text = export_to_toml(&store_with_streams()).expect("export");
+        let upper = sid("s-game").to_uppercase();
+        let respelled = toml_text.replace(&sid("s-game"), &upper);
+        assert_ne!(respelled, toml_text, "test setup: the id is on the file");
+        let err = parse_toml(&respelled).expect_err("not the minted form");
+        assert!(err.to_string().contains("stream id"), "{err}");
     }
 }

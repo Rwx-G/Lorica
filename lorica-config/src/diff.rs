@@ -401,7 +401,7 @@ mod tests {
     use super::*;
     use crate::export::export_to_toml;
     use crate::import::parse_toml_for_preview;
-    use crate::models::{sample_stream, sample_stream_backend};
+    use crate::models::{sample_stream, sample_stream_backend, sample_stream_id as sid};
 
     #[test]
     fn compute_diff_reports_an_added_a_changed_and_a_removed_stream() {
@@ -415,7 +415,7 @@ mod tests {
                 .expect("test setup: stream");
         }
         store
-            .set_stream_backends("s-kept", &["b-1".to_string()])
+            .set_stream_backends(&sid("s-kept"), &["b-1".to_string()])
             .expect("test setup: link");
         let unchanged = parse_toml_for_preview(&export_to_toml(&store).expect("export"))
             .expect("the export parses");
@@ -425,11 +425,11 @@ mod tests {
         );
 
         let mut incoming = unchanged;
-        incoming.streams.retain(|s| s.id != "s-gone");
+        incoming.streams.retain(|s| s.id != sid("s-gone"));
         let kept = incoming
             .streams
             .iter_mut()
-            .find(|s| s.id == "s-kept")
+            .find(|s| s.id == sid("s-kept"))
             .expect("test setup: the kept stream");
         kept.enabled = false;
         kept.updated_at = chrono::Utc::now();
@@ -439,10 +439,19 @@ mod tests {
         incoming.stream_backends.clear();
 
         let diff = compute_diff(&store, &incoming).expect("diff");
-        assert_eq!(diff.streams.added, vec!["imap (s-new)"]);
-        assert_eq!(diff.streams.modified, vec!["smtp (s-kept)"]);
-        assert_eq!(diff.streams.removed, vec!["submission (s-gone)"]);
-        assert_eq!(diff.stream_backends.removed, vec!["s-kept -> b-1"]);
+        assert_eq!(diff.streams.added, vec![format!("imap ({})", sid("s-new"))]);
+        assert_eq!(
+            diff.streams.modified,
+            vec![format!("smtp ({})", sid("s-kept"))]
+        );
+        assert_eq!(
+            diff.streams.removed,
+            vec![format!("submission ({})", sid("s-gone"))]
+        );
+        assert_eq!(
+            diff.stream_backends.removed,
+            vec![format!("{} -> b-1", sid("s-kept"))]
+        );
         assert!(!diff.is_empty());
     }
 

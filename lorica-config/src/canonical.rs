@@ -1326,7 +1326,7 @@ mod tests {
     fn a_stream_is_cut_by_its_selector_with_its_links_and_its_backends() {
         let cut = restrict_for_recipient(&fleet_config(), "id-b", &resolution());
         let streams: Vec<&str> = cut.streams.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(streams, vec!["s-b"]);
+        assert_eq!(streams, vec![crate::models::sample_stream_id("s-b")]);
         assert!(
             !cut.streams[0].enabled,
             "a disabled stream is cut like an enabled one"

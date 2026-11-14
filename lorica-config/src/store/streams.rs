@@ -282,7 +282,7 @@ impl ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{sample_stream, sample_stream_backend};
+    use crate::models::{sample_stream, sample_stream_backend, sample_stream_id as sid};
 
     fn store_with_backends(backends: &[(&str, &str)]) -> ConfigStore {
         let store = ConfigStore::open_in_memory().expect("test setup: store");
@@ -314,19 +314,19 @@ mod tests {
         s.listen_address = "2001:db8::53".parse().expect("test setup: address");
         s.node_selector = vec!["edge-1".to_string()];
         store.create_stream(&s).expect("create");
-        assert_eq!(store.get_stream("s-1").expect("get"), Some(s.clone()));
+        assert_eq!(store.get_stream(&sid("s-1")).expect("get"), Some(s.clone()));
 
         s.enabled = true;
         s.port_last = 54;
         s.name = "dns-pair".to_string();
         store.update_stream(&s).expect("update");
-        assert_eq!(store.get_stream("s-1").expect("get"), Some(s.clone()));
+        assert_eq!(store.get_stream(&sid("s-1")).expect("get"), Some(s.clone()));
         assert_eq!(store.list_streams().expect("list"), vec![s]);
 
-        store.delete_stream("s-1").expect("delete");
-        assert_eq!(store.get_stream("s-1").expect("get"), None);
+        store.delete_stream(&sid("s-1")).expect("delete");
+        assert_eq!(store.get_stream(&sid("s-1")).expect("get"), None);
         assert!(matches!(
-            store.delete_stream("s-1"),
+            store.delete_stream(&sid("s-1")),
             Err(ConfigError::NotFound(_))
         ));
         let ghost = sample_stream("nope", "ghost", StreamProtocol::Tcp, 1);
@@ -363,20 +363,22 @@ mod tests {
             .create_stream(&sample_stream("s-1", "smtp", StreamProtocol::Tcp, 25))
             .expect("create");
         store
-            .set_stream_backends("s-1", &["b-1".to_string()])
+            .set_stream_backends(&sid("s-1"), &["b-1".to_string()])
             .expect("first set");
         assert_eq!(
-            store.list_backends_for_stream("s-1").expect("links"),
+            store.list_backends_for_stream(&sid("s-1")).expect("links"),
             vec!["b-1"]
         );
         store
-            .set_stream_backends("s-1", &["b-2".to_string(), "b-1".to_string()])
+            .set_stream_backends(&sid("s-1"), &["b-2".to_string(), "b-1".to_string()])
             .expect("second set");
         assert_eq!(
-            store.list_backends_for_stream("s-1").expect("links"),
+            store.list_backends_for_stream(&sid("s-1")).expect("links"),
             vec!["b-1", "b-2"]
         );
-        store.set_stream_backends("s-1", &[]).expect("emptied");
+        store
+            .set_stream_backends(&sid("s-1"), &[])
+            .expect("emptied");
         assert!(store.list_stream_backends().expect("links").is_empty());
         assert!(matches!(
             store.set_stream_backends("ghost", &[]),
@@ -393,17 +395,17 @@ mod tests {
             .create_stream(&sample_stream("s-1", "dns", StreamProtocol::Udp, 53))
             .expect("create");
         store
-            .set_stream_backends("s-1", &["b-1".to_string()])
+            .set_stream_backends(&sid("s-1"), &["b-1".to_string()])
             .expect("first set");
         let err = store
-            .set_stream_backends("s-1", &["b-1".to_string(), "b-2".to_string()])
+            .set_stream_backends(&sid("s-1"), &["b-1".to_string(), "b-2".to_string()])
             .expect_err("b-2 serves a route");
         assert!(
             matches!(&err, ConfigError::Validation(m) if m.contains("`dns`")),
             "{err}"
         );
         assert_eq!(
-            store.list_backends_for_stream("s-1").expect("links"),
+            store.list_backends_for_stream(&sid("s-1")).expect("links"),
             vec!["b-1"]
         );
 
@@ -429,7 +431,7 @@ mod tests {
             .create_stream(&sample_stream("s-1", "dns", StreamProtocol::Udp, 53))
             .expect("create");
         store
-            .set_stream_backends("s-1", &["b-1".to_string()])
+            .set_stream_backends(&sid("s-1"), &["b-1".to_string()])
             .expect("link");
         let mut backend = store.get_backend("b-1").expect("get").expect("exists");
         backend.health_check_enabled = true;
@@ -454,7 +456,7 @@ mod tests {
         let mut s = sample_stream("s-1", "smtp", StreamProtocol::Tcp, 25);
         store.create_stream(&s).expect("create");
         store
-            .set_stream_backends("s-1", &["b-1".to_string()])
+            .set_stream_backends(&sid("s-1"), &["b-1".to_string()])
             .expect("link");
         s.port_last = 30;
         assert!(matches!(
@@ -463,7 +465,7 @@ mod tests {
         ));
         assert_eq!(
             store
-                .get_stream("s-1")
+                .get_stream(&sid("s-1"))
                 .expect("get")
                 .expect("exists")
                 .port_last,
@@ -488,7 +490,7 @@ mod tests {
         range.port_last = 27015;
         store.create_stream(&range).expect("create");
         store
-            .set_stream_backends("s-1", &["b-1".to_string()])
+            .set_stream_backends(&sid("s-1"), &["b-1".to_string()])
             .expect("a portless backend serves a range");
 
         insert_route(&store, "r-1", "app.example.com");
@@ -506,19 +508,19 @@ mod tests {
                 .create_stream(&sample_stream(id, name, StreamProtocol::Tcp, port))
                 .expect("create");
             store
-                .set_stream_backends(id, &["b-1".to_string(), "b-2".to_string()])
+                .set_stream_backends(&sid(id), &["b-1".to_string(), "b-2".to_string()])
                 .expect("link");
         }
-        store.delete_stream("s-1").expect("delete stream");
+        store.delete_stream(&sid("s-1")).expect("delete stream");
         assert_eq!(
             store.list_streams_for_backend("b-1").expect("links"),
-            vec!["s-2"]
+            vec![sid("s-2")]
         );
         store.delete_backend("b-1").expect("delete backend");
         assert_eq!(
             store.list_stream_backends().expect("links"),
             vec![StreamBackend {
-                stream_id: "s-2".to_string(),
+                stream_id: sid("s-2"),
                 backend_id: "b-2".to_string(),
             }]
         );
@@ -531,7 +533,7 @@ mod tests {
             .create_stream(&sample_stream("s-1", "smtp", StreamProtocol::Tcp, 25))
             .expect("create");
         store
-            .set_stream_backends("s-1", &["b-1".to_string()])
+            .set_stream_backends(&sid("s-1"), &["b-1".to_string()])
             .expect("link");
         store.clear_all().expect("clear");
         assert!(store.list_streams().expect("list").is_empty());
@@ -545,7 +547,7 @@ mod tests {
             .create_stream(&sample_stream("s-1", "dns", StreamProtocol::Udp, 53))
             .expect("create");
         store
-            .set_stream_backends("s-1", &["b-1".to_string()])
+            .set_stream_backends(&sid("s-1"), &["b-1".to_string()])
             .expect("link");
         insert_route(&store, "r-1", "app.example.com");
         let outcome: Result<()> = store.in_transaction(|s| {

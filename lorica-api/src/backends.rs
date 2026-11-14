@@ -999,7 +999,7 @@ mod tests {
             let store = node.state.store.lock().await;
             let now = chrono::Utc::now();
             let stream = lorica_config::models::Stream {
-                id: "s-1".to_string(),
+                id: uuid::Uuid::new_v4().to_string(),
                 name: "dns-udp".to_string(),
                 group_name: String::new(),
                 protocol: lorica_config::models::StreamProtocol::Udp,
@@ -1013,7 +1013,7 @@ mod tests {
             };
             store.create_stream(&stream).expect("the stream is stored");
             store
-                .set_stream_backends("s-1", std::slice::from_ref(&id))
+                .set_stream_backends(&stream.id, std::slice::from_ref(&id))
                 .expect("a backend with checks off may serve a UDP stream");
         }
 

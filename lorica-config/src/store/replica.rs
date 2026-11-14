@@ -796,7 +796,9 @@ mod tests {
 
     use super::*;
     use crate::canonical::{canonical_bytes, canonical_hash, CanonicalCaptureRule};
-    use crate::models::{binds_here, sample_stream, sample_stream_backend, NodeRole};
+    use crate::models::{
+        binds_here, sample_stream, sample_stream_backend, sample_stream_id as sid, NodeRole,
+    };
     use crate::models::{
         AutomationEnvironment, Backend, CaptureEmit, CaptureLimits, CaptureMatch, CaptureOutput,
         CaptureRedaction, CaptureRule, CaptureScope, CertExportAcl, CertificateMode, CustomCrawler,
@@ -1053,7 +1055,7 @@ mod tests {
         store.create_stream(&stream).expect("test setup: stream");
         store
             .set_stream_backends(
-                "stream-edge",
+                &sid("stream-edge"),
                 &["backend-2".to_string(), "backend-3".to_string()],
             )
             .expect("test setup: stream links");
@@ -1975,8 +1977,8 @@ mod tests {
             ids.sort();
             ids
         };
-        assert_eq!(ids(edge_1_payload), vec!["s-fleet", "s-targeted"]);
-        assert_eq!(ids(edge_2_payload), vec!["s-fleet"]);
+        assert_eq!(ids(edge_1_payload), vec![sid("s-fleet"), sid("s-targeted")]);
+        assert_eq!(ids(edge_2_payload), vec![sid("s-fleet")]);
         assert!(
             !edge_2_payload.backends.iter().any(|b| b.id == "b-pg"),
             "edge-2 never receives the targeted stream's upstream"
@@ -1985,7 +1987,7 @@ mod tests {
             !edge_2_payload
                 .stream_backends
                 .iter()
-                .any(|l| l.stream_id == "s-targeted"),
+                .any(|l| l.stream_id == sid("s-targeted")),
             "nor its link"
         );
         // A follower serving only streams still receives their backends,
@@ -1993,7 +1995,7 @@ mod tests {
         assert!(edge_1.get_backend("b-pg").expect("read").is_some());
         assert_eq!(
             edge_1
-                .list_backends_for_stream("s-targeted")
+                .list_backends_for_stream(&sid("s-targeted"))
                 .expect("links"),
             vec!["b-pg"]
         );
@@ -2023,7 +2025,10 @@ mod tests {
             vec!["dns"]
         );
         assert!(
-            edge_2.get_stream("s-targeted").expect("read").is_none(),
+            edge_2
+                .get_stream(&sid("s-targeted"))
+                .expect("read")
+                .is_none(),
             "edge-2 does not hold it either"
         );
     }
@@ -2058,7 +2063,7 @@ mod tests {
         }
         let (_, edge_1, _) = &disabled[0];
         let held = edge_1
-            .get_stream("s-targeted")
+            .get_stream(&sid("s-targeted"))
             .expect("read")
             .expect("edge-1 holds the disabled stream");
         assert!(!held.enabled);
@@ -2099,7 +2104,7 @@ mod tests {
             .create_stream(&sample_stream("s-dns", "dns", StreamProtocol::Udp, 53))
             .expect("test setup: stream");
         source
-            .set_stream_backends("s-dns", &["b-dns".to_string()])
+            .set_stream_backends(&sid("s-dns"), &["b-dns".to_string()])
             .expect("test setup: link");
         target
             .apply_replica(&prepared(&source).expect("prepare"), "edge-1", 1, "h1")
@@ -2111,7 +2116,7 @@ mod tests {
                 .as_array()
                 .expect("streams array")
                 .iter()
-                .position(|s| s["id"] == "s-dns")
+                .position(|s| s["id"] == sid("s-dns").as_str())
                 .expect("the UDP stream is in the blob")
         };
 
@@ -2122,14 +2127,20 @@ mod tests {
                 .expect("links array")
                 .push(serde_json::json!({"route_id": "route-fleet", "backend_id": "b-dns"}));
         });
-        assert!(message.contains("stream s-dns"), "{message}");
+        assert!(
+            message.contains(&format!("stream {}", sid("s-dns"))),
+            "{message}"
+        );
 
         // A stream whose selector breaks the route rule.
         let message = refusal_after(&blob, |root| {
             let i = index(root);
             root["streams"][i]["node_selector"] = serde_json::json!(["Not A Node Name"]);
         });
-        assert!(message.contains("stream s-dns"), "{message}");
+        assert!(
+            message.contains(&format!("stream {}", sid("s-dns"))),
+            "{message}"
+        );
 
         // A range one port wider than the cap.
         let message = refusal_after(&blob, |root| {
@@ -2137,7 +2148,24 @@ mod tests {
             root["streams"][i]["port_last"] =
                 serde_json::json!(53 + u32::from(crate::models::STREAM_PORT_RANGE_MAX));
         });
-        assert!(message.contains("stream s-dns"), "{message}");
+        assert!(
+            message.contains(&format!("stream {}", sid("s-dns"))),
+            "{message}"
+        );
+
+        // An id that is not a UUID in its canonical form, its link
+        // following it so only the id rule is broken.
+        let message = refusal_after(&blob, |root| {
+            let i = index(root);
+            let upper = sid("s-dns").to_uppercase();
+            root["streams"][i]["id"] = serde_json::json!(upper);
+            for link in root["stream_backends"].as_array_mut().expect("links") {
+                if link["stream_id"] == sid("s-dns").as_str() {
+                    link["stream_id"] = serde_json::json!(upper);
+                }
+            }
+        });
+        assert!(message.contains("stream id"), "{message}");
 
         assert_eq!(
             canonical_hash(&target).expect("post-refusal hash"),
@@ -2161,7 +2189,7 @@ mod tests {
             .create_stream(&sample_stream("s-dns", "dns", StreamProtocol::Udp, 53))
             .expect("test setup: stream");
         source
-            .set_stream_backends("s-dns", &["b-moving".to_string()])
+            .set_stream_backends(&sid("s-dns"), &["b-moving".to_string()])
             .expect("test setup: link");
         target
             .create_certificate(&make_certificate("cert-1", CERT_KEY))
@@ -2171,7 +2199,7 @@ mod tests {
             .expect("first apply");
 
         source
-            .set_stream_backends("s-dns", &[])
+            .set_stream_backends(&sid("s-dns"), &[])
             .expect("test setup: unlinked");
         source
             .link_route_backend("route-fleet", "b-moving")
@@ -2208,11 +2236,19 @@ mod tests {
             .apply_replica(&prepared(&source).expect("prepare"), "edge-1", 2, "h2")
             .expect("a swap of two UNIQUE names applies");
         assert_eq!(
-            target.get_stream("s-1").expect("read").expect("held").name,
+            target
+                .get_stream(&sid("s-1"))
+                .expect("read")
+                .expect("held")
+                .name,
             "beta"
         );
         assert_eq!(
-            target.get_stream("s-2").expect("read").expect("held").name,
+            target
+                .get_stream(&sid("s-2"))
+                .expect("read")
+                .expect("held")
+                .name,
             "alpha"
         );
         assert_eq!(

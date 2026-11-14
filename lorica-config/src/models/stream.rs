@@ -28,6 +28,23 @@ pub const STREAM_PORT_RANGE_MAX: u16 = 1024;
 /// The longest stream name, in bytes (the alphabet is ASCII).
 pub const STREAM_NAME_MAX_LEN: usize = 64;
 
+/// The length of a stream id, in bytes: a UUID in its canonical
+/// lowercase hyphenated form.
+pub const STREAM_ID_LEN: usize = 36;
+
+/// Whether `id` is a UUID in its canonical lowercase hyphenated form,
+/// the form the management API mints (`Uuid::new_v4().to_string()`).
+///
+/// An id is a key the data plane carries further than the database (the
+/// supervisor's stream control channel, log rows, metric labels), so an
+/// id arriving by import or replication is held to the form a server
+/// mints rather than to whatever a file or a blob spells. Any UUID
+/// version is accepted; only the spelling is fixed.
+pub fn is_canonical_stream_id(id: &str) -> bool {
+    id.len() == STREAM_ID_LEN
+        && uuid::Uuid::try_parse(id).is_ok_and(|parsed| parsed.hyphenated().to_string() == id)
+}
+
 /// The transport a stream listens on.
 #[derive(
     Debug,
@@ -68,7 +85,9 @@ impl StreamProtocol {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Stream {
-    /// Stable UUID; primary key of the `streams` table.
+    /// Stable UUID; primary key of the `streams` table. Always its
+    /// canonical text form, [`STREAM_ID_LEN`] bytes (see
+    /// [`is_canonical_stream_id`]).
     pub id: String,
     /// Unique fleet-wide; errors, audit rows, logs and metrics name the
     /// stream by it. ASCII lowercase letters, digits, `-` and `_`, the
@@ -133,16 +152,26 @@ impl Stream {
         self.node_selector.is_empty() || self.node_selector.iter().any(|n| n == node_name)
     }
 
-    /// The stream's own rules: name, group, listen address, ports, the
-    /// [`STREAM_PORT_RANGE_MAX`] cap and the selector rule shared with
-    /// routes. Which backends it may reach is
-    /// [`check_backend_attachments`]; which ports it may hold on a node
-    /// is `crate::listen_ports::stream_port_conflicts`.
+    /// The stream's own rules: id ([`is_canonical_stream_id`]), name,
+    /// group, listen address, ports, the [`STREAM_PORT_RANGE_MAX`] cap
+    /// and the selector rule shared with routes. Which backends it may
+    /// reach is [`check_backend_attachments`]; which ports it may hold
+    /// on a node is `crate::listen_ports::stream_port_conflicts`.
     ///
     /// # Errors
     ///
     /// A message naming the first violated rule, fit for a refusal body.
     pub fn validate(&self) -> Result<(), String> {
+        if !is_canonical_stream_id(&self.id) {
+            // Debug-quoted and cut: the value came from a file or a blob,
+            // and a refusal body is no place for its control characters
+            // or its whole length.
+            let shown: String = self.id.chars().take(STREAM_ID_LEN + 1).collect();
+            return Err(format!(
+                "stream id {shown:?} is not a UUID in canonical lowercase hyphenated form \
+                 ({STREAM_ID_LEN} characters)"
+            ));
+        }
         if self.name.is_empty() || self.name.len() > STREAM_NAME_MAX_LEN {
             return Err(format!(
                 "stream name must be 1..={STREAM_NAME_MAX_LEN} characters long"
@@ -636,10 +665,32 @@ pub(crate) mod tests {
             .with_timezone(&Utc)
     }
 
-    /// A valid enabled fleet-wide TCP stream on `0.0.0.0:port`.
-    pub(crate) fn stream(id: &str, name: &str, protocol: StreamProtocol, port: u16) -> Stream {
+    /// The canonical stream id a test names `label`: the label's bytes
+    /// in hex, right-padded with zeros, so ids sort as their labels do
+    /// and a failure still shows which fixture it is (`s-1` is
+    /// `732d3100-0000-...`). At most 16 bytes of label.
+    pub(crate) fn stream_id(label: &str) -> String {
+        assert!(
+            !label.is_empty() && label.len() <= 16,
+            "test setup: a stream id label is 1 to 16 bytes, got {label:?}"
+        );
+        let hex: String = label.bytes().map(|b| format!("{b:02x}")).collect();
+        let digits = format!("{hex:0<32}");
+        format!(
+            "{}-{}-{}-{}-{}",
+            &digits[0..8],
+            &digits[8..12],
+            &digits[12..16],
+            &digits[16..20],
+            &digits[20..32]
+        )
+    }
+
+    /// A valid enabled fleet-wide stream on `0.0.0.0:port`, whose id is
+    /// [`stream_id`] of `label`.
+    pub(crate) fn stream(label: &str, name: &str, protocol: StreamProtocol, port: u16) -> Stream {
         Stream {
-            id: id.to_string(),
+            id: stream_id(label),
             name: name.to_string(),
             group_name: String::new(),
             protocol,
@@ -686,6 +737,56 @@ pub(crate) mod tests {
     }
 
     // ---- Stream::validate ----
+
+    #[test]
+    fn a_minted_id_is_canonical_and_every_other_spelling_is_refused() {
+        let mut s = stream("s", "dns", StreamProtocol::Udp, 53);
+        for _ in 0..32 {
+            s.id = uuid::Uuid::new_v4().to_string();
+            assert_eq!(s.id.len(), STREAM_ID_LEN);
+            assert!(s.validate().is_ok(), "{}", s.id);
+        }
+        let minted = uuid::Uuid::new_v4();
+        let refused = [
+            String::new(),
+            "s-1".to_string(),
+            minted.hyphenated().to_string().to_uppercase(),
+            minted.simple().to_string(),
+            minted.braced().to_string(),
+            minted.urn().to_string(),
+            format!(" {minted}"),
+            format!("{minted}\n"),
+            format!("{minted}0"),
+            minted.hyphenated().to_string().replacen('-', "_", 1),
+            "g".repeat(STREAM_ID_LEN),
+        ];
+        for id in refused {
+            s.id = id.clone();
+            let err = s.validate().expect_err("not the minted form");
+            assert!(err.contains("stream id"), "{id:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_refused_id_is_shown_quoted_and_cut() {
+        let mut s = stream("s", "dns", StreamProtocol::Udp, 53);
+        s.id = format!("bad\u{1b}[31m{}", "x".repeat(4096));
+        let err = s.validate().expect_err("refused");
+        assert!(!err.contains('\u{1b}'), "{err}");
+        assert!(err.len() < 200, "{err}");
+    }
+
+    #[test]
+    fn the_test_ids_are_canonical_and_keep_their_labels_order() {
+        let labels = ["a", "s", "s-1", "s-10", "s-2", "stream-edge", "u"];
+        let ids: Vec<String> = labels.iter().map(|l| stream_id(l)).collect();
+        for id in &ids {
+            assert!(is_canonical_stream_id(id), "{id}");
+        }
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(sorted, ids);
+    }
 
     #[test]
     fn port_zero_and_inverted_ranges_are_refused() {
