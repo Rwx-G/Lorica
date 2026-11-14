@@ -506,6 +506,7 @@ type BlockType =
   | 'stream'
   | 'stream_server'
   | 'stream_upstream'
+  | 'mail'
   | 'other';
 
 interface BlockFrame {
@@ -642,9 +643,10 @@ function parseDirectiveString(stmt: string): [string, string] {
  *
  * `server` and `upstream` blocks inside `stream {}` are TCP/UDP listeners,
  * not HTTP virtual hosts: they go to `streamServers` / `streamUpstreams` and
- * each stream server yields a "not imported" warning. Everywhere else they
- * are read as HTTP, so a snippet pasted without its `http {}` wrapper parses
- * the same as a wrapped one.
+ * each stream server yields a "not imported" warning. Everything inside
+ * `mail {}` is skipped, with one warning per mail `server`: Lorica does not
+ * proxy mail. Everywhere else `server` and `upstream` are read as HTTP, so a
+ * snippet pasted without its `http {}` wrapper parses the same as a wrapped one.
  *
  * @param text - Raw Nginx configuration text
  * @returns Parsed result with HTTP and stream blocks, and diagnostics
@@ -771,8 +773,19 @@ export function parseNginxConfig(text: string): NginxParseResult {
       if (statements[k + 1] === '{') {
         k++;
         const inStream = blockStack.some(f => f.type === 'stream');
+        const inMail = blockStack.some(f => f.type === 'mail');
 
-        if (inStream && nameLower === 'server') {
+        if (inMail) {
+          // Everything inside mail {} is skipped; only its servers are reported.
+          if (nameLower === 'server') {
+            diagnostics.push({
+              level: 'warning',
+              line: effectiveLine,
+              message: 'Mail server block was not imported: Lorica does not proxy mail.',
+            });
+          }
+          blockStack.push({ type: 'other', name: nameLower, startLine: effectiveLine });
+        } else if (inStream && nameLower === 'server') {
           currentStreamServer = { listen: [], proxyPass: null, directives: [], line: effectiveLine };
           blockStack.push({ type: 'stream_server', name: '', startLine: effectiveLine });
         } else if (inStream && nameLower === 'upstream') {
@@ -805,13 +818,12 @@ export function parseNginxConfig(text: string): NginxParseResult {
           });
           blockStack.push({ type: 'other', name: nameLower, startLine: effectiveLine });
         } else {
-          // Any other block (http, stream, events, limit_except, map, ...):
+          // Any other block (http, stream, mail, events, limit_except, map, ...):
           // its directives are not imported, but it still closes where it should.
-          blockStack.push({
-            type: nameLower === 'stream' ? 'stream' : 'other',
-            name: nameLower,
-            startLine: effectiveLine,
-          });
+          let type: BlockType = 'other';
+          if (nameLower === 'stream') type = 'stream';
+          else if (nameLower === 'mail') type = 'mail';
+          blockStack.push({ type, name: nameLower, startLine: effectiveLine });
         }
         continue;
       }

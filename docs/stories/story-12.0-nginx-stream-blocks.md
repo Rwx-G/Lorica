@@ -44,11 +44,13 @@ These are the PRD's, unchanged. They are the contract.
   - [x] Flip the AC #1 tests to `it`; add the IV1 test, a test on the stream-shaped results and the diagnostic, and a test on an unknown block nested in a `location` (AC #1, #2, #3, IV1)
   - [x] Existing tests untouched and passing (AC #5)
   - [x] Frontend gates: `npm run check`, `npm run lint`, `npx vitest run`
+- [x] Follow-up commit: `mail {}` context (servers and nested blocks skipped, one warning per mail `server`), tests, `CHANGELOG.md` `[Unreleased]` > Fixed entry
 
 ## Dev Notes
 
 - Statements come from `splitStatements`, which emits `{` and `}` as their own tokens. A multi-line opener (`server` on one line, `{` on the next) is joined into one line by the continuation accumulator before splitting, because a line with no `;` and no brace is held as pending. So an opener and its `{` are always adjacent in the same statement list, which is what the lookahead relies on. The one shape that escapes it, an opener after a `;` on the same line with its `{` on the next (`listen 80; location /` then `{`), reads the opener as a directive and gives the `{` an anonymous frame: that block's content is lost, but the braces stay balanced (read from the code, not covered by a test).
-- Only `stream` context is distinguished. A `server` block anywhere outside `stream {}` keeps today's HTTP reading, so configurations pasted without an `http {}` wrapper (the common case, and every existing test) parse exactly as before. `mail {}` servers are out of this story's scope.
+- Two contexts are distinguished, `stream` and `mail`. A `server` block anywhere outside them keeps today's HTTP reading, so configurations pasted without an `http {}` wrapper (the common case, and every existing test) parse exactly as before.
+- Decision (orchestrator, same cycle): `mail {}` gets its own context because it has the same defect as `stream {}`: a mail server on 443 or with `ssl` was read as HTTP and could become a route. Everything inside `mail {}` is skipped, nested blocks included, and each mail `server` yields one `warning` on its opening line saying it was not imported because Lorica does not proxy mail. There are no mail result types: no later story consumes them.
 - Stream results are kept on `NginxParseResult` as two extra arrays and never touch `servers` / `upstreams`, so `convertToLoricaRoutes` and the wizard (`Step2Analysis.svelte` counts `servers` and `upstreams`) need no change and cannot see them. An HTTP `proxy_pass` naming a stream-only upstream therefore does not resolve to its servers, which is correct.
 - The warning carries the stream server's opening line in its `line` field, which the wizard renders as `L<n>` next to the message.
 
@@ -58,6 +60,7 @@ These are the PRD's, unchanged. They are the contract.
 
 - 2026-11-14, commit A (`31f08922`): the three AC #1 cases as `it.fails`; Vitest reported them as 3 expected failures, every other test green.
 - 2026-11-14, commit B: the fix; the three cases flipped to `it`, four tests added. Gates run in `node:22` with `pnpm install --frozen-lockfile` (no lockfile or `package.json` change): `npm run check` 0 errors, `npm run lint` clean, `npx vitest run` 45 files / 801 tests passed.
+- 2026-11-14, commit B (`f4fbcd73`) recorded. Follow-up commit: `mail {}` context and three tests (mail server skipped with one warning, no route for a mail server on 443 with `ssl`, IV1 inputs plus a `mail {}` block give the same HTTP routes); the IV1 inputs moved to file scope so both IV1 tests share them. CHANGELOG entry added.
 
 ### Completion Notes
 
@@ -71,6 +74,7 @@ These are the PRD's, unchanged. They are the contract.
 - `lorica-dashboard/frontend/src/lib/nginx-parser.ts` (modified)
 - `lorica-dashboard/frontend/src/lib/nginx-parser.test.ts` (modified)
 - `docs/stories/story-12.0-nginx-stream-blocks.md` (created)
+- `CHANGELOG.md` (modified)
 
 ## Change Log
 
@@ -79,3 +83,4 @@ These are the PRD's, unchanged. They are the contract.
 | 2026-11-14 | 0.1 | Story drafted from the Epic 12 PRD. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.2 | AC #1 failing cases committed as expected failures. | Romain G. |
 | 2026-11-14 | 0.3 | Fix implemented, tests flipped and added, gates green. Status Review. | Romain G. |
+| 2026-11-14 | 0.4 | `mail {}` servers kept out of the HTTP import with a warning; CHANGELOG entry. Status Review. | Romain G. |

@@ -15,6 +15,8 @@ Author: Rwx-G
 
 ### Fixed
 
+- **The nginx importer reads `stream {}` and `mail {}` blocks as what they are.** A `server` or `upstream` was taken for HTTP wherever it stood, so a TLS passthrough (`stream { server { listen 443; ssl_preread on; proxy_pass tls; } }`) was imported as an HTTP route with an empty hostname pointing at the passthrough's backends, and a mail server on 443 could become a route the same way. Servers inside `stream {}` and `mail {}` are no longer imported: each gets a warning on its line saying so, in place of the "non-standard port" hint a stream listener used to get. Any block the importer does not know now closes where it should, so an `http {}` or `stream {}` wrapper no longer reports "Unexpected closing brace", and a block nested in a `location`, such as `limit_except`, no longer ends the location early and moves its remaining directives to the server.
+
 ### Removed
 
 ### Security

@@ -367,6 +367,59 @@ server {
   });
 });
 
+const HTTP_SITES = `
+upstream app {
+    server 10.0.0.20:3000;
+    server 10.0.0.21:3000;
+}
+server {
+    listen 80;
+    server_name app.example.com;
+    return 301 https://app.example.com$request_uri;
+}
+server {
+    listen 443 ssl;
+    server_name app.example.com;
+    location / {
+        proxy_pass http://app;
+    }
+    location /api {
+        proxy_pass http://127.0.0.1:4000;
+    }
+}
+server {
+    listen 80;
+    server_name static.example.com;
+    proxy_pass http://127.0.0.1:8081;
+}
+`;
+
+const MIXED_HTTP_STREAM = `
+events {
+    worker_connections 1024;
+}
+http {
+${HTTP_SITES}
+}
+stream {
+    upstream tls {
+        server 10.0.0.40:443;
+    }
+    upstream db {
+        server 10.0.0.10:5432;
+    }
+    server {
+        listen 443;
+        ssl_preread on;
+        proxy_pass tls;
+    }
+    server {
+        listen 5432;
+        proxy_pass db;
+    }
+}
+`;
+
 describe('stream {} blocks', () => {
   const TLS_PASSTHROUGH = `
 stream {
@@ -478,59 +531,8 @@ server {
   });
 
   it('IV1: a mixed http {} + stream {} config imports the same HTTP routes and no stream route', () => {
-    const httpSites = `
-upstream app {
-    server 10.0.0.20:3000;
-    server 10.0.0.21:3000;
-}
-server {
-    listen 80;
-    server_name app.example.com;
-    return 301 https://app.example.com$request_uri;
-}
-server {
-    listen 443 ssl;
-    server_name app.example.com;
-    location / {
-        proxy_pass http://app;
-    }
-    location /api {
-        proxy_pass http://127.0.0.1:4000;
-    }
-}
-server {
-    listen 80;
-    server_name static.example.com;
-    proxy_pass http://127.0.0.1:8081;
-}
-`;
-    const mixed = `
-events {
-    worker_connections 1024;
-}
-http {
-${httpSites}
-}
-stream {
-    upstream tls {
-        server 10.0.0.40:443;
-    }
-    upstream db {
-        server 10.0.0.10:5432;
-    }
-    server {
-        listen 443;
-        ssl_preread on;
-        proxy_pass tls;
-    }
-    server {
-        listen 5432;
-        proxy_pass db;
-    }
-}
-`;
-    const routesBefore = convertToLoricaRoutes(parseNginxConfig(httpSites));
-    const parsed = parseNginxConfig(mixed);
+    const routesBefore = convertToLoricaRoutes(parseNginxConfig(HTTP_SITES));
+    const parsed = parseNginxConfig(MIXED_HTTP_STREAM);
     const routes = convertToLoricaRoutes(parsed);
 
     expect(routesBefore.map(r => r.hostname).sort()).toEqual(['app.example.com', 'static.example.com']);
@@ -541,6 +543,46 @@ stream {
       d => d.level === 'warning' && d.message.includes('not imported')
     );
     expect(notImported.map(d => d.line)).toEqual(parsed.streamServers.map(s => s.line));
+    expect(parsed.diagnostics.filter(d => d.level === 'error')).toHaveLength(0);
+  });
+});
+
+describe('mail {} blocks', () => {
+  const MAIL = `
+mail {
+    server_name mail.example.com;
+    auth_http 127.0.0.1:9000/auth;
+    server {
+        listen 443 ssl;
+        protocol imap;
+        proxy on;
+    }
+}
+`;
+
+  it('parseNginxConfig (parser layer): a mail server is skipped with one warning and no HTTP server', () => {
+    const parsed = parseNginxConfig(MAIL);
+
+    expect(parsed.servers).toHaveLength(0);
+    expect(parsed.streamServers).toHaveLength(0);
+    expect(parsed.diagnostics).toHaveLength(1);
+    expect(parsed.diagnostics[0].level).toBe('warning');
+    expect(parsed.diagnostics[0].line).toBe(5);
+    expect(parsed.diagnostics[0].message).toContain('not imported');
+    expect(parsed.diagnostics[0].message).toContain('mail');
+  });
+
+  it('convertToLoricaRoutes (conversion layer): a mail server on 443 with ssl yields no route', () => {
+    expect(convertToLoricaRoutes(parseNginxConfig(MAIL))).toHaveLength(0);
+  });
+
+  it('IV1 with mail: a mixed http {} + stream {} + mail {} config imports the same HTTP routes', () => {
+    const routesBefore = convertToLoricaRoutes(parseNginxConfig(HTTP_SITES));
+    const parsed = parseNginxConfig(MIXED_HTTP_STREAM + MAIL);
+
+    expect(convertToLoricaRoutes(parsed)).toEqual(routesBefore);
+    expect(parsed.streamServers).toHaveLength(2);
+    expect(parsed.diagnostics.filter(d => d.level === 'warning' && d.message.includes('not imported'))).toHaveLength(3);
     expect(parsed.diagnostics.filter(d => d.level === 'error')).toHaveLength(0);
   });
 });
