@@ -32,7 +32,9 @@
 //! A refused message is answered with a `nack`: `unknown_binding` for a
 //! `detach` of a binding it does not hold, `shutting_down` for an
 //! `attach` after a quiesce, `adopt_failed` when a socket cannot be
-//! adopted (the whole `attach` is then dropped and its sockets closed).
+//! adopted (the whole `attach` is then dropped and its sockets closed),
+//! `table_unavailable` for a `refresh` whose table load failed (the
+//! previous table is kept and nothing is drained).
 //!
 //! A `detach` is acknowledged only once its sockets are closed, so the
 //! port is free in this worker when the supervisor reads the `ack`.
@@ -387,7 +389,10 @@ impl StreamRuntime {
         if !self.reload_table() {
             // Nothing to drain against: the previous table is kept and
             // the next `refresh` retries the load.
-            return StreamCtlMsg::Ack { seq, count: 0 };
+            return StreamCtlMsg::Nack {
+                seq,
+                reason: NackReason::TableUnavailable,
+            };
         }
         let table = self.table.current();
         let deadline = Instant::now() + drain_duration(drain_ms);

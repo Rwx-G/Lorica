@@ -129,6 +129,9 @@ pub enum NackReason {
     AdoptFailed,
     /// The worker is quiesced and takes no new binding.
     ShuttingDown,
+    /// A `refresh` could not load the stream table; the worker keeps
+    /// serving the previous one and drained nothing.
+    TableUnavailable,
 }
 
 impl NackReason {
@@ -139,6 +142,7 @@ impl NackReason {
             NackReason::UnknownBinding => "unknown_binding",
             NackReason::AdoptFailed => "adopt_failed",
             NackReason::ShuttingDown => "shutting_down",
+            NackReason::TableUnavailable => "table_unavailable",
         }
     }
 
@@ -148,6 +152,7 @@ impl NackReason {
             "unknown_binding" => Some(NackReason::UnknownBinding),
             "adopt_failed" => Some(NackReason::AdoptFailed),
             "shutting_down" => Some(NackReason::ShuttingDown),
+            "table_unavailable" => Some(NackReason::TableUnavailable),
             _ => None,
         }
     }
@@ -356,9 +361,16 @@ impl StreamCtlMsg {
     }
 }
 
-/// A stream id the channel carries: non-empty, at most
+/// Whether the channel can carry `id`: non-empty, at most
 /// [`MAX_STREAM_ID_LEN`] bytes, printable ASCII without spaces.
-fn check_stream_id(id: &str) -> Result<(), &'static str> {
+///
+/// The one rule both ends apply, public so the supervisor can refuse a
+/// binding it could never attach before binding a socket for it.
+///
+/// # Errors
+///
+/// The reason the id cannot be carried.
+pub fn check_stream_id(id: &str) -> Result<(), &'static str> {
     if id.is_empty() || id.len() > MAX_STREAM_ID_LEN {
         return Err("stream id length out of range");
     }
@@ -535,6 +547,7 @@ mod tests {
             NackReason::UnknownBinding,
             NackReason::AdoptFailed,
             NackReason::ShuttingDown,
+            NackReason::TableUnavailable,
         ] {
             match roundtrip(StreamCtlMsg::Nack { seq: 5, reason }) {
                 StreamCtlMsg::Nack { seq: 5, reason: r } => assert_eq!(r, reason),

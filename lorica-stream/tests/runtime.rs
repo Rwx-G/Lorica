@@ -594,3 +594,33 @@ async fn two_runtimes_sharing_a_udp_group_each_receive_only_their_slot() {
         handle.stop();
     }
 }
+
+/// A source whose store cannot be read.
+struct Unreadable;
+
+impl StreamTableSource for Unreadable {
+    fn load(&self) -> Result<StreamTable, Box<dyn std::error::Error + Send + Sync>> {
+        Err("store unreadable".into())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_that_cannot_load_the_table_is_refused() {
+    let (mut peer, transport) = ControlTransport::in_process_pair(8);
+    let handle = StreamRuntime::spawn(transport, Engines::default(), Arc::new(Unreadable)).unwrap();
+    peer.to_runtime
+        .send(StreamCtlMsg::Refresh {
+            seq: 4,
+            drain_ms: 0,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        answer(&mut peer).await,
+        StreamCtlMsg::Nack {
+            seq: 4,
+            reason: NackReason::TableUnavailable
+        }
+    ));
+    handle.stop();
+}
