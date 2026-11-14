@@ -1,5 +1,67 @@
+<script module lang="ts">
+  import type { ProxyProtocolMode, UpdateSettingsRequest } from '../../lib/api';
+  import { validateCidr } from '../../lib/validators';
+
+  /** The form's three PROXY protocol fields; the list is one entry per line. */
+  export interface ProxyProtocolForm {
+    proxy_protocol_http: ProxyProtocolMode;
+    proxy_protocol_https: ProxyProtocolMode;
+    proxy_protocol_trusted_cidrs: string;
+  }
+
+  function lines(text: string): string[] {
+    return text.split('\n').map((s) => s.trim()).filter((s) => s.length > 0);
+  }
+
+  /**
+   * The settings write's PROXY protocol fields. All three always ride,
+   * since the server judges the mode and the list together on the merged
+   * result.
+   */
+  export function proxyProtocolPayload(
+    form: ProxyProtocolForm,
+  ): Required<Pick<UpdateSettingsRequest, 'proxy_protocol_http' | 'proxy_protocol_https' | 'proxy_protocol_trusted_cidrs'>> {
+    return {
+      proxy_protocol_http: form.proxy_protocol_http,
+      proxy_protocol_https: form.proxy_protocol_https,
+      proxy_protocol_trusted_cidrs: lines(form.proxy_protocol_trusted_cidrs),
+    };
+  }
+
+  /**
+   * The server's PROXY protocol rules (`validate_proxy_protocol` in
+   * `lorica-config`), mirrored so the form says what the save would be
+   * refused for; the server stays the authority. Every entry parses, no
+   * entry is a `/0` (trusting every address to name its own client is no
+   * trust check at all), and a listener mode other than off needs a
+   * trusted entry, or no peer could ever send a header.
+   */
+  export function proxyProtocolError(form: ProxyProtocolForm): string | null {
+    const entries = lines(form.proxy_protocol_trusted_cidrs);
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      const invalid = validateCidr(entry);
+      if (invalid) return `line ${i + 1} (${entry}): ${invalid}`;
+      if (/\/0+$/.test(entry)) {
+        return `line ${i + 1} (${entry}) trusts every address to name its own client; list the load balancers that send the header`;
+      }
+    }
+    if (entries.length > 0) return null;
+    const modes: [string, ProxyProtocolMode][] = [
+      ['HTTP', form.proxy_protocol_http],
+      ['HTTPS', form.proxy_protocol_https],
+    ];
+    for (const [listener, mode] of modes) {
+      if (mode !== 'off') {
+        return `the ${listener} listener is ${mode} but no peer is trusted: no peer could send a PROXY header; list the load balancers first, or set it to off`;
+      }
+    }
+    return null;
+  }
+</script>
+
 <script lang="ts">
-  import { integerInRange, settingsBound, validateCidr } from '../../lib/validators';
+  import { integerInRange, settingsBound } from '../../lib/validators';
   import { isSuperAdmin } from '../../lib/auth';
   import type { SettingsSchemaResponse } from '../../lib/api';
 
@@ -14,7 +76,7 @@
     return null;
   }
 
-  interface NetworkFormShape {
+  interface NetworkFormShape extends ProxyProtocolForm {
     trusted_proxies: string;
     connection_deny_cidrs: string;
     connection_allow_cidrs: string;
@@ -70,6 +132,11 @@
   function checkAllowCidrs() { allowCidrsErr = cidrListErr(settingsForm.connection_allow_cidrs); }
   let automationCidrsErr = $state<string | null>(null);
   function checkAutomationCidrs() { automationCidrsErr = cidrListErr(settingsForm.automation_allowed_cidrs); }
+  // Derived rather than checked on an event: the rule spans three
+  // fields, and a mode switched on is as much a cause as a list emptied.
+  // The stored values passed the same rule server-side, so a freshly
+  // loaded form shows nothing.
+  const proxyProtocolErr = $derived(proxyProtocolError(settingsForm));
 
   // Defense-in-depth numeric bounds (Story 8.9). Empty is treated
   // as "unset"; the connection limit and the audit retention accept 0
@@ -180,6 +247,63 @@
           open at all while this is empty. Matching happens on the connection,
           at TCP accept, before the TLS handshake, so a source outside the list
           never reaches the bearer check.
+        </span>
+      </div>
+
+      <h3>PROXY protocol</h3>
+      <p class="section-hint">
+        Take the client address from a PROXY protocol header (v1 or v2) that a
+        layer-4 load balancer in front of this node sends ahead of each
+        connection. Node-local: never replicated, so each node is set on its
+        own (a follower before it enrolls, or inside a break-glass window).
+        Changes apply to connections accepted after the save.
+      </p>
+      <p class="section-hint">
+        Not the same as Trusted Proxies above: those are HTTP proxies whose
+        <code>X-Forwarded-For</code> is believed. Use PROXY protocol when the
+        balancer passes TCP through (TLS included) and cannot add a header;
+        a connection whose address came from a PROXY header never has its
+        <code>X-Forwarded-For</code> read.
+      </p>
+
+      <div class="settings-form-row">
+        <label for="proxy-protocol-http">HTTP listener</label>
+        <select id="proxy-protocol-http" bind:value={settingsForm.proxy_protocol_http}>
+          <option value="off">off</option>
+          <option value="required">required</option>
+          <option value="optional">optional</option>
+        </select>
+      </div>
+
+      <div class="settings-form-row">
+        <label for="proxy-protocol-https">HTTPS listener</label>
+        <select id="proxy-protocol-https" bind:value={settingsForm.proxy_protocol_https}>
+          <option value="off">off</option>
+          <option value="required">required</option>
+          <option value="optional">optional</option>
+        </select>
+        <span class="hint">
+          <code>required</code>: a trusted peer must send a header, or its
+          connection is closed. <code>optional</code>: a trusted peer that
+          sends none (a load balancer health check) is served on its own
+          address. A peer outside the list below is always a direct client,
+          and a header from it closes the connection.
+        </span>
+      </div>
+
+      <div class="settings-form-row">
+        <label for="proxy-protocol-cidrs">PROXY Protocol Trusted Peers (CIDR)</label>
+        <textarea
+          id="proxy-protocol-cidrs"
+          rows="3"
+          bind:value={settingsForm.proxy_protocol_trusted_cidrs}
+          placeholder="10.0.0.0/24&#10;192.0.2.10"
+        ></textarea>
+        {#if proxyProtocolErr}<span class="field-error" role="alert">{proxyProtocolErr}</span>{/if}
+        <span class="hint">
+          One IP or CIDR per line: the load balancers that send the header.
+          A <code>/0</code> is refused, and so is an empty list while either
+          listener is not off.
         </span>
       </div>
 

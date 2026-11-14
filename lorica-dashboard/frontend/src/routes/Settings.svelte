@@ -8,13 +8,14 @@
     type SecurityHeaderPreset,
     type DnsProviderResponse,
     type SettingsSchemaResponse,
+    type ProxyProtocolMode,
   } from '../lib/api';
   import { showToast } from '../lib/toast';
   import SettingsDnsProviders from '../components/settings/SettingsDnsProviders.svelte';
   import SettingsNotifications from '../components/settings/SettingsNotifications.svelte';
   import AppearanceTab from '../components/settings-tabs/AppearanceTab.svelte';
   import GlobalConfigTab from '../components/settings-tabs/GlobalConfigTab.svelte';
-  import NetworkTab from '../components/settings-tabs/NetworkTab.svelte';
+  import NetworkTab, { proxyProtocolPayload } from '../components/settings-tabs/NetworkTab.svelte';
   import ObservabilityTab from '../components/settings-tabs/ObservabilityTab.svelte';
   import LogExportTab from '../components/settings-tabs/LogExportTab.svelte';
   import SecurityPresetsTab from '../components/settings-tabs/SecurityPresetsTab.svelte';
@@ -64,6 +65,10 @@
     loadtest_max_duration_s: 60,
     loadtest_max_rps: 1000,
     trusted_proxies: '',
+    // PROXY protocol (Story 12.8). The list is held one entry per line.
+    proxy_protocol_http: 'off' as ProxyProtocolMode,
+    proxy_protocol_https: 'off' as ProxyProtocolMode,
+    proxy_protocol_trusted_cidrs: '',
     waf_whitelist_ips: '',
     connection_deny_cidrs: '',
     connection_allow_cidrs: '',
@@ -209,6 +214,7 @@
       settingsForm = {
         ...settingsRes.data,
         trusted_proxies: (settingsRes.data.trusted_proxies ?? []).join('\n'),
+        proxy_protocol_trusted_cidrs: (settingsRes.data.proxy_protocol_trusted_cidrs ?? []).join('\n'),
         waf_whitelist_ips: (settingsRes.data.waf_whitelist_ips ?? []).join('\n'),
         connection_deny_cidrs: (settingsRes.data.connection_deny_cidrs ?? []).join('\n'),
         connection_allow_cidrs: (settingsRes.data.connection_allow_cidrs ?? []).join('\n'),
@@ -333,6 +339,7 @@
         .split('\n')
         .map((s: string) => s.trim())
         .filter((s: string) => s.length > 0),
+      ...proxyProtocolPayload(settingsForm),
       waf_whitelist_ips: settingsForm.waf_whitelist_ips
         .split('\n')
         .map((s: string) => s.trim())
@@ -398,6 +405,7 @@
       settingsForm = {
         ...res.data,
         trusted_proxies: (res.data.trusted_proxies ?? []).join('\n'),
+        proxy_protocol_trusted_cidrs: (res.data.proxy_protocol_trusted_cidrs ?? []).join('\n'),
         waf_whitelist_ips: (res.data.waf_whitelist_ips ?? []).join('\n'),
         connection_deny_cidrs: (res.data.connection_deny_cidrs ?? []).join('\n'),
         connection_allow_cidrs: (res.data.connection_allow_cidrs ?? []).join('\n'),

@@ -1,8 +1,9 @@
 import { render, screen, fireEvent } from '@testing-library/svelte';
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import type { ComponentProps } from 'svelte';
 
-import NetworkTab from './NetworkTab.svelte';
+import NetworkTab, { proxyProtocolError, proxyProtocolPayload } from './NetworkTab.svelte';
+import { auth } from '../../lib/auth';
 import { reactive } from '../../test-reactive.svelte';
 
 type TabProps = ComponentProps<typeof NetworkTab>;
@@ -14,8 +15,11 @@ const FIELD_LABEL = 'Automation Listener Allowed CIDRs';
 /// proxy: a plain object makes the component's writes through the
 /// binding unobservable and Svelte warns `binding_property_non_reactive`.
 function form(overrides: Partial<FormShape> = {}): FormShape {
-  return reactive({
+  return reactive<FormShape>({
     trusted_proxies: '',
+    proxy_protocol_http: 'off',
+    proxy_protocol_https: 'off',
+    proxy_protocol_trusted_cidrs: '',
     connection_deny_cidrs: '',
     connection_allow_cidrs: '',
     automation_allowed_cidrs: '',
@@ -101,6 +105,119 @@ describe('NetworkTab automation allowlist', () => {
     expect(screen.queryAllByRole('alert')).not.toHaveLength(0);
     await fireEvent.input(field, { target: { value: '192.0.2.0/24' } });
     expect(screen.queryAllByRole('alert')).toHaveLength(0);
+  });
+});
+
+const HTTP_MODE = 'HTTP listener';
+const HTTPS_MODE = 'HTTPS listener';
+const PEERS = 'PROXY Protocol Trusted Peers (CIDR)';
+
+function proxyAlert(): string | null {
+  const row = screen.getByLabelText(PEERS).parentElement as HTMLElement;
+  return row.querySelector('[role="alert"]')?.textContent ?? null;
+}
+
+describe('NetworkTab PROXY protocol', () => {
+  afterEach(() => {
+    auth.set({ status: 'unauthenticated' });
+  });
+
+  it('renders the stored values', () => {
+    render(NetworkTab, {
+      props: props({
+        settingsForm: form({
+          proxy_protocol_http: 'optional',
+          proxy_protocol_https: 'required',
+          proxy_protocol_trusted_cidrs: '10.0.0.0/24\n192.0.2.10',
+        }),
+      }),
+    });
+    expect((screen.getByLabelText(HTTP_MODE) as HTMLSelectElement).value).toBe('optional');
+    expect((screen.getByLabelText(HTTPS_MODE) as HTMLSelectElement).value).toBe('required');
+    expect((screen.getByLabelText(PEERS) as HTMLTextAreaElement).value).toBe('10.0.0.0/24\n192.0.2.10');
+    expect(proxyAlert()).toBeNull();
+  });
+
+  it('says the values are node-local and not trusted proxies', () => {
+    render(NetworkTab, { props: props() });
+    const text = (document.body.textContent ?? '').replace(/\s+/g, ' ');
+    expect(text).toContain('Node-local: never replicated');
+    expect(text).toContain('Not the same as Trusted Proxies');
+    expect(text).toContain('apply to connections accepted after the save');
+  });
+
+  it('sends the three fields, the list as one entry per line', async () => {
+    auth.set({ status: 'authenticated', username: 'admin', role: 'super_admin' });
+    const settingsForm = form();
+    const onSave = vi.fn();
+    render(NetworkTab, { props: props({ settingsForm, onSave }) });
+    await fireEvent.input(screen.getByLabelText(PEERS), { target: { value: ' 10.0.0.0/24 \n\n192.0.2.10\n' } });
+    await fireEvent.change(screen.getByLabelText(HTTP_MODE), { target: { value: 'optional' } });
+    await fireEvent.change(screen.getByLabelText(HTTPS_MODE), { target: { value: 'required' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Save Network Settings' }));
+
+    expect(onSave).toHaveBeenCalledOnce();
+    expect(proxyProtocolPayload(settingsForm)).toEqual({
+      proxy_protocol_http: 'optional',
+      proxy_protocol_https: 'required',
+      proxy_protocol_trusted_cidrs: ['10.0.0.0/24', '192.0.2.10'],
+    });
+  });
+
+  it('sends an emptied list as an empty array, so clearing it reaches the server', () => {
+    expect(
+      proxyProtocolPayload({ proxy_protocol_http: 'off', proxy_protocol_https: 'off', proxy_protocol_trusted_cidrs: '  \n' }),
+    ).toEqual({ proxy_protocol_http: 'off', proxy_protocol_https: 'off', proxy_protocol_trusted_cidrs: [] });
+  });
+
+  it('shows the server refusal as returned', () => {
+    const refusal =
+      'proxy_protocol_https is required but proxy_protocol_trusted_cidrs is empty: no peer could send a PROXY header; list the load balancers first, or set proxy_protocol_https to off';
+    render(NetworkTab, { props: props({ settingsError: refusal }) });
+    expect(screen.getByText(refusal)).toBeInTheDocument();
+  });
+
+  it.each(['0.0.0.0/0', '10.0.0.0/0', '::/0', '2001:db8::/0'])('refuses %s, which trusts every address', async (entry) => {
+    render(NetworkTab, { props: props() });
+    await fireEvent.input(screen.getByLabelText(PEERS), { target: { value: `10.0.0.0/24\n${entry}` } });
+    expect(proxyAlert()).toContain(`line 2 (${entry}) trusts every address`);
+  });
+
+  it('accepts a bare address, which is a host prefix and not a /0', async () => {
+    render(NetworkTab, { props: props() });
+    await fireEvent.input(screen.getByLabelText(PEERS), { target: { value: '192.0.2.10\n2001:db8::1' } });
+    expect(proxyAlert()).toBeNull();
+  });
+
+  it('reports a malformed entry by line, like the other address lists', async () => {
+    render(NetworkTab, { props: props() });
+    await fireEvent.input(screen.getByLabelText(PEERS), { target: { value: '10.0.0.0/24\nnot-a-cidr' } });
+    expect(proxyAlert()).toContain('line 2 (not-a-cidr)');
+  });
+
+  it('refuses a listener mode switched on while nobody is trusted', async () => {
+    render(NetworkTab, { props: props() });
+    await fireEvent.change(screen.getByLabelText(HTTPS_MODE), { target: { value: 'required' } });
+    expect(proxyAlert()).toContain('the HTTPS listener is required but no peer is trusted');
+    await fireEvent.input(screen.getByLabelText(PEERS), { target: { value: '10.0.0.0/24' } });
+    expect(proxyAlert()).toBeNull();
+  });
+
+  it('refuses clearing the list while a mode is on', async () => {
+    render(NetworkTab, {
+      props: props({
+        settingsForm: form({ proxy_protocol_http: 'optional', proxy_protocol_trusted_cidrs: '10.0.0.0/24' }),
+      }),
+    });
+    expect(proxyAlert()).toBeNull();
+    await fireEvent.input(screen.getByLabelText(PEERS), { target: { value: '' } });
+    expect(proxyAlert()).toContain('the HTTP listener is optional but no peer is trusted');
+  });
+
+  it('accepts both modes off with an empty list, the default', () => {
+    expect(
+      proxyProtocolError({ proxy_protocol_http: 'off', proxy_protocol_https: 'off', proxy_protocol_trusted_cidrs: '' }),
+    ).toBeNull();
   });
 });
 

@@ -998,6 +998,14 @@ export interface SecurityHeaderPreset {
   headers: Record<string, string>;
 }
 
+/**
+ * Whether a listener reads a PROXY protocol header from the trusted
+ * peers (Story 12.8): `required` closes a trusted peer that sends none,
+ * `optional` serves it on its socket address (load balancer health
+ * checks).
+ */
+export type ProxyProtocolMode = 'off' | 'required' | 'optional';
+
 export interface GlobalSettingsResponse {
   management_port: number;
   log_level: string;
@@ -1035,6 +1043,11 @@ export interface GlobalSettingsResponse {
   loadtest_max_rps: number;
   custom_security_presets?: SecurityHeaderPreset[];
   trusted_proxies: string[];
+  // PROXY protocol on the HTTP and HTTPS listeners (Story 12.8).
+  // Node-local, never replicated.
+  proxy_protocol_http: ProxyProtocolMode;
+  proxy_protocol_https: ProxyProtocolMode;
+  proxy_protocol_trusted_cidrs: string[];
   waf_whitelist_ips: string[];
   connection_deny_cidrs: string[];
   connection_allow_cidrs: string[];
@@ -1120,6 +1133,11 @@ export interface UpdateSettingsRequest {
   loadtest_max_rps?: number;
   custom_security_presets?: SecurityHeaderPreset[];
   trusted_proxies?: string[];
+  // The server refuses a `/0` in the list, and a mode other than off
+  // while the list is empty, on the merged settings.
+  proxy_protocol_http?: ProxyProtocolMode;
+  proxy_protocol_https?: ProxyProtocolMode;
+  proxy_protocol_trusted_cidrs?: string[];
   waf_whitelist_ips?: string[];
   connection_deny_cidrs?: string[];
   connection_allow_cidrs?: string[];

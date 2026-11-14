@@ -755,9 +755,9 @@ Allowlist: `lorica-dashboard/frontend/src/components/settings-tabs/NetworkTab.sv
 save payload is built there).
 Depends on: C1.
 
-- [ ] The section of D-m, with the same CIDR input and error display as
+- [x] The section of D-m, with the same CIDR input and error display as
       "Trusted proxies"; the API's 422 messages shown as returned.
-- [ ] Tests: renders the stored values; sends the three fields; shows a
+- [x] Tests: renders the stored values; sends the three fields; shows a
       refusal.
 
 ### Lot F: documentation - no cargo
@@ -956,6 +956,11 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
   `every_cidr_bearing_setting_is_enumerated` and
   `every_global_setting_is_explicitly_routed` included.
 
+- **Lot E gates.** In `node:22` with `CI=true` and `pnpm install
+  --frozen-lockfile` on a throwaway `node_modules` volume: `pnpm run
+  check` (0 errors, 0 warnings), `pnpm run lint`, `vitest run` (49
+  files, 866 tests). No lockfile or `package.json` change.
+
 ### Completion Notes
 
 - **Lot 0** (`fix(ci)`): the gap was real; see the Debug Log.
@@ -1085,6 +1090,34 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
   "used by import" of the task). The node-local list in the
   `CanonicalGlobalSettings` doc comment is left as it was: the Lot
   allowlists the routing destructure only.
+- **Lot E** (`feat(ui)`): the Network tab gains a "PROXY protocol"
+  subsection after the proxy trust and connection filter rows: two
+  selects (`HTTP listener`, `HTTPS listener`, `off` / `required` /
+  `optional`) and a "PROXY Protocol Trusted Peers (CIDR)" textarea, one
+  entry per line, with the same per-line error display as "Trusted
+  Proxies". Its text says the values are node-local (a follower is set
+  before enrollment or in a break-glass window), apply to connections
+  accepted after the save, and are not trusted proxies, with one line on
+  when to use which.
+- Client-side, `proxyProtocolError` (exported from the tab's module
+  script) mirrors `validate_proxy_protocol`: each entry parses, no `/0`
+  of either family, and no mode other than off with an empty list. It
+  is a `$derived` over the three fields rather than an input handler,
+  since a mode switched on is as much a cause as a list emptied. The
+  server stays the authority: its refusal (a `400`, from the merged
+  settings, as Lot C1 built it, not the `422` the task sketched) is
+  shown as returned through the tab's existing settings error line.
+- The save: `proxyProtocolPayload` (same module script) turns the form
+  into the three request fields, the list split by line, and
+  `Settings.svelte` spreads it into the `PUT /api/v1/settings` body; all
+  three always ride, so an emptied list reaches the server as `[]`.
+  `api.ts` gains `ProxyProtocolMode` and the fields on the settings read
+  and write types.
+- The save button stays gated on `isSuperAdmin`, which is false on a
+  follower outside a break-glass window, the only time a follower may
+  take the node-local write (Resolved 2).
+- Not visually checked: no browser here. The Network tab's new
+  subsection needs a look in both themes.
 
 ## File List
 
@@ -1117,6 +1150,9 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 - `lorica-api/src/settings.rs` (Lot C1: `UpdateSettingsRequest`, the handler)
 - `lorica-api/openapi.yaml` (Lot C1: the `PUT /api/v1/settings` body)
 - `lorica-api/src/tests.rs` (Lot C1)
+- `lorica-dashboard/frontend/src/components/settings-tabs/NetworkTab.svelte`, `lorica-dashboard/frontend/src/components/settings-tabs/NetworkTab.test.ts` (Lot E: the PROXY protocol section, its validation and payload)
+- `lorica-dashboard/frontend/src/lib/api.ts` (Lot E: `ProxyProtocolMode`, the three settings fields)
+- `lorica-dashboard/frontend/src/routes/Settings.svelte` (Lot E: the form fields and the save payload)
 
 ## Change Log
 
@@ -1128,3 +1164,4 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 | 2026-11-14 | 0.4 | Lot A: the PROXY protocol parser in `lorica-core`, its fuzz target and its `FORK.md` entry. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.5 | Lot B: PROXY protocol accept in the forked listener, the reordered connection filter, `SocketDigest::proxied_from`, the `FORK.md` entry and the #81 sentence. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.6 | Lot C1: the three node-local PROXY protocol settings, their validation at the API and at import, the OpenAPI entry. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.7 | Lot E: the PROXY protocol section of the dashboard's Network tab, the server's rules mirrored client-side, the three fields in the settings save. Status InProgress. | Romain G. |
