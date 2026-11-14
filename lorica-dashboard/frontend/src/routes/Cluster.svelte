@@ -288,6 +288,12 @@
     }
   }
 
+  const STATUS_BADGE: Record<ClusterNodeResponse['status'], string> = {
+    active: 'badge-green',
+    pending: 'badge-orange',
+    revoked: 'badge-gray',
+  };
+
   // The server forms this verdict; the page shows it. Recomputing it
   // here is what made the pill disagree with `/cluster/drift`
   // (backlog #71).
@@ -387,12 +393,12 @@
                 {n.name}
               </button>
             </td>
-            <td><span class="pill pill-{n.status}">{n.status}</span></td>
+            <td><span class="badge {STATUS_BADGE[n.status]}">{n.status}</span></td>
             <td>
               {#if n.connected}
-                <span class="pill pill-ok">connected</span>
+                <span class="badge badge-green">connected</span>
               {:else}
-                <span class="pill pill-off">offline</span>
+                <span class="badge badge-gray">offline</span>
               {/if}
             </td>
             <td>{n.version || '-'}</td>
@@ -400,7 +406,7 @@
             <td>
               {n.applied_config_generation}
               {#if driftedFrom(n)}
-                <span class="pill pill-warn" title="Behind the control plane's generation">
+                <span class="badge badge-orange" title="Behind the control plane's generation">
                   drift
                 </span>
               {/if}
@@ -427,7 +433,7 @@
       <dt>Node id</dt>
       <dd class="mono">{node.node_id}</dd>
       <dt>Status</dt>
-      <dd><span class="pill pill-{node.status}">{node.status}</span></dd>
+      <dd><span class="badge {STATUS_BADGE[node.status]}">{node.status}</span></dd>
       <dt>Session</dt>
       <dd>{node.connected ? (node.session_peer ?? 'connected') : 'not connected'}</dd>
       <dt>Version</dt>
@@ -916,28 +922,6 @@
   .row:hover {
     background: var(--color-bg-hover);
   }
-  .pill {
-    display: inline-block;
-    padding: 0.1rem 0.45rem;
-    border-radius: 999px;
-    font-size: 0.75rem;
-    border: 1px solid var(--color-border);
-  }
-  .pill-active,
-  .pill-ok {
-    background: #dcfce7;
-    color: #166534;
-  }
-  .pill-pending,
-  .pill-warn {
-    background: #fef3c7;
-    color: #92400e;
-  }
-  .pill-revoked,
-  .pill-off {
-    background: #f3f4f6;
-    color: #4b5563;
-  }
   .mono {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 0.85rem;
@@ -1018,8 +1002,14 @@
     left: 0;
     right: 0;
     padding: 0.6rem 1rem;
-    background: var(--warning, #b45309);
-    color: #fff;
+    /* Fixed over the page, so the tint is laid on an opaque surface:
+       the subtle token alone is translucent and the content under it
+       would show through the text. */
+    background:
+      linear-gradient(var(--color-orange-subtle), var(--color-orange-subtle)),
+      var(--color-bg-elevated);
+    border-top: 2px solid var(--color-orange);
+    color: var(--color-text-heading);
     text-align: center;
   }
 </style>
