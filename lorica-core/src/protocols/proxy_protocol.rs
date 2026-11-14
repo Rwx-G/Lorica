@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Lorica: a sans-IO parser for the PROXY protocol, versions 1 and 2.
+//! Lorica: a sans-IO parser and encoder for the PROXY protocol, versions
+//! 1 and 2.
 //!
 //! This module does not exist upstream: it is an additive Lorica-only file
 //! of the fork (`FORK.md`, "Lorica divergences in forked crates"), which an
@@ -35,6 +36,12 @@
 //! TLV contents are not interpreted, and `PP2_TYPE_CRC32C` is not checked:
 //! the TLVs stay reachable through [`Header::tlvs`] for a consumer that
 //! needs them.
+//!
+//! The encoder (Story 12.3) writes what a sender puts on a backend
+//! connection: [`encode_v1`], [`encode_v2`], [`encode_v2_dgram`] for a
+//! UDP flow, and the address-less [`encode_v1_unknown`] and
+//! [`encode_v2_unspec`]. No TLV is written. Every header it encodes parses
+//! back through [`parse`] to the same addresses, canonicalised.
 //!
 //! Specification: <https://www.haproxy.org/download/3.0/doc/proxy-protocol.txt>
 
@@ -555,6 +562,132 @@ fn validate_tlvs(mut area: &[u8]) -> Result<(), ParseError> {
     Ok(())
 }
 
+/// Encodes a v1 header for a TCP connection from `source` to
+/// `destination`: `PROXY TCP4 ...` or `PROXY TCP6 ...`, CRLF-terminated,
+/// at most [`V1_MAX_LEN`] bytes.
+///
+/// Both addresses are canonicalised first, so an IPv4-mapped IPv6
+/// address is written as the IPv4 address it carries. When the two
+/// families still differ, a v1 line cannot carry them and the header is
+/// [`encode_v1_unknown`]'s: the receiver then uses the socket's own
+/// addresses, which is what the specification has `UNKNOWN` mean.
+///
+/// # Example
+///
+/// ```
+/// use lorica_core::protocols::proxy_protocol::{encode_v1, parse, Addresses, Parsed};
+///
+/// let source = "192.0.2.10:51000".parse().unwrap();
+/// let destination = "198.51.100.1:443".parse().unwrap();
+/// let wire = encode_v1(source, destination);
+/// assert_eq!(wire, b"PROXY TCP4 192.0.2.10 198.51.100.1 51000 443\r\n");
+/// let Ok(Parsed::Complete { header, consumed }) = parse(&wire) else {
+///     panic!("an encoded header parses");
+/// };
+/// assert_eq!(consumed, wire.len());
+/// assert_eq!(header.addresses, Addresses::Tcp { source, destination });
+/// ```
+pub fn encode_v1(source: SocketAddr, destination: SocketAddr) -> Vec<u8> {
+    let (source, destination) = (canonical(source), canonical(destination));
+    let family = match (source.ip(), destination.ip()) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => "TCP4",
+        (IpAddr::V6(_), IpAddr::V6(_)) => "TCP6",
+        _ => return encode_v1_unknown(),
+    };
+    format!(
+        "PROXY {family} {} {} {} {}\r\n",
+        source.ip(),
+        destination.ip(),
+        source.port(),
+        destination.port()
+    )
+    .into_bytes()
+}
+
+/// Encodes the v1 header that carries no address, `PROXY UNKNOWN`: the
+/// receiver uses the socket's own addresses.
+pub fn encode_v1_unknown() -> Vec<u8> {
+    b"PROXY UNKNOWN\r\n".to_vec()
+}
+
+/// Encodes a v2 header for a TCP connection from `source` to
+/// `destination`: command `PROXY`, transport `STREAM` over `AF_INET` or
+/// `AF_INET6`, no TLV.
+///
+/// The addresses are canonicalised as [`encode_v1`] does, and when the
+/// families still differ the header is [`encode_v2_unspec`]'s.
+pub fn encode_v2(source: SocketAddr, destination: SocketAddr) -> Vec<u8> {
+    encode_v2_inet(source, destination, V2_TRANSPORT_STREAM)
+}
+
+/// Encodes a v2 header for a UDP flow from `source` to `destination`:
+/// command `PROXY`, transport `DGRAM` over `AF_INET` or `AF_INET6`, no
+/// TLV. It prefixes every datagram of the flow, the convention receivers
+/// that accept PROXY on UDP expect (Story 12.5).
+///
+/// The addresses are canonicalised as [`encode_v1`] does, and when the
+/// families still differ the header is [`encode_v2_unspec`]'s.
+pub fn encode_v2_dgram(source: SocketAddr, destination: SocketAddr) -> Vec<u8> {
+    encode_v2_inet(source, destination, V2_TRANSPORT_DGRAM)
+}
+
+/// Encodes the v2 header that carries no address: command `PROXY` over
+/// `AF_UNSPEC`, an empty address block. The receiver uses the socket's
+/// own addresses.
+pub fn encode_v2_unspec() -> Vec<u8> {
+    v2_with_block(V2_FAMILY_UNSPEC, &[])
+}
+
+/// The v2 version nibble and the `PROXY` command, in one byte.
+const V2_VERSION_PROXY: u8 = 0x21;
+/// The family byte of `AF_UNSPEC` with an unspecified transport.
+const V2_FAMILY_UNSPEC: u8 = 0x00;
+/// The address-family nibbles, high half of the family byte.
+const V2_AF_INET: u8 = 0x10;
+const V2_AF_INET6: u8 = 0x20;
+/// The transport nibbles, low half of the family byte.
+const V2_TRANSPORT_STREAM: u8 = 0x01;
+const V2_TRANSPORT_DGRAM: u8 = 0x02;
+
+fn canonical(address: SocketAddr) -> SocketAddr {
+    SocketAddr::new(address.ip().to_canonical(), address.port())
+}
+
+fn encode_v2_inet(source: SocketAddr, destination: SocketAddr, transport: u8) -> Vec<u8> {
+    let (source, destination) = (canonical(source), canonical(destination));
+    let mut block = Vec::with_capacity(V2_INET6_LEN);
+    let family = match (source.ip(), destination.ip()) {
+        (IpAddr::V4(from), IpAddr::V4(to)) => {
+            block.extend_from_slice(&from.octets());
+            block.extend_from_slice(&to.octets());
+            V2_AF_INET
+        }
+        (IpAddr::V6(from), IpAddr::V6(to)) => {
+            block.extend_from_slice(&from.octets());
+            block.extend_from_slice(&to.octets());
+            V2_AF_INET6
+        }
+        _ => return encode_v2_unspec(),
+    };
+    block.extend_from_slice(&source.port().to_be_bytes());
+    block.extend_from_slice(&destination.port().to_be_bytes());
+    v2_with_block(family | transport, &block)
+}
+
+/// The fixed part of a `PROXY` header with `family`, then `block`. Every
+/// block this module writes is an address block of a defined family,
+/// far below `u16::MAX`.
+fn v2_with_block(family: u8, block: &[u8]) -> Vec<u8> {
+    let declared = u16::try_from(block.len()).unwrap_or(u16::MAX);
+    let mut wire = Vec::with_capacity(V2_FIXED_LEN + block.len());
+    wire.extend_from_slice(V2_SIGNATURE);
+    wire.push(V2_VERSION_PROXY);
+    wire.push(family);
+    wire.extend_from_slice(&declared.to_be_bytes());
+    wire.extend_from_slice(block);
+    wire
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1064,6 +1197,142 @@ mod tests {
                 assert!(consumed <= MAX_HEADER_LEN);
                 let tlv_bytes: usize = header.tlvs.map(|(_, value)| 3 + value.len()).sum();
                 assert!(tlv_bytes <= consumed);
+            }
+        }
+    }
+
+    // ---- The encoder (Story 12.3, D-j) ----
+
+    /// Socket address pairs of each family, the port extremes included,
+    /// and IPv4-mapped spellings that must come back as IPv4.
+    fn encoder_vectors() -> Vec<(SocketAddr, SocketAddr)> {
+        [
+            ("192.0.2.10:51000", "198.51.100.1:443"),
+            ("0.0.0.0:0", "255.255.255.255:65535"),
+            ("[2001:db8::10]:0", "[2001:db8::1]:65535"),
+            (
+                "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535",
+                "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe]:65535",
+            ),
+            ("[::ffff:192.0.2.10]:51000", "198.51.100.1:443"),
+            ("[::ffff:192.0.2.10]:1", "[::ffff:198.51.100.1]:2"),
+            ("[::1]:5432", "[fe80::1]:5432"),
+        ]
+        .iter()
+        .map(|(s, d)| (sock(s), sock(d)))
+        .collect()
+    }
+
+    fn canonical_pair(source: SocketAddr, destination: SocketAddr) -> (SocketAddr, SocketAddr) {
+        (
+            SocketAddr::new(source.ip().to_canonical(), source.port()),
+            SocketAddr::new(destination.ip().to_canonical(), destination.port()),
+        )
+    }
+
+    #[test]
+    fn every_encoded_header_parses_back_to_its_addresses() {
+        for (source, destination) in encoder_vectors() {
+            let (source_c, destination_c) = canonical_pair(source, destination);
+            for (version, wire) in [
+                (Version::V1, encode_v1(source, destination)),
+                (Version::V2, encode_v2(source, destination)),
+            ] {
+                let (header, consumed) = complete(&wire);
+                assert_eq!(consumed, wire.len(), "{version:?} {source} {destination}");
+                assert_eq!(header.version, version);
+                assert_eq!(header.command, Command::Proxy);
+                assert!(header.tlvs.is_empty());
+                assert_eq!(
+                    header.addresses,
+                    Addresses::Tcp {
+                        source: source_c,
+                        destination: destination_c,
+                    },
+                    "{version:?} {source} {destination}"
+                );
+                if version == Version::V1 {
+                    assert!(wire.len() <= V1_MAX_LEN, "{}", wire.len());
+                }
+            }
+            let wire = encode_v2_dgram(source, destination);
+            let (header, consumed) = complete(&wire);
+            assert_eq!(consumed, wire.len());
+            assert_eq!(
+                header.addresses,
+                Addresses::Udp {
+                    source: source_c,
+                    destination: destination_c,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn the_longest_v1_line_fits_the_specification_bound() {
+        let widest = sock("[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535");
+        let wire = encode_v1(widest, widest);
+        assert!(wire.len() <= V1_MAX_LEN, "{}", wire.len());
+        assert_eq!(complete(&wire).1, wire.len());
+    }
+
+    #[test]
+    fn families_that_differ_encode_as_no_address() {
+        let v4 = sock("192.0.2.10:51000");
+        let v6 = sock("[2001:db8::1]:443");
+        for (source, destination) in [(v4, v6), (v6, v4)] {
+            assert_eq!(encode_v1(source, destination), encode_v1_unknown());
+            assert_eq!(encode_v2(source, destination), encode_v2_unspec());
+            assert_eq!(encode_v2_dgram(source, destination), encode_v2_unspec());
+        }
+        assert_eq!(encode_v1_unknown(), b"PROXY UNKNOWN\r\n");
+        for wire in [encode_v1_unknown(), encode_v2_unspec()] {
+            let (header, consumed) = complete(&wire);
+            assert_eq!(consumed, wire.len());
+            assert_eq!(header.command, Command::Proxy);
+            assert_eq!(header.addresses, Addresses::Unspecified);
+        }
+        assert_eq!(encode_v2_unspec().len(), V2_FIXED_LEN);
+    }
+
+    #[test]
+    fn v2_headers_have_the_lengths_of_their_family() {
+        let v4 = sock("192.0.2.10:51000");
+        let v6 = sock("[2001:db8::1]:443");
+        assert_eq!(encode_v2(v4, v4).len(), V2_FIXED_LEN + V2_INET_LEN);
+        assert_eq!(encode_v2(v6, v6).len(), V2_FIXED_LEN + V2_INET6_LEN);
+        assert_eq!(encode_v2_dgram(v4, v4).len(), V2_FIXED_LEN + V2_INET_LEN);
+        assert_eq!(encode_v2_dgram(v6, v6).len(), V2_FIXED_LEN + V2_INET6_LEN);
+    }
+
+    /// Random addresses of both families and every port range encode to
+    /// headers that parse back to them.
+    #[test]
+    fn randomized_addresses_round_trip() {
+        let mut rng = StdRng::seed_from_u64(0x454e_434f_4445_5232);
+        let address = |rng: &mut StdRng, v6: bool| {
+            let ip = if v6 {
+                IpAddr::V6(Ipv6Addr::from(rng.random::<u128>()))
+            } else {
+                IpAddr::V4(Ipv4Addr::from(rng.random::<u32>()))
+            };
+            SocketAddr::new(ip, rng.random::<u16>())
+        };
+        for _ in 0..20_000 {
+            let v6 = rng.random::<bool>();
+            let source = address(&mut rng, v6);
+            let destination = address(&mut rng, v6);
+            let expected = Addresses::Tcp {
+                source: canonical_pair(source, destination).0,
+                destination: canonical_pair(source, destination).1,
+            };
+            for wire in [
+                encode_v1(source, destination),
+                encode_v2(source, destination),
+            ] {
+                let (header, consumed) = complete(&wire);
+                assert_eq!(consumed, wire.len());
+                assert_eq!(header.addresses, expected);
             }
         }
     }

@@ -506,17 +506,22 @@ lives in.
   with worker CPU per GiB never more than 4.7 % worse. On an upstream
   sync, keep both constants at 64 KiB; taking `L4BufferSettings` makes
   the read-ahead a setting whose Lorica default is 64 KiB.
-- **`lorica-core`, the PROXY protocol parser (v1.11.0, Story 12.8).**
+- **`lorica-core`, the PROXY protocol parser and encoder (v1.11.0,
+  Stories 12.8 and 12.3).**
   Site: `lorica-core/src/protocols/proxy_protocol.rs`, an additive
   Lorica-only file declared by one `pub mod` line in
   `protocols/mod.rs`. Upstream has no PROXY protocol code at the fork's
   last sync point (`3f87e92c`). The module is a sans-IO parser for v1 and
   v2 (`parse`, `classify_prefix`) with the bounds both of Lorica's planes
-  apply (`MAX_HEADER_LEN`, `HEADER_READ_TIMEOUT`); it does no I/O, is
-  std only and sits behind no feature, so `lorica-stream` reaches it
-  without `connection_filter`. An upstream sync leaves the file alone
-  and keeps the `pub mod` line. Its fuzz target is
-  `fuzz/fuzz_targets/fuzz_proxy_protocol.rs`.
+  apply (`MAX_HEADER_LEN`, `HEADER_READ_TIMEOUT`), and, since Story
+  12.3, the encoder the stream engine sends to backends with
+  (`encode_v1`, `encode_v2`, `encode_v2_dgram`, `encode_v1_unknown`,
+  `encode_v2_unspec`; no TLV). It does no I/O, is std only and sits
+  behind no feature, so `lorica-stream` reaches it without
+  `connection_filter`. An upstream sync leaves the file alone and keeps
+  the `pub mod` line. Its fuzz target is
+  `fuzz/fuzz_targets/fuzz_proxy_protocol.rs`, which also round-trips
+  every encoder through the parser.
 - **`lorica-core`, PROXY protocol accept and the reordered connection
   filter (v1.11.0, Story 12.8).** Upstream runs the connection filter on
   the socket peer in the accept loop and has no PROXY protocol accept.

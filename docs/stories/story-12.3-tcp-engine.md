@@ -966,14 +966,14 @@ divergence entry only).
 Depends on: nothing from this story; sequential with 12.8 Lot B if that
 Lot is editing `FORK.md` at the same time.
 
-- [ ] `encode_v1`, `encode_v2`, `encode_v1_unknown`, `encode_v2_unspec`
+- [x] `encode_v1`, `encode_v2`, `encode_v1_unknown`, `encode_v2_unspec`
       (D-j), doc comments, one runnable example.
-- [ ] Tests: every encoded header round-trips through `parse` to the
+- [x] Tests: every encoded header round-trips through `parse` to the
       same addresses and `consumed == len`; IPv4, IPv6, ports 0 and
       65,535; v1 lengths within `V1_MAX_LEN`.
-- [ ] Fuzz target: a round-trip arm (addresses derived from the input
+- [x] Fuzz target: a round-trip arm (addresses derived from the input
       bytes, encode, parse, compare).
-- [ ] `FORK.md`: the parser entry names the encoder.
+- [x] `FORK.md`: the parser entry names the encoder.
 
 ### Lot B: model, schema, validation - cargo
 
@@ -1352,7 +1352,27 @@ performance phase.
 
 ### Completion Notes
 
-**Lot B (model, schema, validation).**
+**Lot A (PROXY encoder).**
+
+- API, in `lorica_core::protocols::proxy_protocol`, each returning the
+  header as `Vec<u8>`: `encode_v1(source: SocketAddr, destination:
+  SocketAddr)`, `encode_v2(source, destination)` (`PROXY`, `STREAM`, no
+  TLV), `encode_v2_dgram(source, destination)` (`DGRAM`, Story 12.5
+  Interface edit E4, done here since it is one constant away),
+  `encode_v1_unknown()` and `encode_v2_unspec()` (`PROXY` over
+  `AF_UNSPEC`).
+- The encoders canonicalise both addresses and fall back to the
+  address-less header themselves when the families still differ, so the
+  D-j rule lives in one place and the engine passes the two addresses
+  it has whatever they are.
+- Tests: round trip of each encoder over IPv4, IPv6, ports 0 and
+  65,535, IPv4-mapped spellings, the widest v1 line (within
+  `V1_MAX_LEN`), the family mismatch, the v2 lengths per family, and
+  20,000 random address pairs. The fuzz target gains the round-trip
+  arm; it was type-checked on stable (`cargo check` in `fuzz/`), not
+  run, since `cargo fuzz` needs nightly; the unit tests exercise the
+  same assertions.
+
 
 - Migration **75** (`migrate_stream_engine_settings`): 74 was taken by
   12.2 Lot E1's alert subscription. Sixteen `streams` columns
@@ -1423,6 +1443,12 @@ performance phase.
 
 ## File List
 
+Lot A:
+
+- `lorica-core/src/protocols/proxy_protocol.rs`
+- `fuzz/fuzz_targets/fuzz_proxy_protocol.rs`
+- `FORK.md` (the parser's entry)
+
 Lot B:
 
 - `lorica-config/src/local_address.rs` (new)
@@ -1454,3 +1480,4 @@ Lot B:
 | 2026-11-14 | 0.1 | Story drafted from the Epic 12 PRD. Status Draft. | Romain G. |
 | 2026-11-14 | 0.2 | Maintainer answers folded in as Resolved 1 to 9: `max_connections` per worker now and per node from Story 12.6 with one field, stream-scoped local exclusion, no DNS alert (input to 12.9 AC #5), no `optional` PROXY accept, selection through a trait, Python backends for IV1, keepalive on by default, `source_addresses` as a list, survey values verified with URLs in Lot F. Status Draft. | Romain G. |
 | 2026-11-14 | 0.3 | Lot B landed: the D-q fields, migration 75, validation, rule A and the backup and source-family rules, `local_backend_conflicts`, store, canonical digest, diff, export and import. D-s corrected: the PROXY header is written in plaintext right after connect and before any upstream TLS handshake. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.4 | Lot A landed: the PROXY v1 and v2 encoder beside the parser, with `encode_v2_dgram` for Story 12.5, round-trip tests and fuzz arm, FORK.md entry. | Romain G. |
