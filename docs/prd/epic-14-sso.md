@@ -1,10 +1,10 @@
 # Epic 14: Single Sign-On for the Management Plane (OIDC)
 
 **Author:** Romain G.
-**Target version:** not scheduled. Candidate 1.13.0, after Epic 12 Phase 2 (1.12.0); the maintainer may insert it earlier the way Epic 13 was inserted before Epic 12.
+**Target version:** 1.13.0, after Epic 12 Phase 2 (1.12.0) (maintainer decision, 2026-11-14).
 **Status:** Draft (2026-11-14), written against `main` at `459544ee` (v1.10.6); cite function and type names, since line numbers may drift. Not yet reviewed: a requirement challenge, an architecture review against the code and a security review are expected before the first story is drafted. Claims about third-party identity providers marked *(to verify)* come from their documentation as remembered on the day of writing and are checked by Story 14.4 before anything depends on them.
 
-*Revised 2026-11-14 (maintainer decision, same day):* the first draft also carried an LDAPS login and examined Kerberos (SPNEGO) in its place. Both are out: the epic is OIDC only, and Windows integrated login is obtained at the identity provider (D14). "Out of scope" records why each was dropped.
+*Revised 2026-11-14 (maintainer decision, same day):* the first draft also carried an LDAPS login and examined Kerberos (SPNEGO) in its place. Both are out: the epic is OIDC only, and Windows integrated login is obtained at the identity provider (D14). "Out of scope" records why each was dropped. The same day the maintainer set the target version and the absolute session lifetime (D10), which closes the draft's open questions.
 
 **Epic Goal:** Let an operator sign in to the Lorica dashboard with the identity they already have, through an OpenID Connect provider (authentik, Keycloak, AD FS, Entra ID, any conformant one), with their Lorica role derived from their group membership. Joining or leaving the operations team becomes a change at the identity provider, not a ticket to whoever holds the Lorica SuperAdmin password.
 
@@ -42,7 +42,7 @@
 
 **D9 - A local SuperAdmin always remains: break-glass is permanent.** The last-SuperAdmin invariant counts **enabled local** SuperAdmins. An outage of the provider, an expired client secret or a broken group mapping must never lock the operator out of the node that would fix it, and the CLI, which authenticates with a password (see "What exists today"), keeps a working account. Password login stays available on the login form; restricting it is out of scope.
 
-**D10 - External sessions have an absolute lifetime.** A session opened through OIDC keeps the 30-minute idle expiry and gains an absolute lifetime, `sso_session_max_lifetime_minutes`, default 480, bounded. A user removed from the provider, or from the group that granted the role, loses access at the latest when that lifetime ends. Revocation pushed by the provider (back-channel logout) is deferred. Local sessions keep today's behaviour in this epic.
+**D10 - External sessions have an absolute lifetime.** A session opened through OIDC keeps the 30-minute idle expiry and gains an absolute lifetime, `sso_session_max_lifetime_minutes`, default 240, bounded to 15 to 720. Four hours is the maintainer's choice for a plane that grants administrative rights and is used occasionally; the cost of a short lifetime is low, because while the provider's own session is alive a new login is a redirect with nothing to type. A user removed from the provider, or from the group that granted the role, loses access at the latest when that lifetime ends. Revocation pushed by the provider (back-channel logout) is deferred. Local sessions keep today's behaviour in this epic.
 
 **D11 - One provider per node, node-local, SuperAdmin-only.** An identity provider is a trust anchor that decides who becomes SuperAdmin, so it follows the users it creates: node-local, never replicated (the `docs/cluster.md` rule for accounts), and administered by SuperAdmin only, every change audited. On a fleet each node is configured on its own; each node has its own dashboard URL and therefore its own redirect URI anyway. The model keeps a provider id so a later release can add several providers without a migration.
 
@@ -50,7 +50,7 @@
 
 **D13 - No new dependency, no new crate.** `jsonwebtoken`, `ring` (SHA-256 for PKCE), `base64`, `rand` and the shared reqwest client cover the relying party. It lives in `lorica-api` under `src/sso/`, next to the sessions it creates. The JWKS cache of Story 10.5 moves to a module both callers share, with no behaviour change for the automation listener. A separate crate would buy isolation the code size does not justify and costs the full new-crate checklist of `lorica-rust.md`.
 
-**D14 - Windows integrated login happens at the identity provider, not in Lorica.** An operator on a domain-joined workstation gets a login without typing anything when the provider performs Kerberos on the intranet and then hands Lorica an ID token: AD FS with Windows Integrated Authentication, Entra ID with Seamless SSO, authentik with a Kerberos source *(to verify: version that introduced it)* in front of an LDAP or Kerberos source that reads Active Directory. The provider also resolves the AD groups and puts them in the token, so Lorica needs neither a keytab, a service principal, a DNS name in the realm, nor a directory connection. The cost, accepted by the maintainer: an Active Directory estate with no OIDC provider at all must deploy one (authentik, Keycloak or AD FS) to use SSO on Lorica; until then it keeps local accounts.
+**D14 - Windows integrated login happens at the identity provider, not in Lorica.** An operator on a domain-joined workstation gets a login without typing anything when the provider performs Kerberos on the intranet and then hands Lorica an ID token: AD FS with Windows Integrated Authentication, Entra ID with Seamless SSO, authentik with its Kerberos source (documented as available since 2024.10.0 and marked Preview; whether it is still Preview in the release checked by Story 14.4 is *to verify*) in front of an LDAP or Kerberos source that reads Active Directory. The provider also resolves the AD groups and puts them in the token, so Lorica needs neither a keytab, a service principal, a DNS name in the realm, nor a directory connection. The cost, accepted by the maintainer: an Active Directory estate with no OIDC provider at all must deploy one (authentik, Keycloak or AD FS) to use SSO on Lorica; until then it keeps local accounts.
 
 ## Story 14.1: External identities in the account model
 
@@ -131,7 +131,7 @@ so that it ships knowing it works with the estates it claims.
 2. **`docs/sso.md`**: the model (D1 to D14 as an operator reads them), break-glass, and recipes for authentik (OIDC provider with a signing key selected, groups in the token, and the Kerberos source for Windows workstations per D14), Keycloak, AD FS (with Windows Integrated Authentication) and Entra ID (with its group overage and Seamless SSO). Each recipe states the provider version it was checked against.
 3. **Security documentation**: `docs/security.md` management-plane section and `docs/security/threat-model.md` gain the new trust anchor, the D5 public URL, and what a compromise of the provider grants (SuperAdmin on every node that maps it).
 4. **README** API table, `COMPARISON.md` row, `CHANGELOG.md` under Added.
-5. **Release check by the maintainer** against a real authentik, including a login from a domain-joined Windows workstation through its Kerberos source, before the version bump. Every *(to verify)* in this PRD is resolved there or earlier and its outcome written into "Delivery notes".
+5. **Release check by the maintainer** against a real authentik of the current release line (2026.8.x on the day of writing; the line current when the story starts if newer), including a login from a domain-joined Windows workstation through its Kerberos source, before the version bump. Every *(to verify)* in this PRD is resolved there or earlier and its outcome written into "Delivery notes".
 
 ---
 
@@ -155,8 +155,3 @@ so that it ships knowing it works with the estates it claims.
 - **SCIM provisioning and deprovisioning.** Accounts appear at first login and lose access through D8 and D10.
 - **Restricting or hiding the password form.** D9.
 - **A local second factor (TOTP, WebAuthn).** Delegated to the provider in this epic; a separate decision for local accounts.
-
-## Open questions for the maintainer
-
-1. Target version, and whether the epic goes before or after Epic 12 Phase 2.
-2. Default of `sso_session_max_lifetime_minutes` (D10): 480 is a working day; a shorter value costs more round trips to the provider.
