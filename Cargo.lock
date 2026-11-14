@@ -2772,6 +2772,7 @@ dependencies = [
  "lorica-config",
  "lorica-core",
  "lorica-error",
+ "lorica-fleet",
  "lorica-geoip",
  "lorica-http",
  "lorica-ketama",
@@ -2889,6 +2890,7 @@ dependencies = [
  "lorica-cluster",
  "lorica-config",
  "lorica-dashboard",
+ "lorica-fleet",
  "lorica-mcp",
  "lorica-metrics",
  "lorica-notify",
@@ -3124,6 +3126,24 @@ dependencies = [
 [[package]]
 name = "lorica-error"
 version = "0.1.0"
+
+[[package]]
+name = "lorica-fleet"
+version = "1.10.6"
+dependencies = [
+ "chrono",
+ "futures-util",
+ "lorica-cluster",
+ "lorica-config",
+ "parking_lot",
+ "rusqlite",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
 
 [[package]]
 name = "lorica-geoip"

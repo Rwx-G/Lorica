@@ -85,6 +85,7 @@ These crates do not exist in upstream Pingora:
 | `lorica-mcp` | Management MCP server: a scope-gated tool surface over the automation plane, spoken over stdio or over a path on the automation listener |
 | `lorica-automation-policy` | The automation plane's policy as data: scope vocabulary, MCP tier table, admin settings allowlist, one-way protections |
 | `lorica-adcs` | AD CS enrollment client: CSR to issued certificate through CES, WS-Trust over HTTPS with Kerberos SPNEGO bound to the TLS channel |
+| `lorica-fleet` | Fleet runtime: the control-plane and follower runtimes, the cluster telemetry store and the ingest policy, between the transport crate and the management API |
 
 ## Comparing with Upstream
 

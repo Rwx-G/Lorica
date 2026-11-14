@@ -198,10 +198,7 @@ pub(crate) async fn run_api_server(
     // exposes the families at zero; an absent series reads like a
     // feature that does not exist.
     lorica_api::metrics::install_capture_and_automation_metrics();
-    let is_follower = matches!(
-        state.cluster,
-        lorica_api::cluster::ClusterRuntime::Follower(_)
-    );
+    let is_follower = matches!(state.cluster, lorica_fleet::ClusterRuntime::Follower(_));
     if is_follower {
         info!(
             "follower mode: certificate issuance, renewal and expiry alerting are the control plane's job; this node installs what it is sent and keeps stapling its own certs"
@@ -325,7 +322,7 @@ async fn purge_superseded_acme_orphans(store: &Arc<Mutex<ConfigStore>>) {
 pub(crate) fn spawn_retention_loop(
     log_store: lorica_api::server::LogStoreSlot,
     config_store: Arc<Mutex<ConfigStore>>,
-    telemetry: Option<Arc<lorica_api::cluster_telemetry_store::ClusterTelemetryStore>>,
+    telemetry: Option<Arc<lorica_fleet::telemetry_store::ClusterTelemetryStore>>,
 ) {
     // The loop runs even with no log store: several of its jobs
     // (expired ACME challenges, probe results, SLA windows) live in
@@ -433,13 +430,13 @@ pub(crate) fn spawn_retention_loop(
                             continue;
                         }
                         for table in [
-                            lorica_api::cluster_telemetry_store::TelemetryTable::Access,
-                            lorica_api::cluster_telemetry_store::TelemetryTable::Waf,
+                            lorica_fleet::telemetry_store::TelemetryTable::Access,
+                            lorica_fleet::telemetry_store::TelemetryTable::Waf,
                         ] {
                             total += telemetry.enforce_node_quota(
                                 table,
                                 node_id,
-                                lorica_api::cluster_telemetry_store::DEFAULT_ROWS_PER_NODE,
+                                lorica_fleet::telemetry_store::DEFAULT_ROWS_PER_NODE,
                             )?;
                         }
                     }
@@ -1073,7 +1070,7 @@ pub(crate) struct ClusterStartup {
     /// The follower, when this node holds a fleet identity.
     pub follower: Option<cluster_follower::FollowerPlane>,
     /// The role handed to `AppState`.
-    pub runtime: lorica_api::cluster::ClusterRuntime,
+    pub runtime: lorica_fleet::ClusterRuntime,
 }
 
 /// Start the fleet role shared by both startup modes (Stories
@@ -1152,12 +1149,12 @@ pub(crate) async fn spawn_cluster_runtime(
             // One runtime handle shared by the API and the binary's
             // replication tasks, so the drift bookkeeping the report
             // reads is the same one the alert loop advances.
-            lorica_api::cluster::ClusterRuntime::ControlPlane(Arc::clone(&plane.runtime))
+            lorica_fleet::ClusterRuntime::ControlPlane(Arc::clone(&plane.runtime))
         }
         (None, Some(follower)) => {
-            lorica_api::cluster::ClusterRuntime::Follower(Arc::clone(&follower.runtime))
+            lorica_fleet::ClusterRuntime::Follower(Arc::clone(&follower.runtime))
         }
-        (None, None) => lorica_api::cluster::ClusterRuntime::Standalone,
+        (None, None) => lorica_fleet::ClusterRuntime::Standalone,
     };
     ClusterStartup {
         plane,
@@ -1262,7 +1259,7 @@ pub(crate) async fn shutdown_signal() {
 pub(crate) const BACKGROUND_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the exit path waits for cluster units in flight
-/// (`lorica_api::cluster::runtime::detached`): a unit between its
+/// (`lorica_fleet::runtime::detached`): a unit between its
 /// commit and its audit row finishes instead of being cut when the
 /// runtime drops.
 pub(crate) const CLUSTER_UNIT_DRAIN_GRACE: Duration = Duration::from_secs(10);
@@ -1288,7 +1285,7 @@ pub(crate) async fn drain_for_exit(tracker: &tokio_util::task::TaskTracker) -> E
                 .await
                 .is_ok()
         },
-        lorica_api::cluster::runtime::drain_detached(CLUSTER_UNIT_DRAIN_GRACE),
+        lorica_fleet::runtime::drain_detached(CLUSTER_UNIT_DRAIN_GRACE),
     );
     if !background_tasks {
         warn!("some background tasks did not finish within drain timeout; aborting");
@@ -1427,7 +1424,7 @@ mod tests {
         let finished = Arc::new(AtomicBool::new(false));
         let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
         let unit_finished = Arc::clone(&finished);
-        let caller = tokio::spawn(lorica_api::cluster::runtime::detached(
+        let caller = tokio::spawn(lorica_fleet::runtime::detached(
             "exit drain test",
             async move {
                 let _ = started_tx.send(());

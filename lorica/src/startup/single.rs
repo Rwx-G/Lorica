@@ -442,7 +442,7 @@ pub(crate) fn run_single_process(cli: Cli) {
         // only a control plane has a fan-in store, and the retention
         // loop below needs it.
         let fleet_telemetry = match &cluster_runtime {
-            lorica_api::cluster::ClusterRuntime::ControlPlane(runtime) => runtime.telemetry.clone(),
+            lorica_fleet::ClusterRuntime::ControlPlane(runtime) => runtime.telemetry.clone(),
             _ => None,
         };
 

@@ -7,7 +7,8 @@
 //! first, then one serialized refresh, then the session registry.
 //! Failures are typed ([`ClusterRuntimeError`]) so a caller can tell
 //! "the store is unavailable" from "the acceptor could not be
-//! rebuilt" without parsing a message.
+//! rebuilt" without parsing a message; the management API maps them
+//! to its own error at its handler boundary.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,6 +16,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use futures_util::future::BoxFuture;
 use lorica_cluster::{
     AppliedConfig, CertBundle, ClusterConnection, ClusterTlsError, ConfigVersion, ControlPlane,
     NodeIdentity, NodeState, RevokedEntry,
@@ -23,8 +25,6 @@ use lorica_config::models::{ClusterNode, NodeStatus};
 use lorica_config::{ConfigError, ConfigStore};
 use serde::Serialize;
 use tokio::sync::{watch, Mutex};
-
-use crate::error::ApiError;
 
 /// Why a fleet runtime operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -47,46 +47,6 @@ pub enum ClusterRuntimeError {
     /// could not be joined (it panicked, or the runtime is stopping).
     #[error("cluster enforcement task: {0}")]
     EnforcementTask(String),
-}
-
-impl From<ClusterRuntimeError> for ApiError {
-    fn from(err: ClusterRuntimeError) -> Self {
-        match err {
-            ClusterRuntimeError::Store(inner) => inner.into(),
-            ClusterRuntimeError::Refresh(shared) => shared_api_error(&shared),
-            other => ApiError::Internal(other.to_string()),
-        }
-    }
-}
-
-/// The status a shared refresh error answers with: the same one the
-/// bare error would get.
-///
-/// The error sits behind an `Arc` every caller the refresh covered
-/// holds, so it cannot be moved into `From<ConfigError>`, which owns
-/// the variant-to-status mapping. The store error is re-materialised
-/// instead and handed to that mapping, rather than mapped a second time
-/// here. The match is exhaustive on purpose: a new `ConfigError` variant
-/// fails to compile here instead of silently answering 500.
-fn shared_api_error(err: &ClusterRuntimeError) -> ApiError {
-    let store = match err {
-        ClusterRuntimeError::Store(store) => store,
-        ClusterRuntimeError::Refresh(inner) => return shared_api_error(inner),
-        other => return ApiError::Internal(other.to_string()),
-    };
-    let rebuilt = match store {
-        ConfigError::NotFound(m) => ConfigError::NotFound(m.clone()),
-        ConfigError::Validation(m) => ConfigError::Validation(m.clone()),
-        ConfigError::Malformed(m) => ConfigError::Malformed(m.clone()),
-        ConfigError::Corrupt(m) => ConfigError::Corrupt(m.clone()),
-        ConfigError::Serialization(m) => ConfigError::Serialization(m.clone()),
-        // Neither payload can be cloned, and `From<ConfigError>` answers
-        // both with a 500 carrying the error's text.
-        ConfigError::Database(_) | ConfigError::Io(_) => {
-            return ApiError::Internal(store.to_string())
-        }
-    };
-    rebuilt.into()
 }
 
 /// Collapses a burst of control-plane refresh requests into as few
@@ -182,24 +142,23 @@ fn detached_registry() -> &'static DetachedRegistry {
     })
 }
 
-/// The audit row a unit owes for its change, written as
-/// `<action>.incomplete` when the unit panics instead of finishing.
+/// What a unit runs, on its own task, when it panics instead of
+/// finishing.
 ///
-/// A panic can land after the commit and before the row the commit is
-/// owed, and the change then took effect with nothing in the
-/// tamper-evident trail. The unit cannot write that row itself once it
-/// has unwound, so it is described up front and written for it.
-pub struct OwedAudit {
-    /// Where the row goes; `None` when the audit log is not open.
-    pub log_store: Option<Arc<crate::log_store::LogStore>>,
-    /// Who asked for the change.
-    pub ctx: crate::audit::AuditContext,
-    /// The action the unit records when it finishes.
-    pub action: &'static str,
-    /// `(target_type, target_id)` as far as it is known before the
-    /// unit runs.
-    pub target: (&'static str, String),
-}
+/// What a unit owes when it panics is an audit row: a panic can land
+/// after the commit and before the row the commit is owed, and the
+/// change then took effect with nothing in the tamper-evident trail.
+/// The unit cannot write that row itself once it has unwound, so the
+/// row is described up front and written for it.
+///
+/// The dependency is inverted on purpose (backlog #52). The audit chain
+/// belongs to the management API that owns it (`lorica-api`'s `audit`
+/// and `log_store`, with their one-chain-per-node invariant), and this
+/// crate owns the units, their bound and their drain. So the runtime
+/// takes a hook and knows nothing of what it writes, and `lorica-api`'s
+/// `detached_audited` is the thin wrapper that builds the hook from the
+/// row it owes.
+pub type PanicHook = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
 
 /// Run `work` on its own task and await it, so dropping the caller
 /// cannot cut it short.
@@ -216,8 +175,9 @@ pub struct OwedAudit {
 /// The task runs on a tracker the shutdown drains ([`drain_detached`]),
 /// within [`CLUSTER_DETACHED_UNITS_MAX`]; the slot is taken before the
 /// task exists, so a caller dropped while it waits starts nothing. A
-/// panic is caught on the task and logged at ERROR. A unit that owes an
-/// audit row goes through [`detached_audited`] instead.
+/// panic is caught on the task and logged at ERROR. A unit that owes
+/// something when it panics goes through [`detached_with_panic_hook`]
+/// instead.
 pub async fn detached<T, Fut>(what: &'static str, work: Fut) -> Result<T, ClusterRuntimeError>
 where
     Fut: std::future::Future<Output = T> + Send + 'static,
@@ -226,25 +186,25 @@ where
     run_detached(what, None, work).await
 }
 
-/// [`detached`] for a unit that commits a change and owes it an audit
-/// row: when the unit panics, `owed` is written as
-/// `<action>.incomplete` on the unit's own task, so the row does not
-/// depend on the caller still being there.
-pub async fn detached_audited<T, Fut>(
+/// [`detached`] for a unit that commits a change and owes something
+/// when it panics: `on_panic` runs once, on the unit's own task, so
+/// what it writes does not depend on the caller still being there. See
+/// [`PanicHook`] for why the hook is a parameter.
+pub async fn detached_with_panic_hook<T, Fut>(
     what: &'static str,
-    owed: OwedAudit,
+    on_panic: PanicHook,
     work: Fut,
 ) -> Result<T, ClusterRuntimeError>
 where
     Fut: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    run_detached(what, Some(owed), work).await
+    run_detached(what, Some(on_panic), work).await
 }
 
 async fn run_detached<T, Fut>(
     what: &'static str,
-    owed: Option<OwedAudit>,
+    on_panic: Option<PanicHook>,
     work: Fut,
 ) -> Result<T, ClusterRuntimeError>
 where
@@ -278,16 +238,8 @@ where
                     panic = %reason,
                     "a cluster unit panicked; a change it committed may lack its enforcement, and a unit that owes an audit row records it as incomplete"
                 );
-                if let Some(owed) = owed {
-                    crate::audit::record_with_store(
-                        owed.log_store,
-                        &owed.ctx,
-                        &format!("{}.incomplete", owed.action),
-                        (owed.target.0, &owed.target.1),
-                        None,
-                        Some(&serde_json::json!({ "task": what, "outcome": "panicked" })),
-                    )
-                    .await;
+                if let Some(on_panic) = on_panic {
+                    on_panic().await;
                 }
                 None
             }
@@ -318,10 +270,11 @@ pub async fn drain_detached(grace: Duration) -> bool {
     drained
 }
 
-/// Run a pure-store closure and keep its error typed: `db_blocking`
-/// collapses everything into `ApiError`, which this layer must not
-/// name on its way out.
-async fn store_op<T, F>(store: &Arc<Mutex<ConfigStore>>, f: F) -> Result<T, ClusterRuntimeError>
+/// Run a pure-store closure and keep its error typed: the management
+/// API's `db_blocking` collapses everything into its own error, which
+/// this layer must not name on its way out. Public for the management
+/// API's certificate push, which reads the store the same way.
+pub async fn store_op<T, F>(store: &Arc<Mutex<ConfigStore>>, f: F) -> Result<T, ClusterRuntimeError>
 where
     F: FnOnce(&mut ConfigStore) -> Result<T, ConfigError> + Send + 'static,
     T: Send + 'static,
@@ -360,7 +313,7 @@ pub struct ControlPlaneRuntime {
     /// listener's ingest handler so the rows an operator reads are
     /// the rows the fleet delivered. `None` when it could not be
     /// opened, which the fleet endpoints report rather than hide.
-    pub telemetry: Option<Arc<crate::cluster_telemetry_store::ClusterTelemetryStore>>,
+    pub telemetry: Option<Arc<crate::telemetry_store::ClusterTelemetryStore>>,
     /// Every post-boot roster/CRL refresh goes through here (backlog
     /// #79), through [`Self::refresh`] or [`Self::request_refresh`].
     refresher: RefreshCoalescer,
@@ -447,7 +400,7 @@ impl ControlPlaneRuntime {
     /// The same, with the fan-in database attached (Story 9.6).
     pub fn with_telemetry(
         control: Arc<ControlPlane>,
-        telemetry: Option<Arc<crate::cluster_telemetry_store::ClusterTelemetryStore>>,
+        telemetry: Option<Arc<crate::telemetry_store::ClusterTelemetryStore>>,
     ) -> Self {
         Self {
             control,
@@ -655,84 +608,6 @@ pub fn cert_bundle(cert: &lorica_config::models::Certificate) -> CertBundle {
         // The ONE function that owns this format, shared with the
         // canonical blob. A second expression of it here would drift.
         key_digest: lorica_config::canonical::secret_digest(&cert.key_pem),
-    }
-}
-
-/// Push a certificate's key to the nodes entitled to it (Story 9.5
-/// AC #7).
-///
-/// Best effort by decision D2, and that is the whole design: this is
-/// the latency optimisation, not the guarantee. A node that is down,
-/// slow or not yet connected is simply absent from the round and asks
-/// for what it lacks after its next configuration apply. So every
-/// failure here is counted and logged, and none of them fails the
-/// issuance that triggered it.
-///
-/// Does nothing on a node that is not a control plane, which is what
-/// makes it safe to call unconditionally from the issuance paths.
-pub async fn distribute_certificate(
-    cluster: &ClusterRuntime,
-    store: &Arc<Mutex<ConfigStore>>,
-    cert_id: &str,
-) {
-    let ClusterRuntime::ControlPlane(runtime) = cluster else {
-        return;
-    };
-    let id = cert_id.to_string();
-    let resolved = store_op(store, move |store| {
-        let recipients = store.cert_key_recipients(&id)?;
-        let cert = store.get_certificate(&id)?;
-        Ok((recipients, cert))
-    })
-    .await;
-    let (recipients, cert) = match resolved {
-        Ok(resolved) => resolved,
-        Err(e) => {
-            tracing::error!(cert_id, error = %e,
-                "could not resolve certificate recipients; the fleet converges by pull");
-            return;
-        }
-    };
-    // Three ways to have nothing to push, told apart because they mean
-    // very different things to an operator watching an issuance.
-    let Some(cert) = cert else {
-        tracing::warn!(
-            cert_id,
-            "certificate vanished between issuance and distribution"
-        );
-        return;
-    };
-    if cert.key_pem.is_empty() {
-        tracing::error!(
-            cert_id,
-            "certificate carries no private key; nothing to distribute"
-        );
-        return;
-    }
-    if recipients.is_empty() {
-        tracing::info!(cert_id, domain = %cert.domain,
-            "no node is selected for this certificate; nothing to distribute");
-        return;
-    }
-    let report = runtime
-        .control
-        .distribute_certificates(&recipients, vec![cert_bundle(&cert)])
-        .await;
-    for (node_id, count) in &report.installed {
-        crate::metrics::inc_cluster_cert_push_by(node_id, "pushed", *count);
-        tracing::info!(
-            node_id,
-            cert_id,
-            installed = count,
-            "certificate key pushed"
-        );
-    }
-    for (node_id, reason) in &report.failed {
-        // One certificate went into this round, so one certificate is
-        // what failed to reach the node.
-        crate::metrics::inc_cluster_cert_push(node_id, "push_failed");
-        tracing::warn!(node_id, cert_id, %reason,
-            "certificate push failed; the node asks for it after its next apply");
     }
 }
 
@@ -1081,6 +956,32 @@ async fn revoke_in_place(
 mod tests {
     use super::*;
 
+    /// A control plane over a throwaway CA, with its liveness receiver
+    /// kept alive by the caller.
+    fn test_control_plane() -> (Arc<ControlPlaneRuntime>, watch::Receiver<u32>) {
+        let _ = lorica_cluster::tokio_rustls::rustls::crypto::ring::default_provider()
+            .install_default();
+        let ca = lorica_cluster::ClusterCa::generate("Test Cluster CA").expect("test setup");
+        let (leaf_cert, leaf_key) = ca.issue_server_leaf("cp.internal").expect("test setup");
+        let config =
+            lorica_cluster::operational_server_config(ca.cert_pem(), &leaf_cert, &leaf_key)
+                .expect("test setup");
+        let acceptor = Arc::new(lorica_cluster::SwappableAcceptor::new(Arc::new(config)));
+        let (liveness_tx, liveness_rx) = watch::channel(0u32);
+        let control = Arc::new(ControlPlane::new(
+            ca,
+            &leaf_cert,
+            &leaf_key,
+            acceptor,
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            liveness_tx,
+            false,
+            "cp.internal",
+            "test",
+        ));
+        (Arc::new(ControlPlaneRuntime::new(control)), liveness_rx)
+    }
+
     fn node(id: &str, fp: &str, prev: Option<&str>, status: NodeStatus) -> ClusterNode {
         let now = Utc::now();
         ClusterNode {
@@ -1191,7 +1092,7 @@ mod tests {
         // through a handle, and the handle exists once. A read path
         // that wants drift calls `drift_report`, which records
         // first-seen times and spends nothing.
-        let (runtime, _liveness) = crate::tests::test_control_plane();
+        let (runtime, _liveness) = test_control_plane();
         assert!(runtime.claim_drift_alerter().is_some(), "first claim");
         assert!(
             runtime.claim_drift_alerter().is_none(),
@@ -1363,7 +1264,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_revocation_in_a_burst_is_enforced_when_its_call_returns() {
-        let (runtime, _liveness) = crate::tests::test_control_plane();
+        let (runtime, _liveness) = test_control_plane();
         let store = Arc::new(Mutex::new(ConfigStore::open_in_memory().expect("store")));
         const NODES: usize = 6;
         {
@@ -1414,39 +1315,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn store_errors_keep_their_http_identity_through_the_runtime_error() {
-        use axum::http::StatusCode;
-        use axum::response::IntoResponse;
-        let status = |err: ClusterRuntimeError| ApiError::from(err).into_response().status();
-        let shared = |err: ClusterRuntimeError| ClusterRuntimeError::Refresh(Arc::new(err));
-        let absent = || ClusterRuntimeError::Store(ConfigError::NotFound("node".into()));
-        let refused = || ClusterRuntimeError::Store(ConfigError::Validation("cap".into()));
-        let unreadable = || ClusterRuntimeError::Store(ConfigError::Malformed("json".into()));
-        let acceptor = || ClusterRuntimeError::Acceptor(ClusterTlsError::Rustls("crl".into()));
-
-        assert_eq!(status(absent()), StatusCode::NOT_FOUND);
-        assert_eq!(status(acceptor()), StatusCode::INTERNAL_SERVER_ERROR);
-        // A refresh error reaches its callers wrapped and shared since
-        // the refreshes coalesce (backlog #79). The wrapper must not
-        // turn a store refusal into a 500.
-        for (bare, wrapped) in [
-            (absent(), shared(absent())),
-            (refused(), shared(refused())),
-            (unreadable(), shared(unreadable())),
-            (acceptor(), shared(acceptor())),
-        ] {
-            let message = bare.to_string();
-            assert_eq!(status(wrapped), status(bare), "{message}");
-        }
-        let held_by_two = Arc::new(absent());
-        let _other_caller = Arc::clone(&held_by_two);
-        assert_eq!(
-            status(ClusterRuntimeError::Refresh(held_by_two)),
-            StatusCode::NOT_FOUND
-        );
-    }
-
     // -----------------------------------------------------------------
     // A caller dropped after its registry write does not cancel the
     // enforcement that write is owed.
@@ -1469,7 +1337,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refresh_whose_caller_is_dropped_still_lands() {
-        let (runtime, _liveness) = crate::tests::test_control_plane();
+        let (runtime, _liveness) = test_control_plane();
         let store = Arc::new(Mutex::new(ConfigStore::open_in_memory().expect("store")));
         store
             .lock()
@@ -1489,7 +1357,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_revocation_whose_caller_is_dropped_after_the_commit_is_still_enforced() {
-        let (runtime, _liveness) = crate::tests::test_control_plane();
+        let (runtime, _liveness) = test_control_plane();
         let store = Arc::new(Mutex::new(ConfigStore::open_in_memory().expect("store")));
         store
             .lock()
@@ -1535,5 +1403,113 @@ mod tests {
             !Arc::ptr_eq(&before, &runtime.control.acceptor.current())
         })
         .await;
+    }
+
+    // -----------------------------------------------------------------
+    // The panic hook: what a unit owes when it panics runs once, on the
+    // unit's own task, whoever is still waiting for it.
+    // -----------------------------------------------------------------
+
+    /// A hook that counts its runs and records whether each ran inside
+    /// a unit's task.
+    fn counting_hook(
+        runs: &Arc<AtomicU64>,
+        inside_unit: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> PanicHook {
+        let (runs, inside_unit) = (Arc::clone(runs), Arc::clone(inside_unit));
+        Box::new(move || {
+            Box::pin(async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                inside_unit.store(
+                    INSIDE_DETACHED_UNIT.try_with(|_| ()).is_ok(),
+                    Ordering::SeqCst,
+                );
+            })
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_panicking_unit_runs_its_hook_exactly_once_on_its_own_task() {
+        let runs = Arc::new(AtomicU64::new(0));
+        let inside_unit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let outcome =
+            detached_with_panic_hook("probe", counting_hook(&runs, &inside_unit), async {
+                panic!("injected after the commit");
+            })
+            .await;
+
+        assert!(
+            matches!(outcome, Err(ClusterRuntimeError::EnforcementTask(_))),
+            "the caller is told the unit failed"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the hook ran once");
+        assert!(
+            inside_unit.load(Ordering::SeqCst),
+            "the hook ran on the unit's task, not the caller's"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_panic_hook_runs_when_the_caller_is_gone_and_a_unit_that_finishes_runs_none() {
+        let runs = Arc::new(AtomicU64::new(0));
+        let inside_unit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started, running) = tokio::sync::oneshot::channel::<()>();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let caller = tokio::spawn(detached_with_panic_hook(
+            "probe",
+            counting_hook(&runs, &inside_unit),
+            async move {
+                let _ = started.send(());
+                let _ = released.await;
+                panic!("injected after the caller left");
+            },
+        ));
+        running.await.expect("the unit started");
+        caller.abort();
+        assert!(caller.await.is_err(), "the caller was cancelled");
+        release.send(()).expect("the unit outlives its caller");
+        eventually("the hook runs without its caller", || {
+            runs.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        assert!(inside_unit.load(Ordering::SeqCst));
+
+        let finished =
+            detached_with_panic_hook("probe", counting_hook(&runs, &inside_unit), async { 7 })
+                .await
+                .expect("the unit");
+        assert_eq!(finished, 7);
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "a unit that finishes owes nothing"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_unit_nested_in_another_runs_and_the_drain_waits_for_units_in_flight() {
+        let (started, running) = tokio::sync::oneshot::channel::<()>();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let unit = tokio::spawn(detached("outer", async move {
+            // Nested: takes no slot of its own, so it can never wait on the
+            // one its parent holds.
+            let inner = detached("inner", async { 7 }).await;
+            let _ = started.send(());
+            let _ = released.await;
+            inner
+        }));
+        running.await.expect("the unit started");
+
+        assert!(
+            !drain_detached(Duration::from_millis(50)).await,
+            "a unit still in flight is not drained"
+        );
+        release.send(()).expect("the unit is waiting");
+        assert!(drain_detached(Duration::from_secs(5)).await);
+        let inner = unit
+            .await
+            .expect("the caller task")
+            .expect("the outer unit");
+        assert_eq!(inner.expect("the inner unit"), 7);
     }
 }

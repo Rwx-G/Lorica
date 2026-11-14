@@ -7,7 +7,7 @@
 //! and is a frozen historical artefact: never edit it to follow the live
 //! schema, which is what it exists to be compared with.
 
-use lorica_api::cluster_telemetry_store::{ClusterTelemetryStore, FleetQuery, TelemetryTable};
+use lorica_fleet::telemetry_store::{ClusterTelemetryStore, FleetQuery, TelemetryTable};
 use rusqlite::Connection;
 
 const CLUSTER_TELEMETRY_V1_7_0: &str = "

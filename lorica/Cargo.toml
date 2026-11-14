@@ -56,6 +56,8 @@ lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
 lorica-worker = { version = "1.10.6", path = "../lorica-worker" }
 lorica-command = { version = "1.10.6", path = "../lorica-command" }
 lorica-cluster = { version = "1.10.6", path = "../lorica-cluster" }
+# The fleet runtime the cluster plane composes (backlog #52).
+lorica-fleet = { version = "1.10.6", path = "../lorica-fleet" }
 lorica-shmem = { version = "1.10.6", path = "../lorica-shmem" }
 lorica-waf = { version = "1.10.6", path = "../lorica-waf" }
 lorica-notify = { version = "1.10.6", path = "../lorica-notify" }

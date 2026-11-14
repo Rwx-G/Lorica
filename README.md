@@ -380,7 +380,7 @@ The dashboard ships inside the binary and is served on the management port (defa
 
 ## Architecture
 
-Lorica is a Rust workspace with 34 crates: 16 forked from Cloudflare Pingora and 18 product crates. See [FORK.md](FORK.md) for the full fork lineage and renaming rules.
+Lorica is a Rust workspace with 35 crates: 16 forked from Cloudflare Pingora and 19 product crates. See [FORK.md](FORK.md) for the full fork lineage and renaming rules.
 
 | Crate | Purpose |
 |-------|---------|
@@ -404,6 +404,7 @@ Lorica is a Rust workspace with 34 crates: 16 forked from Cloudflare Pingora and
 | `lorica-mcp` | Management MCP server (v1.9.0): a scope-gated tool surface over the automation plane, spoken over stdio or over a path on the automation listener |
 | `lorica-automation-policy` | The automation plane's policy as data (v1.9.0): the scope vocabulary, the MCP tier table, the admin settings allowlist and the one-way route and backend protections, with `serde` as its only dependency so `lorica-mcp` reads it without linking SQLite |
 | `lorica-adcs` | AD CS enrollment client (v1.10.0): turns a CSR into an issued certificate through the authority's CES endpoint, WS-Trust over HTTPS with Kerberos SPNEGO bound to the TLS channel; a leaf crate that links the system GSS-API library |
+| `lorica-fleet` | Fleet runtime (v1.11.0): what the process is in the fleet (control-plane and follower runtimes, roster/CRL refresh, drift, revocation, the detached units a committed change runs in), the control plane's fan-in database and the ingest policy; depends on `lorica-cluster` and `lorica-config`, consumed by `lorica-api` and `lorica` |
 | `lorica-lb` | Load balancing (Round Robin, Peak EWMA, Hash, Random, Least Conn) |
 | `lorica-cache` | HTTP response cache, LRU eviction |
 | `lorica-limits` | Rate estimator + per-route `LocalBucket` / `AuthoritativeBucket` token-bucket primitives (lock-free CAS, 100 ms cross-worker sync) |

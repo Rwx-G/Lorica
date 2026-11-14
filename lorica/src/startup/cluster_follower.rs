@@ -40,7 +40,6 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use lorica_api::cluster::FollowerRuntime;
 use lorica_api::db::db_blocking;
 use lorica_api::error::ApiError;
 use lorica_cluster::enroll::BoxFuture;
@@ -52,6 +51,7 @@ use lorica_cluster::{
 use lorica_config::canonical::CanonicalConfig;
 use lorica_config::models::ClusterIdentity;
 use lorica_config::store::ConfigStore;
+use lorica_fleet::FollowerRuntime;
 use lorica_notify::events::{AlertEvent, AlertType};
 use lorica_notify::AlertSender;
 use tokio::sync::{watch, Mutex};

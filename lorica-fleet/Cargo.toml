@@ -1,0 +1,35 @@
+[package]
+name = "lorica-fleet"
+version = "1.10.6"
+authors = ["Romain G."]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+description = "Fleet runtime for Lorica: control-plane and follower runtimes, the cluster telemetry store and the ingest policy"
+
+# The fleet runtime sits between the transport crate and its two
+# consumers: `lorica-api` (the handlers) and `lorica` (composition at
+# startup). It depends on the transport and on the configuration store
+# and on neither consumer (backlog #52). It is not part of
+# `lorica-cluster` on purpose: that would drag `lorica-config` into the
+# transport crate, whose wire layer treats the replicated blob as
+# opaque bytes.
+[dependencies]
+lorica-cluster = { version = "1.10.6", path = "../lorica-cluster" }
+lorica-config = { version = "1.10.6", path = "../lorica-config" }
+chrono = "0.4"
+# `catch_unwind` on a unit's future, so a panicking unit is caught on
+# its own task.
+futures-util = "0.3"
+parking_lot = "0.12"
+rusqlite = { version = "0.42", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2"
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+# The `TaskTracker` every cluster unit runs on, drained at shutdown.
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

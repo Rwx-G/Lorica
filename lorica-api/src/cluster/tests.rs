@@ -299,13 +299,13 @@ async fn a_panicking_unit_is_logged_and_its_owed_audit_row_is_written_as_incompl
     let _installed = tracing::subscriber::set_default(Recording(Arc::clone(&journal)));
     const ACTION: &str = "cluster.test.probe";
 
-    let owed = crate::cluster::runtime::OwedAudit {
+    let owed = crate::cluster::boundary::OwedAudit {
         log_store: fixture.state.log_store.clone(),
         ctx: crate::audit::AuditContext::node("cluster"),
         action: ACTION,
         target: ("cluster_node", "n0".to_string()),
     };
-    let outcome = crate::cluster::runtime::detached_audited("probe", owed, async {
+    let outcome = crate::cluster::boundary::detached_audited("probe", owed, async {
         panic!("injected after the commit");
     })
     .await;
@@ -313,7 +313,7 @@ async fn a_panicking_unit_is_logged_and_its_owed_audit_row_is_written_as_incompl
     assert!(
         matches!(
             outcome,
-            Err(crate::cluster::runtime::ClusterRuntimeError::EnforcementTask(_))
+            Err(lorica_fleet::ClusterRuntimeError::EnforcementTask(_))
         ),
         "the caller is told the unit failed"
     );
@@ -327,33 +327,6 @@ async fn a_panicking_unit_is_logged_and_its_owed_audit_row_is_written_as_incompl
             .any(|m| m.starts_with("a cluster unit panicked")),
         "the panic reached the journal"
     );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn a_unit_nested_in_another_runs_and_the_drain_waits_for_units_in_flight() {
-    let (started, running) = tokio::sync::oneshot::channel::<()>();
-    let (release, released) = tokio::sync::oneshot::channel::<()>();
-    let unit = tokio::spawn(crate::cluster::runtime::detached("outer", async move {
-        // Nested: takes no slot of its own, so it can never wait on the
-        // one its parent holds.
-        let inner = crate::cluster::runtime::detached("inner", async { 7 }).await;
-        let _ = started.send(());
-        let _ = released.await;
-        inner
-    }));
-    running.await.expect("the unit started");
-
-    assert!(
-        !crate::cluster::runtime::drain_detached(Duration::from_millis(50)).await,
-        "a unit still in flight is not drained"
-    );
-    release.send(()).expect("the unit is waiting");
-    assert!(crate::cluster::runtime::drain_detached(Duration::from_secs(5)).await);
-    let inner = unit
-        .await
-        .expect("the caller task")
-        .expect("the outer unit");
-    assert_eq!(inner.expect("the inner unit"), 7);
 }
 
 /// A follower whose `lorica.db` is a file, so a second connection can

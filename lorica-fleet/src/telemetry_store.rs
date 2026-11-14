@@ -16,7 +16,7 @@
 //!
 //! # Why this is a separate file and a separate connection
 //!
-//! [`crate::log_store::LogStore`] is one `Mutex<Connection>` shared by
+//! `lorica-api`'s `log_store::LogStore` is one `Mutex<Connection>` shared by
 //! every insert, every dashboard query, every retention pass and the
 //! audit verify. Fan-in multiplies the write rate by the fleet size:
 //! the control plane serves its own traffic AND stores every other

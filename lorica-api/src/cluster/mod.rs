@@ -1,13 +1,14 @@
 //! Cluster registry endpoints (Story 9.3 AC #5/#10/#13/#14, plus the
 //! token-minting surface Story 9.7's dialog needs). The fleet runtime
 //! rule (store first, serialized refresh, then the session registry)
-//! lives in [`runtime`], a public module the control-plane binary
-//! imports by name; the handlers here only call it and audit.
+//! lives in `lorica_fleet::runtime`, which the control-plane binary
+//! composes too; the handlers here only call it and audit, and
+//! [`boundary`] holds what this crate adds around it.
 //!
 //! Role floors live in the authorize middleware: token endpoints and
 //! every node mutation are SuperAdmin, reads are Viewer+.
 
-pub mod runtime;
+pub mod boundary;
 #[cfg(test)]
 mod tests;
 
@@ -24,13 +25,13 @@ use lorica_cluster::{leaf_spki_sha256, token, ClusterRequest, ControlPlane, Live
 use lorica_config::models::{ClusterNode, JoinToken, NodeStatus, Role, TokenState};
 use serde::{Deserialize, Serialize};
 
-use crate::cluster_telemetry_store::{FleetQuery, DEFAULT_PAGE, MAX_PAGE};
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
 use crate::server::AppState;
+use lorica_fleet::telemetry_store::{FleetQuery, DEFAULT_PAGE, MAX_PAGE};
 
-pub use runtime::{ClusterRuntime, ControlPlaneRuntime, FollowerRuntime};
+pub use lorica_fleet::{ClusterRuntime, ControlPlaneRuntime, FollowerRuntime};
 
 /// Default join-token lifetime.
 pub const DEFAULT_TOKEN_TTL_S: u64 = 3600;
@@ -66,14 +67,14 @@ fn control_plane(state: &AppState) -> Result<Arc<ControlPlane>, ApiError> {
 }
 
 /// The audit row a detached unit owes its change if it panics; see
-/// [`runtime::OwedAudit`].
+/// [`boundary::OwedAudit`].
 fn owed_audit(
     state: &AppState,
     ctx: &crate::audit::AuditContext,
     action: &'static str,
     target: (&'static str, String),
-) -> runtime::OwedAudit {
-    runtime::OwedAudit {
+) -> boundary::OwedAudit {
+    boundary::OwedAudit {
         log_store: state.log_store.clone(),
         ctx: ctx.clone(),
         action,
@@ -178,7 +179,7 @@ pub async fn mint_token(
     // kind of hole, because it is a credential.
     const ACTION: &str = "cluster.token.mint";
     let owed = owed_audit(&state, &audit_ctx, ACTION, ("cluster_token", String::new()));
-    let response = runtime::detached_audited("token mint", owed, async move {
+    let response = boundary::detached_audited("token mint", owed, async move {
         let bound_node_name = body.node_name.clone();
         let bound_source_cidr = body.source_cidr.clone();
         let minted = db_blocking(&state.store, move |store| {
@@ -204,7 +205,7 @@ pub async fn mint_token(
         })
         .await?;
 
-        let live = runtime::publish_token_liveness(&control, &state.store).await;
+        let live = lorica_fleet::runtime::publish_token_liveness(&control, &state.store).await;
         if let Ok(live) = &live {
             tracing::warn!(
                 public_id = %minted.public_id,
@@ -280,7 +281,7 @@ pub async fn revoke_token(
         ACTION,
         ("cluster_token", public_id.clone()),
     );
-    runtime::detached_audited("token revocation", owed, async move {
+    boundary::detached_audited("token revocation", owed, async move {
         let id = public_id.clone();
         let revoked = db_blocking(&state.store, move |store| {
             store
@@ -293,7 +294,7 @@ pub async fn revoke_token(
                 "no unused token with this public id".into(),
             ));
         }
-        let live = runtime::publish_token_liveness(&control, &state.store).await;
+        let live = lorica_fleet::runtime::publish_token_liveness(&control, &state.store).await;
         crate::audit::record(
             &state,
             &audit_ctx,
@@ -368,7 +369,7 @@ pub struct NodeResponse {
     /// one for a divergence that kept the generation and changed the
     /// hash (backlog #71).
     #[serde(flatten)]
-    pub drift: crate::cluster::runtime::DriftVerdict,
+    pub drift: lorica_fleet::runtime::DriftVerdict,
     /// The live session's peer address, when connected.
     pub session_peer: Option<String>,
     /// Unix seconds of the live session's last activity.
@@ -431,7 +432,7 @@ fn node_responses(
         .map(|node| {
             let session = live.get(&node.node_id);
             let expected = control.expected_config_version(&node.node_id);
-            let drift = crate::cluster::runtime::evaluate_drift(
+            let drift = lorica_fleet::runtime::evaluate_drift(
                 &expected,
                 node.applied_config_generation,
                 &node.applied_config_hash,
@@ -575,7 +576,7 @@ pub async fn activate_node(
     const ACTION: &str = "cluster.node.activate";
     let owed = owed_audit(&state, &audit_ctx, ACTION, ("cluster_node", id.clone()));
     let (node, selected, certificates) =
-        runtime::detached_audited("activation", owed, async move {
+        boundary::detached_audited("activation", owed, async move {
             let node_id = id.clone();
             let (node, selected, certificates) = db_blocking(&state.store, move |store| {
                 let before = store
@@ -669,16 +670,16 @@ pub async fn revoke_node(
     let runtime = control_plane_runtime(&state)?;
     let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
     let node_id = id.clone();
-    // `runtime::revoke_node` already finishes the enforcement whatever
+    // `lorica_fleet::runtime::revoke_node` already finishes the enforcement whatever
     // happens to its caller. The journal line and the audit row ride in
     // the same detached unit, or a client that disconnected after the
     // row flipped would leave a revocation that took effect with no
     // trace in the tamper-evident trail.
     const ACTION: &str = "cluster.node.revoke";
     let owed = owed_audit(&state, &audit_ctx, ACTION, ("cluster_node", id.clone()));
-    let outcome = runtime::detached_audited("revocation record", owed, async move {
+    let outcome = boundary::detached_audited("revocation record", owed, async move {
         let Some(outcome) =
-            runtime::revoke_node(&runtime, &state.store, &node_id, Utc::now()).await?
+            lorica_fleet::runtime::revoke_node(&runtime, &state.store, &node_id, Utc::now()).await?
         else {
             return Ok::<_, ApiError>(None);
         };
@@ -927,7 +928,7 @@ pub async fn leave(
         LEAVE_ACTION,
         ("cluster_node", follower.node_id.clone()),
     );
-    let response = runtime::detached_audited("leave", owed, async move {
+    let response = boundary::detached_audited("leave", owed, async move {
         leave_detached(&state, &follower, &audit_ctx).await
     })
     .await??;
@@ -1120,7 +1121,7 @@ pub async fn get_drift(
     Extension(state): Extension<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
     let runtime = control_plane_runtime(&state)?;
-    let report = runtime::drift_report(&runtime, &state.store).await?;
+    let report = lorica_fleet::runtime::drift_report(&runtime, &state.store).await?;
     Ok(json_data(report))
 }
 
@@ -1323,7 +1324,7 @@ pub async fn fleet_ban(
         ACTION,
         ("cluster_ban", body.client_ip.clone()),
     );
-    let (applied, unreachable) = runtime::detached_audited("fleet ban", owed, async move {
+    let (applied, unreachable) = boundary::detached_audited("fleet ban", owed, async move {
         let (applied, unreachable) = control
             .push_ban(&body.client_ip, body.duration_s, "manual")
             .await;
@@ -1415,10 +1416,10 @@ pub async fn open_break_glass(
     Json(body): Json<BreakGlassRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let follower = follower_runtime(&state)?;
-    if body.duration_s == 0 || body.duration_s > runtime::MAX_BREAK_GLASS_SECS {
+    if body.duration_s == 0 || body.duration_s > lorica_fleet::runtime::MAX_BREAK_GLASS_SECS {
         return Err(ApiError::BadRequest(format!(
             "duration_s must be between 1 and {}",
-            runtime::MAX_BREAK_GLASS_SECS
+            lorica_fleet::runtime::MAX_BREAK_GLASS_SECS
         )));
     }
     let until = Utc::now() + chrono::Duration::seconds(i64::try_from(body.duration_s).unwrap_or(0));
@@ -1455,7 +1456,7 @@ pub async fn open_break_glass(
         BREAK_GLASS_OPEN_ACTION,
         ("cluster_node", follower.node_id.clone()),
     );
-    runtime::detached_audited("break-glass open", owed, async move {
+    boundary::detached_audited("break-glass open", owed, async move {
         let cleared = Arc::clone(&opened);
         db_blocking(&state.store, move |store| {
             store
@@ -1523,7 +1524,7 @@ pub async fn close_break_glass(
         ACTION,
         ("cluster_node", follower.node_id.clone()),
     );
-    runtime::detached_audited("break-glass close", owed, async move {
+    boundary::detached_audited("break-glass close", owed, async move {
         db_blocking(&state.store, |store| {
             store
                 .set_cluster_break_glass_until(None)

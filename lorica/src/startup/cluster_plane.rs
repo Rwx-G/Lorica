@@ -56,13 +56,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use lorica_api::audit::{record_with_store, AuditContext};
-use lorica_api::cluster::runtime::MAX_BREAK_GLASS_SECS;
-use lorica_api::cluster::runtime::{
-    detached, detached_audited, publish_token_liveness, refresh_control_plane, revoke_node,
-    OwedAudit,
-};
-use lorica_api::cluster::{ControlPlaneRuntime, BREAK_GLASS_OPEN_ACTION, LEAVE_ACTION};
-use lorica_api::cluster_telemetry_store::ClusterTelemetryStore;
+use lorica_api::cluster::boundary::{detached_audited, OwedAudit};
+use lorica_api::cluster::{BREAK_GLASS_OPEN_ACTION, LEAVE_ACTION};
 use lorica_api::db::db_blocking;
 use lorica_api::error::ApiError;
 use lorica_api::log_store::LogStore;
@@ -81,6 +76,12 @@ use lorica_cluster::{
 use lorica_config::canonical::{restrict_for_recipient, CanonicalConfig, SelectorResolution};
 use lorica_config::models::{ClusterNode, NodeStatus};
 use lorica_config::store::{ConfigStore, LiveNodeFacts};
+use lorica_fleet::ingest::{ChargedBatch, IngestOutcome, IngestStats};
+use lorica_fleet::runtime::{
+    cert_bundle, detached, drift_report, publish_token_liveness, refresh_control_plane,
+    revoke_node, MAX_BREAK_GLASS_SECS,
+};
+use lorica_fleet::{ClusterTelemetryStore, ControlPlaneRuntime};
 use lorica_notify::events::{AlertEvent, AlertType};
 use lorica_notify::AlertSender;
 use tokio::sync::{watch, Mutex};
@@ -481,87 +482,6 @@ pub(crate) async fn redeem_with_store(
     })
 }
 
-/// Roughly what a batch will cost on disk, for the byte side of the
-/// ingest quota (Story 9.6 AC #8).
-///
-/// Estimated from the decoded payload rather than measured from the
-/// frame: the frame is gone by the time this runs, and what the quota
-/// is protecting is disk, not bandwidth. The fixed addend per row
-/// stands in for the row overhead SQLite adds on top of the strings.
-/// What a batch's audit rows will cost on disk (Story 9.9).
-///
-/// Separate from [`estimated_bytes`] because the audit rows are taken
-/// out of the batch before the quota is computed: they are exempt from
-/// the shedding verdict, not from the accounting, and a node that
-/// pushes only audit rows must still be charged for the work.
-fn audit_bytes(rows: &[lorica_cluster::TelemetryAuditRow]) -> u64 {
-    const ROW_OVERHEAD: u64 = 64;
-    rows.iter()
-        .map(|r| {
-            ROW_OVERHEAD
-                + (r.timestamp.len()
-                    + r.operator_username.len()
-                    + r.operator_role.len()
-                    + r.action.len()
-                    + r.target_type.len()
-                    + r.target_id.len()
-                    + r.before_payload_hash.len()
-                    + r.after_payload_hash.len()
-                    + r.ip.len()
-                    + r.user_agent.len()
-                    + r.prev_chain_hash.len()
-                    + r.chain_hash.len()) as u64
-        })
-        .sum()
-}
-
-fn estimated_bytes(batch: &lorica_cluster::TelemetryPush) -> u64 {
-    const ROW_OVERHEAD: u64 = 64;
-    // Bans are counted too. They replace rather than append, so they
-    // cannot grow the database without bound, but each snapshot is a
-    // DELETE plus up to 256 INSERTs under the store lock: the WORK is
-    // unbounded even where the storage is not, and a node sending
-    // only bans would otherwise pay nothing for it.
-    let bans: u64 = batch
-        .bans
-        .iter()
-        .map(|b| ROW_OVERHEAD + (b.client_ip.len() + b.reason.len()) as u64)
-        .sum();
-    let access: u64 = batch
-        .access
-        .iter()
-        .map(|r| {
-            ROW_OVERHEAD
-                + (r.timestamp.len()
-                    + r.method.len()
-                    + r.path.len()
-                    + r.host.len()
-                    + r.backend.len()
-                    + r.error.len()
-                    + r.client_ip.len()
-                    + r.xff_proxy_ip.len()
-                    + r.source.len()
-                    + r.request_id.len()) as u64
-        })
-        .sum();
-    let waf: u64 = batch
-        .waf
-        .iter()
-        .map(|r| {
-            ROW_OVERHEAD
-                + (r.description.len()
-                    + r.category.len()
-                    + r.matched_field.len()
-                    + r.matched_value.len()
-                    + r.timestamp.len()
-                    + r.client_ip.len()
-                    + r.route_hostname.len()
-                    + r.action.len()) as u64
-        })
-        .sum();
-    access + waf + bans
-}
-
 /// How large the fan-in database and its write-ahead log currently
 /// are, for the storage watermark (Story 9.6 AC #8).
 ///
@@ -877,7 +797,6 @@ impl SessionHandler for FleetHandlers {
         batch: lorica_cluster::TelemetryPush,
     ) -> BoxFuture<'_, Result<lorica_cluster::TelemetryPushAck, String>> {
         let node_id = node_id.to_string();
-        let mut batch = batch;
         Box::pin(async move {
             let Some(telemetry) = self.telemetry.as_ref() else {
                 // Refused rather than silently accepted: a control
@@ -887,13 +806,12 @@ impl SessionHandler for FleetHandlers {
             };
 
             // Audit rows first, and outside every shedding decision
-            // below (Story 9.9 AC #2). Losing an access row costs a
-            // line of traffic; losing an audit row costs the record of
-            // an operator action, on the one table whose entire purpose
-            // is that the record exists. The watermark's own comment
-            // already says audit writes keep the volume when telemetry
-            // is dropped; this is that rule applied to the rows that
-            // arrive over the fan-in rather than only to local ones.
+            // below (Story 9.9 AC #2): charged against the quota, never
+            // shed by it, see `lorica_fleet::ingest`. The watermark's
+            // own comment already says audit writes keep the volume
+            // when telemetry is dropped; this is that rule applied to
+            // the rows that arrive over the fan-in rather than only to
+            // local ones.
             //
             // They land in `audit_log` beside the local rows, not in
             // the telemetry database: verify and retention operate on
@@ -901,17 +819,7 @@ impl SessionHandler for FleetHandlers {
             //
             // Bounded on the wire by `MAX_TELEMETRY_AUDIT`, so exempt
             // from shedding is not the same as unbounded.
-            // Measured BEFORE the take, because the quota is computed
-            // from what remains in the batch. Without this the node
-            // pays nothing for audit rows, which is not what the doc,
-            // the proto comment and this story all say: they are
-            // counted against the quota and exempt from its VERDICT,
-            // which are different things. Charging them is what makes a
-            // node flooding audit get a `retry_after_s` even though its
-            // rows are stored.
-            let audit_charge = audit_bytes(&batch.audit);
-            let audit_count = batch.audit.len();
-            let audit_rows = std::mem::take(&mut batch.audit);
+            let (batch, audit_rows) = ChargedBatch::take_audit(batch);
             let accepted_audit = if audit_rows.is_empty() {
                 0
             } else {
@@ -964,85 +872,60 @@ impl SessionHandler for FleetHandlers {
                 .map_err(|e| format!("the audit fan-in task failed: {e}"))??
             };
 
-            // The storage watermark, which overrides every per-node
-            // budget: when the disk is short, a node well inside its
-            // quota is shed too. Telemetry is the first thing dropped
-            // so configuration and audit writes are the last (AC #8).
-            // Off the executor with the rest of the blocking work:
-            // two stats are cheap, but this handler is careful to
-            // offload everything else and an inconsistency here is a
-            // regression magnet.
+            // The storage watermark's input. Off the executor with the
+            // rest of the blocking work: two stats are cheap, but this
+            // handler is careful to offload everything else and an
+            // inconsistency here is a regression magnet.
             let data_dir = self.data_dir.clone();
             let used = tokio::task::spawn_blocking(move || telemetry_db_bytes(&data_dir))
                 .await
                 .map_err(|e| format!("the storage watermark task failed: {e}"))?;
-            let storage =
-                lorica_cluster::storage_verdict(used, lorica_cluster::DEFAULT_STORAGE_CAP_BYTES);
-            if matches!(storage, lorica_cluster::IngestVerdict::Shed { .. }) {
-                warn!(
-                    node_id,
-                    used_bytes = used,
-                    cap_bytes = lorica_cluster::DEFAULT_STORAGE_CAP_BYTES,
-                    bans_shed = batch.bans.len(),
-                    "shedding telemetry fleet-wide: the fan-in database is at its cap, which means retention is not keeping up. Configuration and audit writes keep the rest of the volume. The ban snapshot is shed too, so the fleet ban view goes stale until this clears"
-                );
-                // Bans are counted in the drop metric like everything
-                // else. They ARE shed here, and saying nothing would
-                // leave the fleet ban view silently stale during
-                // exactly the incident this watermark fires in.
+            let stats = IngestStats {
+                storage_used_bytes: used,
+                storage_cap_bytes: lorica_cluster::DEFAULT_STORAGE_CAP_BYTES,
+            };
+            let outcome = lorica_fleet::ingest::admit(&batch, &node_id, &stats, &self.quota);
+            if let Some((reason, dropped)) = outcome.dropped() {
                 lorica_api::metrics::inc_cluster_telemetry_dropped(
                     &node_id,
-                    "storage_watermark",
-                    (batch.access.len() + batch.waf.len() + batch.bans.len()) as u64,
+                    reason.label(),
+                    dropped,
                 );
-                return Ok(lorica_cluster::TelemetryPushAck {
-                    retry_after_s: storage.retry_after_s(),
-                    // Already stored: the watermark sheds telemetry,
-                    // never the audit trail.
-                    accepted_audit,
-                    audit_cursor: batch.audit_cursor,
-                    ..Default::default()
-                });
             }
-
-            // Bytes are estimated from the decoded payload rather than
-            // the frame, because the frame is gone by now and what
-            // matters is what this will cost on disk.
-            let bytes = estimated_bytes(&batch) + audit_charge;
-            // Bans are part of what the node offered, so they are
-            // part of what it is charged for.
-            let verdict = self.quota.admit(
-                &node_id,
-                batch.access.len(),
-                batch.waf.len() + batch.bans.len() + audit_count,
-                bytes,
-            );
-            let take_access = verdict.access_allowance(batch.access.len());
-            let take_waf = verdict.waf_allowance(batch.waf.len());
-            let shed = (batch.access.len() - take_access) + (batch.waf.len() - take_waf);
-            if shed > 0 {
+            let mut batch = batch.into_batch();
+            let admission = match outcome {
+                IngestOutcome::StorageShed { retry_after_s, .. } => {
+                    warn!(
+                        node_id,
+                        used_bytes = used,
+                        cap_bytes = lorica_cluster::DEFAULT_STORAGE_CAP_BYTES,
+                        bans_shed = batch.bans.len(),
+                        "shedding telemetry fleet-wide: the fan-in database is at its cap, which means retention is not keeping up. Configuration and audit writes keep the rest of the volume. The ban snapshot is shed too, so the fleet ban view goes stale until this clears"
+                    );
+                    return Ok(lorica_cluster::TelemetryPushAck {
+                        retry_after_s,
+                        // Already stored: the watermark sheds telemetry,
+                        // never the audit trail.
+                        accepted_audit,
+                        audit_cursor: batch.audit_cursor,
+                        ..Default::default()
+                    });
+                }
+                IngestOutcome::Admitted(admission) => admission,
+            };
+            if admission.quota_dropped > 0 {
                 warn!(
                     node_id,
-                    shed,
+                    shed = admission.quota_dropped,
                     offered = batch.access.len() + batch.waf.len(),
                     "the node is over its telemetry ingest quota; the excess is dropped and counted"
-                );
-                lorica_api::metrics::inc_cluster_telemetry_dropped(
-                    &node_id,
-                    "node_quota",
-                    shed as u64,
                 );
             }
 
             // The ban snapshot is authoritative for the node that sent
             // it: an address absent from it is no longer banned there
             // (decision D3).
-            // A node whose quota is exhausted does NOT get its
-            // snapshot applied, so ban spam cannot buy an unbounded
-            // amount of work under the store lock.
-            let ban_count = if matches!(verdict, lorica_cluster::IngestVerdict::Shed { .. }) {
-                0
-            } else {
+            let ban_count = if admission.apply_bans {
                 let telemetry_for_bans = Arc::clone(telemetry);
                 let bans = std::mem::take(&mut batch.bans);
                 let ban_node = node_id.clone();
@@ -1051,12 +934,18 @@ impl SessionHandler for FleetHandlers {
                 })
                 .await
                 .map_err(|e| format!("the ban snapshot task failed: {e}"))??
+            } else {
+                0
             };
 
             let store = Arc::clone(telemetry);
             let stamped = node_id.clone();
-            let access: Vec<_> = batch.access.into_iter().take(take_access).collect();
-            let waf: Vec<_> = batch.waf.into_iter().take(take_waf).collect();
+            let access: Vec<_> = batch
+                .access
+                .into_iter()
+                .take(admission.take_access)
+                .collect();
+            let waf: Vec<_> = batch.waf.into_iter().take(admission.take_waf).collect();
             let outcome = tokio::task::spawn_blocking(move || {
                 // `stamped` is the id the SESSION proved. Nothing in
                 // the batch names a node (decision D2).
@@ -1073,7 +962,7 @@ impl SessionHandler for FleetHandlers {
                 accepted_access: outcome.access,
                 accepted_waf: outcome.waf,
                 accepted_bans: ban_count,
-                retry_after_s: verdict.retry_after_s(),
+                retry_after_s: admission.retry_after_s,
                 access_cursor: batch.access_cursor,
                 waf_cursor: batch.waf_cursor,
                 accepted_audit,
@@ -1115,7 +1004,7 @@ impl SessionHandler for FleetHandlers {
                     if cert.key_pem.is_empty() {
                         continue;
                     }
-                    out.push(lorica_api::cluster::runtime::cert_bundle(&cert));
+                    out.push(cert_bundle(&cert));
                 }
                 Ok::<_, ApiError>(out)
             })
@@ -1743,7 +1632,7 @@ fn spawn_drift_watch(
         };
         loop {
             tokio::time::sleep(DRIFT_CHECK_INTERVAL).await;
-            let report = match lorica_api::cluster::runtime::drift_report(&runtime, &store).await {
+            let report = match drift_report(&runtime, &store).await {
                 Ok(report) => report,
                 Err(e) => {
                     error!(error = %e, "cluster drift evaluation failed");

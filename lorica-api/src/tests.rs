@@ -7200,7 +7200,7 @@ async fn test_follower_read_only_gate_and_break_glass_window() {
     assert_eq!(body_json(resp).await["data"]["active"], false);
 
     // The duration is bounded on both ends.
-    for duration in [0u64, crate::cluster::runtime::MAX_BREAK_GLASS_SECS + 1] {
+    for duration in [0u64, lorica_fleet::runtime::MAX_BREAK_GLASS_SECS + 1] {
         let resp = send(
             &state,
             &session_store,

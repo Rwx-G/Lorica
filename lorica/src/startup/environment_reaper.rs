@@ -33,10 +33,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use lorica_api::cluster::ClusterRuntime;
 use lorica_api::db::db_blocking;
 use lorica_api::error::ApiError;
 use lorica_config::ConfigStore;
+use lorica_fleet::ClusterRuntime;
 use tokio::sync::{watch, Mutex};
 use tokio_util::task::TaskTracker;
 use tracing::{info, warn};

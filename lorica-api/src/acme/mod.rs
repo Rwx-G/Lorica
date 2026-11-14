@@ -88,5 +88,5 @@ pub use types::{PendingDnsChallenge, PendingDnsChallenges};
 pub(crate) async fn after_certificate_issued(state: &crate::server::AppState, cert_id: &str) {
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
-    crate::cluster::runtime::distribute_certificate(&state.cluster, &state.store, cert_id).await;
+    crate::cluster::boundary::distribute_certificate(&state.cluster, &state.store, cert_id).await;
 }

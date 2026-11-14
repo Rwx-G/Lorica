@@ -35,6 +35,7 @@ members = [
     "lorica-mcp",
     "lorica-automation-policy",
     "lorica-adcs",
+    "lorica-fleet",
 ]
 
 exclude = ["fuzz"]

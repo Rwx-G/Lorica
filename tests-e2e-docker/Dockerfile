@@ -49,6 +49,7 @@ COPY lorica-challenge/ lorica-challenge/
 COPY lorica-mcp/ lorica-mcp/
 COPY lorica-automation-policy/ lorica-automation-policy/
 COPY lorica-adcs/ lorica-adcs/
+COPY lorica-fleet/ lorica-fleet/
 COPY tinyufo/ tinyufo/
 
 # Copy pre-built frontend into the dashboard crate

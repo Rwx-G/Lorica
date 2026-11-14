@@ -54,7 +54,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use lorica_api::cluster::runtime::FollowerRuntime;
 use lorica_api::log_store::LogStore;
 use lorica_api::server::LogStoreSlot;
 use lorica_cluster::{
@@ -62,6 +61,7 @@ use lorica_cluster::{
     MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_ROWS,
 };
 use lorica_config::{ConfigStore, TelemetryCursor};
+use lorica_fleet::FollowerRuntime;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};

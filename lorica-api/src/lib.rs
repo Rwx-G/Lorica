@@ -31,7 +31,6 @@ pub mod capture_ring;
 pub mod cert_export;
 pub mod certificates;
 pub mod cluster;
-pub mod cluster_telemetry_store;
 pub mod config;
 pub mod connections;
 pub mod db;
