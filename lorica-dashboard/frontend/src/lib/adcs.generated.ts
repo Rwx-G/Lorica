@@ -3,7 +3,7 @@
 // with that output; never edit it by hand.
 
 /** An alert type, as a notification channel subscribes to it. */
-export type AlertType = 'cert_expiring' | 'backend_down' | 'waf_alert' | 'config_changed' | 'sla_breached' | 'sla_recovered' | 'ip_banned' | 'cluster_node_left' | 'cluster_config_refused' | 'cluster_drift' | 'log_store_unavailable' | 'log_store_recovered' | 'adcs_authority_failed' | 'cert_issuance_failed';
+export type AlertType = 'cert_expiring' | 'backend_down' | 'waf_alert' | 'config_changed' | 'sla_breached' | 'sla_recovered' | 'ip_banned' | 'cluster_node_left' | 'cluster_config_refused' | 'cluster_drift' | 'log_store_unavailable' | 'log_store_recovered' | 'adcs_authority_failed' | 'cert_issuance_failed' | 'stream_bind_failed';
 
 /** How an alert reads at a glance. */
 export type AlertTone = 'problem' | 'recovery' | 'warning' | 'info';
@@ -35,6 +35,7 @@ export const ALERT_TYPES: readonly AlertTypeDefinition[] = [
   { value: 'log_store_recovered', label: 'Log persistence restored', tone: 'recovery', recovers: 'log_store_unavailable' },
   { value: 'adcs_authority_failed', label: 'AD CS authority failed', tone: 'problem', recovers: null },
   { value: 'cert_issuance_failed', label: 'Certificate issuance failed', tone: 'problem', recovers: null },
+  { value: 'stream_bind_failed', label: 'Stream bind failed', tone: 'problem', recovers: null },
 ];
 
 /** Where a certificate comes from (`CertificateSource`). */

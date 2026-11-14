@@ -824,11 +824,11 @@ needs the new type, `lorica-dashboard/frontend/src/lib/adcs.generated.ts`
 (regenerated, never hand-edited).
 Depends on: 12.1's migration Lot (same `MIGRATIONS` list). Parallel to D.
 
-- [ ] `AlertType::StreamBindFailed` (`stream_bind_failed`), `ALL`
+- [x] `AlertType::StreamBindFailed` (`stream_bind_failed`), `ALL`
       extended, every exhaustive match in `lorica-notify` updated.
-- [ ] The subscription migration at the next free number, sharing the
+- [x] The subscription migration at the next free number, sharing the
       migration 63 helper as 65 does; idempotence test.
-- [ ] Regenerate the vocabulary file the fixture pins.
+- [x] Regenerate the vocabulary file the fixture pins.
 
 ### Lot E3: API surfaces - cargo
 
@@ -1394,6 +1394,35 @@ the budget view stays Operator and SuperAdmin.
   and `the_stream_plane_settings_replicate_through_apply_to`. The routing
   test's two lines are C1's, unchanged. `diff.rs` reports both keys in
   the import preview (`compute_diff_reports_the_stream_plane_settings`).
+- Lot E1 done. `AlertType::StreamBindFailed` (`stream_bind_failed`), last
+  in `ALL`, with the Slack emoji (`:electric_plug:`), the only exhaustive
+  match in `lorica-notify` besides `events.rs`. Migration 74
+  (`migrate_subscribe_stream_alerts`, frozen `STREAM_ALERT_TYPES`)
+  subscribes explicit channels through the migration 63 helper; pinned by
+  `the_stream_alert_subscription_is_idempotent` (two runs, one result)
+  and `an_upgrade_subscribes_explicit_channels_to_the_stream_alert`
+  (a file rewound to 73). `adcs.generated.ts` regenerated from the
+  fixture's output: label "Stream bind failed", tone `problem`, recovers
+  nothing.
+- Lot E1 needed three files outside its allowlist, each because a gate
+  fails without it: `lorica-api/src/vocabulary.rs` (its exhaustive
+  label, tone and recovery matches do not compile without the variant;
+  they are what the fixture renders), `lorica-api/openapi.yaml` (the one
+  `alert_types` description line, which `lorica-notify`'s
+  `the_api_reference_lists_every_alert_type` reads; Lot E3 owns the rest
+  of the file), and `lorica-config/tests/config_db_upgrade.rs` (the
+  migration 63 and 65 upgrade tests replay every later migration, so
+  their expected lists gain `stream_bind_failed`).
+- Not done here: raising the alert. The raise site is
+  `StreamPlaneHandle::record` in `lorica/src/startup/stream_plane.rs`
+  (the `PlaneEvent::BindFailed` arm, which already writes the
+  `stream.bind_failed` audit row once per entry), outside E1's
+  allowlist. It needs a `lorica_notify::AlertSender` handed to the
+  handle in both startup modes (`alert_sender` exists in
+  `run_supervisor` and `run_single_process`) and the stream's name,
+  which `BindKey` does not carry: `AlertEvent::new(AlertType::StreamBindFailed,
+  summary)` with the details `stream_id`, `stream_name`, `node`, `kind`
+  (`kind.as_str()`), `os_error` and `port`.
 
 ## File List
 
@@ -1422,6 +1451,9 @@ the budget view stays Operator and SuperAdmin.
 - `lorica-worker/src/stream_ctl.rs` (`NackReason::TableUnavailable`, `check_stream_id` public)
 - `lorica-stream/src/runtime.rs`, `lorica-stream/tests/runtime.rs` (the `table_unavailable` nack)
 - `lorica-config/src/canonical.rs` (Lot C2: both settings in `CanonicalGlobalSettings`, the shape digest), `lorica-config/src/diff.rs`
+- `lorica-notify/src/events.rs`, `lorica-notify/src/channels/slack.rs` (Lot E1: `StreamBindFailed`)
+- `lorica-config/src/store/mod.rs` (Lot E1: migration 74), `lorica-config/tests/config_db_upgrade.rs`
+- `lorica-api/src/vocabulary.rs`, `lorica-api/openapi.yaml` (the `alert_types` description line), `lorica-dashboard/frontend/src/lib/adcs.generated.ts` (regenerated)
 
 ## Change Log
 
@@ -1434,3 +1466,4 @@ the budget view stays Operator and SuperAdmin.
 | 2026-11-14 | 0.5 | Lot B implemented: the `lorica-stream` crate (stream runtime, accept and receive loops, connection tracker, engine traits, fd budget, bind state, reconcile diff). D-c amended: the reconcile diff refuses overlapping UDP bindings, which the kernel does not. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.6 | Lot D implemented: the stream plane driver in the supervisor and single-process mode, the stream runtime in each worker, respawn replay, TCP stream listeners across a hot upgrade, the stop path (drain watcher, `EXTEND_TIMEOUT_USEC` keepalive, Pingora's waits from the setting); a stop no longer waits out its bound on zombie workers. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.7 | Lot C2 implemented: `worker_drain_timeout_s` and `stream_listen_socket_cap` replicate through the canonical config inside format version 3, and the import preview reports them. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.8 | Lot E1 implemented: the `stream_bind_failed` alert type and migration 74 subscribing explicit channels to it. Status InProgress. | Romain G. |

@@ -241,7 +241,8 @@ fn an_upgrade_subscribes_explicit_channels_to_the_log_store_alerts() {
             "log_store_unavailable",
             "log_store_recovered",
             "adcs_authority_failed",
-            "cert_issuance_failed"
+            "cert_issuance_failed",
+            "stream_bind_failed"
         ]
     );
     assert!(alert_types_of(&store, "everything").is_empty());
@@ -252,7 +253,8 @@ fn an_upgrade_subscribes_explicit_channels_to_the_log_store_alerts() {
             "log_store_recovered",
             "log_store_unavailable",
             "adcs_authority_failed",
-            "cert_issuance_failed"
+            "cert_issuance_failed",
+            "stream_bind_failed"
         ],
         "a type already ticked is not added twice"
     );
@@ -305,14 +307,72 @@ fn an_upgrade_subscribes_explicit_channels_to_the_adcs_alerts() {
             "backend_down",
             "log_store_unavailable",
             "adcs_authority_failed",
-            "cert_issuance_failed"
+            "cert_issuance_failed",
+            "stream_bind_failed"
         ]
     );
     assert!(alert_types_of(&store, "everything").is_empty());
     assert_eq!(alert_types_of(&store, "wildcard"), ["*"]);
     assert_eq!(
         alert_types_of(&store, "partial"),
-        ["cert_issuance_failed", "adcs_authority_failed"],
+        [
+            "cert_issuance_failed",
+            "adcs_authority_failed",
+            "stream_bind_failed"
+        ],
+        "a type already ticked is not added twice"
+    );
+
+    let mut explicit = store
+        .get_notification_config("explicit")
+        .expect("channel reads")
+        .expect("channel kept");
+    explicit.alert_types = vec!["backend_down".to_string()];
+    store
+        .update_notification_config(&explicit)
+        .expect("operator edit");
+    drop(store);
+    let reopened = ConfigStore::open(&path, None).expect("an upgraded file reopens");
+    assert_eq!(alert_types_of(&reopened, "explicit"), ["backend_down"]);
+}
+
+/// Migration 74 does for the stream bind-failure alert what migration
+/// 63 did for the log-store ones. The file is rewound to version 73 so
+/// the channels are written as a node before it would have them.
+#[test]
+fn an_upgrade_subscribes_explicit_channels_to_the_stream_alert() {
+    let dir = tempfile::tempdir().expect("test setup: tempdir");
+    let path = dir.path().join("lorica.db");
+    drop(ConfigStore::open(&path, None).expect("test setup: fresh store"));
+    Connection::open(&path)
+        .expect("test setup: raw open")
+        .execute_batch(
+            r#"
+            DELETE FROM schema_migrations WHERE version >= 74;
+            INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+            VALUES ('explicit', 'webhook', 1, '{"url":"https://hooks.example.com/a"}',
+                    '["backend_down"]');
+            INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+            VALUES ('everything', 'webhook', 1, '{"url":"https://hooks.example.com/b"}', '[]');
+            INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+            VALUES ('wildcard', 'slack', 1, '{"url":"https://hooks.example.com/c"}', '["*"]');
+            INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+            VALUES ('partial', 'webhook', 0, '{"url":"https://hooks.example.com/d"}',
+                    '["stream_bind_failed"]');
+            "#,
+        )
+        .expect("test setup: channels saved at version 73");
+
+    let store = ConfigStore::open(&path, None).expect("a version 73 lorica.db must open");
+    assert_eq!(
+        alert_types_of(&store, "explicit"),
+        ["backend_down", "stream_bind_failed"]
+    );
+    assert!(alert_types_of(&store, "everything").is_empty());
+    assert_eq!(alert_types_of(&store, "wildcard"), ["*"]);
+    assert_eq!(
+        alert_types_of(&store, "partial"),
+        ["stream_bind_failed"],
         "a type already ticked is not added twice"
     );
 

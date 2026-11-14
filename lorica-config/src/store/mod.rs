@@ -201,6 +201,7 @@ const MIGRATIONS: &[Migration] = &[
     (71, migrate_streams),
     (72, migrate_backend_health_check),
     (73, migrate_cluster_node_reserved_ports),
+    (74, migrate_subscribe_stream_alerts),
 ];
 
 /// The newest schema version, the last entry of [`MIGRATIONS`].
@@ -1215,6 +1216,20 @@ const ADCS_ALERT_TYPES: [&str; 2] = ["adcs_authority_failed", "cert_issuance_fai
 /// certificate that silently failed to renew, would page nobody.
 fn migrate_subscribe_adcs_alerts(conn: &Connection) -> rusqlite::Result<()> {
     subscribe_explicit_channels(conn, &ADCS_ALERT_TYPES)
+}
+
+/// The alert type Story 12.2 introduced, as migration 74 subscribes
+/// existing channels to it. Frozen for the reason given on
+/// `LOG_STORE_ALERT_TYPES`.
+const STREAM_ALERT_TYPES: [&str; 1] = ["stream_bind_failed"];
+
+/// Subscribe every notification channel saved with an explicit
+/// alert-type list to the stream bind-failure alert, for the reason
+/// migration 63 gave: a channel saved before the type existed never had
+/// the box to tick, and a stream whose port never opened would page
+/// nobody.
+fn migrate_subscribe_stream_alerts(conn: &Connection) -> rusqlite::Result<()> {
+    subscribe_explicit_channels(conn, &STREAM_ALERT_TYPES)
 }
 
 /// Append `new_types` to every channel whose stored list is explicit.
@@ -2722,7 +2737,7 @@ mod migration_tests {
         );
     }
 
-    // ---- 1.11.0: migrations 71 to 73 ----
+    // ---- 1.11.0: migrations 71 to 74 ----
 
     /// The last migration the `v1.10.6` tag carries
     /// (`git show v1.10.6:lorica-config/src/store/mod.rs`, whose
@@ -2756,6 +2771,47 @@ mod migration_tests {
                     "migration {version} changed the schema on a second run"
                 );
             }
+        }
+    }
+
+    /// Migration 74 subscribes explicit channels to `stream_bind_failed`
+    /// once: a second run adds nothing, and the channels that already
+    /// receive every type are left alone.
+    #[test]
+    fn the_stream_alert_subscription_is_idempotent() {
+        let store = ConfigStore::open_in_memory().expect("fresh store at head");
+        store
+            .conn
+            .execute_batch(
+                r#"
+                INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+                VALUES ('explicit', 'webhook', 1, '{"url":"https://hooks.example.com/a"}',
+                        '["backend_down"]');
+                INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+                VALUES ('everything', 'webhook', 1, '{"url":"https://hooks.example.com/b"}', '[]');
+                INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+                VALUES ('wildcard', 'slack', 1, '{"url":"https://hooks.example.com/c"}', '["*"]');
+                "#,
+            )
+            .expect("test setup: channels");
+        let stored = |id: &str| -> String {
+            store
+                .conn
+                .query_row(
+                    "SELECT alert_types FROM notification_configs WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .expect("test setup: alert_types reads")
+        };
+        for _ in 0..2 {
+            migrate_subscribe_stream_alerts(&store.conn).expect("migration 74 runs");
+            assert_eq!(
+                stored("explicit"),
+                r#"["backend_down","stream_bind_failed"]"#
+            );
+            assert_eq!(stored("everything"), "[]");
+            assert_eq!(stored("wildcard"), r#"["*"]"#);
         }
     }
 

@@ -58,6 +58,13 @@ pub enum AlertType {
     /// when there is one (a renewal, or an issuance that got that far),
     /// the failing step, and the authority's message.
     CertIssuanceFailed,
+    /// A stream's listening socket could not be bound on a node (Story
+    /// 12.2, D-h): port in use, permission denied, address not
+    /// available, a reserved port, the fd budget, or another OS error.
+    /// Raised by the node's stream plane once per entry into the failed
+    /// state, never on each retry while it lasts. The event carries the
+    /// stream id and name, the node, the failure kind and the OS error.
+    StreamBindFailed,
 }
 
 impl AlertType {
@@ -82,12 +89,13 @@ impl AlertType {
             Self::LogStoreRecovered => "log_store_recovered",
             Self::AdcsAuthorityFailed => "adcs_authority_failed",
             Self::CertIssuanceFailed => "cert_issuance_failed",
+            Self::StreamBindFailed => "stream_bind_failed",
         }
     }
 
     /// Every alert type, in declaration order: the vocabulary a
     /// notification channel can subscribe to.
-    pub const ALL: [AlertType; 14] = [
+    pub const ALL: [AlertType; 15] = [
         Self::CertExpiring,
         Self::BackendDown,
         Self::WafAlert,
@@ -102,6 +110,7 @@ impl AlertType {
         Self::LogStoreRecovered,
         Self::AdcsAuthorityFailed,
         Self::CertIssuanceFailed,
+        Self::StreamBindFailed,
     ];
 }
 
@@ -123,6 +132,7 @@ impl std::str::FromStr for AlertType {
             "log_store_recovered" => Ok(Self::LogStoreRecovered),
             "adcs_authority_failed" => Ok(Self::AdcsAuthorityFailed),
             "cert_issuance_failed" => Ok(Self::CertIssuanceFailed),
+            "stream_bind_failed" => Ok(Self::StreamBindFailed),
             other => Err(format!("unknown alert type: {other}")),
         }
     }
@@ -183,6 +193,7 @@ mod tests {
             AlertType::LogStoreRecovered => 11,
             AlertType::AdcsAuthorityFailed => 12,
             AlertType::CertIssuanceFailed => 13,
+            AlertType::StreamBindFailed => 14,
         }
     }
 

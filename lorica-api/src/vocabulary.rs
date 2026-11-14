@@ -75,6 +75,7 @@ pub fn alert_type_label(alert_type: &AlertType) -> &'static str {
         AlertType::LogStoreRecovered => "Log persistence restored",
         AlertType::AdcsAuthorityFailed => "AD CS authority failed",
         AlertType::CertIssuanceFailed => "Certificate issuance failed",
+        AlertType::StreamBindFailed => "Stream bind failed",
     }
 }
 
@@ -86,6 +87,7 @@ pub fn alert_type_tone(alert_type: &AlertType) -> AlertTone {
         | AlertType::LogStoreUnavailable
         | AlertType::AdcsAuthorityFailed
         | AlertType::CertIssuanceFailed
+        | AlertType::StreamBindFailed
         | AlertType::ClusterConfigRefused => AlertTone::Problem,
         AlertType::SlaRecovered | AlertType::LogStoreRecovered => AlertTone::Recovery,
         AlertType::CertExpiring | AlertType::ClusterDrift | AlertType::ClusterNodeLeft => {
@@ -113,7 +115,8 @@ pub fn alert_type_recovers(alert_type: &AlertType) -> Option<AlertType> {
         | AlertType::ClusterDrift
         | AlertType::LogStoreUnavailable
         | AlertType::AdcsAuthorityFailed
-        | AlertType::CertIssuanceFailed => None,
+        | AlertType::CertIssuanceFailed
+        | AlertType::StreamBindFailed => None,
     }
 }
 
