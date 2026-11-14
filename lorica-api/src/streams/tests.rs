@@ -1145,3 +1145,193 @@ async fn a_follower_answers_the_budget_view_for_its_own_node() {
     assert_eq!(view["node_id"], follower.node_id.as_str());
     assert_eq!(view["node_name"], follower.node_name.as_str());
 }
+
+// ---- The import's fd budget check (Story 12.2 Lot E2, E3's follow-up) ----
+
+/// A TOML export of a store holding `streams`, with
+/// `stream_listen_socket_cap` set to `cap` when given.
+fn export_with(streams: &[lorica_config::models::Stream], cap: Option<u32>) -> String {
+    let source = lorica_config::ConfigStore::open_in_memory().expect("source");
+    for stream in streams {
+        source.create_stream(stream).expect("test setup: stream");
+    }
+    if let Some(cap) = cap {
+        let mut settings = source.get_global_settings().expect("settings");
+        settings.stream_listen_socket_cap = cap;
+        source
+            .update_global_settings(&settings)
+            .expect("test setup: cap");
+    }
+    lorica_config::export::export_to_toml(&source).expect("export")
+}
+
+/// A fleet-wide UDP range on `0.0.0.0`, as a TOML file would carry it.
+fn udp_range(name: &str, first: u16, last: u16) -> lorica_config::models::Stream {
+    lorica_config::models::Stream {
+        protocol: lorica_config::models::StreamProtocol::Udp,
+        port_last: last,
+        ..source_stream(name, first)
+    }
+}
+
+/// The preview's answer and then the import's, for one file.
+async fn preview_and_import(
+    node: &Node,
+    file: String,
+) -> ((StatusCode, Value), (StatusCode, Value)) {
+    let body = json!({ "toml_content": file });
+    let preview = node
+        .call("POST", "/api/v1/config/import/preview", Some(body.clone()))
+        .await;
+    let import = node.call("POST", "/api/v1/config/import", Some(body)).await;
+    (preview, import)
+}
+
+/// The import and its preview run the budget check of a stream write,
+/// through the same function: a file a node's fd budget cannot hold is
+/// refused `422` by both, before anything is cleared.
+#[tokio::test]
+async fn an_import_and_its_preview_refuse_a_stream_the_budget_cannot_hold() {
+    // The import and its preview share one write budget, so each case
+    // runs on a node of its own. 4,096 fds leave a stream budget of
+    // 1,024; the supervisor holds a socket per worker per UDP port, so
+    // 1,000 ports on two workers need 2,000.
+    let fresh_node = || async {
+        let mut node = Node::standalone().await;
+        node.state.stream_plane =
+            StreamPlaneState::new(lorica_stream::StreamBindStates::new(), 4096, 2);
+        let kept = node.created(tcp("smtp", 2525)).await;
+        (node, kept)
+    };
+
+    let (node, kept) = fresh_node().await;
+    let ((preview_status, preview), (import_status, import)) = preview_and_import(
+        &node,
+        export_with(&[udp_range("dns", 20_000, 20_999)], None),
+    )
+    .await;
+    let previewed = budget_refusal(preview_status, &preview);
+    for part in ["`dns`", "this node", "supervisor_fds", "2000"] {
+        assert!(previewed.contains(part), "{part}: {previewed}");
+    }
+    assert_eq!(
+        previewed,
+        budget_refusal(import_status, &import),
+        "the preview and the import refuse alike"
+    );
+    let (_, listed) = node.call("GET", "/api/v1/streams", None).await;
+    let listed: Vec<Value> = listed["data"]["streams"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(without_bind)
+        .collect();
+    assert_eq!(listed, vec![kept], "nothing was cleared");
+
+    // The file's own cap is the one the import writes, so it is the one
+    // checked: 10 ports under a cap of 5.
+    let (node, _) = fresh_node().await;
+    let ((preview_status, preview), (import_status, import)) = preview_and_import(
+        &node,
+        export_with(&[udp_range("small", 30_000, 30_009)], Some(5)),
+    )
+    .await;
+    assert!(budget_refusal(preview_status, &preview).contains("listen_socket_cap"));
+    assert!(budget_refusal(import_status, &import).contains("listen_socket_cap"));
+
+    // A file that fits imports.
+    let (node, _) = fresh_node().await;
+    let ((preview_status, preview), (import_status, import)) = preview_and_import(
+        &node,
+        export_with(&[udp_range("dns", 20_000, 20_099)], None),
+    )
+    .await;
+    assert_eq!(preview_status, StatusCode::OK, "{preview}");
+    assert!(preview["data"].get("warnings").is_none(), "{preview}");
+    assert_eq!(import_status, StatusCode::OK, "{import}");
+}
+
+/// Re-importing what a node already holds is never refused for its
+/// budget, even on a node a lowered cap left over it: a stream carried
+/// under its stored id is judged as an update of that row.
+#[tokio::test]
+async fn re_importing_an_export_passes_on_a_node_already_over_its_budget() {
+    let node = Node::standalone().await;
+    let mut wide = tcp("wide", 1000);
+    wide["port_last"] = json!(1009);
+    let id = node.created(wide).await["id"]
+        .as_str()
+        .expect("an id")
+        .to_string();
+    // The stored row, as a file under a cap of 5 would carry it: the
+    // node's own export would also carry its users, whose redacted
+    // hashes no import takes.
+    let stored = node
+        .state
+        .store
+        .lock()
+        .await
+        .get_stream(&id)
+        .expect("read")
+        .expect("the row");
+    let same = export_with(std::slice::from_ref(&stored), Some(5));
+    let renamed_id = export_with(
+        &[lorica_config::models::Stream {
+            id: uuid::Uuid::new_v4().to_string(),
+            ..stored
+        }],
+        Some(5),
+    );
+
+    let (status, answer) = node
+        .call(
+            "POST",
+            "/api/v1/config/import/preview",
+            Some(json!({ "toml_content": renamed_id })),
+        )
+        .await;
+    assert!(
+        budget_refusal(status, &answer).contains("listen_socket_cap"),
+        "the same ports under a new id are a new demand"
+    );
+    let (status, answer) = node
+        .call(
+            "POST",
+            "/api/v1/config/import",
+            Some(json!({ "toml_content": same })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+}
+
+/// On a control plane, a targeted node that has not reported its budget
+/// is named in the import's warnings and in its preview's, once.
+#[tokio::test]
+async fn an_import_names_each_targeted_node_whose_budget_it_cannot_see() {
+    let node = Node::control_plane().await;
+    node.enrol("edge-1", NodeStatus::Active, Some(EDGE_1)).await;
+    let pinned = |name: &str, port: u16| lorica_config::models::Stream {
+        node_selector: vec!["edge-1".to_string()],
+        ..source_stream(name, port)
+    };
+    let body = json!({
+        "toml_content": export_with(&[pinned("pg", 5432), pinned("smtp", 2525)], None)
+    });
+    let (status, preview) = node
+        .call("POST", "/api/v1/config/import/preview", Some(body.clone()))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    let (status, import) = node.call("POST", "/api/v1/config/import", Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{import}");
+    for answer in [&preview, &import] {
+        let warnings: Vec<&str> = answer["data"]["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|w| w.contains("fd_budget"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{answer}");
+        assert!(warnings[0].contains("node `edge-1`"), "{answer}");
+    }
+}

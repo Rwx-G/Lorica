@@ -4,10 +4,9 @@
 use axum::extract::Extension;
 use axum::http::StatusCode;
 use axum::Json;
-use lorica_config::listen_ports::ReservedPorts;
-use lorica_config::models::Stream;
+use lorica_config::import::ImportData;
 use lorica_config::ConfigStore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
@@ -70,27 +69,53 @@ pub async fn export_config(
 /// Maximum TOML import size: 1 MB.
 const MAX_IMPORT_SIZE: usize = 1_048_576;
 
-/// The port check of a stream write (Story 12.1 D-9), on every stream
-/// of an import file against the nodes that would bind it and the
-/// file's other streams, since an import replaces the stored ones.
-/// Refuses with the first conflict, as a stream write does.
+/// The checks of a stream write, on every stream of an import file
+/// against the nodes that would bind it and the file's other streams,
+/// since an import replaces the stored ones: the port check (Story 12.1
+/// D-9), then the fd budget check (Story 12.2 D-e) under the file's own
+/// `stream_listen_socket_cap`, which the import writes. A stream the
+/// file carries unchanged from a stored row of the same id is judged
+/// as an update of that row, so re-importing an export never refuses
+/// what the node already holds. Refuses with the first conflict or
+/// budget refusal, as a stream write does, and answers the budget
+/// warnings, each once.
 ///
 /// One function for the import and its preview, so a preview that
-/// comes back clean is an import that will not be refused for a port.
-fn refuse_imported_port_conflicts(
+/// comes back clean is an import that will not be refused for a port
+/// or a budget.
+fn check_imported_streams(
     store: &ConfigStore,
     role: &crate::streams::LocalRole,
-    reserved: ReservedPorts,
-    streams: &[Stream],
-) -> Result<(), ApiError> {
+    budget: &crate::streams::BudgetInputs,
+    import: &ImportData,
+) -> Result<Vec<String>, ApiError> {
+    let streams = &import.streams;
     for stream in streams {
         if let Some(conflict) =
-            crate::streams::first_port_conflict(store, role, reserved, stream, streams)?
+            crate::streams::first_port_conflict(store, role, budget.reserved, stream, streams)?
         {
             return Err(crate::streams::port_conflict_error(stream, &conflict));
         }
     }
-    Ok(())
+    let cap = import.global_settings.stream_listen_socket_cap;
+    let mut warnings: Vec<String> = Vec::new();
+    for stream in streams {
+        let stored = store.get_stream(&stream.id)?;
+        for warning in crate::streams::budget_warnings(
+            store,
+            role,
+            budget,
+            cap,
+            stream,
+            stored.as_ref(),
+            streams,
+        )? {
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+        }
+    }
+    Ok(warnings)
 }
 
 /// POST /api/v1/config/import - replace the entire configuration from a TOML payload (max 1 MB).
@@ -132,17 +157,21 @@ pub async fn import_config(
     }
 
     let role = crate::streams::LocalRole::of(&state);
-    let reserved = state.reserved_ports;
+    let budget = crate::streams::BudgetInputs::of(&state);
     // What the import changed on its own initiative, such as an AD CS
     // certificate made manual because its authority is not on this
-    // node (Epic 13 D14). The caller learns it here or not at all.
+    // node (Epic 13 D14), and the nodes whose fd budget it could not
+    // check. The caller learns it here or not at all.
     let warnings: Vec<String> = db_blocking(&state.store, move |store| {
         // Before `import_to_store`, which clears the store first, and in
         // the same closure, so no stream write lands between the check
         // and the import.
-        refuse_imported_port_conflicts(store, &role, reserved, &import_data.streams)?;
-        lorica_config::import::import_to_store(&*store, &import_data)
-            .map_err(|e| ApiError::Internal(e.to_string()))
+        let mut warnings = check_imported_streams(store, &role, &budget, &import_data)?;
+        warnings.extend(
+            lorica_config::import::import_to_store(&*store, &import_data)
+                .map_err(|e| ApiError::Internal(e.to_string()))?,
+        );
+        Ok::<_, ApiError>(warnings)
     })
     .await?;
     state.notify_config_changed();
@@ -183,15 +212,28 @@ pub async fn import_preview(
         .map_err(|e| ApiError::BadRequest(format!("invalid TOML: {e}")))?;
 
     let role = crate::streams::LocalRole::of(&state);
-    let reserved = state.reserved_ports;
-    let diff = db_blocking(&state.store, move |store| {
-        // The import answers 409 on a port conflict; the preview must
-        // say so too, or it reads clean for a file the import refuses.
-        refuse_imported_port_conflicts(store, &role, reserved, &import_data.streams)?;
-        lorica_config::diff::compute_diff(&*store, &import_data)
-            .map_err(|e| ApiError::Internal(e.to_string()))
+    let budget = crate::streams::BudgetInputs::of(&state);
+    let (diff, warnings) = db_blocking(&state.store, move |store| {
+        // The import answers 409 on a port conflict and 422 on a budget
+        // it breaks; the preview must say so too, or it reads clean for
+        // a file the import refuses.
+        let warnings = check_imported_streams(store, &role, &budget, &import_data)?;
+        let diff = lorica_config::diff::compute_diff(&*store, &import_data)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        Ok::<_, ApiError>((diff, warnings))
     })
     .await?;
 
-    Ok(json_data(diff))
+    Ok(json_data(PreviewResponse { diff, warnings }))
+}
+
+/// What `POST /api/v1/config/import/preview` answers: the diff, and the
+/// nodes whose fd budget the import could not check, which the import
+/// would answer too.
+#[derive(Serialize)]
+struct PreviewResponse {
+    #[serde(flatten)]
+    diff: lorica_config::diff::ConfigDiff,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }

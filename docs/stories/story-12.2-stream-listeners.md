@@ -571,9 +571,13 @@ reported again; one that cleared is not invented.
   cluster nodes response gains `stream_plane` (bind summary for every
   role; `fd_limit` and the budget figures Operator and above only).
 - The pending-node review gains `stream_ports`: every stream the node
-  will bind once active, `{ id, name, protocol, listen_address, ports }`,
-  fleet-wide streams included (unlike `selected_for_hostnames`): a port
-  a node opens is a perimeter change whether one node or all open it.
+  will bind once active, `{ id, name, protocol, listen_address,
+  port_first, port_last }`, fleet-wide streams included (unlike
+  `selected_for_hostnames`): a port a node opens is a perimeter change
+  whether one node or all open it. *Amended in Lot E2:* `port_first` and
+  `port_last` replace the `ports` this decision first named, the shape
+  Lot E3 documented in `openapi.yaml` and the stream resource carries; a
+  1,024-port range is two numbers, not a list.
 - `lorica-fleet` is read, not changed, by this story: the bind report
   is session state carried by `lorica-cluster` like `resources`, and the
   follower's provider is `ReplicaHandler` in the binary.
@@ -866,15 +870,15 @@ Allowlist: `lorica-cluster/src/messages.rs`, `lorica-cluster/src/dialer.rs`,
 Depends on: E3 (the `AppState` handle, `openapi.yaml` already carries the
 fields); 12.1's heartbeat Lot (same files).
 
-- [ ] `StreamPlaneReport` on `Heartbeat` (D-i), additive tags, a
+- [x] `StreamPlaneReport` on `Heartbeat` (D-i), additive tags, a
       decode test of a heartbeat without it.
-- [ ] `FollowerHandler::stream_plane()` defaulted to `None` like
+- [x] `FollowerHandler::stream_plane()` defaulted to `None` like
       `resources`; `ReplicaHandler` fills it from the registry.
-- [ ] `roster.rs` records it; `node_responses` renders `stream_plane`
+- [x] `roster.rs` records it; `node_responses` renders `stream_plane`
       (budget figures withheld from Viewers, tested), `unknown` when
       `lorica_fleet::runtime::evaluate_drift` reports drift, and the
       control plane's own node from the local registry.
-- [ ] `stream_ports` on the pending-node review, fleet-wide streams
+- [x] `stream_ports` on the pending-node review, fleet-wide streams
       included; test with one selected and one fleet-wide stream.
 
 ### Lot F: dashboard - frontend gates
@@ -1489,6 +1493,101 @@ the budget view stays Operator and SuperAdmin.
   `StreamPlaneState::unbound_at_packaged_limit()`. Also
   `lorica-api/src/streams/tests.rs`, the handlers module's own tests:
   three comparisons of a read with a write now strip `bind`.
+- Lot E2 done. The wire: `Heartbeat` tag 7 `StreamPlaneReport`
+  (`fd_limit`, `worker_count`, `listen_sockets_used`,
+  `worker_fds_committed`, `supervisor_fds_committed`, `bound_count`,
+  `bindings`, `truncated`), each binding a `StreamBindingReport`
+  (`stream_id`, `state` of the new `StreamBindingState` enum, and for a
+  failure `kind`, `os_error`, `port`, `failed_since_ms`), in
+  `cluster.proto` and `messages.rs`. Compatibility with 1.10.6 both
+  ways is pinned against the frozen `v1_10_6::Heartbeat` of Story 12.1
+  Lot 3: a 1.10.6 control plane decodes a heartbeat carrying tags 6 and
+  7 with every field it knows intact
+  (`a_1_10_6_control_plane_decodes_a_heartbeat_carrying_a_stream_plane_report`),
+  and a 1.10.6 heartbeat decodes here with both reports absent and
+  re-encodes byte for byte
+  (`a_1_11_0_control_plane_reads_a_1_10_6_heartbeat_as_not_reported`).
+  The frozen v1.7.0 corpus is unchanged: its heartbeat carries neither.
+- The kind travels as a string of `[a-z_]`, not an enum: the kinds are
+  `lorica-worker`'s `BindFailureKind`, which the transport crate does not
+  depend on. The control plane maps it back through the new
+  `BindFailureKind::from_name` (over a new `BindFailureKind::ALL`), and a
+  kind it does not know reads `other`; a state it does not know reads
+  `unknown`. The decode boundary
+  (`lorica_cluster::stream_plane_report_defect`) bounds every field
+  (256 bindings, 64-byte ids of `[A-Za-z0-9-]`, 32-byte kinds, 256-byte
+  OS errors without control characters, ports up to 65535) and drops a
+  malformed report whole, with one WARN per session, keeping the
+  session (`StreamPlaneClaim`, like 12.1's `ReservedPortsClaim`).
+- The follower: `FollowerOptions::stream_plane` carries the process's
+  `StreamPlaneState`; `ReplicaHandler::stream_plane()` builds the report
+  at every heartbeat from the registry (fresh bind states) and the
+  committed totals a background task recomputes from the store every
+  15 s (`STREAM_USAGE_INTERVAL`), so the heartbeat never waits on the
+  store. No report until the first computation. Failures are listed
+  before pendings, so a cut keeps them; an OS error is cut and stripped
+  of control characters by the sender (`stream_budget::heartbeat_report`).
+  To hand the plane to the follower, the registry, the fd limit and
+  `StreamPlaneState` are now built before `spawn_cluster_runtime` in
+  `supervisor.rs` and `single.rs` (moved, not duplicated), and
+  `spawn_cluster_runtime` takes it (`startup/mod.rs`).
+- The control plane: `LiveSession` keeps the last valid report as
+  session state (`LiveSessionSnapshot::stream_plane`), recorded by the
+  operational listener. The cluster node view gains `stream_plane`
+  (`bound_count`, `listen_sockets_used`, `bindings`, `truncated`, and
+  `fd_limit` / `worker_count` for Operator and above only) and
+  `stream_ports` (`{ id, name, protocol, listen_address, port_first,
+  port_last }`, every enabled stream `binds_here` gives the node, empty
+  for a revoked node), on every node, not only pending ones: with both,
+  the fleet view reads each stream's bind state per node, a targeted
+  stream the node does not list being bound. Under drift, each targeted
+  stream the node does not list is added as `unknown`. Both shapes are
+  the ones Lot E3 documented in `openapi.yaml`.
+- "The control plane's own node from the local registry": the roster
+  holds enrolled nodes only, and the control plane has no row in it.
+  Its own bind states are where they already were, `bind` on the stream
+  reads and the first entry of the budget view, both from the local
+  registry; the roster gains no synthetic row.
+- The budget: `budget_warnings` now checks every targeted node whose
+  open session reported, on the reported fd limit and worker count
+  (`BudgetInputs`, read before the store lock), and warns only for the
+  others. `GET /api/v1/streams/budget` on a control plane returns its
+  own node, then every active node with a report, by name
+  (`reported_view`): the shares from the control plane's configuration
+  with each stream's reported state (`bound` unless listed, `unknown`
+  under drift or a cut list), the committed totals as the node reported
+  them. The `openapi.yaml` budget text now says so.
+- AC #9: the `stream.*` rows were already each node's own and fan in.
+  What E2 adds is the control plane's side: `cluster.node.activate`
+  records `stream_ports` in its hashed payload, the streams the approved
+  node starts binding, pinned by
+  `an_activation_records_the_stream_ports_the_node_starts_binding`.
+  `docs/cluster.md` gains the heartbeat report, the fleet view, and the
+  `stream.*` rows in the audit table.
+- E3's follow-up: the config import and its preview run the fd budget
+  check through the same `budget_warnings` as create and update
+  (`check_imported_streams` in `config.rs`, replacing
+  `refuse_imported_port_conflicts`): every file stream, after the port
+  check, under the file's own `stream_listen_socket_cap` (the import
+  writes it), and a file stream with a stored id is judged as an update
+  of that row, so re-importing an export never refuses what a node
+  holds. A refusal is the `422` `stream_fd_budget` of a write; budget
+  warnings join the import's `warnings` and the preview's new
+  `warnings` (absent when empty, beside the diff). `openapi.yaml`
+  documents both `422`s.
+- Outside the allowlist, each needed: `lorica-cluster/proto/cluster.proto`
+  (the wire contract `rust_tags_match_the_published_proto` reads),
+  `lorica-cluster/src/lib.rs` (exports), `lorica-cluster/src/listener/operational.rs`
+  (where a heartbeat is recorded; also two log lines whose continuation
+  backslash had been lost, leaving a run of spaces mid-sentence),
+  `lorica-cluster/tests/{enrollment,cluster_plane,wire_corpus}.rs`
+  (heartbeat literals, and the session test),
+  `lorica-worker/src/stream_sockets.rs` (`ALL`, `from_name`),
+  `lorica-api/src/stream_budget.rs` and `lorica-api/src/streams.rs`
+  (E3's, for the budget follow-ups), `lorica-api/src/config.rs` and
+  `lorica-api/src/streams/tests.rs` (the import), `lorica-api/openapi.yaml`
+  (budget and import text), `lorica/src/startup/{mod,supervisor,single}.rs`
+  (the plane handed to the follower), `docs/cluster.md`.
 
 ## File List
 
@@ -1523,6 +1622,12 @@ the budget view stays Operator and SuperAdmin.
 - `lorica/src/startup/stream_plane.rs` (the `stream_bind_failed` alert), `lorica/src/startup/supervisor.rs`, `lorica/src/startup/single.rs` (the alert sender, `AppState::stream_plane`)
 - `lorica-api/src/stream_budget.rs` (new), `lorica-api/src/streams.rs`, `lorica-api/src/streams/tests.rs`, `lorica-api/src/server.rs`, `lorica-api/src/middleware/authorize.rs`, `lorica-api/src/lib.rs`, `lorica-api/Cargo.toml` (`lorica-stream`), `Cargo.lock`, `lorica-api/openapi.yaml` (Lot E3)
 - `lorica-api/src/tests.rs`, `lorica-api/src/acme/tests.rs`, `lorica-api/src/automation/audit.rs`, `lorica-api/src/automation_tokens/tests.rs`, `lorica-api/src/oidc_issuers/tests.rs` (the test `AppState`s)
+- `lorica-cluster/proto/cluster.proto`, `lorica-cluster/src/{messages,dialer,roster,bridge,lib}.rs`, `lorica-cluster/src/listener/operational.rs`, `lorica-cluster/tests/{enrollment,cluster_plane,wire_corpus}.rs` (Lot E2: the heartbeat's stream plane report)
+- `lorica-worker/src/stream_sockets.rs` (`BindFailureKind::ALL`, `from_name`)
+- `lorica-api/src/cluster/mod.rs`, `lorica-api/src/cluster/tests.rs` (Lot E2: `stream_plane`, `stream_ports`, the activation row)
+- `lorica-api/src/stream_budget.rs`, `lorica-api/src/streams.rs`, `lorica-api/src/config.rs`, `lorica-api/src/streams/tests.rs`, `lorica-api/openapi.yaml` (Lot E2: reported budgets, the import's budget check)
+- `lorica/src/startup/cluster_follower.rs`, `lorica/src/startup/mod.rs`, `lorica/src/startup/supervisor.rs`, `lorica/src/startup/single.rs` (Lot E2: the follower's report)
+- `docs/cluster.md` (Lot E2: the heartbeat report, the fleet view, the `stream.*` audit rows)
 
 ## Change Log
 
@@ -1537,3 +1642,4 @@ the budget view stays Operator and SuperAdmin.
 | 2026-11-14 | 0.7 | Lot C2 implemented: `worker_drain_timeout_s` and `stream_listen_socket_cap` replicate through the canonical config inside format version 3, and the import preview reports them. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.8 | Lot E1 implemented: the `stream_bind_failed` alert type and migration 74 subscribing explicit channels to it. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.9 | Lot E3 implemented: `bind` on the stream reads, the fd budget check of stream writes, `GET /api/v1/streams/budget`, the stream plane on `AppState`, the OpenAPI document; the `stream_bind_failed` alert is raised once per failed bind. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.10 | Lot E2 implemented: the heartbeat's stream plane report (tag 7, compatible with 1.10.6 both ways), each stream's bind state per node and `stream_ports` on the cluster node view, the activation row's stream ports, control-plane budget checks and budget view from reported figures, and the fd budget check on the config import and its preview. D-i amended: `stream_ports` carries `port_first`/`port_last`. Status InProgress. | Romain G. |

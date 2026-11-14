@@ -3968,13 +3968,25 @@ paths:
                         description: >-
                           What the import changed on its own, such as an AD CS
                           certificate made manual because its authority is not
-                          on this node. Empty when nothing was.
+                          on this node, and each targeted node whose fd budget
+                          could not be checked, as a stream create names it.
+                          Empty when nothing was.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/StreamConflict"
+        "422":
+          $ref: "#/components/responses/StreamUnprocessable"
+      description: >-
+        Every stream of the file runs the checks of a stream create
+        before anything is cleared: the port check (`409`) and the fd
+        budget check (`422`, `error.code` `stream_fd_budget`), under the
+        file's own `stream_listen_socket_cap`. A stream the file carries
+        under the id of a stored one is judged as an update of it, so
+        re-importing an export is never refused for what the nodes
+        already hold.
 
   /api/v1/config/import/preview:
     post:
@@ -4003,12 +4015,21 @@ paths:
                 properties:
                   data:
                     type: object
+                    description: >-
+                      The diff per table, and `warnings`: each targeted
+                      node whose fd budget could not be checked, as the
+                      import would name it; absent when there is none.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/StreamConflict"
+        "422":
+          $ref: "#/components/responses/StreamUnprocessable"
+      description: >-
+        Runs the import's stream checks, so a file the import refuses
+        `409` or `422` is refused here alike, never previewed as clean.
 
   # ---------------------------------------------------------------------------
   # Notifications
