@@ -366,3 +366,61 @@ server {
     expect(routes[0].return_status).toBe(404);
   });
 });
+
+describe('stream {} blocks', () => {
+  const TLS_PASSTHROUGH = `
+stream {
+    upstream tls {
+        server 10.0.0.40:443;
+    }
+    server {
+        listen 443;
+        ssl_preread on;
+        proxy_pass tls;
+    }
+}
+`;
+
+  const DATABASE_STREAM = `
+stream {
+    upstream db {
+        server 10.0.0.10:5432;
+    }
+    server {
+        listen 5432;
+        proxy_pass db;
+    }
+}
+`;
+
+  it.fails('convertToLoricaRoutes (conversion layer): an ssl_preread passthrough yields no route', () => {
+    const routes = convertToLoricaRoutes(parseNginxConfig(TLS_PASSTHROUGH));
+    expect(routes).toHaveLength(0);
+  });
+
+  it.fails('parseNginxConfig (parser layer): stream server and upstream stay out of the http results', () => {
+    const parsed = parseNginxConfig(DATABASE_STREAM);
+    expect(parsed.servers).toHaveLength(0);
+    expect(parsed.upstreams).toHaveLength(0);
+  });
+
+  it.fails('parseNginxConfig (parser layer): http {} and stream {} wrappers close without a brace error', () => {
+    const httpWrapped = `
+http {
+    server {
+        listen 80;
+        server_name example.com;
+        location / {
+            proxy_pass http://127.0.0.1:8080;
+        }
+    }
+}
+`;
+    for (const config of [httpWrapped, DATABASE_STREAM]) {
+      const braceErrors = parseNginxConfig(config).diagnostics.filter(
+        d => d.level === 'error' && d.message.includes('closing brace')
+      );
+      expect(braceErrors).toHaveLength(0);
+    }
+  });
+});
