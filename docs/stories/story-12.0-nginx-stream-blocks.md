@@ -1,7 +1,7 @@
 # Story 12.0: The nginx importer stops misreading `stream {}` blocks
 
 **Epic:** [Epic 12 - TCP and UDP Stream Proxying (v1.11.0 and v1.12.0)](../prd/epic-12-v1.11.0.md)
-**Status:** InProgress
+**Status:** Review
 **Priority:** P1
 **Author:** Romain G.
 **Depends on:** nothing. First story of the 1.11.0 cycle after the `lorica-fleet` extraction.
@@ -37,17 +37,17 @@ These are the PRD's, unchanged. They are the contract.
 ## Tasks
 
 - [x] Commit A: the failing cases of AC #1 (a), (b), (c) as `it.fails`, each naming the layer it checks (AC #1)
-- [ ] Commit B: the fix
-  - [ ] Block openers detected by the `{` token that follows them; every opener pushes a frame, a bare `{` pushes an anonymous one; the `endsWith('{')` fallback removed (AC #3)
-  - [ ] `http` and `stream` frames; `server` and `upstream` inside `stream {}` parsed into `streamServers` / `streamUpstreams`, exported types `NginxStreamServer` / `NginxStreamUpstream` (AC #2)
-  - [ ] One `warning` per stream `server`, on its opening line, stating it was not imported; no port hint for stream listeners (AC #4)
-  - [ ] Flip the AC #1 tests to `it`; add the IV1 test, a test on the stream-shaped results and the diagnostic, and a test on an unknown block nested in a `location` (AC #1, #2, #3, IV1)
-  - [ ] Existing tests untouched and passing (AC #5)
-  - [ ] Frontend gates: `npm run check`, `npm run lint`, `npx vitest run`
+- [x] Commit B: the fix
+  - [x] Block openers detected by the `{` token that follows them; every opener pushes a frame, a bare `{` pushes an anonymous one; the `endsWith('{')` fallback removed (AC #3)
+  - [x] A `stream` frame (`http` and every other unknown block get a generic frame); `server` and `upstream` inside `stream {}` parsed into `streamServers` / `streamUpstreams`, exported types `NginxStreamServer` / `NginxStreamUpstream` (AC #2)
+  - [x] One `warning` per stream `server`, on its opening line, stating it was not imported; no port hint for stream listeners (AC #4)
+  - [x] Flip the AC #1 tests to `it`; add the IV1 test, a test on the stream-shaped results and the diagnostic, and a test on an unknown block nested in a `location` (AC #1, #2, #3, IV1)
+  - [x] Existing tests untouched and passing (AC #5)
+  - [x] Frontend gates: `npm run check`, `npm run lint`, `npx vitest run`
 
 ## Dev Notes
 
-- Statements come from `splitStatements`, which emits `{` and `}` as their own tokens. A multi-line opener (`server` on one line, `{` on the next) is joined into one line by the continuation accumulator before splitting, because a line with no `;` and no brace is held as pending. So an opener and its `{` are always adjacent in the same statement list, which is what the lookahead relies on.
+- Statements come from `splitStatements`, which emits `{` and `}` as their own tokens. A multi-line opener (`server` on one line, `{` on the next) is joined into one line by the continuation accumulator before splitting, because a line with no `;` and no brace is held as pending. So an opener and its `{` are always adjacent in the same statement list, which is what the lookahead relies on. The one shape that escapes it, an opener after a `;` on the same line with its `{` on the next (`listen 80; location /` then `{`), reads the opener as a directive and gives the `{` an anonymous frame: that block's content is lost, but the braces stay balanced (read from the code, not covered by a test).
 - Only `stream` context is distinguished. A `server` block anywhere outside `stream {}` keeps today's HTTP reading, so configurations pasted without an `http {}` wrapper (the common case, and every existing test) parse exactly as before. `mail {}` servers are out of this story's scope.
 - Stream results are kept on `NginxParseResult` as two extra arrays and never touch `servers` / `upstreams`, so `convertToLoricaRoutes` and the wizard (`Step2Analysis.svelte` counts `servers` and `upstreams`) need no change and cannot see them. An HTTP `proxy_pass` naming a stream-only upstream therefore does not resolve to its servers, which is correct.
 - The warning carries the stream server's opening line in its `line` field, which the wizard renders as `L<n>` next to the message.
@@ -56,12 +56,26 @@ These are the PRD's, unchanged. They are the contract.
 
 ### Debug Log
 
+- 2026-11-14, commit A (`31f08922`): the three AC #1 cases as `it.fails`; Vitest reported them as 3 expected failures, every other test green.
+- 2026-11-14, commit B: the fix; the three cases flipped to `it`, four tests added. Gates run in `node:22` with `pnpm install --frozen-lockfile` (no lockfile or `package.json` change): `npm run check` 0 errors, `npm run lint` clean, `npx vitest run` 45 files / 801 tests passed.
+
 ### Completion Notes
 
+- AC #1 to #5 met, IV1 covered by its own test. The IV1 test compares the mixed configuration's routes with those of the same HTTP servers parsed bare, which is the input the importer already handled before this story.
+- AC #4 reading: the warning names its line through the diagnostic's `line` field, which the wizard displays as `L<n>`, rather than repeating the number in the message; the message names the stream server's `listen` values instead.
+- Wizard: no change. `NginxParseResult` gained two arrays; `Step2Analysis.svelte` counts only `servers` and `upstreams`, which now exclude stream blocks, and shows the new warning with the other diagnostics.
+- Exported for Story 12.17: `NginxStreamServer` (`listen`, `proxyPass`, `directives`, `line`) and `NginxStreamUpstream` (`name`, `servers`, `line`), on `NginxParseResult.streamServers` / `.streamUpstreams`.
+
 ## File List
+
+- `lorica-dashboard/frontend/src/lib/nginx-parser.ts` (modified)
+- `lorica-dashboard/frontend/src/lib/nginx-parser.test.ts` (modified)
+- `docs/stories/story-12.0-nginx-stream-blocks.md` (created)
 
 ## Change Log
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
 | 2026-11-14 | 0.1 | Story drafted from the Epic 12 PRD. Status InProgress. | Romain G. |
+| 2026-11-14 | 0.2 | AC #1 failing cases committed as expected failures. | Romain G. |
+| 2026-11-14 | 0.3 | Fix implemented, tests flipped and added, gates green. Status Review. | Romain G. |

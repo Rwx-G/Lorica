@@ -393,18 +393,18 @@ stream {
 }
 `;
 
-  it.fails('convertToLoricaRoutes (conversion layer): an ssl_preread passthrough yields no route', () => {
+  it('convertToLoricaRoutes (conversion layer): an ssl_preread passthrough yields no route', () => {
     const routes = convertToLoricaRoutes(parseNginxConfig(TLS_PASSTHROUGH));
     expect(routes).toHaveLength(0);
   });
 
-  it.fails('parseNginxConfig (parser layer): stream server and upstream stay out of the http results', () => {
+  it('parseNginxConfig (parser layer): stream server and upstream stay out of the http results', () => {
     const parsed = parseNginxConfig(DATABASE_STREAM);
     expect(parsed.servers).toHaveLength(0);
     expect(parsed.upstreams).toHaveLength(0);
   });
 
-  it.fails('parseNginxConfig (parser layer): http {} and stream {} wrappers close without a brace error', () => {
+  it('parseNginxConfig (parser layer): http {} and stream {} wrappers close without a brace error', () => {
     const httpWrapped = `
 http {
     server {
@@ -422,5 +422,125 @@ http {
       );
       expect(braceErrors).toHaveLength(0);
     }
+  });
+
+  it('parseNginxConfig (parser layer): stream server and upstream land in the stream results', () => {
+    const parsed = parseNginxConfig(DATABASE_STREAM);
+
+    expect(parsed.streamUpstreams).toEqual([
+      { name: 'db', servers: ['10.0.0.10:5432'], line: 3 },
+    ]);
+    expect(parsed.streamServers).toHaveLength(1);
+    expect(parsed.streamServers[0].line).toBe(6);
+    expect(parsed.streamServers[0].listen).toEqual(['5432']);
+    expect(parsed.streamServers[0].proxyPass).toBe('db');
+  });
+
+  it('parseNginxConfig (parser layer): a stream server warns it was not imported, without the port hint', () => {
+    const parsed = parseNginxConfig(DATABASE_STREAM);
+
+    const warnings = parsed.diagnostics.filter(d => d.level === 'warning');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].line).toBe(6);
+    expect(warnings[0].message).toContain('not imported');
+    expect(warnings[0].message).toContain('5432');
+    expect(parsed.diagnostics.some(d => d.message.includes('Non-standard port'))).toBe(false);
+  });
+
+  it('parseNginxConfig (parser layer): an unknown block inside a location does not close the location', () => {
+    const config = `
+server {
+    listen 80;
+    server_name example.com;
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+    }
+    location /api {
+        limit_except GET {
+            deny all;
+        }
+        proxy_pass http://127.0.0.1:9090;
+    }
+}
+`;
+    const parsed = parseNginxConfig(config);
+    expect(parsed.diagnostics.filter(d => d.level === 'error')).toHaveLength(0);
+    expect(parsed.servers).toHaveLength(1);
+    const api = parsed.servers[0].locations.find(l => l.path === '/api');
+    expect(api?.proxyPass).toBe('http://127.0.0.1:9090');
+
+    const routes = convertToLoricaRoutes(parsed);
+    expect(routes).toHaveLength(1);
+    expect(routes[0].backend_addresses).toEqual(['127.0.0.1:8080']);
+    expect(routes[0].path_rules).toHaveLength(1);
+    expect(routes[0].path_rules[0].path).toBe('/api');
+    expect(routes[0].path_rules[0].backend_addresses).toEqual(['127.0.0.1:9090']);
+  });
+
+  it('IV1: a mixed http {} + stream {} config imports the same HTTP routes and no stream route', () => {
+    const httpSites = `
+upstream app {
+    server 10.0.0.20:3000;
+    server 10.0.0.21:3000;
+}
+server {
+    listen 80;
+    server_name app.example.com;
+    return 301 https://app.example.com$request_uri;
+}
+server {
+    listen 443 ssl;
+    server_name app.example.com;
+    location / {
+        proxy_pass http://app;
+    }
+    location /api {
+        proxy_pass http://127.0.0.1:4000;
+    }
+}
+server {
+    listen 80;
+    server_name static.example.com;
+    proxy_pass http://127.0.0.1:8081;
+}
+`;
+    const mixed = `
+events {
+    worker_connections 1024;
+}
+http {
+${httpSites}
+}
+stream {
+    upstream tls {
+        server 10.0.0.40:443;
+    }
+    upstream db {
+        server 10.0.0.10:5432;
+    }
+    server {
+        listen 443;
+        ssl_preread on;
+        proxy_pass tls;
+    }
+    server {
+        listen 5432;
+        proxy_pass db;
+    }
+}
+`;
+    const routesBefore = convertToLoricaRoutes(parseNginxConfig(httpSites));
+    const parsed = parseNginxConfig(mixed);
+    const routes = convertToLoricaRoutes(parsed);
+
+    expect(routesBefore.map(r => r.hostname).sort()).toEqual(['app.example.com', 'static.example.com']);
+    expect(routes).toEqual(routesBefore);
+
+    expect(parsed.streamServers).toHaveLength(2);
+    const notImported = parsed.diagnostics.filter(
+      d => d.level === 'warning' && d.message.includes('not imported')
+    );
+    expect(notImported.map(d => d.line)).toEqual(parsed.streamServers.map(s => s.line));
+    expect(parsed.diagnostics.filter(d => d.level === 'error')).toHaveLength(0);
   });
 });

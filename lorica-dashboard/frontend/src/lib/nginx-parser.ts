@@ -43,6 +43,29 @@ export interface NginxServer {
   directives: NginxDirective[];
 }
 
+/** A parsed `upstream` block inside `stream {}`. */
+export interface NginxStreamUpstream {
+  name: string;
+  /** Server entries as "ip:port" strings. */
+  servers: string[];
+  /** Line of the `upstream` opener. */
+  line: number;
+}
+
+/**
+ * A parsed `server` block inside `stream {}`: a TCP or UDP listener, not an
+ * HTTP virtual host. Kept apart from {@link NginxServer} so that it can never
+ * be converted into an HTTP route.
+ */
+export interface NginxStreamServer {
+  listen: string[];
+  /** Raw `proxy_pass` value: a stream upstream name or a host:port. */
+  proxyPass: string | null;
+  directives: NginxDirective[];
+  /** Line of the `server` opener. */
+  line: number;
+}
+
 /** A diagnostic message produced during parsing. */
 export interface NginxDiagnostic {
   level: 'info' | 'warning' | 'error';
@@ -55,6 +78,10 @@ export interface NginxDiagnostic {
 export interface NginxParseResult {
   servers: NginxServer[];
   upstreams: NginxUpstream[];
+  /** `server` blocks inside `stream {}`. Never converted to routes. */
+  streamServers: NginxStreamServer[];
+  /** `upstream` blocks inside `stream {}`. Never used to resolve an HTTP `proxy_pass`. */
+  streamUpstreams: NginxStreamUpstream[];
   diagnostics: NginxDiagnostic[];
 }
 
@@ -471,12 +498,39 @@ const DIRECTIVE_MAP: Record<string, DirectiveHandler> = {
 // ---------------------------------------------------------------------------
 
 /** Represents a block type during parsing. */
-type BlockType = 'root' | 'server' | 'upstream' | 'location' | 'other';
+type BlockType =
+  | 'root'
+  | 'server'
+  | 'upstream'
+  | 'location'
+  | 'stream'
+  | 'stream_server'
+  | 'stream_upstream'
+  | 'other';
 
 interface BlockFrame {
   type: BlockType;
   name: string;
   startLine: number;
+}
+
+/**
+ * Name a block for a diagnostic.
+ *
+ * @param frame - The block frame
+ * @returns A human-readable block name, e.g. "server", "stream server", "limit_except"
+ */
+function describeBlock(frame: BlockFrame): string {
+  switch (frame.type) {
+    case 'stream_server':
+      return 'stream server';
+    case 'stream_upstream':
+      return 'stream upstream';
+    case 'other':
+      return frame.name || 'anonymous';
+    default:
+      return frame.type;
+  }
 }
 
 /**
@@ -581,16 +635,25 @@ function parseDirectiveString(stmt: string): [string, string] {
  *
  * This is a line-based parser that:
  * 1. Strips comments
- * 2. Tracks brace depth to identify blocks
+ * 2. Tracks a stack of block frames: every statement followed by `{` opens
+ *    one, known or not, so each `}` closes the block it belongs to
  * 3. Splits directives by semicolons
  * 4. Handles multi-line directives (continuation when no semicolon)
  *
+ * `server` and `upstream` blocks inside `stream {}` are TCP/UDP listeners,
+ * not HTTP virtual hosts: they go to `streamServers` / `streamUpstreams` and
+ * each stream server yields a "not imported" warning. Everywhere else they
+ * are read as HTTP, so a snippet pasted without its `http {}` wrapper parses
+ * the same as a wrapped one.
+ *
  * @param text - Raw Nginx configuration text
- * @returns Parsed result with servers, upstreams, and diagnostics
+ * @returns Parsed result with HTTP and stream blocks, and diagnostics
  */
 export function parseNginxConfig(text: string): NginxParseResult {
   const servers: NginxServer[] = [];
   const upstreams: NginxUpstream[] = [];
+  const streamServers: NginxStreamServer[] = [];
+  const streamUpstreams: NginxStreamUpstream[] = [];
   const diagnostics: NginxDiagnostic[] = [];
 
   const blockStack: BlockFrame[] = [{ type: 'root', name: '', startLine: 0 }];
@@ -599,6 +662,8 @@ export function parseNginxConfig(text: string): NginxParseResult {
   let currentServer: NginxServer | null = null;
   let currentUpstream: NginxUpstream | null = null;
   let currentLocation: NginxLocation | null = null;
+  let currentStreamServer: NginxStreamServer | null = null;
+  let currentStreamUpstream: NginxStreamUpstream | null = null;
 
   // Multi-line directive accumulator
   let pendingLine = '';
@@ -649,9 +714,13 @@ export function parseNginxConfig(text: string): NginxParseResult {
 
     const statements = splitStatements(lineToProcess);
 
-    for (const stmt of statements) {
+    for (let k = 0; k < statements.length; k++) {
+      const stmt = statements[k];
+
       if (stmt === '{') {
-        // Opening brace already handled by the block-opening statement
+        // A `{` is consumed with the statement before it. One that reaches
+        // here has no opener, and still needs a frame for its `}` to close.
+        blockStack.push({ type: 'other', name: '', startLine: effectiveLine });
         continue;
       }
 
@@ -679,6 +748,18 @@ export function parseNginxConfig(text: string): NginxParseResult {
         } else if (frame.type === 'upstream' && currentUpstream) {
           upstreams.push(currentUpstream);
           currentUpstream = null;
+        } else if (frame.type === 'stream_server' && currentStreamServer) {
+          streamServers.push(currentStreamServer);
+          const listening = currentStreamServer.listen.join(', ') || 'no listen directive';
+          diagnostics.push({
+            level: 'warning',
+            line: currentStreamServer.line,
+            message: `Stream (TCP/UDP) server block (listen ${listening}) was not imported: stream {} blocks are not imported yet.`,
+          });
+          currentStreamServer = null;
+        } else if (frame.type === 'stream_upstream' && currentStreamUpstream) {
+          streamUpstreams.push(currentStreamUpstream);
+          currentStreamUpstream = null;
         }
         continue;
       }
@@ -686,51 +767,52 @@ export function parseNginxConfig(text: string): NginxParseResult {
       const [name, value] = parseDirectiveString(stmt);
       const nameLower = name.toLowerCase();
 
-      // Block-opening directives
-      if (nameLower === 'server' && (value === '' || value === '{')) {
-        currentServer = {
-          serverNames: [],
-          listen: [],
-          ssl: false,
-          locations: [],
-          directives: [],
-        };
-        seenDirectives.clear();
-        blockStack.push({ type: 'server', name: '', startLine: effectiveLine });
-        continue;
-      }
+      // Block openers: the statement right before a `{` token
+      if (statements[k + 1] === '{') {
+        k++;
+        const inStream = blockStack.some(f => f.type === 'stream');
 
-      if (nameLower === 'upstream') {
-        const upstreamName = value.replace(/\s*\{?\s*$/, '').trim();
-        currentUpstream = { name: upstreamName, servers: [] };
-        blockStack.push({ type: 'upstream', name: upstreamName, startLine: effectiveLine });
-        continue;
-      }
-
-      if (nameLower === 'location') {
-        const locPath = value
-          .replace(/\s*\{?\s*$/, '')
-          .replace(/^[~=^]+\s*/, '') // Strip modifiers like ~, ~*, =, ^~
-          .trim();
-        currentLocation = { path: locPath || '/', proxyPass: null, directives: [] };
-        blockStack.push({ type: 'location', name: locPath, startLine: effectiveLine });
-        continue;
-      }
-
-      // Warn about unsupported 'if' blocks
-      if (nameLower === 'if') {
-        diagnostics.push({
-          level: 'warning',
-          line: effectiveLine,
-          message: 'Conditional "if" block skipped. Most applications handle this logic internally - verify behavior after import.',
-        });
-        blockStack.push({ type: 'other', name: nameLower, startLine: effectiveLine });
-        continue;
-      }
-
-      // Skip block types we do not specifically handle
-      if (value.endsWith('{') || value === '{') {
-        blockStack.push({ type: 'other', name: nameLower, startLine: effectiveLine });
+        if (inStream && nameLower === 'server') {
+          currentStreamServer = { listen: [], proxyPass: null, directives: [], line: effectiveLine };
+          blockStack.push({ type: 'stream_server', name: '', startLine: effectiveLine });
+        } else if (inStream && nameLower === 'upstream') {
+          currentStreamUpstream = { name: value, servers: [], line: effectiveLine };
+          blockStack.push({ type: 'stream_upstream', name: value, startLine: effectiveLine });
+        } else if (!inStream && nameLower === 'server') {
+          currentServer = {
+            serverNames: [],
+            listen: [],
+            ssl: false,
+            locations: [],
+            directives: [],
+          };
+          seenDirectives.clear();
+          blockStack.push({ type: 'server', name: '', startLine: effectiveLine });
+        } else if (!inStream && nameLower === 'upstream') {
+          currentUpstream = { name: value, servers: [] };
+          blockStack.push({ type: 'upstream', name: value, startLine: effectiveLine });
+        } else if (!inStream && nameLower === 'location') {
+          const locPath = value
+            .replace(/^[~=^]+\s*/, '') // Strip modifiers like ~, ~*, =, ^~
+            .trim();
+          currentLocation = { path: locPath || '/', proxyPass: null, directives: [] };
+          blockStack.push({ type: 'location', name: locPath, startLine: effectiveLine });
+        } else if (!inStream && nameLower === 'if') {
+          diagnostics.push({
+            level: 'warning',
+            line: effectiveLine,
+            message: 'Conditional "if" block skipped. Most applications handle this logic internally - verify behavior after import.',
+          });
+          blockStack.push({ type: 'other', name: nameLower, startLine: effectiveLine });
+        } else {
+          // Any other block (http, stream, events, limit_except, map, ...):
+          // its directives are not imported, but it still closes where it should.
+          blockStack.push({
+            type: nameLower === 'stream' ? 'stream' : 'other',
+            name: nameLower,
+            startLine: effectiveLine,
+          });
+        }
         continue;
       }
 
@@ -766,7 +848,18 @@ export function parseNginxConfig(text: string): NginxParseResult {
       }
 
       // Place directive in the right container
-      if (currentFrame?.type === 'upstream' && currentUpstream) {
+      if (currentFrame?.type === 'stream_upstream' && currentStreamUpstream) {
+        if (nameLower === 'server') {
+          currentStreamUpstream.servers.push(value.split(/\s+/)[0]);
+        }
+      } else if (currentFrame?.type === 'stream_server' && currentStreamServer) {
+        currentStreamServer.directives.push(directive);
+        if (nameLower === 'listen') {
+          currentStreamServer.listen.push(value);
+        } else if (nameLower === 'proxy_pass') {
+          currentStreamServer.proxyPass = value;
+        }
+      } else if (currentFrame?.type === 'upstream' && currentUpstream) {
         if (nameLower === 'server') {
           // Upstream server entry: "ip:port weight=N" - keep just the address
           const addr = value.split(/\s+/)[0];
@@ -811,12 +904,12 @@ export function parseNginxConfig(text: string): NginxParseResult {
       diagnostics.push({
         level: 'error',
         line: blockStack[j].startLine,
-        message: `Unclosed ${blockStack[j].type} block.`,
+        message: `Unclosed ${describeBlock(blockStack[j])} block.`,
       });
     }
   }
 
-  return { servers, upstreams, diagnostics };
+  return { servers, upstreams, streamServers, streamUpstreams, diagnostics };
 }
 
 // ---------------------------------------------------------------------------
