@@ -1021,8 +1021,10 @@ pub const READS: &[ToolSpec] = &[
         name: "lorica_backends",
         title: "Backends",
         summary: "Read every configured backend with its health, its open connection count \
-                  and its live EWMA score. Every query value of a `health_check_path` reads \
-                  as `[redacted]`.",
+                  and its live EWMA score. The active check is `health_check`, by `kind`; \
+                  `health_check_path` is its deprecated twin. Every query value of the probe \
+                  path, in `health_check.path` and `health_check_path` alike, reads as \
+                  `[redacted]`.",
         scope: AutomationScope::BackendsRead,
         path: "/automation/v1/backends",
         resource: None,
@@ -1382,6 +1384,7 @@ const BACKEND_FIELDS: &[&str] = &[
     "address",
     "group_name",
     "h2_upstream",
+    "health_check",
     "health_check_enabled",
     "health_check_interval_s",
     "health_check_path",
@@ -1521,7 +1524,10 @@ pub const MUTATIONS: &[Mutation] = &[
         summary: "Create a backend, as the dashboard's backend form would. The address must \
                   be an ip:port inside the token's allowed_backend_cidrs; a name cannot be \
                   checked against a CIDR and is refused. `tls_skip_verify` may not be set: an \
-                  upstream a token creates verifies its certificate whenever TLS is on.",
+                  upstream a token creates verifies its certificate whenever TLS is on. The \
+                  active check is `health_check`: `{\"kind\": \"http\", \"path\": \"/healthz\"}` \
+                  or `{\"kind\": \"tcp_connect\"}`. `health_check_path` is deprecated; sent \
+                  beside `health_check`, it must be the same path.",
         scope: AutomationScope::BackendsWrite,
         verb: Verb::Post,
         path: "/automation/v1/backends",
@@ -1546,10 +1552,12 @@ pub const MUTATIONS: &[Mutation] = &[
                   Upstream TLS moves one way only: `tls_upstream` on, never off; \
                   `tls_skip_verify` off, never on, a create included; `tls_sni` left unchanged \
                   while the upstream certificate is verified. A write in the other direction is \
-                  refused, preview included; it is made in the dashboard. A \
-                  `health_check_path` sent back exactly as read, its `[redacted]` values \
-                  included, keeps the stored path; any other path carrying `[redacted]` is \
-                  refused.",
+                  refused, preview included; it is made in the dashboard. The active check is \
+                  `health_check`, by `kind` (`http` with a `path`, or `tcp_connect`), replaced \
+                  whole; `health_check_path` is deprecated and, sent beside it, must be the \
+                  same path. A probe path sent back exactly as read, in either shape, its \
+                  `[redacted]` values included, keeps the stored path; any other path carrying \
+                  `[redacted]` is refused.",
         scope: AutomationScope::BackendsWrite,
         verb: Verb::Put,
         path: "/automation/v1/backends",

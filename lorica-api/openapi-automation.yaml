@@ -827,7 +827,9 @@ paths:
         Every backend with its address, weight, health status,
         lifecycle state, live connection count and EWMA latency score:
         the view the dashboard's backend table reads, with the query
-        values of `health_check_path` withheld (`[redacted]`). A backend
+        values of the probe path withheld (`[redacted]`), in the typed
+        `health_check.path` and the deprecated `health_check_path`
+        alike. A backend
         an environment owns carries `managed_by`; the environment's name
         in it is `[redacted]` unless `GET
         /automation/v1/environments/{name}` would answer this credential
@@ -872,7 +874,9 @@ paths:
         `allowed_backend_cidrs` as on create. Upstream TLS moves one way
         from a token (403 otherwise): `tls_upstream` on, never off;
         `tls_skip_verify` off, never on; `tls_sni` unchanged while the
-        upstream certificate is verified.
+        upstream certificate is verified. A probe path sent back exactly
+        as read, in `health_check` or the deprecated `health_check_path`,
+        keeps the stored path.
 
 
         With `?dry_run=true`, the backend before and after the patch,
@@ -1888,6 +1892,20 @@ components:
         unchanged: `CreateBackendRequest` in `openapi.yaml`, pinned the
         same way as `ManagementRouteCreate`. On this plane `address`
         must be an `ip:port` inside the token's `allowed_backend_cidrs`.
+        Only the active check is restated below, because it changed
+        shape in 1.11.0; every other field is as `openapi.yaml` states
+        it.
+      properties:
+        health_check:
+          $ref: "#/components/schemas/HealthCheck"
+        health_check_path:
+          type: string
+          deprecated: true
+          description: >-
+            Deprecated since 1.11.0 in favour of `health_check`. A path
+            reads as an `http` check of it, the empty string as
+            `tcp_connect`; sent beside `health_check`, it must be that
+            check's path (400 otherwise).
       additionalProperties: true
 
     ManagementBackendUpdate:
@@ -1895,8 +1913,49 @@ components:
       description: >-
         The body `PUT /api/v1/backends/{id}` accepts on the management
         API, unchanged: `UpdateBackendRequest` in `openapi.yaml`, pinned
-        the same way as `ManagementRouteCreate`.
+        the same way as `ManagementRouteCreate`. The active check is
+        restated as on `ManagementBackendCreate`.
+      properties:
+        health_check:
+          $ref: "#/components/schemas/HealthCheck"
+        health_check_path:
+          type: string
+          deprecated: true
+          description: >-
+            Deprecated since 1.11.0 in favour of `health_check`, read as
+            on create.
       additionalProperties: true
+
+    HealthCheck:
+      description: >-
+        What one active probe of a backend is, tagged by `kind`, as
+        `HealthCheck` in `openapi.yaml` states it. A later release adds
+        kinds as new `kind` values. Every query value of an `http`
+        check's `path` reads as `[redacted]` on this plane; sent back
+        exactly as read, the stored path is kept, and any other path
+        carrying `[redacted]` is refused (400).
+      oneOf:
+        - type: object
+          description: >-
+            An HTTP GET of `path` on the backend; a 2xx answer is
+            healthy. HTTP routes only.
+          required: [kind, path]
+          additionalProperties: false
+          properties:
+            kind:
+              type: string
+              enum: [http]
+            path:
+              type: string
+              minLength: 1
+        - type: object
+          description: A TCP connection that completes is healthy.
+          required: [kind]
+          additionalProperties: false
+          properties:
+            kind:
+              type: string
+              enum: [tcp_connect]
 
     BindCertificateRequest:
       type: object

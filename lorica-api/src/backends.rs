@@ -6,11 +6,18 @@
 //! set as much as changing its address is. The route side differs (a
 //! managed route may be deleted, taking the environment with it);
 //! see `routes::crud::delete_route`.
+//!
+//! The active check is typed since 1.11.0 (Story 12.1, D-2):
+//! `health_check` names its kind. The deprecated `health_check_path` is
+//! still accepted on input and still answered, kept equal to the typed
+//! check's path; a request sending both must send them agreeing
+//! ([`requested_health_check`]).
 
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
+use lorica_config::models::HealthCheck;
 use serde::{Deserialize, Serialize};
 
 use crate::db::db_blocking;
@@ -24,7 +31,8 @@ use crate::server::AppState;
 pub struct BackendResponse {
     /// Backend row id.
     pub id: String,
-    /// `host:port` target.
+    /// `host:port` target, or a host without a port for a backend of
+    /// port-range streams only.
     pub address: String,
     /// Human-readable label.
     pub name: String,
@@ -42,16 +50,23 @@ pub struct BackendResponse {
     pub health_check_enabled: bool,
     /// Health-check interval (s).
     pub health_check_interval_s: i32,
-    /// Optional HTTP health-check path ; TCP connect when `None`.
+    /// What one probe is, by `kind`.
+    pub health_check: HealthCheck,
+    /// Deprecated since 1.11.0: `health_check`'s path when it is an
+    /// `http` check, `None` otherwise. Answered for clients written
+    /// before the typed check.
     pub health_check_path: Option<String>,
-    /// Whether the upstream expects TLS.
+    /// Whether the upstream expects TLS. HTTP routes only; streams
+    /// ignore it.
     pub tls_upstream: bool,
     /// Whether the TLS cert chain is validated ; `true` accepts
-    /// self-signed / invalid certs.
+    /// self-signed / invalid certs. HTTP routes only; streams ignore it.
     pub tls_skip_verify: bool,
-    /// SNI override ; `None` reuses the route hostname.
+    /// SNI override ; `None` reuses the route hostname. HTTP routes
+    /// only; streams ignore it.
     pub tls_sni: Option<String>,
-    /// Force HTTP/2 on the upstream leg.
+    /// Force HTTP/2 on the upstream leg. HTTP routes only; streams
+    /// ignore it.
     pub h2_upstream: bool,
     /// Live EWMA latency score for the Peak-EWMA LB policy (μs).
     pub ewma_score_us: f64,
@@ -69,7 +84,10 @@ pub struct BackendResponse {
 /// JSON body for `POST /api/v1/backends`. Optional fields fall back to defaults.
 #[derive(Deserialize)]
 pub struct CreateBackendRequest {
-    /// `host:port` upstream address. Required.
+    /// `host:port` upstream address, or a host without a port (a
+    /// bracketed IPv6 literal for IPv6) for a backend that serves
+    /// port-range streams only, with its health check disabled.
+    /// Required.
     pub address: String,
     /// Human-readable label.
     pub name: Option<String>,
@@ -81,15 +99,20 @@ pub struct CreateBackendRequest {
     pub health_check_enabled: Option<bool>,
     /// Health-check interval (s).
     pub health_check_interval_s: Option<i32>,
-    /// HTTP health-check path ; TCP connect when `None`.
+    /// What one probe is; `tcp_connect` when neither this nor
+    /// `health_check_path` is sent.
+    pub health_check: Option<HealthCheck>,
+    /// Deprecated since 1.11.0 in favour of `health_check`: a path
+    /// reads as an `http` check of that path, the empty string as
+    /// `tcp_connect`. Sent beside `health_check`, it must agree with it.
     pub health_check_path: Option<String>,
-    /// Whether the upstream expects TLS.
+    /// Whether the upstream expects TLS. HTTP routes only.
     pub tls_upstream: Option<bool>,
-    /// Skip upstream cert validation.
+    /// Skip upstream cert validation. HTTP routes only.
     pub tls_skip_verify: Option<bool>,
-    /// SNI override for the upstream handshake.
+    /// SNI override for the upstream handshake. HTTP routes only.
     pub tls_sni: Option<String>,
-    /// Force HTTP/2 on the upstream leg.
+    /// Force HTTP/2 on the upstream leg. HTTP routes only.
     pub h2_upstream: Option<bool>,
     /// Refused with 422 when present: the mark is server-owned (see
     /// [`refuse_client_managed_by`]).
@@ -100,7 +123,7 @@ pub struct CreateBackendRequest {
 /// JSON body for `PUT /api/v1/backends/:id`. Only the supplied fields are mutated.
 #[derive(Deserialize)]
 pub struct UpdateBackendRequest {
-    /// New `host:port` upstream address.
+    /// New upstream address, `host:port` or portless as on create.
     pub address: Option<String>,
     /// New human-readable label.
     pub name: Option<String>,
@@ -112,15 +135,19 @@ pub struct UpdateBackendRequest {
     pub health_check_enabled: Option<bool>,
     /// New health-check interval (s).
     pub health_check_interval_s: Option<i32>,
-    /// New HTTP health-check path.
+    /// New active check, replacing the stored one whole.
+    pub health_check: Option<HealthCheck>,
+    /// Deprecated since 1.11.0 in favour of `health_check`, read as on
+    /// create: a path sets an `http` check, the empty string
+    /// `tcp_connect`.
     pub health_check_path: Option<String>,
-    /// Upstream TLS toggle.
+    /// Upstream TLS toggle. HTTP routes only.
     pub tls_upstream: Option<bool>,
-    /// Skip upstream cert validation.
+    /// Skip upstream cert validation. HTTP routes only.
     pub tls_skip_verify: Option<bool>,
-    /// SNI override.
+    /// SNI override. HTTP routes only.
     pub tls_sni: Option<String>,
-    /// Force HTTP/2 on the upstream leg.
+    /// Force HTTP/2 on the upstream leg. HTTP routes only.
     pub h2_upstream: Option<bool>,
     /// Refused with 422 when present: the mark is server-owned (see
     /// [`refuse_client_managed_by`]).
@@ -144,7 +171,8 @@ fn backend_to_response(
         active_connections,
         health_check_enabled: b.health_check_enabled,
         health_check_interval_s: b.health_check_interval_s,
-        health_check_path: b.health_check_path.clone(),
+        health_check: b.health_check.clone(),
+        health_check_path: b.health_check.legacy_path().map(str::to_string),
         tls_upstream: b.tls_upstream,
         tls_skip_verify: b.tls_skip_verify,
         tls_sni: b.tls_sni.clone(),
@@ -153,6 +181,48 @@ fn backend_to_response(
         managed_by: b.managed_by.clone(),
         created_at: b.created_at.to_rfc3339(),
         updated_at: b.updated_at.to_rfc3339(),
+    }
+}
+
+/// The active check a create or an update asks for, from the typed
+/// `health_check` and the deprecated `health_check_path`, or `None`
+/// when the request names neither.
+///
+/// The path reads as it always has: a path is an `http` check of it,
+/// the empty string a TCP connect. Sent together, the two must agree,
+/// the path being the typed check's ([`HealthCheck::legacy_path`]):
+/// a client copying a backend it read sends both, and when they differ
+/// nothing says which one it meant.
+///
+/// # Errors
+///
+/// `BadRequest` naming both fields when they disagree;
+/// `Unprocessable` for an `http` check with an empty path.
+fn requested_health_check(
+    typed: Option<HealthCheck>,
+    legacy_path: Option<&str>,
+) -> Result<Option<HealthCheck>, ApiError> {
+    if let Some(HealthCheck::Http { path }) = &typed {
+        if path.is_empty() {
+            return Err(ApiError::Unprocessable(
+                "health_check.path: an `http` check needs a path; a check without one is \
+                 `{\"kind\": \"tcp_connect\"}`"
+                    .into(),
+            ));
+        }
+    }
+    // Compared through the projection, not as checks, so a kind with no
+    // path (every kind but `http`) agrees with an empty legacy path.
+    let legacy: Option<Option<&str>> = legacy_path.map(|path| Some(path).filter(|p| !p.is_empty()));
+    match (typed, legacy) {
+        (Some(typed), Some(legacy)) if typed.legacy_path() != legacy => Err(ApiError::BadRequest(
+            "health_check and health_check_path disagree: health_check_path is deprecated and, \
+             sent beside health_check, must be its path (or empty for a check without one); \
+             send health_check alone"
+                .into(),
+        )),
+        (Some(typed), _) => Ok(Some(typed)),
+        (None, legacy) => Ok(legacy.map(|path| HealthCheck::reconcile(None, path))),
     }
 }
 
@@ -287,6 +357,9 @@ pub(crate) async fn create_backend_as(
     if body.address.is_empty() {
         return Err(ApiError::BadRequest("address is required".into()));
     }
+    let health_check =
+        requested_health_check(body.health_check, body.health_check_path.as_deref())?
+            .unwrap_or_default();
 
     let now = Utc::now();
     let backend = lorica_config::models::Backend {
@@ -305,13 +378,8 @@ pub(crate) async fn create_backend_as(
         health_status: lorica_config::models::HealthStatus::Unknown,
         health_check_enabled: body.health_check_enabled.unwrap_or(true),
         health_check_interval_s: body.health_check_interval_s.unwrap_or(10),
-        health_check_path: body.health_check_path.clone().filter(|s| !s.is_empty()),
-        // The legacy path alone decides until the request takes the
-        // typed shape: the definition it reads as, kept in step.
-        health_check: lorica_config::models::HealthCheck::reconcile(
-            None,
-            body.health_check_path.as_deref().filter(|s| !s.is_empty()),
-        ),
+        health_check_path: health_check.legacy_path().map(str::to_string),
+        health_check,
         lifecycle_state: lorica_config::models::LifecycleState::Normal,
         active_connections: 0,
         tls_upstream: body.tls_upstream.unwrap_or(false),
@@ -421,6 +489,8 @@ pub(crate) async fn update_backend_as(
     guard: crate::target::BackendGuard,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     refuse_client_managed_by(body.managed_by.as_ref())?;
+    let health_check =
+        requested_health_check(body.health_check, body.health_check_path.as_deref())?;
     let (before_backend, backend) = db_blocking(&state.store, move |store| {
         let mut backend = store
             .get_backend(&id)?
@@ -463,12 +533,8 @@ pub(crate) async fn update_backend_as(
         if let Some(interval) = body.health_check_interval_s {
             backend.health_check_interval_s = interval;
         }
-        if let Some(path) = body.health_check_path {
-            if path.is_empty() {
-                backend.health_check_path = None;
-            } else {
-                backend.health_check_path = Some(path);
-            }
+        if let Some(check) = health_check {
+            backend.set_health_check(check);
         }
         if let Some(tls) = body.tls_upstream {
             backend.tls_upstream = tls;
@@ -683,4 +749,305 @@ pub(crate) async fn delete_backend_as(
         "message": "backend draining",
         "lifecycle_state": "closing",
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+    use serde_json::{json, Value};
+
+    use crate::server::AppState;
+    use crate::tests::{body_json, send, setup_admin_and_login, test_state};
+
+    /// A logged-in operator on a fresh in-memory node, and a way to
+    /// call the management API as it.
+    struct Node {
+        state: AppState,
+        sessions: crate::middleware::auth::SessionStore,
+        limiter: crate::middleware::rate_limit::RateLimiter,
+        cookie: String,
+    }
+
+    impl Node {
+        async fn new() -> Self {
+            let (state, sessions, limiter) = test_state().await;
+            let cookie = setup_admin_and_login(&state, &sessions, &limiter).await;
+            Self {
+                state,
+                sessions,
+                limiter,
+                cookie,
+            }
+        }
+
+        /// `(status, whole answer)`.
+        async fn call(&self, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
+            let response = send(
+                &self.state,
+                &self.sessions,
+                &self.limiter,
+                method,
+                uri,
+                &self.cookie,
+                Some(body),
+            )
+            .await;
+            let status = response.status();
+            (status, body_json(response).await)
+        }
+
+        async fn create(&self, body: Value) -> (StatusCode, Value) {
+            self.call("POST", "/api/v1/backends", body).await
+        }
+
+        async fn update(&self, id: &str, body: Value) -> (StatusCode, Value) {
+            self.call("PUT", &format!("/api/v1/backends/{id}"), body)
+                .await
+        }
+
+        async fn stored(&self, id: &str) -> lorica_config::models::Backend {
+            self.state
+                .store
+                .lock()
+                .await
+                .get_backend(id)
+                .expect("store read")
+                .expect("the backend is stored")
+        }
+    }
+
+    fn http(path: &str) -> Value {
+        json!({ "kind": "http", "path": path })
+    }
+
+    /// The answer carries both shapes, agreeing, and the store holds
+    /// the same pair.
+    async fn assert_checked_by(node: &Node, answer: &Value, check: Value, path: Option<&str>) {
+        let data = &answer["data"];
+        assert_eq!(data["health_check"], check, "{answer}");
+        assert_eq!(data["health_check_path"], json!(path), "{answer}");
+        let stored = node.stored(data["id"].as_str().expect("an id")).await;
+        assert_eq!(
+            serde_json::to_value(&stored.health_check).expect("serialises"),
+            check
+        );
+        assert_eq!(stored.health_check_path.as_deref(), path);
+    }
+
+    #[tokio::test]
+    async fn a_create_takes_the_typed_check_the_deprecated_path_or_both_agreeing() {
+        let node = Node::new().await;
+        for (what, body, check, path) in [
+            (
+                "typed http only",
+                json!({ "address": "192.0.2.10:8080", "health_check": http("/healthz") }),
+                http("/healthz"),
+                Some("/healthz"),
+            ),
+            (
+                "typed tcp_connect only",
+                json!({ "address": "192.0.2.11:8080", "health_check": { "kind": "tcp_connect" } }),
+                json!({ "kind": "tcp_connect" }),
+                None,
+            ),
+            (
+                "deprecated path only",
+                json!({ "address": "192.0.2.12:8080", "health_check_path": "/ready" }),
+                http("/ready"),
+                Some("/ready"),
+            ),
+            (
+                "both agreeing",
+                json!({
+                    "address": "192.0.2.13:8080",
+                    "health_check": http("/ready"),
+                    "health_check_path": "/ready",
+                }),
+                http("/ready"),
+                Some("/ready"),
+            ),
+            (
+                "tcp_connect beside an empty path",
+                json!({
+                    "address": "192.0.2.14:8080",
+                    "health_check": { "kind": "tcp_connect" },
+                    "health_check_path": "",
+                }),
+                json!({ "kind": "tcp_connect" }),
+                None,
+            ),
+            (
+                "neither",
+                json!({ "address": "192.0.2.15:8080" }),
+                json!({ "kind": "tcp_connect" }),
+                None,
+            ),
+        ] {
+            let (status, answer) = node.create(body).await;
+            assert_eq!(status, StatusCode::CREATED, "{what}: {answer}");
+            assert_checked_by(&node, &answer, check, path).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_two_shapes_disagreeing_are_refused_naming_both_fields() {
+        let node = Node::new().await;
+        for body in [
+            json!({ "health_check": http("/a"), "health_check_path": "/b" }),
+            json!({ "health_check": { "kind": "tcp_connect" }, "health_check_path": "/b" }),
+            json!({ "health_check": http("/a"), "health_check_path": "" }),
+        ] {
+            let mut create = body.clone();
+            create["address"] = json!("192.0.2.10:8080");
+            let (status, answer) = node.create(create).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+            let message = answer["error"]["message"].as_str().expect("a message");
+            assert!(
+                message.contains("health_check and health_check_path"),
+                "{message}"
+            );
+        }
+        assert!(node
+            .state
+            .store
+            .lock()
+            .await
+            .list_backends()
+            .expect("store read")
+            .is_empty());
+
+        let (_, created) = node
+            .create(json!({ "address": "192.0.2.10:8080", "health_check_path": "/kept" }))
+            .await;
+        let id = created["data"]["id"].as_str().expect("an id").to_string();
+        let (status, _) = node
+            .update(
+                &id,
+                json!({ "health_check": http("/a"), "health_check_path": "/b" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            node.stored(&id).await.health_check_path.as_deref(),
+            Some("/kept")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_http_check_without_a_path_is_refused() {
+        let node = Node::new().await;
+        let (status, answer) = node
+            .create(json!({ "address": "192.0.2.10:8080", "health_check": http("") }))
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+        assert!(answer["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("health_check.path: an `http` check needs a path")));
+    }
+
+    #[tokio::test]
+    async fn an_update_moves_from_the_legacy_path_to_the_typed_check_and_back() {
+        let node = Node::new().await;
+        let (_, created) = node
+            .create(json!({ "address": "192.0.2.10:8080", "health_check_path": "/legacy" }))
+            .await;
+        assert_checked_by(&node, &created, http("/legacy"), Some("/legacy")).await;
+        let id = created["data"]["id"].as_str().expect("an id").to_string();
+
+        for (body, check, path) in [
+            (
+                json!({ "health_check": { "kind": "tcp_connect" } }),
+                json!({ "kind": "tcp_connect" }),
+                None,
+            ),
+            (
+                json!({ "health_check": http("/typed") }),
+                http("/typed"),
+                Some("/typed"),
+            ),
+            (
+                json!({ "health_check_path": "/legacy-again" }),
+                http("/legacy-again"),
+                Some("/legacy-again"),
+            ),
+            (
+                json!({ "health_check_path": "" }),
+                json!({ "kind": "tcp_connect" }),
+                None,
+            ),
+            // A patch naming neither leaves the check alone.
+            (
+                json!({ "weight": 50 }),
+                json!({ "kind": "tcp_connect" }),
+                None,
+            ),
+        ] {
+            let (status, answer) = node.update(&id, body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{body}: {answer}");
+            assert_checked_by(&node, &answer, check, path).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn enabling_checks_on_a_backend_of_a_udp_stream_is_refused_naming_the_stream() {
+        let node = Node::new().await;
+        let (_, created) = node
+            .create(json!({ "address": "192.0.2.10:5353", "health_check_enabled": false }))
+            .await;
+        let id = created["data"]["id"].as_str().expect("an id").to_string();
+        {
+            let store = node.state.store.lock().await;
+            let now = chrono::Utc::now();
+            let stream = lorica_config::models::Stream {
+                id: "s-1".to_string(),
+                name: "dns-udp".to_string(),
+                group_name: String::new(),
+                protocol: lorica_config::models::StreamProtocol::Udp,
+                enabled: true,
+                listen_address: "0.0.0.0".parse().expect("an address"),
+                port_first: 5353,
+                port_last: 5353,
+                node_selector: Vec::new(),
+                created_at: now,
+                updated_at: now,
+            };
+            store.create_stream(&stream).expect("the stream is stored");
+            store
+                .set_stream_backends("s-1", std::slice::from_ref(&id))
+                .expect("a backend with checks off may serve a UDP stream");
+        }
+
+        for body in [
+            json!({ "health_check_enabled": true }),
+            json!({ "health_check_enabled": true, "health_check": { "kind": "tcp_connect" } }),
+        ] {
+            let (status, answer) = node.update(&id, body).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+            let message = answer["error"]["message"].as_str().expect("a message");
+            assert!(message.contains("`dns-udp`"), "{message}");
+        }
+        assert!(!node.stored(&id).await.health_check_enabled);
+    }
+
+    #[tokio::test]
+    async fn a_portless_backend_is_stored_only_with_its_checks_off() {
+        let node = Node::new().await;
+        let (status, answer) = node
+            .create(json!({ "address": "backend.example.com", "health_check_enabled": true }))
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+        assert!(answer["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no port to probe")));
+
+        let (status, answer) = node
+            .create(json!({ "address": "backend.example.com", "health_check_enabled": false }))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{answer}");
+        let id = answer["data"]["id"].as_str().expect("an id").to_string();
+        let (status, answer) = node
+            .update(&id, json!({ "health_check_enabled": true }))
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    }
 }

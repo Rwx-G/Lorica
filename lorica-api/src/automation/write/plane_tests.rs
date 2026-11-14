@@ -3443,6 +3443,106 @@ async fn a_preview_needs_the_read_scope_of_the_row_it_answers() {
 }
 
 #[tokio::test]
+async fn a_token_sets_the_typed_health_check_on_the_plane_and_through_the_config_tier() {
+    // Story 12.1 AC #3: both shapes on every surface. The typed check
+    // is a field of the management body, so the plane and the MCP tool
+    // take it as they take every other field.
+    let f = a_node_with_something_to_write().await;
+    let stored_check = || async {
+        f.state
+            .store
+            .lock()
+            .await
+            .get_backend(&f.backend_id)
+            .expect("store")
+            .expect("the backend")
+    };
+    let backend_path = format!("/automation/v1/backends/{}", f.backend_id);
+    for (check, path) in [
+        (
+            serde_json::json!({ "kind": "http", "path": "/plane" }),
+            Some("/plane"),
+        ),
+        (serde_json::json!({ "kind": "tcp_connect" }), None),
+    ] {
+        let response = automation_call(
+            &f.state,
+            "PUT",
+            &backend_path,
+            &f.bearer,
+            Some(serde_json::json!({ "health_check": check })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{check}");
+        let answer = parse_data(response).await;
+        assert_eq!(answer["health_check"], check);
+        assert_eq!(answer["health_check_path"], serde_json::json!(path));
+        let stored = stored_check().await;
+        assert_eq!(
+            serde_json::to_value(&stored.health_check).expect("serialises"),
+            check
+        );
+        assert_eq!(stored.health_check_path.as_deref(), path);
+    }
+
+    for (check, path) in [
+        (
+            serde_json::json!({ "kind": "http", "path": "/mcp" }),
+            Some("/mcp"),
+        ),
+        (serde_json::json!({ "kind": "tcp_connect" }), None),
+    ] {
+        let answered = mcp_call(
+            &f.state,
+            &f.mcp_bearer,
+            "lorica_backend_update",
+            serde_json::json!({ "id": f.backend_id, "backend": { "health_check": check } }),
+        )
+        .await;
+        assert_eq!(
+            answered["result"]["isError"],
+            serde_json::json!(false),
+            "{answered}"
+        );
+        let stored = stored_check().await;
+        assert_eq!(
+            serde_json::to_value(&stored.health_check).expect("serialises"),
+            check
+        );
+        assert_eq!(stored.health_check_path.as_deref(), path);
+    }
+
+    let created = mcp_call(
+        &f.state,
+        &f.mcp_bearer,
+        "lorica_backend_create",
+        serde_json::json!({ "backend": {
+            "address": "10.0.0.13:8080",
+            "health_check": { "kind": "http", "path": "/created" },
+        } }),
+    )
+    .await;
+    assert_eq!(
+        created["result"]["isError"],
+        serde_json::json!(false),
+        "{created}"
+    );
+    let store = f.state.store.lock().await;
+    let backend = store
+        .list_backends()
+        .expect("store")
+        .into_iter()
+        .find(|backend| backend.address == "10.0.0.13:8080")
+        .expect("the tool created the backend");
+    assert_eq!(
+        backend.health_check,
+        lorica_config::models::HealthCheck::Http {
+            path: "/created".to_string()
+        }
+    );
+}
+
+#[tokio::test]
 async fn a_masked_health_check_path_sent_back_keeps_the_stored_probe_and_is_never_stored() {
     // Architecture audit: the plane masks every query value of a
     // backend's health-check path, and a model copying the listed row
@@ -3483,20 +3583,52 @@ async fn a_masked_health_check_path_sent_back_keeps_the_stored_probe_and_is_neve
         .expect("the listing carries the backend's path")
         .to_string();
     assert_eq!(as_read, "/health?token=[redacted]");
-    for suffix in ["?dry_run=true", ""] {
-        let response = automation_call(
-            &f.state,
-            "PUT",
-            &format!("{backend_path}{suffix}"),
-            &f.bearer,
-            Some(serde_json::json!({ "health_check_path": as_read, "weight": 50 })),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK, "{suffix}");
-        let answer = body_json(response).await;
-        assert!(!answer.to_string().contains("s3cr3t"), "{suffix}: {answer}");
+    let typed_as_read = serde_json::json!({ "kind": "http", "path": as_read });
+    // Whichever shape the row is copied back in, the deprecated path,
+    // the typed check, or both as listed.
+    for body in [
+        serde_json::json!({ "health_check_path": as_read, "weight": 50 }),
+        serde_json::json!({ "health_check": typed_as_read, "weight": 50 }),
+        serde_json::json!({
+            "health_check": typed_as_read,
+            "health_check_path": as_read,
+            "weight": 50,
+        }),
+    ] {
+        for suffix in ["?dry_run=true", ""] {
+            let response = automation_call(
+                &f.state,
+                "PUT",
+                &format!("{backend_path}{suffix}"),
+                &f.bearer,
+                Some(body.clone()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{body}{suffix}");
+            let answer = body_json(response).await;
+            assert!(
+                !answer.to_string().contains("s3cr3t"),
+                "{body}{suffix}: {answer}"
+            );
+        }
+        assert_eq!(stored_probe().await.as_deref(), Some(probe), "{body}");
+        let stored_check = f
+            .state
+            .store
+            .lock()
+            .await
+            .get_backend(&f.backend_id)
+            .expect("store")
+            .expect("the backend")
+            .health_check;
+        assert_eq!(
+            stored_check,
+            lorica_config::models::HealthCheck::Http {
+                path: probe.to_string()
+            },
+            "{body}"
+        );
     }
-    assert_eq!(stored_probe().await.as_deref(), Some(probe));
 
     // A marker that is not the stored path read back, and a create, are
     // refused, and nothing is stored.
@@ -3507,9 +3639,21 @@ async fn a_masked_health_check_path_sent_back_keeps_the_stored_probe_and_is_neve
             serde_json::json!({ "health_check_path": "/ready?token=[redacted]" }),
         ),
         (
+            "PUT",
+            backend_path.clone(),
+            serde_json::json!({
+                "health_check": { "kind": "http", "path": "/ready?token=[redacted]" }
+            }),
+        ),
+        (
             "POST",
             "/automation/v1/backends".to_string(),
             serde_json::json!({ "address": "10.0.0.12:8080", "health_check_path": as_read }),
+        ),
+        (
+            "POST",
+            "/automation/v1/backends".to_string(),
+            serde_json::json!({ "address": "10.0.0.12:8080", "health_check": typed_as_read }),
         ),
     ] {
         let response =
@@ -3523,7 +3667,8 @@ async fn a_masked_health_check_path_sent_back_keeps_the_stored_probe_and_is_neve
         assert!(
             refusal["error"]["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("health_check_path: `[redacted]`")),
+                .is_some_and(|message| message
+                    .contains("health_check_path and health_check.path: `[redacted]`")),
             "{refusal}"
         );
     }

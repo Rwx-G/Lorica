@@ -7048,6 +7048,54 @@ components:
           type: string
           format: date-time
 
+    HealthCheck:
+      description: >-
+        What one active probe of a backend is, tagged by `kind` (since
+        1.11.0). Whether the backend is probed at all is
+        `health_check_enabled`, and how often `health_check_interval_s`.
+        A later release adds kinds as new `kind` values: a client should
+        show a check of a kind it does not know as such rather than fail
+        on it, and leave `health_check` out of a write it does not mean
+        to change it with.
+      oneOf:
+        - $ref: "#/components/schemas/HttpHealthCheck"
+        - $ref: "#/components/schemas/TcpConnectHealthCheck"
+      discriminator:
+        propertyName: kind
+        mapping:
+          http: "#/components/schemas/HttpHealthCheck"
+          tcp_connect: "#/components/schemas/TcpConnectHealthCheck"
+
+    HttpHealthCheck:
+      type: object
+      description: >-
+        An HTTP GET of `path` on the backend, over TLS when
+        `tls_upstream` is on; a 2xx answer is healthy. HTTP routes only:
+        a stream never speaks HTTP to its backends.
+      required: [kind, path]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum: [http]
+        path:
+          type: string
+          minLength: 1
+          description: The request path, query string included, e.g. `/healthz`.
+
+    TcpConnectHealthCheck:
+      type: object
+      description: >-
+        A TCP connection to the backend's address that completes is
+        healthy. The default, and what a backend without a path was
+        probed by before 1.11.0.
+      required: [kind]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum: [tcp_connect]
+
     Backend:
       type: object
       properties:
@@ -7056,6 +7104,12 @@ components:
           format: uuid
         address:
           type: string
+          description: >-
+            `host:port`, or a host without a port (an IPv6 literal in
+            brackets, `[2001:db8::1]`) for a backend that serves port-range
+            streams only, which forward each listen port to the same
+            backend port. A portless backend has its health check
+            disabled: there is no port to probe.
         weight:
           type: integer
         health_status:
@@ -7065,8 +7119,33 @@ components:
           type: boolean
         health_check_interval_s:
           type: integer
+        health_check:
+          $ref: "#/components/schemas/HealthCheck"
+        health_check_path:
+          type: string
+          nullable: true
+          deprecated: true
+          description: >-
+            Deprecated since 1.11.0 in favour of `health_check`: the path
+            of an `http` check, null for every other kind. Kept equal to
+            `health_check` for clients written before the typed check.
         tls_upstream:
           type: boolean
+          description: Whether the upstream expects TLS. HTTP routes only; streams ignore it.
+        tls_skip_verify:
+          type: boolean
+          description: >-
+            Accept an upstream certificate that does not verify. HTTP
+            routes only; streams ignore it.
+        tls_sni:
+          type: string
+          nullable: true
+          description: >-
+            The server name sent in the upstream handshake; null reuses
+            the route hostname. HTTP routes only; streams ignore it.
+        h2_upstream:
+          type: boolean
+          description: Speak HTTP/2 to the upstream. HTTP routes only; streams ignore it.
         managed_by:
           $ref: "#/components/schemas/ManagedBy"
         created_at:
@@ -7082,6 +7161,10 @@ components:
       properties:
         address:
           type: string
+          description: >-
+            `host:port`, or a host without a port for a backend of
+            port-range streams only, created with
+            `health_check_enabled: false` (see `Backend.address`).
         weight:
           type: integer
           default: 100
@@ -7091,23 +7174,69 @@ components:
         health_check_interval_s:
           type: integer
           default: 10
+        health_check:
+          $ref: "#/components/schemas/HealthCheck"
+        health_check_path:
+          type: string
+          deprecated: true
+          description: >-
+            Deprecated since 1.11.0 in favour of `health_check`. A path
+            reads as an `http` check of it, the empty string as
+            `tcp_connect`. Sent beside `health_check`, it must be that
+            check's path (or empty for a check without one): two values
+            that disagree are a 400 naming both fields. With neither
+            field the check is `tcp_connect`.
         tls_upstream:
           type: boolean
           default: false
+          description: HTTP routes only; streams ignore it.
+        tls_skip_verify:
+          type: boolean
+          default: false
+          description: HTTP routes only; streams ignore it.
+        tls_sni:
+          type: string
+          description: HTTP routes only; streams ignore it.
+        h2_upstream:
+          type: boolean
+          default: false
+          description: HTTP routes only; streams ignore it.
 
     UpdateBackendRequest:
       type: object
       properties:
         address:
           type: string
+          description: As on create.
         weight:
           type: integer
         health_check_enabled:
           type: boolean
         health_check_interval_s:
           type: integer
+        health_check:
+          $ref: "#/components/schemas/HealthCheck"
+        health_check_path:
+          type: string
+          deprecated: true
+          description: >-
+            Deprecated since 1.11.0 in favour of `health_check`, read as
+            on create: a path sets an `http` check, the empty string
+            `tcp_connect`, and beside `health_check` it must agree with
+            it (400 otherwise). With neither field the stored check is
+            kept.
         tls_upstream:
           type: boolean
+          description: HTTP routes only; streams ignore it.
+        tls_skip_verify:
+          type: boolean
+          description: HTTP routes only; streams ignore it.
+        tls_sni:
+          type: string
+          description: HTTP routes only; streams ignore it.
+        h2_upstream:
+          type: boolean
+          description: HTTP routes only; streams ignore it.
 
     Certificate:
       type: object

@@ -38,7 +38,8 @@
 //! - a route's `forward_auth.address`: the URL's userinfo and every
 //!   query value, since an authentication endpoint is addressed with
 //!   whatever the verifier needs;
-//! - a backend's `health_check_path`: every query value;
+//! - a backend's probe path, the typed `health_check.path` and the
+//!   deprecated `health_check_path` alike: every query value;
 //! - an access-log row's `path`: every query value and the fragment;
 //! - a route's or a backend's `managed_by.environment`, unless the
 //!   reader may look that environment up
@@ -82,7 +83,8 @@
 //!
 //! # A masked health-check path may be sent back
 //!
-//! `health_check_path` is a field the config tier writes too, and a
+//! The probe path (`health_check.path`, or the deprecated
+//! `health_check_path`) is a field the config tier writes too, and a
 //! model that copies a listed backend into an update or a create sends
 //! the mask back as the probe's query. Stored, the marker replaced the
 //! probe's credential and the backend failed its health checks. So a
@@ -240,9 +242,15 @@ pub fn restore_header_rule_values(
     Ok(())
 }
 
-/// `after`'s `health_check_path` put back to the path `before` stores
-/// when it carries [`REDACTED`] and is exactly the stored path as
+/// `after`'s probe path put back to the path `before` stores when it
+/// carries [`REDACTED`] and is exactly the stored path as
 /// [`backend_row`] answers it. `before` is `None` on a create.
+///
+/// The path is read from `after`'s typed check, which the management
+/// handler has already set from whichever shape the caller sent, the
+/// typed `health_check.path` or the deprecated `health_check_path`;
+/// the stored path is put back into both
+/// (`Backend::set_health_check`), so neither shape can store the mask.
 ///
 /// Run by the backend write guard under the store lock, on the row the
 /// write replaces, so the path put back is the path stored. A path that
@@ -259,22 +267,25 @@ pub fn restore_health_check_path(
     after: &mut lorica_config::models::Backend,
 ) -> Result<(), crate::error::ApiError> {
     let Some(sent) = after
-        .health_check_path
-        .as_deref()
+        .health_check
+        .legacy_path()
         .filter(|sent| sent.contains(REDACTED))
     else {
         return Ok(());
     };
     let stored = before
-        .and_then(|backend| backend.health_check_path.as_deref())
+        .and_then(|backend| backend.health_check.legacy_path())
         .filter(|stored| query_values(stored) == sent);
     let Some(stored) = stored else {
         return Err(crate::error::ApiError::BadRequest(format!(
-            "health_check_path: `{REDACTED}` keeps the stored path only when the whole path is \
-             sent back exactly as it was read, and this one is not; send the path itself"
+            "health_check_path and health_check.path: `{REDACTED}` keeps the stored path only \
+             when the whole path is sent back exactly as it was read, and this one is not; send \
+             the path itself"
         )));
     };
-    after.health_check_path = Some(stored.to_string());
+    after.set_health_check(lorica_config::models::HealthCheck::Http {
+        path: stored.to_string(),
+    });
     Ok(())
 }
 
@@ -343,9 +354,15 @@ pub fn certificate_row(row: &mut Value) {
     }
 }
 
-/// A backend row as the automation plane may answer it.
+/// A backend row as the automation plane may answer it: the query
+/// values of its probe path withheld in both shapes, the typed
+/// `health_check.path` and the deprecated `health_check_path`, which
+/// carry the same string.
 pub fn backend_row(row: &mut Value) {
     mask_string(row, "health_check_path", query_values);
+    if let Some(check) = row.get_mut("health_check") {
+        mask_string(check, "path", query_values);
+    }
 }
 
 /// An access-log row as the automation plane may answer it.
@@ -757,6 +774,10 @@ mod tests {
             sent_back.health_check_path.as_deref(),
             Some("/health?token=s3cr3t&deep=1")
         );
+        assert_eq!(
+            sent_back.health_check, stored.health_check,
+            "the typed check is restored with the deprecated path"
+        );
 
         // A path without the marker is the caller's own, set as sent.
         let mut replaced = backend_probing(Some("/ready?token=rotated"));
@@ -786,11 +807,34 @@ mod tests {
                 panic!("{what}: the refusal is a 400")
             };
             assert!(
-                message.starts_with("health_check_path:"),
+                message.starts_with("health_check_path and health_check.path:"),
                 "{what}: {message}"
             );
             assert!(!message.contains("s3cr3t"), "{what}: {message}");
         }
+    }
+
+    #[test]
+    fn a_backend_row_withholds_the_query_values_of_the_typed_path_too() {
+        let mut row = json!({
+            "id": "b-1",
+            "health_check": { "kind": "http", "path": "/health?token=s3cr3t" },
+            "health_check_path": "/health?token=s3cr3t",
+        });
+        backend_row(&mut row);
+        assert_eq!(
+            row["health_check"],
+            json!({ "kind": "http", "path": "/health?token=[redacted]" })
+        );
+        assert_eq!(row["health_check_path"], "/health?token=[redacted]");
+        assert!(!row.to_string().contains("s3cr3t"));
+
+        // A check without a path is answered as it is.
+        let mut tcp =
+            json!({ "health_check": { "kind": "tcp_connect" }, "health_check_path": null });
+        let before = tcp.clone();
+        backend_row(&mut tcp);
+        assert_eq!(tcp, before);
     }
 
     #[test]
