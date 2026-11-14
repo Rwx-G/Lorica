@@ -704,6 +704,15 @@ export interface UpdateRouteRequest {
   group_name?: string;
 }
 
+/// What one active probe of a backend is, tagged by `kind` (Story 12.1,
+/// `HealthCheck` in `lorica-config`). A later release adds a kind as a
+/// new member of this union.
+export type HealthCheck =
+  /// An HTTP GET of `path`; a 2xx answer is healthy. HTTP routes only.
+  | { kind: 'http'; path: string }
+  /// A TCP connection that completes is healthy.
+  | { kind: 'tcp_connect' };
+
 export interface BackendResponse {
   id: string;
   address: string;
@@ -715,6 +724,8 @@ export interface BackendResponse {
   active_connections: number;
   health_check_enabled: boolean;
   health_check_interval_s: number;
+  health_check: HealthCheck;
+  /** @deprecated since 1.11.0: `health_check`'s path when it is an `http` check. Read `health_check`. */
   health_check_path: string | null;
   tls_upstream: boolean;
   tls_skip_verify: boolean;
@@ -2771,6 +2782,8 @@ export interface CreateBackendRequest {
   weight?: number;
   health_check_enabled?: boolean;
   health_check_interval_s?: number;
+  health_check?: HealthCheck;
+  /** @deprecated since 1.11.0: send `health_check`. Sent beside it, it must be the same path. */
   health_check_path?: string;
   tls_upstream?: boolean;
   tls_skip_verify?: boolean;
@@ -2785,6 +2798,8 @@ export interface UpdateBackendRequest {
   weight?: number;
   health_check_enabled?: boolean;
   health_check_interval_s?: number;
+  health_check?: HealthCheck;
+  /** @deprecated since 1.11.0: send `health_check`. Sent beside it, it must be the same path. */
   health_check_path?: string;
   tls_upstream?: boolean;
   tls_skip_verify?: boolean;

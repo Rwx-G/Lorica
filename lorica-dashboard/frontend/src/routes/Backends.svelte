@@ -4,6 +4,7 @@
     api,
     type BackendResponse,
     type CreateBackendRequest,
+    type HealthCheck,
     type UpdateBackendRequest,
   } from '../lib/api';
   import StatusBadge from '../components/StatusBadge.svelte';
@@ -25,6 +26,7 @@
   let formWeight = $state(100);
   let formHealthCheckEnabled = $state(true);
   let formHealthCheckInterval = $state(10);
+  let formHealthCheckKind: HealthCheck['kind'] = $state('tcp_connect');
   let formHealthCheckPath = $state('');
   let formTlsUpstream = $state(false);
   let formTlsSkipVerify = $state(false);
@@ -94,7 +96,28 @@
     if (addrErr) return addrErr;
     if (formWeight < 1 || formWeight > 1000) return 'Weight must be between 1 and 1000';
     if (formHealthCheckInterval < 5 || formHealthCheckInterval > 3600) return 'Health check interval must be between 5 and 3600 seconds';
+    if (formHealthCheckKind === 'http' && !formHealthCheckPath.trim()) return 'An HTTP health check needs a path (e.g. /healthz)';
     return '';
+  }
+
+  /// The check the form sends: the typed shape only, never the
+  /// deprecated `health_check_path`.
+  function formHealthCheck(): HealthCheck {
+    switch (formHealthCheckKind) {
+      case 'http':
+        return { kind: 'http', path: formHealthCheckPath.trim() };
+      case 'tcp_connect':
+        return { kind: 'tcp_connect' };
+    }
+  }
+
+  function describeHealthCheck(check: HealthCheck): string {
+    switch (check.kind) {
+      case 'http':
+        return `HTTP ${check.path}`;
+      case 'tcp_connect':
+        return 'TCP';
+    }
   }
 
   function handleAddressBlur() {
@@ -155,7 +178,9 @@
     formWeight = 100;
     formHealthCheckEnabled = true;
     formHealthCheckInterval = 10;
+    formHealthCheckKind = 'tcp_connect';
     formHealthCheckPath = '';
+    hcPathError = '';
     formTlsUpstream = false;
     formTlsSkipVerify = false;
     formTlsSni = '';
@@ -176,7 +201,9 @@
     formWeight = b.weight;
     formHealthCheckEnabled = b.health_check_enabled;
     formHealthCheckInterval = b.health_check_interval_s;
-    formHealthCheckPath = b.health_check_path ?? '';
+    formHealthCheckKind = b.health_check.kind;
+    formHealthCheckPath = b.health_check.kind === 'http' ? b.health_check.path : '';
+    hcPathError = '';
     formTlsUpstream = b.tls_upstream;
     formTlsSkipVerify = b.tls_skip_verify;
     formTlsSni = b.tls_sni ?? '';
@@ -203,7 +230,7 @@
         weight: formWeight,
         health_check_enabled: formHealthCheckEnabled,
         health_check_interval_s: formHealthCheckInterval,
-        health_check_path: formHealthCheckPath,
+        health_check: formHealthCheck(),
         tls_upstream: formTlsUpstream,
         tls_skip_verify: formTlsSkipVerify,
         tls_sni: formTlsSni,
@@ -224,7 +251,7 @@
         weight: formWeight,
         health_check_enabled: formHealthCheckEnabled,
         health_check_interval_s: formHealthCheckInterval,
-        health_check_path: formHealthCheckPath || undefined,
+        health_check: formHealthCheck(),
         tls_upstream: formTlsUpstream,
         tls_skip_verify: formTlsSkipVerify,
         tls_sni: formTlsSni || undefined,
@@ -339,7 +366,7 @@
               <td>{b.weight}</td>
               <td>
                 {#if b.health_check_enabled}
-                  <span class="badge-on">{b.health_check_path ? `HTTP ${b.health_check_path}` : 'TCP'}</span>
+                  <span class="badge-on">{describeHealthCheck(b.health_check)}</span>
                   <span class="text-muted small"> / {b.health_check_interval_s}s</span>
                 {:else}
                   <span class="text-muted">Disabled</span>
@@ -439,10 +466,21 @@
           </div>
         </div>
 
-        <div class="form-group">
-          <label for="backend-healthcheck-path">Health Check Path (empty = TCP only)</label>
-          <input id="backend-healthcheck-path" type="text" bind:value={formHealthCheckPath} placeholder="/healthz" onblur={handleHcPathBlur} oninput={handleHcPathBlur} />
-          {#if hcPathError}<span class="field-error">{hcPathError}</span>{/if}
+        <div class="form-row">
+          <div class="form-group">
+            <label for="backend-healthcheck-kind">Health Check Type</label>
+            <select id="backend-healthcheck-kind" bind:value={formHealthCheckKind}>
+              <option value="tcp_connect">TCP connect</option>
+              <option value="http">HTTP GET (HTTP routes only)</option>
+            </select>
+          </div>
+          {#if formHealthCheckKind === 'http'}
+            <div class="form-group">
+              <label for="backend-healthcheck-path">Health Check Path <span class="required">*</span></label>
+              <input id="backend-healthcheck-path" type="text" bind:value={formHealthCheckPath} placeholder="/healthz" onblur={handleHcPathBlur} oninput={handleHcPathBlur} />
+              {#if hcPathError}<span class="field-error">{hcPathError}</span>{/if}
+            </div>
+          {/if}
         </div>
 
         <div class="checkbox-row">
@@ -452,11 +490,11 @@
           </label>
           <label class="checkbox-item">
             <input type="checkbox" bind:checked={formTlsUpstream} />
-            TLS upstream
+            TLS upstream (HTTP routes only; streams ignore it)
           </label>
           <label class="checkbox-item">
             <input type="checkbox" bind:checked={formH2Upstream} />
-            HTTP/2 upstream (h2c for plaintext, ALPN h2 for TLS)
+            HTTP/2 upstream (h2c for plaintext, ALPN h2 for TLS; HTTP routes only; streams ignore it)
           </label>
         </div>
 
@@ -464,11 +502,11 @@
           <div class="form-group">
             <label class="checkbox-item">
               <input type="checkbox" bind:checked={formTlsSkipVerify} />
-              Skip TLS verification (self-signed certificates)
+              Skip TLS verification (self-signed certificates; HTTP routes only; streams ignore it)
             </label>
           </div>
           <div class="form-group">
-            <label for="form-tls-sni">TLS SNI override</label>
+            <label for="form-tls-sni">TLS SNI override (HTTP routes only; streams ignore it)</label>
             <input id="form-tls-sni" type="text" bind:value={formTlsSni} placeholder="Leave empty to use route hostname" />
             <span class="hint">Override the server name sent during TLS handshake to the backend</span>
           </div>
