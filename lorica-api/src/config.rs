@@ -4,6 +4,9 @@
 use axum::extract::Extension;
 use axum::http::StatusCode;
 use axum::Json;
+use lorica_config::listen_ports::ReservedPorts;
+use lorica_config::models::Stream;
+use lorica_config::ConfigStore;
 use serde::Deserialize;
 
 use crate::db::db_blocking;
@@ -67,6 +70,29 @@ pub async fn export_config(
 /// Maximum TOML import size: 1 MB.
 const MAX_IMPORT_SIZE: usize = 1_048_576;
 
+/// The port check of a stream write (Story 12.1 D-9), on every stream
+/// of an import file against the nodes that would bind it and the
+/// file's other streams, since an import replaces the stored ones.
+/// Refuses with the first conflict, as a stream write does.
+///
+/// One function for the import and its preview, so a preview that
+/// comes back clean is an import that will not be refused for a port.
+fn refuse_imported_port_conflicts(
+    store: &ConfigStore,
+    role: &crate::streams::LocalRole,
+    reserved: ReservedPorts,
+    streams: &[Stream],
+) -> Result<(), ApiError> {
+    for stream in streams {
+        if let Some(conflict) =
+            crate::streams::first_port_conflict(store, role, reserved, stream, streams)?
+        {
+            return Err(crate::streams::port_conflict_error(stream, &conflict));
+        }
+    }
+    Ok(())
+}
+
 /// POST /api/v1/config/import - replace the entire configuration from a TOML payload (max 1 MB).
 pub async fn import_config(
     connect_info: crate::audit::ClientConnectInfo,
@@ -111,21 +137,10 @@ pub async fn import_config(
     // certificate made manual because its authority is not on this
     // node (Epic 13 D14). The caller learns it here or not at all.
     let warnings: Vec<String> = db_blocking(&state.store, move |store| {
-        // The port check of a stream write (Story 12.1 D-9), on every
-        // imported stream against the nodes that would bind it and the
-        // other imported streams, since the import replaces the stored
-        // ones. Before `import_to_store`, which clears the store first.
-        for stream in &import_data.streams {
-            if let Some(conflict) = crate::streams::first_port_conflict(
-                store,
-                &role,
-                reserved,
-                stream,
-                &import_data.streams,
-            )? {
-                return Err(crate::streams::port_conflict_error(stream, &conflict));
-            }
-        }
+        // Before `import_to_store`, which clears the store first, and in
+        // the same closure, so no stream write lands between the check
+        // and the import.
+        refuse_imported_port_conflicts(store, &role, reserved, &import_data.streams)?;
         lorica_config::import::import_to_store(&*store, &import_data)
             .map_err(|e| ApiError::Internal(e.to_string()))
     })
@@ -167,7 +182,12 @@ pub async fn import_preview(
     let import_data = lorica_config::import::parse_toml_for_preview(&body.toml_content)
         .map_err(|e| ApiError::BadRequest(format!("invalid TOML: {e}")))?;
 
+    let role = crate::streams::LocalRole::of(&state);
+    let reserved = state.reserved_ports;
     let diff = db_blocking(&state.store, move |store| {
+        // The import answers 409 on a port conflict; the preview must
+        // say so too, or it reads clean for a file the import refuses.
+        refuse_imported_port_conflicts(store, &role, reserved, &import_data.streams)?;
         lorica_config::diff::compute_diff(&*store, &import_data)
             .map_err(|e| ApiError::Internal(e.to_string()))
     })

@@ -805,6 +805,69 @@ async fn an_import_with_a_stream_on_a_reserved_port_is_refused_before_the_store_
     );
 }
 
+/// The preview runs the import's port check, so a file the import
+/// refuses with `409` is never previewed as clean.
+#[tokio::test]
+async fn an_import_preview_reports_the_port_conflict_the_import_refuses() {
+    // The import and its preview share one write budget, so each case
+    // runs on a node of its own.
+    let fresh_node = || async {
+        let node = Node::control_plane().await;
+        node.enrol("edge-1", NodeStatus::Active, Some(EDGE_1)).await;
+        node
+    };
+    let export_of = |streams: Vec<lorica_config::models::Stream>| {
+        let source = lorica_config::ConfigStore::open_in_memory().expect("source");
+        for stream in &streams {
+            source.create_stream(stream).expect("test setup: stream");
+        }
+        lorica_config::export::export_to_toml(&source).expect("export")
+    };
+
+    // On this node's management port (the control plane binds a
+    // fleet-wide stream), and on a follower's HTTPS port: the preview
+    // answers the very refusal the import answers, node named.
+    let mut on_edge_1 = source_stream("on-edge-https", EDGE_1.https);
+    on_edge_1.node_selector = vec!["edge-1".to_string()];
+    for (file, named) in [
+        (
+            export_of(vec![source_stream("on-management", THIS_NODE.management)]),
+            "this node",
+        ),
+        (export_of(vec![on_edge_1]), "edge-1"),
+    ] {
+        let node = fresh_node().await;
+        let body = json!({ "toml_content": file });
+        let (preview_status, preview) = node
+            .call("POST", "/api/v1/config/import/preview", Some(body.clone()))
+            .await;
+        let (import_status, import) = node.call("POST", "/api/v1/config/import", Some(body)).await;
+        let previewed = port_conflict(preview_status, &preview);
+        assert!(previewed.contains(named), "{previewed}");
+        assert_eq!(
+            previewed,
+            port_conflict(import_status, &import),
+            "the preview and the import refuse alike"
+        );
+    }
+
+    // A clean file previews as a diff, as before.
+    let (status, answer) = fresh_node()
+        .await
+        .call(
+            "POST",
+            "/api/v1/config/import/preview",
+            Some(json!({ "toml_content": export_of(vec![source_stream("smtp", 2525)]) })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(
+        answer["data"]["streams"]["added"].as_array().map(Vec::len),
+        Some(1),
+        "{answer}"
+    );
+}
+
 /// A fleet-wide TCP stream on `0.0.0.0:port`, as a TOML file would
 /// carry it.
 fn source_stream(name: &str, port: u16) -> lorica_config::models::Stream {
