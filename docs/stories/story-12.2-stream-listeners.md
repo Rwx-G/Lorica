@@ -1,7 +1,7 @@
 # Story 12.2: Stream Listeners on a Running Process
 
 **Epic:** [Epic 12 - TCP and UDP Stream Proxying (v1.11.0 and v1.12.0)](../prd/epic-12-v1.11.0.md)
-**Status:** Draft
+**Status:** InProgress
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:**
@@ -648,18 +648,18 @@ Allowlist: `lorica-worker/src/fd_passing.rs`, `lorica-worker/src/stream_ctl.rs` 
 (the one `FdKind::StreamCtl` match arm only), `Cargo.lock`.
 Depends on: nothing. Before 12.1.
 
-- [ ] `FdKind::StreamCtl` (`stream-ctl`) and `FdKind::StreamSocket { proto,
+- [x] `FdKind::StreamCtl` (`stream-ctl`) and `FdKind::StreamSocket { proto,
       bind_gen, addr }` with token round-trip tests, including the
       longest IPv6 form; `recv_listener_fds` filters both. Extend the
       compile-time size assertion to the `attach` header plus 32 tokens.
-- [ ] `stream_ctl.rs`: the message enum of D-a (`Attach`, `Detach`,
+- [x] `stream_ctl.rs`: the message enum of D-a (`Attach`, `Detach`,
       `Refresh`, `Quiesce`, `Ack`, `Nack`), encode/decode, `send_msg` /
       `recv_msg` over a `SOCK_SEQPACKET` fd with `SCM_RIGHTS` for
       `Attach`, `MSG_CMSG_CLOEXEC` on receive, the truncation and
       count-mismatch paths closing every received fd (the `OwnedFd`
       idiom of `recv_worker_fds`), chunking of a socket list into
       messages of at most 32 fds. `create_seqpacket_pair()`.
-- [ ] `stream_sockets.rs`: `bind_tcp_stream_listener(addr)` (reuseaddr,
+- [x] `stream_sockets.rs`: `bind_tcp_stream_listener(addr)` (reuseaddr,
       no reuseport, backlog 65535), `bind_udp_group(addr, slots)`
       (reuseport before bind), both applying the IPv6 rule of D-c
       (`IPV6_V6ONLY` off for `[::]`, on for every other IPv6 literal,
@@ -668,13 +668,13 @@ Depends on: nothing. Before 12.1.
       `process_fd_limit()` (soft `RLIMIT_NOFILE` through
       `nix::sys::resource`; enable nix's `resource` feature, an existing
       dependency).
-- [ ] `manager.rs`: the third pair in `spawn_worker`, worker end sent as
+- [x] `manager.rs`: the third pair in `spawn_worker`, worker end sent as
       `StreamCtl` in the fork bundle, supervisor end on `WorkerHandle`
       with `take_stream_ctl_fd()`; `restart_worker` keeps its return
       type and leaves the new end on the handle for the caller to take.
-- [ ] `worker.rs`: the `StreamCtl` arm adopts the fd and reports it in
+- [x] `worker.rs`: the `StreamCtl` arm adopts the fd and reports it in
       the "received worker FDs" log line (wired to the runtime in Lot D).
-- [ ] Tests (Linux): message round trip with real sockets attached;
+- [x] Tests (Linux): message round trip with real sockets attached;
       a 1,024-socket list round-trips in 32-fd chunks; a truncated
       message closes its fds (count open fds via `/proc/self/fd`);
       TCP: a second bind on the same port fails `address_in_use`;
@@ -1129,9 +1129,67 @@ the budget view stays Operator and SuperAdmin.
 
 ### Debug Log
 
+- Lot A, `MSG_CTRUNC`: nix's `RecvMsg::cmsgs()` returns `ENOBUFS` on a
+  control buffer flagged `MSG_CTRUNC` instead of iterating it, while the
+  kernel has already installed the fds that fit. `recv_worker_fds`
+  propagated that error and leaked them (reproduced with 33 fds against a
+  32-fd buffer). Both receivers now go through
+  `fd_passing::recv_with_rights`, which walks the `SCM_RIGHTS` headers
+  itself on `MSG_CTRUNC` and owns every installed fd. Committed apart as
+  a fix, since the fork bundle had the leak before this story.
+- Lot A, UDP and the kernel backstop of D-c: verified in the
+  `rust:1-bookworm` container that the kernel does **not** refuse a
+  second same-user `SO_REUSEPORT` UDP socket on a port a `[::]` group
+  holds, whether on `0.0.0.0`, `127.0.0.1` or `[::]` itself: it joins or
+  shadows the group. Only a socket without `SO_REUSEPORT`, or one of
+  another user, gets `EADDRINUSE`. D-c's "the kernel refuses at bind as
+  the backstop" holds for TCP only. Lot D's node-side backstop must
+  therefore refuse a UDP binding that overlaps one in its own registry
+  before binding; the kernel will not. The test
+  `udp_reuseport_groups_of_one_user_are_not_refused_by_the_kernel` pins
+  that fact; the `[::]` refusal test covers TCP and, for UDP, a plain
+  socket.
+
 ### Completion Notes
 
+- Lot A done (`lorica-worker` and the one `worker.rs` arm). Public API:
+  `fd_passing::{StreamProto, FdKind::StreamCtl, FdKind::StreamSocket}`;
+  `stream_ctl::{StreamCtlMsg, StreamSocket, QuiesceReason, NackReason,
+  StreamCtlError, send_msg, recv_msg, chunk_sockets,
+  create_seqpacket_pair, ATTACH_MAX_SOCKETS, MAX_STREAM_ID_LEN}`;
+  `stream_sockets::{bind_tcp_stream_listener, bind_udp_group,
+  bind_range, BoundPort, BindError, BindFailureKind, process_fd_limit,
+  TCP_STREAM_BACKLOG}`; `WorkerHandle::take_stream_ctl_fd`;
+  `WorkerError::StreamCtl`.
+- `PAYLOAD_BUF_SIZE` went from 4,096 to 8,192 bytes: the old value held
+  exactly 32 tokens of 128 bytes without their separators, so the
+  `attach` header could not fit beside them. The assertion now counts
+  the header and one separator per token.
+- `MAX_STREAM_ID_LEN` is 64, set here because 12.1's id validation has
+  not landed: stream ids are generated UUIDs (36 bytes). Lot B or 12.1
+  may tighten it; the assertion follows the constant.
+- `NackReason` is a closed set (`malformed`, `unknown_binding`,
+  `adopt_failed`, `shutting_down`) chosen for the runtime of Lot B, which
+  may extend it.
+- `worker.rs` carries two arms, not one: the match is exhaustive, so
+  `StreamSocket` needs one too. A stream socket arriving in the fork
+  bundle is closed with a warning; it only ever travels over the stream
+  control channel. Until Lot D the worker holds its stream control end
+  for its whole life and reads nothing from it; the supervisor's end
+  stays on the `WorkerHandle`.
+- `recv_listener_fds` (test wrapper) now closes the fds of the entries it
+  filters out instead of dropping the raw numbers.
+
 ## File List
+
+- `lorica-worker/Cargo.toml` (nix `resource` feature)
+- `lorica-worker/src/fd_passing.rs`
+- `lorica-worker/src/lib.rs`
+- `lorica-worker/src/manager.rs`
+- `lorica-worker/src/stream_ctl.rs` (new)
+- `lorica-worker/src/stream_sockets.rs` (new)
+- `lorica-worker/tests/stream_ctl.rs` (new)
+- `lorica/src/startup/worker.rs` (the `StreamCtl` and `StreamSocket` arms)
 
 ## Change Log
 
@@ -1139,3 +1197,4 @@ the budget view stays Operator and SuperAdmin.
 |------|---------|-------------|--------|
 | 2026-11-14 | 0.1 | Story drafted from the Epic 12 PRD. Status Draft. | Romain G. |
 | 2026-11-14 | 0.2 | Maintainer answers folded in: AC #7 as amended, `EXTEND_TIMEOUT_USEC` stop path, the 300 s fix through Lorica's `ServerConf`, the drain watcher, the dual-stack rule, a generic per-session fd input, paths re-checked after `4e864593`. Status Draft. | Romain G. |
+| 2026-11-14 | 0.3 | Lot A implemented: stream control channel, stream socket binding, third socketpair per worker; `MSG_CTRUNC` fd leak fixed; UDP kernel-backstop gap recorded for Lot D. Status InProgress. | Romain G. |
