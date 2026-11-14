@@ -888,6 +888,7 @@ fn environment_backend(input: &WriteInput, index: usize, backend: &ValidatedBack
         health_check_enabled: true,
         health_check_interval_s: DEFAULT_HEALTH_CHECK_INTERVAL_S,
         health_check_path: None,
+        health_check: lorica_config::models::HealthCheck::TcpConnect,
         lifecycle_state: LifecycleState::Normal,
         active_connections: 0,
         tls_upstream: backend.tls_upstream,

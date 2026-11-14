@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use chrono::{TimeZone, Utc};
-use lorica_config::models::{Role, RouteProtectionRecord};
+use lorica_config::models::{HealthCheck, Role, RouteProtectionRecord};
 use lorica_config::ConfigStore;
 use rusqlite::Connection;
 
@@ -630,4 +630,182 @@ fn an_upgrade_from_version_69_writes_ipv6_names_in_their_canonical_spelling() {
         .expect("records read");
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].hostname, "[2001:db8::20]");
+}
+
+// ---- A 1.10.6 binary on a 1.11.0 database (Story 12.1, D-2) ----
+//
+// The three statements below are a frozen released artefact, copied
+// from `git show v1.10.6:lorica-config/src/store/backends.rs`
+// (`BACKEND_COLUMNS`, `create_backend`, `update_backend`). They are what
+// a 1.10.6 binary rolled back onto a database this release migrated
+// runs against `backends`; they must keep working there, and what they
+// write must read back by the D-2 matrix. Never edit them to follow the
+// current code.
+
+const V1_10_6_BACKEND_COLUMNS: &str = "id, address, name, group_name, weight, health_status, \
+     health_check_enabled, health_check_interval_s, health_check_path, \
+     lifecycle_state, active_connections, tls_upstream, created_at, updated_at, h2_upstream, \
+     tls_sni, tls_skip_verify, managed_by";
+
+const V1_10_6_INSERT_BACKEND: &str = "INSERT INTO backends (id, address, name, group_name, weight, health_status,
+             health_check_enabled, health_check_interval_s, health_check_path,
+             lifecycle_state, active_connections, tls_upstream, h2_upstream, created_at, updated_at, tls_sni, tls_skip_verify,
+             managed_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)";
+
+const V1_10_6_UPDATE_BACKEND: &str =
+    "UPDATE backends SET address=?2, name=?3, group_name=?4, weight=?5,
+             health_status=?6, health_check_enabled=?7, health_check_interval_s=?8,
+             health_check_path=?9, lifecycle_state=?10, active_connections=?11,
+             tls_upstream=?12, h2_upstream=?13, updated_at=?14, tls_sni=?15, tls_skip_verify=?16,
+             managed_by=?17 WHERE id=?1";
+
+fn v1_10_6_insert(conn: &Connection, id: &str, path: Option<&str>) {
+    conn.execute(
+        V1_10_6_INSERT_BACKEND,
+        rusqlite::params![
+            id,
+            "192.0.2.10:8080",
+            "",
+            "",
+            100,
+            "unknown",
+            true,
+            10,
+            path,
+            "normal",
+            0,
+            false,
+            false,
+            "2026-01-01T00:00:00+00:00",
+            "2026-01-01T00:00:00+00:00",
+            "",
+            false,
+            Option::<String>::None,
+        ],
+    )
+    .expect("the 1.10.6 insert runs on a 1.11.0 database");
+}
+
+fn v1_10_6_set_path(conn: &Connection, id: &str, path: Option<&str>) {
+    let changed = conn
+        .execute(
+            V1_10_6_UPDATE_BACKEND,
+            rusqlite::params![
+                id,
+                "192.0.2.10:8080",
+                "",
+                "",
+                100,
+                "unknown",
+                true,
+                10,
+                path,
+                "normal",
+                0,
+                false,
+                false,
+                "2026-01-02T00:00:00+00:00",
+                "",
+                false,
+                Option::<String>::None,
+            ],
+        )
+        .expect("the 1.10.6 update runs on a 1.11.0 database");
+    assert_eq!(changed, 1);
+}
+
+fn read_check(store: &ConfigStore, id: &str) -> (HealthCheck, Option<String>) {
+    let backend = store
+        .get_backend(id)
+        .expect("backend reads")
+        .expect("backend kept");
+    (backend.health_check, backend.health_check_path)
+}
+
+fn http(path: &str) -> HealthCheck {
+    HealthCheck::Http {
+        path: path.to_string(),
+    }
+}
+
+#[test]
+fn a_1_10_6_binary_reads_and_writes_backends_on_a_1_11_0_database() {
+    let dir = tempfile::tempdir().expect("test setup: tempdir");
+    let path = dir.path().join("lorica.db");
+    let store = ConfigStore::open(&path, None).expect("test setup: a database at head");
+
+    // 1.11.0 writes two backends, one per kind it knows today.
+    let template = {
+        let raw = Connection::open(&path).expect("test setup: raw open");
+        v1_10_6_insert(&raw, "template", None);
+        store.get_backend("template").expect("reads").expect("kept")
+    };
+    let mut typed_http = template.clone();
+    typed_http.id = "typed-http".to_string();
+    typed_http.set_health_check(http("/h"));
+    store
+        .create_backend(&typed_http)
+        .expect("1.11.0 writes http");
+    let mut typed_tcp = template.clone();
+    typed_tcp.id = "typed-tcp".to_string();
+    typed_tcp.set_health_check(HealthCheck::TcpConnect);
+    store.create_backend(&typed_tcp).expect("1.11.0 writes tcp");
+    let mut cleared = typed_http.clone();
+    cleared.id = "cleared".to_string();
+    store.create_backend(&cleared).expect("1.11.0 writes http");
+
+    // The rollback: 1.10.6 reads every row through its column list and
+    // writes with its own statements.
+    let raw = Connection::open(&path).expect("raw open");
+    let read_by_1_10_6: Vec<(String, Option<String>)> = raw
+        .prepare(&format!(
+            "SELECT {V1_10_6_BACKEND_COLUMNS} FROM backends ORDER BY address, id"
+        ))
+        .expect("the 1.10.6 select prepares on a 1.11.0 database")
+        .query_map([], |row| Ok((row.get(0)?, row.get(8)?)))
+        .expect("the 1.10.6 select runs")
+        .collect::<rusqlite::Result<_>>()
+        .expect("the 1.10.6 select reads every row");
+    assert!(read_by_1_10_6.contains(&("typed-http".to_string(), Some("/h".to_string()))));
+    assert!(read_by_1_10_6.contains(&("typed-tcp".to_string(), None)));
+
+    v1_10_6_insert(&raw, "legacy-none", None);
+    v1_10_6_insert(&raw, "legacy-path", Some("/h"));
+    v1_10_6_set_path(&raw, "typed-http", Some("/x"));
+    v1_10_6_set_path(&raw, "cleared", None);
+    v1_10_6_set_path(&raw, "typed-tcp", Some("/x"));
+    drop(raw);
+
+    // The re-upgrade reads each row by the D-2 matrix.
+    let expected: [(&str, HealthCheck, Option<&str>); 5] = [
+        ("legacy-none", HealthCheck::TcpConnect, None),
+        ("legacy-path", http("/h"), Some("/h")),
+        ("typed-http", http("/x"), Some("/x")),
+        ("cleared", HealthCheck::TcpConnect, None),
+        ("typed-tcp", http("/x"), Some("/x")),
+    ];
+    drop(store);
+    let store = ConfigStore::open(&path, None).expect("the re-upgrade opens");
+    for (id, check, path) in expected {
+        assert_eq!(
+            read_check(&store, id),
+            (check, path.map(str::to_string)),
+            "{id}"
+        );
+    }
+
+    // And a 1.11.0 write of what it read puts both columns back in step.
+    let mut edited = store
+        .get_backend("typed-http")
+        .expect("reads")
+        .expect("kept");
+    edited.weight = 50;
+    store
+        .update_backend(&edited)
+        .expect("1.11.0 rewrites the row");
+    assert_eq!(
+        read_check(&store, "typed-http"),
+        (http("/x"), Some("/x".to_string()))
+    );
 }

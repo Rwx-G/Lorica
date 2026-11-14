@@ -345,6 +345,31 @@ pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
 }
 
 pub(super) fn row_to_backend(row: &rusqlite::Row<'_>) -> Result<Backend> {
+    let health_check_path: Option<String> = row.get(8)?;
+    // Column index 18 (Story 12.1 migration V72): NULL on every row a
+    // 1.10.6 or earlier binary wrote. Reconciled against the path here,
+    // once, so every reader sees one consistent pair (D-2).
+    //
+    // A definition this binary cannot parse reads as absent, so the
+    // legacy path decides, rather than failing every backend read: it is
+    // a kind a newer release added (a rollback, the same case the path
+    // column exists for), and a probe is not an authority whose
+    // corruption must fail closed.
+    let raw_check = row.get::<_, Option<String>>(18).unwrap_or(None);
+    let stored_check: Option<HealthCheck> =
+        match parse_optional_json_field(raw_check, "health_check_json") {
+            Ok(check) => check,
+            Err(e) => {
+                tracing::warn!(
+                    backend_id = %row.get::<_, String>(0).unwrap_or_default(),
+                    error = %e,
+                    "stored health check definition is not one this version knows; \
+                     reading the backend by its health_check_path"
+                );
+                None
+            }
+        };
+    let health_check = HealthCheck::reconcile(stored_check, health_check_path.as_deref());
     Ok(Backend {
         id: row.get(0)?,
         address: row.get(1)?,
@@ -355,7 +380,8 @@ pub(super) fn row_to_backend(row: &rusqlite::Row<'_>) -> Result<Backend> {
             .map_err(|e| ConfigError::Corrupt(format!("stored health_status is invalid: {e}")))?,
         health_check_enabled: row.get(6)?,
         health_check_interval_s: row.get(7)?,
-        health_check_path: row.get(8)?,
+        health_check_path,
+        health_check,
         lifecycle_state: LifecycleState::from_str(&row.get::<_, String>(9)?)
             .map_err(|e| ConfigError::Corrupt(format!("stored lifecycle_state is invalid: {e}")))?,
         active_connections: row.get(10)?,

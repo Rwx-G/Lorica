@@ -1478,8 +1478,15 @@ mod tests {
     /// 69 puts it behind on schema and the handshake refuses it first.
     /// The version stays at 2. Pinned by
     /// `a_1_10_2_blob_without_case_insensitive_paths_decodes_to_case_sensitive_routes`.
+    ///
+    /// Story 12.1 (1.11.0) moved it: `Backend` gained `health_check`
+    /// (D-2), with a serde default. No peer on the old shape can receive
+    /// it: migrations 71 to 73 put a 1.10.x follower behind on schema and
+    /// the handshake refuses it first. The version step of 1.11.0 is
+    /// taken once, in the change that brings streams into the blob
+    /// (Story 12.1, D-3), and later 1.11.0 shapes ride it.
     const CANONICAL_SHAPE_DIGEST: &str =
-        "a823349c9508932da6768c21e6da71241ee384287bb870369db859294166e9b7";
+        "92d205c651909c1dd56ef9b763db69c609699ff328bf759a89672ef58d81d9d6";
 
     /// Every field name `T` accepts, read from the type itself rather
     /// than from the JSON of some fixture.
@@ -1921,6 +1928,7 @@ fleet_bytes={fleet_bytes} per_recipient_mean_bytes={mean_bytes}",
             health_check_enabled: true,
             health_check_interval_s: 10,
             health_check_path: None,
+            health_check: crate::models::HealthCheck::TcpConnect,
             lifecycle_state: LifecycleState::Normal,
             active_connections: 0,
             tls_upstream: false,

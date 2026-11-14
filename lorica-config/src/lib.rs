@@ -31,6 +31,9 @@ pub mod export;
 pub mod host_shape;
 /// Import path complementing `export` (schema-validated, round-trip).
 pub mod import;
+/// The reserved-port and listen-address rule shared by the CLI, the
+/// control plane's stream conflict check and the stream bind.
+pub mod listen_ports;
 /// Serialisable model types (routes, backends, certs, settings, ...).
 pub mod models;
 /// Which route serves a request's host and path: the proxy's selection,

@@ -202,6 +202,10 @@ pub(crate) struct ClusterPlane {
     handoff_listener: std::net::TcpListener,
     /// The operational bind, the key the handoff table uses.
     operational_bind: std::net::SocketAddr,
+    /// The enrollment bind, held even while the listener is closed (no
+    /// live token): it binds again on the next token, so its port stays
+    /// reserved.
+    enrollment_bind: std::net::SocketAddr,
 }
 
 impl ClusterPlane {
@@ -219,6 +223,12 @@ impl ClusterPlane {
     /// validator can refuse to share it (`ReservedPorts::cluster`).
     pub fn operational_port(&self) -> u16 {
         self.operational_bind.port()
+    }
+
+    /// The enrollment bind's port, reserved like the operational one
+    /// (`ReservedPorts::enrollment`).
+    pub fn enrollment_port(&self) -> u16 {
+        self.enrollment_bind.port()
     }
 
     /// Stop both listeners, every established session and the
@@ -466,6 +476,7 @@ pub(crate) async fn redeem_with_store(
         applied_config_hash: String::new(),
         cert_not_after: issued.not_after,
         revoked_at: None,
+        reserved_ports: None,
     };
     db_blocking(store, move |store| {
         store.create_cluster_node(&row).map_err(internal)
@@ -1764,6 +1775,9 @@ fn spawn_session_flush(
                         0,
                     )
                     .unwrap_or_else(Utc::now),
+                    // The session does not carry the report yet; `None`
+                    // keeps the stored value (`COALESCE`).
+                    reserved_ports: None,
                 })
                 .collect();
             let flushed = db_blocking(&store, move |store| {
@@ -2064,6 +2078,7 @@ pub(crate) async fn spawn_cluster_plane(
         tasks,
         handoff_listener,
         operational_bind: binds.operational,
+        enrollment_bind: binds.enrollment,
     }))
 }
 
@@ -2468,6 +2483,7 @@ mod tests {
             applied_config_hash: String::new(),
             cert_not_after: now + chrono::Duration::days(30),
             revoked_at: None,
+            reserved_ports: None,
         }
     }
 

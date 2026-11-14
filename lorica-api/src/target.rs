@@ -423,6 +423,7 @@ mod tests {
             health_check_enabled: false,
             health_check_interval_s: 10,
             health_check_path: None,
+            health_check: lorica_config::models::HealthCheck::TcpConnect,
             lifecycle_state: lorica_config::models::LifecycleState::Normal,
             active_connections: 0,
             tls_upstream: false,

@@ -1,7 +1,7 @@
 # Story 12.1: The Stream Model, Shared Backends and the Release's Schema Decisions
 
 **Epic:** [Epic 12 - TCP and UDP Stream Proxying (v1.11.0 and v1.12.0)](../prd/epic-12-v1.11.0.md)
-**Status:** Draft
+**Status:** InProgress
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:** the `lorica-fleet` extraction (backlog #52, "The cycle's
@@ -636,10 +636,10 @@ the `lorica/tests/*_e2e_test.rs` suites and `lorica/tests/proxy_{config,routing}
 `lorica-config/src/canonical.rs` and `lorica-config/src/store/replica.rs`
 (test fixtures only). The grep is the authority, this list is not.
 
-- [ ] `models/health_check.rs`: `HealthCheck`, `legacy_path()`,
+- [x] `models/health_check.rs`: `HealthCheck`, `legacy_path()`,
       `reconcile()`, `Backend::set_health_check()`; `Backend` gains
       `health_check` (D-2); doc comments mark the D-11 fields HTTP-only.
-- [ ] `models/stream.rs`: `Stream` (with `enabled`, without
+- [x] `models/stream.rs`: `Stream` (with `enabled`, without
       `managed_by`), `StreamProtocol` (`tcp`, `udp`, strum derives like
       `enums.rs`), `StreamBackend`, `STREAM_PORT_RANGE_MAX`,
       `Stream::validate()` (name, group, address, ports, range cap,
@@ -649,45 +649,45 @@ the `lorica/tests/*_e2e_test.rs` suites and `lorica/tests/proxy_{config,routing}
       `AttachmentSnapshot` and `AttachmentConflict` (D-6),
       `StreamEndReason`, `StreamEndKind`, `StreamRefusal` (D-7).
       `deny_unknown_fields` on `Stream` and `StreamBackend`.
-- [ ] `listen_ports.rs`: `ReservedPorts` (moved, plus `enrollment`),
+- [x] `listen_ports.rs`: `ReservedPorts` (moved, plus `enrollment`),
       `ReservedListener`, `clash`, `clash_in`,
       `listen_addresses_conflict` (the dual-stack rule of D-5),
       `NodePorts`, `PortConflict`, `stream_port_conflicts`. Serde on
       `ReservedPorts` for the `cluster_nodes` column.
-- [ ] Migrations 71 (`migrate_streams`), 72
+- [x] Migrations 71 (`migrate_streams`), 72
       (`migrate_backend_health_check`), 73
       (`migrate_cluster_node_reserved_ports`), each with a doc comment in
       the house style, ending with the downgrade statement of D-2.
-- [ ] `store/streams.rs`: `STREAM_COLUMNS`, `row_to_stream`,
+- [x] `store/streams.rs`: `STREAM_COLUMNS`, `row_to_stream`,
       `create_stream`, `get_stream`, `list_streams`, `update_stream`,
       `delete_stream`, `set_stream_backends` (replace the set in one
       transaction, attachment rule checked), `list_stream_backends`,
       `list_backends_for_stream`, `list_streams_for_backend`, plus the
       unchecked internal writers Lot 2 uses. `clear_all` deletes
       `stream_backends` and `streams`.
-- [ ] `store/backends.rs` and `row_helpers.rs`: `health_check_json`
+- [x] `store/backends.rs` and `row_helpers.rs`: `health_check_json`
       appended to `BACKEND_COLUMNS` and to both writes; reconcile on
       read and on write; attachment rule on `link_route_backend`,
       `create_backend`, `update_backend`; `validate_backend_address`
       accepts the portless forms of D-6.
-- [ ] `ClusterNode.reserved_ports: Option<ReservedPorts>` and
+- [x] `ClusterNode.reserved_ports: Option<ReservedPorts>` and
       `LiveNodeFacts.reserved_ports`, read and written by
       `cluster_nodes.rs`, `COALESCE` on the flush update (D-4).
-- [ ] `lorica/src/cli.rs`: `ReservedPorts` imported from
+- [x] `lorica/src/cli.rs`: `ReservedPorts` imported from
       `lorica_config::listen_ports`, `refuse_reserved` delegating to
       `clash`, the cluster family clearing `enrollment`, existing tests
       green with unchanged messages, one new test for the automation
       listen on the enrollment port.
-- [ ] `lorica/src/startup/{single,supervisor,automation}.rs`: every
+- [x] `lorica/src/startup/{single,supervisor,automation}.rs`: every
       `ReservedPorts` literal gains `enrollment`; the process's complete
       `ReservedPorts` is built once and passed to `AppState.reserved_ports`
       (new field, `lorica-api/src/server.rs`) and to
       `FollowerOptions.reserved_ports` (new field,
       `cluster_follower.rs`; not read until Lot 3).
-- [ ] Construction-site fixes listed above (`health_check:
+- [x] Construction-site fixes listed above (`health_check:
       HealthCheck::TcpConnect` beside `health_check_path: None`,
       `reserved_ports: None`, the `AppState` field, `enrollment`).
-- [ ] Tests listed under Dev Notes, Lot 1.
+- [x] Tests listed under Dev Notes, Lot 1.
 
 ### Lot 2: replication, cut, export, import, diff (after Lot 1; parallel with 3 and 4; cargo)
 
@@ -1162,9 +1162,100 @@ the per-commit guard. Story 12.12's file must list this scenario by name.
 
 ### Debug Log
 
+- Lot 1, first workspace clippy: `clippy::type_complexity` on the
+  additive-migration test's column map; a `ColumnShape` alias fixed it.
+- Lot 1, first product-crate run: the shape digest guard failed, as
+  expected, because `Backend` gained `health_check`; and
+  `test_backend_address_missing_port_rejected` pinned the pre-D-6
+  refusal of a portless address. That test now pins the D-6 rule
+  (refused with checks on, stored with checks off).
+
 ### Completion Notes
 
+Lot 1 (schema, models, store, shared rules, shape changes) is done; Lots
+2 to 6 are not started.
+
+- `Stream.listen_address` is an `IpAddr`, not a `String`: the canonical
+  RFC 5952 form is then true by construction (serde parses any spelling
+  and writes `Display`), a hostname is refused at decode, and
+  `Stream::validate` only has the IPv4-mapped refusal left to do.
+- "`binds_here` with `enabled` taken as true" (D-5) is a named function,
+  `binds_here_when_enabled`; `binds_here` is `enabled &&` it, so the rule
+  still lives in one place. `stream_port_conflicts` reads it.
+- `AttachmentConflict` names the backend (id and address), the stream by
+  name and the rule broken (`AttachmentRule`). Two refusals can involve
+  no stream: a portless backend with checks on that is linked nowhere,
+  and a portless backend on a route alone; those name the backend and the
+  route. The store calls the rule over the backends a write touched
+  only, so a write is never refused for a row it did not change.
+- Checked writes (`create_backend`, `update_backend`,
+  `link_route_backend`, `create_stream`, `update_stream`,
+  `set_stream_backends`) run in a SQLite savepoint
+  (`ConfigStore::within_savepoint`), not a transaction, because they are
+  also called inside `in_transaction` (the environment `PUT`), where a
+  nested `BEGIN` fails. Unchecked writers for Lot 2:
+  `create_backend_unchecked`, `update_backend_unchecked`,
+  `link_route_backend_unchecked`, `create_stream_unchecked`,
+  `update_stream_unchecked`, `link_stream_backend_unchecked`. Until Lot 2
+  switches the replica apply and the import to them, both still use the
+  checked writers; with no stream in any blob or file yet, that refuses
+  nothing a 1.10.x write could produce.
+- A `health_check_json` this binary cannot parse reads as absent (the
+  legacy path decides, with a WARN), not as `Corrupt`: it is a kind a
+  newer release added, the rollback case the path column exists for, and
+  failing it would fail every backend read.
+- `ClusterNode.reserved_ports` is `skip_serializing`: the node's API view
+  and its OpenAPI schema stay as they are; only the conflict check reads
+  it.
+- `ReservedPorts` lives in `lorica_config::listen_ports`; `cli.rs`
+  re-exports it `pub(crate)`, so `crate::cli::ReservedPorts` imports in
+  `cluster_plane.rs` and `automation.rs` did not move.
+- The process's `ReservedPorts` is built once per startup mode in two
+  steps: `listener_ports` (management, proxy, and the automation port
+  read from `--automation-listen` by `cli::requested_port`, before that
+  listener validates it) goes to the follower; the cluster plane's
+  operational and enrollment ports are added after the plane spawns, and
+  that full value goes to `AppState.reserved_ports` and to the
+  automation validator. The cluster plane's own validator still gets it
+  without the automation port, as before.
+- `FollowerOptions.reserved_ports` carries `#[allow(dead_code)]` with a
+  comment: nothing reads it until Lot 3 wires the heartbeat, and a
+  never-read field fails `CARGO_BUILD_WARNINGS=deny`. Lot 3 removes the
+  attribute.
+- `CANONICAL_SHAPE_DIGEST` is updated in Lot 1, with its paragraph,
+  because `Backend.health_check` is a Lot 1 shape change and the guard
+  would otherwise leave the tree red; `CANONICAL_FORMAT_VERSION` stays 2
+  until Lot 2 takes the D-3 step.
+- Allowlist extensions, each forced by compilation or by the Lot 1 task
+  list: `lorica/src/startup/mod.rs` (`spawn_cluster_runtime` takes the
+  follower's ports and fills the `FollowerOptions` literal, which lives
+  there); `lorica/src/startup/cluster_plane.rs` beyond its
+  `LiveNodeFacts` literal (`ClusterPlane::enrollment_port`, so the
+  process's ports include the enrollment bind); `lorica-config/src/canonical.rs`
+  beyond fixtures (the digest above).
+
 ## File List
+
+Lot 1, new: `lorica-config/src/listen_ports.rs`,
+`lorica-config/src/models/health_check.rs`,
+`lorica-config/src/models/stream.rs`, `lorica-config/src/store/streams.rs`.
+
+Lot 1, modified: `lorica-config/src/lib.rs`,
+`lorica-config/src/models/{mod,backend,cluster}.rs`,
+`lorica-config/src/store/{mod,backends,row_helpers,cluster_nodes,replica}.rs`,
+`lorica-config/src/canonical.rs`, `lorica-config/src/tests.rs`,
+`lorica-config/tests/config_db_upgrade.rs`, `lorica/src/cli.rs`,
+`lorica/src/startup/{mod,single,supervisor,automation,cluster_follower,cluster_plane}.rs`,
+`lorica/src/proxy_wiring/tests.rs`, `lorica/tests/*_e2e_test.rs` (every
+suite holding a `Backend` literal),
+`lorica/tests/proxy_{config,routing}_test.rs`, `lorica-fleet/src/runtime.rs`,
+`lorica-api/src/server.rs`, `lorica-api/src/{backends,target,tests}.rs`,
+`lorica-api/src/routes/crud.rs`, `lorica-api/src/cluster/tests.rs`,
+`lorica-api/src/acme/tests.rs`,
+`lorica-api/src/automation/{audit,environments,protections,redact,write}.rs`,
+`lorica-api/src/automation_tokens/tests.rs`,
+`lorica-api/src/oidc_issuers/tests.rs`,
+`docs/stories/story-12.1-stream-model.md`.
 
 ## Change Log
 
@@ -1173,3 +1264,4 @@ the per-commit guard. Story 12.12's file must list this scenario by name.
 | 2026-11-14 | 0.1 | Story drafted from the Epic 12 PRD. Status Draft. | Romain G. |
 | 2026-11-14 | 0.2 | Open questions resolved and folded in (control plane binds as routes, `enabled`, no `managed_by`, `node_shutdown`, dual-stack rule, Operator floor, constant cap, portless backends, 1.10.6 binary scenario to 12.12); allowlists rechecked against `4e864593`. Status Draft. | Romain G. |
 | 2026-11-14 | 0.3 | AC #6 amended: the control plane binds only streams with an empty selector; `binds_here` and `NodeRole` (D-8); the "this node" conflict rule and IV1 test rewritten for the control plane and two followers. Status Draft. | Romain G. |
+| 2026-11-14 | 0.4 | Lot 1 implemented: migrations 71 to 73, `Stream`, `HealthCheck`, `listen_ports`, the stream store, the attachment rule on every management write, reserved ports on `cluster_nodes` and in `AppState`, every construction site. Status InProgress. | Romain G. |

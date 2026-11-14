@@ -690,23 +690,10 @@ pub(crate) struct ClusterBinds {
     pub advertise_host: String,
 }
 
-/// Ports a listener must never share: the management API, the two
-/// proxy listeners, and the opt-in control listeners. The last two are
-/// `Option` because either may be off, in which case there is no port
-/// to collide with.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ReservedPorts {
-    /// The loopback management API port.
-    pub management: u16,
-    /// The HTTP proxy listener port.
-    pub http: u16,
-    /// The HTTPS proxy listener port.
-    pub https: u16,
-    /// The cluster plane's operational port, when the plane is on.
-    pub cluster: Option<u16>,
-    /// The automation API's port, when it is on.
-    pub automation: Option<u16>,
-}
+/// Ports a listener must never share. The type and its clash rule live
+/// in `lorica-config` since Story 12.1, so the control plane checks a
+/// stream's ports by the same rule this CLI checks a listener by.
+pub(crate) use lorica_config::listen_ports::ReservedPorts;
 
 /// How one listener family names itself in a refusal: the flag
 /// carrying the bind, the flag that opts into a wildcard host, and the
@@ -791,21 +778,11 @@ fn refuse_reserved(
     reserved: ReservedPorts,
 ) -> Result<(), String> {
     let port = addr.port();
-    let clash = if port == reserved.management {
-        Some("the management API port")
-    } else if port == reserved.http || port == reserved.https {
-        Some("a proxy listener port")
-    } else if reserved.cluster == Some(port) {
-        Some("the cluster plane port")
-    } else if reserved.automation == Some(port) {
-        Some("the automation API port")
-    } else {
-        None
-    };
-    match clash {
-        Some(what) => {
+    match reserved.clash(port) {
+        Some(listener) => {
             let flag = listen.flag;
             let subject = listen.subject;
+            let what = listener.phrase();
             Err(format!(
                 "{flag} `{addr}`: port {port} is {what}; {subject} must not share it"
             ))
@@ -834,6 +811,18 @@ pub(crate) fn validate_automation_listen(
     validate_listen_bind(AUTOMATION_LISTEN, value, reserved, allow_any)
 }
 
+/// The port a `host:port` listen value asks for, read before the
+/// listener validates and binds it, so the process can describe the
+/// ports it reserves before every listener is up. `None` when the value
+/// carries no parseable port, which that listener's own validation then
+/// refuses at startup.
+pub(crate) fn requested_port(value: &str) -> Option<u16> {
+    value
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|addr| addr.port())
+}
+
 /// Validate the cluster-plane CLI per Story 9.2 AC #11. Both binds
 /// need an explicit `host:port` (a bare port is refused), a wildcard
 /// host needs the separate `--cluster-listen-any` opt-in, and neither
@@ -849,12 +838,14 @@ pub(crate) fn validate_cluster_listen(
     reserved: ReservedPorts,
     allow_any: bool,
 ) -> Result<ClusterBinds, String> {
-    // `reserved.cluster` is this family's own bind, and a listener does
-    // not collide with itself. Clearing it here lets a caller pass one
-    // `ReservedPorts` describing every listener in the process without
-    // the cluster binds refusing themselves.
+    // `reserved.cluster` and `reserved.enrollment` are this family's own
+    // binds, and a listener does not collide with itself. Clearing them
+    // here lets a caller pass one `ReservedPorts` describing every
+    // listener in the process without the cluster binds refusing
+    // themselves.
     let reserved = ReservedPorts {
         cluster: None,
+        enrollment: None,
         ..reserved
     };
     let operational = validate_listen_bind(CLUSTER_LISTEN, value, reserved, allow_any)?;
@@ -1426,8 +1417,33 @@ mod tests {
         http: 8080,
         https: 8443,
         cluster: None,
+        enrollment: None,
         automation: None,
     };
+
+    #[test]
+    fn the_automation_bind_is_refused_on_the_cluster_enrollment_port() {
+        // Before ReservedPorts knew the enrollment port, an automation
+        // bind on it passed validation and failed at bind time (or held
+        // the port the enrollment listener rebinds on its next token).
+        let reserved = ReservedPorts {
+            cluster: Some(9444),
+            enrollment: Some(9445),
+            automation: Some(9600),
+            ..RESERVED
+        };
+        let on_enrollment = validate_automation_listen("192.0.2.10:9445", reserved, false)
+            .expect_err("the cluster enrollment listener holds 9445");
+        assert!(
+            on_enrollment.contains("the cluster enrollment port"),
+            "{on_enrollment}"
+        );
+        // The cluster family itself is not refused on its own enrollment
+        // port.
+        let binds = validate_cluster_listen("192.0.2.10:9444", None, None, reserved, false)
+            .expect("a listener does not collide with itself");
+        assert_eq!(binds.enrollment.port(), 9445);
+    }
 
     #[test]
     fn a_non_cluster_listener_is_refused_under_its_own_flag_names() {

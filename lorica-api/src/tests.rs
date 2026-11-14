@@ -41,6 +41,14 @@ pub(crate) async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         data_dir: std::path::PathBuf::from("/var/lib/lorica"),
         http_port: 8080,
         https_port: 8443,
+        reserved_ports: lorica_config::listen_ports::ReservedPorts {
+            management: 9443,
+            http: 8080,
+            https: 8443,
+            cluster: None,
+            enrollment: None,
+            automation: None,
+        },
         config_reload_tx: None,
         mode: Mode::Test,
         waf_event_buffer: None,
@@ -5372,6 +5380,14 @@ async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         data_dir: std::path::PathBuf::from("/var/lib/lorica"),
         http_port: 8080,
         https_port: 8443,
+        reserved_ports: lorica_config::listen_ports::ReservedPorts {
+            management: 9443,
+            http: 8080,
+            https: 8443,
+            cluster: None,
+            enrollment: None,
+            automation: None,
+        },
         config_reload_tx: None,
         mode: Mode::Test,
         waf_event_buffer: Some(event_buffer),
@@ -5409,6 +5425,14 @@ async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         data_dir: std::path::PathBuf::from("/var/lib/lorica"),
         http_port: 8080,
         https_port: 8443,
+        reserved_ports: lorica_config::listen_ports::ReservedPorts {
+            management: 9443,
+            http: 8080,
+            https: 8443,
+            cluster: None,
+            enrollment: None,
+            automation: None,
+        },
         config_reload_tx: None,
         mode: Mode::Supervisor {
             worker_metrics: Arc::new(WorkerMetrics::new()),
@@ -6920,6 +6944,7 @@ async fn test_cluster_tokens_and_nodes_on_a_control_plane() {
                 applied_config_hash: String::new(),
                 cert_not_after: now + chrono::Duration::days(90),
                 revoked_at: None,
+                reserved_ports: None,
             })
             .expect("test setup");
     }
@@ -8174,6 +8199,7 @@ pub(crate) fn enrolled_node(
         applied_config_hash: String::new(),
         cert_not_after: now + chrono::Duration::days(90),
         revoked_at: None,
+        reserved_ports: None,
     }
 }
 

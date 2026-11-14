@@ -516,6 +516,7 @@ mod node_selector_validation_tests {
             applied_config_hash: String::new(),
             cert_not_after: now,
             revoked_at: None,
+            reserved_ports: None,
         }
     }
 

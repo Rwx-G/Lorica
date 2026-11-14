@@ -56,6 +56,7 @@ mod row_helpers;
 mod sessions;
 mod settings;
 mod sla;
+mod streams;
 mod users;
 mod waf;
 
@@ -197,6 +198,9 @@ const MIGRATIONS: &[Migration] = &[
     (68, migrate_canonical_route_names),
     (69, migrate_route_case_insensitive_paths),
     (70, migrate_address_spellings),
+    (71, migrate_streams),
+    (72, migrate_backend_health_check),
+    (73, migrate_cluster_node_reserved_ports),
 ];
 
 /// The newest schema version, the last entry of [`MIGRATIONS`].
@@ -1589,6 +1593,84 @@ fn migrate_address_spellings(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// `streams` and `stream_backends` (Story 12.1, D-1): the layer-4
+/// listener and its links to the backends it shares with HTTP routes.
+///
+/// Ports are two integers, a single port being `port_first =
+/// port_last`, so the overlap check is an interval comparison the
+/// `(protocol, port_first, port_last)` index serves. The `CHECK`s hold
+/// only what no setting can change, 1..=65535 and `first <= last`; the
+/// range cap is `STREAM_PORT_RANGE_MAX`, enforced by `Stream::validate`.
+/// Both foreign keys cascade, like `route_backends`, so deleting a
+/// stream or a backend, and `clear_all`, need no ordering. The store
+/// reads `streams` through `STREAM_COLUMNS`, never `SELECT *`, so a
+/// later story adds a column with its own migration.
+///
+/// New tables only, the `UNIQUE` name index on the new table: 1.10.6
+/// opening this database after a rollback never names either table,
+/// and its `clear_all` deleting `backends` cascades into
+/// `stream_backends`, leaving streams with no backends rather than a
+/// constraint failure.
+fn migrate_streams(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS streams (
+            id             TEXT PRIMARY KEY,
+            name           TEXT NOT NULL,
+            group_name     TEXT NOT NULL DEFAULT '',
+            protocol       TEXT NOT NULL CHECK (protocol IN ('tcp', 'udp')),
+            enabled        INTEGER NOT NULL DEFAULT 1,
+            listen_address TEXT NOT NULL,
+            port_first     INTEGER NOT NULL CHECK (port_first BETWEEN 1 AND 65535),
+            port_last      INTEGER NOT NULL CHECK (port_last BETWEEN port_first AND 65535),
+            node_selector  TEXT NOT NULL DEFAULT '[]',
+            created_at     TEXT NOT NULL,
+            updated_at     TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_streams_name ON streams(name);
+        CREATE INDEX IF NOT EXISTS idx_streams_protocol_ports
+            ON streams(protocol, port_first, port_last);
+        CREATE TABLE IF NOT EXISTS stream_backends (
+            stream_id  TEXT NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
+            backend_id TEXT NOT NULL REFERENCES backends(id) ON DELETE CASCADE,
+            PRIMARY KEY (stream_id, backend_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_stream_backends_backend
+            ON stream_backends(backend_id);",
+    )
+}
+
+/// `backends.health_check_json`: the typed health check (Story 12.1,
+/// D-2), JSON of `HealthCheck`, beside the legacy `health_check_path`.
+///
+/// Nullable, no default and no backfill: NULL means "no typed
+/// definition stored", which is every row 1.10.6 or earlier wrote, and
+/// `HealthCheck::reconcile` reads such a row by its path. A 1.11.0
+/// write fills both columns.
+///
+/// 1.10.6 opening this database after a rollback reads `backends`
+/// through its explicit column list and writes it with explicit column
+/// lists, so it never sees the column: its inserts leave it NULL and its
+/// updates leave it as it was, the case the reconciliation rule exists
+/// for.
+fn migrate_backend_health_check(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "backends", "health_check_json", "TEXT")
+}
+
+/// `cluster_nodes.reserved_ports_json`: the ports a follower's own
+/// listeners hold, as it last reported them in its heartbeat (Story
+/// 12.1, D-4), JSON of `listen_ports::ReservedPorts`. The control plane
+/// refuses a stream on a node whose ports it overlaps, including while
+/// that node is offline and after a control-plane restart, which is why
+/// it is persisted rather than kept as session state.
+///
+/// Nullable, no default: NULL is a node that has not reported since the
+/// control plane runs 1.11.0. 1.10.6 opening this database after a
+/// rollback writes `cluster_nodes` with explicit column lists and never
+/// names the column.
+fn migrate_cluster_node_reserved_ports(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "cluster_nodes", "reserved_ports_json", "TEXT")
+}
+
 /// A stored wildcard pattern whose body names an address (`*.0.2.10`),
 /// which the matchers no longer let cover one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2370,6 +2452,34 @@ impl ConfigStore {
         Ok(out)
     }
 
+    /// Run `f` inside a SQLite savepoint: its writes are kept when it
+    /// returns `Ok` and undone when it returns `Err`.
+    ///
+    /// A savepoint rather than a transaction because a checked write
+    /// (one that writes, then verifies a rule over the resulting rows)
+    /// is also called from inside [`ConfigStore::in_transaction`], and
+    /// SQLite refuses a `BEGIN` inside a `BEGIN` but nests savepoints.
+    pub(crate) fn within_savepoint<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("SAVEPOINT lorica_checked_write")?;
+        match f() {
+            Ok(value) => {
+                self.conn
+                    .execute_batch("RELEASE SAVEPOINT lorica_checked_write")?;
+                Ok(value)
+            }
+            Err(e) => {
+                // The rollback's own failure would hide the refusal the
+                // caller needs to see, and the savepoint is released
+                // either way.
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT lorica_checked_write; \
+                     RELEASE SAVEPOINT lorica_checked_write",
+                );
+                Err(e)
+            }
+        }
+    }
+
     /// Clear all importable data before applying a TOML import.
     ///
     /// "Importable" here means : every table whose rows are part of
@@ -2414,7 +2524,9 @@ impl ConfigStore {
     /// expects the provider list to round-trip.
     pub fn clear_all(&self) -> Result<()> {
         self.conn.execute_batch(
-            "DELETE FROM route_backends;
+            "DELETE FROM stream_backends;
+             DELETE FROM streams;
+             DELETE FROM route_backends;
              DELETE FROM routes;
              DELETE FROM backends;
              DELETE FROM certificates;
@@ -2608,6 +2720,178 @@ mod migration_tests {
             version_after_first,
             "a second run must not advance or regress the version"
         );
+    }
+
+    // ---- 1.11.0: migrations 71 to 73 ----
+
+    /// The last migration the `v1.10.6` tag carries
+    /// (`git show v1.10.6:lorica-config/src/store/mod.rs`, whose
+    /// migrations 1 to 70 are unchanged since). A 1.10.6 binary rolled
+    /// back onto a database this release migrated must still open it.
+    const LAST_1_10_6_MIGRATION: i64 = 70;
+
+    #[test]
+    fn each_1_11_0_migration_is_a_no_op_the_second_time() {
+        let store = ConfigStore::open_in_memory().expect("fresh store at head");
+        let schema = |conn: &Connection| -> Vec<(String, String)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, COALESCE(sql, '') FROM sqlite_master \
+                     WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
+                )
+                .expect("sqlite_master query");
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("sqlite_master rows")
+                .collect::<rusqlite::Result<_>>()
+                .expect("sqlite_master read")
+        };
+        let before = schema(&store.conn);
+        for &(version, migrate) in MIGRATIONS {
+            if version > LAST_1_10_6_MIGRATION {
+                migrate(&store.conn)
+                    .unwrap_or_else(|e| panic!("migration {version} on its own output: {e}"));
+                assert_eq!(
+                    schema(&store.conn),
+                    before,
+                    "migration {version} changed the schema on a second run"
+                );
+            }
+        }
+    }
+
+    /// One column as `pragma_table_info` reports it: (type, notnull,
+    /// default, pk).
+    type ColumnShape = (String, i64, Option<String>, i64);
+
+    /// Every column of every table, by (table, column).
+    fn columns(conn: &Connection) -> std::collections::BTreeMap<(String, String), ColumnShape> {
+        let mut out = std::collections::BTreeMap::new();
+        let tables: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' \
+                     AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                )
+                .expect("tables query");
+            stmt.query_map([], |row| row.get(0))
+                .expect("tables rows")
+                .collect::<rusqlite::Result<_>>()
+                .expect("tables read")
+        };
+        for table in tables {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?1)",
+                )
+                .expect("pragma_table_info query");
+            let rows = stmt
+                .query_map(params![table], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        (
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ),
+                    ))
+                })
+                .expect("pragma_table_info rows");
+            for row in rows {
+                let (column, shape) = row.expect("pragma_table_info read");
+                out.insert((table.clone(), column), shape);
+            }
+        }
+        out
+    }
+
+    /// Every `UNIQUE` index and trigger, by (table, name).
+    fn unique_indexes_and_triggers(
+        conn: &Connection,
+    ) -> std::collections::BTreeSet<(String, String)> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.name, il.name FROM sqlite_master m, pragma_index_list(m.name) il \
+                 WHERE m.type = 'table' AND il.\"unique\" = 1",
+            )
+            .expect("index list query");
+        for row in stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("index list rows")
+        {
+            out.insert(row.expect("index list read"));
+        }
+        let mut stmt = conn
+            .prepare("SELECT tbl_name, name FROM sqlite_master WHERE type = 'trigger'")
+            .expect("trigger query");
+        for row in stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("trigger rows")
+        {
+            out.insert(row.expect("trigger read"));
+        }
+        out
+    }
+
+    #[test]
+    fn migrations_after_1_10_6_are_additive() {
+        let conn = Connection::open_in_memory().expect("raw connection");
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .expect("foreign keys");
+        for &(version, migrate) in MIGRATIONS {
+            if version <= LAST_1_10_6_MIGRATION {
+                migrate(&conn).unwrap_or_else(|e| panic!("migration {version}: {e}"));
+            }
+        }
+        let old_columns = columns(&conn);
+        let old_tables: std::collections::BTreeSet<String> =
+            old_columns.keys().map(|(table, _)| table.clone()).collect();
+        let old_constraints = unique_indexes_and_triggers(&conn);
+
+        for &(version, migrate) in MIGRATIONS {
+            if version > LAST_1_10_6_MIGRATION {
+                migrate(&conn).unwrap_or_else(|e| panic!("migration {version}: {e}"));
+            }
+        }
+        let new_columns = columns(&conn);
+
+        for (key, shape) in &old_columns {
+            assert_eq!(
+                new_columns.get(key),
+                Some(shape),
+                "1.10.6 column {}.{} changed or disappeared",
+                key.0,
+                key.1
+            );
+        }
+        for (key @ (table, column), (_, notnull, default, _)) in &new_columns {
+            if old_tables.contains(table) && !old_columns.contains_key(key) {
+                assert!(
+                    *notnull == 0 || default.is_some(),
+                    "{table}.{column} was added to a 1.10.6 table as NOT NULL without a \
+                     default; a 1.10.6 insert would fail on it"
+                );
+            }
+        }
+        for added in unique_indexes_and_triggers(&conn).difference(&old_constraints) {
+            assert!(
+                !old_tables.contains(&added.0),
+                "{} on 1.10.6 table {} is a UNIQUE index or a trigger a 1.10.6 write could \
+                 trip on",
+                added.1,
+                added.0
+            );
+        }
+        // The guard saw the 1.11.0 additions, so it is not vacuous.
+        assert!(
+            new_columns.contains_key(&("backends".to_string(), "health_check_json".to_string()))
+        );
+        assert!(new_columns.contains_key(&("streams".to_string(), "port_first".to_string())));
     }
 
     // ---- Migration 53: unique cluster node names ----

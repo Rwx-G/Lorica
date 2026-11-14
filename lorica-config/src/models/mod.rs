@@ -12,6 +12,7 @@ mod cert_export_acl;
 mod certificate;
 mod cluster;
 mod enums;
+mod health_check;
 mod hostname_pattern;
 mod loadtest;
 mod notification;
@@ -22,6 +23,7 @@ mod route;
 mod route_protection_record;
 mod settings;
 mod sla;
+mod stream;
 
 #[cfg(test)]
 mod tests;
@@ -52,7 +54,7 @@ pub use automation_token::{
     AUTOMATION_TOKEN_MAX_TTL_SECONDS_CAP, AUTOMATION_TOKEN_PUBLIC_ID_LEN,
     AUTOMATION_TOKEN_SECRET_LEN, AUTOMATION_TOKEN_SUBJECT,
 };
-pub use backend::{Backend, RouteBackend};
+pub use backend::{backend_address_port, Backend, RouteBackend};
 pub use capture::{
     CaptureEmit, CaptureLimits, CaptureMatch, CaptureOutput, CaptureRedaction, CaptureRule,
     CaptureScope, HeaderMatch, StatusMatch, CAPTURE_BODY_MAX_BYTES_CAP,
@@ -70,6 +72,7 @@ pub use enums::{
     HeaderMatchType, HealthStatus, LifecycleState, LoadBalancing, NotificationChannel,
     PathMatchType, PreferenceValue, Role, WafMode,
 };
+pub use health_check::HealthCheck;
 pub use hostname_pattern::{matches_any_depth, matches_one_label, specificity};
 pub use loadtest::{
     LoadTestComparison, LoadTestConfig, LoadTestResult, SAFE_LIMIT_CONCURRENCY,
@@ -95,3 +98,10 @@ pub use settings::{
     DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S, DEFAULT_HEADER_TIMEOUT_S, MAX_HEADER_TIMEOUT_S,
 };
 pub use sla::{SlaBucket, SlaConfig, SlaSummary};
+#[cfg(test)]
+pub(crate) use stream::tests::{backend as sample_stream_backend, stream as sample_stream};
+pub use stream::{
+    binds_here, binds_here_when_enabled, check_backend_attachments, AttachmentConflict,
+    AttachmentRule, AttachmentSnapshot, NodeRole, Stream, StreamBackend, StreamEndKind,
+    StreamEndReason, StreamProtocol, StreamRefusal, STREAM_NAME_MAX_LEN, STREAM_PORT_RANGE_MAX,
+};

@@ -6,6 +6,8 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::listen_ports::ReservedPorts;
+
 /// Lifecycle state of an enrolled node (Story 9.3 AC #5/#9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,6 +85,14 @@ pub struct ClusterNode {
     pub cert_not_after: DateTime<Utc>,
     /// When the node was revoked, if it was.
     pub revoked_at: Option<DateTime<Utc>>,
+    /// The ports the node's own listeners hold, as it last reported them
+    /// in its heartbeat (Story 12.1, D-4). `None` until it reports once
+    /// to a 1.11.0 control plane; a stream targeting such a node is
+    /// refused rather than accepted unchecked. Read by the stream
+    /// conflict check, and not part of the node's API view, whose
+    /// documented shape does not carry it.
+    #[serde(skip_serializing)]
+    pub reserved_ports: Option<ReservedPorts>,
 }
 
 /// Lifecycle state of a join token (Story 9.3 AC #4).

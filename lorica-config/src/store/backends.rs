@@ -3,44 +3,66 @@
 use rusqlite::{params, OptionalExtension};
 
 use super::row_helpers::row_to_backend;
-use super::{serialize_optional_field, ConfigStore};
+use super::{serialize_field, serialize_optional_field, ConfigStore};
 use crate::error::{ConfigError, Result};
 use crate::models::*;
 
 /// The column list every backend read binds, in the order
-/// `row_to_backend` expects.
+/// `row_to_backend` expects. Explicit, never `SELECT *`: a 1.10.6
+/// binary reading a 1.11.0 database relies on its own copy of this list
+/// never naming a column it does not know.
 const BACKEND_COLUMNS: &str = "id, address, name, group_name, weight, health_status, \
      health_check_enabled, health_check_interval_s, health_check_path, \
      lifecycle_state, active_connections, tls_upstream, created_at, updated_at, h2_upstream, \
-     tls_sni, tls_skip_verify, managed_by";
+     tls_sni, tls_skip_verify, managed_by, health_check_json";
+
+/// The typed health check a write persists, and the legacy path it
+/// projects onto: the reconciled definition (`HealthCheck::reconcile`)
+/// of what the caller holds, so the two columns never disagree after a
+/// 1.11.0 write.
+fn health_check_columns(backend: &Backend) -> Result<(String, Option<String>)> {
+    let check = HealthCheck::reconcile(
+        Some(backend.health_check.clone()),
+        backend.health_check_path.as_deref(),
+    );
+    let path = check.legacy_path().map(str::to_string);
+    Ok((serialize_field("health_check", &check)?, path))
+}
 
 impl ConfigStore {
-    /// Validate that a backend address contains a port (ip:port format).
+    /// Validate a backend address: `host:port`, or a host without a port
+    /// for a port-range stream (`backend_address_port`).
     fn validate_backend_address(address: &str) -> Result<()> {
-        if !address.contains(':') || address.ends_with(':') {
-            return Err(ConfigError::Validation(format!(
-                "backend address must be in ip:port format (got '{address}')"
-            )));
-        }
-        let port_str = address.rsplit(':').next().unwrap_or("");
-        if port_str.parse::<u16>().is_err() {
-            return Err(ConfigError::Validation(format!(
-                "backend address has invalid port (got '{address}')"
-            )));
-        }
-        Ok(())
+        backend_address_port(address)
+            .map(|_| ())
+            .map_err(ConfigError::Validation)
     }
 
     /// Insert a new backend into the database.
+    ///
+    /// Refused when the backend breaks the stream attachment rule
+    /// (`check_backend_attachments`): a portless backend with active
+    /// checks on, for one.
     pub fn create_backend(&self, backend: &Backend) -> Result<()> {
+        self.within_savepoint(|| {
+            self.create_backend_unchecked(backend)?;
+            self.check_attachments_of(&[backend.id.as_str()])
+        })
+    }
+
+    /// [`ConfigStore::create_backend`] without the attachment rule, for
+    /// a writer that checked a whole consistent snapshot first (replica
+    /// apply, import).
+    pub(crate) fn create_backend_unchecked(&self, backend: &Backend) -> Result<()> {
         Self::validate_backend_address(&backend.address)?;
         let managed_by_json = serialize_optional_field("managed_by", backend.managed_by.as_ref())?;
+        let (health_check_json, health_check_path) = health_check_columns(backend)?;
         self.conn.execute(
             "INSERT INTO backends (id, address, name, group_name, weight, health_status,
              health_check_enabled, health_check_interval_s, health_check_path,
              lifecycle_state, active_connections, tls_upstream, h2_upstream, created_at, updated_at, tls_sni, tls_skip_verify,
-             managed_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+             managed_by, health_check_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 backend.id,
                 backend.address,
@@ -50,7 +72,7 @@ impl ConfigStore {
                 backend.health_status.as_str(),
                 backend.health_check_enabled,
                 backend.health_check_interval_s,
-                backend.health_check_path,
+                health_check_path,
                 backend.lifecycle_state.as_str(),
                 backend.active_connections,
                 backend.tls_upstream,
@@ -60,6 +82,7 @@ impl ConfigStore {
                 backend.tls_sni.as_deref().unwrap_or(""),
                 backend.tls_skip_verify,
                 managed_by_json,
+                health_check_json,
             ],
         )?;
         Ok(())
@@ -86,16 +109,29 @@ impl ConfigStore {
         Ok(backends)
     }
 
-    /// Update an existing backend. Returns `NotFound` if the ID does not exist.
+    /// Update an existing backend. Returns `NotFound` if the ID does not
+    /// exist, and refuses an update that breaks the stream attachment
+    /// rule (`check_backend_attachments`), such as turning active checks
+    /// on for a backend of a UDP stream; the error names the stream.
     pub fn update_backend(&self, backend: &Backend) -> Result<()> {
+        self.within_savepoint(|| {
+            self.update_backend_unchecked(backend)?;
+            self.check_attachments_of(&[backend.id.as_str()])
+        })
+    }
+
+    /// [`ConfigStore::update_backend`] without the attachment rule, for
+    /// a writer that checked a whole consistent snapshot first.
+    pub(crate) fn update_backend_unchecked(&self, backend: &Backend) -> Result<()> {
         Self::validate_backend_address(&backend.address)?;
         let managed_by_json = serialize_optional_field("managed_by", backend.managed_by.as_ref())?;
+        let (health_check_json, health_check_path) = health_check_columns(backend)?;
         let changed = self.conn.execute(
             "UPDATE backends SET address=?2, name=?3, group_name=?4, weight=?5,
              health_status=?6, health_check_enabled=?7, health_check_interval_s=?8,
              health_check_path=?9, lifecycle_state=?10, active_connections=?11,
              tls_upstream=?12, h2_upstream=?13, updated_at=?14, tls_sni=?15, tls_skip_verify=?16,
-             managed_by=?17 WHERE id=?1",
+             managed_by=?17, health_check_json=?18 WHERE id=?1",
             params![
                 backend.id,
                 backend.address,
@@ -105,7 +141,7 @@ impl ConfigStore {
                 backend.health_status.as_str(),
                 backend.health_check_enabled,
                 backend.health_check_interval_s,
-                backend.health_check_path,
+                health_check_path,
                 backend.lifecycle_state.as_str(),
                 backend.active_connections,
                 backend.tls_upstream,
@@ -114,6 +150,7 @@ impl ConfigStore {
                 backend.tls_sni.as_deref().unwrap_or(""),
                 backend.tls_skip_verify,
                 managed_by_json,
+                health_check_json,
             ],
         )?;
         if changed == 0 {
@@ -123,6 +160,7 @@ impl ConfigStore {
     }
 
     /// Delete a backend by ID. Returns `NotFound` if the ID does not exist.
+    /// Its route and stream links go with it (both foreign keys cascade).
     pub fn delete_backend(&self, id: &str) -> Result<()> {
         let changed = self
             .conn
@@ -136,7 +174,23 @@ impl ConfigStore {
     // ---- Route-Backend associations ----
 
     /// Associate a backend with a route. Idempotent (ignores duplicates).
+    ///
+    /// Refused when the backend serves a UDP stream or carries no port
+    /// (`check_backend_attachments`); the error names the stream.
     pub fn link_route_backend(&self, route_id: &str, backend_id: &str) -> Result<()> {
+        self.within_savepoint(|| {
+            self.link_route_backend_unchecked(route_id, backend_id)?;
+            self.check_attachments_of(&[backend_id])
+        })
+    }
+
+    /// [`ConfigStore::link_route_backend`] without the attachment rule,
+    /// for a writer that checked a whole consistent snapshot first.
+    pub(crate) fn link_route_backend_unchecked(
+        &self,
+        route_id: &str,
+        backend_id: &str,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO route_backends (route_id, backend_id) VALUES (?1, ?2)",
             params![route_id, backend_id],
@@ -195,5 +249,35 @@ impl ConfigStore {
             links.push(r?);
         }
         Ok(links)
+    }
+
+    /// Apply the stream attachment rule (`check_backend_attachments`) to
+    /// the stored backends among `backend_ids`, against every stored
+    /// stream and link. Only the backends a write touched are checked,
+    /// so a write is never refused for a row it did not change.
+    ///
+    /// # Errors
+    ///
+    /// `ConfigError::Validation` naming the stream, as the API maps it.
+    pub(crate) fn check_attachments_of(&self, backend_ids: &[&str]) -> Result<()> {
+        let mut backends = Vec::with_capacity(backend_ids.len());
+        for id in backend_ids {
+            if let Some(backend) = self.get_backend(id)? {
+                backends.push(backend);
+            }
+        }
+        if backends.is_empty() {
+            return Ok(());
+        }
+        let streams = self.list_streams()?;
+        let stream_backends = self.list_stream_backends()?;
+        let route_backends = self.list_route_backends()?;
+        check_backend_attachments(&AttachmentSnapshot {
+            backends: &backends,
+            streams: &streams,
+            stream_backends: &stream_backends,
+            route_backends: &route_backends,
+        })
+        .map_err(|conflict| ConfigError::Validation(conflict.to_string()))
     }
 }

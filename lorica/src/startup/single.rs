@@ -399,6 +399,20 @@ pub(crate) fn run_single_process(cli: Cli) {
         // shutdown drain path.
         let api_task_tracker = single_task_tracker.clone();
         let shutdown_task_tracker = single_task_tracker.clone();
+        // The ports this process's listeners hold outside the cluster
+        // plane, described once: a follower reports them, and the
+        // cluster plane's own ports are added below for the API.
+        let listener_ports = crate::cli::ReservedPorts {
+            management: management_port,
+            http: http_port,
+            https: https_port,
+            cluster: None,
+            enrollment: None,
+            automation: cli
+                .automation_listen
+                .as_deref()
+                .and_then(crate::cli::requested_port),
+        };
         // The fleet role (control plane, follower or standalone), shared
         // by both startup modes: see `startup::spawn_cluster_runtime`.
         // Spawned BEFORE the API so AppState carries it.
@@ -413,14 +427,12 @@ pub(crate) fn run_single_process(cli: Cli) {
                 advertise: cluster_advertise,
                 listen_any: cluster_listen_any,
                 reserved: crate::cli::ReservedPorts {
-                    management: management_port,
-                    http: http_port,
-                    https: https_port,
-                    // These are the cluster plane's own binds, and the
-                    // automation API is not started yet, so neither
-                    // port exists for them to collide with.
-                    cluster: None,
+                    // The cluster binds are the plane's own, and the
+                    // automation API is not started yet: the automation
+                    // validator refuses that pair once the plane's
+                    // ports are known.
                     automation: None,
+                    ..listener_ports
                 },
                 // Single-process mode never hot-upgrades (it binds the
                 // management port fresh), so there is nothing to adopt.
@@ -431,6 +443,7 @@ pub(crate) fn run_single_process(cli: Cli) {
                 config_reload: config_reload_tx.clone(),
                 data_dir: data_dir.clone(),
             },
+            listener_ports,
             &store,
             // Single-process: a fleet-wide ban writes the shared
             // data-plane map the request path already reads.
@@ -461,10 +474,14 @@ pub(crate) fn run_single_process(cli: Cli) {
         let automation_listen = cli.automation_listen.clone();
         let automation_listen_any = cli.automation_listen_any;
         let automation_store = Arc::clone(&store);
-        // Read before the plane moves out of scope: the automation
-        // bind must not land on the port the cluster plane just took.
-        let cluster_operational_port: Option<u16> =
-            cluster_plane.as_ref().map(|plane| plane.operational_port());
+        // Read before the plane moves out of scope: the automation bind
+        // must not land on a port the cluster plane just took, and the
+        // API checks streams against every port of this process.
+        let process_reserved_ports = crate::cli::ReservedPorts {
+            cluster: cluster_plane.as_ref().map(|plane| plane.operational_port()),
+            enrollment: cluster_plane.as_ref().map(|plane| plane.enrollment_port()),
+            ..listener_ports
+        };
         let oidc_verifier = build_oidc_verifier();
 
         let api_handle = tokio::spawn(async move {
@@ -477,6 +494,7 @@ pub(crate) fn run_single_process(cli: Cli) {
                 data_dir: PathBuf::from(&cli.data_dir),
                 http_port: cli.http_port,
                 https_port: cli.https_port,
+                reserved_ports: process_reserved_ports,
                 config_reload_tx: Some(config_reload_tx),
                 // Single-process: the API shares the proxy's in-process
                 // handles directly. No supervisor, so the hot-upgrade
@@ -520,13 +538,7 @@ pub(crate) fn run_single_process(cli: Cli) {
                 startup::automation::AutomationOptions {
                     automation_listen,
                     listen_any: automation_listen_any,
-                    reserved: crate::cli::ReservedPorts {
-                        management: management_port,
-                        http: http_port,
-                        https: https_port,
-                        cluster: cluster_operational_port,
-                        automation: None,
-                    },
+                    reserved: process_reserved_ports,
                     inherited: Vec::new(),
                     handoff: Arc::new(startup::automation::AutomationHandoff::default()),
                 },

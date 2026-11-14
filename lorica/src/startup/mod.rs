@@ -1081,8 +1081,14 @@ pub(crate) struct ClusterStartup {
 /// for a role, running without it is the wrong failure mode. The only
 /// mode-specific input is the inherited operational socket inside
 /// `opts`.
+///
+/// `listener_ports` are the ports this process's own listeners hold
+/// outside the cluster plane, which a follower reports to its control
+/// plane. A follower runs no cluster plane, so for it they are the whole
+/// process's reserved ports.
 pub(crate) async fn spawn_cluster_runtime(
     opts: cluster_plane::ClusterPlaneOptions,
+    listener_ports: crate::cli::ReservedPorts,
     store: &Arc<Mutex<ConfigStore>>,
     bans: cluster_follower::BanApplier,
 ) -> ClusterStartup {
@@ -1119,6 +1125,7 @@ pub(crate) async fn spawn_cluster_runtime(
             bans,
             data_dir: follower_data_dir,
             log_store: follower_log_store,
+            reserved_ports: listener_ports,
         },
         store,
     )

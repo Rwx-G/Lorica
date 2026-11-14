@@ -886,6 +886,20 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 }
             }
         }
+        // The ports this process's listeners hold outside the cluster
+        // plane, described once: a follower reports them, and the
+        // cluster plane's own ports are added below for the API.
+        let listener_ports = crate::cli::ReservedPorts {
+            management: management_port,
+            http: hu_cli.http_port,
+            https: hu_cli.https_port,
+            cluster: None,
+            enrollment: None,
+            automation: hu_cli
+                .automation_listen
+                .as_deref()
+                .and_then(crate::cli::requested_port),
+        };
         let startup::ClusterStartup {
             plane: mut cluster_plane,
             follower: mut follower_plane,
@@ -897,14 +911,12 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 advertise: hu_cli.cluster_advertise.clone(),
                 listen_any: hu_cli.cluster_listen_any,
                 reserved: crate::cli::ReservedPorts {
-                    management: management_port,
-                    http: hu_cli.http_port,
-                    https: hu_cli.https_port,
-                    // These are the cluster plane's own binds, and the
-                    // automation API is not started yet, so neither
-                    // port exists for them to collide with.
-                    cluster: None,
+                    // The cluster binds are the plane's own, and the
+                    // automation API is not started yet: the automation
+                    // validator refuses that pair once the plane's
+                    // ports are known.
                     automation: None,
+                    ..listener_ports
                 },
                 inherited_operational,
                 auto_activate: hu_cli.cluster_auto_activate,
@@ -913,6 +925,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 config_reload: config_reload_tx.clone(),
                 data_dir: PathBuf::from(&hu_cli.data_dir),
             },
+            listener_ports,
             &store,
             // Supervisor mode: the ban map lives in each worker, so a
             // fleet-wide ban rides the same broadcast the local WAF
@@ -963,13 +976,14 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // return value.
         let automation_handoff = Arc::new(startup::automation::AutomationHandoff::default());
         let task_automation_handoff = Arc::clone(&automation_handoff);
-        let automation_http_port = hu_cli.http_port;
-        let automation_https_port = hu_cli.https_port;
-        // Read before the plane moves into the API task: the
-        // automation bind must not land on the port the cluster plane
-        // just took.
-        let cluster_operational_port: Option<u16> =
-            cluster_plane.as_ref().map(|plane| plane.operational_port());
+        // Read before the plane moves into the API task: the automation
+        // bind must not land on a port the cluster plane just took, and
+        // the API checks streams against every port of this process.
+        let process_reserved_ports = crate::cli::ReservedPorts {
+            cluster: cluster_plane.as_ref().map(|plane| plane.operational_port()),
+            enrollment: cluster_plane.as_ref().map(|plane| plane.enrollment_port()),
+            ..listener_ports
+        };
         let oidc_verifier = super::single::build_oidc_verifier();
 
         let api_handle = tokio::spawn(async move {
@@ -982,6 +996,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 data_dir: PathBuf::from(&cli.data_dir),
                 http_port: cli.http_port,
                 https_port: cli.https_port,
+                reserved_ports: process_reserved_ports,
                 config_reload_tx: Some(config_reload_tx),
                 // Supervisor: cache/ban are per-worker process, surfaced
                 // to the API as metrics aggregated over the command channel.
@@ -1020,13 +1035,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 startup::automation::AutomationOptions {
                     automation_listen,
                     listen_any: automation_listen_any,
-                    reserved: crate::cli::ReservedPorts {
-                        management: management_port,
-                        http: automation_http_port,
-                        https: automation_https_port,
-                        cluster: cluster_operational_port,
-                        automation: None,
-                    },
+                    reserved: process_reserved_ports,
                     inherited: inherited_automation,
                     handoff: task_automation_handoff,
                 },

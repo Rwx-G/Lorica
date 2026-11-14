@@ -306,6 +306,12 @@ pub(crate) async fn create_backend_as(
         health_check_enabled: body.health_check_enabled.unwrap_or(true),
         health_check_interval_s: body.health_check_interval_s.unwrap_or(10),
         health_check_path: body.health_check_path.clone().filter(|s| !s.is_empty()),
+        // The legacy path alone decides until the request takes the
+        // typed shape: the definition it reads as, kept in step.
+        health_check: lorica_config::models::HealthCheck::reconcile(
+            None,
+            body.health_check_path.as_deref().filter(|s| !s.is_empty()),
+        ),
         lifecycle_state: lorica_config::models::LifecycleState::Normal,
         active_connections: 0,
         tls_upstream: body.tls_upstream.unwrap_or(false),

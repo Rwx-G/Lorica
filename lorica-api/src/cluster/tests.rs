@@ -59,6 +59,7 @@ impl Fixture {
             applied_config_hash: String::new(),
             cert_not_after: now + chrono::Duration::days(30),
             revoked_at: None,
+            reserved_ports: None,
         };
         self.state
             .store

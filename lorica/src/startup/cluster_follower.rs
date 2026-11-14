@@ -181,6 +181,15 @@ pub(crate) struct FollowerOptions {
     /// open, where `record_with_store` writes to the sinks only and the
     /// apply goes unrecorded rather than failing.
     pub log_store: lorica_api::server::LogStoreSlot,
+    /// The ports this process's listeners hold, which the follower
+    /// reports in its heartbeat so the control plane can refuse a
+    /// stream that would collide with them (Story 12.1, D-4).
+    // Carried from startup in the commit that adds the shape; the
+    // heartbeat that reads it lands with the wire field (Story 12.1,
+    // Lot 3), and a never-read field fails the warnings-as-errors build
+    // in between.
+    #[allow(dead_code)]
+    pub reserved_ports: crate::cli::ReservedPorts,
 }
 
 /// Live handles for a running follower.

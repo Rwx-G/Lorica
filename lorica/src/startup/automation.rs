@@ -271,6 +271,7 @@ mod tests {
         http: 8080,
         https: 8443,
         cluster: None,
+        enrollment: None,
         automation: None,
     };
 

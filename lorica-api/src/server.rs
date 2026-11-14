@@ -221,6 +221,10 @@ pub struct AppState {
     pub http_port: u16,
     /// HTTPS proxy port (for load test URL construction).
     pub https_port: u16,
+    /// Every port this process's own listeners hold (management, proxy,
+    /// cluster plane, automation), which a stream this node binds must
+    /// not overlap (Story 12.1, D-5).
+    pub reserved_ports: lorica_config::listen_ports::ReservedPorts,
     /// Sender that signals the proxy engine to reload its configuration.
     /// Incremented on each mutation. `None` in tests or when no proxy is running.
     pub config_reload_tx: Option<watch::Sender<u64>>,

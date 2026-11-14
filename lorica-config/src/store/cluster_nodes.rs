@@ -12,15 +12,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use super::row_helpers::{parse_datetime, parse_optional_datetime};
+use super::row_helpers::{parse_datetime, parse_optional_datetime, parse_optional_json_field};
 use super::ConfigStore;
 use crate::error::{ConfigError, Result};
+use crate::listen_ports::ReservedPorts;
 use crate::models::{ClusterNode, NodeStatus, RevokedSerial};
 use crate::route_selection;
 
 const NODE_COLUMNS: &str = "node_id, name, cert_fingerprint, cert_serial, prev_cert_fingerprint, \
      prev_cert_serial, address, version, schema_version, status, enrolled_at, last_seen_at, \
-     applied_config_generation, applied_config_hash, cert_not_after, revoked_at";
+     applied_config_generation, applied_config_hash, cert_not_after, revoked_at, \
+     reserved_ports_json";
 
 /// The routes bound to one certificate, for
 /// [`ConfigStore::cert_key_recipients`].
@@ -180,6 +182,7 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> Result<ClusterNode> {
         applied_config_hash: row.get(13)?,
         cert_not_after: parse_datetime(&row.get::<_, String>(14)?)?,
         revoked_at: parse_optional_datetime(row.get(15)?)?,
+        reserved_ports: parse_optional_json_field(row.get(16)?, "reserved_ports")?,
     })
 }
 
@@ -193,7 +196,7 @@ impl ConfigStore {
         self.conn.execute(
             &format!(
                 "INSERT INTO cluster_nodes ({NODE_COLUMNS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
             ),
             params![
                 node.node_id,
@@ -212,6 +215,7 @@ impl ConfigStore {
                 node.applied_config_hash,
                 node.cert_not_after.to_rfc3339(),
                 node.revoked_at.map(|t| t.to_rfc3339()),
+                reserved_ports_json(node.reserved_ports.as_ref())?,
             ],
         )?;
         Ok(())
@@ -332,7 +336,8 @@ impl ConfigStore {
         {
             let mut update = tx.prepare(
                 "UPDATE cluster_nodes SET address = ?2, version = ?3, schema_version = ?4, \
-                 last_seen_at = ?5, applied_config_generation = ?6, applied_config_hash = ?7 \
+                 last_seen_at = ?5, applied_config_generation = ?6, applied_config_hash = ?7, \
+                 reserved_ports_json = COALESCE(?8, reserved_ports_json) \
                  WHERE node_id = ?1",
             )?;
             for f in facts {
@@ -343,7 +348,8 @@ impl ConfigStore {
                     f.schema_version,
                     f.last_seen_at.to_rfc3339(),
                     f.applied_config_generation,
-                    f.applied_config_hash
+                    f.applied_config_hash,
+                    reserved_ports_json(f.reserved_ports.as_ref())?
                 ])?;
             }
         }
@@ -828,6 +834,18 @@ pub struct LiveNodeFacts {
     /// Canonical hash the node reports for that generation. Empty
     /// until the node applies its first replica.
     pub applied_config_hash: String,
+    /// The ports the node's listeners hold, as its heartbeat last
+    /// reported them (Story 12.1, D-4). `None` keeps the stored value:
+    /// a session that has not reported (it has not beaten yet, or its
+    /// report was invalid) must not erase what a previous one said.
+    pub reserved_ports: Option<ReservedPorts>,
+}
+
+/// The `reserved_ports_json` column value for `ports`.
+fn reserved_ports_json(ports: Option<&ReservedPorts>) -> Result<Option<String>> {
+    ports
+        .map(|p| super::serialize_field("reserved_ports", p))
+        .transpose()
 }
 
 #[cfg(test)]
@@ -859,6 +877,7 @@ mod tests {
             applied_config_hash: String::new(),
             cert_not_after: at("2027-09-08T00:00:00Z"),
             revoked_at: None,
+            reserved_ports: None,
         };
         store
             .create_cluster_node(&node)
@@ -1538,6 +1557,77 @@ mod tests {
                 .hostnames_selecting_node_name("edge-a")
                 .expect("selection resolves"),
             vec!["shop.example.com".to_string()]
+        );
+    }
+
+    fn facts(node_id: &str, reserved_ports: Option<ReservedPorts>) -> LiveNodeFacts {
+        LiveNodeFacts {
+            node_id: node_id.to_string(),
+            address: "192.0.2.10:5001".to_string(),
+            version: "1.11.0".to_string(),
+            schema_version: 73,
+            last_seen_at: at("2026-11-14T00:00:00Z"),
+            applied_config_generation: 1,
+            applied_config_hash: "h".to_string(),
+            reserved_ports,
+        }
+    }
+
+    #[test]
+    fn reserved_ports_round_trip_and_a_session_without_a_report_keeps_them() {
+        let store = ConfigStore::open_in_memory().expect("test setup: store");
+        enrol(&store, "n1", "edge-1", NodeStatus::Active);
+        assert_eq!(
+            store
+                .get_cluster_node("n1")
+                .expect("get")
+                .expect("enrolled")
+                .reserved_ports,
+            None,
+            "a node that never reported has no reserved ports"
+        );
+
+        let reported = ReservedPorts {
+            management: 9443,
+            http: 8080,
+            https: 8443,
+            cluster: None,
+            enrollment: None,
+            automation: Some(9600),
+        };
+        store
+            .touch_cluster_node(&facts("n1", Some(reported)))
+            .expect("flush with a report");
+        let read = |store: &ConfigStore| {
+            store
+                .get_cluster_node("n1")
+                .expect("get")
+                .expect("enrolled")
+                .reserved_ports
+        };
+        assert_eq!(read(&store), Some(reported));
+
+        store
+            .touch_cluster_node(&facts("n1", None))
+            .expect("flush without a report");
+        assert_eq!(
+            read(&store),
+            Some(reported),
+            "COALESCE: no report keeps the stored ports"
+        );
+
+        let moved = ReservedPorts {
+            https: 9443,
+            management: 9444,
+            ..reported
+        };
+        store
+            .touch_cluster_node(&facts("n1", Some(moved)))
+            .expect("flush with a new report");
+        assert_eq!(read(&store), Some(moved));
+        assert_eq!(
+            store.list_cluster_nodes().expect("list")[0].reserved_ports,
+            Some(moved)
         );
     }
 }

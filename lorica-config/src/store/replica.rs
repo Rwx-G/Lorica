@@ -811,6 +811,7 @@ mod tests {
             health_check_enabled: true,
             health_check_interval_s: 10,
             health_check_path: None,
+            health_check: crate::models::HealthCheck::TcpConnect,
             lifecycle_state: LifecycleState::Normal,
             active_connections: 0,
             tls_upstream: false,

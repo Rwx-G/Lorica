@@ -103,6 +103,7 @@ mod tests {
             health_check_enabled: true,
             health_check_interval_s: 10,
             health_check_path: None,
+            health_check: crate::models::HealthCheck::TcpConnect,
             lifecycle_state: LifecycleState::Normal,
             active_connections: 0,
             tls_upstream: false,
@@ -2964,14 +2965,23 @@ cert_critical_days = 3
     // ---- Backend address validation ----
 
     #[test]
-    fn test_backend_address_missing_port_rejected() {
+    fn test_backend_address_without_port_needs_checks_off() {
+        // Since Story 12.1 (D-6) a portless address is a backend for
+        // port-range streams, which supply the port. It has nothing to
+        // probe, so it is refused while active checks are on.
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut backend = make_backend();
         backend.address = "192.168.1.10".into(); // no port
-        let result = store.create_backend(&backend);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("ip:port"));
+        backend.health_check_enabled = true;
+        let err = store
+            .create_backend(&backend)
+            .expect_err("a portless backend with checks on is refused")
+            .to_string();
+        assert!(err.contains("no port to probe"), "{err}");
+        backend.health_check_enabled = false;
+        store
+            .create_backend(&backend)
+            .expect("a portless backend with checks off is stored");
     }
 
     #[test]
@@ -4362,6 +4372,7 @@ cert_critical_days = 3
             applied_config_hash: String::new(),
             cert_not_after: now + chrono::Duration::days(90),
             revoked_at: None,
+            reserved_ports: None,
         }
     }
 
@@ -4456,6 +4467,7 @@ cert_critical_days = 3
                 last_seen_at: now,
                 applied_config_generation: 7,
                 applied_config_hash: "cafebabe".to_string(),
+                reserved_ports: None,
             })
             .expect("touch");
         let node = store.get_cluster_node("n1").expect("read").expect("row");
@@ -4557,6 +4569,7 @@ cert_critical_days = 3
                     last_seen_at: now,
                     applied_config_generation: 9,
                     applied_config_hash: "deadbeef".to_string(),
+                    reserved_ports: None,
                 },
                 crate::store::LiveNodeFacts {
                     node_id: "ghost".to_string(),
@@ -4566,6 +4579,7 @@ cert_critical_days = 3
                     last_seen_at: now,
                     applied_config_generation: 0,
                     applied_config_hash: String::new(),
+                    reserved_ports: None,
                 },
             ])
             .expect("batch touch");

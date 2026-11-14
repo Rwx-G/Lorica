@@ -733,6 +733,7 @@ mod tests {
             health_check_enabled: true,
             health_check_interval_s: 10,
             health_check_path: path.map(str::to_string),
+            health_check: lorica_config::models::HealthCheck::reconcile(None, path),
             lifecycle_state: lorica_config::models::LifecycleState::Normal,
             active_connections: 0,
             tls_upstream: false,
