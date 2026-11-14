@@ -123,6 +123,7 @@ fn heartbeat() -> Heartbeat {
         break_glass: true,
         resources: Some(resources()),
         reserved_ports: None,
+        stream_plane: None,
     }
 }
 

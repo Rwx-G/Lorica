@@ -68,8 +68,9 @@ use crate::challenge::challenge_defect;
 use crate::messages::{
     ban_duration_is_valid, ban_reason_is_valid, ban_target_is_valid, cert_id_is_valid,
     challenge_token_is_valid, cluster_request, config_hash_is_valid, sla_pull_defect,
-    telemetry_audit_row_defect, ClusterRequest, NodeResources, ReportedPorts, ReservedPortsReport,
-    SlaPull, TelemetryPush, MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
+    stream_plane_report_defect, telemetry_audit_row_defect, ClusterRequest, NodeResources,
+    ReportedPorts, ReservedPortsReport, SlaPull, StreamPlaneReport, TelemetryPush,
+    MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
 };
 use crate::replication::{AppliedConfig, ConfigPayload};
 
@@ -97,6 +98,32 @@ impl ReservedPortsClaim {
     }
 }
 
+/// What a heartbeat said about the node's stream plane (Story 12.2
+/// D-i), after the decode-boundary check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamPlaneClaim {
+    /// The heartbeat carried no report: a 1.10.x follower, or a node
+    /// with no follower runtime.
+    NotSent,
+    /// The report passed [`stream_plane_report_defect`].
+    Reported(StreamPlaneReport),
+    /// The report was malformed. It is dropped and the node treated as
+    /// not reported; the caller warns, naming the node.
+    Dropped(&'static str),
+}
+
+impl StreamPlaneClaim {
+    fn of(report: Option<&StreamPlaneReport>) -> Self {
+        match report {
+            None => Self::NotSent,
+            Some(report) => match stream_plane_report_defect(report) {
+                None => Self::Reported(report.clone()),
+                Some(defect) => Self::Dropped(defect),
+            },
+        }
+    }
+}
+
 /// The in-plane actions the control-plane whitelist admits (Story 9.2
 /// session traffic, Story 9.3 lifecycle, Story 9.4 convergence).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +140,8 @@ pub enum InPlaneAction {
         resources: Option<NodeResources>,
         /// The ports the node's own listeners hold (Story 12.1, D-4).
         reserved_ports: ReservedPortsClaim,
+        /// The node's stream plane (Story 12.2 D-i).
+        stream_plane: StreamPlaneClaim,
     },
     /// The follower asks for the current generation because what it
     /// runs may be stale (Story 9.4 AC #7).
@@ -296,6 +325,10 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
                 // either: a clamped port is a different port, which the
                 // control plane would then check streams against.
                 reserved_ports: ReservedPortsClaim::of(hb.reserved_ports.as_ref()),
+                // Dropped whole rather than trimmed, for the same reason:
+                // a report that is partly right would show a binding the
+                // node never reported, or hide one it did.
+                stream_plane: StreamPlaneClaim::of(hb.stream_plane.as_ref()),
             })
         }
         Some(cluster_request::Body::ConfigPull(pull)) => {
@@ -509,8 +542,8 @@ mod tests {
     use super::*;
     use crate::messages::{
         CertMaterial, CertPull, CertPush, ChallengePublish, ClusterFrame, ConfigPrepare,
-        ConfigPull, Heartbeat, Hello, BODY_KIND_HELLO, MAX_CHALLENGE_KEY_AUTHORIZATION_BYTES,
-        MAX_CHALLENGE_TOKEN_BYTES, MAX_CONFIG_HASH_BYTES,
+        ConfigPull, Heartbeat, Hello, StreamBindingReport, StreamBindingState, BODY_KIND_HELLO,
+        MAX_CHALLENGE_KEY_AUTHORIZATION_BYTES, MAX_CHALLENGE_TOKEN_BYTES, MAX_CONFIG_HASH_BYTES,
     };
 
     const IDENTIFIER: &str = "edge.example.com";
@@ -545,6 +578,7 @@ mod tests {
             break_glass: false,
             resources: None,
             reserved_ports: None,
+            stream_plane: None,
         }
     }
 
@@ -594,6 +628,7 @@ mod tests {
             break_glass: true,
             resources: None,
             reserved_ports: None,
+            stream_plane: None,
         });
         assert_eq!(
             translate_cluster_request(&req),
@@ -606,6 +641,7 @@ mod tests {
                 },
                 resources: None,
                 reserved_ports: ReservedPortsClaim::NotSent,
+                stream_plane: StreamPlaneClaim::NotSent,
             })
         );
     }
@@ -625,6 +661,7 @@ mod tests {
                 disk_total_bytes: 2,
             }),
             reserved_ports: None,
+            stream_plane: None,
         });
         let BridgeOutcome::InPlane(InPlaneAction::Heartbeat { resources, .. }) =
             translate_cluster_request(&req)
@@ -639,6 +676,7 @@ mod tests {
     fn reserved_ports_claim(report: Option<ReservedPortsReport>) -> ReservedPortsClaim {
         let req = ClusterRequest::heartbeat(Heartbeat {
             reserved_ports: report,
+            stream_plane: None,
             ..heartbeat(1)
         });
         let BridgeOutcome::InPlane(InPlaneAction::Heartbeat { reserved_ports, .. }) =
@@ -702,6 +740,66 @@ mod tests {
         }
     }
 
+    fn stream_plane_claim(report: Option<StreamPlaneReport>) -> StreamPlaneClaim {
+        let req = ClusterRequest::heartbeat(Heartbeat {
+            stream_plane: report,
+            ..heartbeat(1)
+        });
+        let BridgeOutcome::InPlane(InPlaneAction::Heartbeat { stream_plane, .. }) =
+            translate_cluster_request(&req)
+        else {
+            panic!("a heartbeat is whitelisted whatever its stream plane report says");
+        };
+        stream_plane
+    }
+
+    fn failed(stream_id: &str) -> StreamBindingReport {
+        StreamBindingReport {
+            stream_id: stream_id.to_string(),
+            state: StreamBindingState::Failed as i32,
+            kind: "address_in_use".to_string(),
+            os_error: "Address already in use (os error 98)".to_string(),
+            port: 6000,
+            failed_since_ms: 1,
+        }
+    }
+
+    #[test]
+    fn a_stream_plane_report_passes_through_the_heartbeat() {
+        let report = StreamPlaneReport {
+            fd_limit: 65_536,
+            worker_count: 2,
+            listen_sockets_used: 2,
+            worker_fds_committed: 2,
+            supervisor_fds_committed: 2,
+            bound_count: 1,
+            bindings: vec![failed("0b6f2a4e-6a43-4bd4-9b8e-3c1f8a2d5e70")],
+            truncated: false,
+        };
+        assert_eq!(
+            stream_plane_claim(Some(report.clone())),
+            StreamPlaneClaim::Reported(report)
+        );
+        assert_eq!(stream_plane_claim(None), StreamPlaneClaim::NotSent);
+    }
+
+    #[test]
+    fn a_malformed_stream_plane_report_is_dropped_and_keeps_the_session() {
+        let report = StreamPlaneReport {
+            bindings: vec![StreamBindingReport {
+                os_error: "refused
+Injected: 1"
+                    .to_string(),
+                ..failed("0b6f2a4e-6a43-4bd4-9b8e-3c1f8a2d5e70")
+            }],
+            ..StreamPlaneReport::default()
+        };
+        assert!(matches!(
+            stream_plane_claim(Some(report)),
+            StreamPlaneClaim::Dropped(_)
+        ));
+    }
+
     #[test]
     fn a_convergence_pull_is_whitelisted_on_the_control_plane() {
         let req = ClusterRequest::config_pull(ConfigPull {
@@ -731,6 +829,7 @@ mod tests {
                 applied_generation: 1,
                 resources: None,
                 reserved_ports: None,
+                stream_plane: None,
                 applied_hash: hash.to_string(),
                 break_glass: false,
             });

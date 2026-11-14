@@ -98,7 +98,7 @@ pub mod version;
 pub use admission::{AdmissionDecision, AdmissionGate, AdmissionPermit, DEFAULT_QUEUE_WAIT};
 pub use bridge::{
     translate_cluster_request, translate_control_plane_request, BridgeOutcome, FollowerAction,
-    FollowerBridgeOutcome, InPlaneAction, ReservedPortsClaim,
+    FollowerBridgeOutcome, InPlaneAction, ReservedPortsClaim, StreamPlaneClaim,
 };
 pub use ca::{CaError, ClusterCa, IssuedLeaf, RevokedEntry};
 pub use certs::{
@@ -127,20 +127,23 @@ pub use listener::{
 pub use messages::{
     cert_digest_is_valid, cert_domain_is_valid, cert_id_is_valid,
     challenge_key_authorization_is_valid, challenge_token_is_valid, config_hash_is_valid,
-    telemetry_audit_row_defect, BanPush, BanPushAck, CertMaterial, CertPull, CertPullAck, CertPush,
-    CertPushAck, CertRefusal, ChallengePublish, ChallengePublishAck, ChallengeRetract,
-    ChallengeRetractAck, ClusterFrame, ClusterRequest, ClusterResponse, ClusterStatus, ConfigAbort,
-    ConfigAbortAck, ConfigCommit, ConfigCommitAck, ConfigPrepare, ConfigPrepareAck, ConfigPull,
-    ConfigPullAck, Enroll, EnrollAck, Heartbeat, HeartbeatAck, Hello, HelloAck, Leave, LeaveAck,
-    NodeResources, Renew, RenewAck, ReportedPorts, ReservedPortsReport, TelemetryAccessRow,
-    TelemetryAuditRow, TelemetryBan, TelemetryPush, TelemetryPushAck, TelemetryWafRow,
-    BODY_KIND_BAN_PUSH, BODY_KIND_CERT_PULL, BODY_KIND_CERT_PUSH, BODY_KIND_CHALLENGE_PUBLISH,
-    BODY_KIND_CHALLENGE_RETRACT, BODY_KIND_CONFIG_ABORT, BODY_KIND_CONFIG_COMMIT,
-    BODY_KIND_CONFIG_PREPARE, BODY_KIND_CONFIG_PULL, BODY_KIND_ENROLL, BODY_KIND_HEARTBEAT,
-    BODY_KIND_HELLO, BODY_KIND_LEAVE, BODY_KIND_RENEW, BODY_KIND_TELEMETRY_PUSH,
-    CERT_DIGEST_PREFIX, MAX_AUDIT_FIELD_BYTES, MAX_CERT_DOMAIN_BYTES, MAX_CERT_ID_BYTES,
-    MAX_CHALLENGE_KEY_AUTHORIZATION_BYTES, MAX_CHALLENGE_TOKEN_BYTES, MAX_CONFIG_HASH_BYTES,
-    MAX_TELEMETRY_AUDIT, MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
+    stream_plane_report_defect, telemetry_audit_row_defect, BanPush, BanPushAck, CertMaterial,
+    CertPull, CertPullAck, CertPush, CertPushAck, CertRefusal, ChallengePublish,
+    ChallengePublishAck, ChallengeRetract, ChallengeRetractAck, ClusterFrame, ClusterRequest,
+    ClusterResponse, ClusterStatus, ConfigAbort, ConfigAbortAck, ConfigCommit, ConfigCommitAck,
+    ConfigPrepare, ConfigPrepareAck, ConfigPull, ConfigPullAck, Enroll, EnrollAck, Heartbeat,
+    HeartbeatAck, Hello, HelloAck, Leave, LeaveAck, NodeResources, Renew, RenewAck, ReportedPorts,
+    ReservedPortsReport, StreamBindingReport, StreamBindingState, StreamPlaneReport,
+    TelemetryAccessRow, TelemetryAuditRow, TelemetryBan, TelemetryPush, TelemetryPushAck,
+    TelemetryWafRow, BODY_KIND_BAN_PUSH, BODY_KIND_CERT_PULL, BODY_KIND_CERT_PUSH,
+    BODY_KIND_CHALLENGE_PUBLISH, BODY_KIND_CHALLENGE_RETRACT, BODY_KIND_CONFIG_ABORT,
+    BODY_KIND_CONFIG_COMMIT, BODY_KIND_CONFIG_PREPARE, BODY_KIND_CONFIG_PULL, BODY_KIND_ENROLL,
+    BODY_KIND_HEARTBEAT, BODY_KIND_HELLO, BODY_KIND_LEAVE, BODY_KIND_RENEW,
+    BODY_KIND_TELEMETRY_PUSH, CERT_DIGEST_PREFIX, MAX_AUDIT_FIELD_BYTES, MAX_CERT_DOMAIN_BYTES,
+    MAX_CERT_ID_BYTES, MAX_CHALLENGE_KEY_AUTHORIZATION_BYTES, MAX_CHALLENGE_TOKEN_BYTES,
+    MAX_CONFIG_HASH_BYTES, MAX_STREAM_BINDING_ID_BYTES, MAX_STREAM_BINDING_KIND_BYTES,
+    MAX_STREAM_BINDING_OS_ERROR_BYTES, MAX_STREAM_PLANE_BINDINGS, MAX_TELEMETRY_AUDIT,
+    MAX_TELEMETRY_BANS, MAX_TELEMETRY_ROWS,
 };
 pub use preauth::{source_key, AttemptWindow, PreAuthBudgets, SourceGate, SourceKey, SourceSlot};
 pub use replication::{

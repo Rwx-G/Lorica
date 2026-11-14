@@ -590,6 +590,47 @@ message ReservedPortsReport {
   optional uint32 automation = 6;
 }
 
+// The state of a stream binding a node lists as not bound (Story 12.2
+// D-i). A bound binding is never listed. A value the receiver does not
+// know reads as UNSPECIFIED, which the control plane shows as unknown.
+enum StreamBindingState {
+  STREAM_BINDING_STATE_UNSPECIFIED = 0;
+  STREAM_BINDING_PENDING = 1;      // Desired, not bound yet
+  STREAM_BINDING_FAILED = 2;       // The last bind attempt failed
+}
+
+// One binding a node holds and has not bound. The failure fields are
+// set for FAILED only. The kind is a string of [a-z_] (at most 32
+// bytes) rather than an enum: the kinds are the stream plane's, and a
+// receiver maps one it does not know to "other". The OS error is at
+// most 256 bytes with no control character; the stream id at most 64
+// bytes of [A-Za-z0-9-]. One malformed binding drops the whole report.
+message StreamBindingReport {
+  string stream_id = 1;
+  int32 state = 2;                 // A StreamBindingState
+  string kind = 3;
+  string os_error = 4;
+  uint32 port = 5;                 // At most 65535, FAILED only
+  uint64 failed_since_ms = 6;      // Unix ms of the entry into FAILED
+}
+
+// A node's stream plane (Story 12.2 D-e, D-i): what the control plane
+// shows per node and checks stream writes against. Session state, like
+// NodeResources. Only the bindings that are not bound are listed, at
+// most 256, so the report does not grow with the stream count; a
+// targeted stream the node does not list is bound while the node is in
+// sync with the control plane, and unknown while it drifts.
+message StreamPlaneReport {
+  uint64 fd_limit = 1;             // Soft RLIMIT_NOFILE, 0 if unreadable
+  uint32 worker_count = 2;         // 1 in single-process mode
+  uint64 listen_sockets_used = 3;  // One per port
+  uint64 worker_fds_committed = 4;
+  uint64 supervisor_fds_committed = 5;
+  uint32 bound_count = 6;
+  repeated StreamBindingReport bindings = 7;
+  bool truncated = 8;              // More were not bound than listed
+}
+
 message Heartbeat {
   uint64 timestamp_ms = 1;
   uint64 applied_generation = 2;
@@ -599,6 +640,10 @@ message Heartbeat {
   // Story 12.1: absent from a 1.10.x follower, which a 1.11.0 control
   // plane reads as "not reported"; a 1.10.x control plane skips it.
   ReservedPortsReport reserved_ports = 6;
+  // Story 12.2: absent from a 1.10.x follower and from a node with no
+  // follower runtime, read as "not reported"; a 1.10.x control plane
+  // skips it.
+  StreamPlaneReport stream_plane = 7;
 }
 
 message HeartbeatAck {

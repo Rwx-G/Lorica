@@ -88,7 +88,7 @@ use crate::messages::{
     cluster_response, config_hash_is_valid, BanPushAck, CertPushAck, CertRefusal,
     ChallengePublishAck, ChallengeRetractAck, ClusterFrame, ClusterRequest, ClusterResponse,
     ClusterStatus, ConfigAbortAck, ConfigCommitAck, ConfigPrepareAck, Heartbeat, HelloAck,
-    NodeResources, ReservedPortsReport, SlaPull, SlaPullAck,
+    NodeResources, ReservedPortsReport, SlaPull, SlaPullAck, StreamPlaneReport,
 };
 use crate::replication::{AppliedConfig, ConfigPayload, ConfigVersion};
 use crate::tls::{client_config, negotiated_cluster_alpn, ClusterTlsError};
@@ -196,6 +196,18 @@ pub trait FollowerHandler: Send + Sync + 'static {
     /// a node that reports nothing is one the control plane refuses
     /// streams for by name, which misleads nobody.
     fn reserved_ports(&self) -> Option<ReservedPortsReport> {
+        None
+    }
+
+    /// This node's stream plane, for the control plane's fleet view and
+    /// its fd budget check of stream writes (Story 12.2 D-i).
+    ///
+    /// Defaulted for the same reason as [`FollowerHandler::resources`]:
+    /// a node that reports nothing is shown as unknown and checked at
+    /// bind rather than at the API, which misleads nobody. Called from
+    /// the heartbeat's task, so an implementation returns a published
+    /// value rather than reading a store.
+    fn stream_plane(&self) -> Option<StreamPlaneReport> {
         None
     }
 
@@ -381,6 +393,12 @@ fn node_resources(config: &DialerConfig) -> Option<NodeResources> {
 /// runtime is installed to report them.
 fn node_reserved_ports(config: &DialerConfig) -> Option<ReservedPortsReport> {
     config.follower.as_ref().and_then(|f| f.reserved_ports())
+}
+
+/// This node's stream plane, or `None` when no follower runtime is
+/// installed to report it.
+fn node_stream_plane(config: &DialerConfig) -> Option<StreamPlaneReport> {
+    config.follower.as_ref().and_then(|f| f.stream_plane())
 }
 
 /// What this node runs, or the empty state when no follower runtime is
@@ -833,6 +851,7 @@ async fn heartbeat_until_dead(
             break_glass: applied.break_glass,
             resources: node_resources(config),
             reserved_ports: node_reserved_ports(config),
+            stream_plane: node_stream_plane(config),
         });
         match session
             .endpoint

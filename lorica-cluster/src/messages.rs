@@ -274,6 +274,166 @@ impl From<ReportedPorts> for ReservedPortsReport {
     }
 }
 
+/// The state of one stream binding a node reports as not bound
+/// (Story 12.2 D-i), on the wire as [`StreamBindingReport::state`].
+///
+/// A binding that is bound is never listed: the report would grow with
+/// the node's stream count. A value this build does not know, which only
+/// a newer peer sends, reads as [`StreamBindingState::Unspecified`], and
+/// the control plane renders it as `unknown` rather than refusing the
+/// report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum StreamBindingState {
+    /// Proto3 default; also any value this build does not know.
+    Unspecified = 0,
+    /// Desired on the node and not bound yet.
+    Pending = 1,
+    /// The node's last bind attempt failed.
+    Failed = 2,
+}
+
+impl StreamBindingState {
+    /// Decode from the wire representation; unknown values collapse to
+    /// [`StreamBindingState::Unspecified`].
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            1 => Self::Pending,
+            2 => Self::Failed,
+            _ => Self::Unspecified,
+        }
+    }
+}
+
+/// One stream binding a node holds and has not bound (Story 12.2 D-i).
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct StreamBindingReport {
+    /// The stream's id, at most [`MAX_STREAM_BINDING_ID_BYTES`].
+    #[prost(string, tag = "1")]
+    pub stream_id: ::prost::alloc::string::String,
+    /// A [`StreamBindingState`].
+    #[prost(int32, tag = "2")]
+    pub state: i32,
+    /// `failed` only: the failure kind's machine name (`address_in_use`,
+    /// ...), at most [`MAX_STREAM_BINDING_KIND_BYTES`] of `[a-z_]`. Kept a
+    /// string on the wire: the node's kinds are the stream plane's, which
+    /// this transport crate does not depend on, and the control plane
+    /// maps a kind it does not know to `other`.
+    #[prost(string, tag = "3")]
+    pub kind: ::prost::alloc::string::String,
+    /// `failed` only: the OS error's text, at most
+    /// [`MAX_STREAM_BINDING_OS_ERROR_BYTES`], no control character.
+    #[prost(string, tag = "4")]
+    pub os_error: ::prost::alloc::string::String,
+    /// `failed` only: the port that failed, at most 65535.
+    #[prost(uint32, tag = "5")]
+    pub port: u32,
+    /// `failed` only: when the binding entered the failed state, unix
+    /// milliseconds.
+    #[prost(uint64, tag = "6")]
+    pub failed_since_ms: u64,
+}
+
+impl StreamBindingReport {
+    /// The binding's state, decoded.
+    pub fn binding_state(&self) -> StreamBindingState {
+        StreamBindingState::from_i32(self.state)
+    }
+}
+
+/// What a node's stream plane holds, reported in every heartbeat so the
+/// control plane can show each stream's bind state per node and check a
+/// stream write against the node's fd budget (Story 12.2 D-e, D-i).
+///
+/// Session state like [`NodeResources`]: a current value the control
+/// plane re-learns within one heartbeat of a reconnect, never persisted.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct StreamPlaneReport {
+    /// The process's soft `RLIMIT_NOFILE`, 0 when unreadable.
+    #[prost(uint64, tag = "1")]
+    pub fd_limit: u64,
+    /// Workers on the node, 1 in single-process mode.
+    #[prost(uint32, tag = "2")]
+    pub worker_count: u32,
+    /// The node's stream listening sockets, one per port.
+    #[prost(uint64, tag = "3")]
+    pub listen_sockets_used: u64,
+    /// What one worker holds with every stream at its ceiling.
+    #[prost(uint64, tag = "4")]
+    pub worker_fds_committed: u64,
+    /// What the supervisor holds: TCP ports plus UDP ports per worker.
+    #[prost(uint64, tag = "5")]
+    pub supervisor_fds_committed: u64,
+    /// Bindings the node holds bound.
+    #[prost(uint32, tag = "6")]
+    pub bound_count: u32,
+    /// Every binding that is not bound, at most
+    /// [`MAX_STREAM_PLANE_BINDINGS`].
+    #[prost(message, repeated, tag = "7")]
+    pub bindings: ::prost::alloc::vec::Vec<StreamBindingReport>,
+    /// More bindings were not bound than `bindings` holds.
+    #[prost(bool, tag = "8")]
+    pub truncated: bool,
+}
+
+/// Most bindings one [`StreamPlaneReport`] lists. Past it the sender
+/// sets `truncated`: a node with this many streams failing has a problem
+/// one list will not describe better.
+pub const MAX_STREAM_PLANE_BINDINGS: usize = 256;
+
+/// Longest stream id a binding may carry. Ids are UUIDs (36 characters);
+/// the margin is [`MAX_CERT_ID_BYTES`]'s, for the same reason.
+pub const MAX_STREAM_BINDING_ID_BYTES: usize = 64;
+
+/// Longest failure kind a binding may carry.
+pub const MAX_STREAM_BINDING_KIND_BYTES: usize = 32;
+
+/// Longest OS error text a binding may carry.
+pub const MAX_STREAM_BINDING_OS_ERROR_BYTES: usize = 256;
+
+/// Whether a peer-supplied stream plane report is malformed, and how
+/// (Story 12.2 D-i, the decode boundary).
+///
+/// The whole report is judged: one binding the control plane cannot
+/// render says nothing trustworthy about the node's figures either, and
+/// a node reporting nothing is shown as unknown, which misleads nobody.
+pub fn stream_plane_report_defect(report: &StreamPlaneReport) -> Option<&'static str> {
+    if report.bindings.len() > MAX_STREAM_PLANE_BINDINGS {
+        return Some("more bindings than a report may list");
+    }
+    for binding in &report.bindings {
+        let id = &binding.stream_id;
+        if id.is_empty()
+            || id.len() > MAX_STREAM_BINDING_ID_BYTES
+            || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Some("a stream id is empty, over its bound or outside [A-Za-z0-9-]");
+        }
+        if binding.kind.len() > MAX_STREAM_BINDING_KIND_BYTES
+            || !binding
+                .kind
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b == b'_')
+        {
+            return Some("a failure kind is over its bound or outside [a-z_]");
+        }
+        // The text reaches a table an operator reads and, one careless
+        // `warn!` away, a log line.
+        if binding.os_error.len() > MAX_STREAM_BINDING_OS_ERROR_BYTES
+            || binding.os_error.chars().any(char::is_control)
+        {
+            return Some("an OS error is over its bound or carries a control character");
+        }
+        if binding.port > u32::from(u16::MAX) {
+            return Some("a port is above 65535");
+        }
+        if binding.binding_state() == StreamBindingState::Failed && binding.kind.is_empty() {
+            return Some("a failed binding names no kind");
+        }
+    }
+    None
+}
+
 /// Liveness probe, either direction.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Heartbeat {
@@ -300,6 +460,12 @@ pub struct Heartbeat {
     /// runtime; a 1.10.x control plane skips the unknown tag.
     #[prost(message, optional, tag = "6")]
     pub reserved_ports: Option<ReservedPortsReport>,
+    /// The node's stream plane (Story 12.2 D-i). Absent from a 1.10.x
+    /// follower and from a node with no follower runtime, which the
+    /// control plane reads as "not reported"; a 1.10.x control plane
+    /// skips the unknown tag.
+    #[prost(message, optional, tag = "7")]
+    pub stream_plane: Option<StreamPlaneReport>,
 }
 
 /// Answer to a [`Heartbeat`].
@@ -2005,6 +2171,7 @@ mod tests {
                         disk_total_bytes: 1,
                     }),
                     reserved_ports: Some(every_reserved_port()),
+                    stream_plane: Some(stream_plane_report()),
                 }
                 .encode_to_vec()
             ),
@@ -2015,6 +2182,32 @@ mod tests {
                 tag("Heartbeat", "break_glass"),
                 tag("Heartbeat", "resources"),
                 tag("Heartbeat", "reserved_ports"),
+                tag("Heartbeat", "stream_plane"),
+            ]
+        );
+        assert_eq!(
+            field_numbers(&stream_plane_report().encode_to_vec()),
+            vec![
+                tag("StreamPlaneReport", "fd_limit"),
+                tag("StreamPlaneReport", "worker_count"),
+                tag("StreamPlaneReport", "listen_sockets_used"),
+                tag("StreamPlaneReport", "worker_fds_committed"),
+                tag("StreamPlaneReport", "supervisor_fds_committed"),
+                tag("StreamPlaneReport", "bound_count"),
+                tag("StreamPlaneReport", "bindings"),
+                tag("StreamPlaneReport", "bindings"),
+                tag("StreamPlaneReport", "truncated"),
+            ]
+        );
+        assert_eq!(
+            field_numbers(&failed_binding().encode_to_vec()),
+            vec![
+                tag("StreamBindingReport", "stream_id"),
+                tag("StreamBindingReport", "state"),
+                tag("StreamBindingReport", "kind"),
+                tag("StreamBindingReport", "os_error"),
+                tag("StreamBindingReport", "port"),
+                tag("StreamBindingReport", "failed_since_ms"),
             ]
         );
         assert_eq!(
@@ -2079,6 +2272,7 @@ mod tests {
                     break_glass: true,
                     resources: None,
                     reserved_ports: None,
+                    stream_plane: None,
                 }
                 .encode_to_vec()
             ),
@@ -2589,6 +2783,39 @@ mod tests {
     }
 
     #[test]
+    fn binding_state_values_match_the_published_enum() {
+        let tags = proto_tags();
+        let value = |name: &str| -> i32 {
+            *tags
+                .get(&("StreamBindingState".to_string(), name.to_string()))
+                .unwrap_or_else(|| panic!("StreamBindingState.{name} missing from cluster.proto"))
+                as i32
+        };
+        let pairs = [
+            (
+                "STREAM_BINDING_STATE_UNSPECIFIED",
+                StreamBindingState::Unspecified,
+            ),
+            ("STREAM_BINDING_PENDING", StreamBindingState::Pending),
+            ("STREAM_BINDING_FAILED", StreamBindingState::Failed),
+        ];
+        for (name, state) in pairs {
+            assert_eq!(state as i32, value(name), "{name}");
+            assert_eq!(StreamBindingState::from_i32(state as i32), state, "{name}");
+        }
+        let published = tags
+            .keys()
+            .filter(|(b, _)| b == "StreamBindingState")
+            .count();
+        assert_eq!(published, pairs.len());
+        assert_eq!(
+            StreamBindingState::from_i32(3),
+            StreamBindingState::Unspecified,
+            "a newer peer's state is unknown here, never refused"
+        );
+    }
+
+    #[test]
     fn body_kind_invariant_holds_for_constructors_and_flags_mismatches() {
         assert!(ClusterRequest::hello(Hello::default()).body_kind_matches());
         assert!(ClusterRequest::heartbeat(Heartbeat::default()).body_kind_matches());
@@ -2730,7 +2957,7 @@ mod tests {
     /// The `Heartbeat` exactly as the v1.10.6 tag declares it
     /// (`git show v1.10.6:lorica-cluster/src/messages.rs`), frozen here
     /// as a released artefact: the peer a 1.11.0 node shares a fleet
-    /// with during a rolling upgrade (Story 12.1, D-4).
+    /// with during a rolling upgrade (Story 12.1, D-4; Story 12.2, D-i).
     mod v1_10_6 {
         use super::NodeResources;
 
@@ -2768,6 +2995,7 @@ mod tests {
             break_glass: true,
             resources: Some(reading()),
             reserved_ports: Some(every_reserved_port()),
+            stream_plane: None,
         };
         let old = v1_10_6::Heartbeat::decode(new.encode_to_vec().as_slice())
             .expect("an unknown tag is skipped, never refused");
@@ -2782,6 +3010,69 @@ mod tests {
             },
             "every field the old peer knows survives the new one"
         );
+    }
+
+    /// A failed binding with every field set.
+    fn failed_binding() -> StreamBindingReport {
+        StreamBindingReport {
+            stream_id: "0b6f2a4e-6a43-4bd4-9b8e-3c1f8a2d5e70".to_string(),
+            state: StreamBindingState::Failed as i32,
+            kind: "address_in_use".to_string(),
+            os_error: "Address already in use (os error 98)".to_string(),
+            port: 5432,
+            failed_since_ms: 1_763_100_000_000,
+        }
+    }
+
+    /// A report with every scalar non-zero, one failed and one pending
+    /// binding.
+    fn stream_plane_report() -> StreamPlaneReport {
+        StreamPlaneReport {
+            fd_limit: 65_536,
+            worker_count: 4,
+            listen_sockets_used: 3,
+            worker_fds_committed: 3,
+            supervisor_fds_committed: 9,
+            bound_count: 1,
+            bindings: vec![
+                failed_binding(),
+                StreamBindingReport {
+                    stream_id: "5d0c1e7a-2b9f-4c3e-8a61-0f4b7d2e9c18".to_string(),
+                    state: StreamBindingState::Pending as i32,
+                    ..StreamBindingReport::default()
+                },
+            ],
+            truncated: true,
+        }
+    }
+
+    #[test]
+    fn a_1_10_6_control_plane_decodes_a_heartbeat_carrying_a_stream_plane_report() {
+        let new = Heartbeat {
+            timestamp_ms: 7,
+            applied_generation: 3,
+            applied_hash: "ab".to_string(),
+            break_glass: false,
+            resources: Some(reading()),
+            reserved_ports: Some(every_reserved_port()),
+            stream_plane: Some(stream_plane_report()),
+        };
+        let old = v1_10_6::Heartbeat::decode(new.encode_to_vec().as_slice())
+            .expect("an unknown tag is skipped, never refused");
+        assert_eq!(
+            old,
+            v1_10_6::Heartbeat {
+                timestamp_ms: 7,
+                applied_generation: 3,
+                applied_hash: "ab".to_string(),
+                break_glass: false,
+                resources: Some(reading()),
+            },
+            "every field the old peer knows survives the new one"
+        );
+        // And this build reads its own report back whole.
+        let decoded = Heartbeat::decode(new.encode_to_vec().as_slice()).expect("decodes");
+        assert_eq!(decoded.stream_plane, Some(stream_plane_report()));
     }
 
     #[test]
@@ -2803,11 +3094,119 @@ mod tests {
                 break_glass: false,
                 resources: Some(reading()),
                 reserved_ports: None,
-            }
+                stream_plane: None,
+            },
+            "neither the ports nor the stream plane: both read as not reported"
         );
-        // And a 1.11.0 heartbeat without a report is byte-identical to
-        // the 1.10.6 one: the new field costs an old peer nothing.
+        // And a 1.11.0 heartbeat without either report is byte-identical
+        // to the 1.10.6 one: the new fields cost an old peer nothing.
         assert_eq!(new.encode_to_vec(), old.encode_to_vec());
+    }
+
+    #[test]
+    fn a_well_formed_stream_plane_report_has_no_defect() {
+        assert_eq!(stream_plane_report_defect(&stream_plane_report()), None);
+        assert_eq!(
+            stream_plane_report_defect(&StreamPlaneReport::default()),
+            None,
+            "a node binding nothing reports an empty plane"
+        );
+        let full = StreamPlaneReport {
+            bindings: vec![failed_binding(); MAX_STREAM_PLANE_BINDINGS],
+            ..stream_plane_report()
+        };
+        assert_eq!(stream_plane_report_defect(&full), None);
+        // A state from a newer peer is no defect: it renders as unknown.
+        let newer = StreamPlaneReport {
+            bindings: vec![StreamBindingReport {
+                state: 7,
+                ..failed_binding()
+            }],
+            ..stream_plane_report()
+        };
+        assert_eq!(stream_plane_report_defect(&newer), None);
+    }
+
+    #[test]
+    fn a_stream_plane_report_with_any_malformed_binding_is_refused_whole() {
+        let over_long = |n: usize| "a".repeat(n);
+        let spoiled: Vec<(&str, StreamBindingReport)> = vec![
+            (
+                "empty id",
+                StreamBindingReport {
+                    stream_id: String::new(),
+                    ..failed_binding()
+                },
+            ),
+            (
+                "long id",
+                StreamBindingReport {
+                    stream_id: over_long(MAX_STREAM_BINDING_ID_BYTES + 1),
+                    ..failed_binding()
+                },
+            ),
+            (
+                "id alphabet",
+                StreamBindingReport {
+                    stream_id: "../etc".to_string(),
+                    ..failed_binding()
+                },
+            ),
+            (
+                "long kind",
+                StreamBindingReport {
+                    kind: over_long(MAX_STREAM_BINDING_KIND_BYTES + 1),
+                    ..failed_binding()
+                },
+            ),
+            (
+                "kind alphabet",
+                StreamBindingReport {
+                    kind: "Address In Use".to_string(),
+                    ..failed_binding()
+                },
+            ),
+            (
+                "long OS error",
+                StreamBindingReport {
+                    os_error: over_long(MAX_STREAM_BINDING_OS_ERROR_BYTES + 1),
+                    ..failed_binding()
+                },
+            ),
+            (
+                "control character",
+                StreamBindingReport {
+                    os_error: "refused\r\nInjected: 1".to_string(),
+                    ..failed_binding()
+                },
+            ),
+            (
+                "port",
+                StreamBindingReport {
+                    port: 65_536,
+                    ..failed_binding()
+                },
+            ),
+            (
+                "failed without a kind",
+                StreamBindingReport {
+                    kind: String::new(),
+                    ..failed_binding()
+                },
+            ),
+        ];
+        for (name, binding) in spoiled {
+            let report = StreamPlaneReport {
+                bindings: vec![failed_binding(), binding],
+                ..stream_plane_report()
+            };
+            assert!(stream_plane_report_defect(&report).is_some(), "{name}");
+        }
+        let too_many = StreamPlaneReport {
+            bindings: vec![failed_binding(); MAX_STREAM_PLANE_BINDINGS + 1],
+            ..stream_plane_report()
+        };
+        assert!(stream_plane_report_defect(&too_many).is_some());
     }
 
     #[test]

@@ -90,6 +90,7 @@ fn probe(timestamp_ms: u64) -> Heartbeat {
         break_glass: false,
         resources: None,
         reserved_ports: None,
+        stream_plane: None,
     }
 }
 

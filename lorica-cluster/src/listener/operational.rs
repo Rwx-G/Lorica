@@ -58,7 +58,9 @@ use tokio_rustls::TlsAcceptor;
 use lorica_command::{IncomingRequest, IncomingRequests, RpcEndpoint};
 
 use crate::admission::{AdmissionDecision, AdmissionGate};
-use crate::bridge::{translate_cluster_request, BridgeOutcome, InPlaneAction, ReservedPortsClaim};
+use crate::bridge::{
+    translate_cluster_request, BridgeOutcome, InPlaneAction, ReservedPortsClaim, StreamPlaneClaim,
+};
 use crate::certs::{CertBundle, MAX_CERT_BUNDLES};
 use crate::enroll::{RenewRequest, SessionHandler};
 use crate::handshake::{serve_hello, HandshakeConfig};
@@ -756,6 +758,8 @@ struct SessionTally {
     /// ports report: a node that sends an impossible port sends it on
     /// every beat, and one line per session says it.
     reserved_ports_drop_warned: bool,
+    /// The same, for a dropped stream plane report.
+    stream_plane_drop_warned: bool,
 }
 
 impl SessionTally {
@@ -822,6 +826,7 @@ async fn serve_request(
             applied,
             resources,
             reserved_ports,
+            stream_plane,
         }) => {
             stats.heartbeats_served.fetch_add(1, Ordering::Relaxed);
             // What the node runs, refreshed every interval: the drift
@@ -850,10 +855,33 @@ async fn serve_request(
                         peer = %ctx.peer_addr,
                         node_id = ctx.node_id().unwrap_or("-"),
                         node_name = ctx.node.as_ref().map_or("-", |n| n.name.as_str()),
-                        "reserved ports report dropped: a port is zero or above 65535; the node                          is treated as not reported and streams targeting it are refused"
+                        "reserved ports report dropped: a port is zero or above 65535; the node \
+                         is treated as not reported and streams targeting it are refused"
                     );
                 }
                 ReservedPortsClaim::Dropped | ReservedPortsClaim::NotSent => {}
+            }
+            // The stream plane is session state, like the gauges
+            // (Story 12.2 D-i). A dropped report leaves the previous one,
+            // or none, which the fleet view shows as unknown.
+            match stream_plane {
+                StreamPlaneClaim::Reported(report) => {
+                    if let Some(guard) = guard {
+                        guard.entry().record_stream_plane(report);
+                    }
+                }
+                StreamPlaneClaim::Dropped(defect) if !tally.stream_plane_drop_warned => {
+                    tally.stream_plane_drop_warned = true;
+                    tracing::warn!(
+                        peer = %ctx.peer_addr,
+                        node_id = ctx.node_id().unwrap_or("-"),
+                        node_name = ctx.node.as_ref().map_or("-", |n| n.name.as_str()),
+                        defect,
+                        "stream plane report dropped: the node's bind states and fd budget \
+                         are shown as not reported until it sends a well-formed one"
+                    );
+                }
+                StreamPlaneClaim::Dropped(_) | StreamPlaneClaim::NotSent => {}
             }
             let current = advertised_version(&shared.accepted, ctx.node.as_ref());
             let ack = HeartbeatAck {

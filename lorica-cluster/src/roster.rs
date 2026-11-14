@@ -37,7 +37,7 @@ use lorica_command::RpcEndpoint;
 use crate::ca::{CaError, ClusterCa, IssuedLeaf, RevokedEntry};
 use crate::certs::{CertBundle, CertDistributor, CertPushReport};
 use crate::challenge::{ChallengeFanout, ChallengeReport};
-use crate::messages::{ClusterFrame, NodeResources, ReportedPorts};
+use crate::messages::{ClusterFrame, NodeResources, ReportedPorts, StreamPlaneReport};
 use crate::replication::{
     AcceptedConfig, AppliedConfig, ConfigVersion, PayloadSource, ReplicationReport, Replicator,
 };
@@ -192,6 +192,13 @@ pub struct LiveSession {
     /// for a node that is offline and after a control-plane restart.
     /// Here it is only the latest value this session received.
     reserved_ports: Mutex<Option<ReportedPorts>>,
+    /// The node's last stream plane report (Story 12.2 D-i).
+    ///
+    /// Session state like `resources`, and for the same reason: a bind
+    /// state from before a reconnect would describe a process that may
+    /// no longer run. Only a report that passed the decode-boundary
+    /// check reaches here.
+    stream_plane: Mutex<Option<StreamPlaneReport>>,
     /// Flipped to `true` to end the session synchronously (revocation,
     /// supersession).
     kill: watch::Sender<bool>,
@@ -261,6 +268,23 @@ impl LiveSession {
             .unwrap_or_else(|p| p.into_inner()) = Some(ports);
     }
 
+    /// Replace the node's stream plane report.
+    ///
+    /// A heartbeat without one leaves the previous report in place, as
+    /// [`LiveSession::record_resources`] does: the staleness an operator
+    /// needs is on `last_seen`.
+    pub fn record_stream_plane(&self, report: StreamPlaneReport) {
+        *self.stream_plane.lock().unwrap_or_else(|p| p.into_inner()) = Some(report);
+    }
+
+    /// The node's last stream plane report this session, if any.
+    pub fn stream_plane(&self) -> Option<StreamPlaneReport> {
+        self.stream_plane
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
     /// The ports the node last reported this session, if any.
     pub fn reserved_ports(&self) -> Option<ReportedPorts> {
         *self
@@ -312,6 +336,9 @@ pub struct LiveSessionSnapshot {
     /// The ports the node reported this session, or `None` when it has
     /// not sent a valid report since it connected (Story 12.1, D-4).
     pub reserved_ports: Option<ReportedPorts>,
+    /// The node's last stream plane report, or `None` when it has not
+    /// sent a valid one since it connected (Story 12.2 D-i).
+    pub stream_plane: Option<StreamPlaneReport>,
 }
 
 /// Node id -> live session, with per-session kill switches so a
@@ -403,6 +430,7 @@ impl SessionRegistry {
             applied: Mutex::new(applied),
             resources: Mutex::new(None),
             reserved_ports: Mutex::new(None),
+            stream_plane: Mutex::new(None),
             kill: kill_tx,
         });
         let previous = self
@@ -557,6 +585,7 @@ impl SessionRegistry {
                 applied: s.applied(),
                 resources: s.resources(),
                 reserved_ports: s.reserved_ports(),
+                stream_plane: s.stream_plane(),
             })
             .collect()
     }

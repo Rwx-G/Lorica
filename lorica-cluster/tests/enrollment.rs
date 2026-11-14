@@ -637,6 +637,7 @@ async fn revoked_node_is_refused_at_tls_and_its_session_ends_synchronously() {
         break_glass: false,
         resources: None,
         reserved_ports: None,
+        stream_plane: None,
     });
     assert!(session_a
         .request(probe, Duration::from_secs(2))
@@ -746,6 +747,7 @@ async fn a_heartbeat_carries_the_node_s_resource_reading_onto_its_session() {
         break_glass: false,
         resources: Some(reading.clone()),
         reserved_ports: None,
+        stream_plane: None,
     });
     endpoint
         .request(probe, Duration::from_secs(2))
@@ -769,6 +771,7 @@ async fn a_heartbeat_carries_the_node_s_resource_reading_onto_its_session() {
         break_glass: false,
         resources: None,
         reserved_ports: None,
+        stream_plane: None,
     });
     endpoint
         .request(silent, Duration::from_secs(2))
@@ -820,6 +823,7 @@ async fn a_heartbeat_carries_the_node_s_reserved_ports_onto_its_session() {
             break_glass: false,
             resources: None,
             reserved_ports,
+            stream_plane: None,
         })
     };
     let report = lorica_cluster::ReservedPortsReport {
@@ -877,6 +881,112 @@ async fn a_heartbeat_carries_the_node_s_reserved_ports_onto_its_session() {
     assert!(fleet.sessions.is_connected("node-b"));
     assert_eq!(
         session_ports("node-b"),
+        None,
+        "a dropped report leaves the node not reported"
+    );
+    assert_eq!(fleet.stats.protocol_violations.load(Ordering::Relaxed), 0);
+
+    drop((endpoint, spoiled));
+    fleet.handle.shutdown();
+}
+
+/// Story 12.2 D-i: a follower's stream plane rides the heartbeat onto
+/// its session, a heartbeat without a report keeps it, and a malformed
+/// report is dropped, so the node stays not reported, without ending
+/// the session.
+#[tokio::test]
+async fn a_heartbeat_carries_the_node_s_stream_plane_onto_its_session() {
+    install_ring();
+    let pki = control_plane_pki();
+    let node = issue_node(&pki, "node-a");
+    let other = issue_node(&pki, "node-b");
+    let fleet = spawn_fleet(
+        &pki,
+        HashMap::from([
+            identity(&node, NodeState::Active),
+            identity(&other, NodeState::Active),
+        ]),
+    )
+    .await;
+    let session_plane = |node_id: &str| {
+        fleet
+            .sessions
+            .snapshot()
+            .into_iter()
+            .find(|s| s.node_id == node_id)
+            .and_then(|s| s.stream_plane)
+    };
+    let beat = |timestamp_ms: u64, stream_plane: Option<lorica_cluster::StreamPlaneReport>| {
+        ClusterRequest::heartbeat(lorica_cluster::Heartbeat {
+            timestamp_ms,
+            applied_generation: 0,
+            applied_hash: String::new(),
+            break_glass: false,
+            resources: None,
+            reserved_ports: None,
+            stream_plane,
+        })
+    };
+    let report = lorica_cluster::StreamPlaneReport {
+        fd_limit: 65_536,
+        worker_count: 2,
+        listen_sockets_used: 2,
+        worker_fds_committed: 2,
+        supervisor_fds_committed: 3,
+        bound_count: 1,
+        bindings: vec![lorica_cluster::StreamBindingReport {
+            stream_id: "0b6f2a4e-6a43-4bd4-9b8e-3c1f8a2d5e70".to_string(),
+            state: lorica_cluster::StreamBindingState::Failed as i32,
+            kind: "address_in_use".to_string(),
+            os_error: "Address already in use (os error 98)".to_string(),
+            port: 6000,
+            failed_since_ms: 1_763_100_000_000,
+        }],
+        truncated: false,
+    };
+
+    let endpoint = open_session(&pki, &node, fleet.addr)
+        .await
+        .expect("active node admitted");
+    eventually("session to register", || {
+        fleet.sessions.is_connected("node-a")
+    })
+    .await;
+    assert_eq!(session_plane("node-a"), None, "nothing reported yet");
+    endpoint
+        .request(beat(1, Some(report.clone())), Duration::from_secs(2))
+        .await
+        .expect("heartbeat served");
+    eventually("the report to reach the session", || {
+        session_plane("node-a").as_ref() == Some(&report)
+    })
+    .await;
+    endpoint
+        .request(beat(2, None), Duration::from_secs(2))
+        .await
+        .expect("heartbeat served");
+    assert_eq!(
+        session_plane("node-a").as_ref(),
+        Some(&report),
+        "a heartbeat without a report keeps the last one"
+    );
+
+    let spoiled = open_session(&pki, &other, fleet.addr)
+        .await
+        .expect("active node admitted");
+    eventually("second session to register", || {
+        fleet.sessions.is_connected("node-b")
+    })
+    .await;
+    let mut malformed = report.clone();
+    malformed.bindings[0].port = 70_000;
+    spoiled
+        .request(beat(1, Some(malformed)), Duration::from_secs(2))
+        .await
+        .expect("a malformed report is no protocol violation");
+    assert!(fleet.sessions.is_connected("node-b"));
+    assert_eq!(
+        session_plane("node-b"),
         None,
         "a dropped report leaves the node not reported"
     );
