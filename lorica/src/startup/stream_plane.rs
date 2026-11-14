@@ -345,11 +345,14 @@ pub(crate) enum PlaneEvent {
         /// Why.
         cause: ReleaseCause,
     },
-    /// A binding entered the failed state (`stream.bind_failed`), once
-    /// per entry, never per retry.
+    /// A binding entered the failed state (`stream.bind_failed` and the
+    /// `stream_bind_failed` alert), once per entry, never per retry.
     BindFailed {
         /// The binding.
         key: BindKey,
+        /// The stream's name, which the alert carries and the key does
+        /// not.
+        name: String,
         /// The classification.
         kind: BindFailureKind,
         /// The OS error, or the node-side check's own sentence.
@@ -666,9 +669,18 @@ impl<L: WorkerLink> StreamPlane<L> {
             }
         }
 
+        let names: BTreeMap<&str, &str> = streams
+            .iter()
+            .map(|s| (s.id.as_str(), s.name.as_str()))
+            .collect();
         for refused in actions.refused {
+            let name = names
+                .get(refused.key.stream_id.as_str())
+                .copied()
+                .unwrap_or("");
             self.fail(
                 &refused.key,
+                name,
                 refused.kind(),
                 refused.to_string(),
                 refused.port,
@@ -676,10 +688,6 @@ impl<L: WorkerLink> StreamPlane<L> {
             );
         }
 
-        let names: BTreeMap<&str, &str> = streams
-            .iter()
-            .map(|s| (s.id.as_str(), s.name.as_str()))
-            .collect();
         for key in actions.bind {
             let skip = trigger == Trigger::RetryTick
                 && self
@@ -824,6 +832,7 @@ impl<L: WorkerLink> StreamPlane<L> {
     fn fail(
         &mut self,
         key: &BindKey,
+        name: &str,
         kind: BindFailureKind,
         os_error: String,
         port: u16,
@@ -840,6 +849,7 @@ impl<L: WorkerLink> StreamPlane<L> {
         if entered {
             events.push(PlaneEvent::BindFailed {
                 key: key.clone(),
+                name: name.to_string(),
                 kind,
                 os_error,
                 port,
@@ -900,6 +910,7 @@ impl<L: WorkerLink> StreamPlane<L> {
         if let Err(reason) = check_stream_id(&id) {
             self.fail(
                 &key,
+                name,
                 BindFailureKind::Other,
                 format!("the stream id cannot be sent to the workers: {reason}"),
                 key.port_first,
@@ -910,6 +921,7 @@ impl<L: WorkerLink> StreamPlane<L> {
         if let Some((port, listener)) = self.reserved.clash_in(key.port_first, key.port_last) {
             self.fail(
                 &key,
+                name,
                 BindFailureKind::ReservedPort,
                 format!("port {port} is {}", listener.phrase()),
                 port,
@@ -926,6 +938,7 @@ impl<L: WorkerLink> StreamPlane<L> {
         {
             self.fail(
                 &key,
+                name,
                 BindFailureKind::FdBudget,
                 violation.to_string(),
                 key.port_first,
@@ -943,7 +956,14 @@ impl<L: WorkerLink> StreamPlane<L> {
             ) {
                 Ok(ports) => ports,
                 Err(e) => {
-                    self.fail(&key, e.kind, e.source.to_string(), e.addr.port(), events);
+                    self.fail(
+                        &key,
+                        name,
+                        e.kind,
+                        e.source.to_string(),
+                        e.addr.port(),
+                        events,
+                    );
                     return;
                 }
             },
@@ -1132,12 +1152,14 @@ impl<L: WorkerLink> StreamPlane<L> {
 
 /// A [`StreamPlane`] shared by the reload path, the retry tick, the
 /// worker monitor and the stop path, with what each pass reads (the
-/// store, the node's role) and where its events go (the audit chain).
+/// store, the node's role) and where its events go (the audit chain and
+/// the alert channel).
 pub(crate) struct StreamPlaneHandle<L> {
     plane: Arc<Mutex<StreamPlane<L>>>,
     store: Arc<Mutex<ConfigStore>>,
     role: Arc<PlaneRole>,
     audit: Option<lorica_api::server::LogStoreSlot>,
+    alerts: lorica_notify::AlertSender,
 }
 
 impl<L> Clone for StreamPlaneHandle<L> {
@@ -1147,6 +1169,7 @@ impl<L> Clone for StreamPlaneHandle<L> {
             store: Arc::clone(&self.store),
             role: Arc::clone(&self.role),
             audit: self.audit.clone(),
+            alerts: self.alerts.clone(),
         }
     }
 }
@@ -1154,18 +1177,20 @@ impl<L> Clone for StreamPlaneHandle<L> {
 impl<L: WorkerLink + 'static> StreamPlaneHandle<L> {
     /// Share `plane`, reading `store` and binding for `role`; `audit` is
     /// where `stream.bind`, `stream.release` and `stream.bind_failed`
-    /// rows go.
+    /// rows go, `alerts` where the `stream_bind_failed` alert goes.
     pub(crate) fn new(
         plane: StreamPlane<L>,
         store: Arc<Mutex<ConfigStore>>,
         role: PlaneRole,
         audit: Option<lorica_api::server::LogStoreSlot>,
+        alerts: lorica_notify::AlertSender,
     ) -> Self {
         StreamPlaneHandle {
             plane: Arc::new(Mutex::new(plane)),
             store,
             role: Arc::new(role),
             audit,
+            alerts,
         }
     }
 
@@ -1260,9 +1285,23 @@ impl<L: WorkerLink + 'static> StreamPlaneHandle<L> {
         for event in events {
             let (action, key, payload) = audit_row(node, &event);
             match &event {
-                PlaneEvent::BindFailed { kind, os_error, .. } => {
+                PlaneEvent::BindFailed {
+                    name,
+                    kind,
+                    os_error,
+                    port,
+                    ..
+                } => {
                     warn!(stream_id = %key.stream_id, kind = kind.as_str(), %os_error,
                           "stream bind failed");
+                    self.alerts.send(bind_failed_alert(
+                        node,
+                        &key.stream_id,
+                        name,
+                        *kind,
+                        os_error,
+                        *port,
+                    ));
                 }
                 _ => info!(stream_id = %key.stream_id, action, "stream plane"),
             }
@@ -1279,6 +1318,28 @@ impl<L: WorkerLink + 'static> StreamPlaneHandle<L> {
             }
         }
     }
+}
+
+/// The `stream_bind_failed` alert of one entry into the failed state
+/// (D-h), raised where its `stream.bind_failed` audit row is written.
+fn bind_failed_alert(
+    node: &str,
+    stream_id: &str,
+    name: &str,
+    kind: BindFailureKind,
+    os_error: &str,
+    port: u16,
+) -> lorica_notify::AlertEvent {
+    lorica_notify::AlertEvent::new(
+        lorica_notify::events::AlertType::StreamBindFailed,
+        format!("stream `{name}` failed to bind port {port} on {node}: {os_error}"),
+    )
+    .with_detail("stream_id", stream_id)
+    .with_detail("stream_name", name)
+    .with_detail("node", node)
+    .with_detail("kind", kind.as_str())
+    .with_detail("os_error", os_error)
+    .with_detail("port", port.to_string())
 }
 
 /// The audit action, binding and hashed payload of `event` (D-h).
@@ -1318,8 +1379,11 @@ fn audit_row<'a>(
             payload["cause"] = cause.as_str().into();
             ("stream.release", key, payload)
         }
+        // The name is for the alert: the row names the stream by its
+        // target id, like every other `stream.*` row.
         PlaneEvent::BindFailed {
             key,
+            name: _,
             kind,
             os_error,
             port,
@@ -1763,6 +1827,74 @@ mod tests {
             .await;
         assert!(matches!(recovered.as_slice(), [PlaneEvent::Bound { .. }]));
         assert!(!plane.has_retryable_failure());
+    }
+
+    #[tokio::test]
+    async fn a_failed_bind_raises_one_alert_per_entry_never_per_retry() {
+        let first = free_ports(1);
+        let squatter = TcpListener::bind(("127.0.0.1", first)).unwrap();
+        let mut s = tcp("6f1c1a52-5b0e-4f7e-9a51-1a7c5a1b2c3d", first);
+        s.name = "pg".into();
+        let store = ConfigStore::open_in_memory().expect("test setup: store");
+        store.create_stream(&s).expect("test setup: stream");
+        let alerts = lorica_notify::AlertSender::new(16);
+        let mut received = alerts.subscribe();
+        let (w0, _) = FakeLink::new(&[]);
+        let (plane, states) = plane(vec![w0]);
+        // A follower binds a fleet-wide stream, and the alert names the
+        // node by its roster name.
+        let handle = StreamPlaneHandle::new(
+            plane,
+            Arc::new(Mutex::new(store)),
+            PlaneRole::Follower("edge01".into()),
+            None,
+            alerts,
+        );
+
+        handle.after_commit().await;
+        handle.bind_pass(Trigger::RetryTick).await;
+        handle.after_commit().await;
+
+        let alert = received.try_recv().expect("one alert");
+        assert_eq!(
+            alert.alert_type,
+            lorica_notify::events::AlertType::StreamBindFailed
+        );
+        let detail = |key: &str| alert.details.get(key).map(String::as_str);
+        assert_eq!(detail("stream_id"), Some(s.id.as_str()));
+        assert_eq!(detail("stream_name"), Some("pg"));
+        assert_eq!(detail("node"), Some("edge01"));
+        assert_eq!(detail("kind"), Some("address_in_use"));
+        assert_eq!(detail("port"), Some(first.to_string().as_str()));
+        let os_error = detail("os_error").expect("the OS error");
+        assert!(os_error.contains("os error"), "{os_error}");
+        assert!(alert.summary.contains("`pg`"), "{}", alert.summary);
+        assert!(
+            received.try_recv().is_err(),
+            "a retry or a change that fails again raises nothing"
+        );
+
+        // A recovery then a new failure is a new entry.
+        drop(squatter);
+        handle.bind_pass(Trigger::RetryTick).await;
+        assert!(matches!(states.get(&s.id), Some(BindState::Bound { .. })));
+        handle
+            .store
+            .lock()
+            .await
+            .update_stream(&Stream {
+                port_first: reserved().http,
+                port_last: reserved().http,
+                ..s.clone()
+            })
+            .expect("test setup: move onto a reserved port");
+        handle.before_commit().await;
+        handle.after_commit().await;
+        let again = received.try_recv().expect("a second entry alerts again");
+        assert_eq!(
+            again.details.get("kind").map(String::as_str),
+            Some("reserved_port")
+        );
     }
 
     #[tokio::test]

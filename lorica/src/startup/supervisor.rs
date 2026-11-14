@@ -1020,6 +1020,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 Arc::clone(&store),
                 stream_plane::PlaneRole::of(&cluster_runtime),
                 Some(log_store.clone()),
+                alert_sender.clone(),
             )
         };
 

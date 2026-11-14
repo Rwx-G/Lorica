@@ -549,6 +549,7 @@ pub(crate) fn run_single_process(cli: Cli) {
             Arc::clone(&store),
             PlaneRole::of(&cluster_runtime),
             Some(log_store.clone()),
+            alert_sender.clone(),
         );
 
         let api_handle = tokio::spawn(async move {
