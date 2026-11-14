@@ -280,19 +280,15 @@ mod tests {
         let at: DateTime<Utc> = DateTime::parse_from_rfc3339("2026-11-14T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        Stream {
-            id: id.into(),
-            name: id.into(),
-            group_name: String::new(),
+        Stream::new(
+            id.into(),
+            id.into(),
             protocol,
-            enabled: true,
-            listen_address: addr.parse().unwrap(),
-            port_first: first,
-            port_last: last,
-            node_selector: Vec::new(),
-            created_at: at,
-            updated_at: at,
-        }
+            addr.parse().unwrap(),
+            first,
+            last,
+            at,
+        )
     }
 
     fn tcp(id: &str, port: u16) -> Stream {

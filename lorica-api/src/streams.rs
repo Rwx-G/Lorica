@@ -477,23 +477,24 @@ pub(crate) async fn create_stream_as(
     };
     let now = Utc::now();
     let stream = Stream {
-        id: uuid::Uuid::new_v4().to_string(),
-        name: body.name,
         group_name: match body.group_name.as_deref() {
             Some(raw) => validate_group_name(raw)?,
             None => String::new(),
         },
-        protocol: body.protocol,
         enabled: body.enabled.unwrap_or(true),
-        listen_address: body.listen_address,
-        port_first: body.port_first,
-        port_last: body.port_last.unwrap_or(body.port_first),
         node_selector: match body.node_selector.as_deref() {
             Some(names) => validate_node_selector(names, roster.as_deref())?,
             None => Vec::new(),
         },
-        created_at: now,
-        updated_at: now,
+        ..Stream::new(
+            uuid::Uuid::new_v4().to_string(),
+            body.name,
+            body.protocol,
+            body.listen_address,
+            body.port_first,
+            body.port_last.unwrap_or(body.port_first),
+            now,
+        )
     };
     validated(&stream)?;
     let backend_ids = body.backend_ids.unwrap_or_default();

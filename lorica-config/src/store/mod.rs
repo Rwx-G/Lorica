@@ -202,6 +202,7 @@ const MIGRATIONS: &[Migration] = &[
     (72, migrate_backend_health_check),
     (73, migrate_cluster_node_reserved_ports),
     (74, migrate_subscribe_stream_alerts),
+    (75, migrate_stream_engine_settings),
 ];
 
 /// The newest schema version, the last entry of [`MIGRATIONS`].
@@ -1686,6 +1687,54 @@ fn migrate_cluster_node_reserved_ports(conn: &Connection) -> rusqlite::Result<()
     add_column_if_absent(conn, "cluster_nodes", "reserved_ports_json", "TEXT")
 }
 
+/// The `streams` columns migration 75 adds, with their DDL. Frozen here
+/// on purpose: the migration records the defaults this release shipped,
+/// and `a_stream_stored_before_migration_75_reads_with_the_model_defaults`
+/// holds them equal to `Stream::new`.
+const STREAM_ENGINE_COLUMNS: [(&str, &str); 16] = [
+    ("load_balancing", "TEXT NOT NULL DEFAULT 'round_robin'"),
+    ("connect_timeout_ms", "INTEGER NOT NULL DEFAULT 5000"),
+    ("idle_timeout_s", "INTEGER NOT NULL DEFAULT 600"),
+    ("total_timeout_s", "INTEGER"),
+    ("max_connect_attempts", "INTEGER NOT NULL DEFAULT 3"),
+    ("backend_keepalive", "INTEGER NOT NULL DEFAULT 1"),
+    ("backend_keepalive_idle_s", "INTEGER NOT NULL DEFAULT 60"),
+    ("close_on_backend_down", "INTEGER NOT NULL DEFAULT 0"),
+    ("proxy_protocol_send", "TEXT NOT NULL DEFAULT 'off'"),
+    ("proxy_protocol_accept", "INTEGER NOT NULL DEFAULT 0"),
+    ("proxy_protocol_trusted_cidrs", "TEXT NOT NULL DEFAULT '[]'"),
+    ("source_addresses", "TEXT NOT NULL DEFAULT '[]'"),
+    ("allow_local_backend", "INTEGER NOT NULL DEFAULT 0"),
+    ("upload_rate_bps", "INTEGER"),
+    ("download_rate_bps", "INTEGER"),
+    ("max_connections", "INTEGER NOT NULL DEFAULT 1024"),
+];
+
+/// The TCP engine settings of a stream (Story 12.3, D-q) as columns of
+/// `streams`, and `stream_backends.backup` (D-f).
+///
+/// Each column carries the model's default, or is nullable where the
+/// model's `None` means "no limit", so a row written before this
+/// migration reads as the stream it was. No `CHECK` on the enumerated
+/// text: `load_balancing` grows in Story 12.13 and validation lives in
+/// `Stream::validate` (12.1 D-1). Idempotent through
+/// `add_column_if_absent`.
+///
+/// 1.10.6 opening this database after a rollback never names `streams`
+/// or `stream_backends` (12.1 D-2), so the new columns are invisible to
+/// it.
+fn migrate_stream_engine_settings(conn: &Connection) -> rusqlite::Result<()> {
+    for (column, ddl) in STREAM_ENGINE_COLUMNS {
+        add_column_if_absent(conn, "streams", column, ddl)?;
+    }
+    add_column_if_absent(
+        conn,
+        "stream_backends",
+        "backup",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+}
+
 /// A stored wildcard pattern whose body names an address (`*.0.2.10`),
 /// which the matchers no longer let cover one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2813,6 +2862,48 @@ mod migration_tests {
             assert_eq!(stored("everything"), "[]");
             assert_eq!(stored("wildcard"), r#"["*"]"#);
         }
+    }
+
+    /// A stream and a link written with the 12.1 columns only read back,
+    /// once migration 75 has run (twice), as `Stream::new` builds them:
+    /// the column defaults are the model's.
+    #[test]
+    fn a_stream_stored_before_migration_75_reads_with_the_model_defaults() {
+        let store = ConfigStore::open_in_memory().expect("fresh store at head");
+        for (column, _) in STREAM_ENGINE_COLUMNS {
+            store
+                .conn
+                .execute(&format!("ALTER TABLE streams DROP COLUMN {column}"), [])
+                .expect("test setup: back to the 12.1 shape");
+        }
+        store
+            .conn
+            .execute("ALTER TABLE stream_backends DROP COLUMN backup", [])
+            .expect("test setup: back to the 12.1 shape");
+        let id = crate::models::sample_stream_id("s-1");
+        store
+            .conn
+            .execute_batch(&format!(
+                "INSERT INTO backends (id, address, created_at, updated_at)
+                 VALUES ('b-1', '192.0.2.10:25', '2026-11-14T00:00:00Z', '2026-11-14T00:00:00Z');
+                 INSERT INTO streams (id, name, group_name, protocol, enabled, listen_address,
+                     port_first, port_last, node_selector, created_at, updated_at)
+                 VALUES ('{id}', 'smtp', '', 'tcp', 1, '0.0.0.0', 25, 25, '[]',
+                     '2026-11-14T00:00:00+00:00', '2026-11-14T00:00:00+00:00');
+                 INSERT INTO stream_backends (stream_id, backend_id) VALUES ('{id}', 'b-1');"
+            ))
+            .expect("test setup: a 12.1 row");
+        for _ in 0..2 {
+            migrate_stream_engine_settings(&store.conn).expect("migration 75 runs");
+        }
+        let read = store.get_stream(&id).expect("reads").expect("kept");
+        assert_eq!(
+            read,
+            crate::models::sample_stream("s-1", "smtp", crate::models::StreamProtocol::Tcp, 25)
+        );
+        let links = store.list_stream_backends().expect("links read");
+        assert_eq!(links.len(), 1);
+        assert!(!links[0].backup);
     }
 
     /// One column as `pragma_table_info` reports it: (type, notnull,

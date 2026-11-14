@@ -998,19 +998,15 @@ mod tests {
         {
             let store = node.state.store.lock().await;
             let now = chrono::Utc::now();
-            let stream = lorica_config::models::Stream {
-                id: uuid::Uuid::new_v4().to_string(),
-                name: "dns-udp".to_string(),
-                group_name: String::new(),
-                protocol: lorica_config::models::StreamProtocol::Udp,
-                enabled: true,
-                listen_address: "0.0.0.0".parse().expect("an address"),
-                port_first: 5353,
-                port_last: 5353,
-                node_selector: Vec::new(),
-                created_at: now,
-                updated_at: now,
-            };
+            let stream = lorica_config::models::Stream::new(
+                uuid::Uuid::new_v4().to_string(),
+                "dns-udp".to_string(),
+                lorica_config::models::StreamProtocol::Udp,
+                "0.0.0.0".parse().expect("an address"),
+                5353,
+                5353,
+                now,
+            );
             store.create_stream(&stream).expect("the stream is stored");
             store
                 .set_stream_backends(&stream.id, std::slice::from_ref(&id))

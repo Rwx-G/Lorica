@@ -287,19 +287,15 @@ mod tests {
 
     fn stream() -> Arc<Stream> {
         let now = chrono::Utc::now();
-        Arc::new(Stream {
-            id: "s1".into(),
-            name: "s1".into(),
-            group_name: String::new(),
-            protocol: StreamProtocol::Tcp,
-            enabled: true,
-            listen_address: "127.0.0.1".parse().unwrap(),
-            port_first: 5432,
-            port_last: 5432,
-            node_selector: Vec::new(),
-            created_at: now,
-            updated_at: now,
-        })
+        Arc::new(Stream::new(
+            "s1".into(),
+            "s1".into(),
+            StreamProtocol::Tcp,
+            "127.0.0.1".parse().unwrap(),
+            5432,
+            5432,
+            now,
+        ))
     }
 
     #[test]

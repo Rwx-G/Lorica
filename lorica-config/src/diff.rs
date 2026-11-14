@@ -124,11 +124,8 @@ pub fn compute_diff(store: &ConfigStore, incoming: &ImportData) -> Result<Config
         |s| format!("{} ({})", s.name, s.id),
     );
 
-    let stream_backends = diff_links(
-        &store.list_stream_backends()?,
-        &incoming.stream_backends,
-        |sb| (sb.stream_id.clone(), sb.backend_id.clone()),
-    );
+    let stream_backends =
+        diff_stream_links(&store.list_stream_backends()?, &incoming.stream_backends);
 
     let notification_configs = diff_by_id(
         &store.list_notification_configs()?,
@@ -235,6 +232,26 @@ fn diff_links<T>(
         modified: Vec::new(),
         removed,
     }
+}
+
+/// [`diff_links`] for stream links, which also carry the backup flag
+/// (Story 12.3, D-f): a pair present on both sides whose flag differs is
+/// modified.
+fn diff_stream_links(current: &[StreamBackend], incoming: &[StreamBackend]) -> EntityDiff {
+    let pair = |sb: &StreamBackend| (sb.stream_id.clone(), sb.backend_id.clone());
+    let mut diff = diff_links(current, incoming, pair);
+    let current_flags: std::collections::HashMap<(String, String), bool> =
+        current.iter().map(|sb| (pair(sb), sb.backup)).collect();
+    diff.modified = incoming
+        .iter()
+        .filter(|sb| {
+            current_flags
+                .get(&pair(sb))
+                .is_some_and(|&backup| backup != sb.backup)
+        })
+        .map(|sb| format!("{} -> {}", sb.stream_id, sb.backend_id))
+        .collect();
+    diff
 }
 
 fn diff_settings(current: &GlobalSettings, incoming: &GlobalSettings) -> SettingsDiff {
@@ -494,6 +511,44 @@ mod tests {
                 ("stream_listen_socket_cap", cap_default.as_str(), "64"),
             ]
         );
+    }
+
+    #[test]
+    fn compute_diff_reports_an_engine_setting_and_a_backup_flag() {
+        let store = ConfigStore::open_in_memory().expect("test setup: store");
+        for (id, address) in [("b-1", "192.0.2.10:25"), ("b-2", "192.0.2.20:25")] {
+            store
+                .create_backend(&sample_stream_backend(id, address))
+                .expect("test setup: backend");
+        }
+        store
+            .create_stream(&sample_stream("s-1", "smtp", StreamProtocol::Tcp, 25))
+            .expect("test setup: stream");
+        store
+            .set_stream_backends(&sid("s-1"), &["b-1".to_string(), "b-2".to_string()])
+            .expect("test setup: links");
+        let mut incoming = parse_toml_for_preview(&export_to_toml(&store).expect("export"))
+            .expect("the export parses");
+        assert!(compute_diff(&store, &incoming).expect("diff").is_empty());
+
+        incoming.streams[0].max_connections = 64;
+        let b2 = incoming
+            .stream_backends
+            .iter_mut()
+            .find(|sb| sb.backend_id == "b-2")
+            .expect("test setup: the b-2 link");
+        b2.backup = true;
+        let diff = compute_diff(&store, &incoming).expect("diff");
+        assert_eq!(
+            diff.streams.modified,
+            vec![format!("smtp ({})", sid("s-1"))]
+        );
+        assert_eq!(
+            diff.stream_backends.modified,
+            vec![format!("{} -> b-2", sid("s-1"))]
+        );
+        assert!(diff.stream_backends.added.is_empty());
+        assert!(diff.stream_backends.removed.is_empty());
     }
 
     #[test]

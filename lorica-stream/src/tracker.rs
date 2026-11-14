@@ -318,19 +318,15 @@ mod tests {
     use std::time::Duration;
 
     fn stream(id: &str) -> Arc<Stream> {
-        Arc::new(Stream {
-            id: id.into(),
-            name: id.into(),
-            group_name: String::new(),
-            protocol: StreamProtocol::Tcp,
-            enabled: true,
-            listen_address: "127.0.0.1".parse().unwrap(),
-            port_first: 5432,
-            port_last: 5432,
-            node_selector: Vec::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        })
+        Arc::new(Stream::new(
+            id.into(),
+            id.into(),
+            StreamProtocol::Tcp,
+            "127.0.0.1".parse().unwrap(),
+            5432,
+            5432,
+            Utc::now(),
+        ))
     }
 
     #[test]

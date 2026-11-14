@@ -1,7 +1,7 @@
 # Story 12.3: The TCP Stream Engine
 
 **Epic:** [Epic 12 - TCP and UDP Stream Proxying (v1.11.0 and v1.12.0)](../prd/epic-12-v1.11.0.md)
-**Status:** Draft
+**Status:** InProgress
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:**
@@ -918,8 +918,10 @@ writes logs.
 ### D-s. What later stories rely on, stated so they need not reopen this one
 
 - **12.4:** a TLS read is a phase-2 reader with its own ceiling into
-  the same preamble; upstream TLS wraps the backend socket after
-  connect and before the PROXY header and preamble; TLS-terminated
+  the same preamble; the PROXY header (D-j) is written in plaintext on
+  the backend socket right after connect, before any TLS handshake (as
+  HAProxy and nginx do), and upstream TLS then wraps the socket, so the
+  preamble and every forwarded byte travel inside TLS; TLS-terminated
   forwarding reuses D-c over the TLS stream (and so loses the plain
   socket quiesce point, which D8 accepts).
 - **12.6:** filters and caps run at D-b step 1; refusals use
@@ -999,21 +1001,21 @@ Depends on: 12.1 (landed). Preferably after 12.8 Lot C1 (shared rule in
 12.8 C1 reuses it. Runs alone: it is the shape change every later Lot
 compiles against.
 
-- [ ] The fields and defaults of D-q, `StreamProxyProtocol`,
+- [x] The fields and defaults of D-q, `StreamProxyProtocol`,
       `StreamBackend::backup`, the range constants,
       `StreamRefusal::ConnectionCap`.
-- [ ] `Stream::validate`: ranges, the trust-list rules (D-k), the
+- [x] `Stream::validate`: ranges, the trust-list rules (D-k), the
       source-address rules (D-l), the UDP rule (D-q).
-- [ ] `local_address.rs`: `is_local_ip`, `is_local_host_name` (D-m).
-- [ ] `check_backend_attachments`: `AttachmentRule::LocalBackend`
+- [x] `local_address.rs`: `is_local_ip`, `is_local_host_name` (D-m).
+- [x] `check_backend_attachments`: `AttachmentRule::LocalBackend`
       (rule A), the all-backups rule (D-f), the source-family rule for
       IP-literal backends (D-l).
-- [ ] `listen_ports.rs`: `local_backend_conflicts` (rule B, D-m) over
+- [x] `listen_ports.rs`: `local_backend_conflicts` (rule B, D-m) over
       `&[NodePorts]`.
-- [ ] Migration, store columns, `STREAM_COLUMNS`, the backup column in
+- [x] Migration, store columns, `STREAM_COLUMNS`, the backup column in
       `set_stream_backends` and its readers; canonical digest; diff;
       export and import.
-- [ ] Tests: each default; each range at both bounds and one past;
+- [x] Tests: each default; each range at both bounds and one past;
       every validation refusal named by its rule; rule A with
       `127.0.0.1`, `::1`, `::ffff:127.0.0.1`, `169.254.1.1`, `fe80::1`,
       `0.0.0.0`, `localhost`, `db.localhost`, and acceptance of the same
@@ -1350,7 +1352,100 @@ performance phase.
 
 ### Completion Notes
 
+**Lot B (model, schema, validation).**
+
+- Migration **75** (`migrate_stream_engine_settings`): 74 was taken by
+  12.2 Lot E1's alert subscription. Sixteen `streams` columns
+  (`STREAM_ENGINE_COLUMNS`, the D-q fields, each `NOT NULL DEFAULT` the
+  model's default or nullable where `None` means no limit) and
+  `stream_backends.backup INTEGER NOT NULL DEFAULT 0`. A test drops the
+  columns back to the 12.1 shape, runs 75 twice and reads the row back
+  as `Stream::new` builds it; the existing additive and second-run
+  guards cover it too.
+- `Stream::new(id, name, protocol, listen_address, port_first,
+  port_last, at)` is the one place a writer takes defaults from. The
+  literal sites of `lorica-stream`, `lorica` and `lorica-api` (including
+  the API's create handler, edited at the literal only) now build
+  through it, so a later field touches no site.
+- Ranges and defaults are associated constants on `Stream`
+  (`CONNECT_TIMEOUT_MS_RANGE`, `DEFAULT_MAX_CONNECTIONS`, ...).
+- The UDP rule is a table, `TCP_ENGINE_FIELDS`: each entry names its
+  field, says how its default is judged and carries an `OnUdp`
+  (`UntilStory12_5`, or `Refused(reason)` for `proxy_protocol_accept`).
+  It runs first in `validate` so a UDP stream is told the setting does
+  not apply. A test moves each entry alone on a default UDP stream by
+  its serde name.
+- Interface with 12.5, honoured now: E1, `idle_timeout_s`'s default and
+  range are functions of the protocol (`Stream::default_idle_timeout_s`,
+  `Stream::idle_timeout_s_range`), returning the TCP values for UDP
+  until 12.5 changes their UDP arm; the UDP rule compares against the
+  function, and `Stream::new` fills it by protocol. The serde default
+  has no protocol context and takes the TCP value; 12.5 owns the UDP
+  import and migration fill. E8, every field states the protocols it
+  applies to in its doc comment and its `OnUdp` in the table, so 12.5
+  lifts an entry where it is declared. E4 (`encode_v2_dgram`) is done
+  in Lot A.
+- Trust list: `validate_proxy_protocol(Off, Off, list)` of 12.8 C1
+  (already landed, `connection_filter.rs` read only) gives the parse
+  and `/0` rules with the same messages; the stream adds the 256 cap
+  and "accept on with no non-blank entry". A list with accept off is
+  accepted, as on the HTTP listeners.
+- Source addresses also refuse multicast, broadcast and duplicates.
+- `check_backend_attachments` gains `LocalBackend` (rule A over
+  `backend_address_host`, the new host-part reader, and
+  `local_address::is_local_host`), `NoPrimaryBackend`,
+  `BackupOnUdpStream` and `SourceFamilyMismatch`.
+- `local_backend_conflicts(candidate, backends, nodes, others)` in
+  `listen_ports.rs` returns every rule-B conflict (reserved listener or
+  bound stream port, any protocol, the candidate's own ports included);
+  a node that never reported its reserved ports is checked against its
+  streams only, since `stream_port_conflicts` already refuses it there.
+  Lot E wires it to the API and decides how many conflicts a 409 names.
+- Store: `set_stream_backends` keeps its signature (primaries only) and
+  delegates to the new `set_stream_backend_links(stream, primaries,
+  backups)`; `link_stream_backend_unchecked` takes the whole
+  `StreamBackend`, so the replica apply (`store/replica.rs`, one line,
+  outside the Lot's allowlist) carries the flag. The import refuses a
+  pair listed twice: the store keeps the first row, so a duplicate
+  primary/backup pair would be checked as one thing and stored as the
+  other.
+- `compute_diff` reports a link whose backup flag changed as modified;
+  stream fields were already compared whole by `stream_eq`.
+- Canonical: format stays 3, digest updated, the reason written beside
+  it; `a_blob_without_the_stream_engine_settings_decodes_to_their_defaults`
+  pins the serde defaults.
+- `StreamRefusal::ConnectionCap` (`connection_cap`).
+- `the_view_publishes_every_model_field_but_the_withheld_ones`
+  (`lorica-api/src/streams/tests.rs`) fails by design on a model field
+  the view lacks. Until Lot E publishes the engine settings it filters
+  out the names of `TCP_ENGINE_FIELDS` (derived, not listed), with a
+  comment saying Lot E drops the filter. Lot E must remove it.
+
 ## File List
+
+Lot B:
+
+- `lorica-config/src/local_address.rs` (new)
+- `lorica-config/src/lib.rs`
+- `lorica-config/src/models/stream.rs`
+- `lorica-config/src/models/backend.rs`
+- `lorica-config/src/models/mod.rs`
+- `lorica-config/src/listen_ports.rs`
+- `lorica-config/src/store/mod.rs`
+- `lorica-config/src/store/streams.rs`
+- `lorica-config/src/store/replica.rs` (the link write only)
+- `lorica-config/src/canonical.rs`
+- `lorica-config/src/diff.rs`
+- `lorica-config/src/import.rs`
+- `lorica-stream/src/reconcile.rs`, `lorica-stream/src/table.rs`,
+  `lorica-stream/src/tracker.rs`, `lorica-stream/tests/runtime.rs`
+  (literal sites)
+- `lorica/src/startup/drain.rs`, `lorica/src/startup/stream_plane.rs`
+  (literal sites)
+- `lorica-api/src/backends.rs`, `lorica-api/src/stream_budget.rs`,
+  `lorica-api/src/streams.rs`, `lorica-api/src/streams/tests.rs`
+  (literal sites)
+- `docs/stories/story-12.3-tcp-engine.md`
 
 ## Change Log
 
@@ -1358,3 +1453,4 @@ performance phase.
 |------|---------|-------------|--------|
 | 2026-11-14 | 0.1 | Story drafted from the Epic 12 PRD. Status Draft. | Romain G. |
 | 2026-11-14 | 0.2 | Maintainer answers folded in as Resolved 1 to 9: `max_connections` per worker now and per node from Story 12.6 with one field, stream-scoped local exclusion, no DNS alert (input to 12.9 AC #5), no `optional` PROXY accept, selection through a trait, Python backends for IV1, keepalive on by default, `source_addresses` as a list, survey values verified with URLs in Lot F. Status Draft. | Romain G. |
+| 2026-11-14 | 0.3 | Lot B landed: the D-q fields, migration 75, validation, rule A and the backup and source-family rules, `local_backend_conflicts`, store, canonical digest, diff, export and import. D-s corrected: the PROXY header is written in plaintext right after connect and before any upstream TLS handshake. Status InProgress. | Romain G. |

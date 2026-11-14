@@ -9,14 +9,20 @@
 //! bound.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Display;
 use std::net::IpAddr;
+use std::ops::RangeInclusive;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use strum::{EnumString, IntoStaticStr, VariantArray};
 
-use super::backend::{backend_address_port, Backend, RouteBackend};
+use super::backend::{backend_address_host, backend_address_port, Backend, RouteBackend};
+use super::enums::LoadBalancing;
 use super::route::validate_node_selector_names;
+use super::ProxyProtocolMode;
+use crate::connection_filter::validate_proxy_protocol;
+use crate::local_address::is_local_host;
 
 /// The most ports one stream's range may span, both ends included.
 ///
@@ -117,6 +123,92 @@ pub struct Stream {
     /// as `Route::node_selector`.
     #[serde(default)]
     pub node_selector: Vec<String>,
+
+    // The engine settings of Story 12.3 (D-q). Each carries a serde
+    // default so a document written before they existed still reads,
+    // and each states in its doc comment which protocols it applies to;
+    // [`TCP_ENGINE_FIELDS`] is where a UDP stream's refusal of them is
+    // decided.
+    /// How a backend is chosen for a connection. TCP; on UDP it must
+    /// stay `round_robin` until Story 12.5.
+    #[serde(default = "default_load_balancing")]
+    pub load_balancing: LoadBalancing,
+    /// Per connect attempt, in milliseconds,
+    /// [`Stream::CONNECT_TIMEOUT_MS_RANGE`]. TCP only.
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u32,
+    /// A connection with no forwarded byte either way for this long is
+    /// closed, in seconds. Its default and range depend on the protocol:
+    /// [`Stream::default_idle_timeout_s`] and
+    /// [`Stream::idle_timeout_s_range`]. TCP; on UDP it must hold the
+    /// UDP default until Story 12.5.
+    #[serde(default = "default_tcp_idle_timeout_s")]
+    pub idle_timeout_s: u32,
+    /// The longest a connection may last from accept, in seconds,
+    /// [`Stream::TOTAL_TIMEOUT_S_RANGE`]; `None` for no limit. TCP; on
+    /// UDP it must stay `None` until Story 12.5.
+    #[serde(default)]
+    pub total_timeout_s: Option<u32>,
+    /// Connect attempts per connection, the first one included,
+    /// [`Stream::MAX_CONNECT_ATTEMPTS_RANGE`]. TCP only.
+    #[serde(default = "default_max_connect_attempts")]
+    pub max_connect_attempts: u8,
+    /// Whether TCP keepalive is set on the backend socket. TCP only.
+    #[serde(default = "default_backend_keepalive")]
+    pub backend_keepalive: bool,
+    /// Idle time before the first keepalive probe, in seconds,
+    /// [`Stream::BACKEND_KEEPALIVE_IDLE_S_RANGE`]. TCP only.
+    #[serde(default = "default_backend_keepalive_idle_s")]
+    pub backend_keepalive_idle_s: u32,
+    /// Whether established connections to a backend that goes down are
+    /// closed with `backend_down` (HAProxy's `on-marked-down
+    /// shutdown-sessions`). TCP; on UDP it must stay off until Story
+    /// 12.5.
+    #[serde(default)]
+    pub close_on_backend_down: bool,
+    /// The PROXY protocol header sent to the backend after connect. TCP;
+    /// on UDP it must stay off until Story 12.5.
+    #[serde(default)]
+    pub proxy_protocol_send: StreamProxyProtocol,
+    /// Whether a PROXY header is required from a peer of
+    /// `proxy_protocol_trusted_cidrs`. TCP only, for good: a UDP source
+    /// address is spoofable, so "trusted source" means nothing there.
+    #[serde(default)]
+    pub proxy_protocol_accept: bool,
+    /// The peers allowed to send a PROXY header, at most
+    /// [`Stream::PROXY_PROTOCOL_TRUSTED_CIDRS_MAX`] entries, by the rule
+    /// of the HTTP listeners' list
+    /// (`crate::connection_filter::validate_proxy_protocol`). TCP only.
+    #[serde(default)]
+    pub proxy_protocol_trusted_cidrs: Vec<String>,
+    /// Local addresses backend connections leave from, used in turn per
+    /// attempt among those of the destination's family (nginx's
+    /// `proxy_bind`, as a list); empty lets the kernel choose. At most
+    /// [`Stream::SOURCE_ADDRESSES_MAX`] unicast literals. TCP; on UDP it
+    /// must stay empty until Story 12.5.
+    #[serde(default)]
+    pub source_addresses: Vec<IpAddr>,
+    /// Whether a backend on a local address (loopback, link-local,
+    /// unspecified, `localhost`, or an address of the node) may be
+    /// reached. Never settable from the automation or MCP surfaces. TCP;
+    /// on UDP it must stay off until Story 12.5.
+    #[serde(default)]
+    pub allow_local_backend: bool,
+    /// Client-to-backend bytes per second per connection,
+    /// [`Stream::RATE_BPS_RANGE`]; `None` for no limit. TCP only.
+    #[serde(default)]
+    pub upload_rate_bps: Option<u64>,
+    /// Backend-to-client bytes per second per connection,
+    /// [`Stream::RATE_BPS_RANGE`]; `None` for no limit. TCP only.
+    #[serde(default)]
+    pub download_rate_bps: Option<u64>,
+    /// The most concurrent connections of this stream, per worker
+    /// process until Story 12.6, per node from then on (the same field,
+    /// moved onto shared counters), [`Stream::MAX_CONNECTIONS_RANGE`].
+    /// TCP only: a UDP stream's session cap is its own setting.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
+
     /// First-insert timestamp.
     pub created_at: DateTime<Utc>,
     /// Last-write timestamp.
@@ -125,6 +217,199 @@ pub struct Stream {
 
 fn enabled_by_default() -> bool {
     true
+}
+
+fn default_load_balancing() -> LoadBalancing {
+    LoadBalancing::RoundRobin
+}
+
+fn default_connect_timeout_ms() -> u32 {
+    Stream::DEFAULT_CONNECT_TIMEOUT_MS
+}
+
+/// A document carries no protocol context for a serde default, so the
+/// field defaults to the TCP value; [`Stream::default_idle_timeout_s`]
+/// is what a protocol-aware writer reads.
+fn default_tcp_idle_timeout_s() -> u32 {
+    Stream::default_idle_timeout_s(StreamProtocol::Tcp)
+}
+
+fn default_max_connect_attempts() -> u8 {
+    Stream::DEFAULT_MAX_CONNECT_ATTEMPTS
+}
+
+fn default_backend_keepalive() -> bool {
+    Stream::DEFAULT_BACKEND_KEEPALIVE
+}
+
+fn default_backend_keepalive_idle_s() -> u32 {
+    Stream::DEFAULT_BACKEND_KEEPALIVE_IDLE_S
+}
+
+fn default_max_connections() -> u32 {
+    Stream::DEFAULT_MAX_CONNECTIONS
+}
+
+/// Which PROXY protocol header a stream sends its backends (Story 12.3,
+/// D-j).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    EnumString,
+    IntoStaticStr,
+    VariantArray,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum StreamProxyProtocol {
+    /// No header.
+    #[default]
+    Off,
+    /// The text header of version 1.
+    V1,
+    /// The binary header of version 2.
+    V2,
+}
+
+impl StreamProxyProtocol {
+    /// Snake_case wire and database representation (`off`, `v1`, `v2`).
+    pub fn as_str(&self) -> &'static str {
+        self.into()
+    }
+}
+
+/// What a UDP stream may do with one Story 12.3 setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnUdp {
+    /// It must hold its default until Story 12.5 gives it a UDP meaning
+    /// or decides it has none.
+    UntilStory12_5,
+    /// It is refused for good, for the reason given.
+    Refused(&'static str),
+}
+
+/// One Story 12.3 setting as the UDP rule sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct TcpEngineField {
+    /// The field name, as every surface spells it.
+    pub name: &'static str,
+    /// Whether the stream leaves it at its default for its protocol.
+    pub at_default: fn(&Stream) -> bool,
+    /// What a UDP stream may do with it.
+    pub on_udp: OnUdp,
+}
+
+/// Every Story 12.3 setting, in declaration order, with what a UDP
+/// stream may do with it (D-q). Story 12.5 lifts an entry by changing
+/// its [`OnUdp`], not by adding a second rule somewhere else.
+pub const TCP_ENGINE_FIELDS: &[TcpEngineField] = &[
+    TcpEngineField {
+        name: "load_balancing",
+        at_default: |s| s.load_balancing == LoadBalancing::RoundRobin,
+        on_udp: OnUdp::UntilStory12_5,
+    },
+    TcpEngineField {
+        name: "connect_timeout_ms",
+        at_default: |s| s.connect_timeout_ms == Stream::DEFAULT_CONNECT_TIMEOUT_MS,
+        on_udp: OnUdp::UntilStory12_5,
+    },
+    TcpEngineField {
+        name: "idle_timeout_s",
+        at_default: |s| s.idle_timeout_s == Stream::default_idle_timeout_s(s.protocol),
+        on_udp: OnUdp::UntilStory12_5,
+    },
+    TcpEngineField {
+        name: "total_timeout_s",
+        at_default: |s| s.total_timeout_s.is_none(),
+        on_udp: OnUdp::UntilStory12_5,
+    },
+    TcpEngineField {
+        name: "max_connect_attempts",
+        at_default: |s| s.max_connect_attempts == Stream::DEFAULT_MAX_CONNECT_ATTEMPTS,
+        on_udp: OnUdp::UntilStory12_5,
+    },
+    TcpEngineField {
+        name: "backend_keepalive",
+        at_default: |s| s.backend_keepalive == Stream::DEFAULT_BACKEND_KEEPALIVE,
+        on_udp: OnUdp::UntilStory12_5,
+    },
+    TcpEngineField {
+        name: "backend_keepalive_idle_s",
+        at_default: |s| s.backend_keepalive_idle_s == Stream::DEFAULT_BACKEND_KEEPALIVE_IDLE_S,
+        on_udp: OnUdp::UntilStory12_5,
+    },
+    TcpEngineField {
+        name: "close_on_backend_down",
+        at_default: |s| !s.close_on_backend_down,
+        on_udp: OnUdp::UntilStory12_5,
+    },
+    TcpEngineField {
+        name: "proxy_protocol_send",
+        at_default: |s| s.proxy_protocol_send == StreamProxyProtocol::Off,
+        on_udp: OnUdp::UntilStory12_5,
+    },
+    TcpEngineField {
+        name: "proxy_protocol_accept",
+        at_default: |s| !s.proxy_protocol_accept,
+        on_udp: OnUdp::Refused(
+            "a UDP source address is spoofable, so a trusted PROXY source means nothing on UDP",
+        ),
+    },
+    TcpEngineField {
+        name: "proxy_protocol_trusted_cidrs",
+        at_default: |s| s.proxy_protocol_trusted_cidrs.is_empty(),
+        on_udp: OnUdp::UntilStory12_5,
+    },
+    TcpEngineField {
+        name: "source_addresses",
+        at_default: |s| s.source_addresses.is_empty(),
+        on_udp: OnUdp::UntilStory12_5,
+    },
+    TcpEngineField {
+        name: "allow_local_backend",
+        at_default: |s| !s.allow_local_backend,
+        on_udp: OnUdp::UntilStory12_5,
+    },
+    TcpEngineField {
+        name: "upload_rate_bps",
+        at_default: |s| s.upload_rate_bps.is_none(),
+        on_udp: OnUdp::UntilStory12_5,
+    },
+    TcpEngineField {
+        name: "download_rate_bps",
+        at_default: |s| s.download_rate_bps.is_none(),
+        on_udp: OnUdp::UntilStory12_5,
+    },
+    TcpEngineField {
+        name: "max_connections",
+        at_default: |s| s.max_connections == Stream::DEFAULT_MAX_CONNECTIONS,
+        on_udp: OnUdp::UntilStory12_5,
+    },
+];
+
+/// Refuse `value` outside `range`, naming the stream and the field.
+fn within<T: PartialOrd + Display>(
+    stream: &str,
+    field: &str,
+    value: T,
+    range: &RangeInclusive<T>,
+) -> Result<(), String> {
+    if range.contains(&value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "stream `{stream}`: {field} must be {}..={} (got {value})",
+            range.start(),
+            range.end()
+        ))
+    }
 }
 
 /// Whether `value` is over the `node_selector` alphabet: ASCII lowercase
@@ -138,6 +423,101 @@ fn is_identifier_alphabet(value: &str) -> bool {
 }
 
 impl Stream {
+    /// Default of `connect_timeout_ms`.
+    pub const DEFAULT_CONNECT_TIMEOUT_MS: u32 = 5_000;
+    /// Accepted `connect_timeout_ms`.
+    pub const CONNECT_TIMEOUT_MS_RANGE: RangeInclusive<u32> = 100..=60_000;
+    /// Default of `idle_timeout_s` on a TCP stream (nginx's
+    /// `proxy_timeout`).
+    pub const DEFAULT_TCP_IDLE_TIMEOUT_S: u32 = 600;
+    /// Accepted `idle_timeout_s` on a TCP stream.
+    pub const TCP_IDLE_TIMEOUT_S_RANGE: RangeInclusive<u32> = 1..=86_400;
+    /// Accepted `total_timeout_s` when set.
+    pub const TOTAL_TIMEOUT_S_RANGE: RangeInclusive<u32> = 1..=604_800;
+    /// Default of `max_connect_attempts`.
+    pub const DEFAULT_MAX_CONNECT_ATTEMPTS: u8 = 3;
+    /// Accepted `max_connect_attempts`.
+    pub const MAX_CONNECT_ATTEMPTS_RANGE: RangeInclusive<u8> = 1..=10;
+    /// Default of `backend_keepalive`.
+    pub const DEFAULT_BACKEND_KEEPALIVE: bool = true;
+    /// Default of `backend_keepalive_idle_s`.
+    pub const DEFAULT_BACKEND_KEEPALIVE_IDLE_S: u32 = 60;
+    /// Accepted `backend_keepalive_idle_s`.
+    pub const BACKEND_KEEPALIVE_IDLE_S_RANGE: RangeInclusive<u32> = 1..=7_200;
+    /// The most entries `proxy_protocol_trusted_cidrs` holds.
+    pub const PROXY_PROTOCOL_TRUSTED_CIDRS_MAX: usize = 256;
+    /// The most entries `source_addresses` holds.
+    pub const SOURCE_ADDRESSES_MAX: usize = 16;
+    /// Accepted `upload_rate_bps` and `download_rate_bps` when set.
+    pub const RATE_BPS_RANGE: RangeInclusive<u64> = 1_024..=10_000_000_000;
+    /// Default of `max_connections`.
+    pub const DEFAULT_MAX_CONNECTIONS: u32 = 1_024;
+    /// Accepted `max_connections`.
+    pub const MAX_CONNECTIONS_RANGE: RangeInclusive<u32> = 1..=65_535;
+
+    /// A stream with every setting at its default for `protocol`:
+    /// enabled, fleet-wide, no group, and the Story 12.3 defaults. The
+    /// one place a writer that builds a new stream takes its defaults
+    /// from, so a protocol-dependent default cannot be missed.
+    pub fn new(
+        id: String,
+        name: String,
+        protocol: StreamProtocol,
+        listen_address: IpAddr,
+        port_first: u16,
+        port_last: u16,
+        at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            group_name: String::new(),
+            protocol,
+            enabled: true,
+            listen_address,
+            port_first,
+            port_last,
+            node_selector: Vec::new(),
+            load_balancing: default_load_balancing(),
+            connect_timeout_ms: Self::DEFAULT_CONNECT_TIMEOUT_MS,
+            idle_timeout_s: Self::default_idle_timeout_s(protocol),
+            total_timeout_s: None,
+            max_connect_attempts: Self::DEFAULT_MAX_CONNECT_ATTEMPTS,
+            backend_keepalive: Self::DEFAULT_BACKEND_KEEPALIVE,
+            backend_keepalive_idle_s: Self::DEFAULT_BACKEND_KEEPALIVE_IDLE_S,
+            close_on_backend_down: false,
+            proxy_protocol_send: StreamProxyProtocol::Off,
+            proxy_protocol_accept: false,
+            proxy_protocol_trusted_cidrs: Vec::new(),
+            source_addresses: Vec::new(),
+            allow_local_backend: false,
+            upload_rate_bps: None,
+            download_rate_bps: None,
+            max_connections: Self::DEFAULT_MAX_CONNECTIONS,
+            created_at: at,
+            updated_at: at,
+        }
+    }
+
+    /// The default `idle_timeout_s` of a stream of `protocol`.
+    ///
+    /// A function of the protocol rather than one constant because
+    /// Story 12.5 gives UDP its own default (Interface edit E1); until
+    /// then UDP holds the TCP value, which the UDP rule requires.
+    pub fn default_idle_timeout_s(protocol: StreamProtocol) -> u32 {
+        match protocol {
+            StreamProtocol::Tcp | StreamProtocol::Udp => Self::DEFAULT_TCP_IDLE_TIMEOUT_S,
+        }
+    }
+
+    /// The accepted `idle_timeout_s` of a stream of `protocol`, for the
+    /// reason given on [`Stream::default_idle_timeout_s`].
+    pub fn idle_timeout_s_range(protocol: StreamProtocol) -> RangeInclusive<u32> {
+        match protocol {
+            StreamProtocol::Tcp | StreamProtocol::Udp => Self::TCP_IDLE_TIMEOUT_S_RANGE,
+        }
+    }
+
     /// Whether the stream spans more than one port, which decides the
     /// port shape of its backends (D-6).
     pub fn is_range(&self) -> bool {
@@ -222,7 +602,149 @@ impl Stream {
             ));
         }
         validate_node_selector_names(&self.node_selector)
-            .map_err(|e| format!("stream `{}`: {e}", self.name))
+            .map_err(|e| format!("stream `{}`: {e}", self.name))?;
+        self.validate_engine_settings()
+    }
+
+    /// The Story 12.3 settings (D-q): ranges, the PROXY trust list
+    /// (D-k), the source addresses (D-l), and the UDP rule over
+    /// [`TCP_ENGINE_FIELDS`].
+    fn validate_engine_settings(&self) -> Result<(), String> {
+        let name = self.name.as_str();
+        // First, so a UDP stream is told a setting does not apply rather
+        // than how to make it valid.
+        if self.protocol == StreamProtocol::Udp {
+            if let Some(field) = TCP_ENGINE_FIELDS.iter().find(|f| !(f.at_default)(self)) {
+                return Err(match field.on_udp {
+                    OnUdp::Refused(reason) => format!(
+                        "stream `{name}`: {} is refused on a UDP stream: {reason}",
+                        field.name
+                    ),
+                    OnUdp::UntilStory12_5 => format!(
+                        "stream `{name}`: {} must keep its default on a UDP stream; UDP \
+                         settings arrive with Story 12.5",
+                        field.name
+                    ),
+                });
+            }
+        }
+        within(
+            name,
+            "connect_timeout_ms",
+            self.connect_timeout_ms,
+            &Self::CONNECT_TIMEOUT_MS_RANGE,
+        )?;
+        within(
+            name,
+            "idle_timeout_s",
+            self.idle_timeout_s,
+            &Self::idle_timeout_s_range(self.protocol),
+        )?;
+        if let Some(total) = self.total_timeout_s {
+            within(name, "total_timeout_s", total, &Self::TOTAL_TIMEOUT_S_RANGE)?;
+        }
+        within(
+            name,
+            "max_connect_attempts",
+            self.max_connect_attempts,
+            &Self::MAX_CONNECT_ATTEMPTS_RANGE,
+        )?;
+        within(
+            name,
+            "backend_keepalive_idle_s",
+            self.backend_keepalive_idle_s,
+            &Self::BACKEND_KEEPALIVE_IDLE_S_RANGE,
+        )?;
+        for (field, rate) in [
+            ("upload_rate_bps", self.upload_rate_bps),
+            ("download_rate_bps", self.download_rate_bps),
+        ] {
+            if let Some(rate) = rate {
+                within(name, field, rate, &Self::RATE_BPS_RANGE)?;
+            }
+        }
+        within(
+            name,
+            "max_connections",
+            self.max_connections,
+            &Self::MAX_CONNECTIONS_RANGE,
+        )?;
+        self.validate_proxy_protocol_trust()?;
+        self.validate_source_addresses()
+    }
+
+    /// The trust list by the rule of the HTTP listeners' list (Story
+    /// 12.8 D-d, the same function), its size cap, and accept on with no
+    /// trusted entry refused: no peer could ever send the header.
+    fn validate_proxy_protocol_trust(&self) -> Result<(), String> {
+        let name = self.name.as_str();
+        let list = &self.proxy_protocol_trusted_cidrs;
+        if list.len() > Self::PROXY_PROTOCOL_TRUSTED_CIDRS_MAX {
+            return Err(format!(
+                "stream `{name}`: proxy_protocol_trusted_cidrs holds at most {} entries (got {})",
+                Self::PROXY_PROTOCOL_TRUSTED_CIDRS_MAX,
+                list.len()
+            ));
+        }
+        // Both listener modes off: the shared function then checks the
+        // list's entries alone; the stream's own accept rule follows.
+        validate_proxy_protocol(ProxyProtocolMode::Off, ProxyProtocolMode::Off, list)
+            .map_err(|e| format!("stream `{name}`: {e}"))?;
+        if self.proxy_protocol_accept && list.iter().all(|entry| entry.trim().is_empty()) {
+            return Err(format!(
+                "stream `{name}`: proxy_protocol_accept is on but proxy_protocol_trusted_cidrs \
+                 is empty: no peer could send a PROXY header; list the load balancers first"
+            ));
+        }
+        Ok(())
+    }
+
+    /// At most [`Stream::SOURCE_ADDRESSES_MAX`] distinct unicast
+    /// literals, none unspecified (the kernel's choice is the empty
+    /// list) and none IPv4-mapped (give the IPv4 address itself).
+    fn validate_source_addresses(&self) -> Result<(), String> {
+        let name = self.name.as_str();
+        if self.source_addresses.len() > Self::SOURCE_ADDRESSES_MAX {
+            return Err(format!(
+                "stream `{name}`: source_addresses holds at most {} addresses (got {})",
+                Self::SOURCE_ADDRESSES_MAX,
+                self.source_addresses.len()
+            ));
+        }
+        let mut seen: BTreeSet<IpAddr> = BTreeSet::new();
+        for &address in &self.source_addresses {
+            let refusal = match address {
+                IpAddr::V4(v4) if v4.is_unspecified() => Some("is unspecified"),
+                IpAddr::V6(v6) if v6.is_unspecified() => Some("is unspecified"),
+                IpAddr::V4(v4) if v4.is_multicast() || v4.is_broadcast() => {
+                    Some("is not a unicast address")
+                }
+                IpAddr::V6(v6) if v6.is_multicast() => Some("is not a unicast address"),
+                IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => {
+                    Some("is an IPv4-mapped IPv6 address; give the IPv4 address itself")
+                }
+                _ if !seen.insert(address) => Some("is listed twice"),
+                _ => None,
+            };
+            if let Some(refusal) = refusal {
+                return Err(format!(
+                    "stream `{name}`: source address {address} {refusal}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The families `source_addresses` covers, `None` when the list is
+    /// empty (the kernel chooses, so every family is reachable).
+    fn source_families(&self) -> Option<(bool, bool)> {
+        if self.source_addresses.is_empty() {
+            return None;
+        }
+        Some((
+            self.source_addresses.iter().any(IpAddr::is_ipv4),
+            self.source_addresses.iter().any(IpAddr::is_ipv6),
+        ))
     }
 }
 
@@ -236,6 +758,12 @@ pub struct StreamBackend {
     pub stream_id: String,
     /// ID of the associated `Backend`.
     pub backend_id: String,
+    /// Whether the backend is a backup of the stream (Story 12.3, D-f):
+    /// a candidate only when no primary is. A stream with links has at
+    /// least one primary, and a UDP stream has no backup until Story
+    /// 12.5 ([`check_backend_attachments`]).
+    #[serde(default)]
+    pub backup: bool,
 }
 
 /// The fleet role of the node deciding whether it binds a stream.
@@ -330,6 +858,20 @@ pub enum AttachmentRule {
     /// A portless backend has active checks on: there is no port to
     /// probe.
     PortlessWithActiveChecks,
+    /// A backend whose address is local
+    /// (`crate::local_address::is_local_host`) is linked to a stream
+    /// that does not set `allow_local_backend` (Story 12.3, D-m rule A).
+    LocalBackend,
+    /// Every backend linked to the stream is a backup, so none would
+    /// ever be selected first (Story 12.3, D-f).
+    NoPrimaryBackend,
+    /// A backend is a backup of a UDP stream, which has no backups
+    /// until Story 12.5.
+    BackupOnUdpStream,
+    /// An IP-literal backend's family is none of the stream's
+    /// `source_addresses` (Story 12.3, D-l): no attempt could leave for
+    /// it.
+    SourceFamilyMismatch,
 }
 
 /// A refused attachment, naming the backend and, where one is involved,
@@ -393,6 +935,26 @@ impl std::fmt::Display for AttachmentConflict {
                 "backend {backend} has no port to probe and must have its health check \
                  disabled ({on_stream} involved)"
             ),
+            AttachmentRule::LocalBackend => write!(
+                f,
+                "backend {backend} is a local address and cannot serve {on_stream} unless the \
+                 stream sets allow_local_backend"
+            ),
+            AttachmentRule::NoPrimaryBackend => write!(
+                f,
+                "every backend of {on_stream} is a backup ({backend} included); make at least \
+                 one a primary"
+            ),
+            AttachmentRule::BackupOnUdpStream => write!(
+                f,
+                "backend {backend} cannot be a backup of UDP {on_stream}; UDP backups arrive \
+                 with Story 12.5"
+            ),
+            AttachmentRule::SourceFamilyMismatch => write!(
+                f,
+                "backend {backend} is of an address family none of the source_addresses of \
+                 {on_stream} has, so no connection could leave for it"
+            ),
         }
     }
 }
@@ -411,7 +973,12 @@ impl std::error::Error for AttachmentConflict {}
 ///    write to a stream must not change a backend another surface may
 ///    share);
 /// 3. a backend with a port on a port-range stream, a portless one on a
-///    single-port stream or a route, or portless with active checks on.
+///    single-port stream or a route, or portless with active checks on;
+/// 4. (Story 12.3) a local backend on a stream without
+///    `allow_local_backend` (D-m rule A, IP literals and `localhost`
+///    names: a name is not resolved here), a backup link on a UDP stream
+///    or on a stream with no primary (D-f), and an IP-literal backend of
+///    a family none of the stream's `source_addresses` has (D-l).
 ///
 /// Backends are checked in snapshot order and their streams by name, so
 /// the first conflict reported is deterministic.
@@ -428,12 +995,19 @@ pub fn check_backend_attachments(
         .map(|s| (s.id.as_str(), s))
         .collect();
     let mut streams_of: BTreeMap<&str, Vec<&Stream>> = BTreeMap::new();
+    let mut backup_links: BTreeSet<(&str, &str)> = BTreeSet::new();
+    let mut streams_with_a_primary: BTreeSet<&str> = BTreeSet::new();
     for link in snapshot.stream_backends {
         if let Some(stream) = streams_by_id.get(link.stream_id.as_str()) {
             streams_of
                 .entry(link.backend_id.as_str())
                 .or_default()
                 .push(stream);
+            if link.backup {
+                backup_links.insert((link.stream_id.as_str(), link.backend_id.as_str()));
+            } else {
+                streams_with_a_primary.insert(link.stream_id.as_str());
+            }
         }
     }
     let mut routes_of: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
@@ -518,6 +1092,32 @@ pub fn check_backend_attachments(
                 ));
             }
         }
+
+        let host = backend_address_host(&backend.address);
+        let local = is_local_host(host);
+        let literal_family = host
+            .parse::<IpAddr>()
+            .ok()
+            .map(|ip| ip.to_canonical().is_ipv4());
+        for stream in &streams {
+            let backup = backup_links.contains(&(stream.id.as_str(), backend.id.as_str()));
+            if backup && stream.protocol == StreamProtocol::Udp {
+                return Err(conflict(Some(stream), AttachmentRule::BackupOnUdpStream));
+            }
+            if backup && !streams_with_a_primary.contains(stream.id.as_str()) {
+                return Err(conflict(Some(stream), AttachmentRule::NoPrimaryBackend));
+            }
+            if local && !stream.allow_local_backend {
+                return Err(conflict(Some(stream), AttachmentRule::LocalBackend));
+            }
+            if let (Some(is_v4), Some((has_v4, has_v6))) =
+                (literal_family, stream.source_families())
+            {
+                if (is_v4 && !has_v4) || (!is_v4 && !has_v6) {
+                    return Err(conflict(Some(stream), AttachmentRule::SourceFamilyMismatch));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -533,6 +1133,9 @@ pub fn check_backend_attachments(
 pub enum StreamRefusal {
     /// No rule of the stream matched the connection.
     NoMatch,
+    /// The stream's `max_connections` was reached (Story 12.3, D-p):
+    /// per worker process until Story 12.6, per node from then on.
+    ConnectionCap,
 }
 
 /// How a stream connection or session ended (Story 12.1 AC #8): the one
@@ -689,19 +1292,15 @@ pub(crate) mod tests {
     /// A valid enabled fleet-wide stream on `0.0.0.0:port`, whose id is
     /// [`stream_id`] of `label`.
     pub(crate) fn stream(label: &str, name: &str, protocol: StreamProtocol, port: u16) -> Stream {
-        Stream {
-            id: stream_id(label),
-            name: name.to_string(),
-            group_name: String::new(),
+        Stream::new(
+            stream_id(label),
+            name.to_string(),
             protocol,
-            enabled: true,
-            listen_address: "0.0.0.0".parse().expect("test setup: address"),
-            port_first: port,
-            port_last: port,
-            node_selector: Vec::new(),
-            created_at: at(),
-            updated_at: at(),
-        }
+            "0.0.0.0".parse().expect("test setup: address"),
+            port,
+            port,
+            at(),
+        )
     }
 
     /// A backend at `address` with active checks off.
@@ -733,6 +1332,7 @@ pub(crate) mod tests {
         StreamBackend {
             stream_id: stream_id.to_string(),
             backend_id: backend_id.to_string(),
+            backup: false,
         }
     }
 
@@ -861,7 +1461,7 @@ pub(crate) mod tests {
         with_unknown["managed_by"] = serde_json::json!(null);
         assert!(serde_json::from_value::<Stream>(with_unknown).is_err());
         assert!(serde_json::from_value::<StreamBackend>(
-            serde_json::json!({"stream_id": "s", "backend_id": "b", "backup": true})
+            serde_json::json!({"stream_id": "s", "backend_id": "b", "weight": 1})
         )
         .is_err());
     }
@@ -1193,6 +1793,398 @@ pub(crate) mod tests {
         assert!(f.check().is_err());
         f.backends.clear();
         assert!(f.check().is_ok());
+    }
+
+    // ---- Story 12.3: engine settings ----
+
+    /// A valid TCP stream with every Story 12.3 setting away from its
+    /// default.
+    pub(crate) fn every_engine_setting_off_default(mut s: Stream) -> Stream {
+        s.load_balancing = LoadBalancing::LeastConn;
+        s.connect_timeout_ms = 1_000;
+        s.idle_timeout_s = 30;
+        s.total_timeout_s = Some(3_600);
+        s.max_connect_attempts = 1;
+        s.backend_keepalive = false;
+        s.backend_keepalive_idle_s = 30;
+        s.close_on_backend_down = true;
+        s.proxy_protocol_send = StreamProxyProtocol::V2;
+        s.proxy_protocol_accept = true;
+        s.proxy_protocol_trusted_cidrs = vec!["192.0.2.0/24".to_string()];
+        s.source_addresses = vec!["192.0.2.50".parse().expect("test setup: address")];
+        s.allow_local_backend = true;
+        s.upload_rate_bps = Some(1_048_576);
+        s.download_rate_bps = Some(2_097_152);
+        s.max_connections = 64;
+        s
+    }
+
+    #[test]
+    fn a_stream_written_before_the_engine_settings_reads_as_a_new_stream() {
+        // A 12.1-shaped document: none of the Story 12.3 keys.
+        let json = serde_json::json!({
+            "id": stream_id("s"), "name": "smtp", "protocol": "tcp",
+            "listen_address": "0.0.0.0", "port_first": 25, "port_last": 25,
+            "created_at": "2026-11-14T00:00:00Z", "updated_at": "2026-11-14T00:00:00Z",
+        });
+        let read: Stream = serde_json::from_value(json).expect("a 12.1 stream parses");
+        assert_eq!(read, stream("s", "smtp", StreamProtocol::Tcp, 25));
+        assert!(read.validate().is_ok());
+        let link: StreamBackend =
+            serde_json::from_value(serde_json::json!({"stream_id": "s", "backend_id": "b"}))
+                .expect("a 12.1 link parses");
+        assert!(!link.backup);
+    }
+
+    #[test]
+    fn a_new_stream_holds_the_documented_defaults() {
+        for &protocol in StreamProtocol::VARIANTS {
+            let s = stream("s", "edge", protocol, 5000);
+            assert_eq!(s.load_balancing, LoadBalancing::RoundRobin);
+            assert_eq!(s.connect_timeout_ms, 5_000);
+            assert_eq!(s.idle_timeout_s, 600);
+            assert_eq!(s.idle_timeout_s, Stream::default_idle_timeout_s(protocol));
+            assert_eq!(s.total_timeout_s, None);
+            assert_eq!(s.max_connect_attempts, 3);
+            assert!(s.backend_keepalive);
+            assert_eq!(s.backend_keepalive_idle_s, 60);
+            assert!(!s.close_on_backend_down);
+            assert_eq!(s.proxy_protocol_send, StreamProxyProtocol::Off);
+            assert!(!s.proxy_protocol_accept);
+            assert!(s.proxy_protocol_trusted_cidrs.is_empty());
+            assert!(s.source_addresses.is_empty());
+            assert!(!s.allow_local_backend);
+            assert_eq!(s.upload_rate_bps, None);
+            assert_eq!(s.download_rate_bps, None);
+            assert_eq!(s.max_connections, 1_024);
+            for field in TCP_ENGINE_FIELDS {
+                assert!((field.at_default)(&s), "{protocol:?}: {}", field.name);
+            }
+            assert!(s.validate().is_ok(), "{protocol:?}");
+        }
+    }
+
+    #[test]
+    fn every_range_holds_at_both_bounds_and_refuses_one_past() {
+        type Setter = fn(&mut Stream, u64);
+        let tcp_idle = Stream::idle_timeout_s_range(StreamProtocol::Tcp);
+        let cases: [(&str, Setter, u64, u64); 7] = [
+            (
+                "connect_timeout_ms",
+                |s, v| s.connect_timeout_ms = v as u32,
+                u64::from(*Stream::CONNECT_TIMEOUT_MS_RANGE.start()),
+                u64::from(*Stream::CONNECT_TIMEOUT_MS_RANGE.end()),
+            ),
+            (
+                "idle_timeout_s",
+                |s, v| s.idle_timeout_s = v as u32,
+                u64::from(*tcp_idle.start()),
+                u64::from(*tcp_idle.end()),
+            ),
+            (
+                "total_timeout_s",
+                |s, v| s.total_timeout_s = Some(v as u32),
+                u64::from(*Stream::TOTAL_TIMEOUT_S_RANGE.start()),
+                u64::from(*Stream::TOTAL_TIMEOUT_S_RANGE.end()),
+            ),
+            (
+                "max_connect_attempts",
+                |s, v| s.max_connect_attempts = v as u8,
+                u64::from(*Stream::MAX_CONNECT_ATTEMPTS_RANGE.start()),
+                u64::from(*Stream::MAX_CONNECT_ATTEMPTS_RANGE.end()),
+            ),
+            (
+                "backend_keepalive_idle_s",
+                |s, v| s.backend_keepalive_idle_s = v as u32,
+                u64::from(*Stream::BACKEND_KEEPALIVE_IDLE_S_RANGE.start()),
+                u64::from(*Stream::BACKEND_KEEPALIVE_IDLE_S_RANGE.end()),
+            ),
+            (
+                "upload_rate_bps",
+                |s, v| s.upload_rate_bps = Some(v),
+                *Stream::RATE_BPS_RANGE.start(),
+                *Stream::RATE_BPS_RANGE.end(),
+            ),
+            (
+                "max_connections",
+                |s, v| s.max_connections = v as u32,
+                u64::from(*Stream::MAX_CONNECTIONS_RANGE.start()),
+                u64::from(*Stream::MAX_CONNECTIONS_RANGE.end()),
+            ),
+        ];
+        for (field, set, low, high) in cases {
+            for (value, accepted) in [
+                (low, true),
+                (high, true),
+                (low - 1, false),
+                (high + 1, false),
+            ] {
+                let mut s = stream("s", "edge", StreamProtocol::Tcp, 5000);
+                set(&mut s, value);
+                match s.validate() {
+                    Ok(()) => assert!(accepted, "{field} = {value} was accepted"),
+                    Err(e) => {
+                        assert!(!accepted, "{field} = {value} was refused: {e}");
+                        assert!(e.contains(field), "{e}");
+                    }
+                }
+            }
+        }
+        // The download rate shares the upload rate's range.
+        let mut s = stream("s", "edge", StreamProtocol::Tcp, 5000);
+        s.download_rate_bps = Some(*Stream::RATE_BPS_RANGE.start() - 1);
+        assert!(s
+            .validate()
+            .expect_err("below the range")
+            .contains("download_rate_bps"));
+        s.download_rate_bps = Some(*Stream::RATE_BPS_RANGE.end());
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn the_proxy_protocol_trust_list_follows_the_listener_rule() {
+        let mut s = stream("s", "edge", StreamProtocol::Tcp, 5000);
+        s.proxy_protocol_accept = true;
+        let err = s.validate().expect_err("accept with no trusted peer");
+        assert!(err.contains("proxy_protocol_accept"), "{err}");
+        s.proxy_protocol_trusted_cidrs = vec!["  ".to_string()];
+        assert!(s.validate().is_err(), "a blank entry trusts nobody");
+
+        s.proxy_protocol_trusted_cidrs =
+            vec!["192.0.2.0/24".to_string(), "2001:db8::1".to_string()];
+        assert!(s.validate().is_ok());
+        for refused in ["0.0.0.0/0", "::/0", "192.0.2.0/33", "lb.example.com"] {
+            s.proxy_protocol_trusted_cidrs = vec![refused.to_string()];
+            let err = s.validate().expect_err(refused);
+            assert!(err.contains("proxy_protocol_trusted_cidrs"), "{err}");
+            assert!(err.contains("`edge`"), "{err}");
+        }
+
+        // A list with accept off is kept as written (an operator may
+        // stage it before turning accept on).
+        s.proxy_protocol_accept = false;
+        s.proxy_protocol_trusted_cidrs = vec!["192.0.2.0/24".to_string()];
+        assert!(s.validate().is_ok());
+
+        s.proxy_protocol_trusted_cidrs = (0..Stream::PROXY_PROTOCOL_TRUSTED_CIDRS_MAX)
+            .map(|i| format!("10.{}.{}.0/24", i / 256, i % 256))
+            .collect();
+        assert!(s.validate().is_ok());
+        s.proxy_protocol_trusted_cidrs
+            .push("10.255.0.0/24".to_string());
+        assert!(s.validate().expect_err("one too many").contains("at most"));
+    }
+
+    #[test]
+    fn source_addresses_are_distinct_unicast_literals() {
+        let mut s = stream("s", "edge", StreamProtocol::Tcp, 5000);
+        s.source_addresses = (0..Stream::SOURCE_ADDRESSES_MAX)
+            .map(|i| IpAddr::from([192, 0, 2, u8::try_from(i + 1).expect("test setup: small")]))
+            .collect();
+        assert!(s.validate().is_ok());
+        s.source_addresses
+            .push("2001:db8::1".parse().expect("test setup: address"));
+        assert!(s.validate().expect_err("one too many").contains("at most"));
+
+        for (refused, why) in [
+            ("0.0.0.0", "unspecified"),
+            ("::", "unspecified"),
+            ("::ffff:192.0.2.10", "IPv4-mapped"),
+            ("224.0.0.1", "unicast"),
+            ("255.255.255.255", "unicast"),
+            ("ff02::1", "unicast"),
+        ] {
+            s.source_addresses = vec![refused.parse().expect("test setup: address")];
+            let err = s.validate().expect_err(refused);
+            assert!(err.contains(why), "{refused}: {err}");
+        }
+        s.source_addresses = vec![
+            "192.0.2.10".parse().expect("test setup: address"),
+            "192.0.2.10".parse().expect("test setup: address"),
+        ];
+        assert!(s.validate().expect_err("a duplicate").contains("twice"));
+        s.source_addresses = vec![
+            "192.0.2.10".parse().expect("test setup: address"),
+            "2001:db8::10".parse().expect("test setup: address"),
+        ];
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn a_udp_stream_holds_every_engine_setting_at_its_default() {
+        let tcp = every_engine_setting_off_default(stream("s", "edge", StreamProtocol::Tcp, 5000));
+        assert!(tcp.validate().is_ok(), "{:?}", tcp.validate());
+        // The fixture moves every entry of the table, so the loop below
+        // reaches each one.
+        for field in TCP_ENGINE_FIELDS {
+            assert!(
+                !(field.at_default)(&tcp),
+                "{} is at its default",
+                field.name
+            );
+        }
+
+        let off_default = serde_json::to_value(&tcp).expect("serialize");
+        let udp_default =
+            serde_json::to_value(stream("s", "edge", StreamProtocol::Udp, 5000)).expect("ser");
+        for field in TCP_ENGINE_FIELDS {
+            // A default UDP stream with this one setting moved, by the
+            // name every surface spells it with.
+            let mut value = udp_default.clone();
+            value[field.name] = off_default[field.name].clone();
+            let udp: Stream = serde_json::from_value(value)
+                .unwrap_or_else(|e| panic!("{} is not a field name: {e}", field.name));
+            let moved: Vec<&str> = TCP_ENGINE_FIELDS
+                .iter()
+                .filter(|f| !(f.at_default)(&udp))
+                .map(|f| f.name)
+                .collect();
+            assert_eq!(moved, vec![field.name]);
+            let err = udp.validate().expect_err(field.name);
+            assert!(err.contains(field.name), "{err}");
+            match field.on_udp {
+                OnUdp::UntilStory12_5 => assert!(err.contains("12.5"), "{err}"),
+                OnUdp::Refused(reason) => assert!(err.contains(reason), "{err}"),
+            }
+        }
+        assert!(TCP_ENGINE_FIELDS
+            .iter()
+            .any(|f| f.name == "proxy_protocol_accept" && matches!(f.on_udp, OnUdp::Refused(_))));
+    }
+
+    #[test]
+    fn the_proxy_protocol_send_words() {
+        for &mode in StreamProxyProtocol::VARIANTS {
+            assert_eq!(
+                serde_json::to_value(mode).expect("serialize"),
+                mode.as_str(),
+                "{mode:?}"
+            );
+            assert_eq!(mode.as_str().parse::<StreamProxyProtocol>(), Ok(mode));
+        }
+        assert_eq!(StreamProxyProtocol::default(), StreamProxyProtocol::Off);
+        assert_eq!(StreamProxyProtocol::V2.as_str(), "v2");
+    }
+
+    // ---- Story 12.3: attachment rules ----
+
+    fn backup(stream_id: &str, backend_id: &str) -> StreamBackend {
+        StreamBackend {
+            backup: true,
+            ..link(stream_id, backend_id)
+        }
+    }
+
+    #[test]
+    fn a_local_backend_needs_the_flag() {
+        let local = [
+            "127.0.0.1:5432",
+            "[::1]:5432",
+            "[::ffff:127.0.0.1]:5432",
+            "169.254.1.1:5432",
+            "[fe80::1]:5432",
+            "0.0.0.0:5432",
+            "localhost:5432",
+            "db.localhost:5432",
+        ];
+        for address in local {
+            let tcp = stream("t", "pg", StreamProtocol::Tcp, 5432);
+            let conflict = refused(&fixture(backend("b", address), vec![tcp.clone()], &[]));
+            assert_eq!(conflict.rule, AttachmentRule::LocalBackend, "{address}");
+            assert!(
+                conflict.to_string().contains("allow_local_backend"),
+                "{conflict}"
+            );
+            let flagged = Stream {
+                allow_local_backend: true,
+                ..tcp
+            };
+            assert!(
+                fixture(backend("b", address), vec![flagged], &[])
+                    .check()
+                    .is_ok(),
+                "{address} with the flag"
+            );
+        }
+        // Remote addresses and names that resolve elsewhere pass.
+        for address in [
+            "192.0.2.10:5432",
+            "pg.example.com:5432",
+            "[2001:db8::1]:5432",
+        ] {
+            let tcp = stream("t", "pg", StreamProtocol::Tcp, 5432);
+            assert!(
+                fixture(backend("b", address), vec![tcp], &[])
+                    .check()
+                    .is_ok(),
+                "{address}"
+            );
+        }
+    }
+
+    #[test]
+    fn backups_need_a_primary_and_a_tcp_stream() {
+        let tcp = stream("t", "pg", StreamProtocol::Tcp, 5432);
+        let mut f = fixture(backend("b-1", "192.0.2.10:5432"), vec![tcp.clone()], &[]);
+        f.stream_backends = vec![backup(&tcp.id, "b-1")];
+        assert_eq!(refused(&f).rule, AttachmentRule::NoPrimaryBackend);
+        assert!(refused(&f).to_string().contains("`pg`"));
+
+        f.backends.push(backend("b-2", "192.0.2.20:5432"));
+        f.stream_backends.push(link(&tcp.id, "b-2"));
+        assert!(f.check().is_ok(), "a primary and a backup");
+
+        let udp = stream("u", "dns", StreamProtocol::Udp, 53);
+        let mut f = fixture(backend("b-1", "192.0.2.10:53"), vec![udp.clone()], &[]);
+        f.backends.push(backend("b-2", "192.0.2.20:53"));
+        f.stream_backends.push(backup(&udp.id, "b-2"));
+        let conflict = refused(&f);
+        assert_eq!(conflict.rule, AttachmentRule::BackupOnUdpStream);
+        assert!(conflict.to_string().contains("12.5"), "{conflict}");
+    }
+
+    #[test]
+    fn source_addresses_must_cover_an_ip_literal_backend_s_family() {
+        let mut tcp = stream("t", "pg", StreamProtocol::Tcp, 5432);
+        tcp.source_addresses = vec!["192.0.2.50".parse().expect("test setup: address")];
+        let v6 = refused(&fixture(
+            backend("b", "[2001:db8::1]:5432"),
+            vec![tcp.clone()],
+            &[],
+        ));
+        assert_eq!(v6.rule, AttachmentRule::SourceFamilyMismatch);
+        for fine in [
+            "192.0.2.10:5432",
+            "[::ffff:192.0.2.10]:5432",
+            "pg.example.com:5432",
+        ] {
+            assert!(
+                fixture(backend("b", fine), vec![tcp.clone()], &[])
+                    .check()
+                    .is_ok(),
+                "{fine}"
+            );
+        }
+        tcp.source_addresses = vec!["2001:db8::50".parse().expect("test setup: address")];
+        assert_eq!(
+            refused(&fixture(
+                backend("b", "192.0.2.10:5432"),
+                vec![tcp.clone()],
+                &[]
+            ))
+            .rule,
+            AttachmentRule::SourceFamilyMismatch
+        );
+        tcp.source_addresses.clear();
+        assert!(fixture(backend("b", "192.0.2.10:5432"), vec![tcp], &[])
+            .check()
+            .is_ok());
+    }
+
+    #[test]
+    fn the_connection_cap_refusal_is_published_as_connection_cap() {
+        let word: &'static str = StreamRefusal::ConnectionCap.into();
+        assert_eq!(word, "connection_cap");
     }
 
     // ---- StreamEndReason ----

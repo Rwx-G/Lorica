@@ -24,12 +24,45 @@ use crate::models::*;
 /// `row_to_stream` expects. A later story appends its column here and
 /// in `row_to_stream`, never `SELECT *`.
 const STREAM_COLUMNS: &str = "id, name, group_name, protocol, enabled, listen_address, \
-     port_first, port_last, node_selector, created_at, updated_at";
+     port_first, port_last, node_selector, created_at, updated_at, \
+     load_balancing, connect_timeout_ms, idle_timeout_s, total_timeout_s, \
+     max_connect_attempts, backend_keepalive, backend_keepalive_idle_s, \
+     close_on_backend_down, proxy_protocol_send, proxy_protocol_accept, \
+     proxy_protocol_trusted_cidrs, source_addresses, allow_local_backend, \
+     upload_rate_bps, download_rate_bps, max_connections";
+
+/// A stored JSON list column, refused as corrupt when it does not
+/// decode.
+fn json_list<T: serde::de::DeserializeOwned>(raw: &str, column: &str) -> Result<Vec<T>> {
+    serde_json::from_str(raw)
+        .map_err(|e| ConfigError::Corrupt(format!("invalid stream {column} JSON: {e}")))
+}
+
+/// A stored rate, which `Stream::validate` bounds well inside `i64`.
+fn rate_from_column(raw: Option<i64>, column: &str) -> Result<Option<u64>> {
+    raw.map(|value| {
+        u64::try_from(value)
+            .map_err(|_| ConfigError::Corrupt(format!("stored stream {column} is negative")))
+    })
+    .transpose()
+}
+
+/// A rate as a column value. The range `Stream::validate` enforces fits
+/// an `i64`, so the conversion only fails on a stream that skipped it.
+fn rate_to_column(rate: Option<u64>, column: &str) -> Result<Option<i64>> {
+    rate.map(|value| {
+        i64::try_from(value)
+            .map_err(|_| ConfigError::Validation(format!("stream {column} is out of range")))
+    })
+    .transpose()
+}
 
 fn row_to_stream(row: &rusqlite::Row<'_>) -> Result<Stream> {
     let protocol: String = row.get(3)?;
     let listen_address: String = row.get(5)?;
     let selector: String = row.get(8)?;
+    let load_balancing: String = row.get(11)?;
+    let proxy_protocol_send: String = row.get(19)?;
     Ok(Stream {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -42,8 +75,30 @@ fn row_to_stream(row: &rusqlite::Row<'_>) -> Result<Stream> {
         })?,
         port_first: row.get(6)?,
         port_last: row.get(7)?,
-        node_selector: serde_json::from_str(&selector)
-            .map_err(|e| ConfigError::Corrupt(format!("invalid stream node_selector JSON: {e}")))?,
+        node_selector: json_list(&selector, "node_selector")?,
+        load_balancing: LoadBalancing::from_str(&load_balancing).map_err(|e| {
+            ConfigError::Corrupt(format!("stored stream load_balancing is invalid: {e}"))
+        })?,
+        connect_timeout_ms: row.get(12)?,
+        idle_timeout_s: row.get(13)?,
+        total_timeout_s: row.get(14)?,
+        max_connect_attempts: row.get(15)?,
+        backend_keepalive: row.get(16)?,
+        backend_keepalive_idle_s: row.get(17)?,
+        close_on_backend_down: row.get(18)?,
+        proxy_protocol_send: StreamProxyProtocol::from_str(&proxy_protocol_send).map_err(|e| {
+            ConfigError::Corrupt(format!("stored stream proxy_protocol_send is invalid: {e}"))
+        })?,
+        proxy_protocol_accept: row.get(20)?,
+        proxy_protocol_trusted_cidrs: json_list(
+            &row.get::<_, String>(21)?,
+            "proxy_protocol_trusted_cidrs",
+        )?,
+        source_addresses: json_list(&row.get::<_, String>(22)?, "source_addresses")?,
+        allow_local_backend: row.get(23)?,
+        upload_rate_bps: rate_from_column(row.get(24)?, "upload_rate_bps")?,
+        download_rate_bps: rate_from_column(row.get(25)?, "download_rate_bps")?,
+        max_connections: row.get(26)?,
         created_at: parse_datetime(&row.get::<_, String>(9)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(10)?)?,
     })
@@ -83,11 +138,17 @@ impl ConfigStore {
     pub(crate) fn create_stream_unchecked(&self, stream: &Stream) -> Result<()> {
         validated(stream)?;
         let selector = serialize_field("node_selector", &stream.node_selector)?;
+        let trusted = serialize_field(
+            "proxy_protocol_trusted_cidrs",
+            &stream.proxy_protocol_trusted_cidrs,
+        )?;
+        let sources = serialize_field("source_addresses", &stream.source_addresses)?;
         self.conn
             .execute(
                 &format!(
                     "INSERT INTO streams ({STREAM_COLUMNS}) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)"
                 ),
                 params![
                     stream.id,
@@ -101,6 +162,22 @@ impl ConfigStore {
                     selector,
                     stream.created_at.to_rfc3339(),
                     stream.updated_at.to_rfc3339(),
+                    stream.load_balancing.as_str(),
+                    stream.connect_timeout_ms,
+                    stream.idle_timeout_s,
+                    stream.total_timeout_s,
+                    stream.max_connect_attempts,
+                    stream.backend_keepalive,
+                    stream.backend_keepalive_idle_s,
+                    stream.close_on_backend_down,
+                    stream.proxy_protocol_send.as_str(),
+                    stream.proxy_protocol_accept,
+                    trusted,
+                    sources,
+                    stream.allow_local_backend,
+                    rate_to_column(stream.upload_rate_bps, "upload_rate_bps")?,
+                    rate_to_column(stream.download_rate_bps, "download_rate_bps")?,
+                    stream.max_connections,
                 ],
             )
             .map_err(|e| name_taken(e, &stream.name))?;
@@ -150,12 +227,23 @@ impl ConfigStore {
     pub(crate) fn update_stream_unchecked(&self, stream: &Stream) -> Result<()> {
         validated(stream)?;
         let selector = serialize_field("node_selector", &stream.node_selector)?;
+        let trusted = serialize_field(
+            "proxy_protocol_trusted_cidrs",
+            &stream.proxy_protocol_trusted_cidrs,
+        )?;
+        let sources = serialize_field("source_addresses", &stream.source_addresses)?;
         let changed = self
             .conn
             .execute(
                 "UPDATE streams SET name = ?2, group_name = ?3, protocol = ?4, enabled = ?5, \
                  listen_address = ?6, port_first = ?7, port_last = ?8, node_selector = ?9, \
-                 updated_at = ?10 WHERE id = ?1",
+                 updated_at = ?10, load_balancing = ?11, connect_timeout_ms = ?12, \
+                 idle_timeout_s = ?13, total_timeout_s = ?14, max_connect_attempts = ?15, \
+                 backend_keepalive = ?16, backend_keepalive_idle_s = ?17, \
+                 close_on_backend_down = ?18, proxy_protocol_send = ?19, \
+                 proxy_protocol_accept = ?20, proxy_protocol_trusted_cidrs = ?21, \
+                 source_addresses = ?22, allow_local_backend = ?23, upload_rate_bps = ?24, \
+                 download_rate_bps = ?25, max_connections = ?26 WHERE id = ?1",
                 params![
                     stream.id,
                     stream.name,
@@ -167,6 +255,22 @@ impl ConfigStore {
                     stream.port_last,
                     selector,
                     stream.updated_at.to_rfc3339(),
+                    stream.load_balancing.as_str(),
+                    stream.connect_timeout_ms,
+                    stream.idle_timeout_s,
+                    stream.total_timeout_s,
+                    stream.max_connect_attempts,
+                    stream.backend_keepalive,
+                    stream.backend_keepalive_idle_s,
+                    stream.close_on_backend_down,
+                    stream.proxy_protocol_send.as_str(),
+                    stream.proxy_protocol_accept,
+                    trusted,
+                    sources,
+                    stream.allow_local_backend,
+                    rate_to_column(stream.upload_rate_bps, "upload_rate_bps")?,
+                    rate_to_column(stream.download_rate_bps, "download_rate_bps")?,
+                    stream.max_connections,
                 ],
             )
             .map_err(|e| name_taken(e, &stream.name))?;
@@ -191,38 +295,61 @@ impl ConfigStore {
     // ---- Stream-Backend associations ----
 
     /// Replace the set of backends `stream_id` forwards to with
-    /// `backend_ids`, in one savepoint: either the whole new set stands,
-    /// or, when one backend breaks the attachment rule
-    /// (`check_backend_attachments`), the old set does and the error
-    /// names the stream. `NotFound` when the stream does not exist; a
-    /// backend id naming no backend is refused by the foreign key.
+    /// `backend_ids`, every one a primary: [`Self::set_stream_backend_links`]
+    /// with no backup.
     pub fn set_stream_backends(&self, stream_id: &str, backend_ids: &[String]) -> Result<()> {
+        self.set_stream_backend_links(stream_id, backend_ids, &[])
+    }
+
+    /// Replace the set of backends `stream_id` forwards to with
+    /// `primary_ids` and `backup_ids` (Story 12.3, D-f), in one
+    /// savepoint: either the whole new set stands, or, when one backend
+    /// breaks the attachment rule (`check_backend_attachments`), the old
+    /// set does and the error names the stream. A backend in both lists
+    /// is refused. `NotFound` when the stream does not exist; a backend
+    /// id naming no backend is refused by the foreign key.
+    pub fn set_stream_backend_links(
+        &self,
+        stream_id: &str,
+        primary_ids: &[String],
+        backup_ids: &[String],
+    ) -> Result<()> {
         if self.get_stream(stream_id)?.is_none() {
             return Err(ConfigError::NotFound(format!("stream {stream_id}")));
+        }
+        if let Some(both) = primary_ids.iter().find(|id| backup_ids.contains(id)) {
+            return Err(ConfigError::Validation(format!(
+                "backend {both} is listed both as a primary and as a backup of stream {stream_id}"
+            )));
         }
         self.within_savepoint(|| {
             self.conn.execute(
                 "DELETE FROM stream_backends WHERE stream_id = ?1",
                 params![stream_id],
             )?;
-            for backend_id in backend_ids {
-                self.link_stream_backend_unchecked(stream_id, backend_id)?;
+            let links = primary_ids
+                .iter()
+                .map(|id| (id, false))
+                .chain(backup_ids.iter().map(|id| (id, true)));
+            for (backend_id, backup) in links {
+                self.link_stream_backend_unchecked(&StreamBackend {
+                    stream_id: stream_id.to_string(),
+                    backend_id: backend_id.clone(),
+                    backup,
+                })?;
             }
             self.check_attachments_of_stream(stream_id)
         })
     }
 
-    /// Link one backend to one stream without the attachment rule, for a
+    /// Write one stream-backend link without the attachment rule, for a
     /// writer that checked a whole consistent snapshot first.
-    /// Idempotent (ignores duplicates).
-    pub(crate) fn link_stream_backend_unchecked(
-        &self,
-        stream_id: &str,
-        backend_id: &str,
-    ) -> Result<()> {
+    /// Idempotent (ignores duplicates: the first write of a pair stands).
+    pub(crate) fn link_stream_backend_unchecked(&self, link: &StreamBackend) -> Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO stream_backends (stream_id, backend_id) VALUES (?1, ?2)",
-            params![stream_id, backend_id],
+            "INSERT OR IGNORE INTO stream_backends (stream_id, backend_id, backup) \
+             VALUES (?1, ?2, ?3)",
+            params![link.stream_id, link.backend_id, link.backup],
         )?;
         Ok(())
     }
@@ -230,12 +357,14 @@ impl ConfigStore {
     /// Every stream-backend link, ordered by stream then backend ID.
     pub fn list_stream_backends(&self) -> Result<Vec<StreamBackend>> {
         let mut stmt = self.conn.prepare(
-            "SELECT stream_id, backend_id FROM stream_backends ORDER BY stream_id, backend_id",
+            "SELECT stream_id, backend_id, backup FROM stream_backends \
+             ORDER BY stream_id, backend_id",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(StreamBackend {
                 stream_id: row.get(0)?,
                 backend_id: row.get(1)?,
+                backup: row.get(2)?,
             })
         })?;
         let mut links = Vec::new();
@@ -282,7 +411,9 @@ impl ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{sample_stream, sample_stream_backend, sample_stream_id as sid};
+    use crate::models::{
+        sample_stream, sample_stream_backend, sample_stream_id as sid, sample_stream_off_default,
+    };
 
     fn store_with_backends(backends: &[(&str, &str)]) -> ConfigStore {
         let store = ConfigStore::open_in_memory().expect("test setup: store");
@@ -522,8 +653,71 @@ mod tests {
             vec![StreamBackend {
                 stream_id: sid("s-2"),
                 backend_id: "b-2".to_string(),
+                backup: false,
             }]
         );
+    }
+
+    #[test]
+    fn every_engine_setting_and_the_backup_flag_round_trip() {
+        let store = store_with_backends(&[("b-1", "192.0.2.10:25"), ("b-2", "192.0.2.20:25")]);
+        let s = sample_stream_off_default(sample_stream("s-1", "smtp", StreamProtocol::Tcp, 25));
+        store.create_stream(&s).expect("create");
+        assert_eq!(store.get_stream(&sid("s-1")).expect("get"), Some(s.clone()));
+        let mut changed = s.clone();
+        changed.load_balancing = LoadBalancing::PeakEwma;
+        changed.total_timeout_s = None;
+        changed.upload_rate_bps = Some(*Stream::RATE_BPS_RANGE.end());
+        changed.source_addresses = vec![
+            "192.0.2.51".parse().expect("test setup: address"),
+            "2001:db8::50".parse().expect("test setup: address"),
+        ];
+        store.update_stream(&changed).expect("update");
+        assert_eq!(store.get_stream(&sid("s-1")).expect("get"), Some(changed));
+
+        store
+            .set_stream_backend_links(&sid("s-1"), &["b-1".to_string()], &["b-2".to_string()])
+            .expect("a primary and a backup");
+        let links = store.list_stream_backends().expect("links");
+        let flags: Vec<(&str, bool)> = links
+            .iter()
+            .map(|l| (l.backend_id.as_str(), l.backup))
+            .collect();
+        assert_eq!(flags, vec![("b-1", false), ("b-2", true)]);
+
+        let err = store
+            .set_stream_backend_links(&sid("s-1"), &[], &["b-2".to_string()])
+            .expect_err("backups alone");
+        assert!(
+            matches!(&err, ConfigError::Validation(m) if m.contains("`smtp`")),
+            "{err}"
+        );
+        assert!(store
+            .set_stream_backend_links(&sid("s-1"), &["b-1".to_string()], &["b-1".to_string()])
+            .is_err());
+        assert_eq!(store.list_stream_backends().expect("links"), links);
+    }
+
+    #[test]
+    fn a_local_backend_is_refused_on_a_stream_without_the_flag() {
+        let store = store_with_backends(&[("b-1", "127.0.0.1:5432")]);
+        let mut s = sample_stream("s-1", "pg", StreamProtocol::Tcp, 5432);
+        store.create_stream(&s).expect("create");
+        let err = store
+            .set_stream_backends(&sid("s-1"), &["b-1".to_string()])
+            .expect_err("local");
+        assert!(
+            matches!(&err, ConfigError::Validation(m) if m.contains("allow_local_backend")),
+            "{err}"
+        );
+        s.allow_local_backend = true;
+        store.update_stream(&s).expect("flag on");
+        store
+            .set_stream_backends(&sid("s-1"), &["b-1".to_string()])
+            .expect("with the flag");
+        // Turning the flag off again under a local backend is refused.
+        s.allow_local_backend = false;
+        assert!(store.update_stream(&s).is_err());
     }
 
     #[test]

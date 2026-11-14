@@ -1275,6 +1275,7 @@ mod tests {
         let link = StreamBackend {
             stream_id: stream.id.clone(),
             backend_id: backend.id.clone(),
+            backup: false,
         };
         (stream, backend, link)
     }
@@ -1601,6 +1602,35 @@ mod tests {
         );
     }
 
+    /// A version-3 blob written before Story 12.3 carries none of the
+    /// stream engine settings nor the backup flag; it decodes to their
+    /// defaults, as a stream built by `Stream::new` holds them.
+    #[test]
+    fn a_blob_without_the_stream_engine_settings_decodes_to_their_defaults() {
+        let cfg = fleet_config();
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
+        let stream = root["streams"][0]
+            .as_object_mut()
+            .expect("test setup: a stream is an object");
+        for field in crate::models::TCP_ENGINE_FIELDS {
+            assert!(
+                stream.remove(field.name).is_some(),
+                "{} on the wire",
+                field.name
+            );
+        }
+        let link = root["stream_backends"][0]
+            .as_object_mut()
+            .expect("test setup: a link is an object");
+        assert!(link.remove("backup").is_some(), "backup on the wire");
+        let older = serde_json::to_vec(&root).expect("test setup: re-encode");
+        let decoded = decode_canonical(&older).expect("a 12.2-shaped blob still decodes");
+        assert_eq!(decoded.streams, cfg.streams);
+        assert_eq!(decoded.stream_backends, cfg.stream_backends);
+    }
+
     #[test]
     fn the_stream_plane_settings_replicate_through_apply_to() {
         let source = GlobalSettings {
@@ -1697,8 +1727,17 @@ mod tests {
     /// before it could meet the new fields. Pinned by
     /// `a_blob_without_the_stream_plane_settings_decodes_to_their_defaults`
     /// and `every_1_11_0_shape_rides_format_version_three`.
+    ///
+    /// Story 12.3 (1.11.0) moved it again inside the same cycle: `Stream`
+    /// gained the TCP engine settings (D-q) and `StreamBackend` the
+    /// `backup` flag (D-f), each with a serde default equal to the
+    /// model's. No version step, for Story 12.2's reasons: no released
+    /// blob is stamped 3, a 1.10.x peer is refused by version and by
+    /// schema before it meets them, and a 1.11.0 build from before them
+    /// is refused by schema (migration 75) at the handshake. Pinned by
+    /// `a_blob_without_the_stream_engine_settings_decodes_to_their_defaults`.
     const CANONICAL_SHAPE_DIGEST: &str =
-        "872748f6bfae8aec4d4e13c79747b66e75ff15d276fb83ed40c354f85a425b0d";
+        "597ffb9a3be69a1cb8902c34fcaac3a670e01e76a6dbc3f431c1b92373e75816";
 
     /// Every field name `T` accepts, read from the type itself rather
     /// than from the JSON of some fixture.

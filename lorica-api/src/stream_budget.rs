@@ -523,19 +523,15 @@ mod tests {
     };
 
     fn stream(id: &str, protocol: StreamProtocol, first: u16, last: u16) -> Stream {
-        Stream {
-            id: id.into(),
-            name: id.into(),
-            group_name: String::new(),
+        Stream::new(
+            id.into(),
+            id.into(),
             protocol,
-            enabled: true,
-            listen_address: "0.0.0.0".parse().expect("an address"),
-            port_first: first,
-            port_last: last,
-            node_selector: Vec::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
+            "0.0.0.0".parse().expect("an address"),
+            first,
+            last,
+            Utc::now(),
+        )
     }
 
     fn this_node(fds: Option<NodeFds>) -> BudgetNode<'static> {

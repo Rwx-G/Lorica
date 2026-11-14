@@ -109,17 +109,16 @@ mod tests {
 
     fn stream(id: &str, enabled: bool) -> Stream {
         Stream {
-            id: id.into(),
-            name: id.into(),
-            group_name: String::new(),
-            protocol: StreamProtocol::Tcp,
             enabled,
-            listen_address: "127.0.0.1".parse().unwrap(),
-            port_first: 5432,
-            port_last: 5432,
-            node_selector: Vec::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            ..Stream::new(
+                id.into(),
+                id.into(),
+                StreamProtocol::Tcp,
+                "127.0.0.1".parse().unwrap(),
+                5432,
+                5432,
+                Utc::now(),
+            )
         }
     }
 
@@ -130,6 +129,7 @@ mod tests {
             &[StreamBackend {
                 stream_id: "on".into(),
                 backend_id: "b1".into(),
+                backup: false,
             }],
         );
         assert!(table.holds("on", None));

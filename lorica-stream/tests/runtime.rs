@@ -45,19 +45,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn stream(id: &str, protocol: StreamProtocol) -> Stream {
-    Stream {
-        id: id.into(),
-        name: id.into(),
-        group_name: String::new(),
+    Stream::new(
+        id.into(),
+        id.into(),
         protocol,
-        enabled: true,
-        listen_address: "127.0.0.1".parse().unwrap(),
-        port_first: 1,
-        port_last: 1,
-        node_selector: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    }
+        "127.0.0.1".parse().unwrap(),
+        1,
+        1,
+        Utc::now(),
+    )
 }
 
 /// A table source the test rewrites between messages.
@@ -304,6 +300,7 @@ async fn refresh_drains_what_the_new_table_no_longer_holds() {
     let link = StreamBackend {
         stream_id: "s1".into(),
         backend_id: "b1".into(),
+        backup: false,
     };
     source.set(
         vec![stream("s1", StreamProtocol::Tcp)],

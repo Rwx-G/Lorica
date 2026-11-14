@@ -137,7 +137,17 @@ fn validate_streams(data: &ImportData) -> Result<()> {
             )));
         }
     }
+    let mut pairs: HashSet<(&str, &str)> = HashSet::new();
     for link in &data.stream_backends {
+        // The store keeps the first row of a pair, so a pair listed
+        // twice, once as a backup, would be checked as one thing and
+        // stored as the other.
+        if !pairs.insert((link.stream_id.as_str(), link.backend_id.as_str())) {
+            return Err(ConfigError::Validation(format!(
+                "stream_backend {} -> {} is listed twice",
+                link.stream_id, link.backend_id
+            )));
+        }
         if !data.streams.iter().any(|s| s.id == link.stream_id) {
             return Err(ConfigError::Validation(format!(
                 "stream_backend references unknown stream_id: {}",
@@ -329,7 +339,7 @@ pub fn import_to_store(store: &ConfigStore, data: &ImportData) -> Result<Vec<Str
         store.create_stream_unchecked(stream)?;
     }
     for link in &data.stream_backends {
-        store.link_stream_backend_unchecked(&link.stream_id, &link.backend_id)?;
+        store.link_stream_backend_unchecked(link)?;
     }
     for nc in &data.notification_configs {
         store.create_notification_config(nc)?;
@@ -426,6 +436,81 @@ mod tests {
         import_to_store(&target, &data).expect("and imports");
         assert!(target.list_streams().expect("streams").is_empty());
         assert_eq!(target.list_backends().expect("backends").len(), 2);
+    }
+
+    #[test]
+    fn a_stream_export_from_before_the_engine_settings_imports_with_defaults() {
+        let source = store_with_streams();
+        let mut value = exported(&source);
+        for stream in value
+            .get_mut("streams")
+            .and_then(toml::Value::as_array_mut)
+            .expect("test setup: streams")
+        {
+            let table = stream.as_table_mut().expect("test setup: a stream table");
+            for field in crate::models::TCP_ENGINE_FIELDS {
+                // `None` settings are absent from TOML already.
+                table.remove(field.name);
+            }
+        }
+        for link in value
+            .get_mut("stream_backends")
+            .and_then(toml::Value::as_array_mut)
+            .expect("test setup: links")
+        {
+            let table = link.as_table_mut().expect("test setup: a link table");
+            assert!(table.remove("backup").is_some(), "backup in the export");
+        }
+        let older = toml::to_string(&value).expect("re-encode");
+
+        let target = ConfigStore::open_in_memory().expect("target");
+        let data = parse_toml(&older).expect("a 12.1-shaped export parses");
+        import_to_store(&target, &data).expect("and imports");
+        assert_eq!(
+            target.list_streams().expect("streams"),
+            source.list_streams().expect("streams")
+        );
+        assert_eq!(
+            target.list_stream_backends().expect("links"),
+            source.list_stream_backends().expect("links")
+        );
+    }
+
+    #[test]
+    fn engine_settings_and_backups_round_trip_through_export_and_import() {
+        let source = store_with_streams();
+        source
+            .create_backend(&sample_stream_backend("b-smtp-2", "192.0.2.11:25"))
+            .expect("test setup: backend");
+        let mut smtp = source
+            .get_stream(&sid("s-smtp"))
+            .expect("test setup: read")
+            .expect("test setup: stream");
+        smtp = crate::models::sample_stream_off_default(smtp);
+        source.update_stream(&smtp).expect("test setup: settings");
+        source
+            .set_stream_backend_links(
+                &sid("s-smtp"),
+                &["b-smtp".to_string()],
+                &["b-smtp-2".to_string()],
+            )
+            .expect("test setup: a backup");
+
+        let target = ConfigStore::open_in_memory().expect("target");
+        let data = parse_toml(&export_to_toml(&source).expect("export")).expect("parses");
+        import_to_store(&target, &data).expect("imports");
+        assert_eq!(target.get_stream(&sid("s-smtp")).expect("read"), Some(smtp));
+        assert_eq!(
+            target.list_stream_backends().expect("links"),
+            source.list_stream_backends().expect("links")
+        );
+    }
+
+    #[test]
+    fn a_stream_link_listed_twice_is_refused() {
+        let edited = with_link(&store_with_streams(), &sid("s-smtp"), "b-smtp");
+        let err = parse_toml(&edited).expect_err("a duplicate pair");
+        assert!(err.to_string().contains("twice"), "{err}");
     }
 
     /// The export with one more stream link, from `stream_id` to

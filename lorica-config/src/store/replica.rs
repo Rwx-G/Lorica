@@ -589,7 +589,7 @@ impl ConfigStore {
         let mut written = 0usize;
         for link in &config.stream_backends {
             if kept_ids.contains(link.stream_id.as_str()) {
-                self.link_stream_backend_unchecked(&link.stream_id, &link.backend_id)?;
+                self.link_stream_backend_unchecked(link)?;
                 written += 1;
             }
         }

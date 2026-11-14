@@ -165,9 +165,53 @@ pub fn backend_address_port(address: &str) -> Result<Option<u16>, String> {
     }
 }
 
+/// The host part of a backend address, read the way
+/// [`backend_address_port`] reads the port: the text before the last
+/// `:` of `host:port`, the whole of a portless address, and the
+/// brackets of an IPv6 literal removed. An unbracketed IPv6 literal
+/// keeps its legacy reading (`2001:db8::1` is host `2001:db8:`), which
+/// is no IP literal.
+///
+/// ```
+/// use lorica_config::models::backend_address_host;
+/// assert_eq!(backend_address_host("192.0.2.10:8080"), "192.0.2.10");
+/// assert_eq!(backend_address_host("[2001:db8::1]:5432"), "2001:db8::1");
+/// assert_eq!(backend_address_host("[::1]"), "::1");
+/// assert_eq!(backend_address_host("backend.example.com"), "backend.example.com");
+/// ```
+pub fn backend_address_host(address: &str) -> &str {
+    let host = if address.starts_with('[') && address.ends_with(']') {
+        address
+    } else {
+        match address.rsplit_once(':') {
+            Some((host, _)) => host,
+            None => address,
+        }
+    };
+    host.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 #[cfg(test)]
 mod address_tests {
     use super::*;
+
+    #[test]
+    fn the_host_part_matches_the_port_reading() {
+        for (address, host) in [
+            ("192.0.2.10:8080", "192.0.2.10"),
+            ("192.0.2.10", "192.0.2.10"),
+            ("backend.example.com:25", "backend.example.com"),
+            ("backend.example.com", "backend.example.com"),
+            ("[2001:db8::1]:5432", "2001:db8::1"),
+            ("[2001:db8::1]", "2001:db8::1"),
+            ("[::ffff:127.0.0.1]:80", "::ffff:127.0.0.1"),
+            ("2001:db8::1", "2001:db8:"),
+        ] {
+            assert_eq!(backend_address_host(address), host, "{address}");
+        }
+    }
 
     #[test]
     fn the_portless_forms_are_accepted_without_a_port() {

@@ -54,7 +54,7 @@ pub use automation_token::{
     AUTOMATION_TOKEN_MAX_TTL_SECONDS_CAP, AUTOMATION_TOKEN_PUBLIC_ID_LEN,
     AUTOMATION_TOKEN_SECRET_LEN, AUTOMATION_TOKEN_SUBJECT,
 };
-pub use backend::{backend_address_port, Backend, RouteBackend};
+pub use backend::{backend_address_host, backend_address_port, Backend, RouteBackend};
 pub use capture::{
     CaptureEmit, CaptureLimits, CaptureMatch, CaptureOutput, CaptureRedaction, CaptureRule,
     CaptureScope, HeaderMatch, StatusMatch, CAPTURE_BODY_MAX_BYTES_CAP,
@@ -100,11 +100,13 @@ pub use settings::{
 pub use sla::{SlaBucket, SlaConfig, SlaSummary};
 #[cfg(test)]
 pub(crate) use stream::tests::{
-    backend as sample_stream_backend, stream as sample_stream, stream_id as sample_stream_id,
+    backend as sample_stream_backend,
+    every_engine_setting_off_default as sample_stream_off_default, stream as sample_stream,
+    stream_id as sample_stream_id,
 };
 pub use stream::{
     binds_here, binds_here_when_enabled, check_backend_attachments, is_canonical_stream_id,
-    AttachmentConflict, AttachmentRule, AttachmentSnapshot, NodeRole, Stream, StreamBackend,
-    StreamEndKind, StreamEndReason, StreamProtocol, StreamRefusal, STREAM_ID_LEN,
-    STREAM_NAME_MAX_LEN, STREAM_PORT_RANGE_MAX,
+    AttachmentConflict, AttachmentRule, AttachmentSnapshot, NodeRole, OnUdp, Stream, StreamBackend,
+    StreamEndKind, StreamEndReason, StreamProtocol, StreamProxyProtocol, StreamRefusal,
+    TcpEngineField, STREAM_ID_LEN, STREAM_NAME_MAX_LEN, STREAM_PORT_RANGE_MAX, TCP_ENGINE_FIELDS,
 };

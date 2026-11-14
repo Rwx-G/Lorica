@@ -555,6 +555,13 @@ async fn the_view_publishes_every_model_field_but_the_withheld_ones() {
         .expect("an object")
         .keys()
         .filter(|k| !STREAM_WITHHELD_FIELDS.contains(&k.as_str()))
+        // The Story 12.3 engine settings joined the model in its Lot B
+        // and are published by its Lot E, which drops this filter.
+        .filter(|k| {
+            !lorica_config::models::TCP_ENGINE_FIELDS
+                .iter()
+                .any(|field| field.name == k.as_str())
+        })
         .cloned()
         .chain(std::iter::once("backend_ids".to_string()))
         .collect();
@@ -893,19 +900,15 @@ async fn an_import_preview_reports_the_port_conflict_the_import_refuses() {
 /// carry it.
 fn source_stream(name: &str, port: u16) -> lorica_config::models::Stream {
     let now = Utc::now();
-    lorica_config::models::Stream {
-        id: uuid::Uuid::new_v4().to_string(),
-        name: name.to_string(),
-        group_name: String::new(),
-        protocol: lorica_config::models::StreamProtocol::Tcp,
-        enabled: true,
-        listen_address: "0.0.0.0".parse().expect("an address"),
-        port_first: port,
-        port_last: port,
-        node_selector: Vec::new(),
-        created_at: now,
-        updated_at: now,
-    }
+    lorica_config::models::Stream::new(
+        uuid::Uuid::new_v4().to_string(),
+        name.to_string(),
+        lorica_config::models::StreamProtocol::Tcp,
+        "0.0.0.0".parse().expect("an address"),
+        port,
+        port,
+        now,
+    )
 }
 
 // ---- The stream plane surfaces (Story 12.2 Lot E3) ----

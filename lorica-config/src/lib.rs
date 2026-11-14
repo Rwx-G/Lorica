@@ -34,6 +34,9 @@ pub mod import;
 /// The reserved-port and listen-address rule shared by the CLI, the
 /// control plane's stream conflict check and the stream bind.
 pub mod listen_ports;
+/// What a local stream backend is: loopback, unspecified, link-local
+/// and `localhost` names (Story 12.3, D-m).
+pub mod local_address;
 /// Serialisable model types (routes, backends, certs, settings, ...).
 pub mod models;
 /// Which route serves a request's host and path: the proxy's selection,

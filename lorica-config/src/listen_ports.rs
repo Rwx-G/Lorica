@@ -12,7 +12,11 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 use strum::{IntoStaticStr, VariantArray};
 
-use crate::models::{binds_here_when_enabled, NodeRole, Stream, StreamProtocol};
+use crate::local_address::is_local_host;
+use crate::models::{
+    backend_address_host, backend_address_port, binds_here_when_enabled, Backend, NodeRole, Stream,
+    StreamProtocol,
+};
 
 /// The ports a node's own listeners hold. The `Option`s are listeners
 /// that may be off, in which case there is no port to collide with.
@@ -295,10 +299,130 @@ pub fn stream_port_conflicts(
     conflicts
 }
 
+/// What a local backend's port collides with on one node (Story 12.3,
+/// D-m rule B).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalBackendObject {
+    /// One of the node's own listeners.
+    Reserved {
+        /// The listener.
+        listener: ReservedListener,
+    },
+    /// A listen port of a stream the node binds, the candidate itself
+    /// included: forwarding there is a loop.
+    Stream {
+        /// The stream's name.
+        name: String,
+    },
+}
+
+/// A refusal of a local backend of a candidate stream on one node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBackendConflict {
+    /// The node.
+    pub node: NodeLabel,
+    /// The backend's id.
+    pub backend_id: String,
+    /// The backend's address, which is how an operator knows it.
+    pub backend_address: String,
+    /// The port the candidate would connect to on the node.
+    pub port: u16,
+    /// What holds that port.
+    pub object: LocalBackendObject,
+}
+
+impl std::fmt::Display for LocalBackendConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (node, backend, port) = (&self.node, &self.backend_address, self.port);
+        match &self.object {
+            LocalBackendObject::Reserved { listener } => write!(
+                f,
+                "backend {backend} reaches {node} itself, and port {port} there is {} ({} \
+                 listener); a stream never forwards to a node's own listeners",
+                listener.phrase(),
+                listener.as_str()
+            ),
+            LocalBackendObject::Stream { name } => write!(
+                f,
+                "backend {backend} reaches {node} itself, and port {port} there is a listen \
+                 port of stream `{name}`; forwarding there would loop"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LocalBackendConflict {}
+
+/// Every rule-B conflict of `candidate`'s local backends on `nodes`
+/// (Story 12.3, D-m), in node, backend and port order: a backend whose
+/// host is local without resolution
+/// ([`crate::local_address::is_local_host`]) may not reach a reserved
+/// port of a node binding the stream, nor a listen port of any stream
+/// that node binds, whatever its protocol, the candidate's own ports
+/// included. `allow_local_backend` does not lift this rule.
+///
+/// The ports reached are the backend's own, or every port of the
+/// candidate's range for a portless backend, which therefore always
+/// meets the candidate itself. A node with no reported reserved ports is
+/// checked against its streams only: `stream_port_conflicts` already
+/// refuses the candidate there. The addresses of a node's interfaces are
+/// unknown here; the engine's connect-time check covers them.
+pub fn local_backend_conflicts(
+    candidate: &Stream,
+    backends: &[Backend],
+    nodes: &[NodePorts<'_>],
+    others: &[Stream],
+) -> Vec<LocalBackendConflict> {
+    let mut conflicts = Vec::new();
+    let bound_on = |node: &NodePorts<'_>| -> Vec<&Stream> {
+        others
+            .iter()
+            .filter(|other| other.id != candidate.id && binds_here_when_enabled(other, node.role))
+            .chain(std::iter::once(candidate))
+            .collect()
+    };
+    for node in nodes {
+        let bound = bound_on(node);
+        for backend in backends {
+            if !is_local_host(backend_address_host(&backend.address)) {
+                continue;
+            }
+            let ports: Vec<u16> = match backend_address_port(&backend.address) {
+                Ok(Some(port)) => vec![port],
+                Ok(None) => (candidate.port_first..=candidate.port_last).collect(),
+                // The store refuses such an address; nothing to reach.
+                Err(_) => Vec::new(),
+            };
+            for port in ports {
+                let reserved = node
+                    .reserved
+                    .and_then(|reserved| reserved.clash(port))
+                    .map(|listener| LocalBackendObject::Reserved { listener });
+                let stream = bound
+                    .iter()
+                    .find(|s| s.port_first <= port && port <= s.port_last)
+                    .map(|s| LocalBackendObject::Stream {
+                        name: s.name.clone(),
+                    });
+                for object in [reserved, stream].into_iter().flatten() {
+                    conflicts.push(LocalBackendConflict {
+                        node: node.label.clone(),
+                        backend_id: backend.id.clone(),
+                        backend_address: backend.address.clone(),
+                        port,
+                        object,
+                    });
+                }
+            }
+        }
+    }
+    conflicts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::sample_stream;
+    use crate::models::{sample_stream, sample_stream_backend};
 
     /// Every field holds a distinct port, so each listener is found by
     /// its own port and by no other.
@@ -597,5 +721,125 @@ mod tests {
         let message = stream_port_conflicts(&candidate, &nodes, &[])[0].to_string();
         assert!(message.contains("edge-1"), "{message}");
         assert!(message.contains("https"), "{message}");
+    }
+
+    // ---- Story 12.3: local backends, rule B ----
+
+    #[test]
+    fn a_local_backend_on_a_reserved_port_is_refused_flag_or_not() {
+        let nodes = standalone(distinct());
+        let reserved = distinct();
+        for &listener in ReservedListener::VARIANTS {
+            let port = reserved.port_of(listener).expect("every listener is on");
+            for host in ["127.0.0.1", "[::1]", "localhost", "0.0.0.0"] {
+                let backend = sample_stream_backend("b", &format!("{host}:{port}"));
+                let mut candidate = on("c", "c", StreamProtocol::Tcp, "0.0.0.0", (5000, 5000));
+                for flag in [false, true] {
+                    candidate.allow_local_backend = flag;
+                    let found = local_backend_conflicts(
+                        &candidate,
+                        std::slice::from_ref(&backend),
+                        &nodes,
+                        &[],
+                    );
+                    assert_eq!(
+                        found,
+                        vec![LocalBackendConflict {
+                            node: NodeLabel::ThisNode,
+                            backend_id: "b".to_string(),
+                            backend_address: backend.address.clone(),
+                            port,
+                            object: LocalBackendObject::Reserved { listener },
+                        }],
+                        "{host}:{port}, flag {flag}"
+                    );
+                    assert!(found[0].to_string().contains(listener.as_str()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_local_backend_on_another_stream_s_port_is_a_loop() {
+        let nodes = standalone(distinct());
+        let candidate = on("c", "c", StreamProtocol::Tcp, "0.0.0.0", (5000, 5000));
+        // UDP and on another address: still a listen port of the node.
+        let other = on("o", "dns", StreamProtocol::Udp, "192.0.2.10", (53, 53));
+        let backend = sample_stream_backend("b", "127.0.0.1:53");
+        let found = local_backend_conflicts(
+            &candidate,
+            std::slice::from_ref(&backend),
+            &nodes,
+            std::slice::from_ref(&other),
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].object,
+            LocalBackendObject::Stream {
+                name: "dns".to_string()
+            }
+        );
+        assert!(found[0].to_string().contains("`dns`"), "{}", found[0]);
+
+        // A stream the node does not bind is not a loop there.
+        let mut pinned = other.clone();
+        pinned.node_selector = vec!["edge-2".to_string()];
+        let plane = vec![NodePorts {
+            label: NodeLabel::ThisNode,
+            role: NodeRole::ControlPlane,
+            reserved: Some(distinct()),
+        }];
+        assert!(local_backend_conflicts(
+            &candidate,
+            std::slice::from_ref(&backend),
+            &plane,
+            std::slice::from_ref(&pinned),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_portless_local_backend_on_a_range_meets_the_stream_itself() {
+        let nodes = standalone(distinct());
+        let candidate = on("c", "game", StreamProtocol::Udp, "0.0.0.0", (27000, 27002));
+        let backend = sample_stream_backend("b", "localhost");
+        let found =
+            local_backend_conflicts(&candidate, std::slice::from_ref(&backend), &nodes, &[]);
+        let ports: Vec<u16> = found.iter().map(|c| c.port).collect();
+        assert_eq!(ports, vec![27000, 27001, 27002]);
+        assert!(found.iter().all(|c| c.object
+            == LocalBackendObject::Stream {
+                name: "game".to_string()
+            }));
+        // Its own stored row is the candidate, not a second conflict.
+        let stored = candidate.clone();
+        assert_eq!(
+            local_backend_conflicts(
+                &candidate,
+                std::slice::from_ref(&backend),
+                &nodes,
+                std::slice::from_ref(&stored)
+            )
+            .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_remote_or_free_backend_is_not_refused() {
+        let nodes = standalone(distinct());
+        let candidate = on("c", "c", StreamProtocol::Tcp, "0.0.0.0", (5000, 5000));
+        for address in [
+            "192.0.2.10:9443",
+            "backend.example.com:9443",
+            "127.0.0.1:6000",
+        ] {
+            let backend = sample_stream_backend("b", address);
+            assert!(
+                local_backend_conflicts(&candidate, std::slice::from_ref(&backend), &nodes, &[])
+                    .is_empty(),
+                "{address}"
+            );
+        }
     }
 }
