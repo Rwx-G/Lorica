@@ -521,11 +521,11 @@
   }
   .badge-scope {
     background: var(--color-primary-subtle);
-    color: var(--color-primary);
+    color: var(--color-primary-text);
   }
   .badge-revoked {
     background: var(--color-red);
-    color: white;
+    color: var(--color-text-on-solid);
   }
 
   tr.revoked {

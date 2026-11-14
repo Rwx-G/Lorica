@@ -39,7 +39,7 @@
 
   .healthy {
     background: var(--color-green-subtle);
-    color: var(--color-green);
+    color: var(--color-green-text);
   }
   .healthy .dot {
     background: var(--color-green);
@@ -48,7 +48,7 @@
 
   .degraded {
     background: var(--color-orange-subtle);
-    color: var(--color-orange);
+    color: var(--color-orange-text);
   }
   .degraded .dot {
     background: var(--color-orange);
@@ -57,7 +57,7 @@
 
   .down {
     background: var(--color-red-subtle);
-    color: var(--color-red);
+    color: var(--color-red-text);
   }
   .down .dot {
     background: var(--color-red);
@@ -66,7 +66,7 @@
 
   .unknown {
     background: rgba(100, 116, 139, 0.1);
-    color: var(--color-text-muted);
+    color: var(--color-text);
   }
   .unknown .dot {
     background: var(--color-text-muted);

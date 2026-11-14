@@ -227,12 +227,12 @@
 
   .badge-builtin {
     background: var(--color-bg-input);
-    color: var(--color-text-muted);
+    color: var(--color-text);
   }
 
   .badge-custom {
     background: var(--color-primary-subtle);
-    color: var(--color-primary);
+    color: var(--color-primary-text);
   }
 
   .preset-desc {

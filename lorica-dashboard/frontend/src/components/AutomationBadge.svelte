@@ -23,7 +23,7 @@
     margin-left: var(--space-2);
     border-radius: var(--radius-full, 9999px);
     background: var(--color-primary-subtle);
-    color: var(--color-primary);
+    color: var(--color-primary-text);
     border: 1px solid var(--color-primary-subtle);
     font-size: var(--text-xs);
     font-weight: 600;

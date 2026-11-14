@@ -360,7 +360,7 @@
     padding: 0.0625rem 0.375rem;
     border-radius: 999px;
     background: var(--color-primary);
-    color: #fff;
+    color: var(--color-text-on-solid);
   }
 
   .status-pill {

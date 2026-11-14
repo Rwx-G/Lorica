@@ -220,5 +220,5 @@
 
   code { font-family: ui-monospace, monospace; font-size: 0.75rem; background: var(--color-bg); padding: 0.05rem 0.25rem; border-radius: 0.25rem; }
 
-  .imported-badge { display: inline-block; padding: 0.0625rem 0.375rem; border-radius: 9999px; font-size: 0.625rem; font-weight: 600; text-transform: uppercase; background: rgba(59, 130, 246, 0.15); color: var(--color-primary); vertical-align: middle; }
+  .imported-badge { display: inline-block; padding: 0.0625rem 0.375rem; border-radius: 9999px; font-size: 0.625rem; font-weight: 600; text-transform: uppercase; background: rgba(59, 130, 246, 0.15); color: var(--color-primary-text); vertical-align: middle; }
 </style>

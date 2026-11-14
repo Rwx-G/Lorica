@@ -368,11 +368,11 @@
 <style>
   .probes-page { max-width: none; }
   .route-label { font-weight: 600; color: var(--color-text-heading); }
-  .method-badge { display: inline-block; padding: 0.125rem 0.5rem; border-radius: var(--radius-full); font-size: var(--text-sm); font-weight: 600; background: var(--color-primary-subtle); color: var(--color-primary); font-family: var(--mono); }
+  .method-badge { display: inline-block; padding: 0.125rem 0.5rem; border-radius: var(--radius-full); font-size: var(--text-sm); font-weight: 600; background: var(--color-primary-subtle); color: var(--color-primary-text); font-family: var(--mono); }
   .status-on { color: var(--color-green); font-weight: 500; }
   .status-off { color: var(--color-text-muted); }
   .modal-wide { max-width: 700px; }
-  .badge-green { background: rgba(34, 197, 94, 0.1); color: var(--color-green); padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; }
-  .badge-red { background: rgba(239, 68, 68, 0.1); color: var(--color-red); padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; }
+  .badge-green { background: rgba(34, 197, 94, 0.1); color: var(--color-green-text); padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; }
+  .badge-red { background: rgba(239, 68, 68, 0.1); color: var(--color-red-text); padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; }
   .error-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-xs); color: var(--color-text-muted); }
 </style>

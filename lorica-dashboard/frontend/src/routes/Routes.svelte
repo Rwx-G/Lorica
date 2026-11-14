@@ -445,7 +445,7 @@
     margin-left: var(--space-2);
     border-radius: var(--radius-full, 9999px);
     background: var(--color-primary-subtle);
-    color: var(--color-primary);
+    color: var(--color-primary-text);
     font-size: var(--text-xs);
     font-weight: 600;
     cursor: help;
@@ -534,7 +534,7 @@
     font-weight: 700;
     letter-spacing: 0.05em;
     background: var(--color-orange-subtle);
-    color: var(--color-orange);
+    color: var(--color-orange-text);
     cursor: help;
   }
 

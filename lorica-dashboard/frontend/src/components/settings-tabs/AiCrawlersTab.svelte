@@ -386,7 +386,7 @@
   }
   .badge-verify {
     background: var(--color-primary-subtle);
-    color: var(--color-primary);
+    color: var(--color-primary-text);
     cursor: help;
   }
 

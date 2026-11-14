@@ -162,12 +162,12 @@
   }
   .badge-control {
     background: var(--color-primary-subtle);
-    color: var(--color-primary);
+    color: var(--color-primary-text);
     font-family: var(--mono);
   }
   .badge-unreadable {
     background: var(--color-red);
-    color: white;
+    color: var(--color-text-on-solid);
   }
 
   .wrap-cell code {

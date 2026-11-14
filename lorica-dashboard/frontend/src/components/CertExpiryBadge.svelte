@@ -45,25 +45,25 @@
 
   .valid {
     background: rgba(34, 197, 94, 0.1);
-    color: var(--color-green);
+    color: var(--color-green-text);
   }
   .valid .dot { background: var(--color-green); }
 
   .warning {
     background: rgba(245, 158, 11, 0.1);
-    color: var(--color-orange);
+    color: var(--color-orange-text);
   }
   .warning .dot { background: var(--color-orange); }
 
   .critical {
     background: rgba(239, 68, 68, 0.1);
-    color: var(--color-red);
+    color: var(--color-red-text);
   }
   .critical .dot { background: var(--color-red); }
 
   .expired {
     background: rgba(239, 68, 68, 0.15);
-    color: var(--color-red);
+    color: var(--color-red-text);
   }
   .expired .dot { background: var(--color-red); }
 </style>

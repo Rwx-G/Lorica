@@ -1196,7 +1196,7 @@
     font-size: var(--text-sm);
     font-weight: 500;
     background: var(--color-orange-subtle);
-    color: var(--color-orange);
+    color: var(--color-orange-text);
   }
 
   .action-badge {
@@ -1207,8 +1207,8 @@
     font-weight: 600;
     text-transform: uppercase;
   }
-  .action-blocked { background: var(--color-red-subtle); color: var(--color-red); }
-  .action-detected { background: var(--color-orange-subtle); color: var(--color-orange); }
+  .action-blocked { background: var(--color-red-subtle); color: var(--color-red-text); }
+  .action-detected { background: var(--color-orange-subtle); color: var(--color-orange-text); }
 
   .ban-reason-badge {
     display: inline-block;
@@ -1218,10 +1218,10 @@
     font-weight: 600;
     text-transform: uppercase;
   }
-  .ban-reason-rate-limit { background: var(--color-orange-subtle); color: var(--color-orange); }
-  .ban-reason-waf-flood { background: var(--color-red-subtle); color: var(--color-red); }
-  .ban-reason-waf-critical { background: rgba(127, 29, 29, 0.18); color: #7f1d1d; }
-  .ban-reason-manual { background: var(--color-bg-muted, rgba(148, 163, 184, 0.18)); color: var(--color-text-muted); }
+  .ban-reason-rate-limit { background: var(--color-orange-subtle); color: var(--color-orange-text); }
+  .ban-reason-waf-flood { background: var(--color-red-subtle); color: var(--color-red-text); }
+  .ban-reason-waf-critical { background: rgba(127, 29, 29, 0.18); color: var(--color-red-text); }
+  .ban-reason-manual { background: var(--color-bg-muted, rgba(148, 163, 184, 0.18)); color: var(--color-text); }
 
   .severity-critical {
     color: var(--color-red);
@@ -1299,7 +1299,7 @@
     font-size: var(--text-xs);
     font-weight: 600;
     background: var(--color-green-subtle);
-    color: var(--color-green);
+    color: var(--color-green-text);
     margin-left: 0.375rem;
   }
 
@@ -1310,7 +1310,7 @@
     font-size: var(--text-xs);
     font-weight: 600;
     background: var(--color-bg-hover);
-    color: var(--color-text-muted);
+    color: var(--color-text);
     margin-left: 0.375rem;
   }
 
@@ -1498,7 +1498,7 @@
     padding: 0 0.35rem;
     border-radius: 0.25rem;
     background: var(--color-border);
-    color: var(--color-text-muted);
+    color: var(--color-text);
     font-style: italic;
   }
 

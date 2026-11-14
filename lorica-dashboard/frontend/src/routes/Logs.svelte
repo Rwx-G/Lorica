@@ -595,7 +595,7 @@
     font-weight: 600;
     font-family: var(--mono);
     background: var(--color-primary-subtle);
-    color: var(--color-primary);
+    color: var(--color-primary-text);
   }
 
   .ip-col {
@@ -622,12 +622,12 @@
 
   .source-badge.loadtest {
     background: rgba(245, 158, 11, 0.15);
-    color: var(--color-orange);
+    color: var(--color-orange-text);
   }
 
   .source-badge.internal {
     background: rgba(148, 163, 184, 0.15);
-    color: var(--color-text-muted);
+    color: var(--color-text);
   }
 
   .host-col {

@@ -582,7 +582,7 @@
     font-weight: 600;
     text-transform: uppercase;
     background: rgba(59, 130, 246, 0.15);
-    color: var(--color-primary);
+    color: var(--color-primary-text);
     margin-left: 0.375rem;
     vertical-align: middle;
   }

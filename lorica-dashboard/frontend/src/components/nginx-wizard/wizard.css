@@ -327,27 +327,27 @@
 
 .badge-success {
   background: var(--color-green-subtle);
-  color: var(--color-green);
+  color: var(--color-green-text);
 }
 
 .badge-error {
   background: var(--color-red-subtle);
-  color: var(--color-red);
+  color: var(--color-red-text);
 }
 
 .badge-create {
   background: var(--color-red-subtle);
-  color: var(--color-red);
+  color: var(--color-red-text);
 }
 
 .badge-tls {
   background: var(--color-orange-subtle, rgba(251, 146, 60, 0.15));
-  color: var(--color-orange, #fb923c);
+  color: var(--color-orange-text);
 }
 
 .badge-imported {
   background: var(--color-primary-subtle);
-  color: var(--color-primary);
+  color: var(--color-primary-text);
 }
 
 /* Backend checks */

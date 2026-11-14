@@ -271,7 +271,7 @@
   .override-section { padding: 0.5rem; background: var(--color-bg); border-radius: 0.25rem; }
   .override-title { display: block; font-size: 0.75rem; font-weight: 600; color: var(--color-text-muted); margin-bottom: 0.375rem; text-transform: uppercase; letter-spacing: 0.05em; }
 
-  .imported-badge { display: inline-block; padding: 0.0625rem 0.375rem; border-radius: 9999px; font-size: 0.625rem; font-weight: 600; text-transform: uppercase; background: rgba(59, 130, 246, 0.15); color: var(--color-primary); vertical-align: middle; }
+  .imported-badge { display: inline-block; padding: 0.0625rem 0.375rem; border-radius: 9999px; font-size: 0.625rem; font-weight: 600; text-transform: uppercase; background: rgba(59, 130, 246, 0.15); color: var(--color-primary-text); vertical-align: middle; }
   .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
   .invalid { border-color: var(--color-red) !important; }
 </style>

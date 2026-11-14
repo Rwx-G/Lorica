@@ -430,7 +430,7 @@
     font-weight: 600;
     text-transform: uppercase;
     background: rgba(59, 130, 246, 0.15);
-    color: var(--color-primary);
+    color: var(--color-primary-text);
     vertical-align: middle;
   }
   .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }

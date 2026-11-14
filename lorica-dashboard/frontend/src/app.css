@@ -92,6 +92,16 @@
   --color-red: #dc2626;
   --color-red-subtle: rgba(220, 38, 38, 0.08);
   --color-error: #dc2626;
+  /* Badge text. A badge sets its colour on its own -subtle tint, where
+     the base colours above fall under WCAG AA (4.5:1): these hold it on
+     every surface, row hover included, in both themes. Text on a solid
+     badge uses --color-text-on-solid; a neutral badge uses --color-text,
+     since --color-text-muted on a tint is under AA too. */
+  --color-green-text: #166534;
+  --color-orange-text: #92400e;
+  --color-red-text: #991b1b;
+  --color-primary-text: #1e40af;
+  --color-text-on-solid: #ffffff;
 
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
   --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
@@ -124,6 +134,11 @@
   --color-red: #f87171;
   --color-red-subtle: rgba(248, 113, 113, 0.1);
   --color-error: #f87171;
+  --color-green-text: #34d399;
+  --color-orange-text: #fbbf24;
+  --color-red-text: #fca5a5;
+  --color-primary-text: #93c5fd;
+  --color-text-on-solid: #0b1120;
 
   color-scheme: dark;
   color: var(--color-text);
@@ -539,22 +554,22 @@ tbody tr:hover td {
 
 .badge-green {
   background: var(--color-green-subtle);
-  color: var(--color-green);
+  color: var(--color-green-text);
 }
 
 .badge-orange {
   background: var(--color-orange-subtle);
-  color: var(--color-orange);
+  color: var(--color-orange-text);
 }
 
 .badge-red {
   background: var(--color-red-subtle);
-  color: var(--color-red);
+  color: var(--color-red-text);
 }
 
 .badge-blue {
   background: var(--color-primary-subtle);
-  color: var(--color-primary);
+  color: var(--color-primary-text);
 }
 
 /* Text, not text-muted: muted on the input surface falls to about 3:1

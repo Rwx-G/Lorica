@@ -224,17 +224,17 @@
 
   .cert-source-badge.acme {
     background: rgba(34, 197, 94, 0.15);
-    color: var(--color-green);
+    color: var(--color-green-text);
   }
 
   .cert-source-badge.adcs {
     background: rgba(59, 130, 246, 0.15);
-    color: var(--color-primary);
+    color: var(--color-primary-text);
   }
 
   .cert-source-badge.manual {
     background: rgba(148, 163, 184, 0.15);
-    color: var(--color-text-muted);
+    color: var(--color-text);
   }
 
   .san-count {
