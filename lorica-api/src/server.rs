@@ -834,6 +834,30 @@ pub fn build_router(
             "/api/v1/routes/{id}",
             delete(crate::routes::delete_route).layer(rl("routes_cud", RL_ROUTES_CUD, RL_WINDOW_S)),
         )
+        // Streams (Story 12.1, D-10): the route's floors, body cap and
+        // write budget, in a bucket of their own.
+        .route("/api/v1/streams", get(crate::streams::list_streams))
+        .route(
+            "/api/v1/streams",
+            post(crate::streams::create_stream)
+                .layer(bl(BODY_CAP_DEFAULT))
+                .layer(rl("streams_cud", RL_ROUTES_CUD, RL_WINDOW_S)),
+        )
+        .route("/api/v1/streams/{id}", get(crate::streams::get_stream))
+        .route(
+            "/api/v1/streams/{id}",
+            put(crate::streams::update_stream)
+                .layer(bl(BODY_CAP_DEFAULT))
+                .layer(rl("streams_cud", RL_ROUTES_CUD, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/streams/{id}",
+            delete(crate::streams::delete_stream).layer(rl(
+                "streams_cud",
+                RL_ROUTES_CUD,
+                RL_WINDOW_S,
+            )),
+        )
         // Traffic-capture rules (Story 10.1). Role floors live in the
         // authorize middleware: the listing and `disable` are
         // Operator+, everything that arms or edits a recorder is

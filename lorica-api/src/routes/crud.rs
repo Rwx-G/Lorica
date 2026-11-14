@@ -427,7 +427,7 @@ pub(crate) fn validate_group_name(raw: &str) -> Result<String, ApiError> {
 /// happily and then deliver the route to no node at all.
 ///
 /// Returns the normalised list.
-fn validate_node_selector(
+pub(crate) fn validate_node_selector(
     raw: &[String],
     roster: Option<&[lorica_config::models::ClusterNode]>,
 ) -> Result<Vec<String>, ApiError> {
@@ -478,7 +478,7 @@ fn validate_node_selector(
 /// An operator also legitimately pins a route before the node it names
 /// has enrolled, and the control plane is the one place where "not in
 /// the roster" really means "nobody".
-async fn selector_roster(
+pub(crate) async fn selector_roster(
     state: &AppState,
 ) -> Result<Option<Vec<lorica_config::models::ClusterNode>>, ApiError> {
     if !matches!(

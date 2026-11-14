@@ -612,6 +612,63 @@ mod tests {
     }
 
     #[test]
+    fn streams_have_the_route_floors() {
+        // Story 12.1 D-10: no rule of its own, so a later rule that
+        // moves a stream path off the defaults fails here. Each row
+        // states the route twin it must agree with.
+        for (method, stream_path, route_path, floor) in [
+            (
+                Method::GET,
+                "/api/v1/streams",
+                "/api/v1/routes",
+                Role::Viewer,
+            ),
+            (
+                Method::GET,
+                "/api/v1/streams/abc",
+                "/api/v1/routes/abc",
+                Role::Viewer,
+            ),
+            (
+                Method::POST,
+                "/api/v1/streams",
+                "/api/v1/routes",
+                Role::Operator,
+            ),
+            (
+                Method::PUT,
+                "/api/v1/streams/abc",
+                "/api/v1/routes/abc",
+                Role::Operator,
+            ),
+            (
+                Method::DELETE,
+                "/api/v1/streams/abc",
+                "/api/v1/routes/abc",
+                Role::Operator,
+            ),
+        ] {
+            assert_eq!(
+                required_role(&method, stream_path),
+                floor,
+                "{method} {stream_path}"
+            );
+            assert_eq!(
+                required_role(&method, route_path),
+                floor,
+                "{method} {route_path}"
+            );
+            // A stream write is configuration: a follower answers 409
+            // outside break-glass, reads stay local.
+            assert_eq!(
+                follower_local_request(&method, stream_path),
+                method == Method::GET,
+                "{method} {stream_path}"
+            );
+        }
+    }
+
+    #[test]
     fn cert_download_needs_operator() {
         assert_eq!(
             required_role(&Method::GET, "/api/v1/certificates/abc/download"),

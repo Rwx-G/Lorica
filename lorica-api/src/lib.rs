@@ -55,6 +55,7 @@ pub mod server;
 pub mod settings;
 pub mod sla;
 pub mod status;
+pub mod streams;
 pub mod system;
 pub mod target;
 /// Hot binary-upgrade verification + staging (Story 8.4).

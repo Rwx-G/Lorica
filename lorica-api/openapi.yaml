@@ -20,6 +20,10 @@ tags:
     description: Proxy route management
   - name: Backends
     description: Backend server management
+  - name: Streams
+    description: >-
+      Layer-4 TCP and UDP listeners forwarding to shared backends. Reads
+      are Viewer, writes Operator, as for routes.
   - name: Certificates
     description: TLS certificate management
   - name: ACME
@@ -1467,6 +1471,160 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: The backend is managed by the automation API; delete the environment or update it through the pipeline
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  # ---------------------------------------------------------------------------
+  # Streams (Story 12.1)
+  # ---------------------------------------------------------------------------
+  /api/v1/streams:
+    get:
+      tags: [Streams]
+      summary: List all streams
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Every stream, ordered by name, with its backend ids
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      streams:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/StreamResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Streams]
+      summary: Create a stream
+      description: >-
+        The stream's ports are checked on every node that would bind it:
+        this node when it binds the stream (a standalone node binds every
+        stream, a control plane only those with an empty selector), and
+        on a control plane every active enrolled node the selector
+        targets, against that node's reserved ports and the other streams
+        it binds, disabled ones included.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateStreamRequest"
+      responses:
+        "201":
+          description: Stream created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/StreamResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/StreamConflict"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/streams/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      tags: [Streams]
+      summary: Get a stream by ID
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The stream with its backend ids
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/StreamResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [Streams]
+      summary: Update a stream
+      description: >-
+        Every field is optional and an absent one keeps its stored value.
+        The ports move together: `port_first` without `port_last` makes
+        the stream a single port, `port_last` alone moves the end of the
+        range. `backend_ids` replaces the whole set. The result is
+        checked as on create.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateStreamRequest"
+      responses:
+        "200":
+          description: Stream updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/StreamResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/StreamConflict"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+    delete:
+      tags: [Streams]
+      summary: Delete a stream
+      description: Its backend links go with it; the backends stay.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Stream deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: >-
+            This node is a follower outside a break-glass window;
+            configuration is changed on the control plane.
           content:
             application/json:
               schema:
@@ -3700,6 +3858,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/StreamConflict"
 
   /api/v1/config/import/preview:
     post:
@@ -7238,6 +7398,156 @@ components:
           type: boolean
           description: HTTP routes only; streams ignore it.
 
+    StreamProtocol:
+      type: string
+      enum: [tcp, udp]
+
+    StreamResponse:
+      type: object
+      required:
+        - id
+        - name
+        - group_name
+        - protocol
+        - enabled
+        - listen_address
+        - port_first
+        - port_last
+        - node_selector
+        - backend_ids
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Canonical lowercase hyphenated UUID.
+        name:
+          type: string
+          description: >-
+            Unique fleet-wide; ASCII lowercase letters, digits, `-` and
+            `_`, 1 to 64 characters.
+        group_name:
+          type: string
+        protocol:
+          $ref: "#/components/schemas/StreamProtocol"
+        enabled:
+          type: boolean
+          description: >-
+            A disabled stream is replicated and bound on no node, and keeps
+            its ports reserved in the conflict check.
+        listen_address:
+          type: string
+          description: >-
+            One IP address in its canonical text form. `::` binds
+            dual-stack; any other IPv6 address binds IPv6 only.
+        port_first:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        port_last:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: >-
+            Equal to `port_first` for a single port. A range forwards listen
+            port N to backend port N.
+        node_selector:
+          type: array
+          items:
+            type: string
+          description: Node names the stream is pinned to; empty is fleet-wide.
+        backend_ids:
+          type: array
+          items:
+            type: string
+          description: IDs of the linked backends, sorted.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateStreamRequest:
+      type: object
+      additionalProperties: false
+      required: [name, protocol, listen_address, port_first]
+      properties:
+        name:
+          type: string
+          description: >-
+            Unique fleet-wide; ASCII lowercase letters, digits, `-` and
+            `_`, 1 to 64 characters.
+        group_name:
+          type: string
+        protocol:
+          $ref: "#/components/schemas/StreamProtocol"
+        enabled:
+          type: boolean
+          default: true
+        listen_address:
+          type: string
+          description: >-
+            An IPv4 or IPv6 address; an IPv4-mapped IPv6 address is
+            refused (422).
+        port_first:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        port_last:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: >-
+            Absent for a single port. A range spans at most 1024 ports, and
+            its backends carry no port.
+        node_selector:
+          type: array
+          items:
+            type: string
+        backend_ids:
+          type: array
+          items:
+            type: string
+          description: >-
+            Existing backend ids (422 otherwise). A backend of a UDP stream
+            may serve no route and no TCP stream and must have its health
+            check disabled (422 naming the stream).
+
+    UpdateStreamRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+        group_name:
+          type: string
+        protocol:
+          $ref: "#/components/schemas/StreamProtocol"
+        enabled:
+          type: boolean
+        listen_address:
+          type: string
+        port_first:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: Without `port_last`, the stream becomes a single port.
+        port_last:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        node_selector:
+          type: array
+          items:
+            type: string
+        backend_ids:
+          type: array
+          items:
+            type: string
+          description: Replaces the whole set.
+
     Certificate:
       type: object
       properties:
@@ -7924,6 +8234,19 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     RateLimited:
       description: Too many requests
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    StreamConflict:
+      description: >-
+        `error.code` is `stream_port_conflict`: the stream's ports collide
+        on a node that would bind it, and the message names the stream,
+        the node (`this node` or the node's name) and the object (the
+        reserved listener, the other stream with its address, ports and
+        protocol, or that the node has not reported its reserved ports
+        yet). On a follower outside a break-glass window every write
+        answers 409 with `error.code` `conflict` instead.
       content:
         application/json:
           schema:

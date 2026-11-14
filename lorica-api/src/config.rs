@@ -105,10 +105,27 @@ pub async fn import_config(
         )?;
     }
 
+    let role = crate::streams::LocalRole::of(&state);
+    let reserved = state.reserved_ports;
     // What the import changed on its own initiative, such as an AD CS
     // certificate made manual because its authority is not on this
     // node (Epic 13 D14). The caller learns it here or not at all.
     let warnings: Vec<String> = db_blocking(&state.store, move |store| {
+        // The port check of a stream write (Story 12.1 D-9), on every
+        // imported stream against the nodes that would bind it and the
+        // other imported streams, since the import replaces the stored
+        // ones. Before `import_to_store`, which clears the store first.
+        for stream in &import_data.streams {
+            if let Some(conflict) = crate::streams::first_port_conflict(
+                store,
+                &role,
+                reserved,
+                stream,
+                &import_data.streams,
+            )? {
+                return Err(crate::streams::port_conflict_error(stream, &conflict));
+            }
+        }
         lorica_config::import::import_to_store(&*store, &import_data)
             .map_err(|e| ApiError::Internal(e.to_string()))
     })
