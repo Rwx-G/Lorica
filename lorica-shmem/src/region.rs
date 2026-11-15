@@ -25,7 +25,7 @@
 //!       16    hash_key[0]        u64                       8
 //!       24    hash_key[1]        u64                       8
 //!       32    _pad0              [u8; 32]                 32
-//!       64    waf_flood          AtomicHashTable<N>   N * 64
+//!       64    rate_counters      AtomicHashTable<N>   N * 64
 //!      ...    waf_auto_ban       AtomicHashTable<N>   N * 64
 //! ```
 //!
@@ -56,12 +56,15 @@ pub const LAYOUT_VERSION: u32 = 1;
 ///
 /// A table is sized to hold live keys in half its slots: for the
 /// auto-ban table, one key per client address with a WAF violation in
-/// the last [`DEFAULT_STALE_AFTER`](crate::DEFAULT_STALE_AFTER), since
-/// idle keys are evicted. Up to that load a key is refused with
+/// the last [`DEFAULT_STALE_AFTER`](crate::DEFAULT_STALE_AFTER), and
+/// for the rate counters, one key per client and per minute with a
+/// rate-limit violation over the same span, since idle keys are
+/// evicted. Up to that load a key is refused with
 /// [`SATURATED`](crate::SATURATED) less than once in 100 000, the bound
 /// the table's fill test holds. Past it, refusals grow steeply with the
 /// load (see [`MAX_PROBE`](crate::MAX_PROBE)); they fail open and are
-/// counted on `lorica_waf_auto_ban_uncounted_total`.
+/// counted on `lorica_waf_auto_ban_uncounted_total` and
+/// `lorica_rate_limit_auto_ban_uncounted_total`.
 pub const WAF_SLOTS: usize = 128 * 1024;
 const _: () = {
     assert!(WAF_SLOTS.is_power_of_two());
@@ -79,9 +82,18 @@ pub struct SharedRegion {
     /// read-only thereafter. Workers inherit it by mapping the same
     /// pages. Prevents HashDoS on the probe chain.
     pub hash_key: [u64; 2],
-    /// Explicit pad so `waf_flood` starts at a fresh 64-byte cache line.
+    /// Explicit pad so `rate_counters` starts at a fresh 64-byte cache line.
     _pad0: [u8; 32],
-    pub waf_flood: AtomicHashTable<WAF_SLOTS>,
+    /// Windowed counts shared by the workers, written and read through
+    /// [`WindowedCount`](crate::WindowedCount): each client's rate-limit
+    /// violations per minute, for the rate-limit auto-ban.
+    ///
+    /// Named `waf_flood` until 1.11.0, for a per-client WAF flood count
+    /// that was designed and never built: no release ever wrote to it.
+    /// The rename moves no byte, so [`LAYOUT_VERSION`] stays.
+    pub rate_counters: AtomicHashTable<WAF_SLOTS>,
+    /// Each client's WAF violations, bumped by the workers, read and
+    /// reset by the supervisor's auto-ban.
     pub waf_auto_ban: AtomicHashTable<WAF_SLOTS>,
 }
 
@@ -89,7 +101,7 @@ pub struct SharedRegion {
 const _: () = {
     assert!(std::mem::align_of::<SharedRegion>() == 64);
     // Header (offsets 0..64) must be exactly one cache line wide.
-    assert!(std::mem::offset_of!(SharedRegion, waf_flood) == 64);
+    assert!(std::mem::offset_of!(SharedRegion, rate_counters) == 64);
 };
 
 /// Error returned when opening or creating the region.
@@ -250,20 +262,20 @@ mod tests {
     fn increment_via_region_propagates() {
         let (region, _fd) = SharedRegion::create_supervisor().expect("create");
         let h = region.tagged(0x10_20_30_40);
-        assert_eq!(region.waf_flood.increment(h, 1, 100), 1);
-        assert_eq!(region.waf_flood.increment(h, 4, 200), 5);
-        assert_eq!(region.waf_flood.read(h), Some(5));
+        assert_eq!(region.rate_counters.increment(h, 1, 100), 1);
+        assert_eq!(region.rate_counters.increment(h, 4, 200), 5);
+        assert_eq!(region.rate_counters.read(h), Some(5));
     }
 
     #[test]
-    fn flood_and_auto_ban_are_independent() {
+    fn rate_counters_and_auto_ban_are_independent() {
         let (region, _fd) = SharedRegion::create_supervisor().expect("create");
         let h = region.tagged(42);
-        region.waf_flood.increment(h, 10, 1);
+        region.rate_counters.increment(h, 10, 1);
         assert_eq!(region.waf_auto_ban.read(h), None);
         region.waf_auto_ban.increment(h, 1, 2);
         assert_eq!(region.waf_auto_ban.read(h), Some(1));
-        assert_eq!(region.waf_flood.read(h), Some(10));
+        assert_eq!(region.rate_counters.read(h), Some(10));
     }
 
     #[test]

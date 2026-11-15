@@ -436,21 +436,7 @@ pub(crate) fn run_worker(
                     CommandType::BanIp => {
                         let ip = cmd.ban_ip.clone();
                         let duration_s = cmd.ban_duration_s;
-                        // The supervisor only broadcasts WAF critical-rule
-                        // auto-bans today; an unrecognized wire value
-                        // (e.g. a future reason from a newer supervisor)
-                        // falls back to that rather than mislabeling.
-                        let reason = lorica_api::ban::BanReason::from_i32(cmd.ban_reason)
-                            .unwrap_or(lorica_api::ban::BanReason::WafCriticalRule);
-                        if !ip.is_empty() {
-                            cmd_ban_list.insert(
-                                ip.clone(),
-                                lorica_api::ban::BanRecord {
-                                    banned_at: Instant::now(),
-                                    duration_s,
-                                    reason,
-                                },
-                            );
+                        if apply_ban_ip(&cmd_ban_list, &ip, duration_s, cmd.ban_reason) {
                             info!(
                                 worker_id = id,
                                 ip = %ip,
@@ -514,6 +500,9 @@ pub(crate) fn run_worker(
     let log_sock_path = PathBuf::from(&data_dir).join("log.sock");
     let waf_fwd_engine = Arc::clone(&waf_engine);
     let waf_sock_path_worker = PathBuf::from(&data_dir).join("waf.sock");
+    // Filled by the proxy's rate-limit stage, drained by the forwarder.
+    let rate_limit_bans = Arc::new(lorica::proxy_wiring::RateLimitBanQueue::default());
+    let fwd_rate_limit_bans = Arc::clone(&rate_limit_bans);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("worker background runtime");
         rt.block_on(async move {
@@ -540,10 +529,11 @@ pub(crate) fn run_worker(
                 &worker_blocklist_tracker,
             );
 
-            // Forward WAF events to supervisor. A write error reconnects:
-            // forwarding is what alerts and auto-bans run on, so it must
-            // not stop for the life of the worker. The batch being
-            // written when the socket broke is lost, and logged.
+            // Forward WAF events and rate-limit bans to supervisor. A
+            // write error reconnects: forwarding is what alerts and
+            // auto-bans run on, so it must not stop for the life of the
+            // worker. The batch being written when the socket broke is
+            // lost, and logged; a ban in it holds on this worker only.
             tokio::spawn(async move {
                 let mut cursor = super::waf_forward::WafForwardCursor::new();
                 loop {
@@ -557,7 +547,8 @@ pub(crate) fn run_worker(
                     let mut interval = tokio::time::interval(super::waf_forward::FORWARD_INTERVAL);
                     'forward: loop {
                         interval.tick().await;
-                        let batch = cursor.take_batch(&waf_fwd_engine);
+                        let mut batch = cursor.take_batch(&waf_fwd_engine);
+                        batch.bans = fwd_rate_limit_bans.take();
                         if batch.is_empty() {
                             continue;
                         }
@@ -639,6 +630,7 @@ pub(crate) fn run_worker(
     // 403 "challenge expired or unknown".
     lorica_proxy.bot_engine = Arc::new(lorica::bot::BotEngine::with_sqlite(Arc::clone(&store)));
     lorica_proxy.shmem = shmem_region;
+    lorica_proxy.rate_limit_bans = rate_limit_bans;
     // Worker mode: rate-limit engine runs as a local cache synced with
     // the supervisor via the pipelined RPC channel every 100 ms. See
     // `spawn_rate_limit_sync` below and design doc § 6.
@@ -999,6 +991,35 @@ async fn worker_load_certs_into_resolver(
         }
         Err(e) => warn!(error = %e, "worker failed to load certificates into resolver"),
     }
+}
+
+/// Apply a `BanIp` the supervisor broadcast to this worker's ban list.
+/// Returns `false` for an empty address, which bans nothing.
+///
+/// The supervisor broadcasts WAF and rate-limit auto-bans and operator
+/// bans, each with its reason. A reason this binary does not know (from
+/// a newer supervisor) is read as a WAF critical-rule ban rather than
+/// mislabelled as something it is not.
+pub(crate) fn apply_ban_ip(
+    ban_list: &lorica_api::ban::BanMap,
+    ip: &str,
+    duration_s: u64,
+    reason: i32,
+) -> bool {
+    if ip.is_empty() {
+        return false;
+    }
+    let reason = lorica_api::ban::BanReason::from_i32(reason)
+        .unwrap_or(lorica_api::ban::BanReason::WafCriticalRule);
+    ban_list.insert(
+        ip.to_string(),
+        lorica_api::ban::BanRecord {
+            banned_at: Instant::now(),
+            duration_s,
+            reason,
+        },
+    );
+    true
 }
 
 /// Restore WAF runtime state for a worker from persisted settings: the IP

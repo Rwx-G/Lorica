@@ -160,8 +160,14 @@ pub struct LoricaProxy {
     /// duration in seconds, ban reason). Bans expire after the
     /// route-specific `auto_ban_duration_s`.
     pub ban_list: Arc<lorica_api::ban::BanMap>,
-    /// Rate limit violation counter (per minute) for auto-ban decisions.
+    /// Rate limit violation counter (per minute) for auto-ban decisions,
+    /// in single-process mode. Worker mode counts in `shmem` instead, see
+    /// [`LoricaProxy::rate_limit_violation_earns_ban`].
     pub rate_violations: Arc<lorica_limits::rate::Rate>,
+    /// Rate-limit auto-bans this worker decided, waiting for the WAF
+    /// forwarder to send them to the supervisor, which applies them on
+    /// every worker. Never filled in single-process mode.
+    pub rate_limit_bans: Arc<RateLimitBanQueue>,
     /// Cumulative WAF block counter per IP for WAF auto-ban (single-process fallback).
     /// In multi-worker mode the supervisor counts globally and broadcasts BanIp commands.
     pub waf_violations: Arc<DashMap<String, AtomicU64>>,
@@ -321,7 +327,7 @@ pub mod ai_bot_merged;
 pub mod filters;
 #[cfg(test)]
 pub(crate) use filters::build_redirect_location;
-pub use filters::ip_to_shmem_key;
+pub use filters::{ip_to_shmem_key, RateLimitBan, RateLimitBanQueue};
 
 pub mod waf_body_budget;
 pub use waf_body_budget::{waf_body_budget, WAF_BODY_SCAN_DEFAULT_INFLIGHT_BYTES};
@@ -352,7 +358,10 @@ impl LoricaProxy {
             waf_engine: Arc::new(WafEngine::new()),
             sla_collector,
             ban_list: Arc::new(DashMap::new()),
-            rate_violations: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(60))),
+            rate_violations: Arc::new(lorica_limits::rate::Rate::new(
+                filters::RATE_LIMIT_VIOLATION_WINDOW,
+            )),
+            rate_limit_bans: Arc::new(RateLimitBanQueue::default()),
             waf_violations: Arc::new(DashMap::new()),
             route_connections: Arc::new(DashMap::new()),
             global_rate: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1))),

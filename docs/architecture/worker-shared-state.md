@@ -20,8 +20,12 @@ and should be reviewed before code lands.
 1. **Functional parity**: a configuration that behaves a certain way
    in single-process mode (`--workers 0`) must behave the same way in
    worker mode (`--workers N >= 1`). No silent `× N` amplification.
-2. **High-perf hot path**: simple per-IP counters (WAF flood, auto-ban)
-   must not pay an IPC round trip per request. Token bucket state
+   Until 1.11.0 the rate-limit auto-ban broke this goal: it counted
+   each client's violations per worker and banned on that worker only
+   (§ 6 (c) describes what replaced it).
+2. **High-perf hot path**: simple per-IP counters (the WAF and
+   rate-limit auto-bans) must not pay an IPC round trip per request.
+   Token bucket state
    (per-route) accepts a bounded ~100 ms imprecision in exchange for
    IPC-free hot path.
 3. **Reusable infrastructure**: the new RPC layer and shared-memory
@@ -248,8 +252,8 @@ pub struct SharedRegion {
     /// after fork. See § 5.3.
     pub hash_key: [u64; 2],
 
-    pub waf_flood:    AtomicHashTable<128 * 1024>,  // 8 MiB
-    pub waf_auto_ban: AtomicHashTable<128 * 1024>,  // 8 MiB
+    pub rate_counters: AtomicHashTable<128 * 1024>,  // 8 MiB, § 6 (c)
+    pub waf_auto_ban:  AtomicHashTable<128 * 1024>,  // 8 MiB, § 6 (a)
 }
 
 #[repr(C, align(64))]
@@ -349,8 +353,12 @@ pub fn read(&self, key: u64) -> Option<u64> {
 }
 ```
 
-`MAX_PROBE = 16`. With load factor 50% (64K live entries on 128K
-slots) and a good hash, P(probe > 16) is well under 1e-9.
+The code above is the original design. `lorica-shmem/src/table.rs`
+is the reference: since 1.11.0 a claim stamps the slot before its
+CAS, lookups scan the whole probe window and sum every slot holding
+the key, and `MAX_PROBE` is 32. A refused key (`SATURATED`) fails
+open: nothing is counted, and the table's own documentation states
+the refusal rate at its sized load and the metrics that count them.
 
 ### 5.4 Eviction
 
@@ -359,8 +367,8 @@ A slot is evicted when `last_update_ns` is older than 5 minutes:
 the supervisor CAS's `key` from `h` to 0 to release the slot. No
 separate "active threshold" - staleness by age is the only
 criterion, and it works uniformly for monotonically-growing
-counters (WAF flood, WAF auto-ban) and hypothetical decaying
-counters alike.
+counters (WAF auto-ban) and per-window counts (§ 6 (c)), whose
+key goes idle when its window ends.
 
 `value` and `last_update_ns` are **not** reset at eviction time.
 They are reset by the next `increment` that claims the slot (see
@@ -399,20 +407,20 @@ re-forked with a fresh memfd; the old region is reclaimed.
 
 ## 6. WPAR-1 implementation
 
-Two halves:
+Three parts:
 
-**(a) WAF flood + auto-ban** -> shmem (component B). Per-IP:
+**(a) WAF auto-ban** -> shmem `waf_auto_ban` (component B). On every
+WAF block a worker adds 1 to the client's count in the shared table
+(`proxy_wiring/filters.rs`). No IPC, no lock, ~ns per call. The
+worker forwards the event over `waf.sock`, and the supervisor, on
+each forwarded event, reads the client's count against
+`waf_ban_threshold`; on the crossing it resets the count, broadcasts
+`BanIp` to every worker's command channel and raises one `ip_banned`
+alert (`startup/waf_forward.rs`). The supervisor is the sole issuer
+of WAF bans, so every worker holds the same ones.
 
-```rust
-// On every WAF block from the request hot path:
-let key = siphash13(client_ip);
-let count = state.shmem.waf_auto_ban.increment(key, 1);
-if count >= settings.waf_ban_threshold {
-    state.ban_list.insert(client_ip, ban_until);
-}
-```
-
-No IPC, no lock. ~ns per call.
+A per-client "WAF flood" count was planned beside it and never
+built; its table is the one (c) uses.
 
 **(b) Per-route token buckets** -> worker-cached + supervisor sync
 (component C). Worker hot path:
@@ -465,6 +473,40 @@ both ends of the RPC.
 Imprecision is bounded at `100 ms × N_workers` worth of in-flight
 consumption, in the direction "could let a few extra requests
 through". Acceptable.
+
+**(c) Rate-limit auto-ban** -> shmem `rate_counters` (component B),
+since 1.11.0. A route's `auto_ban_threshold` is compared to the
+client's refused requests per second over the latest completed
+minute, the semantics `lorica_limits::rate::Rate` gives single-process
+mode, which keeps using it. Before 1.11.0 worker mode used the same
+per-process `Rate`: each worker weighed only the requests it served
+itself, so a client whose connections spread over N workers needed
+up to N times the threshold to be banned, and the ban held on the
+worker that issued it alone, the client's connections to the other
+workers carrying on.
+
+- **Count.** A refused request adds 1 to the client's count for the
+  current minute in `rate_counters`, through
+  `lorica_shmem::WindowedCount`: one key per client and minute,
+  windows numbered on `CLOCK_MONOTONIC`, which every process shares.
+  The rate read is the previous minute's count over 60 s, summed over
+  every worker.
+- **Decide once.** Every worker can see the crossing; the one whose
+  `take_completed` clears the previous minute's count decides the
+  ban, and the others then read 0. The decider bans the client in its
+  own ban list at once.
+- **Apply everywhere.** The decider queues the ban
+  (`RateLimitBanQueue`); its WAF forwarder writes it to `waf.sock` on
+  the next tick (every 100 ms), ahead of its WAF events. The
+  supervisor broadcasts `BanIp` with reason `rate_limit` to every
+  worker and raises the one `ip_banned` alert, the path (a) uses.
+  Workers decide because they hold the route's threshold and
+  duration; the supervisor relays without counting.
+- **Bounds.** Each worker refuses the client from the moment its
+  `BanIp` lands, so a few more refused requests can be counted in the
+  meantime; they fall in the current minute, whose count a new ban
+  needs to cross on its own. A refused count (`SATURATED`) fails open
+  and is counted on `lorica_rate_limit_auto_ban_uncounted_total`.
 
 ## 7. WPAR-2/3/7/8 implementation
 

@@ -1043,9 +1043,9 @@ POST /api/v1/cluster/bans   {"client_ip": "192.0.2.10", "duration_s": 3600}
 
 Two things about this are worth knowing before relying on it.
 
-**Automatic per-node auto-ban is not replicated.** A WAF flood or a
-rate-limit trip bans that client on the node that saw it, and nowhere
-else. Replicating it would turn one node's view of one client into a
+**Automatic per-node auto-ban is not replicated.** A WAF auto-ban or a
+rate-limit auto-ban bans that client on every worker of the node that
+saw it, and nowhere else. Replicating it would turn one node's view of one client into a
 fleet-wide outage for that client, so a false positive on the least
 trusted edge would become everyone's false positive. Fleet-wide
 banning is an operator decision, taken deliberately.

@@ -877,6 +877,25 @@ pub fn inc_waf_auto_ban_uncounted() {
     WAF_AUTO_BAN_UNCOUNTED_TOTAL.inc();
 }
 
+/// Rate-limit violations the cross-worker counts could not record,
+/// because every slot of the client's probe window held another key
+/// (`lorica_shmem::SATURATED`). The request was refused all the same;
+/// only its weight toward a rate-limit auto-ban is missing. Label-less
+/// for the same reason as [`inc_waf_auto_ban_uncounted`].
+static RATE_LIMIT_AUTO_BAN_UNCOUNTED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    lorica_metrics::register_int_counter(
+        "rate_limit_auto_ban_uncounted_total",
+        "Rate-limit violations the shared counts refused to record (probe window full)",
+    )
+});
+
+/// Count one rate-limit violation the shared counts refused. Called
+/// from the worker's rate-limit stage (multi-worker mode only;
+/// aggregated via `PER_WORKER_COUNTERS`).
+pub fn inc_rate_limit_auto_ban_uncounted() {
+    RATE_LIMIT_AUTO_BAN_UNCOUNTED_TOTAL.inc();
+}
+
 /// PROXY protocol header reads that let the connection through, on the
 /// HTTP listeners (Story 12.8). Labels: `listener` (`http` or `https`)
 /// and `kind`, the label of an accepted `ProxyHeaderOutcome` of
@@ -1409,6 +1428,8 @@ pub const PER_WORKER_COUNTERS: &[&str] = &[
     // The shared auto-ban table is written only by the workers, and a
     // refused violation is a fail-open an operator should see.
     "lorica_waf_auto_ban_uncounted_total",
+    // Same for the shared rate-limit violation counts.
+    "lorica_rate_limit_auto_ban_uncounted_total",
     // The automation plane's counters (`lorica_automation_*`, Story
     // 10.3 / 10.4) are absent on purpose, not forgotten: the listener,
     // the environment handlers and the reaper all run on the supervisor
@@ -1509,6 +1530,10 @@ fn resolve_per_worker_counter(
         "lorica_waf_auto_ban_uncounted_total" => {
             Some((&[], CounterTarget::Scalar(&WAF_AUTO_BAN_UNCOUNTED_TOTAL)))
         }
+        "lorica_rate_limit_auto_ban_uncounted_total" => Some((
+            &[],
+            CounterTarget::Scalar(&RATE_LIMIT_AUTO_BAN_UNCOUNTED_TOTAL),
+        )),
         _ => None,
     }
 }
@@ -3479,6 +3504,32 @@ mod tests {
             );
         }
         assert_eq!(WAF_AUTO_BAN_UNCOUNTED_TOTAL.get(), before + 5);
+    }
+
+    #[test]
+    fn the_rate_limit_auto_ban_uncounted_counter_ships_and_aggregates_across_workers() {
+        inc_rate_limit_auto_ban_uncounted();
+        let shipped = snapshot_per_worker_counters();
+        assert!(
+            shipped.iter().any(|(name, labels, value)| {
+                name == "lorica_rate_limit_auto_ban_uncounted_total"
+                    && labels.is_empty()
+                    && *value >= 1
+            }),
+            "{shipped:?}"
+        );
+        let before = RATE_LIMIT_AUTO_BAN_UNCOUNTED_TOTAL.get();
+        for (worker, uncounted) in [(61u32, 4u64), (62u32, 1u64)] {
+            apply_worker_generic_counters(
+                worker,
+                &[(
+                    "lorica_rate_limit_auto_ban_uncounted_total".to_string(),
+                    Vec::new(),
+                    uncounted,
+                )],
+            );
+        }
+        assert_eq!(RATE_LIMIT_AUTO_BAN_UNCOUNTED_TOTAL.get(), before + 5);
     }
 
     #[test]

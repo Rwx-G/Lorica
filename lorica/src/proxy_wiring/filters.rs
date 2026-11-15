@@ -63,6 +63,64 @@ pub fn ip_to_shmem_key(ip: &str) -> u64 {
     }
 }
 
+/// The window the rate-limit auto-ban weighs violations over: the
+/// threshold is compared to the violations per second of the latest
+/// completed window, in single-process mode (`rate_violations`) and in
+/// worker mode ([`RATE_LIMIT_VIOLATIONS`]) alike.
+pub const RATE_LIMIT_VIOLATION_WINDOW: Duration = Duration::from_secs(60);
+
+/// Every worker's rate-limit violations, per client and window, in the
+/// shared region: a client spreading its requests over the workers is
+/// weighed on all of them.
+pub const RATE_LIMIT_VIOLATIONS: lorica_shmem::WindowedCount = lorica_shmem::WindowedCount::new(
+    lorica_shmem::CountKind::RateLimitViolations,
+    RATE_LIMIT_VIOLATION_WINDOW,
+);
+
+/// A rate-limit auto-ban a worker decided, on its way to the
+/// supervisor, which applies it on every worker and raises its alert
+/// (`waf.sock`, see `startup::waf_forward`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RateLimitBan {
+    /// The banned client.
+    pub client_ip: String,
+    /// The route's `auto_ban_duration_s`.
+    pub duration_s: u64,
+    /// The violations per second that crossed the route's threshold.
+    pub violations_per_s: f64,
+}
+
+/// The rate-limit bans a worker decided since its WAF forwarder last
+/// drained them; the forwarder sends them to the supervisor every
+/// forwarding interval.
+#[derive(Debug, Default)]
+pub struct RateLimitBanQueue {
+    bans: parking_lot::Mutex<Vec<RateLimitBan>>,
+}
+
+impl RateLimitBanQueue {
+    /// Bans held between two drains at most. A client is banned at most
+    /// once per window, so this bounds the distinct clients banned
+    /// within one forwarding interval, not a request rate.
+    pub const CAPACITY: usize = 1024;
+
+    /// Queue `ban`. Returns `false` when the queue is full and the ban
+    /// was dropped; the deciding worker has applied it all the same.
+    pub fn push(&self, ban: RateLimitBan) -> bool {
+        let mut bans = self.bans.lock();
+        if bans.len() >= Self::CAPACITY {
+            return false;
+        }
+        bans.push(ban);
+        true
+    }
+
+    /// Every queued ban, oldest first, leaving the queue empty.
+    pub fn take(&self) -> Vec<RateLimitBan> {
+        std::mem::take(&mut *self.bans.lock())
+    }
+}
+
 /// Parse an operator's address list for the data plane, skipping what
 /// the shared parser cannot read.
 ///
@@ -824,6 +882,88 @@ impl LoricaProxy {
     /// Whitelisted IPs bypass the limiter (same policy as WAF ban
     /// checks - an operator who added an IP to the whitelist has made
     /// a deliberate trust decision). Terminal: 429 with `Retry-After`.
+    /// Record one rate-limit violation by `ip` and decide whether it
+    /// earns `ip` a ban. Returns the violations per second that crossed
+    /// `ban_threshold` when it does.
+    ///
+    /// The rate is that of the latest completed
+    /// [`RATE_LIMIT_VIOLATION_WINDOW`]. Single-process mode counts in
+    /// `rate_violations` and bans on every violation past the threshold.
+    /// Worker mode counts in the shared region, so the rate is the
+    /// client's on every worker together; every worker then sees the
+    /// crossing, and only the one that takes the completed window
+    /// returns a ban, so the ban is requested once. `now_ns` is
+    /// [`lorica_shmem::now_ns`] and only worker mode reads it.
+    pub fn rate_limit_violation_earns_ban(
+        &self,
+        ip: &str,
+        ban_threshold: u32,
+        now_ns: u64,
+    ) -> Option<f64> {
+        let Some(region) = self.shmem else {
+            let violation_key = format!("violation:{ip}");
+            self.rate_violations.observe(&violation_key, 1);
+            let violations = self.rate_violations.rate(&violation_key);
+            return (violations > ban_threshold as f64).then_some(violations);
+        };
+        let client = ip_to_shmem_key(ip);
+        if !RATE_LIMIT_VIOLATIONS.observe(region, client, now_ns) {
+            lorica_api::metrics::inc_rate_limit_auto_ban_uncounted();
+        }
+        let violations = RATE_LIMIT_VIOLATIONS.rate(region, client, now_ns);
+        (violations > ban_threshold as f64
+            && RATE_LIMIT_VIOLATIONS.take_completed(region, client, now_ns))
+        .then_some(violations)
+    }
+
+    /// Ban `ip` for `ban_duration_s` (the route's `auto_ban_duration_s`)
+    /// after [`Self::rate_limit_violation_earns_ban`] said so.
+    ///
+    /// The ban holds on this process at once. Single-process mode raises
+    /// the alert here. A worker has no alert sender and its ban list is
+    /// its own, so it queues the ban for the supervisor, which applies it
+    /// on every worker and raises the alert once.
+    pub fn ban_for_rate_limit_abuse(&self, ip: &str, ban_duration_s: i32, violations: f64) {
+        self.ban_list.insert(
+            ip.to_string(),
+            lorica_api::ban::BanRecord {
+                banned_at: Instant::now(),
+                duration_s: ban_duration_s as u64,
+                reason: lorica_api::ban::BanReason::RateLimit,
+            },
+        );
+        warn!(
+            ip = %ip,
+            violations = %violations,
+            ban_duration_s = %ban_duration_s,
+            "IP auto-banned for rate limit abuse"
+        );
+        if let Some(ref sender) = self.alert_sender {
+            sender.send(
+                lorica_notify::AlertEvent::new(
+                    lorica_notify::events::AlertType::IpBanned,
+                    format!("IP {ip} auto-banned for rate limit abuse"),
+                )
+                .with_detail("ip", ip.to_string())
+                .with_detail("violations", violations.to_string())
+                .with_detail("ban_duration_s", ban_duration_s.to_string()),
+            );
+        }
+        if self.shmem.is_some() {
+            let queued = self.rate_limit_bans.push(RateLimitBan {
+                client_ip: ip.to_string(),
+                duration_s: ban_duration_s as u64,
+                violations_per_s: violations,
+            });
+            if !queued {
+                warn!(
+                    ip = %ip,
+                    "rate-limit auto-ban queue full; this ban holds on this worker only"
+                );
+            }
+        }
+    }
+
     pub(super) async fn check_structured_rate_limit(
         &self,
         session: &mut Session,
@@ -915,36 +1055,10 @@ impl LoricaProxy {
         if let (Some(ban_threshold), Some(ip)) =
             (entry.route.auto_ban_threshold, ctx.client_ip.as_deref())
         {
-            let violation_key = format!("violation:{ip}");
-            self.rate_violations.observe(&violation_key, 1);
-            let violations = self.rate_violations.rate(&violation_key);
-            if violations > ban_threshold as f64 {
-                let ban_duration = entry.route.auto_ban_duration_s;
-                self.ban_list.insert(
-                    ip.to_string(),
-                    lorica_api::ban::BanRecord {
-                        banned_at: Instant::now(),
-                        duration_s: ban_duration as u64,
-                        reason: lorica_api::ban::BanReason::RateLimit,
-                    },
-                );
-                warn!(
-                    ip = %ip,
-                    violations = %violations,
-                    ban_duration_s = %ban_duration,
-                    "IP auto-banned for rate limit abuse"
-                );
-                if let Some(ref sender) = self.alert_sender {
-                    sender.send(
-                        lorica_notify::AlertEvent::new(
-                            lorica_notify::events::AlertType::IpBanned,
-                            format!("IP {ip} auto-banned for rate limit abuse"),
-                        )
-                        .with_detail("ip", ip.to_string())
-                        .with_detail("violations", violations.to_string())
-                        .with_detail("ban_duration_s", ban_duration.to_string()),
-                    );
-                }
+            if let Some(violations) =
+                self.rate_limit_violation_earns_ban(ip, ban_threshold, lorica_shmem::now_ns())
+            {
+                self.ban_for_rate_limit_abuse(ip, entry.route.auto_ban_duration_s, violations);
             }
         }
 

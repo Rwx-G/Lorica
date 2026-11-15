@@ -44,18 +44,18 @@ pub const DEFAULT_SCAN_INTERVAL: Duration = Duration::from_secs(60);
 /// Statistics returned by a single eviction pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EvictionStats {
-    pub waf_flood_scanned: usize,
-    pub waf_flood_evicted: usize,
+    pub rate_counters_scanned: usize,
+    pub rate_counters_evicted: usize,
     pub waf_auto_ban_scanned: usize,
     pub waf_auto_ban_evicted: usize,
 }
 
 impl EvictionStats {
     pub fn total_evicted(&self) -> usize {
-        self.waf_flood_evicted + self.waf_auto_ban_evicted
+        self.rate_counters_evicted + self.waf_auto_ban_evicted
     }
     pub fn total_scanned(&self) -> usize {
-        self.waf_flood_scanned + self.waf_auto_ban_scanned
+        self.rate_counters_scanned + self.waf_auto_ban_scanned
     }
 }
 
@@ -64,11 +64,11 @@ impl EvictionStats {
 /// `now_ns` is the current monotonic timestamp; slots whose
 /// `last_update_ns` is more than `stale_after_ns` behind are evicted.
 pub fn evict_once(region: &SharedRegion, now_ns: u64, stale_after_ns: u64) -> EvictionStats {
-    let (ws, we) = evict_table(&region.waf_flood, now_ns, stale_after_ns);
+    let (ws, we) = evict_table(&region.rate_counters, now_ns, stale_after_ns);
     let (bs, be) = evict_table(&region.waf_auto_ban, now_ns, stale_after_ns);
     EvictionStats {
-        waf_flood_scanned: ws,
-        waf_flood_evicted: we,
+        rate_counters_scanned: ws,
+        rate_counters_evicted: we,
         waf_auto_ban_scanned: bs,
         waf_auto_ban_evicted: be,
     }
@@ -115,8 +115,8 @@ fn evict_table<const N: usize>(
 pub fn log_pass(stats: EvictionStats) {
     if stats.total_evicted() > 0 {
         tracing::info!(
-            flood_scanned = stats.waf_flood_scanned,
-            flood_evicted = stats.waf_flood_evicted,
+            rate_counters_scanned = stats.rate_counters_scanned,
+            rate_counters_evicted = stats.rate_counters_evicted,
             ban_scanned = stats.waf_auto_ban_scanned,
             ban_evicted = stats.waf_auto_ban_evicted,
             "shmem eviction pass complete",
@@ -143,8 +143,8 @@ mod tests {
         // Populate two entries at different ages.
         let h_fresh = region.tagged(1);
         let h_stale = region.tagged(2);
-        region.waf_flood.increment(h_fresh, 5, 1_000_000_000);
-        region.waf_flood.increment(h_stale, 7, 100_000_000);
+        region.rate_counters.increment(h_fresh, 5, 1_000_000_000);
+        region.rate_counters.increment(h_stale, 7, 100_000_000);
 
         // now_ns = 10s, stale_after = 5s.
         // h_fresh age = 10s - 1s = 9s -> stale (wait, 9 > 5, so evicted)
@@ -161,17 +161,17 @@ mod tests {
         let h_stale = region.tagged(2);
         // Fresh: last_update 999s -> age 1s -> not stale.
         region
-            .waf_flood
+            .rate_counters
             .increment(h_fresh, 5, now_ns - 1_000_000_000);
         // Stale: last_update 900s -> age 100s -> stale.
         region
-            .waf_flood
+            .rate_counters
             .increment(h_stale, 7, now_ns - 100_000_000_000);
 
         let stats = evict_once(region, now_ns, stale_after_ns);
-        assert_eq!(stats.waf_flood_evicted, 1);
-        assert!(region.waf_flood.read(h_fresh).is_some());
-        assert!(region.waf_flood.read(h_stale).is_none());
+        assert_eq!(stats.rate_counters_evicted, 1);
+        assert!(region.rate_counters.read(h_fresh).is_some());
+        assert!(region.rate_counters.read(h_stale).is_none());
     }
 
     #[test]
@@ -180,8 +180,8 @@ mod tests {
         let stats = evict_once(region, 1_000_000_000_000, 5_000_000_000);
         assert_eq!(stats.total_evicted(), 0);
         assert_eq!(
-            stats.waf_flood_scanned + stats.waf_auto_ban_scanned,
-            2 * region.waf_flood.capacity()
+            stats.rate_counters_scanned + stats.waf_auto_ban_scanned,
+            2 * region.rate_counters.capacity()
         );
     }
 
@@ -195,16 +195,18 @@ mod tests {
         let now_ns: u64 = 1_000_000_000_000;
         let stale_after_ns: u64 = 5_000_000_000;
         let h = region.tagged(42);
-        region.waf_flood.increment(h, 1, now_ns - 100_000_000_000); // very stale
+        region
+            .rate_counters
+            .increment(h, 1, now_ns - 100_000_000_000); // very stale
 
         // Simulate a writer touching the slot *just before* evict_once
         // by stamping a fresh last_update_ns.
-        region.waf_flood.increment(h, 1, now_ns);
+        region.rate_counters.increment(h, 1, now_ns);
 
         // Now evictor scans: last_update is fresh, slot survives.
         let stats = evict_once(region, now_ns, stale_after_ns);
-        assert_eq!(stats.waf_flood_evicted, 0);
-        assert_eq!(region.waf_flood.read(h), Some(2));
+        assert_eq!(stats.rate_counters_evicted, 0);
+        assert_eq!(region.rate_counters.read(h), Some(2));
     }
 
     #[test]
@@ -273,11 +275,11 @@ mod tests {
         let stale_after_ns: u64 = 5_000_000_000;
         let old = now_ns - 100_000_000_000;
         for i in 0..5 {
-            region.waf_flood.increment(region.tagged(i), 1, old);
+            region.rate_counters.increment(region.tagged(i), 1, old);
             region.waf_auto_ban.increment(region.tagged(i), 1, old);
         }
         let stats = evict_once(region, now_ns, stale_after_ns);
-        assert_eq!(stats.waf_flood_evicted, 5);
+        assert_eq!(stats.rate_counters_evicted, 5);
         assert_eq!(stats.waf_auto_ban_evicted, 5);
     }
 }

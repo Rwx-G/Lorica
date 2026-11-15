@@ -38,6 +38,8 @@ Schema migrations 71 to 73: upgrade followers first and the control plane immedi
 
 ### Security
 
+- **In worker mode, the packaged default, a route's rate-limit auto-ban weighs a client's violations on every worker and bans it on every worker.** Each worker counted only the refused requests it served itself and banned the client in its own ban list: a client whose connections spread over N workers needed up to N times the route's `auto_ban_threshold` to be banned, and once one worker banned it, the other workers went on serving it. The violations are now counted in the memory the workers share; the ban one worker decides is applied by every worker through the supervisor, as WAF auto-bans already were; and its `ip_banned` alert, which worker mode never raised, fires once per ban. A violation the shared count cannot record is counted on `lorica_rate_limit_auto_ban_uncounted_total`. Single-process mode is unchanged. Affected releases: 1.0.0 to 1.10.6.
+
 ## [1.10.6] - 2026-11-14
 
 Lorica installs and upgrades from signed apt and dnf repositories, and the `.rpm` carries a signature RHEL 9 reads again. No schema migration.

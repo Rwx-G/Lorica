@@ -724,8 +724,10 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 }
             });
         }
-        // The supervisor is the sole WAF ban issuer: see
-        // `SupervisorWafIngest::check_auto_ban`.
+        // The supervisor is the sole WAF ban issuer (see
+        // `SupervisorWafIngest::check_auto_ban`) and relays the
+        // rate-limit bans workers decide to every worker (see
+        // `SupervisorWafIngest::handle_rate_limit_ban`).
         let waf_ingest = Arc::new(super::waf_forward::SupervisorWafIngest {
             engine: Arc::clone(&waf_engine),
             alerts: alert_sender.clone(),
@@ -1806,7 +1808,8 @@ fn spawn_worker_channel_task(
 
         loop {
             tokio::select! {
-                // BanIp command from supervisor's global WAF counter
+                // BanIp command: a WAF or rate-limit auto-ban, or an
+                // operator ban, applied on every worker
                 ban_result = ban_rx.recv() => {
                     match ban_result {
                         Ok((ip, duration_s, reason)) => {

@@ -25,7 +25,9 @@
 //! - killing a child mid-flight does not corrupt state seen by the
 //!   survivor;
 //! - the siphash key populated by the parent is observed identically
-//!   by every child (so they probe the same chain for the same key).
+//!   by every child (so they probe the same chain for the same key);
+//! - windowed counts add up across processes, and a completed window
+//!   is taken by exactly one of them.
 
 #![cfg(target_os = "linux")]
 
@@ -33,7 +35,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use lorica_shmem::{SharedRegion, MAX_PROBE, SATURATED, WAF_SLOTS};
+use lorica_shmem::{CountKind, SharedRegion, WindowedCount, MAX_PROBE, SATURATED, WAF_SLOTS};
 
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitStatus};
@@ -85,19 +87,19 @@ fn two_children_increment_same_key_sum_correct() {
     let pids = [
         fork_child(fd_raw, move |r| {
             for _ in 0..PER_CHILD {
-                r.waf_flood.increment(h, 1, now);
+                r.rate_counters.increment(h, 1, now);
             }
         }),
         fork_child(fd_raw, move |r| {
             for _ in 0..PER_CHILD {
-                r.waf_flood.increment(h, 1, now);
+                r.rate_counters.increment(h, 1, now);
             }
         }),
     ];
 
     wait_all(&pids);
     // Parent observes the aggregate. 10 000 increments total.
-    assert_eq!(region.waf_flood.read(h), Some(2 * PER_CHILD));
+    assert_eq!(region.rate_counters.read(h), Some(2 * PER_CHILD));
     drop(fd);
 }
 
@@ -117,7 +119,7 @@ fn children_racing_on_the_first_increment_of_fresh_keys_lose_nothing() {
         .map(|_| {
             fork_child(fd_raw, move |r| {
                 for k in 0..KEYS {
-                    r.waf_flood.increment(r.tagged(k), 1, 1);
+                    r.rate_counters.increment(r.tagged(k), 1, 1);
                 }
             })
         })
@@ -133,7 +135,7 @@ fn children_racing_on_the_first_increment_of_fresh_keys_lose_nothing() {
     let lost: Vec<(u64, Option<u64>)> = (0..KEYS)
         .map(|k| (k, region.tagged(k)))
         .filter(|&(_, h)| !probe_window_held_by_other_keys(region, h))
-        .map(|(k, h)| (k, region.waf_flood.read(h)))
+        .map(|(k, h)| (k, region.rate_counters.read(h)))
         .filter(|&(_, read)| read != Some(CHILDREN))
         .collect();
     assert!(
@@ -153,11 +155,95 @@ fn probe_window_held_by_other_keys(region: &SharedRegion, h: u64) -> bool {
     let mask = WAF_SLOTS - 1;
     let start = (h as usize) & mask;
     (0..MAX_PROBE).all(|probe| {
-        let key = region.waf_flood.slots[(start + probe) & mask]
+        let key = region.rate_counters.slots[(start + probe) & mask]
             .key
             .load(Ordering::Acquire);
         key != 0 && key != h
     })
+}
+
+const MINUTE_NS: u64 = 60_000_000_000;
+
+#[test]
+fn workers_counting_one_clients_violations_add_up_to_one_rate() {
+    // Each child stands for a worker that served a quarter of one
+    // client's refused requests in a minute. The next minute, every
+    // worker reads the client's whole rate, which no worker's own
+    // share reaches.
+    let (region, fd) = SharedRegion::create_supervisor().expect("create");
+    let fd_raw = fd.as_raw_fd();
+    const CHILDREN: u64 = 4;
+    const PER_CHILD: u64 = 3_000;
+    const CLIENT: u64 = 0xC0A8_0001;
+    let violations = WindowedCount::new(CountKind::RateLimitViolations, Duration::from_secs(60));
+    let minute = 10_000 * MINUTE_NS;
+
+    let pids: Vec<Pid> = (0..CHILDREN)
+        .map(|child| {
+            fork_child(fd_raw, move |r| {
+                for i in 0..PER_CHILD {
+                    // Spread over the minute, each child on its own clock.
+                    let now =
+                        minute + (i * CHILDREN + child) * (MINUTE_NS / (PER_CHILD * CHILDREN));
+                    assert!(violations.observe(r, CLIENT, now));
+                }
+            })
+        })
+        .collect();
+    wait_all(&pids);
+
+    let next_minute = minute + MINUTE_NS + 1;
+    let share_per_s = PER_CHILD as f64 / 60.0;
+    let rate = violations.rate(region, CLIENT, next_minute);
+    assert_eq!(rate, CHILDREN as f64 * share_per_s);
+    // A ban threshold above one worker's share and below the total is
+    // crossed: counted per worker, it never was.
+    let threshold = 2.0 * share_per_s;
+    assert!(share_per_s < threshold && rate > threshold);
+    drop(fd);
+}
+
+#[test]
+fn exactly_one_worker_takes_each_completed_window() {
+    // Every worker sees a client's rate cross the threshold at once;
+    // only the one that takes the window may request the ban. The
+    // taker marks the client in the other table, so the parent sees how
+    // many takers each client had.
+    let (region, fd) = SharedRegion::create_supervisor().expect("create");
+    let fd_raw = fd.as_raw_fd();
+    const CHILDREN: u64 = 4;
+    const CLIENTS: u64 = 5_000;
+    let violations = WindowedCount::new(CountKind::RateLimitViolations, Duration::from_secs(60));
+    let minute = 20_000 * MINUTE_NS;
+    for client in 0..CLIENTS {
+        assert!(violations.observe(region, client, minute));
+    }
+    let next_minute = minute + MINUTE_NS;
+
+    let pids: Vec<Pid> = (0..CHILDREN)
+        .map(|_| {
+            fork_child(fd_raw, move |r| {
+                for client in 0..CLIENTS {
+                    if violations.take_completed(r, client, next_minute) {
+                        r.waf_auto_ban.increment(r.tagged(client), 1, next_minute);
+                    }
+                }
+            })
+        })
+        .collect();
+    wait_all(&pids);
+
+    let not_once: Vec<(u64, Option<u64>)> = (0..CLIENTS)
+        .map(|client| (client, region.waf_auto_ban.read(region.tagged(client))))
+        .filter(|&(_, takers)| takers != Some(1))
+        .collect();
+    assert!(
+        not_once.is_empty(),
+        "{} of {CLIENTS} clients were not taken exactly once, first (client, takers) {:?}",
+        not_once.len(),
+        &not_once[..not_once.len().min(5)]
+    );
+    drop(fd);
 }
 
 #[test]
@@ -204,18 +290,18 @@ fn siphash_key_is_shared_across_children() {
     let parent_key = region.hash_key;
     let fd_raw = fd.as_raw_fd();
 
-    // Child: write a marker value into waf_flood under a known raw key
+    // Child: write a marker value into rate_counters under a known raw key
     // using its own tagged(), then exit. Parent verifies it sees the
     // same tag - which means both hashed the same raw to the same h.
     let pid = fork_child(fd_raw, move |r| {
         assert_eq!(r.hash_key, parent_key, "child must see same key");
         let h = r.tagged(0xabcd_1234);
-        r.waf_flood.increment(h, 777, 1);
+        r.rate_counters.increment(h, 777, 1);
     });
     wait_all(&[pid]);
 
     let h_parent = region.tagged(0xabcd_1234);
-    assert_eq!(region.waf_flood.read(h_parent), Some(777));
+    assert_eq!(region.rate_counters.read(h_parent), Some(777));
     drop(fd);
 }
 
@@ -228,13 +314,13 @@ fn killed_child_does_not_corrupt_state() {
     // Survivor child: increments 1_000 times quickly, exits cleanly.
     let survivor = fork_child(fd_raw, move |r| {
         for _ in 0..1_000 {
-            r.waf_flood.increment(h, 1, 1);
+            r.rate_counters.increment(h, 1, 1);
         }
     });
 
     // Victim child: loops increments forever; parent will SIGKILL.
     let victim = fork_child(fd_raw, move |r| loop {
-        r.waf_flood.increment(h, 1, 1);
+        r.rate_counters.increment(h, 1, 1);
         std::thread::yield_now();
     });
 
@@ -248,11 +334,11 @@ fn killed_child_does_not_corrupt_state() {
 
     // Parent can still read a sane value (at least 1_000 from the
     // survivor plus whatever the victim managed before SIGKILL).
-    let v = region.waf_flood.read(h).expect("some value");
+    let v = region.rate_counters.read(h).expect("some value");
     assert!(v >= 1_000, "survivor contributions must be visible: {v}");
     // And the parent can still write without issue.
-    region.waf_flood.increment(h, 1, 2);
-    assert!(region.waf_flood.read(h).unwrap() > v);
+    region.rate_counters.increment(h, 1, 2);
+    assert!(region.rate_counters.read(h).unwrap() > v);
     drop(fd);
 }
 
@@ -285,7 +371,7 @@ fn probe_chain_saturation_returns_sentinel_across_processes() {
             // Build raw tagged hash directly, bypassing siphash, so we
             // can control the bits. Then increment under that tag.
             let h = (i << 20) | start_bits | 1;
-            r.waf_flood.increment(h, 1, 1);
+            r.rate_counters.increment(h, 1, 1);
         }
     });
     wait_all(&[pid]);
@@ -293,7 +379,7 @@ fn probe_chain_saturation_returns_sentinel_across_processes() {
     // 17th distinct hash on the same start -> saturation.
     let h_extra = ((lorica_shmem::MAX_PROBE as u64) << 20) | start_bits | 1;
     // Silence the warn log via env. Not critical if it fires.
-    let got = region.waf_flood.increment(h_extra, 1, 1);
+    let got = region.rate_counters.increment(h_extra, 1, 1);
     assert_eq!(got, SATURATED);
     drop(fd);
 }

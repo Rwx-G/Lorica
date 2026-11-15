@@ -17,8 +17,9 @@
 //! This crate implements component (B) of the worker shared-state design
 //! (see `docs/architecture/worker-shared-state.md` § 5): an anonymous
 //! memfd region shared between the supervisor and all worker processes,
-//! containing two fixed-layout atomic hashtables used by WPAR-1 for
-//! per-IP WAF flood and auto-ban counters.
+//! containing two fixed-layout atomic hashtables: the per-client WAF
+//! auto-ban counts, and the windowed counts ([`WindowedCount`]) behind
+//! the rate-limit auto-ban.
 //!
 //! The entry point is [`SharedRegion`]:
 //!
@@ -52,8 +53,10 @@ pub mod eviction;
 pub mod hash;
 pub mod region;
 pub mod table;
+pub mod window;
 
 pub use eviction::{evict_once, EvictionStats, DEFAULT_SCAN_INTERVAL, DEFAULT_STALE_AFTER};
 pub use hash::{random_key, siphash13_u64};
 pub use region::{SharedRegion, SharedRegionError, LAYOUT_VERSION, MAGIC, REGION_SIZE, WAF_SLOTS};
 pub use table::{now_ns, tagged_hash, AtomicHashTable, Slot, MAX_PROBE, SATURATED};
+pub use window::{CountKind, WindowedCount};

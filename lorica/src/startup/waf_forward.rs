@@ -16,10 +16,13 @@
 //!
 //! A worker drains its engine's forwarding outbox and writes one JSON
 //! line per event, plus one line per source whose events the outbox had
-//! to drop. The supervisor reads the lines, records them in its own
-//! engine and acts on them (WAF alert, global auto-ban check). The
-//! worker has no notification sender of its own, so a source that never
-//! crosses this stream raises no alert and triggers no auto-ban check.
+//! to drop, plus one line per rate-limit auto-ban it decided. The
+//! supervisor reads the lines, records them in its own engine and acts
+//! on them (WAF alert, global auto-ban check, ban broadcast to every
+//! worker). The worker has no notification sender of its own, so a
+//! source that never crosses this stream raises no alert and triggers
+//! no auto-ban check, and a rate-limit ban that never crosses it holds
+//! on the deciding worker only.
 //!
 //! Residual loss: a drop is reported per source only up to
 //! [`lorica_waf::LOST_SOURCES_CAPACITY`] sources between two reads. A
@@ -32,6 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use lorica::proxy_wiring::RateLimitBan;
 use lorica_notify::events::{AlertEvent, AlertType};
 use lorica_waf::{LostEvents, RuleCategory, WafEngine, WafEvent};
 use serde::{Deserialize, Serialize};
@@ -56,6 +60,11 @@ pub(crate) enum ForwardedLine {
         /// Who and how many.
         lost: LostEvents,
     },
+    /// A rate-limit auto-ban the worker decided, for every worker.
+    RateLimitBan {
+        /// Who, for how long, and on what evidence.
+        rate_limit_ban: RateLimitBan,
+    },
 }
 
 /// What one drain yields.
@@ -63,18 +72,22 @@ pub(crate) enum ForwardedLine {
 pub(crate) struct ForwardBatch {
     pub(crate) events: Vec<WafEvent>,
     pub(crate) lost: Vec<LostEvents>,
+    pub(crate) bans: Vec<RateLimitBan>,
 }
 
 impl ForwardBatch {
     pub(crate) fn is_empty(&self) -> bool {
-        self.events.is_empty() && self.lost.is_empty()
+        self.events.is_empty() && self.lost.is_empty() && self.bans.is_empty()
     }
 
-    /// The batch as stream lines, newline included, events first.
+    /// The batch as stream lines, newline included: bans first, so a
+    /// ban reaches the other workers before a long batch of events is
+    /// written, then events, then lost sources.
     pub(crate) fn into_lines(self) -> impl Iterator<Item = String> {
-        self.events
+        self.bans
             .into_iter()
-            .map(ForwardedLine::Event)
+            .map(|rate_limit_ban| ForwardedLine::RateLimitBan { rate_limit_ban })
+            .chain(self.events.into_iter().map(ForwardedLine::Event))
             .chain(
                 self.lost
                     .into_iter()
@@ -119,6 +132,7 @@ impl WafForwardCursor {
         ForwardBatch {
             events: after.events,
             lost: after.lost_by_source,
+            bans: Vec::new(),
         }
     }
 
@@ -185,8 +199,39 @@ impl SupervisorWafIngest {
         match serde_json::from_str::<ForwardedLine>(line) {
             Ok(ForwardedLine::Event(event)) => self.handle_event(event),
             Ok(ForwardedLine::Lost { lost }) => self.handle_lost(lost),
+            Ok(ForwardedLine::RateLimitBan { rate_limit_ban }) => {
+                self.handle_rate_limit_ban(rate_limit_ban)
+            }
             Err(_) => {}
         }
+    }
+
+    /// Apply a rate-limit auto-ban one worker decided on every worker,
+    /// and raise its alert. The workers decide (they hold the route's
+    /// threshold) and request each crossing once, through the shared
+    /// count, so the supervisor relays without counting again: one
+    /// line, one broadcast, one alert.
+    fn handle_rate_limit_ban(&self, ban: RateLimitBan) {
+        warn!(
+            ip = %ban.client_ip,
+            violations = %ban.violations_per_s,
+            ban_duration_s = %ban.duration_s,
+            "global rate-limit auto-ban: IP banned on every worker"
+        );
+        let _ = self.ban_tx.send((
+            ban.client_ip.clone(),
+            ban.duration_s,
+            lorica_api::ban::BanReason::RateLimit.as_i32(),
+        ));
+        self.alerts.send(
+            AlertEvent::new(
+                AlertType::IpBanned,
+                format!("IP {} auto-banned for rate limit abuse", ban.client_ip),
+            )
+            .with_detail("ip", ban.client_ip.clone())
+            .with_detail("violations", ban.violations_per_s.to_string())
+            .with_detail("ban_duration_s", ban.duration_s.to_string()),
+        );
     }
 
     fn handle_event(&self, event: WafEvent) {
@@ -540,5 +585,135 @@ mod tests {
                 duration_s: 120
             }
         );
+    }
+
+    /// A worker-mode proxy on `region`, as `run_worker` builds one.
+    fn worker_proxy(
+        region: &'static lorica_shmem::SharedRegion,
+    ) -> lorica::proxy_wiring::LoricaProxy {
+        let mut proxy = lorica::proxy_wiring::LoricaProxy::new(
+            Arc::new(ArcSwap::from_pointee(
+                lorica::proxy_wiring::ProxyConfig::default(),
+            )),
+            Arc::new(lorica_api::logs::LogBuffer::new(16)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(lorica_bench::passive_sla::SlaCollector::new()),
+        );
+        proxy.shmem = Some(region);
+        proxy
+    }
+
+    const MINUTE_NS: u64 = 60_000_000_000;
+
+    #[test]
+    fn workers_ban_a_client_once_its_violations_on_all_of_them_cross_the_threshold() {
+        // A route with `auto_ban_threshold = 10`: more than 10 refused
+        // requests per second over a minute, so more than 600 in it.
+        // Four workers each refuse a quarter of a client's requests:
+        // counted per worker, as before 1.11.0, none of them ever got
+        // past 600 / 4.
+        const THRESHOLD: u32 = 10;
+        let h = harness(NO_BAN);
+        let workers: Vec<_> = (0..4).map(|_| worker_proxy(h.ingest.shmem)).collect();
+        let minute = 30_000 * MINUTE_NS;
+        let (over, at) = ("192.0.2.31", "192.0.2.32");
+        for (i, worker) in workers.iter().enumerate() {
+            for n in 0..200u64 {
+                let now = minute + (n * 4 + i as u64) * 70_000_000;
+                assert_eq!(
+                    worker.rate_limit_violation_earns_ban(over, THRESHOLD, now),
+                    None
+                );
+                if n < 150 {
+                    assert_eq!(
+                        worker.rate_limit_violation_earns_ban(at, THRESHOLD, now),
+                        None
+                    );
+                }
+            }
+        }
+
+        // The next minute, the first violation on any worker sees all
+        // 800, and only that worker gets the ban to request.
+        let next = minute + MINUTE_NS;
+        let decided: Vec<Option<f64>> = workers
+            .iter()
+            .map(|worker| worker.rate_limit_violation_earns_ban(over, THRESHOLD, next))
+            .collect();
+        assert_eq!(decided[0], Some(800.0 / 60.0));
+        assert!(decided[1..].iter().all(Option::is_none), "{decided:?}");
+
+        // 600 in the minute is exactly 10 per second, not more than it.
+        for worker in &workers {
+            assert_eq!(
+                worker.rate_limit_violation_earns_ban(at, THRESHOLD, next),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn a_rate_limit_ban_one_worker_decides_reaches_every_worker_and_alerts_once() {
+        let mut h = harness(NO_BAN);
+        let mut other_worker_channel = h.ingest.ban_tx.subscribe();
+        let deciding = worker_proxy(h.ingest.shmem);
+        let other = worker_proxy(h.ingest.shmem);
+        let ip = "192.0.2.40";
+
+        deciding.ban_for_rate_limit_abuse(ip, 600, 12.5);
+        assert!(
+            deciding.ban_list.contains_key(ip),
+            "the decider bans at once"
+        );
+        assert!(!other.ban_list.contains_key(ip));
+
+        // The deciding worker's forwarder tick, then the supervisor.
+        let batch = ForwardBatch {
+            bans: deciding.rate_limit_bans.take(),
+            ..ForwardBatch::default()
+        };
+        for line in batch.into_lines() {
+            h.ingest.handle_line(&line);
+        }
+
+        // Every worker's channel task receives the one broadcast.
+        let reason = lorica_api::ban::BanReason::RateLimit.as_i32();
+        let expected = vec![(ip.to_string(), 600, reason)];
+        assert_eq!(drain(&mut h.bans), expected);
+        let received = drain(&mut other_worker_channel);
+        assert_eq!(received, expected);
+        let (banned, duration_s, reason) = &received[0];
+        assert!(crate::startup::worker::apply_ban_ip(
+            &other.ban_list,
+            banned,
+            *duration_s,
+            *reason
+        ));
+        let record = other
+            .ban_list
+            .get(ip)
+            .expect("the other worker refuses the client");
+        assert_eq!(record.reason, lorica_api::ban::BanReason::RateLimit);
+        assert_eq!(record.duration_s, 600);
+
+        let alerts = drain(&mut h.alerts);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert_eq!(alerts[0].alert_type, AlertType::IpBanned);
+        assert_eq!(alerts[0].details.get("ip").map(String::as_str), Some(ip));
+    }
+
+    #[test]
+    fn a_single_process_proxy_queues_no_rate_limit_ban() {
+        let proxy = lorica::proxy_wiring::LoricaProxy::new(
+            Arc::new(ArcSwap::from_pointee(
+                lorica::proxy_wiring::ProxyConfig::default(),
+            )),
+            Arc::new(lorica_api::logs::LogBuffer::new(16)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(lorica_bench::passive_sla::SlaCollector::new()),
+        );
+        proxy.ban_for_rate_limit_abuse("192.0.2.41", 60, 20.0);
+        assert!(proxy.ban_list.contains_key("192.0.2.41"));
+        assert!(proxy.rate_limit_bans.take().is_empty());
     }
 }

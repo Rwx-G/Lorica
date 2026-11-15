@@ -53,11 +53,14 @@ pub const MAX_PROBE: usize = 32;
 /// and the key reads as absent until eviction frees a slot in its
 /// window, so a refusal fails open.
 ///
-/// In Lorica the only writer is the worker's WAF auto-ban path: the
-/// request was already blocked by the WAF, and a refusal only means the
-/// violation does not count toward a ban; it is counted on the
-/// `lorica_waf_auto_ban_uncounted_total` metric. The supervisor reads a
-/// refused client as having no violations, so no ban follows.
+/// In Lorica the writers are the workers' auto-ban paths. For the WAF
+/// auto-ban the request was already blocked by the WAF, and a refusal
+/// only means the violation does not count toward a ban; it is counted
+/// on the `lorica_waf_auto_ban_uncounted_total` metric, and the
+/// supervisor reads a refused client as having no violations, so no
+/// ban follows. The rate-limit auto-ban is the same with a request the
+/// rate limit already refused, counted on
+/// `lorica_rate_limit_auto_ban_uncounted_total`.
 pub const SATURATED: u64 = u64::MAX;
 
 /// A single table slot. 64-byte aligned so each slot occupies one
