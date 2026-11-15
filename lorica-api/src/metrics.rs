@@ -857,6 +857,26 @@ pub fn inc_per_ip_connection_refused() {
     PER_IP_CONNECTION_REFUSED_TOTAL.inc();
 }
 
+/// WAF violations the cross-worker auto-ban table could not count,
+/// because every slot of the client's probe window held another client
+/// (`lorica_shmem::SATURATED`). The request was blocked all the same;
+/// only its weight toward an auto-ban is missing, so a rising count
+/// means the table is past its documented capacity. Label-less: the
+/// client address would be an unbounded cardinality label.
+static WAF_AUTO_BAN_UNCOUNTED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    lorica_metrics::register_int_counter(
+        "waf_auto_ban_uncounted_total",
+        "WAF violations the shared auto-ban table refused to count (probe window full)",
+    )
+});
+
+/// Count one WAF violation the shared auto-ban table refused. Called
+/// from the worker's WAF path (multi-worker mode only; aggregated via
+/// `PER_WORKER_COUNTERS`).
+pub fn inc_waf_auto_ban_uncounted() {
+    WAF_AUTO_BAN_UNCOUNTED_TOTAL.inc();
+}
+
 /// PROXY protocol header reads that let the connection through, on the
 /// HTTP listeners (Story 12.8). Labels: `listener` (`http` or `https`)
 /// and `kind`, the label of an accepted `ProxyHeaderOutcome` of
@@ -1386,6 +1406,9 @@ pub const PER_WORKER_COUNTERS: &[&str] = &[
     // for `skipped_budget`, the fail-open series an operator is
     // supposed to alarm on.
     "lorica_waf_body_scans_total",
+    // The shared auto-ban table is written only by the workers, and a
+    // refused violation is a fail-open an operator should see.
+    "lorica_waf_auto_ban_uncounted_total",
     // The automation plane's counters (`lorica_automation_*`, Story
     // 10.3 / 10.4) are absent on purpose, not forgotten: the listener,
     // the environment handlers and the reaper all run on the supervisor
@@ -1482,6 +1505,9 @@ fn resolve_per_worker_counter(
         }
         "lorica_waf_body_scans_total" => {
             Some((&["outcome"], CounterTarget::Vec(&WAF_BODY_SCANS_TOTAL)))
+        }
+        "lorica_waf_auto_ban_uncounted_total" => {
+            Some((&[], CounterTarget::Scalar(&WAF_AUTO_BAN_UNCOUNTED_TOTAL)))
         }
         _ => None,
     }
@@ -3425,6 +3451,34 @@ mod tests {
             }),
             "{shipped:?}"
         );
+    }
+
+    #[test]
+    fn the_waf_auto_ban_uncounted_counter_ships_and_aggregates_across_workers() {
+        // Only workers write the shared auto-ban table, so a refusal is
+        // seen on the supervisor's /metrics only through the shipped
+        // snapshot: the worker side must put it on the wire, the
+        // supervisor side must sum it across workers.
+        inc_waf_auto_ban_uncounted();
+        let shipped = snapshot_per_worker_counters();
+        assert!(
+            shipped.iter().any(|(name, labels, value)| {
+                name == "lorica_waf_auto_ban_uncounted_total" && labels.is_empty() && *value >= 1
+            }),
+            "{shipped:?}"
+        );
+        let before = WAF_AUTO_BAN_UNCOUNTED_TOTAL.get();
+        for (worker, uncounted) in [(51u32, 2u64), (52u32, 3u64)] {
+            apply_worker_generic_counters(
+                worker,
+                &[(
+                    "lorica_waf_auto_ban_uncounted_total".to_string(),
+                    Vec::new(),
+                    uncounted,
+                )],
+            );
+        }
+        assert_eq!(WAF_AUTO_BAN_UNCOUNTED_TOTAL.get(), before + 5);
     }
 
     #[test]

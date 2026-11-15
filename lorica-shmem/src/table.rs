@@ -48,9 +48,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// workers exec its own executable.
 pub const MAX_PROBE: usize = 32;
 
-/// Sentinel returned by [`AtomicHashTable::increment`] when the probe
-/// chain is saturated. Callers treat it as "limit reached" so the
-/// fail-safe semantics deny the request.
+/// Sentinel returned by [`AtomicHashTable::increment`] when every slot
+/// of the key's probe window holds another key. Nothing was counted,
+/// and the key reads as absent until eviction frees a slot in its
+/// window, so a refusal fails open.
+///
+/// In Lorica the only writer is the worker's WAF auto-ban path: the
+/// request was already blocked by the WAF, and a refusal only means the
+/// violation does not count toward a ban; it is counted on the
+/// `lorica_waf_auto_ban_uncounted_total` metric. The supervisor reads a
+/// refused client as having no violations, so no ban follows.
 pub const SATURATED: u64 = u64::MAX;
 
 /// A single table slot. 64-byte aligned so each slot occupies one

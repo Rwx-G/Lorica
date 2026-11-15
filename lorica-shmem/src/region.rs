@@ -52,10 +52,16 @@ pub const MAGIC: u64 = 0x4c4f_5249_4341_5348;
 /// [`SharedRegion`] or its tables.
 pub const LAYOUT_VERSION: u32 = 1;
 
-/// Number of slots per WAF table. Must be a power of two. 128 Ki slots
-/// ≈ 8 MiB per table, 16 MiB for both. At 50 % load factor this covers
-/// ~64 Ki concurrent live IPs per table, more than any single-node
-/// Lorica deployment expects.
+/// Number of slots per WAF table, 64 bytes each. Must be a power of two.
+///
+/// A table is sized to hold live keys in half its slots: for the
+/// auto-ban table, one key per client address with a WAF violation in
+/// the last [`DEFAULT_STALE_AFTER`](crate::DEFAULT_STALE_AFTER), since
+/// idle keys are evicted. Up to that load a key is refused with
+/// [`SATURATED`](crate::SATURATED) less than once in 100 000, the bound
+/// the table's fill test holds. Past it, refusals grow steeply with the
+/// load (see [`MAX_PROBE`](crate::MAX_PROBE)); they fail open and are
+/// counted on `lorica_waf_auto_ban_uncounted_total`.
 pub const WAF_SLOTS: usize = 128 * 1024;
 const _: () = {
     assert!(WAF_SLOTS.is_power_of_two());

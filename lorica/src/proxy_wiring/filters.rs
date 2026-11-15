@@ -2438,11 +2438,17 @@ impl LoricaProxy {
                     if threshold > 0 {
                         if let Some(region) = self.shmem {
                             // Multi-worker: just bump the shmem counter.
+                            // Its return value is not the count (the
+                            // supervisor reads that); only a refusal
+                            // matters here, and it fails open.
                             let tagged = region.tagged(ip_to_shmem_key(ip));
-                            let _ =
+                            let counted =
                                 region
                                     .waf_auto_ban
                                     .increment(tagged, 1, lorica_shmem::now_ns());
+                            if counted == lorica_shmem::SATURATED {
+                                lorica_api::metrics::inc_waf_auto_ban_uncounted();
+                            }
                         } else {
                             let violations = self
                                 .waf_violations

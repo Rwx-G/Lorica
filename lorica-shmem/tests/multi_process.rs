@@ -125,8 +125,8 @@ fn children_racing_on_the_first_increment_of_fresh_keys_lose_nothing() {
     wait_all(&pids);
 
     // A key whose whole probe window is held by other keys is refused
-    // by every child (`increment` returns `SATURATED`, the fail-safe
-    // deny), so it reads `None` with nothing counted and nothing lost.
+    // by every child (`increment` returns `SATURATED` and counts
+    // nothing), so it reads `None` with nothing lost.
     // Random keys make that possible in any run, if rare, and it is
     // not the race under test. Any other key must read exactly one
     // increment per child.
