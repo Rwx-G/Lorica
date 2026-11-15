@@ -26,6 +26,7 @@ pub(crate) mod cluster_follower;
 pub(crate) mod cluster_plane;
 pub(crate) mod drain;
 pub(crate) mod environment_reaper;
+pub(crate) mod fd_transfer;
 pub(crate) mod hot_upgrade;
 pub(crate) mod log_store_health;
 pub(crate) mod single;

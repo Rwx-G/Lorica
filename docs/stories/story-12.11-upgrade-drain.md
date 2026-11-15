@@ -1,7 +1,7 @@
 # Story 12.11: Upgrades and Reloads Drain Streams Cleanly
 
 **Epic:** [Epic 12 - TCP and UDP Stream Proxying (v1.11.0 and v1.12.0)](../prd/epic-12-v1.11.0.md)
-**Status:** Draft
+**Status:** InProgress
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:**
@@ -440,7 +440,7 @@ Allowlist: `lorica/src/startup/fd_transfer.rs` (new),
 `StreamUdpFd`; nothing else).
 Depends on: nothing in this story.
 
-- [ ] **First, before any change, the failing test on the current
+- [x] **First, before any change, the failing test on the current
       tree**, committed with the fix but run and recorded red first in
       the Debug Log: through today's `serve_listener_fds_blocking` and
       `pull_inherited_listeners`, (a) a table of 33 descriptors loses
@@ -448,14 +448,14 @@ Depends on: nothing in this story.
       keys exceed 2,048 bytes arrives with truncated keys or trips the
       count assertion of `Fds::deserialize`. The same test then passes
       on the chunked transfer below, unchanged.
-- [ ] `fd_transfer.rs`: header, chunks of at most 32 descriptors and
+- [x] `fd_transfer.rs`: header, chunks of at most 32 descriptors and
       8 KiB of keys, one-byte acknowledgement per chunk; legacy single
       message when the table fits; receiver accepts both; every received
       descriptor closed on any error (D-d).
-- [ ] `stream-udp:<stream_id>:<bind_gen>:<slot>:<addr>` key, parser
+- [x] `stream-udp:<stream_id>:<bind_gen>:<slot>:<addr>` key, parser
       (same "id may hold colons" rule as `parse_stream_tcp_key`),
       `StreamUdpFd`, its arm above the proxy catch-all.
-- [ ] Tests: 1, 32, 33 and 1,100 descriptors round-trip with their keys;
+- [x] Tests: 1, 32, 33 and 1,100 descriptors round-trip with their keys;
       a table that fits is sent as the legacy message and read by the
       fork's `get_fds_from` unchanged (downgrade compatibility); a legacy
       message is read by the new receiver; a truncated chunk and a count
@@ -764,9 +764,90 @@ without systemd; D-b sends nothing to it on this path by design).
 
 ### Debug Log
 
+**Lot A, red run on the unchanged transfer** (`7a0170ed` plus the three
+tests only, `cargo test -p lorica --features otel --bin lorica`, Docker
+`rust:1-bookworm`). Each descriptor is a distinct file and is matched to
+its key through `/proc/self/fd`, so a pairing error would fail too.
+
+```
+test startup::hot_upgrade::tests::a_table_whose_keys_exceed_2048_bytes_crosses_the_upgrade_socket ... FAILED
+test startup::hot_upgrade::tests::a_table_of_33_descriptors_crosses_the_upgrade_socket ... FAILED
+
+---- a_table_whose_keys_exceed_2048_bytes_crosses_the_upgrade_socket stdout ----
+thread '<unnamed>' panicked at lorica-core/src/server/transfer_fd/mod.rs:64:9:
+assertion `left == right` failed
+  left: 14
+ right: 21
+
+---- a_table_of_33_descriptors_crosses_the_upgrade_socket stdout ----
+thread '<unnamed>' panicked at lorica-core/src/server/transfer_fd/mod.rs:193:29:
+called `Result::unwrap()` on an `Err` value: ENOBUFS
+
+test startup::hot_upgrade::tests::tables_of_1_32_and_1100_descriptors_cross_the_upgrade_socket ... FAILED
+the old side serves the table: "failed to serve listener FDs on /tmp/.tmpZtTEWX/upgrade/transfer.sock: EINVAL: Invalid argument"
+```
+
+(a) 33 descriptors: the receive control buffer holds 32, the kernel
+flags `MSG_CTRUNC` and the fork's receiver panics in the new
+supervisor. (b) 21 descriptors whose keys join to more than 2,048
+bytes: the sender's `Write` on the slice stops at 2,048 bytes, 14 keys
+survive, `Fds::deserialize` asserts. 1,100 descriptors do not even
+leave the sender: one `sendmsg` carries at most `SCM_MAX_FD` (253). The
+same three tests pass unchanged on the chunked transfer.
+
+**Which releases could reach it.** The fork's limits date from the
+first hot upgrade (v1.6.0, `d339459c`), but no released table comes
+near them: up to 1.10.6 it holds the HTTP and HTTPS listeners, the
+management listener, at most one cluster listener (`--cluster-listen`
+is a single `Option`) and at most one automation listener
+(`--automation-listen`, idem), five short keys. Only the
+`stream-tcp:` family of this cycle (`d9740fe4`, 12.2 Lot H, unreleased)
+makes the table grow with configuration. No CHANGELOG line: the defect
+never shipped. Lot F's planned "Fixed (fd transfer past 32 sockets)"
+line should go, or move to Changed as the transfer format.
+
+**Lot A, how the `lorica` crate sends `SCM_RIGHTS`.** The crate does
+not depend on `nix` and std's ancillary-data API is unstable. Rather
+than adding a dependency, `lorica-worker/src/fd_passing.rs` (outside
+the allowlist) exposes what it already had: `MAX_FDS` and
+`ReceivedRights` become `pub`, and two thin wrappers are added,
+`send_with_rights` and `recv_with_rights_cloexec` (the existing
+`recv_with_rights`, which also salvages and closes the descriptors of a
+`MSG_CTRUNC` read, always with `MSG_CMSG_CLOEXEC` as the fork's
+receiver does). The legacy sender is the fork's own
+`Fds::send_to_sock`, so the bytes a 1.10.x receiver reads are the ones
+it has always read; the fork is unchanged.
+
+**Lot A, notes for Lot C.** Nothing sends `stream-udp:` keys yet:
+`stream_udp_fds_key`, `StreamUdpFd` and `InheritedListeners::stream_udp`
+carry `#[allow(dead_code)]` with a comment naming Lot C, which removes
+them. Sending the UDP group needs `HandoffArgs`, `run_old_side_handoff`,
+`build_fds_table` and `serve_listener_fds_blocking` to take the
+`StreamUdpFd` list; Lot C's allowance in `hot_upgrade.rs` is the drain
+report only, so it must be widened to those (or a small Lot A2 added).
+Until the new side adopts or closes `inherited.stream_udp`, the old side
+must not send it: an inherited slot socket nobody reads would swallow
+the datagrams hashed to it.
+
+**Lot A gates** (Docker, `CARGO_BUILD_WARNINGS=deny`): fmt, workspace
+clippy, `lorica --features otel`, the forked crates, the rustls line
+and `cargo audit` clean. The product-crate line has one failure that
+predates Lot A and that its diff cannot reach:
+`lorica-api` `streams::tests::the_published_udp_ranges_defaults_and_words_are_the_models`,
+`openapi.yaml`'s `StreamRefusal` lacks the four TLS words
+(`invalid_client_hello`, `no_certificate`, `tls_handshake`,
+`client_certificate`) the enum now carries. Every other test of that
+line passes (`--no-fail-fast`).
+
 ### Completion Notes
 
 ## File List
+
+- `lorica/src/startup/fd_transfer.rs` (new, Lot A)
+- `lorica/src/startup/mod.rs` (module line, Lot A)
+- `lorica/src/startup/hot_upgrade.rs` (transfer, `stream-udp:` family, Lot A)
+- `lorica-worker/src/fd_passing.rs` (`send_with_rights`, `recv_with_rights_cloexec`, Lot A)
+- `docs/stories/story-12.11-upgrade-drain.md`
 
 ## Change Log
 
@@ -774,3 +855,4 @@ without systemd; D-b sends nothing to it on this path by design).
 |---|---|---|---|
 | 2026-11-15 | 0.1 | Draft: decisions D-a to D-i, Lots A to G, five open questions. | Romain G. |
 | 2026-11-15 | 0.2 | Maintainer answers folded in as Resolved 1 to 5: a dedicated `lorica_hot_upgrade_stream_connections_total{stream_id,outcome}` with `lorica_hot_upgrade_total` unchanged (AC #2 copy updated to the amended PRD text, D-g and Lots C, F, G rewritten); HTTP cuts in the report and log only; chained upgrades allowed with a warning; SSH packages approved for the e2e images; the UDP handover of D-e accepted. Lot A opens with the failing 32-fd / 2,048-byte test on the current tree. Status Draft. | Romain G. |
+| 2026-11-15 | 0.3 | Lot A: chunked `lorica-fds/2` transfer with a one-byte acknowledgement per header and chunk, legacy single message kept whenever the table fits, receiver reading both and closing everything on error; `stream-udp:` key family parsed into `StreamUdpFd`. Red run recorded. Status InProgress. | Romain G. |

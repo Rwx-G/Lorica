@@ -19,8 +19,8 @@
 //! The old supervisor keeps long-lived `dup`s of its proxy listening
 //! sockets (see `WorkerManager::handoff_listen_fds`). On upgrade it serves
 //! those exact FDs to a freshly exec'd new supervisor over a Unix socket
-//! (`<data_dir>/upgrade/transfer.sock`) using `lorica_core`'s `Fds`
-//! SCM_RIGHTS machinery. The new supervisor hands the SAME kernel
+//! (`<data_dir>/upgrade/transfer.sock`) as an `SCM_RIGHTS` table
+//! ([`super::fd_transfer`]). The new supervisor hands the SAME kernel
 //! listening sockets to its own workers. Because both processes' workers
 //! now `accept` from the same single kernel accept queue, every incoming
 //! connection is delivered to exactly one of them - there is ALWAYS an
@@ -50,12 +50,14 @@
 //!    readiness datagram from stranding systemd on a killed PID (H3).
 
 use std::net::SocketAddr;
-use std::os::fd::RawFd;
+use std::os::fd::{IntoRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use lorica_core::server::Fds;
+
+use super::fd_transfer;
 
 /// Deadline for the freshly exec'd supervisor to signal readiness before
 /// the old side rolls back (Story 8.4 AC #6).
@@ -125,6 +127,15 @@ const AUTOMATION_KEY_PREFIX: &str = "automation:";
 /// above the proxy catch-all of `partition_inherited_fds`.
 const STREAM_TCP_KEY_PREFIX: &str = "stream-tcp:";
 
+/// `Fds` table key prefix for the UDP stream slot sockets (Story 12.11
+/// D-e), keyed `stream-udp:<stream_id>:<bind_gen>:<slot>:<addr>`, slot `k`
+/// being worker `k`'s socket of the binding's `SO_REUSEPORT` group.
+///
+/// The group is handed over rather than joined by a fresh one, so its
+/// size never changes and no client is remapped. Its arm sits above the
+/// proxy catch-all of `partition_inherited_fds`, like every family.
+const STREAM_UDP_KEY_PREFIX: &str = "stream-udp:";
+
 /// Role of a cluster-plane listener in the FD-handoff table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterListenerRole {
@@ -180,6 +191,53 @@ fn parse_stream_tcp_key(rest: &str) -> Option<(String, u64, SocketAddr)> {
             addr.parse().ok()?,
         ))
     })
+}
+
+/// `Fds` table key of one UDP stream slot socket.
+// Produced by the stream plane's UDP handoff (Story 12.11 Lot C); until
+// it lands nothing sends this family.
+#[allow(dead_code)]
+pub fn stream_udp_fds_key(stream_id: &str, bind_gen: u64, slot: u32, addr: SocketAddr) -> String {
+    format!("{STREAM_UDP_KEY_PREFIX}{stream_id}:{bind_gen}:{slot}:{addr}")
+}
+
+/// Split the part of a `stream-udp:` key after its prefix into stream id,
+/// `bind_gen`, slot and address, with the rule of
+/// [`parse_stream_tcp_key`]: the stream id may hold colons, so the first
+/// split that leaves a well-formed `<bind_gen>:<slot>:<addr>` tail wins.
+fn parse_stream_udp_key(rest: &str) -> Option<(String, u64, u32, SocketAddr)> {
+    let decimal = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    rest.match_indices(':').find_map(|(i, _)| {
+        let (stream_id, tail) = (&rest[..i], &rest[i + 1..]);
+        let (bind_gen, tail) = tail.split_once(':')?;
+        let (slot, addr) = tail.split_once(':')?;
+        if stream_id.is_empty() || !decimal(bind_gen) || !decimal(slot) {
+            return None;
+        }
+        Some((
+            stream_id.to_string(),
+            bind_gen.parse().ok()?,
+            slot.parse().ok()?,
+            addr.parse().ok()?,
+        ))
+    })
+}
+
+/// One UDP stream slot socket crossing a hot upgrade.
+// Read by the stream plane's UDP adoption (Story 12.11 Lot C).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamUdpFd {
+    /// The stream it serves.
+    pub stream_id: String,
+    /// The outgoing supervisor's generation of the binding.
+    pub bind_gen: u64,
+    /// The worker index the socket belongs to in the group.
+    pub slot: u32,
+    /// The bound address and port, shared by every slot of the group.
+    pub addr: SocketAddr,
+    /// The UDP socket.
+    pub fd: RawFd,
 }
 
 /// One TCP stream listener crossing a hot upgrade.
@@ -327,6 +385,11 @@ pub struct InheritedListeners {
     /// TCP stream listeners (Story 12.2 D-j), adopted by the stream
     /// plane before its first reconcile.
     pub stream_tcp: Vec<StreamTcpFd>,
+    /// UDP stream slot sockets (Story 12.11 D-e).
+    // Adopted slot by slot by the stream plane (Story 12.11 Lot C); no
+    // outgoing supervisor sends them before that lands.
+    #[allow(dead_code)]
+    pub stream_udp: Vec<StreamUdpFd>,
 }
 
 /// Build the `Fds` table the old supervisor serves: every proxy listener
@@ -362,9 +425,11 @@ fn build_fds_table(
 
 /// Serve the listening-socket FDs on `transfer.sock` (BLOCKING).
 ///
-/// Runs on a blocking thread (the underlying `send_to_sock` uses
-/// `thread::sleep` for its connect/send retry budget). Returns once the
-/// new supervisor has connected and pulled the FDs, or on error/timeout.
+/// Runs on a blocking thread (the transfer sleeps between connect
+/// attempts). Returns once the new supervisor has connected and pulled
+/// the FDs, or on error/timeout. The table goes as the legacy single
+/// message when it fits, so a 1.10.x binary can still take it, and
+/// chunked otherwise ([`super::fd_transfer`]).
 pub fn serve_listener_fds_blocking(
     data_dir: &Path,
     proxy: &[(String, RawFd)],
@@ -383,32 +448,33 @@ pub fn serve_listener_fds_blocking(
         stream_tcp,
     );
     let sock = transfer_sock_path(data_dir);
-    let sock_str = sock.to_string_lossy().into_owned();
-    table
-        .send_to_sock(sock_str.as_str())
-        .map(|_sent| ())
-        .map_err(|e| format!("failed to serve listener FDs on {sock_str}: {e}"))
+    fd_transfer::send_table(&table, &sock)
+        .map_err(|e| format!("failed to serve listener FDs on {}: {e}", sock.display()))
 }
 
 /// Pull the inherited listening sockets from `transfer.sock` (BLOCKING).
 ///
 /// Called by the NEW supervisor before it starts its tokio runtime,
-/// mirroring the bind-then-fork ordering of a fresh start. Partitions the
-/// pulled FD set into proxy listeners, the management listener, and the
-/// cluster listener.
+/// mirroring the bind-then-fork ordering of a fresh start. Reads either
+/// transfer format ([`super::fd_transfer`]) and partitions the pulled FD
+/// set by key family. A failed transfer has closed every descriptor it
+/// received.
 pub fn pull_inherited_listeners(
     data_dir: &Path,
     management_port: u16,
 ) -> Result<InheritedListeners, String> {
     let sock = transfer_sock_path(data_dir);
-    let sock_str = sock.to_string_lossy().into_owned();
-
-    let mut fds = Fds::new();
-    fds.get_from_sock(sock_str.as_str())
-        .map_err(|e| format!("failed to pull inherited listeners from {sock_str}: {e}"))?;
-
-    let (serialized_keys, serialized_fds) = fds.serialize();
-    partition_inherited_fds(serialized_keys, serialized_fds, management_port)
+    let table = fd_transfer::receive_table(&sock).map_err(|e| {
+        format!(
+            "failed to pull inherited listeners from {}: {e}",
+            sock.display()
+        )
+    })?;
+    let (keys, fds): (Vec<String>, Vec<RawFd>) = table
+        .into_iter()
+        .map(|(key, fd)| (key, fd.into_raw_fd()))
+        .unzip();
+    partition_inherited_fds(keys, fds, management_port)
 }
 
 /// Partition a pulled FD table into proxy / management / cluster /
@@ -438,6 +504,7 @@ fn partition_inherited_fds(
     let mut cluster: Vec<(ClusterListenerRole, String, RawFd)> = Vec::new();
     let mut automation: Vec<(String, RawFd)> = Vec::new();
     let mut stream_tcp: Vec<StreamTcpFd> = Vec::new();
+    let mut stream_udp: Vec<StreamUdpFd> = Vec::new();
     for (key, fd) in keys.into_iter().zip(fds) {
         if key.starts_with(MANAGEMENT_KEY_PREFIX) {
             if management.is_some() {
@@ -492,6 +559,28 @@ fn partition_inherited_fds(
                 addr,
                 fd,
             });
+        } else if let Some(rest) = key.strip_prefix(STREAM_UDP_KEY_PREFIX) {
+            let (stream_id, bind_gen, slot, addr) =
+                parse_stream_udp_key(rest).ok_or_else(|| {
+                    format!("inherited FD table carries a malformed UDP stream key `{key}`")
+                })?;
+            if stream_udp.iter().any(|s| {
+                s.stream_id == stream_id
+                    && s.bind_gen == bind_gen
+                    && s.slot == slot
+                    && s.addr == addr
+            }) {
+                return Err(format!(
+                    "inherited FD table carries a duplicate UDP stream key `{key}`"
+                ));
+            }
+            stream_udp.push(StreamUdpFd {
+                stream_id,
+                bind_gen,
+                slot,
+                addr,
+                fd,
+            });
         } else {
             proxy.push((key, fd));
         }
@@ -502,6 +591,7 @@ fn partition_inherited_fds(
         cluster,
         automation,
         stream_tcp,
+        stream_udp,
     })
 }
 
@@ -778,6 +868,7 @@ pub async fn run_old_side_handoff(args: HandoffArgs) -> HandoffRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::startup::fd_transfer::fixtures::{close_received, path_of, DescriptorFixture};
 
     #[test]
     fn partition_routes_cluster_listeners_by_role_key() {
@@ -1054,6 +1145,180 @@ mod tests {
         let err = partition_inherited_fds(vec![key.clone(), key], vec![71, 72], 9443)
             .expect_err("duplicate stream key must fail");
         assert!(err.contains("duplicate stream key"), "{err}");
+    }
+
+    /// Serve a table through `serve_listener_fds_blocking` and pull it
+    /// back through `pull_inherited_listeners`, as the outgoing and the
+    /// incoming supervisor do across a hot upgrade.
+    fn transfer_through_the_upgrade_socket(
+        proxy: &[(String, RawFd)],
+        management_fd: RawFd,
+        stream_tcp: &[StreamTcpFd],
+    ) -> InheritedListeners {
+        let data_dir = tempfile::tempdir().expect("test data dir");
+        std::fs::create_dir(upgrade_dir(data_dir.path())).expect("test upgrade dir");
+        let receiver_dir = data_dir.path().to_path_buf();
+        let receiver = std::thread::spawn(move || pull_inherited_listeners(&receiver_dir, 9443));
+        serve_listener_fds_blocking(
+            data_dir.path(),
+            proxy,
+            management_fd,
+            9443,
+            &[],
+            &[],
+            stream_tcp,
+        )
+        .expect("the old side serves the table");
+        receiver
+            .join()
+            .expect("the new side does not panic")
+            .expect("the new side pulls the table")
+    }
+
+    /// `proxy_count` proxy listeners and the management listener cross
+    /// the upgrade socket, each received descriptor naming the file sent
+    /// under its key.
+    fn assert_proxy_table_round_trips(proxy_count: usize) {
+        let fixture = DescriptorFixture::new(proxy_count + 1);
+        let proxy: Vec<(String, RawFd)> = (0..proxy_count)
+            .map(|i| (format!("192.0.2.10:{}", 10_000 + i), fixture.fd(i)))
+            .collect();
+        let inherited = transfer_through_the_upgrade_socket(&proxy, fixture.fd(proxy_count), &[]);
+
+        let management = inherited.management.expect("management listener received");
+        assert_eq!(path_of(management), fixture.path(proxy_count));
+        close_received(management);
+        assert_eq!(
+            inherited.proxy.len(),
+            proxy_count,
+            "every proxy listener received"
+        );
+        for (key, fd) in inherited.proxy {
+            let i = proxy
+                .iter()
+                .position(|(sent, _)| *sent == key)
+                .unwrap_or_else(|| panic!("received key `{key}` was never sent"));
+            assert_eq!(path_of(fd), fixture.path(i), "descriptor of `{key}`");
+            close_received(fd);
+        }
+    }
+
+    #[test]
+    fn a_table_of_33_descriptors_crosses_the_upgrade_socket() {
+        // 32 proxy listeners and the management one: one past the single
+        // message's receive buffer.
+        assert_proxy_table_round_trips(32);
+    }
+
+    #[test]
+    fn tables_of_1_32_and_1100_descriptors_cross_the_upgrade_socket() {
+        for total in [1, 32, 1_100] {
+            assert_proxy_table_round_trips(total - 1);
+        }
+    }
+
+    #[test]
+    fn a_table_whose_keys_exceed_2048_bytes_crosses_the_upgrade_socket() {
+        // 20 stream listeners keyed by long stream ids: well under the
+        // descriptor limit, well over the single message's key buffer.
+        let fixture = DescriptorFixture::new(21);
+        let streams: Vec<StreamTcpFd> = (0..20)
+            .map(|i| StreamTcpFd {
+                stream_id: format!("{i:02}-{}", "x".repeat(120)),
+                bind_gen: 7,
+                addr: SocketAddr::from(([192, 0, 2, 10], 5_000 + i as u16)),
+                fd: fixture.fd(i),
+            })
+            .collect();
+        let keys_len: usize = streams
+            .iter()
+            .map(|s| stream_tcp_fds_key(&s.stream_id, s.bind_gen, s.addr).len() + 1)
+            .sum();
+        assert!(keys_len > 2_048, "the fixture must overflow the key buffer");
+
+        let inherited = transfer_through_the_upgrade_socket(&[], fixture.fd(20), &streams);
+
+        let management = inherited.management.expect("management listener received");
+        assert_eq!(path_of(management), fixture.path(20));
+        close_received(management);
+        assert!(inherited.proxy.is_empty(), "{:?}", inherited.proxy);
+        assert_eq!(inherited.stream_tcp.len(), streams.len());
+        for received in inherited.stream_tcp {
+            let i = streams
+                .iter()
+                .position(|s| s.stream_id == received.stream_id)
+                .unwrap_or_else(|| {
+                    panic!("received stream `{}` was never sent", received.stream_id)
+                });
+            assert_eq!(received.bind_gen, streams[i].bind_gen);
+            assert_eq!(received.addr, streams[i].addr);
+            assert_eq!(path_of(received.fd), fixture.path(i));
+            close_received(received.fd);
+        }
+    }
+
+    #[test]
+    fn a_stream_udp_key_never_falls_into_the_proxy_set() {
+        let slots = vec![
+            StreamUdpFd {
+                stream_id: "6f1c1a52-5b0e-4f7e-9a51-1a7c5a1b2c3d".to_string(),
+                bind_gen: 3,
+                slot: 0,
+                addr: "0.0.0.0:53".parse().unwrap(),
+                fd: 80,
+            },
+            StreamUdpFd {
+                stream_id: "6f1c1a52-5b0e-4f7e-9a51-1a7c5a1b2c3d".to_string(),
+                bind_gen: 3,
+                slot: 1,
+                addr: "0.0.0.0:53".parse().unwrap(),
+                fd: 81,
+            },
+            // The stream id is not validated and an IPv6 address carries
+            // colons of its own: neither may confuse the split.
+            StreamUdpFd {
+                stream_id: "odd:1:2".to_string(),
+                bind_gen: u64::MAX,
+                slot: u32::MAX,
+                addr: "[2001:db8::1]:6000".parse().unwrap(),
+                fd: 82,
+            },
+        ];
+        let mut keys = vec!["0.0.0.0:8080".to_string()];
+        keys.extend(
+            slots
+                .iter()
+                .map(|s| stream_udp_fds_key(&s.stream_id, s.bind_gen, s.slot, s.addr)),
+        );
+        let mut fds = vec![10];
+        fds.extend(slots.iter().map(|s| s.fd));
+        let inherited = partition_inherited_fds(keys, fds, 9443).expect("partition succeeds");
+        assert_eq!(inherited.proxy, vec![("0.0.0.0:8080".to_string(), 10)]);
+        assert!(inherited.stream_tcp.is_empty());
+        assert_eq!(inherited.stream_udp, slots);
+    }
+
+    #[test]
+    fn a_malformed_or_duplicate_stream_udp_key_fails_the_pull() {
+        for bad in [
+            "stream-udp:",
+            "stream-udp:s1",
+            "stream-udp:s1:3:0.0.0.0:53",
+            "stream-udp:s1:x:0:0.0.0.0:53",
+            "stream-udp:s1:3:x:0.0.0.0:53",
+            "stream-udp:s1:3:-1:0.0.0.0:53",
+            "stream-udp:s1:3:4294967296:0.0.0.0:53",
+            "stream-udp:s1:3:0:not-an-address",
+            "stream-udp::3:0:0.0.0.0:53",
+        ] {
+            let err = partition_inherited_fds(vec![bad.to_string()], vec![90], 9443)
+                .expect_err("a malformed UDP stream key must fail");
+            assert!(err.contains("malformed UDP stream key"), "{bad}: {err}");
+        }
+        let key = stream_udp_fds_key("s1", 3, 0, "0.0.0.0:53".parse().unwrap());
+        let err = partition_inherited_fds(vec![key.clone(), key], vec![91, 92], 9443)
+            .expect_err("duplicate UDP stream key must fail");
+        assert!(err.contains("duplicate UDP stream key"), "{err}");
     }
 
     #[test]

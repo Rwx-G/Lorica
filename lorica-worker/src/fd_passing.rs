@@ -51,7 +51,7 @@ use crate::WorkerError;
 /// ceiling (`SCM_MAX_FD`, 253) is far above; keeping it at 32 also bounds
 /// the fds in flight per worker on the stream control channel, which the
 /// kernel charges to the sender's `RLIMIT_NOFILE` (`ETOOMANYREFS`).
-pub(crate) const MAX_FDS: usize = 32;
+pub const MAX_FDS: usize = 32;
 
 /// Upper bound on one wire token's encoded size. The longest token is a
 /// stream socket token, bounded by [`STREAM_SOCKET_TOKEN_MAX_LEN`]; the
@@ -305,13 +305,38 @@ pub fn recv_worker_fds(sock: RawFd) -> Result<Vec<FdEntry>, WorkerError> {
 }
 
 /// One `recvmsg` with its `SCM_RIGHTS` fds already owned.
-pub(crate) struct ReceivedRights {
+pub struct ReceivedRights {
     /// Payload bytes written into the caller's buffer.
-    pub(crate) bytes: usize,
+    pub bytes: usize,
     /// `MSG_TRUNC` or `MSG_CTRUNC`: payload or fds were lost.
-    pub(crate) truncated: bool,
+    pub truncated: bool,
     /// Every fd the kernel installed, owned so any error path closes it.
-    pub(crate) fds: Vec<OwnedFd>,
+    pub fds: Vec<OwnedFd>,
+}
+
+/// Send `payload` with `fds` attached as one `SCM_RIGHTS` message on a
+/// connected unix socket, and return how many payload bytes the kernel
+/// took.
+///
+/// On a stream socket the kernel may take less than the whole payload;
+/// the descriptors travel with the bytes it took, so the caller sends the
+/// rest without any.
+pub fn send_with_rights(sock: RawFd, payload: &[u8], fds: &[RawFd]) -> Result<usize, WorkerError> {
+    let iov = [IoSlice::new(payload)];
+    let rights = [ControlMessage::ScmRights(fds)];
+    let cmsg: &[ControlMessage<'_>] = if fds.is_empty() { &[] } else { &rights };
+    socket::sendmsg::<UnixAddr>(sock, &iov, cmsg, MsgFlags::empty(), None)
+        .map_err(WorkerError::SendFds)
+}
+
+/// [`recv_with_rights`] for a receiver outside this crate, always with
+/// `MSG_CMSG_CLOEXEC`: descriptors received from another process must not
+/// leak into the processes this one forks and execs.
+pub fn recv_with_rights_cloexec(
+    sock: RawFd,
+    buf: &mut [u8],
+) -> Result<ReceivedRights, WorkerError> {
+    recv_with_rights(sock, buf, MsgFlags::MSG_CMSG_CLOEXEC).map_err(WorkerError::RecvFds)
 }
 
 /// `recvmsg` into `buf` with room for [`MAX_FDS`] passed fds, owning every
