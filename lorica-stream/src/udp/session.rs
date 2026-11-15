@@ -390,6 +390,7 @@ impl Session {
             if c.rb.saturating_add(len) > self.bounds.bytes_ratio.saturating_mul(c.qb) {
                 self.stats.dropped(DatagramDropReason::ResponseByteBound);
                 response.end = Some(StreamEndReason::ResponseBoundReached);
+                st.phase = Phase::Ended;
                 return response;
             }
         }
@@ -417,6 +418,12 @@ impl Session {
             } else {
                 StreamEndReason::ResponseBoundReached
             });
+            // Ended under the same lock as the send: a client that sends
+            // again the moment its answer lands opens a new session,
+            // rather than joining this one in the instant before its
+            // task ends it, where its datagram would be forwarded and
+            // its answer lost.
+            st.phase = Phase::Ended;
         }
         response
     }
@@ -569,6 +576,12 @@ mod tests {
             }
         );
         assert_eq!(s.forwarded().datagrams_download, 1);
+        assert_eq!(
+            s.offer(&[0u8; 50]),
+            Offer::Gone,
+            "the next query, sent the moment the answer lands, opens a new session"
+        );
+        assert_eq!(s.forwarded().datagrams_upload, 1);
     }
 
     #[tokio::test]
@@ -586,6 +599,7 @@ mod tests {
         let over = s.on_response(&[0u8; 1], sent);
         assert_eq!(over.end, Some(StreamEndReason::ResponseBoundReached));
         assert_eq!(s.forwarded().bytes_download, 200);
+        assert_eq!(s.offer(&[0u8; 100]), Offer::Gone, "the allowance is spent");
     }
 
     #[tokio::test]
