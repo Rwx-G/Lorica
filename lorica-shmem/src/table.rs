@@ -133,6 +133,16 @@ impl<const N: usize> AtomicHashTable<N> {
                 // to `value` at once, and a store would erase their
                 // adds. It subtracts what the slot held instead, read
                 // before the CAS while no writer of this key exists.
+                //
+                // The timestamp is written before the CAS, not after:
+                // the slot still carries its previous occupant's stamp
+                // (0 if never used), and an eviction pass that saw the
+                // new key beside that stale stamp would release the
+                // claim at once. The evictor reads the key with Acquire,
+                // so seeing this CAS means seeing this stamp. A CAS lost
+                // to another key leaves it a fresher stamp, which at
+                // worst delays that slot's eviction by one pass.
+                s.last_update_ns.store(now_ns, Ordering::Release);
                 let left_over = s.value.load(Ordering::Acquire);
                 match s
                     .key
@@ -140,12 +150,10 @@ impl<const N: usize> AtomicHashTable<N> {
                 {
                     Ok(_) => {
                         let delta = by.wrapping_sub(left_over);
-                        let new = s
+                        return s
                             .value
                             .fetch_add(delta, Ordering::AcqRel)
                             .wrapping_add(delta);
-                        s.last_update_ns.store(now_ns, Ordering::Release);
-                        return new;
                     }
                     // Another writer claimed this slot first, often for
                     // this same key. Weigh the key it wrote rather than

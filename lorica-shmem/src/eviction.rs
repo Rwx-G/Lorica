@@ -208,6 +208,47 @@ mod tests {
     }
 
     #[test]
+    fn an_eviction_pass_never_releases_a_slot_claimed_now() {
+        // A claimed slot used to carry its previous occupant's timestamp
+        // (or 0 on a never-used slot) until the claimer stamped it after
+        // the claim, and an eviction pass landing in between released
+        // the fresh claim. Here the evictor runs without pause over a
+        // small table while a writer claims one slot again and again,
+        // its stamp aged as a long-idle slot's would be; any claim the
+        // pass releases is caught by the read right after it.
+        const NOW: u64 = 1_000_000_000_000;
+        const CLAIMS: u64 = 200_000;
+        const SLOT: u64 = 5;
+        let table: std::sync::Arc<AtomicHashTable<1024>> =
+            std::sync::Arc::from(AtomicHashTable::new_zeroed());
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let evictor = {
+            let table = table.clone();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    evict_table(&*table, NOW, 1);
+                }
+            })
+        };
+        let mut lost = 0u64;
+        for generation in 1..=CLAIMS {
+            let h = (generation << 10) | SLOT | 1;
+            table.increment(h, 1, NOW);
+            if table.read(h) != Some(1) {
+                lost += 1;
+            }
+            table.reset(h);
+            table.slots[SLOT as usize]
+                .last_update_ns
+                .store(0, Ordering::Release);
+        }
+        done.store(true, Ordering::Relaxed);
+        evictor.join().expect("evictor thread");
+        assert_eq!(lost, 0, "{lost} of {CLAIMS} fresh claims were evicted");
+    }
+
+    #[test]
     fn evict_both_tables() {
         let (region, _fd) = SharedRegion::create_supervisor().expect("create");
         let now_ns: u64 = 1_000_000_000_000;
