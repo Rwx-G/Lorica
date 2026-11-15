@@ -1263,6 +1263,35 @@ impl<L: WorkerLink + 'static> StreamPlaneHandle<L> {
         self.record(events).await;
     }
 
+    /// A backend's health or lifecycle changed (Story 12.3 D-i): every
+    /// worker reloads its stream table, so new connections select with
+    /// the new health and `close_on_backend_down` streams drain. Not a
+    /// configuration change: no binding moves and the reload path is not
+    /// woken.
+    pub(crate) async fn refresh_tables(&self) {
+        let pass = {
+            let store = self.store.lock().await;
+            match store.get_global_settings() {
+                Ok(settings) => PassSettings::of(&settings),
+                Err(e) => {
+                    warn!(error = %e, "stream plane: settings unreadable; stream tables not refreshed");
+                    return;
+                }
+            }
+        };
+        self.plane.lock().await.refresh_all(pass).await;
+    }
+
+    /// The health loop's `on_change` hook: [`Self::refresh_tables`] on a
+    /// task of its own, so the loop never waits on a worker's answer.
+    pub(crate) fn refresh_hook(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let handle = self.clone();
+        Arc::new(move || {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.refresh_tables().await });
+        })
+    }
+
     /// Retry the failures that may have cleared, every
     /// [`STREAM_BIND_RETRY_INTERVAL`], for the life of the process.
     pub(crate) fn spawn_retry_loop(&self) -> tokio::task::JoinHandle<()> {
@@ -1428,6 +1457,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use chrono::Utc;
+    use lorica_config::models::HealthStatus;
 
     const TEST_ACK_TIMEOUT: Duration = Duration::from_millis(200);
     const PASS: PassSettings = PassSettings {
@@ -2217,6 +2247,126 @@ mod tests {
             source.drain_timeout(),
             Duration::from_secs(u64::from(GlobalSettings::DEFAULT_WORKER_DRAIN_TIMEOUT_S))
         );
+    }
+
+    /// A TCP engine that serves nothing and reports the health of every
+    /// backend each table it is given holds.
+    struct HealthSeen(tokio::sync::mpsc::UnboundedSender<Vec<(String, HealthStatus)>>);
+
+    impl lorica_stream::StreamHandler for HealthSeen {
+        fn handle(
+            &self,
+            _conn: lorica_stream::AcceptedConnection,
+        ) -> lorica_stream::handler::HandlerFuture {
+            Box::pin(async {})
+        }
+
+        fn table_changed(&self, table: &lorica_stream::StreamTable) {
+            let mut seen: Vec<(String, HealthStatus)> = table
+                .backends()
+                .map(|b| (b.id.clone(), b.health_status.clone()))
+                .collect();
+            seen.sort_by(|a, b| a.0.cmp(&b.0));
+            let _ = self.0.send(seen);
+        }
+    }
+
+    fn stored_backend(id: &str, health_status: HealthStatus) -> lorica_config::models::Backend {
+        lorica_config::models::Backend {
+            id: id.into(),
+            address: "192.0.2.10:5432".into(),
+            name: id.into(),
+            group_name: String::new(),
+            weight: 1,
+            health_status,
+            health_check_enabled: true,
+            health_check_interval_s: 10,
+            health_check_path: None,
+            health_check: lorica_config::models::HealthCheck::TcpConnect,
+            lifecycle_state: lorica_config::models::LifecycleState::Normal,
+            active_connections: 0,
+            tls_upstream: false,
+            tls_skip_verify: false,
+            tls_sni: None,
+            h2_upstream: false,
+            managed_by: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    async fn next(
+        seen: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<(String, HealthStatus)>>,
+    ) -> Vec<(String, HealthStatus)> {
+        tokio::time::timeout(Duration::from_secs(10), seen.recv())
+            .await
+            .expect("the worker reloads its table")
+            .expect("the engine is alive")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_health_flip_reaches_the_workers_stream_table_through_refresh_tables() {
+        let dir = tempfile::tempdir().expect("test setup: tempdir");
+        let db = dir.path().join("lorica.db");
+        let stream_id = "6f1c1a52-5b0e-4f7e-9a51-1a7c5a1b2c3d";
+        let backend_id = "0b7e3c2a-1d4f-4e5a-8b6c-7d8e9f0a1b2c";
+        let store = ConfigStore::open(&db, None).expect("test setup: store");
+        store
+            .create_backend(&stored_backend(backend_id, HealthStatus::Healthy))
+            .expect("test setup: backend");
+        store
+            .create_stream(&tcp(stream_id, 5432))
+            .expect("test setup: stream");
+        store
+            .set_stream_backends(stream_id, &[backend_id.to_string()])
+            .expect("test setup: link");
+
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let (peer, transport) = lorica_stream::ControlTransport::in_process_pair(8);
+        let runtime = lorica_stream::StreamRuntime::spawn(
+            transport,
+            lorica_stream::Engines {
+                tcp: Some(Arc::new(HealthSeen(seen_tx))),
+                ..lorica_stream::Engines::default()
+            },
+            Arc::new(StoreStreamTable::open(&db, None).expect("a second connection opens")),
+        )
+        .unwrap();
+        assert_eq!(
+            next(&mut seen).await,
+            vec![(backend_id.to_string(), HealthStatus::Healthy)],
+            "the first load carries the linked backend and its health"
+        );
+
+        let store = Arc::new(Mutex::new(store));
+        let handle = StreamPlaneHandle::new(
+            StreamPlane::new(
+                vec![(0, InProcessLink(peer))],
+                1,
+                FdBudget::from_limit(65536),
+                reserved(),
+                StreamBindStates::new(),
+                STREAM_CTL_ACK_TIMEOUT,
+            ),
+            Arc::clone(&store),
+            PlaneRole::Standalone,
+            None,
+            lorica_notify::AlertSender::new(16),
+        );
+        // What the health loop persists on a confirmed flip.
+        store
+            .lock()
+            .await
+            .update_backend(&stored_backend(backend_id, HealthStatus::Down))
+            .expect("the flip is written");
+        let hook = handle.refresh_hook();
+        hook();
+
+        assert_eq!(
+            next(&mut seen).await,
+            vec![(backend_id.to_string(), HealthStatus::Down)]
+        );
+        runtime.stop();
     }
 
     #[test]

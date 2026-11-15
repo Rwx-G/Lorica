@@ -1106,22 +1106,22 @@ Allowlist: `lorica/src/stream_engine.rs` (new), `lorica/src/lib.rs` or
 Depends on: C, D1; after 12.8 Lot D, 12.2 Lot E3 and any open 12.7 Lot
 on `health.rs`.
 
-- [ ] `stream_engine.rs`: `BackendSelector` over `select_index` with
+- [x] `stream_engine.rs`: `BackendSelector` over `select_index` with
       per-stream WRR, its own `BackendConnections` and `EwmaTracker`;
       `BreakerGate` over `BreakerEngine` with the `stream:` key and the
       late-bound slot (D-g); `Resolve` over `hickory-resolver` from the
       system configuration with the hosts file (D-n).
-- [ ] `run_worker`: build the engine, install it in `Engines.tcp`, fill
+- [x] `run_worker`: build the engine, install it in `Engines.tcp`, fill
       the breaker slot after `RpcEndpoint::from_raw_fd`.
       `run_single_process`: same, with the local `BreakerEngine` clone.
       The test drivers in `stream_plane.rs` and `drain.rs` keep
       `Engines::default()`.
-- [ ] `StoreStreamTable::load` reads the linked backends;
+- [x] `StoreStreamTable::load` reads the linked backends;
       `demand_of` declares `held_fds` (D-p).
-- [ ] `StreamPlaneHandle::refresh_tables()` and its single-process
+- [x] `StreamPlaneHandle::refresh_tables()` and its single-process
       twin; `health_check_loop`'s `on_change` wired to them (D-i).
-- [ ] `--reserved-ports` from `WorkerManager` to `run_worker` (D-m).
-- [ ] Tests: two workers' worth of breaker traffic through a real
+- [x] `--reserved-ports` from `WorkerManager` to `run_worker` (D-m).
+- [x] Tests: two workers' worth of breaker traffic through a real
       `SupervisorBreakerRegistry` and RPC pair trip the (stream,
       backend) entry and leave a route entry with the same backend
       address closed; a health flip written to the store reaches a
@@ -1455,6 +1455,107 @@ performance phase.
   `demand_of` through `lorica_stream::tcp::held_fds`; the reserved ports
   into `TcpEngineParts::reserved_ports`.
 
+**Lot D2 (wiring in the binary).**
+
+- `lorica::stream_engine` is declared in `lib.rs`, not `main.rs`: it
+  calls `proxy_wiring` (library), and the integration tests under
+  `lorica/tests/` can only reach the library. The startup code uses it
+  as `lorica::stream_engine`.
+- `StreamSelector`: `select_index` with `ring_addresses` built from
+  each `Candidate::ring_address` only for `consistent_hash` (no
+  allocation for the other algorithms), the client as text,
+  `lb::random_seed(accepted_at)`, one `SmoothWrrState` per stream id
+  seeded with the process id as HTTP's route states are, its own
+  `BackendConnections` (incremented in `connected`, decremented in
+  `closed`) and its own `EwmaTracker` fed the connect latency in
+  microseconds. Both are keyed by the configured address, which is what
+  `select_index` reads. `table_changed` drops the round-robin state of
+  streams the table no longer holds and the latency scores of addresses
+  no linked backend has; `BackendConnections` has no removal API, so a
+  deleted backend keeps a zero counter (bounded by the backends ever
+  linked).
+- `StreamBreakerGate`: an `ArcSwapOption<BreakerEngine>`, key
+  `stream_breaker_key(id)` (`STREAM_BREAKER_PREFIX` and the id) with the
+  backend's configured address; `Probe` maps to `AllowProbe`. Empty, it
+  admits and records nothing. Worker: built empty before
+  `StreamRuntime::spawn` and filled with the same `BreakerEngine::rpc`
+  HTTP gets right after `RpcEndpoint::from_raw_fd`; when that fails or
+  no RPC fd came, it is filled with the proxy's local engine, as HTTP
+  falls back. Single process: `with_engine` over a clone of
+  `LoricaProxy`'s local engine, the same `Arc<CircuitBreaker>`.
+- `HickoryResolve`: `read_system_conf`, `use_hosts_file = Always`, a
+  per-attempt timeout of 2 s with one retry so a lookup ends inside the
+  cache's `DNS_RESOLVE_TIMEOUT`. The TTL is what is left of
+  `LookupIp::valid_until`, so an answer from hickory's own cache is not
+  taken as fresher than its record. An unreadable system configuration
+  is one warn line and a resolver whose every lookup fails (IP-literal
+  backends never call it). `with_config` exists for tests.
+- `tcp_engines(breaker, resolver, reserved_ports)` builds the one
+  selector, one `ResolverCache` and one counters `Arc` of a process and
+  returns `Engines { tcp: Some(..), counters, ..Engines::default() }`.
+  The observer is `LogObserver` until Story 12.9.
+- `StoreStreamTable::load` reads `list_backends` and builds through
+  `StreamTable::with_backends`, which keeps the linked rows only.
+- `demand_of(key, Option<&Stream>)` adds `tcp::held_fds` of the stream
+  the pass reads; a held binding whose stream is absent from the pass
+  declares nothing (that same pass detaches it). Held bindings now
+  carry their stream's name in the demand instead of an empty one.
+- `StreamPlane::refresh_all` is the refresh-every-worker block
+  `bind_desired` already ran on a change, factored out.
+  `StreamPlaneHandle::refresh_tables` reads `drain_ms` from the settings
+  and calls it; `refresh_hook()` wraps it in a spawned task for the
+  health loop's `on_change: Option<Arc<dyn Fn() + Send + Sync>>`, so
+  the loop never waits on a worker. The handle is generic over the
+  link, so the single-process twin is the same method over
+  `InProcessLink`.
+- Supervisor: the health loop spawn moved below the stream plane's
+  construction, which the hook needs; it still starts before the first
+  reconcile and keeps its `reload_bc_tx` signal unchanged.
+- `--reserved-ports` is `management,http,https,cluster,enrollment,automation`,
+  `-` for a listener that is off (`cli::reserved_ports_arg`,
+  `cli::parse_reserved_ports_arg`). `WorkerConfig` gains
+  `reserved_ports: Option<String>`: `lorica-worker` does not depend on
+  `lorica-config`, so the manager carries the encoded value. The
+  supervisor builds it before forking, from the CLI: the cluster binds
+  through `validate_cluster_listen` as the plane will validate them (an
+  invalid bind stops the process when the plane starts), the automation
+  port through `requested_port`. The argument is optional: a worker
+  execed without it warns once and its engine refuses only the stream
+  listen ports.
+- Tests. `lorica/src/startup/supervisor.rs`: two workers' breaker
+  traffic through real RPC socketpairs served by `handle_breaker_query`
+  and `handle_breaker_report` over one `SupervisorBreakerRegistry` trips
+  the `stream:<id>|<address>` entry, seen as `Deny` by both workers'
+  gates, while a route on the same address stays `Allow`; a gate admits
+  before its engine is installed. `lorica/src/startup/stream_plane.rs`:
+  a health flip written to the store reaches a real stream runtime's
+  table (over `StoreStreamTable`) through `refresh_hook`; a TCP
+  binding's demand declares `held_fds`. `lorica/src/cli.rs`:
+  `--reserved-ports` round-trips the supervisor's value with and
+  without the optional listeners, is optional, and refuses malformed
+  values. `lorica/tests/stream_engine_adapters.rs` (a real `TcpEngine`
+  and `StreamRuntime` over the binary's seams): per-stream round robin
+  and its pruning, least-conn counting and the EWMA sample, consistent
+  hash stability; the hickory adapter against an in-test UDP DNS
+  responder returns the record TTL and a silent server is a
+  `ResolveError`; IV4 at this level: a name the responder resolves to
+  `127.0.0.1` is never connected (`no_healthy_backend`, zero attempts,
+  zero accepts), and a backend on the node's management port is never
+  connected even with `allow_local_backend` while the same backend on a
+  port no listener holds is; IV2's stream half: a backend going `Down`
+  through a `refresh` leaves selection (`no_healthy_backend`, no new
+  accept) while the connection established before keeps echoing.
+  IV4's first half (refused at creation) is Lot E's API; IV2's HTTP
+  half is `upstream_peer`'s unchanged eligibility filter, and both
+  halves on one shared backend are Lot G's.
+- End to end: `lorica/tests/stream_engine_process_test.rs` starts the
+  real binary (`CARGO_BIN_EXE_lorica`) in single-process mode
+  (`--workers 0`) and in worker mode (`--workers 2`) over a store seeded
+  with a TCP stream linked to a loopback echo backend, connects to the
+  stream port and gets the bytes back on two connections, then stops
+  the node with SIGTERM. The worker-mode run also checks that no worker
+  started without `--reserved-ports`.
+
 **Lot D1 (the shared selection function).**
 
 - `lorica::proxy_wiring::lb::select_index(algorithm: &LoadBalancing,
@@ -1590,6 +1691,20 @@ Lot C:
 - `Cargo.lock`
 - `docs/stories/story-12.3-tcp-engine.md`
 
+Lot D2:
+
+- `lorica/src/stream_engine.rs` (new), `lorica/src/lib.rs`
+- `lorica/src/startup/worker.rs`, `lorica/src/startup/single.rs`,
+  `lorica/src/startup/supervisor.rs`, `lorica/src/startup/stream_plane.rs`,
+  `lorica/src/startup/mod.rs`
+- `lorica/src/health.rs` (the `on_change` hook)
+- `lorica/src/cli.rs`, `lorica/src/main.rs`
+- `lorica-worker/src/manager.rs` (`WorkerConfig::reserved_ports` and the
+  exec argument)
+- `lorica/tests/stream_engine_adapters.rs`,
+  `lorica/tests/stream_engine_process_test.rs` (new)
+- `docs/stories/story-12.3-tcp-engine.md`
+
 Lot D1:
 
 - `lorica/src/proxy_wiring/lb.rs`
@@ -1635,4 +1750,5 @@ Lot B:
 | 2026-11-14 | 0.3 | Lot B landed: the D-q fields, migration 75, validation, rule A and the backup and source-family rules, `local_backend_conflicts`, store, canonical digest, diff, export and import. D-s corrected: the PROXY header is written in plaintext right after connect and before any upstream TLS handshake. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.4 | Lot A landed: the PROXY v1 and v2 encoder beside the parser, with `encode_v2_dgram` for Story 12.5, round-trip tests and fuzz arm, FORK.md entry. | Romain G. |
 | 2026-11-14 | 0.5 | Lot D1 landed: HTTP's selection block extracted into `lb::select_index`, behaviour unchanged, `ring_addresses` refined to an `Option`. | Romain G. |
+| 2026-11-15 | 0.7 | Lot D2 landed: the selector, breaker gate and hickory resolver in `lorica::stream_engine`, the engine installed in worker and single-process modes, the stream table carrying backends, `held_fds` in the budget, health flips refreshing every stream table, `--reserved-ports` for workers; the real binary forwards a TCP stream in both modes. | Romain G. |
 | 2026-11-15 | 0.6 | Lot C landed: the TCP engine in `lorica_stream::tcp`, the protocol-neutral seams, local check, resolver cache and counters at the crate root (Story 12.5 E2, E3), `StreamTable::with_backends`, `table_changed` and the `backend_down` drain, the connection record and its observer. | Romain G. |

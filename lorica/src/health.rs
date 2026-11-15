@@ -113,6 +113,11 @@ async fn next_interval(store: &Mutex<ConfigStore>, fallback: u64) -> Duration {
 ///
 /// `default_interval_s` is the pause used when the store cannot be
 /// read; otherwise every cycle waits the interval stored at its start.
+///
+/// `on_change` is called once per cycle that persisted a confirmed
+/// health flip or a lifecycle transition, beside the `config_reload_tx`
+/// signal: the stream plane's table refresh (Story 12.3 D-i), which is
+/// not a configuration change and must not wake the reload path.
 pub async fn health_check_loop(
     store: Arc<Mutex<ConfigStore>>,
     proxy_config: Arc<ArcSwap<ProxyConfig>>,
@@ -120,6 +125,7 @@ pub async fn health_check_loop(
     backend_connections: Option<Arc<BackendConnections>>,
     alert_sender: Option<lorica_notify::AlertSender>,
     config_reload_tx: Option<tokio::sync::broadcast::Sender<u64>>,
+    on_change: Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
     // Track when each backend entered Closing state for drain timeout
     let mut drain_start: HashMap<String, Instant> = HashMap::new();
@@ -300,6 +306,9 @@ pub async fn health_check_loop(
             // Notify workers to reload their proxy config with updated health statuses
             if let Some(ref tx) = config_reload_tx {
                 let _ = tx.send(0);
+            }
+            if let Some(ref on_change) = on_change {
+                on_change();
             }
         }
     }

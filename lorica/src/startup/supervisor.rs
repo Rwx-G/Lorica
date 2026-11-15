@@ -689,19 +689,6 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // Create non-blocking alert sender (broadcast channel for proxy/health/acme -> dispatcher)
         let alert_sender = lorica_notify::AlertSender::new(256);
 
-        // Start health check background task (runs in supervisor, not
-        // workers). No backend_connections in supervisor - drain
-        // monitoring is per-worker. Spawn shared with single-process
-        // mode (audit H-9, see `startup::spawn_health_check_loop`).
-        let health_handle = startup::spawn_health_check_loop(
-            &store,
-            &proxy_config,
-            None,
-            alert_sender.clone(),
-            Some(reload_bc_tx.clone()),
-        )
-        .await;
-
         // Create WAF engine in supervisor for API access (rules listing,
         // blocklist toggle, events). Workers have their own engines for
         // real-time evaluation in the proxy pipeline.
@@ -1070,6 +1057,22 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 alert_sender.clone(),
             )
         };
+
+        // Start health check background task (runs in supervisor, not
+        // workers). No backend_connections in supervisor - drain
+        // monitoring is per-worker. Spawn shared with single-process
+        // mode (audit H-9, see `startup::spawn_health_check_loop`).
+        // Spawned once the stream plane exists: a confirmed flip also
+        // refreshes every worker's stream table (Story 12.3 D-i).
+        let health_handle = startup::spawn_health_check_loop(
+            &store,
+            &proxy_config,
+            None,
+            alert_sender.clone(),
+            Some(reload_bc_tx.clone()),
+            Some(stream_plane.refresh_hook()),
+        )
+        .await;
 
         // Config-change bridge: every change signalled on the watch
         // channel (API, environment reaper, GeoIP updater, cluster

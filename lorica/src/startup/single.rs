@@ -713,13 +713,15 @@ pub(crate) fn run_single_process(cli: Cli) {
         // supervisor mode (audit H-9, see
         // `startup::spawn_health_check_loop`). Single-process mode
         // passes direct backend-connection handles for drain
-        // monitoring and has no workers to notify on a status flip.
+        // monitoring and has no workers to notify on a status flip; its
+        // own stream table is refreshed on one (Story 12.3 D-i).
         let health_handle = startup::spawn_health_check_loop(
             &store,
             &proxy_config,
             Some(health_backend_conns),
             health_alert_sender2,
             None,
+            Some(stream_plane.refresh_hook()),
         )
         .await;
 

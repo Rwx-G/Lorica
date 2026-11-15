@@ -737,6 +737,8 @@ pub(crate) fn spawn_ocsp_refresh_loop(
 /// - `config_reload_tx`: `Some` in supervisor mode so a health-status
 ///   flip triggers a worker config reload; `None` in single-process
 ///   mode (no workers to notify).
+/// - `on_change`: the stream plane's `refresh_tables`, in both modes,
+///   so a flip reaches every stream table (Story 12.3 D-i).
 ///
 /// Returns the `JoinHandle` so the caller can abort it at shutdown
 /// (both modes keep it bound as `health_handle`).
@@ -746,6 +748,7 @@ pub(crate) async fn spawn_health_check_loop(
     backend_connections: Option<Arc<BackendConnections>>,
     alert_sender: lorica_notify::AlertSender,
     config_reload_tx: Option<tokio::sync::broadcast::Sender<u64>>,
+    on_change: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> tokio::task::JoinHandle<()> {
     let health_store = Arc::clone(store);
     let health_config = Arc::clone(proxy_config);
@@ -763,6 +766,7 @@ pub(crate) async fn spawn_health_check_loop(
             backend_connections,
             Some(alert_sender),
             config_reload_tx,
+            on_change,
         )
         .await;
     })
