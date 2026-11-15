@@ -127,191 +127,245 @@ pub async fn health_check_loop(
     config_reload_tx: Option<tokio::sync::broadcast::Sender<u64>>,
     on_change: Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
-    // Track when each backend entered Closing state for drain timeout
-    let mut drain_start: HashMap<String, Instant> = HashMap::new();
-    // Track an in-progress health-status flip per backend (candidate status +
-    // consecutive-confirmation count) so a transient probe blip does not flip
-    // the stored status. See `confirm_status_flip` / `HEALTH_FLIP_THRESHOLD`.
-    let mut pending_health: HashMap<String, (HealthStatus, u32)> = HashMap::new();
-
+    let health = HealthLoop {
+        store,
+        proxy_config,
+        backend_connections,
+        alert_sender,
+        config_reload_tx,
+        on_change,
+    };
+    let mut state = HealthLoopState::default();
     loop {
-        tokio::time::sleep(next_interval(&store, default_interval_s).await).await;
+        tokio::time::sleep(next_interval(&health.store, default_interval_s).await).await;
+        run_health_cycle(&health, &mut state).await;
+    }
+}
 
-        let backends = {
-            let store = store.lock().await;
-            match store.list_backends() {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(error = %e, "failed to list backends for health check");
-                    continue;
-                }
-            }
-        };
+/// What every health cycle reads and notifies, fixed for the loop's
+/// life.
+struct HealthLoop {
+    store: Arc<Mutex<ConfigStore>>,
+    proxy_config: Arc<ArcSwap<ProxyConfig>>,
+    backend_connections: Option<Arc<BackendConnections>>,
+    alert_sender: Option<lorica_notify::AlertSender>,
+    config_reload_tx: Option<tokio::sync::broadcast::Sender<u64>>,
+    on_change: Option<Arc<dyn Fn() + Send + Sync>>,
+}
 
-        let mut changed = false;
+/// What the health loop carries from one cycle to the next.
+#[derive(Default)]
+struct HealthLoopState {
+    /// When each backend was first seen Closing, for the drain timeout.
+    drain_start: HashMap<String, Instant>,
+    /// An in-progress health-status flip per backend (candidate status
+    /// and consecutive-confirmation count), so a transient probe blip
+    /// does not flip the stored status. See `confirm_status_flip` and
+    /// `HEALTH_FLIP_THRESHOLD`.
+    pending_health: HashMap<String, (HealthStatus, u32)>,
+}
 
-        // --- Phase 0: drain monitoring (sequential) ---
-        // Closing backends may transition to Closed; non-Closing backends just
-        // clear stale drain / flip tracking. This is cheap and rare, so it
-        // stays sequential.
-        for backend in &backends {
-            if backend.lifecycle_state == LifecycleState::Closing {
-                let start = drain_start
-                    .entry(backend.id.clone())
-                    .or_insert_with(Instant::now);
-
-                let active = backend_connections
-                    .as_ref()
-                    .map(|bc| bc.get(&backend.address))
-                    .unwrap_or(0);
-
-                let timed_out = start.elapsed() >= DEFAULT_DRAIN_TIMEOUT;
-
-                if active == 0 || timed_out {
-                    let reason = if active == 0 {
-                        "all connections drained"
-                    } else {
-                        "drain timeout expired"
-                    };
-                    info!(
-                        backend = %backend.address,
-                        active_connections = active,
-                        reason = reason,
-                        "transitioning backend to Closed"
-                    );
-
-                    let mut updated = backend.clone();
-                    updated.lifecycle_state = LifecycleState::Closed;
-                    updated.updated_at = chrono::Utc::now();
-
-                    let store = store.lock().await;
-                    if let Err(e) = store.update_backend(&updated) {
-                        warn!(
-                            backend = %backend.address,
-                            error = %e,
-                            "failed to transition backend to Closed"
-                        );
-                    } else {
-                        changed = true;
-                        drain_start.remove(&backend.id);
-                    }
-                }
-                continue;
-            }
-
-            // Clean up drain tracking for non-Closing backends.
-            drain_start.remove(&backend.id);
-            // A backend that is not health-checked keeps no flip streak.
-            if !backend.health_check_enabled {
-                pending_health.remove(&backend.id);
+/// One health cycle: list the backends, close the drained ones, probe
+/// the eligible ones, persist the confirmed flips, and signal the
+/// reload when anything was persisted. Returns whether it was.
+async fn run_health_cycle(health: &HealthLoop, state: &mut HealthLoopState) -> bool {
+    let backends = {
+        let store = health.store.lock().await;
+        match store.list_backends() {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "failed to list backends for health check");
+                return false;
             }
         }
+    };
 
-        // --- Phase A: probe eligible backends concurrently ---
-        // One slow or timing-out backend must not delay every other backend's
-        // probe or overrun the loop interval. Bound concurrency with the
-        // operator-tunable `health_max_concurrent_probes` (default 32).
-        let max_concurrent = {
-            let store = store.lock().await;
-            store
-                .get_global_settings()
-                .map(|s| s.health_max_concurrent_probes.clamp(1, 512) as usize)
-                .unwrap_or(32)
-        };
-        // Clone the eligible backends so each probe future owns its data; this
-        // keeps the spawned `health_check_loop` future free of borrows that the
-        // stream combinators cannot prove `Send` across the await points.
-        let eligible: Vec<Backend> = backends
-            .iter()
-            .filter(|b| b.lifecycle_state != LifecycleState::Closing && b.health_check_enabled)
-            .cloned()
-            .collect();
-        let probe_results: Vec<(Backend, HealthStatus)> = futures_util::stream::iter(eligible)
-            .map(|backend| async move {
-                let probe = match probe_for(&backend) {
-                    ProbeTarget::Http { url } => http_probe(&url).await,
-                    ProbeTarget::TcpConnect { address } => tcp_probe(&address).await,
+    let mut changed = close_drained_backends(health, state, &backends).await;
+
+    // --- Phase A: probe eligible backends concurrently ---
+    // One slow or timing-out backend must not delay every other backend's
+    // probe or overrun the loop interval. Bound concurrency with the
+    // operator-tunable `health_max_concurrent_probes` (default 32).
+    let max_concurrent = {
+        let store = health.store.lock().await;
+        store
+            .get_global_settings()
+            .map(|s| s.health_max_concurrent_probes.clamp(1, 512) as usize)
+            .unwrap_or(32)
+    };
+    // Clone the eligible backends so each probe future owns its data; this
+    // keeps the spawned `health_check_loop` future free of borrows that the
+    // stream combinators cannot prove `Send` across the await points.
+    let eligible: Vec<Backend> = backends
+        .iter()
+        .filter(|b| b.lifecycle_state != LifecycleState::Closing && b.health_check_enabled)
+        .cloned()
+        .collect();
+    let probe_results: Vec<(Backend, HealthStatus)> = futures_util::stream::iter(eligible)
+        .map(|backend| async move {
+            let probe = match probe_for(&backend) {
+                ProbeTarget::Http { url } => http_probe(&url).await,
+                ProbeTarget::TcpConnect { address } => tcp_probe(&address).await,
+            };
+            (backend, probe.to_health_status())
+        })
+        .buffer_unordered(max_concurrent)
+        .collect()
+        .await;
+
+    // --- Phase B: apply flip hysteresis (sequential) ---
+    // `pending_health` is single-threaded loop state, so the decision runs
+    // sequentially over the collected probe outcomes. Only confirmed flips
+    // (the new status observed HEALTH_FLIP_THRESHOLD times in a row) are
+    // carried forward; a transient probe blip is absorbed.
+    let mut commits: Vec<(Backend, HealthStatus)> = Vec::new();
+    for (backend, new_status) in probe_results {
+        if confirm_status_flip(
+            &mut state.pending_health,
+            &backend.id,
+            &backend.health_status,
+            &new_status,
+            HEALTH_FLIP_THRESHOLD,
+        ) {
+            commits.push((backend, new_status));
+        }
+    }
+
+    changed |= persist_health_flips(health, &commits).await;
+
+    if changed {
+        if let Err(e) = reload_proxy_config(&health.store, &health.proxy_config, None).await {
+            warn!(error = %e, "failed to reload proxy config after health check");
+        }
+        // Notify workers to reload their proxy config with updated health statuses
+        if let Some(ref tx) = health.config_reload_tx {
+            let _ = tx.send(0);
+        }
+        if let Some(ref on_change) = health.on_change {
+            on_change();
+        }
+    }
+    changed
+}
+
+/// Phase 0, drain monitoring (sequential): move each `Closing` backend
+/// of `backends` to `Closed` once it is drained or its drain timed out,
+/// and clear the drain and flip tracking of the others. Returns whether
+/// a transition was persisted.
+///
+/// Writes the lifecycle state alone, so an edit committed since
+/// `backends` was listed survives.
+async fn close_drained_backends(
+    health: &HealthLoop,
+    state: &mut HealthLoopState,
+    backends: &[Backend],
+) -> bool {
+    let mut changed = false;
+    for backend in backends {
+        if backend.lifecycle_state == LifecycleState::Closing {
+            let start = state
+                .drain_start
+                .entry(backend.id.clone())
+                .or_insert_with(Instant::now);
+
+            let active = health
+                .backend_connections
+                .as_ref()
+                .map(|bc| bc.get(&backend.address))
+                .unwrap_or(0);
+
+            let timed_out = start.elapsed() >= DEFAULT_DRAIN_TIMEOUT;
+
+            if active == 0 || timed_out {
+                let reason = if active == 0 {
+                    "all connections drained"
+                } else {
+                    "drain timeout expired"
                 };
-                (backend, probe.to_health_status())
-            })
-            .buffer_unordered(max_concurrent)
-            .collect()
-            .await;
-
-        // --- Phase B: apply flip hysteresis (sequential) ---
-        // `pending_health` is single-threaded loop state, so the decision runs
-        // sequentially over the collected probe outcomes. Only confirmed flips
-        // (the new status observed HEALTH_FLIP_THRESHOLD times in a row) are
-        // carried forward; a transient probe blip is absorbed.
-        let mut commits: Vec<(Backend, HealthStatus)> = Vec::new();
-        for (backend, new_status) in probe_results {
-            if confirm_status_flip(
-                &mut pending_health,
-                &backend.id,
-                &backend.health_status,
-                &new_status,
-                HEALTH_FLIP_THRESHOLD,
-            ) {
-                commits.push((backend, new_status));
-            }
-        }
-
-        // --- Phase C: persist confirmed flips under a single lock ---
-        if !commits.is_empty() {
-            let store = store.lock().await;
-            for (backend, new_status) in &commits {
-                debug!(
+                info!(
                     backend = %backend.address,
-                    old = backend.health_status.as_str(),
-                    new = new_status.as_str(),
-                    "backend health status changed"
+                    active_connections = active,
+                    reason = reason,
+                    "transitioning backend to Closed"
                 );
 
-                let mut updated = backend.clone();
-                updated.health_status = new_status.clone();
-
-                // Dispatch backend_down notification on a confirmed transition
-                // to Down (not on a transient blip - the hysteresis already
-                // filtered those out).
-                if *new_status == HealthStatus::Down {
-                    if let Some(ref sender) = alert_sender {
-                        sender.send(
-                            lorica_notify::AlertEvent::new(
-                                lorica_notify::events::AlertType::BackendDown,
-                                format!("Backend {} is down", backend.address),
-                            )
-                            .with_detail("backend_id", backend.id.clone())
-                            .with_detail("address", backend.address.clone())
-                            .with_detail("name", backend.name.clone()),
-                        );
-                    }
-                }
-
-                if let Err(e) = store.update_backend(&updated) {
+                let store = health.store.lock().await;
+                if let Err(e) = store.set_backend_lifecycle_state(
+                    &backend.id,
+                    &LifecycleState::Closed,
+                    chrono::Utc::now(),
+                ) {
                     warn!(
                         backend = %backend.address,
                         error = %e,
-                        "failed to update backend health status"
+                        "failed to transition backend to Closed"
                     );
                 } else {
                     changed = true;
+                    state.drain_start.remove(&backend.id);
                 }
+            }
+            continue;
+        }
+
+        // Clean up drain tracking for non-Closing backends.
+        state.drain_start.remove(&backend.id);
+        // A backend that is not health-checked keeps no flip streak.
+        if !backend.health_check_enabled {
+            state.pending_health.remove(&backend.id);
+        }
+    }
+    changed
+}
+
+/// Phase C: persist confirmed flips under a single lock, and send
+/// `BackendDown` for each flip to `Down`. Returns whether a flip was
+/// persisted.
+///
+/// Writes the health status alone, so an edit committed since the
+/// probed rows were listed survives.
+async fn persist_health_flips(health: &HealthLoop, commits: &[(Backend, HealthStatus)]) -> bool {
+    if commits.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    let store = health.store.lock().await;
+    for (backend, new_status) in commits {
+        debug!(
+            backend = %backend.address,
+            old = backend.health_status.as_str(),
+            new = new_status.as_str(),
+            "backend health status changed"
+        );
+
+        // Dispatch backend_down notification on a confirmed transition
+        // to Down (not on a transient blip - the hysteresis already
+        // filtered those out).
+        if *new_status == HealthStatus::Down {
+            if let Some(ref sender) = health.alert_sender {
+                sender.send(
+                    lorica_notify::AlertEvent::new(
+                        lorica_notify::events::AlertType::BackendDown,
+                        format!("Backend {} is down", backend.address),
+                    )
+                    .with_detail("backend_id", backend.id.clone())
+                    .with_detail("address", backend.address.clone())
+                    .with_detail("name", backend.name.clone()),
+                );
             }
         }
 
-        if changed {
-            if let Err(e) = reload_proxy_config(&store, &proxy_config, None).await {
-                warn!(error = %e, "failed to reload proxy config after health check");
-            }
-            // Notify workers to reload their proxy config with updated health statuses
-            if let Some(ref tx) = config_reload_tx {
-                let _ = tx.send(0);
-            }
-            if let Some(ref on_change) = on_change {
-                on_change();
-            }
+        if let Err(e) = store.set_backend_health_status(&backend.id, new_status) {
+            warn!(
+                backend = %backend.address,
+                error = %e,
+                "failed to update backend health status"
+            );
+        } else {
+            changed = true;
         }
     }
+    changed
 }
 
 /// What one active probe of a backend reaches.
@@ -640,6 +694,201 @@ mod tests {
             probe_for(&backend),
             ProbeTarget::TcpConnect { .. }
         ));
+    }
+
+    // ---- The cycle's writes ----
+
+    fn health_loop_over(store: &Arc<Mutex<ConfigStore>>) -> HealthLoop {
+        HealthLoop {
+            store: Arc::clone(store),
+            proxy_config: Arc::new(ArcSwap::from_pointee(ProxyConfig::default())),
+            backend_connections: None,
+            alert_sender: None,
+            config_reload_tx: None,
+            on_change: None,
+        }
+    }
+
+    async fn store_holding(backend: &Backend) -> Arc<Mutex<ConfigStore>> {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store");
+        store
+            .create_backend(backend)
+            .expect("test setup: backend stored");
+        Arc::new(Mutex::new(store))
+    }
+
+    async fn stored(store: &Arc<Mutex<ConfigStore>>, id: &str) -> Backend {
+        store
+            .lock()
+            .await
+            .get_backend(id)
+            .expect("test setup: backend read")
+            .expect("test setup: backend present")
+    }
+
+    /// What an operator changes on a backend while a cycle probes it.
+    fn operator_edit(backend: &mut Backend) {
+        backend.weight = 7;
+        backend.address = "192.0.2.20:9090".to_string();
+        backend.set_health_check(HealthCheck::Http {
+            path: "/edited".to_string(),
+        });
+    }
+
+    async fn edit_stored(store: &Arc<Mutex<ConfigStore>>, id: &str) {
+        let mut backend = stored(store, id).await;
+        operator_edit(&mut backend);
+        store
+            .lock()
+            .await
+            .update_backend(&backend)
+            .expect("test setup: operator edit stored");
+    }
+
+    fn assert_edit_kept(backend: &Backend) {
+        let mut expected = backend.clone();
+        operator_edit(&mut expected);
+        assert_eq!(backend.weight, expected.weight);
+        assert_eq!(backend.address, expected.address);
+        assert_eq!(backend.health_check, expected.health_check);
+        assert_eq!(backend.health_check_path, expected.health_check_path);
+    }
+
+    #[tokio::test]
+    async fn a_flip_keeps_an_edit_committed_after_the_cycle_listed_the_backend() {
+        let backend = backend_checked_by(None, false);
+        let store = store_holding(&backend).await;
+        let listed = stored(&store, &backend.id).await;
+        edit_stored(&store, &backend.id).await;
+
+        let health = health_loop_over(&store);
+        assert!(persist_health_flips(&health, &[(listed, HealthStatus::Down)]).await);
+
+        let after = stored(&store, &backend.id).await;
+        assert_eq!(after.health_status, HealthStatus::Down);
+        assert_edit_kept(&after);
+    }
+
+    #[tokio::test]
+    async fn closing_a_drained_backend_keeps_an_edit_committed_after_the_cycle_listed_it() {
+        let mut backend = backend_checked_by(None, false);
+        backend.lifecycle_state = LifecycleState::Closing;
+        let store = store_holding(&backend).await;
+        let listed = stored(&store, &backend.id).await;
+        edit_stored(&store, &backend.id).await;
+
+        let health = health_loop_over(&store);
+        let mut state = HealthLoopState::default();
+        assert!(close_drained_backends(&health, &mut state, &[listed]).await);
+
+        let after = stored(&store, &backend.id).await;
+        assert_eq!(after.lifecycle_state, LifecycleState::Closed);
+        assert_edit_kept(&after);
+        assert!(state.drain_start.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_flip_of_a_backend_deleted_during_the_cycle_persists_nothing() {
+        let backend = backend_checked_by(None, false);
+        let store = store_holding(&backend).await;
+        let listed = stored(&store, &backend.id).await;
+        store
+            .lock()
+            .await
+            .delete_backend(&backend.id)
+            .expect("test setup: backend deleted");
+
+        let health = health_loop_over(&store);
+        assert!(!persist_health_flips(&health, &[(listed, HealthStatus::Down)]).await);
+    }
+
+    /// An HTTP backend answering every request `503`, which commits
+    /// [`operator_edit`] to the stored backend `id` while it holds the
+    /// `edit_on`-th request, before it answers: an edit made while a
+    /// cycle is probing.
+    async fn serve_503_editing_during_probe(
+        listener: tokio::net::TcpListener,
+        store: Arc<Mutex<ConfigStore>>,
+        id: String,
+        edit_on: usize,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut served = 0;
+        while let Ok((mut socket, _)) = listener.accept().await {
+            served += 1;
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&chunk[..read]),
+                }
+            }
+            if served == edit_on {
+                edit_stored(&store, &id).await;
+            }
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cycle_keeps_an_edit_committed_while_it_probed_and_signals_the_flip_once() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test setup: listener");
+        let mut backend = backend_checked_by(Some("/healthz"), false);
+        backend.address = listener
+            .local_addr()
+            .expect("test setup: local address")
+            .to_string();
+        let store = store_holding(&backend).await;
+        tokio::spawn(serve_503_editing_during_probe(
+            listener,
+            Arc::clone(&store),
+            backend.id.clone(),
+            HEALTH_FLIP_THRESHOLD as usize,
+        ));
+
+        let signals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let alerts = lorica_notify::AlertSender::new(16);
+        let mut alerts_received = alerts.subscribe();
+        let mut health = health_loop_over(&store);
+        health.alert_sender = Some(alerts);
+        health.on_change = Some({
+            let signals = Arc::clone(&signals);
+            Arc::new(move || {
+                signals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        });
+        let mut state = HealthLoopState::default();
+
+        for cycle in 1..HEALTH_FLIP_THRESHOLD {
+            assert!(
+                !run_health_cycle(&health, &mut state).await,
+                "cycle {cycle} is below the flip threshold"
+            );
+            assert_eq!(
+                stored(&store, &backend.id).await.health_status,
+                HealthStatus::Healthy
+            );
+        }
+        assert_eq!(signals.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        assert!(run_health_cycle(&health, &mut state).await);
+        let after = stored(&store, &backend.id).await;
+        assert_eq!(after.health_status, HealthStatus::Down);
+        assert_edit_kept(&after);
+        assert_eq!(signals.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let alert = alerts_received.try_recv().expect("one BackendDown alert");
+        assert_eq!(
+            alert.alert_type,
+            lorica_notify::events::AlertType::BackendDown
+        );
+        assert!(alerts_received.try_recv().is_err());
     }
 
     // ---- Flip hysteresis ----

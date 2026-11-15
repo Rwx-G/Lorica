@@ -545,6 +545,109 @@ mod tests {
             .is_none());
     }
 
+    /// Every stored column of the backend `id`, by name, as SQLite holds it.
+    fn stored_backend_columns(
+        store: &ConfigStore,
+        id: &str,
+    ) -> std::collections::BTreeMap<String, rusqlite::types::Value> {
+        let mut stmt = store
+            .conn
+            .prepare("SELECT * FROM backends WHERE id = ?1")
+            .expect("test setup: statement prepares");
+        let names: Vec<String> = stmt.column_names().map(str::to_string).collect();
+        stmt.query_row([id], |row| {
+            names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| Ok((name.clone(), row.get(index)?)))
+                .collect()
+        })
+        .expect("test setup: backend row read")
+    }
+
+    fn assert_only_columns_changed(
+        before: &std::collections::BTreeMap<String, rusqlite::types::Value>,
+        after: &std::collections::BTreeMap<String, rusqlite::types::Value>,
+        written: &[&str],
+    ) {
+        assert_eq!(
+            before.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>()
+        );
+        for (column, value) in before {
+            if written.contains(&column.as_str()) {
+                assert_ne!(&after[column], value, "{column} was written");
+            } else {
+                assert_eq!(&after[column], value, "{column} left as it was");
+            }
+        }
+    }
+
+    #[test]
+    fn set_backend_health_status_writes_the_status_and_nothing_else() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut backend = make_backend();
+        backend.health_check_path = Some("/healthz".into());
+        backend.health_check = HealthCheck::Http {
+            path: "/healthz".into(),
+        };
+        store
+            .create_backend(&backend)
+            .expect("test setup: backend inserts");
+        let before = stored_backend_columns(&store, &backend.id);
+
+        store
+            .set_backend_health_status(&backend.id, &HealthStatus::Down)
+            .expect("status stored");
+
+        let after = stored_backend_columns(&store, &backend.id);
+        assert_only_columns_changed(&before, &after, &["health_status"]);
+        let fetched = store
+            .get_backend(&backend.id)
+            .expect("test setup: backend fetch")
+            .expect("test setup: value present");
+        assert_eq!(fetched.health_status, HealthStatus::Down);
+    }
+
+    #[test]
+    fn set_backend_lifecycle_state_writes_the_state_and_its_timestamp_and_nothing_else() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut backend = make_backend();
+        backend.lifecycle_state = LifecycleState::Closing;
+        backend.updated_at = Utc::now() - chrono::Duration::hours(1);
+        store
+            .create_backend(&backend)
+            .expect("test setup: backend inserts");
+        let before = stored_backend_columns(&store, &backend.id);
+        let closed_at = Utc::now();
+
+        store
+            .set_backend_lifecycle_state(&backend.id, &LifecycleState::Closed, closed_at)
+            .expect("lifecycle state stored");
+
+        let after = stored_backend_columns(&store, &backend.id);
+        assert_only_columns_changed(&before, &after, &["lifecycle_state", "updated_at"]);
+        let fetched = store
+            .get_backend(&backend.id)
+            .expect("test setup: backend fetch")
+            .expect("test setup: value present");
+        assert_eq!(fetched.lifecycle_state, LifecycleState::Closed);
+        assert_eq!(fetched.updated_at.timestamp(), closed_at.timestamp());
+    }
+
+    #[test]
+    fn the_health_loop_writers_refuse_an_unknown_backend() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        assert!(matches!(
+            store.set_backend_health_status("missing", &HealthStatus::Down),
+            Err(crate::error::ConfigError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.set_backend_lifecycle_state("missing", &LifecycleState::Closed, Utc::now()),
+            Err(crate::error::ConfigError::NotFound(_))
+        ));
+    }
+
     // ---- Route-Backend links ----
 
     #[test]

@@ -159,6 +159,47 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Store a probed health status, and nothing else, for the backend
+    /// `id`. Returns `NotFound` if the ID does not exist.
+    ///
+    /// The health loop's writer: a whole-row write from the copy it
+    /// listed at the start of a cycle would revert an operator edit
+    /// committed while the cycle probed. `updated_at` is not touched (a
+    /// probe is not an edit), and the stream attachment rule does not
+    /// run, since it reads nothing this changes.
+    pub fn set_backend_health_status(&self, id: &str, status: &HealthStatus) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE backends SET health_status=?2 WHERE id=?1",
+            params![id, status.as_str()],
+        )?;
+        if changed == 0 {
+            return Err(ConfigError::NotFound(format!("backend {id}")));
+        }
+        Ok(())
+    }
+
+    /// Store a lifecycle state and its `updated_at`, and nothing else,
+    /// for the backend `id`. Returns `NotFound` if the ID does not exist.
+    ///
+    /// The health loop's drain writer, for the reason given on
+    /// [`ConfigStore::set_backend_health_status`]; the attachment rule
+    /// reads no lifecycle state, so it does not run.
+    pub fn set_backend_lifecycle_state(
+        &self,
+        id: &str,
+        state: &LifecycleState,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE backends SET lifecycle_state=?2, updated_at=?3 WHERE id=?1",
+            params![id, state.as_str(), updated_at.to_rfc3339()],
+        )?;
+        if changed == 0 {
+            return Err(ConfigError::NotFound(format!("backend {id}")));
+        }
+        Ok(())
+    }
+
     /// Delete a backend by ID. Returns `NotFound` if the ID does not exist.
     /// Its route and stream links go with it (both foreign keys cascade).
     pub fn delete_backend(&self, id: &str) -> Result<()> {

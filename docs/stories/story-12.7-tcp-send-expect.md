@@ -1,7 +1,7 @@
 # Story 12.7: TCP Health Checks that Speak the Protocol
 
 **Epic:** [Epic 12 - TCP and UDP Stream Proxying (v1.11.0 and v1.12.0)](../prd/epic-12-v1.11.0.md)
-**Status:** Draft
+**Status:** InProgress
 **Priority:** P1
 **Author:** Romain G.
 **Depends on:**
@@ -619,19 +619,19 @@ default only), `lorica-api/src/tests.rs` and
 
 Commit 1, `fix(health): stop the health loop overwriting backend edits made during a cycle`:
 
-- [ ] `run_health_cycle(...)` extracted from `health_check_loop`, no
+- [x] `run_health_cycle(...)` extracted from `health_check_loop`, no
       behaviour change, so tests drive cycles without sleeping.
-- [ ] `ConfigStore::set_backend_health_status(id, status)` and
+- [x] `ConfigStore::set_backend_health_status(id, status)` and
       `set_backend_lifecycle_state(id, state, updated_at)`: one `UPDATE`
       of the named columns each, `NotFound` on an unknown id, no
       attachment rule (they change nothing it reads).
-- [ ] Phase C uses the first, Phase 0 the second; neither clones and
+- [x] Phase C uses the first, Phase 0 the second; neither clones and
       writes a whole row any more.
-- [ ] Tests: an edit of the backend (weight, address, check) committed
+- [x] Tests: an edit of the backend (weight, address, check) committed
       between a cycle's listing and its flip is still stored after the
       flip; the same for the `Closing` to `Closed` transition; both
       writers leave every other column byte-identical.
-- [ ] CHANGELOG Fixed: the health loop no longer reverts a backend edit
+- [x] CHANGELOG Fixed: the health loop no longer reverts a backend edit
       committed while a check cycle was running (all releases up to
       1.10.6).
 
@@ -1029,9 +1029,29 @@ None open.
 
 ### Debug Log
 
+- Lot 0, affected releases re-checked on 2026-11-15 with `git log -S`:
+  the whole-row `update_backend(&updated)` writes come from `ac09f95e`
+  and `cc1ca5b4`, the hard-coded `unwrap_or(10)` create from `5f2df297`,
+  all three contained in every tag `v0.1.2` to `v1.10.6` and never
+  removed before Lot 0; `git show v0.1.2:` and `v1.10.6:lorica/src/health.rs`
+  read no `health_check_interval_s` (1.10.6 names it in a doc comment
+  only).
+
 ### Completion Notes
 
+- Lot 0, commit 1: `run_health_cycle` takes the loop's fixed context
+  (`HealthLoop`) and its carried state (`HealthLoopState`); Phase 0 and
+  Phase C are `close_drained_backends` and `persist_health_flips`, each
+  testable with a stale listing. `on_change` and the reload signal still
+  fire only when a write succeeded, so a flip of a backend deleted during
+  the cycle (`NotFound`) signals nothing.
+
 ## File List
+
+- `lorica/src/health.rs` (Lot 0)
+- `lorica-config/src/store/backends.rs` (Lot 0)
+- `lorica-config/src/tests.rs` (Lot 0)
+- `CHANGELOG.md` (Lot 0)
 
 ## Change Log
 
@@ -1040,3 +1060,4 @@ None open.
 | 2026-11-14 | 0.1 | Story drafted from the Epic 12 PRD and Story 12.1. Status Draft. | Romain G. |
 | 2026-11-14 | 0.2 | Maintainer answers folded in: `-NOAUTH` healthy, `send` masked for Viewer on the management API, catalogue in the policy crate, Lot 0 with the two pre-existing `fix(health)` defects (affected releases verified per tag), last-failure view out, Redis image added to 12.12 AC #6. OQ-7 raised. Status Draft. | Romain G. |
 | 2026-11-14 | 0.3 | OQ-7 resolved: `default_health_check_interval_s` becomes the default for new backends in Lot 0's second commit (`backends.rs` and `environments.rs` added to its allowlist, tests and CHANGELOG entry extended). Status Draft. | Romain G. |
+| 2026-11-15 | 0.4 | Lot 0 commit 1: the health loop writes the health status and the lifecycle state alone (`set_backend_health_status`, `set_backend_lifecycle_state`), cycle extracted into `run_health_cycle`. Status InProgress. | Romain G. |
