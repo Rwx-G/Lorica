@@ -259,8 +259,11 @@ pub(crate) async fn run_api_server(
 
 /// Purge superseded orphan ACME certificates left over by the old
 /// insert-then-reassign renewal (fix 1.5.12). An orphan is an ACME
-/// cert that is unreferenced by any route AND has a sibling for the
-/// same identifier set with a later `not_after`. Unique unbound certs
+/// cert that is unreferenced by any route or stream AND has a sibling
+/// for the same identifier set with a later `not_after`. A stream's
+/// references are `Stream::certificate_references`, the list the
+/// certificate delete guard reads, so a certificate the API refuses to
+/// delete is never purged here either. Unique unbound certs
 /// are kept (an operator may bind them); the decision lives in the
 /// pure `superseded_orphans` selector so it is unit-tested in
 /// `lorica-api`.
@@ -277,7 +280,7 @@ async fn purge_superseded_acme_orphans(store: &Arc<Mutex<ConfigStore>>) {
             return;
         }
     };
-    let bound_ids: std::collections::HashSet<String> = match s.list_routes() {
+    let mut bound_ids: std::collections::HashSet<String> = match s.list_routes() {
         Ok(routes) => routes
             .iter()
             .filter_map(|r| r.certificate_id.clone())
@@ -287,6 +290,18 @@ async fn purge_superseded_acme_orphans(store: &Arc<Mutex<ConfigStore>>) {
             return;
         }
     };
+    match s.list_streams() {
+        Ok(streams) => bound_ids.extend(
+            streams
+                .iter()
+                .flat_map(|stream| stream.certificate_references())
+                .map(str::to_string),
+        ),
+        Err(e) => {
+            warn!(error = %e, "startup orphan purge: failed to list streams");
+            return;
+        }
+    }
 
     let orphan_ids = lorica_api::acme::superseded_orphans(&certs, &bound_ids);
     if orphan_ids.is_empty() {
@@ -1324,6 +1339,98 @@ pub(crate) async fn drain_for_exit(tracker: &tokio_util::task::TaskTracker) -> E
 
 #[cfg(test)]
 mod tests {
+    /// An ACME certificate of `domain` expiring in `days`, as the store
+    /// holds one.
+    fn acme_certificate(id: &str, domain: &str, days: i64) -> lorica_config::models::Certificate {
+        let now = chrono::Utc::now();
+        lorica_config::models::Certificate {
+            id: id.to_string(),
+            domain: domain.to_string(),
+            san_domains: vec![domain.to_string()],
+            fingerprint: format!("fp-{id}"),
+            cert_pem: "---CERT---".to_string(),
+            key_pem: "---KEY---".to_string(),
+            issuer: "Test ACME".to_string(),
+            not_before: now - chrono::Duration::days(1),
+            not_after: now + chrono::Duration::days(days),
+            is_acme: true,
+            acme_auto_renew: true,
+            created_at: now - chrono::Duration::days(1),
+            acme_method: Some("http01".to_string()),
+            acme_dns_provider_id: None,
+            adcs_authority_id: None,
+            adcs_template: None,
+            adcs_template_oid: None,
+            adcs_request_id: None,
+        }
+    }
+
+    /// The startup purge removes a superseded ACME certificate nothing
+    /// names, and keeps one a stream names, as a terminating
+    /// certificate or as its upstream client certificate, exactly as it
+    /// keeps one a route names.
+    #[tokio::test]
+    async fn the_orphan_purge_keeps_a_certificate_a_stream_names() {
+        use lorica_config::models::{
+            Stream, StreamMatchRule, StreamMatcher, StreamProtocol, StreamTlsMode,
+            StreamTlsTerminate, StreamUpstreamTls,
+        };
+
+        let store = lorica_config::ConfigStore::open_in_memory().expect("test setup: store");
+        // Four certificates of one identity: the newest supersedes the
+        // three others.
+        for (id, days) in [
+            ("terminated", 10),
+            ("presented", 20),
+            ("orphan", 30),
+            ("newest", 80),
+        ] {
+            store
+                .create_certificate(&acme_certificate(id, "mail.example.com", days))
+                .expect("test setup: certificate");
+        }
+        let mut stream = Stream::new(
+            "00000000-0000-4000-8000-000000000001".to_string(),
+            "smtps".to_string(),
+            StreamProtocol::Tcp,
+            "0.0.0.0".parse().expect("an address"),
+            465,
+            465,
+            chrono::Utc::now(),
+        );
+        stream.tls_mode = StreamTlsMode::Terminate;
+        stream.match_rules = vec![StreamMatchRule {
+            name: "mail".to_string(),
+            matcher: StreamMatcher::Tls {
+                server_names: vec!["mail.example.com".to_string()],
+                alpn: Vec::new(),
+            },
+        }];
+        stream.tls_terminate = Some(StreamTlsTerminate {
+            certificate_ids: vec!["terminated".to_string()],
+            client_auth: None,
+        });
+        stream.upstream_tls = Some(StreamUpstreamTls {
+            client_certificate_id: Some("presented".to_string()),
+            ..StreamUpstreamTls::default()
+        });
+        store.create_stream(&stream).expect("test setup: stream");
+
+        let store = std::sync::Arc::new(tokio::sync::Mutex::new(store));
+        super::purge_superseded_acme_orphans(&store).await;
+
+        let mut kept: Vec<String> = store
+            .lock()
+            .await
+            .list_certificates()
+            .expect("certificates")
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        kept.sort();
+        assert_eq!(kept, vec!["newest", "presented", "terminated"]);
+    }
+
     /// Story 9.5 AC #4 / D7 drift gate.
     ///
     /// OCSP stapling is a SERVING concern, not an issuance one: the

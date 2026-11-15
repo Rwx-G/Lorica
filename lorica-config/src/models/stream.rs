@@ -1365,8 +1365,8 @@ impl Stream {
     /// Every stored certificate the stream refers to, each once:
     /// `tls_terminate.certificate_ids` then
     /// `upstream_tls.client_certificate_id`. The fleet entitlement to a
-    /// certificate's private key, and the certificate delete guard,
-    /// read this list.
+    /// certificate's private key, the certificate delete guard and the
+    /// startup purge of superseded ACME certificates read this list.
     pub fn certificate_references(&self) -> Vec<&str> {
         let mut references: Vec<&str> = Vec::new();
         let terminate = self
