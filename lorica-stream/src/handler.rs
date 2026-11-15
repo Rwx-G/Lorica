@@ -138,6 +138,12 @@ pub trait DatagramHandler: Send + Sync + 'static {
 /// What one stream connection did, built once when it ends (Story 12.3
 /// D-r). Story 12.9 writes it as the access-log row; Story 12.16 carries
 /// the same values across a transfer.
+///
+/// A UDP session (Story 12.5 D-n) is recorded in the same shape: its
+/// peer is its client, `proxied_from` is always `None` (PROXY accept is
+/// refused on UDP), `local` is the address the client targeted, the
+/// instants are the first datagram and the upstream socket's connect,
+/// and the datagram counts are set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionRecord {
     /// The stream's id.
@@ -166,6 +172,10 @@ pub struct ConnectionRecord {
     pub bytes_upload: u64,
     /// Backend-to-client bytes forwarded.
     pub bytes_download: u64,
+    /// Client datagrams forwarded to the backend; `None` on TCP.
+    pub datagrams_upload: Option<u64>,
+    /// Backend datagrams forwarded to the client; `None` on TCP.
+    pub datagrams_download: Option<u64>,
     /// When the connection was accepted.
     pub accepted_at: DateTime<Utc>,
     /// When an attempt connected.
@@ -195,6 +205,8 @@ pub trait ConnectionObserver: Send + Sync + 'static {
             attempts = record.attempts,
             bytes_upload = record.bytes_upload,
             bytes_download = record.bytes_download,
+            datagrams_upload = ?record.datagrams_upload,
+            datagrams_download = ?record.datagrams_download,
             accepted_at = %record.accepted_at,
             connected_at = ?record.connected_at,
             ended_at = %record.ended_at,

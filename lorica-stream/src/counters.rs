@@ -22,18 +22,23 @@
 //! the workers and writes the logs; nothing here is a metric name.
 //!
 //! Keyed families (end kinds, refusals, header outcomes, connect failure
-//! kinds) are maps filled on first use, so a snapshot carries only what
-//! happened; the word lists come from the enums ([`StreamEndKind`],
-//! [`StreamRefusal`], [`ProxyHeaderOutcome::ALL`],
-//! [`ConnectFailureKind::ALL`]).
+//! kinds, datagram drops) are maps filled on first use, so a snapshot
+//! carries only what happened; the word lists come from the enums
+//! ([`StreamEndKind`], [`StreamRefusal`], [`ProxyHeaderOutcome::ALL`],
+//! [`ConnectFailureKind::ALL`], [`DatagramDropReason`]).
+//!
+//! A UDP stream (Story 12.5 D-n) uses the same words with their session
+//! meaning (`accepted` counts sessions, `active` live sessions, the bytes
+//! what was forwarded) and adds the datagram counts, the drops and the
+//! "ceiling reached" edge.
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use lorica_config::models::{StreamEndKind, StreamRefusal};
+use lorica_config::models::{DatagramDropReason, StreamEndKind, StreamRefusal};
 
 use crate::table::StreamTable;
 
@@ -95,10 +100,14 @@ impl ProxyHeaderOutcome {
     }
 }
 
-/// Why a connect attempt failed, as the breaker counts it (D-g).
+/// Why a connect attempt failed, as the breaker counts it (D-g). On a
+/// UDP session (Story 12.5 D-i) `refused` and `unreachable` come from an
+/// ICMP error on the session socket, and `no_response` is a session that
+/// expected answers and reached its idle timeout without any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConnectFailureKind {
-    /// The backend answered with a reset to the SYN.
+    /// The backend answered with a reset to the SYN, or with an ICMP port
+    /// unreachable to a datagram.
     Refused,
     /// No answer within the connect timeout.
     Timeout,
@@ -106,12 +115,20 @@ pub enum ConnectFailureKind {
     Unreachable,
     /// The connection was reset while being established.
     Reset,
+    /// A UDP session owed responses reached its idle timeout without
+    /// receiving one.
+    NoResponse,
 }
 
 impl ConnectFailureKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ConnectFailureKind; 4] =
-        [Self::Refused, Self::Timeout, Self::Unreachable, Self::Reset];
+    pub const ALL: [ConnectFailureKind; 5] = [
+        Self::Refused,
+        Self::Timeout,
+        Self::Unreachable,
+        Self::Reset,
+        Self::NoResponse,
+    ];
 
     /// The snake_case word of the kind.
     pub fn as_str(&self) -> &'static str {
@@ -120,9 +137,14 @@ impl ConnectFailureKind {
             Self::Timeout => "timeout",
             Self::Unreachable => "unreachable",
             Self::Reset => "reset",
+            Self::NoResponse => "no_response",
         }
     }
 }
+
+/// The share of `udp.max_sessions` below which the "ceiling reached"
+/// edge re-arms, in percent (Story 12.5 D-n).
+pub const CEILING_REARM_PERCENT: u64 = 90;
 
 /// A map of counts keyed by an enum, filled on first use.
 #[derive(Debug)]
@@ -176,6 +198,13 @@ pub struct StreamStats {
     local_destination_refused: AtomicU64,
     source_family_mismatch: AtomicU64,
     source_bind_failed: AtomicU64,
+    datagrams_upload: AtomicU64,
+    datagrams_download: AtomicU64,
+    dropped: Keyed<DatagramDropReason>,
+    ceiling_reached: AtomicU64,
+    /// Set by the `session_cap` refusal that raised the edge, cleared
+    /// once the stream is below [`CEILING_REARM_PERCENT`] again.
+    ceiling_raised: AtomicBool,
 }
 
 impl StreamStats {
@@ -241,7 +270,43 @@ impl StreamStats {
         bump(&self.source_bind_failed);
     }
 
-    fn snapshot(&self) -> StreamCountersSnapshot {
+    /// Count one client datagram of `bytes` bytes forwarded to a backend
+    /// (the PROXY header excluded).
+    pub fn datagram_upload(&self, bytes: u64) {
+        bump(&self.datagrams_upload);
+        self.add_upload(bytes);
+    }
+
+    /// Count one backend datagram of `bytes` bytes forwarded to a client.
+    pub fn datagram_download(&self, bytes: u64) {
+        bump(&self.datagrams_download);
+        self.add_download(bytes);
+    }
+
+    /// Count a datagram dropped for `reason`.
+    pub fn dropped(&self, reason: DatagramDropReason) {
+        self.dropped.add(reason);
+    }
+
+    /// A `session_cap` refusal: raises the "ceiling reached" edge unless
+    /// it is already raised. Returns whether this refusal raised it.
+    pub fn session_cap_refused(&self) -> bool {
+        let raised = !self.ceiling_raised.swap(true, Ordering::AcqRel);
+        if raised {
+            bump(&self.ceiling_reached);
+        }
+        raised
+    }
+
+    /// The stream holds `sessions` of its `max_sessions` on the node: the
+    /// edge re-arms once that is below [`CEILING_REARM_PERCENT`].
+    pub fn sessions_held(&self, sessions: u64, max_sessions: u64) {
+        if sessions.saturating_mul(100) < max_sessions.saturating_mul(CEILING_REARM_PERCENT) {
+            self.ceiling_raised.store(false, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> StreamCountersSnapshot {
         StreamCountersSnapshot {
             active: get(&self.active),
             accepted: get(&self.accepted),
@@ -256,6 +321,10 @@ impl StreamStats {
             local_destination_refused: get(&self.local_destination_refused),
             source_family_mismatch: get(&self.source_family_mismatch),
             source_bind_failed: get(&self.source_bind_failed),
+            datagrams_upload: get(&self.datagrams_upload),
+            datagrams_download: get(&self.datagrams_download),
+            dropped: self.dropped.snapshot(),
+            ceiling_reached: get(&self.ceiling_reached),
         }
     }
 }
@@ -333,6 +402,13 @@ impl LinkStats {
         ActiveGuard::new(&self.active)
     }
 
+    /// Count a UDP session opened on the backend, active until the guard
+    /// drops. No latency: a connected UDP socket has no handshake to time.
+    pub fn session_opened(&self) -> ActiveGuard {
+        bump(&self.connects);
+        ActiveGuard::new(&self.active)
+    }
+
     /// Count a failed connect attempt.
     pub fn connect_failed(&self, kind: ConnectFailureKind) {
         self.connect_failures.add(kind);
@@ -404,6 +480,16 @@ fn entry<K: Eq + Hash, V: Default>(family: &Family<K, V>, key: K) -> Arc<V> {
     )
 }
 
+/// [`entry`] for a family keyed by id, which allocates the key only on
+/// first use: the UDP engine reads a stream's counters per datagram.
+fn entry_by_id<V: Default>(family: &Family<String, V>, id: &str) -> Arc<V> {
+    let mut map = family.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(found) = map.get(id) {
+        return Arc::clone(found);
+    }
+    Arc::clone(map.entry(id.to_string()).or_default())
+}
+
 fn read<K: Clone + Ord, V, S>(family: &Family<K, V>, snap: impl Fn(&V) -> S) -> BTreeMap<K, S> {
     family
         .lock()
@@ -430,7 +516,7 @@ impl StreamCounters {
 
     /// The counters of `stream_id`, created on first use.
     pub fn stream(&self, stream_id: &str) -> Arc<StreamStats> {
-        entry(&self.streams, stream_id.to_string())
+        entry_by_id(&self.streams, stream_id)
     }
 
     /// The counters of `backend_id` on `stream_id`, created on first use.
@@ -440,7 +526,7 @@ impl StreamCounters {
 
     /// The counters of `backend_id`, created on first use.
     pub fn backend(&self, backend_id: &str) -> Arc<BackendStats> {
-        entry(&self.backends, backend_id.to_string())
+        entry_by_id(&self.backends, backend_id)
     }
 
     /// Drop the counters of streams, links and backends `table` no
@@ -481,7 +567,7 @@ pub struct CountersSnapshot {
     pub backends: BTreeMap<String, BackendCountersSnapshot>,
 }
 
-/// One stream's counters.
+/// One stream's counters. On a UDP stream a connection is a session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamCountersSnapshot {
     /// Open connections now (a gauge).
@@ -510,6 +596,17 @@ pub struct StreamCountersSnapshot {
     pub source_family_mismatch: u64,
     /// Failed source binds.
     pub source_bind_failed: u64,
+    /// UDP: client datagrams forwarded to a backend.
+    pub datagrams_upload: u64,
+    /// UDP: backend datagrams forwarded to a client.
+    pub datagrams_download: u64,
+    /// UDP: datagrams dropped, per reason. A datagram whose session was
+    /// refused counts as the refusal only.
+    pub dropped: HashMap<DatagramDropReason, u64>,
+    /// UDP: times the stream reached its `udp.max_sessions` on the node
+    /// after holding less than [`CEILING_REARM_PERCENT`] of it, as this
+    /// process saw it.
+    pub ceiling_reached: u64,
 }
 
 /// The cumulative counts of a latency histogram.
@@ -580,6 +677,31 @@ mod tests {
         assert_eq!(snap.connect_latency.le[1], 3);
         assert_eq!(snap.connect_latency.le.last().copied(), Some(4));
         assert_eq!(snap.connect_latency.sum, Duration::from_millis(9_706));
+    }
+
+    #[test]
+    fn the_ceiling_edge_raises_once_and_rearms_below_ninety_percent() {
+        let stats = StreamStats::default();
+        assert!(stats.session_cap_refused());
+        assert!(!stats.session_cap_refused(), "already raised");
+        stats.sessions_held(95, 100);
+        assert!(!stats.session_cap_refused(), "still above the threshold");
+        stats.sessions_held(89, 100);
+        assert!(stats.session_cap_refused(), "re-armed below 90 %");
+        assert_eq!(stats.snapshot().ceiling_reached, 2);
+    }
+
+    #[test]
+    fn datagram_counts_carry_their_bytes() {
+        let stats = StreamStats::default();
+        stats.datagram_upload(40);
+        stats.datagram_download(400);
+        stats.datagram_download(100);
+        stats.dropped(DatagramDropReason::ResponseCountBound);
+        let snap = stats.snapshot();
+        assert_eq!((snap.datagrams_upload, snap.bytes_upload), (1, 40));
+        assert_eq!((snap.datagrams_download, snap.bytes_download), (2, 500));
+        assert_eq!(snap.dropped[&DatagramDropReason::ResponseCountBound], 1);
     }
 
     #[test]

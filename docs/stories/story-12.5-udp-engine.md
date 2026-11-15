@@ -981,22 +981,22 @@ new function), and, only if
 (Interface edits E2 and E3).
 Depends on: D; 12.3 Lots A, C and D1.
 
-- [ ] The move of E2 and E3 first, as a `refactor(proxy)` commit of its
+- [x] The move of E2 and E3 first, as a `refactor(proxy)` commit of its
       own with no behaviour change, if 12.3 left the modules under `tcp`.
-- [ ] `encode_v2_dgram` beside `encode_v2`; every encoded header parses
+- [x] `encode_v2_dgram` beside `encode_v2`; every encoded header parses
       back to the same addresses and transport.
-- [ ] `UdpEngine: DatagramHandler`: oversize, rate charge, session lookup,
+- [x] `UdpEngine: DatagramHandler`: oversize, rate charge, session lookup,
       admit (region of D-d), selection and admission through
       `BackendSelector` and `BreakerGate` (D-i), local check, upstream
       socket (D-a, D-f), the session's PROXY v2 header (D-j), `try_send`,
       session task spawn, tracker registration and `set_backend`,
       `table_changed` pruning.
-- [ ] Session task: readiness on the upstream socket, response bounds of
+- [x] Session task: readiness on the upstream socket, response bounds of
       D-b, `sendmsg` with the reply source (D-g), idle and total timers,
       tracker close, ICMP handling, breaker reports, the connection record
       to the `ConnectionObserver`, permit release.
-- [ ] Counters of D-n in `StreamCounters` and the `ceiling_reached` edge.
-- [ ] Tests (loopback, Linux): each end of D-b (`K = 1` closes on the
+- [x] Counters of D-n in `StreamCounters` and the `ceiling_reached` edge.
+- [x] Tests (loopback, Linux): each end of D-b (`K = 1` closes on the
       answer with `response_bound_reached`; `R` retires and a pipelined
       client opens a second session; `K = 0` ends at `R`; byte bound drop
       and close; idle; total; ICMP before and after a response);
@@ -1448,6 +1448,103 @@ decision.
 
 ### Completion Notes
 
+**Lot E (`lorica-stream`).**
+
+- Moot tasks. E2, E3 and E4 were done by Story 12.3 (see "Status after
+  Story 12.3 landed"): the seams, local check and resolver are crate-root
+  modules, and `encode_v2_dgram` exists with its round trip and fuzz arm.
+  Nothing moved, `proxy_protocol.rs`, the fuzz target and `FORK.md` are
+  untouched. `udp::held_fds` stays in `budget.rs` where Lot D put it
+  (outside this allowlist; the dispatch already serves both callers).
+- API. `lorica_stream::{UdpEngine, UdpEngineParts}`; `UdpEngine::new(
+  UdpEngineParts { selector, breaker, resolver, counters, observer,
+  reserved_ports })`, the shape of `TcpEngineParts`, so Lot F hands both
+  engines the same `Arc`s. `udp::{MAX_UDP_PAYLOAD,
+  UPSTREAM_RECEIVE_BUFFER, OPENING_QUEUE_DATAGRAMS}`.
+- **Deviation from D-c: selection, the breaker admission and the upstream
+  socket run in the session task, not in `handle`.** `BreakerGate::admit`
+  is an async seam whose implementation waits on the supervisor's breaker
+  registry in worker mode (`lorica/src/stream_engine.rs`), so a
+  synchronous handler cannot call it without blocking or dropping a
+  half-done admission. `handle` keeps everything D-c needs synchronous:
+  size, session lookup, drain, rate charge, caps admission, tracker
+  registration, and the spawn. The new session holds its first client
+  datagrams (at most `OPENING_QUEUE_DATAGRAMS`, 4, so a stub resolver's
+  back-to-back A and AAAA from one port both pass; past it `send_failed`)
+  and sends them in order once its socket is connected. Selection is
+  still cache-only: a name not resolved yet is not a candidate. The
+  receive loop still never waits on a backend or a seam, which the
+  never-waits test pins with a breaker that never answers.
+- Lifecycle, per D-b (`udp/session.rs`): `taken`, `q`, `qb`, `r`, `rb`
+  under one uncontended mutex shared by the loop and the task. Retirement
+  at `taken == R` removes the key from the map (the next datagram opens a
+  new session); `K >= 1` ends at `r == K x q`, `request_bound_reached`
+  once retired, `response_bound_reached` before; a response past the byte
+  allowance is dropped and ends `response_bound_reached`; `K = 0` or
+  `unbounded_responses` with `R` set ends `request_bound_reached` right
+  after the R-th forward (D-b's "ends only on R" read literally). Idle is
+  measured from the last forwarded datagram either way; total from the
+  first datagram.
+- Sends go straight to the kernel (`SockRef::send`, `send_vectored` for
+  the PROXY header and payload as two iovecs, `nix` `sendmsg` with
+  `IP_PKTINFO` / `IPV6_PKTINFO` for a wildcard socket's reply source),
+  not through tokio's `try_send`: tokio answers `WouldBlock` on a socket
+  whose write readiness its reactor has not seen, which is every new
+  session socket at its first send (the unit tests caught it).
+- ICMP. An ICMP error raises only `EPOLLERR` on a connected UDP socket,
+  which tokio's read readiness never reports, so the task waits on
+  `Interest::READABLE | Interest::ERROR` and reads the error with
+  `take_error`. An ICMP error a client datagram's send meets ends the
+  session the same way. Before any response: `connect_failed`, link
+  `refused` or `unreachable`, a breaker failure. After one:
+  `backend_close`, no second report.
+- Breaker: one outcome per session. Success at the first backend
+  datagram (forwarded or not); failure on ICMP before any, on a
+  no-response idle (`K >= 1`, bounded, link `no_response`), or on a
+  `connect` that fails at once (no route). Not reported: a local
+  refusal, a source bind failure, a session drained or timed out before
+  any outcome. `selector.connected` is told `Duration::ZERO` (no
+  handshake; `peak_ewma` is refused on UDP).
+- Refusals are counted once, as the refusal, with no record and no
+  `ended` count: a record per refused datagram would let a spoofed flood
+  choose the access-log rate (Story 12.6 rate-limits refusal rows). This
+  differs from TCP, which records a refused connection. A datagram with
+  no region yet (Lot F sends `caps` before `attach`) is dropped at debug,
+  uncounted.
+- Rates: a new session is charged in the current region, a live one in
+  the region it was admitted in, whose rate cell its held shard cell
+  keeps from eviction, so `TableFull` cannot come back for it.
+- Counters (`counters.rs`): `ConnectFailureKind::NoResponse`;
+  `LinkStats::session_opened` (connects and active, no latency sample);
+  `StreamStats::{datagram_upload, datagram_download, dropped,
+  session_cap_refused, sessions_held}`; the snapshot's
+  `datagrams_upload`, `datagrams_download`, `dropped` and
+  `ceiling_reached`. The edge is per process: raised by the first
+  `session_cap` refusal, re-armed when an admission sees the stream's
+  regions below `CEILING_REARM_PERCENT` (90) of `max_sessions`, or a
+  session's end sees its own region below it. `stream()` and
+  `backend()` no longer allocate the key when the entry exists (the UDP
+  path reads them per datagram).
+- Record (E6): `datagrams_upload` and `datagrams_download` as
+  `Option<u64>`; `peer` is the client, `proxied_from` none, `local` the
+  canonical address the client targeted, `attempts` 1 once connected.
+- Order at the end: the session leaves the map, the slot-socket clone
+  drops, then the permit, then the tracker entry (so a draining binding
+  closes with its last session), then the active gauge, then the record.
+- Not covered by a test: a full send buffer. Loopback cannot fill a UDP
+  send buffer (delivery is synchronous and an overflowing receiver drops),
+  so the never-waits test uses a breaker that never answers and a
+  2,000-datagram flood into a black hole while another stream answers;
+  a `WouldBlock` send is a non-waiting syscall counted `send_failed` by
+  construction. The IPv6 header bytes are pinned by a unit test, not end
+  to end (the tests do not assume `::1` in the container); the dual-stack
+  `[::]` path, IPv4-mapped reply source included, is end to end.
+- For Lot F: build `UdpEngine` with the `Arc`s the TCP engine gets, put
+  it in `Engines.udp`, and send `caps` before every `attach` (the engine
+  admits no session without a region).
+- Outside the allowlist: `lorica-stream/src/tcp/engine.rs`, the two
+  `None` datagram fields in its record literal (E6), nothing else.
+
 **Lot D (`lorica-stream`).**
 
 - Demand. `lorica_stream::held_fds(&Stream)` (in `budget.rs`, re-exported
@@ -1730,6 +1827,17 @@ decision.
 
 ## File List
 
+Lot E:
+
+- `lorica-stream/src/udp/mod.rs`, `lorica-stream/src/udp/engine.rs`,
+  `lorica-stream/src/udp/session.rs` (new)
+- `lorica-stream/src/counters.rs`, `lorica-stream/src/handler.rs`,
+  `lorica-stream/src/lib.rs`
+- `lorica-stream/tests/udp_engine.rs` (new)
+- `lorica-stream/src/tcp/engine.rs` (the record's two `None` fields),
+  outside the allowlist
+- `docs/stories/story-12.5-udp-engine.md`
+
 Lot D:
 
 - `lorica-stream/src/budget.rs`, `lorica-stream/src/handler.rs`,
@@ -1780,3 +1888,4 @@ Lot A:
 | 2026-11-15 | 0.4 | Lot B landed: the stream-caps region (`StreamCapsRegion`, its own layout version, per-stream sizing, exact totals, per-worker session shards never evicted, shared GCRA rate cells), the probe factored out of `AtomicHashTable`, multi-process tests. | Romain G. |
 | 2026-11-15 | 0.5 | Lot C landed: `UdpSettings` on `Stream`, the UDP idle default and range, 12.3's settings lifted on UDP, backups on UDP, the refusal and drop vocabularies, migration 76, canonical digest, import and diff. The listen-address rule's call from `Stream::validate` moves to Lot G; status of the Interface edits after 12.3 recorded. | Romain G. |
 | 2026-11-15 | 0.6 | Lot D landed: the UDP demand (`held_fds`, one fd per session), the source-port constraint and the node session ceiling with its view fields, the synchronous `DatagramHandler` borrowing from one receive buffer per worker, the wildcard destination, caps adoption (`CapsRegistry`) and the supervisor's regions (`NodeCapsRegions`, the per-worker release), UDP drain mode with the sockets kept open. | Romain G. |
+| 2026-11-15 | 0.7 | Lot E landed: the UDP engine (`UdpEngine`), sessions per key with one connected upstream socket each, the D-b bounds, per-source rates and session caps on the region, PROXY v2 per datagram, reply source on wildcard addresses, ICMP and no-response failures, the UDP counters, drop reasons, `ceiling_reached` edge and the record's datagram counts. Selection and breaker admission run in the session task (the breaker seam is async). | Romain G. |

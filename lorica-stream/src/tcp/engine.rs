@@ -201,6 +201,8 @@ impl Inner {
                 attempts: 0,
                 bytes_upload: 0,
                 bytes_download: 0,
+                datagrams_upload: None,
+                datagrams_download: None,
                 accepted_at: Utc::now(),
                 connected_at: None,
                 ended_at: Utc::now(),

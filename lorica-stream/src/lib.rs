@@ -35,8 +35,8 @@
 //!   that keeps the stream plane off the HTTP reserve, and the bind
 //!   [`state`] registry the API, the audit chain and the fleet view read.
 //!
-//! The TCP engine of Story 12.3 is [`tcp`]. What it shares with the UDP
-//! engine of Story 12.5 sits beside it: the [`seams`] the binary
+//! The TCP engine of Story 12.3 is [`tcp`], the UDP engine of Story 12.5
+//! is [`udp`]. What they share sits beside them: the [`seams`] the binary
 //! implements (selection, breaker, resolution), the connect-time
 //! [`local`] check, the host-name [`resolver`] cache and the
 //! [`counters`]. The UDP streams' per-node caps live on the stream-caps
@@ -61,6 +61,7 @@ pub mod table;
 pub mod tcp;
 pub mod tracker;
 pub mod transport;
+pub mod udp;
 
 pub use budget::{
     held_fds, BudgetUsage, BudgetViolation, CeilingBound, FdBudget, HeldFds, SessionCeiling,
@@ -85,3 +86,4 @@ pub use table::{StreamTable, StreamTableSource};
 pub use tcp::{TcpEngine, TcpEngineParts};
 pub use tracker::{ConnectionTracker, TrackedConnection};
 pub use transport::{ControlTransport, InProcessPeer};
+pub use udp::{UdpEngine, UdpEngineParts};
