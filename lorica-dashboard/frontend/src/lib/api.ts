@@ -54,8 +54,10 @@ import type {
   AdoptionUnavailableReason,
   CertificateSource,
 } from './adcs.generated';
+import type { MatchAnchor, TcpCheckTemplateName } from './health-check-templates.generated';
 
 export type { AdcsKeyType, AdcsSubjectField, CertificateSource };
+export type { MatchAnchor, TcpCheckTemplateName };
 
 export interface ApiError {
   code: string;
@@ -704,6 +706,17 @@ export interface UpdateRouteRequest {
   group_name?: string;
 }
 
+/// Bytes on the wire of a custom check, in exactly one spelling: the
+/// UTF-8 bytes of `text`, or `hex` digits for bytes a JSON string cannot
+/// carry as themselves (Story 12.7, `Payload` in `lorica-config`).
+export type HealthCheckPayload = { text: string } | { hex: string };
+
+/// One answer a custom check accepts (`Expectation` in `lorica-config`).
+export interface HealthCheckExpectation {
+  match: MatchAnchor;
+  bytes: HealthCheckPayload;
+}
+
 /// What one active probe of a backend is, tagged by `kind` (Story 12.1,
 /// `HealthCheck` in `lorica-config`). A later release adds a kind as a
 /// new member of this union.
@@ -711,7 +724,18 @@ export type HealthCheck =
   /// An HTTP GET of `path`; a 2xx answer is healthy. HTTP routes only.
   | { kind: 'http'; path: string }
   /// A TCP connection that completes is healthy.
-  | { kind: 'tcp_connect' };
+  | { kind: 'tcp_connect' }
+  /// A protocol check the release ships, by name (Story 12.7).
+  | { kind: 'tcp_template'; template: TcpCheckTemplateName; timeout_ms?: number }
+  /// Bytes of the operator's own to send, and the answers that make the
+  /// probe healthy. A Viewer session reads `send` as
+  /// `{ text: '[redacted]' }`; sent back unchanged it keeps the stored one.
+  | {
+      kind: 'tcp_send_expect';
+      send?: HealthCheckPayload;
+      expect: HealthCheckExpectation[];
+      timeout_ms?: number;
+    };
 
 export interface BackendResponse {
   id: string;

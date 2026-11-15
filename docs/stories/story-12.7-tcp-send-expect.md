@@ -731,26 +731,26 @@ D-8 finds, for the mask only,
 `lorica-api/openapi-automation.yaml`, `lorica-api/tests/openapi_contract.rs`,
 `lorica-mcp/src/tools.rs`.
 
-- [ ] `protections.rs`: `backend::HEALTH_CHECK_PAYLOAD` with its rule
+- [x] `protections.rs`: `backend::HEALTH_CHECK_PAYLOAD` with its rule
       and reason; the existing words test covers it.
-- [ ] `write.rs`: `ensure_no_new_raw_payload(before, after)` in
+- [x] `write.rs`: `ensure_no_new_raw_payload(before, after)` in
       `backend_guard`, calling `carries_raw_payload`, refusing with
       `403` in the policy's words; `restore_backend_withheld` passed to
       `restoring_withheld`; handler doc comments name the rule.
-- [ ] `redact.rs`: `backend_row` masks a custom `send`;
+- [x] `redact.rs`: `backend_row` masks a custom `send`;
       `restore_health_check_payload`; module doc gains the field.
-- [ ] `backends.rs`: `list_backends` and `get_backend` take the
+- [x] `backends.rs`: `list_backends` and `get_backend` take the
       `Session`; `backend_to_response` masks `send` for a Viewer (the
       mask helper shared with `redact.rs`, not a second copy);
       `create_backend_as` and `update_backend_as` run
       `restore_health_check_payload` on every plane. Grep every GET
       handler that serializes a `Backend` or `BackendResponse` and
       record the list in the Completion Notes.
-- [ ] `tools.rs`: the `health_check` nested list (`kind`, `path`,
+- [x] `tools.rs`: the `health_check` nested list (`kind`, `path`,
       `template`, `timeout_ms`), the rendered `template` enum, the two
       backend summaries.
-- [ ] OpenAPI per D-11, both documents; the contract assertions of D-12.
-- [ ] Tests listed under Dev Notes, Lot 2.
+- [x] OpenAPI per D-11, both documents; the contract assertions of D-12.
+- [x] Tests listed under Dev Notes, Lot 2.
 
 ### Lot 3: dashboard and the rendered template fixture (after Lot 1; parallel with Lot 2; frontend gates)
 
@@ -761,14 +761,14 @@ Lot 4 writes the rest), `lorica-dashboard/frontend/src/lib/api.ts`,
 `lorica-dashboard/frontend/src/routes/Backends.svelte`,
 `lorica-dashboard/frontend/src/routes/Backends.test.ts`.
 
-- [ ] The fixture test renders the TS module and the doc section from
+- [x] The fixture test renders the TS module and the doc section from
       `TCP_CHECK_TEMPLATES` and the D-2 constants, refuses either file
       when stale, and prints the expected content.
-- [ ] `api.ts`: the `HealthCheck` union gains both kinds, `Payload`,
+- [x] `api.ts`: the `HealthCheck` union gains both kinds, `Payload`,
       `Expectation`.
-- [ ] `Backends.svelte`: the two new choices of the kind picker (D-11),
+- [x] `Backends.svelte`: the two new choices of the kind picker (D-11),
       client-side limits read from the generated module, the badge.
-- [ ] Vitest: each kind sends its typed shape; a template shows its
+- [x] Vitest: each kind sends its typed shape; a template shows its
       bytes; a hex field refuses an odd length; a backend read with a
       custom payload loads into the form and saves back unchanged.
 
@@ -1108,6 +1108,92 @@ None open.
   `tcp_send_expect` (the management request structs carry the typed
   check since Story 12.1 Lot 4) and return `send` unmasked. Lot 2 closes
   both; the branch must not ship without it.
+- Lot 2, D-7: `ensure_no_new_raw_payload` runs in `backend_guard` on
+  the row after the patch, after the grant, through
+  `carries_raw_payload` only. `HEALTH_CHECK_PAYLOAD` is a
+  `ProtectionRule` of `protections::backend` but not one of
+  `BACKEND_PROTECTION_RULES`: that list is "may only be strengthened",
+  paired one to one with `BACKEND_PROTECTIONS` and tabulated in
+  `docs/mcp.md`, and this rule has no direction. Its own words test sits
+  beside the existing one.
+- Lot 2, D-8, deviation: `restore_health_check_payload` runs in
+  `create_backend_as` and `update_backend_as` themselves, on every plane,
+  before the guard's restore; the guard keeps `restore_health_check_path`.
+  No `restore_backend_withheld`: the payload restore would otherwise run
+  twice on the automation plane for one rule.
+- Lot 2, D-8: the mask has one statement,
+  `redact::health_check_payload_withheld` (typed, exhaustive match).
+  `backend_row` decodes the row's check and applies it, and fails closed
+  on a check it cannot decode by masking any `send` key. The management
+  plane masks below Operator (`as_read_by`, `Role < Operator`) in
+  `list_backends` and `get_backend`, which now take the `Session`; the
+  automation listing reads through `list_backends_as(.., Role::Viewer)`
+  and masks again (`automation/read.rs`, one line, outside the
+  allowlist).
+- Lot 2, the D-8 grep of Viewer-readable GETs serializing a backend:
+  `GET /api/v1/backends` and `GET /api/v1/backends/{id}` only. Streams
+  answer backend ids, `status` counts, the drift and replication reports
+  and the audit log sit at the Operator floor, and the config export is
+  a POST outside the Viewer floor.
+- Lot 2, disclosure: none before this cycle. Payloads were added by Lot
+  1 on this branch and never released, so the masking is new-feature
+  hardening, not the fix of a shipped disclosure.
+- Lot 2, deviation from D-6 and the Lot 2 test list: a D-2 limit or the
+  TLS refusal answers 422, not 400. `ConfigError::Validation` maps to
+  `Unprocessable` by a deliberate rule (`error.rs`, "a rule the store
+  enforces is a request refused on its merits"); the story's "already
+  maps to 400" is wrong against the code. Tests and both OpenAPI
+  documents say 422.
+- Lot 2, D-7 table, one test each: automation create, update and dry run
+  `iv2_a_token_sets_a_template_and_never_authors_a_custom_payload`
+  (`write/plane_tests.rs`); environments
+  `an_environment_backend_takes_no_health_check_and_so_no_payload`;
+  MCP Streamable HTTP
+  `iv2_on_this_binding_a_payload_is_refused_by_the_tool_and_a_template_is_applied`
+  (`mcp/plane_tests.rs`); MCP stdio
+  `over_stdio_a_custom_health_check_payload_never_leaves_and_a_template_crosses`
+  (`lorica-mcp/src/stdio.rs`, outside the allowlist, the transport's own
+  harness) and the tool check
+  `a_custom_health_check_payload_is_refused_by_the_tool_naming_it_and_a_template_passes`;
+  reads
+  `a_custom_payload_reads_masked_on_every_token_read_and_its_answers_and_templates_do_not`;
+  admin tier `the_admin_tier_carries_no_health_check_and_so_no_payload`
+  (`write/admin_tier_tests.rs`, outside the allowlist); management
+  `a_viewer_reads_a_custom_payload_masked_and_an_operator_reads_it_whole`,
+  `a_masked_payload_sent_back_by_an_operator_keeps_the_stored_one_and_is_never_stored`,
+  `an_operator_creates_every_kind_and_each_check_limit_is_a_422_naming_its_field`;
+  import `a_custom_check_exports_and_imports_through_the_management_api`;
+  replica: Lot 1's
+  `a_replica_with_an_oversized_payload_is_refused_naming_the_backend`
+  already applies a valid payload through `prepare_replica`. The
+  management tests sit in `backends.rs`'s own test module, where the
+  backend handler tests live, not in `src/tests.rs`.
+- Lot 2, legacy path: an update sending only `health_check_path: ""`
+  leaves a check without a path (template, custom) as stored; on an
+  `http` check it still clears to `tcp_connect`
+  (`an_empty_legacy_path_speaks_of_the_http_path_only_and_leaves_a_template_alone`).
+- Lot 2, MCP: `Nested` gains `withheld` (keys refused by name with the
+  policy's reason, before any call) and `choices` (a field's `enum`,
+  rendered when the schema is built: `template` from
+  `TCP_CHECK_TEMPLATES`). `openapi_contract.rs` pins the `health_check`
+  vocabulary against the enum's own serialised fields, every kind sampled
+  and held to serde's variant list, with offered and withheld disjoint
+  and covering; the automation write schema `AutomationHealthCheck`
+  carries no payload kind, its fields are the tier's offered fields, and
+  both documents' template enum, timeout bounds and default, `maxItems`
+  and decoded-byte limits (`x-max-decoded-bytes`) are the constants'.
+- Lot 3: the dashboard's text payload field takes the escapes `\r`,
+  `\n`, `\t` and `\\` (a text input cannot hold a CR), and a stored text
+  payload is shown escaped, so a payload loaded into the form saves back
+  byte for byte, the masked one included; any other byte goes as hex.
+  The client mirrors every D-2 limit, the TLS refusal and the timeout
+  bounds from the generated module; the server's refusal is shown as it
+  comes. Badges: `TCP <template>` and `TCP send/expect`.
+- Lot 3: `docs/health-checks.md` is created with its title and the
+  marked section only; Lot 4 writes the rest. The fixture test compares
+  that section with CRLF folded to LF, since Markdown files check out
+  CRLF on a Windows clone and `.gitattributes` (outside the allowlist)
+  pins only `*.generated.ts` and the OpenAPI documents to LF.
 
 ## File List
 
@@ -1140,6 +1226,28 @@ None open.
 - `lorica/src/health.rs` (Lot 1)
 - `lorica-api/src/metrics.rs` (Lot 1, the counter, its setter and read-back)
 - `lorica/Cargo.toml` and `Cargo.lock` (Lot 1, `strum`)
+- `lorica-automation-policy/src/protections.rs` (Lot 2)
+- `lorica-automation-policy/src/lib.rs` (Lot 2, module doc)
+- `lorica-api/src/backends.rs` (Lot 2, Viewer mask, restore, legacy path, tests)
+- `lorica-api/src/automation/redact.rs` (Lot 2)
+- `lorica-api/src/automation/write.rs` (Lot 2)
+- `lorica-api/src/automation/read.rs` (Lot 2, one line, outside the allowlist)
+- `lorica-api/src/automation/write/plane_tests.rs` (Lot 2)
+- `lorica-api/src/automation/write/admin_tier_tests.rs` (Lot 2, outside the allowlist)
+- `lorica-api/src/automation/read/plane_tests.rs` (Lot 2)
+- `lorica-api/src/automation/mcp/plane_tests.rs` (Lot 2)
+- `lorica-api/src/automation/environments/tests.rs` (Lot 2)
+- `lorica-api/openapi.yaml` (Lot 2, backend schemas)
+- `lorica-api/openapi-automation.yaml` (Lot 2)
+- `lorica-api/tests/openapi_contract.rs` (Lot 2)
+- `lorica-mcp/src/tools.rs` (Lot 2)
+- `lorica-mcp/src/stdio.rs` (Lot 2, one test, outside the allowlist)
+- `lorica-api/tests/health_check_template_fixture.rs` (Lot 3, new)
+- `lorica-dashboard/frontend/src/lib/health-check-templates.generated.ts` (Lot 3, new)
+- `docs/health-checks.md` (Lot 3, new: title and the marked section)
+- `lorica-dashboard/frontend/src/lib/api.ts` (Lot 3)
+- `lorica-dashboard/frontend/src/routes/Backends.svelte` (Lot 3)
+- `lorica-dashboard/frontend/src/routes/Backends.test.ts` (Lot 3)
 
 ## Change Log
 
@@ -1152,3 +1260,5 @@ None open.
 | 2026-11-15 | 0.5 | Lot 0 commit 2: each backend probed at its own `health_check_interval_s` on a one-second tick; `default_health_check_interval_s` is the interval of a backend created without one (management, automation, environment). Lot 0 done. Status InProgress. | Romain G. |
 | 2026-11-15 | 0.6 | Lot 0 follow-up: the dashboard backend create omits the interval unless typed, so it takes the setting. Status InProgress. | Romain G. |
 | 2026-11-15 | 0.7 | Lot 1: template catalogue, `tcp_template` and `tcp_send_expect` validated by every writer, shape guard over kinds and template names, send/expect probe with failure reasons, counter, log line and alert details, IV1 automated. Status InProgress. | Romain G. |
+| 2026-11-15 | 0.8 | Lot 2: D9 on every automation and MCP surface (a token never creates or changes a custom payload), `send` masked for tokens and for Viewer with restore on echo, MCP schema offers templates and withholds payload keys, both OpenAPI documents and their contract assertions. Status InProgress. | Romain G. |
+| 2026-11-15 | 0.9 | Lot 3: rendered template module and documentation section with their fixture test, dashboard template and send/expect editors with client-side limits. Status InProgress. | Romain G. |
