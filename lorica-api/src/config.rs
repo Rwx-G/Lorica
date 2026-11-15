@@ -73,13 +73,14 @@ const MAX_IMPORT_SIZE: usize = 1_048_576;
 /// against the nodes that would bind it and the file's other streams,
 /// since an import replaces the stored ones: the port check (Story 12.1
 /// D-9), the local backend rule over the file's own backends and links
-/// (Story 12.3 D-m, rule B), then the fd budget check (Story 12.2 D-e)
-/// under the file's own `stream_listen_socket_cap`, which the import
-/// writes. A stream the file carries unchanged from a stored row of the
-/// same id is judged as an update of that row, so re-importing an
-/// export never refuses what the node already holds. Refuses with the
-/// first conflict or budget refusal, as a stream write does, and
-/// answers the budget warnings, each once.
+/// (Story 12.3 D-m, rule B), the TLS checks against the file's own
+/// certificates (Story 12.4 D-k), then the fd budget check (Story 12.2
+/// D-e) under the file's own `stream_listen_socket_cap`, which the
+/// import writes. A stream the file carries unchanged from a stored row
+/// of the same id is judged as an update of that row, so re-importing
+/// an export never refuses what the node already holds. Refuses with the
+/// first conflict or refusal, as a stream write does, and answers the
+/// TLS and budget warnings, each budget warning once.
 ///
 /// One function for the import and its preview, so a preview that
 /// comes back clean is an import that will not be refused for a port,
@@ -119,6 +120,16 @@ fn check_imported_streams(
     }
     let cap = import.global_settings.stream_listen_socket_cap;
     let mut warnings: Vec<String> = Vec::new();
+    // The TLS checks of a stream write (Story 12.4), against the file's
+    // certificates, which replace the stored ones.
+    for stream in streams {
+        let mut candidate = stream.clone();
+        warnings.extend(crate::streams::tls_checks::check_bundles(&mut candidate)?);
+        warnings.extend(crate::streams::tls_checks::check_certificates(
+            &candidate,
+            &import.certificates,
+        )?);
+    }
     for stream in streams {
         let stored = store.get_stream(&stream.id)?;
         for warning in crate::streams::budget_warnings(

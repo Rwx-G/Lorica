@@ -31,6 +31,16 @@ const LINK_FIELDS: &[&str] = &["backend_ids", "backup_backend_ids"];
 /// stamps the times.
 const SERVER_OWNED_FIELDS: &[&str] = &["id", "created_at", "updated_at"];
 
+/// The view fields that are not model fields and that a client never
+/// writes either: what the view derives from the model (Story 12.4
+/// D-j).
+const DERIVED_FIELDS: &[&str] = &["drains_on_upgrade"];
+
+/// Every view field a create and an update refuse.
+fn read_only(field: &str) -> bool {
+    SERVER_OWNED_FIELDS.contains(&field) || DERIVED_FIELDS.contains(&field)
+}
+
 /// The ports of the node under test. Distinct from every port an
 /// enrolled node of these tests reports, so a refusal names the node it
 /// is about and no other.
@@ -587,24 +597,45 @@ fn keys(object: &Value) -> BTreeSet<String> {
 #[tokio::test]
 async fn the_view_publishes_every_model_field_but_the_withheld_ones() {
     let node = Node::standalone().await;
-    for body in [tcp("smtp", 2525), udp("dns", 53)] {
+    let terminating = terminating_body(&node).await;
+    for body in [tcp("smtp", 2525), udp("dns", 53), terminating] {
         let created = node.created(body).await;
         let stored = stored_stream(&node, created["id"].as_str().expect("an id")).await;
         let model_json = serde_json::to_value(&stored).expect("the model serialises");
         let model: BTreeSet<String> = keys(&model_json)
             .into_iter()
             .filter(|k| !STREAM_WITHHELD_FIELDS.contains(&k.as_str()))
-            // Story 12.4 Lot F publishes the TLS fields; until then the view
-            // leaves them out. Lot F drops this filter.
-            .filter(|k| !lorica_config::models::Stream::tls_field_names().contains(&k.as_str()))
             // Story 12.6 Lot E publishes the source controls; until then
             // the view leaves them out. Lot E drops this filter.
             .filter(|k| {
                 !lorica_config::models::Stream::protection_field_names().contains(&k.as_str())
             })
             .chain(LINK_FIELDS.iter().map(|k| k.to_string()))
+            .chain(DERIVED_FIELDS.iter().map(|k| k.to_string()))
             .collect();
         assert_eq!(keys(&created), model);
+        assert_eq!(created["drains_on_upgrade"], stored.drains_on_upgrade());
+        // The TLS objects are built field by field too, each the stored
+        // value; a rule is the model's plus the backends serving it.
+        for field in ["tls_mode", "no_sni_acknowledged", "clienthello_timeout_ms"] {
+            assert_eq!(created[field], model_json[field], "{field}");
+        }
+        for object in ["tls_terminate", "upstream_tls"] {
+            assert_eq!(created[object], model_json[object], "{object}");
+        }
+        let rules = created["match_rules"].as_array().expect("a list");
+        assert_eq!(rules.len(), stored.match_rules.len());
+        for (view, model) in rules
+            .iter()
+            .zip(model_json["match_rules"].as_array().expect("a list"))
+        {
+            let mut view = view.clone();
+            let object = view.as_object_mut().expect("an object");
+            for link in LINK_FIELDS {
+                assert!(object.remove(*link).is_some(), "{link} in {object:?}");
+            }
+            assert_eq!(&view, model);
+        }
         // The `udp` object is built field by field too: every setting of
         // the model's, each the stored value.
         match stored.protocol {
@@ -1605,18 +1636,59 @@ async fn every_written_view_field_is_accepted_back_on_create_and_update() {
     let created = node.created(body).await;
     let id = created["id"].as_str().expect("an id").to_string();
 
-    let mut echoed = created.clone();
-    let object = echoed.as_object_mut().expect("an object");
-    for key in SERVER_OWNED_FIELDS {
-        assert!(object.remove(*key).is_some(), "{key} is in the view");
+    let terminating = node.created(terminating_body(&node).await).await;
+    let terminating_id = terminating["id"].as_str().expect("an id").to_string();
+
+    for (id, created, copy_port) in [(id, created, 5433), (terminating_id, terminating, 8444)] {
+        let mut echoed = created.clone();
+        let object = echoed.as_object_mut().expect("an object");
+        for key in SERVER_OWNED_FIELDS.iter().chain(DERIVED_FIELDS) {
+            assert!(object.remove(*key).is_some(), "{key} is in the view");
+        }
+        let (status, answer) = node.update(&id, echoed.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        let mut answered = answer["data"].clone();
+        answered["updated_at"] = created["updated_at"].clone();
+        answered
+            .as_object_mut()
+            .expect("an object")
+            .remove("warnings");
+        assert_eq!(answered, created, "echoing the view changes nothing");
+        echoed["name"] = json!(format!(
+            "{}-copy",
+            created["name"].as_str().expect("a name")
+        ));
+        echoed["port_first"] = json!(copy_port);
+        echoed["port_last"] = json!(copy_port);
+        let (status, answer) = node.create(echoed).await;
+        assert_eq!(status, StatusCode::CREATED, "{answer}");
     }
-    let (status, answer) = node.update(&id, echoed.clone()).await;
-    assert_eq!(status, StatusCode::OK, "{answer}");
-    echoed["name"] = json!("pg-copy");
-    echoed["port_first"] = json!(5433);
-    echoed["port_last"] = json!(5433);
-    let (status, answer) = node.create(echoed).await;
-    assert_eq!(status, StatusCode::CREATED, "{answer}");
+
+    let (status, answer) = node
+        .update(
+            created_id_of(&node, "pg").await.as_str(),
+            json!({ "drains_on_upgrade": true }),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "read-only: {answer}"
+    );
+}
+
+/// The id of the stream named `name`.
+async fn created_id_of(node: &Node, name: &str) -> String {
+    node.state
+        .store
+        .lock()
+        .await
+        .list_streams()
+        .expect("list")
+        .into_iter()
+        .find(|s| s.name == name)
+        .expect("the stream exists")
+        .id
 }
 
 #[tokio::test]
@@ -2270,11 +2342,7 @@ async fn the_published_stream_schemas_name_exactly_the_fields_the_api_reads_and_
         .cloned()
         .collect();
     assert_eq!(schema_properties("StreamResponse"), view);
-    let writable: BTreeSet<String> = view
-        .iter()
-        .filter(|k| !SERVER_OWNED_FIELDS.contains(&k.as_str()))
-        .cloned()
-        .collect();
+    let writable: BTreeSet<String> = view.iter().filter(|k| !read_only(k)).cloned().collect();
     assert_eq!(schema_properties("CreateStreamRequest"), writable);
     assert_eq!(schema_properties("UpdateStreamRequest"), writable);
     let required: BTreeSet<String> = schema_block("StreamResponse")
@@ -2558,4 +2626,987 @@ fn the_published_defaults_are_the_models() {
         checked += 1;
     }
     assert!(checked > 0, "the scan found no default");
+}
+
+// ---- TLS at layer 4 (Story 12.4 Lot F) ----
+
+/// A self-signed leaf for `names`, DNS names or IP literals, and its
+/// key, as PEM.
+fn certificate_pems(names: &[&str]) -> (String, String) {
+    let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+    let params = rcgen::CertificateParams::new(names).expect("test setup: names");
+    let key = rcgen::KeyPair::generate().expect("test setup: key");
+    let certificate = params.self_signed(&key).expect("test setup: certificate");
+    (certificate.pem(), key.serialize_pem())
+}
+
+/// The parameters of a CA named `name`.
+fn ca_params(name: &str) -> rcgen::CertificateParams {
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("test setup");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, name);
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+}
+
+/// One self-signed CA, as PEM: a client CA bundle that trusts only
+/// itself.
+fn single_ca_pem() -> String {
+    let key = rcgen::KeyPair::generate().expect("test setup: key");
+    ca_params("Stream Client CA")
+        .self_signed(&key)
+        .expect("test setup: CA")
+        .pem()
+}
+
+/// A root and the CA it issued, as one PEM bundle: the shape the 1.10.3
+/// check warns about.
+fn root_and_issuing_ca_pem() -> String {
+    let root_key = rcgen::KeyPair::generate().expect("test setup: key");
+    let root_params = ca_params("Stream Test Root");
+    let root = root_params
+        .self_signed(&root_key)
+        .expect("test setup: root");
+    let root_issuer = rcgen::Issuer::new(root_params, root_key);
+    let issuing_key = rcgen::KeyPair::generate().expect("test setup: key");
+    let issuing = ca_params("Stream Test Issuing")
+        .signed_by(&issuing_key, &root_issuer)
+        .expect("test setup: issuing CA");
+    format!("{}{}", root.pem(), issuing.pem())
+}
+
+impl Node {
+    /// Upload a certificate for `names`, its domain the first; answer
+    /// its id.
+    async fn certificate(&self, names: &[&str]) -> String {
+        let (cert_pem, key_pem) = certificate_pems(names);
+        let (status, answer) = self
+            .call(
+                "POST",
+                "/api/v1/certificates",
+                Some(json!({ "domain": names[0], "cert_pem": cert_pem, "key_pem": key_pem })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{answer}");
+        answer["data"]["id"].as_str().expect("an id").to_string()
+    }
+
+    /// The links of stream `id` as stored, sorted.
+    async fn stored_links(&self, id: &str) -> Vec<lorica_config::models::StreamBackend> {
+        self.state
+            .store
+            .lock()
+            .await
+            .list_stream_backends()
+            .expect("links")
+            .into_iter()
+            .filter(|link| link.stream_id == id)
+            .collect()
+    }
+}
+
+/// A TCP stream on `port` in `mode` routing by `rules`.
+fn tls_stream(name: &str, port: u16, mode: &str, rules: Value) -> Value {
+    let mut body = tcp(name, port);
+    body["tls_mode"] = json!(mode);
+    body["match_rules"] = rules;
+    body
+}
+
+/// A `tls` rule named `name` for `server_names`, served by `backends`.
+fn tls_rule(name: &str, server_names: &[&str], backends: &[&String]) -> Value {
+    json!({
+        "name": name,
+        "matcher": { "kind": "tls", "server_names": server_names },
+        "backend_ids": backends,
+    })
+}
+
+/// A terminating stream that sets every TLS field: a rule spelled in a
+/// form the store canonicalises, a client CA, and upstream TLS
+/// presenting a stored client certificate.
+async fn terminating_body(node: &Node) -> Value {
+    let backend = node.backend("192.0.2.60:8443").await;
+    let served = node.certificate(&["app.example.com"]).await;
+    let client = node.certificate(&["client.example.com"]).await;
+    let mut body = tls_stream(
+        "tls-edge",
+        8443,
+        "terminate",
+        json!([{
+            "name": "app",
+            "matcher": { "kind": "tls", "server_names": ["App.Example.com."], "alpn": ["h2"] },
+            "backend_ids": [backend],
+        }]),
+    );
+    body["clienthello_timeout_ms"] = json!(3000);
+    body["tls_terminate"] = json!({
+        "certificate_ids": [served],
+        "client_auth": {
+            "ca_cert_pem": single_ca_pem(),
+            "required": true,
+            "allowed_organizations": ["Example Corp"],
+        },
+    });
+    body["upstream_tls"] = json!({
+        "server_name": { "mode": "fixed", "name": "backend.example.com" },
+        "client_certificate_id": client,
+        "alpn": ["h2"],
+    });
+    body
+}
+
+#[tokio::test]
+async fn a_terminating_stream_answers_its_tls_fields_and_never_a_key() {
+    let node = Node::standalone().await;
+    let created = node.created(terminating_body(&node).await).await;
+    assert_eq!(created["tls_mode"], "terminate");
+    assert_eq!(created["drains_on_upgrade"], true);
+    assert_eq!(
+        created["match_rules"][0]["matcher"]["server_names"],
+        json!(["app.example.com"]),
+        "a server name is answered as it is stored"
+    );
+    assert_eq!(created["backend_ids"], json!([]), "the links are per rule");
+    assert_eq!(created["clienthello_timeout_ms"], 3000);
+    assert!(
+        created["upstream_tls"]["client_certificate_id"].is_string(),
+        "a client certificate by id: {created}"
+    );
+    let text = created.to_string();
+    assert!(!text.contains("PRIVATE KEY"), "no key in the view: {text}");
+
+    // A stream that terminates nothing and opens no TLS does not drain
+    // for its TLS; one that only originates does.
+    let plain = node.created(tcp("plain", 2525)).await;
+    assert_eq!(plain["drains_on_upgrade"], false);
+    let id = plain["id"].as_str().expect("an id");
+    let (status, originating) = node
+        .update(id, json!({ "upstream_tls": { "skip_verify": true } }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{originating}");
+    assert_eq!(originating["data"]["drains_on_upgrade"], true);
+    assert_eq!(
+        originating["data"]["upstream_tls"]["server_name"],
+        json!({ "mode": "backend_address" }),
+        "the default name"
+    );
+    let (status, cleared) = node.update(id, json!({ "upstream_tls": null })).await;
+    assert_eq!(status, StatusCode::OK, "{cleared}");
+    assert_eq!(cleared["data"]["upstream_tls"], Value::Null);
+    assert_eq!(cleared["data"]["drains_on_upgrade"], false);
+}
+
+#[tokio::test]
+async fn a_tls_streams_links_travel_inside_its_rules() {
+    let node = Node::standalone().await;
+    let first = node.backend("192.0.2.70:443").await;
+    let second = node.backend("192.0.2.71:443").await;
+    let third = node.backend("192.0.2.72:443").await;
+    let mut web = tls_rule("web", &["a.example.com"], &[&first]);
+    web["backup_backend_ids"] = json!([second]);
+    // A rule with no backend is accepted, as a stream with none is.
+    let legacy = tls_rule("legacy", &["*.example.com"], &[]);
+    let created = node
+        .created(tls_stream("sni", 8443, "passthrough", json!([web, legacy])))
+        .await;
+    let id = created["id"].as_str().expect("an id").to_string();
+    assert_eq!(created["backend_ids"], json!([]));
+    assert_eq!(created["backup_backend_ids"], json!([]));
+    assert_eq!(
+        created["drains_on_upgrade"], false,
+        "passthrough holds no TLS state"
+    );
+    assert_eq!(created["match_rules"][0]["backend_ids"], json!([first]));
+    assert_eq!(
+        created["match_rules"][0]["backup_backend_ids"],
+        json!([second])
+    );
+    assert_eq!(created["match_rules"][1]["backend_ids"], json!([]));
+    let rules_of = |links: Vec<lorica_config::models::StreamBackend>| {
+        let mut rules: Vec<(String, bool, Option<String>)> = links
+            .into_iter()
+            .map(|l| (l.backend_id, l.backup, l.rule))
+            .collect();
+        rules.sort();
+        rules
+    };
+    let mut expected = vec![
+        (first.clone(), false, Some("web".to_string())),
+        (second.clone(), true, Some("web".to_string())),
+    ];
+    expected.sort();
+    assert_eq!(rules_of(node.stored_links(&id).await), expected);
+
+    // `match_rules` replaces the rules and every link; left out, both
+    // stay.
+    let (status, moved) = node
+        .update(
+            &id,
+            json!({ "match_rules": [
+                tls_rule("web", &["a.example.com"], &[&third]),
+                tls_rule("legacy", &["*.example.com"], &[&first]),
+            ] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{moved}");
+    let mut expected = vec![
+        (third.clone(), false, Some("web".to_string())),
+        (first.clone(), false, Some("legacy".to_string())),
+    ];
+    expected.sort();
+    assert_eq!(rules_of(node.stored_links(&id).await), expected);
+    let (status, kept) = node.update(&id, json!({ "enabled": false })).await;
+    assert_eq!(status, StatusCode::OK, "{kept}");
+    assert_eq!(kept["data"]["match_rules"], moved["data"]["match_rules"]);
+
+    // Refused, and nothing moves: a stream-level list on a TLS stream, a
+    // backend serving two rules, a rule served by backups alone.
+    let backup_only = {
+        let mut rule = tls_rule("web", &["a.example.com"], &[]);
+        rule["backup_backend_ids"] = json!([third]);
+        rule
+    };
+    for (what, body, words) in [
+        (
+            "a stream-level primary",
+            json!({ "backend_ids": [first] }),
+            vec!["backend_ids", "passthrough", "match_rules"],
+        ),
+        (
+            "a stream-level backup",
+            json!({ "backup_backend_ids": [first] }),
+            vec!["backup_backend_ids", "passthrough"],
+        ),
+        (
+            "one backend for two rules",
+            json!({ "match_rules": [
+                tls_rule("web", &["a.example.com"], &[&first]),
+                tls_rule("legacy", &["*.example.com"], &[&first]),
+            ] }),
+            vec![first.as_str()],
+        ),
+        (
+            "a rule with backups alone",
+            json!({ "match_rules": [backup_only] }),
+            vec!["backup", "primary"],
+        ),
+        (
+            "a backend both primary and backup of a rule",
+            json!({ "match_rules": [{
+                "name": "web",
+                "matcher": { "kind": "tls", "server_names": ["a.example.com"] },
+                "backend_ids": [first],
+                "backup_backend_ids": [first],
+            }] }),
+            vec!["web", first.as_str()],
+        ),
+        (
+            "leaving TLS with the rules' links",
+            json!({ "tls_mode": "none", "match_rules": [] }),
+            vec!["reads no ClientHello"],
+        ),
+    ] {
+        let (status, answer) = node.update(&id, body).await;
+        let message = unprocessable(status, &answer);
+        for word in words {
+            assert!(message.contains(word), "{what}: {word}: {message}");
+        }
+        assert_eq!(
+            rules_of(node.stored_links(&id).await),
+            expected,
+            "{what}: nothing moved"
+        );
+    }
+    let (status, answer) = node
+        .create(merged(
+            tls_stream(
+                "sni-2",
+                8444,
+                "passthrough",
+                json!([tls_rule("web", &["b.example.com"], &[])]),
+            ),
+            &json!({ "backend_ids": [second] }),
+        ))
+        .await;
+    assert!(
+        unprocessable(status, &answer).contains("backend_ids"),
+        "{answer}"
+    );
+
+    // Leaving TLS: the rules go, and the links with them, in one write.
+    let (status, plain) = node
+        .update(
+            &id,
+            json!({ "tls_mode": "none", "match_rules": [], "backend_ids": [second] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{plain}");
+    assert_eq!(
+        rules_of(node.stored_links(&id).await),
+        vec![(second.clone(), false, None)]
+    );
+    assert_eq!(plain["data"]["match_rules"], json!([]));
+}
+
+#[tokio::test]
+async fn every_tls_field_a_mode_does_not_take_is_refused_naming_field_and_mode() {
+    let node = Node::standalone().await;
+    let certificate = node.certificate(&["app.example.com"]).await;
+    let rules = json!([tls_rule("app", &["app.example.com"], &[])]);
+    let no_sni = json!([{ "name": "any", "matcher": { "kind": "no_sni" } }]);
+    let terminate = json!({ "certificate_ids": [certificate] });
+    let on = |base: Value, patch: Value| merged(base, &patch);
+    let none = || tcp("plain", 2600);
+    let passthrough = || tls_stream("sni", 2601, "passthrough", rules.clone());
+    let udp_stream = || udp("dns", 2602);
+    for (what, body, words) in [
+        (
+            "rules on none",
+            on(none(), json!({ "match_rules": rules })),
+            vec!["match_rules", "none"],
+        ),
+        (
+            "a ClientHello deadline on none",
+            on(none(), json!({ "clienthello_timeout_ms": 5000 })),
+            vec!["clienthello_timeout_ms", "none"],
+        ),
+        (
+            "termination on none",
+            on(none(), json!({ "tls_terminate": terminate })),
+            vec!["tls_terminate", "none"],
+        ),
+        (
+            "the client's name upstream on none",
+            on(
+                none(),
+                json!({ "upstream_tls": { "server_name": { "mode": "client" } } }),
+            ),
+            vec!["upstream_tls.server_name client", "none"],
+        ),
+        (
+            "an acknowledgement without a no_sni rule",
+            on(none(), json!({ "no_sni_acknowledged": true })),
+            vec!["no_sni_acknowledged"],
+        ),
+        (
+            "passthrough without rules",
+            on(none(), json!({ "tls_mode": "passthrough" })),
+            vec!["match_rules", "passthrough"],
+        ),
+        (
+            "termination on passthrough",
+            on(passthrough(), json!({ "tls_terminate": terminate })),
+            vec!["tls_terminate", "passthrough"],
+        ),
+        (
+            "upstream TLS on passthrough",
+            on(passthrough(), json!({ "upstream_tls": {} })),
+            vec!["upstream_tls", "passthrough"],
+        ),
+        (
+            "terminate without its certificates",
+            tls_stream("tls", 2603, "terminate", rules.clone()),
+            vec!["tls_terminate", "terminate"],
+        ),
+        (
+            "a no_sni rule unacknowledged",
+            tls_stream("tls", 2603, "passthrough", no_sni.clone()),
+            vec!["no_sni_acknowledged", "source allowlist"],
+        ),
+        (
+            "a ClientHello deadline below its range",
+            on(
+                passthrough(),
+                json!({
+                    "clienthello_timeout_ms":
+                        lorica_config::models::Stream::CLIENTHELLO_TIMEOUT_MS_RANGE.start() - 1
+                }),
+            ),
+            vec!["clienthello_timeout_ms"],
+        ),
+        (
+            "skip_verify with a client certificate",
+            on(
+                none(),
+                json!({ "upstream_tls": {
+                    "skip_verify": true, "client_certificate_id": certificate,
+                } }),
+            ),
+            vec!["skip_verify", "client_certificate_id"],
+        ),
+        (
+            "TLS on UDP",
+            on(
+                udp_stream(),
+                json!({ "tls_mode": "passthrough", "match_rules": rules }),
+            ),
+            vec!["tls_mode", "UDP"],
+        ),
+        (
+            "upstream TLS on UDP",
+            on(udp_stream(), json!({ "upstream_tls": {} })),
+            vec!["upstream_tls", "UDP"],
+        ),
+    ] {
+        let (status, answer) = node.create(body).await;
+        let message = unprocessable(status, &answer);
+        for word in words {
+            assert!(message.contains(word), "{what}: {word}: {message}");
+        }
+    }
+    assert!(
+        node.state
+            .store
+            .lock()
+            .await
+            .list_streams()
+            .expect("list")
+            .is_empty(),
+        "no refused create left a row"
+    );
+}
+
+#[tokio::test]
+async fn certificate_coverage_follows_the_lookup_the_handshake_runs() {
+    let node = Node::standalone().await;
+    let exact = node.certificate(&["app.example.com"]).await;
+    let wildcard = node.certificate(&["*.example.com"]).await;
+    let terminating = |name: &str, server_name: &str, certificate: &str| {
+        let mut body = tls_stream(
+            name,
+            9000,
+            "terminate",
+            json!([tls_rule("site", &[server_name], &[])]),
+        );
+        body["tls_terminate"] = json!({ "certificate_ids": [certificate] });
+        body
+    };
+    let mut port = 9000;
+    let mut write = |name: &str, server_name: &str, certificate: &str| {
+        port += 1;
+        let mut body = terminating(name, server_name, certificate);
+        body["port_first"] = json!(port);
+        body
+    };
+
+    // Served: the exact name, a name one label under a wildcard
+    // certificate, and a wildcard rule by that wildcard itself, which
+    // warns that the rule routes deeper names than it serves.
+    for (what, body) in [
+        ("exact", write("exact", "app.example.com", &exact)),
+        (
+            "one label",
+            write("one-label", "api.example.com", &wildcard),
+        ),
+    ] {
+        let (status, answer) = node.create(body).await;
+        assert_eq!(status, StatusCode::CREATED, "{what}: {answer}");
+        assert!(answer["data"].get("warnings").is_none(), "{what}: {answer}");
+    }
+    let (status, answer) = node
+        .create(write("wildcard", "*.example.com", &wildcard))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    let warnings = answer["data"]["warnings"].to_string();
+    for word in [
+        "`site`",
+        "*.example.com",
+        "every depth",
+        "a.b.example.com",
+        "no_certificate",
+    ] {
+        assert!(warnings.contains(word), "{word}: {warnings}");
+    }
+
+    // Not served: another exact name, two labels under a wildcard
+    // certificate, a wildcard rule over an exact certificate, and a
+    // deeper wildcard rule over a wildcard certificate.
+    for (what, body, name, certificate) in [
+        (
+            "another name",
+            write("miss-exact", "www.example.org", &exact),
+            "www.example.org",
+            &exact,
+        ),
+        (
+            "two labels",
+            write("miss-depth", "a.b.example.com", &wildcard),
+            "a.b.example.com",
+            &wildcard,
+        ),
+        (
+            "a wildcard over an exact certificate",
+            write("miss-wild", "*.example.com", &exact),
+            "*.example.com",
+            &exact,
+        ),
+        (
+            "a deeper wildcard",
+            write("miss-deep", "*.b.example.com", &wildcard),
+            "*.b.example.com",
+            &wildcard,
+        ),
+    ] {
+        let (status, answer) = node.create(body).await;
+        let message = unprocessable(status, &answer);
+        for word in ["`site`", name, certificate.as_str()] {
+            assert!(message.contains(word), "{what}: {word}: {message}");
+        }
+    }
+
+    // A certificate that does not exist, on either field.
+    let (status, answer) = node
+        .create(write("missing", "app.example.com", "no-such-certificate"))
+        .await;
+    let message = unprocessable(status, &answer);
+    assert!(
+        message.contains("tls_terminate.certificate_ids"),
+        "{message}"
+    );
+    assert!(message.contains("no-such-certificate"), "{message}");
+    let mut body = tcp("origin", 9100);
+    body["upstream_tls"] = json!({ "client_certificate_id": "no-such-certificate" });
+    let (status, answer) = node.create(body).await;
+    assert!(
+        unprocessable(status, &answer).contains("upstream_tls.client_certificate_id"),
+        "{answer}"
+    );
+
+    // An update is checked as a create is.
+    let id = created_id_of(&node, "exact").await;
+    let (status, answer) = node
+        .update(
+            &id,
+            json!({ "match_rules": [tls_rule("site", &["www.example.org"], &[])] }),
+        )
+        .await;
+    assert!(
+        unprocessable(status, &answer).contains("www.example.org"),
+        "{answer}"
+    );
+}
+
+#[tokio::test]
+async fn a_no_sni_rule_on_a_terminating_stream_needs_an_address_certificate() {
+    let node = Node::standalone().await;
+    let named = node.certificate(&["app.example.com"]).await;
+    let addressed = node.certificate(&["192.0.2.10"]).await;
+    let body = |listen: &str, port: u16, certificate: &str| {
+        let mut body = tls_stream(
+            "bare",
+            port,
+            "terminate",
+            json!([{ "name": "any", "matcher": { "kind": "no_sni" } }]),
+        );
+        body["listen_address"] = json!(listen);
+        body["no_sni_acknowledged"] = json!(true);
+        body["tls_terminate"] = json!({ "certificate_ids": [certificate] });
+        body
+    };
+    let (status, answer) = node.create(body("0.0.0.0", 9200, &named)).await;
+    let message = unprocessable(status, &answer);
+    for word in ["`any`", "IP address SAN", named.as_str()] {
+        assert!(message.contains(word), "{word}: {message}");
+    }
+    let (status, answer) = node.create(body("192.0.2.20", 9200, &addressed)).await;
+    assert!(
+        unprocessable(status, &answer).contains("192.0.2.20"),
+        "the listen address is named: {answer}"
+    );
+    for (listen, port) in [("0.0.0.0", 9201), ("192.0.2.10", 9202)] {
+        let mut accepted = body(listen, port, &addressed);
+        accepted["name"] = json!(format!("bare-{port}"));
+        let (status, answer) = node.create(accepted).await;
+        assert_eq!(status, StatusCode::CREATED, "{listen}: {answer}");
+    }
+}
+
+#[tokio::test]
+async fn the_pem_bundles_are_checked_as_a_routes_and_a_widening_bundle_is_warned() {
+    let node = Node::standalone().await;
+    let certificate = node.certificate(&["app.example.com"]).await;
+    let with_client_ca = |name: &str, port: u16, ca: &str| {
+        let mut body = tls_stream(
+            name,
+            port,
+            "terminate",
+            json!([tls_rule("app", &["app.example.com"], &[])]),
+        );
+        body["tls_terminate"] = json!({
+            "certificate_ids": [certificate],
+            "client_auth": { "ca_cert_pem": ca, "allowed_organizations": [" Example Corp ", "Example Corp"] },
+        });
+        body
+    };
+
+    // A root next to the CA it issued saves, and the write says what it
+    // trusts beyond the bundle, speaking of the stream.
+    let bundle = root_and_issuing_ca_pem();
+    let (status, answer) = node
+        .create(with_client_ca("wide", 9300, &format!("\n{bundle}\n")))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    let warnings = answer["data"]["warnings"].to_string();
+    for word in [
+        "`wide`",
+        "tls_terminate.client_auth.ca_cert_pem",
+        "Stream Test Root",
+        "self-signed root",
+        "this stream",
+    ] {
+        assert!(warnings.contains(word), "{word}: {warnings}");
+    }
+    assert!(!warnings.contains("route"), "{warnings}");
+    let client_auth = &answer["data"]["tls_terminate"]["client_auth"];
+    assert_eq!(
+        client_auth["ca_cert_pem"],
+        bundle.trim(),
+        "stored as the route validator leaves it"
+    );
+    assert_eq!(
+        client_auth["allowed_organizations"],
+        json!(["Example Corp"])
+    );
+
+    // One CA trusts only itself: no warning.
+    let (status, answer) = node
+        .create(with_client_ca("narrow", 9301, &single_ca_pem()))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    assert!(answer["data"].get("warnings").is_none(), "{answer}");
+
+    // A block that is no X.509 certificate passes the model's shape check
+    // and is refused here, naming the stream's own field.
+    let junk = "-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n";
+    let (status, answer) = node.create(with_client_ca("junk", 9302, junk)).await;
+    let message = unprocessable(status, &answer);
+    assert!(
+        message.contains("tls_terminate.client_auth.ca_cert_pem") && !message.contains("mtls."),
+        "{message}"
+    );
+    let mut body = tcp("origin", 9303);
+    body["upstream_tls"] = json!({ "ca_cert_pem": junk });
+    let (status, answer) = node.create(body).await;
+    let message = unprocessable(status, &answer);
+    assert!(message.contains("upstream_tls.ca_cert_pem"), "{message}");
+
+    // A server CA bundle may hold a root: trusting one is its purpose.
+    let mut body = tcp("origin", 9303);
+    body["upstream_tls"] = json!({ "ca_cert_pem": bundle });
+    let (status, answer) = node.create(body).await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    assert!(answer["data"].get("warnings").is_none(), "{answer}");
+}
+
+#[tokio::test]
+async fn a_certificate_a_stream_names_cannot_be_deleted() {
+    let node = Node::standalone().await;
+    let created = node.created(terminating_body(&node).await).await;
+    let served = created["tls_terminate"]["certificate_ids"][0]
+        .as_str()
+        .expect("an id")
+        .to_string();
+    let client = created["upstream_tls"]["client_certificate_id"]
+        .as_str()
+        .expect("an id")
+        .to_string();
+    for certificate in [&served, &client] {
+        let (status, answer) = node
+            .call(
+                "DELETE",
+                &format!("/api/v1/certificates/{certificate}"),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+        let message = answer["error"]["message"].as_str().expect("a message");
+        assert!(
+            message.contains("tls-edge"),
+            "the stream is named: {message}"
+        );
+    }
+    let id = created["id"].as_str().expect("an id");
+    let (status, _) = node
+        .call("DELETE", &format!("/api/v1/streams/{id}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for certificate in [&served, &client] {
+        let (status, answer) = node
+            .call(
+                "DELETE",
+                &format!("/api/v1/certificates/{certificate}"),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+    }
+}
+
+#[tokio::test]
+async fn an_import_and_its_preview_run_the_tls_checks() {
+    let node = Node::standalone().await;
+    let terminating = |certificate: &str| {
+        let mut stream = lorica_config::models::Stream::new(
+            uuid::Uuid::new_v4().to_string(),
+            "imported".to_string(),
+            lorica_config::models::StreamProtocol::Tcp,
+            "0.0.0.0".parse().expect("an address"),
+            9400,
+            9400,
+            Utc::now(),
+        );
+        stream.tls_mode = lorica_config::models::StreamTlsMode::Terminate;
+        stream.match_rules = vec![lorica_config::models::StreamMatchRule {
+            name: "site".to_string(),
+            matcher: lorica_config::models::StreamMatcher::Tls {
+                server_names: vec!["*.example.com".to_string()],
+                alpn: Vec::new(),
+            },
+        }];
+        stream.tls_terminate = Some(lorica_config::models::StreamTlsTerminate {
+            certificate_ids: vec![certificate.to_string()],
+            client_auth: None,
+        });
+        stream
+    };
+
+    // The file names a certificate it does not carry: both refuse.
+    let ((preview_status, preview), (import_status, import)) = preview_and_import(
+        &node,
+        export_with(&[terminating("absent-certificate")], None),
+    )
+    .await;
+    for (status, answer) in [(preview_status, &preview), (import_status, &import)] {
+        let message = unprocessable(status, answer);
+        assert!(message.contains("absent-certificate"), "{message}");
+    }
+
+    // The file carries it: the preview passes, with the wildcard
+    // warning a write answers. A node of its own: the import and its
+    // preview share one rate budget.
+    let node = Node::standalone().await;
+    let source = lorica_config::ConfigStore::open_in_memory().expect("source");
+    let (cert_pem, key_pem) = certificate_pems(&["*.example.com"]);
+    let now = Utc::now();
+    let mut certificate = lorica_config::models::Certificate {
+        id: uuid::Uuid::new_v4().to_string(),
+        domain: "*.example.com".to_string(),
+        san_domains: vec!["*.example.com".to_string()],
+        fingerprint: "fp".to_string(),
+        cert_pem,
+        key_pem,
+        issuer: "test".to_string(),
+        not_before: now,
+        not_after: now + chrono::Duration::days(30),
+        is_acme: false,
+        acme_auto_renew: false,
+        created_at: now,
+        acme_method: None,
+        acme_dns_provider_id: None,
+        adcs_authority_id: None,
+        adcs_template: None,
+        adcs_template_oid: None,
+        adcs_request_id: None,
+    };
+    source
+        .create_certificate(&certificate)
+        .expect("test setup: certificate");
+    source
+        .create_stream(&terminating(&certificate.id))
+        .expect("test setup: stream");
+    let file = lorica_config::export::export_to_toml(&source).expect("export");
+    let (status, preview) = node
+        .call(
+            "POST",
+            "/api/v1/config/import/preview",
+            Some(json!({ "toml_content": file })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert!(
+        preview["data"]["warnings"]
+            .to_string()
+            .contains("every depth"),
+        "{preview}"
+    );
+
+    // A file whose certificate no longer covers the rule is refused.
+    certificate.domain = "www.example.org".to_string();
+    certificate.san_domains = vec!["www.example.org".to_string()];
+    let source = lorica_config::ConfigStore::open_in_memory().expect("source");
+    source
+        .create_certificate(&certificate)
+        .expect("test setup: certificate");
+    source
+        .create_stream(&terminating(&certificate.id))
+        .expect("test setup: stream");
+    let file = lorica_config::export::export_to_toml(&source).expect("export");
+    let (status, preview) = node
+        .call(
+            "POST",
+            "/api/v1/config/import/preview",
+            Some(json!({ "toml_content": file })),
+        )
+        .await;
+    assert!(
+        unprocessable(status, &preview).contains("*.example.com"),
+        "{preview}"
+    );
+}
+
+#[test]
+fn the_published_tls_words_and_limits_are_the_models() {
+    use lorica_config::models::{Stream, StreamMatcher, StreamTlsMode, UpstreamServerName};
+    use strum::VariantArray as _;
+
+    let modes: Vec<String> = StreamTlsMode::VARIANTS
+        .iter()
+        .map(|mode| mode.as_str().to_string())
+        .collect();
+    assert_eq!(enum_words(&schema_block("StreamTlsMode")), modes);
+
+    // `StreamMatcher` and `UpstreamServerName` carry data, so they list
+    // no variants; these matches fail to compile when one is added,
+    // which is when the lists must grow with it.
+    let every_matcher = |matcher: &StreamMatcher| match matcher {
+        StreamMatcher::Tls { .. } | StreamMatcher::NoSni { .. } => matcher.kind(),
+    };
+    let matchers = [
+        StreamMatcher::Tls {
+            server_names: Vec::new(),
+            alpn: Vec::new(),
+        },
+        StreamMatcher::NoSni { alpn: Vec::new() },
+    ];
+    assert_eq!(
+        enum_words(&property_block("StreamTlsMatcher", "kind")),
+        vec![every_matcher(&matchers[0]).to_string()]
+    );
+    assert_eq!(
+        enum_words(&property_block("StreamNoSniMatcher", "kind")),
+        vec![every_matcher(&matchers[1]).to_string()]
+    );
+    let every_name = |name: &UpstreamServerName| match name {
+        UpstreamServerName::BackendAddress {}
+        | UpstreamServerName::Client {}
+        | UpstreamServerName::Fixed { .. } => name.mode().to_string(),
+    };
+    let names: Vec<String> = [
+        UpstreamServerName::BackendAddress {},
+        UpstreamServerName::Client {},
+        UpstreamServerName::Fixed {
+            name: String::new(),
+        },
+    ]
+    .iter()
+    .map(every_name)
+    .collect();
+    assert_eq!(
+        enum_words(&property_block("StreamUpstreamServerName", "mode")),
+        names
+    );
+    assert_eq!(
+        serde_json::to_value(UpstreamServerName::default()).expect("serialises")["mode"],
+        names[0],
+        "the first mode published is the default"
+    );
+
+    let deadline = property_block("StreamResponse", "clienthello_timeout_ms");
+    let range = Stream::CLIENTHELLO_TIMEOUT_MS_RANGE;
+    assert_eq!(
+        scalar(&deadline, "minimum"),
+        Some(range.start().to_string().as_str())
+    );
+    assert_eq!(
+        scalar(&deadline, "maximum"),
+        Some(range.end().to_string().as_str())
+    );
+    let deadline_prose = prose(&deadline);
+    assert!(
+        deadline_prose.contains(&format!(
+            "`null` is {}",
+            Stream::DEFAULT_CLIENTHELLO_TIMEOUT_MS
+        )),
+        "{deadline_prose}"
+    );
+    for (schema, property, key, limit) in [
+        (
+            "StreamResponse",
+            "match_rules",
+            "maxItems",
+            Stream::MATCH_RULES_MAX,
+        ),
+        (
+            "StreamMatchRule",
+            "name",
+            "maxLength",
+            Stream::MATCH_RULE_NAME_MAX_LEN,
+        ),
+        (
+            "StreamTlsMatcher",
+            "server_names",
+            "maxItems",
+            Stream::RULE_SERVER_NAMES_MAX,
+        ),
+        ("StreamTlsMatcher", "alpn", "maxItems", Stream::ALPN_MAX),
+        ("StreamUpstreamTls", "alpn", "maxItems", Stream::ALPN_MAX),
+        (
+            "StreamTlsTerminate",
+            "certificate_ids",
+            "maxItems",
+            Stream::TERMINATE_CERTIFICATES_MAX,
+        ),
+        (
+            "StreamClientAuth",
+            "allowed_organizations",
+            "maxItems",
+            Stream::ALLOWED_ORGANIZATIONS_MAX,
+        ),
+    ] {
+        assert_eq!(
+            scalar(&property_block(schema, property), key),
+            Some(limit.to_string().as_str()),
+            "{schema}.{property}"
+        );
+    }
+    let rules = prose(&property_block("StreamResponse", "match_rules"));
+    assert!(
+        rules.contains(&format!(
+            "at most {} server names",
+            Stream::SERVER_NAMES_MAX
+        )),
+        "{rules}"
+    );
+    let alpn = prose(&property_block("StreamTlsMatcher", "alpn"));
+    assert!(
+        alpn.contains(&format!("1 to {} bytes", Stream::ALPN_PROTOCOL_MAX_LEN)),
+        "{alpn}"
+    );
+
+    // Every nested TLS object publishes exactly the fields the view
+    // answers, the model's own.
+    let terminate = serde_json::to_value(lorica_config::models::StreamTlsTerminate {
+        certificate_ids: Vec::new(),
+        client_auth: None,
+    })
+    .expect("serialises");
+    assert_eq!(schema_properties("StreamTlsTerminate"), keys(&terminate));
+    let client_auth = serde_json::to_value(lorica_config::models::MtlsConfig {
+        ca_cert_pem: String::new(),
+        required: false,
+        allowed_organizations: Vec::new(),
+    })
+    .expect("serialises");
+    assert_eq!(schema_properties("StreamClientAuth"), keys(&client_auth));
+    let upstream = serde_json::to_value(lorica_config::models::StreamUpstreamTls::default())
+        .expect("serialises");
+    assert_eq!(schema_properties("StreamUpstreamTls"), keys(&upstream));
+    let rule: BTreeSet<String> = ["name", "matcher"]
+        .iter()
+        .chain(LINK_FIELDS)
+        .map(|k| k.to_string())
+        .collect();
+    assert_eq!(schema_properties("StreamMatchRule"), rule);
 }

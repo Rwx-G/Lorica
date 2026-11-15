@@ -794,7 +794,7 @@ pub async fn update_certificate(
     Ok(json_data(response))
 }
 
-/// DELETE /api/v1/certificates/:id - delete a certificate, refusing if any route still references it.
+/// DELETE /api/v1/certificates/:id - delete a certificate, refusing if any route or stream still references it.
 pub async fn delete_certificate(
     connect_info: crate::audit::ClientConnectInfo,
     headers: http::HeaderMap,
@@ -815,6 +815,22 @@ pub async fn delete_certificate(
         if !referencing.is_empty() {
             return Err(ApiError::Conflict(format!(
                 "certificate is referenced by routes: {}",
+                referencing.join(", ")
+            )));
+        }
+
+        // A stream names a certificate it terminates with or presents
+        // to its backends (Story 12.4 D-k); no foreign key holds either
+        // reference, so this is the guard.
+        let streams = store.list_streams()?;
+        let referencing: Vec<&str> = streams
+            .iter()
+            .filter(|s| s.certificate_references().contains(&id.as_str()))
+            .map(|s| s.name.as_str())
+            .collect();
+        if !referencing.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "certificate is referenced by streams: {}",
                 referencing.join(", ")
             )));
         }

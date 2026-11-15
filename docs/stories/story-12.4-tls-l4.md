@@ -1098,14 +1098,14 @@ only), `lorica-api/src/config.rs` (the import's stream TLS checks only),
 `lorica-api/openapi.yaml`, `lorica-api/src/tests.rs`.
 Depends on: C; 12.3 Lot E and 12.5 Lot G (same files).
 
-- [ ] Request and response fields, links per rule,
+- [x] Request and response fields, links per rule,
       `drains_on_upgrade` (D-k, D-j).
-- [ ] `tls_checks.rs`: existence, coverage, IP SAN for `no_sni`, the
+- [x] `tls_checks.rs`: existence, coverage, IP SAN for `no_sni`, the
       bundle checks (D-h, D-k), on create, update and import.
-- [ ] Certificate delete guard for streams.
-- [ ] `openapi.yaml`, contract test green; the backend's HTTP TLS field
+- [x] Certificate delete guard for streams.
+- [x] `openapi.yaml`, contract test green; the backend's HTTP TLS field
       descriptions say "HTTP routes only".
-- [ ] Tests: each D-g refusal answers 400 naming field and mode;
+- [x] Tests: each D-g refusal answers 400 naming field and mode;
       coverage hit and miss (exact, one-label wildcard, a deep wildcard
       rule against a wildcard certificate); `no_sni` without an IP-SAN
       certificate refused; a bundle with a root and its issuing CA
@@ -1313,6 +1313,126 @@ The decisions above cite each one as "Resolved N".
 ### Debug Log
 
 ### Completion Notes
+
+**Lot F (API surfaces).**
+
+- **Status codes: 422, not 400.** D-g and D-k say 400; the stream API's
+  house rule (`ApiError::Unprocessable`, the module doc of
+  `lorica-api/src/streams.rs`) answers 422 for a body that parses and
+  breaks a model rule, and every other stream refusal already does. Every
+  TLS refusal is therefore 422 naming the field and the mode, the bundle
+  refusals of `build_mtls_config` included (that function answers 400
+  on a route; on a stream its message is rewritten to name the stream's
+  field, `tls_terminate.client_auth.ca_cert_pem` or
+  `upstream_tls.ca_cert_pem`, and answered 422 like the model's own
+  shape check of the same field). The certificate delete guard is 409,
+  as the route guard.
+- **The shape.** `CreateStreamRequest` and `UpdateStreamRequest` gain
+  `tls_mode`, `match_rules`, `no_sni_acknowledged`, and the nullable
+  `clienthello_timeout_ms`, `tls_terminate` and `upstream_tls` (`null`
+  restores the default or removes the object on an update). A rule in a
+  body is `{ name, matcher, backend_ids, backup_backend_ids }`, the two
+  lists optional; `matcher` and `upstream_tls.server_name` are the
+  model's tagged enums (`kind`, `mode`), `tls_terminate` and
+  `upstream_tls` the model's types, so every `deny_unknown_fields` of
+  the model holds at the API. `StreamResponse` gains the same fields,
+  built field by field (`StreamMatchRuleResponse`,
+  `StreamTlsTerminateResponse`, `StreamClientAuthResponse`,
+  `StreamUpstreamTlsResponse`), and the read-only `drains_on_upgrade`
+  from `Stream::drains_on_upgrade`, which a body refuses as an unknown
+  field. A CA bundle is public and is answered; a client certificate is
+  answered by id; no key is ever in a view (`STREAM_WITHHELD_FIELDS`
+  stays empty, with the reason in its doc).
+- **Links per rule.** On a stream whose `tls_mode` reads a ClientHello
+  the links travel inside each rule and the stream-level lists are empty
+  in the view; a body carrying a non-empty stream-level list there is
+  refused naming the list and the mode. `match_rules` in an update
+  replaces the rules and every link (written with `set_stream_links`,
+  the rule on each row); left out, both stay. On any other stream the
+  stream-level lists behave as in 12.3. A stream leaving TLS sends
+  `match_rules: []` and its new `backend_ids`; without them its old
+  links still name rules and the store refuses `RuleOnNonTlsStream`
+  (422), which the test pins. `StreamLinks` keeps the links per rule
+  beside the stream-level ones, so the local backend rule and the
+  unknown-backend check see every link.
+- **Decision: a rule with no backend is accepted.** The store, the
+  replica apply and the import accept it (Amendments, D-d), and a stream
+  with no backend is accepted by this API since 12.1; refusing it at the
+  management API alone would make the import accept what the API
+  refuses, which every other stream rule is built to avoid. Its clients
+  end `no_healthy_backend`, exactly as a rule whose backends are all
+  down, and are counted. What it gives up: an operator can save a rule
+  that black-holes its clients; the `openapi.yaml` description of
+  `match_rules` says so, and Story 12.10's form is where to flag it.
+- **`tls_checks.rs`** (`lorica-api/src/streams/tls_checks.rs`), two steps
+  so the one that reads no row runs before the store lock:
+  `check_bundles` runs `build_mtls_config` on the client CA bundle and on
+  `upstream_tls.ca_cert_pem` and stores what it returns (trimmed, the
+  organizations trimmed and deduplicated); for the client CA bundle it
+  logs `log_mtls_bundle_trust_warnings` like a route write and answers
+  each finding of `mtls_bundle_trust_warnings` in the write's
+  `warnings`, naming the stream (a server CA bundle draws none: trusting
+  a root is its purpose). `check_certificates` checks, against
+  `list_certificates_without_private_keys` (no key decrypted), that
+  every `certificate_ids` entry and the `client_certificate_id` exist;
+  on a terminating stream that every exact rule name is served by a
+  listed certificate through `lookup_keys` (the name, then the one-label
+  wildcard), every wildcard rule name by a certificate carrying that
+  exact wildcard, and a `no_sni` rule by a listed certificate with an
+  `iPAddress` SAN (`ip_sans_of_leaf` over the parsed leaf), the listen
+  address among them when it is not unspecified. Each wildcard rule name
+  of a terminating stream draws a warning saying a deeper name fails
+  `no_certificate` (Resolved 8). Create, update, and the import with its
+  preview (`check_imported_streams`, against the file's certificates)
+  run both, so none accepts what another refuses.
+- **The write's `warnings`** now carries the TLS warnings beside the fd
+  budget ones; `openapi.yaml` says so.
+- **Certificate delete guard** (`certificates.rs`): after the route
+  check, a certificate any stream's `certificate_references` names is a
+  409 naming the streams by name.
+- **`openapi.yaml`**: `StreamTlsMode`, `StreamMatchRule`,
+  `StreamMatcher` (`StreamTlsMatcher`, `StreamNoSniMatcher`, a
+  discriminator on `kind`), `StreamTlsTerminate`, `StreamClientAuth`,
+  `StreamUpstreamTls`, `StreamUpstreamServerName`; the TLS fields and
+  `drains_on_upgrade` on `StreamResponse` and the requests; the create
+  and update descriptions, `StreamWriteResponse.warnings`,
+  `StreamUnprocessable` and the certificate delete 409. The backend's
+  HTTP TLS fields already said "HTTP routes only; streams ignore it"
+  before this Lot; nothing to change there. The refusal enum already carried this story's words.
+- **Tests** (`lorica-api/src/streams/tests.rs`): the view key-set test
+  without its TLS filter, now over a terminating stream too, each nested
+  TLS object compared with the model's JSON; the echo test over a
+  terminating stream, an echoed view changing nothing, and
+  `drains_on_upgrade` refused in a body; a terminating stream's fields
+  and no key in its view, origination draining, `null` removing
+  `upstream_tls`; links per rule (a rule without backend accepted,
+  replace and keep, a stream-level list refused naming list and mode, a
+  backend serving two rules, backups alone, a backend both primary and
+  backup of a rule, leaving TLS with and without new links); every D-g
+  cell refused naming field and mode, UDP included; coverage (exact,
+  one-label wildcard, wildcard rule by wildcard certificate with its
+  warning; misses for another name, two labels, a wildcard over an exact
+  certificate, a deeper wildcard rule over a wildcard certificate; a
+  missing certificate on either field; an update checked as a create);
+  `no_sni` without an IP certificate and with the wrong listen address
+  refused, unspecified and matching addresses accepted; a root with its
+  issuing CA saved with the warning naming the stream, one CA without
+  warning, a junk block refused naming the stream's field on both
+  bundles, a server bundle with a root accepted silently; deleting a
+  certificate a stream terminates with or presents is 409 naming the
+  stream, then allowed once the stream is gone; the import and its
+  preview refusing an absent certificate and an uncovered rule, and
+  warning on a covered wildcard; the published TLS enum words, ranges,
+  caps and nested property sets derived from the model.
+- **Found outside the allowlist, not changed.**
+  `lorica/src/startup/mod.rs::purge_superseded_acme_orphans` deletes, at
+  startup, an ACME certificate no route names when a newer certificate
+  of the same names exists (`superseded_orphans`). It reads routes only,
+  so a superseded ACME certificate that only a stream names would be
+  deleted under the stream, leaving a dangling `certificate_ids` or
+  `client_certificate_id`. It needs the same stream references the
+  delete guard now reads; left to the maintainer, since the file is
+  outside this Lot.
 
 **Lot E (wiring in the binary).**
 
@@ -1712,6 +1832,16 @@ The decisions above cite each one as "Resolved N".
 
 ## File List
 
+Lot F:
+
+- `lorica-api/src/streams.rs`, `lorica-api/src/streams/tests.rs`
+- `lorica-api/src/streams/tls_checks.rs` (new)
+- `lorica-api/src/routes/mtls.rs` (visibility only)
+- `lorica-api/src/certificates.rs` (the delete guard only)
+- `lorica-api/src/config.rs` (the import's stream TLS checks only)
+- `lorica-api/openapi.yaml`
+- `docs/stories/story-12.4-tls-l4.md`
+
 Lot E:
 
 - `lorica/src/stream_engine.rs`, `lorica/src/startup/worker.rs`,
@@ -1784,3 +1914,4 @@ Lot A:
 | 2026-11-15 | 0.6 | Lot D landed: the forwarding loop over any stream pair (I2), the matcher, passthrough, termination on the shared resolver with per-stream client verification, upstream TLS inside the attempt, the TLS counters and the record's `tls`. | Romain G. |
 | 2026-11-15 | 0.5 | Lot C landed: the TLS fields, rules and link rules of D-k, migration 77, the mode table and rule validation, `drains_on_upgrade`, `organizations_admitted`, canonical digest, diff and import, and certificate key entitlement by streams. Decisions amended after Stories 12.3 and 12.5 landed. | Romain G. |
 | 2026-11-15 | 0.7 | Lot E landed: the TCP engine built with the process's certificate resolver and public roots in both process modes (the worker's resolver now filled before its stream runtime starts), client identities in the stream table, round-robin per (stream, rule), `evaluate_mtls` over `organizations_admitted`, and the resolver reload keeping the certificates terminating streams name. | Romain G. |
+| 2026-11-15 | 0.8 | Lot F landed: the TLS fields and `drains_on_upgrade` on the stream API with links per rule, the bundle and certificate checks of `tls_checks.rs` on create, update and import (422, coverage by the handshake's lookup, IP SAN for `no_sni`, trust and wildcard-depth warnings), the certificate delete guard for streams, and `openapi.yaml`. A rule with no backend is accepted. | Romain G. |

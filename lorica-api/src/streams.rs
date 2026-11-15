@@ -19,6 +19,12 @@
 //! (Story 12.2 D-e, [`crate::stream_budget`]), and the reads carry this
 //! node's bind state of each stream.
 //!
+//! A TLS stream (Story 12.4) routes by its `match_rules`, and its links
+//! travel inside each rule as `backend_ids` and `backup_backend_ids`;
+//! the stream-level lists are then empty, and the reverse on a stream
+//! that reads no ClientHello. Its PEM bundles and the certificates it
+//! names are checked by [`tls_checks`] on every write.
+//!
 //! Status codes: `400` for a body this API's shared route validators
 //! refuse (group name, selector) and for a body that does not parse;
 //! `422` for a body that parses and breaks a model rule
@@ -26,14 +32,16 @@
 //! and the `udp` settings' ranges included, a backend id naming no
 //! backend, a name already
 //! taken, the attachment rules of D-6 and of Story 12.3, a local backend
-//! without `allow_local_backend` among them), the rule
+//! without `allow_local_backend` among them, the TLS field a mode does
+//! not take, a PEM bundle that does not parse, a certificate that does
+//! not exist or does not cover a rule's name), the rule
 //! `ApiError::Unprocessable` documents, and a write a node's fd budget
 //! cannot hold ([`crate::stream_budget::STREAM_FD_BUDGET_CODE`]); `404`
 //! for an unknown id; `409` for a port conflict, a local backend on a
 //! node's port, and, on a follower outside break-glass, for every
 //! write.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 
 use axum::extract::{Extension, Path};
@@ -45,8 +53,9 @@ use lorica_config::listen_ports::{
     NodeLabel, NodePorts, PortConflict, ReservedPorts,
 };
 use lorica_config::models::{
-    binds_here_when_enabled, Backend, ClusterNode, LoadBalancing, NodeRole, NodeStatus, Stream,
-    StreamBackend, StreamProtocol, StreamProxyProtocol, UdpSettings,
+    binds_here_when_enabled, Backend, ClusterNode, LoadBalancing, MtlsConfig, NodeRole, NodeStatus,
+    Stream, StreamBackend, StreamMatchRule, StreamMatcher, StreamProtocol, StreamProxyProtocol,
+    StreamTlsMode, StreamTlsTerminate, StreamUpstreamTls, UdpSettings, UpstreamServerName,
 };
 use lorica_config::ConfigStore;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -60,6 +69,7 @@ use crate::stream_budget::{check_write, reported_fds, BudgetNode, NodeFds, Strea
 
 #[cfg(test)]
 mod tests;
+pub(crate) mod tls_checks;
 
 /// The `error.code` of a `409` refusing a stream's ports, so a client
 /// tells it from the follower read-only `409` without reading the
@@ -75,9 +85,11 @@ pub const STREAM_LOCAL_BACKEND_CODE: &str = "stream_local_backend";
 /// Model fields deliberately absent from [`StreamResponse`]. Empty: a
 /// stream carries no secret, and the PROXY trust list and the local
 /// backend flag are exactly what an operator reviewing a stream must
-/// see (Story 12.3 D-q). A later secret-bearing field is withheld by
-/// adding it here, and the view test fails until it is either here or
-/// in the view.
+/// see (Story 12.3 D-q). Its TLS fields hold none either: a client
+/// certificate is named by its stored id, never pasted with its key,
+/// and a CA bundle is public (Story 12.4 D-i). A later secret-bearing
+/// field is withheld by adding it here, and the view test fails until
+/// it is either here or in the view.
 pub const STREAM_WITHHELD_FIELDS: &[&str] = &[];
 
 /// JSON view of a stream returned by every stream endpoint. Built field
@@ -139,16 +151,118 @@ pub struct StreamResponse {
     /// Mirror of `Stream.udp`: the settings of a UDP stream, `null` on a
     /// TCP stream, which carries none (Story 12.5 D-l).
     pub udp: Option<StreamUdpResponse>,
+    /// Mirror of `Stream.tls_mode` (`none`, `passthrough` or
+    /// `terminate`).
+    pub tls_mode: StreamTlsMode,
+    /// Mirror of `Stream.match_rules`, each with the backends that
+    /// serve it.
+    pub match_rules: Vec<StreamMatchRuleResponse>,
+    /// Mirror of `Stream.no_sni_acknowledged`.
+    pub no_sni_acknowledged: bool,
+    /// Mirror of `Stream.clienthello_timeout_ms`; `null` for the
+    /// default.
+    pub clienthello_timeout_ms: Option<u32>,
+    /// Mirror of `Stream.tls_terminate`; `null` unless the stream
+    /// terminates TLS.
+    pub tls_terminate: Option<StreamTlsTerminateResponse>,
+    /// Mirror of `Stream.upstream_tls`; `null` when the stream opens no
+    /// TLS towards its backends.
+    pub upstream_tls: Option<StreamUpstreamTlsResponse>,
+    /// `Stream::drains_on_upgrade`: a hot upgrade drains this stream's
+    /// connections even once live transfer exists (D8). Read-only.
+    pub drains_on_upgrade: bool,
     /// IDs of the primary backends linked through `stream_backends`,
-    /// sorted.
+    /// sorted; empty on a TLS stream, whose links are per rule.
     pub backend_ids: Vec<String>,
     /// IDs of the backup backends, sorted: candidates only when no
-    /// primary is (Story 12.3 D-f).
+    /// primary is (Story 12.3 D-f); empty on a TLS stream.
     pub backup_backend_ids: Vec<String>,
     /// RFC 3339 creation timestamp.
     pub created_at: String,
     /// RFC 3339 last-write timestamp.
     pub updated_at: String,
+}
+
+/// One rule of a TLS stream's view (Story 12.4 D-d): the model's rule
+/// and the backends linked to serve it.
+#[derive(Debug, Serialize)]
+pub struct StreamMatchRuleResponse {
+    /// Mirror of `StreamMatchRule.name`.
+    pub name: String,
+    /// Mirror of `StreamMatchRule.matcher`, tagged by `kind`. A kind is
+    /// a matcher's whole shape, so the model's own form is the view.
+    pub matcher: StreamMatcher,
+    /// IDs of the primary backends serving the rule, sorted.
+    pub backend_ids: Vec<String>,
+    /// IDs of the backup backends serving the rule, sorted.
+    pub backup_backend_ids: Vec<String>,
+}
+
+/// The `tls_terminate` object of a stream's view (Story 12.4 D-f, D-h).
+#[derive(Debug, Serialize)]
+pub struct StreamTlsTerminateResponse {
+    /// Mirror of `StreamTlsTerminate.certificate_ids`.
+    pub certificate_ids: Vec<String>,
+    /// Mirror of `StreamTlsTerminate.client_auth`; `null` verifies no
+    /// client.
+    pub client_auth: Option<StreamClientAuthResponse>,
+}
+
+/// The client certificate verification of a terminating stream's view,
+/// in the shape of a route's `mtls`.
+#[derive(Debug, Serialize)]
+pub struct StreamClientAuthResponse {
+    /// Mirror of `MtlsConfig.ca_cert_pem`: the CA certificates trusted,
+    /// public material.
+    pub ca_cert_pem: String,
+    /// Mirror of `MtlsConfig.required`.
+    pub required: bool,
+    /// Mirror of `MtlsConfig.allowed_organizations`.
+    pub allowed_organizations: Vec<String>,
+}
+
+/// The `upstream_tls` object of a stream's view (Story 12.4 D-i).
+#[derive(Debug, Serialize)]
+pub struct StreamUpstreamTlsResponse {
+    /// Mirror of `StreamUpstreamTls.server_name`, tagged by `mode`.
+    pub server_name: UpstreamServerName,
+    /// Mirror of `StreamUpstreamTls.ca_cert_pem`; `null` trusts the
+    /// public roots.
+    pub ca_cert_pem: Option<String>,
+    /// Mirror of `StreamUpstreamTls.skip_verify`.
+    pub skip_verify: bool,
+    /// Mirror of `StreamUpstreamTls.client_certificate_id`: the stored
+    /// certificate presented, by id; its key is never in the view.
+    pub client_certificate_id: Option<String>,
+    /// Mirror of `StreamUpstreamTls.alpn`.
+    pub alpn: Vec<String>,
+}
+
+impl StreamTlsTerminateResponse {
+    fn of(terminate: &StreamTlsTerminate) -> Self {
+        StreamTlsTerminateResponse {
+            certificate_ids: terminate.certificate_ids.clone(),
+            client_auth: terminate.client_auth.as_ref().map(|auth: &MtlsConfig| {
+                StreamClientAuthResponse {
+                    ca_cert_pem: auth.ca_cert_pem.clone(),
+                    required: auth.required,
+                    allowed_organizations: auth.allowed_organizations.clone(),
+                }
+            }),
+        }
+    }
+}
+
+impl StreamUpstreamTlsResponse {
+    fn of(upstream: &StreamUpstreamTls) -> Self {
+        StreamUpstreamTlsResponse {
+            server_name: upstream.server_name.clone(),
+            ca_cert_pem: upstream.ca_cert_pem.clone(),
+            skip_verify: upstream.skip_verify,
+            client_certificate_id: upstream.client_certificate_id.clone(),
+            alpn: upstream.alpn.clone(),
+        }
+    }
 }
 
 /// The `udp` object of a stream's view (Story 12.5 D-l), built field by
@@ -210,15 +324,17 @@ pub struct StreamReadResponse {
     pub bind: Option<lorica_stream::BindState>,
 }
 
-/// What a stream create or update answers: the view, and the nodes the
-/// fd budget check could not reach (Story 12.2 D-e).
+/// What a stream create or update answers: the view, the nodes the fd
+/// budget check could not reach (Story 12.2 D-e), and what the TLS
+/// checks accepted but the operator should know (Story 12.4).
 #[derive(Debug, Serialize)]
 pub struct StreamWriteResponse {
     /// The stream as written.
     #[serde(flatten)]
     pub stream: StreamResponse,
-    /// One sentence per targeted node whose budget is unknown here;
-    /// absent when there is none.
+    /// One sentence per targeted node whose budget is unknown here, per
+    /// client CA bundle finding and per wildcard rule name of a
+    /// terminating stream ([`tls_checks`]); absent when there is none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
@@ -230,13 +346,27 @@ fn with_bind(state: &AppState, stream: StreamResponse) -> StreamReadResponse {
     }
 }
 
-/// The backends a stream links, by role (Story 12.3 D-f).
+/// The backends of one rule of a TLS stream, by role.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct StreamLinks {
+pub(crate) struct RuleLinks {
     /// The primaries, in the order given or sorted when read back.
     pub(crate) primaries: Vec<String>,
     /// The backups, likewise.
     pub(crate) backups: Vec<String>,
+}
+
+/// The backends a stream links, by role (Story 12.3 D-f): the links
+/// serving no rule, and on a TLS stream the links of each rule (Story
+/// 12.4 D-d).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StreamLinks {
+    /// The primaries serving no rule, in the order given or sorted when
+    /// read back.
+    pub(crate) primaries: Vec<String>,
+    /// The backups serving no rule, likewise.
+    pub(crate) backups: Vec<String>,
+    /// The links of each rule, by rule name.
+    pub(crate) rules: BTreeMap<String, RuleLinks>,
 }
 
 impl StreamLinks {
@@ -245,10 +375,17 @@ impl StreamLinks {
         let mut by_stream: HashMap<String, StreamLinks> = HashMap::new();
         for row in rows {
             let links = by_stream.entry(row.stream_id).or_default();
+            let (primaries, backups) = match row.rule {
+                Some(rule) => {
+                    let rule = links.rules.entry(rule).or_default();
+                    (&mut rule.primaries, &mut rule.backups)
+                }
+                None => (&mut links.primaries, &mut links.backups),
+            };
             if row.backup {
-                links.backups.push(row.backend_id);
+                backups.push(row.backend_id);
             } else {
-                links.primaries.push(row.backend_id);
+                primaries.push(row.backend_id);
             }
         }
         by_stream
@@ -261,14 +398,94 @@ impl StreamLinks {
             .unwrap_or_default())
     }
 
-    /// Every backend id, primaries first.
+    /// Each list of backend ids with the field a body sets it in, the
+    /// links serving no rule first.
+    fn lists(&self) -> Vec<(String, &Vec<String>)> {
+        let mut lists: Vec<(String, &Vec<String>)> = vec![
+            ("backend_ids".to_string(), &self.primaries),
+            ("backup_backend_ids".to_string(), &self.backups),
+        ];
+        for (rule, links) in &self.rules {
+            lists.push((
+                format!("match_rules `{rule}` backend_ids"),
+                &links.primaries,
+            ));
+            lists.push((
+                format!("match_rules `{rule}` backup_backend_ids"),
+                &links.backups,
+            ));
+        }
+        lists
+    }
+
+    /// Every backend id, the links serving no rule first.
     fn ids(&self) -> impl Iterator<Item = &String> {
-        self.primaries.iter().chain(&self.backups)
+        self.primaries.iter().chain(&self.backups).chain(
+            self.rules
+                .values()
+                .flat_map(|rule| rule.primaries.iter().chain(&rule.backups)),
+        )
+    }
+
+    /// The rows these links write for `stream`.
+    ///
+    /// # Errors
+    ///
+    /// `422` naming the stream when one backend is both a primary and a
+    /// backup of the same rule (or of no rule). A backend serving two
+    /// rules is refused by the store, which names it.
+    fn rows(&self, stream: &Stream) -> Result<Vec<StreamBackend>, ApiError> {
+        let groups = std::iter::once((None, &self.primaries, &self.backups)).chain(
+            self.rules
+                .iter()
+                .map(|(rule, links)| (Some(rule), &links.primaries, &links.backups)),
+        );
+        let mut rows: Vec<StreamBackend> = Vec::new();
+        for (rule, primaries, backups) in groups {
+            if let Some(both) = primaries.iter().find(|id| backups.contains(id)) {
+                let serving = rule.map_or(String::new(), |rule| format!(" for rule `{rule}`"));
+                return Err(ApiError::Unprocessable(format!(
+                    "stream `{}`: backend {both} is listed both as a primary and as a \
+                     backup{serving}",
+                    stream.name
+                )));
+            }
+            let roles = primaries
+                .iter()
+                .map(|id| (id, false))
+                .chain(backups.iter().map(|id| (id, true)));
+            for (backend_id, backup) in roles {
+                rows.push(StreamBackend {
+                    backup,
+                    rule: rule.cloned(),
+                    ..StreamBackend::primary(&stream.id, backend_id)
+                });
+            }
+        }
+        Ok(rows)
     }
 }
 
 /// The view of `stream` with the backends it links.
 pub(crate) fn stream_to_response(stream: &Stream, links: StreamLinks) -> StreamResponse {
+    let StreamLinks {
+        primaries,
+        backups,
+        mut rules,
+    } = links;
+    let match_rules = stream
+        .match_rules
+        .iter()
+        .map(|rule: &StreamMatchRule| {
+            let links = rules.remove(&rule.name).unwrap_or_default();
+            StreamMatchRuleResponse {
+                name: rule.name.clone(),
+                matcher: rule.matcher.clone(),
+                backend_ids: links.primaries,
+                backup_backend_ids: links.backups,
+            }
+        })
+        .collect();
     StreamResponse {
         id: stream.id.clone(),
         name: stream.name.clone(),
@@ -296,8 +513,21 @@ pub(crate) fn stream_to_response(stream: &Stream, links: StreamLinks) -> StreamR
         download_rate_bps: stream.download_rate_bps,
         max_connections: stream.max_connections,
         udp: stream.udp.as_ref().map(StreamUdpResponse::of),
-        backend_ids: links.primaries,
-        backup_backend_ids: links.backups,
+        tls_mode: stream.tls_mode,
+        match_rules,
+        no_sni_acknowledged: stream.no_sni_acknowledged,
+        clienthello_timeout_ms: stream.clienthello_timeout_ms,
+        tls_terminate: stream
+            .tls_terminate
+            .as_ref()
+            .map(StreamTlsTerminateResponse::of),
+        upstream_tls: stream
+            .upstream_tls
+            .as_ref()
+            .map(StreamUpstreamTlsResponse::of),
+        drains_on_upgrade: stream.drains_on_upgrade(),
+        backend_ids: primaries,
+        backup_backend_ids: backups,
         created_at: stream.created_at.to_rfc3339(),
         updated_at: stream.updated_at.to_rfc3339(),
     }
@@ -375,11 +605,48 @@ pub struct CreateStreamRequest {
     /// default, and the object absent (or `null`) takes every default.
     /// Refused on a TCP stream.
     pub udp: Option<UdpSettingsRequest>,
-    /// Primary backends the stream forwards to; absent is none.
+    /// `Stream.tls_mode`; absent is `none`.
+    pub tls_mode: Option<StreamTlsMode>,
+    /// `Stream.match_rules`, each with the backends serving it; absent
+    /// is none.
+    pub match_rules: Option<Vec<StreamMatchRuleRequest>>,
+    /// `Stream.no_sni_acknowledged`.
+    pub no_sni_acknowledged: Option<bool>,
+    /// `Stream.clienthello_timeout_ms`; absent or `null` for the
+    /// default.
+    #[serde(default, deserialize_with = "nullable")]
+    pub clienthello_timeout_ms: Option<Option<u32>>,
+    /// `Stream.tls_terminate`; absent or `null` for none.
+    #[serde(default, deserialize_with = "nullable")]
+    pub tls_terminate: Option<Option<StreamTlsTerminate>>,
+    /// `Stream.upstream_tls`; absent or `null` for none.
+    #[serde(default, deserialize_with = "nullable")]
+    pub upstream_tls: Option<Option<StreamUpstreamTls>>,
+    /// Primary backends the stream forwards to; absent is none. Empty
+    /// on a TLS stream, whose backends are listed per rule.
     pub backend_ids: Option<Vec<String>>,
     /// Backup backends, used only when no primary is a candidate; absent
-    /// is none. A backend may not be in both lists.
+    /// is none. A backend may not be in both lists. Empty on a TLS
+    /// stream.
     pub backup_backend_ids: Option<Vec<String>>,
+}
+
+/// A rule of a TLS stream as a create or an update writes it (Story
+/// 12.4 D-d, D-k): the model's rule and the backends that serve it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamMatchRuleRequest {
+    /// `StreamMatchRule.name`.
+    pub name: String,
+    /// `StreamMatchRule.matcher`, tagged by `kind`.
+    pub matcher: StreamMatcher,
+    /// Primary backends serving the rule; absent is none.
+    #[serde(default)]
+    pub backend_ids: Vec<String>,
+    /// Backup backends serving the rule, used only when none of its
+    /// primaries is a candidate; absent is none.
+    #[serde(default)]
+    pub backup_backend_ids: Vec<String>,
 }
 
 /// Body of `PUT /api/v1/streams/{id}`: every field optional, an absent
@@ -391,7 +658,9 @@ pub struct CreateStreamRequest {
 /// stream never turns it into a range by accident. `port_last` alone
 /// moves the end of the range and keeps its start. `backend_ids`
 /// replaces the primaries and `backup_backend_ids` the backups; a list
-/// left out keeps its stored half.
+/// left out keeps its stored half. On a TLS stream `match_rules`
+/// replaces the rules and every link with the ones its rules carry, and
+/// left out keeps both.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateStreamRequest {
@@ -450,9 +719,27 @@ pub struct UpdateStreamRequest {
     /// to UDP, each absent one takes its default); the object absent or
     /// `null` keeps them all. Refused on a TCP stream.
     pub udp: Option<UdpSettingsRequest>,
-    /// New primaries, replacing the stored ones.
+    /// New `Stream.tls_mode`.
+    pub tls_mode: Option<StreamTlsMode>,
+    /// New `Stream.match_rules` with the backends serving each,
+    /// replacing the rules and every link.
+    pub match_rules: Option<Vec<StreamMatchRuleRequest>>,
+    /// New `Stream.no_sni_acknowledged`.
+    pub no_sni_acknowledged: Option<bool>,
+    /// New `Stream.clienthello_timeout_ms`; `null` restores the default.
+    #[serde(default, deserialize_with = "nullable")]
+    pub clienthello_timeout_ms: Option<Option<u32>>,
+    /// New `Stream.tls_terminate`, replacing the object; `null` removes
+    /// it.
+    #[serde(default, deserialize_with = "nullable")]
+    pub tls_terminate: Option<Option<StreamTlsTerminate>>,
+    /// New `Stream.upstream_tls`, replacing the object; `null` removes
+    /// it.
+    #[serde(default, deserialize_with = "nullable")]
+    pub upstream_tls: Option<Option<StreamUpstreamTls>>,
+    /// New primaries, replacing the stored ones; empty on a TLS stream.
     pub backend_ids: Option<Vec<String>>,
-    /// New backups, replacing the stored ones.
+    /// New backups, replacing the stored ones; empty on a TLS stream.
     pub backup_backend_ids: Option<Vec<String>>,
 }
 
@@ -602,6 +889,108 @@ impl EngineSettings {
             udp.apply(stream);
         }
     }
+}
+
+/// The Story 12.4 fields a create or an update carries, each `None`
+/// when the body left it out. One type for both bodies, as
+/// [`EngineSettings`].
+struct TlsSettings {
+    tls_mode: Option<StreamTlsMode>,
+    match_rules: Option<Vec<StreamMatchRuleRequest>>,
+    no_sni_acknowledged: Option<bool>,
+    clienthello_timeout_ms: Option<Option<u32>>,
+    tls_terminate: Option<Option<StreamTlsTerminate>>,
+    upstream_tls: Option<Option<StreamUpstreamTls>>,
+}
+
+impl TlsSettings {
+    /// Write every field the body carried onto `stream`, its server
+    /// names in the form they are stored in, and answer the links the
+    /// rules carry when the body sent `match_rules`.
+    fn apply(self, stream: &mut Stream) -> Option<BTreeMap<String, RuleLinks>> {
+        if let Some(v) = self.tls_mode {
+            stream.tls_mode = v;
+        }
+        if let Some(v) = self.no_sni_acknowledged {
+            stream.no_sni_acknowledged = v;
+        }
+        if let Some(v) = self.clienthello_timeout_ms {
+            stream.clienthello_timeout_ms = v;
+        }
+        if let Some(v) = self.tls_terminate {
+            stream.tls_terminate = v;
+        }
+        if let Some(v) = self.upstream_tls {
+            stream.upstream_tls = v;
+        }
+        let rules = self.match_rules?;
+        let mut links: BTreeMap<String, RuleLinks> = BTreeMap::new();
+        stream.match_rules = rules
+            .into_iter()
+            .map(|rule| {
+                links.insert(
+                    rule.name.clone(),
+                    RuleLinks {
+                        primaries: rule.backend_ids,
+                        backups: rule.backup_backend_ids,
+                    },
+                );
+                StreamMatchRule {
+                    name: rule.name,
+                    matcher: rule.matcher,
+                }
+            })
+            .collect();
+        stream.canonicalise_server_names();
+        Some(links)
+    }
+}
+
+/// The links a write of `stream` sets, `None` when it keeps `stored`.
+///
+/// On a stream that reads a ClientHello the links are the rules':
+/// `rules` when the body sent `match_rules`, and the stream-level lists
+/// must be absent or empty. On any other stream they are the
+/// stream-level lists, a list left out keeping its `stored` half.
+///
+/// # Errors
+///
+/// `422` naming the list and the mode when a TLS stream's body carries
+/// a stream-level backend.
+fn written_links(
+    stream: &Stream,
+    backend_ids: Option<Vec<String>>,
+    backup_backend_ids: Option<Vec<String>>,
+    rules: Option<BTreeMap<String, RuleLinks>>,
+    stored: &StreamLinks,
+) -> Result<Option<StreamLinks>, ApiError> {
+    if stream.tls_mode.reads_client_hello() {
+        for (field, ids) in [
+            ("backend_ids", &backend_ids),
+            ("backup_backend_ids", &backup_backend_ids),
+        ] {
+            if ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
+                return Err(ApiError::Unprocessable(format!(
+                    "stream `{}`: {field} is refused on a stream whose tls_mode is {}: its \
+                     backends are listed in each of match_rules",
+                    stream.name,
+                    stream.tls_mode.as_str()
+                )));
+            }
+        }
+        return Ok(rules.map(|rules| StreamLinks {
+            rules,
+            ..StreamLinks::default()
+        }));
+    }
+    if backend_ids.is_none() && backup_backend_ids.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(StreamLinks {
+        primaries: backend_ids.unwrap_or_else(|| stored.primaries.clone()),
+        backups: backup_backend_ids.unwrap_or_else(|| stored.backups.clone()),
+        rules: BTreeMap::new(),
+    }))
 }
 
 /// The fleet role of this process, owned so it crosses into a store
@@ -927,10 +1316,7 @@ pub(crate) fn port_conflict_error(stream: &Stream, conflict: &PortConflict) -> A
 /// to read.
 fn linked_backends(store: &ConfigStore, links: &StreamLinks) -> Result<Vec<Backend>, ApiError> {
     let mut rows = Vec::new();
-    for (field, ids) in [
-        ("backend_ids", &links.primaries),
-        ("backup_backend_ids", &links.backups),
-    ] {
+    for (field, ids) in links.lists() {
         for id in ids {
             match store.get_backend(id)? {
                 Some(backend) => rows.push(backend),
@@ -1038,6 +1424,12 @@ pub(crate) async fn create_stream_as(
         download_rate_bps,
         max_connections,
         udp,
+        tls_mode,
+        match_rules,
+        no_sni_acknowledged,
+        clienthello_timeout_ms,
+        tls_terminate,
+        upstream_tls,
         backend_ids,
         backup_backend_ids,
     } = body;
@@ -1081,16 +1473,35 @@ pub(crate) async fn create_stream_as(
         udp,
     }
     .apply(&mut stream);
+    let rule_links = TlsSettings {
+        tls_mode,
+        match_rules,
+        no_sni_acknowledged,
+        clienthello_timeout_ms,
+        tls_terminate,
+        upstream_tls,
+    }
+    .apply(&mut stream);
     validated(&stream)?;
-    let links = StreamLinks {
-        primaries: backend_ids.unwrap_or_default(),
-        backups: backup_backend_ids.unwrap_or_default(),
-    };
+    let mut tls_warnings = tls_checks::check_bundles(&mut stream)?;
+    let links = written_links(
+        &stream,
+        backend_ids,
+        backup_backend_ids,
+        rule_links,
+        &StreamLinks::default(),
+    )?
+    .unwrap_or_default();
+    let rows = links.rows(&stream)?;
     let role = LocalRole::of(state);
     let budget = BudgetInputs::of(state);
 
     let (stream, links, warnings) = db_blocking(&state.store, move |store| {
         let backends = linked_backends(store, &links)?;
+        tls_warnings.extend(tls_checks::check_certificates(
+            &stream,
+            &store.list_certificates_without_private_keys()?,
+        )?);
         // Under the lock that writes, so two creates on one port cannot
         // both pass, nor two creates that each fit the budget alone.
         let others = store.list_streams()?;
@@ -1101,10 +1512,11 @@ pub(crate) async fn create_stream_as(
         }
         refuse_local_backends(store, &role, budget.reserved, &stream, &backends, &others)?;
         let cap = store.get_global_settings()?.stream_listen_socket_cap;
-        let warnings = budget_warnings(store, &role, &budget, cap, &stream, None, &others)?;
+        let mut warnings = budget_warnings(store, &role, &budget, cap, &stream, None, &others)?;
+        warnings.extend(tls_warnings);
         store.in_transaction(|store| {
             store.create_stream(&stream)?;
-            store.set_stream_backend_links(&stream.id, &links.primaries, &links.backups)
+            store.set_stream_links(&stream.id, &rows)
         })?;
         let links = StreamLinks::of(store, &stream.id)?;
         Ok::<_, ApiError>((stream, links, warnings))
@@ -1180,6 +1592,12 @@ pub(crate) async fn update_stream_as(
         download_rate_bps,
         max_connections,
         udp,
+        tls_mode,
+        match_rules,
+        no_sni_acknowledged,
+        clienthello_timeout_ms,
+        tls_terminate,
+        upstream_tls,
         backend_ids,
         backup_backend_ids,
     } = body;
@@ -1209,6 +1627,14 @@ pub(crate) async fn update_stream_as(
         download_rate_bps,
         max_connections,
         udp,
+    };
+    let tls = TlsSettings {
+        tls_mode,
+        match_rules,
+        no_sni_acknowledged,
+        clienthello_timeout_ms,
+        tls_terminate,
+        upstream_tls,
     };
     let role = LocalRole::of(state);
     let budget = BudgetInputs::of(state);
@@ -1253,14 +1679,26 @@ pub(crate) async fn update_stream_as(
             stream.node_selector = selector;
         }
         engine.apply(&mut stream);
+        let rule_links = tls.apply(&mut stream);
         stream.updated_at = Utc::now();
         validated(&stream)?;
-        let new_links =
-            (backend_ids.is_some() || backup_backend_ids.is_some()).then(|| StreamLinks {
-                primaries: backend_ids.unwrap_or_else(|| stored_links.primaries.clone()),
-                backups: backup_backend_ids.unwrap_or_else(|| stored_links.backups.clone()),
-            });
+        let mut tls_warnings = tls_checks::check_bundles(&mut stream)?;
+        let new_links = written_links(
+            &stream,
+            backend_ids,
+            backup_backend_ids,
+            rule_links,
+            &stored_links,
+        )?;
+        let new_rows = new_links
+            .as_ref()
+            .map(|links| links.rows(&stream))
+            .transpose()?;
         let backends = linked_backends(store, new_links.as_ref().unwrap_or(&stored_links))?;
+        tls_warnings.extend(tls_checks::check_certificates(
+            &stream,
+            &store.list_certificates_without_private_keys()?,
+        )?);
 
         let others = store.list_streams()?;
         if let Some(conflict) =
@@ -1270,19 +1708,20 @@ pub(crate) async fn update_stream_as(
         }
         refuse_local_backends(store, &role, budget.reserved, &stream, &backends, &others)?;
         let cap = store.get_global_settings()?.stream_listen_socket_cap;
-        let warnings =
+        let mut warnings =
             budget_warnings(store, &role, &budget, cap, &stream, Some(&stored), &others)?;
-        store.in_transaction(|store| match &new_links {
+        warnings.extend(tls_warnings);
+        store.in_transaction(|store| match &new_rows {
             // Unlinked first, then the row, then the new links: the
             // attachment rules then judge the row as written against the
             // links as they will stand, and neither half against the
             // other's old state (a stream turned UDP while its links
             // change, the local backend flag set with the backend it
-            // allows).
-            Some(links) => {
-                store.set_stream_backend_links(&stream.id, &[], &[])?;
+            // allows, a rule renamed with the links that serve it).
+            Some(rows) => {
+                store.set_stream_links(&stream.id, &[])?;
                 store.update_stream(&stream)?;
-                store.set_stream_backend_links(&stream.id, &links.primaries, &links.backups)
+                store.set_stream_links(&stream.id, rows)
             }
             None => store.update_stream(&stream),
         })?;

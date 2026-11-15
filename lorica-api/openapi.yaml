@@ -1600,7 +1600,11 @@ paths:
         reach a reserved port of one of those nodes or a listen port of
         a stream it binds, this one included: `409` with `error.code`
         `stream_local_backend`. The same holds for another stream's
-        local backend that would reach a port this one takes.
+        local backend that would reach a port this one takes. A TLS
+        stream's PEM bundles are parsed as a route's `mtls` bundle is,
+        and the certificates it names must exist and, on a terminating
+        stream, serve its rules' names (422 naming the rule, the name
+        and the certificates).
       security:
         - sessionCookie: []
       requestBody:
@@ -1717,7 +1721,13 @@ paths:
         can still be renamed, moved, narrowed, lowered or disabled. A
         switch of protocol replaces `udp` with the new protocol's: the
         defaults on a switch to UDP, under the `udp` object the body
-        carries.
+        carries. On a TLS stream `match_rules` replaces the rules and
+        every link with the backends its rules carry, and left out
+        keeps both; a stream leaving TLS sends `match_rules: []` and its
+        new `backend_ids`, since a link serving a rule is refused on a
+        stream that reads no ClientHello (422). `null` on
+        `clienthello_timeout_ms` restores the default, on
+        `tls_terminate` or `upstream_tls` removes the object.
       security:
         - sessionCookie: []
       requestBody:
@@ -1919,7 +1929,11 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          description: Certificate is referenced by routes
+          description: >-
+            Certificate is referenced by a route's `certificate_id`, or by a
+            stream's `tls_terminate.certificate_ids` or
+            `upstream_tls.client_certificate_id`; the message names them
+            (routes by id, streams by name).
           content:
             application/json:
               schema:
@@ -7719,7 +7733,13 @@ components:
         422 naming the field and why; `proxy_protocol_accept` is refused
         on UDP for good, a UDP source address being spoofable, as are
         `peak_ewma` and `proxy_protocol_send` `v1`. Its own settings are
-        `udp`.
+        `udp`. The TLS fields (Story 12.4), from `tls_mode` to
+        `upstream_tls`, apply to TCP streams only (no DTLS: each is
+        refused on UDP), and a field the chosen `tls_mode` does not take
+        is refused with a 422 naming the field and the mode, never
+        ignored. A TLS stream (`passthrough` or `terminate`) lists its
+        backends in each of its `match_rules`, and its stream-level
+        `backend_ids` and `backup_backend_ids` are empty.
       required:
         - id
         - name
@@ -7747,6 +7767,13 @@ components:
         - download_rate_bps
         - max_connections
         - udp
+        - tls_mode
+        - match_rules
+        - no_sni_acknowledged
+        - clienthello_timeout_ms
+        - tls_terminate
+        - upstream_tls
+        - drains_on_upgrade
         - backend_ids
         - backup_backend_ids
         - created_at
@@ -7926,24 +7953,331 @@ components:
           description: >-
             The settings of a UDP stream (Story 12.5); `null` on a TCP
             stream, which carries none.
+        tls_mode:
+          allOf:
+            - $ref: "#/components/schemas/StreamTlsMode"
+          default: none
+        match_rules:
+          type: array
+          maxItems: 64
+          items:
+            $ref: "#/components/schemas/StreamMatchRule"
+          description: >-
+            The rules a TLS stream routes by, at least one in
+            `passthrough` and `terminate`, none in `none`. For one
+            ClientHello naming a server: the rules naming it exactly,
+            then the wildcard rules covering it, most specific first, a
+            level whose ALPN condition no rule meets falling through to
+            the next; a ClientHello naming none reaches only a `no_sni`
+            rule. Within a level a rule with `alpn` holds when the client
+            offered one of its values, the client's most preferred
+            winning, before a rule with empty `alpn`. No rule matching
+            closes the connection before any byte is forwarded
+            (`no_match`). Two rules a ClientHello could match alike (a
+            shared server name, or both `no_sni`, with intersecting or
+            both empty `alpn`) are refused (422), so their order never
+            decides anything. The rules list at most 1024 server names
+            together. A rule with no backend is accepted, as a stream
+            with none is: its clients end `no_healthy_backend`.
+        no_sni_acknowledged:
+          type: boolean
+          default: false
+          description: >-
+            The operator's acknowledgement that a `no_sni` rule admits
+            clients naming no server. A stream with a `no_sni` rule needs
+            it until source allowlists exist (Story 12.6), and a stream
+            without one refuses it (422).
+        clienthello_timeout_ms:
+          type: integer
+          nullable: true
+          minimum: 1000
+          maximum: 60000
+          default: null
+          description: >-
+            The deadline, from accept, of a TLS stream's ClientHello (a
+            PROXY header read before it included), and on a terminating
+            stream of its handshake too: a ClientHello not complete by
+            then ends `clienthello_timeout`, a handshake not complete by
+            then `tls_handshake`. `null` is 5000. Refused (422) on a
+            stream whose `tls_mode` is `none`.
+        tls_terminate:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/StreamTlsTerminate"
+          description: >-
+            Required with `tls_mode` `terminate`, refused (422) with the
+            others.
+        upstream_tls:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/StreamUpstreamTls"
+          description: >-
+            TLS from Lorica to the backends: origination on a stream
+            whose `tls_mode` is `none`, re-encryption on a terminating
+            one, refused (422) in `passthrough`, where Lorica neither
+            terminates nor originates. The backend's own `tls_upstream`,
+            `tls_sni` and `tls_skip_verify` are HTTP routes only and never
+            apply to a stream.
+        drains_on_upgrade:
+          type: boolean
+          readOnly: true
+          description: >-
+            Read-only, never accepted in a request. True when the stream
+            terminates TLS or opens TLS towards its backends: a TLS
+            session Lorica holds keys for cannot be handed to another
+            process, so a hot upgrade drains these connections even once
+            live transfer exists (D8). In 1.11.0 a hot upgrade drains
+            every stream; the flag names the streams that will keep
+            draining once a later release transfers the others.
         backend_ids:
           type: array
           items:
             type: string
-          description: IDs of the linked primary backends, sorted.
+          description: >-
+            IDs of the linked primary backends, sorted; empty on a TLS
+            stream, whose backends are listed per rule.
         backup_backend_ids:
           type: array
           items:
             type: string
           description: >-
             IDs of the linked backup backends, sorted: candidates only
-            when no primary is.
+            when no primary is. Empty on a TLS stream.
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
+
+    StreamTlsMode:
+      type: string
+      enum: [none, passthrough, terminate]
+      description: >-
+        How a TCP stream treats TLS (Story 12.4). `none` forwards bytes
+        as they come. `passthrough` reads the ClientHello to choose a
+        rule, then forwards it and everything after it unchanged, to a
+        backend that terminates. `terminate` reads it the same way,
+        completes the handshake with a certificate of the node's
+        resolver, and forwards plaintext, or re-encrypted with
+        `upstream_tls`.
+
+    StreamMatchRule:
+      type: object
+      additionalProperties: false
+      required: [name, matcher]
+      description: >-
+        One rule of a TLS stream and the backends serving it. A backend
+        serves at most one rule of a stream; each rule with backends has
+        at least one primary (422 otherwise). In a create or an update a
+        list left out is empty; the view always carries both.
+      properties:
+        name:
+          type: string
+          maxLength: 64
+          pattern: "^[a-z0-9_-]+$"
+          description: Unique in the stream.
+        matcher:
+          $ref: "#/components/schemas/StreamMatcher"
+        backend_ids:
+          type: array
+          items:
+            type: string
+          description: >-
+            IDs of the primary backends serving the rule, sorted in the
+            view. Existing backend ids (422 otherwise), under the rules
+            of the stream-level list.
+        backup_backend_ids:
+          type: array
+          items:
+            type: string
+          description: >-
+            IDs of the backup backends serving the rule, candidates only
+            when none of its primaries is; none may also be a primary.
+
+    StreamMatcher:
+      description: >-
+        What a ClientHello must carry to match a rule, tagged by `kind`.
+        A later release adds kinds as new `kind` values.
+      oneOf:
+        - $ref: "#/components/schemas/StreamTlsMatcher"
+        - $ref: "#/components/schemas/StreamNoSniMatcher"
+      discriminator:
+        propertyName: kind
+        mapping:
+          tls: "#/components/schemas/StreamTlsMatcher"
+          no_sni: "#/components/schemas/StreamNoSniMatcher"
+
+    StreamTlsMatcher:
+      type: object
+      additionalProperties: false
+      required: [kind, server_names]
+      description: A ClientHello naming one of `server_names`.
+      properties:
+        kind:
+          type: string
+          enum: [tls]
+        server_names:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: string
+          description: >-
+            Host names, exact or wildcard (`*.example.com`), stored in
+            the canonical form routes use (ASCII lowercase, no trailing
+            dot). A wildcard covers names at every depth, as a route's
+            does; a certificate serves one label, so on a terminating
+            stream a deeper name fails its handshake (`no_certificate`)
+            and the write answers a warning. An IP address is refused:
+            a ClientHello never names one.
+        alpn:
+          type: array
+          maxItems: 8
+          items:
+            type: string
+          description: >-
+            Protocols, each 1 to 255 bytes of visible ASCII, none twice;
+            empty matches any offer and no offer. On a terminating
+            stream they are also the protocols the handshake negotiates,
+            in this order.
+
+    StreamNoSniMatcher:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      description: >-
+        A ClientHello naming no server: explicit, counted, and
+        acknowledged with `no_sni_acknowledged`. On a terminating stream
+        such a client is served the certificate whose IP address SAN is
+        the address it dialed, so one of `tls_terminate.certificate_ids`
+        must carry an IP address SAN, the listen address when it is not
+        unspecified (422 otherwise).
+      properties:
+        kind:
+          type: string
+          enum: [no_sni]
+        alpn:
+          $ref: "#/components/schemas/StreamTlsMatcher/properties/alpn"
+
+    StreamTlsTerminate:
+      type: object
+      additionalProperties: false
+      required: [certificate_ids]
+      description: What a terminating stream presents and verifies.
+      properties:
+        certificate_ids:
+          type: array
+          minItems: 1
+          maxItems: 16
+          items:
+            type: string
+          description: >-
+            Stored certificates (422 for an id naming none), the fleet
+            entitlement for their private keys: each reaches the nodes
+            the stream targets. Every exact server name of a `tls` rule
+            must be served by one of them, by its domain or a SAN equal
+            to the name or to the wildcard one label above it, and every
+            wildcard rule name by a certificate carrying that wildcard
+            itself (422 naming the rule, the name and the certificates).
+            The handshake answers from the node's resolver, so a renewal
+            is served on the next handshake. A certificate named here
+            cannot be deleted (409).
+        client_auth:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/StreamClientAuth"
+
+    StreamClientAuth:
+      type: object
+      additionalProperties: false
+      required: [ca_cert_pem]
+      description: >-
+        Client certificate verification against the stream's own CA
+        bundle, in the shape of a route's `mtls`, with the same bundle
+        checks: a bundle that trusts more than the CAs it lists (a root
+        beside other certificates, a CA beside one it issued) is saved,
+        logged, and named in the write's `warnings`. A certificate that
+        does not chain to the bundle fails the handshake whether or not
+        `required`.
+      properties:
+        ca_cert_pem:
+          type: string
+          description: >-
+            Concatenated PEM CA certificates, at most 1 MiB, every
+            `CERTIFICATE` block a valid X.509 certificate (422
+            otherwise).
+        required:
+          type: boolean
+          default: false
+          description: >-
+            A client presenting no certificate fails the handshake when
+            true, passes as anonymous when false.
+        allowed_organizations:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+          description: >-
+            When not empty, a verified certificate must carry one of
+            these `O=` values, compared whole and case-sensitively, or
+            the connection is refused (`client_certificate`). Trimmed and
+            deduplicated on write.
+
+    StreamUpstreamTls:
+      type: object
+      additionalProperties: false
+      description: TLS from Lorica to the stream's backends.
+      properties:
+        server_name:
+          $ref: "#/components/schemas/StreamUpstreamServerName"
+        ca_cert_pem:
+          type: string
+          nullable: true
+          description: >-
+            A PEM bundle of CA certificates replacing the public trust,
+            checked as `tls_terminate.client_auth.ca_cert_pem` is;
+            `null` trusts the public roots.
+        skip_verify:
+          type: boolean
+          default: false
+          description: >-
+            Accept any backend certificate. Refused (422) beside
+            `ca_cert_pem` or `client_certificate_id`.
+        client_certificate_id:
+          type: string
+          nullable: true
+          description: >-
+            A stored certificate (422 for an id naming none) presented
+            to the backends, by id: its key is never written to or read
+            from a stream, reaches the nodes the stream targets, and a
+            renewal is presented on the next connection.
+        alpn:
+          type: array
+          maxItems: 8
+          items:
+            type: string
+          description: Protocols offered to the backends, in order; empty offers none.
+
+    StreamUpstreamServerName:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      description: >-
+        The name upstream TLS sends and verifies, tagged by `mode`.
+        `backend_address`, the default: the backend's host, a DNS name
+        sent and verified, an IP literal sending no SNI and verified
+        against an IP address SAN. `client`, on a terminating stream
+        only: the server name the client sent, the backend's host for a
+        client that sent none. `fixed`: `name`, a DNS name or an IP
+        literal.
+      properties:
+        mode:
+          type: string
+          enum: [backend_address, client, fixed]
+        name:
+          type: string
+          description: "`fixed` only, and required there."
 
     StreamUdpSettings:
       type: object
@@ -8138,8 +8472,11 @@ components:
                 type: string
               description: >-
                 One sentence per targeted node whose fd budget could not
-                be checked here, because it has not reported it. Absent
-                when every node was checked.
+                be checked here, because it has not reported it; per
+                finding on a client CA bundle that trusts more than the
+                CAs it lists; and per wildcard server name of a
+                terminating stream's rules, which routes deeper names
+                than a certificate serves. Absent when there is none.
 
     StreamBindState:
       type: object
@@ -8540,6 +8877,18 @@ components:
           nullable: true
           allOf:
             - $ref: "#/components/schemas/StreamUdpSettingsInput"
+        tls_mode:
+          $ref: "#/components/schemas/StreamResponse/properties/tls_mode"
+        match_rules:
+          $ref: "#/components/schemas/StreamResponse/properties/match_rules"
+        no_sni_acknowledged:
+          $ref: "#/components/schemas/StreamResponse/properties/no_sni_acknowledged"
+        clienthello_timeout_ms:
+          $ref: "#/components/schemas/StreamResponse/properties/clienthello_timeout_ms"
+        tls_terminate:
+          $ref: "#/components/schemas/StreamResponse/properties/tls_terminate"
+        upstream_tls:
+          $ref: "#/components/schemas/StreamResponse/properties/upstream_tls"
         backend_ids:
           type: array
           items:
@@ -8549,7 +8898,9 @@ components:
             of a UDP stream may serve no route and no TCP stream and must
             have its health check disabled (422 naming the stream). A
             local backend needs `allow_local_backend` (422) and never
-            reaches a node's port (409, `stream_local_backend`).
+            reaches a node's port (409, `stream_local_backend`). Absent or
+            empty on a TLS stream, whose backends are listed per rule
+            (422 naming the field and the mode otherwise).
         backup_backend_ids:
           type: array
           items:
@@ -8557,7 +8908,8 @@ components:
           description: >-
             Existing backend ids used only when no primary is a
             candidate, on a stream with at least one primary (422
-            otherwise); none may also be in `backend_ids`.
+            otherwise); none may also be in `backend_ids`. Absent or
+            empty on a TLS stream.
 
     UpdateStreamRequest:
       type: object
@@ -8622,16 +8974,45 @@ components:
           nullable: true
           allOf:
             - $ref: "#/components/schemas/StreamUdpSettingsInput"
+        tls_mode:
+          $ref: "#/components/schemas/StreamTlsMode"
+        match_rules:
+          type: array
+          items:
+            $ref: "#/components/schemas/StreamMatchRule"
+          description: >-
+            Replaces the rules and every link of the stream with the
+            backends the rules carry; absent keeps both.
+        no_sni_acknowledged:
+          type: boolean
+        clienthello_timeout_ms:
+          type: integer
+          nullable: true
+          description: "`null` restores the default."
+        tls_terminate:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/StreamTlsTerminate"
+          description: Replaces the object; `null` removes it.
+        upstream_tls:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/StreamUpstreamTls"
+          description: Replaces the object; `null` removes it.
         backend_ids:
           type: array
           items:
             type: string
-          description: Replaces the primaries; absent keeps them.
+          description: >-
+            Replaces the primaries; absent keeps them. Absent or empty
+            on a TLS stream.
         backup_backend_ids:
           type: array
           items:
             type: string
-          description: Replaces the backups; absent keeps them.
+          description: >-
+            Replaces the backups; absent keeps them. Absent or empty on
+            a TLS stream.
 
     Certificate:
       type: object
@@ -9327,7 +9708,10 @@ components:
       description: >-
         The body parsed but a model rule refuses its content (a setting
         out of its range, a backend the stream may not link, a local
-        backend without `allow_local_backend`), or a node that would
+        backend without `allow_local_backend`, a TLS field its
+        `tls_mode` does not take, a PEM bundle that does not parse, a
+        certificate that does not exist or does not serve a rule's
+        name), or a node that would
         bind the stream cannot hold it: then `error.code` is
         `stream_fd_budget` and the message names the stream, the node,
         the constraint (`listen_socket_cap`, `worker_fds` or
