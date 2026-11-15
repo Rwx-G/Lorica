@@ -140,7 +140,20 @@ fn validate_structure(data: &ImportData) -> Result<()> {
         }
     }
 
+    validate_backend_health_checks(data)?;
     validate_streams(data)
+}
+
+/// Every backend's health check as the store writers check it (Story
+/// 12.7, D-6), so a refusal names the backend and comes before
+/// `clear_all` rather than half way through an import.
+fn validate_backend_health_checks(data: &ImportData) -> Result<()> {
+    for backend in &data.backends {
+        backend.validate_health_check().map_err(|reason| {
+            ConfigError::Validation(format!("backend '{}': {reason}", backend.id))
+        })?;
+    }
+    Ok(())
 }
 
 /// The stream half of [`validate_structure`] (Story 12.1, D-6 and D-9):
@@ -325,10 +338,12 @@ fn validate(data: &ImportData) -> Result<()> {
 ///
 /// Backends, links and streams are written through the store's
 /// unchecked writers (Story 12.1, D-6): the attachment rule is checked
-/// once on the whole file. [`parse_toml`] already checked it; it is
-/// checked again here, before `clear_all`, so a caller holding an
-/// [`ImportData`] built any other way cannot skip it.
+/// once on the whole file. [`parse_toml`] already checked it and the
+/// backends' health checks; both are checked again here, before
+/// `clear_all`, so a caller holding an [`ImportData`] built any other
+/// way cannot skip them.
 pub fn import_to_store(store: &ConfigStore, data: &ImportData) -> Result<Vec<String>> {
+    validate_backend_health_checks(data)?;
     validate_streams(data)?;
     let local_authority_id = store.get_adcs_authority()?.map(|authority| authority.id);
     let mut warnings = Vec::new();

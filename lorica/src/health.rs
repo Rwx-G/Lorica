@@ -455,7 +455,11 @@ fn probe_for(backend: &Backend) -> ProbeTarget {
                 url: format!("{scheme}://{}{path}", backend.address),
             }
         }
-        HealthCheck::TcpConnect => ProbeTarget::TcpConnect {
+        // Probed by TCP connect until the send/expect probe exists, as
+        // a 1.10.6 rollback probes them: weaker, never a false Down.
+        HealthCheck::TcpConnect
+        | HealthCheck::TcpTemplate { .. }
+        | HealthCheck::TcpSendExpect { .. } => ProbeTarget::TcpConnect {
             address: backend.address.clone(),
         },
     }

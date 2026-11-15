@@ -72,7 +72,11 @@ pub use enums::{
     HeaderMatchType, HealthStatus, LifecycleState, LoadBalancing, NotificationChannel,
     PathMatchType, PreferenceValue, ProxyProtocolMode, Role, WafMode,
 };
-pub use health_check::HealthCheck;
+pub use health_check::{
+    default_probe_timeout_ms, Exchange, Expectation, HealthCheck, MatchAnchor, Payload,
+    TcpCheckTemplateName, EXPECT_MAX_ALTERNATIVES, EXPECT_MAX_BYTES, PROBE_READ_MAX_BYTES,
+    PROBE_TIMEOUT_MS_DEFAULT, PROBE_TIMEOUT_MS_MAX, PROBE_TIMEOUT_MS_MIN, SEND_MAX_BYTES,
+};
 pub use hostname_pattern::{matches_any_depth, matches_one_label, specificity};
 pub use loadtest::{
     LoadTestComparison, LoadTestConfig, LoadTestResult, SAFE_LIMIT_CONCURRENCY,

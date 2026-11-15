@@ -38,11 +38,25 @@ impl ConfigStore {
             .map_err(ConfigError::Validation)
     }
 
+    /// What every backend writer refuses before writing: a malformed
+    /// address, and a health check breaking its limits or the
+    /// plaintext-exchange rule (`Backend::validate_health_check`,
+    /// Story 12.7 D-6). The unchecked writers run it too, so a replica
+    /// apply or an import that skipped its own pre-check still cannot
+    /// store an invalid check.
+    fn validate_backend_fields(backend: &Backend) -> Result<()> {
+        Self::validate_backend_address(&backend.address)?;
+        backend
+            .validate_health_check()
+            .map_err(ConfigError::Validation)
+    }
+
     /// Insert a new backend into the database.
     ///
     /// Refused when the backend breaks the stream attachment rule
     /// (`check_backend_attachments`): a portless backend with active
-    /// checks on, for one.
+    /// checks on, for one; and when its health check breaks
+    /// `Backend::validate_health_check`.
     pub fn create_backend(&self, backend: &Backend) -> Result<()> {
         self.within_savepoint(|| {
             self.create_backend_unchecked(backend)?;
@@ -54,7 +68,7 @@ impl ConfigStore {
     /// a writer that checked a whole consistent snapshot first (replica
     /// apply, import).
     pub(crate) fn create_backend_unchecked(&self, backend: &Backend) -> Result<()> {
-        Self::validate_backend_address(&backend.address)?;
+        Self::validate_backend_fields(backend)?;
         let managed_by_json = serialize_optional_field("managed_by", backend.managed_by.as_ref())?;
         let (health_check_json, health_check_path) = health_check_columns(backend)?;
         self.conn.execute(
@@ -123,7 +137,7 @@ impl ConfigStore {
     /// [`ConfigStore::update_backend`] without the attachment rule, for
     /// a writer that checked a whole consistent snapshot first.
     pub(crate) fn update_backend_unchecked(&self, backend: &Backend) -> Result<()> {
-        Self::validate_backend_address(&backend.address)?;
+        Self::validate_backend_fields(backend)?;
         let managed_by_json = serialize_optional_field("managed_by", backend.managed_by.as_ref())?;
         let (health_check_json, health_check_path) = health_check_columns(backend)?;
         let changed = self.conn.execute(

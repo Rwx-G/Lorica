@@ -37,7 +37,8 @@
 //! the rule that resolves a scope set to one tier ([`tier`]), the admin
 //! tier's settings allowlist ([`settings`]), and the config tier's
 //! withheld route fields and one-way protection rules
-//! ([`protections`]).
+//! ([`protections`]), and the named TCP health-check templates a token
+//! may select in place of a custom payload ([`health_templates`]).
 //!
 //! Not here: anything that reads a row, a request or a clock. The
 //! predicates that weigh a patched route against the stored one need
@@ -45,11 +46,15 @@
 //! stays in `lorica-config`. No I/O and no dependency beyond `serde`,
 //! so this crate adds nothing to the stdio binary's graph.
 
+pub mod health_templates;
 pub mod protections;
 pub mod scope;
 pub mod settings;
 pub mod tier;
 
+pub use health_templates::{
+    tcp_check_template, CheckTemplate, MatchAnchor, TemplateExpectation, TCP_CHECK_TEMPLATES,
+};
 pub use protections::{
     ProtectionRule, BACKEND_PROTECTION_RULES, ROUTE_PROTECTION_RULES, WITHHELD_ROUTE_FIELDS,
 };

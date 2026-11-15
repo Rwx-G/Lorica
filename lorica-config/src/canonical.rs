@@ -1787,8 +1787,24 @@ mod tests {
     /// handshake. A blob without `udp` still decodes, a UDP stream in it
     /// with the UDP defaults. Pinned by
     /// `a_blob_without_the_udp_settings_decodes_to_their_defaults`.
+    ///
+    /// Story 12.7 (1.11.0) moved it again inside the same cycle, and
+    /// widened what it watches: `HealthCheck` gained `tcp_template` and
+    /// `tcp_send_expect`, and the guard now reads the health check's
+    /// kinds, each kind's fields, `Payload`, `Expectation`,
+    /// `MatchAnchor` and the template names
+    /// (`health_check_shape_lines`), which an enum's shape never put in
+    /// the inventory before. The lines it already had hash to the
+    /// previous digest unchanged. No version step, for Story 12.3's
+    /// reasons: no released blob is stamped 3, a 1.10.x peer is refused
+    /// by version and by schema before it meets the new kinds. A 1.11.0
+    /// build from before them shares this schema; it would refuse a
+    /// blob carrying a new kind or template by its strict decode, which
+    /// is the refusal this guard exists to make deliberate. From here a
+    /// new kind or template name moves this digest
+    /// (`a_template_name_more_moves_the_shape_digest`).
     const CANONICAL_SHAPE_DIGEST: &str =
-        "370ef7621ee7210ab94caea9b8217c9e7321e63b3f9b859ceed4f2c08202d95e";
+        "3c0f782a203249daf7a10b669f593029946d67379803ebf2d005a3633061504f";
 
     /// Every field name `T` accepts, read from the type itself rather
     /// than from the JSON of some fixture.
@@ -1799,19 +1815,39 @@ mod tests {
     /// `Option` a fixture happens to leave `None`, are both in it,
     /// where the JSON of one particular value would carry neither.
     fn field_names<T: serde::de::DeserializeOwned>(type_name: &str) -> Vec<String> {
-        const PROBE: &str = "__lorica_shape_probe__";
-        let Err(error) = serde_json::from_str::<T>(&format!("{{\"{PROBE}\": null}}")) else {
+        let names = names_refused_with::<T>(
+            type_name,
+            serde_json::json!({ SHAPE_PROBE: null }),
+            "unknown field",
+        );
+        assert!(!names.is_empty(), "{type_name}: no field names came back");
+        names
+    }
+
+    const SHAPE_PROBE: &str = "__lorica_shape_probe__";
+
+    /// The names serde lists when `T` refuses `probe` with an error
+    /// starting with `refusal` ("unknown field `X`, expected one of `a`,
+    /// `b` at line .."), sorted: every odd-indexed split on a backtick is
+    /// a quoted name, and the first of them is [`SHAPE_PROBE`]. Empty
+    /// when serde says the shape has none ("there are no fields").
+    fn names_refused_with<T: serde::de::DeserializeOwned>(
+        type_name: &str,
+        probe: serde_json::Value,
+        refusal: &str,
+    ) -> Vec<String> {
+        let Err(error) = serde_json::from_value::<T>(probe.clone()) else {
             panic!(
-                "{type_name} accepted an unknown field, so it carries no \
-                 #[serde(deny_unknown_fields)] and the shape guard cannot read it. Add the \
-                 attribute (the blob's strict decode wants it anyway) or drop the type from \
-                 the inventory and say why"
+                "{type_name} accepted {probe}, so it carries no #[serde(deny_unknown_fields)] \
+                 and the shape guard cannot read it. Add the attribute (the blob's strict \
+                 decode wants it anyway) or drop the type from the inventory and say why"
             );
         };
         let message = error.to_string();
-        // "unknown field `X`, expected one of `a`, `b` at line .."
-        // Every odd-indexed split on a backtick is a quoted name; the
-        // first of them is the probe.
+        assert!(
+            message.starts_with(refusal),
+            "{type_name}: serde did not answer {probe} with \"{refusal}\": {message}"
+        );
         let mut names: Vec<String> = message
             .split('`')
             .skip(1)
@@ -1820,21 +1856,74 @@ mod tests {
             .collect();
         assert_eq!(
             names.first().map(String::as_str),
-            Some(PROBE),
-            "{type_name}: serde did not answer the probe with an unknown-field error: {message}"
+            Some(SHAPE_PROBE),
+            "{type_name}: {message}"
         );
         names.remove(0);
-        assert!(
-            !names.is_empty(),
-            "{type_name}: no field names came back from {message}"
-        );
         names.sort();
         names
+    }
+
+    /// The shape lines of a backend's health check (Story 12.7, D-4),
+    /// with `template_names` as the template catalogue: the accepted
+    /// kinds, each kind's fields, the payload spellings, the
+    /// expectation's fields and anchors, and the template names. A kind
+    /// or a template name a peer does not know makes it refuse the blob,
+    /// so each moves the digest; a template's bytes do not, since they
+    /// change nothing that decodes.
+    fn health_check_shape_lines(template_names: &[&str]) -> Vec<String> {
+        use crate::models::{Expectation, HealthCheck, MatchAnchor, Payload};
+        let kinds = names_refused_with::<HealthCheck>(
+            "HealthCheck",
+            serde_json::json!({ "kind": SHAPE_PROBE }),
+            "unknown variant",
+        );
+        let mut lines = vec![format!("HealthCheck({})", kinds.join(","))];
+        for kind in &kinds {
+            let fields = names_refused_with::<HealthCheck>(
+                kind,
+                serde_json::json!({ "kind": kind, SHAPE_PROBE: null }),
+                "unknown field",
+            );
+            lines.push(format!("HealthCheck::{kind}({})", fields.join(",")));
+        }
+        let forms = names_refused_with::<Payload>(
+            "Payload",
+            serde_json::json!({ SHAPE_PROBE: "" }),
+            "unknown variant",
+        );
+        lines.push(format!("Payload({})", forms.join(",")));
+        lines.push(format!(
+            "Expectation({})",
+            field_names::<Expectation>("Expectation").join(",")
+        ));
+        let anchors = names_refused_with::<MatchAnchor>(
+            "MatchAnchor",
+            serde_json::json!(SHAPE_PROBE),
+            "unknown variant",
+        );
+        lines.push(format!("MatchAnchor({})", anchors.join(",")));
+        let mut names = template_names.to_vec();
+        names.sort_unstable();
+        lines.push(format!("TcpCheckTemplate({})", names.join(",")));
+        lines
+    }
+
+    fn catalogue_template_names() -> Vec<&'static str> {
+        lorica_automation_policy::TCP_CHECK_TEMPLATES
+            .iter()
+            .map(|template| template.name)
+            .collect()
     }
 
     /// One line per type, `Type(field,field,...)`, sorted twice so the
     /// digest depends on the shape and on nothing else.
     fn shape_lines() -> Vec<String> {
+        shape_lines_with(&catalogue_template_names())
+    }
+
+    /// [`shape_lines`] with `template_names` as the template catalogue.
+    fn shape_lines_with(template_names: &[&str]) -> Vec<String> {
         macro_rules! shapes {
             ($($t:ty),+ $(,)?) => {{
                 let mut lines: Vec<String> = Vec::new();
@@ -1849,8 +1938,10 @@ mod tests {
         // The blob's type inventory: `CanonicalConfig` and everything
         // reachable from its fields. A canonical type absent from this
         // list is a type the guard does not watch, so adding one is
-        // part of adding a replicated table.
-        shapes![
+        // part of adding a replicated table. `HealthCheck` and the types
+        // under it are enums or reached through one, so their lines come
+        // from `health_check_shape_lines`.
+        let mut lines = shapes![
             CanonicalConfig,
             CanonicalGlobalSettings,
             CanonicalWafRule,
@@ -1878,7 +1969,10 @@ mod tests {
             crate::models::Stream,
             crate::models::StreamBackend,
             crate::models::UdpSettings,
-        ]
+        ];
+        lines.extend(health_check_shape_lines(template_names));
+        lines.sort();
+        lines
     }
 
     /// The guard `CANONICAL_FORMAT_VERSION` cannot be on its own.
@@ -1902,6 +1996,17 @@ mod tests {
              Current inventory:\n{}",
             shape_lines().join("\n")
         );
+    }
+
+    /// The guard really watches template names: one more name in the
+    /// catalogue is one more name a peer that lacks it would refuse.
+    #[test]
+    fn a_template_name_more_moves_the_shape_digest() {
+        let digest = |names: &[&str]| sha256_hex(shape_lines_with(names).join("\n").as_bytes());
+        let mut names = catalogue_template_names();
+        let shipped = digest(&names);
+        names.push("test_only_extra_template");
+        assert_ne!(digest(&names), shipped);
     }
 
     #[test]

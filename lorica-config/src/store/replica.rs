@@ -177,10 +177,12 @@ impl ConfigStore {
     /// version, malformed shape), on a global setting carrying a
     /// malformed CIDR entry, on a route whose `node_selector` breaks
     /// [`Route::validate_node_selector`], on a stream that breaks
-    /// [`Stream::validate`] (selector included), and on a snapshot whose
-    /// backends break the stream attachment rule
+    /// [`Stream::validate`] (selector included), on a backend whose
+    /// health check breaks
+    /// [`crate::models::Backend::validate_health_check`], and on a
+    /// snapshot whose backends break the stream attachment rule
     /// ([`check_backend_attachments`]). A stream refusal names the
-    /// stream's id.
+    /// stream's id, a health-check refusal the backend's.
     pub fn prepare_replica(
         blob: &[u8],
         expected_hash: &str,
@@ -208,6 +210,11 @@ impl ConfigStore {
         for stream in &config.streams {
             stream.validate().map_err(|reason| {
                 ReplicaError::Refused(format!("stream {}: {reason}", stream.id))
+            })?;
+        }
+        for backend in &config.backends {
+            backend.validate_health_check().map_err(|reason| {
+                ReplicaError::Refused(format!("backend {}: {reason}", backend.id))
             })?;
         }
         // Once, on the whole snapshot (D-6): the apply below writes row

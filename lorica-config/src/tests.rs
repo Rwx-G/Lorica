@@ -648,6 +648,196 @@ mod tests {
         ));
     }
 
+    // ---- Send/expect health checks (Story 12.7) ----
+
+    /// A custom check sending `send` and expecting `+` as a prefix.
+    fn custom_check(send: &str) -> HealthCheck {
+        HealthCheck::TcpSendExpect {
+            send: Some(Payload::Text(send.to_string())),
+            expect: vec![Expectation {
+                anchor: MatchAnchor::Prefix,
+                bytes: Payload::Text("+".to_string()),
+            }],
+            timeout_ms: PROBE_TIMEOUT_MS_DEFAULT,
+        }
+    }
+
+    fn oversized_check() -> HealthCheck {
+        custom_check(&"a".repeat(SEND_MAX_BYTES + 1))
+    }
+
+    fn assert_refused_naming(result: crate::error::Result<()>, field: &str) {
+        match result {
+            Err(crate::error::ConfigError::Validation(reason)) => {
+                assert!(reason.contains(field), "{reason}");
+            }
+            other => panic!("expected a validation refusal naming {field}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn both_store_writers_refuse_an_invalid_health_check() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut backend = make_backend();
+        backend.set_health_check(oversized_check());
+        assert_refused_naming(store.create_backend(&backend), "health_check.send");
+        assert!(store
+            .get_backend(&backend.id)
+            .expect("test setup: backend read")
+            .is_none());
+
+        backend.set_health_check(custom_check("PING\r\n"));
+        store
+            .create_backend(&backend)
+            .expect("a valid custom check is stored");
+        let mut edited = backend.clone();
+        edited.set_health_check(oversized_check());
+        assert_refused_naming(store.update_backend(&edited), "health_check.send");
+
+        let mut tls = backend.clone();
+        tls.tls_upstream = true;
+        assert_refused_naming(store.update_backend(&tls), "tls_upstream");
+
+        let stored = store
+            .get_backend(&backend.id)
+            .expect("test setup: backend read")
+            .expect("test setup: backend kept");
+        assert_eq!(stored.health_check, custom_check("PING\r\n"));
+        assert!(!stored.tls_upstream);
+    }
+
+    /// The rollback rule of Story 12.7 D-5: a definition this binary
+    /// cannot parse (a later release's kind or template) is probed by
+    /// the legacy path and survives the health loop's writes untouched,
+    /// so a rollback does not destroy it within a few cycles.
+    #[test]
+    fn a_status_flip_keeps_a_definition_this_binary_cannot_parse_byte_for_byte() {
+        const LATER_RELEASE: &str =
+            r#"{"kind":"tcp_template","template":"memcached_stats","timeout_ms":500}"#;
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let backend = make_backend();
+        store
+            .create_backend(&backend)
+            .expect("test setup: backend inserts");
+        store
+            .conn
+            .execute(
+                "UPDATE backends SET health_check_json = ?1 WHERE id = ?2",
+                rusqlite::params![LATER_RELEASE, backend.id],
+            )
+            .expect("test setup: a later release's definition");
+        assert_eq!(
+            store
+                .get_backend(&backend.id)
+                .expect("an unknown definition is not a corrupt row")
+                .expect("test setup: backend kept")
+                .health_check,
+            HealthCheck::TcpConnect,
+            "read by the legacy path"
+        );
+
+        store
+            .set_backend_health_status(&backend.id, &HealthStatus::Down)
+            .expect("status stored");
+        store
+            .set_backend_lifecycle_state(&backend.id, &LifecycleState::Closing, Utc::now())
+            .expect("lifecycle stored");
+
+        let kept: String = store
+            .conn
+            .query_row(
+                "SELECT health_check_json FROM backends WHERE id = ?1",
+                rusqlite::params![backend.id],
+                |row| row.get(0),
+            )
+            .expect("test setup: column read");
+        assert_eq!(kept, LATER_RELEASE);
+    }
+
+    #[test]
+    fn a_replica_with_an_oversized_payload_is_refused_naming_the_backend() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut backend = make_backend();
+        backend.set_health_check(custom_check("PING\r\n"));
+        store
+            .create_backend(&backend)
+            .expect("test setup: backend inserts");
+        let mut cfg = crate::canonical::canonical_config(&store).expect("test setup: snapshot");
+        let blob = crate::canonical::encode_canonical(&cfg).expect("test setup: encode");
+        ConfigStore::prepare_replica(&blob, &crate::canonical::sha256_hex(&blob))
+            .expect("a valid custom check replicates");
+
+        cfg.backends[0].set_health_check(oversized_check());
+        let blob = crate::canonical::encode_canonical(&cfg).expect("test setup: encode");
+        match ConfigStore::prepare_replica(&blob, &crate::canonical::sha256_hex(&blob)) {
+            Err(crate::ReplicaError::Refused(reason)) => {
+                assert!(
+                    reason.contains(&format!("backend {}", backend.id))
+                        && reason.contains("health_check.send"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_import_with_an_oversized_payload_is_refused_naming_the_backend() {
+        const MARKER: &str = "send-expect-marker";
+        let source = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut backend = make_backend();
+        backend.set_health_check(HealthCheck::TcpSendExpect {
+            send: Some(Payload::Text(MARKER.to_string())),
+            expect: vec![
+                Expectation {
+                    anchor: MatchAnchor::Prefix,
+                    bytes: Payload::Hex("2b".to_string()),
+                },
+                Expectation {
+                    anchor: MatchAnchor::Contains,
+                    bytes: Payload::Text("PONG".to_string()),
+                },
+            ],
+            timeout_ms: 2_000,
+        });
+        source
+            .create_backend(&backend)
+            .expect("test setup: backend inserts");
+        let exported = export_to_toml(&source).expect("test setup: export");
+        let data = parse_toml(&exported).expect("a custom check exports and imports");
+        assert_eq!(data.backends[0].health_check, backend.health_check);
+
+        let target = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let resident = make_backend();
+        target
+            .create_backend(&resident)
+            .expect("test setup: the target's own backend");
+
+        let oversized = exported.replace(MARKER, &"a".repeat(SEND_MAX_BYTES + 1));
+        let reason = parse_toml(&oversized)
+            .expect_err("an oversized payload is refused")
+            .to_string();
+        assert!(
+            reason.contains(&format!("backend '{}'", backend.id))
+                && reason.contains("health_check.send"),
+            "{reason}"
+        );
+
+        let mut built_elsewhere = data;
+        built_elsewhere.backends[0].set_health_check(oversized_check());
+        assert_refused_naming(
+            import_to_store(&target, &built_elsewhere).map(|_| ()),
+            &format!("backend '{}'", backend.id),
+        );
+        assert!(
+            target
+                .get_backend(&resident.id)
+                .expect("test setup: backend read")
+                .is_some(),
+            "the refusal came before the store was cleared"
+        );
+    }
+
     // ---- Route-Backend links ----
 
     #[test]

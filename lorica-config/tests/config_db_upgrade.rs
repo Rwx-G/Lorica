@@ -10,7 +10,10 @@
 use std::path::Path;
 
 use chrono::{TimeZone, Utc};
-use lorica_config::models::{HealthCheck, Role, RouteProtectionRecord};
+use lorica_config::models::{
+    Expectation, HealthCheck, HealthStatus, MatchAnchor, Payload, Role, RouteProtectionRecord,
+    TcpCheckTemplateName,
+};
 use lorica_config::ConfigStore;
 use rusqlite::Connection;
 
@@ -867,5 +870,123 @@ fn a_1_10_6_binary_reads_and_writes_backends_on_a_1_11_0_database() {
     assert_eq!(
         read_check(&store, "typed-http"),
         (http("/x"), Some("/x".to_string()))
+    );
+}
+
+// ---- The send/expect kinds across a 1.10.6 rollback (Story 12.7, D-5) ----
+
+fn redis_ping() -> HealthCheck {
+    HealthCheck::TcpTemplate {
+        template: TcpCheckTemplateName::new("redis_ping").expect("a catalogue template"),
+        timeout_ms: 1_000,
+    }
+}
+
+fn custom_banner() -> HealthCheck {
+    HealthCheck::TcpSendExpect {
+        send: None,
+        expect: vec![Expectation {
+            anchor: MatchAnchor::Prefix,
+            bytes: Payload::Text("220".to_string()),
+        }],
+        timeout_ms: 2_000,
+    }
+}
+
+/// A 1.10.6 binary sees no path on a backend checked by a template or
+/// a custom exchange, so it probes it by TCP connect: weaker, never a
+/// false Down. Its writes leave the typed definition alone, which the
+/// re-upgrade restores unless a path was set meanwhile. A kind or a
+/// template this release does not know reads as absent, so the path
+/// decides, and the status writes of this release's health loop keep it.
+#[test]
+fn a_1_10_6_rollback_probes_send_expect_backends_by_tcp_connect_and_keeps_their_check() {
+    let dir = tempfile::tempdir().expect("test setup: tempdir");
+    let path = dir.path().join("lorica.db");
+    let store = ConfigStore::open(&path, None).expect("test setup: a database at head");
+
+    let template = {
+        let raw = Connection::open(&path).expect("test setup: raw open");
+        v1_10_6_insert(&raw, "template", None);
+        store.get_backend("template").expect("reads").expect("kept")
+    };
+    for (id, check) in [
+        ("redis", redis_ping()),
+        ("banner", custom_banner()),
+        ("redis-then-path", redis_ping()),
+        ("banner-then-path", custom_banner()),
+    ] {
+        let mut backend = template.clone();
+        backend.id = id.to_string();
+        backend.set_health_check(check);
+        store
+            .create_backend(&backend)
+            .expect("1.11.0 writes the check");
+    }
+
+    // The rollback: 1.10.6 reads no path, so it probes by TCP connect,
+    // and writes the rows back with its own statements.
+    let raw = Connection::open(&path).expect("raw open");
+    let read_by_1_10_6: Vec<(String, Option<String>)> = raw
+        .prepare(&format!(
+            "SELECT {V1_10_6_BACKEND_COLUMNS} FROM backends ORDER BY address, id"
+        ))
+        .expect("the 1.10.6 select prepares on a 1.11.0 database")
+        .query_map([], |row| Ok((row.get(0)?, row.get(8)?)))
+        .expect("the 1.10.6 select runs")
+        .collect::<rusqlite::Result<_>>()
+        .expect("the 1.10.6 select reads every row");
+    for id in ["redis", "banner", "redis-then-path", "banner-then-path"] {
+        assert!(
+            read_by_1_10_6.contains(&(id.to_string(), None)),
+            "{id}: 1.10.6 reads no path"
+        );
+    }
+    v1_10_6_set_path(&raw, "redis", None);
+    v1_10_6_set_path(&raw, "banner", None);
+    v1_10_6_set_path(&raw, "redis-then-path", Some("/x"));
+    v1_10_6_set_path(&raw, "banner-then-path", Some("/x"));
+
+    // A later release's kind, then a rollback to this one.
+    raw.execute(
+        "UPDATE backends SET health_check_json = ?1, health_check_path = NULL WHERE id = ?2",
+        rusqlite::params![
+            r#"{"kind":"tcp_template","template":"memcached_stats","timeout_ms":500}"#,
+            "template"
+        ],
+    )
+    .expect("test setup: a later release's definition");
+    drop(raw);
+
+    drop(store);
+    let store = ConfigStore::open(&path, None).expect("the re-upgrade opens");
+    for (id, check, path) in [
+        ("redis", redis_ping(), None),
+        ("banner", custom_banner(), None),
+        ("redis-then-path", http("/x"), Some("/x")),
+        ("banner-then-path", http("/x"), Some("/x")),
+        ("template", HealthCheck::TcpConnect, None),
+    ] {
+        assert_eq!(
+            read_check(&store, id),
+            (check, path.map(str::to_string)),
+            "{id}"
+        );
+    }
+
+    store
+        .set_backend_health_status("template", &HealthStatus::Down)
+        .expect("the health loop stores a flip");
+    let raw = Connection::open(&path).expect("raw open");
+    let kept: String = raw
+        .query_row(
+            "SELECT health_check_json FROM backends WHERE id = 'template'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("column read");
+    assert_eq!(
+        kept, r#"{"kind":"tcp_template","template":"memcached_stats","timeout_ms":500}"#,
+        "a flip does not write the definition this binary could not read"
     );
 }
