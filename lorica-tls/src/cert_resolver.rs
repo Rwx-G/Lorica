@@ -475,11 +475,33 @@ pub trait ResolvesServerCertByLocalIp: ResolvesServerCert {
     fn serves_local_ip(&self, local_ip: IpAddr) -> bool {
         self.resolve_by_local_ip(local_ip).is_some()
     }
+
+    /// Whether a ClientHello naming the server `_name` would get a
+    /// certificate from [`ResolvesServerCert::resolve`]. A stream
+    /// terminating TLS asks it before the handshake to classify a failure
+    /// as `no_certificate`; the handshake runs either way. The default
+    /// answers `true`, which is always correct and only gives up the
+    /// classification.
+    fn serves_server_name(&self, _name: &str) -> bool {
+        true
+    }
 }
 
 impl ResolvesServerCertByLocalIp for CertResolver {
     fn resolve_by_local_ip(&self, local_ip: IpAddr) -> Option<Arc<CertifiedKey>> {
         CertResolver::resolve_by_local_ip(self, local_ip)
+    }
+
+    fn serves_server_name(&self, name: &str) -> bool {
+        let inner = self.inner.load();
+        probe_lookup_keys(name, |key: &str| {
+            inner
+                .certs
+                .get(key)
+                .filter(|entries: &&Vec<CertEntry>| !entries.is_empty())
+                .map(|_| ())
+        })
+        .is_some()
     }
 
     fn has_local_ip_certs(&self) -> bool {
@@ -622,55 +644,79 @@ pub struct RefreshStats {
 
 impl ResolvesServerCert for CertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let sni_raw = client_hello.server_name()?;
+        let sni = client_hello.server_name()?;
         let inner = self.inner.load();
-
-        // Audit M-13 : every TLS handshake calls this. Avoid the
-        // `to_lowercase()` String allocation when the SNI is already
-        // lowercase (the common case ; modern clients normalise) -
-        // RFC 5890 leaves DNS labels case-insensitive but practical
-        // SNI traffic is overwhelmingly lower-case ASCII.
-        let already_lower = sni_raw.bytes().all(|b| !b.is_ascii_uppercase());
-        let sni_owned;
-        let sni: &str = if already_lower {
-            sni_raw
-        } else {
-            sni_owned = sni_raw.to_ascii_lowercase();
-            &sni_owned
-        };
-
-        // 1. Exact match
-        if let Some(entries) = inner.certs.get(sni) {
-            if let Some(entry) = entries.first() {
-                return Some(Arc::clone(&entry.key));
-            }
-        }
-
-        // 2. Wildcard match: replace first label with *
-        if let Some(dot_pos) = sni.find('.') {
-            // Build the wildcard form into a stack-friendly buffer.
-            // DNS names are <= 253 bytes ; `*` + suffix fits in 256.
-            // Avoids the `format!` allocation on every handshake.
-            let suffix = &sni[dot_pos..];
-            let mut wildcard_buf = [0u8; 256];
-            let needed = 1 + suffix.len();
-            if needed <= wildcard_buf.len() {
-                wildcard_buf[0] = b'*';
-                wildcard_buf[1..needed].copy_from_slice(suffix.as_bytes());
-                // SAFETY: `*` is ASCII, `suffix` is a valid &str sub-
-                // slice ; the concatenation is therefore valid UTF-8.
-                let wildcard = std::str::from_utf8(&wildcard_buf[..needed])
-                    .expect("ASCII '*' + UTF-8 DNS suffix is UTF-8");
-                if let Some(entries) = inner.certs.get(wildcard) {
-                    if let Some(entry) = entries.first() {
-                        return Some(Arc::clone(&entry.key));
-                    }
-                }
-            }
-        }
-
-        None
+        probe_lookup_keys(sni, |key: &str| {
+            inner
+                .certs
+                .get(key)
+                .and_then(|entries: &Vec<CertEntry>| entries.first())
+                .map(|entry: &CertEntry| Arc::clone(&entry.key))
+        })
     }
+}
+
+/// The keys [`CertResolver`] looks a server name up by, in order: the
+/// name lowercased, then the one-label wildcard `*` plus the suffix from
+/// its first dot (`*.example.com` for `a.example.com`, never for
+/// `a.b.example.com`), `None` when the name has no dot.
+///
+/// The one statement of "which certificate serves this name": the
+/// handshake's lookup ([`ResolvesServerCert::resolve`] on
+/// [`CertResolver`]), [`ResolvesServerCertByLocalIp::serves_server_name`]
+/// and the management API's coverage check all read it, so a name the
+/// API accepts as covered is a name the handshake serves.
+///
+/// ```
+/// use lorica_tls::cert_resolver::lookup_keys;
+/// assert_eq!(
+///     lookup_keys("App.Example.com"),
+///     ("app.example.com".to_string(), Some("*.example.com".to_string()))
+/// );
+/// assert_eq!(lookup_keys("localhost"), ("localhost".to_string(), None));
+/// ```
+pub fn lookup_keys(name: &str) -> (String, Option<String>) {
+    let mut keys: Vec<String> = Vec::with_capacity(2);
+    probe_lookup_keys(name, |key: &str| -> Option<()> {
+        keys.push(key.to_owned());
+        None
+    });
+    let mut keys = keys.into_iter();
+    let exact: String = keys.next().unwrap_or_default();
+    (exact, keys.next())
+}
+
+/// Call `probe` on each of [`lookup_keys`]'s keys in turn, stopping at
+/// the first answer, without allocating when `name` is already lowercase.
+///
+/// Audit M-13: every TLS handshake runs this, so the lowercase copy is
+/// made only for a name that needs it (practical SNI traffic is
+/// lowercase), and the wildcard key is built in a stack buffer: DNS names
+/// are at most 253 bytes, so `*` plus a suffix fits in 256, and a longer
+/// name gets no wildcard key.
+fn probe_lookup_keys<T>(name: &str, mut probe: impl FnMut(&str) -> Option<T>) -> Option<T> {
+    let lowered: String;
+    let name: &str = if name.bytes().any(|b: u8| b.is_ascii_uppercase()) {
+        lowered = name.to_ascii_lowercase();
+        &lowered
+    } else {
+        name
+    };
+    if let Some(found) = probe(name) {
+        return Some(found);
+    }
+    let suffix: &str = &name[name.find('.')?..];
+    let mut wildcard_buf: [u8; 256] = [0u8; 256];
+    let needed: usize = 1 + suffix.len();
+    if needed > wildcard_buf.len() {
+        return None;
+    }
+    wildcard_buf[0] = b'*';
+    wildcard_buf[1..needed].copy_from_slice(suffix.as_bytes());
+    // `*` is ASCII and `suffix` a `&str` slice cut at an ASCII dot, so
+    // the concatenation is UTF-8 and the `ok()` never drops a key.
+    let wildcard: &str = std::str::from_utf8(&wildcard_buf[..needed]).ok()?;
+    probe(wildcard)
 }
 
 /// Parse PEM strings and build a rustls `CertifiedKey`, optionally with an
@@ -1520,5 +1566,100 @@ mod tests {
             "the IP path and the SNI path serve the same staple"
         );
         assert_eq!(resolver.ip_staple_for(ip("2001:db8::1")), Some(vec![0xBB]));
+    }
+
+    /// Whether a real ClientHello naming `name` gets a certificate from
+    /// `resolver`: the server side of an in-memory handshake fails while
+    /// processing the hello exactly when `resolve` answers `None`.
+    fn served_by_handshake(resolver: &Arc<CertResolver>, name: &str) -> bool {
+        let server: ServerConfig =
+            ServerConfig::builder_with_provider(crate::http_client::crypto_provider())
+                .with_safe_default_protocol_versions()
+                .expect("test setup: versions")
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::clone(resolver) as Arc<dyn ResolvesServerCert>);
+        let client: rustls::ClientConfig = crate::http_client::config_builder()
+            .dangerous()
+            .with_custom_certificate_verifier(crate::http_client::accept_any_server())
+            .with_no_client_auth();
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(client),
+            rustls_pki_types::ServerName::try_from(name.to_owned()).expect("test setup: name"),
+        )
+        .expect("test setup: client");
+        let mut server =
+            rustls::ServerConnection::new(Arc::new(server)).expect("test setup: server");
+        let mut hello: Vec<u8> = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut hello).expect("in memory");
+        }
+        let mut flight: &[u8] = &hello;
+        while !flight.is_empty() {
+            server.read_tls(&mut flight).expect("in memory");
+        }
+        server.process_new_packets().is_ok()
+    }
+
+    #[test]
+    fn lookup_keys_are_the_name_then_its_one_label_wildcard() {
+        assert_eq!(
+            lookup_keys("a.b.example.com"),
+            (
+                "a.b.example.com".to_string(),
+                Some("*.b.example.com".to_string())
+            )
+        );
+        assert_eq!(
+            lookup_keys("APP.Example.COM"),
+            (
+                "app.example.com".to_string(),
+                Some("*.example.com".to_string())
+            )
+        );
+        assert_eq!(lookup_keys("localhost"), ("localhost".to_string(), None));
+        let long: String = format!("a{}", ".b".repeat(128));
+        assert_eq!(
+            lookup_keys(&long),
+            (long.clone(), None),
+            "no wildcard key past 256 bytes"
+        );
+    }
+
+    #[test]
+    fn serves_server_name_agrees_with_resolve() {
+        let exact: IpCert = ip_cert("app.example.com", &["app.example.com"], &[], 9_999_999_999);
+        let wildcard: IpCert = ip_cert(
+            "*.wild.example.com",
+            &["*.wild.example.com"],
+            &[],
+            9_999_999_999,
+        );
+        let resolver: Arc<CertResolver> = Arc::new(CertResolver::new());
+        resolver.reload(vec![exact.data, wildcard.data]).unwrap();
+        for (name, served) in [
+            ("app.example.com", true),
+            ("a.wild.example.com", true),
+            ("a.b.wild.example.com", false),
+            ("APP.Example.COM", true),
+            ("A.Wild.Example.Com", true),
+            ("unknown.example.org", false),
+            ("wild.example.com", false),
+        ] {
+            assert_eq!(
+                served_by_handshake(&resolver, name),
+                served,
+                "{name}: the handshake"
+            );
+            assert_eq!(
+                ResolvesServerCertByLocalIp::serves_server_name(&*resolver, name),
+                served,
+                "{name}: serves_server_name"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_serves_server_name_never_hides_a_certificate() {
+        assert!(MinimalResolver(None).serves_server_name("app.example.com"));
     }
 }

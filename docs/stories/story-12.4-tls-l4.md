@@ -1,7 +1,7 @@
 # Story 12.4: TLS at Layer 4
 
 **Epic:** [Epic 12 - TCP and UDP Stream Proxying (v1.11.0 and v1.12.0)](../prd/epic-12-v1.11.0.md)
-**Status:** Draft
+**Status:** InProgress
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:**
@@ -891,11 +891,11 @@ Lot G. G after D, E and F. H after E, F, 12.3 Lot G and 12.5 Lot I
 Allowlist: `lorica-tls/src/cert_resolver.rs`, `lorica-tls/src/http_client.rs`.
 Depends on: nothing.
 
-- [ ] `lookup_keys`, `resolve` rewritten over it with no behaviour
+- [x] `lookup_keys`, `resolve` rewritten over it with no behaviour
       change; `serves_server_name` on the trait (default `true`) and on
       `CertResolver` (D-o).
-- [ ] `accept_any_server()`; `unverified()` built on it (D-o).
-- [ ] Tests: the existing resolver tests pass unchanged;
+- [x] `accept_any_server()`; `unverified()` built on it (D-o).
+- [x] Tests: the existing resolver tests pass unchanged;
       `serves_server_name` agrees with `resolve` on exact, one-label
       wildcard, two-label miss, uppercase and unknown names;
       `accept_any_server()` behind `config_builder()` completes a
@@ -1271,7 +1271,37 @@ The decisions above cite each one as "Resolved N".
 
 ### Completion Notes
 
+**Lot A (`lorica-tls`).**
+
+- `cert_resolver::lookup_keys(name: &str) -> (String, Option<String>)`:
+  the name lowercased, then `*` plus the suffix from its first dot,
+  `None` without a dot or past 256 bytes. One private
+  `probe_lookup_keys(name, probe)` holds the rule and keeps audit M-13's
+  allocation-free path (no lowercase copy for a lowercase name, the
+  wildcard key in a stack buffer); `resolve`, `lookup_keys` and
+  `serves_server_name` all run it, so they cannot disagree. The
+  `expect` the old wildcard path carried became an `ok()?` on a
+  conversion that cannot fail.
+- `ResolvesServerCertByLocalIp::serves_server_name(&self, name: &str) ->
+  bool`, defaulted to `true`; `CertResolver` answers from its domain map
+  over `probe_lookup_keys`.
+- `http_client::accept_any_server() -> Arc<dyn ServerCertVerifier>`;
+  `unverified()` is `with_verifier(accept_any_server())`.
+- Tests: the existing resolver and client tests are unchanged and pass.
+  `serves_server_name_agrees_with_resolve` runs a real in-memory
+  handshake per name (exact, one-label wildcard, two-label miss,
+  uppercase, unknown, the wildcard's parent) and asserts the handshake
+  and `serves_server_name` agree with the expected answer;
+  `accept_any_server_behind_config_builder_completes_a_handshake`
+  completes one against a self-signed server for its own and another
+  name, with no ALPN offered.
+
 ## File List
+
+Lot A:
+
+- `lorica-tls/src/cert_resolver.rs`, `lorica-tls/src/http_client.rs`
+- `docs/stories/story-12.4-tls-l4.md`
 
 ## Change Log
 
@@ -1279,3 +1309,4 @@ The decisions above cite each one as "Resolved N".
 |------|---------|-------------|--------|
 | 2026-11-14 | 0.1 | Story drafted from the Epic 12 PRD and its 2026-11-04, 2026-11-12 and 2026-11-14 amendments, against the 12.3 and 12.5 drafts. Status Draft. | Romain G. |
 | 2026-11-14 | 0.2 | Maintainer answers folded in as Resolved 1 to 8, all as recommended; `certificate_ids` entitlement extended to replication with store tests (Lot C) and a cluster-profile check (Lot H); `clienthello_timeout_ms` bounds documented with their NFR2 reason. Status Draft. | Romain G. |
+| 2026-11-15 | 0.3 | Lot A landed: `lookup_keys` as the one statement of which certificate serves a name, `serves_server_name` on the resolver trait, `accept_any_server` behind `unverified`. Status InProgress. | Romain G. |

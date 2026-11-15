@@ -197,11 +197,21 @@ pub fn with_verifier(verifier: Arc<dyn ServerCertVerifier>) -> ClientConfig {
 /// did. For probes of operator backends and for tests, never for a
 /// client that carries a credential.
 pub fn unverified() -> ClientConfig {
-    with_verifier(Arc::new(AcceptAnything {
+    with_verifier(accept_any_server())
+}
+
+/// The verifier behind [`unverified`]: any certificate for any name, the
+/// handshake signature unchecked, over the policy's own signature
+/// schemes. For a TLS client that is not an HTTP client and starts from
+/// [`config_builder`] (a stream's upstream TLS with verification off),
+/// under the same rule as [`unverified`]: never for a client that
+/// carries a credential.
+pub fn accept_any_server() -> Arc<dyn ServerCertVerifier> {
+    Arc::new(AcceptAnything {
         schemes: crypto_provider()
             .signature_verification_algorithms
             .supported_schemes(),
-    }))
+    })
 }
 
 /// `config`, offering `h2` before `http/1.1`, for a client built with
@@ -567,5 +577,28 @@ mod tests {
         let origin: Server = server();
         handshake(unverified(), &origin, "elsewhere.example.net")
             .expect("verification is off, the name and issuer are not checked");
+    }
+
+    /// The verifier a non-HTTP client takes from [`config_builder`]
+    /// completes a handshake against a self-signed server for any name,
+    /// with no ALPN of this module's imposed: the server's own offer then
+    /// settles nothing.
+    #[test]
+    fn accept_any_server_behind_config_builder_completes_a_handshake() {
+        let origin: Server = server();
+        let client = || -> ClientConfig {
+            config_builder()
+                .dangerous()
+                .with_custom_certificate_verifier(accept_any_server())
+                .with_no_client_auth()
+        };
+        assert!(client().alpn_protocols.is_empty());
+        for name in [SERVER_NAME, "elsewhere.example.net"] {
+            assert_eq!(
+                handshake(client(), &origin, name).expect("verification is off"),
+                None,
+                "{name}: no ALPN offered, none negotiated"
+            );
+        }
     }
 }
