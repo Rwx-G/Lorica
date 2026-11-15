@@ -22,6 +22,13 @@
 //! sender: memory per connection is the two buffers whatever the peers
 //! do.
 //!
+//! The loop runs over any `AsyncRead + AsyncWrite` pair (Story 12.4
+//! Interface edit I2): a plain socket, a TLS stream Lorica terminates, a
+//! TLS stream it originates. It owns neither side and splits neither:
+//! each turn polls both directions in one future, each direction reading
+//! from one side and writing to the other through the same `&mut`, so no
+//! lock is taken and no half is handed out.
+//!
 //! Every step is one read or one write, and a direction's state changes
 //! only once that call has completed. A step is therefore cancel-safe,
 //! and [`Forwarder::run`] can be dropped at any await and called again
@@ -30,12 +37,17 @@
 //! [`DirectionState::Closed`], no forwarded byte is in userspace. That
 //! is the quiesce point Story 12.16 parks a connection on.
 
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
 use lorica_config::models::{Stream, StreamEndReason};
 use lorica_core::protocols::proxy_protocol::{classify_prefix, Prefix};
 use socket2::SockRef;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, MissedTickBehavior};
 
@@ -106,6 +118,13 @@ impl Side {
             Self::Backend => StreamEndReason::BackendClose,
         }
     }
+
+    fn other(self) -> Side {
+        match self {
+            Self::Client => Self::Backend,
+            Self::Backend => Self::Client,
+        }
+    }
 }
 
 enum Step {
@@ -114,12 +133,20 @@ enum Step {
     ProxySignature,
 }
 
+/// A throttled direction's wait for tokens, holding the bucket while it
+/// waits so the wait survives a dropped [`Forwarder::run`].
+type Throttle = Pin<Box<dyn Future<Output = TokenBucket> + Send>>;
+
 /// One direction of a connection.
 pub struct Direction {
     buf: Box<[u8]>,
     state: DirectionState,
     bucket: Option<TokenBucket>,
+    throttle: Option<Throttle>,
     fin_after_write: bool,
+    /// The reader's FIN was read and the writer's shutdown has started;
+    /// the direction is [`DirectionState::Closed`] once it completes.
+    shutting_down: bool,
     classify: bool,
     reads_from: Side,
     writes_to: Side,
@@ -137,15 +164,17 @@ impl std::fmt::Debug for Direction {
 }
 
 impl Direction {
-    fn new(reads_from: Side, writes_to: Side, rate: Option<u64>) -> Self {
+    fn new(reads_from: Side, rate: Option<u64>, size: usize) -> Self {
         Direction {
-            buf: vec![0u8; FORWARD_BUFFER_SIZE].into_boxed_slice(),
+            buf: vec![0u8; size].into_boxed_slice(),
             state: DirectionState::Reading,
             bucket: rate.map(TokenBucket::new),
+            throttle: None,
             fin_after_write: false,
+            shutting_down: false,
             classify: false,
             reads_from,
-            writes_to,
+            writes_to: reads_from.other(),
             forwarded: 0,
         }
     }
@@ -169,91 +198,132 @@ impl Direction {
         self.state == DirectionState::Closed
     }
 
-    async fn finish<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) {
-        // The peer may already be gone (`ENOTCONN`): that is an end, not
-        // an error worth reporting.
-        let _ = writer.shutdown().await;
-        self.state = DirectionState::Closed;
+    /// Ready once the bucket, if any, allows a read. A bucket with
+    /// tokens answers on the spot; one that must wait is moved into a
+    /// boxed wait, which only a throttled direction ever allocates.
+    fn poll_throttle(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.throttle.is_none() {
+            let Some(bucket) = self.bucket.as_mut() else {
+                return Poll::Ready(());
+            };
+            let ready_now = {
+                let wait = bucket.ready();
+                tokio::pin!(wait);
+                wait.poll(cx).is_ready()
+            };
+            if ready_now {
+                return Poll::Ready(());
+            }
+            if let Some(mut bucket) = self.bucket.take() {
+                self.throttle = Some(Box::pin(async move {
+                    bucket.ready().await;
+                    bucket
+                }));
+            }
+        }
+        if let Some(throttle) = self.throttle.as_mut() {
+            let bucket = ready!(throttle.as_mut().poll(cx));
+            self.throttle = None;
+            self.bucket = Some(bucket);
+        }
+        Poll::Ready(())
     }
 
-    async fn step<R, W>(
+    fn poll_step<R, W>(
         &mut self,
+        cx: &mut Context<'_>,
         reader: &mut R,
         writer: &mut W,
-        count: impl Fn(u64),
-    ) -> Result<Step, Side>
+        count: &dyn Fn(u64),
+    ) -> Poll<Result<Step, Side>>
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        match self.state {
-            DirectionState::Closed => std::future::pending().await,
-            DirectionState::Writing { filled, written } => {
-                let n = match writer.write(&self.buf[written..filled]).await {
-                    Ok(0) | Err(_) => return Err(self.writes_to),
-                    Ok(n) => n,
-                };
-                self.forwarded += n as u64;
-                count(n as u64);
-                if written + n < filled {
-                    self.state = DirectionState::Writing {
-                        filled,
-                        written: written + n,
-                    };
-                    return Ok(Step::Progress);
-                }
-                if self.fin_after_write {
-                    self.finish(writer).await;
-                    return Ok(Step::Finished);
-                }
-                self.state = DirectionState::Reading;
-                Ok(Step::Progress)
+        loop {
+            if self.shutting_down {
+                // The peer may already be gone (`ENOTCONN`): that is an
+                // end, not an error worth reporting.
+                let _ = ready!(Pin::new(&mut *writer).poll_shutdown(cx));
+                self.shutting_down = false;
+                self.state = DirectionState::Closed;
+                return Poll::Ready(Ok(Step::Finished));
             }
-            DirectionState::Reading | DirectionState::Classifying { .. } => {
-                let offset = self.state.held_bytes();
-                if let Some(bucket) = self.bucket.as_mut() {
-                    bucket.ready().await;
-                }
-                let room = self.buf.len() - offset;
-                let max = self
-                    .bucket
-                    .as_mut()
-                    .map_or(room, |b| b.available().clamp(1, room));
-                let n = match reader.read(&mut self.buf[offset..offset + max]).await {
-                    Ok(n) => n,
-                    Err(_) => return Err(self.reads_from),
-                };
-                if n == 0 {
-                    if offset == 0 {
-                        self.finish(writer).await;
-                        return Ok(Step::Finished);
-                    }
-                    // A client that closes inside an unfinished
-                    // signature sent no PROXY header: its bytes go on,
-                    // then its FIN.
-                    self.fin_after_write = true;
-                    self.state = DirectionState::Writing {
-                        filled: offset,
-                        written: 0,
+            match self.state {
+                DirectionState::Closed => return Poll::Pending,
+                DirectionState::Writing { filled, written } => {
+                    let n = match ready!(
+                        Pin::new(&mut *writer).poll_write(cx, &self.buf[written..filled])
+                    ) {
+                        Ok(0) | Err(_) => return Poll::Ready(Err(self.writes_to)),
+                        Ok(n) => n,
                     };
-                    return Ok(Step::Progress);
-                }
-                if let Some(bucket) = self.bucket.as_mut() {
-                    bucket.spend(n);
-                }
-                let filled = offset + n;
-                if self.classify {
-                    match classify_prefix(&self.buf[..filled]) {
-                        Prefix::V1 | Prefix::V2 => return Ok(Step::ProxySignature),
-                        Prefix::NeedMore => {
-                            self.state = DirectionState::Classifying { filled };
-                            return Ok(Step::Progress);
-                        }
-                        Prefix::NotProxy => self.classify = false,
+                    self.forwarded += n as u64;
+                    count(n as u64);
+                    if written + n < filled {
+                        self.state = DirectionState::Writing {
+                            filled,
+                            written: written + n,
+                        };
+                        return Poll::Ready(Ok(Step::Progress));
                     }
+                    self.state = DirectionState::Reading;
+                    if self.fin_after_write {
+                        self.shutting_down = true;
+                        continue;
+                    }
+                    return Poll::Ready(Ok(Step::Progress));
                 }
-                self.state = DirectionState::Writing { filled, written: 0 };
-                Ok(Step::Progress)
+                DirectionState::Reading | DirectionState::Classifying { .. } => {
+                    ready!(self.poll_throttle(cx));
+                    let offset = self.state.held_bytes();
+                    let room = self.buf.len() - offset;
+                    let max = self
+                        .bucket
+                        .as_mut()
+                        .map_or(room, |b| b.available().clamp(1, room));
+                    let mut read = ReadBuf::new(&mut self.buf[offset..offset + max]);
+                    let n = match ready!(Pin::new(&mut *reader).poll_read(cx, &mut read)) {
+                        Ok(()) => read.filled().len(),
+                        // A TLS peer that closed its socket without
+                        // `close_notify`: an end, the FIN it is.
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => 0,
+                        Err(_) => return Poll::Ready(Err(self.reads_from)),
+                    };
+                    if n == 0 {
+                        if offset == 0 {
+                            self.shutting_down = true;
+                            continue;
+                        }
+                        // A client that closes inside an unfinished
+                        // signature sent no PROXY header: its bytes go
+                        // on, then its FIN.
+                        self.fin_after_write = true;
+                        self.state = DirectionState::Writing {
+                            filled: offset,
+                            written: 0,
+                        };
+                        return Poll::Ready(Ok(Step::Progress));
+                    }
+                    if let Some(bucket) = self.bucket.as_mut() {
+                        bucket.spend(n);
+                    }
+                    let filled = offset + n;
+                    if self.classify {
+                        match classify_prefix(&self.buf[..filled]) {
+                            Prefix::V1 | Prefix::V2 => {
+                                return Poll::Ready(Ok(Step::ProxySignature))
+                            }
+                            Prefix::NeedMore => {
+                                self.state = DirectionState::Classifying { filled };
+                                return Poll::Ready(Ok(Step::Progress));
+                            }
+                            Prefix::NotProxy => self.classify = false,
+                        }
+                    }
+                    self.state = DirectionState::Writing { filled, written: 0 };
+                    return Poll::Ready(Ok(Step::Progress));
+                }
             }
         }
     }
@@ -267,16 +337,53 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
     }
 }
 
+/// Poll the open directions once each, starting with `first`, until one
+/// completes a step; returns its outcome and the side it reads from.
+fn poll_directions<C, B>(
+    cx: &mut Context<'_>,
+    upload: &mut Direction,
+    download: &mut Direction,
+    first: &mut Side,
+    client: &mut C,
+    backend: &mut B,
+    stats: &StreamStats,
+) -> Poll<(Result<Step, Side>, Side)>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    // Alternating which direction is polled first keeps a direction
+    // that is always ready from starving the other.
+    let order = [*first, first.other()];
+    *first = first.other();
+    for side in order {
+        let stepped = match side {
+            Side::Client if !upload.is_closed() => {
+                upload.poll_step(cx, client, backend, &|n| stats.add_upload(n))
+            }
+            Side::Backend if !download.is_closed() => {
+                download.poll_step(cx, backend, client, &|n| stats.add_download(n))
+            }
+            _ => Poll::Pending,
+        };
+        if let Poll::Ready(stepped) = stepped {
+            return Poll::Ready((stepped, side));
+        }
+    }
+    Poll::Pending
+}
+
 /// The two directions of one connection and its timers.
 #[derive(Debug)]
 pub struct Forwarder {
     upload: Direction,
     download: Direction,
+    first: Side,
     idle: Duration,
     total_deadline: Option<Instant>,
     last_activity: Instant,
     first_end: Option<Side>,
-    stats: std::sync::Arc<StreamStats>,
+    stats: Arc<StreamStats>,
 }
 
 impl Forwarder {
@@ -286,14 +393,24 @@ impl Forwarder {
     /// chunk. `classify` holds the client's first bytes until they are
     /// known not to open a PROXY signature (an untrusted peer on an
     /// accepting stream, D-k).
+    ///
+    /// The upload buffer is [`FORWARD_BUFFER_SIZE`], or the preamble's
+    /// length when that is larger: a passthrough ClientHello with what
+    /// followed it fills up to the 17 KiB of the ClientHello buffer
+    /// (Story 12.4 D-b), and is replayed as one chunk, never split
+    /// across a queue.
     pub fn new(
         stream: &Stream,
         accepted_at: Instant,
         preamble: &[u8],
         classify: bool,
-        stats: std::sync::Arc<StreamStats>,
+        stats: Arc<StreamStats>,
     ) -> Self {
-        let mut upload = Direction::new(Side::Client, Side::Backend, stream.upload_rate_bps);
+        let mut upload = Direction::new(
+            Side::Client,
+            stream.upload_rate_bps,
+            FORWARD_BUFFER_SIZE.max(preamble.len()),
+        );
         upload.classify = classify;
         if !preamble.is_empty() {
             upload.buf[..preamble.len()].copy_from_slice(preamble);
@@ -304,7 +421,8 @@ impl Forwarder {
         }
         Forwarder {
             upload,
-            download: Direction::new(Side::Backend, Side::Client, stream.download_rate_bps),
+            download: Direction::new(Side::Backend, stream.download_rate_bps, FORWARD_BUFFER_SIZE),
+            first: Side::Client,
             idle: Duration::from_secs(u64::from(stream.idle_timeout_s)),
             total_deadline: stream
                 .total_timeout_s
@@ -335,18 +453,20 @@ impl Forwarder {
         self.first_end.unwrap_or(Side::Client).end_reason()
     }
 
-    /// Forward until both directions have ended, a timer fires, or the
-    /// tracker closes the connection; returns the end reason. Dropping
-    /// the future at any await leaves the forwarder consistent and
-    /// callable again.
-    pub async fn run(
+    /// Forward between `client` and `backend` until both directions have
+    /// ended, a timer fires, or the tracker closes the connection;
+    /// returns the end reason. Dropping the future at any await leaves
+    /// the forwarder consistent and callable again.
+    pub async fn run<C, B>(
         &mut self,
-        client: &mut TcpStream,
-        backend: &mut TcpStream,
+        client: &mut C,
+        backend: &mut B,
         tracked: &mut TrackedConnection,
-    ) -> StreamEndReason {
-        let (mut client_read, mut client_write) = client.split();
-        let (mut backend_read, mut backend_write) = backend.split();
+    ) -> StreamEndReason
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+        B: AsyncRead + AsyncWrite + Unpin,
+    {
         let mut idle_check =
             tokio::time::interval_at(Instant::now() + IDLE_CHECK_INTERVAL, IDLE_CHECK_INTERVAL);
         idle_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -354,7 +474,12 @@ impl Forwarder {
             if self.upload.is_closed() && self.download.is_closed() {
                 return self.natural_end();
             }
-            let stats = &self.stats;
+            let (upload, download, first, stats) = (
+                &mut self.upload,
+                &mut self.download,
+                &mut self.first,
+                &self.stats,
+            );
             let (stepped, from) = tokio::select! {
                 biased;
                 reason = tracked.closed() => return reason,
@@ -365,12 +490,9 @@ impl Forwarder {
                     }
                     continue;
                 }
-                stepped = self.upload.step(&mut client_read, &mut backend_write,
-                                           |n| stats.add_upload(n)),
-                    if !self.upload.is_closed() => (stepped, Side::Client),
-                stepped = self.download.step(&mut backend_read, &mut client_write,
-                                             |n| stats.add_download(n)),
-                    if !self.download.is_closed() => (stepped, Side::Backend),
+                stepped = std::future::poll_fn(|cx| {
+                    poll_directions(cx, upload, download, first, client, backend, stats)
+                }) => stepped,
             };
             match stepped {
                 Ok(Step::Progress) => self.last_activity = Instant::now(),
@@ -402,7 +524,7 @@ mod tests {
     use crate::tracker::ConnectionTracker;
     use chrono::Utc;
     use lorica_config::models::StreamProtocol;
-    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     async fn pair() -> (TcpStream, TcpStream) {
@@ -518,6 +640,65 @@ mod tests {
             }
         );
         assert_eq!(forwarder.upload().state().held_bytes(), 5);
+        assert_eq!(forwarder.upload().buffer_len(), FORWARD_BUFFER_SIZE);
         assert!(!forwarder.at_quiesce_point());
+    }
+
+    #[tokio::test]
+    async fn a_preamble_past_one_buffer_is_held_whole() {
+        let preamble = vec![3u8; FORWARD_BUFFER_SIZE + 1_024];
+        let forwarder = Forwarder::new(
+            &stream(),
+            Instant::now(),
+            &preamble,
+            false,
+            Arc::new(StreamStats::default()),
+        );
+        assert_eq!(forwarder.upload().buffer_len(), preamble.len());
+        assert_eq!(forwarder.upload().state().held_bytes(), preamble.len());
+        assert_eq!(forwarder.download().buffer_len(), FORWARD_BUFFER_SIZE);
+    }
+
+    /// The loop over streams that are not sockets, both half-closes
+    /// carried in order: the client's end first, then the backend's.
+    #[tokio::test]
+    async fn any_stream_pair_is_forwarded_with_both_half_closes() {
+        let (mut client_peer, mut client) = tokio::io::duplex(64);
+        let (mut backend, mut backend_peer) = tokio::io::duplex(64);
+        let snapshot = stream();
+        let tracker = ConnectionTracker::new();
+        let mut tracked = tracker.register(1, Arc::clone(&snapshot));
+        let stats = Arc::new(StreamStats::default());
+        let mut forwarder = Forwarder::new(
+            &snapshot,
+            Instant::now(),
+            b"pre-",
+            false,
+            Arc::clone(&stats),
+        );
+        let run = tokio::spawn(async move {
+            let reason = forwarder.run(&mut client, &mut backend, &mut tracked).await;
+            (
+                reason,
+                forwarder.upload().forwarded(),
+                forwarder.download().forwarded(),
+            )
+        });
+
+        client_peer.write_all(b"amble").await.unwrap();
+        client_peer.shutdown().await.unwrap();
+        let mut uploaded = Vec::new();
+        backend_peer.read_to_end(&mut uploaded).await.unwrap();
+        assert_eq!(uploaded, b"pre-amble");
+
+        backend_peer.write_all(b"answer").await.unwrap();
+        backend_peer.shutdown().await.unwrap();
+        let mut downloaded = Vec::new();
+        client_peer.read_to_end(&mut downloaded).await.unwrap();
+        assert_eq!(downloaded, b"answer");
+
+        let (reason, up, down) = run.await.unwrap();
+        assert_eq!(reason, StreamEndReason::ClientClose);
+        assert_eq!((up, down), (9, 6));
     }
 }
