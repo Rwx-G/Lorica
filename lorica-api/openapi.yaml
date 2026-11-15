@@ -8097,7 +8097,7 @@ components:
       description: >-
         Why a stream connection or a UDP session was refused, the word the
         stream counters and access-log rows carry.
-      enum: [no_match, connection_cap, session_cap, source_session_cap, session_table_full]
+      enum: [no_match, connection_cap, session_cap, source_session_cap, session_table_full, invalid_client_hello, no_certificate, tls_handshake, client_certificate]
 
     StreamDatagramDropReason:
       type: string
