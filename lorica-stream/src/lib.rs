@@ -72,8 +72,8 @@ pub use budget::{
 pub use caps::{CapsRegistry, NodeCapsRegions, StreamCaps};
 pub use counters::{CountersSnapshot, StreamCounters};
 pub use handler::{
-    AcceptedConnection, ConnectionObserver, ConnectionRecord, Datagram, DatagramHandler, Engines,
-    LogObserver, StreamHandler,
+    AcceptedConnection, ClientCertificateOutcome, ConnectionObserver, ConnectionRecord, Datagram,
+    DatagramHandler, Engines, LogObserver, StreamHandler, TlsRecord,
 };
 pub use local::BoundPorts;
 pub use reconcile::{diff, Actions, BindKey, BoundBinding, Detach, ReleaseCause, UdpOverlap};
@@ -84,8 +84,9 @@ pub use seams::{
     SelectionRequest,
 };
 pub use state::{BindFailure, BindFailureKind, BindState, BindStateKind, StreamBindStates};
-pub use table::{StreamTable, StreamTableSource};
+pub use table::{ClientIdentity, StreamTable, StreamTableSource};
 pub use tcp::{TcpEngine, TcpEngineParts};
+pub use tls::TlsParts;
 pub use tracker::{ConnectionTracker, TrackedConnection};
 pub use transport::{ControlTransport, InProcessPeer};
 pub use udp::{UdpEngine, UdpEngineParts};

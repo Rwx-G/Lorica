@@ -27,7 +27,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use lorica_config::models::{Stream, StreamEndReason};
+use lorica_config::models::{Stream, StreamEndReason, StreamTlsMode};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::debug;
 
@@ -184,6 +184,47 @@ pub struct ConnectionRecord {
     pub ended_at: DateTime<Utc>,
     /// How it ended.
     pub end_reason: StreamEndReason,
+    /// What TLS the connection read, terminated or originated (Story
+    /// 12.4 D-m); `None` on a stream with no TLS at all and on UDP.
+    pub tls: Option<TlsRecord>,
+}
+
+/// The TLS side of a [`ConnectionRecord`] (Story 12.4 D-m). Story 12.9
+/// decides which of it the access log writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsRecord {
+    /// The stream's TLS mode as the connection's snapshot had it.
+    pub mode: StreamTlsMode,
+    /// The server name the ClientHello carried, canonical; `None` when
+    /// it carried none or was not read.
+    pub server_name: Option<String>,
+    /// The ALPN protocols the client offered, in its order, as sent.
+    pub offered_alpn: Vec<Vec<u8>>,
+    /// The protocol a terminating handshake negotiated.
+    pub negotiated_alpn: Option<Vec<u8>>,
+    /// The rule the ClientHello matched.
+    pub rule: Option<String>,
+    /// Whether the ClientHello carried an `encrypted_client_hello`
+    /// extension.
+    pub ech_offered: bool,
+    /// What a terminating handshake made of the client's certificate;
+    /// `None` when the stream does not terminate or the handshake did
+    /// not complete.
+    pub client_certificate: Option<ClientCertificateOutcome>,
+    /// Whether the connection to the backend is TLS Lorica originates.
+    pub upstream_tls: bool,
+}
+
+/// The client certificate of a completed terminating handshake. The
+/// subject is not recorded; whether it joins the access log is Story
+/// 12.9's decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientCertificateOutcome {
+    /// The client presented none.
+    Absent,
+    /// The client presented one that verified against the stream's
+    /// bundle and its organization allowlist.
+    Verified,
 }
 
 /// Where an engine hands each [`ConnectionRecord`]. The default method
@@ -211,6 +252,7 @@ pub trait ConnectionObserver: Send + Sync + 'static {
             connected_at = ?record.connected_at,
             ended_at = %record.ended_at,
             end_reason = record.end_reason.kind().as_str(),
+            tls = ?record.tls,
             "stream connection ended"
         );
     }

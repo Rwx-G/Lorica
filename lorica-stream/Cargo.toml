@@ -17,8 +17,15 @@ description = "Stream data plane for Lorica: the worker-side stream runtime, its
 lorica-config = { version = "1.10.6", path = "../lorica-config" }
 lorica-worker = { version = "1.10.6", path = "../lorica-worker" }
 # The PROXY protocol parser and encoder (Story 12.3 D-j, D-k), shared
-# with the HTTP listeners. Default features off: no TLS stack.
-lorica-core = { version = "0.1.0", path = "../lorica-core", default-features = false }
+# with the HTTP listeners. Its `rustls` feature carries
+# `get_organizations_serial_bytes`, so a terminating stream reads a
+# client certificate's `O=` values the way HTTP routes do (Story 12.4
+# D-h); the binary enables that feature anyway.
+lorica-core = { version = "0.1.0", path = "../lorica-core", default-features = false, features = ["rustls"] }
+# TLS at layer 4 (Story 12.4): the process's certificate resolver and
+# its per-local-address configs, the outbound TLS policy, and rustls and
+# tokio-rustls through their re-exports.
+lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
 # The stream-caps regions of UDP streams (Story 12.5 D-d): a worker maps
 # the memfd a `caps` message carries, the supervisor creates them.
 lorica-shmem = { version = "1.10.6", path = "../lorica-shmem" }
@@ -39,5 +46,8 @@ tracing = "0.1"
 # tests parse (Story 12.4 Lot B). The `ring` provider the workspace pins
 # (audit M-6); already in the lockfile through `lorica-tls`.
 rustls = { version = "0.23.12", default-features = false, features = ["ring", "std", "tls12"] }
+# Certificates and CAs for the TLS engine's tests, at the version the
+# rest of the workspace uses.
+rcgen = "0.14"
 serde_json = "1.0"
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "test-util"] }

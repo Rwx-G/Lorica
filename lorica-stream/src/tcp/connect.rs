@@ -25,28 +25,40 @@
 //! Each backend is tried at most once per connection, and every way a
 //! candidate can be passed over (a breaker `Deny`, a local destination,
 //! no source address of its family) removes it for this connection.
+//!
+//! On a TLS stream (Story 12.4) the candidates are the matched rule's
+//! links. With upstream TLS an attempt is TCP connect, the PROXY header
+//! in plaintext, then the TLS handshake, all under the one connect
+//! timeout, and it is connected when the handshake completes (Interface
+//! edits I1 and I4): a failed handshake is a failed attempt and the next
+//! candidate is tried, no client byte having been forwarded.
 
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use lorica_config::listen_ports::ReservedPorts;
 use lorica_config::models::{
     backend_address_host, backend_address_port, Backend, HealthStatus, LifecycleState, Stream,
-    StreamEndReason,
+    StreamEndReason, StreamUpstreamTls,
 };
+use lorica_tls::{ClientConfig, ClientTlsStream};
 use socket2::{SockRef, TcpKeepalive};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
-use crate::counters::{ConnectFailureKind, StreamCounters, StreamStats};
+use crate::counters::{ConnectFailureKind, StreamCounters, StreamStats, UpstreamTlsFailure};
 use crate::local::{BoundPorts, LocalRefusal, NodeLocality};
 use crate::resolver::{LocalExclusions, ResolverCache};
 use crate::seams::{Admission, BackendSelector, BreakerGate, Candidate, SelectionRequest};
 use crate::table::{LinkedBackend, StreamTable};
+use crate::tls::upstream;
 
 /// Interval between TCP keepalive probes on a backend socket, the
 /// constant HTTP's upstream keepalive uses beside its idle time (D-d).
@@ -109,13 +121,92 @@ pub(crate) struct Request<'a> {
     pub(crate) accepted_at: std::time::Instant,
     pub(crate) bound: &'a BoundPorts,
     pub(crate) stats: &'a StreamStats,
+    /// The rule the ClientHello matched on a TLS stream: only its links
+    /// are candidates. `None` on a stream that reads no ClientHello,
+    /// whose links serve no rule.
+    pub(crate) rule: Option<&'a str>,
+    /// The stream's upstream TLS, when it originates TLS.
+    pub(crate) upstream_tls: Option<UpstreamAttempt<'a>>,
+}
+
+/// What an attempt with upstream TLS needs.
+pub(crate) struct UpstreamAttempt<'a> {
+    /// The stream's settings.
+    pub(crate) settings: &'a StreamUpstreamTls,
+    /// Its client config, or why it has none on this node.
+    pub(crate) config: Result<Arc<ClientConfig>, &'a str>,
+    /// The client's SNI as matched, for `server_name = client`.
+    pub(crate) client_sni: Option<&'a str>,
+    /// The PROXY header, written in plaintext before the handshake.
+    pub(crate) proxy_header: Option<&'a [u8]>,
+}
+
+/// The backend side of a connection: a socket, or TLS Lorica originates
+/// over one.
+pub(crate) enum Upstream {
+    Plain(TcpStream),
+    Tls(Box<ClientTlsStream<TcpStream>>),
+}
+
+impl Upstream {
+    /// The socket under it.
+    pub(crate) fn socket(&self) -> &TcpStream {
+        match self {
+            Upstream::Plain(socket) => socket,
+            Upstream::Tls(tls) => tls.get_ref().0,
+        }
+    }
+
+    pub(crate) fn is_tls(&self) -> bool {
+        matches!(self, Upstream::Tls(_))
+    }
+}
+
+impl AsyncRead for Upstream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Upstream::Plain(socket) => Pin::new(socket).poll_read(cx, buf),
+            Upstream::Tls(tls) => Pin::new(tls.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Upstream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Upstream::Plain(socket) => Pin::new(socket).poll_write(cx, buf),
+            Upstream::Tls(tls) => Pin::new(tls.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Upstream::Plain(socket) => Pin::new(socket).poll_flush(cx),
+            Upstream::Tls(tls) => Pin::new(tls.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Upstream::Plain(socket) => Pin::new(socket).poll_shutdown(cx),
+            Upstream::Tls(tls) => Pin::new(tls.as_mut()).poll_shutdown(cx),
+        }
+    }
 }
 
 /// An established backend connection.
 pub(crate) struct Connected {
     pub(crate) backend: Arc<Backend>,
     pub(crate) address: SocketAddr,
-    pub(crate) socket: TcpStream,
+    pub(crate) socket: Upstream,
     pub(crate) latency: Duration,
 }
 
@@ -162,7 +253,8 @@ impl Shared {
         let mut eligible = Vec::new();
         for link in request.table.linked_backends(&request.stream.id) {
             let backend = &link.backend;
-            if excluded.contains(&backend.id)
+            if link.rule.as_deref() != request.rule
+                || excluded.contains(&backend.id)
                 || backend.health_status == HealthStatus::Down
                 || backend.lifecycle_state != LifecycleState::Normal
             {
@@ -250,6 +342,34 @@ impl Shared {
                 }
             };
 
+            // A stream whose upstream TLS has no config on this node opens
+            // nothing: each attempt ends `no_trust` at once, and the
+            // breaker, which judges backends, is never asked.
+            let tls = match &request.upstream_tls {
+                None => None,
+                Some(attempt) => match (
+                    &attempt.config,
+                    upstream::server_name(
+                        &attempt.settings.server_name,
+                        &backend,
+                        attempt.client_sni,
+                    ),
+                ) {
+                    (Ok(config), Ok(name)) => Some((attempt, Arc::clone(config), name)),
+                    (config, name) => {
+                        *attempts += 1;
+                        request.stats.connect_attempt(*attempts == 1);
+                        self.counters
+                            .link(&stream.id, &backend.id)
+                            .upstream_tls_failed(UpstreamTlsFailure::NoTrust);
+                        debug!(stream_id = %stream.id, backend_id = %backend.id,
+                               config = ?config.as_ref().err(), name = ?name.err(),
+                               "stream upstream TLS not configured: attempt ended no_trust");
+                        continue;
+                    }
+                },
+            };
+
             let admission = self.breaker.admit(&stream.id, &backend).await;
             if admission == Admission::Deny {
                 request.stats.breaker_denied();
@@ -262,6 +382,33 @@ impl Shared {
             let started = Instant::now();
             match open(stream, address, source, connect_timeout).await {
                 Ok(socket) => {
+                    let socket = match tls {
+                        None => Upstream::Plain(socket),
+                        Some((attempt, config, name)) => {
+                            let left = connect_timeout.saturating_sub(started.elapsed());
+                            let established = tokio::time::timeout(
+                                left,
+                                originate(socket, attempt.proxy_header, config, name),
+                            )
+                            .await
+                            .unwrap_or(Err(UpstreamTlsFailure::Timeout));
+                            match established {
+                                Ok(tls) => Upstream::Tls(Box::new(tls)),
+                                Err(kind) => {
+                                    self.upstream_tls_failed(
+                                        stream, &backend, address, kind, was_probe,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    if socket.is_tls() {
+                        self.counters
+                            .link(&stream.id, &backend.id)
+                            .upstream_tls_verified();
+                    }
                     self.breaker
                         .record(&stream.id, &backend, true, was_probe)
                         .await;
@@ -292,6 +439,43 @@ impl Shared {
                            "stream backend connect failed");
                 }
             }
+        }
+    }
+
+    /// Count a failed upstream handshake of `kind` and tell the breaker
+    /// what it means. A reset, an alert or a timeout says the backend
+    /// does not serve TLS correctly and counts against it. A certificate
+    /// that does not verify says the configuration and the backend
+    /// disagree: it is not counted, or one wrong bundle would trip every
+    /// backend's breaker; only a half-open breaker's probe is answered,
+    /// as a success, since the backend did answer.
+    async fn upstream_tls_failed(
+        &self,
+        stream: &Stream,
+        backend: &Backend,
+        address: SocketAddr,
+        kind: UpstreamTlsFailure,
+        was_probe: bool,
+    ) {
+        let first = self
+            .counters
+            .link(&stream.id, &backend.id)
+            .upstream_tls_failed(kind);
+        if kind.is_backend_failure() {
+            self.breaker
+                .record(&stream.id, backend, false, was_probe)
+                .await;
+        } else if was_probe {
+            self.breaker.record(&stream.id, backend, true, true).await;
+        }
+        if first {
+            warn!(stream_id = %stream.id, stream = %stream.name,
+                  backend_id = %backend.id, backend = %backend.name, %address,
+                  "stream backend's certificate does not verify against the stream's \
+                   upstream TLS trust; logged once until a handshake verifies");
+        } else {
+            debug!(stream_id = %stream.id, backend_id = %backend.id, %address,
+                   kind = kind.as_str(), "stream upstream TLS handshake failed");
         }
     }
 
@@ -368,6 +552,24 @@ impl Shared {
             Some((*destination, Some(family[turn % family.len()])))
         })
     }
+}
+
+/// The TLS half of an attempt on an open `socket`: the PROXY header in
+/// plaintext first, as HAProxy's `send-proxy` with `ssl` and nginx's
+/// `proxy_protocol` with `proxy_ssl` send it, then the handshake.
+async fn originate(
+    mut socket: TcpStream,
+    proxy_header: Option<&[u8]>,
+    config: Arc<ClientConfig>,
+    name: lorica_tls::ServerName<'static>,
+) -> Result<ClientTlsStream<TcpStream>, UpstreamTlsFailure> {
+    if let Some(header) = proxy_header {
+        socket
+            .write_all(header)
+            .await
+            .map_err(|_| UpstreamTlsFailure::Handshake)?;
+    }
+    upstream::connect(config, name, socket).await
 }
 
 /// Open one backend connection: socket, source bind, connect within

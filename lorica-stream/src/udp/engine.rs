@@ -429,6 +429,7 @@ impl Inner {
             connected_at: None,
             ended_at: accepted_wall,
             end_reason: StreamEndReason::IdleTimeout,
+            tls: None,
         };
 
         let opening = tokio::select! {

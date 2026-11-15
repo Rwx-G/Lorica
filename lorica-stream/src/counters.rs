@@ -25,7 +25,13 @@
 //! kinds, datagram drops) are maps filled on first use, so a snapshot
 //! carries only what happened; the word lists come from the enums
 //! ([`StreamEndKind`], [`StreamRefusal`], [`ProxyHeaderOutcome::ALL`],
-//! [`ConnectFailureKind::ALL`], [`DatagramDropReason`]).
+//! [`ConnectFailureKind::ALL`], [`DatagramDropReason`],
+//! [`ClientHelloOutcome::ALL`], [`HandshakeOutcome::ALL`],
+//! [`UpstreamTlsFailure::ALL`]).
+//!
+//! A TLS stream (Story 12.4 D-n) adds the ClientHello and handshake
+//! outcomes per stream, a `matched` count per (stream, rule), and the
+//! upstream TLS failures per (stream, backend).
 //!
 //! A UDP stream (Story 12.5 D-n) uses the same words with their session
 //! meaning (`accepted` counts sessions, `active` live sessions, the bytes
@@ -142,6 +148,123 @@ impl ConnectFailureKind {
     }
 }
 
+/// How a TLS stream's ClientHello read ended (Story 12.4 D-n).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClientHelloOutcome {
+    /// A complete ClientHello was read.
+    Parsed,
+    /// None was complete by the deadline: the connection ended
+    /// `clienthello_timeout`.
+    Timeout,
+    /// The bytes are no ClientHello the stream accepts.
+    Invalid,
+    /// The hello was larger, or spread over more records, than the
+    /// reader accepts.
+    Oversized,
+}
+
+impl ClientHelloOutcome {
+    /// Every outcome, in declaration order.
+    pub const ALL: [ClientHelloOutcome; 4] =
+        [Self::Parsed, Self::Timeout, Self::Invalid, Self::Oversized];
+
+    /// The snake_case word of the outcome.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Parsed => "parsed",
+            Self::Timeout => "timeout",
+            Self::Invalid => "invalid",
+            Self::Oversized => "oversized",
+        }
+    }
+}
+
+/// How a terminating stream's handshake ended (Story 12.4 D-n). Every
+/// outcome but `ok` refuses the connection with the
+/// [`StreamRefusal`] of the same word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HandshakeOutcome {
+    /// The handshake completed.
+    Ok,
+    /// No certificate of the node serves the name or the local address.
+    NoCertificate,
+    /// The client's certificate, its absence or its organization was
+    /// refused.
+    ClientCertificate,
+    /// Any other failure, the deadline included.
+    TlsHandshake,
+}
+
+impl HandshakeOutcome {
+    /// Every outcome, in declaration order.
+    pub const ALL: [HandshakeOutcome; 4] = [
+        Self::Ok,
+        Self::NoCertificate,
+        Self::ClientCertificate,
+        Self::TlsHandshake,
+    ];
+
+    /// The snake_case word of the outcome.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::NoCertificate => "no_certificate",
+            Self::ClientCertificate => "client_certificate",
+            Self::TlsHandshake => "tls_handshake",
+        }
+    }
+
+    /// The refusal a failed handshake ends the connection with; `None`
+    /// for [`HandshakeOutcome::Ok`].
+    pub fn refusal(&self) -> Option<StreamRefusal> {
+        match self {
+            Self::Ok => None,
+            Self::NoCertificate => Some(StreamRefusal::NoCertificate),
+            Self::ClientCertificate => Some(StreamRefusal::ClientCertificate),
+            Self::TlsHandshake => Some(StreamRefusal::TlsHandshake),
+        }
+    }
+}
+
+/// Why an attempt's upstream TLS failed (Story 12.4 D-i, D-n). Only
+/// `handshake` and `timeout` count against the backend in the breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UpstreamTlsFailure {
+    /// The backend reset the connection or sent an alert during the
+    /// handshake: it does not serve TLS correctly.
+    Handshake,
+    /// The backend's certificate did not verify against the stream's
+    /// trust: the configuration and the backend disagree.
+    Verify,
+    /// The handshake did not complete within the connect timeout.
+    Timeout,
+    /// The stream's upstream TLS cannot be configured on this node: the
+    /// public roots did not load, its CA bundle does not load, or its
+    /// client identity's key is not held here. No connection is opened.
+    NoTrust,
+}
+
+impl UpstreamTlsFailure {
+    /// Every kind, in declaration order.
+    pub const ALL: [UpstreamTlsFailure; 4] =
+        [Self::Handshake, Self::Verify, Self::Timeout, Self::NoTrust];
+
+    /// The snake_case word of the kind.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Handshake => "handshake",
+            Self::Verify => "verify",
+            Self::Timeout => "timeout",
+            Self::NoTrust => "no_trust",
+        }
+    }
+
+    /// Whether the breaker counts it as a failure of the backend.
+    pub fn is_backend_failure(&self) -> bool {
+        matches!(self, Self::Handshake | Self::Timeout)
+    }
+}
+
 /// The share of `udp.max_sessions` below which the "ceiling reached"
 /// edge re-arms, in percent (Story 12.5 D-n).
 pub const CEILING_REARM_PERCENT: u64 = 90;
@@ -205,6 +328,11 @@ pub struct StreamStats {
     /// Set by the `session_cap` refusal that raised the edge, cleared
     /// once the stream is below [`CEILING_REARM_PERCENT`] again.
     ceiling_raised: AtomicBool,
+    clienthello: Keyed<ClientHelloOutcome>,
+    no_sni_matched: AtomicU64,
+    ech_offered: AtomicU64,
+    handshakes: Keyed<HandshakeOutcome>,
+    sni_mismatch: AtomicU64,
 }
 
 impl StreamStats {
@@ -306,8 +434,40 @@ impl StreamStats {
         }
     }
 
+    /// Count how a ClientHello read ended.
+    pub fn clienthello(&self, outcome: ClientHelloOutcome) {
+        self.clienthello.add(outcome);
+    }
+
+    /// Count a client without SNI that a `no_sni` rule admitted.
+    pub fn no_sni_matched(&self) {
+        bump(&self.no_sni_matched);
+    }
+
+    /// Count a ClientHello carrying an `encrypted_client_hello`
+    /// extension.
+    pub fn ech_offered(&self) {
+        bump(&self.ech_offered);
+    }
+
+    /// Count how a terminating handshake ended.
+    pub fn handshake(&self, outcome: HandshakeOutcome) {
+        self.handshakes.add(outcome);
+    }
+
+    /// Count a handshake whose server name, as rustls read it, differs
+    /// from the one the rule was chosen by.
+    pub fn sni_mismatch(&self) {
+        bump(&self.sni_mismatch);
+    }
+
     pub(crate) fn snapshot(&self) -> StreamCountersSnapshot {
         StreamCountersSnapshot {
+            clienthello: self.clienthello.snapshot(),
+            no_sni_matched: get(&self.no_sni_matched),
+            ech_offered: get(&self.ech_offered),
+            handshakes: self.handshakes.snapshot(),
+            sni_mismatch: get(&self.sni_mismatch),
             active: get(&self.active),
             accepted: get(&self.accepted),
             ended: self.ended.snapshot(),
@@ -391,9 +551,27 @@ pub struct LinkStats {
     connects: AtomicU64,
     connect_failures: Keyed<ConnectFailureKind>,
     connect_latency: Histogram,
+    upstream_tls_failures: Keyed<UpstreamTlsFailure>,
+    /// Whether the last upstream handshake on the link failed
+    /// verification, so the failure is logged once per transition.
+    verify_failing: AtomicBool,
 }
 
 impl LinkStats {
+    /// Count an upstream TLS failure of `kind`. For `verify`, returns
+    /// whether the link was not already failing verification, which is
+    /// when the failure deserves a log line.
+    pub fn upstream_tls_failed(&self, kind: UpstreamTlsFailure) -> bool {
+        self.upstream_tls_failures.add(kind);
+        kind == UpstreamTlsFailure::Verify && !self.verify_failing.swap(true, Ordering::AcqRel)
+    }
+
+    /// An upstream handshake completed: a later verification failure is
+    /// a new transition.
+    pub fn upstream_tls_verified(&self) {
+        self.verify_failing.store(false, Ordering::Release);
+    }
+
     /// Count an established connection after `latency`, active until
     /// the guard drops.
     pub fn connected(&self, latency: Duration) -> ActiveGuard {
@@ -416,6 +594,7 @@ impl LinkStats {
 
     fn snapshot(&self) -> LinkCountersSnapshot {
         LinkCountersSnapshot {
+            upstream_tls_failures: self.upstream_tls_failures.snapshot(),
             active: get(&self.active),
             connects: get(&self.connects),
             connect_failures: self.connect_failures.snapshot(),
@@ -506,6 +685,26 @@ pub struct StreamCounters {
     streams: Family<String, StreamStats>,
     links: Family<(String, String), LinkStats>,
     backends: Family<String, BackendStats>,
+    rules: Family<(String, String), RuleStats>,
+}
+
+/// The counters of one rule of a TLS stream (Story 12.4 D-n).
+#[derive(Debug, Default)]
+pub struct RuleStats {
+    matched: AtomicU64,
+}
+
+impl RuleStats {
+    /// Count a ClientHello the rule matched.
+    pub fn matched(&self) {
+        bump(&self.matched);
+    }
+
+    fn snapshot(&self) -> RuleCountersSnapshot {
+        RuleCountersSnapshot {
+            matched: get(&self.matched),
+        }
+    }
 }
 
 impl StreamCounters {
@@ -529,6 +728,11 @@ impl StreamCounters {
         entry_by_id(&self.backends, backend_id)
     }
 
+    /// The counters of rule `rule` of `stream_id`, created on first use.
+    pub fn rule(&self, stream_id: &str, rule: &str) -> Arc<RuleStats> {
+        entry(&self.rules, (stream_id.to_string(), rule.to_string()))
+    }
+
     /// Drop the counters of streams, links and backends `table` no
     /// longer holds.
     pub fn retain(&self, table: &StreamTable) {
@@ -544,6 +748,14 @@ impl StreamCounters {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|id, _| table.backend(id).is_some());
+        self.rules
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(stream, rule), _| {
+                table
+                    .stream(stream)
+                    .is_some_and(|s| s.match_rule(rule).is_some())
+            });
     }
 
     /// Every counter as it stands.
@@ -552,6 +764,7 @@ impl StreamCounters {
             streams: read(&self.streams, StreamStats::snapshot),
             links: read(&self.links, LinkStats::snapshot),
             backends: read(&self.backends, BackendStats::snapshot),
+            rules: read(&self.rules, RuleStats::snapshot),
         }
     }
 }
@@ -565,6 +778,15 @@ pub struct CountersSnapshot {
     pub links: BTreeMap<(String, String), LinkCountersSnapshot>,
     /// Per backend id.
     pub backends: BTreeMap<String, BackendCountersSnapshot>,
+    /// Per (stream id, rule name) of a TLS stream.
+    pub rules: BTreeMap<(String, String), RuleCountersSnapshot>,
+}
+
+/// One rule's counters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuleCountersSnapshot {
+    /// ClientHellos the rule matched.
+    pub matched: u64,
 }
 
 /// One stream's counters. On a UDP stream a connection is a session.
@@ -607,6 +829,17 @@ pub struct StreamCountersSnapshot {
     /// after holding less than [`CEILING_REARM_PERCENT`] of it, as this
     /// process saw it.
     pub ceiling_reached: u64,
+    /// TLS: how ClientHello reads ended, per outcome.
+    pub clienthello: HashMap<ClientHelloOutcome, u64>,
+    /// TLS: clients without SNI a `no_sni` rule admitted.
+    pub no_sni_matched: u64,
+    /// TLS: ClientHellos carrying an `encrypted_client_hello` extension.
+    pub ech_offered: u64,
+    /// TLS: how terminating handshakes ended, per outcome.
+    pub handshakes: HashMap<HandshakeOutcome, u64>,
+    /// TLS: handshakes whose server name, as rustls read it, differed
+    /// from the one the rule was chosen by.
+    pub sni_mismatch: u64,
 }
 
 /// The cumulative counts of a latency histogram.
@@ -632,6 +865,8 @@ pub struct LinkCountersSnapshot {
     pub connect_failures: HashMap<ConnectFailureKind, u64>,
     /// Connect latency, SYN to established.
     pub connect_latency: HistogramSnapshot,
+    /// Failed upstream TLS handshakes, per kind (Story 12.4).
+    pub upstream_tls_failures: HashMap<UpstreamTlsFailure, u64>,
 }
 
 /// One backend's counters.
@@ -712,5 +947,49 @@ mod tests {
         let words: std::collections::HashSet<&str> =
             ConnectFailureKind::ALL.iter().map(|k| k.as_str()).collect();
         assert_eq!(words.len(), ConnectFailureKind::ALL.len());
+        let words: std::collections::HashSet<&str> =
+            ClientHelloOutcome::ALL.iter().map(|o| o.as_str()).collect();
+        assert_eq!(words.len(), ClientHelloOutcome::ALL.len());
+        let words: std::collections::HashSet<&str> =
+            UpstreamTlsFailure::ALL.iter().map(|k| k.as_str()).collect();
+        assert_eq!(words.len(), UpstreamTlsFailure::ALL.len());
+    }
+
+    /// A failed handshake's word is its refusal's, so the counter and the
+    /// end reason read the same.
+    #[test]
+    fn handshake_failures_are_spelled_as_their_refusals() {
+        for outcome in HandshakeOutcome::ALL {
+            match outcome.refusal() {
+                None => assert_eq!(outcome, HandshakeOutcome::Ok),
+                Some(refusal) => {
+                    let word: &'static str = refusal.into();
+                    assert_eq!(word, outcome.as_str());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_verification_failure_is_reported_once_per_transition() {
+        let link = LinkStats::default();
+        assert!(link.upstream_tls_failed(UpstreamTlsFailure::Verify));
+        assert!(!link.upstream_tls_failed(UpstreamTlsFailure::Verify));
+        assert!(!link.upstream_tls_failed(UpstreamTlsFailure::Handshake));
+        link.upstream_tls_verified();
+        assert!(link.upstream_tls_failed(UpstreamTlsFailure::Verify));
+        let snap = link.snapshot();
+        assert_eq!(snap.upstream_tls_failures[&UpstreamTlsFailure::Verify], 3);
+        assert_eq!(
+            snap.upstream_tls_failures[&UpstreamTlsFailure::Handshake],
+            1
+        );
+        assert!(UpstreamTlsFailure::ALL
+            .iter()
+            .all(|k| k.is_backend_failure()
+                == matches!(
+                    k,
+                    UpstreamTlsFailure::Handshake | UpstreamTlsFailure::Timeout
+                )));
     }
 }

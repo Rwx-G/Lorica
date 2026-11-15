@@ -1036,17 +1036,17 @@ on `lorica-core`, `rcgen` dev), `lorica-stream/tests/tls_*.rs` (new),
 `Cargo.lock`.
 Depends on: A, B, C; 12.3 Lot C; 12.5 Lots D and E (same files).
 
-- [ ] Matcher (D-d) over the parsed hello and the stream's rules.
-- [ ] Phase-2 ClientHello reader on the preamble with the deadline
+- [x] Matcher (D-d) over the parsed hello and the stream's rules.
+- [x] Phase-2 ClientHello reader on the preamble with the deadline
       (D-b); passthrough (D-e).
-- [ ] Termination (D-f): per-rule configs, `LocalIpConfigs`, `Rewind`,
+- [x] Termination (D-f): per-rule configs, `LocalIpConfigs`, `Rewind`,
       the deadline, classification, the SNI agreement check, buffer
       limit, half-close over TLS.
-- [ ] Client auth (D-h); upstream TLS (D-i) inside the attempt, with
+- [x] Client auth (D-h); upstream TLS (D-i) inside the attempt, with
       I1's order and I4's decision point; I2 if 12.3 did not.
-- [ ] `StreamTable` carries `ClientIdentity` values (`NoDebug`) and
+- [x] `StreamTable` carries `ClientIdentity` values (`NoDebug`) and
       link rules; counters (D-n); the record's `tls` (D-m).
-- [ ] Tests (Linux, real sockets, `rcgen`, fake seams): IV1 in-crate
+- [x] Tests (Linux, real sockets, `rcgen`, fake seams): IV1 in-crate
       (two names to two echo backends that report the ClientHello they
       received, compared byte for byte with what the client sent; a
       third name `no_match` with nothing forwarded); wildcard depth and
@@ -1314,6 +1314,139 @@ The decisions above cite each one as "Resolved N".
 
 ### Completion Notes
 
+**Lot D (the TLS engine in `lorica-stream`).**
+
+- **I2 landed here**, as its own `refactor(proxy)` commit: 12.3 had
+  split two `TcpStream`s. `Forwarder::run` is generic over any
+  `AsyncRead + AsyncWrite + Unpin` pair; each direction is a poll step
+  over one side's reader and the other's writer, both polled in one
+  `poll_fn` through the same `&mut`, no split and no lock.
+  `DirectionState`, `held_bytes`, the quiesce point and the half-close
+  rules are unchanged; a throttled direction keeps its token wait in a
+  boxed future (allocated only when it must wait) so a dropped `run`
+  loses nothing; the two directions alternate which is polled first. A
+  read error `UnexpectedEof` (a TLS peer's FIN without `close_notify`)
+  is that side's FIN, never an error. The upload buffer is the
+  preamble's length when that exceeds `FORWARD_BUFFER_SIZE`: a
+  passthrough preamble is up to `CLIENTHELLO_BUFFER` and is replayed as
+  one chunk, so the quiesce point still means "nothing in userspace".
+- **The API Lot E wires.** `TcpEngine::with_tls(parts, TlsParts {
+  resolver, public_roots })`, with `resolver` the process's
+  `Arc<CertResolver>` as `Arc<dyn ResolvesServerCertByLocalIp>` and
+  `public_roots` from `tls::load_public_roots()` (one `public_roots()`
+  call, the failure logged once, `None` then). `TcpEngine::new` is
+  unchanged and runs `TlsParts::without_certificates()` (an empty
+  resolver, no roots): terminating streams refuse `no_certificate`,
+  upstream TLS on the public roots ends `no_trust`.
+  `StreamTable::with_client_identities(iter of (certificate id,
+  ClientIdentity))`, with `ClientIdentity::from_pem(cert_pem, key_pem)`
+  for the rows `cert_data_for_resolver` decodes; the table holds them
+  behind `NoDebug`, `ClientIdentity` has no `Debug`. For I3,
+  `StreamTable::rule_of(stream_id, backend_id)` gives the rule a
+  candidate serves (one rule per backend, Resolved 3), so the selector
+  keys per (stream, rule) from `SelectionRequest` as it stands; the
+  candidates it is handed are already the matched rule's links.
+- **Phase 2** (`tcp/engine.rs`). The deadline is `accept +
+  clienthello_timeout_ms`; a trusted PROXY read on a TLS stream is
+  bounded by the earlier of its 5 s and that deadline, and a timeout
+  that is the ClientHello's ends `clienthello_timeout`. The PROXY
+  leftover is copied into the `CLIENTHELLO_BUFFER` (a compile-time
+  assertion pins `MAX_HEADER_LEN` under it) and the reader appends,
+  reparsing the whole buffer after each read. A refusal counts
+  `invalid`, or `oversized` for `InvalidClientHello::Oversized`; an
+  untrusted peer on an accepting TLS stream opening with a PROXY
+  signature still ends `proxy_header_invalid`, counted
+  `refused_untrusted_peer`, as on a plain stream. A client that closes
+  before its hello is complete ends `client_close`, counted under no
+  ClientHello outcome. The rule comes from `tls::matcher::select`; no
+  rule ends `refused(no_match)` before any connect or handshake.
+- **Passthrough** forwards the whole buffer (hello and what followed)
+  as the preamble, after the PROXY header when the stream sends one.
+- **Termination** (`tls/server.rs`): `TerminateConfigs` per stream, one
+  `ServerConfig` per rule (TLS 1.2 and 1.3 on `crypto_provider()`, the
+  stream's one client verifier or none, the shared resolver, the rule's
+  ALPN, `max_early_data_size` 0, rustls' default session cache and no
+  tickets) wrapped in `LocalIpConfigs`; the connection takes
+  `for_connection(|| Some(local_ip))` with the accepted socket's local
+  address. Built in `table_changed` for every stream that terminates or
+  originates TLS (`TlsContext`); a connection whose snapshot is not the
+  one the cache was built from (the table moved on since its accept)
+  builds its own, so it is served by the stream as accepted. The
+  handshake runs on `Rewind(buffer, &mut socket)` under the deadline,
+  with `set_buffer_limit(FORWARD_BUFFER_SIZE)`; `no_certificate` is
+  classified before the handshake (`serves_server_name` or
+  `serves_local_ip`) and rustls still runs; `NoCertificatesPresented` and
+  `InvalidCertificate` are `client_certificate`, anything else
+  `tls_handshake`. Then the SNI agreement check (`sni_mismatch`,
+  `refused(invalid_client_hello)`), the organization allowlist
+  (`tls/client_auth.rs`, `organizations_admitted` over
+  `get_organizations_serial_bytes`), the connect and the loop between
+  the server TLS stream and the backend.
+- **Upstream TLS** (`tls/upstream.rs`, `tcp/connect.rs`): one
+  `ClientConfig` per stream from `http_client::config_builder()`, roots
+  from the stream's bundle (`pem_roots`) or the process's public roots,
+  `accept_any_server()` for `skip_verify` (refused beside a client
+  certificate or a bundle), the client identity from the table, the
+  stream's ALPN. An attempt is TCP connect, the PROXY header, the
+  handshake, under one `connect_timeout_ms`; it is connected when the
+  handshake completes. A config that cannot be built on this node (no
+  public roots, a bundle that does not load, a client identity whose key
+  is not here, a server name that is no name) ends each attempt
+  `no_trust` before any socket opens and without asking the breaker; the
+  connection then ends `connect_failed`. `handshake` and `timeout`
+  failures are recorded as breaker failures; a `verify` failure is not,
+  except that a half-open breaker's probe is answered as a success (the
+  backend did answer; leaving the probe unanswered would hold the
+  breaker half-open), and it is logged at warn once per transition per
+  (stream, backend). A completed handshake clears the transition.
+- **Counters** (D-n): per stream `clienthello` per
+  `ClientHelloOutcome`, `no_sni_matched`, `ech_offered`, `handshakes` per
+  `HandshakeOutcome` (whose words equal the refusals', a test pins it),
+  `sni_mismatch`; per (stream, rule) `matched` in a new `rules` family,
+  pruned when the stream or the rule leaves the table; per (stream,
+  backend) `upstream_tls_failures` per `UpstreamTlsFailure`. A handshake
+  that completed counts `ok` even when the organization allowlist then
+  refuses the client (`refused(client_certificate)`).
+- **The record's `tls`** (D-m): `TlsRecord { mode, server_name,
+  offered_alpn (bytes, GREASE included), negotiated_alpn, rule,
+  ech_offered, client_certificate: Option<ClientCertificateOutcome>,
+  upstream_tls }`, set on every stream with a TLS mode or upstream TLS,
+  `None` otherwise and on UDP.
+- **Tests** (`tests/tls_engine.rs`, real sockets, `rcgen`, fake seams;
+  unit tests in `tls::{matcher, rewind, server, upstream, client_auth}`,
+  `counters`, `table`, `tcp::forward`): IV1 in-crate (two names to two
+  backends that hand back what they received, byte-equal with the
+  hello and the bytes after it; a third name `no_match` with nothing
+  forwarded and no backend connected); wildcard depth and precedence
+  and ALPN by client preference, with a level falling through on ALPN;
+  no SNI refused without a `no_sni` rule and routed with one; a hello
+  trickled one byte per 200 ms ends `clienthello_timeout` at the 1 s
+  deadline; a hello in 3 records replayed whole; PROXY header and hello
+  in one segment; bytes that are no hello refused `invalid`; terminate
+  with an exact-name certificate and, without SNI on a `no_sni` rule,
+  the `iPAddress` certificate; `no_certificate`; the two-CA proof (a
+  client of CA A admitted on A and refused on B, the reverse, no
+  certificate admitted where optional and refused where required);
+  `allowed_organizations` hit and miss; half-close both ways over TLS
+  (the client's `close_notify` reaches the backend as EOF, the
+  backend's FIN reaches the client as `close_notify`); a resolver
+  reload serving the next handshake while an open connection keeps
+  echoing; a drain in the middle of a handshake ending
+  `config_removed`; a rule config refusing a client that offers none of
+  its ALPN; upstream TLS verified on public-style roots from a test CA
+  with `server_name` in each mode (a DNS backend address, an IP one
+  sending no SNI, `fixed`, `client` on a re-encrypting stream) and the
+  ALPN offered; the client identity seen by the backend and printed as
+  `...` in the table; `skip_verify`; a verification failure the breaker
+  never records while a dropped handshake is recorded as a failure;
+  the PROXY header in plaintext before the backend's TLS; no public
+  roots ending `no_trust` with no socket opened.
+- **What Lot E or later must know.** `seams.rs` is untouched:
+  `SelectionRequest` carries no rule (use `rule_of`). The
+  `TlsContext` builds terminate configs on the runtime thread at each
+  table load, as the Pitfalls ask. Story 12.6's pending slot wraps
+  `pipeline` up to the connect, ClientHello and handshake included.
+
 **Lot C (model, schema, validation, entitlement).**
 
 - Migration **77** (`migrate_stream_tls`), the next free number after
@@ -1498,6 +1631,25 @@ The decisions above cite each one as "Resolved N".
 
 ## File List
 
+Lot D:
+
+- `lorica-stream/src/tcp/forward.rs` (I2, its own commit)
+- `lorica-stream/src/tls/mod.rs`, `lorica-stream/src/tls/matcher.rs`,
+  `lorica-stream/src/tls/server.rs`, `lorica-stream/src/tls/client_auth.rs`,
+  `lorica-stream/src/tls/upstream.rs`, `lorica-stream/src/tls/rewind.rs`
+  (new but `mod.rs`)
+- `lorica-stream/src/tcp/engine.rs`, `lorica-stream/src/tcp/connect.rs`,
+  `lorica-stream/src/counters.rs`, `lorica-stream/src/handler.rs`,
+  `lorica-stream/src/table.rs`
+- `lorica-stream/Cargo.toml` (the `lorica-tls` edge, the `rustls`
+  feature on `lorica-core`, `rcgen` dev), `Cargo.lock`
+- `lorica-stream/tests/tls_engine.rs` (new)
+- Outside the allowlist: `lorica-stream/src/lib.rs` (re-exports of
+  `TlsParts`, `ClientIdentity`, `TlsRecord`,
+  `ClientCertificateOutcome`), `lorica-stream/src/udp/engine.rs` (the
+  record's `tls: None`, a literal site)
+- `docs/stories/story-12.4-tls-l4.md`
+
 Lot C:
 
 - `lorica-config/src/models/stream.rs`, `lorica-config/src/models/route.rs`,
@@ -1536,4 +1688,5 @@ Lot A:
 | 2026-11-14 | 0.2 | Maintainer answers folded in as Resolved 1 to 8, all as recommended; `certificate_ids` entitlement extended to replication with store tests (Lot C) and a cluster-profile check (Lot H); `clienthello_timeout_ms` bounds documented with their NFR2 reason. Status Draft. | Romain G. |
 | 2026-11-15 | 0.3 | Lot A landed: `lookup_keys` as the one statement of which certificate serves a name, `serves_server_name` on the resolver trait, `accept_any_server` behind `unverified`. Status InProgress. | Romain G. |
 | 2026-11-15 | 0.4 | Lot B landed: the bounded ClientHello reader `tls::client_hello::parse`, refusing at the first byte that rules a hello out, a record past the hello refused, and its fuzz target in the weekly matrix. | Romain G. |
+| 2026-11-15 | 0.6 | Lot D landed: the forwarding loop over any stream pair (I2), the matcher, passthrough, termination on the shared resolver with per-stream client verification, upstream TLS inside the attempt, the TLS counters and the record's `tls`. | Romain G. |
 | 2026-11-15 | 0.5 | Lot C landed: the TLS fields, rules and link rules of D-k, migration 77, the mode table and rule validation, `drains_on_upgrade`, `organizations_admitted`, canonical digest, diff and import, and certificate key entitlement by streams. Decisions amended after Stories 12.3 and 12.5 landed. | Romain G. |
