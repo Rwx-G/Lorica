@@ -13,6 +13,9 @@
 // limitations under the License.
 
 //! Stream sockets as the supervisor binds them, and the process fd limit.
+//! Also the two `nix` calls the stream engine needs, kept here so
+//! `lorica-stream` takes no `nix` edge of its own: the host's interface
+//! addresses and `IP_BIND_ADDRESS_NO_PORT`.
 //!
 //! - **TCP:** one listening socket per port, `SO_REUSEADDR` on and
 //!   `SO_REUSEPORT` off, so a port any other socket holds is refused with
@@ -218,6 +221,50 @@ pub fn process_fd_limit() -> Result<u64, nix::Error> {
     Ok(soft)
 }
 
+/// Every address assigned to an interface of this host, canonical
+/// (an IPv4-mapped address as the IPv4 address it carries). The stream
+/// engine treats a backend on one of them as local (Story 12.3 D-m):
+/// `10.0.0.5:<management port>` on the node itself is the management
+/// API exactly as `127.0.0.1` is.
+///
+/// # Errors
+///
+/// The `getifaddrs` failure.
+pub fn interface_addresses() -> Result<Vec<IpAddr>, nix::Error> {
+    let mut addresses: Vec<IpAddr> = nix::ifaddrs::getifaddrs()?
+        .filter_map(|ifaddr| {
+            let address = ifaddr.address?;
+            if let Some(v4) = address.as_sockaddr_in() {
+                Some(IpAddr::V4(v4.ip()))
+            } else {
+                address
+                    .as_sockaddr_in6()
+                    .map(|v6| IpAddr::V6(v6.ip()).to_canonical())
+            }
+        })
+        .collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    Ok(addresses)
+}
+
+/// Set `IP_BIND_ADDRESS_NO_PORT` on an unbound socket, so a later `bind`
+/// to `(address, 0)` reserves no ephemeral port and the kernel picks one
+/// at `connect` per destination 4-tuple (Story 12.3 D-l). Must be set
+/// before `bind`. Applies to IPv6 sockets too: Linux handles `SOL_IP`
+/// options on them.
+///
+/// # Errors
+///
+/// The `setsockopt` failure.
+pub fn set_bind_address_no_port(socket: &impl std::os::fd::AsFd) -> Result<(), nix::Error> {
+    nix::sys::socket::setsockopt(
+        socket,
+        nix::sys::socket::sockopt::IpBindAddressNoPort,
+        &true,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +316,22 @@ mod tests {
     #[test]
     fn fd_limit_is_readable() {
         assert!(process_fd_limit().expect("getrlimit") > 0);
+    }
+
+    #[test]
+    fn the_loopback_is_an_interface_address() {
+        let addresses = interface_addresses().expect("getifaddrs");
+        assert!(addresses.contains(&IpAddr::from([127, 0, 0, 1])));
+        assert!(addresses.iter().all(|ip| *ip == ip.to_canonical()));
+    }
+
+    #[test]
+    fn bind_address_no_port_is_set_before_bind() {
+        use nix::sys::socket::{getsockopt, sockopt::IpBindAddressNoPort};
+        for domain in [Domain::IPV4, Domain::IPV6] {
+            let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).expect("socket");
+            set_bind_address_no_port(&socket).expect("setsockopt");
+            assert!(getsockopt(&socket, IpBindAddressNoPort).expect("getsockopt"));
+        }
     }
 }
