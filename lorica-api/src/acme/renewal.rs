@@ -257,7 +257,8 @@ pub(super) fn in_cooldown(
 }
 
 /// Pure selector : among `certs`, return the ids of ACME certificates
-/// that are BOTH unreferenced by any route AND superseded by a sibling
+/// that are BOTH outside the references the caller passes (every route's
+/// and every stream's) AND superseded by a sibling
 /// (same identifier set, strictly later `not_after`).
 ///
 /// The identifier set is the UNION of the primary `domain` and the
