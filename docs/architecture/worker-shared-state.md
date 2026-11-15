@@ -20,12 +20,14 @@ and should be reviewed before code lands.
 1. **Functional parity**: a configuration that behaves a certain way
    in single-process mode (`--workers 0`) must behave the same way in
    worker mode (`--workers N >= 1`). No silent `× N` amplification.
-   Until 1.11.0 the rate-limit auto-ban broke this goal: it counted
-   each client's violations per worker and banned on that worker only
-   (§ 6 (c) describes what replaced it).
-2. **High-perf hot path**: simple per-IP counters (the WAF and
-   rate-limit auto-bans) must not pay an IPC round trip per request.
-   Token bucket state
+   Until 1.11.0 two features broke this goal: the rate-limit auto-ban
+   counted each client's violations per worker and banned on that
+   worker only, and the flood defence compared each worker's own
+   request rate to a proxy-wide threshold (§ 6 (c) and (d) describe
+   what replaced them).
+2. **High-perf hot path**: simple counters (the WAF and rate-limit
+   auto-bans per client, the flood defence's request rate) must not
+   pay an IPC round trip per request. Token bucket state
    (per-route) accepts a bounded ~100 ms imprecision in exchange for
    IPC-free hot path.
 3. **Reusable infrastructure**: the new RPC layer and shared-memory
@@ -407,7 +409,7 @@ re-forked with a fresh memfd; the old region is reclaimed.
 
 ## 6. WPAR-1 implementation
 
-Three parts:
+Four parts:
 
 **(a) WAF auto-ban** -> shmem `waf_auto_ban` (component B). On every
 WAF block a worker adds 1 to the client's count in the shared table
@@ -507,6 +509,26 @@ workers carrying on.
   meantime; they fall in the current minute, whose count a new ban
   needs to cross on its own. A refused count (`SATURATED`) fails open
   and is counted on `lorica_rate_limit_auto_ban_uncounted_total`.
+
+**(d) Flood defence** -> shmem `rate_counters` (component B), since
+1.11.0. While the proxy takes more than `flood_threshold_rps` requests
+per second (over the latest completed second), a per-IP rate-limited
+request costs `flood_threshold_rps / flood_strict_rps` tokens instead
+of 1. Single-process mode counts in its `Rate`. Before 1.11.0 worker
+mode did too, per worker, so the defence engaged only once a single
+worker's share passed the threshold: with N workers sharing the load,
+at about N times the configured value.
+
+Worker mode now adds every request to one key per second in
+`rate_counters` (`WindowedCount` of kind `Requests`), and reads the
+previous second's count, every worker's together. The request path
+pays one atomic add on a cache line all workers share, the same
+order of cost as the per-process `Rate` it replaces, which all of a
+worker's threads already contended for. The supervisor's aggregate
+was the alternative and was rejected: it only reaches the workers on
+the metrics-report tick, seconds late, and would need a new push to
+every worker, while a flood is decided second by second. Nothing is
+counted while the defence is off (`flood_threshold_rps = 0`).
 
 ## 7. WPAR-2/3/7/8 implementation
 

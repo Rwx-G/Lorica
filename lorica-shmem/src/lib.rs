@@ -19,7 +19,7 @@
 //! memfd region shared between the supervisor and all worker processes,
 //! containing two fixed-layout atomic hashtables: the per-client WAF
 //! auto-ban counts, and the windowed counts ([`WindowedCount`]) behind
-//! the rate-limit auto-ban.
+//! the rate-limit auto-ban and the flood defence's proxy-wide rate.
 //!
 //! The entry point is [`SharedRegion`]:
 //!

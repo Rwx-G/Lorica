@@ -1540,6 +1540,98 @@ fn test_global_rate_decays_to_zero() {
     );
 }
 
+fn flood_config(threshold_rps: u32) -> ProxyConfig {
+    ProxyConfig::from_store(
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        ProxyConfigGlobals {
+            flood_threshold_rps: threshold_rps,
+            ..Default::default()
+        },
+    )
+}
+
+/// A proxy as `run_worker` builds one (`shmem` set), or as single-process
+/// mode does (`None`).
+fn flood_proxy(shmem: Option<&'static lorica_shmem::SharedRegion>) -> LoricaProxy {
+    let mut proxy = LoricaProxy::new(
+        Arc::new(arc_swap::ArcSwap::from_pointee(ProxyConfig::default())),
+        Arc::new(lorica_api::logs::LogBuffer::new(8)),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::new(lorica_bench::passive_sla::SlaCollector::new()),
+    );
+    proxy.shmem = shmem;
+    proxy
+}
+
+const SECOND_NS: u64 = 1_000_000_000;
+
+#[test]
+fn the_flood_threshold_is_crossed_by_every_worker_together() {
+    // flood_threshold_rps = 100 with the default strict rate (50): a
+    // per-IP request costs 2 tokens while the proxy takes more than 100
+    // requests per second. Four workers taking 30 each are such a proxy;
+    // counted per worker, as before 1.11.0, none of them ever was.
+    let (region, _fd) = lorica_shmem::SharedRegion::create_supervisor().expect("region");
+    let workers: Vec<LoricaProxy> = (0..4).map(|_| flood_proxy(Some(region))).collect();
+    let config = flood_config(100);
+    let second = 9_000_000 * SECOND_NS;
+    for (i, worker) in workers.iter().enumerate() {
+        for n in 0..30u64 {
+            worker.count_request_for_flood_defence(100, second + (n * 4 + i as u64) * 8_000_000);
+        }
+    }
+    let next = second + SECOND_NS;
+    for worker in &workers {
+        assert_eq!(worker.proxy_wide_rps(next), 120.0);
+        assert_eq!(worker.flood_cost(&config, next), 2);
+    }
+
+    // 96 requests in a second stay under the threshold.
+    let later = next + SECOND_NS;
+    for worker in &workers {
+        for n in 0..24u64 {
+            worker.count_request_for_flood_defence(100, later + n * 10_000_000);
+        }
+    }
+    for worker in &workers {
+        assert_eq!(worker.flood_cost(&config, later + SECOND_NS), 1);
+    }
+}
+
+#[test]
+fn workers_count_no_request_while_the_flood_defence_is_off() {
+    let (region, _fd) = lorica_shmem::SharedRegion::create_supervisor().expect("region");
+    let worker = flood_proxy(Some(region));
+    let second = 9_100_000 * SECOND_NS;
+    for _ in 0..500 {
+        worker.count_request_for_flood_defence(0, second);
+    }
+    assert_eq!(worker.proxy_wide_rps(second + SECOND_NS), 0.0);
+    assert_eq!(worker.flood_cost(&flood_config(0), second + SECOND_NS), 1);
+}
+
+#[test]
+fn single_process_mode_weighs_its_own_requests_over_the_last_second() {
+    // Unchanged by 1.11.0: `global_rate`, on the process's own clock,
+    // counted whatever the threshold.
+    let proxy = flood_proxy(None);
+    for _ in 0..150 {
+        proxy.count_request_for_flood_defence(0, 0);
+    }
+    assert_eq!(
+        proxy.flood_cost(&flood_config(100), 0),
+        1,
+        "no completed second yet"
+    );
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(proxy.proxy_wide_rps(0) >= 140.0);
+    assert_eq!(proxy.flood_cost(&flood_config(100), 0), 2);
+    assert_eq!(proxy.flood_cost(&flood_config(200), 0), 1);
+}
+
 // ---- Catch-all Hostname ----
 
 #[test]

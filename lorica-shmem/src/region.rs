@@ -58,8 +58,8 @@ pub const LAYOUT_VERSION: u32 = 1;
 /// auto-ban table, one key per client address with a WAF violation in
 /// the last [`DEFAULT_STALE_AFTER`](crate::DEFAULT_STALE_AFTER), and
 /// for the rate counters, one key per client and per minute with a
-/// rate-limit violation over the same span, since idle keys are
-/// evicted. Up to that load a key is refused with
+/// rate-limit violation over the same span, plus one per second of
+/// proxy-wide request count, since idle keys are evicted. Up to that load a key is refused with
 /// [`SATURATED`](crate::SATURATED) less than once in 100 000, the bound
 /// the table's fill test holds. Past it, refusals grow steeply with the
 /// load (see [`MAX_PROBE`](crate::MAX_PROBE)); they fail open and are
@@ -86,7 +86,8 @@ pub struct SharedRegion {
     _pad0: [u8; 32],
     /// Windowed counts shared by the workers, written and read through
     /// [`WindowedCount`](crate::WindowedCount): each client's rate-limit
-    /// violations per minute, for the rate-limit auto-ban.
+    /// violations per minute, for the rate-limit auto-ban, and the
+    /// proxy's requests per second, for the flood defence.
     ///
     /// Named `waf_flood` until 1.11.0, for a per-client WAF flood count
     /// that was designed and never built: no release ever wrote to it.

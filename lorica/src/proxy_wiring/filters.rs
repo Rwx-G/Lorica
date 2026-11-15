@@ -77,6 +77,20 @@ pub const RATE_LIMIT_VIOLATIONS: lorica_shmem::WindowedCount = lorica_shmem::Win
     RATE_LIMIT_VIOLATION_WINDOW,
 );
 
+/// The window the flood defence's proxy-wide rate is read over: the
+/// latest completed second, in single-process mode (`global_rate`) and
+/// worker mode ([`PROXY_REQUESTS`]) alike.
+pub const FLOOD_RATE_WINDOW: Duration = Duration::from_secs(1);
+
+/// Every worker's requests per second, in the shared region. Counted
+/// on one key, [`PROXY_WIDE`]: the flood threshold is a rate for the
+/// whole proxy, not per worker.
+pub const PROXY_REQUESTS: lorica_shmem::WindowedCount =
+    lorica_shmem::WindowedCount::new(lorica_shmem::CountKind::Requests, FLOOD_RATE_WINDOW);
+
+/// The one subject [`PROXY_REQUESTS`] counts: the proxy as a whole.
+pub const PROXY_WIDE: u64 = 0;
+
 /// A rate-limit auto-ban a worker decided, on its way to the
 /// supervisor, which applies it on every worker and raises its alert
 /// (`waf.sock`, see `startup::waf_forward`).
@@ -916,6 +930,56 @@ impl LoricaProxy {
         .then_some(violations)
     }
 
+    /// Count one request toward the proxy-wide rate the flood defence
+    /// weighs. Single-process mode counts every request in
+    /// `global_rate`, as it always did. Worker mode counts in the shared
+    /// region, so the rate is every worker's together, and only while
+    /// the defence is on (`flood_threshold_rps > 0`): every worker adds
+    /// to the same key, which is not worth contending for nothing.
+    pub fn count_request_for_flood_defence(&self, flood_threshold_rps: u32, now_ns: u64) {
+        match self.shmem {
+            None => {
+                self.global_rate.observe(&"global", 1);
+            }
+            Some(region) => {
+                if flood_threshold_rps > 0 {
+                    PROXY_REQUESTS.observe(region, PROXY_WIDE, now_ns);
+                }
+            }
+        }
+    }
+
+    /// Requests per second the whole proxy received over the latest
+    /// completed second: this process's in single-process mode, every
+    /// worker's together in worker mode.
+    pub fn proxy_wide_rps(&self, now_ns: u64) -> f64 {
+        match self.shmem {
+            None => self.global_rate.rate(&"global"),
+            Some(region) => PROXY_REQUESTS.rate(region, PROXY_WIDE, now_ns),
+        }
+    }
+
+    /// Tokens a per-IP rate-limited request costs under the adaptive
+    /// flood defence: 1, or `flood_threshold_rps / flood_strict_rps`
+    /// rounded while [`Self::proxy_wide_rps`] is above the threshold.
+    pub fn flood_cost(&self, config: &ProxyConfig, now_ns: u64) -> u32 {
+        if config.flood_threshold_rps == 0
+            || self.proxy_wide_rps(now_ns) <= config.flood_threshold_rps as f64
+        {
+            return 1;
+        }
+        let strict = if config.flood_strict_rps > 0 {
+            config.flood_strict_rps
+        } else {
+            config.flood_threshold_rps / 2
+        };
+        if strict > 0 && config.flood_threshold_rps > strict {
+            ((config.flood_threshold_rps as f64 / strict as f64).round() as u32).max(1)
+        } else {
+            1
+        }
+    }
+
     /// Ban `ip` for `ban_duration_s` (the route's `auto_ban_duration_s`)
     /// after [`Self::rate_limit_violation_earns_ban`] said so.
     ///
@@ -1005,25 +1069,12 @@ impl LoricaProxy {
         // the token-bucket equivalent of the historical 0.5x "halve the
         // limit" factor. Only PerIp buckets are tightened, matching the
         // legacy per-IP-only semantics.
-        let mut cost: u32 = 1;
-        if config.flood_threshold_rps > 0
-            && rl.scope == lorica_config::models::RateLimitScope::PerIp
-        {
-            let global_rps = self.global_rate.rate(&"global");
-            if global_rps > config.flood_threshold_rps as f64 {
-                let strict = if config.flood_strict_rps > 0 {
-                    config.flood_strict_rps
-                } else {
-                    config.flood_threshold_rps / 2
-                };
-                if strict > 0 && config.flood_threshold_rps > strict {
-                    cost =
-                        ((config.flood_threshold_rps as f64 / strict as f64).round() as u32).max(1);
-                }
-            }
-        }
-
         let now_ns = lorica_shmem::now_ns();
+        let cost = if rl.scope == lorica_config::models::RateLimitScope::PerIp {
+            self.flood_cost(config, now_ns)
+        } else {
+            1
+        };
         let admitted = self.rate_limit_buckets.try_consume(&key, &rl, cost, now_ns);
 
         // Rate-limit response headers (kept even when admitted, matching

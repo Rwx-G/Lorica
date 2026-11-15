@@ -173,7 +173,9 @@ pub struct LoricaProxy {
     pub waf_violations: Arc<DashMap<String, AtomicU64>>,
     /// Per-route active connection counters for `max_connections` enforcement.
     pub route_connections: Arc<DashMap<String, Arc<AtomicU64>>>,
-    /// Global request rate tracker for flood detection and dashboard metrics.
+    /// Global request rate tracker for flood detection, in
+    /// single-process mode. Worker mode counts in `shmem` instead, see
+    /// [`LoricaProxy::count_request_for_flood_defence`].
     pub global_rate: Arc<lorica_limits::rate::Rate>,
     /// Cache hit counter for dashboard stats.
     pub cache_hits: Arc<AtomicU64>,
@@ -364,7 +366,7 @@ impl LoricaProxy {
             rate_limit_bans: Arc::new(RateLimitBanQueue::default()),
             waf_violations: Arc::new(DashMap::new()),
             route_connections: Arc::new(DashMap::new()),
-            global_rate: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1))),
+            global_rate: Arc::new(lorica_limits::rate::Rate::new(filters::FLOOD_RATE_WINDOW)),
             cache_hits: Arc::new(AtomicU64::new(0)),
             cache_misses: Arc::new(AtomicU64::new(0)),
             request_counts: Arc::new(DashMap::new()),
@@ -1056,11 +1058,13 @@ impl ProxyHttp for LoricaProxy {
                 return Ok(handled);
             }
 
-            // Global flood tracking (before any other processing)
-            self.global_rate.observe(&"global", 1);
-
-            // Global connection limit (before any other processing)
+            // Global flood tracking and connection limit (before any
+            // other processing)
             let config = self.config.load();
+            self.count_request_for_flood_defence(
+                config.flood_threshold_rps,
+                lorica_shmem::now_ns(),
+            );
             if let Some(handled) = self
                 .check_global_connection_limit(session, ctx, &config)
                 .await?

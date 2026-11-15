@@ -204,6 +204,38 @@ fn workers_counting_one_clients_violations_add_up_to_one_rate() {
 }
 
 #[test]
+fn workers_requests_add_up_to_one_proxy_wide_rate() {
+    // Four workers each serve 30 requests in a second, all on one key.
+    // The next second every worker reads 120 per second, past a flood
+    // threshold of 100 that no worker's own 30 reaches.
+    let (region, fd) = SharedRegion::create_supervisor().expect("create");
+    let fd_raw = fd.as_raw_fd();
+    const CHILDREN: u64 = 4;
+    const PER_CHILD: u64 = 30;
+    const SECOND_NS: u64 = 1_000_000_000;
+    let requests = WindowedCount::new(CountKind::Requests, Duration::from_secs(1));
+    let second = 5_000_000 * SECOND_NS;
+
+    let pids: Vec<Pid> = (0..CHILDREN)
+        .map(|child| {
+            fork_child(fd_raw, move |r| {
+                for i in 0..PER_CHILD {
+                    let now =
+                        second + (i * CHILDREN + child) * (SECOND_NS / (PER_CHILD * CHILDREN));
+                    assert!(requests.observe(r, 0, now));
+                }
+            })
+        })
+        .collect();
+    wait_all(&pids);
+
+    let rate = requests.rate(region, 0, second + SECOND_NS);
+    assert_eq!(rate, (CHILDREN * PER_CHILD) as f64);
+    assert!(PER_CHILD < 100 && rate > 100.0);
+    drop(fd);
+}
+
+#[test]
 fn exactly_one_worker_takes_each_completed_window() {
     // Every worker sees a client's rate cross the threshold at once;
     // only the one that takes the window may request the ban. The

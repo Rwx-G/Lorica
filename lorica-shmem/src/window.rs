@@ -41,6 +41,9 @@ pub enum CountKind {
     /// Requests refused by a route's rate limit, per client address:
     /// the evidence the rate-limit auto-ban weighs.
     RateLimitViolations = 1,
+    /// Requests the proxy received, every client together: the
+    /// proxy-wide rate the flood defence compares to its threshold.
+    Requests = 2,
 }
 
 /// A count of `kind` events per subject and per window of fixed length.
@@ -145,6 +148,20 @@ mod tests {
         let next = now + 60 * SECOND;
         assert_eq!(violations.rate(region, 1, next), 1.0);
         assert_eq!(violations.rate(region, 2, next), 0.0);
+    }
+
+    #[test]
+    fn kinds_keep_separate_counts_for_the_same_subject_and_window() {
+        let (region, _fd) = SharedRegion::create_supervisor().expect("create");
+        let violations = WindowedCount::new(CountKind::RateLimitViolations, MINUTE);
+        let requests = WindowedCount::new(CountKind::Requests, MINUTE);
+        let now = 700 * 60 * SECOND;
+        for _ in 0..60 {
+            requests.observe(region, 0, now);
+        }
+        let next = now + 60 * SECOND;
+        assert_eq!(requests.rate(region, 0, next), 1.0);
+        assert_eq!(violations.rate(region, 0, next), 0.0);
     }
 
     #[test]
