@@ -9,11 +9,13 @@
 //! A follower reports the same figures in its heartbeat
 //! ([`heartbeat_report`]), which is how a control plane checks a stream
 //! write against a node it does not run and shows that node's budget.
-//! The arithmetic is `lorica_stream::budget`'s and every demand is
+//! The arithmetic is `lorica_stream::budget`'s, every demand is
 //! `StreamDemand::of`, the function the node's driver builds its own
-//! demands with (the TCP engine's connections included, Story 12.3
-//! D-p), so the API refuses exactly what the node would refuse at bind
-//! with `fd_budget`.
+//! demands with (the TCP engine's connections and the UDP engine's
+//! sessions included, Stories 12.3 D-p and 12.5 D-e), and the rule is
+//! `FdBudget::check_change`, the one the driver binds by, so the API
+//! refuses exactly what the node would refuse at bind with `fd_budget`
+//! or `source_ports`.
 
 use std::collections::HashMap;
 
@@ -50,22 +52,44 @@ pub const STREAM_FD_BUDGET_CODE: &str = "stream_fd_budget";
 #[derive(Debug, Clone)]
 pub struct StreamPlaneState {
     states: StreamBindStates,
-    fds: NodeFds,
+    fd_limit: u64,
+    worker_count: u32,
+    source_ports: SourcePorts,
+}
+
+/// Where a [`StreamPlaneState`] takes `U`, the usable UDP source ports
+/// per source address (Story 12.5 D-e).
+#[derive(Debug, Clone, Copy)]
+enum SourcePorts {
+    /// The host's port range, read at every use as the node's driver
+    /// reads it at every pass, so a sysctl change is seen without a
+    /// restart.
+    Host,
+    /// A fixed figure, `None` for a range that cannot be read.
+    Fixed(Option<u64>),
 }
 
 impl StreamPlaneState {
     /// The stream plane of a process whose soft fd limit is `fd_limit`
     /// (0 when it could not be read, which leaves no stream budget) and
     /// which runs `worker_count` workers (1 in single-process mode),
-    /// reading the bind states from `states`.
+    /// reading the bind states from `states` and its usable UDP source
+    /// ports from the host.
     pub fn new(states: StreamBindStates, fd_limit: u64, worker_count: u32) -> Self {
         StreamPlaneState {
             states,
-            fds: NodeFds {
-                fd_limit,
-                worker_count,
-            },
+            fd_limit,
+            worker_count,
+            source_ports: SourcePorts::Host,
         }
+    }
+
+    /// The same plane with `U` fixed at `usable_source_ports` instead of
+    /// read from the host; `None` stands for a range that cannot be read,
+    /// which leaves the fd constraints alone to decide.
+    pub fn with_usable_source_ports(mut self, usable_source_ports: Option<u64>) -> Self {
+        self.source_ports = SourcePorts::Fixed(usable_source_ports);
+        self
     }
 
     /// This node's bind state of `stream_id`, `None` when this node does
@@ -74,28 +98,56 @@ impl StreamPlaneState {
         self.states.get(stream_id)
     }
 
-    /// This node's budget inputs.
+    /// This node's budget inputs, `U` read now.
     pub fn fds(&self) -> NodeFds {
-        self.fds
+        NodeFds {
+            fd_limit: self.fd_limit,
+            worker_count: self.worker_count,
+            usable_source_ports: match self.source_ports {
+                SourcePorts::Fixed(usable) => usable,
+                // The driver logs an unreadable range at every pass; a
+                // second warning here would repeat it at every read.
+                SourcePorts::Host => match lorica_stream::budget::usable_udp_source_ports() {
+                    Ok(usable) => Some(u64::from(usable)),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "usable UDP source ports unreadable");
+                        None
+                    }
+                },
+            },
+        }
     }
 }
 
 #[cfg(test)]
 impl StreamPlaneState {
     /// A plane that binds nothing yet, at the packaged unit's
-    /// `LimitNOFILE` with one worker: the test `AppState`s' default.
+    /// `LimitNOFILE` and the default port range's `U`, with one worker:
+    /// the test `AppState`s' default.
     pub(crate) fn unbound_at_packaged_limit() -> Self {
         StreamPlaneState::new(StreamBindStates::new(), 65_536, 1)
+            .with_usable_source_ports(Some(DEFAULT_RANGE_USABLE_PORTS))
     }
 }
 
-/// A node's fd limit and worker count, what its budget is computed from.
+/// `U` at the kernel's default `ip_local_port_range` (32768 to 60999),
+/// nothing reserved: what the tests' nodes report.
+#[cfg(test)]
+pub(crate) const DEFAULT_RANGE_USABLE_PORTS: u64 = 27_208;
+
+/// A node's budget inputs: its fd limit and worker count, and its usable
+/// UDP source ports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeFds {
     /// The process's soft `RLIMIT_NOFILE`.
     pub fd_limit: u64,
     /// Workers on the node, the UDP slot count.
     pub worker_count: u32,
+    /// `U`, the usable UDP source ports per source address; `None` when
+    /// the node could not read its port range or has not reported it (a
+    /// node from before Story 12.5), which leaves the fd constraints
+    /// alone to decide.
+    pub usable_source_ports: Option<u64>,
 }
 
 impl NodeFds {
@@ -104,6 +156,7 @@ impl NodeFds {
         NodeFds {
             fd_limit: report.fd_limit,
             worker_count: report.worker_count,
+            usable_source_ports: report.usable_source_ports,
         }
     }
 }
@@ -117,13 +170,14 @@ pub fn committed(plane: &StreamPlaneState, role: NodeRole<'_>, streams: &[Stream
         .filter(|s| binds_here(s, role))
         .map(StreamDemand::of)
         .collect();
-    FdBudget::from_limit(plane.fds.fd_limit).usage(&demands, plane.fds.worker_count)
+    FdBudget::from_limit(plane.fd_limit).usage(&demands, plane.worker_count)
 }
 
 /// This node's stream plane as its heartbeat reports it (D-i): the
-/// budget inputs, `usage` (from [`committed`]), how many bindings are
-/// bound, and every binding that is not, failures first, at most
-/// [`MAX_STREAM_PLANE_BINDINGS`] with `truncated` set past it.
+/// budget inputs (`U` read now, Story 12.5 D-e), `usage` (from
+/// [`committed`]), how many bindings are bound, and every binding that
+/// is not, failures first, at most [`MAX_STREAM_PLANE_BINDINGS`] with
+/// `truncated` set past it.
 ///
 /// Built so the control plane's decode-boundary check
 /// (`lorica_cluster::stream_plane_report_defect`) passes: an OS error
@@ -155,15 +209,17 @@ pub fn heartbeat_report(plane: &StreamPlaneState, usage: BudgetUsage) -> StreamP
     let mut bindings = failed;
     bindings.extend(pending);
     bindings.truncate(MAX_STREAM_PLANE_BINDINGS);
+    let fds = plane.fds();
     StreamPlaneReport {
-        fd_limit: plane.fds.fd_limit,
-        worker_count: plane.fds.worker_count,
+        fd_limit: fds.fd_limit,
+        worker_count: fds.worker_count,
         listen_sockets_used: usage.listen_sockets_used,
         worker_fds_committed: usage.worker_fds_committed,
         supervisor_fds_committed: usage.supervisor_fds_committed,
         bound_count,
         truncated: not_bound > bindings.len(),
         bindings,
+        usable_source_ports: fds.usable_source_ports,
     }
 }
 
@@ -283,30 +339,20 @@ impl BudgetRefusal {
     }
 }
 
-/// Whether `candidate` adds nothing to what `stored` already asked of a
-/// node in `role`: the same protocol, no more ports, no more fds held
-/// at its cap, already bound there. Such a write (a rename, a backend
-/// change) is never refused for the budget, so a node already over it
-/// after a cap was lowered can still have its streams edited, disabled
-/// or narrowed.
-fn adds_no_demand(stored: Option<&Stream>, candidate: &Stream, role: NodeRole<'_>) -> bool {
-    stored.is_some_and(|s| {
-        let (was, will) = (StreamDemand::of(s), StreamDemand::of(candidate));
-        binds_here(s, role)
-            && s.protocol == candidate.protocol
-            && was.listen_sockets >= will.listen_sockets
-            && was.worker_fds() >= will.worker_fds()
-    })
-}
-
 /// Check a stream write against the budget of every node in `nodes`
-/// (D-e): `candidate` as it would be written, `stored` the row it
-/// replaces (`None` on create), `others` every stored stream (the
-/// candidate's own row is skipped).
+/// (Story 12.2 D-e, Story 12.5 D-e): `candidate` as it would be
+/// written, `stored` the row it replaces (`None` on create), `others`
+/// every stored stream (the candidate's own row is skipped).
 ///
-/// A node that would not bind the candidate, or to which the write adds
-/// nothing, is not checked. A node without figures cannot be checked
-/// here: it is named in the returned warnings and refuses at bind.
+/// Each node applies [`FdBudget::check_change`], the rule the node's own
+/// bind applies: the fd constraints and, where the node knows its `U`,
+/// the source ports; a write that raises nothing over what the stored
+/// row asks of a node already binding it (a rename, a backend change, a
+/// lower share) is never refused, so a node past its ceiling can still
+/// have its streams edited, disabled or narrowed. A node that would not
+/// bind the candidate, or to which the write adds nothing, is not
+/// checked. A node without figures cannot be checked here: it is named
+/// in the returned warnings and refuses at bind.
 ///
 /// # Errors
 ///
@@ -318,9 +364,16 @@ pub(crate) fn check_write(
     nodes: &[BudgetNode<'_>],
     listen_socket_cap: u32,
 ) -> Result<Vec<String>, BudgetRefusal> {
+    let demand = StreamDemand::of(candidate);
     let mut warnings = Vec::new();
     for node in nodes {
-        if !binds_here(candidate, node.role) || adds_no_demand(stored, candidate, node.role) {
+        if !binds_here(candidate, node.role) {
+            continue;
+        }
+        let counted = stored
+            .filter(|s| binds_here(s, node.role))
+            .map(StreamDemand::of);
+        if counted.as_ref().is_some_and(|was| !demand.raises(was)) {
             continue;
         }
         let Some(fds) = node.fds else {
@@ -335,10 +388,16 @@ pub(crate) fn check_write(
             .iter()
             .filter(|s| s.id != candidate.id && binds_here(s, node.role))
             .map(StreamDemand::of)
-            .chain(std::iter::once(StreamDemand::of(candidate)))
             .collect();
         FdBudget::from_limit(fds.fd_limit)
-            .check(&demands, fds.worker_count, listen_socket_cap)
+            .check_change(
+                &demand,
+                counted.as_ref(),
+                &demands,
+                fds.worker_count,
+                listen_socket_cap,
+                fds.usable_source_ports,
+            )
             .map_err(|violation| BudgetRefusal {
                 label: node.label.clone(),
                 violation,
@@ -378,9 +437,7 @@ pub(crate) fn local_view(
             worker_count: fds.worker_count,
             listen_socket_cap: settings.stream_listen_socket_cap,
             worker_drain_timeout_s: settings.worker_drain_timeout_s,
-            // Read and carried by Story 12.5 Lot G; until then the
-            // ceiling is the fd budget's alone.
-            usable_source_ports: None,
+            usable_source_ports: fds.usable_source_ports,
         },
         &shares,
     )
@@ -421,8 +478,7 @@ pub(crate) fn reported_view(
             worker_count: report.worker_count,
             listen_socket_cap: settings.stream_listen_socket_cap,
             worker_drain_timeout_s: settings.worker_drain_timeout_s,
-            // The heartbeat carries it from Story 12.5 Lot G.
-            usable_source_ports: None,
+            usable_source_ports: report.usable_source_ports,
         },
         &shares,
     );
@@ -531,6 +587,7 @@ mod tests {
     const PACKAGED: NodeFds = NodeFds {
         fd_limit: 65_536,
         worker_count: 8,
+        usable_source_ports: Some(DEFAULT_RANGE_USABLE_PORTS),
     };
 
     fn stream(id: &str, protocol: StreamProtocol, first: u16, last: u16) -> Stream {
@@ -575,6 +632,7 @@ mod tests {
         let small = NodeFds {
             fd_limit: 4096,
             worker_count: 2,
+            usable_source_ports: Some(DEFAULT_RANGE_USABLE_PORTS),
         };
         let mut candidate = stream("dns", StreamProtocol::Udp, 20_000, 20_999);
         candidate
@@ -691,14 +749,20 @@ mod tests {
     }
 
     /// What the node's driver refuses at bind for `streams` on a node
-    /// of `fds`: its arithmetic over the demands it builds, which are
-    /// [`StreamDemand::of`] each stream (pinned on the driver's side by
-    /// `a_tcp_binding_declares_what_its_connections_hold`).
+    /// of `fds`, the last one new there: its rule over the demands it
+    /// builds, which are [`StreamDemand::of`] each stream (pinned on the
+    /// driver's side by `a_tcp_binding_declares_what_its_connections_hold`).
     fn node_verdict(streams: &[&Stream], fds: NodeFds, cap: u32) -> Result<(), BudgetViolation> {
-        let demands: Vec<StreamDemand> = streams.iter().map(|s| StreamDemand::of(s)).collect();
-        FdBudget::from_limit(fds.fd_limit)
-            .check(&demands, fds.worker_count, cap)
-            .map(|_| ())
+        let mut demands: Vec<StreamDemand> = streams.iter().map(|s| StreamDemand::of(s)).collect();
+        let new = demands.pop().expect("a stream to bind");
+        FdBudget::from_limit(fds.fd_limit).check_change(
+            &new,
+            None,
+            &demands,
+            fds.worker_count,
+            cap,
+            fds.usable_source_ports,
+        )
     }
 
     #[test]
@@ -753,6 +817,7 @@ mod tests {
         let small = NodeFds {
             fd_limit: 2048,
             worker_count: 1,
+            usable_source_ports: Some(DEFAULT_RANGE_USABLE_PORTS),
         };
         let nodes = [this_node(Some(small))];
         let mut lowered = stored.clone();
@@ -763,6 +828,82 @@ mod tests {
         let refusal = check_write(&raised, Some(&stored), others, &nodes, 2048)
             .expect_err("more connections are more fds");
         assert_eq!(refusal.violation.constraint(), "worker_fds");
+    }
+
+    fn udp_on_private(id: &str, port: u16) -> Stream {
+        Stream::new(
+            id.into(),
+            id.into(),
+            StreamProtocol::Udp,
+            "10.0.0.10".parse().expect("an address"),
+            port,
+            port,
+            Utc::now(),
+        )
+    }
+
+    #[test]
+    fn the_api_refuses_exactly_what_the_node_would_for_udp_shares_of_the_source_ports() {
+        // Six default UDP streams fill the default pool at the default
+        // range; the seventh needs ports the node does not have.
+        let six: Vec<Stream> = (0..6)
+            .map(|n| udp_on_private(&format!("u{n}"), 5000 + n))
+            .collect();
+        let seventh = udp_on_private("u6", 6000);
+        let nodes = [this_node(Some(PACKAGED))];
+        assert!(check_write(&six[5], None, &six[..5], &nodes, 2048).is_ok());
+        let refusal = check_write(&seventh, None, &six, &nodes, 2048)
+            .expect_err("a seventh default UDP stream exceeds the source ports");
+        assert_eq!(
+            refusal.violation,
+            BudgetViolation::SourcePorts {
+                pool: lorica_stream::budget::SourcePool::Default,
+                committed: 7 * 4096,
+                usable: DEFAULT_RANGE_USABLE_PORTS
+            }
+        );
+        let mut all: Vec<&Stream> = six.iter().collect();
+        all.push(&seventh);
+        assert_eq!(Err(refusal.violation), node_verdict(&all, PACKAGED, 2048));
+        // A node that could not read its range checks its fds only.
+        let unread = [this_node(Some(NodeFds {
+            usable_source_ports: None,
+            ..PACKAGED
+        }))];
+        assert!(check_write(&seventh, None, &six, &unread, 2048).is_ok());
+    }
+
+    #[test]
+    fn a_node_past_its_source_port_ceiling_takes_writes_that_raise_nothing() {
+        // Three default UDP streams on a range narrowed to 10,000 ports.
+        let streams: Vec<Stream> = (0..3)
+            .map(|n| udp_on_private(&format!("u{n}"), 5000 + n))
+            .collect();
+        let narrowed = [this_node(Some(NodeFds {
+            usable_source_ports: Some(10_000),
+            ..PACKAGED
+        }))];
+        let stored = &streams[0];
+        let write =
+            |candidate: &Stream| check_write(candidate, Some(stored), &streams, &narrowed, 2048);
+
+        let mut moved = stored.clone();
+        moved.port_first = 7000;
+        moved.port_last = 7000;
+        let mut lowered = stored.clone();
+        lowered.udp.as_mut().expect("UDP settings").max_sessions = 1024;
+        for candidate in [&moved, &lowered] {
+            assert_eq!(write(candidate), Ok(Vec::new()), "{candidate:?}");
+        }
+        let mut raised = stored.clone();
+        raised.udp.as_mut().expect("UDP settings").max_sessions = 4097;
+        let refusal = write(&raised).expect_err("a raise is checked against the ports");
+        assert_eq!(refusal.violation.constraint(), "source_ports");
+        let message = refusal.into_error(&raised).to_string();
+        assert!(
+            message.contains("source_ports") && message.contains("10000"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -855,7 +996,7 @@ mod tests {
             6000,
             Utc::now(),
         );
-        let plane = StreamPlaneState::new(states, 65_536, 2);
+        let plane = StreamPlaneState::new(states, 65_536, 2).with_usable_source_ports(Some(9_000));
         let streams = [
             stream(&uuid(1), StreamProtocol::Tcp, 5432, 5432),
             stream(&uuid(3), StreamProtocol::Udp, 6000, 6001),
@@ -865,6 +1006,13 @@ mod tests {
         assert_eq!(lorica_cluster::stream_plane_report_defect(&report), None);
         assert_eq!(report.fd_limit, 65_536);
         assert_eq!(report.worker_count, 2);
+        assert_eq!(report.usable_source_ports, Some(9_000));
+        assert_eq!(
+            heartbeat_report(&plane.clone().with_usable_source_ports(None), usage)
+                .usable_source_ports,
+            None,
+            "a range the node cannot read is not reported, never guessed"
+        );
         assert_eq!(report.listen_sockets_used, 3);
         let held = |s: &Stream| {
             lorica_stream::held_fds(s)
@@ -942,6 +1090,7 @@ mod tests {
             bound_count: 1,
             bindings,
             truncated,
+            usable_source_ports: Some(10_000),
         }
     }
 

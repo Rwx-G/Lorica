@@ -1293,10 +1293,10 @@ impl Stream {
 
     /// The stream's own rules: id ([`is_canonical_stream_id`]), name,
     /// group, listen address, ports, the [`STREAM_PORT_RANGE_MAX`] cap,
-    /// the selector rule shared with routes, the engine settings, and on
-    /// UDP its settings. The listen-address rule
-    /// ([`udp_exposure_check`]) joins it with Story 12.5 Lot G, which
-    /// makes `udp.source_session_cap` settable from the management API. Which backends it may
+    /// the selector rule shared with routes, the engine settings, on UDP
+    /// its settings, and last the listen-address rule
+    /// ([`udp_exposure_check`]), with no source allowlist until Story
+    /// 12.6 passes the stream's own. Which backends it may
     /// reach is [`check_backend_attachments`]; which ports it may hold
     /// on a node is `crate::listen_ports::stream_port_conflicts`.
     ///
@@ -1365,7 +1365,8 @@ impl Stream {
         }
         validate_node_selector_names(&self.node_selector)
             .map_err(|e| format!("stream `{}`: {e}", self.name))?;
-        self.validate_engine_settings()
+        self.validate_engine_settings()?;
+        udp_exposure_check(self, false)
     }
 
     /// The Story 12.3 settings (D-q): ranges, the PROXY trust list
@@ -3395,6 +3396,12 @@ pub(crate) mod tests {
             assert!(err.contains("source allowlist"), "{err}");
             assert!(err.contains("udp.source_session_cap"), "{err}");
             assert!(udp_exposure_check(&refused, true).is_ok(), "{address}");
+            assert_eq!(
+                refused.validate(),
+                Err(err),
+                "Stream::validate applies the rule"
+            );
+            assert!(with(address, Some(max)).validate().is_ok(), "{address}");
             assert!(check(&with(address, Some(max))).is_ok(), "{address}");
             assert!(check(&with(address, Some(1))).is_ok(), "{address}");
             assert!(

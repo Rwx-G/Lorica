@@ -568,6 +568,7 @@ fn report(bindings: Vec<lorica_cluster::StreamBindingReport>) -> lorica_cluster:
         bound_count: 1,
         bindings,
         truncated: false,
+        usable_source_ports: Some(27_208),
     }
 }
 

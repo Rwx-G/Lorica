@@ -374,6 +374,12 @@ pub struct StreamPlaneReport {
     /// More bindings were not bound than `bindings` holds.
     #[prost(bool, tag = "8")]
     pub truncated: bool,
+    /// `U`, the usable UDP source ports per source address (Story 12.5
+    /// D-e), at most 65535. Absent from a node that could not read its
+    /// port range and from a node before Story 12.5, either of which the
+    /// control plane checks on its fds alone.
+    #[prost(uint64, optional, tag = "9")]
+    pub usable_source_ports: Option<u64>,
 }
 
 /// Most bindings one [`StreamPlaneReport`] lists. Past it the sender
@@ -400,6 +406,14 @@ pub const MAX_STREAM_BINDING_OS_ERROR_BYTES: usize = 256;
 pub fn stream_plane_report_defect(report: &StreamPlaneReport) -> Option<&'static str> {
     if report.bindings.len() > MAX_STREAM_PLANE_BINDINGS {
         return Some("more bindings than a report may list");
+    }
+    // Ports are 16-bit: a larger figure would let a node vouch for
+    // capacity no host has.
+    if report
+        .usable_source_ports
+        .is_some_and(|usable| usable > u64::from(u16::MAX))
+    {
+        return Some("usable source ports above 65535");
     }
     for binding in &report.bindings {
         let id = &binding.stream_id;
@@ -2197,6 +2211,7 @@ mod tests {
                 tag("StreamPlaneReport", "bindings"),
                 tag("StreamPlaneReport", "bindings"),
                 tag("StreamPlaneReport", "truncated"),
+                tag("StreamPlaneReport", "usable_source_ports"),
             ]
         );
         assert_eq!(
@@ -3043,7 +3058,70 @@ mod tests {
                 },
             ],
             truncated: true,
+            usable_source_ports: Some(27_208),
         }
+    }
+
+    /// The stream plane report as Story 12.2 Lot E2 declared it, before
+    /// Story 12.5 added `usable_source_ports`: what a node of a 1.11.0
+    /// build from before that sends.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct StreamPlaneReportBeforeSourcePorts {
+        #[prost(uint64, tag = "1")]
+        fd_limit: u64,
+        #[prost(uint32, tag = "2")]
+        worker_count: u32,
+        #[prost(uint64, tag = "3")]
+        listen_sockets_used: u64,
+        #[prost(uint64, tag = "4")]
+        worker_fds_committed: u64,
+        #[prost(uint64, tag = "5")]
+        supervisor_fds_committed: u64,
+        #[prost(uint32, tag = "6")]
+        bound_count: u32,
+        #[prost(message, repeated, tag = "7")]
+        bindings: ::prost::alloc::vec::Vec<StreamBindingReport>,
+        #[prost(bool, tag = "8")]
+        truncated: bool,
+    }
+
+    #[test]
+    fn a_report_without_usable_source_ports_decodes_as_not_reported() {
+        let before = StreamPlaneReportBeforeSourcePorts {
+            fd_limit: 65_536,
+            worker_count: 4,
+            listen_sockets_used: 3,
+            worker_fds_committed: 3,
+            supervisor_fds_committed: 9,
+            bound_count: 1,
+            bindings: vec![failed_binding()],
+            truncated: true,
+        };
+        let read = StreamPlaneReport::decode(before.encode_to_vec().as_slice()).expect("decodes");
+        assert_eq!(
+            read,
+            StreamPlaneReport {
+                bindings: vec![failed_binding()],
+                usable_source_ports: None,
+                ..stream_plane_report()
+            }
+        );
+        assert_eq!(stream_plane_report_defect(&read), None);
+        // And the older reader skips the new tag, keeping the rest.
+        let back = StreamPlaneReportBeforeSourcePorts::decode(
+            stream_plane_report().encode_to_vec().as_slice(),
+        )
+        .expect("an unknown tag is skipped");
+        assert_eq!(back.fd_limit, 65_536);
+        assert_eq!(back.bindings.len(), 2);
+        // `Some(0)` (a range the margin swallows whole) is a figure, not
+        // an absence: it survives the wire.
+        let zero = StreamPlaneReport {
+            usable_source_ports: Some(0),
+            ..stream_plane_report()
+        };
+        let read = StreamPlaneReport::decode(zero.encode_to_vec().as_slice()).expect("decodes");
+        assert_eq!(read.usable_source_ports, Some(0));
     }
 
     #[test]
@@ -3207,6 +3285,17 @@ mod tests {
             ..stream_plane_report()
         };
         assert!(stream_plane_report_defect(&too_many).is_some());
+        for (usable, defect) in [(65_535, false), (65_536, true)] {
+            let report = StreamPlaneReport {
+                usable_source_ports: Some(usable),
+                ..stream_plane_report()
+            };
+            assert_eq!(
+                stream_plane_report_defect(&report).is_some(),
+                defect,
+                "usable_source_ports {usable}"
+            );
+        }
     }
 
     #[test]

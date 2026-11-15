@@ -1052,21 +1052,21 @@ Allowlist: `lorica-api/src/streams.rs`, `lorica-api/src/streams/tests.rs`,
 bind an exposed address (an explicit `source_session_cap` of 64).
 Depends on: C; 12.2 Lots E2 and E3 and 12.3 Lot E (same files).
 
-- [ ] `StreamResponse.udp` field by field (the key-set test of 12.1 D-10
+- [x] `StreamResponse.udp` field by field (the key-set test of 12.1 D-10
       moves with it: drop the `udp` filter Lot C left in
       `the_view_publishes_every_model_field_but_the_withheld_ones`);
       create fills the defaults; the update takes a `udp` object, and a
       protocol switch takes the new protocol's settings (Lot C already
       resets `udp` to `Stream::default_udp_settings` on a switch);
       refusals with the rule's text.
-- [ ] Call `udp_exposure_check(self, false)` at the end of
+- [x] Call `udp_exposure_check(self, false)` at the end of
       `Stream::validate` (deferred from Lot C), in the commit that lets
       the bodies carry `udp.source_session_cap`, with the fixtures it
       needs.
-- [ ] Budget check on create and update with the D-e constraints, per
+- [x] Budget check on create and update with the D-e constraints, per
       reporting targeted node; `usable_source_ports` on
       `StreamPlaneReport` at its next free tag, decode test without it.
-- [ ] `openapi.yaml`: the `udp` object with bounds and defaults, the
+- [x] `openapi.yaml`: the `udp` object with bounds and defaults, the
       refusal and drop words from their enums, the budget fields, and
       `source_ports` in the `StreamBindFailureKind` enum (Lot A added the
       kind; nothing pins that enum to `BindFailureKind::ALL` yet, so this
@@ -1447,6 +1447,82 @@ decision.
 ### Debug Log
 
 ### Completion Notes
+
+**Lot G (`lorica-api`, `lorica-cluster`).**
+
+- View. `StreamResponse.udp: Option<StreamUdpResponse>`, built field by
+  field from `UdpSettings` (`null` on TCP); the key-set test checks both
+  protocols, the `udp` object's keys and values against the model's, and
+  Lot C's filter is gone.
+- Bodies. `CreateStreamRequest.udp` and `UpdateStreamRequest.udp` take a
+  `UdpSettingsRequest` (`deny_unknown_fields`), every setting optional,
+  `null` on `source_session_cap` (the default cap) or
+  `requests_per_session` (no bound); applied over the defaults on a
+  create or a switch to UDP, over the stored settings on an update. It
+  rides in `EngineSettings`, applied after the protocol switch. A `udp`
+  object on a TCP stream is written onto it and refused by
+  `Stream::validate` in the model's words; `udp: null` (what a TCP
+  view echoes back) is no change.
+- Listen-address rule. `Stream::validate` ends with
+  `udp_exposure_check(self, false)`. Story 12.6 replaces `false` with
+  `self.has_source_allowlist()` (its Lot F) and nothing else moves: the
+  rule, its refusal text and its call site are final. Fixtures binding
+  UDP on an exposed address carry `source_session_cap` =
+  `UDP_EXPOSED_SOURCE_SESSION_CAP_MAX` (the API tests' `udp()` and
+  `exposed_udp()`, `udp_range`, the UDP stream of
+  `lorica-api/src/backends.rs`'s health-check test; the model's
+  `stream()` already did). No other fixture in the workspace stores a
+  UDP stream on an exposed address: the engine and plane tests listen
+  on loopback or never validate.
+- One budget rule (and Lot F's gap). `FdBudget::check_change(candidate,
+  stored, others, workers, cap, U)` in `lorica-stream/src/budget.rs`:
+  a change that does not `raise` what is counted passes unchecked,
+  anything else is `check_node`. The API's `check_write` and the node's
+  `bind_one` both call it; the API's `adds_no_demand` is gone (it is now
+  `StreamDemand::raises`, pools included). Node side: `HeldBinding`
+  keeps the demand it was bound with, a detach for `Rebind` records it
+  per stream in `StreamPlane.rebinding` until the stream binds again or
+  is no longer wanted (across the passes a drain wait or a retry takes),
+  and `bind_one` compares the new binding with it. So a node already
+  past its ceiling moves a stream (another port or address) at the same
+  share, and still refuses a rebind that raises it. Tests: the pure rule
+  (`a_change_is_checked_only_when_it_raises_what_the_node_counts`), the
+  node (`a_node_past_its_ceiling_rebinds_what_raises_nothing_and_refuses_raises`,
+  fake transport, a narrowed range read through the reader), the API
+  (`a_node_past_its_source_port_ceiling_takes_writes_that_raise_nothing`
+  and the HTTP `a_udp_write_past_the_source_ports_is_refused_and_one_raising_nothing_passes`).
+- `U` on the API side. `StreamPlaneState` reads it at every use through
+  `lorica_stream::budget::usable_udp_source_ports` (re-exported there:
+  `lorica-api` does not depend on `lorica-worker`), so its constructor
+  and its callers in `supervisor.rs` and `single.rs` are unchanged;
+  `with_usable_source_ports` fixes it (tests). `NodeFds` gains
+  `usable_source_ports`, filled from the heartbeat for an enrolled node;
+  the local and reported budget views carry it, so `session_ceiling`,
+  `over_ceiling` and `source_pools` are live.
+- Heartbeat. `StreamPlaneReport.usable_source_ports`, `optional uint64`
+  at tag 9, `None` when the node cannot read its range; the decode
+  boundary refuses a figure above 65535. A report from before this
+  decodes as `None` (frozen message in the test), an older reader
+  skips the tag, and the proto parity test pins tag 9. `cluster_follower.rs` needed no change:
+  `heartbeat_report` reads the figure itself.
+- `openapi.yaml`: `StreamUdpSettings` (ranges and defaults, pinned to
+  `UdpSettings` by a test, the reflection bound and the listen-address
+  rule in prose with their figures pinned) and `StreamUdpSettingsInput`;
+  `udp` on the view and both bodies; `StreamRefusal` and
+  `StreamDatagramDropReason` enums pinned to their `VARIANTS`;
+  `StreamBindFailureKind` gains `source_ports`, now pinned to
+  `BindFailureKind::ALL`; `NodeStreamBudget` gains the six ceiling
+  fields and `StreamSourcePool`, the view's keys pinned to the schemas;
+  the create, update and budget descriptions updated.
+- Outside the allowlist: `lorica-stream/src/budget.rs` and
+  `lorica/src/startup/stream_plane.rs` (the shared rule, asked of this
+  Lot); `lorica-cluster/tests/enrollment.rs` and
+  `lorica-api/src/cluster/tests.rs` (the new report field in their
+  struct literals); `lorica-cluster/src/bridge.rs` and
+  `lorica-cluster/src/listener/operational.rs`: the field pushed
+  `InPlaneAction::Heartbeat` past clippy's `large_enum_variant`, so
+  `StreamPlaneClaim::Reported` now boxes its report, as
+  `TelemetryPush` boxes its batch.
 
 **Lot F (`lorica`).**
 
@@ -1918,6 +1994,24 @@ decision.
 
 ## File List
 
+Lot G:
+
+- `lorica-api/src/streams.rs`, `lorica-api/src/streams/tests.rs`,
+  `lorica-api/src/stream_budget.rs`, `lorica-api/openapi.yaml`
+- `lorica-api/src/backends.rs` (a UDP test fixture on `0.0.0.0`)
+- `lorica-cluster/src/messages.rs`, `lorica-cluster/proto/cluster.proto`
+- `lorica-config/src/models/stream.rs` (the `udp_exposure_check` call and
+  its test)
+- `lorica-stream/src/budget.rs` (`FdBudget::check_change`, the
+  re-export of `usable_udp_source_ports`) and
+  `lorica/src/startup/stream_plane.rs` (the node applies it), outside
+  the allowlist
+- `lorica-cluster/tests/enrollment.rs`, `lorica-api/src/cluster/tests.rs`
+  (the report field in test literals), `lorica-cluster/src/bridge.rs`
+  and `lorica-cluster/src/listener/operational.rs` (the boxed report),
+  outside the allowlist
+- `docs/stories/story-12.5-udp-engine.md`
+
 Lot F:
 
 - `lorica/src/stream_engine.rs`, `lorica/src/startup/stream_plane.rs`,
@@ -1992,3 +2086,4 @@ Lot A:
 | 2026-11-15 | 0.6 | Lot D landed: the UDP demand (`held_fds`, one fd per session), the source-port constraint and the node session ceiling with its view fields, the synchronous `DatagramHandler` borrowing from one receive buffer per worker, the wildcard destination, caps adoption (`CapsRegistry`) and the supervisor's regions (`NodeCapsRegions`, the per-worker release), UDP drain mode with the sockets kept open. | Romain G. |
 | 2026-11-15 | 0.7 | Lot E landed: the UDP engine (`UdpEngine`), sessions per key with one connected upstream socket each, the D-b bounds, per-source rates and session caps on the region, PROXY v2 per datagram, reply source on wildcard addresses, ICMP and no-response failures, the UDP counters, drop reasons, `ceiling_reached` edge and the record's datagram counts. Selection and breaker admission run in the session task (the breaker seam is async). | Romain G. |
 | 2026-11-15 | 0.8 | Lot F landed: the UDP engine installed in worker and single-process mode over the TCP engine's selector and resolver cache, a caps region per UDP stream sent ahead of every `attach` and replaced on a size change, a dead worker's sessions released before its respawn is replayed, the 1 s caps tick, draining UDP bindings holding their ports until the drain ends, the node's source-port backstop. | Romain G. |
+| 2026-11-15 | 0.9 | Lot G landed: the `udp` settings on the stream view and both bodies, the listen-address rule called by `Stream::validate`, the usable source ports in the heartbeat and in the API's budget check and view, one "refuse raises, allow lowers" rule (`FdBudget::check_change`) for the API's write check and the node's bind, `openapi.yaml` with the UDP schemas, the refusal and drop words and `source_ports` pinned to their enums. | Romain G. |

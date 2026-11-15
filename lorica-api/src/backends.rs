@@ -1073,7 +1073,7 @@ mod tests {
         {
             let store = node.state.store.lock().await;
             let now = chrono::Utc::now();
-            let stream = lorica_config::models::Stream::new(
+            let mut stream = lorica_config::models::Stream::new(
                 uuid::Uuid::new_v4().to_string(),
                 "dns-udp".to_string(),
                 lorica_config::models::StreamProtocol::Udp,
@@ -1082,6 +1082,12 @@ mod tests {
                 5353,
                 now,
             );
+            // On an exposed address the listen-address rule wants an
+            // explicit per-source cap (Story 12.5 D-k).
+            if let Some(udp) = stream.udp.as_mut() {
+                udp.source_session_cap =
+                    Some(lorica_config::models::UDP_EXPOSED_SOURCE_SESSION_CAP_MAX);
+            }
             store.create_stream(&stream).expect("the stream is stored");
             store
                 .set_stream_backends(&stream.id, std::slice::from_ref(&id))

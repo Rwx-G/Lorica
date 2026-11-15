@@ -867,7 +867,7 @@ async fn serve_request(
             match stream_plane {
                 StreamPlaneClaim::Reported(report) => {
                     if let Some(guard) = guard {
-                        guard.entry().record_stream_plane(report);
+                        guard.entry().record_stream_plane(*report);
                     }
                 }
                 StreamPlaneClaim::Dropped(defect) if !tally.stream_plane_drop_warned => {

@@ -105,8 +105,10 @@ pub enum StreamPlaneClaim {
     /// The heartbeat carried no report: a 1.10.x follower, or a node
     /// with no follower runtime.
     NotSent,
-    /// The report passed [`stream_plane_report_defect`].
-    Reported(StreamPlaneReport),
+    /// The report passed [`stream_plane_report_defect`]. Boxed: it is
+    /// the largest part of a heartbeat, and the action enum carrying it
+    /// stays small for every other request.
+    Reported(Box<StreamPlaneReport>),
     /// The report was malformed. It is dropped and the node treated as
     /// not reported; the caller warns, naming the node.
     Dropped(&'static str),
@@ -117,7 +119,7 @@ impl StreamPlaneClaim {
         match report {
             None => Self::NotSent,
             Some(report) => match stream_plane_report_defect(report) {
-                None => Self::Reported(report.clone()),
+                None => Self::Reported(Box::new(report.clone())),
                 Some(defect) => Self::Dropped(defect),
             },
         }
@@ -775,10 +777,11 @@ mod tests {
             bound_count: 1,
             bindings: vec![failed("0b6f2a4e-6a43-4bd4-9b8e-3c1f8a2d5e70")],
             truncated: false,
+            usable_source_ports: Some(27_208),
         };
         assert_eq!(
             stream_plane_claim(Some(report.clone())),
-            StreamPlaneClaim::Reported(report)
+            StreamPlaneClaim::Reported(Box::new(report))
         );
         assert_eq!(stream_plane_claim(None), StreamPlaneClaim::NotSent);
     }

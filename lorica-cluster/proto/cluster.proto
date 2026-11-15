@@ -629,6 +629,10 @@ message StreamPlaneReport {
   uint32 bound_count = 6;
   repeated StreamBindingReport bindings = 7;
   bool truncated = 8;              // More were not bound than listed
+  // Story 12.5: usable UDP source ports per source address, at most
+  // 65535; absent when the node cannot read its port range, and from a
+  // node before Story 12.5, either checked on its fds alone.
+  optional uint64 usable_source_ports = 9;
 }
 
 message Heartbeat {

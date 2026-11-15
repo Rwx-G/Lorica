@@ -943,6 +943,7 @@ async fn a_heartbeat_carries_the_node_s_stream_plane_onto_its_session() {
             failed_since_ms: 1_763_100_000_000,
         }],
         truncated: false,
+        usable_source_ports: Some(27_208),
     };
 
     let endpoint = open_session(&pki, &node, fleet.addr)

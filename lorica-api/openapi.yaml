@@ -1584,10 +1584,14 @@ paths:
         it binds, disabled ones included. The same nodes are then checked
         against their fd budget (`GET /api/v1/streams/budget`), counting
         the enabled streams each binds, a TCP stream with its
-        `max_connections` connections of two fds each: a stream that
-        would break one is refused `422` with `error.code`
-        `stream_fd_budget`. An enrolled node is checked on the fd limit
-        and worker count its heartbeat reported on its open session; a
+        `max_connections` connections of two fds each and a UDP stream
+        with its `udp.max_sessions` sessions of one fd and one ephemeral
+        source port each: a stream that would break one is refused `422`
+        with `error.code` `stream_fd_budget`, the message naming the node
+        and the constraint (`listen_socket_cap`, `worker_fds`,
+        `supervisor_fds`, `source_ports`). An enrolled node is checked on
+        the fd limit, worker count and usable source ports its heartbeat
+        reported on its open session; a
         targeted node with no such report (offline, or not reported yet)
         is named in `warnings` instead, and refuses the stream when it
         binds it. A backend local without resolution (loopback,
@@ -1638,15 +1642,19 @@ paths:
         that streams never use, and a stream budget `S = L - B - H`. One
         worker holds its listening sockets plus what each stream's engine
         declares at its ceiling within `S`; the supervisor, which keeps
-        one socket per TCP port and one per worker per UDP port, holds
-        its share within `S` too; and the node's listening sockets stay
-        within `stream_listen_socket_cap`. Operator and above: a Viewer
+        one socket per TCP port, one per worker per UDP port and one caps
+        memfd per UDP stream, holds its share within `S` too; the node's
+        listening sockets stay within `stream_listen_socket_cap`; and the
+        UDP sessions leaving from each source pool stay within the node's
+        usable ephemeral ports (Story 12.5), which with the fds sets the
+        node's UDP session ceiling. Operator and above: a Viewer
         does not get node capacity. Standalone and on a follower the
         answer is the node itself. A control plane answers its own node
         first, then, by name, every active enrolled node whose open
         session carried a stream plane report in its heartbeat (Story
-        12.2 D-i): its fd limit, worker count and committed totals as the
-        node reported them, and each stream this control plane expects it
+        12.2 D-i): its fd limit, worker count, usable source ports and
+        committed totals as the node reported them, and each stream this
+        control plane expects it
         to bind, `bound` unless the node lists it as `pending` or
         `failed`, and `unknown` while the node drifts from this control
         plane's configuration or its list was cut. A node that is offline
@@ -1703,9 +1711,13 @@ paths:
         `download_rate_bps` removes the limit. The result is checked as
         on create, except that an update adding nothing to what a node
         already binds (the same protocol, no more ports, no higher
-        `max_connections`) is never refused for that node's fd budget,
-        so a stream on a node over its budget can still be renamed,
-        narrowed or disabled.
+        `max_connections` or `udp.max_sessions`, no more ports from any
+        source pool) is never refused for that node's budget, so a
+        stream on a node over its budget or past its session ceiling
+        can still be renamed, moved, narrowed, lowered or disabled. A
+        switch of protocol replaces `udp` with the new protocol's: the
+        defaults on a switch to UDP, under the `udp` object the body
+        carries.
       security:
         - sessionCookie: []
       requestBody:
@@ -7701,10 +7713,13 @@ components:
       type: object
       description: >-
         A stream. The engine settings (Story 12.3), from
-        `load_balancing` to `max_connections`, apply to TCP streams: on a
-        UDP stream each must keep its default until Story 12.5 (422
-        naming the field), and `proxy_protocol_accept` is refused on UDP
-        for good, a UDP source address being spoofable.
+        `load_balancing` to `max_connections`, apply to TCP streams. A
+        UDP stream (Story 12.5) takes the ones with a UDP meaning, per
+        session, and refuses a non-default value of the others with a
+        422 naming the field and why; `proxy_protocol_accept` is refused
+        on UDP for good, a UDP source address being spoofable, as are
+        `peak_ewma` and `proxy_protocol_send` `v1`. Its own settings are
+        `udp`.
       required:
         - id
         - name
@@ -7731,6 +7746,7 @@ components:
         - upload_rate_bps
         - download_rate_bps
         - max_connections
+        - udp
         - backend_ids
         - backup_backend_ids
         - created_at
@@ -7796,7 +7812,10 @@ components:
           minimum: 1
           maximum: 86400
           default: 600
-          description: A connection with no byte forwarded either way for this long is closed.
+          description: >-
+            A connection with no byte forwarded either way for this long
+            is closed. A UDP session with no datagram either way, on a
+            UDP stream, where it defaults to 10 and stops at 3600.
         total_timeout_s:
           type: integer
           nullable: true
@@ -7900,6 +7919,13 @@ components:
             is refused and counted (`connection_cap`). Each connection
             counts two fds against the node's stream budget
             (`GET /api/v1/streams/budget`).
+        udp:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/StreamUdpSettings"
+          description: >-
+            The settings of a UDP stream (Story 12.5); `null` on a TCP
+            stream, which carries none.
         backend_ids:
           type: array
           items:
@@ -7918,6 +7944,170 @@ components:
         updated_at:
           type: string
           format: date-time
+
+    StreamUdpSettings:
+      type: object
+      description: >-
+        The settings of a UDP stream (Story 12.5). A session is keyed on
+        the client's address and port, holds one connected upstream
+        socket, and ends on its request or response bound
+        (`request_bound_reached`, `response_bound_reached`), on idle or on
+        its total time. A source key is an IPv4 address or an IPv6 /64.
+        Towards one source key, per node and per second, Lorica forwards
+        at most `min(source_byte_rate x response_bytes_ratio,
+        source_datagram_rate x responses_per_request x
+        max_datagram_bytes)` response bytes, plus one second's worth as
+        burst, unless `unbounded_responses` is set. A session refused is
+        counted under a `StreamRefusal` word, a datagram dropped under a
+        `StreamDatagramDropReason` word, never both. On a listen address
+        other than loopback, RFC 1918 or ULA (`0.0.0.0` and `::`
+        included), the stream needs an explicit `source_session_cap` of
+        at most 64 (422 otherwise).
+      required:
+        - max_sessions
+        - source_session_cap
+        - requests_per_session
+        - responses_per_request
+        - response_bytes_ratio
+        - unbounded_responses
+        - source_datagram_rate
+        - source_byte_rate
+        - max_datagram_bytes
+      properties:
+        max_sessions:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+          default: 4096
+          description: >-
+            Concurrent sessions of the stream per node, exact across
+            workers: the stream's share of the node's session ceiling
+            (`GET /api/v1/streams/budget`), each session holding one fd
+            and one ephemeral source port. The next one is refused
+            (`session_cap`).
+        source_session_cap:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 65535
+          default: null
+          description: >-
+            Concurrent sessions per source key per node; `null` for the
+            default of 256, which does not satisfy the listen-address
+            rule. Workers admitting one source at once may pass it by the
+            worker count minus one. The next one is refused
+            (`source_session_cap`); a session table with no room for a new
+            source refuses it too (`session_table_full`), on this stream
+            only.
+        requests_per_session:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 65535
+          default: 64
+          description: >-
+            Client datagrams forwarded per session before it is retired
+            and the next one opens a new session; `null` for no bound
+            (nginx's `proxy_requests`).
+        responses_per_request:
+          type: integer
+          minimum: 0
+          maximum: 64
+          default: 1
+          description: >-
+            Backend datagrams forwarded per client datagram; past it a
+            response is dropped (`response_count_bound`). 0 for a one-way
+            protocol (syslog).
+        response_bytes_ratio:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 32
+          description: >-
+            Response bytes forwarded per request byte of the session; a
+            response past it is dropped (`response_byte_bound`) and ends
+            the session. The default serves a DNSSEC answer.
+        unbounded_responses:
+          type: boolean
+          default: false
+          description: >-
+            Lifts both response bounds, for protocols whose backend speaks
+            unasked (games, VoIP signalling). The two keep their stored
+            values, shown here, and apply again when it is cleared.
+        source_datagram_rate:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+          default: 1000
+          description: >-
+            Client datagrams per second per source key per node, burst one
+            second; past it a datagram is dropped
+            (`source_datagram_rate`).
+        source_byte_rate:
+          type: integer
+          minimum: 1024
+          maximum: 1073741824
+          default: 524288
+          description: >-
+            Client bytes per second per source key per node, burst one
+            second, at least `max_datagram_bytes`; past it a datagram is
+            dropped (`source_byte_rate`).
+        max_datagram_bytes:
+          type: integer
+          minimum: 512
+          maximum: 65507
+          default: 8192
+          description: >-
+            The largest payload forwarded, both directions; a larger
+            datagram is dropped (`request_oversize`,
+            `response_oversize`).
+
+    StreamUdpSettingsInput:
+      type: object
+      additionalProperties: false
+      description: >-
+        The `udp` object of a create or an update, UDP streams only (422
+        on a TCP stream). Every setting is optional: an absent one keeps
+        the value it is written over, the default on a create or a switch
+        to UDP, the stored one on an update; `null` on
+        `source_session_cap` or `requests_per_session` sets the default
+        cap or no bound. The object absent or `null` changes nothing.
+      properties:
+        max_sessions:
+          $ref: "#/components/schemas/StreamUdpSettings/properties/max_sessions"
+        source_session_cap:
+          $ref: "#/components/schemas/StreamUdpSettings/properties/source_session_cap"
+        requests_per_session:
+          $ref: "#/components/schemas/StreamUdpSettings/properties/requests_per_session"
+        responses_per_request:
+          $ref: "#/components/schemas/StreamUdpSettings/properties/responses_per_request"
+        response_bytes_ratio:
+          $ref: "#/components/schemas/StreamUdpSettings/properties/response_bytes_ratio"
+        unbounded_responses:
+          $ref: "#/components/schemas/StreamUdpSettings/properties/unbounded_responses"
+        source_datagram_rate:
+          $ref: "#/components/schemas/StreamUdpSettings/properties/source_datagram_rate"
+        source_byte_rate:
+          $ref: "#/components/schemas/StreamUdpSettings/properties/source_byte_rate"
+        max_datagram_bytes:
+          $ref: "#/components/schemas/StreamUdpSettings/properties/max_datagram_bytes"
+
+    StreamRefusal:
+      type: string
+      description: >-
+        Why a stream connection or a UDP session was refused, the word the
+        stream counters and access-log rows carry.
+      enum: [no_match, connection_cap, session_cap, source_session_cap, session_table_full]
+
+    StreamDatagramDropReason:
+      type: string
+      description: >-
+        Why a UDP datagram was dropped rather than forwarded (Story 12.5),
+        the word the stream counters carry. `binding_draining`: a
+        datagram that would open a session on a binding being removed;
+        `send_failed`: a send that found the socket's buffer full or
+        failed.
+      enum: [request_oversize, response_oversize, source_datagram_rate, source_byte_rate, response_count_bound, response_byte_bound, binding_draining, send_failed]
 
     StreamReadResponse:
       description: A stream as the reads answer it, with this node's bind state of it.
@@ -7978,7 +8168,8 @@ components:
           description: >-
             `failed` only: the OS error's text (`Address already in use
             (os error 98)`), or the node's own sentence for a refusal no
-            system call made (`reserved_port`, `fd_budget`).
+            system call made (`reserved_port`, `fd_budget`,
+            `source_ports`).
         port:
           type: integer
           description: "`failed` only: the port that failed; for a range, the first that did."
@@ -7994,14 +8185,10 @@ components:
         overlapping another on the node), `permission_denied` (`EACCES`,
         `EPERM`), `address_not_available` (`EADDRNOTAVAIL`),
         `reserved_port` (one of the node's own listeners), `fd_budget`
-        (the node's fd budget), `other`.
-      enum:
-        - address_in_use
-        - permission_denied
-        - address_not_available
-        - reserved_port
-        - fd_budget
-        - other
+        (the node's fd budget), `source_ports` (a UDP stream's sessions
+        would need more ephemeral source ports than the node has, Story
+        12.5), `other`.
+      enum: [address_in_use, permission_denied, address_not_available, reserved_port, fd_budget, source_ports, other]
 
     StreamBudgetView:
       type: object
@@ -8014,7 +8201,9 @@ components:
 
     NodeStreamBudget:
       type: object
-      description: One node's stream fd budget (Story 12.2 D-e).
+      description: >-
+        One node's stream fd budget (Story 12.2 D-e) and UDP session
+        ceiling (Story 12.5 D-e).
       required:
         - node_id
         - node_name
@@ -8029,6 +8218,12 @@ components:
         - worker_fds_committed
         - supervisor_fds_committed
         - worker_drain_timeout_s
+        - usable_source_ports
+        - session_ceiling
+        - session_ceiling_bound_by
+        - udp_sessions_committed
+        - over_ceiling
+        - source_pools
         - streams
       properties:
         node_id:
@@ -8081,15 +8276,77 @@ components:
         supervisor_fds_committed:
           type: integer
           format: int64
-          description: TCP ports plus UDP ports times `worker_count`, against `stream_budget`.
+          description: >-
+            TCP ports plus UDP ports times `worker_count`, plus one caps
+            memfd per UDP stream, against `stream_budget`.
         worker_drain_timeout_s:
           type: integer
           description: The `worker_drain_timeout_s` setting.
+        usable_source_ports:
+          type: integer
+          format: int64
+          nullable: true
+          description: >-
+            `U`, the UDP source ports one source address can use: the size
+            of `net.ipv4.ip_local_port_range`, less the reserved ports in
+            it and a margin left to the host's own clients. `null`
+            when the node could not read its range or has not reported it
+            (a node from before 1.11.0), which leaves the fd constraints
+            alone to check its writes.
+        session_ceiling:
+          type: integer
+          format: int64
+          description: >-
+            The UDP sessions the node can hold across its UDP streams:
+            what `stream_budget` leaves after every other commitment, one
+            fd per session, and at most `usable_source_ports` per source
+            pool.
+        session_ceiling_bound_by:
+          type: string
+          enum: [fd_budget, source_ports]
+          description: The limit that set `session_ceiling`; `fd_budget` on a tie.
+        udp_sessions_committed:
+          type: integer
+          format: int64
+          description: The UDP streams' shares added up, each its `udp.max_sessions`.
+        over_ceiling:
+          type: boolean
+          description: >-
+            The committed sessions pass the ceiling or a pool's ports, as
+            a narrowed port range or a lowered fd limit leaves a node:
+            bound streams stay bound, and every write that raises the
+            demand is refused until it fits again; writes that lower it
+            pass.
+        source_pools:
+          type: array
+          description: >-
+            The ephemeral ports each source pool commits: `default` for
+            the UDP streams without `source_addresses`, then one per
+            address, a stream with several spreading its sessions evenly.
+          items:
+            $ref: "#/components/schemas/StreamSourcePool"
         streams:
           type: array
           description: Every stream the node binds, by name.
           items:
             $ref: "#/components/schemas/StreamBudgetShare"
+
+    StreamSourcePool:
+      type: object
+      required: [pool, committed, usable]
+      properties:
+        pool:
+          type: string
+          description: "`default`, or a source address."
+        committed:
+          type: integer
+          format: int64
+          description: The sessions the UDP streams leaving from it may hold.
+        usable:
+          type: integer
+          format: int64
+          nullable: true
+          description: "`usable_source_ports`, `null` as there."
 
     StreamBudgetShare:
       type: object
@@ -8118,10 +8375,11 @@ components:
           format: int64
           nullable: true
           description: >-
-            The connection cap of a TCP stream (`max_connections`) or the
-            session ceiling of a UDP one; `null` while the stream's engine
-            declares none (UDP until Story 12.5), which counts nothing
-            beyond the listening sockets.
+            The connection cap of a TCP stream (`max_connections`) or a
+            UDP stream's share of the session ceiling
+            (`udp.max_sessions`); `null` while the stream's engine
+            declares none, which counts nothing beyond the listening
+            sockets.
         fds_per_unit:
           type: integer
           format: int64
@@ -8278,6 +8536,10 @@ components:
           $ref: "#/components/schemas/StreamResponse/properties/download_rate_bps"
         max_connections:
           $ref: "#/components/schemas/StreamResponse/properties/max_connections"
+        udp:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/StreamUdpSettingsInput"
         backend_ids:
           type: array
           items:
@@ -8294,7 +8556,7 @@ components:
             type: string
           description: >-
             Existing backend ids used only when no primary is a
-            candidate, on a TCP stream with at least one primary (422
+            candidate, on a stream with at least one primary (422
             otherwise); none may also be in `backend_ids`.
 
     UpdateStreamRequest:
@@ -8356,6 +8618,10 @@ components:
           $ref: "#/components/schemas/StreamResponse/properties/download_rate_bps"
         max_connections:
           $ref: "#/components/schemas/StreamResponse/properties/max_connections"
+        udp:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/StreamUdpSettingsInput"
         backend_ids:
           type: array
           items:

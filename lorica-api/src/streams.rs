@@ -22,7 +22,9 @@
 //! Status codes: `400` for a body this API's shared route validators
 //! refuse (group name, selector) and for a body that does not parse;
 //! `422` for a body that parses and breaks a model rule
-//! (`Stream::validate`, a backend id naming no backend, a name already
+//! (`Stream::validate`, the UDP listen-address rule of Story 12.5 D-k
+//! and the `udp` settings' ranges included, a backend id naming no
+//! backend, a name already
 //! taken, the attachment rules of D-6 and of Story 12.3, a local backend
 //! without `allow_local_backend` among them), the rule
 //! `ApiError::Unprocessable` documents, and a write a node's fd budget
@@ -44,7 +46,7 @@ use lorica_config::listen_ports::{
 };
 use lorica_config::models::{
     binds_here_when_enabled, Backend, ClusterNode, LoadBalancing, NodeRole, NodeStatus, Stream,
-    StreamBackend, StreamProtocol, StreamProxyProtocol,
+    StreamBackend, StreamProtocol, StreamProxyProtocol, UdpSettings,
 };
 use lorica_config::ConfigStore;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -134,6 +136,9 @@ pub struct StreamResponse {
     pub download_rate_bps: Option<u64>,
     /// Mirror of `Stream.max_connections`.
     pub max_connections: u32,
+    /// Mirror of `Stream.udp`: the settings of a UDP stream, `null` on a
+    /// TCP stream, which carries none (Story 12.5 D-l).
+    pub udp: Option<StreamUdpResponse>,
     /// IDs of the primary backends linked through `stream_backends`,
     /// sorted.
     pub backend_ids: Vec<String>,
@@ -144,6 +149,50 @@ pub struct StreamResponse {
     pub created_at: String,
     /// RFC 3339 last-write timestamp.
     pub updated_at: String,
+}
+
+/// The `udp` object of a stream's view (Story 12.5 D-l), built field by
+/// field from `UdpSettings` like the view around it. The response bounds
+/// keep their stored values while `unbounded_responses` lifts them, so
+/// the view shows what clearing the flag would apply again.
+#[derive(Debug, Serialize)]
+pub struct StreamUdpResponse {
+    /// Mirror of `UdpSettings.max_sessions`.
+    pub max_sessions: u32,
+    /// Mirror of `UdpSettings.source_session_cap`; `null` for the
+    /// default cap, which does not satisfy the listen-address rule.
+    pub source_session_cap: Option<u32>,
+    /// Mirror of `UdpSettings.requests_per_session`; `null` for no bound.
+    pub requests_per_session: Option<u32>,
+    /// Mirror of `UdpSettings.responses_per_request`.
+    pub responses_per_request: u32,
+    /// Mirror of `UdpSettings.response_bytes_ratio`.
+    pub response_bytes_ratio: u32,
+    /// Mirror of `UdpSettings.unbounded_responses` (PRD AC #4: the flag
+    /// every listing carries).
+    pub unbounded_responses: bool,
+    /// Mirror of `UdpSettings.source_datagram_rate`.
+    pub source_datagram_rate: u32,
+    /// Mirror of `UdpSettings.source_byte_rate`.
+    pub source_byte_rate: u32,
+    /// Mirror of `UdpSettings.max_datagram_bytes`.
+    pub max_datagram_bytes: u32,
+}
+
+impl StreamUdpResponse {
+    fn of(udp: &UdpSettings) -> Self {
+        StreamUdpResponse {
+            max_sessions: udp.max_sessions,
+            source_session_cap: udp.source_session_cap,
+            requests_per_session: udp.requests_per_session,
+            responses_per_request: udp.responses_per_request,
+            response_bytes_ratio: udp.response_bytes_ratio,
+            unbounded_responses: udp.unbounded_responses,
+            source_datagram_rate: udp.source_datagram_rate,
+            source_byte_rate: udp.source_byte_rate,
+            max_datagram_bytes: udp.max_datagram_bytes,
+        }
+    }
 }
 
 /// What `GET /api/v1/streams` and `GET /api/v1/streams/{id}` answer
@@ -246,6 +295,7 @@ pub(crate) fn stream_to_response(stream: &Stream, links: StreamLinks) -> StreamR
         upload_rate_bps: stream.upload_rate_bps,
         download_rate_bps: stream.download_rate_bps,
         max_connections: stream.max_connections,
+        udp: stream.udp.as_ref().map(StreamUdpResponse::of),
         backend_ids: links.primaries,
         backup_backend_ids: links.backups,
         created_at: stream.created_at.to_rfc3339(),
@@ -321,6 +371,10 @@ pub struct CreateStreamRequest {
     pub download_rate_bps: Option<Option<u64>>,
     /// `Stream.max_connections`.
     pub max_connections: Option<u32>,
+    /// `Stream.udp`, UDP streams only: each setting absent takes its
+    /// default, and the object absent (or `null`) takes every default.
+    /// Refused on a TCP stream.
+    pub udp: Option<UdpSettingsRequest>,
     /// Primary backends the stream forwards to; absent is none.
     pub backend_ids: Option<Vec<String>>,
     /// Backup backends, used only when no primary is a candidate; absent
@@ -392,15 +446,86 @@ pub struct UpdateStreamRequest {
     pub download_rate_bps: Option<Option<u64>>,
     /// New `Stream.max_connections`.
     pub max_connections: Option<u32>,
+    /// New `Stream.udp` settings, each absent one kept (after a switch
+    /// to UDP, each absent one takes its default); the object absent or
+    /// `null` keeps them all. Refused on a TCP stream.
+    pub udp: Option<UdpSettingsRequest>,
     /// New primaries, replacing the stored ones.
     pub backend_ids: Option<Vec<String>>,
     /// New backups, replacing the stored ones.
     pub backup_backend_ids: Option<Vec<String>>,
 }
 
-/// The Story 12.3 settings a create or an update carries, each `None`
-/// when the body left it out. One type for both bodies, so the two
-/// cannot apply a setting differently.
+/// The `udp` object of a create or an update (Story 12.5 D-l): every
+/// setting optional, an absent one keeping the value it is applied over
+/// (the defaults on a create or a switch to UDP, the stored value on an
+/// update), and `null` on `source_session_cap` or `requests_per_session`
+/// setting the default cap or no bound.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UdpSettingsRequest {
+    /// `UdpSettings.max_sessions`.
+    pub max_sessions: Option<u32>,
+    /// `UdpSettings.source_session_cap`; `null` for the default cap.
+    #[serde(default, deserialize_with = "nullable")]
+    pub source_session_cap: Option<Option<u32>>,
+    /// `UdpSettings.requests_per_session`; `null` for no bound.
+    #[serde(default, deserialize_with = "nullable")]
+    pub requests_per_session: Option<Option<u32>>,
+    /// `UdpSettings.responses_per_request`.
+    pub responses_per_request: Option<u32>,
+    /// `UdpSettings.response_bytes_ratio`.
+    pub response_bytes_ratio: Option<u32>,
+    /// `UdpSettings.unbounded_responses`.
+    pub unbounded_responses: Option<bool>,
+    /// `UdpSettings.source_datagram_rate`.
+    pub source_datagram_rate: Option<u32>,
+    /// `UdpSettings.source_byte_rate`.
+    pub source_byte_rate: Option<u32>,
+    /// `UdpSettings.max_datagram_bytes`.
+    pub max_datagram_bytes: Option<u32>,
+}
+
+impl UdpSettingsRequest {
+    /// Write every setting the object carried onto `stream`'s `udp`, over
+    /// the defaults when the stream holds none: a TCP stream then carries
+    /// settings, which `Stream::validate` refuses with the model's words.
+    fn apply(self, stream: &mut Stream) {
+        let mut udp = stream.udp.unwrap_or_default();
+        if let Some(v) = self.max_sessions {
+            udp.max_sessions = v;
+        }
+        if let Some(v) = self.source_session_cap {
+            udp.source_session_cap = v;
+        }
+        if let Some(v) = self.requests_per_session {
+            udp.requests_per_session = v;
+        }
+        if let Some(v) = self.responses_per_request {
+            udp.responses_per_request = v;
+        }
+        if let Some(v) = self.response_bytes_ratio {
+            udp.response_bytes_ratio = v;
+        }
+        if let Some(v) = self.unbounded_responses {
+            udp.unbounded_responses = v;
+        }
+        if let Some(v) = self.source_datagram_rate {
+            udp.source_datagram_rate = v;
+        }
+        if let Some(v) = self.source_byte_rate {
+            udp.source_byte_rate = v;
+        }
+        if let Some(v) = self.max_datagram_bytes {
+            udp.max_datagram_bytes = v;
+        }
+        stream.udp = Some(udp);
+    }
+}
+
+/// The Story 12.3 settings and the Story 12.5 `udp` object a create or
+/// an update carries, each `None` when the body left it out. One type
+/// for both bodies, so the two cannot apply a setting differently.
 struct EngineSettings {
     load_balancing: Option<LoadBalancing>,
     connect_timeout_ms: Option<u32>,
@@ -418,10 +543,12 @@ struct EngineSettings {
     upload_rate_bps: Option<Option<u64>>,
     download_rate_bps: Option<Option<u64>>,
     max_connections: Option<u32>,
+    udp: Option<UdpSettingsRequest>,
 }
 
 impl EngineSettings {
-    /// Write every setting the body carried onto `stream`.
+    /// Write every setting the body carried onto `stream`, whose
+    /// protocol is already the one it will have.
     fn apply(self, stream: &mut Stream) {
         if let Some(v) = self.load_balancing {
             stream.load_balancing = v;
@@ -470,6 +597,9 @@ impl EngineSettings {
         }
         if let Some(v) = self.max_connections {
             stream.max_connections = v;
+        }
+        if let Some(udp) = self.udp {
+            udp.apply(stream);
         }
     }
 }
@@ -907,6 +1037,7 @@ pub(crate) async fn create_stream_as(
         upload_rate_bps,
         download_rate_bps,
         max_connections,
+        udp,
         backend_ids,
         backup_backend_ids,
     } = body;
@@ -947,6 +1078,7 @@ pub(crate) async fn create_stream_as(
         upload_rate_bps,
         download_rate_bps,
         max_connections,
+        udp,
     }
     .apply(&mut stream);
     validated(&stream)?;
@@ -1047,6 +1179,7 @@ pub(crate) async fn update_stream_as(
         upload_rate_bps,
         download_rate_bps,
         max_connections,
+        udp,
         backend_ids,
         backup_backend_ids,
     } = body;
@@ -1075,6 +1208,7 @@ pub(crate) async fn update_stream_as(
         upload_rate_bps,
         download_rate_bps,
         max_connections,
+        udp,
     };
     let role = LocalRole::of(state);
     let budget = BudgetInputs::of(state);

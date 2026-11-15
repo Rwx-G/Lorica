@@ -18,7 +18,7 @@ use super::{
     STREAM_WITHHELD_FIELDS,
 };
 use crate::server::AppState;
-use crate::stream_budget::{StreamPlaneState, STREAM_FD_BUDGET_CODE};
+use crate::stream_budget::{StreamPlaneState, DEFAULT_RANGE_USABLE_PORTS, STREAM_FD_BUDGET_CODE};
 use crate::tests::{
     body_json, create_user_and_login, send, setup_admin_and_login, test_control_plane,
     test_follower_runtime, test_state,
@@ -215,6 +215,21 @@ fn tcp(name: &str, port: u16) -> Value {
         "listen_address": "0.0.0.0",
         "port_first": port,
     })
+}
+
+/// The `udp` object that lets a UDP stream listen on an exposed address
+/// (Story 12.5 D-k): the highest explicit per-source cap the rule takes.
+fn exposed_udp() -> Value {
+    json!({ "source_session_cap": lorica_config::models::UDP_EXPOSED_SOURCE_SESSION_CAP_MAX })
+}
+
+/// [`tcp`] as a UDP stream, with [`exposed_udp`] since it listens on
+/// `0.0.0.0`.
+fn udp(name: &str, port: u16) -> Value {
+    let mut body = tcp(name, port);
+    body["protocol"] = json!("udp");
+    body["udp"] = exposed_udp();
+    body
 }
 
 /// A stream as a read answers it, less its `bind`, which only the reads
@@ -440,14 +455,23 @@ async fn every_validation_refuses_with_its_status_and_nothing_is_stored() {
         ),
         (
             "UDP backend shared with a route",
-            with(json!({ "protocol": "udp", "backend_ids": [route_backend] })),
+            with(json!({
+                "protocol": "udp",
+                "udp": exposed_udp(),
+                "backend_ids": [route_backend],
+            })),
             StatusCode::UNPROCESSABLE_ENTITY,
         ),
     ] {
         let (status, answer) = node.create(body).await;
         assert_eq!(status, expected, "{what}: {answer}");
     }
-    let shared = with(json!({ "name": "dns", "protocol": "udp", "backend_ids": [route_backend] }));
+    let shared = with(json!({
+        "name": "dns",
+        "protocol": "udp",
+        "udp": exposed_udp(),
+        "backend_ids": [route_backend],
+    }));
     let (_, answer) = node.create(shared).await;
     assert!(
         answer["error"]["message"]
@@ -469,9 +493,12 @@ async fn every_validation_refuses_with_its_status_and_nothing_is_stored() {
     // A taken name is refused by the store, and an update is held to
     // the same rules.
     let first = node
-        .created(with(
-            json!({ "name": "dns", "protocol": "udp", "backend_ids": [udp_backend] }),
-        ))
+        .created(with(json!({
+            "name": "dns",
+            "protocol": "udp",
+            "udp": exposed_udp(),
+            "backend_ids": [udp_backend],
+        })))
         .await;
     let (status, answer) = node.create(with(json!({ "name": "dns" }))).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
@@ -547,45 +574,49 @@ async fn the_ports_of_an_update_move_together() {
     );
 }
 
+/// The keys of a JSON object.
+fn keys(object: &Value) -> BTreeSet<String> {
+    object
+        .as_object()
+        .expect("an object")
+        .keys()
+        .cloned()
+        .collect()
+}
+
 #[tokio::test]
 async fn the_view_publishes_every_model_field_but_the_withheld_ones() {
     let node = Node::standalone().await;
-    let created = node.created(tcp("smtp", 2525)).await;
-    let stored = node
-        .state
-        .store
-        .lock()
-        .await
-        .get_stream(created["id"].as_str().expect("an id"))
-        .expect("read")
-        .expect("stored");
-    let model: BTreeSet<String> = serde_json::to_value(&stored)
-        .expect("the model serialises")
-        .as_object()
-        .expect("an object")
-        .keys()
-        .filter(|k| !STREAM_WITHHELD_FIELDS.contains(&k.as_str()))
-        // Story 12.5 Lot G publishes `udp` field by field; until then
-        // the view leaves it out. Lot G drops this filter.
-        .filter(|k| k.as_str() != "udp")
-        // Story 12.4 Lot F publishes the TLS fields; until then the view
-        // leaves them out. Lot F drops this filter.
-        .filter(|k| !lorica_config::models::Stream::tls_field_names().contains(&k.as_str()))
-        .cloned()
-        .chain(LINK_FIELDS.iter().map(|k| k.to_string()))
-        .collect();
-    let view: BTreeSet<String> = created
-        .as_object()
-        .expect("an object")
-        .keys()
-        .cloned()
-        .collect();
-    assert_eq!(view, model);
-    let typed: StreamResponse = super::stream_to_response(&stored, StreamLinks::default());
-    assert_eq!(
-        serde_json::to_value(&typed).expect("serialises")["listen_address"],
-        "0.0.0.0"
-    );
+    for body in [tcp("smtp", 2525), udp("dns", 53)] {
+        let created = node.created(body).await;
+        let stored = stored_stream(&node, created["id"].as_str().expect("an id")).await;
+        let model_json = serde_json::to_value(&stored).expect("the model serialises");
+        let model: BTreeSet<String> = keys(&model_json)
+            .into_iter()
+            .filter(|k| !STREAM_WITHHELD_FIELDS.contains(&k.as_str()))
+            // Story 12.4 Lot F publishes the TLS fields; until then the view
+            // leaves them out. Lot F drops this filter.
+            .filter(|k| !lorica_config::models::Stream::tls_field_names().contains(&k.as_str()))
+            .chain(LINK_FIELDS.iter().map(|k| k.to_string()))
+            .collect();
+        assert_eq!(keys(&created), model);
+        // The `udp` object is built field by field too: every setting of
+        // the model's, each the stored value.
+        match stored.protocol {
+            lorica_config::models::StreamProtocol::Tcp => {
+                assert_eq!(created["udp"], Value::Null, "a TCP stream carries none")
+            }
+            lorica_config::models::StreamProtocol::Udp => {
+                assert_eq!(keys(&created["udp"]), keys(&model_json["udp"]));
+                assert_eq!(created["udp"], model_json["udp"]);
+            }
+        }
+        let typed: StreamResponse = super::stream_to_response(&stored, StreamLinks::default());
+        assert_eq!(
+            serde_json::to_value(&typed).expect("serialises")["listen_address"],
+            "0.0.0.0"
+        );
+    }
 }
 
 // ---- Roles and the follower gate ----
@@ -678,9 +709,10 @@ async fn a_control_plane_checks_its_own_ports_only_for_the_streams_it_binds() {
 #[tokio::test]
 async fn a_standalone_node_checks_every_stream_against_its_own_ports() {
     let node = Node::standalone().await;
-    for protocol in ["tcp", "udp"] {
-        let mut body = tcp("on-management", THIS_NODE.management);
-        body["protocol"] = json!(protocol);
+    for body in [
+        tcp("on-management", THIS_NODE.management),
+        udp("on-management", THIS_NODE.management),
+    ] {
         let (status, answer) = node.create(body).await;
         let message = port_conflict(status, &answer);
         assert!(message.contains("this node"), "{message}");
@@ -690,13 +722,11 @@ async fn a_standalone_node_checks_every_stream_against_its_own_ports() {
 #[tokio::test]
 async fn streams_conflict_by_protocol_ports_and_address() {
     let node = Node::standalone().await;
-    let mut game = tcp("game", 6000);
-    game["protocol"] = json!("udp");
+    let mut game = udp("game", 6000);
     game["port_last"] = json!(6099);
     let game = node.created(game).await;
 
-    let mut overlapping = tcp("overlap", 6050);
-    overlapping["protocol"] = json!("udp");
+    let mut overlapping = udp("overlap", 6050);
     overlapping["port_last"] = json!(6150);
     let (status, answer) = node.create(overlapping).await;
     let message = port_conflict(status, &answer);
@@ -710,13 +740,11 @@ async fn streams_conflict_by_protocol_ports_and_address() {
 
     // `[::]` binds dual-stack, so it collides with `0.0.0.0`; a specific
     // IPv6 address binds IPv6 only and does not.
-    let mut dual = tcp("dual", 6000);
-    dual["protocol"] = json!("udp");
+    let mut dual = udp("dual", 6000);
     dual["listen_address"] = json!("::");
     let (status, answer) = node.create(dual).await;
     port_conflict(status, &answer);
-    let mut v6 = tcp("v6", 6000);
-    v6["protocol"] = json!("udp");
+    let mut v6 = udp("v6", 6000);
     v6["listen_address"] = json!("2001:db8::1");
     node.created(v6).await;
 
@@ -724,9 +752,7 @@ async fn streams_conflict_by_protocol_ports_and_address() {
     let id = game["id"].as_str().expect("an id");
     let (status, answer) = node.update(id, json!({ "enabled": false })).await;
     assert_eq!(status, StatusCode::OK, "{answer}");
-    let mut again = tcp("again", 6099);
-    again["protocol"] = json!("udp");
-    let (status, answer) = node.create(again).await;
+    let (status, answer) = node.create(udp("again", 6099)).await;
     let message = port_conflict(status, &answer);
     assert!(message.contains("`game`"), "{message}");
 
@@ -922,6 +948,18 @@ fn source_stream(name: &str, port: u16) -> lorica_config::models::Stream {
 
 // ---- The stream plane surfaces (Story 12.2 Lot E3) ----
 
+/// This node's stream plane at `fd_limit` with `workers` workers, its
+/// usable UDP source ports those of the default port range rather than
+/// whatever the test host's are.
+fn plane_at(
+    states: lorica_stream::StreamBindStates,
+    fd_limit: u64,
+    workers: u32,
+) -> StreamPlaneState {
+    StreamPlaneState::new(states, fd_limit, workers)
+        .with_usable_source_ports(Some(DEFAULT_RANGE_USABLE_PORTS))
+}
+
 /// The `422` of a write a node's fd budget cannot hold, with its
 /// message.
 fn budget_refusal(status: StatusCode, answer: &Value) -> String {
@@ -937,7 +975,7 @@ fn budget_refusal(status: StatusCode, answer: &Value) -> String {
 async fn the_reads_carry_this_nodes_bind_state_of_each_stream() {
     let mut node = Node::standalone().await;
     let states = lorica_stream::StreamBindStates::new();
-    node.state.stream_plane = StreamPlaneState::new(states.clone(), 65_536, 2);
+    node.state.stream_plane = plane_at(states.clone(), 65_536, 2);
     let pg = node.created(tcp("pg", 5432)).await;
     let pg_id = pg["id"].as_str().expect("an id");
     let smtp = node.created(tcp("smtp", 2525)).await;
@@ -989,10 +1027,8 @@ async fn a_create_or_update_the_budget_cannot_hold_is_refused_naming_node_and_co
     // holds a socket per worker per UDP port, 6,000 on six workers, and
     // the stream's caps memfd.
     let mut node = Node::standalone().await;
-    node.state.stream_plane =
-        StreamPlaneState::new(lorica_stream::StreamBindStates::new(), 12_288, 6);
-    let mut range = tcp("dns", 20_000);
-    range["protocol"] = json!("udp");
+    node.state.stream_plane = plane_at(lorica_stream::StreamBindStates::new(), 12_288, 6);
+    let mut range = udp("dns", 20_000);
     range["port_last"] = json!(20_999);
 
     let (status, answer) = node.create(range.clone()).await;
@@ -1076,11 +1112,10 @@ async fn a_control_plane_warns_for_each_targeted_node_whose_budget_it_cannot_see
 async fn the_budget_view_answers_this_node_to_operators_and_above() {
     let mut node = Node::standalone().await;
     let states = lorica_stream::StreamBindStates::new();
-    node.state.stream_plane = StreamPlaneState::new(states.clone(), 65_536, 4);
+    node.state.stream_plane = plane_at(states.clone(), 65_536, 4);
     let pg = node.created(tcp("pg", 5432)).await;
     states.set_bound(pg["id"].as_str().expect("an id"), 4, 4);
-    let mut dns = tcp("dns", 53);
-    dns["protocol"] = json!("udp");
+    let mut dns = udp("dns", 53);
     dns["port_last"] = json!(54);
     node.created(dns).await;
     let mut off = tcp("off", 6000);
@@ -1120,6 +1155,21 @@ async fn the_budget_view_answers_this_node_to_operators_and_above() {
     );
     // The TCP port, the UDP ports per worker, the UDP caps memfd.
     assert_eq!(view["supervisor_fds_committed"], 1 + 2 * 4 + 1);
+    // The UDP session ceiling: the default range's ports bind it, the
+    // fds left after the other streams being more.
+    assert_eq!(view["usable_source_ports"], DEFAULT_RANGE_USABLE_PORTS);
+    assert_eq!(view["session_ceiling"], DEFAULT_RANGE_USABLE_PORTS);
+    assert_eq!(view["session_ceiling_bound_by"], "source_ports");
+    assert_eq!(view["udp_sessions_committed"], dns_sessions);
+    assert_eq!(view["over_ceiling"], false);
+    assert_eq!(
+        view["source_pools"],
+        json!([{
+            "pool": "default",
+            "committed": dns_sessions,
+            "usable": DEFAULT_RANGE_USABLE_PORTS,
+        }])
+    );
     let shares: Vec<(&str, &str)> = view["streams"]
         .as_array()
         .expect("streams")
@@ -1147,6 +1197,14 @@ async fn the_budget_view_answers_this_node_to_operators_and_above() {
         vec![("dns", "pending"), ("pg", "bound")],
         "a disabled stream holds no share"
     );
+    // The published schemas name exactly what the view carries.
+    for (schema, object) in [
+        ("NodeStreamBudget", view),
+        ("StreamBudgetShare", &view["streams"][0]),
+        ("StreamSourcePool", &view["source_pools"][0]),
+    ] {
+        assert_eq!(schema_properties(schema), keys(object), "{schema}");
+    }
 
     let viewer = create_user_and_login(
         &node.state,
@@ -1206,17 +1264,25 @@ fn export_with(streams: &[lorica_config::models::Stream], cap: Option<u32>) -> S
 
 /// A fleet-wide UDP range on `0.0.0.0`, as a TOML file would carry it,
 /// with 16 sessions: few enough that what one worker holds stays within
-/// the small budgets these tests run on, so the ports alone decide.
+/// the small budgets these tests run on, so the ports alone decide. Its
+/// explicit per-source cap lets it listen on that exposed address.
 fn udp_range(name: &str, first: u16, last: u16) -> lorica_config::models::Stream {
-    lorica_config::models::Stream {
-        protocol: lorica_config::models::StreamProtocol::Udp,
-        port_last: last,
-        udp: Some(lorica_config::models::UdpSettings {
-            max_sessions: 16,
-            ..lorica_config::models::UdpSettings::default()
-        }),
-        ..source_stream(name, first)
-    }
+    let mut stream = lorica_config::models::Stream::new(
+        uuid::Uuid::new_v4().to_string(),
+        name.to_string(),
+        lorica_config::models::StreamProtocol::Udp,
+        "0.0.0.0".parse().expect("an address"),
+        first,
+        last,
+        Utc::now(),
+    );
+    let udp = stream
+        .udp
+        .as_mut()
+        .expect("a UDP stream carries its settings");
+    udp.max_sessions = 16;
+    udp.source_session_cap = Some(lorica_config::models::UDP_EXPOSED_SOURCE_SESSION_CAP_MAX);
+    stream
 }
 
 /// The preview's answer and then the import's, for one file.
@@ -1244,8 +1310,7 @@ async fn an_import_and_its_preview_refuse_a_stream_the_budget_cannot_hold() {
     // 2,001.
     let fresh_node = || async {
         let mut node = Node::standalone().await;
-        node.state.stream_plane =
-            StreamPlaneState::new(lorica_stream::StreamBindStates::new(), 4096, 2);
+        node.state.stream_plane = plane_at(lorica_stream::StreamBindStates::new(), 4096, 2);
         // Within the 1,024 fds: one port and 100 connections of two.
         let mut smtp = tcp("smtp", 2525);
         smtp["max_connections"] = json!(100);
@@ -1603,12 +1668,13 @@ async fn every_engine_and_link_refusal_answers_422_and_stores_nothing() {
         ),
         (
             "an engine setting on UDP",
-            on(json!({ "protocol": "udp", "max_connections": 10 })),
+            on(json!({ "protocol": "udp", "udp": exposed_udp(), "max_connections": 10 })),
         ),
         (
             "PROXY accept on UDP",
             on(json!({
                 "protocol": "udp",
+                "udp": exposed_udp(),
                 "proxy_protocol_accept": true,
                 "proxy_protocol_trusted_cidrs": ["192.0.2.0/24"],
             })),
@@ -1891,8 +1957,7 @@ async fn a_tcp_streams_connections_count_against_the_fd_budget_as_the_node_count
     // 4,096 fds leave a stream budget of 1,024: one port and 511
     // connections of two fds fit, 512 do not.
     let mut node = Node::standalone().await;
-    node.state.stream_plane =
-        StreamPlaneState::new(lorica_stream::StreamBindStates::new(), 4096, 2);
+    node.state.stream_plane = plane_at(lorica_stream::StreamBindStates::new(), 4096, 2);
     let mut body = tcp("pg", 5432);
     body["max_connections"] = json!(512);
     let (status, answer) = node.create(body.clone()).await;
@@ -1911,6 +1976,222 @@ async fn a_tcp_streams_connections_count_against_the_fd_budget_as_the_node_count
         StatusCode::OK,
         "lowering the cap is always allowed: {answer}"
     );
+}
+
+// ---- The UDP settings and the listen-address rule (Story 12.5 Lot G) ----
+
+/// The message of a `422`.
+fn unprocessable(status: StatusCode, answer: &Value) -> String {
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    answer["error"]["message"]
+        .as_str()
+        .expect("a message")
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_udp_streams_settings_take_their_defaults_and_each_written_one() {
+    let node = Node::standalone().await;
+    let defaults =
+        serde_json::to_value(lorica_config::models::UdpSettings::default()).expect("serialises");
+
+    // On a private address a UDP stream needs no `udp` object at all.
+    let mut body = tcp("dns", 53);
+    body["protocol"] = json!("udp");
+    body["listen_address"] = json!("10.0.0.10");
+    let created = node.created(body).await;
+    assert_eq!(created["udp"], defaults);
+    assert_eq!(
+        created["idle_timeout_s"],
+        lorica_config::models::Stream::DEFAULT_UDP_IDLE_TIMEOUT_S
+    );
+
+    // Each written setting over the defaults, `null` included.
+    let mut body = udp("syslog", 514);
+    body["udp"] = json!({
+        "source_session_cap": 8,
+        "responses_per_request": 0,
+        "requests_per_session": null,
+    });
+    let syslog = node.created(body).await;
+    let mut expected = defaults.clone();
+    expected["source_session_cap"] = json!(8);
+    expected["responses_per_request"] = json!(0);
+    expected["requests_per_session"] = Value::Null;
+    assert_eq!(syslog["udp"], expected);
+
+    // An update keeps what it leaves out, and a `null` object is no
+    // change.
+    let id = syslog["id"].as_str().expect("an id");
+    let (status, answer) = node
+        .update(
+            id,
+            json!({ "udp": { "unbounded_responses": true, "max_sessions": 128 } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    expected["unbounded_responses"] = json!(true);
+    expected["max_sessions"] = json!(128);
+    assert_eq!(answer["data"]["udp"], expected);
+    let (status, answer) = node.update(id, json!({ "udp": null })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["data"]["udp"], expected);
+    let stored = stored_stream(&node, id).await;
+    assert_eq!(
+        serde_json::to_value(stored.udp).expect("serialises"),
+        expected
+    );
+
+    // A range is the model's, named in the refusal; an unknown setting
+    // is refused.
+    for (patch, field) in [
+        (json!({ "max_sessions": 0 }), "udp.max_sessions"),
+        (json!({ "source_byte_rate": 1024 }), "udp.source_byte_rate"),
+    ] {
+        let (status, answer) = node.update(id, json!({ "udp": patch })).await;
+        assert!(unprocessable(status, &answer).contains(field), "{answer}");
+    }
+    let (status, answer) = node.update(id, json!({ "udp": { "max": 1 } })).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(
+        read_udp(&node, id).await,
+        expected,
+        "no refused update moved it"
+    );
+
+    // A TCP stream carries none and takes none, in the model's words.
+    let pg = node.created(tcp("pg", 5432)).await;
+    assert_eq!(pg["udp"], Value::Null);
+    let pg_id = pg["id"].as_str().expect("an id");
+    let refused_on_tcp = "udp settings are refused on a TCP stream";
+    let mut body = tcp("pg-udp", 5433);
+    body["udp"] = json!({ "max_sessions": 10 });
+    let (status, answer) = node.create(body).await;
+    assert!(unprocessable(status, &answer).contains(refused_on_tcp));
+    let (status, answer) = node
+        .update(pg_id, json!({ "udp": { "max_sessions": 10 } }))
+        .await;
+    assert!(unprocessable(status, &answer).contains(refused_on_tcp));
+
+    // A switch takes the new protocol's settings: the defaults under
+    // the object a switch to UDP carries, none on the way back.
+    let (status, answer) = node
+        .update(
+            pg_id,
+            json!({ "protocol": "udp", "udp": merged(exposed_udp(), &json!({ "max_sessions": 10 })) }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let mut switched = merged(defaults.clone(), &exposed_udp());
+    switched["max_sessions"] = json!(10);
+    assert_eq!(answer["data"]["udp"], switched);
+    let (status, answer) = node.update(pg_id, json!({ "protocol": "tcp" })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["data"]["udp"], Value::Null);
+}
+
+/// The `udp` object of stream `id` as a read answers it.
+async fn read_udp(node: &Node, id: &str) -> Value {
+    let (_, read) = node
+        .call("GET", &format!("/api/v1/streams/{id}"), None)
+        .await;
+    read["data"]["udp"].clone()
+}
+
+#[tokio::test]
+async fn an_exposed_udp_stream_needs_an_explicit_source_cap_at_most_the_maximum() {
+    let node = Node::standalone().await;
+    let max = lorica_config::models::UDP_EXPOSED_SOURCE_SESSION_CAP_MAX;
+    let rule = |status: StatusCode, answer: &Value, address: &str| {
+        let message = unprocessable(status, answer);
+        for part in [
+            address,
+            "exposed",
+            "source allowlist",
+            "udp.source_session_cap",
+        ] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+    };
+    for (n, address) in (0u16..).zip(["0.0.0.0", "::", "192.0.2.10", "2001:db8::1"]) {
+        let port = 6000 + n;
+        let mut body = tcp(&format!("exposed-{n}"), port);
+        body["protocol"] = json!("udp");
+        body["listen_address"] = json!(address);
+        for refused in [
+            None,
+            Some(json!({ "source_session_cap": null })),
+            Some(json!({ "source_session_cap": max + 1 })),
+        ] {
+            let mut attempt = body.clone();
+            if let Some(udp) = refused {
+                attempt["udp"] = udp;
+            }
+            let (status, answer) = node.create(attempt).await;
+            rule(status, &answer, address);
+        }
+        body["udp"] = json!({ "source_session_cap": max });
+        node.created(body).await;
+    }
+
+    // The rule follows a stream through its updates.
+    let mut body = tcp("private", 7000);
+    body["protocol"] = json!("udp");
+    body["listen_address"] = json!("10.0.0.10");
+    let id = node.created(body).await["id"]
+        .as_str()
+        .expect("an id")
+        .to_string();
+    let (status, answer) = node
+        .update(&id, json!({ "listen_address": "0.0.0.0" }))
+        .await;
+    rule(status, &answer, "0.0.0.0");
+    let (status, answer) = node
+        .update(
+            &id,
+            json!({ "listen_address": "0.0.0.0", "udp": { "source_session_cap": max } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    for cap in [json!(max + 1), Value::Null] {
+        let (status, answer) = node
+            .update(&id, json!({ "udp": { "source_session_cap": cap } }))
+            .await;
+        rule(status, &answer, "0.0.0.0");
+    }
+}
+
+#[tokio::test]
+async fn a_udp_write_past_the_source_ports_is_refused_and_one_raising_nothing_passes() {
+    let mut node = Node::standalone().await;
+    let narrowed_to = |usable: u64| {
+        StreamPlaneState::new(lorica_stream::StreamBindStates::new(), 65_536, 1)
+            .with_usable_source_ports(Some(usable))
+    };
+    node.state.stream_plane = narrowed_to(5_000);
+    let dns = node.created(udp("dns", 53)).await;
+    let id = dns["id"].as_str().expect("an id");
+    let (status, answer) = node.create(udp("ntp", 123)).await;
+    let message = budget_refusal(status, &answer);
+    for part in ["`ntp`", "this node", "source_ports", "8192", "5000"] {
+        assert!(message.contains(part), "{part}: {message}");
+    }
+
+    // The range narrows under the stream: 4,096 sessions on 3,000
+    // ports. A move and a lower share pass; a raise is refused.
+    node.state.stream_plane = narrowed_to(3_000);
+    let (status, answer) = node
+        .update(id, json!({ "listen_address": "10.0.0.10" }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "a move raises nothing: {answer}");
+    let (status, answer) = node
+        .update(id, json!({ "udp": { "max_sessions": 2048 } }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "a lower share passes: {answer}");
+    let (status, answer) = node
+        .update(id, json!({ "udp": { "max_sessions": 4096 } }))
+        .await;
+    assert!(budget_refusal(status, &answer).contains("source_ports"));
 }
 
 // ---- The published description (`lorica-api/openapi.yaml`) ----
@@ -1997,6 +2278,144 @@ async fn the_published_stream_schemas_name_exactly_the_fields_the_api_reads_and_
         .map(str::to_string)
         .collect();
     assert_eq!(required, view, "every view field is always present");
+}
+
+#[tokio::test]
+async fn the_published_udp_schemas_name_exactly_the_udp_view() {
+    let node = Node::standalone().await;
+    let created = node.created(udp("dns", 53)).await;
+    let udp_view = keys(&created["udp"]);
+    assert_eq!(schema_properties("StreamUdpSettings"), udp_view);
+    assert_eq!(schema_properties("StreamUdpSettingsInput"), udp_view);
+    let required: BTreeSet<String> = schema_block("StreamUdpSettings")
+        .into_iter()
+        .filter_map(|line| line.strip_prefix("        - "))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(required, udp_view, "every udp field is always present");
+}
+
+/// The prose of `block`, its lines joined with single spaces, so a
+/// phrase reads the same wherever the YAML wraps it.
+fn prose(block: &[&str]) -> String {
+    block
+        .iter()
+        .map(|line| line.trim())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn the_published_udp_ranges_defaults_and_words_are_the_models() {
+    use lorica_config::models::{
+        DatagramDropReason, Stream, StreamRefusal, UdpSettings, UDP_EXPOSED_SOURCE_SESSION_CAP_MAX,
+    };
+    use strum::VariantArray as _;
+
+    for (field, range) in [
+        ("max_sessions", UdpSettings::MAX_SESSIONS_RANGE),
+        ("source_session_cap", UdpSettings::SOURCE_SESSION_CAP_RANGE),
+        (
+            "requests_per_session",
+            UdpSettings::REQUESTS_PER_SESSION_RANGE,
+        ),
+        (
+            "responses_per_request",
+            UdpSettings::RESPONSES_PER_REQUEST_RANGE,
+        ),
+        (
+            "response_bytes_ratio",
+            UdpSettings::RESPONSE_BYTES_RATIO_RANGE,
+        ),
+        (
+            "source_datagram_rate",
+            UdpSettings::SOURCE_DATAGRAM_RATE_RANGE,
+        ),
+        ("source_byte_rate", UdpSettings::SOURCE_BYTE_RATE_RANGE),
+        ("max_datagram_bytes", UdpSettings::MAX_DATAGRAM_BYTES_RANGE),
+    ] {
+        let block = property_block("StreamUdpSettings", field);
+        assert_eq!(
+            scalar(&block, "minimum"),
+            Some(range.start().to_string().as_str()),
+            "{field}"
+        );
+        assert_eq!(
+            scalar(&block, "maximum"),
+            Some(range.end().to_string().as_str()),
+            "{field}"
+        );
+    }
+    let defaults = serde_json::to_value(UdpSettings::default()).expect("serialises");
+    for property in schema_properties("StreamUdpSettings") {
+        let block = property_block("StreamUdpSettings", &property);
+        let published = scalar(&block, "default").expect("every udp setting publishes its default");
+        assert_eq!(published, defaults[&property].to_string(), "{property}");
+    }
+
+    // The figures the prose states are the model's.
+    let settings = prose(&schema_block("StreamUdpSettings"));
+    assert!(
+        settings.contains(&format!("at most {UDP_EXPOSED_SOURCE_SESSION_CAP_MAX}")),
+        "{settings}"
+    );
+    let cap = prose(&property_block("StreamUdpSettings", "source_session_cap"));
+    assert!(
+        cap.contains(&format!(
+            "default of {}",
+            UdpSettings::DEFAULT_SOURCE_SESSION_CAP
+        )),
+        "{cap}"
+    );
+    let idle = prose(&property_block("StreamResponse", "idle_timeout_s"));
+    for figure in [
+        format!("defaults to {}", Stream::DEFAULT_UDP_IDLE_TIMEOUT_S),
+        format!("stops at {}", Stream::UDP_IDLE_TIMEOUT_S_RANGE.end()),
+    ] {
+        assert!(idle.contains(&figure), "{figure}: {idle}");
+    }
+
+    // The words are the enums'.
+    let refusals: Vec<String> = StreamRefusal::VARIANTS
+        .iter()
+        .map(|v| <&str>::from(v).to_string())
+        .collect();
+    assert_eq!(enum_words(&schema_block("StreamRefusal")), refusals);
+    let drops: Vec<String> = DatagramDropReason::VARIANTS
+        .iter()
+        .map(|v| v.as_str().to_string())
+        .collect();
+    assert_eq!(enum_words(&schema_block("StreamDatagramDropReason")), drops);
+    let kinds: Vec<String> = lorica_stream::BindFailureKind::ALL
+        .iter()
+        .map(|k| k.as_str().to_string())
+        .collect();
+    assert_eq!(enum_words(&schema_block("StreamBindFailureKind")), kinds);
+    // `CeilingBound` lists no variants; this match fails to compile when
+    // one is added, which is when this list must grow with it.
+    use lorica_stream::budget::CeilingBound;
+    let every_bound = |bound: &CeilingBound| match bound {
+        CeilingBound::FdBudget | CeilingBound::SourcePorts => (),
+    };
+    let all_bounds = [CeilingBound::FdBudget, CeilingBound::SourcePorts];
+    all_bounds.iter().for_each(every_bound);
+    let bounds: Vec<String> = all_bounds
+        .iter()
+        .map(|b| {
+            serde_json::to_value(b)
+                .expect("serialises")
+                .as_str()
+                .expect("a word")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        enum_words(&property_block(
+            "NodeStreamBudget",
+            "session_ceiling_bound_by"
+        )),
+        bounds
+    );
 }
 
 #[test]
