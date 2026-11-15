@@ -532,20 +532,25 @@ fn proto_of(protocol: StreamProtocol) -> StreamProto {
     }
 }
 
-/// The budget demand of binding `key`, with what its engine holds at the
-/// stream's cap (Story 12.3 D-p) when `stream` is known: the same
-/// [`lorica_stream::tcp::held_fds`] the API's budget check reads.
+/// The budget demand of binding `key`: [`StreamDemand::of`] its stream,
+/// the one demand function the API's write check also builds on (Story
+/// 12.3 D-p), with the protocol and ports of the binding as bound. A
+/// binding whose stream is gone declares nothing beyond its sockets.
 fn demand_of(key: &BindKey, stream: Option<&Stream>) -> StreamDemand {
-    let demand = StreamDemand {
-        stream_id: key.stream_id.clone(),
-        name: stream.map(|s| s.name.clone()).unwrap_or_default(),
-        protocol: key.protocol,
-        listen_sockets: u64::from(key.port_last.saturating_sub(key.port_first)) + 1,
-        held: None,
-    };
-    match stream.and_then(lorica_stream::tcp::held_fds) {
-        Some(held) => demand.with_held(held),
-        None => demand,
+    let listen_sockets = u64::from(key.port_last.saturating_sub(key.port_first)) + 1;
+    match stream {
+        Some(stream) => StreamDemand {
+            protocol: key.protocol,
+            listen_sockets,
+            ..StreamDemand::of(stream)
+        },
+        None => StreamDemand {
+            stream_id: key.stream_id.clone(),
+            name: String::new(),
+            protocol: key.protocol,
+            listen_sockets,
+            held: None,
+        },
     }
 }
 
@@ -2377,10 +2382,14 @@ mod tests {
             .into_iter()
             .next()
             .expect("a desired binding");
-        let held = demand_of(&key, Some(&s))
-            .held
-            .expect("a TCP stream declares its fds");
-        assert_eq!(Some(held), lorica_stream::tcp::held_fds(&s));
+        let demand = demand_of(&key, Some(&s));
+        assert_eq!(
+            demand,
+            StreamDemand::of(&s),
+            "the driver's demand is the one the API's write check builds"
+        );
+        assert_eq!(demand.held, lorica_stream::tcp::held_fds(&s));
+        assert!(demand.held.is_some(), "a TCP stream declares its fds");
         assert_eq!(
             demand_of(&key, None).held,
             None,

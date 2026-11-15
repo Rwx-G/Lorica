@@ -13,13 +13,23 @@ use lorica_config::listen_ports::ReservedPorts;
 use lorica_config::models::{ClusterNode, NodeStatus, Role};
 use serde_json::{json, Value};
 
-use super::{StreamResponse, STREAM_PORT_CONFLICT_CODE, STREAM_WITHHELD_FIELDS};
+use super::{
+    StreamLinks, StreamResponse, STREAM_LOCAL_BACKEND_CODE, STREAM_PORT_CONFLICT_CODE,
+    STREAM_WITHHELD_FIELDS,
+};
 use crate::server::AppState;
 use crate::stream_budget::{StreamPlaneState, STREAM_FD_BUDGET_CODE};
 use crate::tests::{
     body_json, create_user_and_login, send, setup_admin_and_login, test_control_plane,
     test_follower_runtime, test_state,
 };
+
+/// The view fields that are not model fields: the links, by role.
+const LINK_FIELDS: &[&str] = &["backend_ids", "backup_backend_ids"];
+
+/// The view fields a client never writes: the server mints the id and
+/// stamps the times.
+const SERVER_OWNED_FIELDS: &[&str] = &["id", "created_at", "updated_at"];
 
 /// The ports of the node under test. Distinct from every port an
 /// enrolled node of these tests reports, so a refusal names the node it
@@ -555,15 +565,8 @@ async fn the_view_publishes_every_model_field_but_the_withheld_ones() {
         .expect("an object")
         .keys()
         .filter(|k| !STREAM_WITHHELD_FIELDS.contains(&k.as_str()))
-        // The Story 12.3 engine settings joined the model in its Lot B
-        // and are published by its Lot E, which drops this filter.
-        .filter(|k| {
-            !lorica_config::models::TCP_ENGINE_FIELDS
-                .iter()
-                .any(|field| field.name == k.as_str())
-        })
         .cloned()
-        .chain(std::iter::once("backend_ids".to_string()))
+        .chain(LINK_FIELDS.iter().map(|k| k.to_string()))
         .collect();
     let view: BTreeSet<String> = created
         .as_object()
@@ -572,7 +575,7 @@ async fn the_view_publishes_every_model_field_but_the_withheld_ones() {
         .cloned()
         .collect();
     assert_eq!(view, model);
-    let typed: StreamResponse = super::stream_to_response(&stored, Vec::new());
+    let typed: StreamResponse = super::stream_to_response(&stored, StreamLinks::default());
     assert_eq!(
         serde_json::to_value(&typed).expect("serialises")["listen_address"],
         "0.0.0.0"
@@ -1091,15 +1094,31 @@ async fn the_budget_view_answers_this_node_to_operators_and_above() {
     assert_eq!(view["listen_socket_cap"], 2048);
     assert_eq!(view["worker_drain_timeout_s"], 30);
     assert_eq!(view["listen_sockets_used"], 3);
-    assert_eq!(view["worker_fds_committed"], 3);
+    let pg_held = {
+        let stored = node
+            .state
+            .store
+            .lock()
+            .await
+            .get_stream(pg["id"].as_str().expect("an id"))
+            .expect("read")
+            .expect("stored");
+        lorica_stream::tcp::held_fds(&stored).expect("a TCP stream declares its connections")
+    };
+    assert_eq!(view["worker_fds_committed"], 3 + pg_held.total());
     assert_eq!(view["supervisor_fds_committed"], 1 + 2 * 4);
     let shares: Vec<(&str, &str)> = view["streams"]
         .as_array()
         .expect("streams")
         .iter()
         .map(|s| {
-            assert_eq!(s["ceiling"], Value::Null, "no engine declares one yet");
-            assert_eq!(s["fds_per_unit"], Value::Null);
+            if s["protocol"] == "tcp" {
+                assert_eq!(s["ceiling"], pg_held.ceiling, "{s}");
+                assert_eq!(s["fds_per_unit"], pg_held.fds_per_unit, "{s}");
+            } else {
+                assert_eq!(s["ceiling"], Value::Null, "UDP declares none yet: {s}");
+                assert_eq!(s["fds_per_unit"], Value::Null);
+            }
             (
                 s["name"].as_str().expect("a name"),
                 s["bind_state"].as_str().expect("a state"),
@@ -1203,7 +1222,10 @@ async fn an_import_and_its_preview_refuse_a_stream_the_budget_cannot_hold() {
         let mut node = Node::standalone().await;
         node.state.stream_plane =
             StreamPlaneState::new(lorica_stream::StreamBindStates::new(), 4096, 2);
-        let kept = node.created(tcp("smtp", 2525)).await;
+        // Within the 1,024 fds: one port and 100 connections of two.
+        let mut smtp = tcp("smtp", 2525);
+        smtp["max_connections"] = json!(100);
+        let kept = node.created(smtp).await;
         (node, kept)
     };
 
@@ -1337,4 +1359,755 @@ async fn an_import_names_each_targeted_node_whose_budget_it_cannot_see() {
         assert_eq!(warnings.len(), 1, "{answer}");
         assert!(warnings[0].contains("node `edge-1`"), "{answer}");
     }
+}
+
+// ---- The engine settings and their surfaces (Story 12.3 Lot E) ----
+
+/// A body that moves every Story 12.3 setting off its default, valid on
+/// a TCP stream.
+fn engine_settings_off_default() -> Value {
+    json!({
+        "load_balancing": "least_conn",
+        "connect_timeout_ms": 2500,
+        "idle_timeout_s": 120,
+        "total_timeout_s": 3600,
+        "max_connect_attempts": 5,
+        "backend_keepalive": false,
+        "backend_keepalive_idle_s": 30,
+        "close_on_backend_down": true,
+        "proxy_protocol_send": "v2",
+        "proxy_protocol_accept": true,
+        "proxy_protocol_trusted_cidrs": ["192.0.2.0/24"],
+        "source_addresses": ["192.0.2.50"],
+        "allow_local_backend": true,
+        "upload_rate_bps": 65536,
+        "download_rate_bps": 131072,
+        "max_connections": 200,
+    })
+}
+
+/// `body` with every key of `patch` set on it.
+fn merged(mut body: Value, patch: &Value) -> Value {
+    for (key, value) in patch.as_object().expect("an object") {
+        body[key] = value.clone();
+    }
+    body
+}
+
+/// A stored stream as the model holds it.
+async fn stored_stream(node: &Node, id: &str) -> lorica_config::models::Stream {
+    node.state
+        .store
+        .lock()
+        .await
+        .get_stream(id)
+        .expect("read")
+        .expect("stored")
+}
+
+/// The `409` of a local backend on a node's port, with its message.
+fn local_backend_conflict(status: StatusCode, answer: &Value) -> String {
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(
+        answer["error"]["code"], STREAM_LOCAL_BACKEND_CODE,
+        "{answer}"
+    );
+    answer["error"]["message"]
+        .as_str()
+        .expect("a message")
+        .to_string()
+}
+
+#[tokio::test]
+async fn every_engine_setting_and_the_backups_round_trip_through_create_update_and_read() {
+    let node = Node::standalone().await;
+    let primary = node.backend("192.0.2.30:5432").await;
+    let backup = node.backend("192.0.2.31:5432").await;
+    let settings = engine_settings_off_default();
+    let mut body = merged(tcp("pg", 5432), &settings);
+    body["backend_ids"] = json!([primary]);
+    body["backup_backend_ids"] = json!([backup]);
+    let created = node.created(body).await;
+    for (key, value) in settings.as_object().expect("an object") {
+        assert_eq!(&created[key], value, "{key}: {created}");
+    }
+    assert_eq!(created["backend_ids"], json!([primary]));
+    assert_eq!(created["backup_backend_ids"], json!([backup]));
+    let id = created["id"].as_str().expect("an id");
+    let (_, read) = node
+        .call("GET", &format!("/api/v1/streams/{id}"), None)
+        .await;
+    assert_eq!(without_bind(&read["data"]), created);
+
+    // The view is the model: each published setting is the stored one.
+    let stored = serde_json::to_value(stored_stream(&node, id).await).expect("serialises");
+    for key in settings.as_object().expect("an object").keys() {
+        assert_eq!(stored[key], created[key], "{key}");
+    }
+
+    // An absent field keeps its value, `null` lifts a limit, and each
+    // list of links replaces its own half.
+    let (status, patched) = node
+        .update(
+            id,
+            json!({
+                "total_timeout_s": null,
+                "upload_rate_bps": null,
+                "connect_timeout_ms": 4000,
+                "backup_backend_ids": [],
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    let patched = &patched["data"];
+    assert_eq!(patched["total_timeout_s"], Value::Null);
+    assert_eq!(patched["upload_rate_bps"], Value::Null);
+    assert_eq!(patched["connect_timeout_ms"], 4000);
+    assert_eq!(patched["download_rate_bps"], created["download_rate_bps"]);
+    assert_eq!(patched["max_connections"], created["max_connections"]);
+    assert_eq!(patched["backend_ids"], json!([primary]));
+    assert_eq!(patched["backup_backend_ids"], json!([]));
+
+    // A backup moved to primary in one write.
+    let (status, swapped) = node
+        .update(id, json!({ "backend_ids": [primary, backup] }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{swapped}");
+    let mut both = vec![primary.clone(), backup.clone()];
+    both.sort();
+    assert_eq!(swapped["data"]["backend_ids"], json!(both));
+}
+
+#[tokio::test]
+async fn a_create_without_engine_settings_answers_the_model_defaults() {
+    let node = Node::standalone().await;
+    let created = node.created(tcp("smtp", 2525)).await;
+    let id = created["id"].as_str().expect("an id");
+    let mut defaults = lorica_config::models::Stream::new(
+        id.to_string(),
+        "smtp".to_string(),
+        lorica_config::models::StreamProtocol::Tcp,
+        "0.0.0.0".parse().expect("an address"),
+        2525,
+        2525,
+        Utc::now(),
+    );
+    let stored = stored_stream(&node, id).await;
+    defaults.created_at = stored.created_at;
+    defaults.updated_at = stored.updated_at;
+    assert_eq!(stored, defaults, "an absent setting is Stream::new's");
+    assert_eq!(created["backup_backend_ids"], json!([]));
+}
+
+/// Every field a write answers, less the ones the server owns, is a
+/// field a create and an update accept back: both bodies refuse an
+/// unknown field, so a view field neither takes would fail here.
+#[tokio::test]
+async fn every_written_view_field_is_accepted_back_on_create_and_update() {
+    let node = Node::standalone().await;
+    let primary = node.backend("192.0.2.32:5432").await;
+    let mut body = merged(tcp("pg", 5432), &engine_settings_off_default());
+    body["backend_ids"] = json!([primary]);
+    let created = node.created(body).await;
+    let id = created["id"].as_str().expect("an id").to_string();
+
+    let mut echoed = created.clone();
+    let object = echoed.as_object_mut().expect("an object");
+    for key in SERVER_OWNED_FIELDS {
+        assert!(object.remove(*key).is_some(), "{key} is in the view");
+    }
+    let (status, answer) = node.update(&id, echoed.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    echoed["name"] = json!("pg-copy");
+    echoed["port_first"] = json!(5433);
+    echoed["port_last"] = json!(5433);
+    let (status, answer) = node.create(echoed).await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+}
+
+#[tokio::test]
+async fn every_engine_and_link_refusal_answers_422_and_stores_nothing() {
+    let node = Node::standalone().await;
+    let first = node.backend("192.0.2.40:5432").await;
+    let second = node.backend("192.0.2.41:5432").await;
+    let v6 = node.backend("[2001:db8::40]:5432").await;
+    let local = node.backend("127.0.0.1:5999").await;
+    let on = |patch: Value| merged(tcp("pg", 5432), &patch);
+    let below = |range: std::ops::RangeInclusive<u32>| range.start() - 1;
+    let above = |range: std::ops::RangeInclusive<u32>| range.end() + 1;
+    type S = lorica_config::models::Stream;
+    for (what, body) in [
+        (
+            "connect timeout below its range",
+            on(json!({ "connect_timeout_ms": below(S::CONNECT_TIMEOUT_MS_RANGE) })),
+        ),
+        (
+            "connect timeout above its range",
+            on(json!({ "connect_timeout_ms": above(S::CONNECT_TIMEOUT_MS_RANGE) })),
+        ),
+        (
+            "max_connections zero",
+            on(json!({ "max_connections": below(S::MAX_CONNECTIONS_RANGE) })),
+        ),
+        (
+            "max_connections above its range",
+            on(json!({ "max_connections": above(S::MAX_CONNECTIONS_RANGE) })),
+        ),
+        (
+            "attempts above their range",
+            on(json!({ "max_connect_attempts": S::MAX_CONNECT_ATTEMPTS_RANGE.end() + 1 })),
+        ),
+        (
+            "a rate below its range",
+            on(json!({ "upload_rate_bps": S::RATE_BPS_RANGE.start() - 1 })),
+        ),
+        (
+            "PROXY accept with no trusted peer",
+            on(json!({ "proxy_protocol_accept": true })),
+        ),
+        (
+            "a trust list of everyone",
+            on(json!({ "proxy_protocol_trusted_cidrs": ["0.0.0.0/0"] })),
+        ),
+        (
+            "an unspecified source address",
+            on(json!({ "source_addresses": ["0.0.0.0"] })),
+        ),
+        (
+            "an unknown balancing algorithm",
+            on(json!({ "load_balancing": "fastest" })),
+        ),
+        (
+            "an engine setting on UDP",
+            on(json!({ "protocol": "udp", "max_connections": 10 })),
+        ),
+        (
+            "PROXY accept on UDP",
+            on(json!({
+                "protocol": "udp",
+                "proxy_protocol_accept": true,
+                "proxy_protocol_trusted_cidrs": ["192.0.2.0/24"],
+            })),
+        ),
+        (
+            "an unknown backup",
+            on(json!({ "backend_ids": [first], "backup_backend_ids": ["no-such-backend"] })),
+        ),
+        (
+            "a backend both primary and backup",
+            on(json!({ "backend_ids": [first], "backup_backend_ids": [first] })),
+        ),
+        (
+            "backups and no primary",
+            on(json!({ "backup_backend_ids": [first, second] })),
+        ),
+        (
+            "a source family no backend has",
+            on(json!({ "source_addresses": ["192.0.2.50"], "backend_ids": [v6] })),
+        ),
+        (
+            "a local backend without the flag",
+            on(json!({ "backend_ids": [local] })),
+        ),
+    ] {
+        let (status, answer) = node.create(body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{what}: {answer}");
+    }
+    assert!(
+        node.state
+            .store
+            .lock()
+            .await
+            .list_streams()
+            .expect("list")
+            .is_empty(),
+        "no refused create left a row"
+    );
+    let (_, answer) = node.create(on(json!({ "backend_ids": [local] }))).await;
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("allow_local_backend") && m.contains("`pg`")),
+        "rule A names the flag and the stream: {answer}"
+    );
+
+    // The same rules on an update, and a refused update moves nothing.
+    let created = node.created(on(json!({ "backend_ids": [first] }))).await;
+    let id = created["id"].as_str().expect("an id");
+    let read_back = || async {
+        let (_, read) = node
+            .call("GET", &format!("/api/v1/streams/{id}"), None)
+            .await;
+        without_bind(&read["data"])
+    };
+    for (what, body) in [
+        ("a range broken", json!({ "idle_timeout_s": 0 })),
+        ("a local backend linked", json!({ "backend_ids": [local] })),
+    ] {
+        let (status, answer) = node.update(id, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{what}: {answer}");
+        assert_eq!(read_back().await, created, "{what}");
+    }
+
+    // The flag and the backend it allows land in one write, and leave
+    // in one; the flag alone cannot leave under the backend.
+    let (status, answer) = node
+        .update(
+            id,
+            json!({ "allow_local_backend": true, "backend_ids": [local] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let flagged = read_back().await;
+    let (status, answer) = node
+        .update(id, json!({ "allow_local_backend": false }))
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(read_back().await, flagged);
+    let (status, answer) = node
+        .update(
+            id,
+            json!({ "allow_local_backend": false, "backend_ids": [first] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+}
+
+/// IV4, first half: a stream pointed at this node's management API
+/// through loopback is refused at creation, flag or not.
+#[tokio::test]
+async fn iv4_a_stream_pointed_at_the_management_port_is_refused_at_creation() {
+    let node = Node::standalone().await;
+    let management = node
+        .backend(&format!("127.0.0.1:{}", THIS_NODE.management))
+        .await;
+    for flag in [false, true] {
+        let mut body = tcp("admin", 5000);
+        body["allow_local_backend"] = json!(flag);
+        body["backend_ids"] = json!([management]);
+        let (status, answer) = node.create(body).await;
+        let message = local_backend_conflict(status, &answer);
+        for part in [
+            "`admin`",
+            "this node",
+            &format!("127.0.0.1:{}", THIS_NODE.management),
+            "management",
+        ] {
+            assert!(message.contains(part), "flag {flag}, {part}: {message}");
+        }
+    }
+    // The same address as a backup, and in its other local spellings.
+    let mut body = tcp("admin", 5000);
+    body["allow_local_backend"] = json!(true);
+    let primary = node.backend("192.0.2.60:5000").await;
+    body["backend_ids"] = json!([primary]);
+    body["backup_backend_ids"] = json!([management]);
+    let (status, answer) = node.create(body).await;
+    local_backend_conflict(status, &answer);
+    for address in [
+        format!("localhost:{}", THIS_NODE.management),
+        format!("[::1]:{}", THIS_NODE.management),
+        format!("127.0.0.1:{}", THIS_NODE.https),
+    ] {
+        let backend = node.backend(&address).await;
+        let mut body = tcp("admin", 5000);
+        body["allow_local_backend"] = json!(true);
+        body["backend_ids"] = json!([backend]);
+        let (status, answer) = node.create(body).await;
+        local_backend_conflict(status, &answer);
+    }
+    assert!(
+        node.state
+            .store
+            .lock()
+            .await
+            .list_streams()
+            .expect("list")
+            .is_empty(),
+        "nothing was created"
+    );
+
+    // A local backend on a port nothing holds needs the flag, and only
+    // the flag.
+    let free = node.backend("127.0.0.1:5999").await;
+    let mut body = tcp("local", 5001);
+    body["backend_ids"] = json!([free]);
+    let (status, answer) = node.create(body.clone()).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    body["allow_local_backend"] = json!(true);
+    node.created(body).await;
+}
+
+#[tokio::test]
+async fn a_local_backend_may_not_reach_a_stream_port_in_either_order() {
+    let node = Node::standalone().await;
+    let other = node.created(tcp("pg", 6000)).await;
+    let onto_pg = node.backend("127.0.0.1:6000").await;
+    let mut looping = tcp("loop", 6001);
+    looping["allow_local_backend"] = json!(true);
+    looping["backend_ids"] = json!([onto_pg]);
+    let (status, answer) = node.create(looping).await;
+    let message = local_backend_conflict(status, &answer);
+    assert!(
+        message.contains("`loop`") && message.contains("`pg`"),
+        "{message}"
+    );
+
+    // Its own port: the stream would forward to itself.
+    let onto_self = node.backend("127.0.0.1:6002").await;
+    let mut to_itself = tcp("self", 6002);
+    to_itself["allow_local_backend"] = json!(true);
+    to_itself["backend_ids"] = json!([onto_self]);
+    let (status, answer) = node.create(to_itself).await;
+    assert!(local_backend_conflict(status, &answer).contains("`self`"));
+
+    // The other way round: a stored stream's local backend on a port a
+    // write would now take. The refusal names the stream whose backend
+    // it is.
+    let onto_7000 = node.backend("127.0.0.1:7000").await;
+    let mut forwarder = tcp("forwarder", 6003);
+    forwarder["allow_local_backend"] = json!(true);
+    forwarder["backend_ids"] = json!([onto_7000]);
+    node.created(forwarder).await;
+    let (status, answer) = node.create(tcp("target", 7000)).await;
+    let message = local_backend_conflict(status, &answer);
+    assert!(
+        message.contains("`forwarder`") && message.contains("`target`"),
+        "{message}"
+    );
+    let id = other["id"].as_str().expect("an id");
+    let (status, answer) = node.update(id, json!({ "port_first": 7000 })).await;
+    let message = local_backend_conflict(status, &answer);
+    assert!(
+        message.contains("`forwarder`") && message.contains("`pg`"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn a_backend_update_moving_a_linked_backend_onto_a_node_port_is_refused() {
+    let node = Node::standalone().await;
+    node.created(tcp("pg", 6100)).await;
+    let backend = node.backend("127.0.0.1:5999").await;
+    let mut local = tcp("local", 6000);
+    local["allow_local_backend"] = json!(true);
+    local["backend_ids"] = json!([backend]);
+    node.created(local).await;
+
+    let uri = format!("/api/v1/backends/{backend}");
+    for (address, holder) in [
+        ("127.0.0.1:6100".to_string(), "`pg`"),
+        ("127.0.0.1:6000".to_string(), "`local`"),
+        (format!("127.0.0.1:{}", THIS_NODE.management), "management"),
+    ] {
+        let (status, answer) = node
+            .call("PUT", &uri, Some(json!({ "address": address })))
+            .await;
+        let message = local_backend_conflict(status, &answer);
+        assert!(
+            message.contains("stream `local`") && message.contains(holder),
+            "{address}: {message}"
+        );
+    }
+    let (_, read) = node.call("GET", &uri, None).await;
+    assert_eq!(read["data"]["address"], "127.0.0.1:5999", "nothing moved");
+
+    // A port nothing holds is the backend's to take.
+    let (status, answer) = node
+        .call("PUT", &uri, Some(json!({ "address": "127.0.0.1:5998" })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+}
+
+#[tokio::test]
+async fn an_import_and_its_preview_refuse_a_local_backend_on_a_node_port() {
+    let node = Node::standalone().await;
+    // A backend row as the management API stores it, carried into the
+    // file below.
+    let backend_id = node
+        .backend(&format!("127.0.0.1:{}", THIS_NODE.management))
+        .await;
+    let backend = node
+        .state
+        .store
+        .lock()
+        .await
+        .get_backend(&backend_id)
+        .expect("read")
+        .expect("stored");
+    let file = {
+        let source = lorica_config::ConfigStore::open_in_memory().expect("source");
+        source
+            .create_backend(&backend)
+            .expect("test setup: backend");
+        let mut stream = source_stream("admin", 5000);
+        stream.allow_local_backend = true;
+        source.create_stream(&stream).expect("test setup: stream");
+        source
+            .set_stream_backends(&stream.id, std::slice::from_ref(&backend.id))
+            .expect("test setup: the store checks no node ports");
+        lorica_config::export::export_to_toml(&source).expect("export")
+    };
+    let ((preview_status, preview), (import_status, import)) =
+        preview_and_import(&node, file).await;
+    let previewed = local_backend_conflict(preview_status, &preview);
+    assert!(
+        previewed.contains("`admin`") && previewed.contains("this node"),
+        "{previewed}"
+    );
+    assert_eq!(
+        previewed,
+        local_backend_conflict(import_status, &import),
+        "the preview and the import refuse alike"
+    );
+}
+
+#[tokio::test]
+async fn a_tcp_streams_connections_count_against_the_fd_budget_as_the_node_counts_them() {
+    // 4,096 fds leave a stream budget of 1,024: one port and 511
+    // connections of two fds fit, 512 do not.
+    let mut node = Node::standalone().await;
+    node.state.stream_plane =
+        StreamPlaneState::new(lorica_stream::StreamBindStates::new(), 4096, 2);
+    let mut body = tcp("pg", 5432);
+    body["max_connections"] = json!(512);
+    let (status, answer) = node.create(body.clone()).await;
+    let message = budget_refusal(status, &answer);
+    for part in ["`pg`", "worker_fds", "1025", "1024"] {
+        assert!(message.contains(part), "{part}: {message}");
+    }
+    body["max_connections"] = json!(511);
+    let created = node.created(body).await;
+    let id = created["id"].as_str().expect("an id");
+    let (status, answer) = node.update(id, json!({ "max_connections": 512 })).await;
+    budget_refusal(status, &answer);
+    let (status, answer) = node.update(id, json!({ "max_connections": 100 })).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "lowering the cap is always allowed: {answer}"
+    );
+}
+
+// ---- The published description (`lorica-api/openapi.yaml`) ----
+
+const OPENAPI: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.yaml"));
+
+/// The lines of the component schema `name`, its header excluded.
+fn schema_block(name: &str) -> Vec<&'static str> {
+    let header = format!("    {name}:");
+    let mut lines = OPENAPI.lines().skip_while(|l| l.trim_end() != header);
+    assert!(lines.next().is_some(), "openapi.yaml has no schema {name}");
+    lines
+        .take_while(|l| l.trim().is_empty() || l.starts_with("     "))
+        .collect()
+}
+
+/// The property names of the component schema `name`.
+fn schema_properties(name: &str) -> BTreeSet<String> {
+    schema_block(name)
+        .into_iter()
+        .filter_map(|line| {
+            let key = line.strip_prefix("        ")?.strip_suffix(':')?;
+            key.chars()
+                .all(|c| c.is_ascii_lowercase() || c == '_')
+                .then(|| key.to_string())
+        })
+        .collect()
+}
+
+/// The lines describing `property` of the component schema `name`.
+fn property_block(name: &str, property: &str) -> Vec<&'static str> {
+    let header = format!("        {property}:");
+    let mut lines = schema_block(name)
+        .into_iter()
+        .skip_while(|l| l.trim_end() != header);
+    assert!(lines.next().is_some(), "{name} has no property {property}");
+    lines
+        .take_while(|l| l.trim().is_empty() || l.starts_with("         "))
+        .collect()
+}
+
+/// The value of the `key: value` line in `block`, unquoted.
+fn scalar<'a>(block: &[&'a str], key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}: ");
+    block.iter().find_map(|line| {
+        line.trim()
+            .strip_prefix(prefix.as_str())
+            .map(|value| value.trim_matches('"'))
+    })
+}
+
+/// The words of the `enum: [a, b]` line in `block`, unquoted.
+fn enum_words(block: &[&str]) -> Vec<String> {
+    let list = scalar(block, "enum").expect("an enum line");
+    list.trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .map(|word| word.trim().trim_matches('"').to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_published_stream_schemas_name_exactly_the_fields_the_api_reads_and_answers() {
+    let node = Node::standalone().await;
+    let created = node.created(tcp("smtp", 2525)).await;
+    let view: BTreeSet<String> = created
+        .as_object()
+        .expect("an object")
+        .keys()
+        .filter(|k| k.as_str() != "warnings")
+        .cloned()
+        .collect();
+    assert_eq!(schema_properties("StreamResponse"), view);
+    let writable: BTreeSet<String> = view
+        .iter()
+        .filter(|k| !SERVER_OWNED_FIELDS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    assert_eq!(schema_properties("CreateStreamRequest"), writable);
+    assert_eq!(schema_properties("UpdateStreamRequest"), writable);
+    let required: BTreeSet<String> = schema_block("StreamResponse")
+        .into_iter()
+        .filter_map(|line| line.strip_prefix("        - "))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(required, view, "every view field is always present");
+}
+
+#[test]
+fn the_published_enums_and_ranges_are_the_models() {
+    use lorica_config::models::{LoadBalancing, Stream, StreamProxyProtocol};
+    use strum::VariantArray as _;
+
+    let proxy: Vec<String> = enum_words(&schema_block("StreamProxyProtocol"));
+    let model: Vec<String> = StreamProxyProtocol::VARIANTS
+        .iter()
+        .map(|v| v.as_str().to_string())
+        .collect();
+    assert_eq!(proxy, model);
+
+    // `LoadBalancing` lists no variants; this match fails to compile
+    // when one is added, which is when this list must grow with it.
+    let every_algorithm = |lb: &LoadBalancing| match lb {
+        LoadBalancing::RoundRobin
+        | LoadBalancing::ConsistentHash
+        | LoadBalancing::Random
+        | LoadBalancing::PeakEwma
+        | LoadBalancing::LeastConn => (),
+    };
+    let algorithms = [
+        LoadBalancing::RoundRobin,
+        LoadBalancing::ConsistentHash,
+        LoadBalancing::Random,
+        LoadBalancing::PeakEwma,
+        LoadBalancing::LeastConn,
+    ];
+    algorithms.iter().for_each(every_algorithm);
+    let published: BTreeSet<String> =
+        enum_words(&property_block("StreamResponse", "load_balancing"))
+            .into_iter()
+            .collect();
+    let model: BTreeSet<String> = algorithms.iter().map(|a| a.as_str().to_string()).collect();
+    assert_eq!(published, model);
+
+    for (field, start, end) in [
+        (
+            "connect_timeout_ms",
+            u64::from(*Stream::CONNECT_TIMEOUT_MS_RANGE.start()),
+            u64::from(*Stream::CONNECT_TIMEOUT_MS_RANGE.end()),
+        ),
+        (
+            "idle_timeout_s",
+            u64::from(*Stream::TCP_IDLE_TIMEOUT_S_RANGE.start()),
+            u64::from(*Stream::TCP_IDLE_TIMEOUT_S_RANGE.end()),
+        ),
+        (
+            "total_timeout_s",
+            u64::from(*Stream::TOTAL_TIMEOUT_S_RANGE.start()),
+            u64::from(*Stream::TOTAL_TIMEOUT_S_RANGE.end()),
+        ),
+        (
+            "max_connect_attempts",
+            u64::from(*Stream::MAX_CONNECT_ATTEMPTS_RANGE.start()),
+            u64::from(*Stream::MAX_CONNECT_ATTEMPTS_RANGE.end()),
+        ),
+        (
+            "backend_keepalive_idle_s",
+            u64::from(*Stream::BACKEND_KEEPALIVE_IDLE_S_RANGE.start()),
+            u64::from(*Stream::BACKEND_KEEPALIVE_IDLE_S_RANGE.end()),
+        ),
+        (
+            "upload_rate_bps",
+            *Stream::RATE_BPS_RANGE.start(),
+            *Stream::RATE_BPS_RANGE.end(),
+        ),
+        (
+            "download_rate_bps",
+            *Stream::RATE_BPS_RANGE.start(),
+            *Stream::RATE_BPS_RANGE.end(),
+        ),
+        (
+            "max_connections",
+            u64::from(*Stream::MAX_CONNECTIONS_RANGE.start()),
+            u64::from(*Stream::MAX_CONNECTIONS_RANGE.end()),
+        ),
+    ] {
+        let block = property_block("StreamResponse", field);
+        assert_eq!(
+            scalar(&block, "minimum"),
+            Some(start.to_string().as_str()),
+            "{field}"
+        );
+        assert_eq!(
+            scalar(&block, "maximum"),
+            Some(end.to_string().as_str()),
+            "{field}"
+        );
+    }
+    for (field, max) in [
+        (
+            "proxy_protocol_trusted_cidrs",
+            Stream::PROXY_PROTOCOL_TRUSTED_CIDRS_MAX,
+        ),
+        ("source_addresses", Stream::SOURCE_ADDRESSES_MAX),
+    ] {
+        let block = property_block("StreamResponse", field);
+        assert_eq!(
+            scalar(&block, "maxItems"),
+            Some(max.to_string().as_str()),
+            "{field}"
+        );
+    }
+}
+
+/// Every `default:` the description publishes for a stream setting is
+/// what a stream created without it holds.
+#[test]
+fn the_published_defaults_are_the_models() {
+    let stream = lorica_config::models::Stream::new(
+        "00000000-0000-4000-8000-000000000000".to_string(),
+        "defaults".to_string(),
+        lorica_config::models::StreamProtocol::Tcp,
+        "0.0.0.0".parse().expect("an address"),
+        5432,
+        5432,
+        Utc::now(),
+    );
+    let view = serde_json::to_value(super::stream_to_response(&stream, StreamLinks::default()))
+        .expect("serialises");
+    let mut checked = 0;
+    for property in schema_properties("StreamResponse") {
+        let block = property_block("StreamResponse", &property);
+        let Some(published) = scalar(&block, "default") else {
+            continue;
+        };
+        let model = match &view[&property] {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        assert_eq!(published, model, "{property}");
+        checked += 1;
+    }
+    assert!(checked > 0, "the scan found no default");
 }

@@ -72,17 +72,18 @@ const MAX_IMPORT_SIZE: usize = 1_048_576;
 /// The checks of a stream write, on every stream of an import file
 /// against the nodes that would bind it and the file's other streams,
 /// since an import replaces the stored ones: the port check (Story 12.1
-/// D-9), then the fd budget check (Story 12.2 D-e) under the file's own
-/// `stream_listen_socket_cap`, which the import writes. A stream the
-/// file carries unchanged from a stored row of the same id is judged
-/// as an update of that row, so re-importing an export never refuses
-/// what the node already holds. Refuses with the first conflict or
-/// budget refusal, as a stream write does, and answers the budget
-/// warnings, each once.
+/// D-9), the local backend rule over the file's own backends and links
+/// (Story 12.3 D-m, rule B), then the fd budget check (Story 12.2 D-e)
+/// under the file's own `stream_listen_socket_cap`, which the import
+/// writes. A stream the file carries unchanged from a stored row of the
+/// same id is judged as an update of that row, so re-importing an
+/// export never refuses what the node already holds. Refuses with the
+/// first conflict or budget refusal, as a stream write does, and
+/// answers the budget warnings, each once.
 ///
 /// One function for the import and its preview, so a preview that
-/// comes back clean is an import that will not be refused for a port
-/// or a budget.
+/// comes back clean is an import that will not be refused for a port,
+/// a local backend or a budget.
 fn check_imported_streams(
     store: &ConfigStore,
     role: &crate::streams::LocalRole,
@@ -95,6 +96,25 @@ fn check_imported_streams(
             crate::streams::first_port_conflict(store, role, budget.reserved, stream, streams)?
         {
             return Err(crate::streams::port_conflict_error(stream, &conflict));
+        }
+    }
+    for stream in streams {
+        let backends: Vec<lorica_config::models::Backend> = import
+            .stream_backends
+            .iter()
+            .filter(|link| link.stream_id == stream.id)
+            .filter_map(|link| import.backends.iter().find(|b| b.id == link.backend_id))
+            .cloned()
+            .collect();
+        if let Some(conflict) = crate::streams::first_local_backend_conflict(
+            store,
+            role,
+            budget.reserved,
+            stream,
+            &backends,
+            streams,
+        )? {
+            return Err(crate::streams::local_backend_error(stream, &conflict));
         }
     }
     let cap = import.global_settings.stream_listen_socket_cap;

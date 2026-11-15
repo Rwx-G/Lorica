@@ -1507,7 +1507,14 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          description: The backend is managed by the automation API; update its environment through the pipeline
+          description: >-
+            The backend is managed by the automation API; update its
+            environment through the pipeline. Or, with `error.code`
+            `stream_local_backend`, the new address is local (loopback,
+            unspecified, link-local, `localhost`) and would make a stream
+            linking the backend reach a reserved port or a stream listen
+            port of a node binding it; the message names the stream, the
+            node and the port.
           content:
             application/json:
               schema:
@@ -1576,12 +1583,20 @@ paths:
         targets, against that node's reserved ports and the other streams
         it binds, disabled ones included. The same nodes are then checked
         against their fd budget (`GET /api/v1/streams/budget`), counting
-        the enabled streams each binds: a stream that would break one is
-        refused `422` with `error.code` `stream_fd_budget`. An enrolled
-        node is checked on the fd limit and worker count its heartbeat
-        reported on its open session; a targeted node with no such report
-        (offline, or not reported yet) is named in `warnings` instead,
-        and refuses the stream when it binds it.
+        the enabled streams each binds, a TCP stream with its
+        `max_connections` connections of two fds each: a stream that
+        would break one is refused `422` with `error.code`
+        `stream_fd_budget`. An enrolled node is checked on the fd limit
+        and worker count its heartbeat reported on its open session; a
+        targeted node with no such report (offline, or not reported yet)
+        is named in `warnings` instead, and refuses the stream when it
+        binds it. A backend local without resolution (loopback,
+        unspecified, link-local, `localhost`) needs
+        `allow_local_backend` (`422` otherwise), and even then may not
+        reach a reserved port of one of those nodes or a listen port of
+        a stream it binds, this one included: `409` with `error.code`
+        `stream_local_backend`. The same holds for another stream's
+        local backend that would reach a port this one takes.
       security:
         - sessionCookie: []
       requestBody:
@@ -1682,11 +1697,15 @@ paths:
         Every field is optional and an absent one keeps its stored value.
         The ports move together: `port_first` without `port_last` makes
         the stream a single port, `port_last` alone moves the end of the
-        range. `backend_ids` replaces the whole set. The result is
-        checked as on create, except that an update adding nothing to
-        what a node already binds (the same protocol, no more ports) is
-        never refused for that node's fd budget, so a stream on a node
-        over its budget can still be renamed, narrowed or disabled.
+        range. `backend_ids` replaces the primaries and
+        `backup_backend_ids` the backups; a list left out keeps its
+        stored half. `null` on `total_timeout_s`, `upload_rate_bps` or
+        `download_rate_bps` removes the limit. The result is checked as
+        on create, except that an update adding nothing to what a node
+        already binds (the same protocol, no more ports, no higher
+        `max_connections`) is never refused for that node's fd budget,
+        so a stream on a node over its budget can still be renamed,
+        narrowed or disabled.
       security:
         - sessionCookie: []
       requestBody:
@@ -3981,8 +4000,10 @@ paths:
           $ref: "#/components/responses/StreamUnprocessable"
       description: >-
         Every stream of the file runs the checks of a stream create
-        before anything is cleared: the port check (`409`) and the fd
-        budget check (`422`, `error.code` `stream_fd_budget`), under the
+        before anything is cleared: the port check (`409`), the local
+        backend rule over the file's own backends and links (`409`,
+        `error.code` `stream_local_backend`) and the fd budget check
+        (`422`, `error.code` `stream_fd_budget`), under the
         file's own `stream_listen_socket_cap`. A stream the file carries
         under the id of a stored one is judged as an update of it, so
         re-importing an export is never refused for what the nodes
@@ -7557,8 +7578,20 @@ components:
       type: string
       enum: [tcp, udp]
 
+    StreamProxyProtocol:
+      type: string
+      # Quoted: a YAML 1.1 reader takes a bare `off` for a boolean.
+      enum: ["off", v1, v2]
+      description: The PROXY protocol header a stream sends its backends after connect.
+
     StreamResponse:
       type: object
+      description: >-
+        A stream. The engine settings (Story 12.3), from
+        `load_balancing` to `max_connections`, apply to TCP streams: on a
+        UDP stream each must keep its default until Story 12.5 (422
+        naming the field), and `proxy_protocol_accept` is refused on UDP
+        for good, a UDP source address being spoofable.
       required:
         - id
         - name
@@ -7569,7 +7602,24 @@ components:
         - port_first
         - port_last
         - node_selector
+        - load_balancing
+        - connect_timeout_ms
+        - idle_timeout_s
+        - total_timeout_s
+        - max_connect_attempts
+        - backend_keepalive
+        - backend_keepalive_idle_s
+        - close_on_backend_down
+        - proxy_protocol_send
+        - proxy_protocol_accept
+        - proxy_protocol_trusted_cidrs
+        - source_addresses
+        - allow_local_backend
+        - upload_rate_bps
+        - download_rate_bps
+        - max_connections
         - backend_ids
+        - backup_backend_ids
         - created_at
         - updated_at
       properties:
@@ -7612,11 +7662,143 @@ components:
           items:
             type: string
           description: Node names the stream is pinned to; empty is fleet-wide.
+        load_balancing:
+          type: string
+          enum: [round_robin, consistent_hash, random, peak_ewma, least_conn]
+          default: round_robin
+          description: >-
+            How a backend is chosen per connection, with the algorithms
+            routes use. Weights apply to `round_robin` and
+            `consistent_hash` (on the client address); `least_conn` and
+            `peak_ewma` (on connect latency) are counted per worker
+            process.
+        connect_timeout_ms:
+          type: integer
+          minimum: 100
+          maximum: 60000
+          default: 5000
+          description: Per connect attempt.
+        idle_timeout_s:
+          type: integer
+          minimum: 1
+          maximum: 86400
+          default: 600
+          description: A connection with no byte forwarded either way for this long is closed.
+        total_timeout_s:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 604800
+          default: null
+          description: The longest a connection may last from accept; `null` for no limit.
+        max_connect_attempts:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 3
+          description: >-
+            Connect attempts per connection, the first included, each to
+            a backend not yet tried. Never retried once bytes have flowed.
+        backend_keepalive:
+          type: boolean
+          default: true
+          description: TCP keepalive on the backend socket.
+        backend_keepalive_idle_s:
+          type: integer
+          minimum: 1
+          maximum: 7200
+          default: 60
+          description: Idle time before the first keepalive probe.
+        close_on_backend_down:
+          type: boolean
+          default: false
+          description: >-
+            Close established connections to a backend that goes down,
+            with the end reason `backend_down` (HAProxy's
+            `on-marked-down shutdown-sessions`). Off, a backend going
+            down only stops receiving new connections.
+        proxy_protocol_send:
+          allOf:
+            - $ref: "#/components/schemas/StreamProxyProtocol"
+          default: "off"
+        proxy_protocol_accept:
+          type: boolean
+          default: false
+          description: >-
+            Require a PROXY protocol header (v1 or v2) from a peer inside
+            `proxy_protocol_trusted_cidrs`, read before any backend is
+            chosen; a peer outside the list that sends one is
+            disconnected. Needs a non-empty list. Refused on UDP.
+        proxy_protocol_trusted_cidrs:
+          type: array
+          maxItems: 256
+          items:
+            type: string
+          description: >-
+            CIDRs or bare IPs (a host prefix) allowed to send a PROXY
+            header, by the rule of the HTTP listeners' list:
+            `0.0.0.0/0` and `::/0` are refused.
+        source_addresses:
+          type: array
+          maxItems: 16
+          items:
+            type: string
+          description: >-
+            Local addresses backend connections leave from, in turn per
+            attempt among those of the destination's family (nginx's
+            `proxy_bind`, as a list); empty lets the kernel choose.
+            Distinct unicast literals, neither unspecified nor
+            IPv4-mapped.
+        allow_local_backend:
+          type: boolean
+          default: false
+          description: >-
+            Allow a backend on a local address (loopback, unspecified,
+            link-local, `localhost`, or an address of the node). A local
+            backend is never allowed on a reserved port or a stream
+            listen port of a node binding the stream, flag or not. Not
+            settable from the automation or MCP surfaces, which write no
+            stream; a token may not change the address of a backend a
+            stream with this flag forwards to.
+        upload_rate_bps:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 1024
+          maximum: 10000000000
+          default: null
+          description: Client-to-backend bytes per second per connection; `null` for no limit.
+        download_rate_bps:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 1024
+          maximum: 10000000000
+          default: null
+          description: Backend-to-client bytes per second per connection; `null` for no limit.
+        max_connections:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          default: 1024
+          description: >-
+            The most concurrent connections of the stream, per worker
+            process until Story 12.6, per node from then on; the next one
+            is refused and counted (`connection_cap`). Each connection
+            counts two fds against the node's stream budget
+            (`GET /api/v1/streams/budget`).
         backend_ids:
           type: array
           items:
             type: string
-          description: IDs of the linked backends, sorted.
+          description: IDs of the linked primary backends, sorted.
+        backup_backend_ids:
+          type: array
+          items:
+            type: string
+          description: >-
+            IDs of the linked backup backends, sorted: candidates only
+            when no primary is.
         created_at:
           type: string
           format: date-time
@@ -7823,9 +8005,10 @@ components:
           format: int64
           nullable: true
           description: >-
-            The connection cap of a TCP stream or the session ceiling of a
-            UDP one; `null` while the stream's engine declares none, which
-            counts nothing beyond the listening sockets.
+            The connection cap of a TCP stream (`max_connections`) or the
+            session ceiling of a UDP one; `null` while the stream's engine
+            declares none (UDP until Story 12.5), which counts nothing
+            beyond the listening sockets.
         fds_per_unit:
           type: integer
           format: int64
@@ -7950,14 +8133,56 @@ components:
           type: array
           items:
             type: string
+        load_balancing:
+          $ref: "#/components/schemas/StreamResponse/properties/load_balancing"
+        connect_timeout_ms:
+          $ref: "#/components/schemas/StreamResponse/properties/connect_timeout_ms"
+        idle_timeout_s:
+          $ref: "#/components/schemas/StreamResponse/properties/idle_timeout_s"
+        total_timeout_s:
+          $ref: "#/components/schemas/StreamResponse/properties/total_timeout_s"
+        max_connect_attempts:
+          $ref: "#/components/schemas/StreamResponse/properties/max_connect_attempts"
+        backend_keepalive:
+          $ref: "#/components/schemas/StreamResponse/properties/backend_keepalive"
+        backend_keepalive_idle_s:
+          $ref: "#/components/schemas/StreamResponse/properties/backend_keepalive_idle_s"
+        close_on_backend_down:
+          $ref: "#/components/schemas/StreamResponse/properties/close_on_backend_down"
+        proxy_protocol_send:
+          $ref: "#/components/schemas/StreamResponse/properties/proxy_protocol_send"
+        proxy_protocol_accept:
+          $ref: "#/components/schemas/StreamResponse/properties/proxy_protocol_accept"
+        proxy_protocol_trusted_cidrs:
+          $ref: "#/components/schemas/StreamResponse/properties/proxy_protocol_trusted_cidrs"
+        source_addresses:
+          $ref: "#/components/schemas/StreamResponse/properties/source_addresses"
+        allow_local_backend:
+          $ref: "#/components/schemas/StreamResponse/properties/allow_local_backend"
+        upload_rate_bps:
+          $ref: "#/components/schemas/StreamResponse/properties/upload_rate_bps"
+        download_rate_bps:
+          $ref: "#/components/schemas/StreamResponse/properties/download_rate_bps"
+        max_connections:
+          $ref: "#/components/schemas/StreamResponse/properties/max_connections"
         backend_ids:
           type: array
           items:
             type: string
           description: >-
-            Existing backend ids (422 otherwise). A backend of a UDP stream
-            may serve no route and no TCP stream and must have its health
-            check disabled (422 naming the stream).
+            Existing backend ids (422 otherwise), the primaries. A backend
+            of a UDP stream may serve no route and no TCP stream and must
+            have its health check disabled (422 naming the stream). A
+            local backend needs `allow_local_backend` (422) and never
+            reaches a node's port (409, `stream_local_backend`).
+        backup_backend_ids:
+          type: array
+          items:
+            type: string
+          description: >-
+            Existing backend ids used only when no primary is a
+            candidate, on a TCP stream with at least one primary (422
+            otherwise); none may also be in `backend_ids`.
 
     UpdateStreamRequest:
       type: object
@@ -7986,11 +8211,48 @@ components:
           type: array
           items:
             type: string
+        load_balancing:
+          $ref: "#/components/schemas/StreamResponse/properties/load_balancing"
+        connect_timeout_ms:
+          $ref: "#/components/schemas/StreamResponse/properties/connect_timeout_ms"
+        idle_timeout_s:
+          $ref: "#/components/schemas/StreamResponse/properties/idle_timeout_s"
+        total_timeout_s:
+          $ref: "#/components/schemas/StreamResponse/properties/total_timeout_s"
+        max_connect_attempts:
+          $ref: "#/components/schemas/StreamResponse/properties/max_connect_attempts"
+        backend_keepalive:
+          $ref: "#/components/schemas/StreamResponse/properties/backend_keepalive"
+        backend_keepalive_idle_s:
+          $ref: "#/components/schemas/StreamResponse/properties/backend_keepalive_idle_s"
+        close_on_backend_down:
+          $ref: "#/components/schemas/StreamResponse/properties/close_on_backend_down"
+        proxy_protocol_send:
+          $ref: "#/components/schemas/StreamResponse/properties/proxy_protocol_send"
+        proxy_protocol_accept:
+          $ref: "#/components/schemas/StreamResponse/properties/proxy_protocol_accept"
+        proxy_protocol_trusted_cidrs:
+          $ref: "#/components/schemas/StreamResponse/properties/proxy_protocol_trusted_cidrs"
+        source_addresses:
+          $ref: "#/components/schemas/StreamResponse/properties/source_addresses"
+        allow_local_backend:
+          $ref: "#/components/schemas/StreamResponse/properties/allow_local_backend"
+        upload_rate_bps:
+          $ref: "#/components/schemas/StreamResponse/properties/upload_rate_bps"
+        download_rate_bps:
+          $ref: "#/components/schemas/StreamResponse/properties/download_rate_bps"
+        max_connections:
+          $ref: "#/components/schemas/StreamResponse/properties/max_connections"
         backend_ids:
           type: array
           items:
             type: string
-          description: Replaces the whole set.
+          description: Replaces the primaries; absent keeps them.
+        backup_backend_ids:
+          type: array
+          items:
+            type: string
+          description: Replaces the backups; absent keeps them.
 
     Certificate:
       type: object
@@ -8684,8 +8946,10 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     StreamUnprocessable:
       description: >-
-        The body parsed but a model rule refuses its content, or a node
-        that would bind the stream cannot hold it: then `error.code` is
+        The body parsed but a model rule refuses its content (a setting
+        out of its range, a backend the stream may not link, a local
+        backend without `allow_local_backend`), or a node that would
+        bind the stream cannot hold it: then `error.code` is
         `stream_fd_budget` and the message names the stream, the node,
         the constraint (`listen_socket_cap`, `worker_fds` or
         `supervisor_fds`) and its numbers.
@@ -8700,7 +8964,12 @@ components:
         the node (`this node` or the node's name) and the object (the
         reserved listener, the other stream with its address, ports and
         protocol, or that the node has not reported its reserved ports
-        yet). On a follower outside a break-glass window every write
+        yet). `error.code` is `stream_local_backend` when a local backend
+        (loopback, unspecified, link-local, `localhost`) would reach a
+        reserved port or a stream listen port of such a node, whatever
+        `allow_local_backend` says: the message names the stream whose
+        backend it is, the node, the backend, the port and what holds
+        it. On a follower outside a break-glass window every write
         answers 409 with `error.code` `conflict` instead.
       content:
         application/json:

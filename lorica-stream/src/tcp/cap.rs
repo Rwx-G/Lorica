@@ -35,9 +35,9 @@ use crate::table::StreamTable;
 pub const TCP_FDS_PER_CONNECTION: u64 = 2;
 
 /// What a TCP stream may hold at its cap, for the fd budget: the one
-/// definition the driver's `demand_of` and the API's budget check both
-/// call, so they cannot disagree. `None` for a UDP stream (Story 12.5
-/// declares its own).
+/// definition, read through [`crate::StreamDemand::of`], which both the
+/// driver's demand and the API's budget check build on, so they cannot
+/// disagree. `None` for a UDP stream (Story 12.5 declares its own).
 pub fn held_fds(stream: &Stream) -> Option<HeldFds> {
     match stream.protocol {
         StreamProtocol::Tcp => Some(HeldFds {

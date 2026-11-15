@@ -491,6 +491,8 @@ pub(crate) async fn update_backend_as(
     refuse_client_managed_by(body.managed_by.as_ref())?;
     let health_check =
         requested_health_check(body.health_check, body.health_check_path.as_deref())?;
+    let role = crate::streams::LocalRole::of(state);
+    let reserved = state.reserved_ports;
     let (before_backend, backend) = db_blocking(&state.store, move |store| {
         let mut backend = store
             .get_backend(&id)?
@@ -557,6 +559,10 @@ pub(crate) async fn update_backend_as(
                 after: Some(&backend),
             },
         )?;
+        // A stream's local backend may not be moved onto a node's port
+        // (Story 12.3 D-m, rule B); the preview answers what the write
+        // would.
+        crate::streams::refuse_local_backend_on_its_streams(store, &role, reserved, &backend)?;
 
         if mode.previews() {
             return Ok::<_, ApiError>((before_backend, backend));

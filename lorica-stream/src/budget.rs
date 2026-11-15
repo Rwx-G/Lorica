@@ -34,9 +34,10 @@
 //!    `S`.
 //!
 //! What an engine holds per connection or session is a generic
-//! [`HeldFds`] input (`ceiling x fds_per_unit`). Stories 12.3 and 12.5
-//! fill it; until they do it is absent and counts 0, and this module
-//! assumes no figure.
+//! [`HeldFds`] input (`ceiling x fds_per_unit`), declared by the
+//! engine's own function and read by [`StreamDemand::of`]: Story 12.3
+//! fills it for TCP; for UDP it stays absent and counts 0 until Story
+//! 12.5 declares its own.
 
 use chrono::{DateTime, Utc};
 use lorica_config::models::{Stream, StreamProtocol};
@@ -98,14 +99,21 @@ pub struct StreamDemand {
 }
 
 impl StreamDemand {
-    /// The demand of `stream` with nothing declared by an engine.
+    /// The demand of `stream`: one listening socket per port, and what
+    /// its engine declares it may hold at its cap
+    /// ([`crate::tcp::held_fds`] for a TCP stream).
+    ///
+    /// The one demand function: the node's stream plane driver and the
+    /// management API's write check both build their demands here, so
+    /// the API never accepts a stream the node then refuses at bind with
+    /// `fd_budget`.
     pub fn of(stream: &Stream) -> Self {
         StreamDemand {
             stream_id: stream.id.clone(),
             name: stream.name.clone(),
             protocol: stream.protocol,
             listen_sockets: u64::from(stream.port_last.saturating_sub(stream.port_first)) + 1,
-            held: None,
+            held: crate::tcp::held_fds(stream),
         }
     }
 

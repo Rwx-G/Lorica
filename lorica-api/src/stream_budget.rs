@@ -9,8 +9,11 @@
 //! A follower reports the same figures in its heartbeat
 //! ([`heartbeat_report`]), which is how a control plane checks a stream
 //! write against a node it does not run and shows that node's budget.
-//! The arithmetic is `lorica_stream::budget`'s, so the API refuses
-//! exactly what the node would refuse at bind with `fd_budget`.
+//! The arithmetic is `lorica_stream::budget`'s and every demand is
+//! `StreamDemand::of`, the function the node's driver builds its own
+//! demands with (the TCP engine's connections included, Story 12.3
+//! D-p), so the API refuses exactly what the node would refuse at bind
+//! with `fd_budget`.
 
 use std::collections::HashMap;
 
@@ -281,15 +284,18 @@ impl BudgetRefusal {
 }
 
 /// Whether `candidate` adds nothing to what `stored` already asked of a
-/// node in `role`: the same protocol, no more ports, already bound
-/// there. Such a write (a rename, a backend change) is never refused for
-/// the budget, so a node already over it after a cap was lowered can
-/// still have its streams edited, disabled or narrowed.
+/// node in `role`: the same protocol, no more ports, no more fds held
+/// at its cap, already bound there. Such a write (a rename, a backend
+/// change) is never refused for the budget, so a node already over it
+/// after a cap was lowered can still have its streams edited, disabled
+/// or narrowed.
 fn adds_no_demand(stored: Option<&Stream>, candidate: &Stream, role: NodeRole<'_>) -> bool {
     stored.is_some_and(|s| {
+        let (was, will) = (StreamDemand::of(s), StreamDemand::of(candidate));
         binds_here(s, role)
             && s.protocol == candidate.protocol
-            && StreamDemand::of(s).listen_sockets >= StreamDemand::of(candidate).listen_sockets
+            && was.listen_sockets >= will.listen_sockets
+            && was.worker_fds() >= will.worker_fds()
     })
 }
 
@@ -673,6 +679,81 @@ mod tests {
         );
     }
 
+    /// What the node's driver refuses at bind for `streams` on a node
+    /// of `fds`: its arithmetic over the demands it builds, which are
+    /// [`StreamDemand::of`] each stream (pinned on the driver's side by
+    /// `a_tcp_binding_declares_what_its_connections_hold`).
+    fn node_verdict(streams: &[&Stream], fds: NodeFds, cap: u32) -> Result<(), BudgetViolation> {
+        let demands: Vec<StreamDemand> = streams.iter().map(|s| StreamDemand::of(s)).collect();
+        FdBudget::from_limit(fds.fd_limit)
+            .check(&demands, fds.worker_count, cap)
+            .map(|_| ())
+    }
+
+    #[test]
+    fn the_api_refuses_exactly_what_the_node_would_for_a_tcp_streams_connections() {
+        // One port and `max_connections` connections of two fds each:
+        // `1 + 2 x max` against the stream budget of the packaged limit.
+        let budget = FdBudget::from_limit(PACKAGED.fd_limit).stream_budget;
+        let per_connection = lorica_stream::tcp::TCP_FDS_PER_CONNECTION;
+        let fitting = u32::try_from((budget - 1) / per_connection).expect("a cap");
+        let nodes = [this_node(Some(PACKAGED))];
+        for (max, fits) in [(fitting, true), (fitting + 1, false)] {
+            let mut candidate = stream("pg", StreamProtocol::Tcp, 5432, 5432);
+            candidate.max_connections = max;
+            let api = check_write(&candidate, None, &[], &nodes, 2048);
+            assert_eq!(api.is_ok(), fits, "max_connections {max}");
+            assert_eq!(
+                api.map(|_| ()).map_err(|refusal| refusal.violation),
+                node_verdict(&[&candidate], PACKAGED, 2048),
+                "max_connections {max}: the API and the node disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_cap_admits_fifteen_tcp_streams_at_the_packaged_limit() {
+        // Story 12.3 D-p: "the default admits about fifteen TCP streams
+        // per node before the budget refuses one".
+        let others: Vec<Stream> = (0..15)
+            .map(|n| stream(&format!("s{n}"), StreamProtocol::Tcp, 5000 + n, 5000 + n))
+            .collect();
+        let nodes = [this_node(Some(PACKAGED))];
+        let sixteenth = stream("s15", StreamProtocol::Tcp, 6000, 6000);
+        let refusal = check_write(&sixteenth, None, &others, &nodes, 2048)
+            .expect_err("the sixteenth default TCP stream breaks the worker budget");
+        assert_eq!(refusal.violation.constraint(), "worker_fds");
+        let mut all: Vec<&Stream> = others.iter().collect();
+        all.push(&sixteenth);
+        assert_eq!(Err(refusal.violation), node_verdict(&all, PACKAGED, 2048));
+        let fifteenth = &others[14];
+        assert!(
+            check_write(fifteenth, None, &others[..14], &nodes, 2048).is_ok(),
+            "fifteen fit"
+        );
+    }
+
+    #[test]
+    fn raising_a_tcp_streams_cap_is_new_demand_and_lowering_it_is_not() {
+        let stored = stream("pg", StreamProtocol::Tcp, 5432, 5432);
+        let others = std::slice::from_ref(&stored);
+        // A node already over its budget: one worker cannot hold even
+        // the stored stream.
+        let small = NodeFds {
+            fd_limit: 2048,
+            worker_count: 1,
+        };
+        let nodes = [this_node(Some(small))];
+        let mut lowered = stored.clone();
+        lowered.max_connections = stored.max_connections - 1;
+        assert!(check_write(&lowered, Some(&stored), others, &nodes, 2048).is_ok());
+        let mut raised = stored.clone();
+        raised.max_connections = stored.max_connections + 1;
+        let refusal = check_write(&raised, Some(&stored), others, &nodes, 2048)
+            .expect_err("more connections are more fds");
+        assert_eq!(refusal.violation.constraint(), "worker_fds");
+    }
+
     #[test]
     fn a_node_without_figures_is_named_in_a_warning_and_a_reporting_one_is_checked() {
         let candidate = Stream {
@@ -773,7 +854,10 @@ mod tests {
         assert_eq!(report.fd_limit, 65_536);
         assert_eq!(report.worker_count, 2);
         assert_eq!(report.listen_sockets_used, 3);
-        assert_eq!(report.worker_fds_committed, 3);
+        let tcp_held = lorica_stream::tcp::held_fds(&streams[0])
+            .expect("a TCP stream declares its connections")
+            .total();
+        assert_eq!(report.worker_fds_committed, 3 + tcp_held);
         assert_eq!(report.supervisor_fds_committed, 1 + 2 * 2);
         assert_eq!(report.bound_count, 1);
         assert!(!report.truncated);
