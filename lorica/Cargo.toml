@@ -112,6 +112,10 @@ serde_json = "1.0"
 thiserror = "2"
 http = { workspace = true }
 ipnet = "2"
+# The health loop's closed probe-failure set (Story 12.7, D-10): its
+# metric label and log words, and the list of them, come from the
+# enum. Already in the graph through lorica-config.
+strum = { version = "0.28", features = ["derive"] }
 
 # OpenTelemetry (feature-gated, off by default)
 # Enabled via `--features otel`. Policy matches `route53` since v1.3.0

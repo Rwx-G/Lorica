@@ -12,18 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use futures_util::stream::StreamExt;
-use lorica_config::models::{Backend, HealthCheck, HealthStatus, LifecycleState};
+use lorica_config::models::{
+    Backend, Exchange, HealthCheck, HealthStatus, LifecycleState, MatchAnchor, PROBE_READ_MAX_BYTES,
+};
 use lorica_config::ConfigStore;
 use once_cell::sync::Lazy;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 use tracing::{debug, info, warn};
 
 use lorica::proxy_wiring::{BackendConnections, ProxyConfig};
@@ -71,15 +75,19 @@ const DEGRADED_THRESHOLD_MS: u128 = 2000;
 /// operator's `health_check_interval_s`.
 const HEALTH_FLIP_THRESHOLD: u32 = 3;
 
-/// Result of a single TCP health check probe.
+/// How many of the bytes a send/expect probe read the confirmed-Down
+/// log line shows (Story 12.7, D-10).
+const LOGGED_READ_BYTES: usize = 64;
+
+/// Result of a single health check probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeResult {
-    /// Connection succeeded within the degraded threshold.
+    /// The probe succeeded within the degraded threshold.
     Healthy,
-    /// Connection succeeded but took longer than the degraded threshold.
+    /// The probe succeeded but took longer than the degraded threshold.
     Degraded,
-    /// Connection failed or timed out.
-    Down,
+    /// The probe failed, for this reason.
+    Down(ProbeFailure),
 }
 
 impl ProbeResult {
@@ -87,7 +95,85 @@ impl ProbeResult {
         match self {
             ProbeResult::Healthy => HealthStatus::Healthy,
             ProbeResult::Degraded => HealthStatus::Degraded,
-            ProbeResult::Down => HealthStatus::Down,
+            ProbeResult::Down(_) => HealthStatus::Down,
+        }
+    }
+}
+
+/// Why a probe failed, over every probe kind (Story 12.7, D-10). A
+/// closed set: it is the `reason` label of
+/// `lorica_backend_health_probe_failures_total`, so a word published
+/// anywhere is read from [`strum::VariantArray::VARIANTS`] and spelled
+/// by `IntoStaticStr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::VariantArray, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum ProbeFailure {
+    /// The TCP connection was refused or failed.
+    ConnectFailed,
+    /// The TCP connection did not complete before the deadline.
+    ConnectTimeout,
+    /// The bytes to send could not be written before the deadline.
+    SendFailed,
+    /// Reading the answer failed (a reset, for one).
+    ReadFailed,
+    /// No byte was read before the deadline.
+    ResponseTimeout,
+    /// The backend closed the connection before sending a byte.
+    ClosedBeforeMatch,
+    /// Bytes were read and none of the expected answers matched them,
+    /// by end of stream, full buffer, early mismatch or deadline.
+    NoMatch,
+    /// The HTTP check got an answer outside 2xx.
+    HttpStatus,
+    /// The HTTP check got no answer.
+    HttpFailed,
+}
+
+impl ProbeFailure {
+    /// The snake_case word this reason is published as.
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
+}
+
+/// The bytes a probe read, as much of them as the log line shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ReadSample {
+    /// How many bytes the probe read.
+    total: usize,
+    /// The first [`LOGGED_READ_BYTES`] of them.
+    head: Vec<u8>,
+}
+
+impl ReadSample {
+    fn of(read: &[u8]) -> Self {
+        Self {
+            total: read.len(),
+            head: read[..read.len().min(LOGGED_READ_BYTES)].to_vec(),
+        }
+    }
+}
+
+/// One probe's result and what it read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbeOutcome {
+    result: ProbeResult,
+    read: ReadSample,
+}
+
+impl ProbeOutcome {
+    /// The outcome of a probe that reads nothing it reports.
+    fn reading_nothing(result: ProbeResult) -> Self {
+        Self {
+            result,
+            read: ReadSample::default(),
+        }
+    }
+
+    fn down(reason: ProbeFailure, read: &[u8]) -> Self {
+        Self {
+            result: ProbeResult::Down(reason),
+            read: ReadSample::of(read),
         }
     }
 }
@@ -254,13 +340,13 @@ async fn run_health_cycle(health: &HealthLoop, state: &mut HealthLoopState, now:
             .map(|s| s.health_max_concurrent_probes.clamp(1, 512) as usize)
             .unwrap_or(32)
     };
-    let probe_results: Vec<(Backend, HealthStatus)> = futures_util::stream::iter(due)
+    let probe_results: Vec<(Backend, ProbeOutcome)> = futures_util::stream::iter(due)
         .map(|backend| async move {
-            let probe = match probe_for(&backend) {
-                ProbeTarget::Http { url } => http_probe(&url).await,
-                ProbeTarget::TcpConnect { address } => tcp_probe(&address).await,
-            };
-            (backend, probe.to_health_status())
+            let outcome = probe(&backend).await;
+            if let ProbeResult::Down(reason) = outcome.result {
+                lorica_api::metrics::inc_backend_health_probe_failure(&backend.id, reason.as_str());
+            }
+            (backend, outcome)
         })
         .buffer_unordered(max_concurrent)
         .collect()
@@ -271,16 +357,16 @@ async fn run_health_cycle(health: &HealthLoop, state: &mut HealthLoopState, now:
     // sequentially over the collected probe outcomes. Only confirmed flips
     // (the new status observed HEALTH_FLIP_THRESHOLD times in a row) are
     // carried forward; a transient probe blip is absorbed.
-    let mut commits: Vec<(Backend, HealthStatus)> = Vec::new();
-    for (backend, new_status) in probe_results {
+    let mut commits: Vec<HealthFlip> = Vec::new();
+    for (backend, outcome) in probe_results {
         if confirm_status_flip(
             &mut state.pending_health,
             &backend.id,
             &backend.health_status,
-            &new_status,
+            &outcome.result.to_health_status(),
             HEALTH_FLIP_THRESHOLD,
         ) {
-            commits.push((backend, new_status));
+            commits.push(HealthFlip { backend, outcome });
         }
     }
 
@@ -371,19 +457,27 @@ async fn close_drained_backends(
     changed
 }
 
+/// A confirmed status flip: the backend as the cycle listed it, and the
+/// probe that confirmed the new status.
+struct HealthFlip {
+    backend: Backend,
+    outcome: ProbeOutcome,
+}
+
 /// Phase C: persist confirmed flips under a single lock, and send
 /// `BackendDown` for each flip to `Down`. Returns whether a flip was
 /// persisted.
 ///
 /// Writes the health status alone, so an edit committed since the
 /// probed rows were listed survives.
-async fn persist_health_flips(health: &HealthLoop, commits: &[(Backend, HealthStatus)]) -> bool {
+async fn persist_health_flips(health: &HealthLoop, commits: &[HealthFlip]) -> bool {
     if commits.is_empty() {
         return false;
     }
     let mut changed = false;
     let store = health.store.lock().await;
-    for (backend, new_status) in commits {
+    for HealthFlip { backend, outcome } in commits {
+        let new_status = outcome.result.to_health_status();
         debug!(
             backend = %backend.address,
             old = backend.health_status.as_str(),
@@ -393,8 +487,9 @@ async fn persist_health_flips(health: &HealthLoop, commits: &[(Backend, HealthSt
 
         // Dispatch backend_down notification on a confirmed transition
         // to Down (not on a transient blip - the hysteresis already
-        // filtered those out).
-        if *new_status == HealthStatus::Down {
+        // filtered those out). The check that failed and why; never
+        // a payload, never a byte the backend sent.
+        if let ProbeResult::Down(reason) = outcome.result {
             if let Some(ref sender) = health.alert_sender {
                 sender.send(
                     lorica_notify::AlertEvent::new(
@@ -403,12 +498,14 @@ async fn persist_health_flips(health: &HealthLoop, commits: &[(Backend, HealthSt
                     )
                     .with_detail("backend_id", backend.id.clone())
                     .with_detail("address", backend.address.clone())
-                    .with_detail("name", backend.name.clone()),
+                    .with_detail("name", backend.name.clone())
+                    .with_detail("check", check_label(&backend.health_check))
+                    .with_detail("reason", reason.as_str()),
                 );
             }
         }
 
-        if let Err(e) = store.set_backend_health_status(&backend.id, new_status) {
+        if let Err(e) = store.set_backend_health_status(&backend.id, &new_status) {
             warn!(
                 backend = %backend.address,
                 error = %e,
@@ -416,9 +513,53 @@ async fn persist_health_flips(health: &HealthLoop, commits: &[(Backend, HealthSt
             );
         } else {
             changed = true;
+            if let ProbeResult::Down(reason) = outcome.result {
+                log_confirmed_down(backend, reason, &outcome.read);
+            }
         }
     }
     changed
+}
+
+/// What a notification names a check by: its template, or its kind.
+fn check_label(check: &HealthCheck) -> &'static str {
+    check.template_name().unwrap_or_else(|| check.kind())
+}
+
+/// The one line a confirmed flip to `Down` logs (Story 12.7, D-10):
+/// once per flip, never per probe, so a backend cannot choose the log
+/// write rate. The bytes read are shown for `no_match` only, the first
+/// [`LOGGED_READ_BYTES`] of them, escaped.
+fn log_confirmed_down(backend: &Backend, reason: ProbeFailure, read: &ReadSample) {
+    let first_bytes = if reason == ProbeFailure::NoMatch {
+        escape_bytes(&read.head)
+    } else {
+        String::new()
+    };
+    info!(
+        backend_id = %backend.id,
+        address = %backend.address,
+        kind = backend.health_check.kind(),
+        template = backend.health_check.template_name().unwrap_or("-"),
+        reason = reason.as_str(),
+        bytes_read = read.total,
+        first_bytes = %first_bytes,
+        "backend marked down by its health check"
+    );
+}
+
+/// Printable ASCII kept, every other byte (and the backslash, so the
+/// escape reads one way) as `\xNN`.
+fn escape_bytes(bytes: &[u8]) -> String {
+    let mut escaped = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        if (0x20..0x7f).contains(&byte) && byte != b'\\' {
+            escaped.push(char::from(byte));
+        } else {
+            escaped.push_str(&format!("\\x{byte:02x}"));
+        }
+    }
+    escaped
 }
 
 /// What one active probe of a backend reaches.
@@ -434,6 +575,13 @@ enum ProbeTarget {
     TcpConnect {
         /// The backend's address.
         address: String,
+    },
+    /// A TCP connection to this `host:port`, then `exchange`.
+    TcpExchange {
+        /// The backend's address.
+        address: String,
+        /// What to send and what to expect, within one deadline.
+        exchange: Exchange,
     },
 }
 
@@ -455,13 +603,36 @@ fn probe_for(backend: &Backend) -> ProbeTarget {
                 url: format!("{scheme}://{}{path}", backend.address),
             }
         }
-        // Probed by TCP connect until the send/expect probe exists, as
-        // a 1.10.6 rollback probes them: weaker, never a false Down.
-        HealthCheck::TcpConnect
-        | HealthCheck::TcpTemplate { .. }
-        | HealthCheck::TcpSendExpect { .. } => ProbeTarget::TcpConnect {
+        HealthCheck::TcpConnect => ProbeTarget::TcpConnect {
             address: backend.address.clone(),
         },
+        // A payload that does not decode (only a row no write validated
+        // holds one) exchanges nothing: probed by TCP connect, never
+        // marked down over bytes it could not send.
+        HealthCheck::TcpTemplate { .. } | HealthCheck::TcpSendExpect { .. } => {
+            match backend.health_check.exchange() {
+                Some(exchange) => ProbeTarget::TcpExchange {
+                    address: backend.address.clone(),
+                    exchange,
+                },
+                None => ProbeTarget::TcpConnect {
+                    address: backend.address.clone(),
+                },
+            }
+        }
+    }
+}
+
+/// Probe `backend` the way its check asks.
+async fn probe(backend: &Backend) -> ProbeOutcome {
+    match probe_for(backend) {
+        ProbeTarget::Http { url } => ProbeOutcome::reading_nothing(http_probe(&url).await),
+        ProbeTarget::TcpConnect { address } => {
+            ProbeOutcome::reading_nothing(tcp_probe(&address).await)
+        }
+        ProbeTarget::TcpExchange { address, exchange } => {
+            send_expect_probe(&address, &exchange).await
+        }
     }
 }
 
@@ -486,11 +657,11 @@ async fn tcp_probe(address: &str) -> ProbeResult {
         }
         Ok(Err(e)) => {
             debug!(address = %address, error = %e, "TCP health check failed");
-            ProbeResult::Down
+            ProbeResult::Down(ProbeFailure::ConnectFailed)
         }
         Err(_) => {
             debug!(address = %address, "TCP health check timed out");
-            ProbeResult::Down
+            ProbeResult::Down(ProbeFailure::ConnectTimeout)
         }
     }
 }
@@ -514,7 +685,7 @@ async fn http_probe(url: &str) -> ProbeResult {
                     status = resp.status().as_u16(),
                     "HTTP health check non-2xx response"
                 );
-                return ProbeResult::Down;
+                return ProbeResult::Down(ProbeFailure::HttpStatus);
             }
             if elapsed_ms > DEGRADED_THRESHOLD_MS {
                 debug!(
@@ -529,7 +700,231 @@ async fn http_probe(url: &str) -> ProbeResult {
         }
         Err(e) => {
             debug!(url = %url, error = %e, "HTTP health check failed");
-            ProbeResult::Down
+            ProbeResult::Down(ProbeFailure::HttpFailed)
+        }
+    }
+}
+
+/// Connect to `address`, send `exchange.send`, and read until one of
+/// `exchange.expect` matches or none can (Story 12.7, D-9).
+///
+/// One deadline covers the whole probe, connect, write and read, so
+/// no probe outlives the check's timeout. The read buffer is the
+/// longest expected prefix when every alternative is a prefix, and
+/// [`PROBE_READ_MAX_BYTES`] otherwise: a backend dribbling bytes is
+/// bounded by the deadline, one flooding them by the buffer. Matching
+/// is incremental ([`Matcher`]). The connection is dropped once the
+/// answer is decided, with no farewell bytes. A match slower than
+/// [`DEGRADED_THRESHOLD_MS`] from the start of the connect is
+/// `Degraded`.
+async fn send_expect_probe(address: &str, exchange: &Exchange) -> ProbeOutcome {
+    let start = Instant::now();
+    let deadline = tokio::time::Instant::now() + exchange.timeout;
+    let mut stream = match timeout_at(deadline, TcpStream::connect(address)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            debug!(address = %address, error = %e, "send/expect health check connect failed");
+            return ProbeOutcome::down(ProbeFailure::ConnectFailed, &[]);
+        }
+        Err(_) => return ProbeOutcome::down(ProbeFailure::ConnectTimeout, &[]),
+    };
+    // A short send must leave at once rather than wait for an ACK.
+    if let Err(e) = stream.set_nodelay(true) {
+        debug!(address = %address, error = %e, "TCP_NODELAY not set on a health probe");
+    }
+    if let Some(send) = &exchange.send {
+        if !matches!(
+            timeout_at(deadline, stream.write_all(send)).await,
+            Ok(Ok(()))
+        ) {
+            return ProbeOutcome::down(ProbeFailure::SendFailed, &[]);
+        }
+    }
+
+    let mut buffer = vec![0u8; read_budget(&exchange.expect)];
+    let mut filled = 0;
+    let mut matcher = Matcher::new(&exchange.expect);
+    loop {
+        let finished = match timeout_at(deadline, stream.read(&mut buffer[filled..])).await {
+            Err(_) => {
+                let reason = if filled == 0 {
+                    ProbeFailure::ResponseTimeout
+                } else {
+                    ProbeFailure::NoMatch
+                };
+                return ProbeOutcome::down(reason, &buffer[..filled]);
+            }
+            Ok(Err(e)) => {
+                debug!(address = %address, error = %e, "send/expect health check read failed");
+                return ProbeOutcome::down(ProbeFailure::ReadFailed, &buffer[..filled]);
+            }
+            Ok(Ok(0)) => true,
+            Ok(Ok(read)) => {
+                filled += read;
+                filled == buffer.len()
+            }
+        };
+        match matcher.evaluate(&buffer[..filled], finished) {
+            Verdict::NeedMore => {}
+            Verdict::Match => {
+                return ProbeOutcome {
+                    result: healthy_after(start),
+                    read: ReadSample::of(&buffer[..filled]),
+                }
+            }
+            Verdict::Mismatch => {
+                let reason = if filled == 0 {
+                    ProbeFailure::ClosedBeforeMatch
+                } else {
+                    ProbeFailure::NoMatch
+                };
+                return ProbeOutcome::down(reason, &buffer[..filled]);
+            }
+        }
+    }
+}
+
+/// `Healthy`, or `Degraded` when the probe that started at `start` took
+/// longer than [`DEGRADED_THRESHOLD_MS`].
+fn healthy_after(start: Instant) -> ProbeResult {
+    if start.elapsed().as_millis() > DEGRADED_THRESHOLD_MS {
+        ProbeResult::Degraded
+    } else {
+        ProbeResult::Healthy
+    }
+}
+
+/// The most bytes a probe expecting `expect` reads: the longest
+/// alternative when every one is a prefix (no byte past it can change
+/// the answer), [`PROBE_READ_MAX_BYTES`] otherwise, and never more.
+fn read_budget(expect: &[(MatchAnchor, Cow<'static, [u8]>)]) -> usize {
+    let prefixes_only = expect
+        .iter()
+        .all(|(anchor, _)| *anchor == MatchAnchor::Prefix);
+    let budget = if prefixes_only {
+        expect
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .max()
+            .unwrap_or(0)
+    } else {
+        PROBE_READ_MAX_BYTES
+    };
+    budget.clamp(1, PROBE_READ_MAX_BYTES)
+}
+
+/// What the bytes read so far say about an expected answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// An alternative matched: the probe is healthy.
+    Match,
+    /// No alternative matches and none can any more.
+    Mismatch,
+    /// Nothing decided yet: read again.
+    NeedMore,
+}
+
+/// Literal matching of the bytes a probe reads against its expected
+/// alternatives, any one of them (Story 12.7, D-3): `prefix` when the
+/// bytes start with it, `contains` when it occurs anywhere in them.
+///
+/// Incremental, so its cost does not depend on how the bytes arrive:
+/// each call is handed the whole buffer read so far and compares only
+/// what earlier calls could not have. A prefix alternative compares the
+/// new bytes within its length and is dropped at its first difference;
+/// a contains alternative tries only the windows that end in a new
+/// byte. Every byte is therefore compared at most an alternative's
+/// length times per alternative, whatever the read sizes.
+struct Matcher<'a> {
+    expect: &'a [(MatchAnchor, Cow<'static, [u8]>)],
+    /// Per alternative, whether a prefix alternative still agrees with
+    /// every byte read. Always `true` for a contains alternative.
+    viable: Vec<bool>,
+    /// How much of the buffer earlier calls examined.
+    scanned: usize,
+    /// Every byte comparison made, so a test can bound them.
+    #[cfg(test)]
+    comparisons: usize,
+}
+
+impl<'a> Matcher<'a> {
+    fn new(expect: &'a [(MatchAnchor, Cow<'static, [u8]>)]) -> Self {
+        Self {
+            expect,
+            viable: vec![true; expect.len()],
+            scanned: 0,
+            #[cfg(test)]
+            comparisons: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn count(&mut self, compared: usize) {
+        self.comparisons += compared;
+    }
+
+    #[cfg(not(test))]
+    fn count(&mut self, _compared: usize) {}
+
+    /// The verdict on `read`, the whole buffer read so far (it only ever
+    /// grows between calls). `finished` says no byte will follow (end of
+    /// stream, or a full buffer), so `NeedMore` becomes `Mismatch`.
+    /// `Mismatch` also comes early, before `finished`, once every
+    /// alternative is a prefix the bytes have left.
+    fn evaluate(&mut self, read: &[u8], finished: bool) -> Verdict {
+        let new_from = self.scanned.min(read.len());
+        self.scanned = read.len();
+        let expect = self.expect;
+        for (index, (anchor, bytes)) in expect.iter().enumerate() {
+            let len = bytes.len();
+            let matched = match anchor {
+                MatchAnchor::Prefix => {
+                    if !self.viable[index] {
+                        continue;
+                    }
+                    let end = read.len().min(len);
+                    if new_from < end {
+                        let agrees = read[new_from..end] == bytes[new_from..end];
+                        self.count(end - new_from);
+                        if !agrees {
+                            self.viable[index] = false;
+                            continue;
+                        }
+                    }
+                    read.len() >= len
+                }
+                MatchAnchor::Contains => {
+                    if len == 0 {
+                        true
+                    } else if read.len() < len {
+                        false
+                    } else {
+                        let first = new_from.saturating_sub(len - 1);
+                        let last = read.len() - len;
+                        let mut found = false;
+                        for window in first..=last {
+                            self.count(len);
+                            if read[window..window + len] == bytes[..] {
+                                found = true;
+                                break;
+                            }
+                        }
+                        found
+                    }
+                }
+            };
+            if matched {
+                return Verdict::Match;
+            }
+        }
+        let an_alternative_can_still_match = expect
+            .iter()
+            .zip(&self.viable)
+            .any(|((anchor, _), viable)| *anchor == MatchAnchor::Contains || *viable);
+        if finished || !an_alternative_can_still_match {
+            Verdict::Mismatch
+        } else {
+            Verdict::NeedMore
         }
     }
 }
@@ -573,7 +968,7 @@ fn confirm_status_flip(
 #[cfg(test)]
 fn classify_latency(connected: bool, latency_ms: u128) -> ProbeResult {
     if !connected {
-        ProbeResult::Down
+        ProbeResult::Down(ProbeFailure::ConnectFailed)
     } else if latency_ms > DEGRADED_THRESHOLD_MS {
         ProbeResult::Degraded
     } else {
@@ -603,8 +998,11 @@ mod tests {
 
     #[test]
     fn test_classify_latency_down() {
-        assert_eq!(classify_latency(false, 0), ProbeResult::Down);
-        assert_eq!(classify_latency(false, 3000), ProbeResult::Down);
+        assert!(matches!(classify_latency(false, 0), ProbeResult::Down(_)));
+        assert!(matches!(
+            classify_latency(false, 3000),
+            ProbeResult::Down(_)
+        ));
     }
 
     #[test]
@@ -617,27 +1015,30 @@ mod tests {
             ProbeResult::Degraded.to_health_status(),
             HealthStatus::Degraded
         );
-        assert_eq!(ProbeResult::Down.to_health_status(), HealthStatus::Down);
+        assert_eq!(
+            ProbeResult::Down(ProbeFailure::NoMatch).to_health_status(),
+            HealthStatus::Down
+        );
     }
 
     #[tokio::test]
     async fn test_tcp_probe_unreachable_address() {
         // Use a non-routable address to guarantee failure
         let result = tcp_probe("192.0.2.1:1").await;
-        assert_eq!(result, ProbeResult::Down);
+        assert!(matches!(result, ProbeResult::Down(_)), "{result:?}");
     }
 
     #[tokio::test]
     async fn test_tcp_probe_invalid_address() {
         let result = tcp_probe("not-a-valid-address").await;
-        assert_eq!(result, ProbeResult::Down);
+        assert_eq!(result, ProbeResult::Down(ProbeFailure::ConnectFailed));
     }
 
     #[tokio::test]
     async fn test_tcp_probe_refused() {
         // Localhost on a port nothing is listening on
         let result = tcp_probe("127.0.0.1:1").await;
-        assert_eq!(result, ProbeResult::Down);
+        assert_eq!(result, ProbeResult::Down(ProbeFailure::ConnectFailed));
     }
 
     // ---- HTTP probe ----
@@ -645,13 +1046,13 @@ mod tests {
     #[tokio::test]
     async fn test_http_probe_unreachable() {
         let result = http_probe("http://192.0.2.1:1/healthz").await;
-        assert_eq!(result, ProbeResult::Down);
+        assert_eq!(result, ProbeResult::Down(ProbeFailure::HttpFailed));
     }
 
     #[tokio::test]
     async fn test_http_probe_invalid_url() {
         let result = http_probe("not-a-url").await;
-        assert_eq!(result, ProbeResult::Down);
+        assert_eq!(result, ProbeResult::Down(ProbeFailure::HttpFailed));
     }
 
     // ---- Probe selection ----
@@ -950,11 +1351,40 @@ mod tests {
         edit_stored(&store, &backend.id).await;
 
         let health = health_loop_over(&store);
-        assert!(persist_health_flips(&health, &[(listed, HealthStatus::Down)]).await);
+        assert!(persist_health_flips(&health, &[flip_down(listed)]).await);
 
         let after = stored(&store, &backend.id).await;
         assert_eq!(after.health_status, HealthStatus::Down);
         assert_edit_kept(&after);
+    }
+
+    /// A confirmed flip to `Down` of `backend` as listed.
+    fn flip_down(backend: Backend) -> HealthFlip {
+        HealthFlip {
+            backend,
+            outcome: ProbeOutcome::down(ProbeFailure::ConnectFailed, &[]),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flip_keeps_a_template_chosen_after_the_cycle_listed_the_backend() {
+        let backend = backend_checked_by(None, false);
+        let store = store_holding(&backend).await;
+        let listed = stored(&store, &backend.id).await;
+        let mut switched = listed.clone();
+        switched.set_health_check(redis_ping(1_000));
+        store
+            .lock()
+            .await
+            .update_backend(&switched)
+            .expect("test setup: the operator switches the failing check");
+
+        let health = health_loop_over(&store);
+        assert!(persist_health_flips(&health, &[flip_down(listed)]).await);
+
+        let after = stored(&store, &backend.id).await;
+        assert_eq!(after.health_status, HealthStatus::Down);
+        assert_eq!(after.health_check, redis_ping(1_000));
     }
 
     #[tokio::test]
@@ -987,7 +1417,7 @@ mod tests {
             .expect("test setup: backend deleted");
 
         let health = health_loop_over(&store);
-        assert!(!persist_health_flips(&health, &[(listed, HealthStatus::Down)]).await);
+        assert!(!persist_health_flips(&health, &[flip_down(listed)]).await);
     }
 
     /// An HTTP backend answering every request `503`, which commits
@@ -1077,6 +1507,534 @@ mod tests {
         assert_eq!(
             alert.alert_type,
             lorica_notify::events::AlertType::BackendDown
+        );
+        assert_eq!(alert.details["check"], "http");
+        assert_eq!(alert.details["reason"], ProbeFailure::HttpStatus.as_str());
+        assert!(alerts_received.try_recv().is_err());
+    }
+
+    // ---- Send/expect (Story 12.7) ----
+
+    fn redis_ping(timeout_ms: u32) -> HealthCheck {
+        template_check("redis_ping", timeout_ms)
+    }
+
+    fn template_check(name: &str, timeout_ms: u32) -> HealthCheck {
+        HealthCheck::TcpTemplate {
+            template: lorica_config::models::TcpCheckTemplateName::new(name)
+                .expect("test setup: a catalogue template"),
+            timeout_ms,
+        }
+    }
+
+    fn template_exchange(name: &str, timeout_ms: u32) -> Exchange {
+        template_check(name, timeout_ms)
+            .exchange()
+            .expect("a template exchanges bytes")
+    }
+
+    /// A custom exchange sending nothing and expecting `expect`.
+    fn custom_exchange(expect: Vec<(MatchAnchor, &[u8])>, timeout_ms: u32) -> Exchange {
+        HealthCheck::TcpSendExpect {
+            send: None,
+            expect: expect
+                .into_iter()
+                .map(|(anchor, bytes)| lorica_config::models::Expectation {
+                    anchor,
+                    bytes: lorica_config::models::Payload::Text(
+                        String::from_utf8(bytes.to_vec()).expect("test setup: text bytes"),
+                    ),
+                })
+                .collect(),
+            timeout_ms,
+        }
+        .exchange()
+        .expect("a custom check exchanges bytes")
+    }
+
+    fn alternatives(
+        expect: &[(MatchAnchor, &'static [u8])],
+    ) -> Vec<(MatchAnchor, Cow<'static, [u8]>)> {
+        expect
+            .iter()
+            .map(|(anchor, bytes)| (*anchor, Cow::Borrowed(*bytes)))
+            .collect()
+    }
+
+    const P: MatchAnchor = MatchAnchor::Prefix;
+    const C: MatchAnchor = MatchAnchor::Contains;
+
+    /// (alternatives, bytes read, `finished` after them, verdict).
+    #[allow(clippy::type_complexity)] // a vector table reads best inline
+    fn evaluate_vectors() -> Vec<(Vec<(MatchAnchor, &'static [u8])>, Vec<u8>, bool, Verdict)> {
+        vec![
+            (
+                vec![(P, b"+PONG")],
+                b"+PONG\r\n".to_vec(),
+                false,
+                Verdict::Match,
+            ),
+            (
+                vec![(P, b"+PONG")],
+                b"+PO".to_vec(),
+                false,
+                Verdict::NeedMore,
+            ),
+            (
+                vec![(P, b"+PONG")],
+                b"-ERR".to_vec(),
+                false,
+                Verdict::Mismatch,
+            ),
+            (
+                vec![(P, b"+PONG")],
+                b"+PO".to_vec(),
+                true,
+                Verdict::Mismatch,
+            ),
+            (
+                vec![(P, b"+PONG"), (P, b"-NOAUTH")],
+                b"-NOAUTH Authentication required.\r\n".to_vec(),
+                false,
+                Verdict::Match,
+            ),
+            (
+                vec![(P, b"+PONG"), (P, b"-NOAUTH")],
+                b"-LOADING".to_vec(),
+                false,
+                Verdict::Mismatch,
+            ),
+            (
+                vec![(P, b"S"), (P, b"N")],
+                b"N".to_vec(),
+                false,
+                Verdict::Match,
+            ),
+            (
+                vec![(P, b"S"), (P, b"N")],
+                b"E".to_vec(),
+                false,
+                Verdict::Mismatch,
+            ),
+            (
+                vec![(C, b"ESMTP")],
+                b"220 mail.example.com ESMTP ready\r\n".to_vec(),
+                false,
+                Verdict::Match,
+            ),
+            (
+                vec![(C, b"ESMTP")],
+                b"220 mail.example.com ES".to_vec(),
+                false,
+                Verdict::NeedMore,
+            ),
+            (
+                vec![(C, b"ESMTP")],
+                b"220 mail.example.com ES".to_vec(),
+                true,
+                Verdict::Mismatch,
+            ),
+            (
+                vec![(P, b"+PONG"), (C, b"LOADING")],
+                b"-LOADING Redis is loading".to_vec(),
+                false,
+                Verdict::Match,
+            ),
+            (
+                vec![(P, b"+PONG"), (C, b"zz")],
+                b"-ERR".to_vec(),
+                false,
+                Verdict::NeedMore,
+            ),
+            (vec![(C, b"x")], Vec::new(), true, Verdict::Mismatch),
+            (
+                vec![(C, b"zz")],
+                vec![b'a'; PROBE_READ_MAX_BYTES],
+                true,
+                Verdict::Mismatch,
+            ),
+        ]
+    }
+
+    #[test]
+    fn evaluate_decides_the_same_whole_or_one_byte_at_a_time() {
+        for (expect, read, finished, verdict) in evaluate_vectors() {
+            let expect = alternatives(&expect);
+            let whole = Matcher::new(&expect).evaluate(&read, finished);
+            assert_eq!(whole, verdict, "{read:?} whole");
+
+            let mut matcher = Matcher::new(&expect);
+            let mut dribbled = if read.is_empty() {
+                matcher.evaluate(&read, finished)
+            } else {
+                Verdict::NeedMore
+            };
+            for end in 1..=read.len() {
+                dribbled = matcher.evaluate(&read[..end], finished && end == read.len());
+                if dribbled != Verdict::NeedMore {
+                    break;
+                }
+            }
+            assert_eq!(dribbled, verdict, "{read:?} one byte at a time");
+        }
+    }
+
+    #[test]
+    fn a_contains_alternative_matches_across_a_read_boundary() {
+        let expect = alternatives(&[(C, b"ESMTP")]);
+        let answer = b"220 mail.example.com ESMTP\r\n";
+        let split = answer
+            .windows(5)
+            .position(|window| window == b"ESMTP")
+            .expect("test setup: the word is in the answer")
+            + 2;
+        let mut matcher = Matcher::new(&expect);
+        assert_eq!(matcher.evaluate(&answer[..split], false), Verdict::NeedMore);
+        assert_eq!(matcher.evaluate(answer, false), Verdict::Match);
+    }
+
+    /// The worst case of D-3: every alternative as long as allowed and
+    /// never matching, a full read buffer fed one byte at a time. A
+    /// rescan of the whole buffer after each read would be quadratic in
+    /// the read size and blow through the bound.
+    #[test]
+    fn matching_one_byte_at_a_time_stays_within_its_comparison_bound() {
+        use lorica_config::models::{EXPECT_MAX_ALTERNATIVES, EXPECT_MAX_BYTES};
+        let mut near_miss = vec![b'b'; EXPECT_MAX_BYTES - 1];
+        near_miss.push(b'c');
+        let read = vec![b'b'; PROBE_READ_MAX_BYTES];
+        let bound = PROBE_READ_MAX_BYTES * EXPECT_MAX_BYTES * EXPECT_MAX_ALTERNATIVES;
+        for anchor in [P, C] {
+            let expect: Vec<(MatchAnchor, Cow<'static, [u8]>)> = (0..EXPECT_MAX_ALTERNATIVES)
+                .map(|_| (anchor, Cow::Owned(near_miss.clone())))
+                .collect();
+            let mut matcher = Matcher::new(&expect);
+            let mut verdict = Verdict::NeedMore;
+            for end in 1..=read.len() {
+                verdict = matcher.evaluate(&read[..end], end == read.len());
+                if verdict != Verdict::NeedMore {
+                    break;
+                }
+            }
+            assert_eq!(verdict, Verdict::Mismatch, "{anchor:?}");
+            assert!(
+                matcher.comparisons <= bound,
+                "{anchor:?}: {} comparisons, bound {bound}",
+                matcher.comparisons
+            );
+        }
+    }
+
+    #[test]
+    fn the_read_buffer_is_the_longest_prefix_or_the_cap() {
+        assert_eq!(
+            read_budget(&alternatives(&[(P, b"+PONG"), (P, b"-NOAUTH")])),
+            7
+        );
+        assert_eq!(
+            read_budget(&alternatives(&[(P, b"+PONG"), (C, b"x")])),
+            PROBE_READ_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn a_failure_reason_is_a_unique_snake_case_word() {
+        use strum::VariantArray;
+        let words: HashSet<&str> = ProbeFailure::VARIANTS.iter().map(|r| r.as_str()).collect();
+        assert_eq!(words.len(), ProbeFailure::VARIANTS.len());
+        for word in words {
+            assert!(
+                word.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{word}"
+            );
+        }
+        assert_eq!(ProbeFailure::ResponseTimeout.as_str(), "response_timeout");
+    }
+
+    #[test]
+    fn logged_bytes_keep_printable_ascii_and_escape_the_rest() {
+        assert_eq!(
+            escape_bytes(b"-LOADING\r\n\x00\xff\\"),
+            "-LOADING\\x0d\\x0a\\x00\\xff\\x5c"
+        );
+    }
+
+    /// What a scripted backend does on each connection once it has read
+    /// the probe's request.
+    #[derive(Clone)]
+    enum Reply {
+        Bytes(&'static [u8]),
+        After(Duration, &'static [u8]),
+        Silent,
+        Close,
+        Flood,
+    }
+
+    /// A loopback backend that reads `request_len` bytes from each
+    /// connection, then plays `reply`. Returns its address.
+    async fn scripted_backend(request_len: usize, reply: Reply) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test setup: listener");
+        let address = listener
+            .local_addr()
+            .expect("test setup: local address")
+            .to_string();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(play(socket, request_len, reply.clone()));
+            }
+        });
+        address
+    }
+
+    async fn play(mut socket: TcpStream, request_len: usize, reply: Reply) {
+        let mut request = vec![0u8; request_len];
+        if socket.read_exact(&mut request).await.is_err() {
+            return;
+        }
+        match reply {
+            Reply::Bytes(bytes) => {
+                let _ = socket.write_all(bytes).await;
+            }
+            Reply::After(delay, bytes) => {
+                tokio::time::sleep(delay).await;
+                let _ = socket.write_all(bytes).await;
+            }
+            Reply::Silent => {}
+            Reply::Close => return,
+            Reply::Flood => {
+                let chunk = vec![b'a'; 64 * 1024];
+                for _ in 0..16 {
+                    if socket.write_all(&chunk).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        // Hold the connection until the probe drops it.
+        let _ = socket.read(&mut [0u8; 1]).await;
+    }
+
+    #[tokio::test]
+    async fn each_template_is_healthy_against_its_canonical_answer() {
+        let cases: [(&str, usize, &'static [u8]); 5] = [
+            ("redis_ping", 6, b"+PONG\r\n"),
+            ("redis_ping", 6, b"-NOAUTH Authentication required.\r\n"),
+            ("smtp_banner", 0, b"220 mail.example.com ESMTP\r\n"),
+            ("postgresql_ssl_request", 8, b"S"),
+            ("postgresql_ssl_request", 8, b"N"),
+        ];
+        for (name, request_len, answer) in cases {
+            let address = scripted_backend(request_len, Reply::Bytes(answer)).await;
+            let outcome = send_expect_probe(&address, &template_exchange(name, 2_000)).await;
+            assert_eq!(outcome.result, ProbeResult::Healthy, "{name}: {answer:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wrong_answer_is_no_match() {
+        let cases: [(&str, usize, &'static [u8]); 2] = [
+            (
+                "redis_ping",
+                6,
+                b"-LOADING Redis is loading the dataset in memory\r\n",
+            ),
+            (
+                "smtp_banner",
+                0,
+                b"554 mail.example.com no SMTP service here\r\n",
+            ),
+        ];
+        for (name, request_len, answer) in cases {
+            let address = scripted_backend(request_len, Reply::Bytes(answer)).await;
+            let outcome = send_expect_probe(&address, &template_exchange(name, 2_000)).await;
+            assert_eq!(
+                outcome.result,
+                ProbeResult::Down(ProbeFailure::NoMatch),
+                "{name}: {answer:?}"
+            );
+            assert!(outcome.read.total > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silent_backend_is_a_response_timeout_at_the_deadline() {
+        let address = scripted_backend(6, Reply::Silent).await;
+        let start = Instant::now();
+        let outcome = send_expect_probe(&address, &template_exchange("redis_ping", 300)).await;
+        let elapsed = start.elapsed();
+        assert_eq!(
+            outcome.result,
+            ProbeResult::Down(ProbeFailure::ResponseTimeout)
+        );
+        assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(1_500), "{elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_closes_is_closed_before_match() {
+        let address = scripted_backend(6, Reply::Close).await;
+        let outcome = send_expect_probe(&address, &template_exchange("redis_ping", 2_000)).await;
+        assert_eq!(
+            outcome.result,
+            ProbeResult::Down(ProbeFailure::ClosedBeforeMatch)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_port_is_connect_failed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test setup: listener");
+        let address = listener
+            .local_addr()
+            .expect("test setup: local address")
+            .to_string();
+        drop(listener);
+        let outcome = send_expect_probe(&address, &template_exchange("redis_ping", 2_000)).await;
+        assert_eq!(
+            outcome.result,
+            ProbeResult::Down(ProbeFailure::ConnectFailed)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flood_is_decided_within_the_read_cap() {
+        let address = scripted_backend(0, Reply::Flood).await;
+        let outcome = send_expect_probe(&address, &custom_exchange(vec![(C, b"zz")], 2_000)).await;
+        assert_eq!(outcome.result, ProbeResult::Down(ProbeFailure::NoMatch));
+        assert_eq!(outcome.read.total, PROBE_READ_MAX_BYTES);
+        assert_eq!(outcome.read.head.len(), LOGGED_READ_BYTES);
+
+        let address = scripted_backend(0, Reply::Flood).await;
+        let outcome =
+            send_expect_probe(&address, &custom_exchange(vec![(P, b"+PONG")], 2_000)).await;
+        assert_eq!(outcome.result, ProbeResult::Down(ProbeFailure::NoMatch));
+        assert!(
+            outcome.read.total <= "+PONG".len(),
+            "{}",
+            outcome.read.total
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_match_is_degraded() {
+        let delay =
+            Duration::from_millis(u64::try_from(DEGRADED_THRESHOLD_MS).expect("fits") + 200);
+        let address = scripted_backend(6, Reply::After(delay, b"+PONG\r\n")).await;
+        let outcome = send_expect_probe(&address, &template_exchange("redis_ping", 5_000)).await;
+        assert_eq!(outcome.result, ProbeResult::Degraded);
+    }
+
+    #[test]
+    fn a_template_or_a_custom_check_is_probed_by_its_exchange() {
+        let mut backend = backend_checked_by(None, false);
+        backend.set_health_check(redis_ping(1_000));
+        assert_eq!(
+            probe_for(&backend),
+            ProbeTarget::TcpExchange {
+                address: backend.address.clone(),
+                exchange: template_exchange("redis_ping", 1_000),
+            }
+        );
+        // A stored payload no write validated exchanges nothing: it is
+        // probed by TCP connect rather than marked down.
+        backend.set_health_check(HealthCheck::TcpSendExpect {
+            send: Some(lorica_config::models::Payload::Hex("0".to_string())),
+            expect: Vec::new(),
+            timeout_ms: 1_000,
+        });
+        assert!(matches!(
+            probe_for(&backend),
+            ProbeTarget::TcpConnect { .. }
+        ));
+    }
+
+    /// A fake Redis on loopback: the first `answered` connections get
+    /// `+PONG`, every later one is accepted and never answered, as a
+    /// frozen server whose listen backlog still completes handshakes.
+    async fn fake_redis(answered: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test setup: listener");
+        let address = listener
+            .local_addr()
+            .expect("test setup: local address")
+            .to_string();
+        tokio::spawn(async move {
+            let mut accepted = 0;
+            while let Ok((socket, _)) = listener.accept().await {
+                accepted += 1;
+                let reply = if accepted <= answered {
+                    Reply::Bytes(b"+PONG\r\n")
+                } else {
+                    Reply::Silent
+                };
+                tokio::spawn(play(socket, "PING\r\n".len(), reply));
+            }
+        });
+        address
+    }
+
+    /// IV1: a Redis backend that stops answering `PING` while its port
+    /// stays open is marked down within the configured thresholds.
+    #[tokio::test]
+    async fn iv1_a_redis_that_stops_answering_ping_is_marked_down() {
+        let mut backend = backend_checked_by(None, false);
+        backend.id = "iv1-redis-ping".to_string();
+        backend.address = fake_redis(1).await;
+        backend.set_health_check(redis_ping(1_000));
+        let store = store_holding(&backend).await;
+
+        let alerts = lorica_notify::AlertSender::new(16);
+        let mut alerts_received = alerts.subscribe();
+        let mut health = health_loop_over(&store);
+        health.alert_sender = Some(alerts);
+        let mut state = HealthLoopState::default();
+        let start = Instant::now();
+        let probe_due = |cycle: u32| start + probe_interval(&backend) * cycle;
+        let failures = || {
+            lorica_api::metrics::backend_health_probe_failures_value(
+                &backend.id,
+                ProbeFailure::ResponseTimeout.as_str(),
+            )
+        };
+        let failures_before = failures();
+
+        // The first probe is answered.
+        assert!(!run_health_cycle(&health, &mut state, probe_due(0)).await);
+        assert_eq!(failures(), failures_before);
+
+        for cycle in 1..HEALTH_FLIP_THRESHOLD {
+            assert!(!run_health_cycle(&health, &mut state, probe_due(cycle)).await);
+            assert_eq!(
+                stored(&store, &backend.id).await.health_status,
+                HealthStatus::Healthy,
+                "cycle {cycle} is below the flip threshold"
+            );
+            assert_eq!(failures(), failures_before + u64::from(cycle));
+        }
+        assert!(alerts_received.try_recv().is_err());
+
+        assert!(run_health_cycle(&health, &mut state, probe_due(HEALTH_FLIP_THRESHOLD)).await);
+        assert_eq!(
+            stored(&store, &backend.id).await.health_status,
+            HealthStatus::Down
+        );
+        assert_eq!(
+            failures(),
+            failures_before + u64::from(HEALTH_FLIP_THRESHOLD)
+        );
+        let alert = alerts_received.try_recv().expect("one BackendDown alert");
+        assert_eq!(
+            alert.alert_type,
+            lorica_notify::events::AlertType::BackendDown
+        );
+        assert_eq!(alert.details["check"], "redis_ping");
+        assert_eq!(
+            alert.details["reason"],
+            ProbeFailure::ResponseTimeout.as_str()
         );
         assert!(alerts_received.try_recv().is_err());
     }

@@ -689,29 +689,29 @@ break, for the new arms only. Print them with
 `grep -rn --include=*.rs -e "HealthCheck::" . | grep -v "^./target" | grep -v "^./.claude"`;
 the grep is the authority.
 
-- [ ] `health_templates.rs`: `MatchAnchor`, `TemplateExpectation`,
+- [x] `health_templates.rs`: `MatchAnchor`, `TemplateExpectation`,
       `CheckTemplate`, `TCP_CHECK_TEMPLATES` with the three templates of
       D-4, `tcp_check_template`; module doc saying why protocol bytes
       live in the policy crate; re-exports in `lib.rs`.
-- [ ] `health_check.rs`: `TcpTemplate`, `TcpSendExpect`,
+- [x] `health_check.rs`: `TcpTemplate`, `TcpSendExpect`,
       `TcpCheckTemplateName` (custom serde, D-4), `Payload`,
       `Expectation`, the D-2 constants, `default_probe_timeout_ms`,
       `legacy_path` arms, `carries_raw_payload`, `validate`,
       `Backend::validate_health_check`, `exchange()` and `Exchange`, the
       hex codec.
-- [ ] `store/backends.rs`: `validate_health_check` in both unchecked
+- [x] `store/backends.rs`: `validate_health_check` in both unchecked
       writers.
-- [ ] `prepare_replica` and `validate_structure` call D-6, naming the
+- [x] `prepare_replica` and `validate_structure` call D-6, naming the
       backend.
-- [ ] `canonical.rs` tests: the shape lines of D-4 and the digest moved
+- [x] `canonical.rs` tests: the shape lines of D-4 and the digest moved
       with its paragraph.
-- [ ] `health.rs`: `ProbeTarget::TcpExchange`, `evaluate` and `Verdict`,
+- [x] `health.rs`: `ProbeTarget::TcpExchange`, `evaluate` and `Verdict`,
       `send_expect_probe`, `ProbeFailure` on every probe kind, the
       counter, the flip log line, the alert details.
-- [ ] `metrics.rs`: `lorica_backend_health_probe_failures_total` with
+- [x] `metrics.rs`: `lorica_backend_health_probe_failures_total` with
       the `lorica_metrics` counter-vec helper the module already uses
       for counters, and its setter.
-- [ ] Tests listed under Dev Notes, Lot 1.
+- [x] Tests listed under Dev Notes, Lot 1.
 
 ### Lot 2: management, automation and MCP surfaces (after Lot 1; parallel with Lot 3; cargo)
 
@@ -1068,6 +1068,46 @@ None open.
   named an interval and never got the setting. A create now leaves the
   field empty and omits the interval unless the operator types one, as
   the form already does for name, group and SNI.
+- Lot 1, two commits. The first adds the catalogue, the two kinds, the
+  validation on every writer and the shape guard, with the new kinds
+  probed by TCP connect (the rollback behaviour); the second adds the
+  probe, the failure reasons, the counter, the log line and the alert
+  details.
+- Lot 1, D-3: `evaluate` is a method of a `Matcher` built per probe,
+  not a free function of `(expect, read, finished)`. Comparing only the
+  new bytes needs to know where the previous call stopped and which
+  prefixes already diverged; the matcher holds exactly that and does no
+  I/O, so it is as deterministic as the free function. Its comparison
+  counter exists in the test build only.
+- Lot 1, D-9: `HealthCheck::exchange` returns `None` for a custom payload
+  that does not decode (a row no write validated), and `probe_for` then
+  probes by TCP connect, so a bad stored payload never marks a backend
+  down. The exchange's timeout is clamped to the written bounds, so no
+  probe outlives `PROBE_TIMEOUT_MS_MAX` whatever a row says. A deadline
+  reached while writing `send` is `send_failed`.
+- Lot 1, D-10: the alert keeps its place before the status write, as
+  before; the log line is written after the write succeeded, so a flip
+  of a backend deleted during the cycle logs nothing.
+- Lot 1, D-4: `TcpCheckTemplateName` holds the catalogue entry, compares
+  and prints by name. A hex payload is lowercased both when read and when
+  written, so a value built in code is stored lowercased too.
+- Lot 1, shape guard: `field_names` became a case of `names_refused_with`,
+  which also reads an enum's variants and a variant's fields from serde's
+  refusals. The lines the inventory already had were checked to hash to
+  the previous digest before it moved.
+- Lot 1, outside the allowlist: `lorica/Cargo.toml` gains `strum` for
+  `ProbeFailure`'s derives (already in the graph through `lorica-config`,
+  so `Cargo.lock` gains an edge and no package); `import_to_store` runs
+  the same health-check validation as `validate_structure` before
+  `clear_all`, as it already re-runs the stream rules, so an
+  `ImportData` built without `parse_toml` cannot clear the store and then
+  fail; `metrics.rs` gains `backend_health_probe_failures_value`, a
+  read-back the health loop's tests need, on the precedent of
+  `proxy_protocol_refused_value`.
+- Until Lot 2 lands, the automation plane and MCP accept a
+  `tcp_send_expect` (the management request structs carry the typed
+  check since Story 12.1 Lot 4) and return `send` unmasked. Lot 2 closes
+  both; the branch must not ship without it.
 
 ## File List
 
@@ -1087,6 +1127,19 @@ None open.
 - `lorica-automation-policy/src/settings.rs` (Lot 0, `why` text)
 - `lorica-dashboard/frontend/src/routes/Backends.svelte` (Lot 0 follow-up)
 - `lorica-dashboard/frontend/src/routes/Backends.test.ts` (Lot 0 follow-up)
+- `lorica-automation-policy/src/health_templates.rs` (Lot 1, new)
+- `lorica-automation-policy/src/lib.rs` (Lot 1)
+- `lorica-config/src/models/health_check.rs` (Lot 1)
+- `lorica-config/src/models/mod.rs` (Lot 1)
+- `lorica-config/src/store/backends.rs` (Lot 1)
+- `lorica-config/src/store/replica.rs` (Lot 1, `prepare_replica`)
+- `lorica-config/src/import.rs` (Lot 1, `validate_structure` and `import_to_store`)
+- `lorica-config/src/canonical.rs` (Lot 1, shape guard tests)
+- `lorica-config/src/tests.rs` (Lot 1)
+- `lorica-config/tests/config_db_upgrade.rs` (Lot 1)
+- `lorica/src/health.rs` (Lot 1)
+- `lorica-api/src/metrics.rs` (Lot 1, the counter, its setter and read-back)
+- `lorica/Cargo.toml` and `Cargo.lock` (Lot 1, `strum`)
 
 ## Change Log
 
@@ -1098,3 +1151,4 @@ None open.
 | 2026-11-15 | 0.4 | Lot 0 commit 1: the health loop writes the health status and the lifecycle state alone (`set_backend_health_status`, `set_backend_lifecycle_state`), cycle extracted into `run_health_cycle`. Status InProgress. | Romain G. |
 | 2026-11-15 | 0.5 | Lot 0 commit 2: each backend probed at its own `health_check_interval_s` on a one-second tick; `default_health_check_interval_s` is the interval of a backend created without one (management, automation, environment). Lot 0 done. Status InProgress. | Romain G. |
 | 2026-11-15 | 0.6 | Lot 0 follow-up: the dashboard backend create omits the interval unless typed, so it takes the setting. Status InProgress. | Romain G. |
+| 2026-11-15 | 0.7 | Lot 1: template catalogue, `tcp_template` and `tcp_send_expect` validated by every writer, shape guard over kinds and template names, send/expect probe with failure reasons, counter, log line and alert details, IV1 automated. Status InProgress. | Romain G. |

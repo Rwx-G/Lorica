@@ -65,6 +65,20 @@ static BACKEND_HEALTH: Lazy<GaugeVec> = Lazy::new(|| {
     )
 });
 
+/// Failed active health probes (Story 12.7, D-10), every one, whether
+/// or not it flipped the backend. Labels: `backend_id` and `reason`,
+/// the snake_case name of the health loop's closed `ProbeFailure` set:
+/// the cardinality is backends times that set, with no address and no
+/// byte read in a label. The health loop runs in the process that
+/// serves `/metrics`, as for `backend_health`.
+static BACKEND_HEALTH_PROBE_FAILURES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "backend_health_probe_failures_total",
+        "Failed active health probes, by backend and reason",
+        &["backend_id", "reason"],
+    )
+});
+
 /// Certificate days to expiry gauge. Labels: domain.
 static CERT_EXPIRY_DAYS: Lazy<GaugeVec> = Lazy::new(|| {
     lorica_metrics::register_gauge_vec(
@@ -1159,6 +1173,22 @@ pub fn set_backend_health(backend_id: &str, address: &str, health: f64) {
     BACKEND_HEALTH
         .with_label_values(&[backend_id, address])
         .set(health);
+}
+
+/// Count one failed active health probe of `backend_id`, `reason`
+/// being a word of the health loop's closed failure set.
+pub fn inc_backend_health_probe_failure(backend_id: &str, reason: &str) {
+    BACKEND_HEALTH_PROBE_FAILURES_TOTAL
+        .with_label_values(&[backend_id, reason])
+        .inc();
+}
+
+/// Read back this process's `lorica_backend_health_probe_failures_total`
+/// for one backend and reason.
+pub fn backend_health_probe_failures_value(backend_id: &str, reason: &str) -> u64 {
+    BACKEND_HEALTH_PROBE_FAILURES_TOTAL
+        .with_label_values(&[backend_id, reason])
+        .get()
 }
 
 /// Update certificate expiry metric.
