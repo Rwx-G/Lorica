@@ -334,6 +334,26 @@ impl StreamRuntime {
                     count: count(stopped),
                 })
             }
+            StreamCtlMsg::Caps {
+                seq,
+                stream_id,
+                caps_gen,
+                ..
+            } => {
+                // No engine here counts sessions on a caps region yet: the
+                // region's fd closes with the message and the binding
+                // reports the worker as not serving, as a bad attach does.
+                warn!(
+                    seq,
+                    %stream_id,
+                    caps_gen,
+                    "stream caps region refused: this runtime maps none"
+                );
+                Some(StreamCtlMsg::Nack {
+                    seq,
+                    reason: NackReason::AdoptFailed,
+                })
+            }
             StreamCtlMsg::Ack { seq, .. } | StreamCtlMsg::Nack { seq, .. } => {
                 warn!(
                     seq,

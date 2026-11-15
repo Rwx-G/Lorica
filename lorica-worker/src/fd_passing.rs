@@ -29,6 +29,9 @@
 //!   ([`crate::stream_ctl`])
 //! - `stream:<tcp|udp>:<bind_gen>:<addr>`: a stream socket, sent only
 //!   over the stream control channel, never in the fork bundle
+//! - `stream-caps:<caps_gen>`: the memfd of one stream's caps region
+//!   (`lorica_shmem::StreamCapsRegion`), sent only over the stream control
+//!   channel, never in the fork bundle
 
 use std::io::{IoSlice, IoSliceMut};
 use std::net::SocketAddr;
@@ -144,6 +147,10 @@ pub enum FdKind {
         bind_gen: u64,
         addr: SocketAddr,
     },
+    /// The memfd of one UDP stream's caps region, sent in a stream
+    /// control `caps`. `caps_gen` names the region among the stream's
+    /// successive ones (a size change replaces it).
+    StreamCaps { caps_gen: u64 },
 }
 
 impl FdKind {
@@ -159,6 +166,7 @@ impl FdKind {
                 bind_gen,
                 addr,
             } => format!("stream:{proto}:{bind_gen}:{addr}"),
+            FdKind::StreamCaps { caps_gen } => format!("stream-caps:{caps_gen}"),
         }
     }
 
@@ -170,6 +178,10 @@ impl FdKind {
             Ok(FdKind::Rpc)
         } else if tok == "stream-ctl" {
             Ok(FdKind::StreamCtl)
+        } else if let Some(caps_gen) = tok.strip_prefix("stream-caps:") {
+            Ok(FdKind::StreamCaps {
+                caps_gen: parse_decimal_u64(caps_gen)?,
+            })
         } else if let Some(addr) = tok.strip_prefix("listener:") {
             Ok(FdKind::Listener {
                 addr: addr.to_string(),
@@ -186,6 +198,14 @@ impl FdKind {
             Err(WorkerError::InvalidPayload)
         }
     }
+}
+
+/// A decimal `u64` of digits only: `str::parse` would also take a sign.
+fn parse_decimal_u64(tok: &str) -> Result<u64, WorkerError> {
+    if tok.is_empty() || !tok.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(WorkerError::InvalidPayload);
+    }
+    tok.parse().map_err(|_| WorkerError::InvalidPayload)
 }
 
 /// A typed FD entry sent over the command channel at worker fork.
@@ -404,7 +424,11 @@ pub fn recv_listener_fds(sock: RawFd) -> Result<Vec<(RawFd, String)>, WorkerErro
         .into_iter()
         .filter_map(|e| match e.kind {
             FdKind::Listener { addr } => Some((e.fd, addr)),
-            FdKind::Shmem | FdKind::Rpc | FdKind::StreamCtl | FdKind::StreamSocket { .. } => {
+            FdKind::Shmem
+            | FdKind::Rpc
+            | FdKind::StreamCtl
+            | FdKind::StreamSocket { .. }
+            | FdKind::StreamCaps { .. } => {
                 // SAFETY: `recv_worker_fds` handed this FD over with
                 // exclusive ownership and nothing else refers to it.
                 unsafe { close_fd(e.fd) };
@@ -690,6 +714,8 @@ mod tests {
                     .parse()
                     .unwrap(),
             },
+            FdKind::StreamCaps { caps_gen: 0 },
+            FdKind::StreamCaps { caps_gen: u64::MAX },
         ];
         for k in cases {
             let t = k.to_token();
@@ -799,6 +825,24 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_caps_token_is_documented_and_strict() {
+        assert_eq!(
+            FdKind::StreamCaps { caps_gen: 12 }.to_token(),
+            "stream-caps:12"
+        );
+        for bad in [
+            "stream-caps:",
+            "stream-caps:+1",
+            "stream-caps:-1",
+            "stream-caps:x",
+            "stream-caps:18446744073709551616",
+            "stream-caps:1:2",
+        ] {
+            assert!(FdKind::from_token(bad).is_err(), "{bad} was accepted");
+        }
+    }
+
+    #[test]
     fn test_legacy_listener_wrapper_filters_out_stream_kinds() {
         let (parent_fd, child_fd) = create_socketpair().expect("socketpair failed");
         let ctl = socket::socket(
@@ -822,10 +866,19 @@ mod tests {
             None,
         )
         .unwrap();
+        let caps = nix::sys::memfd::memfd_create(
+            c"lorica-stream-caps-test",
+            nix::sys::memfd::MFdFlags::MFD_CLOEXEC,
+        )
+        .unwrap();
         let entries = [
             FdEntry {
                 fd: ctl.as_raw_fd(),
                 kind: FdKind::StreamCtl,
+            },
+            FdEntry {
+                fd: caps.as_raw_fd(),
+                kind: FdKind::StreamCaps { caps_gen: 1 },
             },
             FdEntry {
                 fd: stream_sock.as_raw_fd(),

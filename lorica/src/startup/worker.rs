@@ -102,6 +102,16 @@ pub(crate) fn run_worker(
                 drop(unsafe { OwnedFd::from_raw_fd(entry.fd) });
                 warn!(worker_id = id, %proto, %addr, "closed a stream socket sent in the fork bundle");
             }
+            fd_passing::FdKind::StreamCaps { caps_gen } => {
+                // Caps regions only travel over the stream control
+                // channel, like stream sockets.
+                // SAFETY: as above, the FD is exclusively ours.
+                drop(unsafe { OwnedFd::from_raw_fd(entry.fd) });
+                warn!(
+                    worker_id = id,
+                    caps_gen, "closed a stream caps region sent in the fork bundle"
+                );
+            }
         }
     }
 

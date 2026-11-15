@@ -1,7 +1,7 @@
 # Story 12.5: The UDP Stream Engine
 
 **Epic:** [Epic 12 - TCP and UDP Stream Proxying (v1.11.0 and v1.12.0)](../prd/epic-12-v1.11.0.md)
-**Status:** Draft
+**Status:** InProgress
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:**
@@ -837,21 +837,21 @@ Allowlist: `lorica-worker/src/fd_passing.rs`, `lorica-worker/src/stream_ctl.rs`,
 `lorica/src/startup/worker.rs` (the exhaustive `FdKind` match arm only).
 Depends on: nothing.
 
-- [ ] `FdKind::StreamCaps { caps_gen }` (`stream-caps:<caps_gen>`) with
+- [x] `FdKind::StreamCaps { caps_gen }` (`stream-caps:<caps_gen>`) with
       token round trip; `recv_listener_fds` filters it; the arm in
       `run_worker`'s match closes a stray one with a warning, like
       `StreamSocket`.
-- [ ] `StreamCtlMsg::Caps { seq, stream_id, caps_gen, slot }` with exactly
+- [x] `StreamCtlMsg::Caps { seq, stream_id, caps_gen, slot }` with exactly
       one fd; encode/decode; a count mismatch closes what arrived.
-- [ ] `bind_udp_group`: `IP_PKTINFO` / `IPV6_RECVPKTINFO` on unspecified
+- [x] `bind_udp_group`: `IP_PKTINFO` / `IPV6_RECVPKTINFO` on unspecified
       addresses only.
-- [ ] `usable_udp_source_ports()`: range size from
+- [x] `usable_udp_source_ports()`: range size from
       `/proc/sys/net/ipv4/ip_local_port_range`, minus reserved ports in it
       (`ip_local_reserved_ports`, comma and range syntax), minus
       `EPHEMERAL_PORT_MARGIN` (1,024), saturating; a parse failure is an
       error the caller reports, never a guessed figure.
-- [ ] `BindFailureKind::SourcePorts` (`source_ports`).
-- [ ] Tests (Linux): `caps` round trip with a memfd; reserved-port parsing
+- [x] `BindFailureKind::SourcePorts` (`source_ports`).
+- [x] Tests (Linux): `caps` round trip with a memfd; reserved-port parsing
       (single ports, ranges, outside the range, empty); `[::]` with
       `IPV6_RECVPKTINFO` reports the IPv4 destination of an IPv4 datagram
       (pins the D-g assumption; if it fails, set `IP_PKTINFO` on the v6
@@ -1054,8 +1054,10 @@ Depends on: C; 12.2 Lots E2 and E3 and 12.3 Lot E (same files).
       reporting targeted node; `usable_source_ports` on
       `StreamPlaneReport` at its next free tag, decode test without it.
 - [ ] `openapi.yaml`: the `udp` object with bounds and defaults, the
-      refusal and drop words from their enums, the budget fields; contract
-      test green.
+      refusal and drop words from their enums, the budget fields, and
+      `source_ports` in the `StreamBindFailureKind` enum (Lot A added the
+      kind; nothing pins that enum to `BindFailureKind::ALL` yet, so this
+      Lot derives or tests it); contract test green.
 
 ### Lot J: dashboard budget panel - frontend gates
 
@@ -1063,7 +1065,8 @@ Allowlist: `lorica-dashboard/frontend/src/lib/api.ts`,
 `lorica-dashboard/frontend/src/components/StreamBudget.svelte` (+ `.test.ts`).
 Depends on: G; Story 12.2 Lot F (same files).
 
-- [ ] Types; the panel shows the node ceiling, `bound_by`, `over_ceiling`,
+- [ ] Types (the bind failure-kind union gains `source_ports`); the
+      panel shows the node ceiling, `bound_by`, `over_ceiling`,
       the source pools and each UDP stream's share; Vitest for each.
 - [ ] The stream form and the unbounded-responses badge are Story 12.10's
       (D-l); nothing here.
@@ -1415,7 +1418,49 @@ decision.
 
 ### Completion Notes
 
+**Lot A (`lorica-worker`).**
+
+- Wire. `FdKind::StreamCaps { caps_gen }` is the token
+  `stream-caps:<caps_gen>` (decimal digits only, a sign refused).
+  `StreamCtlMsg::Caps { seq, stream_id, caps_gen, slot: u32, region:
+  OwnedFd }` is `caps <seq> <stream_id> <caps_gen> slot=<i>
+  stream-caps:<caps_gen>` with exactly one `SCM_RIGHTS` fd: the payload
+  carries the fd's typed token as `attach` does, and a token whose
+  generation is not the header's is `malformed`. Zero or two fds are
+  `FdCountMismatch { tokens: 1 }`; every fd that arrived is closed on any
+  refusal. A compile-time assertion keeps the longest `caps` inside the
+  payload buffer, and a test pins the bound against the real rendering.
+- `IP_PKTINFO` (IPv4) and `IPV6_RECVPKTINFO` (IPv6) are set by
+  `bind_udp_group` on the unspecified address only. D-g's assumption
+  holds and is pinned
+  (`ipv6_wildcard_reports_the_ipv4_destination_of_an_ipv4_datagram`): on
+  a dual-stack `[::]` socket, `IPV6_RECVPKTINFO` alone reports an IPv4
+  datagram's destination IPv4-mapped, so no `IP_PKTINFO` on the v6
+  socket. The IPv4 test sends to `127.0.0.2` and reads `127.0.0.2`.
+- `usable_udp_source_ports() -> Result<u32, PortRangeError>` reads both
+  `/proc` files at every call; the arithmetic is the pure
+  `usable_source_ports_from(range, reserved)`, which merges overlapping
+  reserved entries and clips them to the range. `EPHEMERAL_PORT_MARGIN`
+  (1,024) and the two paths are public constants. A file that cannot be
+  read or parsed is `PortRangeError::{Read, Parse}` naming the file.
+- `BindFailureKind::SourcePorts` (`source_ports`) is in `ALL`, so
+  `from_name` and the heartbeat's kind mapping know it. `openapi.yaml`'s
+  `StreamBindFailureKind` enum and the dashboard's failure-kind union
+  do not list it yet; Lots G and J now say so.
+- Outside the allowlist, needed for the workspace to build:
+  `lorica-stream/src/runtime.rs`, whose message match is exhaustive. Until
+  Lot D maps regions, a `caps` is answered `nack adopt_failed` and its fd
+  closes with the message; no supervisor sends one before Lot F.
+
 ## File List
+
+Lot A:
+
+- `lorica-worker/src/fd_passing.rs`, `lorica-worker/src/stream_ctl.rs`,
+  `lorica-worker/src/stream_sockets.rs`, `lorica-worker/tests/stream_ctl.rs`
+- `lorica/src/startup/worker.rs` (the `FdKind` arm)
+- `lorica-stream/src/runtime.rs` (the `caps` arm, outside the allowlist)
+- `docs/stories/story-12.5-udp-engine.md`
 
 ## Change Log
 
@@ -1423,3 +1468,4 @@ decision.
 |------|---------|-------------|--------|
 | 2026-11-14 | 0.1 | Story drafted from the Epic 12 PRD and the Dev Agent Records of Stories 12.1 and 12.2. Status Draft. | Romain G. |
 | 2026-11-14 | 0.2 | Maintainer answers folded in (Resolved 1 to 8: ratio 32 and the reflection bound recomputed, `source_addresses`); aligned with the Story 12.3 draft (seams, breaker key, fields, counters, record) with the remaining mismatches listed as edits E1 to E9. Status Draft. | Romain G. |
+| 2026-11-15 | 0.3 | Lot A landed: the `caps` message and its `stream-caps` fd tag, `IP_PKTINFO` / `IPV6_RECVPKTINFO` on wildcard UDP groups (the dual-stack assumption of D-g pinned), `usable_udp_source_ports`, `BindFailureKind::SourcePorts`. Status InProgress. | Romain G. |

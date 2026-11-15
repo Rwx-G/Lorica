@@ -28,7 +28,11 @@
 //!   per socket token, in order, at most [`ATTACH_MAX_SOCKETS`];
 //! - `detach <seq> <stream_id> <bind_gen> drain_ms=<n>`;
 //! - `refresh <seq> drain_ms=<n>`;
-//! - `quiesce <seq> reason=<reason> drain_ms=<n>`.
+//! - `quiesce <seq> reason=<reason> drain_ms=<n>`;
+//! - `caps <seq> <stream_id> <caps_gen> slot=<i> stream-caps:<caps_gen>`,
+//!   exactly one `SCM_RIGHTS` fd: the memfd of the stream's caps region,
+//!   and `i` the worker's shard index in it, which the worker does not
+//!   otherwise know.
 //!
 //! Worker to supervisor: `ack <seq> <count>` or `nack <seq> <reason>`,
 //! where `reason` is a [`NackReason`] token, never free text.
@@ -65,6 +69,27 @@ pub const MAX_STREAM_ID_LEN: usize = 64;
 /// Longest `attach <seq> <stream_id> <bind_gen>` header.
 pub(crate) const ATTACH_HEADER_MAX_LEN: usize =
     "attach".len() + 1 + U64_MAX_DIGITS + 1 + MAX_STREAM_ID_LEN + 1 + U64_MAX_DIGITS;
+
+/// Longest decimal rendering of a `u32`.
+const U32_MAX_DIGITS: usize = 10;
+
+/// Longest `caps` message, its one fd token included.
+const CAPS_MAX_LEN: usize = "caps".len()
+    + 1
+    + U64_MAX_DIGITS
+    + 1
+    + MAX_STREAM_ID_LEN
+    + 1
+    + U64_MAX_DIGITS
+    + " slot=".len()
+    + U32_MAX_DIGITS
+    + " stream-caps:".len()
+    + U64_MAX_DIGITS;
+
+const _: () = assert!(
+    CAPS_MAX_LEN <= PAYLOAD_BUF_SIZE,
+    "a caps message must fit the payload buffer"
+);
 
 /// Errors of the stream control channel.
 #[derive(Debug, thiserror::Error)]
@@ -196,6 +221,17 @@ pub enum StreamCtlMsg {
         reason: QuiesceReason,
         drain_ms: u64,
     },
+    /// Hand the worker the caps region `caps_gen` of UDP stream
+    /// `stream_id`, as the memfd `region`; `slot` is the worker's shard
+    /// index in it. Sent before the stream's first `attach`, in a respawn
+    /// replay before the `attach` replay, and when the region is replaced.
+    Caps {
+        seq: u64,
+        stream_id: String,
+        caps_gen: u64,
+        slot: u32,
+        region: OwnedFd,
+    },
     /// The worker applied message `seq`; `count` is what it applied (the
     /// number of sockets adopted for an `attach`).
     Ack { seq: u64, count: u32 },
@@ -211,6 +247,7 @@ impl StreamCtlMsg {
             | StreamCtlMsg::Detach { seq, .. }
             | StreamCtlMsg::Refresh { seq, .. }
             | StreamCtlMsg::Quiesce { seq, .. }
+            | StreamCtlMsg::Caps { seq, .. }
             | StreamCtlMsg::Ack { seq, .. }
             | StreamCtlMsg::Nack { seq, .. } => *seq,
         }
@@ -271,6 +308,23 @@ impl StreamCtlMsg {
                 ),
                 Vec::new(),
             )),
+            StreamCtlMsg::Caps {
+                seq,
+                stream_id,
+                caps_gen,
+                slot,
+                region,
+            } => {
+                check_stream_id(stream_id).map_err(StreamCtlError::Invalid)?;
+                let token = FdKind::StreamCaps {
+                    caps_gen: *caps_gen,
+                }
+                .to_token();
+                Ok((
+                    format!("caps {seq} {stream_id} {caps_gen} slot={slot} {token}"),
+                    vec![region.as_raw_fd()],
+                ))
+            }
             StreamCtlMsg::Ack { seq, count } => Ok((format!("ack {seq} {count}"), Vec::new())),
             StreamCtlMsg::Nack { seq, reason } => {
                 Ok((format!("nack {seq} {}", reason.as_str()), Vec::new()))
@@ -285,7 +339,7 @@ impl StreamCtlMsg {
         let (&verb, args) = tokens
             .split_first()
             .ok_or(StreamCtlError::Malformed("empty payload"))?;
-        if verb != "attach" && !fds.is_empty() {
+        if verb != "attach" && verb != "caps" && !fds.is_empty() {
             return Err(StreamCtlError::FdCountMismatch {
                 fds: fds.len(),
                 tokens: 0,
@@ -346,6 +400,34 @@ impl StreamCtlMsg {
                     .ok_or(StreamCtlError::Malformed("unknown quiesce reason"))?,
                 drain_ms: parse_u64(keyed(drain, "drain_ms")?)?,
             }),
+            ("caps", [seq, stream_id, caps_gen, slot, token]) => {
+                let [region] = <[OwnedFd; 1]>::try_from(fds).map_err(|fds| {
+                    StreamCtlError::FdCountMismatch {
+                        fds: fds.len(),
+                        tokens: 1,
+                    }
+                })?;
+                let caps_gen = parse_u64(caps_gen)?;
+                match FdKind::from_token(token) {
+                    Ok(FdKind::StreamCaps {
+                        caps_gen: token_gen,
+                    }) if token_gen == caps_gen => {}
+                    Ok(FdKind::StreamCaps { .. }) => {
+                        return Err(StreamCtlError::Malformed(
+                            "caps token caps_gen differs from the header",
+                        ))
+                    }
+                    _ => return Err(StreamCtlError::Malformed("bad caps token")),
+                }
+                Ok(StreamCtlMsg::Caps {
+                    seq: parse_u64(seq)?,
+                    stream_id: parse_stream_id(stream_id)?,
+                    caps_gen,
+                    slot: u32::try_from(parse_u64(keyed(slot, "slot")?)?)
+                        .map_err(|_| StreamCtlError::Malformed("caps slot out of range"))?,
+                    region,
+                })
+            }
             ("ack", [seq, count]) => Ok(StreamCtlMsg::Ack {
                 seq: parse_u64(seq)?,
                 count: u32::try_from(parse_u64(count)?)
@@ -653,6 +735,73 @@ mod tests {
             drain_ms: 0,
         };
         assert!(at_bound.encode().is_ok());
+    }
+
+    fn memfd() -> OwnedFd {
+        nix::sys::memfd::memfd_create(c"lorica-caps-unit", nix::sys::memfd::MFdFlags::MFD_CLOEXEC)
+            .expect("memfd_create")
+    }
+
+    #[test]
+    fn caps_wire_form_is_the_documented_one_and_round_trips() {
+        let msg = StreamCtlMsg::Caps {
+            seq: 9,
+            stream_id: "s1".into(),
+            caps_gen: 4,
+            slot: 2,
+            region: memfd(),
+        };
+        let (payload, fds) = msg.encode().unwrap();
+        assert_eq!(payload, "caps 9 s1 4 slot=2 stream-caps:4");
+        assert_eq!(fds.len(), 1);
+        let StreamCtlMsg::Caps {
+            seq,
+            stream_id,
+            caps_gen,
+            slot,
+            ..
+        } = StreamCtlMsg::decode(&payload, vec![memfd()]).unwrap()
+        else {
+            panic!("expected caps");
+        };
+        assert_eq!((seq, stream_id.as_str(), caps_gen, slot), (9, "s1", 4, 2));
+    }
+
+    #[test]
+    fn longest_caps_message_matches_its_bound() {
+        let msg = StreamCtlMsg::Caps {
+            seq: u64::MAX,
+            stream_id: "a".repeat(MAX_STREAM_ID_LEN),
+            caps_gen: u64::MAX,
+            slot: u32::MAX,
+            region: memfd(),
+        };
+        assert_eq!(msg.encode().unwrap().0.len(), CAPS_MAX_LEN);
+    }
+
+    #[test]
+    fn caps_decode_refuses_a_wrong_fd_count_or_malformed_fields() {
+        for count in [0, 2] {
+            let fds = (0..count).map(|_| memfd()).collect();
+            assert!(matches!(
+                StreamCtlMsg::decode("caps 1 s1 2 slot=0 stream-caps:2", fds),
+                Err(StreamCtlError::FdCountMismatch { fds, tokens: 1 }) if fds == count
+            ));
+        }
+        for bad in [
+            "caps 1 s1 2 slot=0 stream-caps:3",
+            "caps 1 s1 2 slot=0 stream:udp:2:127.0.0.1:53",
+            "caps 1 s1 2 0 stream-caps:2",
+            "caps 1 s1 2 slot=x stream-caps:2",
+            "caps 1 s1 2 slot=4294967296 stream-caps:2",
+            "caps 1 s1 2 slot=0",
+            "caps 1 s1 2 slot=0 stream-caps:2 extra",
+        ] {
+            assert!(
+                StreamCtlMsg::decode(bad, vec![memfd()]).is_err(),
+                "{bad:?} was accepted"
+            );
+        }
     }
 
     #[test]

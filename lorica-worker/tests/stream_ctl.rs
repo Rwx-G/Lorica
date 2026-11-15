@@ -13,11 +13,12 @@
 // limitations under the License.
 
 //! The stream control channel and the stream sockets against a real
-//! kernel (Story 12.2 Lot A). Linux only.
+//! kernel (Story 12.2 Lot A, Story 12.5 Lot A). Linux only.
 
-use std::io::{IoSlice, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::io::{IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::time::Duration;
 
 use lorica_worker::fd_passing::StreamProto;
 use lorica_worker::stream_ctl::{
@@ -28,7 +29,10 @@ use lorica_worker::stream_sockets::{
     bind_range, bind_tcp_stream_listener, bind_udp_group, BindFailureKind,
 };
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
-use nix::sys::socket::{self, ControlMessage, MsgFlags, UnixAddr};
+use nix::sys::socket::{
+    self, getsockopt, sockopt, ControlMessage, ControlMessageOwned, MsgFlags, SockaddrStorage,
+    UnixAddr,
+};
 use nix::sys::stat::fstat;
 use socket2::{Domain, SockRef, Socket, Type};
 
@@ -493,6 +497,193 @@ fn bind_range_is_all_or_nothing_and_names_the_failing_port() {
             assert_eq!(port.sockets.len(), expected);
         }
     }
+}
+
+fn memfd(name: &std::ffi::CStr) -> OwnedFd {
+    nix::sys::memfd::memfd_create(name, nix::sys::memfd::MFdFlags::MFD_CLOEXEC)
+        .expect("memfd_create")
+}
+
+#[test]
+fn caps_round_trips_a_region_memfd_the_worker_can_read() {
+    let (sup, wrk) = create_seqpacket_pair().unwrap();
+    let region = memfd(c"lorica-stream-caps-it");
+    let mut file = std::fs::File::from(region.try_clone().unwrap());
+    file.write_all(b"LORICASC").unwrap();
+    let ino = inode(&region);
+
+    send_msg(
+        &sup,
+        &StreamCtlMsg::Caps {
+            seq: 12,
+            stream_id: STREAM_ID.into(),
+            caps_gen: 3,
+            slot: 5,
+            region,
+        },
+    )
+    .unwrap();
+    let StreamCtlMsg::Caps {
+        seq,
+        stream_id,
+        caps_gen,
+        slot,
+        region,
+    } = recv_msg(&wrk).unwrap()
+    else {
+        panic!("expected caps");
+    };
+    assert_eq!(
+        (seq, stream_id.as_str(), caps_gen, slot),
+        (12, STREAM_ID, 3, 5)
+    );
+    assert_eq!(inode(&region), ino, "same memfd, fresh descriptor");
+    let flags = FdFlag::from_bits_truncate(fcntl(&region, FcntlArg::F_GETFD).unwrap());
+    assert!(flags.contains(FdFlag::FD_CLOEXEC), "MSG_CMSG_CLOEXEC");
+    let mut received = std::fs::File::from(region);
+    received.seek(SeekFrom::Start(0)).unwrap();
+    let mut magic = [0u8; 8];
+    received.read_exact(&mut magic).unwrap();
+    assert_eq!(&magic, b"LORICASC");
+}
+
+/// How many descriptors of this process refer to the memfd named `name`
+/// (each test names its own).
+fn open_fds_on_memfd(name: &str) -> usize {
+    let target = format!("/memfd:{name} ");
+    std::fs::read_dir("/proc/self/fd")
+        .expect("/proc/self/fd")
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            std::fs::read_link(e.path()).is_ok_and(|l| {
+                let link = l.to_string_lossy();
+                link.starts_with(&target) || link == target.trim_end()
+            })
+        })
+        .count()
+}
+
+#[test]
+fn a_caps_with_a_wrong_fd_count_closes_what_arrived() {
+    let (sup, wrk) = create_seqpacket_pair().unwrap();
+    let first = memfd(c"lorica-caps-first");
+    let second = memfd(c"lorica-caps-second");
+
+    send_raw(
+        &sup,
+        b"caps 1 s1 2 slot=0 stream-caps:2",
+        &[first.as_raw_fd(), second.as_raw_fd()],
+    );
+    assert!(matches!(
+        recv_msg(&wrk),
+        Err(StreamCtlError::FdCountMismatch { fds: 2, tokens: 1 })
+    ));
+    send_raw(&sup, b"caps 2 s1 2 slot=0 stream-caps:2", &[]);
+    assert!(matches!(
+        recv_msg(&wrk),
+        Err(StreamCtlError::FdCountMismatch { fds: 0, tokens: 1 })
+    ));
+    // A token whose generation is not the header's.
+    send_raw(
+        &sup,
+        b"caps 3 s1 2 slot=0 stream-caps:9",
+        &[first.as_raw_fd()],
+    );
+    assert!(matches!(recv_msg(&wrk), Err(StreamCtlError::Malformed(_))));
+    for name in ["lorica-caps-first", "lorica-caps-second"] {
+        assert_eq!(
+            open_fds_on_memfd(name),
+            1,
+            "a received copy of {name} leaked"
+        );
+    }
+}
+
+/// Receive one datagram on `fd` and return the destination address the
+/// kernel reported in `IP_PKTINFO` or `IPV6_PKTINFO`, if any.
+fn destination_of_next_datagram(fd: &OwnedFd) -> Option<IpAddr> {
+    let mut buf = [0u8; 64];
+    let mut iov = [IoSliceMut::new(&mut buf)];
+    let mut cmsg = nix::cmsg_space!(nix::libc::in6_pktinfo, nix::libc::in_pktinfo);
+    let msg = socket::recvmsg::<SockaddrStorage>(
+        fd.as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsg),
+        MsgFlags::empty(),
+    )
+    .expect("recvmsg");
+    let mut destination = None;
+    for c in msg.cmsgs().expect("cmsgs") {
+        match c {
+            ControlMessageOwned::Ipv4PacketInfo(info) => {
+                destination = Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                    info.ipi_addr.s_addr,
+                ))));
+            }
+            ControlMessageOwned::Ipv6PacketInfo(info) => {
+                destination = Some(IpAddr::V6(Ipv6Addr::from(info.ipi6_addr.s6_addr)));
+            }
+            _ => {}
+        }
+    }
+    destination
+}
+
+/// Send one datagram to `to` from an unconnected socket and read it back
+/// on the single slot of `group`.
+fn send_and_read_destination(group: &[OwnedFd], to: SocketAddr) -> Option<IpAddr> {
+    let slot = &group[0];
+    socket2::SockRef::from(slot)
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let client = UdpSocket::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).unwrap();
+    client.send_to(b"q", to).unwrap();
+    destination_of_next_datagram(slot)
+}
+
+/// Story 12.5 D-g: the IPv4 wildcard reports the address a client sent
+/// to, here `127.0.0.2`, not the one the routing table would pick.
+#[test]
+fn ipv4_wildcard_reports_the_destination_of_each_datagram() {
+    let port = free_ports(1);
+    let group = bind_udp_group(sa("0.0.0.0", port), 1).unwrap();
+    assert!(getsockopt(&group[0], sockopt::Ipv4PacketInfo).unwrap());
+    assert_eq!(
+        send_and_read_destination(&group, sa("127.0.0.2", port)),
+        Some(IpAddr::from([127, 0, 0, 2]))
+    );
+}
+
+/// Story 12.5 D-g's assumption, pinned: on a dual-stack `[::]` socket,
+/// `IPV6_RECVPKTINFO` alone reports an IPv4 datagram's destination,
+/// IPv4-mapped, so no `IP_PKTINFO` is needed on it.
+#[test]
+fn ipv6_wildcard_reports_the_ipv4_destination_of_an_ipv4_datagram() {
+    let port = free_ports(1);
+    let group = bind_udp_group(v6_unspecified(port), 1).unwrap();
+    assert!(getsockopt(&group[0], sockopt::Ipv6RecvPacketInfo).unwrap());
+    let destination = send_and_read_destination(&group, sa("127.0.0.2", port))
+        .expect("an IPV6_PKTINFO for an IPv4 datagram");
+    assert_eq!(destination.to_canonical(), IpAddr::from([127, 0, 0, 2]));
+}
+
+#[test]
+fn a_specific_listen_address_asks_for_no_destination() {
+    let v4 = bind_udp_group(sa("127.0.0.1", free_ports(1)), 1).unwrap();
+    assert!(!getsockopt(&v4[0], sockopt::Ipv4PacketInfo).unwrap());
+    let v6 = bind_udp_group(sa("::1", free_ports(1)), 1).unwrap();
+    assert!(!getsockopt(&v6[0], sockopt::Ipv6RecvPacketInfo).unwrap());
+    assert_eq!(
+        send_and_read_destination(
+            &v4,
+            socket2::SockRef::from(&v4[0])
+                .local_addr()
+                .unwrap()
+                .as_socket()
+                .unwrap()
+        ),
+        None
+    );
 }
 
 #[test]
