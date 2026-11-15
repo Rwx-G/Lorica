@@ -378,6 +378,9 @@ pub(crate) fn local_view(
             worker_count: fds.worker_count,
             listen_socket_cap: settings.stream_listen_socket_cap,
             worker_drain_timeout_s: settings.worker_drain_timeout_s,
+            // Read and carried by Story 12.5 Lot G; until then the
+            // ceiling is the fd budget's alone.
+            usable_source_ports: None,
         },
         &shares,
     )
@@ -418,6 +421,8 @@ pub(crate) fn reported_view(
             worker_count: report.worker_count,
             listen_socket_cap: settings.stream_listen_socket_cap,
             worker_drain_timeout_s: settings.worker_drain_timeout_s,
+            // The heartbeat carries it from Story 12.5 Lot G.
+            usable_source_ports: None,
         },
         &shares,
     );
@@ -565,19 +570,25 @@ mod tests {
     #[test]
     fn the_refusal_names_the_node_the_constraint_and_its_numbers() {
         // 4,096 fds leave a stream budget of 1,024; a 1,000-port UDP
-        // range on two workers needs 2,000 in the supervisor.
+        // range of 16 sessions fits one worker, and on two workers needs
+        // 2,000 slot sockets and its caps memfd in the supervisor.
         let small = NodeFds {
             fd_limit: 4096,
             worker_count: 2,
         };
-        let candidate = stream("dns", StreamProtocol::Udp, 20_000, 20_999);
+        let mut candidate = stream("dns", StreamProtocol::Udp, 20_000, 20_999);
+        candidate
+            .udp
+            .as_mut()
+            .expect("a UDP stream carries its settings")
+            .max_sessions = 16;
         let refusal = check_write(&candidate, None, &[], &[this_node(Some(small))], 2048)
             .expect_err("over the supervisor budget");
         assert_eq!(refusal.label, NodeLabel::ThisNode);
         assert_eq!(
             refusal.violation,
             BudgetViolation::SupervisorFds {
-                committed: 2000,
+                committed: 2001,
                 budget: 1024,
                 fd_limit: 4096,
                 workers: 2
@@ -587,7 +598,7 @@ mod tests {
         assert!(message.contains("`dns`"), "{message}");
         assert!(message.contains("this node"), "{message}");
         assert!(message.contains("supervisor_fds"), "{message}");
-        assert!(message.contains("2000"), "{message}");
+        assert!(message.contains("2001"), "{message}");
     }
 
     #[test]
@@ -811,7 +822,8 @@ mod tests {
         assert_eq!(view.listen_socket_cap, settings.stream_listen_socket_cap);
         assert_eq!(view.worker_drain_timeout_s, settings.worker_drain_timeout_s);
         assert_eq!(view.listen_sockets_used, 3);
-        assert_eq!(view.supervisor_fds_committed, 1 + 2 * 2);
+        // The TCP port, the UDP ports per worker, the UDP caps memfd.
+        assert_eq!(view.supervisor_fds_committed, 1 + 2 * 2 + 1);
         let shares: Vec<(&str, BindStateKind)> = view
             .streams
             .iter()
@@ -854,11 +866,16 @@ mod tests {
         assert_eq!(report.fd_limit, 65_536);
         assert_eq!(report.worker_count, 2);
         assert_eq!(report.listen_sockets_used, 3);
-        let tcp_held = lorica_stream::tcp::held_fds(&streams[0])
-            .expect("a TCP stream declares its connections")
-            .total();
-        assert_eq!(report.worker_fds_committed, 3 + tcp_held);
-        assert_eq!(report.supervisor_fds_committed, 1 + 2 * 2);
+        let held = |s: &Stream| {
+            lorica_stream::held_fds(s)
+                .expect("each stream declares what it holds")
+                .total()
+        };
+        assert_eq!(
+            report.worker_fds_committed,
+            3 + held(&streams[0]) + held(&streams[1])
+        );
+        assert_eq!(report.supervisor_fds_committed, 1 + 2 * 2 + 1);
         assert_eq!(report.bound_count, 1);
         assert!(!report.truncated);
         let listed: Vec<(&str, StreamBindingState)> = report
@@ -1043,10 +1060,16 @@ mod tests {
 
     #[test]
     fn a_control_plane_checks_a_node_on_the_figures_its_heartbeat_reported() {
-        let candidate = Stream {
+        let mut candidate = Stream {
             node_selector: vec!["edge-1".into()],
             ..stream("dns", StreamProtocol::Udp, 20_000, 20_999)
         };
+        // Few enough sessions for one worker; the ports decide.
+        candidate
+            .udp
+            .as_mut()
+            .expect("a UDP stream carries its settings")
+            .max_sessions = 16;
         let report = report_listing(vec![], false);
         let node = BudgetNode {
             label: NodeLabel::Named("edge-1".into()),

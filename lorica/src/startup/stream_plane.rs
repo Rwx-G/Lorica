@@ -550,6 +550,7 @@ fn demand_of(key: &BindKey, stream: Option<&Stream>) -> StreamDemand {
             protocol: key.protocol,
             listen_sockets,
             held: None,
+            source_addresses: Vec::new(),
         },
     }
 }

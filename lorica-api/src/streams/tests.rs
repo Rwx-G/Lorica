@@ -981,11 +981,13 @@ async fn the_reads_carry_this_nodes_bind_state_of_each_stream() {
 
 #[tokio::test]
 async fn a_create_or_update_the_budget_cannot_hold_is_refused_naming_node_and_constraint() {
-    // 4,096 fds leave a stream budget of 1,024; the supervisor holds a
-    // socket per worker per UDP port.
+    // 12,288 fds leave a stream budget of 5,120: one worker holds the
+    // 1,000 ports and the 4,096 default sessions, but the supervisor
+    // holds a socket per worker per UDP port, 6,000 on six workers, and
+    // the stream's caps memfd.
     let mut node = Node::standalone().await;
     node.state.stream_plane =
-        StreamPlaneState::new(lorica_stream::StreamBindStates::new(), 4096, 2);
+        StreamPlaneState::new(lorica_stream::StreamBindStates::new(), 12_288, 6);
     let mut range = tcp("dns", 20_000);
     range["protocol"] = json!("udp");
     range["port_last"] = json!(20_999);
@@ -996,9 +998,9 @@ async fn a_create_or_update_the_budget_cannot_hold_is_refused_naming_node_and_co
         "`dns`",
         "this node",
         "supervisor_fds",
-        "2000",
-        "1024",
-        "4096",
+        "6001",
+        "5120",
+        "12288",
     ] {
         assert!(message.contains(part), "{part}: {message}");
     }
@@ -1108,8 +1110,13 @@ async fn the_budget_view_answers_this_node_to_operators_and_above() {
             .expect("stored");
         lorica_stream::tcp::held_fds(&stored).expect("a TCP stream declares its connections")
     };
-    assert_eq!(view["worker_fds_committed"], 3 + pg_held.total());
-    assert_eq!(view["supervisor_fds_committed"], 1 + 2 * 4);
+    let dns_sessions = u64::from(lorica_config::models::UdpSettings::DEFAULT_MAX_SESSIONS);
+    assert_eq!(
+        view["worker_fds_committed"],
+        3 + pg_held.total() + dns_sessions * lorica_stream::budget::UDP_FDS_PER_SESSION
+    );
+    // The TCP port, the UDP ports per worker, the UDP caps memfd.
+    assert_eq!(view["supervisor_fds_committed"], 1 + 2 * 4 + 1);
     let shares: Vec<(&str, &str)> = view["streams"]
         .as_array()
         .expect("streams")
@@ -1119,8 +1126,12 @@ async fn the_budget_view_answers_this_node_to_operators_and_above() {
                 assert_eq!(s["ceiling"], pg_held.ceiling, "{s}");
                 assert_eq!(s["fds_per_unit"], pg_held.fds_per_unit, "{s}");
             } else {
-                assert_eq!(s["ceiling"], Value::Null, "UDP declares none yet: {s}");
-                assert_eq!(s["fds_per_unit"], Value::Null);
+                assert_eq!(s["ceiling"], dns_sessions, "the stream's share: {s}");
+                assert_eq!(
+                    s["fds_per_unit"],
+                    lorica_stream::budget::UDP_FDS_PER_SESSION,
+                    "{s}"
+                );
             }
             (
                 s["name"].as_str().expect("a name"),
@@ -1190,14 +1201,17 @@ fn export_with(streams: &[lorica_config::models::Stream], cap: Option<u32>) -> S
     lorica_config::export::export_to_toml(&source).expect("export")
 }
 
-/// A fleet-wide UDP range on `0.0.0.0`, as a TOML file would carry it.
+/// A fleet-wide UDP range on `0.0.0.0`, as a TOML file would carry it,
+/// with 16 sessions: few enough that what one worker holds stays within
+/// the small budgets these tests run on, so the ports alone decide.
 fn udp_range(name: &str, first: u16, last: u16) -> lorica_config::models::Stream {
     lorica_config::models::Stream {
         protocol: lorica_config::models::StreamProtocol::Udp,
         port_last: last,
-        udp: lorica_config::models::Stream::default_udp_settings(
-            lorica_config::models::StreamProtocol::Udp,
-        ),
+        udp: Some(lorica_config::models::UdpSettings {
+            max_sessions: 16,
+            ..lorica_config::models::UdpSettings::default()
+        }),
         ..source_stream(name, first)
     }
 }
@@ -1222,8 +1236,9 @@ async fn preview_and_import(
 async fn an_import_and_its_preview_refuse_a_stream_the_budget_cannot_hold() {
     // The import and its preview share one write budget, so each case
     // runs on a node of its own. 4,096 fds leave a stream budget of
-    // 1,024; the supervisor holds a socket per worker per UDP port, so
-    // 1,000 ports on two workers need 2,000.
+    // 1,024; the supervisor holds a socket per worker per UDP port and
+    // a caps memfd per UDP stream, so 1,000 ports on two workers need
+    // 2,001.
     let fresh_node = || async {
         let mut node = Node::standalone().await;
         node.state.stream_plane =
@@ -1242,7 +1257,7 @@ async fn an_import_and_its_preview_refuse_a_stream_the_budget_cannot_hold() {
     )
     .await;
     let previewed = budget_refusal(preview_status, &preview);
-    for part in ["`dns`", "this node", "supervisor_fds", "2000"] {
+    for part in ["`dns`", "this node", "supervisor_fds", "2001"] {
         assert!(previewed.contains(part), "{part}: {previewed}");
     }
     assert_eq!(

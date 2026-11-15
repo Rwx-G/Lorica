@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The fd budget of Story 12.2 D-e, as pure arithmetic, and the view
-//! types of `GET /api/v1/streams/budget`.
+//! The fd budget of Story 12.2 D-e and the UDP session ceiling of Story
+//! 12.5 D-e, as pure arithmetic, and the view types of
+//! `GET /api/v1/streams/budget`.
 //!
 //! From the process's soft `RLIMIT_NOFILE` `L`:
 //!
@@ -21,23 +22,40 @@
 //! - `H` = `L / 2`, the HTTP reserve, never usable by streams;
 //! - `S` = `L - B - H`, the stream budget of one process.
 //!
-//! Three constraints hold for the streams a node binds:
+//! Four constraints hold for the streams a node binds:
 //!
 //! 1. their listening sockets (one per port) stay within the per-node
 //!    `stream_listen_socket_cap` setting;
 //! 2. in any one worker, listening sockets plus what the engines declare
 //!    a stream may hold at its ceiling stay within `S`. Caps are per
-//!    node, so the worst case puts every connection on one worker, and
-//!    that is what is counted;
-//! 3. in the supervisor, which keeps one socket per TCP port and one per
-//!    worker slot per UDP port, `TCP ports + UDP ports x W` stays within
-//!    `S`.
+//!    node, so the worst case puts every connection or session on one
+//!    worker, and that is what is counted;
+//! 3. in the supervisor, which keeps one socket per TCP port, one per
+//!    worker slot per UDP port and the caps memfd of each UDP stream,
+//!    `TCP ports + UDP ports x W + UDP streams` stays within `S`;
+//! 4. per source pool (each address of any UDP stream's
+//!    `source_addresses`, and one `default` pool for the UDP streams
+//!    without any), the UDP sessions that leave from it stay within `U`,
+//!    the usable ephemeral ports per source address
+//!    (`lorica_worker::stream_sockets::usable_udp_source_ports`): every
+//!    session holds one connected upstream socket, hence one port. A
+//!    stream with several source addresses spreads its sessions evenly,
+//!    `ceil(max_sessions / addresses)` on each. TCP connections do not
+//!    count here: TCP ports are a separate space.
 //!
 //! What an engine holds per connection or session is a generic
-//! [`HeldFds`] input (`ceiling x fds_per_unit`), declared by the
-//! engine's own function and read by [`StreamDemand::of`]: Story 12.3
-//! fills it for TCP; for UDP it stays absent and counts 0 until Story
-//! 12.5 declares its own.
+//! [`HeldFds`] input (`ceiling x fds_per_unit`), declared by [`held_fds`],
+//! the one function [`StreamDemand::of`] reads: `max_connections` x 2 for
+//! TCP (Story 12.3 D-p), `udp.max_sessions` x 1 for UDP.
+//!
+//! The node's UDP session ceiling is `min(S - other committed fds,
+//! U x pools)`, reported with the limit that bound it. Each UDP stream's
+//! share is its `max_sessions`; constraints 2 and 4 refuse shares that
+//! add up past the ceiling.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::net::IpAddr;
 
 use chrono::{DateTime, Utc};
 use lorica_config::models::{Stream, StreamProtocol};
@@ -51,6 +69,10 @@ use crate::state::BindStateKind;
 /// `LimitNOFILE`, which grows the stream budget and the HTTP reserve
 /// together.
 pub const BASE_RESERVE: u64 = 1024;
+
+/// Fds one UDP session holds: its connected upstream socket. No
+/// client-side socket exists (Story 12.5 D-a).
+pub const UDP_FDS_PER_SESSION: u64 = 1;
 
 /// The budget figures of one process, derived from its fd limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +105,21 @@ impl HeldFds {
     }
 }
 
+/// What `stream` may hold at its cap, for the fd budget: the one
+/// definition for both protocols, dispatching to
+/// [`crate::tcp::held_fds`] for TCP and declaring `udp.max_sessions`
+/// sessions of [`UDP_FDS_PER_SESSION`] for UDP. `None` for a UDP stream
+/// without its `udp` settings, which validation never stores.
+pub fn held_fds(stream: &Stream) -> Option<HeldFds> {
+    match stream.protocol {
+        StreamProtocol::Tcp => crate::tcp::held_fds(stream),
+        StreamProtocol::Udp => stream.udp.as_ref().map(|udp| HeldFds {
+            ceiling: u64::from(udp.max_sessions),
+            fds_per_unit: UDP_FDS_PER_SESSION,
+        }),
+    }
+}
+
 /// One stream's demand on the budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamDemand {
@@ -96,24 +133,31 @@ pub struct StreamDemand {
     pub listen_sockets: u64,
     /// What the engine declares, `None` until an engine declares it.
     pub held: Option<HeldFds>,
+    /// The source addresses a UDP stream's sessions leave from; empty
+    /// for the `default` pool, and on TCP, whose connections take no
+    /// UDP port.
+    pub source_addresses: Vec<IpAddr>,
 }
 
 impl StreamDemand {
-    /// The demand of `stream`: one listening socket per port, and what
-    /// its engine declares it may hold at its cap
-    /// ([`crate::tcp::held_fds`] for a TCP stream).
+    /// The demand of `stream`: one listening socket per port, what
+    /// [`held_fds`] declares it may hold at its cap, and for UDP the
+    /// source pools its sessions take ports from.
     ///
     /// The one demand function: the node's stream plane driver and the
     /// management API's write check both build their demands here, so
-    /// the API never accepts a stream the node then refuses at bind with
-    /// `fd_budget`.
+    /// the API never accepts a stream the node then refuses at bind.
     pub fn of(stream: &Stream) -> Self {
         StreamDemand {
             stream_id: stream.id.clone(),
             name: stream.name.clone(),
             protocol: stream.protocol,
             listen_sockets: u64::from(stream.port_last.saturating_sub(stream.port_first)) + 1,
-            held: crate::tcp::held_fds(stream),
+            held: held_fds(stream),
+            source_addresses: match stream.protocol {
+                StreamProtocol::Tcp => Vec::new(),
+                StreamProtocol::Udp => stream.source_addresses.clone(),
+            },
         }
     }
 
@@ -130,13 +174,95 @@ impl StreamDemand {
     }
 
     /// What the stream costs the supervisor with `workers` worker slots:
-    /// one socket per TCP port, one per slot per UDP port.
+    /// one socket per TCP port; one per slot per UDP port, plus the
+    /// stream's caps memfd.
     pub fn supervisor_fds(&self, workers: u32) -> u64 {
         match self.protocol {
             StreamProtocol::Tcp => self.listen_sockets,
-            StreamProtocol::Udp => self.listen_sockets.saturating_mul(u64::from(workers)),
+            StreamProtocol::Udp => self
+                .listen_sockets
+                .saturating_mul(u64::from(workers))
+                .saturating_add(1),
         }
     }
+
+    /// The UDP sessions the stream may hold on the node, its share of
+    /// the session ceiling; 0 on TCP.
+    pub fn udp_sessions(&self) -> u64 {
+        match self.protocol {
+            StreamProtocol::Tcp => 0,
+            StreamProtocol::Udp => self.held.map_or(0, |h| h.ceiling),
+        }
+    }
+
+    /// The ports the stream's sessions take from each of its source
+    /// pools: `ceil(sessions / pools)` on each, sessions spreading
+    /// evenly over its addresses. Empty on TCP.
+    pub fn pool_shares(&self) -> Vec<(SourcePool, u64)> {
+        if self.protocol != StreamProtocol::Udp {
+            return Vec::new();
+        }
+        let pools: BTreeSet<SourcePool> = if self.source_addresses.is_empty() {
+            BTreeSet::from([SourcePool::Default])
+        } else {
+            self.source_addresses
+                .iter()
+                .copied()
+                .map(SourcePool::Address)
+                .collect()
+        };
+        let share = self.udp_sessions().div_ceil(pools.len() as u64);
+        pools.into_iter().map(|pool| (pool, share)).collect()
+    }
+
+    /// Whether this demand asks more of a node than `stored` did: another
+    /// protocol, more listening sockets, more fds at its ceiling, or more
+    /// ports from any source pool. A write that raises nothing is never
+    /// refused for the budget, so a node already over its ceiling (a
+    /// narrowed port range, a lowered fd limit) can still have its
+    /// streams edited, lowered or narrowed.
+    pub fn raises(&self, stored: &StreamDemand) -> bool {
+        if self.protocol != stored.protocol
+            || self.listen_sockets > stored.listen_sockets
+            || self.worker_fds() > stored.worker_fds()
+        {
+            return true;
+        }
+        let before: BTreeMap<SourcePool, u64> = stored.pool_shares().into_iter().collect();
+        self.pool_shares()
+            .into_iter()
+            .any(|(pool, share)| share > before.get(&pool).copied().unwrap_or(0))
+    }
+}
+
+/// Where a UDP session's upstream socket takes its ephemeral port from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SourcePool {
+    /// The kernel's choice of source address, for the streams without
+    /// `source_addresses`.
+    Default,
+    /// One address of a stream's `source_addresses`.
+    Address(IpAddr),
+}
+
+impl fmt::Display for SourcePool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SourcePool::Default => f.write_str("default"),
+            SourcePool::Address(ip) => write!(f, "{ip}"),
+        }
+    }
+}
+
+/// The ports the UDP streams of a node commit in each source pool, in
+/// pool order (`default` first, then by address).
+pub fn source_pool_usage(streams: &[StreamDemand]) -> Vec<(SourcePool, u64)> {
+    let mut pools: BTreeMap<SourcePool, u64> = BTreeMap::new();
+    for (pool, share) in streams.iter().flat_map(StreamDemand::pool_shares) {
+        let committed = pools.entry(pool).or_default();
+        *committed = committed.saturating_add(share);
+    }
+    pools.into_iter().collect()
 }
 
 /// What a set of streams commits, against each constraint.
@@ -179,8 +305,9 @@ pub enum BudgetViolation {
     },
     /// The supervisor would hold more than the stream budget.
     #[error(
-        "supervisor fds: {committed} committed (TCP ports + UDP ports x {workers} workers) \
-         exceed the stream budget of {budget} (fd limit {fd_limit})"
+        "supervisor fds: {committed} committed (TCP ports + UDP ports x {workers} workers \
+         + one caps memfd per UDP stream) exceed the stream budget of {budget} \
+         (fd limit {fd_limit})"
     )]
     SupervisorFds {
         /// Fds the supervisor would hold.
@@ -192,18 +319,53 @@ pub enum BudgetViolation {
         /// Worker slots per UDP port.
         workers: u32,
     },
+    /// The UDP sessions leaving from one source pool would need more
+    /// ephemeral ports than it has.
+    #[error(
+        "source ports: {committed} UDP sessions committed on source pool {pool} exceed its \
+         {usable} usable ephemeral ports (lower udp.max_sessions, add source_addresses, \
+         or widen net.ipv4.ip_local_port_range)"
+    )]
+    SourcePorts {
+        /// The pool.
+        pool: SourcePool,
+        /// Sessions the streams would hold on it.
+        committed: u64,
+        /// `U`.
+        usable: u64,
+    },
 }
 
 impl BudgetViolation {
-    /// The constraint's machine name: `listen_socket_cap`, `worker_fds`
-    /// or `supervisor_fds`.
+    /// The constraint's machine name: `listen_socket_cap`, `worker_fds`,
+    /// `supervisor_fds` or `source_ports`.
     pub fn constraint(&self) -> &'static str {
         match self {
             BudgetViolation::ListenSocketCap { .. } => "listen_socket_cap",
             BudgetViolation::WorkerFds { .. } => "worker_fds",
             BudgetViolation::SupervisorFds { .. } => "supervisor_fds",
+            BudgetViolation::SourcePorts { .. } => "source_ports",
         }
     }
+}
+
+/// What bound a node's UDP session ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CeilingBound {
+    /// The fds left in `S` after every other stream's commitment.
+    FdBudget,
+    /// The usable ephemeral ports times the source pools.
+    SourcePorts,
+}
+
+/// A node's UDP session ceiling and the limit that bound it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionCeiling {
+    /// Sessions the node can hold across its UDP streams.
+    pub sessions: u64,
+    /// The limit that set `sessions`.
+    pub bound_by: CeilingBound,
 }
 
 impl FdBudget {
@@ -234,7 +396,7 @@ impl FdBudget {
     }
 
     /// Check `streams`, every stream the node would bind, against the
-    /// three constraints, in the order of the module doc.
+    /// three fd constraints, in the order of the module doc.
     ///
     /// # Errors
     ///
@@ -269,6 +431,73 @@ impl FdBudget {
             });
         }
         Ok(usage)
+    }
+
+    /// [`FdBudget::check`], then the source-port constraint against
+    /// `usable_source_ports` (`U`), every pool in order. `None` when the
+    /// node could not read its port range, which leaves the fd
+    /// constraints only: the figure is never guessed.
+    ///
+    /// # Errors
+    ///
+    /// The first [`BudgetViolation`].
+    pub fn check_node(
+        &self,
+        streams: &[StreamDemand],
+        workers: u32,
+        listen_socket_cap: u32,
+        usable_source_ports: Option<u64>,
+    ) -> Result<BudgetUsage, BudgetViolation> {
+        let usage = self.check(streams, workers, listen_socket_cap)?;
+        if let Some(usable) = usable_source_ports {
+            if let Some((pool, committed)) = source_pool_usage(streams)
+                .into_iter()
+                .find(|(_, committed)| *committed > usable)
+            {
+                return Err(BudgetViolation::SourcePorts {
+                    pool,
+                    committed,
+                    usable,
+                });
+            }
+        }
+        Ok(usage)
+    }
+
+    /// The node's UDP session ceiling for `streams`: what `S` leaves
+    /// after every listening socket and every TCP stream's held fds, in
+    /// sessions of [`UDP_FDS_PER_SESSION`], and at most `U` per source
+    /// pool the UDP streams use (one, `default`, when they use none). On
+    /// a tie the fd budget is named. Without `U` the fds alone bound it.
+    pub fn session_ceiling(
+        &self,
+        streams: &[StreamDemand],
+        usable_source_ports: Option<u64>,
+    ) -> SessionCeiling {
+        let other = streams.iter().fold(0u64, |acc, s| {
+            let udp_fds = s.udp_sessions().saturating_mul(UDP_FDS_PER_SESSION);
+            acc.saturating_add(s.worker_fds().saturating_sub(udp_fds))
+        });
+        let by_fds = self.stream_budget.saturating_sub(other) / UDP_FDS_PER_SESSION;
+        let Some(usable) = usable_source_ports else {
+            return SessionCeiling {
+                sessions: by_fds,
+                bound_by: CeilingBound::FdBudget,
+            };
+        };
+        let pools = source_pool_usage(streams).len().max(1) as u64;
+        let by_ports = usable.saturating_mul(pools);
+        if by_ports < by_fds {
+            SessionCeiling {
+                sessions: by_ports,
+                bound_by: CeilingBound::SourcePorts,
+            }
+        } else {
+            SessionCeiling {
+                sessions: by_fds,
+                bound_by: CeilingBound::FdBudget,
+            }
+        }
     }
 }
 
@@ -309,8 +538,35 @@ pub struct NodeBudgetView {
     pub supervisor_fds_committed: u64,
     /// The `worker_drain_timeout_s` setting.
     pub worker_drain_timeout_s: u32,
+    /// `U`, the usable UDP source ports per source address; `None` when
+    /// the node could not read (or has not reported) its port range.
+    pub usable_source_ports: Option<u64>,
+    /// See [`SessionCeiling::sessions`].
+    pub session_ceiling: u64,
+    /// See [`SessionCeiling::bound_by`].
+    pub session_ceiling_bound_by: CeilingBound,
+    /// The UDP streams' shares added up: their `udp.max_sessions`.
+    pub udp_sessions_committed: u64,
+    /// Whether the committed UDP sessions pass the ceiling or a source
+    /// pool's ports, as a narrowed port range or a lowered fd limit
+    /// leaves a node: bound streams stay bound, and every change that
+    /// raises the demand is refused until it fits again.
+    pub over_ceiling: bool,
+    /// The ports each source pool commits.
+    pub source_pools: Vec<SourcePoolView>,
     /// Each stream's share.
     pub streams: Vec<StreamBudgetView>,
+}
+
+/// One source pool's ports on a node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourcePoolView {
+    /// `default`, or the source address.
+    pub pool: String,
+    /// The sessions the UDP streams leaving from it may hold.
+    pub committed: u64,
+    /// `U`, `None` as [`NodeBudgetView::usable_source_ports`].
+    pub usable: Option<u64>,
 }
 
 /// One stream's share of a node's budget.
@@ -324,8 +580,9 @@ pub struct StreamBudgetView {
     pub protocol: StreamProtocol,
     /// See [`StreamDemand::listen_sockets`].
     pub listen_sockets: u64,
-    /// The connection cap (TCP) or session ceiling (UDP), `null` until
-    /// an engine declares it.
+    /// The connection cap (TCP) or the stream's share of the session
+    /// ceiling (UDP, `udp.max_sessions`), `null` until an engine
+    /// declares it.
     pub ceiling: Option<u64>,
     /// Fds per connection or session, `null` until an engine declares it.
     pub fds_per_unit: Option<u64>,
@@ -352,6 +609,8 @@ pub struct NodeBudgetInputs {
     pub listen_socket_cap: u32,
     /// See [`NodeBudgetView::worker_drain_timeout_s`].
     pub worker_drain_timeout_s: u32,
+    /// See [`NodeBudgetView::usable_source_ports`].
+    pub usable_source_ports: Option<u64>,
 }
 
 impl NodeBudgetView {
@@ -361,6 +620,14 @@ impl NodeBudgetView {
         let budget = FdBudget::from_limit(node.fd_limit);
         let demands: Vec<StreamDemand> = streams.iter().map(|(d, _)| d.clone()).collect();
         let usage = budget.usage(&demands, node.worker_count);
+        let ceiling = budget.session_ceiling(&demands, node.usable_source_ports);
+        let udp_sessions_committed = demands
+            .iter()
+            .fold(0u64, |acc, d| acc.saturating_add(d.udp_sessions()));
+        let pools = source_pool_usage(&demands);
+        let pool_over = node
+            .usable_source_ports
+            .is_some_and(|usable| pools.iter().any(|(_, committed)| *committed > usable));
         NodeBudgetView {
             node_id: node.node_id,
             node_name: node.node_name,
@@ -375,6 +642,19 @@ impl NodeBudgetView {
             worker_fds_committed: usage.worker_fds_committed,
             supervisor_fds_committed: usage.supervisor_fds_committed,
             worker_drain_timeout_s: node.worker_drain_timeout_s,
+            usable_source_ports: node.usable_source_ports,
+            session_ceiling: ceiling.sessions,
+            session_ceiling_bound_by: ceiling.bound_by,
+            udp_sessions_committed,
+            over_ceiling: udp_sessions_committed > ceiling.sessions || pool_over,
+            source_pools: pools
+                .into_iter()
+                .map(|(pool, committed)| SourcePoolView {
+                    pool: pool.to_string(),
+                    committed,
+                    usable: node.usable_source_ports,
+                })
+                .collect(),
             streams: streams
                 .iter()
                 .map(|(d, state)| StreamBudgetView {
@@ -395,6 +675,7 @@ impl NodeBudgetView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lorica_config::models::UdpSettings;
 
     /// The packaged unit's `LimitNOFILE`.
     const PACKAGED_LIMIT: u64 = 65_536;
@@ -407,6 +688,41 @@ mod tests {
             protocol,
             listen_sockets: ports,
             held: None,
+            source_addresses: Vec::new(),
+        }
+    }
+
+    /// `U` at the kernel's default `ip_local_port_range` (32768 to
+    /// 60999) with nothing reserved, through Lot A's arithmetic.
+    fn default_usable_ports() -> u64 {
+        u64::from(
+            lorica_worker::stream_sockets::usable_source_ports_from("32768\t60999\n", "\n")
+                .expect("the default range parses"),
+        )
+    }
+
+    fn udp_stream(id: &str, port: u16) -> Stream {
+        Stream::new(
+            id.into(),
+            id.into(),
+            StreamProtocol::Udp,
+            "10.0.0.10".parse().unwrap(),
+            port,
+            port,
+            Utc::now(),
+        )
+    }
+
+    fn inputs(fd_limit: u64, usable_source_ports: Option<u64>) -> NodeBudgetInputs {
+        NodeBudgetInputs {
+            node_id: None,
+            node_name: None,
+            reported_at: Utc::now(),
+            fd_limit,
+            worker_count: 8,
+            listen_socket_cap: DEFAULT_CAP,
+            worker_drain_timeout_s: 30,
+            usable_source_ports,
         }
     }
 
@@ -436,14 +752,15 @@ mod tests {
     fn at_4096_a_wide_udp_range_breaks_the_supervisor_constraint_only_past_one_worker() {
         let b = FdBudget::from_limit(4096);
         assert_eq!(b.stream_budget, 1024);
-        let range = [demand("udp", StreamProtocol::Udp, 1024)];
+        // 1,023 ports and the stream's caps memfd.
+        let range = [demand("udp", StreamProtocol::Udp, 1023)];
         let usage = b.check(&range, 1, DEFAULT_CAP).expect("one worker fits");
         assert_eq!(usage.supervisor_fds_committed, 1024);
         let err = b.check(&range, 2, DEFAULT_CAP).unwrap_err();
         assert_eq!(
             err,
             BudgetViolation::SupervisorFds {
-                committed: 2048,
+                committed: 2047,
                 budget: 1024,
                 fd_limit: 4096,
                 workers: 2
@@ -460,24 +777,24 @@ mod tests {
             demand("tcp", StreamProtocol::Tcp, 100),
             demand("udp", StreamProtocol::Udp, 495),
         ];
-        // 100 + 495 x 64 = 31,780 > 31,744; one worker holds 595.
+        // 100 + 495 x 64 + 1 memfd = 31,781 > 31,744; one worker holds 595.
         let err = b.check(&streams, 64, DEFAULT_CAP).unwrap_err();
         assert_eq!(
             err,
             BudgetViolation::SupervisorFds {
-                committed: 31_780,
+                committed: 31_781,
                 budget: 31_744,
                 fd_limit: PACKAGED_LIMIT,
                 workers: 64
             }
         );
-        // One port fewer fits: 100 + 494 x 64 = 31,716.
+        // One port fewer fits: 100 + 494 x 64 + 1 = 31,717.
         let fewer = [
             demand("tcp", StreamProtocol::Tcp, 100),
             demand("udp", StreamProtocol::Udp, 494),
         ];
         let usage = b.check(&fewer, 64, DEFAULT_CAP).expect("fits");
-        assert_eq!(usage.supervisor_fds_committed, 31_716);
+        assert_eq!(usage.supervisor_fds_committed, 31_717);
         assert_eq!(usage.worker_fds_committed, 594);
     }
 
@@ -537,7 +854,216 @@ mod tests {
             fds_per_unit: u64::MAX,
         });
         assert_eq!(s.worker_fds(), u64::MAX);
-        assert!(b.check(&[s.clone(), s], u32::MAX, u32::MAX).is_err());
+        assert!(b
+            .check(&[s.clone(), s.clone()], u32::MAX, u32::MAX)
+            .is_err());
+        assert!(b
+            .check_node(&[s.clone(), s.clone()], 1, u32::MAX, Some(u64::MAX))
+            .is_err());
+        let ceiling = b.session_ceiling(&[s.clone(), s], Some(u64::MAX));
+        assert_eq!(ceiling.bound_by, CeilingBound::FdBudget);
+    }
+
+    #[test]
+    fn a_udp_stream_declares_one_fd_per_session_and_its_source_pools() {
+        let mut s = udp_stream("dns", 53);
+        s.source_addresses = vec!["10.0.0.11".parse().unwrap(), "10.0.0.12".parse().unwrap()];
+        assert_eq!(
+            held_fds(&s),
+            Some(HeldFds {
+                ceiling: u64::from(UdpSettings::DEFAULT_MAX_SESSIONS),
+                fds_per_unit: UDP_FDS_PER_SESSION
+            })
+        );
+        let d = StreamDemand::of(&s);
+        assert_eq!(d.held, held_fds(&s));
+        assert_eq!(d.worker_fds(), 1 + 4096);
+        assert_eq!(d.supervisor_fds(8), 8 + 1, "the slots and the caps memfd");
+        assert_eq!(
+            d.pool_shares(),
+            vec![
+                (SourcePool::Address("10.0.0.11".parse().unwrap()), 2048),
+                (SourcePool::Address("10.0.0.12".parse().unwrap()), 2048)
+            ]
+        );
+        // Odd sessions round up on every address.
+        s.udp.as_mut().unwrap().max_sessions = 4097;
+        let odd = StreamDemand::of(&s);
+        assert!(odd.pool_shares().iter().all(|(_, share)| *share == 2049));
+
+        // A TCP stream keeps 12.3's declaration and takes no UDP port.
+        let mut tcp = udp_stream("pg", 5432);
+        tcp.protocol = StreamProtocol::Tcp;
+        tcp.udp = None;
+        tcp.source_addresses = vec!["10.0.0.11".parse().unwrap()];
+        assert_eq!(held_fds(&tcp), crate::tcp::held_fds(&tcp));
+        let tcp = StreamDemand::of(&tcp);
+        assert!(tcp.pool_shares().is_empty());
+        assert_eq!(tcp.udp_sessions(), 0);
+        assert_eq!(tcp.supervisor_fds(8), 1);
+    }
+
+    #[test]
+    fn six_default_udp_streams_fit_and_the_seventh_breaks_the_source_ports() {
+        let b = FdBudget::from_limit(PACKAGED_LIMIT);
+        let usable = default_usable_ports();
+        assert_eq!(usable, 27_208);
+        let streams: Vec<StreamDemand> = (0..7)
+            .map(|n| StreamDemand::of(&udp_stream(&format!("u{n}"), 5000 + n)))
+            .collect();
+        let six = &streams[..6];
+        let usage = b
+            .check_node(six, 8, DEFAULT_CAP, Some(usable))
+            .expect("six default UDP streams fit");
+        assert_eq!(usage.worker_fds_committed, 6 * 4097);
+        assert_eq!(usage.supervisor_fds_committed, 6 * (8 + 1));
+        // The fds alone would still admit the seventh: 7 x 4,097 = 28,679
+        // fits in 31,744; the ports do not.
+        assert!(b.check(&streams, 8, DEFAULT_CAP).is_ok());
+        let err = b
+            .check_node(&streams, 8, DEFAULT_CAP, Some(usable))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            BudgetViolation::SourcePorts {
+                pool: SourcePool::Default,
+                committed: 7 * 4096,
+                usable: 27_208
+            }
+        );
+        assert_eq!(err.constraint(), "source_ports");
+        let text = err.to_string();
+        assert!(text.contains("default") && text.contains("28672"), "{text}");
+        assert!(text.contains("source_addresses"), "{text}");
+        // Without the port figure, only the fds are checked.
+        assert!(b.check_node(&streams, 8, DEFAULT_CAP, None).is_ok());
+
+        let ceiling = b.session_ceiling(six, Some(usable));
+        assert_eq!(
+            ceiling,
+            SessionCeiling {
+                sessions: 27_208,
+                bound_by: CeilingBound::SourcePorts
+            }
+        );
+    }
+
+    #[test]
+    fn a_seventh_stream_with_two_source_addresses_fits_in_their_pools() {
+        let b = FdBudget::from_limit(PACKAGED_LIMIT);
+        let usable = default_usable_ports();
+        let mut streams: Vec<StreamDemand> = (0..6)
+            .map(|n| StreamDemand::of(&udp_stream(&format!("u{n}"), 5000 + n)))
+            .collect();
+        let mut spread = udp_stream("spread", 6000);
+        spread.source_addresses = vec!["10.0.0.11".parse().unwrap(), "10.0.0.12".parse().unwrap()];
+        streams.push(StreamDemand::of(&spread));
+        assert!(b.check_node(&streams, 8, DEFAULT_CAP, Some(usable)).is_ok());
+        assert_eq!(
+            source_pool_usage(&streams),
+            vec![
+                (SourcePool::Default, 6 * 4096),
+                (SourcePool::Address("10.0.0.11".parse().unwrap()), 2048),
+                (SourcePool::Address("10.0.0.12".parse().unwrap()), 2048),
+            ]
+        );
+        // Three pools: 3 x 27,208 ports, more than the 31,744 - 7 fds
+        // left after the listening sockets.
+        assert_eq!(
+            b.session_ceiling(&streams, Some(usable)),
+            SessionCeiling {
+                sessions: 31_744 - 7,
+                bound_by: CeilingBound::FdBudget
+            }
+        );
+    }
+
+    #[test]
+    fn tcp_streams_lower_the_fd_ceiling_and_not_the_ports() {
+        let b = FdBudget::from_limit(PACKAGED_LIMIT);
+        let tcp = demand("pg", StreamProtocol::Tcp, 1).with_held(HeldFds {
+            ceiling: 10_000,
+            fds_per_unit: 2,
+        });
+        let udp = StreamDemand::of(&udp_stream("dns", 53));
+        let ceiling = b.session_ceiling(&[tcp, udp], Some(27_208));
+        // 31,744 - (1 + 20,000) - 1 listening socket of the UDP stream.
+        assert_eq!(
+            ceiling,
+            SessionCeiling {
+                sessions: 11_742,
+                bound_by: CeilingBound::FdBudget
+            }
+        );
+    }
+
+    #[test]
+    fn a_narrowed_port_range_flags_the_node_and_only_raises_are_refused() {
+        let streams: Vec<(StreamDemand, BindStateKind)> = (0..3)
+            .map(|n| {
+                (
+                    StreamDemand::of(&udp_stream(&format!("u{n}"), 5000 + n)),
+                    BindStateKind::Bound,
+                )
+            })
+            .collect();
+        let view = NodeBudgetView::build(inputs(PACKAGED_LIMIT, Some(10_000)), &streams);
+        assert!(view.over_ceiling);
+        assert_eq!(view.udp_sessions_committed, 3 * 4096);
+        assert_eq!(view.session_ceiling, 10_000);
+        assert_eq!(view.session_ceiling_bound_by, CeilingBound::SourcePorts);
+        assert_eq!(
+            view.source_pools,
+            vec![SourcePoolView {
+                pool: "default".into(),
+                committed: 12_288,
+                usable: Some(10_000)
+            }]
+        );
+        let wide = NodeBudgetView::build(inputs(PACKAGED_LIMIT, Some(27_208)), &streams);
+        assert!(!wide.over_ceiling);
+
+        let stored = udp_stream("u0", 5000);
+        let mut lowered = stored.clone();
+        lowered.udp.as_mut().unwrap().max_sessions = 1024;
+        let mut raised = stored.clone();
+        raised.udp.as_mut().unwrap().max_sessions = 8192;
+        let mut renamed = stored.clone();
+        renamed.name = "renamed".into();
+        let mut narrowed_pools = stored.clone();
+        narrowed_pools.source_addresses = vec!["10.0.0.11".parse().unwrap()];
+        let was = StreamDemand::of(&stored);
+        assert!(!StreamDemand::of(&lowered).raises(&was));
+        assert!(!StreamDemand::of(&renamed).raises(&was));
+        assert!(StreamDemand::of(&raised).raises(&was));
+        assert!(
+            StreamDemand::of(&narrowed_pools).raises(&was),
+            "a pool the stream did not use is new demand"
+        );
+        let mut to_tcp = stored.clone();
+        to_tcp.protocol = StreamProtocol::Tcp;
+        to_tcp.udp = None;
+        assert!(StreamDemand::of(&to_tcp).raises(&was));
+        let mut one_address = stored.clone();
+        one_address.source_addresses = vec!["10.0.0.11".parse().unwrap()];
+        let mut two_addresses = one_address.clone();
+        two_addresses
+            .source_addresses
+            .push("10.0.0.12".parse().unwrap());
+        let mut two_lowered = two_addresses.clone();
+        two_lowered.udp.as_mut().unwrap().max_sessions = 2048;
+        assert!(
+            !StreamDemand::of(&two_lowered).raises(&StreamDemand::of(&two_addresses)),
+            "a lower share on the same pools"
+        );
+        assert!(
+            StreamDemand::of(&two_addresses).raises(&StreamDemand::of(&one_address)),
+            "a pool the stream did not use is new demand, though its share elsewhere falls"
+        );
+        assert!(
+            StreamDemand::of(&one_address).raises(&StreamDemand::of(&two_addresses)),
+            "fewer addresses raise the share of each one left"
+        );
     }
 
     #[test]
@@ -563,14 +1089,23 @@ mod tests {
                 worker_count: 8,
                 listen_socket_cap: DEFAULT_CAP,
                 worker_drain_timeout_s: 30,
+                usable_source_ports: Some(27_208),
             },
             &streams,
         );
         assert_eq!(view.listen_sockets_used, 3);
         assert_eq!(view.worker_fds_committed, 103);
-        assert_eq!(view.supervisor_fds_committed, 17);
+        assert_eq!(view.supervisor_fds_committed, 1 + 2 * 8 + 1);
+        assert_eq!(view.udp_sessions_committed, 100);
+        assert!(!view.over_ceiling);
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(json["stream_budget"], 31_744);
+        assert_eq!(json["usable_source_ports"], 27_208);
+        assert_eq!(json["session_ceiling"], 27_208);
+        assert_eq!(json["session_ceiling_bound_by"], "source_ports");
+        assert_eq!(json["over_ceiling"], false);
+        assert_eq!(json["source_pools"][0]["pool"], "default");
+        assert_eq!(json["source_pools"][0]["committed"], 100);
         assert_eq!(json["streams"][0]["ceiling"], serde_json::Value::Null);
         assert_eq!(json["streams"][0]["fds_per_unit"], serde_json::Value::Null);
         assert_eq!(json["streams"][0]["bind_state"], "bound");
@@ -579,5 +1114,10 @@ mod tests {
         assert_eq!(json["streams"][1]["fds_committed"], 102);
         let back: NodeBudgetView = serde_json::from_value(json).unwrap();
         assert_eq!(back, view);
+
+        let unread = NodeBudgetView::build(inputs(PACKAGED_LIMIT, None), &streams);
+        assert_eq!(unread.usable_source_ports, None);
+        assert_eq!(unread.session_ceiling_bound_by, CeilingBound::FdBudget);
+        assert_eq!(unread.source_pools[0].usable, None);
     }
 }

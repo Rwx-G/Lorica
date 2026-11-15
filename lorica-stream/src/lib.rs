@@ -59,7 +59,10 @@ pub mod tcp;
 pub mod tracker;
 pub mod transport;
 
-pub use budget::{BudgetUsage, BudgetViolation, FdBudget, HeldFds, StreamDemand};
+pub use budget::{
+    held_fds, BudgetUsage, BudgetViolation, CeilingBound, FdBudget, HeldFds, SessionCeiling,
+    SourcePool, StreamDemand,
+};
 pub use counters::{CountersSnapshot, StreamCounters};
 pub use handler::{
     AcceptedConnection, ConnectionObserver, ConnectionRecord, Datagram, DatagramHandler, Engines,
