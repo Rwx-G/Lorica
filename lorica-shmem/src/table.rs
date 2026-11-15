@@ -21,9 +21,11 @@
 //! occur. Writers race on `value.fetch_add` (commutative) and on a
 //! best-effort `last_update_ns.store`. See design doc § 5.2, § 5.3, § 8.
 //!
-//! Collision resolution: linear probing up to `MAX_PROBE = 16`. At load
-//! factor 50 % (64 K entries in 128 K slots) with a good hash, the
-//! probability of exceeding `MAX_PROBE` is well under `1e-9`.
+//! Collision resolution: linear probing over a window of `MAX_PROBE`
+//! slots. A key whose whole window holds other keys is refused with
+//! [`SATURATED`]; the window is sized so that this stays rare at the
+//! capacity [`WAF_SLOTS`](crate::region::WAF_SLOTS) documents, and a
+//! fill test holds it there.
 //!
 //! Eviction and `reset` release a slot by clearing its key, which can
 //! free a slot in front of keys placed further along the same window.
@@ -35,10 +37,16 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Maximum probe distance before we give up and return a poison value.
-/// Chosen so the failure probability is vanishing under the intended
-/// load factor (50 %).
-pub const MAX_PROBE: usize = 16;
+/// Number of slots a key may occupy, from its start slot on. Refusals
+/// grow steeply with the load factor and fall steeply with the window:
+/// at half load, a window of 16 refused about one key in 3 000 and a
+/// window of 32 about one in 300 000. The cost is the window scan an
+/// `increment` of a new key and every `read` make, which only WAF
+/// violations pay. Not part of the shared layout: each supervisor
+/// creates its own region at startup (the memfd is close-on-exec, so a
+/// hot upgrade's new supervisor never inherits the old one), and its
+/// workers exec its own executable.
+pub const MAX_PROBE: usize = 32;
 
 /// Sentinel returned by [`AtomicHashTable::increment`] when the probe
 /// chain is saturated. Callers treat it as "limit reached" so the
@@ -237,8 +245,14 @@ impl<const N: usize> AtomicHashTable<N> {
         released > 0
     }
 
+    /// `N` is a power of two, so `N - 1` masks a slot index, and holds
+    /// at least one window, so a window never visits a slot twice and
+    /// `read` never counts one twice.
+    const SHAPE_IS_VALID: () = assert!(N.is_power_of_two() && N >= MAX_PROBE);
+
     /// The `MAX_PROBE` slots `tagged_hash` may occupy, in probe order.
     fn window(&self, tagged_hash: u64) -> impl Iterator<Item = &Slot> {
+        let () = Self::SHAPE_IS_VALID;
         let mask = N - 1;
         let start = (tagged_hash as usize) & mask;
         (0..MAX_PROBE).map(move |probe| &self.slots[(start + probe) & mask])
@@ -356,15 +370,15 @@ mod tests {
 
     #[test]
     fn saturation_returns_sentinel() {
-        // A tiny table where we force the entire probe chain to fill.
-        let t: Box<AtomicHashTable<16>> = AtomicHashTable::new_zeroed();
-        // Tag every hash with the same low bits to force probe-chain
-        // collisions.
+        // The smallest table a window fits in twice over, with every key
+        // starting at the same slot, so the window fills.
+        let t: Box<AtomicHashTable<{ MAX_PROBE * 2 }>> = AtomicHashTable::new_zeroed();
+        let shift = (MAX_PROBE * 2).trailing_zeros();
         for i in 0..MAX_PROBE as u64 {
-            let h = tagged_hash((i << 4) | 1); // low 4 bits all 1
+            let h = tagged_hash((i << shift) | 1);
             t.increment(h, 1, 0);
         }
-        let h_extra = tagged_hash(((MAX_PROBE as u64) << 4) | 1);
+        let h_extra = tagged_hash(((MAX_PROBE as u64) << shift) | 1);
         assert_eq!(t.increment(h_extra, 1, 0), SATURATED);
     }
 
@@ -596,6 +610,42 @@ mod tests {
         for n in 0..STABLE {
             assert_eq!(t.read(key(n)), Some(WRITERS * PER_WRITER), "key {n}");
         }
+    }
+
+    /// SplitMix64: a fixed stream of well-mixed keys, so a fill test
+    /// gives the same result on every run.
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    #[test]
+    fn a_table_filled_to_its_documented_capacity_refuses_almost_no_key() {
+        // The production table filled to half its slots, the capacity
+        // `WAF_SLOTS` documents, eight times over. A refused key is a
+        // client whose violations go uncounted, so refusals must stay
+        // below one key in 100 000 there.
+        use crate::region::WAF_SLOTS;
+        const FILLS: u64 = 8;
+        let keys_per_fill = (WAF_SLOTS / 2) as u64;
+        let mut refused = 0u64;
+        for fill in 0..FILLS {
+            let t: Box<AtomicHashTable<WAF_SLOTS>> = AtomicHashTable::new_zeroed();
+            let mut seed = fill;
+            for _ in 0..keys_per_fill {
+                if t.increment(tagged_hash(splitmix64(&mut seed)), 1, 0) == SATURATED {
+                    refused += 1;
+                }
+            }
+        }
+        let keys = FILLS * keys_per_fill;
+        assert!(
+            refused * 100_000 < keys,
+            "{refused} of {keys} keys refused at half load"
+        );
     }
 
     #[test]

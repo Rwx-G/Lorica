@@ -127,10 +127,9 @@ fn children_racing_on_the_first_increment_of_fresh_keys_lose_nothing() {
     // A key whose whole probe window is held by other keys is refused
     // by every child (`increment` returns `SATURATED`, the fail-safe
     // deny), so it reads `None` with nothing counted and nothing lost.
-    // With this many random keys in a production-size table that was
-    // measured at about one run in a thousand, and it is not the race
-    // under test. Any other key must read exactly one increment per
-    // child.
+    // Random keys make that possible in any run, if rare, and it is
+    // not the race under test. Any other key must read exactly one
+    // increment per child.
     let lost: Vec<(u64, Option<u64>)> = (0..KEYS)
         .map(|k| (k, region.tagged(k)))
         .filter(|&(_, h)| !probe_window_held_by_other_keys(region, h))
