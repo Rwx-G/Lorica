@@ -55,7 +55,9 @@
 //!   until then: the `address_in_use` retry binds it afterwards.
 //! - **The source-port constraint** (D-e), read from the host's port
 //!   range at every pass and checked with the fd constraints before
-//!   every bind.
+//!   every bind, by the API's rule: a rebind that raises nothing over
+//!   what the node counted for the stream passes, so a node already past
+//!   its ceiling (a narrowed port range) can still move a stream.
 //!
 //! [`WORKER_RELEASE`]: StreamPlane::release_worker
 
@@ -551,6 +553,9 @@ struct HeldBinding {
     /// acknowledged: they hold the sockets but admit no session, so they
     /// do not count as serving (D-d).
     caps_refused: BTreeSet<u32>,
+    /// What the budget check counted for the binding when it bound: the
+    /// demand a rebind of its stream is compared with.
+    demand: StreamDemand,
 }
 
 impl HeldBinding {
@@ -667,6 +672,11 @@ pub(crate) struct StreamPlane<L> {
     workers: BTreeMap<u32, WorkerSlot<L>>,
     worker_count: u32,
     held: BTreeMap<String, HeldBinding>,
+    /// The demand of each binding detached for a rebind, by stream id,
+    /// until the stream binds again or is no longer wanted: what its new
+    /// binding is compared with (refuse raises, allow lowers), across the
+    /// passes a drain or a retry may take.
+    rebinding: BTreeMap<String, StreamDemand>,
     /// Detached UDP bindings still draining in the workers.
     draining: Vec<DrainingBinding>,
     /// See [`UDP_DRAIN_RELEASE_MARGIN`]; a field so tests can shorten it.
@@ -709,6 +719,7 @@ impl<L: WorkerLink> StreamPlane<L> {
                 .collect(),
             worker_count,
             held: BTreeMap::new(),
+            rebinding: BTreeMap::new(),
             draining: Vec::new(),
             drain_margin: UDP_DRAIN_RELEASE_MARGIN,
             caps: Arc::new(StdMutex::new(NodeCapsRegions::new(worker_count))),
@@ -825,6 +836,7 @@ impl<L: WorkerLink> StreamPlane<L> {
             .collect();
         self.retire_caps(&desired_udp);
         let desired: BTreeSet<&str> = desired_keys.iter().map(|k| k.stream_id.as_str()).collect();
+        self.rebinding.retain(|id, _| desired.contains(id.as_str()));
         for id in self.states.snapshot().into_keys() {
             if !desired.contains(id.as_str()) && !self.held.contains_key(&id) {
                 self.states.remove(&id);
@@ -1111,7 +1123,11 @@ impl<L: WorkerLink> StreamPlane<L> {
                     until: Instant::now() + pass.drain + self.drain_margin,
                 });
             }
-            drop(self.held.remove(&id));
+            if let Some(held) = self.held.remove(&id) {
+                if d.cause == ReleaseCause::Rebind {
+                    self.rebinding.insert(id.clone(), held.demand.clone());
+                }
+            }
             for slot in self.workers.values_mut() {
                 slot.outstanding.retain(|_, p| {
                     *p != Pending::Attach {
@@ -1249,16 +1265,20 @@ impl<L: WorkerLink> StreamPlane<L> {
             return;
         }
         let stream_of = |id: &str| streams.iter().find(|s| s.id == id);
-        let mut demands: Vec<StreamDemand> = self
+        let others: Vec<StreamDemand> = self
             .held
             .values()
             .map(|b| demand_of(&b.key, stream_of(&b.key.stream_id)))
             .collect();
-        demands.push(demand_of(&key, stream_of(&key.stream_id)));
-        // The node's backstop of the API's write check (Story 12.5 D-e),
-        // with `U` as read at the start of this pass.
-        if let Err(violation) = self.budget.check_node(
-            &demands,
+        let demand = demand_of(&key, stream_of(&key.stream_id));
+        // The node's backstop of the API's write check, by the same rule
+        // (Story 12.5 D-e): a rebind is judged against what the node
+        // counted for the stream's last binding, with `U` as read at the
+        // start of this pass.
+        if let Err(violation) = self.budget.check_change(
+            &demand,
+            self.rebinding.get(&id),
+            &others,
             self.worker_count,
             pass.listen_socket_cap,
             self.usable_source_ports,
@@ -1317,6 +1337,7 @@ impl<L: WorkerLink> StreamPlane<L> {
 
         let bind_gen = self.next_gen;
         self.next_gen += 1;
+        self.rebinding.remove(&id);
         self.held.insert(
             id.clone(),
             HeldBinding {
@@ -1326,6 +1347,7 @@ impl<L: WorkerLink> StreamPlane<L> {
                 chunks: 0,
                 acked: BTreeMap::new(),
                 caps_refused: BTreeSet::new(),
+                demand,
             },
         );
         let mut per_worker: BTreeMap<u32, Vec<StreamCtlMsg>> = BTreeMap::new();
@@ -2826,6 +2848,85 @@ mod tests {
             matches!(events.as_slice(), [PlaneEvent::Bound { .. }]),
             "{events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_node_past_its_ceiling_rebinds_what_raises_nothing_and_refuses_raises() {
+        let (w0, _) = FakeLink::new(&[]);
+        let (plane, states) = plane(vec![w0]);
+        let usable = Arc::new(std::sync::atomic::AtomicU64::new(
+            DEFAULT_RANGE_USABLE_PORTS,
+        ));
+        let reading = Arc::clone(&usable);
+        let mut plane = plane.with_source_ports(Box::new(move || {
+            Some(reading.load(std::sync::atomic::Ordering::Relaxed))
+        }));
+        let mut streams = vec![udp("u1", free_udp_port()), udp("u2", free_udp_port())];
+        plane
+            .bind_desired(&streams, STANDALONE, PASS, Trigger::Change)
+            .await;
+        assert!(matches!(states.get("u1"), Some(BindState::Bound { .. })));
+        assert!(matches!(states.get("u2"), Some(BindState::Bound { .. })));
+
+        // The range narrows under the two bound streams: 8,192 sessions
+        // committed on 5,000 ports. Nothing is unbound.
+        usable.store(5_000, std::sync::atomic::Ordering::Relaxed);
+        let rebind = |streams: &mut Vec<Stream>, max_sessions: u32| {
+            let moved = &mut streams[0];
+            let port = free_udp_port();
+            moved.port_first = port;
+            moved.port_last = port;
+            moved.udp.as_mut().unwrap().max_sessions = max_sessions;
+        };
+
+        // A move to another port at the same share raises nothing.
+        rebind(&mut streams, 4096);
+        plane.release_stale(&streams, STANDALONE, PASS).await;
+        let events = plane
+            .bind_desired(&streams, STANDALONE, PASS, Trigger::Change)
+            .await;
+        assert!(
+            matches!(events.as_slice(), [PlaneEvent::Bound { .. }]),
+            "{events:?}"
+        );
+
+        // A move that also raises the share is checked, and refused.
+        rebind(&mut streams, 4097);
+        plane.release_stale(&streams, STANDALONE, PASS).await;
+        let events = plane
+            .bind_desired(&streams, STANDALONE, PASS, Trigger::Change)
+            .await;
+        match events.as_slice() {
+            [PlaneEvent::BindFailed {
+                kind: BindFailureKind::SourcePorts,
+                ..
+            }] => {}
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Lowered back, the retry compares with what the node counted
+        // for the stream's last binding, not with nothing.
+        streams[0].udp.as_mut().unwrap().max_sessions = 2048;
+        let events = plane
+            .bind_desired(&streams, STANDALONE, PASS, Trigger::Change)
+            .await;
+        assert!(
+            matches!(events.as_slice(), [PlaneEvent::Bound { .. }]),
+            "{events:?}"
+        );
+
+        // A stream the node never held is all new demand.
+        streams.push(udp("u3", free_udp_port()));
+        let events = plane
+            .bind_desired(&streams, STANDALONE, PASS, Trigger::Change)
+            .await;
+        match events.as_slice() {
+            [PlaneEvent::BindFailed {
+                kind: BindFailureKind::SourcePorts,
+                ..
+            }] => {}
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[tokio::test]

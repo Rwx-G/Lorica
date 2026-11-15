@@ -220,7 +220,7 @@ impl StreamDemand {
     /// ports from any source pool. A write that raises nothing is never
     /// refused for the budget, so a node already over its ceiling (a
     /// narrowed port range, a lowered fd limit) can still have its
-    /// streams edited, lowered or narrowed.
+    /// streams edited, lowered or narrowed ([`FdBudget::check_change`]).
     pub fn raises(&self, stored: &StreamDemand) -> bool {
         if self.protocol != stored.protocol
             || self.listen_sockets > stored.listen_sockets
@@ -462,6 +462,44 @@ impl FdBudget {
             }
         }
         Ok(usage)
+    }
+
+    /// The check of one stream's change on a node, "refuse raises, allow
+    /// lowers" (Story 12.5 D-e): the one rule the management API's write
+    /// check and the node's bind both apply, so neither refuses what the
+    /// other lets through for want of the other's exemption.
+    ///
+    /// `candidate` is the stream's demand as it will stand, `stored` what
+    /// the node already counts for it (`None` for a stream the node does
+    /// not hold), `others` every other stream the node binds. A change
+    /// that raises nothing over `stored` ([`StreamDemand::raises`])
+    /// passes unchecked, so a node already past its ceiling (a narrowed
+    /// port range, a lowered fd limit) can still have its streams
+    /// renamed, rebound, lowered or narrowed; any other change is
+    /// [`FdBudget::check_node`] over `others` and `candidate`.
+    ///
+    /// # Errors
+    ///
+    /// The first [`BudgetViolation`] of a change that raises the demand.
+    pub fn check_change(
+        &self,
+        candidate: &StreamDemand,
+        stored: Option<&StreamDemand>,
+        others: &[StreamDemand],
+        workers: u32,
+        listen_socket_cap: u32,
+        usable_source_ports: Option<u64>,
+    ) -> Result<(), BudgetViolation> {
+        if stored.is_some_and(|stored| !candidate.raises(stored)) {
+            return Ok(());
+        }
+        let demands: Vec<StreamDemand> = others
+            .iter()
+            .cloned()
+            .chain(std::iter::once(candidate.clone()))
+            .collect();
+        self.check_node(&demands, workers, listen_socket_cap, usable_source_ports)
+            .map(|_| ())
     }
 
     /// The node's UDP session ceiling for `streams`: what `S` leaves
@@ -1064,6 +1102,68 @@ mod tests {
             StreamDemand::of(&one_address).raises(&StreamDemand::of(&two_addresses)),
             "fewer addresses raise the share of each one left"
         );
+    }
+
+    #[test]
+    fn a_change_is_checked_only_when_it_raises_what_the_node_counts() {
+        // Three default streams on a range narrowed to 10,000 ports: the
+        // node is past its ceiling, and each stream on its own fits.
+        let b = FdBudget::from_limit(PACKAGED_LIMIT);
+        let narrowed = Some(10_000);
+        let others: Vec<StreamDemand> = (1..3)
+            .map(|n| StreamDemand::of(&udp_stream(&format!("u{n}"), 5000 + n)))
+            .collect();
+        let stored = udp_stream("u0", 5000);
+        let was = StreamDemand::of(&stored);
+        let check = |candidate: &Stream, stored: Option<&StreamDemand>| {
+            b.check_change(
+                &StreamDemand::of(candidate),
+                stored,
+                &others,
+                8,
+                DEFAULT_CAP,
+                narrowed,
+            )
+        };
+
+        let mut rebound = stored.clone();
+        rebound.listen_address = "10.0.0.20".parse().unwrap();
+        let mut lowered = stored.clone();
+        lowered.udp.as_mut().unwrap().max_sessions = 2048;
+        for unchanged_or_lower in [&stored, &rebound, &lowered] {
+            assert_eq!(check(unchanged_or_lower, Some(&was)), Ok(()));
+        }
+
+        let mut raised = stored.clone();
+        raised.udp.as_mut().unwrap().max_sessions = 4097;
+        let refusal = check(&raised, Some(&was)).expect_err("a raise is checked");
+        assert_eq!(
+            refusal,
+            BudgetViolation::SourcePorts {
+                pool: SourcePool::Default,
+                committed: 2 * 4096 + 4097,
+                usable: 10_000
+            }
+        );
+        assert_eq!(
+            check(&stored, None),
+            Err(BudgetViolation::SourcePorts {
+                pool: SourcePool::Default,
+                committed: 3 * 4096,
+                usable: 10_000
+            }),
+            "a stream the node does not hold yet is all new demand"
+        );
+        // The rule refuses what does not fit, not every raise: from 1,024
+        // sessions, a raise to the 1,808 the narrowed range leaves fits,
+        // one more does not.
+        let mut small = stored.clone();
+        small.udp.as_mut().unwrap().max_sessions = 1024;
+        let small = StreamDemand::of(&small);
+        raised.udp.as_mut().unwrap().max_sessions = 1808;
+        assert_eq!(check(&raised, Some(&small)), Ok(()));
+        raised.udp.as_mut().unwrap().max_sessions = 1809;
+        assert!(check(&raised, Some(&small)).is_err());
     }
 
     #[test]
