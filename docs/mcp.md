@@ -830,17 +830,17 @@ the same cross-field checks, the same reload. What makes it a tier and
 not the management API behind a different door is the list of keys it
 accepts, and how far it lets each one move:
 
-| Setting | Tier bound | Reach | Takes effect |
-|---|---|---|---|
-| `access_log_retention` | raise-only, 1..=1000000 | fleet | live |
-| `waf_event_retention` | raise-only, 1..=1000000 | fleet | live |
-| `sla_purge_retention_days` | raise-only, 1..=3650 | fleet | live |
-| `cert_warning_days` | 14..=365 | fleet | live |
-| `cert_critical_days` | 3..=365 | fleet | live |
-| `waf_ban_threshold` | 3..=100 | fleet | live |
-| `waf_ban_duration_s` | 60..=86400 | fleet | live |
-| `default_health_check_interval_s` | 5..=60 | fleet | live |
-| `health_max_concurrent_probes` | 16..=512 | fleet | live |
+| Setting | Tier bound | Management API | Reach | Takes effect |
+|---|---|---|---|---|
+| `access_log_retention` | raise-only, 1..=1000000 | 0.. | fleet | live |
+| `waf_event_retention` | raise-only, 1..=1000000 | 0.. | fleet | live |
+| `sla_purge_retention_days` | raise-only, 1..=3650 | 1..=3650 | fleet | live |
+| `cert_warning_days` | 14..=365 | 1.. | fleet | live |
+| `cert_critical_days` | 3..=365 | 1.. | fleet | live |
+| `waf_ban_threshold` | 3..=100 | 0.. | fleet | live |
+| `waf_ban_duration_s` | 60..=86400 | 0..=2592000 | fleet | live |
+| `default_health_check_interval_s` | 5..=60 | 1..=3600 | fleet | live |
+| `health_max_concurrent_probes` | 16..=512 | 1..=512 | fleet | live |
 
 The list is `SETTINGS_ALLOWLIST` in
 `lorica-automation-policy/src/settings.rs`, where each entry carries the
@@ -850,6 +850,16 @@ description states are built from it. This table and the
 `SettingsPatch` schema in `openapi-automation.yaml` restate it, and a
 test pins each of them against the constant, so none of them can
 drift from what the node enforces.
+
+The tier bound is what an automation token may set, through
+`PUT /automation/v1/settings` or `lorica_settings_update`. The
+"Management API" column is what `PUT /api/v1/settings`, the dashboard's
+settings page, accepts from a session, as `GET /api/v1/settings/schema`
+publishes it; `0..` and `1..` have no upper bound. The same test pins
+that column against the schema. Each tier bound sits inside the
+management range, so a value a token may set is always one the
+dashboard accepts, and a value only the dashboard accepts is set
+there.
 
 **Every key has a safe direction and a bound.** A key is on the list
 only when a model reading attacker-authored text can move it in a

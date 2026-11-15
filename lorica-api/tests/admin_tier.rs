@@ -240,18 +240,57 @@ fn iv1_the_admin_tiers_tools_change_exactly_the_allowlist() {
 const MCP_REFERENCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/mcp.md"));
 
 /// The header row of that table; its body runs to the first blank line.
-const ALLOWLIST_TABLE_HEADER: &str = "| Setting | Tier bound | Reach | Takes effect |";
+const ALLOWLIST_TABLE_HEADER: &str =
+    "| Setting | Tier bound | Management API | Reach | Takes effect |";
+
+/// What `PUT /api/v1/settings` accepts for `name`, rendered from the
+/// published settings schema: `min..=max`, or `min..` for a setting
+/// whose validator has no upper bound.
+fn management_bound_text(schema: &serde_json::Value, name: &str) -> String {
+    let field = &schema[name];
+    let min = field["min"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("the settings schema gives `{name}` a minimum"));
+    match field["max"].as_i64() {
+        Some(max) => format!("{min}..={max}"),
+        None => format!("{min}.."),
+    }
+}
 
 /// The row `docs/mcp.md` must carry for `setting`, rendered from the
-/// entry itself.
-fn documented_row(setting: &AdminSetting) -> String {
+/// entry itself and from the management settings schema.
+fn documented_row(setting: &AdminSetting, schema: &serde_json::Value) -> String {
     format!(
-        "| `{}` | {} | {} | {} |",
+        "| `{}` | {} | {} | {} | {} |",
         setting.name,
         setting.bound_text(),
+        management_bound_text(schema, setting.name),
         setting.reach.describe(),
         setting.takes_effect.describe()
     )
+}
+
+#[test]
+fn every_tier_bound_sits_inside_what_the_management_api_accepts() {
+    // `docs/mcp.md` says a value a token may set is always one the
+    // dashboard accepts; this is that claim, run.
+    let schema = lorica_api::settings::settings_schema();
+    for setting in SETTINGS_ALLOWLIST {
+        let field = &schema[setting.name];
+        let min = field["min"].as_i64().expect("a schema minimum");
+        assert!(
+            min <= setting.min,
+            "{}: tier minimum below the management one",
+            setting.name
+        );
+        if let Some(max) = field["max"].as_i64() {
+            assert!(
+                setting.max <= max,
+                "{}: tier maximum above the management one",
+                setting.name
+            );
+        }
+    }
 }
 
 #[test]
@@ -269,7 +308,11 @@ fn the_operator_reference_lists_exactly_the_allowlist_with_its_bounds() {
         .take_while(|line| !line.trim().is_empty())
         .map(|line| line.trim().to_string())
         .collect();
-    let expected: BTreeSet<String> = SETTINGS_ALLOWLIST.iter().map(documented_row).collect();
+    let schema = lorica_api::settings::settings_schema();
+    let expected: BTreeSet<String> = SETTINGS_ALLOWLIST
+        .iter()
+        .map(|setting| documented_row(setting, &schema))
+        .collect();
     assert!(
         !documented.is_empty(),
         "the table in docs/mcp.md was found and read as empty; the parse went blind"
