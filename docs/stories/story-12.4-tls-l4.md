@@ -1075,16 +1075,16 @@ Allowlist: `lorica/src/stream_engine.rs`, `lorica/src/startup/worker.rs`,
 `Cargo.lock`.
 Depends on: D; 12.3 Lot D2 and 12.5 Lot F (same files).
 
-- [ ] The engine is built with the process's `CertResolver` and one
+- [x] The engine is built with the process's `CertResolver` and one
       `public_roots()` store, in `run_worker` and `run_single_process`
       (check the order against `StreamRuntime::spawn`; the resolver
       exists earlier in both today).
-- [ ] `StoreStreamTable::load` reads the referenced client certificates
+- [x] `StoreStreamTable::load` reads the referenced client certificates
       through the resolver's loading path (D-i).
-- [ ] The selector keyed per (stream, rule) (I3).
-- [ ] `evaluate_mtls` calls `organizations_admitted`; its tests pass
+- [x] The selector keyed per (stream, rule) (I3).
+- [x] `evaluate_mtls` calls `organizations_admitted`; its tests pass
       unchanged.
-- [ ] Tests: IV2's mechanism in-process (a certificate replaced through
+- [x] Tests: IV2's mechanism in-process (a certificate replaced through
       the reload path the ACME renewal takes; the next connection to a
       terminating stream presents it); an upstream client certificate
       renewed in the store reaches the stream table through `refresh`.
@@ -1313,6 +1313,87 @@ The decisions above cite each one as "Resolved N".
 ### Debug Log
 
 ### Completion Notes
+
+**Lot E (wiring in the binary).**
+
+- **One correction to "What the code does today".** The boot loaders
+  (`worker_load_certs_into_resolver`, `load_certs_into_resolver`) load
+  every stored certificate, but `reload::reload_cert_resolver`, the path
+  every later reload takes (the ACME and AD CS renewals, an upload, a
+  follower receiving a key), kept only the certificates a route's
+  `certificate_id` names. A certificate only a terminating stream names
+  was therefore served until the first reload and dropped by it, which
+  broke AC #3 and IV2. `reload_cert_resolver` now also keeps every id
+  of a stream's `tls_terminate.certificate_ids`; an upstream
+  `client_certificate_id` is presented, never served, and stays out of
+  the resolver. `lorica/src/reload.rs` is outside the Lot's allowlist;
+  the IV2 test below fails without it.
+- **The engines** (`stream_engine.rs`): `stream_engines` takes a fourth
+  argument, `TlsParts`, and builds the TCP engine with
+  `TcpEngine::with_tls`. `stream_tls_parts(Arc<CertResolver>)` gives the
+  process's resolver as `Arc<dyn ResolvesServerCertByLocalIp>` and calls
+  `tls::load_public_roots()` once, so once per process: per worker in
+  worker mode, once in single-process mode.
+- **Worker mode** (`run_worker`): the resolver used to be created after
+  `StreamRuntime::spawn`. It is now created and filled right after the
+  store opens and before the runtime starts, so a stream the supervisor
+  attaches early never handshakes against an empty resolver;
+  `worker_load_certs_into_resolver` became a plain function over the
+  `ConfigStore` it is handed before the store is wrapped. The HTTPS
+  listener, the command channel's reload, the RPC commit's reload and
+  the OCSP loop keep the same instance, so a renewal reaches the next
+  handshake of a terminating stream through `reload_cert_resolver`.
+- **Single-process mode** (`run_single_process`): the resolver already
+  existed before the runtime; the engine takes it, and the reload loop
+  that calls `reload_cert_resolver` then `after_commit` (the stream
+  `refresh`) is unchanged.
+- **Client identities** (D-i): `stream_client_identities(streams,
+  certificate)` reads the row of every distinct
+  `upstream_tls.client_certificate_id` and builds `ClientIdentity`
+  values; `StoreStreamTable::load` calls it with `get_certificate` on its
+  own connection and hands the result to `with_client_identities`. Not
+  `list_certificates` plus `cert_data_for_resolver` as the task line
+  says: that would decrypt every key of the store on each table load,
+  and `cert_data_for_resolver` publishes the awaiting-key gauge, which a
+  subset would overwrite. The rule is the same: a row without a key (a
+  follower the key has not reached) is held back and logged by id, as
+  are a missing row and one that does not decode; no PEM is ever
+  logged. A row that cannot be read fails the load, and the runtime
+  keeps its previous table.
+- **Keys reaching followers.** Lot C's entitlement decides which keys a
+  follower receives; when keys are installed the follower fires its
+  config reload (`install_certs`), which runs `reload_cert_resolver`
+  (now keeping stream certificates) and the stream plane's
+  `after_commit`, whose `refresh` reloads the table and its client
+  identities. Nothing else was needed in the binary.
+- **Selection per (stream, rule)** (I3): `StreamSelector` keeps its
+  round-robin states by stream id, then rule name (the empty name for a
+  stream without rules, which a rule name never is). The rule is read
+  with `StreamTable::rule_of(stream, first candidate)` from the table of
+  the last `table_changed`, which the selector now keeps; the
+  candidates are the matched rule's links (Lot D). `table_changed` drops
+  a stream's states with the stream and a rule's with the rule. Least
+  connections and the latency tracker stay per backend address.
+  `holds_rule_round_robin(stream, rule)` joins `holds_round_robin`.
+- **`evaluate_mtls`** calls `organizations_admitted`; the proxy wiring
+  tests pass unchanged.
+- **Tests.** `lorica/tests/stream_tls_wiring.rs`: IV2's mechanism
+  in-process (a terminating stream over `stream_engines`, its
+  certificate named by no route, loaded with `reload_cert_resolver`;
+  the row rewritten in place and the resolver reloaded the way a
+  renewal does; the next handshake presents the new leaf, the
+  connection opened before it keeps echoing); round-robin per rule and
+  pruned with the rule and the stream; client identities read once per
+  id, keyless and missing rows left out, a read error propagated.
+  `startup::stream_plane` unit test: a renewed client certificate
+  reaches a worker's table through `refresh_tables`, and a row whose key
+  is gone is held back. `lorica/tests/stream_tls_process_test.rs`, the
+  real binary with `--workers 0` and `--workers 2`: a passthrough stream
+  routes two names to two loopback TLS backends, each presenting a
+  certificate for its own name only to a client verifying the name it
+  asked for, and each writing its name before echoing; a third name is
+  refused; a terminating stream whose certificate is in the store
+  answers a verifying client and carries its bytes to an echo backend.
 
 **Lot D (the TLS engine in `lorica-stream`).**
 
@@ -1631,6 +1712,18 @@ The decisions above cite each one as "Resolved N".
 
 ## File List
 
+Lot E:
+
+- `lorica/src/stream_engine.rs`, `lorica/src/startup/worker.rs`,
+  `lorica/src/startup/single.rs`, `lorica/src/startup/stream_plane.rs`
+- `lorica/src/proxy_wiring/helpers.rs` (`evaluate_mtls` only)
+- `lorica/tests/stream_tls_wiring.rs`,
+  `lorica/tests/stream_tls_process_test.rs` (new)
+- Outside the allowlist: `lorica/src/reload.rs`
+  (`reload_cert_resolver` keeps the certificates terminating streams
+  name)
+- `docs/stories/story-12.4-tls-l4.md`
+
 Lot D:
 
 - `lorica-stream/src/tcp/forward.rs` (I2, its own commit)
@@ -1690,3 +1783,4 @@ Lot A:
 | 2026-11-15 | 0.4 | Lot B landed: the bounded ClientHello reader `tls::client_hello::parse`, refusing at the first byte that rules a hello out, a record past the hello refused, and its fuzz target in the weekly matrix. | Romain G. |
 | 2026-11-15 | 0.6 | Lot D landed: the forwarding loop over any stream pair (I2), the matcher, passthrough, termination on the shared resolver with per-stream client verification, upstream TLS inside the attempt, the TLS counters and the record's `tls`. | Romain G. |
 | 2026-11-15 | 0.5 | Lot C landed: the TLS fields, rules and link rules of D-k, migration 77, the mode table and rule validation, `drains_on_upgrade`, `organizations_admitted`, canonical digest, diff and import, and certificate key entitlement by streams. Decisions amended after Stories 12.3 and 12.5 landed. | Romain G. |
+| 2026-11-15 | 0.7 | Lot E landed: the TCP engine built with the process's certificate resolver and public roots in both process modes (the worker's resolver now filled before its stream runtime starts), client identities in the stream table, round-robin per (stream, rule), `evaluate_mtls` over `organizations_admitted`, and the resolver reload keeping the certificates terminating streams name. | Romain G. |

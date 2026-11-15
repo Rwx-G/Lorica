@@ -1364,7 +1364,8 @@ pub fn cert_data_for_resolver(certs: &[lorica_config::models::Certificate]) -> V
 }
 
 /// Reload the TLS certificate resolver from the database.
-/// Only loads certificates that are actively referenced by at least one route.
+/// Only loads certificates that are actively referenced by at least one
+/// route's `certificate_id` or one stream's `tls_terminate.certificate_ids`.
 /// Called alongside `reload_proxy_config` when certificates change.
 pub async fn reload_cert_resolver(
     store: &Arc<Mutex<ConfigStore>>,
@@ -1388,8 +1389,13 @@ pub async fn reload_cert_resolver(
         }
     };
 
-    // Only load certificates referenced by at least one route
-    let active_cert_ids: std::collections::HashSet<String> = match s.list_routes() {
+    // Only load certificates referenced by at least one route or served
+    // by one terminating stream: such a stream answers from this
+    // resolver (Story 12.4 D-f), so a certificate only a stream names
+    // must survive a reload, a renewal's included. A stream's upstream
+    // client certificate is presented, never served: the stream table
+    // carries it, not the resolver.
+    let mut active_cert_ids: std::collections::HashSet<String> = match s.list_routes() {
         Ok(routes) => routes
             .iter()
             .filter_map(|r| r.certificate_id.clone())
@@ -1400,6 +1406,19 @@ pub async fn reload_cert_resolver(
             return;
         }
     };
+    match s.list_streams() {
+        Ok(streams) => active_cert_ids.extend(
+            streams
+                .iter()
+                .filter_map(|stream| stream.tls_terminate.as_ref())
+                .flat_map(|terminate| terminate.certificate_ids.iter().cloned()),
+        ),
+        Err(e) => {
+            lorica_api::metrics::inc_cert_resolver_reload("fail");
+            warn!(error = %e, "failed to list streams for resolver reload");
+            return;
+        }
+    }
 
     // Build cert bodies only - no OCSP fetch on the reload critical
     // path (Story 8.5 AC #3). Stapling used to run a 10 s-per-responder

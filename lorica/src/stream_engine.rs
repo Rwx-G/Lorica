@@ -18,7 +18,8 @@
 //!
 //! - [`StreamSelector`]: [`select_index`], HTTP's selection function,
 //!   with state of its own: one smooth weighted round-robin state per
-//!   stream, a least-connections count fed by the engine's connects and
+//!   stream and rule (Story 12.4 I3), a least-connections count fed by
+//!   the engine's connects and
 //!   closes, and a latency tracker fed connect latency (D-e). Never
 //!   HTTP's instances, so a backend shared by a route and a stream is
 //!   balanced for each by its own traffic.
@@ -33,7 +34,11 @@
 //! [`stream_engines`] assembles them into the [`Engines`] a process's
 //! stream runtime serves with: a TCP and a UDP engine over one selector
 //! and one resolver cache per process, and one counters `Arc` shared by
-//! both engines and the runtime handle that snapshots it.
+//! both engines and the runtime handle that snapshots it. The TCP engine
+//! terminates and originates TLS with [`stream_tls_parts`]: the process's
+//! certificate resolver and public roots (Story 12.4). The stream table
+//! carries the client identities of upstream TLS,
+//! [`stream_client_identities`].
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -45,14 +50,15 @@ use hickory_resolver::config::{ResolveHosts, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::{Resolver, TokioResolver};
 use lorica_config::listen_ports::ReservedPorts;
-use lorica_config::models::{Backend, LoadBalancing};
+use lorica_config::models::{Backend, Certificate, LoadBalancing, Stream};
 use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
-    Admission, BackendSelector, BreakerGate, ConnectionObserver, Engines, LogObserver, Resolve,
-    ResolveError, Resolved, ResolverCache, SelectionRequest, StreamCounters, StreamTable,
-    TcpEngine, TcpEngineParts, UdpEngine, UdpEngineParts,
+    Admission, BackendSelector, BreakerGate, Candidate, ClientIdentity, ConnectionObserver,
+    Engines, LogObserver, Resolve, ResolveError, Resolved, ResolverCache, SelectionRequest,
+    StreamCounters, StreamTable, TcpEngine, TcpEngineParts, TlsParts, UdpEngine, UdpEngineParts,
 };
-use tracing::warn;
+use lorica_tls::cert_resolver::{CertResolver, ResolvesServerCertByLocalIp};
+use tracing::{info, warn};
 
 use crate::proxy_wiring::lb::{random_seed, select_index, SelectionState};
 use crate::proxy_wiring::{
@@ -78,10 +84,26 @@ const RESOLVER_TIMEOUT: Duration = Duration::from_secs(2);
 /// Retries after a failed attempt, see [`RESOLVER_TIMEOUT`].
 const RESOLVER_ATTEMPTS: usize = 1;
 
+/// The round-robin key of a stream that reads no ClientHello: its links
+/// serve no rule, and a rule name is never empty.
+const NO_RULE: &str = "";
+
 /// Backend selection for the stream engines, one per process (D-e).
+///
+/// Round-robin state is kept per (stream, rule) (Story 12.4 I3): the
+/// candidates of a TLS stream's connection are the links of the rule it
+/// matched, so each rule rotates over its own backends. The rule is read
+/// from the last table with [`StreamTable::rule_of`] (a backend serves
+/// at most one rule of a stream). Least connections and the latency
+/// tracker stay per backend address: a backend's load does not depend
+/// on which rule reached it.
 pub struct StreamSelector {
     worker_offset: usize,
-    round_robin: parking_lot::Mutex<HashMap<String, Arc<SmoothWrrState>>>,
+    /// Stream id, then rule name ([`NO_RULE`] for none), to its state.
+    round_robin: parking_lot::Mutex<HashMap<String, HashMap<String, Arc<SmoothWrrState>>>>,
+    /// The table of the last [`BackendSelector::table_changed`], which
+    /// says which rule a candidate's link serves.
+    table: parking_lot::RwLock<Arc<StreamTable>>,
     connections: BackendConnections,
     ewma: EwmaTracker,
 }
@@ -103,18 +125,39 @@ impl StreamSelector {
         StreamSelector {
             worker_offset,
             round_robin: parking_lot::Mutex::new(HashMap::new()),
+            table: parking_lot::RwLock::new(Arc::new(StreamTable::default())),
             connections: BackendConnections::new(),
             ewma: EwmaTracker::new(),
         }
     }
 
-    fn round_robin_of(&self, stream_id: &str) -> Arc<SmoothWrrState> {
+    /// The round-robin state of the rule the candidates of a connection
+    /// of `stream_id` serve, read from the link of the first one:
+    /// [`NO_RULE`]'s for a stream without rules, or for a backend the
+    /// last table does not link.
+    fn round_robin_for(
+        &self,
+        stream_id: &str,
+        candidates: &[Candidate<'_>],
+    ) -> Arc<SmoothWrrState> {
+        let table = self.table.read();
+        let rule = candidates
+            .first()
+            .and_then(|first| table.rule_of(stream_id, &first.backend.id))
+            .unwrap_or(NO_RULE);
+        self.round_robin_of(stream_id, rule)
+    }
+
+    fn round_robin_of(&self, stream_id: &str, rule: &str) -> Arc<SmoothWrrState> {
         let mut states = self.round_robin.lock();
-        if let Some(state) = states.get(stream_id) {
+        if let Some(state) = states.get(stream_id).and_then(|rules| rules.get(rule)) {
             return Arc::clone(state);
         }
         let state = Arc::new(SmoothWrrState::new(self.worker_offset));
-        states.insert(stream_id.to_string(), Arc::clone(&state));
+        states
+            .entry(stream_id.to_string())
+            .or_default()
+            .insert(rule.to_string(), Arc::clone(&state));
         state
     }
 
@@ -130,9 +173,18 @@ impl StreamSelector {
         self.ewma.scores.get(&backend.address).map(|s| *s)
     }
 
-    /// Whether `stream_id` holds round-robin state.
+    /// Whether `stream_id` holds round-robin state, for any rule.
     pub fn holds_round_robin(&self, stream_id: &str) -> bool {
         self.round_robin.lock().contains_key(stream_id)
+    }
+
+    /// Whether `stream_id` holds round-robin state for `rule` (`None` for
+    /// a stream without rules).
+    pub fn holds_rule_round_robin(&self, stream_id: &str, rule: Option<&str>) -> bool {
+        self.round_robin
+            .lock()
+            .get(stream_id)
+            .is_some_and(|rules| rules.contains_key(rule.unwrap_or(NO_RULE)))
     }
 }
 
@@ -153,7 +205,7 @@ impl BackendSelector for StreamSelector {
             .as_ref()
             .map(|ring| ring.iter().map(String::as_str).collect());
         let client = request.client.to_string();
-        let round_robin = self.round_robin_of(&request.stream.id);
+        let round_robin = self.round_robin_for(&request.stream.id, request.candidates);
         let index = select_index(
             &request.stream.load_balancing,
             &candidates,
@@ -187,10 +239,15 @@ impl BackendSelector for StreamSelector {
     }
 
     fn table_changed(&self, table: &StreamTable) {
-        let streams: HashSet<&str> = table.streams().map(|s| s.id.as_str()).collect();
-        self.round_robin
-            .lock()
-            .retain(|id, _| streams.contains(id.as_str()));
+        *self.table.write() = Arc::new(table.clone());
+        // A stream's state goes with the stream, a rule's with the rule.
+        self.round_robin.lock().retain(|id, rules| {
+            let Some(stream) = table.stream(id) else {
+                return false;
+            };
+            rules.retain(|rule, _| rule == NO_RULE || stream.match_rule(rule).is_some());
+            !rules.is_empty()
+        });
         let addresses: HashSet<&str> = table.backends().map(|b| b.address.as_str()).collect();
         self.ewma
             .scores
@@ -359,23 +416,32 @@ impl Resolve for HickoryResolve {
 /// and the node's `reserved_ports` for the local check (`None` when the
 /// process was not told them: the stream listen ports are still
 /// refused). Both engines and the runtime share one counters `Arc`.
+///
+/// `tls` is what the TCP engine terminates and originates TLS with
+/// (Story 12.4): [`stream_tls_parts`] over the process's certificate
+/// resolver, so every reload of that resolver (a renewal, an upload, a
+/// hot swap) reaches the next handshake of a terminating stream.
 pub fn stream_engines(
     breaker: Arc<StreamBreakerGate>,
     resolver: Arc<dyn Resolve>,
     reserved_ports: Option<ReservedPorts>,
+    tls: TlsParts,
 ) -> Engines {
     let counters = Arc::new(StreamCounters::new());
     let selector = Arc::new(StreamSelector::new(std::process::id() as usize));
     let resolver = ResolverCache::new(resolver, Arc::clone(&counters));
     let observer = Arc::new(LogObserver);
-    let tcp = TcpEngine::new(TcpEngineParts {
-        selector: Arc::clone(&selector) as Arc<dyn BackendSelector>,
-        breaker: Arc::clone(&breaker) as Arc<dyn BreakerGate>,
-        resolver: Arc::clone(&resolver),
-        counters: Arc::clone(&counters),
-        observer: Arc::clone(&observer) as Arc<dyn ConnectionObserver>,
-        reserved_ports,
-    });
+    let tcp = TcpEngine::with_tls(
+        TcpEngineParts {
+            selector: Arc::clone(&selector) as Arc<dyn BackendSelector>,
+            breaker: Arc::clone(&breaker) as Arc<dyn BreakerGate>,
+            resolver: Arc::clone(&resolver),
+            counters: Arc::clone(&counters),
+            observer: Arc::clone(&observer) as Arc<dyn ConnectionObserver>,
+            reserved_ports,
+        },
+        tls,
+    );
     let udp = UdpEngine::new(UdpEngineParts {
         selector,
         breaker,
@@ -389,4 +455,69 @@ pub fn stream_engines(
         udp: Some(Arc::new(udp)),
         counters,
     }
+}
+
+/// The TLS parts of a process's TCP engine (Story 12.4): `resolver`, the
+/// one instance the HTTPS listener answers from and every certificate
+/// reload swaps, and the public roots of upstream TLS, read here, once
+/// per process ([`lorica_stream::tls::load_public_roots`], which logs a
+/// failure and leaves `None`).
+pub fn stream_tls_parts(resolver: Arc<CertResolver>) -> TlsParts {
+    TlsParts {
+        resolver: resolver as Arc<dyn ResolvesServerCertByLocalIp>,
+        public_roots: lorica_stream::tls::load_public_roots(),
+    }
+}
+
+/// The client identities a stream table carries (Story 12.4 D-i): the
+/// stored certificate of every `upstream_tls.client_certificate_id` of
+/// `streams`, with its key, as [`ClientIdentity`] values by certificate
+/// id. `certificate` reads one row from the store.
+///
+/// A row without a key (a follower the key has not reached, the rule
+/// [`crate::reload::cert_data_for_resolver`] applies to the resolver), a
+/// missing row, or one that does not decode is left out, so the stream's
+/// upstream TLS ends `no_trust` until it arrives; each is logged by id,
+/// never with a PEM. A row that cannot be read fails the load, like any
+/// other read of the table.
+///
+/// # Errors
+///
+/// The first error `certificate` returns.
+pub fn stream_client_identities<E>(
+    streams: &[Stream],
+    mut certificate: impl FnMut(&str) -> Result<Option<Certificate>, E>,
+) -> Result<Vec<(String, ClientIdentity)>, E> {
+    let mut ids: Vec<&str> = streams
+        .iter()
+        .filter_map(|stream| {
+            stream
+                .upstream_tls
+                .as_ref()?
+                .client_certificate_id
+                .as_deref()
+        })
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut identities = Vec::with_capacity(ids.len());
+    for id in ids {
+        match certificate(id)? {
+            None => {
+                warn!(certificate_id = %id, "stream client certificate not in the store");
+            }
+            Some(row) if row.key_pem.is_empty() => {
+                info!(certificate_id = %id,
+                      "stream client certificate held back: no private key on this node yet");
+            }
+            Some(row) => match ClientIdentity::from_pem(&row.cert_pem, &row.key_pem) {
+                Ok(identity) => identities.push((id.to_string(), identity)),
+                Err(reason) => {
+                    warn!(certificate_id = %id, %reason,
+                          "stream client certificate does not load");
+                }
+            },
+        }
+    }
+    Ok(identities)
 }

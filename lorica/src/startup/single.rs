@@ -553,13 +553,17 @@ pub(crate) fn run_single_process(cli: Cli) {
         let stream_runtime = match lorica_stream::StreamRuntime::spawn(
             stream_transport,
             // The TCP engine (Story 12.3) and the UDP engine (Story
-            // 12.5), over one selector and one resolver cache.
+            // 12.5), over one selector and one resolver cache. TLS
+            // streams terminate on the resolver the HTTPS listener
+            // answers from, which the reload loop below swaps on every
+            // certificate change (Story 12.4).
             lorica::stream_engine::stream_engines(
                 Arc::new(lorica::stream_engine::StreamBreakerGate::with_engine(
                     stream_breaker_engine,
                 )),
                 Arc::new(lorica::stream_engine::HickoryResolve::from_system_conf()),
                 Some(process_reserved_ports),
+                lorica::stream_engine::stream_tls_parts(Arc::clone(&cert_resolver)),
             ),
             stream_source as Arc<dyn lorica_stream::StreamTableSource>,
         ) {

@@ -147,6 +147,14 @@ pub(crate) fn run_worker(
         }
     };
 
+    // The certificate resolver for TLS termination, filled before the
+    // stream runtime starts: the HTTPS listener and the terminating
+    // streams answer from this one instance, which every reload swaps
+    // (Story 12.4 D-f), so a stream attached early never handshakes
+    // against an empty resolver.
+    let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
+    worker_load_certs_into_resolver(&store, &cert_resolver, id);
+
     // The stream runtime (Story 12.2 D-b), started as soon as the store
     // opens so the supervisor's first `attach` is answered well inside
     // its ack timeout. The handle lives as long as the worker: dropping
@@ -167,7 +175,9 @@ pub(crate) fn run_worker(
     // until the RPC endpoint, created well after this, installs the
     // supervisor's registry below (D-g). The UDP engine opens no session
     // on a stream before the supervisor's `caps` hands it the stream's
-    // region, which it sends ahead of every `attach`.
+    // region, which it sends ahead of every `attach`. The TCP engine
+    // terminates TLS on the resolver above and verifies upstream TLS on
+    // this worker's public roots (Story 12.4).
     if reserved_ports.is_none() {
         warn!(
             worker_id = id,
@@ -181,6 +191,7 @@ pub(crate) fn run_worker(
             Arc::clone(&stream_breaker),
             Arc::new(lorica::stream_engine::HickoryResolve::from_system_conf()),
             reserved_ports,
+            lorica::stream_engine::stream_tls_parts(Arc::clone(&cert_resolver)),
         ),
         Arc::clone(&stream_source) as Arc<dyn lorica_stream::StreamTableSource>,
     ) {
@@ -245,10 +256,6 @@ pub(crate) fn run_worker(
     // apply_per_process_reload_state in the two-phase commit handler
     // and the legacy fallback.
     rt.block_on(lorica::reload::apply_log_sinks_from_store(&store));
-
-    // Build CertResolver for TLS termination in worker
-    let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
-    rt.block_on(worker_load_certs_into_resolver(&store, &cert_resolver, id));
 
     // Pre-create metric Arcs so the command thread can read them
     let worker_cache_hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -974,13 +981,12 @@ pub(crate) fn run_worker(
 /// Load persisted certificates into the worker's SNI resolver at boot.
 /// Mirrors single-process cert loading; OCSP staples are attached later
 /// by the reload path, so each `CertData` starts with `ocsp_response: None`.
-async fn worker_load_certs_into_resolver(
-    store: &Arc<Mutex<ConfigStore>>,
+fn worker_load_certs_into_resolver(
+    store: &ConfigStore,
     cert_resolver: &Arc<lorica_tls::cert_resolver::CertResolver>,
     id: u32,
 ) {
-    let db_certs = store.lock().await;
-    let certs = db_certs.list_certificates().unwrap_or_default();
+    let certs = store.list_certificates().unwrap_or_default();
     if certs.is_empty() {
         return;
     }

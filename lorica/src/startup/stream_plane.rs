@@ -296,7 +296,8 @@ impl WorkerLink for InProcessLink {
 /// What the table answers is whether an attached binding still has its
 /// stream, enabled, with the backend a connection uses, which a
 /// `refresh` drains on, and the linked backend rows the engines select
-/// from, with their health as stored (Story 12.3 D-i).
+/// from, with their health as stored (Story 12.3 D-i), and the client
+/// certificates the streams' upstream TLS presents (Story 12.4 D-i).
 pub(crate) struct StoreStreamTable {
     store: Arc<std::sync::Mutex<ConfigStore>>,
 }
@@ -334,9 +335,16 @@ impl lorica_stream::StreamTableSource for StoreStreamTable {
         let streams = store.list_streams()?;
         let links = store.list_stream_backends()?;
         let backends = store.list_backends()?;
-        Ok(lorica_stream::StreamTable::with_backends(
-            streams, &links, backends,
-        ))
+        // Read with the table, so a renewed client certificate reaches
+        // new connections through the same `refresh` as any edit (Story
+        // 12.4 D-i).
+        let identities = lorica::stream_engine::stream_client_identities(&streams, |id| {
+            store.get_certificate(id)
+        })?;
+        Ok(
+            lorica_stream::StreamTable::with_backends(streams, &links, backends)
+                .with_client_identities(identities),
+        )
     }
 }
 
@@ -3209,6 +3217,142 @@ mod tests {
             next(&mut seen).await,
             vec![(backend_id.to_string(), HealthStatus::Down)]
         );
+        runtime.stop();
+    }
+
+    /// A TCP engine that serves nothing and reports the leaf of client
+    /// identity `CLIENT_CERT_ID` in each table it is given.
+    struct IdentitySeen(tokio::sync::mpsc::UnboundedSender<Option<Vec<u8>>>);
+
+    const CLIENT_CERT_ID: &str = "3c9d2f4e-8a1b-4c5d-9e6f-0a1b2c3d4e5f";
+
+    impl lorica_stream::StreamHandler for IdentitySeen {
+        fn handle(
+            &self,
+            _conn: lorica_stream::AcceptedConnection,
+        ) -> lorica_stream::handler::HandlerFuture {
+            Box::pin(async {})
+        }
+
+        fn table_changed(&self, table: &lorica_stream::StreamTable) {
+            let leaf = table
+                .client_identity(CLIENT_CERT_ID)
+                .map(|identity| identity.chain()[0].to_vec());
+            let _ = self.0.send(leaf);
+        }
+    }
+
+    async fn next_leaf(
+        seen: &mut tokio::sync::mpsc::UnboundedReceiver<Option<Vec<u8>>>,
+    ) -> Option<Vec<u8>> {
+        tokio::time::timeout(Duration::from_secs(10), seen.recv())
+            .await
+            .expect("the worker reloads its table")
+            .expect("the engine is alive")
+    }
+
+    /// A stored client certificate `CLIENT_CERT_ID`, and its leaf's DER.
+    fn client_certificate() -> (lorica_config::models::Certificate, Vec<u8>) {
+        let key = rcgen::KeyPair::generate().expect("test setup: key");
+        let cert = rcgen::CertificateParams::new(vec!["client.example.test".to_string()])
+            .expect("test setup: params")
+            .self_signed(&key)
+            .expect("test setup: certificate");
+        let now = Utc::now();
+        let row = lorica_config::models::Certificate {
+            id: CLIENT_CERT_ID.into(),
+            domain: "client.example.test".into(),
+            san_domains: vec!["client.example.test".into()],
+            fingerprint: String::new(),
+            cert_pem: cert.pem(),
+            key_pem: key.serialize_pem(),
+            issuer: "test".into(),
+            not_before: now,
+            not_after: now + chrono::Duration::days(30),
+            is_acme: false,
+            acme_auto_renew: false,
+            created_at: now,
+            acme_method: None,
+            acme_dns_provider_id: None,
+            adcs_authority_id: None,
+            adcs_template: None,
+            adcs_template_oid: None,
+            adcs_request_id: None,
+        };
+        (row, cert.der().to_vec())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_renewed_client_certificate_reaches_the_workers_stream_table_through_refresh() {
+        let dir = tempfile::tempdir().expect("test setup: tempdir");
+        let db = dir.path().join("lorica.db");
+        let stream_id = "6f1c1a52-5b0e-4f7e-9a51-1a7c5a1b2c3d";
+        let store = ConfigStore::open(&db, None).expect("test setup: store");
+        let (first, first_leaf) = client_certificate();
+        store
+            .create_certificate(&first)
+            .expect("test setup: certificate");
+        let mut s = tcp(stream_id, 5432);
+        s.upstream_tls = Some(lorica_config::models::StreamUpstreamTls {
+            client_certificate_id: Some(CLIENT_CERT_ID.into()),
+            ..lorica_config::models::StreamUpstreamTls::default()
+        });
+        store.create_stream(&s).expect("test setup: stream");
+
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let (peer, transport) = lorica_stream::ControlTransport::in_process_pair(8);
+        let runtime = lorica_stream::StreamRuntime::spawn(
+            transport,
+            lorica_stream::Engines {
+                tcp: Some(Arc::new(IdentitySeen(seen_tx))),
+                ..lorica_stream::Engines::default()
+            },
+            Arc::new(StoreStreamTable::open(&db, None).expect("a second connection opens")),
+        )
+        .unwrap();
+        assert_eq!(
+            next_leaf(&mut seen).await,
+            Some(first_leaf),
+            "the first load carries the identity the stream names"
+        );
+
+        let store = Arc::new(Mutex::new(store));
+        let handle = StreamPlaneHandle::new(
+            StreamPlane::new(
+                vec![(0, InProcessLink(peer))],
+                1,
+                FdBudget::from_limit(65536),
+                reserved(),
+                StreamBindStates::new(),
+                STREAM_CTL_ACK_TIMEOUT,
+            ),
+            Arc::clone(&store),
+            PlaneRole::Standalone,
+            None,
+            lorica_notify::AlertSender::new(16),
+        );
+        // What a renewal writes: the same row, a new certificate and key.
+        let (mut renewed, renewed_leaf) = client_certificate();
+        renewed.id = CLIENT_CERT_ID.into();
+        store
+            .lock()
+            .await
+            .update_certificate(&renewed)
+            .expect("the renewal is written");
+        handle.refresh_tables().await;
+
+        assert_eq!(next_leaf(&mut seen).await, Some(renewed_leaf));
+
+        // A follower that holds the row without its key yet: the
+        // identity is held back, not loaded half.
+        renewed.key_pem.clear();
+        store
+            .lock()
+            .await
+            .update_certificate(&renewed)
+            .expect("the keyless row is written");
+        handle.refresh_tables().await;
+        assert_eq!(next_leaf(&mut seen).await, None);
         runtime.stop();
     }
 
