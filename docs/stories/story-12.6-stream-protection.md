@@ -1,7 +1,7 @@
 # Story 12.6: Protecting Stream Listeners
 
 **Epic:** [Epic 12 - TCP and UDP Stream Proxying (v1.11.0 and v1.12.0)](../prd/epic-12-v1.11.0.md)
-**Status:** Draft
+**Status:** InProgress
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:**
@@ -554,18 +554,18 @@ G, 12.4 Lot H and 12.5 Lot I (same compose profile and runner image).
 Allowlist: `lorica-shmem/src/stream_caps.rs`, `lorica-shmem/src/lib.rs`.
 Depends on: nothing (12.5 Lot B landed).
 
-- [ ] Layout version 2 of D-e: `backend_slots`, pending totals with
+- [x] Layout version 2 of D-e: `backend_slots`, pending totals with
       per-worker attribution, the stream `open_tat` cell, `open_tat` in
       the rate cell, 32-byte source shard cells, backend shards;
       `STREAM_CAPS_LAYOUT_VERSION = 2`; `layout_for` takes the link
       count.
-- [ ] `admit_stream`, `admit_source`, `end_pending`, `claim_backend`,
+- [x] `admit_stream`, `admit_source`, `end_pending`, `claim_backend`,
       `charge_open`, `CapRefusal::{PendingCap, SourcePendingCap}`;
       `admit_session` kept as a wrapper so the UDP engine compiles
       unchanged.
-- [ ] `release_worker` frees pending attribution and backend shards;
+- [x] `release_worker` frees pending attribution and backend shards;
       `evict_rates` keeps a cell whose `open_tat` bucket is not full.
-- [ ] Tests: exact stream and pending totals under N threads; the
+- [x] Tests: exact stream and pending totals under N threads; the
       `cap + (W - 1)` bound for source, source pending and backend
       counts with W simulated slots; a refusal undoes everything counted
       before it; `admit_source` after `admit_stream` on a trusted path;
@@ -832,9 +832,79 @@ All eight recommendations of the draft accepted as written.
 
 ### Debug Log
 
+- Lot A, the join ABA. `table.rs` (9fc991f6) fixed a claim that
+  adjusted a count read before its CAS. The shard claim never did that
+  (it sets the count to 1), but its join did have an ABA of its own: a
+  writer reads a cell's key, the cell is released and claimed for
+  another key, and the writer's count CAS lands on that key. A
+  reverse probe (the post-add key check removed) fails
+  `churned_shard_cells_never_count_one_key_for_another` in 6 of 20
+  runs; with the check, 0. In production a shard has one writer (its
+  worker's single-threaded runtime), so the race needed test threads to
+  show; the fix costs one load per join.
+
 ### Completion Notes
 
+**Lot A (`lorica-shmem`, layout version 2).**
+
+- API, additive: `WorkerCaps::admit_stream(stream_cap, pending,
+  pending_cap) -> Result<StreamPermit, AdmitRefusal>`,
+  `StreamPermit::admit_source(self, source, source_cap,
+  source_pending_cap)` (consumes the permit, so a refusal gives the
+  stream part back with it), `StreamPermit::end_pending(&mut self)`
+  (idempotent, also run by `Drop`), `WorkerCaps::claim_backend(BackendKey,
+  cap) -> Option<BackendSlot>`, `StreamCapsRegion::charge_open(Option<
+  SourceKey>, OpenLimits, now_ns) -> OpenVerdict`, and
+  `charge_new_session(source, bytes, RateLimits, OpenLimits, now_ns) ->
+  NewSessionVerdict` for D-g's "one CAS sequence" on UDP. Readers:
+  `pending`, `worker_pending`, `source_pending`, `backend_active`.
+  `BackendKey::of(id)` is a 64-bit FNV-1a of the backend id, rehashed
+  with the region's SipHash key before placement.
+- **Deviation, `CapRefusal`.** The story has `CapRefusal` gain
+  `PendingCap` and `SourcePendingCap` *and* the UDP engine compile
+  unchanged; `lorica-stream/src/udp/engine.rs` matches `CapRefusal`
+  exhaustively, so both cannot hold. The new API refuses with a new
+  `AdmitRefusal { StreamCap, PendingCap, SourceCap, SourcePendingCap,
+  TableFull }`; `CapRefusal` keeps its three variants for the
+  `admit_session` wrapper. Lot C removes the wrapper and `CapRefusal`
+  with it (and may rename `AdmitRefusal` to `CapRefusal`).
+  `SessionPermit` is a type alias of `StreamPermit` until then.
+- **Deviation, `layout_for`.** Changing its signature would break
+  `lorica-stream/src/caps.rs`. `layout_for(max, workers)` stays (no
+  links) beside `layout_with_links(max, workers, links)`, and
+  `StreamCapsRegion::create` beside `create_with_links`. Lot C switches
+  `NodeCapsRegions` to the link-aware pair (and compares
+  `backend_slots` when deciding a replacement).
+- **Deviation, backend floor.** D-e's `max(2 x links, 16)` is below one
+  probe window (`MAX_PROBE` = 32), which every table must hold, so the
+  floor is `MIN_BACKEND_SLOTS` = 32: `next_pow2(max(2 x links, 32))`.
+  512 bytes per worker.
+- Sizes: TCP at 1,024 connections on 8 workers gives D-e's 256 KiB of
+  rate cells and 512 KiB of source shards. The UDP default (4,096
+  sessions, 8 workers) doubles its source shards to 2 MiB with the
+  32-byte cell; Lot H's docs carry the new figure.
+- Pending is a subset of active: a pending connection counts against
+  `source_cap` from accept (AC #5), and a cell's `pending` is given
+  back before its `active`, so the release that frees a cell never
+  leaves a pending count behind.
+- Order inside the split API: `admit_stream` checks the stream cap then
+  the pending cap, `admit_source` the source cap then the source's
+  pending share. On an untrusted path the refusal named when several
+  apply is therefore `pending_cap` before `source_connection_cap`,
+  where D-a's table lists step 7's source cap first. The counts are
+  the same either way.
+- A rate charge re-reads its cell's key after charging and takes the
+  charge back if eviction gave the cell to another source meanwhile
+  (`a_charge_on_a_cell_that_changed_hands_is_taken_back`).
+
 ## File List
+
+Lot A:
+
+- `lorica-shmem/src/stream_caps.rs` (modified)
+- `lorica-shmem/src/lib.rs` (modified)
+- `lorica-shmem/tests/stream_caps.rs` (modified; outside the Lot A
+  allowlist, the multi-process tests the Lot asks for live there)
 
 ## Change Log
 
@@ -842,3 +912,4 @@ All eight recommendations of the draft accepted as written.
 |---|---|---|---|
 | 2026-11-15 | 0.1 | Draft: admission order, trusted-peer split, region version 2 for TCP and per-backend counts, per-node `max_connections`, pending cap and per-source share, open rates, link caps, refusal reasons and the shared refusal-log limiter, allowlist hook-ups for 12.4 and 12.5, Lots A to I, eight open questions. | Romain G. |
 | 2026-11-15 | 0.2 | Maintainer answers folded in as Resolved 1 to 8: reasons and costs of new-connections-only filters and of no auto-ban on streams stated in D-a and D-d and made explicit in Lot H; the two `/1` halves accepted in D-c. Status Draft. | Romain G. |
+| 2026-11-15 | 0.3 | Lot A: stream-caps region layout version 2 (pending totals, stream and source open rates, 32-byte source cells, backend shards), the split admission API, the join ABA closed and tested. Status InProgress. | Romain G. |

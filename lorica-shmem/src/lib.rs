@@ -43,11 +43,11 @@
 //! existing keys and on a CAS for new-key claims. See design doc § 5.2,
 //! § 5.3, § 8.
 //!
-//! A second region type, [`StreamCapsRegion`], holds the per-node session
-//! caps and per-source rates of one UDP stream (Story 12.5 D-d): one
-//! memfd per stream, sized at runtime from the stream's settings, with
-//! its own [`STREAM_CAPS_LAYOUT_VERSION`]. The WAF region above is not
-//! touched by it.
+//! A second region type, [`StreamCapsRegion`], holds the per-node caps
+//! and rates of one TCP or UDP stream (Story 12.5 D-d, Story 12.6 D-e):
+//! one memfd per stream, sized at runtime from the stream's settings,
+//! with its own [`STREAM_CAPS_LAYOUT_VERSION`]. The WAF region above is
+//! not touched by it.
 //!
 //! Linux-only: the crate relies on `memfd_create`, `mmap(MAP_SHARED)`,
 //! and SCM_RIGHTS. This matches the rest of the Lorica codebase.
@@ -66,9 +66,10 @@ pub use eviction::{evict_once, EvictionStats, DEFAULT_SCAN_INTERVAL, DEFAULT_STA
 pub use hash::{random_key, siphash13_u64};
 pub use region::{SharedRegion, SharedRegionError, LAYOUT_VERSION, MAGIC, REGION_SIZE, WAF_SLOTS};
 pub use stream_caps::{
-    layout_for, CapRefusal, RateEvictionStats, RateLimits, RateVerdict, SessionPermit, SourceKey,
-    StreamCapsError, StreamCapsLayout, StreamCapsRegion, WorkerCaps, STREAM_CAPS_LAYOUT_VERSION,
-    STREAM_CAPS_MAGIC,
+    layout_for, layout_with_links, AdmitRefusal, BackendKey, BackendSlot, CapRefusal,
+    NewSessionVerdict, OpenLimits, OpenVerdict, RateEvictionStats, RateLimits, RateVerdict,
+    SessionPermit, SourceKey, StreamCapsError, StreamCapsLayout, StreamCapsRegion, StreamPermit,
+    WorkerCaps, STREAM_CAPS_LAYOUT_VERSION, STREAM_CAPS_MAGIC,
 };
 pub use table::{now_ns, tagged_hash, AtomicHashTable, Slot, MAX_PROBE, SATURATED};
 pub use window::{CountKind, WindowedCount};

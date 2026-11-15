@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The stream-caps region across processes (Story 12.5 Lot B): a forked
-//! worker adopts the creator's memfd through `open` and both see the same
-//! counts, a dead worker's sessions are released by its slot, and a
-//! region this binary cannot read is refused.
+//! The stream-caps region across processes (Story 12.5 Lot B, Story 12.6
+//! Lot A): a forked worker adopts the creator's memfd through `open` and
+//! both see the same counts, pending totals, backend counts and rates, a
+//! dead worker's admissions are released by its slot, and a region this
+//! binary cannot read is refused.
 
 #![cfg(target_os = "linux")]
 
@@ -25,8 +26,8 @@ use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
 use lorica_shmem::{
-    RateLimits, RateVerdict, SourceKey, StreamCapsError, StreamCapsRegion,
-    STREAM_CAPS_LAYOUT_VERSION,
+    AdmitRefusal, BackendKey, OpenLimits, OpenVerdict, RateLimits, RateVerdict, SourceKey,
+    StreamCapsError, StreamCapsRegion, STREAM_CAPS_LAYOUT_VERSION,
 };
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, ForkResult};
@@ -123,6 +124,61 @@ fn a_forked_worker_shares_the_source_rates() {
         region.charge_rate(source(10), 1, limits, now),
         RateVerdict::Allowed
     );
+}
+
+#[test]
+fn a_forked_worker_counts_pending_connections_backends_and_openings() {
+    let (region, fd) = StreamCapsRegion::create_with_links(64, 4, 2, 1).expect("create");
+    let region = Arc::new(region);
+    let backend = BackendKey::of("backend-a");
+    let open = OpenLimits {
+        stream_per_s: Some(2),
+        source_per_s: None,
+    };
+    let now = 20_000_000_000;
+    let mine = region
+        .worker(0)
+        .unwrap()
+        .admit_stream(64, true, 2)
+        .unwrap()
+        .admit_source(source(1), 8, 2)
+        .unwrap();
+    let _my_backend = region.worker(0).unwrap().claim_backend(backend, 2).unwrap();
+
+    in_child(&fd, move |child| {
+        assert_eq!((child.total(), child.pending()), (1, 1));
+        let caps = child.worker(3).unwrap();
+        // The pending total is node-wide: one more fits, then the cap.
+        let held = caps
+            .admit_stream(64, true, 2)
+            .unwrap()
+            .admit_source(source(1), 8, 2)
+            .unwrap();
+        assert_eq!(
+            caps.admit_stream(64, true, 2).unwrap_err(),
+            AdmitRefusal::PendingCap
+        );
+        assert_eq!(child.source_pending(source(1)), 2);
+        std::mem::forget(held);
+        std::mem::forget(caps.claim_backend(backend, 2).unwrap());
+        assert!(caps.claim_backend(backend, 2).is_none());
+        for _ in 0..2 {
+            assert_eq!(child.charge_open(None, open, now), OpenVerdict::Allowed);
+        }
+    });
+
+    assert_eq!((region.total(), region.pending()), (2, 2));
+    assert_eq!(region.worker_pending(3), Some(1));
+    assert_eq!(region.backend_active(backend), 2);
+    // The child spent the stream's whole burst of openings.
+    assert_eq!(region.charge_open(None, open, now), OpenVerdict::OpenRate);
+
+    assert_eq!(region.release_worker(3), Some(1));
+    assert_eq!((region.total(), region.pending()), (1, 1));
+    assert_eq!(region.source_pending(source(1)), 1);
+    assert_eq!(region.backend_active(backend), 1);
+    drop(mine);
+    assert_eq!((region.total(), region.pending()), (0, 0));
 }
 
 #[test]
