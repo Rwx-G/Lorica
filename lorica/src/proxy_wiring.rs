@@ -2148,62 +2148,26 @@ impl ProxyHttp for LoricaProxy {
             None
         };
 
-        // Backend selection based on load balancing algorithm
-        use lorica_config::models::LoadBalancing;
+        // Backend selection by the route's algorithm. `ctx.client_ip`
+        // is populated in `request_filter` and already honors
+        // X-Forwarded-For when the immediate peer is in
+        // `trusted_proxies`, so consistent hashing uses the same key
+        // whether Lorica sits at the edge or behind another proxy.
         let idx = if let Some(sticky_idx) = sticky_backend_idx {
             sticky_idx
         } else {
-            match entry.route.load_balancing {
-                LoadBalancing::PeakEwma => self.ewma_tracker.select_best(&healthy_backends),
-                LoadBalancing::Random => {
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = DefaultHasher::new();
-                    ctx.start_time.hash(&mut hasher);
-                    (hasher.finish() as usize) % healthy_backends.len()
-                }
-                LoadBalancing::LeastConn => {
-                    // Select the backend with the fewest active connections
-                    healthy_backends
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, b)| self.backend_connections.get(&b.address))
-                        .map(|(i, _)| i)
-                        .unwrap_or(0)
-                }
-                LoadBalancing::ConsistentHash => {
-                    // Ketama hash ring keyed by client IP. `ctx.client_ip`
-                    // is populated in `request_filter` and already honors
-                    // X-Forwarded-For when the immediate peer is in
-                    // `trusted_proxies`, so the same key is used whether
-                    // Lorica sits at the edge or behind another proxy.
-                    //
-                    // Falls back to smooth weighted round-robin when the
-                    // helper returns `None` (no client IP, or no healthy
-                    // backend parses as an Inet `SocketAddr` - ketama
-                    // does not support Unix-domain backends).
-                    let pairs: Vec<(&str, i32)> = healthy_backends
-                        .iter()
-                        .map(|b| (b.address.as_str(), b.weight))
-                        .collect();
-                    pick_consistent_hash(&pairs, ctx.client_ip.as_deref()).unwrap_or_else(|| {
-                        let bw: Vec<(&str, i64)> = healthy_backends
-                            .iter()
-                            .map(|b| (b.address.as_str(), b.weight.max(1) as i64))
-                            .collect();
-                        entry.wrr_state.next(&bw)
-                    })
-                }
-                _ => {
-                    // Smooth weighted round-robin (Nginx algorithm) for
-                    // RoundRobin. ConsistentHash is handled above.
-                    let bw: Vec<(&str, i64)> = healthy_backends
-                        .iter()
-                        .map(|b| (b.address.as_str(), b.weight.max(1) as i64))
-                        .collect();
-                    entry.wrr_state.next(&bw)
-                }
-            }
+            lb::select_index(
+                &entry.route.load_balancing,
+                &healthy_backends,
+                None,
+                ctx.client_ip.as_deref(),
+                lb::random_seed(&ctx.start_time),
+                lb::SelectionState {
+                    wrr: &entry.wrr_state,
+                    ewma: &self.ewma_tracker,
+                    connections: &self.backend_connections,
+                },
+            )
         };
         let backend = healthy_backends[idx];
 

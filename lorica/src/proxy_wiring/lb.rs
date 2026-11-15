@@ -8,15 +8,21 @@
 
 //! Load-balancing primitives (backlog #7 step 3).
 //!
-//! Peak-EWMA latency tracker (bounded explore/exploit selection),
-//! the per-(route, backend) circuit breaker state machine, and the
-//! `BackendConnections` re-export.
+//! The one backend selection function HTTP routes and streams share
+//! ([`select_index`], Story 12.3 D-e), the Peak-EWMA latency tracker
+//! (bounded explore/exploit selection), the per-(route, backend) circuit
+//! breaker state machine, and the `BackendConnections` re-export.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lorica_config::models::Backend;
+use lorica_config::models::{Backend, LoadBalancing};
+
+use super::config::SmoothWrrState;
+use super::pick_consistent_hash;
 
 /// Per-backend active connection counter.
 ///
@@ -138,6 +144,96 @@ impl EwmaTracker {
     /// Return a shared reference to the scores map (for passing to API state).
     pub fn scores_ref(&self) -> Arc<dashmap::DashMap<String, f64>> {
         Arc::clone(&self.scores)
+    }
+}
+
+/// The per-process state the selection algorithms read and advance,
+/// owned by whoever selects: a route's [`SmoothWrrState`], and the
+/// process's EWMA scores and connection counts. A stream selector holds
+/// its own instances, so a backend shared by a route and a stream is
+/// balanced for each by its own traffic (Story 12.3 D-e).
+pub struct SelectionState<'a> {
+    /// Smooth weighted round-robin state, advanced by `round_robin` and
+    /// by the `consistent_hash` fallback.
+    pub wrr: &'a SmoothWrrState,
+    /// Latency scores read by `peak_ewma`.
+    pub ewma: &'a EwmaTracker,
+    /// Open connections per backend address, read by `least_conn`.
+    pub connections: &'a BackendConnections,
+}
+
+/// The seed of the `random` algorithm for a selection made at `at`:
+/// the instant hashed, as HTTP has always seeded it.
+pub fn random_seed(at: &Instant) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    at.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Pick one of `candidates` by `algorithm`; returns its index. HTTP's
+/// `upstream_peer` and the stream engine's selector both call it, so an
+/// algorithm exists once (Story 12.3 D-e).
+///
+/// - `round_robin`: smooth weighted round robin over the backend
+///   addresses, weights `max(1)`.
+/// - `consistent_hash`: a ketama ring over `ring_addresses`, or the
+///   backends' configured addresses when `None`, weighted, keyed on
+///   `client_ip`; smooth weighted round robin when there is no client
+///   IP or no ring address parses as a socket address.
+/// - `random`: `random_seed` modulo the candidate count, weights
+///   ignored.
+/// - `least_conn`: the fewest open connections in `state.connections`,
+///   the first on a tie.
+/// - `peak_ewma`: [`EwmaTracker::select_best`].
+///
+/// `ring_addresses` is an `Option` rather than the slice Story 12.3
+/// sketched: HTTP passes `None` and allocates nothing, where a slice of
+/// the configured addresses would cost it a vector per request; a stream
+/// passes each candidate's resolved `ip:port`, index for index.
+///
+/// Returns 0 for no candidate; callers only select among at least one.
+pub fn select_index(
+    algorithm: &LoadBalancing,
+    candidates: &[&Backend],
+    ring_addresses: Option<&[&str]>,
+    client_ip: Option<&str>,
+    random_seed: u64,
+    state: SelectionState<'_>,
+) -> usize {
+    if candidates.is_empty() {
+        return 0;
+    }
+    let smooth_wrr = || {
+        let weighted: Vec<(&str, i64)> = candidates
+            .iter()
+            .map(|b| (b.address.as_str(), i64::from(b.weight.max(1))))
+            .collect();
+        state.wrr.next(&weighted)
+    };
+    match algorithm {
+        LoadBalancing::PeakEwma => state.ewma.select_best(candidates),
+        LoadBalancing::Random => (random_seed as usize) % candidates.len(),
+        LoadBalancing::LeastConn => candidates
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, b)| state.connections.get(&b.address))
+            .map(|(i, _)| i)
+            .unwrap_or(0),
+        LoadBalancing::ConsistentHash => {
+            let pairs: Vec<(&str, i32)> = match ring_addresses {
+                Some(ring) => ring
+                    .iter()
+                    .zip(candidates)
+                    .map(|(address, b)| (*address, b.weight))
+                    .collect(),
+                None => candidates
+                    .iter()
+                    .map(|b| (b.address.as_str(), b.weight))
+                    .collect(),
+            };
+            pick_consistent_hash(&pairs, client_ip).unwrap_or_else(smooth_wrr)
+        }
+        LoadBalancing::RoundRobin => smooth_wrr(),
     }
 }
 

@@ -1084,9 +1084,9 @@ Allowlist: `lorica/src/proxy_wiring/lb.rs`, `lorica/src/proxy_wiring.rs`
 (only if it calls what moved).
 Depends on: nothing. A `refactor(proxy)` commit of its own.
 
-- [ ] `select_index` and `SelectionState` (D-e); `upstream_peer` calls
+- [x] `select_index` and `SelectionState` (D-e); `upstream_peer` calls
       it with the values it computes today.
-- [ ] Tests: the existing selection tests pass unchanged; one new test
+- [x] Tests: the existing selection tests pass unchanged; one new test
       per algorithm asserting `select_index` returns what the former
       inline block returned for the same inputs (round robin sequence
       for weights 5,1,1; ketama index for a fixed IP; least-conn tie;
@@ -1352,7 +1352,34 @@ performance phase.
 
 ### Completion Notes
 
-**Lot A (PROXY encoder).**
+**Lot D1 (the shared selection function).**
+
+- `lorica::proxy_wiring::lb::select_index(algorithm: &LoadBalancing,
+  candidates: &[&Backend], ring_addresses: Option<&[&str]>, client_ip:
+  Option<&str>, random_seed: u64, state: SelectionState<'_>) -> usize`,
+  with `SelectionState { wrr, ewma, connections }` as D-e names them, and
+  `lb::random_seed(&Instant) -> u64`, the `DefaultHasher` of the
+  instant HTTP has always seeded `random` with.
+- One refinement, recorded as D-e allows: `ring_addresses` is an
+  `Option`. HTTP passes `None` (the configured addresses, no
+  allocation); a slice would have cost HTTP a vector per request. The
+  stream selector passes its resolved `ip:port` list, index for index.
+  The round-robin fallback of `consistent_hash` stays keyed on the
+  backends' configured addresses, so a re-resolution does not reset a
+  stream's WRR state.
+- `select_index` returns 0 for no candidate; `upstream_peer` only calls
+  it with at least one.
+- Proof HTTP is unchanged: the existing selection tests
+  (`test_smooth_wrr_*`, `test_least_conn_*`, `test_pick_consistent_hash_*`,
+  `test_ewma_tracker_*`) are untouched and pass. Five new tests keep the
+  former inline block verbatim as `former_inline_selection` and assert
+  index equality, round by round with separate state copies, for round
+  robin with weights 5, 1, 1 (14 rounds, 10/2/2), ketama for a fixed IP
+  and its no-IP fallback, the least-connections tie, random over 64
+  instants and a fixed seed, and EWMA exploitation with the explore
+  schedule.
+- `lorica/benches/circuit_breaker.rs` calls nothing that moved.
+
 
 - API, in `lorica_core::protocols::proxy_protocol`, each returning the
   header as `Vec<u8>`: `encode_v1(source: SocketAddr, destination:
@@ -1443,6 +1470,12 @@ performance phase.
 
 ## File List
 
+Lot D1:
+
+- `lorica/src/proxy_wiring/lb.rs`
+- `lorica/src/proxy_wiring.rs` (the selection block of `upstream_peer`)
+- `lorica/src/proxy_wiring/tests.rs`
+
 Lot A:
 
 - `lorica-core/src/protocols/proxy_protocol.rs`
@@ -1481,3 +1514,4 @@ Lot B:
 | 2026-11-14 | 0.2 | Maintainer answers folded in as Resolved 1 to 9: `max_connections` per worker now and per node from Story 12.6 with one field, stream-scoped local exclusion, no DNS alert (input to 12.9 AC #5), no `optional` PROXY accept, selection through a trait, Python backends for IV1, keepalive on by default, `source_addresses` as a list, survey values verified with URLs in Lot F. Status Draft. | Romain G. |
 | 2026-11-14 | 0.3 | Lot B landed: the D-q fields, migration 75, validation, rule A and the backup and source-family rules, `local_backend_conflicts`, store, canonical digest, diff, export and import. D-s corrected: the PROXY header is written in plaintext right after connect and before any upstream TLS handshake. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.4 | Lot A landed: the PROXY v1 and v2 encoder beside the parser, with `encode_v2_dgram` for Story 12.5, round-trip tests and fuzz arm, FORK.md entry. | Romain G. |
+| 2026-11-14 | 0.5 | Lot D1 landed: HTTP's selection block extracted into `lb::select_index`, behaviour unchanged, `ring_addresses` refined to an `Option`. | Romain G. |

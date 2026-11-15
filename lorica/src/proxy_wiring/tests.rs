@@ -4166,3 +4166,251 @@ fn the_body_hold_is_bounded_per_read_and_in_total_whatever_is_stored() {
     );
     assert_eq!(body_hold_bounds(30, -5).1, Duration::from_secs(1));
 }
+
+// ---- select_index (Story 12.3 Lot D1) ----
+
+/// The selection block `upstream_peer` held before Lot D1, verbatim but
+/// for its inputs, kept as the reference `select_index` must agree
+/// with.
+fn former_inline_selection(
+    algorithm: &LoadBalancing,
+    healthy_backends: &[&Backend],
+    client_ip: Option<&str>,
+    start_time: &Instant,
+    wrr_state: &SmoothWrrState,
+    ewma_tracker: &EwmaTracker,
+    backend_connections: &BackendConnections,
+) -> usize {
+    match algorithm {
+        LoadBalancing::PeakEwma => ewma_tracker.select_best(healthy_backends),
+        LoadBalancing::Random => {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            start_time.hash(&mut hasher);
+            (hasher.finish() as usize) % healthy_backends.len()
+        }
+        LoadBalancing::LeastConn => healthy_backends
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, b)| backend_connections.get(&b.address))
+            .map(|(i, _)| i)
+            .unwrap_or(0),
+        LoadBalancing::ConsistentHash => {
+            let pairs: Vec<(&str, i32)> = healthy_backends
+                .iter()
+                .map(|b| (b.address.as_str(), b.weight))
+                .collect();
+            pick_consistent_hash(&pairs, client_ip).unwrap_or_else(|| {
+                let bw: Vec<(&str, i64)> = healthy_backends
+                    .iter()
+                    .map(|b| (b.address.as_str(), b.weight.max(1) as i64))
+                    .collect();
+                wrr_state.next(&bw)
+            })
+        }
+        _ => {
+            let bw: Vec<(&str, i64)> = healthy_backends
+                .iter()
+                .map(|b| (b.address.as_str(), b.weight.max(1) as i64))
+                .collect();
+            wrr_state.next(&bw)
+        }
+    }
+}
+
+fn weighted(id: &str, addr: &str, weight: i32) -> Backend {
+    Backend {
+        weight,
+        ..make_backend(id, addr)
+    }
+}
+
+/// Run both paths over `rounds` selections, each with its own copy of
+/// the mutable state, and return the shared sequence.
+fn both_paths(
+    algorithm: LoadBalancing,
+    backends: &[Backend],
+    client_ip: Option<&str>,
+    connections: &BackendConnections,
+    rounds: usize,
+) -> Vec<usize> {
+    let refs: Vec<&Backend> = backends.iter().collect();
+    let (wrr_before, wrr_after) = (SmoothWrrState::new(0), SmoothWrrState::new(0));
+    let (ewma_before, ewma_after) = (EwmaTracker::new(), EwmaTracker::new());
+    for (i, b) in backends.iter().enumerate() {
+        if i > 0 {
+            let latency = 1_000.0 * (i as f64 + 1.0);
+            ewma_before.record(&b.address, latency);
+            ewma_after.record(&b.address, latency);
+        }
+    }
+    let start = Instant::now();
+    (0..rounds)
+        .map(|round| {
+            let at = start + Duration::from_millis(round as u64);
+            let before = former_inline_selection(
+                &algorithm,
+                &refs,
+                client_ip,
+                &at,
+                &wrr_before,
+                &ewma_before,
+                connections,
+            );
+            let after = lb::select_index(
+                &algorithm,
+                &refs,
+                None,
+                client_ip,
+                lb::random_seed(&at),
+                lb::SelectionState {
+                    wrr: &wrr_after,
+                    ewma: &ewma_after,
+                    connections,
+                },
+            );
+            assert_eq!(after, before, "{algorithm:?}, round {round}");
+            after
+        })
+        .collect()
+}
+
+#[test]
+fn select_index_round_robin_matches_the_former_block_for_weights_5_1_1() {
+    let backends = [
+        weighted("b1", "10.0.0.1:80", 5),
+        weighted("b2", "10.0.0.2:80", 1),
+        weighted("b3", "10.0.0.3:80", 1),
+    ];
+    let picks = both_paths(
+        LoadBalancing::RoundRobin,
+        &backends,
+        None,
+        &BackendConnections::new(),
+        14,
+    );
+    let mut counts = [0usize; 3];
+    for &pick in &picks {
+        counts[pick] += 1;
+    }
+    assert_eq!(counts, [10, 2, 2]);
+}
+
+#[test]
+fn select_index_consistent_hash_matches_the_former_block() {
+    let backends = [
+        make_backend("b1", "10.0.0.1:80"),
+        make_backend("b2", "10.0.0.2:80"),
+        make_backend("b3", "10.0.0.3:80"),
+    ];
+    let picks = both_paths(
+        LoadBalancing::ConsistentHash,
+        &backends,
+        Some("203.0.113.5"),
+        &BackendConnections::new(),
+        8,
+    );
+    assert!(picks.windows(2).all(|w| w[0] == w[1]), "sticky: {picks:?}");
+    // Without a client IP both fall back to the same round robin.
+    both_paths(
+        LoadBalancing::ConsistentHash,
+        &backends,
+        None,
+        &BackendConnections::new(),
+        8,
+    );
+    // A stream's resolved ring reaches the same backend as the
+    // configured addresses when they are the same text.
+    let refs: Vec<&Backend> = backends.iter().collect();
+    let ring: Vec<&str> = backends.iter().map(|b| b.address.as_str()).collect();
+    let wrr = SmoothWrrState::new(0);
+    let ewma = EwmaTracker::new();
+    let connections = BackendConnections::new();
+    let state = || lb::SelectionState {
+        wrr: &wrr,
+        ewma: &ewma,
+        connections: &connections,
+    };
+    assert_eq!(
+        lb::select_index(
+            &LoadBalancing::ConsistentHash,
+            &refs,
+            Some(&ring),
+            Some("203.0.113.5"),
+            0,
+            state()
+        ),
+        picks[0]
+    );
+}
+
+#[test]
+fn select_index_least_conn_matches_the_former_block_on_a_tie() {
+    let backends = [
+        make_backend("b1", "10.0.0.1:80"),
+        make_backend("b2", "10.0.0.2:80"),
+        make_backend("b3", "10.0.0.3:80"),
+    ];
+    let connections = BackendConnections::new();
+    connections.increment("10.0.0.1:80");
+    // b2 and b3 tie at zero: the first of them.
+    assert_eq!(
+        both_paths(LoadBalancing::LeastConn, &backends, None, &connections, 3),
+        vec![1, 1, 1]
+    );
+}
+
+#[test]
+fn select_index_random_matches_the_former_block_for_a_seed() {
+    let backends = [
+        make_backend("b1", "10.0.0.1:80"),
+        make_backend("b2", "10.0.0.2:80"),
+        make_backend("b3", "10.0.0.3:80"),
+    ];
+    both_paths(
+        LoadBalancing::Random,
+        &backends,
+        None,
+        &BackendConnections::new(),
+        64,
+    );
+    let refs: Vec<&Backend> = backends.iter().collect();
+    let wrr = SmoothWrrState::new(0);
+    let ewma = EwmaTracker::new();
+    let connections = BackendConnections::new();
+    assert_eq!(
+        lb::select_index(
+            &LoadBalancing::Random,
+            &refs,
+            None,
+            None,
+            7,
+            lb::SelectionState {
+                wrr: &wrr,
+                ewma: &ewma,
+                connections: &connections,
+            },
+        ),
+        7 % 3
+    );
+}
+
+#[test]
+fn select_index_peak_ewma_matches_the_former_block_when_exploiting() {
+    // b1 unscored, b2 and b3 scored: b2 is the lowest. Both paths take
+    // the same explore ticket schedule.
+    let backends = [
+        make_backend("b1", "10.0.0.1:80"),
+        make_backend("b2", "10.0.0.2:80"),
+        make_backend("b3", "10.0.0.3:80"),
+    ];
+    let picks = both_paths(
+        LoadBalancing::PeakEwma,
+        &backends,
+        None,
+        &BackendConnections::new(),
+        20,
+    );
+    assert_eq!(picks.iter().filter(|&&p| p == 1).count(), 18, "{picks:?}");
+}
