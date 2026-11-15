@@ -1063,9 +1063,11 @@ None open.
   schema, which documented `default: 10`.
 - An environment `PUT` replaces the environment's backend rows, so its
   backends take the setting of the latest `PUT`; pinned by the test.
-- Not done here: the dashboard's backend form still starts its interval
-  field at 10 (`Backends.svelte`), so a dashboard create always names
-  an interval and never gets the setting.
+- Lot 0 follow-up (`fix(ui)`): the dashboard's backend form started its
+  interval field at 10 (`Backends.svelte`), so a dashboard create always
+  named an interval and never got the setting. A create now leaves the
+  field empty and omits the interval unless the operator types one, as
+  the form already does for name, group and SNI.
 
 ## File List
 
@@ -1083,6 +1085,8 @@ None open.
 - `lorica-config/src/models/settings.rs` (Lot 0, doc comment)
 - `lorica-config/src/canonical.rs` (Lot 0, doc comment)
 - `lorica-automation-policy/src/settings.rs` (Lot 0, `why` text)
+- `lorica-dashboard/frontend/src/routes/Backends.svelte` (Lot 0 follow-up)
+- `lorica-dashboard/frontend/src/routes/Backends.test.ts` (Lot 0 follow-up)
 
 ## Change Log
 
@@ -1093,3 +1097,4 @@ None open.
 | 2026-11-14 | 0.3 | OQ-7 resolved: `default_health_check_interval_s` becomes the default for new backends in Lot 0's second commit (`backends.rs` and `environments.rs` added to its allowlist, tests and CHANGELOG entry extended). Status Draft. | Romain G. |
 | 2026-11-15 | 0.4 | Lot 0 commit 1: the health loop writes the health status and the lifecycle state alone (`set_backend_health_status`, `set_backend_lifecycle_state`), cycle extracted into `run_health_cycle`. Status InProgress. | Romain G. |
 | 2026-11-15 | 0.5 | Lot 0 commit 2: each backend probed at its own `health_check_interval_s` on a one-second tick; `default_health_check_interval_s` is the interval of a backend created without one (management, automation, environment). Lot 0 done. Status InProgress. | Romain G. |
+| 2026-11-15 | 0.6 | Lot 0 follow-up: the dashboard backend create omits the interval unless typed, so it takes the setting. Status InProgress. | Romain G. |

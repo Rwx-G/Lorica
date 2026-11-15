@@ -109,6 +109,36 @@ describe('Backends page: the typed health check (Story 12.1 AC #3)', () => {
     expect(body).not.toHaveProperty('health_check_path');
   });
 
+  it('leaves the interval of a create to the server default unless one is typed', async () => {
+    const create = vi.spyOn(api, 'createBackend').mockResolvedValue({ data: backend() });
+    await openCreateForm();
+    const interval = screen.getByLabelText('Health Check Interval (s)');
+    expect(interval).toHaveValue(null);
+    expect(interval).toHaveAttribute('placeholder', 'Default (Settings)');
+    await fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+    expect(create).toHaveBeenCalledTimes(1);
+    // What reaches the server is the JSON body, where an undefined field is absent.
+    expect(JSON.parse(JSON.stringify(create.mock.calls[0][0]))).not.toHaveProperty('health_check_interval_s');
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Add Backend' }));
+    await fireEvent.input(screen.getByLabelText(/^Address/), { target: { value: '10.0.0.21:8080' } });
+    await fireEvent.input(screen.getByLabelText('Health Check Interval (s)'), { target: { value: '15' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(create.mock.calls[1][0].health_check_interval_s).toBe(15);
+  });
+
+  it('sends the stored interval back on edit', async () => {
+    const slow = backend({ id: 'backend-5', name: 'slow-01', health_check_interval_s: 45 });
+    vi.spyOn(api, 'listBackends').mockResolvedValue({ data: { backends: [slow] } });
+    const update = vi.spyOn(api, 'updateBackend').mockResolvedValue({ data: slow });
+    render(Backends);
+    await fireEvent.click(await screen.findByRole('button', { name: 'Edit slow-01' }));
+    expect(screen.getByLabelText('Health Check Interval (s)')).toHaveValue(45);
+    await fireEvent.click(screen.getByRole('button', { name: 'Update' }));
+    expect(update.mock.calls[0][1].health_check_interval_s).toBe(45);
+  });
+
   it('creates a backend with an HTTP check of the path entered', async () => {
     const create = vi.spyOn(api, 'createBackend').mockResolvedValue({ data: backend() });
     await openCreateForm();

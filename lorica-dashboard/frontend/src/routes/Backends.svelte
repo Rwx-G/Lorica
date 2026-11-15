@@ -25,7 +25,11 @@
   let formGroupName = $state('');
   let formWeight = $state(100);
   let formHealthCheckEnabled = $state(true);
-  let formHealthCheckInterval = $state(10);
+  // `null` on a create until the operator types one: the request then
+  // omits the interval and the server stores its
+  // `default_health_check_interval_s`, as it does for every other field
+  // the form leaves empty.
+  let formHealthCheckInterval: number | null = $state(null);
   let formHealthCheckKind: HealthCheck['kind'] = $state('tcp_connect');
   let formHealthCheckPath = $state('');
   let formTlsUpstream = $state(false);
@@ -95,7 +99,7 @@
     const addrErr = validateAddress(formAddress);
     if (addrErr) return addrErr;
     if (formWeight < 1 || formWeight > 1000) return 'Weight must be between 1 and 1000';
-    if (formHealthCheckInterval < 5 || formHealthCheckInterval > 3600) return 'Health check interval must be between 5 and 3600 seconds';
+    if (formHealthCheckInterval != null && (formHealthCheckInterval < 5 || formHealthCheckInterval > 3600)) return 'Health check interval must be between 5 and 3600 seconds';
     if (formHealthCheckKind === 'http' && !formHealthCheckPath.trim()) return 'An HTTP health check needs a path (e.g. /healthz)';
     return '';
   }
@@ -140,6 +144,7 @@
     }
   }
   function handleHcIntervalBlur() {
+    if (formHealthCheckInterval == null) { hcIntervalError = ''; return; }
     const n = Number(formHealthCheckInterval);
     if (!Number.isInteger(n) || n < 5 || n > 3600) {
       hcIntervalError = 'Interval must be an integer in 5..3600 s';
@@ -177,7 +182,8 @@
     formGroupName = '';
     formWeight = 100;
     formHealthCheckEnabled = true;
-    formHealthCheckInterval = 10;
+    formHealthCheckInterval = null;
+    hcIntervalError = '';
     formHealthCheckKind = 'tcp_connect';
     formHealthCheckPath = '';
     hcPathError = '';
@@ -229,7 +235,7 @@
         group_name: formGroupName || undefined,
         weight: formWeight,
         health_check_enabled: formHealthCheckEnabled,
-        health_check_interval_s: formHealthCheckInterval,
+        health_check_interval_s: formHealthCheckInterval ?? undefined,
         health_check: formHealthCheck(),
         tls_upstream: formTlsUpstream,
         tls_skip_verify: formTlsSkipVerify,
@@ -250,7 +256,7 @@
         group_name: formGroupName || undefined,
         weight: formWeight,
         health_check_enabled: formHealthCheckEnabled,
-        health_check_interval_s: formHealthCheckInterval,
+        health_check_interval_s: formHealthCheckInterval ?? undefined,
         health_check: formHealthCheck(),
         tls_upstream: formTlsUpstream,
         tls_skip_verify: formTlsSkipVerify,
@@ -461,7 +467,7 @@
           </div>
           <div class="form-group">
             <label for="backend-healthcheck-interval">Health Check Interval (s)</label>
-            <input id="backend-healthcheck-interval" type="number" bind:value={formHealthCheckInterval} min="5" max="3600" onblur={handleHcIntervalBlur} oninput={handleHcIntervalBlur} />
+            <input id="backend-healthcheck-interval" type="number" bind:value={formHealthCheckInterval} min="5" max="3600" placeholder="Default (Settings)" onblur={handleHcIntervalBlur} oninput={handleHcIntervalBlur} />
             {#if hcIntervalError}<span class="field-error">{hcIntervalError}</span>{/if}
           </div>
         </div>
