@@ -862,15 +862,15 @@ Depends on: nothing.
 Allowlist: `lorica-shmem/src/**`.
 Depends on: nothing. Parallel with A.
 
-- [ ] Factor the probe logic of `AtomicHashTable<N>` into functions over
+- [x] Factor the probe logic of `AtomicHashTable<N>` into functions over
       a slot slice, `AtomicHashTable<N>` delegating to them; the WAF
       tables' behaviour and every existing test unchanged.
-- [ ] `stream_caps.rs`: `StreamCapsRegion::create(max_sessions, workers,
+- [x] `stream_caps.rs`: `StreamCapsRegion::create(max_sessions, workers,
       caps_gen)` (memfd, `ftruncate`, map, header, fresh SipHash key) and
       `open(fd)` (verify magic, `STREAM_CAPS_LAYOUT_VERSION`, sizes against
       the file size); `layout_for(max_sessions, workers)` as a pure
       function the budget and the docs use.
-- [ ] `admit_session(slot, source_key, source_cap, stream_cap) ->
+- [x] `admit_session(slot, source_key, source_cap, stream_cap) ->
       Result<SessionPermit, CapRefusal>` (exact total with rollback,
       shard sum check, own-shard claim, `TableFull`), `SessionPermit`
       releasing on drop (shard count, slot released at 0 by its owner,
@@ -879,9 +879,9 @@ Depends on: nothing. Parallel with A.
       `TableFull`); `release_worker(slot)`; `evict_rates(now) -> stats`
       (released only when both times are past and no shard holds the
       key); `total()`.
-- [ ] Source key derivation: IPv4 address, IPv6 /64, IPv4-mapped
+- [x] Source key derivation: IPv4 address, IPv6 /64, IPv4-mapped
       canonicalised first.
-- [ ] Tests: exact total under 8 threads at the cap; shard overshoot never
+- [x] Tests: exact total under 8 threads at the cap; shard overshoot never
       above W - 1 (8 threads hammering one source); a held key is never
       released by `evict_rates` however old; `release_worker` restores
       `total` and empties the shard; GCRA admits one second of burst then
@@ -1452,7 +1452,71 @@ decision.
   Lot D maps regions, a `caps` is answered `nack adopt_failed` and its fd
   closes with the message; no supervisor sends one before Lot F.
 
+**Lot B (`lorica-shmem`).**
+
+- Probe factored. `table.rs` holds the window and the WAF slot
+  operations as functions over a slice (`window_indices`, `window`,
+  `holding`, `increment`, `read`, `last_update`, `reset`) behind a
+  crate-private `Keyed` trait; `AtomicHashTable<N>` delegates and keeps
+  its compile-time shape assertion. Every existing test passes unchanged.
+- API (`lorica_shmem::stream_caps`, re-exported at the crate root):
+  `StreamCapsRegion::create(max_sessions: u64, workers: u32, caps_gen:
+  u64) -> Result<(StreamCapsRegion, OwnedFd), StreamCapsError>`;
+  `StreamCapsRegion::open(OwnedFd)` (magic, `STREAM_CAPS_LAYOUT_VERSION`,
+  the header's shape, and the file length against the layout the header
+  describes; the fd closes on return, the mapping stays);
+  `layout_for(max_sessions, workers) -> StreamCapsLayout` (offsets, sizes,
+  `rate_table_bytes()`, `shard_bytes()`); `region.worker(slot) ->
+  Option<WorkerCaps>` and `WorkerCaps::admit_session(SourceKey,
+  source_cap, stream_cap) -> Result<SessionPermit, CapRefusal>`
+  (`SessionCap`, `SourceSessionCap`, `TableFull`); `charge_rate(SourceKey,
+  bytes, RateLimits, now_ns) -> RateVerdict` (`Allowed`, `DatagramRate`,
+  `ByteRate`, `TableFull`); `release_worker(slot) -> Option<u64>`;
+  `evict_rates(now_ns) -> RateEvictionStats { occupied, evicted, held }`;
+  `total()`, `worker_sessions(slot)`, `source_sessions(SourceKey)`;
+  `SourceKey::of(IpAddr)`.
+- Two refinements of the Task's signatures. The slot is bound once in a
+  `WorkerCaps` handle (`worker(slot)` refuses one the region has not), so
+  `admit_session` has no out-of-range case. `charge_rate` takes the
+  `RateLimits`: only sizes live in the region, the limits come from the
+  snapshot at each charge, as D-d says.
+- Shard cells are safe with any number of writers, not only their owner:
+  a count rises only from a non-zero value and only the claimer sets it
+  from 0 to 1, so a cell a release brought to 0 is never revived and the
+  release that did it owns the cell until it clears the key. Only the
+  owner writes its shard all the same; `release_worker` empties a dead
+  slot's shard (counts, then keys) and subtracts its attribution.
+- Counting order. A session adds to the total, then claims its shard
+  cell, then adds its attribution; a permit gives back the cell, the
+  attribution, then the total. A worker dying between two steps leaves
+  the total one too high, never too low, and `release_worker` never
+  subtracts more than was added.
+- Rate cells. GCRA with a one-second burst on both arrival times; a
+  datagram refused on the byte rate gives its datagram token back. A
+  released cell keeps arrival times in the past, which reads as a full
+  bucket, so a claim needs no reset. Eviction also skips a cell claimed
+  or charged in the last `RATE_CELL_GRACE_NS` (1 s), closing the window
+  between a claim and its first charge. Shard cells are never read for
+  release by eviction. The IPv6 /64 key hashes under a derived key, so an
+  IPv4 address and a /64 of the same numeric value never share a cell.
+- A burst of one second means a datagram larger than one second of byte
+  rate never passes. Lot C refuses `udp.source_byte_rate` below
+  `udp.max_datagram_bytes`.
+- Several live regions of one stream (a size change): `admit_session`
+  takes the cap left for this region; the engine passes `max_sessions`
+  minus the other live regions' totals (Lot E).
+- Commit scope `proxy`: the region serves the stream proxy's caps, not
+  the WAF, whose region is untouched.
+
 ## File List
+
+Lot B:
+
+- `lorica-shmem/src/stream_caps.rs` (new), `lorica-shmem/src/table.rs`,
+  `lorica-shmem/src/lib.rs`
+- `lorica-shmem/tests/stream_caps.rs` (new, outside the `src/**`
+  allowlist: the multi-process tests the Lot asks for)
+- `docs/stories/story-12.5-udp-engine.md`
 
 Lot A:
 
@@ -1469,3 +1533,4 @@ Lot A:
 | 2026-11-14 | 0.1 | Story drafted from the Epic 12 PRD and the Dev Agent Records of Stories 12.1 and 12.2. Status Draft. | Romain G. |
 | 2026-11-14 | 0.2 | Maintainer answers folded in (Resolved 1 to 8: ratio 32 and the reflection bound recomputed, `source_addresses`); aligned with the Story 12.3 draft (seams, breaker key, fields, counters, record) with the remaining mismatches listed as edits E1 to E9. Status Draft. | Romain G. |
 | 2026-11-15 | 0.3 | Lot A landed: the `caps` message and its `stream-caps` fd tag, `IP_PKTINFO` / `IPV6_RECVPKTINFO` on wildcard UDP groups (the dual-stack assumption of D-g pinned), `usable_udp_source_ports`, `BindFailureKind::SourcePorts`. Status InProgress. | Romain G. |
+| 2026-11-15 | 0.4 | Lot B landed: the stream-caps region (`StreamCapsRegion`, its own layout version, per-stream sizing, exact totals, per-worker session shards never evicted, shared GCRA rate cells), the probe factored out of `AtomicHashTable`, multi-process tests. | Romain G. |

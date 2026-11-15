@@ -115,6 +115,142 @@ pub struct AtomicHashTable<const N: usize> {
     pub slots: [Slot; N],
 }
 
+/// A cell an open-addressing probe walks: one key word, `0` when free.
+/// The WAF tables' [`Slot`] and the stream-caps region's cells share the
+/// probe through it, so a window means the same thing in every table.
+pub(crate) trait Keyed {
+    /// The cell's key word.
+    fn key(&self) -> &AtomicU64;
+}
+
+impl Keyed for Slot {
+    fn key(&self) -> &AtomicU64 {
+        &self.key
+    }
+}
+
+/// Indices of the [`MAX_PROBE`] cells `tagged_hash` may occupy in a table
+/// of `len` cells, in probe order. `len` is a power of two holding at
+/// least one window, so a window never visits a cell twice; the fixed
+/// tables assert it at compile time, the sized ones when they are laid
+/// out.
+pub(crate) fn window_indices(len: usize, tagged_hash: u64) -> impl Iterator<Item = usize> {
+    debug_assert!(len.is_power_of_two() && len >= MAX_PROBE);
+    let mask = len - 1;
+    let start = (tagged_hash as usize) & mask;
+    (0..MAX_PROBE).map(move |probe| (start + probe) & mask)
+}
+
+/// The cells of `tagged_hash`'s window, in probe order.
+pub(crate) fn window<C>(cells: &[C], tagged_hash: u64) -> impl Iterator<Item = &C> {
+    window_indices(cells.len(), tagged_hash).map(move |i| &cells[i])
+}
+
+/// The cells of the window currently holding `tagged_hash`. Lookups
+/// never stop at a free cell: a release frees cells in the middle of a
+/// window, and a key placed behind one is still there.
+pub(crate) fn holding<C: Keyed>(cells: &[C], tagged_hash: u64) -> impl Iterator<Item = &C> {
+    window(cells, tagged_hash).filter(move |c| c.key().load(Ordering::Acquire) == tagged_hash)
+}
+
+/// [`AtomicHashTable::increment`] over a slice of slots.
+pub(crate) fn increment(slots: &[Slot], tagged_hash: u64, by: u64, now_ns: u64) -> u64 {
+    debug_assert!(tagged_hash != 0, "tagged_hash must be non-zero");
+    // The whole window is searched before anything is claimed. A
+    // release frees a slot in the middle of the window, so the first
+    // free slot is no sign that the key lies nowhere beyond it, and
+    // claiming it would split the key's count across two slots.
+    if let Some(s) =
+        window(slots, tagged_hash).find(|s| s.key.load(Ordering::Acquire) == tagged_hash)
+    {
+        return add(s, by, now_ns);
+    }
+    for s in window(slots, tagged_hash) {
+        let mut cur = s.key.load(Ordering::Acquire);
+        if cur == 0 {
+            // A released slot keeps the value it had (eviction and
+            // `reset` only clear the key), so the claim must start
+            // the counter from `by`. It cannot store `by`: other
+            // writers see the key as soon as the CAS lands and add
+            // to `value` at once, and a store would erase their
+            // adds. It subtracts what the slot held instead, read
+            // before the CAS while no writer of this key exists.
+            //
+            // The timestamp is written before the CAS, not after:
+            // the slot still carries its previous occupant's stamp
+            // (0 if never used), and an eviction pass that saw the
+            // new key beside that stale stamp would release the
+            // claim at once. The evictor reads the key with Acquire,
+            // so seeing this CAS means seeing this stamp. A CAS lost
+            // to another key leaves it a fresher stamp, which at
+            // worst delays that slot's eviction by one pass.
+            s.last_update_ns.store(now_ns, Ordering::Release);
+            let left_over = s.value.load(Ordering::Acquire);
+            match s
+                .key
+                .compare_exchange(0, tagged_hash, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    let delta = by.wrapping_sub(left_over);
+                    return s
+                        .value
+                        .fetch_add(delta, Ordering::AcqRel)
+                        .wrapping_add(delta);
+                }
+                // Another writer claimed this slot first, often for
+                // this same key. Weigh the key it wrote rather than
+                // probing on, which would claim a second slot for it.
+                Err(claimed) => cur = claimed,
+            }
+        }
+        if cur == tagged_hash {
+            return add(s, by, now_ns);
+        }
+    }
+    tracing::warn!(
+        table_slots = slots.len(),
+        start_slot = (tagged_hash as usize) & (slots.len() - 1),
+        "shmem hashtable saturated at probe limit"
+    );
+    SATURATED
+}
+
+/// [`AtomicHashTable::read`] over a slice of slots.
+pub(crate) fn read(slots: &[Slot], tagged_hash: u64) -> Option<u64> {
+    debug_assert!(tagged_hash != 0, "tagged_hash must be non-zero");
+    holding(slots, tagged_hash)
+        .map(|s| s.value.load(Ordering::Acquire))
+        .reduce(u64::wrapping_add)
+}
+
+/// [`AtomicHashTable::last_update`] over a slice of slots.
+pub(crate) fn last_update(slots: &[Slot], tagged_hash: u64) -> Option<u64> {
+    debug_assert!(tagged_hash != 0);
+    holding(slots, tagged_hash)
+        .map(|s| s.last_update_ns.load(Ordering::Acquire))
+        .max()
+}
+
+/// [`AtomicHashTable::reset`] over a slice of slots.
+pub(crate) fn reset(slots: &[Slot], tagged_hash: u64) -> bool {
+    debug_assert!(tagged_hash != 0);
+    let released = holding(slots, tagged_hash)
+        .filter(|s| {
+            s.key
+                .compare_exchange(tagged_hash, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        })
+        .count();
+    released > 0
+}
+
+/// Commutative add to a slot the key holds, then refresh its stamp.
+fn add(s: &Slot, by: u64, now_ns: u64) -> u64 {
+    let new = s.value.fetch_add(by, Ordering::AcqRel).wrapping_add(by);
+    s.last_update_ns.store(now_ns, Ordering::Release);
+    new
+}
+
 impl<const N: usize> AtomicHashTable<N> {
     /// Construct an empty table. Not typically used directly - in a
     /// shared-memory region the bytes are zero-initialised by
@@ -153,84 +289,20 @@ impl<const N: usize> AtomicHashTable<N> {
     /// [`read`]: Self::read
     /// [`reset`]: Self::reset
     pub fn increment(&self, tagged_hash: u64, by: u64, now_ns: u64) -> u64 {
-        debug_assert!(tagged_hash != 0, "tagged_hash must be non-zero");
-        // The whole window is searched before anything is claimed. A
-        // release frees a slot in the middle of the window, so the first
-        // free slot is no sign that the key lies nowhere beyond it, and
-        // claiming it would split the key's count across two slots.
-        if let Some(s) = self
-            .window(tagged_hash)
-            .find(|s| s.key.load(Ordering::Acquire) == tagged_hash)
-        {
-            return Self::add(s, by, now_ns);
-        }
-        for s in self.window(tagged_hash) {
-            let mut cur = s.key.load(Ordering::Acquire);
-            if cur == 0 {
-                // A released slot keeps the value it had (eviction and
-                // `reset` only clear the key), so the claim must start
-                // the counter from `by`. It cannot store `by`: other
-                // writers see the key as soon as the CAS lands and add
-                // to `value` at once, and a store would erase their
-                // adds. It subtracts what the slot held instead, read
-                // before the CAS while no writer of this key exists.
-                //
-                // The timestamp is written before the CAS, not after:
-                // the slot still carries its previous occupant's stamp
-                // (0 if never used), and an eviction pass that saw the
-                // new key beside that stale stamp would release the
-                // claim at once. The evictor reads the key with Acquire,
-                // so seeing this CAS means seeing this stamp. A CAS lost
-                // to another key leaves it a fresher stamp, which at
-                // worst delays that slot's eviction by one pass.
-                s.last_update_ns.store(now_ns, Ordering::Release);
-                let left_over = s.value.load(Ordering::Acquire);
-                match s
-                    .key
-                    .compare_exchange(0, tagged_hash, Ordering::AcqRel, Ordering::Acquire)
-                {
-                    Ok(_) => {
-                        let delta = by.wrapping_sub(left_over);
-                        return s
-                            .value
-                            .fetch_add(delta, Ordering::AcqRel)
-                            .wrapping_add(delta);
-                    }
-                    // Another writer claimed this slot first, often for
-                    // this same key. Weigh the key it wrote rather than
-                    // probing on, which would claim a second slot for it.
-                    Err(claimed) => cur = claimed,
-                }
-            }
-            if cur == tagged_hash {
-                return Self::add(s, by, now_ns);
-            }
-        }
-        tracing::warn!(
-            table_slots = N,
-            start_slot = (tagged_hash as usize) & (N - 1),
-            "shmem hashtable saturated at probe limit"
-        );
-        SATURATED
+        increment(self.cells(), tagged_hash, by, now_ns)
     }
 
     /// Read the counter for `tagged_hash`: the sum of every slot of its
     /// probe window holding the key, usually one. Returns `None` if no
     /// slot holds it.
     pub fn read(&self, tagged_hash: u64) -> Option<u64> {
-        debug_assert!(tagged_hash != 0, "tagged_hash must be non-zero");
-        self.slots_of(tagged_hash)
-            .map(|s| s.value.load(Ordering::Acquire))
-            .reduce(u64::wrapping_add)
+        read(self.cells(), tagged_hash)
     }
 
     /// Read the latest update timestamp among the slots holding
     /// `tagged_hash`, if any.
     pub fn last_update(&self, tagged_hash: u64) -> Option<u64> {
-        debug_assert!(tagged_hash != 0);
-        self.slots_of(tagged_hash)
-            .map(|s| s.last_update_ns.load(Ordering::Acquire))
-            .max()
+        last_update(self.cells(), tagged_hash)
     }
 
     /// Release every slot holding `tagged_hash` by CAS-ing its key back
@@ -243,16 +315,7 @@ impl<const N: usize> AtomicHashTable<N> {
     /// has been issued - a repeat offender after ban expiry starts
     /// counting from zero rather than inheriting the previous run.
     pub fn reset(&self, tagged_hash: u64) -> bool {
-        debug_assert!(tagged_hash != 0);
-        let released = self
-            .slots_of(tagged_hash)
-            .filter(|s| {
-                s.key
-                    .compare_exchange(tagged_hash, 0, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            })
-            .count();
-        released > 0
+        reset(self.cells(), tagged_hash)
     }
 
     /// `N` is a power of two, so `N - 1` masks a slot index, and holds
@@ -260,27 +323,11 @@ impl<const N: usize> AtomicHashTable<N> {
     /// `read` never counts one twice.
     const SHAPE_IS_VALID: () = assert!(N.is_power_of_two() && N >= MAX_PROBE);
 
-    /// The `MAX_PROBE` slots `tagged_hash` may occupy, in probe order.
-    fn window(&self, tagged_hash: u64) -> impl Iterator<Item = &Slot> {
+    /// The slots as the probe functions take them, the shape checked at
+    /// compile time.
+    fn cells(&self) -> &[Slot] {
         let () = Self::SHAPE_IS_VALID;
-        let mask = N - 1;
-        let start = (tagged_hash as usize) & mask;
-        (0..MAX_PROBE).map(move |probe| &self.slots[(start + probe) & mask])
-    }
-
-    /// The slots of the window currently holding `tagged_hash`. Lookups
-    /// never stop at a free slot: a release frees slots in the middle of
-    /// a window, and a key placed behind one is still there.
-    fn slots_of(&self, tagged_hash: u64) -> impl Iterator<Item = &Slot> {
-        self.window(tagged_hash)
-            .filter(move |s| s.key.load(Ordering::Acquire) == tagged_hash)
-    }
-
-    /// Commutative add to a slot the key holds, then refresh its stamp.
-    fn add(s: &Slot, by: u64, now_ns: u64) -> u64 {
-        let new = s.value.fetch_add(by, Ordering::AcqRel).wrapping_add(by);
-        s.last_update_ns.store(now_ns, Ordering::Release);
-        new
+        &self.slots
     }
 
     /// Number of slots (capacity).
