@@ -19,9 +19,9 @@ use strum::{EnumString, IntoStaticStr, VariantArray};
 
 use super::backend::{backend_address_host, backend_address_port, Backend, RouteBackend};
 use super::enums::LoadBalancing;
-use super::route::{validate_node_selector_names, MtlsConfig};
+use super::route::{validate_node_selector_names, GeoIpConfig, MtlsConfig};
 use super::ProxyProtocolMode;
-use crate::connection_filter::validate_proxy_protocol;
+use crate::connection_filter::{parse_cidr, validate_proxy_protocol};
 use crate::host_shape::names_an_address;
 use crate::local_address::is_local_host;
 use crate::route_selection::{
@@ -209,12 +209,59 @@ pub struct Stream {
     /// [`Stream::RATE_BPS_RANGE`]; `None` for no limit. TCP only.
     #[serde(default)]
     pub download_rate_bps: Option<u64>,
-    /// The most concurrent connections of this stream, per worker
-    /// process until Story 12.6, per node from then on (the same field,
-    /// moved onto shared counters), [`Stream::MAX_CONNECTIONS_RANGE`].
-    /// TCP only: a UDP stream's session cap is its own setting.
+    /// The most concurrent connections of this stream on one node,
+    /// counted across its workers (Story 12.6 D-f),
+    /// [`Stream::MAX_CONNECTIONS_RANGE`]. A stream placed on several
+    /// nodes holds up to this many on each. TCP only: a UDP stream's
+    /// session cap is its own setting.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+    /// The most concurrent connections one source (an IPv4 address, or
+    /// the /64 of an IPv6 one) holds on one node, pending ones included,
+    /// [`Stream::SOURCE_MAX_CONNECTIONS_RANGE`]; `None` bounds a source
+    /// by `max_connections` alone (Story 12.6 D-f). TCP only: a UDP
+    /// stream's per-source cap is `udp.source_session_cap`.
+    #[serde(default)]
+    pub source_max_connections: Option<u32>,
+    /// The most connections of this stream on one node still in their
+    /// pre-forwarding reads (a PROXY header, a ClientHello), from accept
+    /// to the choice of a backend, [`Stream::MAX_PENDING_CONNECTIONS_RANGE`];
+    /// [`Stream::effective_pending_connections`] caps it at
+    /// `max_connections`, and one source holds at most
+    /// [`Stream::source_pending_share`] of it (Story 12.6 D-f). TCP only.
+    #[serde(default = "default_max_pending_connections")]
+    pub max_pending_connections: u32,
+
+    // Source controls (Story 12.6 D-c, D-d, D-g), on both protocols:
+    // checked before any byte is forwarded (TCP) or any session created
+    // (UDP), and only for connections and sessions admitted after a
+    // change. Each carries a serde default so a document written before
+    // them still reads.
+    /// Sources admitted when non-empty: a client outside every entry is
+    /// refused ([`Stream::has_source_allowlist`]). CIDRs or addresses,
+    /// at most [`Stream::SOURCE_CIDRS_MAX`], no `/0`.
+    #[serde(default)]
+    pub source_allow_cidrs: Vec<String>,
+    /// Sources refused, before the allowlist: a deny entry always wins.
+    /// CIDRs or addresses, at most [`Stream::SOURCE_CIDRS_MAX`], no `/0`
+    /// (set `enabled` to false to refuse everyone).
+    #[serde(default)]
+    pub source_deny_cidrs: Vec<String>,
+    /// Country allow or deny list, as a route's; a client whose country
+    /// is unknown passes. Not an address allowlist: it satisfies neither
+    /// listen-address rule [`Stream::has_source_allowlist`] serves.
+    #[serde(default)]
+    pub geoip: Option<GeoIpConfig>,
+    /// New connections (TCP) or sessions (UDP) per second from one
+    /// source on one node, [`Stream::OPEN_RATE_RANGE`], with one second
+    /// of burst; `None` for no limit.
+    #[serde(default)]
+    pub source_open_rate: Option<u32>,
+    /// New connections (TCP) or sessions (UDP) per second on the stream
+    /// on one node, [`Stream::OPEN_RATE_RANGE`], with one second of
+    /// burst; `None` for no limit.
+    #[serde(default)]
+    pub open_rate: Option<u32>,
 
     /// The UDP settings (Story 12.5 D-l): present on every UDP stream,
     /// absent on every TCP one, so no UDP field is ever stored on a TCP
@@ -295,6 +342,10 @@ fn default_backend_keepalive_idle_s() -> u32 {
 
 fn default_max_connections() -> u32 {
     Stream::DEFAULT_MAX_CONNECTIONS
+}
+
+fn default_max_pending_connections() -> u32 {
+    Stream::DEFAULT_MAX_PENDING_CONNECTIONS
 }
 
 /// Which PROXY protocol header a stream sends its backends (Story 12.3,
@@ -870,8 +921,8 @@ pub fn is_unexposed_udp_listen_address(address: IpAddr) -> bool {
 /// stream, or a UDP stream without its settings, passes; the latter is
 /// [`Stream::validate`]'s to refuse.
 ///
-/// Called by `Stream::validate` from Story 12.5 Lot G, with
-/// `has_source_allowlist = false` until Story 12.6 adds the allowlist.
+/// `Stream::validate` calls it with [`Stream::has_source_allowlist`]
+/// (Story 12.6 D-l).
 ///
 /// # Errors
 ///
@@ -894,8 +945,8 @@ pub fn udp_exposure_check(stream: &Stream, has_source_allowlist: bool) -> Result
     }
     Err(format!(
         "stream `{}`: UDP listen address {} is exposed (not loopback, RFC 1918 or ULA), so the \
-         stream needs a source allowlist or an explicit udp.source_session_cap of at most \
-         {UDP_EXPOSED_SOURCE_SESSION_CAP_MAX}",
+         stream needs a source allowlist (source_allow_cidrs) or an explicit \
+         udp.source_session_cap of at most {UDP_EXPOSED_SOURCE_SESSION_CAP_MAX}",
         stream.name, stream.listen_address
     ))
 }
@@ -921,10 +972,11 @@ pub struct TcpEngineField {
     pub on_udp: OnUdp,
 }
 
-/// Every Story 12.3 setting, in declaration order, with what a UDP
-/// stream may do with it (Story 12.3 D-q, Story 12.5 D-l). A setting
-/// gains or loses a UDP meaning by changing its [`OnUdp`] here, not by
-/// adding a second rule somewhere else.
+/// Every TCP engine setting, Story 12.3's and the two caps Story 12.6
+/// added beside `max_connections`, in declaration order, with what a
+/// UDP stream may do with it (Story 12.3 D-q, Story 12.5 D-l, Story 12.6
+/// D-f). A setting gains or loses a UDP meaning by changing its
+/// [`OnUdp`] here, not by adding a second rule somewhere else.
 pub const TCP_ENGINE_FIELDS: &[TcpEngineField] = &[
     TcpEngineField {
         name: "load_balancing",
@@ -1012,6 +1064,16 @@ pub const TCP_ENGINE_FIELDS: &[TcpEngineField] = &[
         at_default: |s| s.max_connections == Stream::DEFAULT_MAX_CONNECTIONS,
         on_udp: OnUdp::KeepsDefault("a UDP stream's session cap is udp.max_sessions"),
     },
+    TcpEngineField {
+        name: "source_max_connections",
+        at_default: |s| s.source_max_connections.is_none(),
+        on_udp: OnUdp::KeepsDefault("a UDP stream's per-source cap is udp.source_session_cap"),
+    },
+    TcpEngineField {
+        name: "max_pending_connections",
+        at_default: |s| s.max_pending_connections == Stream::DEFAULT_MAX_PENDING_CONNECTIONS,
+        on_udp: OnUdp::KeepsDefault("a UDP session has no pre-forwarding reads to wait in"),
+    },
 ];
 
 /// Refuse `value` outside `range`, naming the stream and the field.
@@ -1081,6 +1143,25 @@ impl Stream {
     pub const DEFAULT_MAX_CONNECTIONS: u32 = 1_024;
     /// Accepted `max_connections`.
     pub const MAX_CONNECTIONS_RANGE: RangeInclusive<u32> = 1..=65_535;
+    /// Accepted `source_max_connections` when set.
+    pub const SOURCE_MAX_CONNECTIONS_RANGE: RangeInclusive<u32> = 1..=65_535;
+    /// Default of `max_pending_connections`: with a 17 KiB ClientHello
+    /// buffer each, 4.3 MiB of pending reads per stream per node.
+    pub const DEFAULT_MAX_PENDING_CONNECTIONS: u32 = 256;
+    /// Accepted `max_pending_connections`.
+    pub const MAX_PENDING_CONNECTIONS_RANGE: RangeInclusive<u32> = 1..=65_535;
+    /// One source holds at most this fraction (1 / divisor) of the
+    /// effective pending cap, so filling it takes this many sources
+    /// (Story 12.6 D-f, Resolved 4).
+    pub const PENDING_SOURCE_SHARE_DIVISOR: u32 = 8;
+    /// The most entries `source_allow_cidrs` and `source_deny_cidrs`
+    /// each hold.
+    pub const SOURCE_CIDRS_MAX: usize = 1_024;
+    /// Accepted `source_open_rate` and `open_rate` when set, openings
+    /// per second.
+    pub const OPEN_RATE_RANGE: RangeInclusive<u32> = 1..=1_000_000;
+    /// Accepted `max_active` of a stream-backend link when set.
+    pub const MAX_ACTIVE_RANGE: RangeInclusive<u32> = 1..=65_535;
     /// What a TLS stream waits for a ClientHello when
     /// `clienthello_timeout_ms` is unset: a client's first flight, sent
     /// the moment TCP completes, with room for several retransmissions.
@@ -1152,6 +1233,13 @@ impl Stream {
             upload_rate_bps: None,
             download_rate_bps: None,
             max_connections: Self::DEFAULT_MAX_CONNECTIONS,
+            source_max_connections: None,
+            max_pending_connections: Self::DEFAULT_MAX_PENDING_CONNECTIONS,
+            source_allow_cidrs: Vec::new(),
+            source_deny_cidrs: Vec::new(),
+            geoip: None,
+            source_open_rate: None,
+            open_rate: None,
             udp: Self::default_udp_settings(protocol),
             tls_mode: StreamTlsMode::None,
             match_rules: Vec::new(),
@@ -1189,10 +1277,84 @@ impl Stream {
 
     /// Whether the stream's `no_sni` rule needs `no_sni_acknowledged`
     /// (D-d, D7): it does unless the stream restricts its sources.
-    /// Story 12.4 calls it with `false`; Story 12.6 passes whether the
-    /// stream has a source allowlist.
+    /// `Stream::validate` passes [`Stream::has_source_allowlist`] (Story
+    /// 12.6 D-l).
     pub fn no_sni_needs_acknowledgement(&self, has_source_allowlist: bool) -> bool {
         self.has_no_sni_rule() && !has_source_allowlist
+    }
+
+    /// Whether the stream admits only the sources it lists: a non-empty
+    /// `source_allow_cidrs` (Story 12.6 D-c). The one definition the
+    /// listen-address rule of a UDP stream ([`udp_exposure_check`]) and
+    /// the `no_sni` acknowledgement read. A GeoIP allowlist does not
+    /// count (a country is not an address range, and an unknown country
+    /// passes), nor does the PROXY trust list (it names who may speak
+    /// for a client, not which clients may connect). Any non-empty list
+    /// counts, however wide (Resolved 6): validation refuses `/0` and
+    /// blank entries, not a choice of two `/1` halves.
+    pub fn has_source_allowlist(&self) -> bool {
+        !self.source_allow_cidrs.is_empty()
+    }
+
+    /// The pending cap a TCP stream enforces on a node:
+    /// `max_pending_connections`, never above `max_connections`.
+    pub fn effective_pending_connections(&self) -> u32 {
+        self.max_pending_connections.min(self.max_connections)
+    }
+
+    /// The most pending connections one source holds on a node: the
+    /// effective pending cap over [`Stream::PENDING_SOURCE_SHARE_DIVISOR`],
+    /// at least 1.
+    pub fn source_pending_share(&self) -> u32 {
+        (self.effective_pending_connections() / Self::PENDING_SOURCE_SHARE_DIVISOR).max(1)
+    }
+
+    /// The names of the fields Story 12.6 added to a stream (D-c, D-d,
+    /// D-f, D-g), as every surface spells them, in declaration order.
+    /// `every_protection_field_is_a_wire_key_the_fixture_moves` holds
+    /// the list to the type.
+    pub fn protection_field_names() -> [&'static str; 7] {
+        let any = Stream::new(
+            String::new(),
+            String::new(),
+            StreamProtocol::Tcp,
+            IpAddr::from([0, 0, 0, 0]),
+            0,
+            0,
+            DateTime::<Utc>::default(),
+        );
+        any.protection_fields_set().map(|(name, _)| name)
+    }
+
+    /// The source-control fields that are off their default, by name,
+    /// in declaration order.
+    fn protection_fields_set(&self) -> [(&'static str, bool); 7] {
+        [
+            (
+                "source_max_connections",
+                self.source_max_connections.is_some(),
+            ),
+            (
+                "max_pending_connections",
+                self.max_pending_connections != Self::DEFAULT_MAX_PENDING_CONNECTIONS,
+            ),
+            ("source_allow_cidrs", !self.source_allow_cidrs.is_empty()),
+            ("source_deny_cidrs", !self.source_deny_cidrs.is_empty()),
+            ("geoip", self.geoip.is_some()),
+            ("source_open_rate", self.source_open_rate.is_some()),
+            ("open_rate", self.open_rate.is_some()),
+        ]
+    }
+
+    /// Put `geoip` in the form it is stored and matched in
+    /// ([`GeoIpConfig::normalised`]): codes uppercased, deduplicated,
+    /// blanks dropped. A list that does not normalise is left for
+    /// [`Stream::validate`] to refuse. The store and the import apply it
+    /// on every write, as they do [`Stream::canonicalise_server_names`].
+    pub fn canonicalise_geoip(&mut self) {
+        if let Some(normalised) = self.geoip.as_ref().and_then(|g| g.normalised().ok()) {
+            self.geoip = Some(normalised);
+        }
     }
 
     /// The rule named `name`.
@@ -1294,11 +1456,12 @@ impl Stream {
     /// The stream's own rules: id ([`is_canonical_stream_id`]), name,
     /// group, listen address, ports, the [`STREAM_PORT_RANGE_MAX`] cap,
     /// the selector rule shared with routes, the engine settings, on UDP
-    /// its settings, and last the listen-address rule
-    /// ([`udp_exposure_check`]), with no source allowlist until Story
-    /// 12.6 passes the stream's own. Which backends it may
-    /// reach is [`check_backend_attachments`]; which ports it may hold
-    /// on a node is `crate::listen_ports::stream_port_conflicts`.
+    /// its settings, the source controls, and last the listen-address
+    /// rule ([`udp_exposure_check`]) with the stream's own
+    /// [`Stream::has_source_allowlist`], so removing the allowlist a
+    /// stream relies on is refused on every write path. Which backends
+    /// it may reach is [`check_backend_attachments`]; which ports it may
+    /// hold on a node is `crate::listen_ports::stream_port_conflicts`.
     ///
     /// # Errors
     ///
@@ -1366,7 +1529,95 @@ impl Stream {
         validate_node_selector_names(&self.node_selector)
             .map_err(|e| format!("stream `{}`: {e}", self.name))?;
         self.validate_engine_settings()?;
-        udp_exposure_check(self, false)
+        self.validate_source_controls()?;
+        udp_exposure_check(self, self.has_source_allowlist())
+    }
+
+    /// The source controls of Story 12.6: the two CIDR lists (D-c), the
+    /// GeoIP list (D-d), the per-source and pending caps (D-f) and the
+    /// open rates (D-g).
+    fn validate_source_controls(&self) -> Result<(), String> {
+        let name = self.name.as_str();
+        self.validate_source_cidrs(
+            "source_allow_cidrs",
+            &self.source_allow_cidrs,
+            "admits every address, which is no allowlist; list the networks that may connect",
+        )?;
+        self.validate_source_cidrs(
+            "source_deny_cidrs",
+            &self.source_deny_cidrs,
+            "refuses every address; set enabled to false to stop the stream",
+        )?;
+        if let Some(geoip) = &self.geoip {
+            geoip
+                .normalised()
+                .map_err(|e| format!("stream `{name}`: {e}"))?;
+        }
+        if let Some(cap) = self.source_max_connections {
+            within(
+                name,
+                "source_max_connections",
+                cap,
+                &Self::SOURCE_MAX_CONNECTIONS_RANGE,
+            )?;
+        }
+        within(
+            name,
+            "max_pending_connections",
+            self.max_pending_connections,
+            &Self::MAX_PENDING_CONNECTIONS_RANGE,
+        )?;
+        for (field, rate) in [
+            ("source_open_rate", self.source_open_rate),
+            ("open_rate", self.open_rate),
+        ] {
+            if let Some(rate) = rate {
+                within(name, field, rate, &Self::OPEN_RATE_RANGE)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One source CIDR list (D-c): at most [`Stream::SOURCE_CIDRS_MAX`]
+    /// entries, each an address or a CIDR, none blank (a blank would make
+    /// a list that restricts nothing count as an allowlist), none
+    /// IPv4-mapped (a client is judged on its canonical address, so such
+    /// an entry would never match), none a `/0` (`every` says what one
+    /// would do instead).
+    fn validate_source_cidrs(
+        &self,
+        field: &str,
+        entries: &[String],
+        every: &str,
+    ) -> Result<(), String> {
+        let name = self.name.as_str();
+        if entries.len() > Self::SOURCE_CIDRS_MAX {
+            return Err(format!(
+                "stream `{name}`: {field} holds at most {} entries (got {})",
+                Self::SOURCE_CIDRS_MAX,
+                entries.len()
+            ));
+        }
+        for entry in entries {
+            if entry.trim().is_empty() {
+                return Err(format!("stream `{name}`: {field} holds an empty entry"));
+            }
+            let net = parse_cidr(entry).map_err(|_| {
+                format!("stream `{name}`: `{entry}` is not a valid IP or CIDR in {field}")
+            })?;
+            if net.prefix_len() == 0 {
+                return Err(format!("stream `{name}`: `{entry}` in {field} {every}"));
+            }
+            if let ipnet::IpNet::V6(v6) = net {
+                if v6.addr().to_ipv4_mapped().is_some() {
+                    return Err(format!(
+                        "stream `{name}`: `{entry}` in {field} is an IPv4-mapped IPv6 network; \
+                         give the IPv4 network itself"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The Story 12.3 settings (D-q): ranges, the PROXY trust list
@@ -1527,10 +1778,13 @@ impl Stream {
                 "stream `{name}`: no_sni_acknowledged is refused on a stream without a no_sni rule"
             ));
         }
-        if self.no_sni_needs_acknowledgement(false) && !self.no_sni_acknowledged {
+        if self.no_sni_needs_acknowledgement(self.has_source_allowlist())
+            && !self.no_sni_acknowledged
+        {
             return Err(format!(
                 "stream `{name}`: a no_sni rule admits clients that name no server; restrict \
-                 the stream to a source allowlist or set no_sni_acknowledged"
+                 the stream to a source allowlist (source_allow_cidrs) or set \
+                 no_sni_acknowledged"
             ));
         }
         if let Some(timeout) = self.clienthello_timeout_ms {
@@ -1883,16 +2137,44 @@ pub struct StreamBackend {
     /// rule of a stream.
     #[serde(default)]
     pub rule: Option<String>,
+    /// The most connections (TCP) or sessions (UDP) the stream holds to
+    /// this backend on one node, [`Stream::MAX_ACTIVE_RANGE`]; `None` for
+    /// no cap (Story 12.6 D-h, nginx's `max_conns`). On the link, not on
+    /// the backend: HTTP routes sharing the backend do not count against
+    /// it.
+    #[serde(default)]
+    pub max_active: Option<u32>,
 }
 
 impl StreamBackend {
-    /// A primary link serving no rule.
+    /// A primary link serving no rule, with no cap.
     pub fn primary(stream_id: &str, backend_id: &str) -> StreamBackend {
         StreamBackend {
             stream_id: stream_id.to_string(),
             backend_id: backend_id.to_string(),
             backup: false,
             rule: None,
+            max_active: None,
+        }
+    }
+
+    /// The link's own rule: `max_active` within
+    /// [`Stream::MAX_ACTIVE_RANGE`]. Whether its stream may reach its
+    /// backend is [`check_backend_attachments`].
+    ///
+    /// # Errors
+    ///
+    /// The refusal, naming the stream and the backend.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.max_active {
+            Some(cap) if !Stream::MAX_ACTIVE_RANGE.contains(&cap) => Err(format!(
+                "the link of stream {} to backend {}: max_active must be {}..={} (got {cap})",
+                self.stream_id,
+                self.backend_id,
+                Stream::MAX_ACTIVE_RANGE.start(),
+                Stream::MAX_ACTIVE_RANGE.end()
+            )),
+            _ => Ok(()),
         }
     }
 }
@@ -2329,8 +2611,8 @@ pub fn check_backend_attachments(
 pub enum StreamRefusal {
     /// No rule of the stream matched the connection.
     NoMatch,
-    /// The stream's `max_connections` was reached (Story 12.3, D-p):
-    /// per worker process until Story 12.6, per node from then on.
+    /// The stream holds its `max_connections` on this node (Story 12.3
+    /// D-p, Story 12.6 D-f).
     ConnectionCap,
     /// The UDP stream holds its `udp.max_sessions` on this node (Story
     /// 12.5 D-n).
@@ -2353,6 +2635,37 @@ pub enum StreamRefusal {
     /// A terminating stream refused the client's certificate, or its
     /// absence, or its organization.
     ClientCertificate,
+    /// The global connection filter refused the client (Story 12.6 D-d).
+    ConnectionFilter,
+    /// The client is on the global IP blocklist and not in the global
+    /// WAF whitelist.
+    IpBlocklist,
+    /// The stream's `source_deny_cidrs` holds the client, or its
+    /// `source_allow_cidrs` does not (D-c).
+    SourceDenied,
+    /// The stream's `geoip` list refused the client's country.
+    Geoip,
+    /// Over the stream's `open_rate` on this node (D-g).
+    OpenRate,
+    /// Over the stream's `source_open_rate` for the source on this node.
+    SourceOpenRate,
+    /// The source holds its `source_max_connections` on this node (D-f).
+    SourceConnectionCap,
+    /// The stream holds its pending cap on this node: as many
+    /// connections still in their pre-forwarding reads as
+    /// `max_pending_connections` allows.
+    PendingCap,
+    /// The source holds its share of the pending cap on this node.
+    SourcePendingCap,
+    /// Every candidate backend holds its link's `max_active` on this
+    /// node (D-h).
+    BackendCap,
+    /// The stream's connection tables on this node have no room for the
+    /// source (its probe window is full); other streams are unaffected.
+    ConnectionTableFull,
+    /// The stream's caps region has not reached this worker yet, so
+    /// nothing can be counted against its caps.
+    CapsUnavailable,
 }
 
 /// Why a UDP datagram was dropped rather than forwarded (Story 12.5
@@ -2559,7 +2872,7 @@ pub(crate) fn sample_tls_stream(label: &str, name: &str, port: u16) -> Stream {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::models::{HealthCheck, HealthStatus, LifecycleState, ManagedBy};
+    use crate::models::{GeoIpMode, HealthCheck, HealthStatus, LifecycleState, ManagedBy};
 
     fn at() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-11-14T00:00:00Z")
@@ -3117,6 +3430,8 @@ pub(crate) mod tests {
         s.upload_rate_bps = Some(1_048_576);
         s.download_rate_bps = Some(2_097_152);
         s.max_connections = 64;
+        s.source_max_connections = Some(16);
+        s.max_pending_connections = 32;
         s
     }
 
@@ -4555,5 +4870,341 @@ pub(crate) mod tests {
             serde_json::to_value(StreamEndReason::IdleTimeout).expect("serialize"),
             serde_json::json!({"reason": "idle_timeout"})
         );
+    }
+
+    // ---- Story 12.6: source controls ----
+
+    /// A valid stream of `protocol` with every source control of Story
+    /// 12.6 away from its default, the two TCP-only caps on TCP alone.
+    fn every_protection_setting_off_default(protocol: StreamProtocol) -> Stream {
+        let mut s = stream("s-p", "guarded", protocol, 5000);
+        s.source_allow_cidrs = vec!["192.0.2.0/24".to_string(), "2001:db8::/32".to_string()];
+        s.source_deny_cidrs = vec!["192.0.2.66".to_string()];
+        s.geoip = Some(GeoIpConfig {
+            mode: GeoIpMode::Denylist,
+            countries: vec!["US".to_string()],
+        });
+        s.source_open_rate = Some(5);
+        s.open_rate = Some(500);
+        if protocol == StreamProtocol::Tcp {
+            s.source_max_connections = Some(16);
+            s.max_pending_connections = 32;
+        }
+        s
+    }
+
+    fn geoip(mode: GeoIpMode, countries: &[&str]) -> Option<GeoIpConfig> {
+        Some(GeoIpConfig {
+            mode,
+            countries: countries.iter().map(|c| (*c).to_string()).collect(),
+        })
+    }
+
+    #[test]
+    fn a_new_stream_holds_the_protection_defaults() {
+        for &protocol in StreamProtocol::VARIANTS {
+            let s = stream("s", "edge", protocol, 5000);
+            assert!(s.source_allow_cidrs.is_empty());
+            assert!(s.source_deny_cidrs.is_empty());
+            assert_eq!(s.geoip, None);
+            assert_eq!(s.source_max_connections, None);
+            assert_eq!(s.max_pending_connections, 256);
+            assert_eq!(s.source_open_rate, None);
+            assert_eq!(s.open_rate, None);
+            assert!(!s.has_source_allowlist());
+            assert!(s.protection_fields_set().iter().all(|(_, set)| !set));
+        }
+    }
+
+    /// The names the API filters and the canonical tests strip are the
+    /// type's own: each is a key of the serialised stream, the fixture
+    /// moves each one, and moving one moves no other.
+    #[test]
+    fn every_protection_field_is_a_wire_key_the_fixture_moves() {
+        let moved = every_protection_setting_off_default(StreamProtocol::Tcp);
+        moved.validate().expect("test setup: a valid stream");
+        assert!(moved.protection_fields_set().iter().all(|(_, set)| *set));
+        let moved_json = serde_json::to_value(&moved).expect("serialize");
+        let default_json =
+            serde_json::to_value(stream("s-p", "guarded", StreamProtocol::Tcp, 5000))
+                .expect("serialize");
+        for name in Stream::protection_field_names() {
+            let mut value = default_json.clone();
+            value[name] = moved_json[name].clone();
+            let one: Stream = serde_json::from_value(value)
+                .unwrap_or_else(|e| panic!("{name} is not a field name: {e}"));
+            let set: Vec<&str> = one
+                .protection_fields_set()
+                .iter()
+                .filter(|(_, set)| *set)
+                .map(|(name, _)| *name)
+                .collect();
+            assert_eq!(set, vec![name]);
+        }
+    }
+
+    #[test]
+    fn a_document_without_the_source_controls_reads_with_their_defaults() {
+        for &protocol in StreamProtocol::VARIANTS {
+            let s = stream("s", "edge", protocol, 5000);
+            let mut value = serde_json::to_value(&s).expect("serialize");
+            let object = value.as_object_mut().expect("an object");
+            for name in Stream::protection_field_names() {
+                assert!(object.remove(name).is_some(), "{name} on the wire");
+            }
+            let read: Stream = serde_json::from_value(value).expect("a 12.4 stream parses");
+            assert_eq!(read, s);
+        }
+        let link: StreamBackend =
+            serde_json::from_value(serde_json::json!({"stream_id": "s", "backend_id": "b"}))
+                .expect("a 12.4 link parses");
+        assert_eq!(link.max_active, None);
+    }
+
+    #[test]
+    fn both_protocols_take_the_lists_the_geoip_and_the_rates() {
+        let tcp = every_protection_setting_off_default(StreamProtocol::Tcp);
+        assert!(tcp.validate().is_ok(), "{:?}", tcp.validate());
+        let udp = every_protection_setting_off_default(StreamProtocol::Udp);
+        assert!(udp.validate().is_ok(), "{:?}", udp.validate());
+    }
+
+    #[test]
+    fn the_source_cidr_lists_are_checked() {
+        for field in ["source_allow_cidrs", "source_deny_cidrs"] {
+            let with = |entries: Vec<String>| {
+                let mut s = stream("s", "edge", StreamProtocol::Tcp, 5000);
+                match field {
+                    "source_allow_cidrs" => s.source_allow_cidrs = entries,
+                    _ => s.source_deny_cidrs = entries,
+                }
+                s
+            };
+            let refusal = |entries: &[&str]| {
+                with(entries.iter().map(|e| (*e).to_string()).collect())
+                    .validate()
+                    .expect_err("refused")
+            };
+            assert!(with(vec![
+                "10.0.0.0/8".into(),
+                " 203.0.113.7 ".into(),
+                "::1".into()
+            ])
+            .validate()
+            .is_ok());
+            let err = refusal(&["10.0.0.0/33"]);
+            assert!(err.contains("10.0.0.0/33") && err.contains(field), "{err}");
+            assert!(refusal(&["bogus"]).contains("not a valid IP or CIDR"));
+            let err = refusal(&["10.0.0.0/8", "  "]);
+            assert!(err.contains("empty entry") && err.contains(field), "{err}");
+            for every in ["0.0.0.0/0", "::/0", " 10.0.0.0/0 "] {
+                let err = refusal(&[every]);
+                assert!(err.contains(every) && err.contains(field), "{err}");
+                let remedy = match field {
+                    "source_allow_cidrs" => "no allowlist",
+                    _ => "enabled to false",
+                };
+                assert!(err.contains(remedy), "{err}");
+            }
+            let err = refusal(&["::ffff:192.0.2.0/120"]);
+            assert!(err.contains("IPv4-mapped"), "{err}");
+            let full: Vec<String> = (0..=Stream::SOURCE_CIDRS_MAX)
+                .map(|n| format!("10.{}.{}.0/24", n / 256, n % 256))
+                .collect();
+            let err = with(full.clone()).validate().expect_err("one too many");
+            assert!(
+                err.contains(&format!("at most {}", Stream::SOURCE_CIDRS_MAX)),
+                "{err}"
+            );
+            assert!(with(full[..Stream::SOURCE_CIDRS_MAX].to_vec())
+                .validate()
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn an_allowlist_is_any_non_empty_source_allow_cidrs() {
+        let mut s = stream("s", "edge", StreamProtocol::Tcp, 5000);
+        assert!(!s.has_source_allowlist());
+        s.source_deny_cidrs = vec!["192.0.2.0/24".to_string()];
+        s.geoip = geoip(GeoIpMode::Allowlist, &["FR"]);
+        s.proxy_protocol_accept = true;
+        s.proxy_protocol_trusted_cidrs = vec!["10.0.0.0/8".to_string()];
+        assert!(
+            !s.has_source_allowlist(),
+            "a deny list, a country allowlist and a PROXY trust list are no allowlist"
+        );
+        // Two halves that together admit everything still count
+        // (Resolved 6): a deliberate operator act.
+        s.source_allow_cidrs = vec!["0.0.0.0/1".to_string(), "128.0.0.0/1".to_string()];
+        assert!(s.has_source_allowlist());
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn geoip_is_held_to_the_route_rule_and_stored_normalised() {
+        let mut s = stream("s", "edge", StreamProtocol::Udp, 5000);
+        s.geoip = geoip(GeoIpMode::Denylist, &[" us ", "US", "fr"]);
+        assert!(s.validate().is_ok());
+        s.canonicalise_geoip();
+        assert_eq!(s.geoip, geoip(GeoIpMode::Denylist, &["US", "FR"]));
+        s.geoip = geoip(GeoIpMode::Denylist, &[]);
+        assert!(s.validate().is_ok(), "an empty denylist filters nothing");
+        for (refused, words) in [
+            (geoip(GeoIpMode::Denylist, &["USA"]), "alpha-2"),
+            (geoip(GeoIpMode::Allowlist, &[]), "allowlist"),
+        ] {
+            s.geoip = refused.clone();
+            let err = s.validate().expect_err("refused");
+            assert!(
+                err.contains("geoip.countries") && err.contains(words) && err.contains("`edge`"),
+                "{err}"
+            );
+            // A list that does not normalise is left for validation.
+            s.canonicalise_geoip();
+            assert_eq!(s.geoip, refused);
+        }
+        let codes: Vec<String> = (b'A'..=b'Z')
+            .flat_map(|a| (b'A'..=b'Z').map(move |b| format!("{}{}", a as char, b as char)))
+            .take(GeoIpConfig::COUNTRIES_MAX + 1)
+            .collect();
+        s.geoip = Some(GeoIpConfig {
+            mode: GeoIpMode::Denylist,
+            countries: codes,
+        });
+        assert!(s.validate().expect_err("too many").contains("at most"));
+    }
+
+    #[test]
+    fn the_caps_and_rates_are_ranged() {
+        let base = stream("s", "edge", StreamProtocol::Tcp, 5000);
+        let refused = |s: Stream, field: &str| {
+            let err = s.validate().expect_err(field);
+            assert!(err.contains(field), "{err}");
+        };
+        for (cap, ok) in [(0, false), (1, true), (65_535, true), (65_536, false)] {
+            let mut s = base.clone();
+            s.source_max_connections = Some(cap);
+            if ok {
+                assert!(s.validate().is_ok(), "{cap}");
+            } else {
+                refused(s, "source_max_connections");
+            }
+            let mut s = base.clone();
+            s.max_pending_connections = cap;
+            if ok {
+                assert!(s.validate().is_ok(), "{cap}");
+            } else {
+                refused(s, "max_pending_connections");
+            }
+        }
+        for (rate, ok) in [(0, false), (1, true), (1_000_000, true), (1_000_001, false)] {
+            for field in ["source_open_rate", "open_rate"] {
+                let mut s = base.clone();
+                match field {
+                    "source_open_rate" => s.source_open_rate = Some(rate),
+                    _ => s.open_rate = Some(rate),
+                }
+                if ok {
+                    assert!(s.validate().is_ok(), "{field} {rate}");
+                } else {
+                    refused(s, field);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_pending_share_is_an_eighth_of_the_effective_cap() {
+        let mut s = stream("s", "edge", StreamProtocol::Tcp, 5000);
+        assert_eq!(s.effective_pending_connections(), 256);
+        assert_eq!(s.source_pending_share(), 32);
+        s.max_connections = 100;
+        assert_eq!(s.effective_pending_connections(), 100);
+        assert_eq!(s.source_pending_share(), 12);
+        s.max_pending_connections = 7;
+        assert_eq!(s.effective_pending_connections(), 7);
+        assert_eq!(s.source_pending_share(), 1, "never below one");
+    }
+
+    #[test]
+    fn an_allowlist_meets_the_udp_listen_address_rule_and_its_removal_is_refused() {
+        let mut s = stream("s", "dns", StreamProtocol::Udp, 53);
+        s.udp.as_mut().expect("test setup: udp").source_session_cap = None;
+        let err = s
+            .validate()
+            .expect_err("exposed with no cap and no allowlist");
+        assert!(err.contains("source_allow_cidrs"), "{err}");
+        s.source_allow_cidrs = vec!["198.51.100.0/24".to_string()];
+        assert!(s.validate().is_ok(), "{:?}", s.validate());
+        s.source_allow_cidrs.clear();
+        assert_eq!(s.validate(), Err(err), "removing the allowlist is refused");
+    }
+
+    #[test]
+    fn an_allowlist_stands_in_for_the_no_sni_acknowledgement() {
+        let mut s = passthrough();
+        s.match_rules.push(no_sni_rule("bare", &[]));
+        let err = tls_refusal(&s);
+        assert!(err.contains("source_allow_cidrs"), "{err}");
+        s.source_allow_cidrs = vec!["10.0.0.0/8".to_string()];
+        s.validate().expect("an allowlist, no acknowledgement");
+        s.source_allow_cidrs.clear();
+        assert_eq!(s.validate(), Err(err), "removing the allowlist is refused");
+    }
+
+    #[test]
+    fn the_tcp_only_caps_keep_their_default_on_udp() {
+        let mut s = stream("s", "dns", StreamProtocol::Udp, 53);
+        s.source_max_connections = Some(4);
+        let err = s.validate().expect_err("TCP only");
+        assert!(
+            err.contains("source_max_connections") && err.contains("udp.source_session_cap"),
+            "{err}"
+        );
+        s.source_max_connections = None;
+        s.max_pending_connections = 16;
+        assert!(s
+            .validate()
+            .expect_err("TCP only")
+            .contains("max_pending_connections"));
+    }
+
+    #[test]
+    fn a_link_cap_is_ranged() {
+        let mut link = StreamBackend::primary("s", "b");
+        assert!(link.validate().is_ok());
+        for (cap, ok) in [(0, false), (1, true), (65_535, true), (65_536, false)] {
+            link.max_active = Some(cap);
+            assert_eq!(link.validate().is_ok(), ok, "{cap}");
+        }
+        link.max_active = Some(0);
+        let err = link.validate().expect_err("0");
+        assert!(
+            err.contains("max_active") && err.contains("backend b"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_protection_refusals_have_their_words() {
+        for (refusal, word) in [
+            (StreamRefusal::ConnectionFilter, "connection_filter"),
+            (StreamRefusal::IpBlocklist, "ip_blocklist"),
+            (StreamRefusal::SourceDenied, "source_denied"),
+            (StreamRefusal::Geoip, "geoip"),
+            (StreamRefusal::OpenRate, "open_rate"),
+            (StreamRefusal::SourceOpenRate, "source_open_rate"),
+            (StreamRefusal::SourceConnectionCap, "source_connection_cap"),
+            (StreamRefusal::PendingCap, "pending_cap"),
+            (StreamRefusal::SourcePendingCap, "source_pending_cap"),
+            (StreamRefusal::BackendCap, "backend_cap"),
+            (StreamRefusal::ConnectionTableFull, "connection_table_full"),
+            (StreamRefusal::CapsUnavailable, "caps_unavailable"),
+        ] {
+            let spelled: &'static str = refusal.into();
+            assert_eq!(spelled, word);
+            assert!(StreamRefusal::VARIANTS.contains(&refusal));
+        }
     }
 }

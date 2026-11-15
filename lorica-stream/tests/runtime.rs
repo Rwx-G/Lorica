@@ -307,6 +307,7 @@ async fn refresh_drains_what_the_new_table_no_longer_holds() {
         backend_id: "b1".into(),
         backup: false,
         rule: None,
+        max_active: None,
     };
     source.set(
         vec![stream("s1", StreamProtocol::Tcp)],

@@ -1023,6 +1023,66 @@ pub struct GeoIpConfig {
 }
 
 impl GeoIpConfig {
+    /// The most country codes a list holds once normalised: every ISO
+    /// 3166-1 code fits, with room to spare.
+    pub const COUNTRIES_MAX: usize = 300;
+
+    /// The list in the form it is stored and matched in, or why it is
+    /// refused: each code two ASCII letters, uppercased, deduplicated,
+    /// blank entries dropped, at most [`GeoIpConfig::COUNTRIES_MAX`]; an
+    /// allowlist left empty is refused, since it would block every
+    /// client. The one rule the route handlers and `Stream::validate`
+    /// apply, so a GeoIP list reaching the store by import or
+    /// replication is held to what the API holds it to.
+    ///
+    /// # Errors
+    ///
+    /// The refusal, naming `geoip.countries`.
+    ///
+    /// ```rust
+    /// use lorica_config::models::{GeoIpConfig, GeoIpMode};
+    ///
+    /// let raw = GeoIpConfig { mode: GeoIpMode::Denylist, countries: vec![" us ".into(), "US".into(), "fr".into()] };
+    /// assert_eq!(raw.normalised().unwrap().countries, vec!["US", "FR"]);
+    /// let empty = GeoIpConfig { mode: GeoIpMode::Allowlist, countries: Vec::new() };
+    /// assert!(empty.normalised().is_err());
+    /// ```
+    pub fn normalised(&self) -> Result<GeoIpConfig, String> {
+        let mut countries: Vec<String> = Vec::with_capacity(self.countries.len());
+        for raw in &self.countries {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.len() != 2 || !trimmed.chars().all(|c| c.is_ascii_alphabetic()) {
+                return Err(format!(
+                    "geoip.countries: '{trimmed}' is not a valid ISO 3166-1 alpha-2 code"
+                ));
+            }
+            let upper = trimmed.to_ascii_uppercase();
+            if !countries.contains(&upper) {
+                countries.push(upper);
+            }
+        }
+        if self.mode == GeoIpMode::Allowlist && countries.is_empty() {
+            return Err(
+                "geoip.countries: allowlist mode with empty country list would block every \
+                 request. Use denylist mode or add at least one country"
+                    .to_string(),
+            );
+        }
+        if countries.len() > Self::COUNTRIES_MAX {
+            return Err(format!(
+                "geoip.countries: at most {} entries allowed",
+                Self::COUNTRIES_MAX
+            ));
+        }
+        Ok(GeoIpConfig {
+            mode: self.mode,
+            countries,
+        })
+    }
+
     /// Decide whether a given `country` (ISO 3166-1 alpha-2, any case)
     /// should be blocked by this filter. Pure / side-effect-free so
     /// the request filter can call it directly and unit tests can

@@ -68,54 +68,13 @@ pub const BOT_CAPTCHA_ALPHABET_MAX: usize = 128;
 /// "single broad config can DoS the proxy" territory.
 pub const BOT_MAX_BYPASS_ENTRIES_PER_CATEGORY: usize = 500;
 
-/// Validate a per-route `GeoIpConfig` for API acceptance. Country
-/// codes must be ISO 3166-1 alpha-2 (two ASCII letters, normalised to
-/// upper). Duplicates are collapsed. Allowlist mode rejects empty
-/// lists so an operator cannot accidentally block everything by
-/// leaving the country list blank after switching modes.
+/// Validate a per-route `GeoIpConfig` for API acceptance:
+/// [`GeoIpConfig::normalised`](lorica_config::models::GeoIpConfig::normalised),
+/// the rule streams are held to as well, its refusal a 400.
 fn validate_geoip(
     cfg: &lorica_config::models::GeoIpConfig,
 ) -> Result<lorica_config::models::GeoIpConfig, ApiError> {
-    use lorica_config::models::GeoIpMode;
-
-    let mut normalised: Vec<String> = Vec::with_capacity(cfg.countries.len());
-    for raw in &cfg.countries {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.len() != 2 || !trimmed.chars().all(|c| c.is_ascii_alphabetic()) {
-            return Err(ApiError::BadRequest(format!(
-                "geoip.countries: '{trimmed}' is not a valid ISO 3166-1 alpha-2 code"
-            )));
-        }
-        let upper = trimmed.to_ascii_uppercase();
-        if !normalised.contains(&upper) {
-            normalised.push(upper);
-        }
-    }
-
-    if cfg.mode == GeoIpMode::Allowlist && normalised.is_empty() {
-        return Err(ApiError::BadRequest(
-            "geoip.countries: allowlist mode with empty country list would block every request. \
-             Use denylist mode or add at least one country"
-                .into(),
-        ));
-    }
-
-    // Upper bound on the country list so an operator cannot paste a
-    // huge blob. 300 covers every ISO code twice over.
-    const MAX_COUNTRIES: usize = 300;
-    if normalised.len() > MAX_COUNTRIES {
-        return Err(ApiError::BadRequest(format!(
-            "geoip.countries: at most {MAX_COUNTRIES} entries allowed"
-        )));
-    }
-
-    Ok(lorica_config::models::GeoIpConfig {
-        mode: cfg.mode,
-        countries: normalised,
-    })
+    cfg.normalised().map_err(ApiError::BadRequest)
 }
 
 /// Validate a `BotProtectionConfig` for API acceptance (v1.4.0 Epic

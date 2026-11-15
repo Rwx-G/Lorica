@@ -71,8 +71,9 @@ pub fn parse_toml_for_preview(content: &str) -> Result<ImportData> {
 /// defaults a serde default cannot know (Story 12.5 Interface edit E1):
 /// the UDP `idle_timeout_s` when the key is absent, which only the
 /// document still shows, and the UDP settings when absent; and putting
-/// every TLS rule's server names in their stored form (Story 12.4 D-c),
-/// so the preview's diff compares what the import would write.
+/// every TLS rule's server names (Story 12.4 D-c) and every GeoIP list
+/// (Story 12.6 D-d) in their stored form, so the preview's diff compares
+/// what the import would write.
 fn decode(content: &str) -> Result<ImportData> {
     let parse_failed =
         |e: toml::de::Error| ConfigError::Serialization(format!("TOML parse failed: {e}"));
@@ -96,6 +97,7 @@ fn decode(content: &str) -> Result<ImportData> {
     for stream in &mut data.streams {
         stream.fill_protocol_defaults();
         stream.canonicalise_server_names();
+        stream.canonicalise_geoip();
     }
     Ok(data)
 }
@@ -192,6 +194,7 @@ fn validate_streams(data: &ImportData) -> Result<()> {
                 link.stream_id, link.backend_id
             )));
         }
+        link.validate().map_err(ConfigError::Validation)?;
         if !data.streams.iter().any(|s| s.id == link.stream_id) {
             return Err(ConfigError::Validation(format!(
                 "stream_backend references unknown stream_id: {}",
@@ -517,6 +520,83 @@ mod tests {
                 .server_names()[0],
             "app.example.com",
             "stored canonical"
+        );
+    }
+
+    /// A stream with every source control set and a capped link, its
+    /// GeoIP list written in lowercase by hand: the import stores the
+    /// list uppercased, and a second export round-trips unchanged.
+    #[test]
+    fn protected_streams_and_capped_links_round_trip_through_export_and_import() {
+        let source = store_with_streams();
+        let mut smtp = source
+            .get_stream(&sid("s-smtp"))
+            .expect("test setup: get")
+            .expect("test setup: kept");
+        smtp.source_allow_cidrs = vec!["192.0.2.0/24".to_string(), "2001:db8::/32".to_string()];
+        smtp.source_deny_cidrs = vec!["192.0.2.66".to_string()];
+        smtp.geoip = Some(crate::models::GeoIpConfig {
+            mode: crate::models::GeoIpMode::Allowlist,
+            countries: vec!["FR".to_string(), "DE".to_string()],
+        });
+        smtp.source_max_connections = Some(8);
+        smtp.max_pending_connections = 64;
+        smtp.source_open_rate = Some(5);
+        smtp.open_rate = Some(200);
+        source.update_stream(&smtp).expect("test setup: update");
+        source
+            .set_stream_links(
+                &sid("s-smtp"),
+                &[StreamBackend {
+                    max_active: Some(100),
+                    ..StreamBackend::primary(&sid("s-smtp"), "b-smtp")
+                }],
+            )
+            .expect("test setup: a capped link");
+
+        let lowercase = export_to_toml(&source)
+            .expect("export")
+            .replace("\"FR\"", "\"fr\"");
+        let target = ConfigStore::open_in_memory().expect("target");
+        let data = parse_toml(&lowercase).expect("the export parses");
+        import_to_store(&target, &data).expect("the export imports");
+        assert_eq!(
+            target.list_streams().expect("streams"),
+            source.list_streams().expect("streams")
+        );
+        assert_eq!(
+            target.list_stream_backends().expect("links"),
+            source.list_stream_backends().expect("links")
+        );
+
+        let mut refused = parse_toml(&export_to_toml(&source).expect("export")).expect("parses");
+        refused.stream_backends[0].max_active = Some(0);
+        let err = import_to_store(&ConfigStore::open_in_memory().expect("target"), &refused)
+            .expect_err("a cap of 0 is refused");
+        assert!(err.to_string().contains("max_active"), "{err}");
+    }
+
+    #[test]
+    fn a_stream_export_from_before_the_source_controls_imports_without_them() {
+        let source = store_with_streams();
+        let mut value = exported(&source);
+        for stream in value
+            .get_mut("streams")
+            .and_then(toml::Value::as_array_mut)
+            .expect("test setup: streams")
+        {
+            let table = stream.as_table_mut().expect("test setup: a stream table");
+            // `None` settings are absent from TOML already.
+            for key in crate::models::Stream::protection_field_names() {
+                table.remove(key);
+            }
+        }
+        let target = ConfigStore::open_in_memory().expect("target");
+        let data = parse_toml(&toml::to_string(&value).expect("re-encode")).expect("parses");
+        import_to_store(&target, &data).expect("imports");
+        assert_eq!(
+            target.list_streams().expect("streams"),
+            source.list_streams().expect("streams")
         );
     }
 

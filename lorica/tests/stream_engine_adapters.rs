@@ -149,6 +149,7 @@ fn round_robin_state_is_per_stream_and_pruned_with_the_stream() {
         backend_id: "a".into(),
         backup: false,
         rule: None,
+        max_active: None,
     }];
     selector.table_changed(&StreamTable::with_backends(
         vec![two.clone()],
@@ -461,6 +462,7 @@ fn one_link(s: &Stream, b: &Backend) -> StreamTable {
         backend_id: b.id.clone(),
         backup: false,
         rule: None,
+        max_active: None,
     }];
     StreamTable::with_backends(vec![s.clone()], &links, vec![b.clone()])
 }

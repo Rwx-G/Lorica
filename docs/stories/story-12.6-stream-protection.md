@@ -584,16 +584,16 @@ Allowlist: `lorica-config/src/models/stream.rs`,
 `normalised`, messages unchanged).
 Depends on: 12.4 Lot C and 12.5 Lot G if open (same `stream.rs`).
 
-- [ ] The fields of D-m with ranges and defaults; `max_active` on
+- [x] The fields of D-m with ranges and defaults; `max_active` on
       `StreamBackend`; `TCP_ENGINE_FIELDS` entries for the two TCP-only
       fields.
-- [ ] Validation: CIDR lists (D-c), `/0` refused in both, 1,024 cap;
+- [x] Validation: CIDR lists (D-c), `/0` refused in both, 1,024 cap;
       `geoip` through `normalised`; ranges; `max_active` keys.
-- [ ] `has_source_allowlist()`; the `StreamRefusal` variants of D-i;
+- [x] `has_source_allowlist()`; the `StreamRefusal` variants of D-i;
       `max_connections` doc comment says "per node".
-- [ ] Migration, `STREAM_COLUMNS`, canonical digest, diff, export,
+- [x] Migration, `STREAM_COLUMNS`, canonical digest, diff, export,
       import.
-- [ ] Tests: each refusal message; defaults on create; the migration
+- [x] Tests: each refusal message; defaults on create; the migration
       twice; a canonical round trip; route GeoIP behaviour unchanged.
 
 ### Lot C: admission in the engines (`lorica-stream`) - cargo
@@ -669,9 +669,9 @@ Allowlist: `lorica-config/src/models/stream.rs` (the two calls in
 `Stream::validate` and their tests only).
 Depends on: B, 12.4 Lot C, 12.5 Lot G.
 
-- [ ] `udp_exposure_check(self, self.has_source_allowlist())`.
-- [ ] `no_sni_needs_acknowledgement(self.has_source_allowlist())`.
-- [ ] Tests: an exposed UDP stream with an allowlist and no explicit
+- [x] `udp_exposure_check(self, self.has_source_allowlist())`.
+- [x] `no_sni_needs_acknowledgement(self.has_source_allowlist())`.
+- [x] Tests: an exposed UDP stream with an allowlist and no explicit
       cap passes; a `no_sni` stream with an allowlist and no
       acknowledgement passes; removing the allowlist from either is
       refused with the rule's message.
@@ -897,6 +897,67 @@ All eight recommendations of the draft accepted as written.
   charge back if eviction gave the cell to another source meanwhile
   (`a_charge_on_a_cell_that_changed_hands_is_taken_back`).
 
+**Lot B (`lorica-config`), with Lot F folded in.** 12.4 Lot C and 12.5
+Lot G had both landed when Lot B started, so the two allowlist hook-ups
+of Lot F ship here, as the Order paragraph provides.
+
+- **Migration 78** (`migrate_stream_protection`, the next free number):
+  `streams.source_max_connections` (nullable `INTEGER`),
+  `max_pending_connections` (`INTEGER NOT NULL DEFAULT 256`),
+  `source_allow_cidrs` and `source_deny_cidrs` (JSON `TEXT NOT NULL
+  DEFAULT '[]'`), `geoip` (nullable JSON `TEXT`), `source_open_rate`
+  and `open_rate` (nullable `INTEGER`); `stream_backends.max_active`
+  (nullable `INTEGER`). Idempotent through `add_column_if_absent`; the
+  test runs it twice on a 12.4-shaped row.
+- **Canonical format stays 3**, digest updated. Every new field carries
+  a serde default equal to the model's, so a blob without them decodes
+  to streams with no source control and uncapped links
+  (`a_blob_without_the_stream_protection_fields_decodes_to_their_defaults`);
+  no released blob is stamped 3; a 1.10.x peer is refused by version
+  and by schema before it meets the fields; a 1.11.0 build from before
+  them is refused by schema (migration 78) at the handshake. A version
+  step would protect nothing and tell a mixed fleet two incompatible
+  things happened when one did. `GeoIpConfig` joined the shape
+  inventory (reached through a stream now) with a `GeoIpMode` line.
+- `GeoIpConfig::normalised` in `lorica-config` (with
+  `GeoIpConfig::COUNTRIES_MAX`); `validate_geoip` in
+  `routes/crud.rs` delegates to it, messages unchanged, the route
+  tests unchanged and green. `Stream::canonicalise_geoip` stores a
+  stream's list normalised on every store write and import, as
+  `canonicalise_server_names` does.
+- Validation beyond the story's letter, each with its test: a blank
+  entry in either CIDR list is refused (the runtime parser skips
+  blanks, so `["  "]` would count as an allowlist while admitting
+  everyone); an IPv4-mapped IPv6 network is refused (clients are
+  judged on their canonical address, so it would never match, failing
+  open in a deny list). `/0` messages: "admits every address, which is
+  no allowlist" and "refuses every address; set enabled to false".
+- `StreamBackend::validate` (the `max_active` range) runs in
+  `link_stream_backend_unchecked`, so the management write, the import
+  and the replica apply all hold it; the import's preview checks it
+  too. The API's `backend_max_active` key rule is Lot E's.
+- `Stream::effective_pending_connections`, `source_pending_share` and
+  `PENDING_SOURCE_SHARE_DIVISOR` (8) live on the model, for Lot C.
+  `Stream::protection_field_names` names the seven fields (pinned to
+  the type by `every_protection_field_is_a_wire_key_the_fixture_moves`).
+- The two hook-ups name the field in their messages: "a source
+  allowlist (source_allow_cidrs)". Removing the allowlist a stream
+  relies on is refused by the same validation on every write path.
+- `compute_diff` reports a link whose `max_active` changed (a link now
+  compares whole); `stream_eq` already compared every field. Export
+  needed no change: serde carries the fields.
+- **Outside the Lot B allowlist, to keep the gates green:**
+  `lorica-api/openapi.yaml` (the twelve new words in the
+  `StreamRefusal` enum only, which `streams/tests.rs` pins to
+  `StreamRefusal::VARIANTS`); `lorica-api/src/streams/tests.rs` (the
+  view key-set test filters `protection_field_names()` until Lot E
+  publishes them, as 12.4 Lot C did for its TLS fields); one
+  `max_active: None` line in each `StreamBackend` literal of
+  `lorica-stream/src/table.rs`, `lorica-stream/tests/{runtime,
+  tcp_engine, tcp_runtime, udp_engine}.rs` and
+  `lorica/tests/stream_engine_adapters.rs`, without which the
+  workspace does not compile.
+
 ## File List
 
 Lot A:
@@ -906,6 +967,25 @@ Lot A:
 - `lorica-shmem/tests/stream_caps.rs` (modified; outside the Lot A
   allowlist, the multi-process tests the Lot asks for live there)
 
+Lot B (and Lot F):
+
+- `lorica-config/src/models/stream.rs` (modified)
+- `lorica-config/src/models/route.rs` (modified, `GeoIpConfig::normalised`)
+- `lorica-config/src/store/streams.rs` (modified)
+- `lorica-config/src/store/mod.rs` (modified, migration 78)
+- `lorica-config/src/canonical.rs` (modified)
+- `lorica-config/src/diff.rs` (modified)
+- `lorica-config/src/import.rs` (modified)
+- `lorica-api/src/routes/crud.rs` (modified, `validate_geoip` delegates)
+- `lorica-api/openapi.yaml` (modified, refusal enum only; outside the
+  allowlist)
+- `lorica-api/src/streams/tests.rs` (modified, interim view filter;
+  outside the allowlist)
+- `lorica-stream/src/table.rs`, `lorica-stream/tests/runtime.rs`,
+  `lorica-stream/tests/tcp_engine.rs`, `lorica-stream/tests/tcp_runtime.rs`,
+  `lorica-stream/tests/udp_engine.rs`, `lorica/tests/stream_engine_adapters.rs`
+  (modified, `max_active: None` in link literals; outside the allowlist)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -913,3 +993,4 @@ Lot A:
 | 2026-11-15 | 0.1 | Draft: admission order, trusted-peer split, region version 2 for TCP and per-backend counts, per-node `max_connections`, pending cap and per-source share, open rates, link caps, refusal reasons and the shared refusal-log limiter, allowlist hook-ups for 12.4 and 12.5, Lots A to I, eight open questions. | Romain G. |
 | 2026-11-15 | 0.2 | Maintainer answers folded in as Resolved 1 to 8: reasons and costs of new-connections-only filters and of no auto-ban on streams stated in D-a and D-d and made explicit in Lot H; the two `/1` halves accepted in D-c. Status Draft. | Romain G. |
 | 2026-11-15 | 0.3 | Lot A: stream-caps region layout version 2 (pending totals, stream and source open rates, 32-byte source cells, backend shards), the split admission API, the join ABA closed and tested. Status InProgress. | Romain G. |
+| 2026-11-15 | 0.4 | Lot B with Lot F folded in: the source controls on `Stream` and `max_active` on the link, their validation, `GeoIpConfig::normalised`, migration 78, canonical digest (format 3), diff and import; the two allowlist hook-ups. | Romain G. |

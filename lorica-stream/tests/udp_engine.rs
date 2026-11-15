@@ -343,6 +343,7 @@ impl Harness {
                     backend_id: b.id.clone(),
                     backup: false,
                     rule: None,
+                    max_active: None,
                 });
                 rows.push(b.clone());
             }

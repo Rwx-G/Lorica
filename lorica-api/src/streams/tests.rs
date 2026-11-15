@@ -597,6 +597,11 @@ async fn the_view_publishes_every_model_field_but_the_withheld_ones() {
             // Story 12.4 Lot F publishes the TLS fields; until then the view
             // leaves them out. Lot F drops this filter.
             .filter(|k| !lorica_config::models::Stream::tls_field_names().contains(&k.as_str()))
+            // Story 12.6 Lot E publishes the source controls; until then
+            // the view leaves them out. Lot E drops this filter.
+            .filter(|k| {
+                !lorica_config::models::Stream::protection_field_names().contains(&k.as_str())
+            })
             .chain(LINK_FIELDS.iter().map(|k| k.to_string()))
             .collect();
         assert_eq!(keys(&created), model);

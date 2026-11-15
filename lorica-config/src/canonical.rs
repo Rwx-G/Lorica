@@ -1778,6 +1778,55 @@ mod tests {
             .all(|s| s.tls_mode == crate::models::StreamTlsMode::None));
     }
 
+    /// A version-3 blob written before Story 12.6 carries none of the
+    /// stream source controls nor the link's `max_active`; it decodes to
+    /// their defaults, and a blob carrying them decodes them unchanged.
+    #[test]
+    fn a_blob_without_the_stream_protection_fields_decodes_to_their_defaults() {
+        let mut cfg = fleet_config();
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
+        for stream in root["streams"].as_array_mut().expect("test setup: streams") {
+            let object = stream.as_object_mut().expect("test setup: an object");
+            for field in crate::models::Stream::protection_field_names() {
+                assert!(object.remove(field).is_some(), "{field} on the wire");
+            }
+        }
+        for link in root["stream_backends"]
+            .as_array_mut()
+            .expect("test setup: links")
+        {
+            let object = link.as_object_mut().expect("test setup: an object");
+            assert!(
+                object.remove("max_active").is_some(),
+                "max_active on the wire"
+            );
+        }
+        let older = serde_json::to_vec(&root).expect("test setup: re-encode");
+        let decoded = decode_canonical(&older).expect("a 12.4-shaped blob still decodes");
+        assert_eq!(decoded.streams, cfg.streams);
+        assert_eq!(decoded.stream_backends, cfg.stream_backends);
+
+        let stream = &mut cfg.streams[0];
+        stream.source_allow_cidrs = vec!["192.0.2.0/24".to_string()];
+        stream.source_deny_cidrs = vec!["192.0.2.66".to_string()];
+        stream.geoip = Some(crate::models::GeoIpConfig {
+            mode: crate::models::GeoIpMode::Denylist,
+            countries: vec!["US".to_string()],
+        });
+        stream.source_max_connections = Some(16);
+        stream.max_pending_connections = 32;
+        stream.source_open_rate = Some(5);
+        stream.open_rate = Some(500);
+        stream.validate().expect("test setup: a valid stream");
+        cfg.stream_backends[0].max_active = Some(100);
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let decoded = decode_canonical(&bytes).expect("decodes");
+        assert_eq!(decoded.streams, cfg.streams);
+        assert_eq!(decoded.stream_backends, cfg.stream_backends);
+    }
+
     #[test]
     fn the_stream_plane_settings_replicate_through_apply_to() {
         let source = GlobalSettings {
@@ -1926,8 +1975,23 @@ mod tests {
     /// build from before them is refused by schema (migration 77) at the
     /// handshake. A blob without them decodes to streams without TLS.
     /// Pinned by `a_blob_without_the_tls_fields_decodes_to_their_defaults`.
+    ///
+    /// Story 12.6 (1.11.0) moved it again inside the same cycle: `Stream`
+    /// gained the source controls (`source_allow_cidrs`,
+    /// `source_deny_cidrs`, `geoip`, `source_max_connections`,
+    /// `max_pending_connections`, `source_open_rate`, `open_rate`) and
+    /// `StreamBackend` the link's `max_active`, each with a serde default
+    /// equal to the model's; `GeoIpConfig` (reached through a route
+    /// before, through a stream now) joined the inventory and
+    /// `geoip_shape_lines` reads its modes. No version step, for Story
+    /// 12.3's reasons: no released blob is stamped 3, a 1.10.x peer is
+    /// refused by version and by schema before it meets the fields, and a
+    /// 1.11.0 build from before them is refused by schema (migration 78)
+    /// at the handshake. A blob without them decodes to streams with no
+    /// source control and uncapped links. Pinned by
+    /// `a_blob_without_the_stream_protection_fields_decodes_to_their_defaults`.
     const CANONICAL_SHAPE_DIGEST: &str =
-        "a6ce7eff2e19985cf89dd35115aad818ea5e1fbe2c23bfa0d0ae2ceaf4a6973e";
+        "fdccb2993c119eca4def668b78f0648d9b7ed1a56f99115feecde5609c9da10e";
 
     /// Every field name `T` accepts, read from the type itself rather
     /// than from the JSON of some fixture.
@@ -2069,6 +2133,18 @@ mod tests {
         lines
     }
 
+    /// The shape lines of the GeoIP modes a route or a stream filters by
+    /// (Story 12.6): a mode a peer does not know makes it refuse the
+    /// blob.
+    fn geoip_shape_lines() -> Vec<String> {
+        let modes = names_refused_with::<crate::models::GeoIpMode>(
+            "GeoIpMode",
+            serde_json::json!(SHAPE_PROBE),
+            "unknown variant",
+        );
+        vec![format!("GeoIpMode({})", modes.join(","))]
+    }
+
     fn catalogue_template_names() -> Vec<&'static str> {
         lorica_automation_policy::TCP_CHECK_TEMPLATES
             .iter()
@@ -2133,9 +2209,11 @@ mod tests {
             crate::models::StreamTlsTerminate,
             crate::models::StreamUpstreamTls,
             crate::models::MtlsConfig,
+            crate::models::GeoIpConfig,
         ];
         lines.extend(health_check_shape_lines(template_names));
         lines.extend(stream_tls_shape_lines());
+        lines.extend(geoip_shape_lines());
         lines.sort();
         lines
     }

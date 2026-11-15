@@ -235,8 +235,9 @@ fn diff_links<T>(
 }
 
 /// [`diff_links`] for stream links, which also carry the backup flag
-/// (Story 12.3, D-f) and the rule they serve (Story 12.4, D-d): a pair
-/// present on both sides whose flag or rule differs is modified.
+/// (Story 12.3, D-f), the rule they serve (Story 12.4, D-d) and their
+/// cap (Story 12.6, D-h): a pair present on both sides that differs in
+/// any of them is modified.
 fn diff_stream_links(current: &[StreamBackend], incoming: &[StreamBackend]) -> EntityDiff {
     let pair = |sb: &StreamBackend| (sb.stream_id.clone(), sb.backend_id.clone());
     let mut diff = diff_links(current, incoming, pair);
@@ -247,7 +248,7 @@ fn diff_stream_links(current: &[StreamBackend], incoming: &[StreamBackend]) -> E
         .filter(|sb| {
             current_links
                 .get(&pair(sb))
-                .is_some_and(|stored| stored.backup != sb.backup || stored.rule != sb.rule)
+                .is_some_and(|stored| *stored != *sb)
         })
         .map(|sb| format!("{} -> {}", sb.stream_id, sb.backend_id))
         .collect();
@@ -612,6 +613,32 @@ mod tests {
         assert_eq!(
             diff.stream_backends.modified,
             vec![format!("{} -> b-2", sid("s-1"))]
+        );
+    }
+
+    #[test]
+    fn compute_diff_reports_a_source_control_and_a_link_cap() {
+        let store = ConfigStore::open_in_memory().expect("test setup: store");
+        store
+            .create_backend(&sample_stream_backend("b-1", "192.0.2.10:5432"))
+            .expect("test setup: backend");
+        store
+            .create_stream(&sample_stream("s-1", "pg", StreamProtocol::Tcp, 5432))
+            .expect("test setup: stream");
+        store
+            .set_stream_backends(&sid("s-1"), &["b-1".to_string()])
+            .expect("test setup: link");
+        let mut incoming = parse_toml_for_preview(&export_to_toml(&store).expect("export"))
+            .expect("the export parses");
+        assert!(compute_diff(&store, &incoming).expect("diff").is_empty());
+
+        incoming.streams[0].source_allow_cidrs = vec!["192.0.2.0/24".to_string()];
+        incoming.stream_backends[0].max_active = Some(50);
+        let diff = compute_diff(&store, &incoming).expect("diff");
+        assert_eq!(diff.streams.modified, vec![format!("pg ({})", sid("s-1"))]);
+        assert_eq!(
+            diff.stream_backends.modified,
+            vec![format!("{} -> b-1", sid("s-1"))]
         );
     }
 

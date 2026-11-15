@@ -34,7 +34,8 @@ const STREAM_COLUMNS: &str = "id, name, group_name, protocol, enabled, listen_ad
      udp_responses_per_request, udp_response_bytes_ratio, udp_unbounded_responses, \
      udp_source_datagram_rate, udp_source_byte_rate, udp_max_datagram_bytes, \
      tls_mode, match_rules, no_sni_acknowledged, clienthello_timeout_ms, tls_terminate, \
-     upstream_tls";
+     upstream_tls, source_max_connections, max_pending_connections, source_allow_cidrs, \
+     source_deny_cidrs, geoip, source_open_rate, open_rate";
 
 /// The `udp_*` columns of one row (Story 12.5 D-l), in `STREAM_COLUMNS`
 /// order, every one NULL on a TCP row.
@@ -155,11 +156,37 @@ fn tls_to_columns(stream: &Stream) -> Result<TlsColumns> {
     })
 }
 
-/// The stream as the store writes it: its rules' server names in the
-/// form they are matched in (Story 12.4, D-c), whichever writer sent it.
+/// The source-control columns of a stream (Story 12.6, D-m), in
+/// `STREAM_COLUMNS` order.
+struct ProtectionColumns {
+    source_max_connections: Option<u32>,
+    max_pending_connections: u32,
+    source_allow_cidrs: String,
+    source_deny_cidrs: String,
+    geoip: Option<String>,
+    source_open_rate: Option<u32>,
+    open_rate: Option<u32>,
+}
+
+fn protection_to_columns(stream: &Stream) -> Result<ProtectionColumns> {
+    Ok(ProtectionColumns {
+        source_max_connections: stream.source_max_connections,
+        max_pending_connections: stream.max_pending_connections,
+        source_allow_cidrs: serialize_field("source_allow_cidrs", &stream.source_allow_cidrs)?,
+        source_deny_cidrs: serialize_field("source_deny_cidrs", &stream.source_deny_cidrs)?,
+        geoip: serialize_optional_field("geoip", stream.geoip.as_ref())?,
+        source_open_rate: stream.source_open_rate,
+        open_rate: stream.open_rate,
+    })
+}
+
+/// The stream as the store writes it, whichever writer sent it: its
+/// rules' server names in the form they are matched in (Story 12.4,
+/// D-c), and its GeoIP country codes in theirs (Story 12.6, D-d).
 fn as_stored(stream: &Stream) -> Stream {
     let mut stored = stream.clone();
     stored.canonicalise_server_names();
+    stored.canonicalise_geoip();
     stored
 }
 
@@ -248,6 +275,13 @@ fn row_to_stream(row: &rusqlite::Row<'_>) -> Result<Stream> {
         clienthello_timeout_ms: row.get(39)?,
         tls_terminate: json_object(row.get(40)?, "tls_terminate")?,
         upstream_tls: json_object(row.get(41)?, "upstream_tls")?,
+        source_max_connections: row.get(42)?,
+        max_pending_connections: row.get(43)?,
+        source_allow_cidrs: json_list(&row.get::<_, String>(44)?, "source_allow_cidrs")?,
+        source_deny_cidrs: json_list(&row.get::<_, String>(45)?, "source_deny_cidrs")?,
+        geoip: json_object(row.get(46)?, "geoip")?,
+        source_open_rate: row.get(47)?,
+        open_rate: row.get(48)?,
         created_at: parse_datetime(&row.get::<_, String>(9)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(10)?)?,
     })
@@ -295,13 +329,15 @@ impl ConfigStore {
         let sources = serialize_field("source_addresses", &stream.source_addresses)?;
         let udp = udp_to_columns(stream.udp.as_ref());
         let tls = tls_to_columns(stream)?;
+        let protection = protection_to_columns(stream)?;
         self.conn
             .execute(
                 &format!(
                     "INSERT INTO streams ({STREAM_COLUMNS}) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
                      ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
-                     ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)"
+                     ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, \
+                     ?43, ?44, ?45, ?46, ?47, ?48, ?49)"
                 ),
                 params![
                     stream.id,
@@ -346,6 +382,13 @@ impl ConfigStore {
                     tls.clienthello_timeout_ms,
                     tls.tls_terminate,
                     tls.upstream_tls,
+                    protection.source_max_connections,
+                    protection.max_pending_connections,
+                    protection.source_allow_cidrs,
+                    protection.source_deny_cidrs,
+                    protection.geoip,
+                    protection.source_open_rate,
+                    protection.open_rate,
                 ],
             )
             .map_err(|e| name_taken(e, &stream.name))?;
@@ -403,6 +446,7 @@ impl ConfigStore {
         let sources = serialize_field("source_addresses", &stream.source_addresses)?;
         let udp = udp_to_columns(stream.udp.as_ref());
         let tls = tls_to_columns(stream)?;
+        let protection = protection_to_columns(stream)?;
         let changed = self
             .conn
             .execute(
@@ -420,7 +464,10 @@ impl ConfigStore {
                  udp_unbounded_responses = ?32, udp_source_datagram_rate = ?33, \
                  udp_source_byte_rate = ?34, udp_max_datagram_bytes = ?35, tls_mode = ?36, \
                  match_rules = ?37, no_sni_acknowledged = ?38, clienthello_timeout_ms = ?39, \
-                 tls_terminate = ?40, upstream_tls = ?41 WHERE id = ?1",
+                 tls_terminate = ?40, upstream_tls = ?41, source_max_connections = ?42, \
+                 max_pending_connections = ?43, source_allow_cidrs = ?44, \
+                 source_deny_cidrs = ?45, geoip = ?46, source_open_rate = ?47, \
+                 open_rate = ?48 WHERE id = ?1",
                 params![
                     stream.id,
                     stream.name,
@@ -463,6 +510,13 @@ impl ConfigStore {
                     tls.clienthello_timeout_ms,
                     tls.tls_terminate,
                     tls.upstream_tls,
+                    protection.source_max_connections,
+                    protection.max_pending_connections,
+                    protection.source_allow_cidrs,
+                    protection.source_deny_cidrs,
+                    protection.geoip,
+                    protection.source_open_rate,
+                    protection.open_rate,
                 ],
             )
             .map_err(|e| name_taken(e, &stream.name))?;
@@ -561,13 +615,21 @@ impl ConfigStore {
     }
 
     /// Write one stream-backend link without the attachment rule, for a
-    /// writer that checked a whole consistent snapshot first.
-    /// Idempotent (ignores duplicates: the first write of a pair stands).
+    /// writer that checked a whole consistent snapshot first. The link's
+    /// own rule (`StreamBackend::validate`) still applies. Idempotent
+    /// (ignores duplicates: the first write of a pair stands).
     pub(crate) fn link_stream_backend_unchecked(&self, link: &StreamBackend) -> Result<()> {
+        link.validate().map_err(ConfigError::Validation)?;
         self.conn.execute(
-            "INSERT OR IGNORE INTO stream_backends (stream_id, backend_id, backup, rule) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![link.stream_id, link.backend_id, link.backup, link.rule],
+            "INSERT OR IGNORE INTO stream_backends \
+             (stream_id, backend_id, backup, rule, max_active) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                link.stream_id,
+                link.backend_id,
+                link.backup,
+                link.rule,
+                link.max_active
+            ],
         )?;
         Ok(())
     }
@@ -575,7 +637,7 @@ impl ConfigStore {
     /// Every stream-backend link, ordered by stream then backend ID.
     pub fn list_stream_backends(&self) -> Result<Vec<StreamBackend>> {
         let mut stmt = self.conn.prepare(
-            "SELECT stream_id, backend_id, backup, rule FROM stream_backends \
+            "SELECT stream_id, backend_id, backup, rule, max_active FROM stream_backends \
              ORDER BY stream_id, backend_id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -584,6 +646,7 @@ impl ConfigStore {
                 backend_id: row.get(1)?,
                 backup: row.get(2)?,
                 rule: row.get(3)?,
+                max_active: row.get(4)?,
             })
         })?;
         let mut links = Vec::new();
@@ -869,12 +932,7 @@ mod tests {
         store.delete_backend("b-1").expect("delete backend");
         assert_eq!(
             store.list_stream_backends().expect("links"),
-            vec![StreamBackend {
-                stream_id: sid("s-2"),
-                backend_id: "b-2".to_string(),
-                backup: false,
-                rule: None,
-            }]
+            vec![StreamBackend::primary(&sid("s-2"), "b-2")]
         );
     }
 
@@ -965,6 +1023,66 @@ mod tests {
             Err(ConfigError::Validation(_))
         ));
         assert_eq!(store.list_stream_backends().expect("links"), links);
+    }
+
+    #[test]
+    fn every_source_control_and_the_link_cap_round_trip() {
+        let store = store_with_backends(&[("b-1", "192.0.2.10:5432"), ("b-2", "192.0.2.20:5432")]);
+        let mut s = sample_stream("s-1", "pg", StreamProtocol::Tcp, 5432);
+        s.source_allow_cidrs = vec!["192.0.2.0/24".to_string(), "2001:db8::/32".to_string()];
+        s.source_deny_cidrs = vec!["192.0.2.66".to_string()];
+        s.geoip = Some(GeoIpConfig {
+            mode: GeoIpMode::Allowlist,
+            countries: vec!["fr".to_string(), " DE ".to_string(), "FR".to_string()],
+        });
+        s.source_max_connections = Some(16);
+        s.max_pending_connections = 32;
+        s.source_open_rate = Some(5);
+        s.open_rate = Some(500);
+        store.create_stream(&s).expect("create");
+        let stored = store.get_stream(&sid("s-1")).expect("get").expect("kept");
+        let mut expected = s.clone();
+        expected.geoip = Some(GeoIpConfig {
+            mode: GeoIpMode::Allowlist,
+            countries: vec!["FR".to_string(), "DE".to_string()],
+        });
+        assert_eq!(stored, expected, "the GeoIP list is stored normalised");
+
+        s.source_allow_cidrs.clear();
+        s.geoip = None;
+        s.source_open_rate = None;
+        store.update_stream(&s).expect("update");
+        assert_eq!(store.get_stream(&sid("s-1")).expect("get"), Some(s.clone()));
+
+        let links = vec![
+            StreamBackend {
+                max_active: Some(100),
+                ..StreamBackend::primary(&sid("s-1"), "b-1")
+            },
+            StreamBackend::primary(&sid("s-1"), "b-2"),
+        ];
+        store
+            .set_stream_links(&sid("s-1"), &links)
+            .expect("a capped and an uncapped link");
+        assert_eq!(store.list_stream_backends().expect("links"), links);
+        let zero = [StreamBackend {
+            max_active: Some(0),
+            ..StreamBackend::primary(&sid("s-1"), "b-1")
+        }];
+        let err = store
+            .set_stream_links(&sid("s-1"), &zero)
+            .expect_err("a cap of 0");
+        assert!(
+            matches!(&err, ConfigError::Validation(m) if m.contains("max_active")),
+            "{err}"
+        );
+        assert_eq!(store.list_stream_backends().expect("links"), links);
+
+        s.source_deny_cidrs = vec!["0.0.0.0/0".to_string()];
+        assert!(matches!(
+            store.update_stream(&s),
+            Err(ConfigError::Validation(m)) if m.contains("source_deny_cidrs")
+        ));
     }
 
     #[test]

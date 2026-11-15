@@ -265,6 +265,7 @@ impl Harness {
                 backend_id: b.id.clone(),
                 backup: *backup,
                 rule: None,
+                max_active: None,
             })
             .collect();
         let rows = backends.into_iter().map(|(b, _)| b).collect();

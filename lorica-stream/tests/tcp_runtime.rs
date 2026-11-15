@@ -159,12 +159,14 @@ fn table(health: HealthStatus, addresses: [SocketAddr; 2]) -> StreamTable {
             backend_id: "b-follows".into(),
             backup: false,
             rule: None,
+            max_active: None,
         },
         StreamBackend {
             stream_id: "stays".into(),
             backend_id: "b-stays".into(),
             backup: false,
             rule: None,
+            max_active: None,
         },
     ];
     let backends = vec![

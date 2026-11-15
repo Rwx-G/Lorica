@@ -295,6 +295,7 @@ mod tests {
                 backend_id: "b1".into(),
                 backup: false,
                 rule: None,
+                max_active: None,
             }],
         );
         assert!(table.holds("on", None));
