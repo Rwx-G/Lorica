@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use lorica_cache::key::HashBinary;
 use lorica_cache::{CacheMeta, VarianceBuilder};
-use lorica_config::models::Route;
+use lorica_config::models::{organizations_admitted, Route};
 use lorica_proxy::Session;
 use once_cell::sync::Lazy;
 use std::borrow::Cow;
@@ -488,17 +488,7 @@ pub fn evaluate_mtls(enforcer: &MtlsEnforcer, client_cert: RouteClientCert<'_>) 
         RouteClientCert::Absent => enforcer.required.then_some(496),
         RouteClientCert::Untrusted => enforcer.required.then_some(495),
         RouteClientCert::Verified { organizations } => {
-            // Empty allowlist = accept any verified client.
-            if enforcer.allowed_organizations.is_empty()
-                || enforcer
-                    .allowed_organizations
-                    .iter()
-                    .any(|allowed| organizations.iter().any(|o| o == allowed))
-            {
-                None
-            } else {
-                Some(495)
-            }
+            (!organizations_admitted(&enforcer.allowed_organizations, organizations)).then_some(495)
         }
     }
 }
