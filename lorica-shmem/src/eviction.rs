@@ -249,6 +249,24 @@ mod tests {
     }
 
     #[test]
+    fn evicting_an_idle_key_keeps_the_count_of_the_active_key_behind_it() {
+        const NOW: u64 = 1_000_000_000_000;
+        const STALE_AFTER: u64 = 5_000_000_000;
+        let table: Box<AtomicHashTable<1024>> = AtomicHashTable::new_zeroed();
+        // Same start slot: `active` is placed behind `idle`.
+        let idle = crate::table::tagged_hash(0x0000_0000_0000_0401);
+        let active = crate::table::tagged_hash(0x8000_0000_0000_0401);
+        table.increment(idle, 1, NOW - 100 * STALE_AFTER);
+        for _ in 0..5 {
+            table.increment(active, 1, NOW);
+        }
+        assert_eq!(evict_table(&*table, NOW, STALE_AFTER).1, 1);
+        assert_eq!(table.read(idle), None);
+        assert_eq!(table.read(active), Some(5));
+        assert_eq!(table.increment(active, 1, NOW), 6);
+    }
+
+    #[test]
     fn evict_both_tables() {
         let (region, _fd) = SharedRegion::create_supervisor().expect("create");
         let now_ns: u64 = 1_000_000_000_000;
