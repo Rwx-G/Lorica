@@ -250,7 +250,13 @@ impl CanonicalCaptureRule {
 /// log-sink and exporter field is treated as node-local here:
 /// collectors and their credentials are per-node infrastructure the
 /// PRD predates - Story 9.4 revisits that split if fleet-wide sink
-/// policy is wanted.
+/// policy is wanted. Story 12.8's `proxy_protocol_http`,
+/// `proxy_protocol_https` and `proxy_protocol_trusted_cidrs` are
+/// node-local for the reason `trusted_proxies` is: a replicated PROXY
+/// trust list would let one control-plane compromise make every edge
+/// accept forged client addresses. The routing destructure of
+/// [`GlobalSettings`] in this module is what enforces the split; this paragraph
+/// says why.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalGlobalSettings {
