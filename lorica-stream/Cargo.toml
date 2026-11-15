@@ -19,6 +19,12 @@ lorica-worker = { version = "1.10.6", path = "../lorica-worker" }
 # The PROXY protocol parser and encoder (Story 12.3 D-j, D-k), shared
 # with the HTTP listeners. Default features off: no TLS stack.
 lorica-core = { version = "0.1.0", path = "../lorica-core", default-features = false }
+# The stream-caps regions of UDP streams (Story 12.5 D-d): a worker maps
+# the memfd a `caps` message carries, the supervisor creates them.
+lorica-shmem = { version = "1.10.6", path = "../lorica-shmem" }
+# `recvmsg` with `IP_PKTINFO` / `IPV6_PKTINFO` on wildcard UDP listen
+# addresses (Story 12.5 D-g): tokio's `UdpSocket` has no ancillary API.
+nix = { version = "0.31", features = ["socket", "net", "uio"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 # Puts the stream control end in non-blocking mode for `AsyncFd`; TCP

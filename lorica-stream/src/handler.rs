@@ -31,12 +31,13 @@ use lorica_config::models::{Stream, StreamEndReason};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::debug;
 
+use crate::caps::CapsRegistry;
 use crate::counters::StreamCounters;
 use crate::local::BoundPorts;
 use crate::table::StreamTable;
 use crate::tracker::{ConnectionTracker, TrackedConnection};
 
-/// The future a handler returns; the runtime spawns it.
+/// The future a TCP handler returns; the runtime spawns it.
 pub type HandlerFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 /// A TCP connection accepted on a stream listener.
@@ -74,30 +75,64 @@ pub trait StreamHandler: Send + Sync + 'static {
     fn table_changed(&self, _table: &StreamTable) {}
 }
 
-/// A datagram received on a stream's UDP socket.
+/// A datagram received on a stream's UDP socket, borrowed from the
+/// receive loop for the length of one [`DatagramHandler::handle`] call
+/// (Story 12.5 D-c). An engine that keeps anything past the call (a new
+/// session's socket, snapshot or table) clones it then, never per
+/// datagram.
 #[derive(Debug)]
-pub struct Datagram {
-    /// The payload.
-    pub payload: Vec<u8>,
-    /// Where it came from.
+pub struct Datagram<'a> {
+    /// The payload, in the runtime thread's receive buffer
+    /// ([`crate::listener::with_receive_buffer`]): nothing is copied or
+    /// allocated per datagram.
+    pub payload: &'a [u8],
+    /// Where it came from, as the socket reports it: on a dual-stack
+    /// `[::]` socket an IPv4 client shows IPv4-mapped.
     pub source: SocketAddr,
+    /// The local address and port the datagram reached: the socket's own
+    /// address for a specific listen address, and for `0.0.0.0` or
+    /// `[::]` the destination `IP_PKTINFO` / `IPV6_PKTINFO` reported
+    /// (Story 12.5 D-g), in the socket's family (IPv4-mapped on a
+    /// dual-stack `[::]` socket), so a reply sent with it as source
+    /// leaves from the address the client targeted.
+    pub local: SocketAddr,
     /// The worker slot's socket it arrived on, to answer from.
-    pub socket: Arc<UdpSocket>,
+    pub socket: &'a Arc<UdpSocket>,
     /// The binding the socket belongs to.
     pub bind_gen: u64,
     /// The stream as the table holds it now. A session the engine
-    /// creates keeps this `Arc` for its life.
-    pub snapshot: Arc<Stream>,
+    /// creates keeps a clone of this `Arc` for its life.
+    pub snapshot: &'a Arc<Stream>,
+    /// The table the datagram was received against: the backends, their
+    /// links and their health (Story 12.3 D-i).
+    pub table: &'a Arc<StreamTable>,
     /// The worker's tracker, where the engine registers a session.
-    pub tracker: ConnectionTracker,
+    pub tracker: &'a ConnectionTracker,
+    /// The listen ports this process holds, for the connect-time local
+    /// check (Story 12.3 D-m).
+    pub bound_ports: &'a BoundPorts,
+    /// The stream-caps regions this worker was handed, by stream id
+    /// (Story 12.5 D-d).
+    pub caps: &'a CapsRegistry,
+    /// Whether the binding is draining (Story 12.5 D-m): a datagram of
+    /// an existing session is still served; one that would open a
+    /// session is dropped and counted `binding_draining`, and no session
+    /// is created.
+    pub draining: bool,
 }
 
 /// What serves UDP datagrams (Story 12.5).
 pub trait DatagramHandler: Send + Sync + 'static {
-    /// Take one datagram. The receive loop awaits it before reading the
-    /// next one on the same socket, so it must hand off rather than wait
-    /// on a backend.
-    fn handle(&self, datagram: Datagram) -> HandlerFuture;
+    /// Take one datagram, synchronously: the receive loop reads the next
+    /// datagram only when this returns, so it never waits. Everything it
+    /// does is a non-blocking syscall or an atomic; whatever must wait on
+    /// a backend runs in a task the engine spawns (D-c).
+    fn handle(&self, datagram: Datagram<'_>);
+
+    /// Told after every table load, including the first, from the
+    /// runtime's thread, as [`StreamHandler::table_changed`]. Must not
+    /// block.
+    fn table_changed(&self, _table: &StreamTable) {}
 }
 
 /// What one stream connection did, built once when it ends (Story 12.3

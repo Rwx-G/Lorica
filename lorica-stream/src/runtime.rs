@@ -20,30 +20,42 @@
 //! nothing with Pingora but the process: no listener in Pingora's set, no
 //! task on Pingora's runtimes.
 //!
-//! The runtime applies the four control messages and answers each:
+//! The runtime applies the five control messages and answers each:
 //!
 //! | Message | Effect | `ack` count |
 //! |---|---|---|
 //! | `attach` | adopt the sockets, start one loop per socket | sockets adopted |
-//! | `detach` | stop the binding's loops, close its sockets, drain its connections with `config_removed` | sockets closed |
+//! | `detach` | TCP: stop the binding's loops, close its sockets; UDP: put its loops in drain mode; then drain its connections or sessions with `config_removed` | TCP: sockets closed; UDP: sockets put in drain |
 //! | `refresh` | reload the table, drain what it no longer holds with `config_removed` | connections newly draining |
-//! | `quiesce` | stop every loop, drain everything with `node_shutdown` | bindings stopped |
+//! | `quiesce` | stop every TCP loop, put every UDP loop in drain mode, drain everything with `node_shutdown` | bindings stopped or draining |
+//! | `caps` | map the UDP stream's caps region and make it the stream's current one in the [`CapsRegistry`] the engine reads | 1 |
 //!
 //! A refused message is answered with a `nack`: `unknown_binding` for a
 //! `detach` of a binding it does not hold, `shutting_down` for an
 //! `attach` after a quiesce, `adopt_failed` when a socket cannot be
-//! adopted (the whole `attach` is then dropped and its sockets closed),
+//! adopted (the whole `attach` is then dropped and its sockets closed)
+//! or a caps region cannot be used (not mappable, another layout
+//! version, another `caps_gen` than the message's, no such slot: the
+//! stream's sessions then have no region in this worker),
 //! `table_unavailable` for a `refresh` whose table load failed (the
 //! previous table is kept and nothing is drained).
 //!
-//! A `detach` is acknowledged only once its sockets are closed, so the
-//! port is free in this worker when the supervisor reads the `ack`.
+//! A TCP `detach` is acknowledged only once its sockets are closed, so
+//! the port is free in this worker when the supervisor reads the `ack`.
+//! A UDP binding drains with its sockets open (Story 12.5 D-m): a session
+//! is only reachable through the slot socket its client hashes to, so
+//! its loops keep serving existing sessions, open none, and close their
+//! sockets when the binding's last session ends or at the drain
+//! deadline, whichever comes first.
 //!
 //! After every table load (start, `refresh`, the `attach` of an unknown
-//! stream) the TCP engine is told ([`crate::StreamHandler::table_changed`]),
-//! and every connection whose accepted snapshot sets
-//! `close_on_backend_down` and whose backend is `Down` in the new table
-//! is closed at once with `backend_down` (Story 12.3 D-i).
+//! stream) both engines are told
+//! ([`crate::StreamHandler::table_changed`],
+//! [`crate::DatagramHandler::table_changed`]), the caps regions of
+//! streams the table no longer holds are forgotten, and every connection
+//! or session whose accepted snapshot sets `close_on_backend_down` and
+//! whose backend is `Down` in the new table is closed at once with
+//! `backend_down` (Story 12.3 D-i).
 //!
 //! Every drain duration is capped at
 //! [`GlobalSettings::WORKER_DRAIN_TIMEOUT_MAX_S`], the setting's hard
@@ -51,20 +63,24 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use lorica_config::models::{GlobalSettings, HealthStatus, StreamEndReason};
+use lorica_shmem::StreamCapsRegion;
+use lorica_worker::fd_passing::StreamProto;
 use lorica_worker::stream_ctl::{NackReason, StreamCtlMsg, StreamSocket};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
+use crate::caps::CapsRegistry;
 use crate::counters::{CountersSnapshot, StreamCounters};
 use crate::handler::Engines;
-use crate::listener::{self, AdoptedSocket, LoopContext};
+use crate::listener::{self, AdoptedSocket, LoopContext, LoopMode};
 use crate::local::BoundPorts;
 use crate::table::{SharedTable, StreamTable, StreamTableSource};
 use crate::tracker::ConnectionTracker;
@@ -164,13 +180,21 @@ pub struct StreamRuntime {
     tracker: ConnectionTracker,
     bindings: HashMap<(String, u64), Binding>,
     bound_ports: BoundPorts,
+    caps: CapsRegistry,
+    /// The tasks closing draining UDP bindings (D-m).
+    draining: Vec<JoinHandle<()>>,
+    /// Turns true when the runtime ends, closing every draining binding
+    /// at once.
+    ending: watch::Sender<bool>,
     quiesced: watch::Sender<Option<Duration>>,
 }
 
 struct Binding {
-    stop: watch::Sender<bool>,
+    mode: watch::Sender<LoopMode>,
     loops: Vec<JoinHandle<()>>,
     ports: Vec<u16>,
+    /// Whether its sockets are UDP ones, which drain open (D-m).
+    udp: bool,
 }
 
 fn drain_duration(drain_ms: u64) -> Duration {
@@ -215,6 +239,9 @@ impl StreamRuntime {
             tracker: tracker.clone(),
             bindings: HashMap::new(),
             bound_ports: BoundPorts::new(),
+            caps: CapsRegistry::new(),
+            draining: Vec::new(),
+            ending: watch::channel(false).0,
             quiesced: quiesced_tx,
         };
         let thread = thread::Builder::new()
@@ -266,7 +293,13 @@ impl StreamRuntime {
         reaper.abort();
         let bindings: Vec<Binding> = self.bindings.drain().map(|(_, b)| b).collect();
         for binding in bindings {
-            self.stop_binding(binding).await;
+            stop_binding(binding, &self.bound_ports).await;
+        }
+        self.ending.send_replace(true);
+        for task in self.draining.drain(..) {
+            if let Err(e) = task.await {
+                error!(error = %e, "draining UDP binding ended abnormally");
+            }
         }
     }
 
@@ -292,6 +325,14 @@ impl StreamRuntime {
         if let Some(tcp) = &self.engines.tcp {
             tcp.table_changed(table);
         }
+        if let Some(udp) = &self.engines.udp {
+            udp.table_changed(table);
+        }
+        // A `caps` precedes the `attach` of a new stream, whose table
+        // load reads the store the supervisor wrote it to first, so a
+        // stream the table lacks is one that left.
+        self.caps
+            .retain(|stream_id| table.stream(stream_id).is_some());
         let now = Instant::now();
         let down = self.tracker.drain_where(
             |e| {
@@ -338,22 +379,9 @@ impl StreamRuntime {
                 seq,
                 stream_id,
                 caps_gen,
-                ..
-            } => {
-                // No engine here counts sessions on a caps region yet: the
-                // region's fd closes with the message and the binding
-                // reports the worker as not serving, as a bad attach does.
-                warn!(
-                    seq,
-                    %stream_id,
-                    caps_gen,
-                    "stream caps region refused: this runtime maps none"
-                );
-                Some(StreamCtlMsg::Nack {
-                    seq,
-                    reason: NackReason::AdoptFailed,
-                })
-            }
+                slot,
+                region,
+            } => Some(self.adopt_caps(seq, &stream_id, caps_gen, slot, region)),
             StreamCtlMsg::Ack { seq, .. } | StreamCtlMsg::Nack { seq, .. } => {
                 warn!(
                     seq,
@@ -379,6 +407,7 @@ impl StreamRuntime {
         }
         let mut adopted: Vec<AdoptedSocket> = Vec::with_capacity(sockets.len());
         let mut ports: Vec<u16> = Vec::with_capacity(sockets.len());
+        let udp = sockets.iter().any(|s| s.proto == StreamProto::Udp);
         for socket in sockets {
             match listener::adopt(socket.proto, socket.fd) {
                 Ok(a) => {
@@ -405,10 +434,12 @@ impl StreamRuntime {
             .bindings
             .entry((stream_id.clone(), bind_gen))
             .or_insert_with(|| Binding {
-                stop: watch::channel(false).0,
+                mode: watch::channel(LoopMode::Serving).0,
                 loops: Vec::new(),
                 ports: Vec::new(),
+                udp: false,
             });
+        binding.udp |= udp;
         for port in ports {
             self.bound_ports.add(port);
             binding.ports.push(port);
@@ -420,12 +451,13 @@ impl StreamRuntime {
             tracker: self.tracker.clone(),
             engines: self.engines.clone(),
             bound_ports: self.bound_ports.clone(),
+            caps: self.caps.clone(),
         };
         for socket in adopted {
             binding.loops.push(tokio::spawn(listener::run(
                 socket,
                 ctx.clone(),
-                binding.stop.subscribe(),
+                binding.mode.subscribe(),
             )));
         }
         debug!(%stream_id, bind_gen, sockets = n, "stream sockets attached");
@@ -448,8 +480,20 @@ impl StreamRuntime {
                 reason: NackReason::UnknownBinding,
             };
         };
-        let closed = self.stop_binding(binding).await;
         let deadline = Instant::now() + drain_duration(drain_ms);
+        let sockets = if binding.udp {
+            let sockets = binding.loops.len();
+            self.drain_open(
+                stream_id.clone(),
+                bind_gen,
+                binding,
+                deadline,
+                StreamEndReason::ConfigRemoved,
+            );
+            sockets
+        } else {
+            stop_binding(binding, &self.bound_ports).await
+        };
         let draining = self.tracker.drain_binding(
             &stream_id,
             bind_gen,
@@ -457,11 +501,45 @@ impl StreamRuntime {
             StreamEndReason::ConfigRemoved,
         );
         self.tracker.close_expired(Instant::now());
-        debug!(%stream_id, bind_gen, sockets = closed, draining, "stream binding detached");
+        debug!(%stream_id, bind_gen, sockets, draining, "stream binding detached");
         StreamCtlMsg::Ack {
             seq,
-            count: count(closed),
+            count: count(sockets),
         }
+    }
+
+    /// Put a UDP binding's loops in drain mode and hand it to a task
+    /// that closes its sockets when its last session ends, at
+    /// `deadline`, or when the runtime ends, whichever comes first
+    /// (D-m). Its sessions are drained by the caller, with `reason`.
+    fn drain_open(
+        &mut self,
+        stream_id: String,
+        bind_gen: u64,
+        binding: Binding,
+        deadline: Instant,
+        reason: StreamEndReason,
+    ) {
+        binding.mode.send_replace(LoopMode::Draining);
+        self.draining.retain(|task| !task.is_finished());
+        let tracker = self.tracker.clone();
+        let bound_ports = self.bound_ports.clone();
+        let mut ending = self.ending.subscribe();
+        self.draining.push(tokio::spawn(async move {
+            tokio::select! {
+                _ = tracker.binding_ended(&stream_id, bind_gen) => {}
+                _ = tokio::time::sleep_until(deadline) => {}
+                _ = ending.wait_for(|e| *e) => {}
+            }
+            // A loop that read `serving` just before the switch may have
+            // opened a session after its binding was drained: it ends now
+            // with the binding's reason rather than outliving its socket.
+            let now = Instant::now();
+            tracker.drain_binding(&stream_id, bind_gen, now, reason);
+            tracker.close_expired(now);
+            let closed = stop_binding(binding, &bound_ports).await;
+            debug!(%stream_id, bind_gen, sockets = closed, "draining UDP binding closed");
+        }));
     }
 
     fn refresh(&mut self, seq: u64, drain_ms: u64) -> StreamCtlMsg {
@@ -487,37 +565,88 @@ impl StreamRuntime {
         }
     }
 
-    /// Stop every binding and drain everything for `drain`. Returns the
-    /// bindings stopped.
+    /// Stop every TCP binding, put every UDP binding in drain mode, and
+    /// drain everything for `drain` with `node_shutdown`. Returns the
+    /// bindings stopped or draining.
     async fn quiesce(&mut self, drain: Duration) -> usize {
-        let bindings: Vec<Binding> = self.bindings.drain().map(|(_, b)| b).collect();
+        let deadline = Instant::now() + drain;
+        let bindings: Vec<((String, u64), Binding)> = self.bindings.drain().collect();
         let stopped = bindings.len();
-        for binding in bindings {
-            self.stop_binding(binding).await;
+        for ((stream_id, bind_gen), binding) in bindings {
+            if binding.udp {
+                self.drain_open(
+                    stream_id,
+                    bind_gen,
+                    binding,
+                    deadline,
+                    StreamEndReason::NodeShutdown,
+                );
+            } else {
+                stop_binding(binding, &self.bound_ports).await;
+            }
         }
         self.tracker
-            .drain_all(Instant::now() + drain, StreamEndReason::NodeShutdown);
+            .drain_all(deadline, StreamEndReason::NodeShutdown);
         self.tracker.close_expired(Instant::now());
         self.quiesced.send_replace(Some(drain));
         stopped
     }
 
-    /// Stop a binding's loops, wait until each has closed its socket, and
-    /// forget its ports. Returns the sockets closed.
-    async fn stop_binding(&self, binding: Binding) -> usize {
-        binding.stop.send_replace(true);
-        let mut closed = 0;
-        for task in binding.loops {
-            if let Err(e) = task.await {
-                error!(error = %e, "stream loop ended abnormally");
+    /// Map the caps region of UDP stream `stream_id` and make it the
+    /// stream's current one under worker slot `slot` (D-d).
+    fn adopt_caps(
+        &self,
+        seq: u64,
+        stream_id: &str,
+        caps_gen: u64,
+        slot: u32,
+        region: OwnedFd,
+    ) -> StreamCtlMsg {
+        let refused = |why: &dyn std::fmt::Display| {
+            warn!(seq, %stream_id, caps_gen, slot, reason = %why,
+                  "stream caps region refused");
+            StreamCtlMsg::Nack {
+                seq,
+                reason: NackReason::AdoptFailed,
             }
-            closed += 1;
+        };
+        let region = match StreamCapsRegion::open(region) {
+            Ok(region) => Arc::new(region),
+            Err(e) => return refused(&e),
+        };
+        if region.caps_gen() != caps_gen {
+            return refused(&format_args!(
+                "the region is caps_gen {}, the message {caps_gen}",
+                region.caps_gen()
+            ));
         }
-        for port in binding.ports {
-            self.bound_ports.remove(port);
-        }
-        closed
+        let Some(worker) = region.worker(slot) else {
+            return refused(&format_args!(
+                "the region has {} worker slots",
+                region.layout().workers
+            ));
+        };
+        self.caps.adopt(stream_id, worker);
+        debug!(%stream_id, caps_gen, slot, "stream caps region adopted");
+        StreamCtlMsg::Ack { seq, count: 1 }
     }
+}
+
+/// Stop a binding's loops, wait until each has closed its socket, and
+/// forget its ports. Returns the sockets closed.
+async fn stop_binding(binding: Binding, bound_ports: &BoundPorts) -> usize {
+    binding.mode.send_replace(LoopMode::Stopped);
+    let mut closed = 0;
+    for task in binding.loops {
+        if let Err(e) = task.await {
+            error!(error = %e, "stream loop ended abnormally");
+        }
+        closed += 1;
+    }
+    for port in binding.ports {
+        bound_ports.remove(port);
+    }
+    closed
 }
 
 /// Close each draining connection at its deadline.

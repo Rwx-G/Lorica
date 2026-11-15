@@ -39,12 +39,15 @@
 //! engine of Story 12.5 sits beside it: the [`seams`] the binary
 //! implements (selection, breaker, resolution), the connect-time
 //! [`local`] check, the host-name [`resolver`] cache and the
-//! [`counters`].
+//! [`counters`]. The UDP streams' per-node caps live on the stream-caps
+//! regions of [`caps`] (Story 12.5 D-d): created by the supervisor,
+//! mapped by every worker.
 //!
 //! The crate opens no store and spawns nothing on its own: the binary
 //! composes it (Story 12.2 Lot D), the API reads its types (Lot E3).
 
 pub mod budget;
+pub mod caps;
 pub mod counters;
 pub mod handler;
 pub mod listener;
@@ -63,6 +66,7 @@ pub use budget::{
     held_fds, BudgetUsage, BudgetViolation, CeilingBound, FdBudget, HeldFds, SessionCeiling,
     SourcePool, StreamDemand,
 };
+pub use caps::{CapsRegistry, NodeCapsRegions, StreamCaps};
 pub use counters::{CountersSnapshot, StreamCounters};
 pub use handler::{
     AcceptedConnection, ConnectionObserver, ConnectionRecord, Datagram, DatagramHandler, Engines,

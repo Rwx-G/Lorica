@@ -935,26 +935,26 @@ Allowlist: `lorica-stream/src/budget.rs`, `lorica-stream/src/handler.rs`,
 `lorica-stream/Cargo.toml` (`lorica-shmem` path dependency), `Cargo.lock`.
 Depends on: A, B, C; 12.3 Lot C (same files).
 
-- [ ] Budget (D-e): `lorica_stream::held_fds(&Stream)` dispatching to
+- [x] Budget (D-e): `lorica_stream::held_fds(&Stream)` dispatching to
       12.3's `tcp::held_fds` and the new `udp::held_fds` (Interface edit
       E5; the callers switch in Lots F and G);
       `NodeBudgetInputs.usable_source_ports`; `BudgetViolation::SourcePorts`
       with pools from `source_addresses`; the supervisor memfd per UDP
       stream; the node ceiling with `bound_by`, `over_ceiling` (refuse
       raises, allow lowers), the view fields.
-- [ ] `DatagramHandler` synchronous with `Datagram<'_>` (D-c), `local`
+- [x] `DatagramHandler` synchronous with `Datagram<'_>` (D-c), `local`
       from `IP_PKTINFO` on wildcard sockets (D-g), `bound_ports` filled by
       the receive loop as 12.3's accept loop fills it, and the defaulted
       `table_changed` called by the runtime after every reload, as for
       `StreamHandler`.
-- [ ] One thread-local scratch buffer per runtime thread (D-h); the
+- [x] One thread-local scratch buffer per runtime thread (D-h); the
       per-socket buffer and the per-datagram `Vec` are gone.
-- [ ] The `caps` message: map the region, hand it to the engine through a
+- [x] The `caps` message: map the region, hand it to the engine through a
       `CapsRegistry` the engine reads (stream id to current region and
       slot); `nack adopt_failed` on a bad region.
-- [ ] Drain mode of D-m for UDP bindings on `detach` and `quiesce`; the
+- [x] Drain mode of D-m for UDP bindings on `detach` and `quiesce`; the
       `ack` count; sockets closed at last session or deadline.
-- [ ] Tests: budget with UDP shares at the packaged limit and at the
+- [x] Tests: budget with UDP shares at the packaged limit and at the
       default range (six default streams fit, the seventh is refused with
       `source_ports`), with two source addresses, with a narrowed
       range (`over_ceiling`); the loop never allocates per datagram (one
@@ -1448,6 +1448,118 @@ decision.
 
 ### Completion Notes
 
+**Lot D (`lorica-stream`).**
+
+- Demand. `lorica_stream::held_fds(&Stream)` (in `budget.rs`, re-exported
+  at the root) dispatches to `tcp::held_fds` and declares
+  `udp.max_sessions` sessions of `UDP_FDS_PER_SESSION` (1) on UDP.
+  `StreamDemand::of` reads it, so the driver and the API take the UDP arm
+  with no call-site change (E5 as the "status after 12.3" note shapes
+  it). The UDP arm is not a `udp::held_fds`: `udp/` is Lot E's
+  allowlist, and Lot E may move it there. `StreamDemand` gains
+  `source_addresses` (UDP only, empty for the `default` pool),
+  `pool_shares()` (`ceil(sessions / addresses)` per address),
+  `udp_sessions()`, and `supervisor_fds` counts one caps memfd per UDP
+  stream.
+- Constraints. `FdBudget::check` keeps the three fd constraints;
+  `FdBudget::check_node(streams, workers, cap, usable_source_ports:
+  Option<u64>)` adds `BudgetViolation::SourcePorts { pool: SourcePool,
+  committed, usable }` (`source_ports`, its text names the three
+  remedies); `None` (a range the node could not read) checks the fds only,
+  never a guessed figure. `source_pool_usage` sums the pools.
+  `FdBudget::session_ceiling` is `min(S - other fds, U x pools)` with
+  `CeilingBound::{FdBudget, SourcePorts}`, the fd budget named on a tie.
+  `StreamDemand::raises(&stored)` is "refuse raises, allow lowers":
+  another protocol, more sockets, more fds, or more ports from any pool
+  (an address the stream did not use is new demand on it, even when its
+  share elsewhere falls).
+- View. `NodeBudgetInputs.usable_source_ports`; `NodeBudgetView` gains
+  `usable_source_ports`, `session_ceiling`, `session_ceiling_bound_by`,
+  `udp_sessions_committed`, `over_ceiling` (the UDP commitment past the
+  ceiling, or a pool past `U`) and `source_pools: [{ pool, committed,
+  usable }]`; `StreamBudgetView.ceiling` and `fds_per_unit` are filled for
+  UDP. Pinned: six default UDP streams fit at the packaged limit and the
+  default range (`U` = 27,208 through Lot A's `usable_source_ports_from`),
+  the seventh is refused `source_ports` while its fds still fit; a
+  seventh with two source addresses fits; a range narrowed to 10,000
+  flags `over_ceiling`.
+- Left to Lots F and G, which own the call sites: the driver's bind check
+  and the API's `check_write` move from `check` to `check_node` with
+  `usable_udp_source_ports()` or the heartbeat's figure; the API's
+  `adds_no_demand` moves onto `StreamDemand::raises`; the two
+  `NodeBudgetInputs` the API builds pass `usable_source_ports: None` until
+  then, so its ceiling is the fd budget's alone; `openapi.yaml` documents
+  the view fields.
+- Receive path. `DatagramHandler::handle(&self, Datagram<'_>)`, no
+  future, and a defaulted `table_changed` the runtime calls after every
+  table load. `Datagram<'a> { payload: &'a [u8], source, local, socket:
+  &'a Arc<UdpSocket>, bind_gen, snapshot: &'a Arc<Stream>, table: &'a
+  Arc<StreamTable>, tracker: &'a ConnectionTracker, bound_ports: &'a
+  BoundPorts, caps: &'a CapsRegistry, draining: bool }`. Three fields
+  beyond D-c's list: `table` (selection reads the table the datagram was
+  received against, as `AcceptedConnection.table` does), `caps` (the
+  runtime's own registry, so an engine cannot read another one than the
+  `caps` messages fill) and `draining` (D-m). Everything is borrowed: an
+  engine clones what a new session keeps, never per datagram.
+- One buffer. A `thread_local!` 64 KiB buffer, `pub fn
+  with_receive_buffer` for Lot E's session tasks (never nested: a
+  handler already holds it through its payload). Wildcard sockets read
+  with `nix` `recvmsg` inside `UdpSocket::try_io` for the
+  `IP_PKTINFO` / `IPV6_PKTINFO` destination, kept in the socket's family
+  (IPv4-mapped on `[::]`, which is what `sendmsg` with `IPV6_PKTINFO`
+  needs; the engine canonicalises for keys and records); specific
+  addresses use `try_recv_from` and `local` is the bound address. Pinned
+  by a 64-port range whose 64 datagrams all land at one buffer address,
+  and by a client sending to `127.0.0.2` on a `0.0.0.0` stream.
+- Caps, worker side. `caps.rs` (new): `CapsRegistry` maps a stream id to
+  its current `WorkerCaps` and the retired regions still counting;
+  `StreamCaps::stream_cap_left(max_sessions)` is `max_sessions` less the
+  retired regions' totals, the cap Lot B's notes ask the engine to pass.
+  A replayed `caps_gen` replaces; streams the table no longer holds are
+  forgotten at each table load. The runtime maps the region
+  (`StreamCapsRegion::open`), refuses with `nack adopt_failed` an fd that
+  is not a region, a header `caps_gen` other than the message's, or a
+  slot the region lacks, and answers `ack 1` otherwise.
+- Caps, supervisor side, for Lot F. `NodeCapsRegions`: `ensure(stream,
+  max_sessions)` creates `caps_gen` 1, or a replacement at `caps_gen + 1`
+  when the table sizes move (`None` otherwise); `caps_message(stream,
+  seq, slot)` duplicates the kept memfd; `retire(stream)`;
+  `release_worker(slot)` over every live region (current, retired, and
+  those of removed streams), the per-worker release on worker death,
+  called before the `caps` and `attach` replay; `tick(now_ns)` evicts
+  rate cells and drops empty retired regions; `memfds()`;
+  `sessions(stream)`.
+- Drain mode. The loops watch a `LoopMode` (`serving`, `draining`,
+  `stopped`) instead of a stop flag. A UDP `detach` or `quiesce` puts the
+  binding in `draining`, acks the sockets put in drain at once, drains
+  the sessions (`config_removed` or `node_shutdown`), and hands the
+  binding to a task that closes its sockets when
+  `ConnectionTracker::binding_ended` resolves, at the deadline, or when
+  the runtime ends; before closing it ends with the binding's reason any
+  session a loop opened across the switch. TCP bindings are unchanged.
+  Interim until Lot F's `draining` registry state: the supervisor may
+  rebind the same port during the drain, and the new group then joins the
+  old one; no release carries it.
+- For Lot E. Admit with `datagram.caps.get(stream_id)` and
+  `current().admit_session(key, source_cap,
+  stream_cap_left(max_sessions))`; no region (every stream until Lot F
+  sends `caps`) refuses the session. While `draining`, a datagram with no
+  session is dropped and counted `binding_draining`. A session drops its
+  slot-socket clone no later than its `TrackedConnection`, since the
+  socket closes only when the loops and every session let it go.
+- `nix` (0.31, features `socket`, `net`, `uio`) joins `lorica-shmem` in
+  the crate's dependencies: both already in the workspace, no new crate
+  in `Cargo.lock`.
+- Outside the allowlist: `lorica-stream/src/caps.rs` (new);
+  `lorica-stream/src/tracker.rs` (`binding_len`, `binding_ended`, a
+  deregistration `Notify`, and a test); `lorica/src/startup/stream_plane.rs`
+  (the new field in `demand_of`'s literal); `lorica-api/src/stream_budget.rs`
+  (`usable_source_ports: None` in two literals; tests for the memfd and the
+  UDP held fds); `lorica-api/src/streams/tests.rs` (a default UDP stream now
+  declares 4,096 sessions, so the supervisor-constraint tests run on 12,288
+  fds and six workers, or import 16-session UDP ranges, and the view test
+  reads the UDP share).
+
 **Lot A (`lorica-worker`).**
 
 - Wire. `FdKind::StreamCaps { caps_gen }` is the token
@@ -1618,6 +1730,18 @@ decision.
 
 ## File List
 
+Lot D:
+
+- `lorica-stream/src/budget.rs`, `lorica-stream/src/handler.rs`,
+  `lorica-stream/src/listener.rs`, `lorica-stream/src/runtime.rs`,
+  `lorica-stream/src/lib.rs`, `lorica-stream/tests/runtime.rs`,
+  `lorica-stream/Cargo.toml`, `Cargo.lock`
+- `lorica-stream/src/caps.rs` (new), `lorica-stream/src/tracker.rs`,
+  outside the allowlist
+- `lorica/src/startup/stream_plane.rs`, `lorica-api/src/stream_budget.rs`,
+  `lorica-api/src/streams/tests.rs`, outside the allowlist
+- `docs/stories/story-12.5-udp-engine.md`
+
 Lot C:
 
 - `lorica-config/src/models/stream.rs`, `lorica-config/src/models/mod.rs`
@@ -1655,3 +1779,4 @@ Lot A:
 | 2026-11-15 | 0.3 | Lot A landed: the `caps` message and its `stream-caps` fd tag, `IP_PKTINFO` / `IPV6_RECVPKTINFO` on wildcard UDP groups (the dual-stack assumption of D-g pinned), `usable_udp_source_ports`, `BindFailureKind::SourcePorts`. Status InProgress. | Romain G. |
 | 2026-11-15 | 0.4 | Lot B landed: the stream-caps region (`StreamCapsRegion`, its own layout version, per-stream sizing, exact totals, per-worker session shards never evicted, shared GCRA rate cells), the probe factored out of `AtomicHashTable`, multi-process tests. | Romain G. |
 | 2026-11-15 | 0.5 | Lot C landed: `UdpSettings` on `Stream`, the UDP idle default and range, 12.3's settings lifted on UDP, backups on UDP, the refusal and drop vocabularies, migration 76, canonical digest, import and diff. The listen-address rule's call from `Stream::validate` moves to Lot G; status of the Interface edits after 12.3 recorded. | Romain G. |
+| 2026-11-15 | 0.6 | Lot D landed: the UDP demand (`held_fds`, one fd per session), the source-port constraint and the node session ceiling with its view fields, the synchronous `DatagramHandler` borrowing from one receive buffer per worker, the wildcard destination, caps adoption (`CapsRegistry`) and the supervisor's regions (`NodeCapsRegions`, the per-worker release), UDP drain mode with the sockets kept open. | Romain G. |

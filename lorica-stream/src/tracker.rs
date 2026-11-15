@@ -66,6 +66,7 @@ struct State {
 struct Inner {
     state: Mutex<State>,
     drains_changed: Notify,
+    deregistered: Notify,
 }
 
 /// What a drain predicate sees of one tracked connection.
@@ -241,6 +242,34 @@ impl ConnectionTracker {
         self.len() == 0
     }
 
+    /// Live connections and sessions of binding `bind_gen` of
+    /// `stream_id`.
+    pub fn binding_len(&self, stream_id: &str, bind_gen: u64) -> usize {
+        self.with_state(|s| {
+            s.entries
+                .values()
+                .filter(|e| e.bind_gen == bind_gen && e.stream_id == stream_id)
+                .count()
+        })
+    }
+
+    /// Resolve once binding `bind_gen` of `stream_id` has no live entry:
+    /// the moment a draining UDP binding's sockets may close (Story 12.5
+    /// D-m).
+    pub async fn binding_ended(&self, stream_id: &str, bind_gen: u64) {
+        loop {
+            // Enabled before the count is read, so an entry leaving in
+            // between still wakes this wait.
+            let deregistered = self.inner.deregistered.notified();
+            tokio::pin!(deregistered);
+            deregistered.as_mut().enable();
+            if self.binding_len(stream_id, bind_gen) == 0 {
+                return;
+            }
+            deregistered.await;
+        }
+    }
+
     fn set_backend(&self, id: u64, backend_id: &str) {
         self.with_state(|s| {
             if let Some(e) = s.entries.get_mut(&id) {
@@ -251,6 +280,7 @@ impl ConnectionTracker {
 
     fn deregister(&self, id: u64) {
         self.with_state(|s| s.entries.remove(&id));
+        self.inner.deregistered.notify_waiters();
     }
 }
 
@@ -440,6 +470,31 @@ mod tests {
         assert_eq!(on_b1.close_reason(), Some(StreamEndReason::ConfigRemoved));
         assert_eq!(on_b2.close_reason(), None);
         assert_eq!(undecided.close_reason(), None);
+    }
+
+    #[tokio::test]
+    async fn binding_ended_resolves_when_the_bindings_last_entry_leaves() {
+        let tracker = ConnectionTracker::new();
+        let first = tracker.register(1, stream("s"));
+        let second = tracker.register(1, stream("s"));
+        let _other_binding = tracker.register(2, stream("s"));
+        assert_eq!(tracker.binding_len("s", 1), 2);
+        let waiter = {
+            let tracker = tracker.clone();
+            tokio::spawn(async move { tracker.binding_ended("s", 1).await })
+        };
+        drop(first);
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "one entry of the binding is left");
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("the binding ended")
+            .unwrap();
+        assert_eq!(tracker.binding_len("s", 2), 1);
+        tokio::time::timeout(Duration::from_secs(1), tracker.binding_ended("s", 9))
+            .await
+            .expect("a binding without entries has ended");
     }
 
     #[tokio::test]
