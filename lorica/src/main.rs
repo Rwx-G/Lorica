@@ -64,6 +64,7 @@ fn main() {
             log_format,
             log_file,
             upstream_crl_file,
+            reserved_ports,
         }) => {
             init_logging(&log_level, &log_format, log_file.as_deref());
             startup::worker::run_worker(
@@ -72,6 +73,7 @@ fn main() {
                 &data_dir,
                 https_port,
                 upstream_crl_file.as_deref(),
+                reserved_ports,
             );
         }
         Some(Commands::RotateKey { new_key_file }) => {

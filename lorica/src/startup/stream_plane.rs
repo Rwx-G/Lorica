@@ -247,7 +247,8 @@ impl WorkerLink for InProcessLink {
 /// not know whether it runs on the control plane (`--cluster-listen`).
 /// What the table answers is whether an attached binding still has its
 /// stream, enabled, with the backend a connection uses, which a
-/// `refresh` drains on.
+/// `refresh` drains on, and the linked backend rows the engines select
+/// from, with their health as stored (Story 12.3 D-i).
 pub(crate) struct StoreStreamTable {
     store: Arc<std::sync::Mutex<ConfigStore>>,
 }
@@ -284,7 +285,10 @@ impl lorica_stream::StreamTableSource for StoreStreamTable {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let streams = store.list_streams()?;
         let links = store.list_stream_backends()?;
-        Ok(lorica_stream::StreamTable::new(streams, &links))
+        let backends = store.list_backends()?;
+        Ok(lorica_stream::StreamTable::with_backends(
+            streams, &links, backends,
+        ))
     }
 }
 
@@ -528,13 +532,20 @@ fn proto_of(protocol: StreamProtocol) -> StreamProto {
     }
 }
 
-fn demand_of(key: &BindKey, name: &str) -> StreamDemand {
-    StreamDemand {
+/// The budget demand of binding `key`, with what its engine holds at the
+/// stream's cap (Story 12.3 D-p) when `stream` is known: the same
+/// [`lorica_stream::tcp::held_fds`] the API's budget check reads.
+fn demand_of(key: &BindKey, stream: Option<&Stream>) -> StreamDemand {
+    let demand = StreamDemand {
         stream_id: key.stream_id.clone(),
-        name: name.to_string(),
+        name: stream.map(|s| s.name.clone()).unwrap_or_default(),
         protocol: key.protocol,
         listen_sockets: u64::from(key.port_last.saturating_sub(key.port_first)) + 1,
         held: None,
+    };
+    match stream.and_then(lorica_stream::tcp::held_fds) {
+        Some(held) => demand.with_held(held),
+        None => demand,
     }
 }
 
@@ -698,7 +709,7 @@ impl<L: WorkerLink> StreamPlane<L> {
                 continue;
             }
             let name = names.get(key.stream_id.as_str()).copied().unwrap_or("");
-            self.bind_one(key, name, pass, &mut events).await;
+            self.bind_one(key, name, streams, pass, &mut events).await;
         }
 
         // Inherited listeners serve the first pass only: whatever it did
@@ -708,20 +719,27 @@ impl<L: WorkerLink> StreamPlane<L> {
         }
 
         if trigger == Trigger::Change {
-            let mut per_worker: BTreeMap<u32, Vec<StreamCtlMsg>> = BTreeMap::new();
-            for id in self.workers.keys().copied().collect::<Vec<_>>() {
-                let seq = self.seq();
-                per_worker.insert(
-                    id,
-                    vec![StreamCtlMsg::Refresh {
-                        seq,
-                        drain_ms: pass.drain_ms(),
-                    }],
-                );
-            }
-            self.send_all(per_worker).await;
+            self.refresh_all(pass).await;
         }
         events
+    }
+
+    /// Send `refresh` to every worker: each reloads its stream table and
+    /// drains what the new one no longer holds. Binds and detaches
+    /// nothing.
+    pub(crate) async fn refresh_all(&mut self, pass: PassSettings) {
+        let mut per_worker: BTreeMap<u32, Vec<StreamCtlMsg>> = BTreeMap::new();
+        for id in self.workers.keys().copied().collect::<Vec<_>>() {
+            let seq = self.seq();
+            per_worker.insert(
+                id,
+                vec![StreamCtlMsg::Refresh {
+                    seq,
+                    drain_ms: pass.drain_ms(),
+                }],
+            );
+        }
+        self.send_all(per_worker).await;
     }
 
     /// A worker came back after a crash: take its new channel and replay
@@ -898,6 +916,7 @@ impl<L: WorkerLink> StreamPlane<L> {
         &mut self,
         key: BindKey,
         name: &str,
+        streams: &[Stream],
         pass: PassSettings,
         events: &mut Vec<PlaneEvent>,
     ) {
@@ -929,9 +948,13 @@ impl<L: WorkerLink> StreamPlane<L> {
             );
             return;
         }
-        let mut demands: Vec<StreamDemand> =
-            self.held.values().map(|b| demand_of(&b.key, "")).collect();
-        demands.push(demand_of(&key, name));
+        let stream_of = |id: &str| streams.iter().find(|s| s.id == id);
+        let mut demands: Vec<StreamDemand> = self
+            .held
+            .values()
+            .map(|b| demand_of(&b.key, stream_of(&b.key.stream_id)))
+            .collect();
+        demands.push(demand_of(&key, stream_of(&key.stream_id)));
         if let Err(violation) =
             self.budget
                 .check(&demands, self.worker_count, pass.listen_socket_cap)
@@ -2193,6 +2216,25 @@ mod tests {
         assert_eq!(
             source.drain_timeout(),
             Duration::from_secs(u64::from(GlobalSettings::DEFAULT_WORKER_DRAIN_TIMEOUT_S))
+        );
+    }
+
+    #[test]
+    fn a_tcp_binding_declares_what_its_connections_hold() {
+        let mut s = tcp("s1", 5432);
+        s.max_connections = 100;
+        let key = desired_bindings(std::slice::from_ref(&s), STANDALONE)
+            .into_iter()
+            .next()
+            .expect("a desired binding");
+        let held = demand_of(&key, Some(&s))
+            .held
+            .expect("a TCP stream declares its fds");
+        assert_eq!(Some(held), lorica_stream::tcp::held_fds(&s));
+        assert_eq!(
+            demand_of(&key, None).held,
+            None,
+            "a binding whose stream is gone declares nothing"
         );
     }
 

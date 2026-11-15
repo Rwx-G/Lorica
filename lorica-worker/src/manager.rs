@@ -60,6 +60,10 @@ pub struct WorkerConfig {
     pub log_file: Option<String>,
     /// Path to upstream CRL file (passed to worker via CLI).
     pub upstream_crl_file: Option<String>,
+    /// The node's reserved listener ports, as the supervisor encodes
+    /// them (passed to worker via CLI as `--reserved-ports`). The
+    /// worker's stream engine never connects to them on this node.
+    pub reserved_ports: Option<String>,
 }
 
 impl WorkerConfig {
@@ -389,6 +393,10 @@ impl WorkerManager {
                     args_strings.push("--upstream-crl-file".to_string());
                     args_strings.push(crl.clone());
                 }
+                if let Some(ref reserved) = self.config.reserved_ports {
+                    args_strings.push("--reserved-ports".to_string());
+                    args_strings.push(reserved.clone());
+                }
 
                 let c_args: Vec<CString> = args_strings
                     .iter()
@@ -696,6 +704,7 @@ mod tests {
             https_addr: None,
             https_port: 0,
             upstream_crl_file: None,
+            reserved_ports: None,
         };
         let mgr = WorkerManager::new(config);
         assert_eq!(mgr.worker_count(), 0);
@@ -714,6 +723,7 @@ mod tests {
             https_addr: None,
             https_port: 0,
             upstream_crl_file: None,
+            reserved_ports: None,
         };
         let mut mgr = WorkerManager::new(config);
         mgr.create_listen_sockets().expect("create sockets failed");
@@ -733,6 +743,7 @@ mod tests {
             https_addr: Some("127.0.0.1:0".to_string()),
             https_port: 443,
             upstream_crl_file: None,
+            reserved_ports: None,
         };
         let mut mgr = WorkerManager::new(config);
         mgr.create_listen_sockets().expect("create sockets failed");
@@ -752,6 +763,7 @@ mod tests {
             https_addr: None,
             https_port: 0,
             upstream_crl_file: None,
+            reserved_ports: None,
         };
         let mgr = WorkerManager::new(config);
         let events = mgr.check_workers();
@@ -793,6 +805,7 @@ mod tests {
             https_addr: None,
             https_port: 0,
             upstream_crl_file: None,
+            reserved_ports: None,
         };
         let mut mgr = WorkerManager::new(config);
         let child = std::process::Command::new("true")

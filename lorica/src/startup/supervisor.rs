@@ -127,6 +127,41 @@ pub(crate) fn run_supervisor(cli: Cli) {
 
     let worker_count = cli.workers.resolved();
 
+    // The ports this node's listeners hold, for the workers' stream
+    // engines, which never connect to them (Story 12.3 D-m). Workers are
+    // forked before the cluster plane starts, so its binds are read the
+    // way the plane validates them; an invalid one stops the process
+    // when the plane starts.
+    let worker_reserved_ports = {
+        let listener_ports = crate::cli::ReservedPorts {
+            management: cli.management_port,
+            http: cli.http_port,
+            https: cli.https_port,
+            cluster: None,
+            enrollment: None,
+            automation: None,
+        };
+        let cluster_binds = cli.cluster_listen.as_deref().and_then(|value| {
+            crate::cli::validate_cluster_listen(
+                value,
+                cli.cluster_enrollment_listen.as_deref(),
+                cli.cluster_advertise.as_deref(),
+                listener_ports,
+                cli.cluster_listen_any,
+            )
+            .ok()
+        });
+        crate::cli::ReservedPorts {
+            cluster: cluster_binds.as_ref().map(|b| b.operational.port()),
+            enrollment: cluster_binds.as_ref().map(|b| b.enrollment.port()),
+            automation: cli
+                .automation_listen
+                .as_deref()
+                .and_then(crate::cli::requested_port),
+            ..listener_ports
+        }
+    };
+
     let config = WorkerConfig {
         worker_count,
         data_dir: cli.data_dir.clone(),
@@ -137,6 +172,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
         https_addr: Some(format!("0.0.0.0:{}", cli.https_port)),
         https_port: cli.https_port,
         upstream_crl_file: cli.upstream_crl_file.clone(),
+        reserved_ports: Some(crate::cli::reserved_ports_arg(worker_reserved_ports)),
     };
 
     // Run DB migrations BEFORE forking workers to avoid SQLite lock contention.
@@ -3144,6 +3180,120 @@ mod supervisor_tests {
         );
         assert_eq!(
             r.query("route-b", "b"),
+            lorica_command::BreakerDecision::Allow
+        );
+    }
+
+    /// A worker's end of a real RPC socketpair whose supervisor end
+    /// serves breaker traffic from `registry`, as the supervisor's RPC
+    /// loop does.
+    fn breaker_rpc_worker(registry: Arc<SupervisorBreakerRegistry>) -> lorica_command::RpcEndpoint {
+        let (supervisor_end, worker_end) =
+            tokio::net::UnixStream::pair().expect("test setup: UnixStream::pair");
+        let (supervisor_ep, mut supervisor_incoming) =
+            lorica_command::RpcEndpoint::new(supervisor_end);
+        let (worker_ep, _worker_incoming) = lorica_command::RpcEndpoint::new(worker_end);
+        tokio::spawn(async move {
+            let _keep_open = supervisor_ep;
+            while let Some(inc) = supervisor_incoming.recv().await {
+                match inc.command_type() {
+                    lorica_command::CommandType::BreakerQuery => {
+                        handle_breaker_query(inc, &registry).await
+                    }
+                    lorica_command::CommandType::BreakerReport => {
+                        handle_breaker_report(inc, &registry).await
+                    }
+                    _ => {
+                        let _ = inc.reply_error("not a breaker command").await;
+                    }
+                }
+            }
+        });
+        worker_ep
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_breaker_traffic_of_two_workers_trips_the_stream_entry_and_not_the_route() {
+        use lorica::stream_engine::{stream_breaker_key, StreamBreakerGate};
+        use lorica_stream::{Admission, BreakerGate};
+
+        const STREAM_ID: &str = "6f1c1a52-5b0e-4f7e-9a51-1a7c5a1b2c3d";
+        const ROUTE_ID: &str = "0b7e3c2a-1d4f-4e5a-8b6c-7d8e9f0a1b2c";
+        let registry = Arc::new(SupervisorBreakerRegistry::new(5, Duration::from_secs(10)));
+        let backend = lorica_config::models::Backend {
+            id: "b1".into(),
+            address: "192.0.2.10:5432".into(),
+            name: "b1".into(),
+            group_name: String::new(),
+            weight: 1,
+            health_status: lorica_config::models::HealthStatus::Healthy,
+            health_check_enabled: false,
+            health_check_interval_s: 10,
+            health_check_path: None,
+            health_check: lorica_config::models::HealthCheck::TcpConnect,
+            lifecycle_state: lorica_config::models::LifecycleState::Normal,
+            active_connections: 0,
+            tls_upstream: false,
+            tls_skip_verify: false,
+            tls_sni: None,
+            h2_upstream: false,
+            managed_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let workers: Vec<(StreamBreakerGate, lorica::proxy_wiring::BreakerEngine)> = (0..2)
+            .map(|_| {
+                let engine = lorica::proxy_wiring::BreakerEngine::rpc(
+                    breaker_rpc_worker(Arc::clone(&registry)),
+                    Duration::from_millis(500),
+                );
+                (StreamBreakerGate::new(), engine)
+            })
+            .collect();
+        // Before a worker's RPC endpoint exists the gate admits, the
+        // fail-open policy of an RPC failure (D-g).
+        assert_eq!(
+            workers[0].0.admit(STREAM_ID, &backend).await,
+            Admission::Allow
+        );
+        for (gate, engine) in &workers {
+            gate.install(engine.clone());
+        }
+
+        // Connect failures from both workers, the threshold between them.
+        for _ in 0..3 {
+            workers[0].0.record(STREAM_ID, &backend, false, false).await;
+        }
+        assert_eq!(
+            workers[1].0.admit(STREAM_ID, &backend).await,
+            Admission::Allow
+        );
+        for _ in 0..2 {
+            workers[1].0.record(STREAM_ID, &backend, false, false).await;
+        }
+
+        for (gate, _) in &workers {
+            assert_eq!(
+                gate.admit(STREAM_ID, &backend).await,
+                Admission::Deny,
+                "one registry entry for the (stream, backend), whichever worker asks"
+            );
+        }
+        assert!(registry
+            .entries
+            .contains_key(&SupervisorBreakerRegistry::key(
+                &stream_breaker_key(STREAM_ID),
+                &backend.address
+            )));
+        // A route on the same backend address asks the same registry
+        // under its own key and stays closed.
+        assert_eq!(
+            workers[0].1.admit(ROUTE_ID, &backend.address).await,
+            lorica::proxy_wiring::BreakerAdmission::Allow
+        );
+        assert_eq!(
+            registry.query(ROUTE_ID, &backend.address),
             lorica_command::BreakerDecision::Allow
         );
     }

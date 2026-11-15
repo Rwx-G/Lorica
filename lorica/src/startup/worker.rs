@@ -39,6 +39,7 @@ pub(crate) fn run_worker(
     data_dir: &str,
     https_port: u16,
     upstream_crl_file: Option<&str>,
+    reserved_ports: Option<lorica_config::listen_ports::ReservedPorts>,
 ) {
     use lorica_command::{Command, CommandChannel, CommandType, Response};
     use lorica_core::server::Fds;
@@ -151,11 +152,24 @@ pub(crate) fn run_worker(
             std::process::exit(1);
         }
     };
+    // The TCP engine (Story 12.3). Its breaker gate admits until the
+    // RPC endpoint, created well after this, installs the supervisor's
+    // registry below (D-g). No UDP engine until Story 12.5: a datagram
+    // is dropped.
+    if reserved_ports.is_none() {
+        warn!(
+            worker_id = id,
+            "started without --reserved-ports; stream connects refuse only the stream listen ports"
+        );
+    }
+    let stream_breaker = Arc::new(lorica::stream_engine::StreamBreakerGate::new());
     let stream_runtime = match lorica_stream::StreamRuntime::spawn(
         lorica_stream::ControlTransport::Seqpacket(stream_ctl_fd),
-        // No engine until Stories 12.3 and 12.5: an accepted connection
-        // is closed at once and a datagram dropped (D-b, Resolved #6).
-        lorica_stream::Engines::default(),
+        lorica::stream_engine::tcp_engines(
+            Arc::clone(&stream_breaker),
+            Arc::new(lorica::stream_engine::HickoryResolve::from_system_conf()),
+            reserved_ports,
+        ),
         Arc::clone(&stream_source) as Arc<dyn lorica_stream::StreamTableSource>,
     ) {
         Ok(handle) => Arc::new(handle),
@@ -736,6 +750,9 @@ pub(crate) fn run_worker(
                     endpoint.clone(),
                     Duration::from_millis(500),
                 );
+                // The stream engine's breaker is the same registry,
+                // keyed `stream:<id>` (Story 12.3 D-g).
+                stream_breaker.install(lorica_proxy.circuit_breaker_engine.clone());
                 let _rpc_listener = lorica_proxy.spawn_worker_rpc_listener(
                     &worker_auth_prune_tracker,
                     incoming,
@@ -770,6 +787,9 @@ pub(crate) fn run_worker(
                     error = %e,
                     "failed to create worker RpcEndpoint; rate-limit sync disabled"
                 );
+                // Streams fall back with HTTP to this process's local
+                // breaker rather than to none.
+                stream_breaker.install(lorica_proxy.circuit_breaker_engine.clone());
             }
         }
     } else if shmem_region.is_some() {
@@ -780,6 +800,9 @@ pub(crate) fn run_worker(
             worker_id = id,
             "worker started with shmem but no RPC FD; rate-limit sync disabled"
         );
+    }
+    if rpc_fd.is_none() {
+        stream_breaker.install(lorica_proxy.circuit_breaker_engine.clone());
     }
     drop(_rt_guard);
     // Open a LogStore so the worker can persist access logs and WAF

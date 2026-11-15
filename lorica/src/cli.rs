@@ -214,6 +214,12 @@ pub(crate) enum Commands {
         /// Path to upstream CRL file (passed from supervisor)
         #[arg(long)]
         upstream_crl_file: Option<String>,
+
+        /// The node's reserved listener ports (passed from supervisor),
+        /// as `reserved_ports_arg` writes them: the stream engine never
+        /// connects to them on this node (Story 12.3 D-m)
+        #[arg(long, value_parser = parse_reserved_ports_arg)]
+        reserved_ports: Option<ReservedPorts>,
     },
     /// Rotate the encryption key (re-encrypts all secrets in the database)
     RotateKey {
@@ -694,6 +700,55 @@ pub(crate) struct ClusterBinds {
 /// in `lorica-config` since Story 12.1, so the control plane checks a
 /// stream's ports by the same rule this CLI checks a listener by.
 pub(crate) use lorica_config::listen_ports::ReservedPorts;
+
+/// The text of a port slot `reserved_ports_arg` leaves empty.
+const NO_PORT: &str = "-";
+
+/// `reserved` as the worker's `--reserved-ports` value: the management,
+/// HTTP and HTTPS ports, then the cluster, enrollment and automation
+/// ports or `-` for a listener that is off, comma-separated.
+/// [`parse_reserved_ports_arg`] reads it back.
+pub(crate) fn reserved_ports_arg(reserved: ReservedPorts) -> String {
+    let optional = |port: Option<u16>| port.map_or_else(|| NO_PORT.to_string(), |p| p.to_string());
+    [
+        reserved.management.to_string(),
+        reserved.http.to_string(),
+        reserved.https.to_string(),
+        optional(reserved.cluster),
+        optional(reserved.enrollment),
+        optional(reserved.automation),
+    ]
+    .join(",")
+}
+
+/// Read a `--reserved-ports` value [`reserved_ports_arg`] wrote.
+pub(crate) fn parse_reserved_ports_arg(value: &str) -> Result<ReservedPorts, String> {
+    let fields: Vec<&str> = value.split(',').collect();
+    let [management, http, https, cluster, enrollment, automation] = fields[..] else {
+        return Err(format!(
+            "`{value}`: six comma-separated ports expected (management, http, https,              cluster, enrollment, automation; `{NO_PORT}` for a listener that is off)"
+        ));
+    };
+    let port = |text: &str| {
+        text.parse::<u16>()
+            .map_err(|_| format!("`{value}`: `{text}` is not a port"))
+    };
+    let optional = |text: &str| {
+        if text == NO_PORT {
+            Ok(None)
+        } else {
+            port(text).map(Some)
+        }
+    };
+    Ok(ReservedPorts {
+        management: port(management)?,
+        http: port(http)?,
+        https: port(https)?,
+        cluster: optional(cluster)?,
+        enrollment: optional(enrollment)?,
+        automation: optional(automation)?,
+    })
+}
 
 /// How one listener family names itself in a refusal: the flag
 /// carrying the bind, the flag that opts into a wildcard host, and the
@@ -1420,6 +1475,69 @@ mod tests {
         enrollment: None,
         automation: None,
     };
+
+    #[test]
+    fn the_worker_parses_reserved_ports_back_to_the_supervisors_value() {
+        let every_listener = ReservedPorts {
+            cluster: Some(9444),
+            enrollment: Some(9445),
+            automation: Some(9600),
+            ..RESERVED
+        };
+        for supervisor in [RESERVED, every_listener] {
+            let arg = reserved_ports_arg(supervisor);
+            let parsed = Cli::try_parse_from([
+                "lorica",
+                "worker",
+                "--id",
+                "1",
+                "--cmd-fd",
+                "3",
+                "--data-dir",
+                "/path/to/data",
+                "--reserved-ports",
+                arg.as_str(),
+            ])
+            .expect("the supervisor's value parses");
+            match parsed.command {
+                Some(Commands::Worker { reserved_ports, .. }) => {
+                    assert_eq!(reserved_ports, Some(supervisor), "{arg}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_worker_started_without_reserved_ports_has_none() {
+        let parsed = Cli::try_parse_from([
+            "lorica",
+            "worker",
+            "--id",
+            "1",
+            "--cmd-fd",
+            "3",
+            "--data-dir",
+            "/path/to/data",
+        ])
+        .expect("an older supervisor's argv still parses");
+        match parsed.command {
+            Some(Commands::Worker { reserved_ports, .. }) => assert_eq!(reserved_ports, None),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_reserved_ports_value_is_refused() {
+        for bad in [
+            "",
+            "9443,8080,8443",
+            "9443,8080,8443,-,-,-,-",
+            "9443,x,8443,-,-,-",
+        ] {
+            assert!(parse_reserved_ports_arg(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn the_automation_bind_is_refused_on_the_cluster_enrollment_port() {

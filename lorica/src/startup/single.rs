@@ -290,6 +290,9 @@ pub(crate) fn run_single_process(cli: Cli) {
             &single_task_tracker,
             lorica::capture::CAPTURE_DISABLE_INTERVAL,
         );
+        // The stream engine's breaker is HTTP's local one, keyed
+        // `stream:<id>` (Story 12.3 D-g).
+        let stream_breaker_engine = lorica_proxy.circuit_breaker_engine.clone();
         let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
         let health_backend_conns = Arc::clone(&backend_conns);
         let proxy_cache_hits = Arc::clone(&lorica_proxy.cache_hits);
@@ -549,8 +552,14 @@ pub(crate) fn run_single_process(cli: Cli) {
             lorica_stream::ControlTransport::in_process_pair(STREAM_CHANNEL_CAPACITY);
         let stream_runtime = match lorica_stream::StreamRuntime::spawn(
             stream_transport,
-            // No engine until Stories 12.3 and 12.5 (D-b, Resolved #6).
-            lorica_stream::Engines::default(),
+            // The TCP engine (Story 12.3); no UDP engine until Story 12.5.
+            lorica::stream_engine::tcp_engines(
+                Arc::new(lorica::stream_engine::StreamBreakerGate::with_engine(
+                    stream_breaker_engine,
+                )),
+                Arc::new(lorica::stream_engine::HickoryResolve::from_system_conf()),
+                Some(process_reserved_ports),
+            ),
             stream_source as Arc<dyn lorica_stream::StreamTableSource>,
         ) {
             Ok(handle) => handle,
