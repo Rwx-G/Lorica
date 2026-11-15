@@ -568,6 +568,9 @@ async fn the_view_publishes_every_model_field_but_the_withheld_ones() {
         // Story 12.5 Lot G publishes `udp` field by field; until then
         // the view leaves it out. Lot G drops this filter.
         .filter(|k| k.as_str() != "udp")
+        // Story 12.4 Lot F publishes the TLS fields; until then the view
+        // leaves them out. Lot F drops this filter.
+        .filter(|k| !lorica_config::models::Stream::tls_field_names().contains(&k.as_str()))
         .cloned()
         .chain(LINK_FIELDS.iter().map(|k| k.to_string()))
         .collect();

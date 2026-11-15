@@ -524,6 +524,30 @@ pub struct MtlsConfig {
     pub allowed_organizations: Vec<String>,
 }
 
+/// Whether a verified client certificate whose subject carries the
+/// `O=` values `presented` passes the allowlist `allowed`: an empty
+/// allowlist admits every verified certificate, otherwise one presented
+/// value must equal one listed value, whole and case-sensitively.
+///
+/// The one predicate a route's mTLS check (`evaluate_mtls` in the binary)
+/// and a terminating stream's client verification (Story 12.4, D-h)
+/// share. Neither applies it to a client that presented no certificate.
+///
+/// ```
+/// use lorica_config::models::organizations_admitted;
+/// let allowed = vec!["Acme".to_string()];
+/// assert!(organizations_admitted(&[], &["Anyone".to_string()]));
+/// assert!(organizations_admitted(&allowed, &["Other".to_string(), "Acme".to_string()]));
+/// assert!(!organizations_admitted(&allowed, &["acme".to_string()]));
+/// assert!(!organizations_admitted(&allowed, &[]));
+/// ```
+pub fn organizations_admitted(allowed: &[String], presented: &[String]) -> bool {
+    allowed.is_empty()
+        || allowed
+            .iter()
+            .any(|listed| presented.iter().any(|value| value == listed))
+}
+
 /// Canary traffic split: send `weight_percent` of a route's requests to
 /// a specific backend group, the rest fall through to the next split or
 /// (if cumulative weights < 100) to the route's default backends.

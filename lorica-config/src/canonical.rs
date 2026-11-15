@@ -1284,11 +1284,7 @@ mod tests {
         stream.node_selector = vec!["edge-b".to_string()];
         stream.enabled = false;
         let backend = make_backend("b-s", "192.0.2.40:5432");
-        let link = StreamBackend {
-            stream_id: stream.id.clone(),
-            backend_id: backend.id.clone(),
-            backup: false,
-        };
+        let link = StreamBackend::primary(&stream.id, &backend.id);
         (stream, backend, link)
     }
 
@@ -1670,6 +1666,118 @@ mod tests {
         assert_eq!(decoded.streams, cfg.streams);
     }
 
+    /// A terminating stream with every TLS field set, and a passthrough
+    /// stream with a `no_sni` rule, each with a link serving a rule.
+    fn tls_streams() -> (Vec<Stream>, Vec<StreamBackend>) {
+        use crate::models::{
+            MtlsConfig, StreamMatchRule, StreamMatcher, StreamTlsMode, StreamTlsTerminate,
+            StreamUpstreamTls, UpstreamServerName,
+        };
+        let mut terminate =
+            crate::models::sample_stream("s-tls", "tls", crate::models::StreamProtocol::Tcp, 443);
+        terminate.tls_mode = StreamTlsMode::Terminate;
+        terminate.match_rules = vec![StreamMatchRule {
+            name: "web".to_string(),
+            matcher: StreamMatcher::Tls {
+                server_names: vec!["app.example.com".to_string(), "*.example.com".to_string()],
+                alpn: vec!["h2".to_string()],
+            },
+        }];
+        terminate.clienthello_timeout_ms = Some(2_000);
+        terminate.tls_terminate = Some(StreamTlsTerminate {
+            certificate_ids: vec!["cert-1".to_string()],
+            client_auth: Some(MtlsConfig {
+                ca_cert_pem: "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n"
+                    .to_string(),
+                required: true,
+                allowed_organizations: vec!["Acme".to_string()],
+            }),
+        });
+        terminate.upstream_tls = Some(StreamUpstreamTls {
+            server_name: UpstreamServerName::Fixed {
+                name: "origin.internal.example.org".to_string(),
+            },
+            client_certificate_id: Some("cert-2".to_string()),
+            alpn: vec!["postgresql".to_string()],
+            ..StreamUpstreamTls::default()
+        });
+        let mut passthrough = crate::models::sample_stream(
+            "s-pass",
+            "pass",
+            crate::models::StreamProtocol::Tcp,
+            8443,
+        );
+        passthrough.tls_mode = StreamTlsMode::Passthrough;
+        passthrough.match_rules = vec![StreamMatchRule {
+            name: "bare".to_string(),
+            matcher: StreamMatcher::NoSni { alpn: Vec::new() },
+        }];
+        passthrough.no_sni_acknowledged = true;
+        let links = vec![
+            StreamBackend {
+                rule: Some("web".to_string()),
+                ..StreamBackend::primary(&terminate.id, "b-1")
+            },
+            StreamBackend {
+                rule: Some("bare".to_string()),
+                ..StreamBackend::primary(&passthrough.id, "b-1")
+            },
+        ];
+        (vec![terminate, passthrough], links)
+    }
+
+    #[test]
+    fn tls_streams_and_their_rule_links_round_trip_through_the_blob() {
+        let (streams, links) = tls_streams();
+        for stream in &streams {
+            stream.validate().expect("test setup: a valid stream");
+        }
+        let mut cfg = fleet_config();
+        cfg.streams.extend(streams);
+        cfg.stream_backends.extend(links);
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let decoded = decode_canonical(&bytes).expect("decodes");
+        assert_eq!(decoded.streams, cfg.streams);
+        assert_eq!(decoded.stream_backends, cfg.stream_backends);
+    }
+
+    #[test]
+    fn a_blob_without_the_tls_fields_decodes_to_their_defaults() {
+        let cfg = fleet_config();
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
+        for stream in root["streams"].as_array_mut().expect("test setup: streams") {
+            let object = stream.as_object_mut().expect("test setup: an object");
+            for field in [
+                "tls_mode",
+                "match_rules",
+                "no_sni_acknowledged",
+                "clienthello_timeout_ms",
+                "tls_terminate",
+                "upstream_tls",
+            ] {
+                object.remove(field);
+            }
+        }
+        for link in root["stream_backends"]
+            .as_array_mut()
+            .expect("test setup: links")
+        {
+            link.as_object_mut()
+                .expect("test setup: an object")
+                .remove("rule");
+        }
+        let older = serde_json::to_vec(&root).expect("test setup: re-encode");
+        let decoded = decode_canonical(&older).expect("a 12.5-shaped blob still decodes");
+        assert_eq!(decoded.streams, cfg.streams);
+        assert_eq!(decoded.stream_backends, cfg.stream_backends);
+        assert!(decoded
+            .streams
+            .iter()
+            .all(|s| s.tls_mode == crate::models::StreamTlsMode::None));
+    }
+
     #[test]
     fn the_stream_plane_settings_replicate_through_apply_to() {
         let source = GlobalSettings {
@@ -1803,8 +1911,23 @@ mod tests {
     /// is the refusal this guard exists to make deliberate. From here a
     /// new kind or template name moves this digest
     /// (`a_template_name_more_moves_the_shape_digest`).
+    ///
+    /// Story 12.4 (1.11.0) moved it again inside the same cycle: `Stream`
+    /// gained the TLS fields (`tls_mode`, `match_rules`,
+    /// `no_sni_acknowledged`, `clienthello_timeout_ms`, `tls_terminate`,
+    /// `upstream_tls`) and `StreamBackend` the `rule` it serves, each
+    /// with a serde default; `StreamMatchRule`, `StreamTlsTerminate`,
+    /// `StreamUpstreamTls` and `MtlsConfig` (reached through a route
+    /// before, through a stream now) joined the inventory, and
+    /// `stream_tls_shape_lines` reads the TLS modes, the matcher kinds
+    /// and the upstream name modes. No version step, for Story 12.3's
+    /// reasons: no released blob is stamped 3, a 1.10.x peer is refused
+    /// by version and by schema before it meets the fields, and a 1.11.0
+    /// build from before them is refused by schema (migration 77) at the
+    /// handshake. A blob without them decodes to streams without TLS.
+    /// Pinned by `a_blob_without_the_tls_fields_decodes_to_their_defaults`.
     const CANONICAL_SHAPE_DIGEST: &str =
-        "3c0f782a203249daf7a10b669f593029946d67379803ebf2d005a3633061504f";
+        "a6ce7eff2e19985cf89dd35115aad818ea5e1fbe2c23bfa0d0ae2ceaf4a6973e";
 
     /// Every field name `T` accepts, read from the type itself rather
     /// than from the JSON of some fixture.
@@ -1909,6 +2032,43 @@ mod tests {
         lines
     }
 
+    /// The shape lines of a stream's TLS enums (Story 12.4): the modes,
+    /// the matcher kinds and each kind's fields, the upstream name modes
+    /// and each mode's fields. A kind or mode a peer does not know makes
+    /// it refuse the blob, so each moves the digest.
+    fn stream_tls_shape_lines() -> Vec<String> {
+        use crate::models::{StreamMatcher, StreamTlsMode, UpstreamServerName};
+        let modes = names_refused_with::<StreamTlsMode>(
+            "StreamTlsMode",
+            serde_json::json!(SHAPE_PROBE),
+            "unknown variant",
+        );
+        let mut lines = vec![format!("StreamTlsMode({})", modes.join(","))];
+        fn tagged<T: serde::de::DeserializeOwned>(
+            lines: &mut Vec<String>,
+            type_name: &str,
+            tag: &str,
+        ) {
+            let variants = names_refused_with::<T>(
+                type_name,
+                serde_json::json!({ tag: SHAPE_PROBE }),
+                "unknown variant",
+            );
+            lines.push(format!("{type_name}({})", variants.join(",")));
+            for variant in &variants {
+                let fields = names_refused_with::<T>(
+                    variant,
+                    serde_json::json!({ tag: variant, SHAPE_PROBE: null }),
+                    "unknown field",
+                );
+                lines.push(format!("{type_name}::{variant}({})", fields.join(",")));
+            }
+        }
+        tagged::<StreamMatcher>(&mut lines, "StreamMatcher", "kind");
+        tagged::<UpstreamServerName>(&mut lines, "UpstreamServerName", "mode");
+        lines
+    }
+
     fn catalogue_template_names() -> Vec<&'static str> {
         lorica_automation_policy::TCP_CHECK_TEMPLATES
             .iter()
@@ -1969,8 +2129,13 @@ mod tests {
             crate::models::Stream,
             crate::models::StreamBackend,
             crate::models::UdpSettings,
+            crate::models::StreamMatchRule,
+            crate::models::StreamTlsTerminate,
+            crate::models::StreamUpstreamTls,
+            crate::models::MtlsConfig,
         ];
         lines.extend(health_check_shape_lines(template_names));
+        lines.extend(stream_tls_shape_lines());
         lines.sort();
         lines
     }

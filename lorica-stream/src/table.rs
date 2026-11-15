@@ -201,6 +201,7 @@ mod tests {
                 stream_id: "on".into(),
                 backend_id: "b1".into(),
                 backup: false,
+                rule: None,
             }],
         );
         assert!(table.holds("on", None));

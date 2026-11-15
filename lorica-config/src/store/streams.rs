@@ -16,7 +16,7 @@ use std::str::FromStr;
 use rusqlite::{params, OptionalExtension};
 
 use super::row_helpers::parse_datetime;
-use super::{serialize_field, ConfigStore};
+use super::{serialize_field, serialize_optional_field, ConfigStore};
 use crate::error::{ConfigError, Result};
 use crate::models::*;
 
@@ -32,7 +32,9 @@ const STREAM_COLUMNS: &str = "id, name, group_name, protocol, enabled, listen_ad
      upload_rate_bps, download_rate_bps, max_connections, \
      udp_max_sessions, udp_source_session_cap, udp_requests_per_session, \
      udp_responses_per_request, udp_response_bytes_ratio, udp_unbounded_responses, \
-     udp_source_datagram_rate, udp_source_byte_rate, udp_max_datagram_bytes";
+     udp_source_datagram_rate, udp_source_byte_rate, udp_max_datagram_bytes, \
+     tls_mode, match_rules, no_sni_acknowledged, clienthello_timeout_ms, tls_terminate, \
+     upstream_tls";
 
 /// The `udp_*` columns of one row (Story 12.5 D-l), in `STREAM_COLUMNS`
 /// order, every one NULL on a TCP row.
@@ -118,6 +120,49 @@ fn json_list<T: serde::de::DeserializeOwned>(raw: &str, column: &str) -> Result<
         .map_err(|e| ConfigError::Corrupt(format!("invalid stream {column} JSON: {e}")))
 }
 
+/// A stored nullable JSON object column, refused as corrupt when it
+/// does not decode.
+fn json_object<T: serde::de::DeserializeOwned>(
+    raw: Option<String>,
+    column: &str,
+) -> Result<Option<T>> {
+    raw.map(|raw| {
+        serde_json::from_str(&raw)
+            .map_err(|e| ConfigError::Corrupt(format!("invalid stream {column} JSON: {e}")))
+    })
+    .transpose()
+}
+
+/// The TLS columns of a stream (Story 12.4, D-k), in `STREAM_COLUMNS`
+/// order.
+struct TlsColumns {
+    tls_mode: &'static str,
+    match_rules: String,
+    no_sni_acknowledged: bool,
+    clienthello_timeout_ms: Option<u32>,
+    tls_terminate: Option<String>,
+    upstream_tls: Option<String>,
+}
+
+fn tls_to_columns(stream: &Stream) -> Result<TlsColumns> {
+    Ok(TlsColumns {
+        tls_mode: stream.tls_mode.as_str(),
+        match_rules: serialize_field("match_rules", &stream.match_rules)?,
+        no_sni_acknowledged: stream.no_sni_acknowledged,
+        clienthello_timeout_ms: stream.clienthello_timeout_ms,
+        tls_terminate: serialize_optional_field("tls_terminate", stream.tls_terminate.as_ref())?,
+        upstream_tls: serialize_optional_field("upstream_tls", stream.upstream_tls.as_ref())?,
+    })
+}
+
+/// The stream as the store writes it: its rules' server names in the
+/// form they are matched in (Story 12.4, D-c), whichever writer sent it.
+fn as_stored(stream: &Stream) -> Stream {
+    let mut stored = stream.clone();
+    stored.canonicalise_server_names();
+    stored
+}
+
 /// A stored rate, which `Stream::validate` bounds well inside `i64`.
 fn rate_from_column(raw: Option<i64>, column: &str) -> Result<Option<u64>> {
     raw.map(|value| {
@@ -159,6 +204,7 @@ fn row_to_stream(row: &rusqlite::Row<'_>) -> Result<Stream> {
             row.get(35)?,
         ),
     )?;
+    let tls_mode: String = row.get(36)?;
     Ok(Stream {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -195,6 +241,13 @@ fn row_to_stream(row: &rusqlite::Row<'_>) -> Result<Stream> {
         download_rate_bps: rate_from_column(row.get(25)?, "download_rate_bps")?,
         max_connections: row.get(26)?,
         udp,
+        tls_mode: StreamTlsMode::from_str(&tls_mode)
+            .map_err(|e| ConfigError::Corrupt(format!("stored stream tls_mode is invalid: {e}")))?,
+        match_rules: json_list(&row.get::<_, String>(37)?, "match_rules")?,
+        no_sni_acknowledged: row.get(38)?,
+        clienthello_timeout_ms: row.get(39)?,
+        tls_terminate: json_object(row.get(40)?, "tls_terminate")?,
+        upstream_tls: json_object(row.get(41)?, "upstream_tls")?,
         created_at: parse_datetime(&row.get::<_, String>(9)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(10)?)?,
     })
@@ -232,6 +285,7 @@ impl ConfigStore {
     /// writer that checked a whole consistent snapshot first.
     /// `Stream::validate` and the name uniqueness still apply.
     pub(crate) fn create_stream_unchecked(&self, stream: &Stream) -> Result<()> {
+        let stream = &as_stored(stream);
         validated(stream)?;
         let selector = serialize_field("node_selector", &stream.node_selector)?;
         let trusted = serialize_field(
@@ -240,13 +294,14 @@ impl ConfigStore {
         )?;
         let sources = serialize_field("source_addresses", &stream.source_addresses)?;
         let udp = udp_to_columns(stream.udp.as_ref());
+        let tls = tls_to_columns(stream)?;
         self.conn
             .execute(
                 &format!(
                     "INSERT INTO streams ({STREAM_COLUMNS}) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
                      ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
-                     ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)"
+                     ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)"
                 ),
                 params![
                     stream.id,
@@ -285,6 +340,12 @@ impl ConfigStore {
                     udp.6,
                     udp.7,
                     udp.8,
+                    tls.tls_mode,
+                    tls.match_rules,
+                    tls.no_sni_acknowledged,
+                    tls.clienthello_timeout_ms,
+                    tls.tls_terminate,
+                    tls.upstream_tls,
                 ],
             )
             .map_err(|e| name_taken(e, &stream.name))?;
@@ -332,6 +393,7 @@ impl ConfigStore {
     /// [`ConfigStore::update_stream`] without the attachment rule, for a
     /// writer that checked a whole consistent snapshot first.
     pub(crate) fn update_stream_unchecked(&self, stream: &Stream) -> Result<()> {
+        let stream = &as_stored(stream);
         validated(stream)?;
         let selector = serialize_field("node_selector", &stream.node_selector)?;
         let trusted = serialize_field(
@@ -340,6 +402,7 @@ impl ConfigStore {
         )?;
         let sources = serialize_field("source_addresses", &stream.source_addresses)?;
         let udp = udp_to_columns(stream.udp.as_ref());
+        let tls = tls_to_columns(stream)?;
         let changed = self
             .conn
             .execute(
@@ -355,7 +418,9 @@ impl ConfigStore {
                  udp_source_session_cap = ?28, udp_requests_per_session = ?29, \
                  udp_responses_per_request = ?30, udp_response_bytes_ratio = ?31, \
                  udp_unbounded_responses = ?32, udp_source_datagram_rate = ?33, \
-                 udp_source_byte_rate = ?34, udp_max_datagram_bytes = ?35 WHERE id = ?1",
+                 udp_source_byte_rate = ?34, udp_max_datagram_bytes = ?35, tls_mode = ?36, \
+                 match_rules = ?37, no_sni_acknowledged = ?38, clienthello_timeout_ms = ?39, \
+                 tls_terminate = ?40, upstream_tls = ?41 WHERE id = ?1",
                 params![
                     stream.id,
                     stream.name,
@@ -392,6 +457,12 @@ impl ConfigStore {
                     udp.6,
                     udp.7,
                     udp.8,
+                    tls.tls_mode,
+                    tls.match_rules,
+                    tls.no_sni_acknowledged,
+                    tls.clienthello_timeout_ms,
+                    tls.tls_terminate,
+                    tls.upstream_tls,
                 ],
             )
             .map_err(|e| name_taken(e, &stream.name))?;
@@ -423,41 +494,67 @@ impl ConfigStore {
     }
 
     /// Replace the set of backends `stream_id` forwards to with
-    /// `primary_ids` and `backup_ids` (Story 12.3, D-f), in one
-    /// savepoint: either the whole new set stands, or, when one backend
-    /// breaks the attachment rule (`check_backend_attachments`), the old
-    /// set does and the error names the stream. A backend in both lists
-    /// is refused. `NotFound` when the stream does not exist; a backend
-    /// id naming no backend is refused by the foreign key.
+    /// `primary_ids` and `backup_ids` (Story 12.3, D-f), none serving a
+    /// rule: [`Self::set_stream_links`] for a stream that reads no
+    /// ClientHello. A backend in both lists is refused.
     pub fn set_stream_backend_links(
         &self,
         stream_id: &str,
         primary_ids: &[String],
         backup_ids: &[String],
     ) -> Result<()> {
-        if self.get_stream(stream_id)?.is_none() {
-            return Err(ConfigError::NotFound(format!("stream {stream_id}")));
-        }
         if let Some(both) = primary_ids.iter().find(|id| backup_ids.contains(id)) {
             return Err(ConfigError::Validation(format!(
                 "backend {both} is listed both as a primary and as a backup of stream {stream_id}"
             )));
+        }
+        let links: Vec<StreamBackend> = primary_ids
+            .iter()
+            .map(|id| (id, false))
+            .chain(backup_ids.iter().map(|id| (id, true)))
+            .map(|(backend_id, backup)| StreamBackend {
+                backup,
+                ..StreamBackend::primary(stream_id, backend_id)
+            })
+            .collect();
+        self.set_stream_links(stream_id, &links)
+    }
+
+    /// Replace every link of `stream_id` with `links`, each carrying its
+    /// backup flag (Story 12.3, D-f) and the rule it serves (Story 12.4,
+    /// D-d), in one savepoint: either the whole new set stands, or, when
+    /// one backend breaks the attachment rule (`check_backend_attachments`),
+    /// the old set does and the error names the stream. A link of another
+    /// stream, and a backend listed twice (it serves at most one rule of
+    /// a stream), are refused. `NotFound` when the stream does not exist;
+    /// a backend id naming no backend is refused by the foreign key.
+    pub fn set_stream_links(&self, stream_id: &str, links: &[StreamBackend]) -> Result<()> {
+        if self.get_stream(stream_id)?.is_none() {
+            return Err(ConfigError::NotFound(format!("stream {stream_id}")));
+        }
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for link in links {
+            if link.stream_id != stream_id {
+                return Err(ConfigError::Validation(format!(
+                    "a link of stream {} cannot be written as a link of stream {stream_id}",
+                    link.stream_id
+                )));
+            }
+            if !seen.insert(link.backend_id.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "backend {} is listed twice for stream {stream_id}; a backend serves at \
+                     most one rule of a stream",
+                    link.backend_id
+                )));
+            }
         }
         self.within_savepoint(|| {
             self.conn.execute(
                 "DELETE FROM stream_backends WHERE stream_id = ?1",
                 params![stream_id],
             )?;
-            let links = primary_ids
-                .iter()
-                .map(|id| (id, false))
-                .chain(backup_ids.iter().map(|id| (id, true)));
-            for (backend_id, backup) in links {
-                self.link_stream_backend_unchecked(&StreamBackend {
-                    stream_id: stream_id.to_string(),
-                    backend_id: backend_id.clone(),
-                    backup,
-                })?;
+            for link in links {
+                self.link_stream_backend_unchecked(link)?;
             }
             self.check_attachments_of_stream(stream_id)
         })
@@ -468,9 +565,9 @@ impl ConfigStore {
     /// Idempotent (ignores duplicates: the first write of a pair stands).
     pub(crate) fn link_stream_backend_unchecked(&self, link: &StreamBackend) -> Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO stream_backends (stream_id, backend_id, backup) \
-             VALUES (?1, ?2, ?3)",
-            params![link.stream_id, link.backend_id, link.backup],
+            "INSERT OR IGNORE INTO stream_backends (stream_id, backend_id, backup, rule) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![link.stream_id, link.backend_id, link.backup, link.rule],
         )?;
         Ok(())
     }
@@ -478,7 +575,7 @@ impl ConfigStore {
     /// Every stream-backend link, ordered by stream then backend ID.
     pub fn list_stream_backends(&self) -> Result<Vec<StreamBackend>> {
         let mut stmt = self.conn.prepare(
-            "SELECT stream_id, backend_id, backup FROM stream_backends \
+            "SELECT stream_id, backend_id, backup, rule FROM stream_backends \
              ORDER BY stream_id, backend_id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -486,6 +583,7 @@ impl ConfigStore {
                 stream_id: row.get(0)?,
                 backend_id: row.get(1)?,
                 backup: row.get(2)?,
+                rule: row.get(3)?,
             })
         })?;
         let mut links = Vec::new();
@@ -775,6 +873,7 @@ mod tests {
                 stream_id: sid("s-2"),
                 backend_id: "b-2".to_string(),
                 backup: false,
+                rule: None,
             }]
         );
     }
@@ -817,6 +916,81 @@ mod tests {
             .set_stream_backend_links(&sid("s-1"), &["b-1".to_string()], &["b-1".to_string()])
             .is_err());
         assert_eq!(store.list_stream_backends().expect("links"), links);
+    }
+
+    #[test]
+    fn every_tls_field_and_the_link_rule_round_trip() {
+        let store = store_with_backends(&[("b-1", "192.0.2.10:443"), ("b-2", "192.0.2.20:443")]);
+        let s = crate::models::sample_tls_stream("s-1", "tls", 443);
+        store.create_stream(&s).expect("create");
+        assert_eq!(store.get_stream(&sid("s-1")).expect("get"), Some(s.clone()));
+
+        let links = vec![
+            StreamBackend {
+                rule: Some("web".to_string()),
+                ..StreamBackend::primary(&sid("s-1"), "b-1")
+            },
+            StreamBackend {
+                rule: Some("bare".to_string()),
+                ..StreamBackend::primary(&sid("s-1"), "b-2")
+            },
+        ];
+        store
+            .set_stream_links(&sid("s-1"), &links)
+            .expect("rule links");
+        assert_eq!(store.list_stream_backends().expect("links"), links);
+
+        let mut changed = s.clone();
+        changed.tls_mode = StreamTlsMode::Passthrough;
+        changed.tls_terminate = None;
+        changed.upstream_tls = None;
+        changed.clienthello_timeout_ms = None;
+        store.update_stream(&changed).expect("update");
+        assert_eq!(store.get_stream(&sid("s-1")).expect("get"), Some(changed));
+
+        let err = store
+            .set_stream_links(&sid("s-1"), &[StreamBackend::primary(&sid("s-1"), "b-1")])
+            .expect_err("a TLS stream's link names a rule");
+        assert!(
+            matches!(&err, ConfigError::Validation(m) if m.contains("`tls`")),
+            "{err}"
+        );
+        let twice = [links[0].clone(), links[0].clone()];
+        assert!(matches!(
+            store.set_stream_links(&sid("s-1"), &twice),
+            Err(ConfigError::Validation(m)) if m.contains("at most one rule")
+        ));
+        assert!(matches!(
+            store.set_stream_links(&sid("s-1"), &[StreamBackend::primary(&sid("s-9"), "b-1")]),
+            Err(ConfigError::Validation(_))
+        ));
+        assert_eq!(store.list_stream_backends().expect("links"), links);
+    }
+
+    #[test]
+    fn server_names_are_stored_canonical_whoever_writes_them() {
+        let store = store_with_backends(&[]);
+        let mut s = crate::models::sample_tls_stream("s-1", "tls", 443);
+        s.match_rules[0].matcher = StreamMatcher::Tls {
+            server_names: vec!["App.Example.COM.".to_string()],
+            alpn: Vec::new(),
+        };
+        store.create_stream(&s).expect("create");
+        let stored = store.get_stream(&sid("s-1")).expect("get").expect("kept");
+        assert_eq!(
+            stored.match_rules[0].matcher.server_names(),
+            ["app.example.com".to_string()]
+        );
+        s.match_rules[0].matcher = StreamMatcher::Tls {
+            server_names: vec!["API.example.com".to_string()],
+            alpn: Vec::new(),
+        };
+        store.update_stream(&s).expect("update");
+        let stored = store.get_stream(&sid("s-1")).expect("get").expect("kept");
+        assert_eq!(
+            stored.match_rules[0].matcher.server_names(),
+            ["api.example.com".to_string()]
+        );
     }
 
     #[test]

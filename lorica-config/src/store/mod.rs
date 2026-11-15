@@ -204,6 +204,7 @@ const MIGRATIONS: &[Migration] = &[
     (74, migrate_subscribe_stream_alerts),
     (75, migrate_stream_engine_settings),
     (76, migrate_stream_udp_settings),
+    (77, migrate_stream_tls),
 ];
 
 /// The newest schema version, the last entry of [`MIGRATIONS`].
@@ -1782,6 +1783,41 @@ fn migrate_stream_udp_settings(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// The `streams` columns migration 77 adds, with their DDL. Frozen here
+/// on purpose, as migration 75's are:
+/// `a_stream_stored_before_migration_77_reads_with_the_tls_defaults`
+/// holds them equal to `Stream::new`.
+const STREAM_TLS_COLUMNS: [(&str, &str); 6] = [
+    ("tls_mode", "TEXT NOT NULL DEFAULT 'none'"),
+    ("match_rules", "TEXT NOT NULL DEFAULT '[]'"),
+    ("no_sni_acknowledged", "INTEGER NOT NULL DEFAULT 0"),
+    ("clienthello_timeout_ms", "INTEGER"),
+    ("tls_terminate", "TEXT"),
+    ("upstream_tls", "TEXT"),
+];
+
+/// TLS at layer 4 (Story 12.4, D-k): the TLS mode, rules and settings of
+/// a stream as columns of `streams`, and `stream_backends.rule`, the rule
+/// a link serves.
+///
+/// Each `streams` column carries the model's default, or is nullable
+/// where the model's `None` means "not set", so a row written before
+/// this migration reads as the stream it was: no TLS. `match_rules`,
+/// `tls_terminate` and `upstream_tls` hold JSON. `stream_backends.rule`
+/// is nullable, NULL on every link of a stream that reads no
+/// ClientHello. No `CHECK` on the enumerated text (12.1 D-1).
+/// Idempotent through `add_column_if_absent`.
+///
+/// 1.10.6 opening this database after a rollback never names `streams`
+/// or `stream_backends` (12.1 D-2), so the new columns are invisible to
+/// it.
+fn migrate_stream_tls(conn: &Connection) -> rusqlite::Result<()> {
+    for (column, ddl) in STREAM_TLS_COLUMNS {
+        add_column_if_absent(conn, "streams", column, ddl)?;
+    }
+    add_column_if_absent(conn, "stream_backends", "rule", "TEXT")
+}
+
 /// A stored wildcard pattern whose body names an address (`*.0.2.10`),
 /// which the matchers no longer let cover one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2951,6 +2987,51 @@ mod migration_tests {
         let links = store.list_stream_backends().expect("links read");
         assert_eq!(links.len(), 1);
         assert!(!links[0].backup);
+    }
+
+    /// A stream and a link written before migration 77 read back, once
+    /// it has run (twice), as `Stream::new` builds them: no TLS, and a
+    /// link serving no rule.
+    #[test]
+    fn a_stream_stored_before_migration_77_reads_with_the_tls_defaults() {
+        let store = ConfigStore::open_in_memory().expect("fresh store at head");
+        for (column, _) in STREAM_TLS_COLUMNS {
+            store
+                .conn
+                .execute(&format!("ALTER TABLE streams DROP COLUMN {column}"), [])
+                .expect("test setup: back to the 12.5 shape");
+        }
+        store
+            .conn
+            .execute("ALTER TABLE stream_backends DROP COLUMN rule", [])
+            .expect("test setup: back to the 12.5 shape");
+        let id = crate::models::sample_stream_id("s-1");
+        store
+            .conn
+            .execute_batch(&format!(
+                "INSERT INTO backends (id, address, created_at, updated_at)
+                 VALUES ('b-1', '192.0.2.10:443', '2026-11-14T00:00:00Z', '2026-11-14T00:00:00Z');
+                 INSERT INTO streams (id, name, group_name, protocol, enabled, listen_address,
+                     port_first, port_last, node_selector, created_at, updated_at)
+                 VALUES ('{id}', 'tls', '', 'tcp', 1, '0.0.0.0', 443, 443, '[]',
+                     '2026-11-14T00:00:00+00:00', '2026-11-14T00:00:00+00:00');
+                 INSERT INTO stream_backends (stream_id, backend_id, backup)
+                 VALUES ('{id}', 'b-1', 1);"
+            ))
+            .expect("test setup: a 12.5 row");
+        for _ in 0..2 {
+            migrate_stream_tls(&store.conn).expect("migration 77 runs");
+        }
+        let read = store.get_stream(&id).expect("reads").expect("kept");
+        assert_eq!(
+            read,
+            crate::models::sample_stream("s-1", "tls", crate::models::StreamProtocol::Tcp, 443)
+        );
+        assert!(!read.drains_on_upgrade());
+        let links = store.list_stream_backends().expect("links read");
+        assert_eq!(links.len(), 1);
+        assert!(links[0].backup, "the 12.3 column is kept");
+        assert_eq!(links[0].rule, None);
     }
 
     /// A UDP stream written before migration 76, with every Story 12.3

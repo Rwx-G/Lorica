@@ -91,10 +91,10 @@ pub use oidc_issuer::{
 pub use preferences::{User, UserPreference};
 pub use probes::{ProbeConfig, ProbeResultRow};
 pub use route::{
-    validate_node_selector_names, AiBotPolicy, BotBypassRules, BotProtectionConfig,
-    BotProtectionMode, ForwardAuthConfig, GeoIpConfig, GeoIpMode, HeaderRule, MirrorConfig,
-    MtlsConfig, PathRule, RateLimit, RateLimitScope, ResponseRewriteConfig, ResponseRewriteRule,
-    Route, SpoofedFallback, TrafficSplit, NODE_SELECTOR_MAX_ENTRIES,
+    organizations_admitted, validate_node_selector_names, AiBotPolicy, BotBypassRules,
+    BotProtectionConfig, BotProtectionMode, ForwardAuthConfig, GeoIpConfig, GeoIpMode, HeaderRule,
+    MirrorConfig, MtlsConfig, PathRule, RateLimit, RateLimitScope, ResponseRewriteConfig,
+    ResponseRewriteRule, Route, SpoofedFallback, TrafficSplit, NODE_SELECTOR_MAX_ENTRIES,
 };
 pub use route_protection_record::RouteProtectionRecord;
 pub use settings::{
@@ -103,16 +103,20 @@ pub use settings::{
 };
 pub use sla::{SlaBucket, SlaConfig, SlaSummary};
 #[cfg(test)]
+pub(crate) use stream::sample_tls_stream;
+#[cfg(test)]
 pub(crate) use stream::tests::{
     backend as sample_stream_backend,
     every_engine_setting_off_default as sample_stream_off_default, stream as sample_stream,
     stream_id as sample_stream_id,
 };
 pub use stream::{
-    binds_here, binds_here_when_enabled, check_backend_attachments, is_canonical_stream_id,
-    is_unexposed_udp_listen_address, udp_exposure_check, AttachmentConflict, AttachmentRule,
-    AttachmentSnapshot, DatagramDropReason, NodeRole, OnUdp, Stream, StreamBackend, StreamEndKind,
-    StreamEndReason, StreamProtocol, StreamProxyProtocol, StreamRefusal, TcpEngineField,
-    UdpSettings, STREAM_ID_LEN, STREAM_NAME_MAX_LEN, STREAM_PORT_RANGE_MAX, TCP_ENGINE_FIELDS,
+    binds_here, binds_here_when_enabled, canonical_server_name, check_backend_attachments,
+    is_canonical_stream_id, is_unexposed_udp_listen_address, udp_exposure_check,
+    AttachmentConflict, AttachmentRule, AttachmentSnapshot, DatagramDropReason, NodeRole, OnUdp,
+    Stream, StreamBackend, StreamEndKind, StreamEndReason, StreamMatchRule, StreamMatcher,
+    StreamProtocol, StreamProxyProtocol, StreamRefusal, StreamTlsMode, StreamTlsTerminate,
+    StreamUpstreamTls, TcpEngineField, UdpSettings, UpstreamServerName, STREAM_ID_LEN,
+    STREAM_NAME_MAX_LEN, STREAM_PORT_RANGE_MAX, TCP_ENGINE_FIELDS,
     UDP_EXPOSED_SOURCE_SESSION_CAP_MAX,
 };

@@ -342,6 +342,7 @@ impl Harness {
                     stream_id: stream.id.clone(),
                     backend_id: b.id.clone(),
                     backup: false,
+                    rule: None,
                 });
                 rows.push(b.clone());
             }

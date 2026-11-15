@@ -70,7 +70,9 @@ pub fn parse_toml_for_preview(content: &str) -> Result<ImportData> {
 /// Decode a TOML export, giving every UDP stream the protocol-dependent
 /// defaults a serde default cannot know (Story 12.5 Interface edit E1):
 /// the UDP `idle_timeout_s` when the key is absent, which only the
-/// document still shows, and the UDP settings when absent.
+/// document still shows, and the UDP settings when absent; and putting
+/// every TLS rule's server names in their stored form (Story 12.4 D-c),
+/// so the preview's diff compares what the import would write.
 fn decode(content: &str) -> Result<ImportData> {
     let parse_failed =
         |e: toml::de::Error| ConfigError::Serialization(format!("TOML parse failed: {e}"));
@@ -93,6 +95,7 @@ fn decode(content: &str) -> Result<ImportData> {
     let mut data: ImportData = document.try_into().map_err(parse_failed)?;
     for stream in &mut data.streams {
         stream.fill_protocol_defaults();
+        stream.canonicalise_server_names();
     }
     Ok(data)
 }
@@ -455,6 +458,93 @@ mod tests {
         let data = parse_toml(&toml_text).expect("the export parses");
         import_to_store(&target, &data).expect("the export imports");
 
+        assert_eq!(
+            target.list_streams().expect("streams"),
+            source.list_streams().expect("streams")
+        );
+        assert_eq!(
+            target.list_stream_backends().expect("links"),
+            source.list_stream_backends().expect("links")
+        );
+    }
+
+    #[test]
+    fn tls_streams_and_rule_links_round_trip_through_export_and_import() {
+        let source = ConfigStore::open_in_memory().expect("test setup: store");
+        source
+            .create_backend(&sample_stream_backend("b-1", "192.0.2.10:443"))
+            .expect("test setup: backend");
+        source
+            .create_backend(&sample_stream_backend("b-2", "192.0.2.20:443"))
+            .expect("test setup: backend");
+        let mut tls = crate::models::sample_tls_stream("s-tls", "tls", 443);
+        tls.match_rules[0].matcher = crate::models::StreamMatcher::Tls {
+            server_names: vec!["App.Example.COM.".to_string(), "*.example.com".to_string()],
+            alpn: vec!["h2".to_string()],
+        };
+        source.create_stream(&tls).expect("test setup: stream");
+        source
+            .set_stream_links(
+                &sid("s-tls"),
+                &[
+                    StreamBackend {
+                        rule: Some("web".to_string()),
+                        ..StreamBackend::primary(&sid("s-tls"), "b-1")
+                    },
+                    StreamBackend {
+                        backup: false,
+                        rule: Some("bare".to_string()),
+                        ..StreamBackend::primary(&sid("s-tls"), "b-2")
+                    },
+                ],
+            )
+            .expect("test setup: links");
+        let toml_text = export_to_toml(&source).expect("export");
+        let target = ConfigStore::open_in_memory().expect("target");
+        let data = parse_toml(&toml_text).expect("the export parses");
+        import_to_store(&target, &data).expect("the export imports");
+        assert_eq!(
+            target.list_streams().expect("streams"),
+            source.list_streams().expect("streams")
+        );
+        assert_eq!(
+            target.list_stream_backends().expect("links"),
+            source.list_stream_backends().expect("links")
+        );
+        assert_eq!(
+            target.list_streams().expect("streams")[0].match_rules[0]
+                .matcher
+                .server_names()[0],
+            "app.example.com",
+            "stored canonical"
+        );
+    }
+
+    #[test]
+    fn a_stream_export_from_before_tls_imports_without_tls() {
+        let source = store_with_streams();
+        let mut value = exported(&source);
+        for stream in value
+            .get_mut("streams")
+            .and_then(toml::Value::as_array_mut)
+            .expect("test setup: streams")
+        {
+            let table = stream.as_table_mut().expect("test setup: a stream table");
+            for key in ["tls_mode", "match_rules", "no_sni_acknowledged"] {
+                assert!(table.remove(key).is_some(), "{key} exported");
+            }
+        }
+        for link in value
+            .get_mut("stream_backends")
+            .and_then(toml::Value::as_array_mut)
+            .expect("test setup: links")
+        {
+            let table = link.as_table_mut().expect("test setup: a link table");
+            assert!(!table.contains_key("rule"), "no rule, no key");
+        }
+        let target = ConfigStore::open_in_memory().expect("target");
+        let data = parse_toml(&toml::to_string(&value).expect("re-encode")).expect("parses");
+        import_to_store(&target, &data).expect("imports");
         assert_eq!(
             target.list_streams().expect("streams"),
             source.list_streams().expect("streams")

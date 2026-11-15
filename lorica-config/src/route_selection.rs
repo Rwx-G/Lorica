@@ -75,8 +75,9 @@ pub const CATCH_ALL_HOSTNAME: &str = "_";
 /// which is every request a browser sends by DNS name. An IPv6 literal
 /// costs one small allocation to check.
 ///
-/// Every stored route name and protection record name is in this form,
-/// rewritten by migrations 68 and 70 when the form changed. A change to
+/// Every stored route name, protection record name and stream server
+/// name is in this form, rewritten by migrations 68 and 70 when the form
+/// changed. A change to
 /// what this function answers therefore needs a new migration that
 /// rewrites the stored names again, or they stop matching the requests
 /// that name them; `store::tests` pins the answers with the migration
@@ -173,6 +174,36 @@ pub const ROUTE_ALIAS_SHAPE: HostnameShape<'static> = HostnameShape {
     field_label: "hostname alias",
     ..ROUTE_HOSTNAME_SHAPE
 };
+
+/// The shape of a server name in a TLS stream's rule (Story 12.4, D-c):
+/// a DNS name or a wildcard, never empty, the catch-all or an IPv6
+/// literal. A ClientHello never names an address (RFC 6066), so the
+/// stream model also refuses any name `crate::host_shape::names_an_address`
+/// reads as one, which this shape alone lets through as a dotted IPv4.
+pub const STREAM_SERVER_NAME_SHAPE: HostnameShape<'static> = HostnameShape {
+    allow_wildcard: true,
+    allow_empty: false,
+    allow_catch_all: false,
+    allow_ipv6_literal: false,
+    field_label: "server name",
+};
+
+/// The order in which overlapping wildcard patterns are tried, in
+/// [`canonical_hostname`] form: the longest pattern first, then by
+/// spelling, so the pattern a host matches most narrowly wins and the
+/// choice is the same on every node and every reload. Routes
+/// ([`HostIndex::new`]) and TLS stream rules (Story 12.4, D-c) both sort
+/// by it, so the two cannot drift.
+///
+/// ```
+/// use lorica_config::route_selection::wildcard_precedence;
+/// let mut patterns = vec!["*.example.com", "*.b.example.com", "*.a.example.com"];
+/// patterns.sort_by(|a, b| wildcard_precedence(a, b));
+/// assert_eq!(patterns, ["*.a.example.com", "*.b.example.com", "*.example.com"]);
+/// ```
+pub fn wildcard_precedence(a: &str, b: &str) -> std::cmp::Ordering {
+    b.len().cmp(&a.len()).then_with(|| a.cmp(b))
+}
 
 /// RFC 1123-shaped hostname validation for every field that takes a
 /// bare hostname: no scheme, path, port, query, fragment, userinfo or
@@ -485,7 +516,7 @@ impl<E: Clone> HostIndex<E> {
             .into_iter()
             .filter_map(|name| by_name.remove(&name).map(|entries| (name, entries)))
             .collect();
-        wildcards.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        wildcards.sort_by(|(a, _), (b, _)| wildcard_precedence(a, b));
         let longest_prefix_first = |entries: &mut Vec<E>| {
             entries.sort_by_key(|entry| std::cmp::Reverse(route_of(entry).path_prefix.len()));
         };

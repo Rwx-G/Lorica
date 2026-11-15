@@ -235,19 +235,19 @@ fn diff_links<T>(
 }
 
 /// [`diff_links`] for stream links, which also carry the backup flag
-/// (Story 12.3, D-f): a pair present on both sides whose flag differs is
-/// modified.
+/// (Story 12.3, D-f) and the rule they serve (Story 12.4, D-d): a pair
+/// present on both sides whose flag or rule differs is modified.
 fn diff_stream_links(current: &[StreamBackend], incoming: &[StreamBackend]) -> EntityDiff {
     let pair = |sb: &StreamBackend| (sb.stream_id.clone(), sb.backend_id.clone());
     let mut diff = diff_links(current, incoming, pair);
-    let current_flags: std::collections::HashMap<(String, String), bool> =
-        current.iter().map(|sb| (pair(sb), sb.backup)).collect();
+    let current_links: std::collections::HashMap<(String, String), &StreamBackend> =
+        current.iter().map(|sb| (pair(sb), sb)).collect();
     diff.modified = incoming
         .iter()
         .filter(|sb| {
-            current_flags
+            current_links
                 .get(&pair(sb))
-                .is_some_and(|&backup| backup != sb.backup)
+                .is_some_and(|stored| stored.backup != sb.backup || stored.rule != sb.rule)
         })
         .map(|sb| format!("{} -> {}", sb.stream_id, sb.backend_id))
         .collect();
@@ -574,6 +574,45 @@ mod tests {
         );
         assert!(diff.stream_backends.added.is_empty());
         assert!(diff.stream_backends.removed.is_empty());
+    }
+
+    #[test]
+    fn compute_diff_reports_a_link_whose_rule_changed() {
+        let store = ConfigStore::open_in_memory().expect("test setup: store");
+        for (id, address) in [("b-1", "192.0.2.10:443"), ("b-2", "192.0.2.20:443")] {
+            store
+                .create_backend(&sample_stream_backend(id, address))
+                .expect("test setup: backend");
+        }
+        store
+            .create_stream(&crate::models::sample_tls_stream("s-1", "tls", 443))
+            .expect("test setup: stream");
+        let rule_link = |backend: &str, rule: &str| StreamBackend {
+            rule: Some(rule.to_string()),
+            ..StreamBackend::primary(&sid("s-1"), backend)
+        };
+        store
+            .set_stream_links(
+                &sid("s-1"),
+                &[rule_link("b-1", "web"), rule_link("b-2", "bare")],
+            )
+            .expect("test setup: links");
+        let mut incoming = parse_toml_for_preview(&export_to_toml(&store).expect("export"))
+            .expect("the export parses");
+        assert!(compute_diff(&store, &incoming).expect("diff").is_empty());
+
+        let b2 = incoming
+            .stream_backends
+            .iter_mut()
+            .find(|sb| sb.backend_id == "b-2")
+            .expect("test setup: the b-2 link");
+        b2.rule = Some("web".to_string());
+        let diff = compute_diff(&store, &incoming).expect("diff");
+        assert!(diff.streams.is_empty());
+        assert_eq!(
+            diff.stream_backends.modified,
+            vec![format!("{} -> b-2", sid("s-1"))]
+        );
     }
 
     #[test]

@@ -823,6 +823,49 @@ Prometheus names and labels are Story 12.9's.
 These modules are Lorica's own inside the fork; nothing upstream
 changes.
 
+### Amendments after Stories 12.3 and 12.5 landed (2026-11-15)
+
+Read against the code on `feat/v1.11.0` at `8a7e075a`. Where the text
+above assumed a shape the code does not have, the code wins and the
+decision reads as below.
+
+- **D-b, the buffer and 12.3's preamble.** 12.3 built its preamble as a
+  `Vec<u8>` copied out of the PROXY read's own buffer
+  (`tcp::proxy_header::read_trusted`, at most `MAX_HEADER_LEN` = 4,096
+  bytes), not as one buffer phase 2 appends to. Lot D allocates the
+  fixed `CLIENTHELLO_BUFFER` for a TLS stream, copies that leftover into
+  it (it always fits) and reads on from there; a stream without TLS
+  keeps 12.3's preamble unchanged.
+- **D-b, a record past the hello is refused** (Lot B Completion Notes).
+- **D-d, a rule without a primary.** `check_backend_attachments` judges
+  backends, so a rule is refused when its links are all backups
+  (`RuleWithoutPrimary`), the per-rule analogue of 12.3's
+  `NoPrimaryBackend`. A rule with no link at all, like a stream with
+  none, has no backend to report it against: the store accepts it and
+  its clients end `no_healthy_backend`. Lot F decides whether the API
+  requires a link per rule at write.
+- **D-i, `UpstreamServerName`.** Tagged by `mode`; the two modes without
+  a field are empty struct variants (`backend_address {}`, `client {}`),
+  because serde enforces `deny_unknown_fields` on an internally tagged
+  enum's struct variants and silently ignores extra keys beside a unit
+  variant's tag, which the strict canonical decode must not.
+- **D-h and D-i, bundle checks on every writer.** `Stream::validate`
+  checks the shape a writer without X.509 parsing can check (not blank,
+  at most 1 MiB, at least one `CERTIFICATE` block, at most 100
+  organizations, none blank or with a control character), so the replica
+  apply and the import refuse what the API would. Parsing every block
+  and the trust warnings stay the API's (`build_mtls_config`, Lot F).
+- **D-k, links with rules.** `set_stream_backends` and
+  `set_stream_backend_links` keep their signatures and write links
+  serving no rule; `ConfigStore::set_stream_links(stream_id,
+  &[StreamBackend])` writes whole links, rule included, and refuses a
+  backend listed twice (one rule per backend, Resolved 3).
+- **D-c, where canonicalisation happens.** `Stream::validate` accepts
+  any spelling that canonicalises to a valid name; the store writes the
+  canonical form whoever the writer (management API, replica apply,
+  import), and the import's decode canonicalises too, so its preview
+  diff compares what it would write.
+
 ## Interface with Story 12.3
 
 Aligned with the 12.3 draft (Draft, 2026-11-14). What this story uses
@@ -943,21 +986,21 @@ new fields break, as `grep` lists them when the Lot starts (literal
 sites only, no behaviour).
 Depends on: 12.3 Lot B and 12.5 Lot C (same files). Runs alone.
 
-- [ ] The fields and types of D-k, D-d's `StreamMatcher` and
+- [x] The fields and types of D-k, D-d's `StreamMatcher` and
       `StreamMatchRule`, `StreamTlsMode`, `StreamTlsTerminate`,
       `StreamUpstreamTls`, `UpstreamServerName`; `StreamBackend::rule`;
       the refusals of D-l; `drains_on_upgrade` (D-j);
       `no_sni_needs_acknowledgement` (D-d).
-- [ ] `Stream::validate` and `check_backend_attachments` (D-k).
-- [ ] `organizations_admitted` (D-h).
-- [ ] Migration, store columns, the link `rule` in
+- [x] `Stream::validate` and `check_backend_attachments` (D-k).
+- [x] `organizations_admitted` (D-h).
+- [x] Migration, store columns, the link `rule` in
       `set_stream_backends` and its readers; canonical digest; diff;
       export and import.
-- [ ] Entitlement in `cert_key_recipients` and
+- [x] Entitlement in `cert_key_recipients` and
       `certificates_entitling_node` (D-f, D-k), which the control
       plane's pull answer, the issuance push and the node drawer already
       read, so replication follows with no change outside this file.
-- [ ] Tests: each default; every D-g cell refused with the field and
+- [x] Tests: each default; every D-g cell refused with the field and
       mode named; ambiguity (same name, intersecting ALPN; both empty;
       two `no_sni`), accepted when ALPN sets are disjoint; rule caps at
       both bounds; server names canonicalised on write (`App.Example.COM.`
@@ -967,7 +1010,7 @@ Depends on: 12.3 Lot B and 12.5 Lot C (same files). Runs alone.
       for each mode with and without upstream TLS; migration idempotence;
       a 12.3-shaped TOML imports with defaults; canonical round trip;
       `HostIndex` ordering unchanged; the entitlement tests of D-k.
-- [ ] Replication tests (Resolved 2), on a store with a control plane
+- [x] Replication tests (Resolved 2), on a store with a control plane
       and three active followers A, B and C, certificates X, Y and Z,
       no route naming any of them: a terminating stream targeted at A
       naming X and re-encrypting with client identity Y gives
@@ -1271,6 +1314,97 @@ The decisions above cite each one as "Resolved N".
 
 ### Completion Notes
 
+**Lot C (model, schema, validation, entitlement).**
+
+- Migration **77** (`migrate_stream_tls`), the next free number after
+  12.3's 75 and 12.5's 76: `tls_mode TEXT NOT NULL DEFAULT 'none'`,
+  `match_rules TEXT NOT NULL DEFAULT '[]'`, `no_sni_acknowledged INTEGER
+  NOT NULL DEFAULT 0`, `clienthello_timeout_ms INTEGER`, `tls_terminate
+  TEXT`, `upstream_tls TEXT` on `streams` (`STREAM_TLS_COLUMNS`, frozen)
+  and `stream_backends.rule TEXT`. A test drops them back to the 12.5
+  shape, runs 77 twice and reads the row as `Stream::new` builds it and
+  the link with its backup flag kept and no rule.
+- Model (`models/stream.rs`): `StreamTlsMode` (`none`, `passthrough`,
+  `terminate`, `reads_client_hello()`), `StreamMatchRule { name,
+  matcher }`, `StreamMatcher::{Tls { server_names, alpn }, NoSni { alpn
+  }}` tagged `kind`, `StreamTlsTerminate { certificate_ids, client_auth:
+  Option<MtlsConfig> }`, `StreamUpstreamTls { server_name, ca_cert_pem,
+  skip_verify, client_certificate_id, alpn }`, `UpstreamServerName`
+  (amended above); the six `Stream` fields of D-k with serde defaults;
+  `StreamBackend::rule` and `StreamBackend::primary(stream, backend)`.
+  Limits are associated constants (`CLIENTHELLO_TIMEOUT_MS_RANGE`,
+  `MATCH_RULES_MAX`, `RULE_SERVER_NAMES_MAX`, `SERVER_NAMES_MAX`,
+  `ALPN_MAX`, `TERMINATE_CERTIFICATES_MAX`, ...). Methods:
+  `drains_on_upgrade`, `no_sni_needs_acknowledgement`,
+  `effective_clienthello_timeout_ms`, `has_no_sni_rule`, `match_rule`,
+  `certificate_references` (the list entitlement and the delete guard
+  read), `canonicalise_server_names`, `tls_field_names` (derived from the
+  one list the mode table judges, so the API's interim view filter
+  cannot drift). `canonical_server_name` is the stored form.
+  `StreamRefusal` gains `invalid_client_hello`, `no_certificate`,
+  `tls_handshake`, `client_certificate`.
+- Validation: the D-g table, UDP refusals saying there is no DTLS for
+  streams, the acknowledgement both ways naming both remedies, the
+  ClientHello deadline range, rule names, caps, ALPN shape, server names
+  through `STREAM_SERVER_NAME_SHAPE` plus `names_an_address`, the
+  ambiguity rule over canonical names naming both rules, termination and
+  upstream checks (amended above). `check_backend_attachments` gains
+  `LinkWithoutRule`, `UnknownRule`, `RuleWithoutPrimary` and
+  `RuleOnNonTlsStream`.
+- `route_selection.rs`: `STREAM_SERVER_NAME_SHAPE`, `pub fn
+  wildcard_precedence(a, b)` which `HostIndex::new` now sorts by (its
+  tests pass unchanged), and the `canonical_hostname` doc sentence.
+  `models/route.rs`: `pub fn organizations_admitted(allowed, presented)`;
+  `evaluate_mtls` moves onto it in Lot E.
+- **Entitlement** (`store/cluster_nodes.rs`): `cert_key_recipients` and
+  `certificates_by_node` (behind `certificates_entitling_node`) fold the
+  selectors of the streams whose `certificate_references` name the
+  certificate, read from the decoded rows (`list_streams`), never by a
+  `LIKE`; a stream row that does not decode, its selector included, fails
+  closed with `ConfigError::Corrupt`. Rule: a follower receives exactly
+  the keys that the streams targeting it name
+  (`tls_terminate.certificate_ids` and `upstream_tls.client_certificate_id`),
+  disabled streams included, Active nodes only. Tests on a store with
+  followers A, B, C and certificates X, Y, Z no route names: a stream
+  targeted at A naming X and presenting Y entitles A to X and Y and
+  nobody to Z, both views agreeing; retargeted to B both move to B
+  alone; disabled it still entitles; fleet-wide it entitles A, B and C; a
+  pending node gets nothing; a route and a stream on one certificate
+  give the union; a corrupt stream selector is `Corrupt` in both views.
+  Not extended: `hostnames_by_selected_name`, the pending-node review
+  ("what would approving this name hand over"), still lists route
+  hostnames only.
+- Store: `STREAM_COLUMNS` extended, the canonical form written by every
+  writer (`as_stored`), `set_stream_links`, the link `rule` written by
+  `link_stream_backend_unchecked` (so the replica apply carries it) and
+  read by `list_stream_backends`. Canonical: format stays 3 and
+  `CANONICAL_SHAPE_DIGEST` moves, the reason beside it (no released blob
+  is stamped 3, a 1.10.x peer is refused by version and schema, a 1.11.0
+  build from before 77 by schema at the handshake);
+  `StreamMatchRule`, `StreamTlsTerminate`, `StreamUpstreamTls` and
+  `MtlsConfig` join the inventory and `stream_tls_shape_lines` reads the
+  three enums. `compute_diff` reports a link whose rule changed. Export
+  and import carry every field through serde; the import canonicalises
+  server names on decode.
+- Tests: defaults and a 12.5-shaped document; every refused D-g cell
+  naming field and mode (UDP included); the deadline at both bounds;
+  ambiguity (intersecting ALPN, both empty, two `no_sni`) and the
+  accepted disjoint cases; every cap at both bounds; canonicalisation and
+  address-shaped names; the acknowledgement both ways; termination and
+  upstream combinations; `drains_on_upgrade` per mode with and without
+  upstream TLS; the four link rules; the refusal words; migration 77
+  twice; store round trip of every field and link rule and the
+  canonical form on create and update; TOML round trip of a TLS stream
+  and a 12.5-shaped export importing without TLS; the canonical blob
+  round trip and a blob without the fields; the diff; the entitlement
+  tests above.
+- Literal sites (no behaviour): `lorica-stream/src/table.rs`,
+  `lorica-stream/tests/{runtime,tcp_engine,tcp_runtime,udp_engine}.rs`,
+  `lorica/tests/stream_engine_adapters.rs` gain `rule: None`;
+  `lorica-api/src/streams/tests.rs`'s view key-set test filters
+  `Stream::tls_field_names()` until Lot F publishes them, as 12.3 Lot B
+  and 12.5 Lot C did. Lot F drops the filter.
+
 **Lot B (the ClientHello parser).**
 
 - API, `lorica_stream::tls::client_hello`: `parse(buf: &[u8]) ->
@@ -1364,6 +1498,22 @@ The decisions above cite each one as "Resolved N".
 
 ## File List
 
+Lot C:
+
+- `lorica-config/src/models/stream.rs`, `lorica-config/src/models/route.rs`,
+  `lorica-config/src/models/mod.rs`, `lorica-config/src/route_selection.rs`
+- `lorica-config/src/store/mod.rs` (migration 77),
+  `lorica-config/src/store/streams.rs`, `lorica-config/src/store/cluster_nodes.rs`
+- `lorica-config/src/canonical.rs`, `lorica-config/src/diff.rs`,
+  `lorica-config/src/import.rs`
+- `lorica-stream/src/table.rs`, `lorica-stream/tests/runtime.rs`,
+  `lorica-stream/tests/tcp_engine.rs`, `lorica-stream/tests/tcp_runtime.rs`,
+  `lorica-stream/tests/udp_engine.rs`, `lorica/tests/stream_engine_adapters.rs`
+  (literal sites)
+- `lorica-api/src/streams/tests.rs` (the view key-set filter, outside the
+  allowlist)
+- `docs/stories/story-12.4-tls-l4.md`
+
 Lot B:
 
 - `lorica-stream/src/tls/mod.rs`, `lorica-stream/src/tls/client_hello.rs`
@@ -1386,3 +1536,4 @@ Lot A:
 | 2026-11-14 | 0.2 | Maintainer answers folded in as Resolved 1 to 8, all as recommended; `certificate_ids` entitlement extended to replication with store tests (Lot C) and a cluster-profile check (Lot H); `clienthello_timeout_ms` bounds documented with their NFR2 reason. Status Draft. | Romain G. |
 | 2026-11-15 | 0.3 | Lot A landed: `lookup_keys` as the one statement of which certificate serves a name, `serves_server_name` on the resolver trait, `accept_any_server` behind `unverified`. Status InProgress. | Romain G. |
 | 2026-11-15 | 0.4 | Lot B landed: the bounded ClientHello reader `tls::client_hello::parse`, refusing at the first byte that rules a hello out, a record past the hello refused, and its fuzz target in the weekly matrix. | Romain G. |
+| 2026-11-15 | 0.5 | Lot C landed: the TLS fields, rules and link rules of D-k, migration 77, the mode table and rule validation, `drains_on_upgrade`, `organizations_admitted`, canonical digest, diff and import, and certificate key entitlement by streams. Decisions amended after Stories 12.3 and 12.5 landed. | Romain G. |

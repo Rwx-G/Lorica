@@ -264,6 +264,7 @@ impl Harness {
                 stream_id: stream.id.clone(),
                 backend_id: b.id.clone(),
                 backup: *backup,
+                rule: None,
             })
             .collect();
         let rows = backends.into_iter().map(|(b, _)| b).collect();

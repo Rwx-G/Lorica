@@ -131,12 +131,19 @@ impl SelectorUnion {
                 "node_selector of route {route_id} is not a JSON array of node names: {e}"
             ))
         })?;
+        self.add_names(&names);
+        Ok(())
+    }
+
+    /// Fold one selector already read in: a stream's, which the store
+    /// decodes (and refuses as [`ConfigError::Corrupt`] when it does not
+    /// parse) before it gets here.
+    fn add_names(&mut self, names: &[String]) {
         if names.is_empty() {
             self.fleet_wide = true;
         } else {
-            self.names.extend(names);
+            self.names.extend(names.iter().cloned());
         }
-        Ok(())
     }
 }
 
@@ -477,14 +484,26 @@ impl ConfigStore {
     /// make re-enabling a route race key delivery, and the route row
     /// itself already replicates to the same nodes.
     ///
+    /// A stream names certificates too (Story 12.4, D-f): a terminating
+    /// stream's `tls_terminate.certificate_ids` and an upstream client
+    /// identity's `upstream_tls.client_certificate_id`
+    /// (`Stream::certificate_references`). Each entitles the stream's
+    /// `node_selector` exactly as a route's `certificate_id` entitles the
+    /// route's, through the same fold, and a disabled stream still
+    /// entitles, as a disabled route does. A follower therefore receives
+    /// the keys its targeted streams name and no other key on a stream's
+    /// account. The references are read from the decoded rows (they are
+    /// JSON columns), never matched by a `LIKE`.
+    ///
     /// # Errors
     ///
     /// Returns [`ConfigError::Database`] on a read failure, and
     /// [`ConfigError::Corrupt`] when a stored `node_selector` is not
-    /// a JSON array of strings. That case fails closed on purpose:
-    /// `row_to_route` degrades an unreadable selector to "fleet-wide"
-    /// so a corrupt row still serves traffic, but doing the same here
-    /// would hand a private key to every node in the fleet.
+    /// a JSON array of strings, or a stream's row does not decode. That
+    /// case fails closed on purpose: `row_to_route` degrades an
+    /// unreadable selector to "fleet-wide" so a corrupt row still serves
+    /// traffic, but doing the same here would hand a private key to every
+    /// node in the fleet.
     pub fn cert_key_recipients(&self, cert_id: &str) -> Result<Vec<String>> {
         let mut union = SelectorUnion::default();
         {
@@ -495,6 +514,11 @@ impl ConfigStore {
             for row in rows {
                 let (route_id, raw_selector) = row?;
                 union.add(&route_id, &raw_selector)?;
+            }
+        }
+        for stream in self.list_streams()? {
+            if stream.certificate_references().contains(&cert_id) {
+                union.add_names(&stream.node_selector);
             }
         }
         self.resolve_selector_union(&union)
@@ -590,6 +614,22 @@ impl ConfigStore {
                 } else {
                     for name in union.names {
                         scoped.entry(name).or_default().insert(cert_id.clone());
+                    }
+                }
+            }
+        }
+        // The streams' references, folded the same way
+        // (`cert_key_recipients` says why a stream entitles).
+        for stream in self.list_streams()? {
+            for cert_id in stream.certificate_references() {
+                if stream.node_selector.is_empty() {
+                    fleet_wide.insert(cert_id.to_string());
+                } else {
+                    for name in &stream.node_selector {
+                        scoped
+                            .entry(name.clone())
+                            .or_default()
+                            .insert(cert_id.to_string());
                     }
                 }
             }
@@ -984,6 +1024,193 @@ mod tests {
         enrol(&store, "node-c", "edge-c", NodeStatus::Active);
         issue_certificate(&store, "cert-1", "shop.example.com");
         store
+    }
+
+    // ---- Story 12.4: certificates a stream names ----
+
+    /// A terminating stream named `name` on `port` targeted at
+    /// `selector`, serving `cert_id` and, when given, presenting
+    /// `client_id` to its backends.
+    fn terminating_stream(
+        name: &str,
+        port: u16,
+        cert_id: &str,
+        client_id: Option<&str>,
+        selector: &[&str],
+    ) -> crate::models::Stream {
+        use crate::models::{
+            StreamMatchRule, StreamMatcher, StreamTlsMode, StreamTlsTerminate, StreamUpstreamTls,
+        };
+        let mut stream =
+            crate::models::sample_stream(name, name, crate::models::StreamProtocol::Tcp, port);
+        stream.node_selector = selector.iter().map(|s| s.to_string()).collect();
+        stream.tls_mode = StreamTlsMode::Terminate;
+        stream.match_rules = vec![StreamMatchRule {
+            name: "web".to_string(),
+            matcher: StreamMatcher::Tls {
+                server_names: vec![format!("{name}.example.com")],
+                alpn: Vec::new(),
+            },
+        }];
+        stream.tls_terminate = Some(StreamTlsTerminate {
+            certificate_ids: vec![cert_id.to_string()],
+            client_auth: None,
+        });
+        stream.upstream_tls = client_id.map(|id| StreamUpstreamTls {
+            client_certificate_id: Some(id.to_string()),
+            ..StreamUpstreamTls::default()
+        });
+        stream
+    }
+
+    /// The control plane's store of Resolved 2: three active followers
+    /// A, B and C, certificates X, Y and Z, no route naming any of them.
+    fn fleet_with_three_unrouted_certificates() -> ConfigStore {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        enrol(&store, "node-a", "edge-a", NodeStatus::Active);
+        enrol(&store, "node-b", "edge-b", NodeStatus::Active);
+        enrol(&store, "node-c", "edge-c", NodeStatus::Active);
+        issue_certificate(&store, "cert-x", "x.example.com");
+        issue_certificate(&store, "cert-y", "y.example.com");
+        issue_certificate(&store, "cert-z", "z.example.com");
+        store
+    }
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    /// What a node holds, both ways: the certificate view per
+    /// certificate and the node view per node.
+    fn entitlement(store: &ConfigStore) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
+        let by_cert = ["cert-x", "cert-y", "cert-z"]
+            .iter()
+            .map(|c| store.cert_key_recipients(c).expect("recipients resolve"))
+            .collect();
+        let by_node = ["node-a", "node-b", "node-c"]
+            .iter()
+            .map(|n| {
+                store
+                    .certificates_entitling_node(n)
+                    .expect("node view resolves")
+            })
+            .collect();
+        (by_cert, by_node)
+    }
+
+    #[test]
+    fn a_follower_receives_exactly_the_keys_its_targeted_stream_names() {
+        let store = fleet_with_three_unrouted_certificates();
+        let mut stream = terminating_stream("tls", 443, "cert-x", Some("cert-y"), &["edge-a"]);
+        store.create_stream(&stream).expect("test setup: stream");
+
+        let (by_cert, by_node) = entitlement(&store);
+        assert_eq!(by_cert, vec![ids(&["node-a"]), ids(&["node-a"]), ids(&[])]);
+        assert_eq!(
+            by_node,
+            vec![ids(&["cert-x", "cert-y"]), ids(&[]), ids(&[])],
+            "B and C receive nothing on the stream's account"
+        );
+
+        // Retargeted to B, both keys move to B alone.
+        stream.node_selector = ids(&["edge-b"]);
+        store.update_stream(&stream).expect("retarget");
+        let (by_cert, by_node) = entitlement(&store);
+        assert_eq!(by_cert, vec![ids(&["node-b"]), ids(&["node-b"]), ids(&[])]);
+        assert_eq!(
+            by_node,
+            vec![ids(&[]), ids(&["cert-x", "cert-y"]), ids(&[])]
+        );
+
+        // Disabled, it still entitles, as a disabled route does.
+        stream.enabled = false;
+        store.update_stream(&stream).expect("disable");
+        assert_eq!(entitlement(&store).0[0], ids(&["node-b"]));
+
+        // Fleet-wide, every active node.
+        stream.node_selector = Vec::new();
+        store.update_stream(&stream).expect("fleet-wide");
+        let (by_cert, by_node) = entitlement(&store);
+        let every = ids(&["node-a", "node-b", "node-c"]);
+        assert_eq!(by_cert, vec![every.clone(), every, ids(&[])]);
+        for held in by_node {
+            assert_eq!(held, ids(&["cert-x", "cert-y"]));
+        }
+    }
+
+    #[test]
+    fn a_pending_node_receives_nothing_a_stream_names() {
+        let store = fleet_with_three_unrouted_certificates();
+        enrol(&store, "node-p", "edge-p", NodeStatus::Pending);
+        store
+            .create_stream(&terminating_stream(
+                "tls",
+                443,
+                "cert-x",
+                Some("cert-y"),
+                &["edge-p"],
+            ))
+            .expect("test setup: stream");
+        assert!(store
+            .cert_key_recipients("cert-x")
+            .expect("resolves")
+            .is_empty());
+        assert!(store
+            .cert_key_recipients("cert-y")
+            .expect("resolves")
+            .is_empty());
+        assert!(!store
+            .certificates_by_node()
+            .expect("resolves")
+            .contains_key("node-p"));
+    }
+
+    #[test]
+    fn a_route_and_a_stream_on_one_certificate_take_the_union_of_their_nodes() {
+        let store = fleet_with_three_unrouted_certificates();
+        bind_route(&store, "r1", "x.example.com", "cert-x", &["edge-c"]);
+        store
+            .create_stream(&terminating_stream("tls", 443, "cert-x", None, &["edge-a"]))
+            .expect("test setup: stream");
+        assert_eq!(
+            store.cert_key_recipients("cert-x").expect("resolves"),
+            ids(&["node-a", "node-c"])
+        );
+        assert_eq!(
+            store
+                .certificates_entitling_node("node-c")
+                .expect("resolves"),
+            ids(&["cert-x"])
+        );
+        assert!(
+            store
+                .cert_key_recipients("cert-y")
+                .expect("resolves")
+                .is_empty(),
+            "a stream without an upstream identity names none"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_stream_row_fails_closed() {
+        let store = fleet_with_three_unrouted_certificates();
+        let stream = terminating_stream("tls", 443, "cert-x", None, &["edge-a"]);
+        store.create_stream(&stream).expect("test setup: stream");
+        store
+            .conn
+            .execute(
+                "UPDATE streams SET node_selector = 'not json' WHERE id = ?1",
+                params![stream.id],
+            )
+            .expect("test setup: corrupt the selector");
+        assert!(matches!(
+            store.cert_key_recipients("cert-x"),
+            Err(ConfigError::Corrupt(_))
+        ));
+        assert!(matches!(
+            store.certificates_entitling_node("node-a"),
+            Err(ConfigError::Corrupt(_))
+        ));
     }
 
     #[test]
