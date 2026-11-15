@@ -97,6 +97,39 @@ pub(crate) fn parse_cidrs_skipping(entries: &[String], field: &str) -> Vec<ipnet
         .collect()
 }
 
+/// Whether the client's `X-Forwarded-For` may name the client of
+/// `session`: the one rule every reader of that header goes through
+/// (Story 12.8 D-g).
+///
+/// The header is read when the socket peer is in `trusted_proxies`, and
+/// never on a connection whose client address came from a PROXY header,
+/// whatever `trusted_proxies` holds: the trusted peer already said who
+/// the client is, and stacking a header the client wrote on top of it
+/// would let that client choose its own address. A trusted PROXY peer
+/// whose header carried no address (`LOCAL`, or none under `optional`)
+/// is a direct connection from that peer and follows the rule above.
+pub(super) fn forwarded_for_is_trusted(session: &Session, config: &ProxyConfig) -> bool {
+    let downstream = session.as_downstream();
+    let proxied = downstream
+        .digest()
+        .and_then(|digest| digest.socket_digest.as_ref())
+        .is_some_and(|socket| socket.proxied_from().is_some());
+    let peer = downstream
+        .client_addr()
+        .and_then(|addr| addr.as_inet())
+        .map(|addr| addr.ip());
+    forwarded_for_trusted_from(peer, proxied, &config.trusted_proxies)
+}
+
+/// [`forwarded_for_is_trusted`] on what it reads from the session.
+pub(super) fn forwarded_for_trusted_from(
+    peer: Option<std::net::IpAddr>,
+    proxied: bool,
+    trusted_proxies: &[ipnet::IpNet],
+) -> bool {
+    !proxied && peer.is_some_and(|ip| trusted_proxies.iter().any(|net| net.contains(&ip)))
+}
+
 /// Precompile a route's allow/deny patterns (bare IPs or CIDRs) into
 /// `IpNet` ranges once at config-reload time, so `check_ip_allow_deny`
 /// does not re-parse every entry on each request (audit hot-path finding).
@@ -456,9 +489,9 @@ impl LoricaProxy {
             // stashed entry's IP prefix (XFF-unwrapped) won't
             // match the current TCP client's prefix and the
             // handler rejects with 403 "client network changed".
-            // Duplicates the xff_used logic from the client-IP
-            // resolution stage, because that stage is skipped
-            // entirely when we take this early return.
+            // The client-IP resolution stage is skipped entirely
+            // when we take this early return, so the unwrap is
+            // repeated here, on the same trust rule.
             let config = self.config.load();
             let tcp_ip = session
                 .client_addr()
@@ -469,9 +502,7 @@ impl LoricaProxy {
                 .headers
                 .get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok());
-            let direct_is_trusted =
-                tcp_ip.is_some_and(|ip| config.trusted_proxies.iter().any(|net| net.contains(&ip)));
-            let client_ip = if direct_is_trusted {
+            let client_ip = if forwarded_for_is_trusted(session, &config) {
                 xff_header
                     .and_then(|xff| xff.split(',').next().unwrap_or(xff).trim().parse().ok())
                     .or(tcp_ip)
@@ -547,11 +578,13 @@ impl LoricaProxy {
     }
 
     /// Stage: client IP resolution (never terminal). Derives the
-    /// effective client IP - the direct TCP peer, or the leftmost
-    /// X-Forwarded-For entry when the direct peer is a trusted proxy -
-    /// stamps `ctx.client_ip`, `ctx.client_ip_addr`, `ctx.is_xff`,
-    /// `ctx.xff_proxy_ip` and `ctx.source`, and returns the IP string
-    /// every later check keys on.
+    /// effective client IP - the connection's client address (the
+    /// socket peer, or the address a trusted PROXY header carried), or
+    /// the leftmost X-Forwarded-For entry when
+    /// [`forwarded_for_is_trusted`] admits it - stamps `ctx.client_ip`,
+    /// `ctx.client_ip_addr`, `ctx.is_xff`, `ctx.xff_proxy_ip` and
+    /// `ctx.source`, and returns the IP string every later check keys
+    /// on.
     pub(super) fn resolve_client_ip(
         &self,
         session: &Session,
@@ -564,21 +597,13 @@ impl LoricaProxy {
             .and_then(|addr| addr.as_inet())
             .map(|addr| addr.ip().to_string());
 
-        // Only trust X-Forwarded-For when the direct TCP client is a trusted proxy.
-        // When trusted_proxies is empty, XFF is never used (secure default).
+        // X-Forwarded-For is read only under the one trust rule; with
+        // trusted_proxies empty it is never used (secure default).
         let req = session.req_header();
         let has_xff = req.headers.get("x-forwarded-for").is_some();
         let direct_ip = client_ip.clone();
 
-        let direct_is_trusted = direct_ip.as_ref().is_some_and(|ip| {
-            if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
-                config.trusted_proxies.iter().any(|net| net.contains(&addr))
-            } else {
-                false
-            }
-        });
-
-        let xff_used = direct_is_trusted && has_xff;
+        let xff_used = has_xff && forwarded_for_is_trusted(session, config);
         let check_ip = if xff_used {
             // Trusted proxy: extract real client IP from XFF (leftmost entry)
             req.headers

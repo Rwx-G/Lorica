@@ -20,7 +20,9 @@ use lorica_tls::cert_resolver::{CertData, CertResolver};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::connection_filter::{ConnectionFilterPolicy, GlobalConnectionFilter};
+use crate::connection_filter::{
+    ConnectionFilterPolicy, GlobalConnectionFilter, HttpListener, ProxyProtocolSettings,
+};
 use crate::proxy_wiring::ProxyConfig;
 
 /// Load all routes, backends, certificates and route-backend links from the store
@@ -49,6 +51,12 @@ pub struct PreparedReload {
     /// disables it. Applied on the connection filter at commit time,
     /// beside the CIDR policy.
     pub connection_limits_per_ip: Option<u32>,
+    /// The PROXY protocol settings of the HTTP listeners (Story 12.8),
+    /// installed on the connection filter's gate at commit time. `None`
+    /// when the settings could not be read: the gate then keeps what it
+    /// has, since falling back to off would turn a `required` listener's
+    /// balancer traffic into bytes the HTTP parser refuses.
+    pub proxy_protocol: Option<ProxyProtocolSettings>,
     pub mtls_fingerprint_drift: Option<(Option<String>, Option<String>)>,
 }
 
@@ -123,6 +131,21 @@ pub fn commit_prepared_reload(
             per_ip_limit = prepared.connection_limits_per_ip.unwrap_or(0),
             "connection filter reloaded"
         );
+        match &prepared.proxy_protocol {
+            Some(settings) => {
+                let gate = filter.proxy_protocol();
+                gate.reload(settings);
+                info!(
+                    http = ?gate.mode(HttpListener::Http),
+                    https = ?gate.mode(HttpListener::Https),
+                    trusted_cidrs = settings.trusted_cidrs.len(),
+                    "PROXY protocol policy reloaded"
+                );
+            }
+            None => warn!(
+                "settings unreadable on this reload: the PROXY protocol policy keeps its last applied state"
+            ),
+        }
     }
 }
 
@@ -1129,6 +1152,7 @@ async fn build_proxy_config_inner(
         .as_ref()
         .and_then(|s| s.connection_limits_per_ip)
         .filter(|v| *v > 0);
+    let proxy_protocol = settings.as_ref().map(ProxyProtocolSettings::from_global);
     // Story 8.2 AC #3 / #11. Plumbed at config-load time so the
     // filter-chain helpers read a stable snapshot, no SettingsStore
     // lookup on the hot path.
@@ -1268,6 +1292,7 @@ async fn build_proxy_config_inner(
         connection_allow_cidrs,
         connection_deny_cidrs,
         connection_limits_per_ip,
+        proxy_protocol,
         mtls_fingerprint_drift,
     })
 }
@@ -2168,5 +2193,98 @@ mod downstream_idle_timeout_tests {
                 .downstream_idle_timeout_s,
             DEFAULT_DOWNSTREAM_IDLE_TIMEOUT_S
         );
+    }
+}
+
+#[cfg(test)]
+mod proxy_protocol_reload_tests {
+    //! Story 12.8: the PROXY protocol settings reach the gate the
+    //! listeners read, on every reload, without a restart.
+
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use arc_swap::ArcSwap;
+    use lorica_config::models::ProxyProtocolMode as Stored;
+    use lorica_config::ConfigStore;
+    use lorica_core::listeners::ProxyProtocolMode;
+    use tokio::sync::Mutex;
+
+    use super::{build_proxy_config, commit_prepared_reload, reload_proxy_config};
+    use crate::connection_filter::{GlobalConnectionFilter, HttpListener};
+    use crate::proxy_wiring::ProxyConfig;
+
+    fn balancer() -> SocketAddr {
+        "192.0.2.10:40000".parse().expect("literal")
+    }
+
+    #[tokio::test]
+    async fn a_settings_change_reaches_the_gate_on_the_next_reload() {
+        let store = ConfigStore::open_in_memory().expect("test setup: store opens");
+        let store = Arc::new(Mutex::new(store));
+        let proxy_config = Arc::new(ArcSwap::from_pointee(ProxyConfig::default()));
+        let filter = Arc::new(GlobalConnectionFilter::empty());
+        let https = filter.proxy_protocol().policy(HttpListener::Https);
+
+        reload_proxy_config(&store, &proxy_config, Some(&filter))
+            .await
+            .expect("reload");
+        assert_eq!(https.mode(), ProxyProtocolMode::Off);
+        assert!(!https.is_trusted(&balancer()));
+
+        {
+            let s = store.lock().await;
+            let mut settings = s.get_global_settings().expect("settings");
+            settings.proxy_protocol_https = Stored::Required;
+            settings.proxy_protocol_trusted_cidrs = vec!["192.0.2.0/24".to_string()];
+            s.update_global_settings(&settings).expect("settings write");
+        }
+        reload_proxy_config(&store, &proxy_config, Some(&filter))
+            .await
+            .expect("reload");
+        assert_eq!(https.mode(), ProxyProtocolMode::Required);
+        assert!(https.is_trusted(&balancer()));
+        assert_eq!(
+            filter.proxy_protocol().mode(HttpListener::Http),
+            ProxyProtocolMode::Off
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_settings_leave_the_gate_as_it_was() {
+        let store = ConfigStore::open_in_memory().expect("test setup: store opens");
+        {
+            let mut settings = store.get_global_settings().expect("settings");
+            settings.proxy_protocol_http = Stored::Optional;
+            settings.proxy_protocol_trusted_cidrs = vec!["192.0.2.0/24".to_string()];
+            store
+                .update_global_settings(&settings)
+                .expect("settings write");
+        }
+        let store = Arc::new(Mutex::new(store));
+        let proxy_config = Arc::new(ArcSwap::from_pointee(ProxyConfig::default()));
+        let filter = Arc::new(GlobalConnectionFilter::empty());
+        let mut prepared = build_proxy_config(&store, &proxy_config, None)
+            .await
+            .expect("the snapshot builds");
+        assert!(prepared.proxy_protocol.is_some());
+        commit_prepared_reload(&proxy_config, Some(&filter), prepared);
+        assert_eq!(
+            filter.proxy_protocol().mode(HttpListener::Http),
+            ProxyProtocolMode::Optional
+        );
+
+        prepared = build_proxy_config(&store, &proxy_config, None)
+            .await
+            .expect("the snapshot builds");
+        prepared.proxy_protocol = None;
+        commit_prepared_reload(&proxy_config, Some(&filter), prepared);
+        assert_eq!(
+            filter.proxy_protocol().mode(HttpListener::Http),
+            ProxyProtocolMode::Optional
+        );
+        assert!(filter
+            .proxy_protocol()
+            .trusts(HttpListener::Http, &balancer()));
     }
 }

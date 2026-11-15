@@ -868,9 +868,15 @@ pub(crate) fn run_worker(
     // fingerprint slot is wired here - the supervisor side carries
     // the drift-detection responsibility for the entire worker pool.
 
-    // Register listeners - TCP for HTTP, TLS for HTTPS
+    // Register listeners - TCP for HTTP, TLS for HTTPS. Both carry their
+    // PROXY protocol policy (Story 12.8) whatever the stored mode: the
+    // mode is read on every accept, so a settings change applies without
+    // re-registering, and with the mode off the endpoint behaves as one
+    // registered without a policy.
     let https_suffix = format!(":{https_port}");
+    let proxy_protocol = connection_filter.proxy_protocol();
     for addr in &listener_addrs {
+        let l4 = lorica_core::listeners::ServerAddress::Tcp(addr.clone(), None);
         if https_port > 0 && addr.ends_with(&https_suffix) {
             let mut tls_settings =
                 lorica_core::listeners::tls::TlsSettings::with_resolver(cert_resolver.clone());
@@ -878,10 +884,18 @@ pub(crate) fn run_worker(
             if let Some(ref v) = mtls_verifier {
                 tls_settings.set_client_cert_verifier(v.clone());
             }
-            proxy_service.add_tls_with_settings(addr, None, tls_settings);
+            proxy_service.endpoints().add_endpoint_with_proxy_protocol(
+                l4,
+                Some(tls_settings),
+                proxy_protocol.policy(lorica::connection_filter::HttpListener::Https),
+            );
             info!(worker_id = id, addr = %addr, "registered TLS listener");
         } else {
-            proxy_service.add_tcp(addr);
+            proxy_service.endpoints().add_endpoint_with_proxy_protocol(
+                l4,
+                None,
+                proxy_protocol.policy(lorica::connection_filter::HttpListener::Http),
+            );
             info!(worker_id = id, addr = %addr, "registered TCP listener");
         }
     }

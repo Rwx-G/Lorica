@@ -857,6 +857,60 @@ pub fn inc_per_ip_connection_refused() {
     PER_IP_CONNECTION_REFUSED_TOTAL.inc();
 }
 
+/// PROXY protocol header reads that let the connection through, on the
+/// HTTP listeners (Story 12.8). Labels: `listener` (`http` or `https`)
+/// and `kind`, the label of an accepted `ProxyHeaderOutcome` of
+/// `lorica-core`, a closed enum: the label set is bounded by it.
+static PROXY_PROTOCOL_ACCEPTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "proxy_protocol_accepted_total",
+        "Connections the PROXY protocol accept path let through, by listener and kind",
+        &["listener", "kind"],
+    )
+});
+
+/// PROXY protocol header reads that closed the connection (Story 12.8).
+/// Labels: `listener` and `reason`, the label of a refused
+/// `ProxyHeaderOutcome`. No peer address label: the peer of an
+/// `untrusted_peer` refusal is attacker-chosen, an unbounded cardinality.
+static PROXY_PROTOCOL_REFUSED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "proxy_protocol_refused_total",
+        "Connections the PROXY protocol accept path closed, by listener and reason",
+        &["listener", "reason"],
+    )
+});
+
+/// Count one connection the PROXY protocol accept path let through.
+/// Called from the listener policy, in the worker processes in
+/// multi-worker mode (aggregated via `PER_WORKER_COUNTERS`).
+pub fn inc_proxy_protocol_accepted(listener: &str, kind: &str) {
+    PROXY_PROTOCOL_ACCEPTED_TOTAL
+        .with_label_values(&[listener, kind])
+        .inc();
+}
+
+/// Count one connection the PROXY protocol accept path closed.
+pub fn inc_proxy_protocol_refused(listener: &str, reason: &str) {
+    PROXY_PROTOCOL_REFUSED_TOTAL
+        .with_label_values(&[listener, reason])
+        .inc();
+}
+
+/// Read back this process's `lorica_proxy_protocol_accepted_total`.
+pub fn proxy_protocol_accepted_value(listener: &str, kind: &str) -> u64 {
+    PROXY_PROTOCOL_ACCEPTED_TOTAL
+        .with_label_values(&[listener, kind])
+        .get()
+}
+
+/// Read back this process's `lorica_proxy_protocol_refused_total`.
+pub fn proxy_protocol_refused_value(listener: &str, reason: &str) -> u64 {
+    PROXY_PROTOCOL_REFUSED_TOTAL
+        .with_label_values(&[listener, reason])
+        .get()
+}
+
 static AI_BOT_RDNS_UNAVAILABLE_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     lorica_metrics::register_int_counter(
         "ai_bot_rdns_unavailable_total",
@@ -1302,6 +1356,10 @@ pub const PER_WORKER_COUNTERS: &[&str] = &[
     // the worker accept loops; without aggregation the supervisor's
     // /metrics would always read 0 in multi-worker mode.
     "lorica_per_ip_connection_refused_total",
+    // PROXY protocol header reads (Story 12.8) happen in the connection
+    // tasks of the worker listeners, like the per-IP refusals above.
+    "lorica_proxy_protocol_accepted_total",
+    "lorica_proxy_protocol_refused_total",
     // Cert-resolver reload + OCSP background-refresh outcomes (Story
     // 8.5) fire inside the workers (the resolver lives there); without
     // aggregation the supervisor's /metrics never sees them.
@@ -1397,6 +1455,14 @@ fn resolve_per_worker_counter(
         "lorica_per_ip_connection_refused_total" => {
             Some((&[], CounterTarget::Scalar(&PER_IP_CONNECTION_REFUSED_TOTAL)))
         }
+        "lorica_proxy_protocol_accepted_total" => Some((
+            &["listener", "kind"],
+            CounterTarget::Vec(&PROXY_PROTOCOL_ACCEPTED_TOTAL),
+        )),
+        "lorica_proxy_protocol_refused_total" => Some((
+            &["listener", "reason"],
+            CounterTarget::Vec(&PROXY_PROTOCOL_REFUSED_TOTAL),
+        )),
         "lorica_cert_resolver_reload_total" => {
             Some((&["result"], CounterTarget::Vec(&CERT_RESOLVER_RELOAD_TOTAL)))
         }
@@ -3299,6 +3365,65 @@ mod tests {
             AI_BOT_RDNS_UNAVAILABLE_TOTAL.get(),
             before + 10,
             "label-less rdns-unavailable scalar must aggregate across workers"
+        );
+    }
+
+    #[test]
+    fn the_proxy_protocol_counters_aggregate_across_workers() {
+        // Story 12.8 D-j: the header is read in the worker listeners, so
+        // the supervisor's /metrics sees only what the workers ship. Two
+        // workers each report both counters; the supervisor holds the sum
+        // under the same labels, whatever order the wire carries them in.
+        let accepted_before = proxy_protocol_accepted_value("https", "v2");
+        let refused_before = proxy_protocol_refused_value("http", "untrusted_peer");
+        for (worker, accepted, refused) in [(41u32, 3u64, 1u64), (42u32, 4u64, 2u64)] {
+            apply_worker_generic_counters(
+                worker,
+                &[
+                    (
+                        "lorica_proxy_protocol_accepted_total".to_string(),
+                        vec![
+                            ("kind".to_string(), "v2".to_string()),
+                            ("listener".to_string(), "https".to_string()),
+                        ],
+                        accepted,
+                    ),
+                    (
+                        "lorica_proxy_protocol_refused_total".to_string(),
+                        vec![
+                            ("listener".to_string(), "http".to_string()),
+                            ("reason".to_string(), "untrusted_peer".to_string()),
+                        ],
+                        refused,
+                    ),
+                ],
+            );
+        }
+        assert_eq!(
+            proxy_protocol_accepted_value("https", "v2"),
+            accepted_before + 7
+        );
+        assert_eq!(
+            proxy_protocol_refused_value("http", "untrusted_peer"),
+            refused_before + 3
+        );
+    }
+
+    #[test]
+    fn a_worker_ships_the_proxy_protocol_counters_it_moved() {
+        // The snapshot side: a counter this process moved is on the wire
+        // under its full name, so the supervisor's apply above is fed.
+        inc_proxy_protocol_refused("https", "snapshot-test-reason");
+        let shipped = snapshot_per_worker_counters();
+        assert!(
+            shipped.iter().any(|(name, labels, value)| {
+                name == "lorica_proxy_protocol_refused_total"
+                    && *value >= 1
+                    && labels
+                        .iter()
+                        .any(|(k, v)| k == "reason" && v == "snapshot-test-reason")
+            }),
+            "{shipped:?}"
         );
     }
 

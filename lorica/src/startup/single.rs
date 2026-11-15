@@ -318,9 +318,20 @@ pub(crate) fn run_single_process(cli: Cli) {
         proxy_service.set_connection_filter(
             connection_filter.clone() as Arc<dyn lorica_core::listeners::ConnectionFilter>
         );
+        // Both listeners carry their PROXY protocol policy (Story 12.8)
+        // whatever the stored mode: the mode is read on every accept, and
+        // with it off the endpoint behaves as one without a policy.
+        let proxy_protocol = Arc::clone(connection_filter.proxy_protocol());
         let mut tcp_opts = lorica_core::listeners::TcpSocketOptions::default();
         tcp_opts.so_reuseport = Some(true);
-        proxy_service.add_tcp_with_settings(&format!("0.0.0.0:{}", cli.http_port), tcp_opts);
+        proxy_service.endpoints().add_endpoint_with_proxy_protocol(
+            lorica_core::listeners::ServerAddress::Tcp(
+                format!("0.0.0.0:{}", cli.http_port),
+                Some(tcp_opts),
+            ),
+            None,
+            proxy_protocol.policy(lorica::connection_filter::HttpListener::Http),
+        );
 
         info!(port = cli.http_port, "HTTP proxy listener configured");
 
@@ -360,10 +371,13 @@ pub(crate) fn run_single_process(cli: Cli) {
             }
             let mut tls_tcp_opts = lorica_core::listeners::TcpSocketOptions::default();
             tls_tcp_opts.so_reuseport = Some(true);
-            proxy_service.add_tls_with_settings(
-                &format!("0.0.0.0:{https_port}"),
-                Some(tls_tcp_opts),
-                tls_settings,
+            proxy_service.endpoints().add_endpoint_with_proxy_protocol(
+                lorica_core::listeners::ServerAddress::Tcp(
+                    format!("0.0.0.0:{https_port}"),
+                    Some(tls_tcp_opts),
+                ),
+                Some(tls_settings),
+                proxy_protocol.policy(lorica::connection_filter::HttpListener::Https),
             );
             info!(
                 port = https_port,

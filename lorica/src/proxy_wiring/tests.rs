@@ -4414,3 +4414,179 @@ fn select_index_peak_ewma_matches_the_former_block_when_exploiting() {
     );
     assert_eq!(picks.iter().filter(|&&p| p == 1).count(), 18, "{picks:?}");
 }
+
+// ---- Story 12.8: the client address of a PROXY-protocol connection ----
+
+mod proxy_protocol_client_address {
+    use super::super::filters::forwarded_for_trusted_from;
+    use super::*;
+    use lorica_core::protocols::l4::stream::Stream as L4Stream;
+    use lorica_core::protocols::{GetSocketDigest, ProxiedFrom, SocketDigest};
+    use std::net::{IpAddr, SocketAddr};
+    use std::os::unix::io::AsRawFd;
+    use tokio::io::AsyncWriteExt;
+
+    /// The address a balancer's header carries in these tests.
+    const CARRIED: &str = "203.0.113.7";
+    /// What the client writes in its own `X-Forwarded-For`.
+    const FORGED: &str = "198.51.100.9";
+
+    /// An HTTP/1 session over a real loopback socket, whose digest is
+    /// the one the PROXY accept path would have installed: proxied from
+    /// the loopback peer with `carried` as the client, or the plain
+    /// socket digest when `carried` is `None`. The client half is
+    /// returned so the socket stays open.
+    async fn session(carried: Option<&str>, request: &str) -> (Session, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test setup: bind");
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().expect("addr"))
+            .await
+            .expect("test setup: connect");
+        let (server, peer) = listener.accept().await.expect("test setup: accept");
+        let mut stream = L4Stream::from(server);
+        if let Some(carried) = carried {
+            let source = SocketAddr::new(carried.parse().expect("literal"), 40000);
+            let destination: SocketAddr = "192.0.2.1:443".parse().expect("literal");
+            let from = ProxiedFrom {
+                peer,
+                local: None,
+                version: lorica_core::protocols::proxy_protocol::Version::V2,
+            };
+            let digest = SocketDigest::proxied(stream.as_raw_fd(), source, destination, from);
+            stream.set_socket_digest(digest);
+        } else {
+            let digest = SocketDigest::from_raw_fd(stream.as_raw_fd());
+            stream.set_socket_digest(digest);
+        }
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("test setup: write");
+        let mut session = Session::new_h1(Box::new(stream));
+        assert!(session
+            .downstream_session
+            .read_request()
+            .await
+            .expect("test setup: a request"));
+        (session, client)
+    }
+
+    fn get_with_forged_xff() -> String {
+        format!("GET / HTTP/1.1\r\nHost: example.com\r\nX-Forwarded-For: {FORGED}\r\n\r\n")
+    }
+
+    fn proxy(trusted_proxies: &[&str]) -> (LoricaProxy, ProxyConfig) {
+        let config = ProxyConfig::from_store(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals {
+                trusted_proxy_cidrs: trusted_proxies.iter().map(|e| (*e).to_string()).collect(),
+                ..ProxyConfigGlobals::default()
+            },
+        );
+        let proxy = LoricaProxy::new(
+            Arc::new(ArcSwap::from_pointee(config.clone())),
+            Arc::new(LogBuffer::new(8)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(SlaCollector::new()),
+        );
+        (proxy, config)
+    }
+
+    fn nets(entries: &[&str]) -> Vec<ipnet::IpNet> {
+        entries
+            .iter()
+            .map(|e| e.parse().expect("literal"))
+            .collect()
+    }
+
+    #[test]
+    fn the_forwarded_for_rule_never_reads_the_header_on_a_proxied_connection() {
+        let loopback: IpAddr = "127.0.0.1".parse().expect("literal");
+        let carried: IpAddr = CARRIED.parse().expect("literal");
+        let trusted = nets(&["127.0.0.0/8", "203.0.113.0/24"]);
+        // Direct: today's rule on the socket peer.
+        assert!(forwarded_for_trusted_from(Some(loopback), false, &trusted));
+        assert!(!forwarded_for_trusted_from(Some(loopback), false, &[]));
+        assert!(!forwarded_for_trusted_from(None, false, &trusted));
+        // Proxied: never, even when the carried address is itself trusted.
+        assert!(!forwarded_for_trusted_from(Some(carried), true, &trusted));
+    }
+
+    #[tokio::test]
+    async fn a_proxied_client_is_resolved_from_the_header_and_its_forwarded_for_is_ignored() {
+        // AC #3 and IV2's second half: the carried address is in
+        // `trusted_proxies`, and the balancer's loopback address too;
+        // the client's forged header still names nobody.
+        let (proxy, config) = proxy(&["127.0.0.0/8", "203.0.113.0/24"]);
+        let (session, _client) = session(Some(CARRIED), &get_with_forged_xff()).await;
+        let mut ctx = proxy.new_ctx();
+        let resolved = proxy.resolve_client_ip(&session, &mut ctx, &config);
+        assert_eq!(resolved.as_deref(), Some(CARRIED));
+        assert_eq!(ctx.client_ip.as_deref(), Some(CARRIED));
+        assert_eq!(ctx.client_ip_addr, Some(CARRIED.parse().expect("literal")));
+        assert!(!ctx.is_xff);
+        assert_eq!(ctx.xff_proxy_ip, None);
+    }
+
+    #[tokio::test]
+    async fn a_trusted_socket_peer_without_a_carried_address_keeps_todays_forwarded_for_rule() {
+        // A balancer's `LOCAL` header, or none under `optional`, leaves
+        // the plain socket digest: the loopback peer is in
+        // `trusted_proxies`, so its header is read as before.
+        let (proxy, config) = proxy(&["127.0.0.0/8"]);
+        let (session, _client) = session(None, &get_with_forged_xff()).await;
+        let mut ctx = proxy.new_ctx();
+        let resolved = proxy.resolve_client_ip(&session, &mut ctx, &config);
+        assert_eq!(resolved.as_deref(), Some(FORGED));
+        assert!(ctx.is_xff);
+        assert_eq!(ctx.xff_proxy_ip.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn upstream_headers_name_the_carried_client_after_what_the_client_sent() {
+        // D-g, Resolved 4: `X-Real-IP` is the client address and Lorica
+        // appends it to the client's own `X-Forwarded-For`, as on a
+        // direct connection; the entry Lorica vouches for is the last.
+        let (proxy, _config) = proxy(&["127.0.0.0/8"]);
+        let (mut session, _client) = session(Some(CARRIED), &get_with_forged_xff()).await;
+        let mut ctx = proxy.new_ctx();
+        ctx.route_snapshot = Some(Arc::new(make_route("r-pp", "example.com", "/", true)));
+        let mut upstream =
+            lorica_http::RequestHeader::build("GET", b"/", None).expect("test setup: header");
+        proxy
+            .upstream_request_filter(&mut session, &mut upstream, &mut ctx)
+            .await
+            .expect("the filter runs");
+        let header = |name: &str| {
+            upstream
+                .headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        assert_eq!(header("x-real-ip").as_deref(), Some(CARRIED));
+        assert_eq!(
+            header("x-forwarded-for"),
+            Some(format!("{FORGED}, {CARRIED}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_is_refused_for_a_proxied_client_behind_a_loopback_peer() {
+        // `is_purge` judges the client address: the balancer on
+        // loopback, in `trusted_proxies` too, does not lend its standing
+        // to the client it carries. The same loopback peer without a
+        // carried address still may purge.
+        let (proxy, _config) = proxy(&["127.0.0.0/8"]);
+        let purge = "PURGE /cached HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let (proxied, _client) = session(Some(CARRIED), purge).await;
+        let ctx = proxy.new_ctx();
+        assert!(!proxy.is_purge(&proxied, &ctx));
+        let (direct, _client) = session(None, purge).await;
+        assert!(proxy.is_purge(&direct, &ctx));
+    }
+}

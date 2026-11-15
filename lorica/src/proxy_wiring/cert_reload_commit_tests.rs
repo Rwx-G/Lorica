@@ -199,6 +199,7 @@ async fn handle_config_reload_commit_reloads_cert_resolver() {
         connection_allow_cidrs: vec![],
         connection_deny_cidrs: vec![],
         connection_limits_per_ip: None,
+        proxy_protocol: None,
         mtls_fingerprint_drift: None,
     };
     let pending = Arc::new(parking_lot::Mutex::new(Some(PendingProxyConfig {
@@ -329,6 +330,7 @@ async fn handle_config_reload_commit_unreferenced_cert_stays_unloaded() {
         connection_allow_cidrs: vec![],
         connection_deny_cidrs: vec![],
         connection_limits_per_ip: None,
+        proxy_protocol: None,
         mtls_fingerprint_drift: None,
     };
     let pending = Arc::new(parking_lot::Mutex::new(Some(PendingProxyConfig {
@@ -434,6 +436,7 @@ async fn handle_config_reload_commit_stale_generation_replies_error_and_skips_re
             connection_allow_cidrs: vec![],
             connection_deny_cidrs: vec![],
             connection_limits_per_ip: None,
+            proxy_protocol: None,
             mtls_fingerprint_drift: None,
         },
     })));

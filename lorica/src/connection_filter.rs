@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! TCP-level connection pre-filter.
+//! TCP-level connection pre-filter, and the PROXY protocol policy of the
+//! HTTP listeners.
 //!
 //! Evaluated once per TCP accept, before the TLS handshake. Allows the
 //! operator to drop connections from known-hostile networks without spending
@@ -32,15 +33,31 @@
 //! `GlobalConnectionFilter` instance, updated through the same
 //! `reload_proxy_config` path the supervisor broadcasts via the command
 //! channel.
+//!
+//! The filter also carries the node's [`ProxyProtocolGate`] (Story 12.8):
+//! the PROXY protocol settings behind their own `ArcSwap`, reloaded in the
+//! same commit, and one [`ProxyProtocolPolicy`] view of them per HTTP
+//! listener. On a listener whose mode is not off, the accept path of
+//! `lorica-core` reads a header from the peers the gate trusts and then
+//! runs this filter on the client address the header carried, so the
+//! allow and deny lists and the per-IP cap judge the real client.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use lorica_core::listeners::{AcceptPermit, AcceptVerdict, ConnectionFilter};
+use ipnet::IpNet;
+use lorica_config::models::ProxyProtocolMode as StoredProxyProtocolMode;
+use lorica_core::listeners::{
+    AcceptPermit, AcceptVerdict, ConnectionFilter, ProxyHeaderOutcome, ProxyProtocolMode,
+    ProxyProtocolPolicy,
+};
+use tracing::warn;
 
 /// The policy this filter evaluates. Re-exported so the accept-loop
 /// wiring names one path for the rule and the runtime it runs in.
@@ -88,16 +105,18 @@ pub struct GlobalConnectionFilter {
     /// 0 = cap disabled.
     per_ip_limit: AtomicU32,
     per_ip_counts: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
+    proxy_protocol: Arc<ProxyProtocolGate>,
 }
 
 impl GlobalConnectionFilter {
     /// Build a filter with an initial policy (defaults to allow-all when both
-    /// lists are empty).
+    /// lists are empty). PROXY protocol accept starts off on both listeners.
     pub fn new(policy: ConnectionFilterPolicy) -> Self {
         Self {
             policy: ArcSwap::from_pointee(policy),
             per_ip_limit: AtomicU32::new(0),
             per_ip_counts: Arc::new(DashMap::new()),
+            proxy_protocol: Arc::new(ProxyProtocolGate::new()),
         }
     }
 
@@ -129,6 +148,14 @@ impl GlobalConnectionFilter {
     /// Read a snapshot of the current policy. Useful for tests and metrics.
     pub fn snapshot(&self) -> Arc<ConnectionFilterPolicy> {
         self.policy.load_full()
+    }
+
+    /// The PROXY protocol gate of this process's HTTP listeners, reloaded
+    /// with the filter. Each listener registers with
+    /// [`ProxyProtocolGate::policy`]; Story 12.15 reads
+    /// [`ProxyProtocolGate::trusts`].
+    pub fn proxy_protocol(&self) -> &Arc<ProxyProtocolGate> {
+        &self.proxy_protocol
     }
 
     /// Atomically reserve one connection slot for `ip`. Returns the
@@ -187,6 +214,357 @@ impl ConnectionFilter for GlobalConnectionFilter {
                 AcceptVerdict::Reject
             }
         }
+    }
+}
+
+/// One of the two HTTP listeners a PROXY protocol policy serves, and the
+/// `listener` label of its counters and refusal lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HttpListener {
+    /// The plaintext HTTP listener.
+    Http,
+    /// The HTTPS listener.
+    Https,
+}
+
+impl HttpListener {
+    /// The stable label of the listener, for metrics and logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HttpListener::Http => "http",
+            HttpListener::Https => "https",
+        }
+    }
+}
+
+/// The three node-local PROXY protocol settings (Story 12.8), as a reload
+/// carries them from the store to the [`ProxyProtocolGate`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyProtocolSettings {
+    /// `proxy_protocol_http`.
+    pub http: StoredProxyProtocolMode,
+    /// `proxy_protocol_https`.
+    pub https: StoredProxyProtocolMode,
+    /// `proxy_protocol_trusted_cidrs`.
+    pub trusted_cidrs: Vec<String>,
+}
+
+impl ProxyProtocolSettings {
+    /// The PROXY protocol part of a stored settings document.
+    pub fn from_global(settings: &lorica_config::models::GlobalSettings) -> Self {
+        Self {
+            http: settings.proxy_protocol_http,
+            https: settings.proxy_protocol_https,
+            trusted_cidrs: settings.proxy_protocol_trusted_cidrs.clone(),
+        }
+    }
+}
+
+/// The parsed settings one reload installs.
+#[derive(Debug, Default)]
+struct GatePolicy {
+    http: ProxyProtocolMode,
+    https: ProxyProtocolMode,
+    trusted: Vec<IpNet>,
+}
+
+impl GatePolicy {
+    fn from_settings(settings: &ProxyProtocolSettings) -> Self {
+        Self {
+            http: listener_mode(settings.http),
+            https: listener_mode(settings.https),
+            trusted: parse_trust_list(&settings.trusted_cidrs),
+        }
+    }
+
+    fn mode(&self, listener: HttpListener) -> ProxyProtocolMode {
+        match listener {
+            HttpListener::Http => self.http,
+            HttpListener::Https => self.https,
+        }
+    }
+
+    fn trusts_peer(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        self.trusted.iter().any(|net| net.contains(&ip))
+    }
+}
+
+fn listener_mode(stored: StoredProxyProtocolMode) -> ProxyProtocolMode {
+    match stored {
+        StoredProxyProtocolMode::Off => ProxyProtocolMode::Off,
+        StoredProxyProtocolMode::Required => ProxyProtocolMode::Required,
+        StoredProxyProtocolMode::Optional => ProxyProtocolMode::Optional,
+    }
+}
+
+/// The trust list as the runtime reads it: a malformed entry is skipped
+/// with a warning, as every stored address list is, and so is a `/0`.
+/// The validators refuse both at the write boundary; a `/0` reaching
+/// here would let any peer name its own client and defeat every address
+/// control the node has, so the runtime does not widen to it either.
+fn parse_trust_list(entries: &[String]) -> Vec<IpNet> {
+    const FIELD: &str = "proxy_protocol_trusted_cidrs";
+    entries
+        .iter()
+        .filter_map(
+            |entry| match lorica_config::connection_filter::parse_cidr(entry) {
+                Ok(net) if net.prefix_len() == 0 => {
+                    warn!(
+                        field = FIELD,
+                        entry = %entry,
+                        "ignoring a trust entry that would trust every address"
+                    );
+                    None
+                }
+                Ok(net) => Some(net),
+                Err(_) if entry.trim().is_empty() => None,
+                Err(reason) => {
+                    warn!(field = FIELD, %reason, "ignoring invalid address entry");
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
+/// How long one refusal line per listener and reason holds back the
+/// next ones (Story 12.8 D-j).
+pub const REFUSAL_LOG_WINDOW: Duration = Duration::from_secs(10);
+
+/// What the refusal log does with one refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalLogDecision {
+    /// Write the refusal line, after a line reporting `suppressed`
+    /// refusals of the same listener and reason that the window just
+    /// closed held back and nobody has reported yet.
+    Write {
+        /// Refusals held back and not yet reported, 0 for none.
+        suppressed: u64,
+    },
+    /// Hold the line back. `first` is true for the first refusal held back
+    /// in this window: its caller arranges the report due at `window_ends`.
+    Suppress {
+        /// Whether this is the window's first held-back refusal.
+        first: bool,
+        /// When the window closes.
+        window_ends: Instant,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RefusalWindow {
+    opened: Instant,
+    suppressed: u64,
+}
+
+/// At most one refusal line per listener and reason per
+/// [`REFUSAL_LOG_WINDOW`], then one line counting what the window held
+/// back. Refusals from an untrusted peer are attacker-driven, so an
+/// unthrottled line per refusal would let anyone write the log at will;
+/// the counters still count every refusal.
+#[derive(Debug, Default)]
+pub struct RefusalLogLimiter {
+    windows: parking_lot::Mutex<HashMap<(HttpListener, ProxyHeaderOutcome), RefusalWindow>>,
+}
+
+impl RefusalLogLimiter {
+    /// Decides on one refusal of `reason` on `listener` at `now`.
+    pub fn admit(
+        &self,
+        listener: HttpListener,
+        reason: ProxyHeaderOutcome,
+        now: Instant,
+    ) -> RefusalLogDecision {
+        let mut windows = self.windows.lock();
+        let fresh = RefusalWindow {
+            opened: now,
+            suppressed: 0,
+        };
+        match windows.get_mut(&(listener, reason)) {
+            Some(window) if now < window.opened + REFUSAL_LOG_WINDOW => {
+                window.suppressed += 1;
+                RefusalLogDecision::Suppress {
+                    first: window.suppressed == 1,
+                    window_ends: window.opened + REFUSAL_LOG_WINDOW,
+                }
+            }
+            Some(window) => {
+                let suppressed = window.suppressed;
+                *window = fresh;
+                RefusalLogDecision::Write { suppressed }
+            }
+            None => {
+                windows.insert((listener, reason), fresh);
+                RefusalLogDecision::Write { suppressed: 0 }
+            }
+        }
+    }
+
+    /// Takes the count the window ending at `window_ends` held back, once:
+    /// 0 when it was already taken, or when a later refusal opened a new
+    /// window and reported it with its own line.
+    pub fn close(
+        &self,
+        listener: HttpListener,
+        reason: ProxyHeaderOutcome,
+        window_ends: Instant,
+    ) -> u64 {
+        let mut windows = self.windows.lock();
+        match windows.get_mut(&(listener, reason)) {
+            Some(window) if window.opened + REFUSAL_LOG_WINDOW == window_ends => {
+                std::mem::take(&mut window.suppressed)
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// The node's PROXY protocol policy for its HTTP and HTTPS listeners
+/// (Story 12.8): the two listener modes and the trust list behind an
+/// [`ArcSwap`], reloaded with the connection filter, so a settings change
+/// applies to the connections accepted after it without a restart.
+#[derive(Debug)]
+pub struct ProxyProtocolGate {
+    policy: ArcSwap<GatePolicy>,
+    refusal_log: RefusalLogLimiter,
+}
+
+impl Default for ProxyProtocolGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProxyProtocolGate {
+    /// A gate with both listeners off and nobody trusted.
+    pub fn new() -> Self {
+        Self {
+            policy: ArcSwap::from_pointee(GatePolicy::default()),
+            refusal_log: RefusalLogLimiter::default(),
+        }
+    }
+
+    /// Installs `settings`. Connections already accepted keep the policy
+    /// they were accepted under.
+    pub fn reload(&self, settings: &ProxyProtocolSettings) {
+        self.policy
+            .store(Arc::new(GatePolicy::from_settings(settings)));
+    }
+
+    /// The live mode of `listener`.
+    pub fn mode(&self, listener: HttpListener) -> ProxyProtocolMode {
+        self.policy.load().mode(listener)
+    }
+
+    /// Whether `listener` reads a PROXY header from the socket peer
+    /// `addr`: its mode is not off and `addr` is in the trust list. An
+    /// IPv4-mapped IPv6 address is matched as the IPv4 address it maps.
+    pub fn trusts(&self, listener: HttpListener, addr: &SocketAddr) -> bool {
+        let policy = self.policy.load();
+        policy.mode(listener) != ProxyProtocolMode::Off && policy.trusts_peer(addr.ip())
+    }
+
+    /// The policy `listener`'s endpoint is registered with.
+    pub fn policy(self: &Arc<Self>, listener: HttpListener) -> Arc<dyn ProxyProtocolPolicy> {
+        Arc::new(ListenerPolicy {
+            gate: Arc::clone(self),
+            listener,
+        })
+    }
+
+    /// Counts one outcome, and writes a refusal's line unless the
+    /// refusal log holds it back.
+    fn record(
+        self: &Arc<Self>,
+        listener: HttpListener,
+        outcome: ProxyHeaderOutcome,
+        peer: Option<&SocketAddr>,
+        detail: Option<&'static str>,
+    ) {
+        if outcome.is_accepted() {
+            lorica_api::metrics::inc_proxy_protocol_accepted(listener.as_str(), outcome.as_str());
+            return;
+        }
+        lorica_api::metrics::inc_proxy_protocol_refused(listener.as_str(), outcome.as_str());
+        match self.refusal_log.admit(listener, outcome, Instant::now()) {
+            RefusalLogDecision::Write { suppressed } => {
+                if suppressed > 0 {
+                    log_suppressed(listener, outcome, suppressed);
+                }
+                warn!(
+                    listener = listener.as_str(),
+                    reason = outcome.as_str(),
+                    peer = ?peer,
+                    detail = detail.unwrap_or(""),
+                    "PROXY protocol: connection refused"
+                );
+            }
+            RefusalLogDecision::Suppress {
+                first: true,
+                window_ends,
+            } => self.report_suppressed_at(listener, outcome, window_ends),
+            RefusalLogDecision::Suppress { first: false, .. } => {}
+        }
+    }
+
+    /// Writes the held-back count when the window closes. Without a
+    /// runtime to wait on (a unit test), the next refusal after the window
+    /// reports it instead.
+    fn report_suppressed_at(
+        self: &Arc<Self>,
+        listener: HttpListener,
+        outcome: ProxyHeaderOutcome,
+        window_ends: Instant,
+    ) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let gate = Arc::clone(self);
+        runtime.spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(window_ends)).await;
+            let suppressed = gate.refusal_log.close(listener, outcome, window_ends);
+            if suppressed > 0 {
+                log_suppressed(listener, outcome, suppressed);
+            }
+        });
+    }
+}
+
+fn log_suppressed(listener: HttpListener, outcome: ProxyHeaderOutcome, suppressed: u64) {
+    warn!(
+        listener = listener.as_str(),
+        reason = outcome.as_str(),
+        suppressed,
+        window_s = REFUSAL_LOG_WINDOW.as_secs(),
+        "PROXY protocol: refusals suppressed"
+    );
+}
+
+/// One listener's view of the gate, the [`ProxyProtocolPolicy`] its
+/// endpoint asks on every accept.
+#[derive(Debug)]
+struct ListenerPolicy {
+    gate: Arc<ProxyProtocolGate>,
+    listener: HttpListener,
+}
+
+impl ProxyProtocolPolicy for ListenerPolicy {
+    fn mode(&self) -> ProxyProtocolMode {
+        self.gate.mode(self.listener)
+    }
+
+    fn is_trusted(&self, peer: &SocketAddr) -> bool {
+        self.gate.trusts(self.listener, peer)
+    }
+
+    fn record(
+        &self,
+        outcome: ProxyHeaderOutcome,
+        peer: Option<&SocketAddr>,
+        detail: Option<&'static str>,
+    ) {
+        self.gate.record(self.listener, outcome, peer, detail);
     }
 }
 
@@ -310,5 +688,208 @@ mod tests {
             &[],
         ));
         assert!(!f.should_accept(Some(&addr)).await);
+    }
+
+    // ---- Story 12.8: the PROXY protocol gate ----
+
+    fn settings(
+        http: StoredProxyProtocolMode,
+        https: StoredProxyProtocolMode,
+        trusted: &[&str],
+    ) -> ProxyProtocolSettings {
+        ProxyProtocolSettings {
+            http,
+            https,
+            trusted_cidrs: trusted.iter().map(|e| (*e).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_gate_starts_off_and_follows_every_reload_through_views_taken_before_it() {
+        // Live apply: the endpoints register their view once, at
+        // startup, and each reload is what they read on the next accept.
+        let filter = GlobalConnectionFilter::empty();
+        let gate = Arc::clone(filter.proxy_protocol());
+        let http = gate.policy(HttpListener::Http);
+        let https = gate.policy(HttpListener::Https);
+        let balancer = v4(192, 0, 2, 10);
+        assert_eq!(http.mode(), ProxyProtocolMode::Off);
+        assert_eq!(https.mode(), ProxyProtocolMode::Off);
+        assert!(!gate.trusts(HttpListener::Http, &balancer));
+
+        filter.proxy_protocol().reload(&settings(
+            StoredProxyProtocolMode::Off,
+            StoredProxyProtocolMode::Required,
+            &["192.0.2.0/24"],
+        ));
+        assert_eq!(http.mode(), ProxyProtocolMode::Off);
+        assert_eq!(https.mode(), ProxyProtocolMode::Required);
+        // A listener that is off trusts nobody, whatever the list holds.
+        assert!(!gate.trusts(HttpListener::Http, &balancer));
+        assert!(!http.is_trusted(&balancer));
+        assert!(gate.trusts(HttpListener::Https, &balancer));
+        assert!(https.is_trusted(&balancer));
+        assert!(!https.is_trusted(&v4(198, 51, 100, 1)));
+        // An IPv4-mapped IPv6 peer is matched as the address it maps.
+        let mapped = v6("::ffff:192.0.2.10".parse().unwrap());
+        assert!(https.is_trusted(&mapped));
+
+        filter.proxy_protocol().reload(&settings(
+            StoredProxyProtocolMode::Optional,
+            StoredProxyProtocolMode::Off,
+            &["127.0.0.1/32", "::1/128"],
+        ));
+        assert_eq!(http.mode(), ProxyProtocolMode::Optional);
+        assert_eq!(https.mode(), ProxyProtocolMode::Off);
+        assert!(http.is_trusted(&v4(127, 0, 0, 1)));
+        assert!(http.is_trusted(&v6(Ipv6Addr::LOCALHOST)));
+        assert!(!http.is_trusted(&balancer));
+
+        filter
+            .proxy_protocol()
+            .reload(&ProxyProtocolSettings::default());
+        assert_eq!(http.mode(), ProxyProtocolMode::Off);
+        assert!(!gate.trusts(HttpListener::Http, &v4(127, 0, 0, 1)));
+    }
+
+    #[test]
+    fn the_runtime_skips_a_slash_zero_and_a_malformed_trust_entry() {
+        // The validators refuse both; a stored list that predates them
+        // must not widen the trust to every address.
+        let gate = Arc::new(ProxyProtocolGate::new());
+        gate.reload(&settings(
+            StoredProxyProtocolMode::Required,
+            StoredProxyProtocolMode::Required,
+            &["0.0.0.0/0", "::/0", "bogus", " ", "192.0.2.10"],
+        ));
+        assert!(!gate.trusts(HttpListener::Http, &v4(203, 0, 113, 9)));
+        assert!(!gate.trusts(HttpListener::Http, &v6("2001:db8::1".parse().unwrap())));
+        assert!(gate.trusts(HttpListener::Http, &v4(192, 0, 2, 10)));
+        assert!(!gate.trusts(HttpListener::Http, &v4(192, 0, 2, 11)));
+    }
+
+    #[test]
+    fn the_settings_are_read_from_the_stored_document() {
+        let mut stored = lorica_config::models::GlobalSettings::default();
+        assert_eq!(
+            ProxyProtocolSettings::from_global(&stored),
+            ProxyProtocolSettings::default()
+        );
+        stored.proxy_protocol_https = StoredProxyProtocolMode::Optional;
+        stored.proxy_protocol_trusted_cidrs = vec!["10.0.0.0/24".to_string()];
+        assert_eq!(
+            ProxyProtocolSettings::from_global(&stored),
+            settings(
+                StoredProxyProtocolMode::Off,
+                StoredProxyProtocolMode::Optional,
+                &["10.0.0.0/24"]
+            )
+        );
+    }
+
+    #[test]
+    fn the_refusal_log_writes_one_line_per_window_and_reports_what_it_held_back_once() {
+        let log = RefusalLogLimiter::default();
+        let (http, https) = (HttpListener::Http, HttpListener::Https);
+        let untrusted = ProxyHeaderOutcome::UntrustedPeer;
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let first_window_ends = t0 + REFUSAL_LOG_WINDOW;
+
+        assert_eq!(
+            log.admit(http, untrusted, t0),
+            RefusalLogDecision::Write { suppressed: 0 }
+        );
+        assert_eq!(
+            log.admit(http, untrusted, at(1)),
+            RefusalLogDecision::Suppress {
+                first: true,
+                window_ends: first_window_ends
+            }
+        );
+        assert_eq!(
+            log.admit(http, untrusted, at(2)),
+            RefusalLogDecision::Suppress {
+                first: false,
+                window_ends: first_window_ends
+            }
+        );
+        // Each listener and each reason has its own window.
+        assert_eq!(
+            log.admit(https, untrusted, at(2)),
+            RefusalLogDecision::Write { suppressed: 0 }
+        );
+        assert_eq!(
+            log.admit(http, ProxyHeaderOutcome::Timeout, at(2)),
+            RefusalLogDecision::Write { suppressed: 0 }
+        );
+
+        // The window's end reports its two held-back refusals, once.
+        assert_eq!(log.close(http, untrusted, first_window_ends), 2);
+        assert_eq!(log.close(http, untrusted, first_window_ends), 0);
+        // Already reported: the next window opens with nothing owed.
+        assert_eq!(
+            log.admit(http, untrusted, first_window_ends),
+            RefusalLogDecision::Write { suppressed: 0 }
+        );
+
+        // A refusal after the window, before its report ran, carries the
+        // count itself, and the late report then finds nothing to say.
+        let second_window_ends = first_window_ends + REFUSAL_LOG_WINDOW;
+        assert!(matches!(
+            log.admit(http, untrusted, first_window_ends + Duration::from_secs(1)),
+            RefusalLogDecision::Suppress { first: true, .. }
+        ));
+        assert_eq!(
+            log.admit(http, untrusted, second_window_ends + Duration::from_secs(1)),
+            RefusalLogDecision::Write { suppressed: 1 }
+        );
+        assert_eq!(log.close(http, untrusted, second_window_ends), 0);
+    }
+
+    #[test]
+    fn every_outcome_lands_on_one_counter_under_its_listener_and_its_own_label() {
+        // D-j: accepted outcomes count as `kind`, refused ones as
+        // `reason`, each under the listener that saw it. Walked over the
+        // enum, so a new outcome is counted somewhere or this fails. The
+        // counters are process-wide and other tests may record too, so
+        // each step checks the one series it moved.
+        let gate = Arc::new(ProxyProtocolGate::new());
+        for listener in [HttpListener::Http, HttpListener::Https] {
+            let view = gate.policy(listener);
+            let other = match listener {
+                HttpListener::Http => HttpListener::Https,
+                HttpListener::Https => HttpListener::Http,
+            };
+            for outcome in ProxyHeaderOutcome::all() {
+                let label = outcome.as_str();
+                let read = |l: HttpListener| {
+                    (
+                        lorica_api::metrics::proxy_protocol_accepted_value(l.as_str(), label),
+                        lorica_api::metrics::proxy_protocol_refused_value(l.as_str(), label),
+                    )
+                };
+                let (accepted, refused) = read(listener);
+                let elsewhere = read(other);
+                view.record(
+                    outcome,
+                    Some(&v4(192, 0, 2, 10)),
+                    (!outcome.is_accepted()).then_some("test"),
+                );
+                let (accepted_after, refused_after) = read(listener);
+                if outcome.is_accepted() {
+                    assert!(accepted_after > accepted, "{label} not counted as accepted");
+                    assert_eq!(refused_after, refused, "{label} counted as refused");
+                } else {
+                    assert!(refused_after > refused, "{label} not counted as refused");
+                    assert_eq!(accepted_after, accepted, "{label} counted as accepted");
+                }
+                assert_eq!(
+                    read(other),
+                    elsewhere,
+                    "{label} counted on the other listener"
+                );
+            }
+        }
     }
 }

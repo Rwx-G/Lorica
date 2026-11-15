@@ -727,19 +727,19 @@ endpoint registration only), `lorica/src/proxy_wiring/filters.rs`,
 `lorica/src/proxy_wiring/tests.rs`, `lorica-api/src/metrics.rs`.
 Depends on: B, C1; after Story 12.2's Lot D on the two startup files.
 
-- [ ] `ProxyProtocolGate` in `connection_filter.rs`: the live policy
+- [x] `ProxyProtocolGate` in `connection_filter.rs`: the live policy
       behind an `ArcSwap`, one `ProxyProtocolPolicy` view per listener,
       `trusts(listener, addr)` for Story 12.15 (D-l), and the refusal
       log limiter (D-j).
-- [ ] `commit_prepared_reload` reloads it with the filter; the prepared
+- [x] `commit_prepared_reload` reloads it with the filter; the prepared
       reload carries the three settings.
-- [ ] `run_worker` and `run_single_process` register both endpoints
+- [x] `run_worker` and `run_single_process` register both endpoints
       through `add_endpoint_with_proxy_protocol` with their view, always
       (the mode is read live).
-- [ ] `forwarded_for_is_trusted` (D-g) used by `resolve_client_ip` and
+- [x] `forwarded_for_is_trusted` (D-g) used by `resolve_client_ip` and
       `check_bot_endpoints`; `is_purge` left on the client address.
-- [ ] The two counters in `metrics.rs` and `PER_WORKER_COUNTERS` (D-j).
-- [ ] Tests: XFF ignored on a proxied session whose carried address is
+- [x] The two counters in `metrics.rs` and `PER_WORKER_COUNTERS` (D-j).
+- [x] Tests: XFF ignored on a proxied session whose carried address is
       in `trusted_proxies`; XFF read for a trusted socket peer without
       a carried address; upstream `X-Real-IP` and `X-Forwarded-For` on a
       proxied session; `PURGE` refused for a proxied client behind a
@@ -966,6 +966,11 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
   JSON-RPC invalid-params error (`-32602`), not as a tool result with
   `isError`; the test asserts that.
 
+- **Lot D gates.** On the Lot D tree, the same full chain and
+  `cargo audit`, all green, the new `lorica` tests (gate, limiter,
+  counters, reload, session-level client address) and
+  `proxy_protocol_e2e_test` included.
+
 ### Completion Notes
 
 - **Lot 0** (`fix(ci)`): the gap was real; see the Debug Log.
@@ -1144,6 +1149,85 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
   `write.rs` declares its admin-tier tests in, rather than in `write.rs`
   itself: the helpers it needs (`an_admin_tier_token`,
   `stored_settings`) are private to that module.
+- **Lot D** (`feat(proxy)`): `lorica::connection_filter` gains
+  `ProxyProtocolGate` (the two listener modes and the parsed trust list
+  behind an `ArcSwap`), `HttpListener` (`http`, `https`, the `listener`
+  label), `ProxyProtocolSettings` (the three stored fields as a reload
+  carries them) and `RefusalLogLimiter`. The gate is a field of
+  `GlobalConnectionFilter` (`proxy_protocol()`), not a separate object:
+  every reload path already hands the filter to `commit_prepared_reload`
+  (startup, the worker command channel, the two-phase worker RPC, the
+  single-process reload loop), so the gate reloads in all of them with
+  no signature change. `ProxyProtocolGate::policy(listener)` is the
+  `ProxyProtocolPolicy` view an endpoint registers with;
+  `ProxyProtocolGate::trusts(listener, addr)` and `mode(listener)` are
+  what Story 12.15 reads (D-l). `trusts` is true only while the
+  listener's mode is not off, and matches an IPv4-mapped peer as the
+  IPv4 address it maps.
+- How each AC #5 control receives the carried address: Lot B installs
+  it as the socket digest's `peer_addr` before the handshake, so
+  `session.client_addr()` returns it. The connection filter and the
+  per-IP cap run on it in Lot B's deferred `try_accept`.
+  `resolve_client_ip` stamps it in `ctx.client_ip` /
+  `ctx.client_ip_addr`, which the access log, WAF and ban list, the
+  blocklist, rate limits and flood counters, GeoIP and bot protection
+  read; the bot solve path resolves it through the same helper.
+  `X-Real-IP` and the entry Lorica appends to `X-Forwarded-For` come
+  from `client_addr()` in `upstream_request_filter`, unchanged.
+- `forwarded_for_is_trusted(session, config)` in
+  `proxy_wiring/filters.rs` is the one rule for reading the client's
+  `X-Forwarded-For`, used by `resolve_client_ip` and
+  `check_bot_endpoints`: false whenever the session's digest carries
+  `proxied_from`, otherwise today's `trusted_proxies` test on the socket
+  peer. Its decision is the pure `forwarded_for_trusted_from`, tested
+  on its own. `is_purge` is unchanged: it reads `client_addr()`, so it
+  now judges the carried client.
+- Metrics: `lorica_proxy_protocol_accepted_total{listener, kind}` and
+  `lorica_proxy_protocol_refused_total{listener, reason}` in
+  `lorica-api/src/metrics.rs`, both in `PER_WORKER_COUNTERS` and the
+  resolver. Label values are `ProxyHeaderOutcome::as_str`; a test walks
+  `ProxyHeaderOutcome::all()` and checks each outcome lands on exactly
+  one counter under its own listener.
+- The refusal log: one `warn` line per listener and reason per 10 s
+  (`REFUSAL_LOG_WINDOW`), naming the listener, the reason, the socket
+  peer and the parser's detail. The first refusal held back in a window
+  spawns one task that writes "refusals suppressed" with the count when
+  the window closes; a refusal arriving after the window but before that
+  task runs carries the count itself, and the task then finds nothing,
+  so a count is reported once. Story 12.6 had shipped no limiter, so
+  this one is new (D-j).
+- Choices inside the contract:
+  - `PreparedReload.proxy_protocol` is an `Option`: `None` when the
+    settings row could not be read, and the gate then keeps its last
+    applied state with a warning, rather than falling back to off as the
+    other settings of that function do. Off would turn a `required`
+    listener's balancer traffic into bytes the HTTP parser refuses.
+  - The runtime skips a `/0` trust entry with a warning, as it skips a
+    malformed one. The validators refuse both; a stored list predating
+    them must not widen trust to every address.
+  - The endpoints are registered with `Service::endpoints()` and
+    `ServerAddress::Tcp`, keeping the socket options single-process
+    passes (`so_reuseport`) and the TLS settings the worker builds.
+- Outside the Lot D allowlist: `lorica/src/proxy_wiring/cert_reload_commit_tests.rs`
+  (three `PreparedReload` literals gain `proxy_protocol: None`),
+  `lorica/tests/proxy_protocol_e2e_test.rs` (new: a real `LoricaProxy`
+  with its HTTP endpoint registered as the startup code does, proving
+  live apply from off to `required`, the carried client in `X-Real-IP`,
+  `X-Forwarded-For` and the access log with a forged header beside it,
+  and an untrusted peer's header disconnected and counted while its
+  plain request is served), and `lorica-config/src/canonical.rs` (the
+  `CanonicalGlobalSettings` doc comment names the three settings among
+  the node-local fields, which Lot C1 could not; its own commit).
+  `lorica/src/proxy_wiring.rs` is not edited: `is_purge` and
+  `upstream_request_filter` already read `client_addr()`.
+- The session-level tests (`proxy_wiring/tests.rs`, module
+  `proxy_protocol_client_address`) build a real HTTP/1 session over a
+  loopback socket whose digest is the one Lot B installs
+  (`SocketDigest::proxied`), so `resolve_client_ip`, `is_purge` and
+  `upstream_request_filter` are exercised as the proxy calls them.
+- Not run here: the HTTPS listener end to end (Lot B covers the TLS
+  path in `lorica-core`; the wiring registers it with the `https` view),
+  and the worker-mode reload RPC with a live worker (Lot G).
 
 ## File List
 
@@ -1183,6 +1267,16 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 - `lorica-api/src/automation/write/admin_tier_tests.rs` (Lot C2: a test)
 - `lorica-mcp/src/tools.rs` (Lot C2: a test)
 - `docs/mcp.md` (Lot C2: the family line)
+- `lorica/src/connection_filter.rs` (Lot D: `ProxyProtocolGate`, `HttpListener`, `ProxyProtocolSettings`, `RefusalLogLimiter`, tests)
+- `lorica/src/reload.rs` (Lot D: the prepared reload carries the settings, the commit reloads the gate, tests)
+- `lorica/src/startup/worker.rs` (Lot D: endpoint registration)
+- `lorica/src/startup/single.rs` (Lot D: endpoint registration)
+- `lorica/src/proxy_wiring/filters.rs` (Lot D: `forwarded_for_is_trusted`, its two callers)
+- `lorica/src/proxy_wiring/tests.rs` (Lot D: module `proxy_protocol_client_address`)
+- `lorica/src/proxy_wiring/cert_reload_commit_tests.rs` (Lot D: `PreparedReload` literals)
+- `lorica/tests/proxy_protocol_e2e_test.rs` (Lot D, new)
+- `lorica-api/src/metrics.rs` (Lot D: the two counters, `PER_WORKER_COUNTERS`, tests)
+- `lorica-config/src/canonical.rs` (the `CanonicalGlobalSettings` doc comment)
 
 ## Change Log
 
@@ -1196,3 +1290,4 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 | 2026-11-14 | 0.6 | Lot C1: the three node-local PROXY protocol settings, their validation at the API and at import, the OpenAPI entry. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.7 | Lot E: the PROXY protocol section of the dashboard's Network tab, the server's rules mirrored client-side, the three fields in the settings save. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.8 | Lot C2: the PROXY protocol settings refused on the automation plane and by the MCP tools, by test, and named in the refused family. Status InProgress. | Romain G. |
+| 2026-11-15 | 0.9 | Lot D: PROXY accept wired on the HTTP and HTTPS listeners through a live gate on the connection filter, one `X-Forwarded-For` trust rule, the two per-worker counters and the rate-limited refusal log. Status InProgress. | Romain G. |
