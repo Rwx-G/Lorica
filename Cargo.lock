@@ -3368,6 +3368,7 @@ dependencies = [
  "lorica-shmem",
  "lorica-worker",
  "nix",
+ "rustls",
  "serde",
  "serde_json",
  "socket2",

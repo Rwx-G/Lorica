@@ -13,6 +13,10 @@ lorica-waf = { path = "../lorica-waf" }
 lorica-config = { path = "../lorica-config" }
 lorica-tls = { path = "../lorica-tls" }
 lorica-core = { path = "../lorica-core", default-features = false }
+lorica-stream = { path = "../lorica-stream" }
+# rustls' own ClientHello for `fuzz_client_hello`'s round trip, on the
+# `ring` provider the workspace pins (audit M-6).
+rustls = { version = "0.23.12", default-features = false, features = ["ring", "std", "tls12"] }
 serde_json = "1"
 
 [[bin]]
@@ -33,4 +37,9 @@ doc = false
 [[bin]]
 name = "fuzz_proxy_protocol"
 path = "fuzz_targets/fuzz_proxy_protocol.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_client_hello"
+path = "fuzz_targets/fuzz_client_hello.rs"
 doc = false

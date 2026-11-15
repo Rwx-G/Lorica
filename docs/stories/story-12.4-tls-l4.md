@@ -910,19 +910,19 @@ Allowlist: `lorica-stream/src/tls/mod.rs` (new),
 dependency).
 Depends on: 12.3 Lot C; not concurrently with 12.5 Lots D or E.
 
-- [ ] `parse(buf) -> Result<Parsed, NeedMore | Invalid(kind)>` over a
+- [x] `parse(buf) -> Result<Parsed, NeedMore | Invalid(kind)>` over a
       byte slice, incremental (the caller reads more on `NeedMore`),
       with `CLIENTHELLO_MAX_LEN`, `CLIENTHELLO_MAX_RECORDS`,
       `CLIENTHELLO_BUFFER`; `Parsed { server_name, alpn, ech_offered,
       consumed }` (D-b). No I/O in this module.
-- [ ] Tests: hellos captured from rustls' client (TLS 1.2 and 1.3, with
+- [x] Tests: hellos captured from rustls' client (TLS 1.2 and 1.3, with
       and without SNI and ALPN), a hello split over 2 and over 64
       records, 65 records, a 16,385-byte message, a record of 16,385, a
       non-handshake record mid-hello, SSLv2 shape, duplicate extension,
       SNI with an IP literal (absent), SNI with an invalid byte, an
       uppercase SNI with a trailing dot (canonicalised), ECH present,
       no extensions block, every length field one past its enclosure.
-- [ ] Fuzz target: arbitrary bytes never panic, `consumed` never
+- [x] Fuzz target: arbitrary bytes never panic, `consumed` never
       exceeds the input, and a hello re-serialised from a parse of
       rustls' output parses to the same fields.
 
@@ -1271,6 +1271,72 @@ The decisions above cite each one as "Resolved N".
 
 ### Completion Notes
 
+**Lot B (the ClientHello parser).**
+
+- API, `lorica_stream::tls::client_hello`: `parse(buf: &[u8]) ->
+  Result<Parsed, ClientHelloError>`, `ClientHelloError::{NeedMore,
+  Invalid(InvalidClientHello)}`, `Parsed { server_name: Option<String>,
+  alpn: Vec<Vec<u8>>, ech_offered: bool, consumed: usize }`.
+  `InvalidClientHello` is `not_handshake`, `record_version`,
+  `record_length`, `not_client_hello`, `oversized`, `truncated`,
+  `malformed`, `duplicate_extension`, `server_name`, with `ALL` and
+  `as_str` (the crate's own word-list pattern, as `counters.rs`; no
+  `strum` edge). Lot D counts `Oversized` as D-n's `oversized` and every
+  other kind as `invalid`. Constants: `CLIENTHELLO_MAX_LEN` (16,384, the
+  handshake header's 24-bit length), `CLIENTHELLO_MAX_RECORDS` (64),
+  `CLIENTHELLO_BUFFER` (17,408, with a compile-time assertion that the
+  largest accepted hello over 64 records fits), `RECORD_HEADER_LEN`,
+  `MAX_RECORD_LEN`, `SERVER_NAME_MAX_LEN`, and the three extension
+  numbers.
+- Incremental by reparsing: the engine calls `parse` on the whole buffer
+  after each read. Every refusal is made at the first byte that rules
+  the hello out (a record version as soon as its two bytes are in, the
+  handshake type at its first byte, an oversized length at the header),
+  so every strict prefix of an accepted hello is `NeedMore` and a
+  refusal never changes with what follows. Both properties are pinned by
+  the tests and by the fuzz target.
+- One refinement of D-b, recorded here: **a record that runs past the
+  end of the ClientHello is refused** (`malformed`) as soon as the two
+  headers show it. Nothing follows a ClientHello in a client's first
+  handshake flight, and accepting a coalesced record would let
+  `consumed` (the end of the record) exceed `CLIENTHELLO_BUFFER`, so the
+  reader would wait for bytes that can never fit. `consumed` is
+  therefore at most 16,388 plus 64 headers.
+- `alpn` holds bytes, not strings: a client offers GREASE values that
+  are not ASCII, and the matcher compares them against the rules'
+  visible-ASCII values. The first `host_name` entry of `server_name` is
+  the name; other name types are skipped by length. A server name that
+  is `.` alone canonicalises to nothing and is refused `server_name`.
+- Tests (25 unit, 1 doc): rustls' own client hellos (TLS 1.2 and 1.3,
+  with and without SNI and ALPN, an IP literal sending none), every
+  prefix of each asking for more; bytes past the hello not consumed;
+  reassembly over 2 records, over exactly 64, a handshake header split
+  over three records; the 65th record refused at its first byte; a
+  16,385-byte message refused from its header and 16,384 accepted; a
+  record of 16,385 and of 0; a non-handshake record mid-hello (alert,
+  ChangeCipherSpec); SSLv2 and PostgreSQL's SSLRequest; record versions;
+  a handshake other than a ClientHello; a record past the message;
+  duplicate extensions (known and unknown types); an IP literal SNI
+  (absent); seven invalid server names and both length bounds; an
+  uppercase name with a trailing dot (canonicalised); ECH present with
+  ALPN kept in client order, GREASE included; no extensions block; the
+  body's field rules; each of the twelve length fields of a full hello
+  raised by one; the largest accepted hello inside the buffer.
+- Fuzz target `fuzz/fuzz_targets/fuzz_client_hello.rs`, in `fuzz.yml`'s
+  matrix: arbitrary bytes never panic, `consumed` stays within the input
+  and the buffer, the prefix and finality properties, and rustls' hello
+  for a name and ALPN list the input picks, cut into records at sizes
+  the input picks, parses to the canonical name and that list, then a
+  hello re-serialised from the parse parses to the same fields. Run on
+  nightly for 120 s: 1,743,892 runs, no crash. The fuzz build must run
+  without `CARGO_BUILD_WARNINGS=deny`, as the CI fuzz job does: nightly
+  raises a warning in `lorica-worker` that stable does not.
+- Outside the allowlist: `lorica-stream/Cargo.toml` gains `rustls` as a
+  dev-dependency (ring only, already in the lockfile through
+  `lorica-tls`) for the captured hellos, and `Cargo.lock` its entry;
+  `fuzz/Cargo.toml` gains `rustls` beside the `lorica-stream` path
+  dependency; `.github/workflows/fuzz.yml` gains the matrix entry.
+
 **Lot A (`lorica-tls`).**
 
 - `cert_resolver::lookup_keys(name: &str) -> (String, Option<String>)`:
@@ -1298,6 +1364,15 @@ The decisions above cite each one as "Resolved N".
 
 ## File List
 
+Lot B:
+
+- `lorica-stream/src/tls/mod.rs`, `lorica-stream/src/tls/client_hello.rs`
+  (new), `lorica-stream/src/lib.rs`
+- `lorica-stream/Cargo.toml` (the `rustls` dev-dependency), `Cargo.lock`
+- `fuzz/fuzz_targets/fuzz_client_hello.rs` (new), `fuzz/Cargo.toml`,
+  `.github/workflows/fuzz.yml`
+- `docs/stories/story-12.4-tls-l4.md`
+
 Lot A:
 
 - `lorica-tls/src/cert_resolver.rs`, `lorica-tls/src/http_client.rs`
@@ -1310,3 +1385,4 @@ Lot A:
 | 2026-11-14 | 0.1 | Story drafted from the Epic 12 PRD and its 2026-11-04, 2026-11-12 and 2026-11-14 amendments, against the 12.3 and 12.5 drafts. Status Draft. | Romain G. |
 | 2026-11-14 | 0.2 | Maintainer answers folded in as Resolved 1 to 8, all as recommended; `certificate_ids` entitlement extended to replication with store tests (Lot C) and a cluster-profile check (Lot H); `clienthello_timeout_ms` bounds documented with their NFR2 reason. Status Draft. | Romain G. |
 | 2026-11-15 | 0.3 | Lot A landed: `lookup_keys` as the one statement of which certificate serves a name, `serves_server_name` on the resolver trait, `accept_any_server` behind `unverified`. Status InProgress. | Romain G. |
+| 2026-11-15 | 0.4 | Lot B landed: the bounded ClientHello reader `tls::client_hello::parse`, refusing at the first byte that rules a hello out, a record past the hello refused, and its fuzz target in the weekly matrix. | Romain G. |

@@ -36,7 +36,8 @@
 //!   [`state`] registry the API, the audit chain and the fleet view read.
 //!
 //! The TCP engine of Story 12.3 is [`tcp`], the UDP engine of Story 12.5
-//! is [`udp`]. What they share sits beside them: the [`seams`] the binary
+//! is [`udp`]; what a TLS stream reads before forwarding (Story 12.4) is
+//! [`tls`]. What they share sits beside them: the [`seams`] the binary
 //! implements (selection, breaker, resolution), the connect-time
 //! [`local`] check, the host-name [`resolver`] cache and the
 //! [`counters`]. The UDP streams' per-node caps live on the stream-caps
@@ -59,6 +60,7 @@ pub mod seams;
 pub mod state;
 pub mod table;
 pub mod tcp;
+pub mod tls;
 pub mod tracker;
 pub mod transport;
 pub mod udp;

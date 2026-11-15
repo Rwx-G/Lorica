@@ -15,7 +15,7 @@ jobs:
       # One target's crash must not cancel the others' runs.
       fail-fast: false
       matrix:
-        target: [fuzz_waf_evaluate, fuzz_api_input, fuzz_ocsp_response, fuzz_proxy_protocol]
+        target: [fuzz_waf_evaluate, fuzz_api_input, fuzz_ocsp_response, fuzz_proxy_protocol, fuzz_client_hello]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master

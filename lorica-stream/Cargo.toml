@@ -35,5 +35,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time"
 tracing = "0.1"
 
 [dev-dependencies]
+# The ClientHellos of rustls' own client, which `tls::client_hello`'s
+# tests parse (Story 12.4 Lot B). The `ring` provider the workspace pins
+# (audit M-6); already in the lockfile through `lorica-tls`.
+rustls = { version = "0.23.12", default-features = false, features = ["ring", "std", "tls12"] }
 serde_json = "1.0"
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "test-util"] }
