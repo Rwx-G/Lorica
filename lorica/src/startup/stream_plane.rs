@@ -39,15 +39,18 @@
 //! reconcile path: one stream's bind never blocks another's, and nothing
 //! here can stop the process.
 //!
-//! UDP streams (Story 12.5) add three things the plane owns:
+//! **Caps regions** (Story 12.5 D-d, every protocol since Story 12.6
+//! D-e): one [`NodeCapsRegions`] entry per stream on the node, sized from
+//! its [`admitted_cap`], created at its first bind, replaced when a size
+//! change moves its table sizes, retired once no binding of the stream is
+//! held or wanted. Its `caps` message goes to a worker ahead of every
+//! `attach` of the stream, and again to every worker when the region is
+//! replaced. A worker that dies has its connections and sessions
+//! released from every live region before its respawn is sent anything
+//! ([`WORKER_RELEASE`]).
 //!
-//! - **Caps regions** (D-d): one [`NodeCapsRegions`] entry per UDP
-//!   stream on the node, created at its first bind, replaced when a size
-//!   change moves its table sizes, retired once no binding of the stream
-//!   is held or wanted. Its `caps` message goes to a worker ahead of every
-//!   `attach` of the stream, and again to every worker when the region is
-//!   replaced. A worker that dies has its sessions released from every
-//!   live region before its respawn is sent anything ([`WORKER_RELEASE`]).
+//! UDP streams (Story 12.5) add two more things the plane owns:
+//!
 //! - **Draining bindings** (D-m): a detached UDP binding keeps its
 //!   workers' slot sockets open while its sessions drain, so the plane
 //!   keeps it as draining until the drain ends plus
@@ -72,6 +75,7 @@ use futures_util::future::join_all;
 use lorica_config::listen_ports::ReservedPorts;
 use lorica_config::models::{GlobalSettings, NodeRole, Stream, StreamProtocol};
 use lorica_config::ConfigStore;
+use lorica_stream::caps::admitted_cap;
 use lorica_stream::reconcile::desired_bindings;
 use lorica_stream::{
     diff, BindFailureKind, BindKey, BindState, BoundBinding, BudgetViolation, Detach, FdBudget,
@@ -557,9 +561,9 @@ struct HeldBinding {
     chunks: usize,
     /// `attach` messages each worker acknowledged.
     acked: BTreeMap<u32, usize>,
-    /// Workers whose last `caps` for this UDP binding's stream was not
-    /// acknowledged: they hold the sockets but admit no session, so they
-    /// do not count as serving (D-d).
+    /// Workers whose last `caps` for this binding's stream was not
+    /// acknowledged: they hold the sockets but admit no connection or
+    /// session, so they do not count as serving (D-d).
     caps_refused: BTreeSet<u32>,
     /// What the budget check counted for the binding when it bound: the
     /// demand a rebind of its stream is compared with.
@@ -629,20 +633,20 @@ fn release_worker_sessions(caps: &SharedCaps, worker: u32) -> u64 {
     if released > 0 {
         info!(
             worker_id = worker,
-            sessions = released,
-            "UDP sessions of a dead worker released from the stream caps regions"
+            released,
+            "connections and sessions of a dead worker released from the stream caps regions"
         );
     }
     released
 }
 
-/// `udp.max_sessions` of a UDP stream, which sizes its caps region.
-fn udp_max_sessions(stream: &Stream) -> Option<u64> {
-    match stream.protocol {
-        StreamProtocol::Tcp => None,
-        StreamProtocol::Udp => stream.udp.as_ref().map(|u| u64::from(u.max_sessions)),
-    }
-}
+/// The backend links a region is sized for. The plane reads streams, not
+/// their links, so every region takes the backend floor
+/// (`lorica_shmem::stream_caps::MIN_BACKEND_SLOTS` cells per worker,
+/// one per backend counted). The engines count a backend only on a link
+/// with `max_active`, so only a stream with more capped links than that
+/// can find a worker's backend shard full.
+const REGION_LINKS: u64 = 0;
 
 /// The failure kind a node-side budget refusal is reported with.
 fn budget_failure_kind(violation: &BudgetViolation) -> BindFailureKind {
@@ -689,7 +693,7 @@ pub(crate) struct StreamPlane<L> {
     draining: Vec<DrainingBinding>,
     /// See [`UDP_DRAIN_RELEASE_MARGIN`]; a field so tests can shorten it.
     drain_margin: Duration,
-    /// One caps region per UDP stream on the node.
+    /// One caps region per stream on the node.
     caps: SharedCaps,
     source_ports: SourcePortsReader,
     /// `U` as read at the start of the current pass.
@@ -837,13 +841,8 @@ impl<L: WorkerLink> StreamPlane<L> {
         self.draining.retain(|d| d.until > now);
 
         let desired_keys = desired_bindings(streams, role);
-        let desired_udp: BTreeSet<&str> = desired_keys
-            .iter()
-            .filter(|k| k.protocol == StreamProtocol::Udp)
-            .map(|k| k.stream_id.as_str())
-            .collect();
-        self.retire_caps(&desired_udp);
         let desired: BTreeSet<&str> = desired_keys.iter().map(|k| k.stream_id.as_str()).collect();
+        self.retire_caps(&desired);
         self.rebinding.retain(|id, _| desired.contains(id.as_str()));
         for id in self.states.snapshot().into_keys() {
             if !desired.contains(id.as_str()) && !self.held.contains_key(&id) {
@@ -915,16 +914,17 @@ impl<L: WorkerLink> StreamPlane<L> {
         self.send_all(per_worker).await;
     }
 
-    /// Retire the caps region of every stream with no UDP binding wanted
-    /// on this node any more (deleted, disabled, deselected, switched to
-    /// TCP): its memfd closes, and the region stays mapped while its
-    /// sessions drain. Held UDP bindings that are no longer wanted were
-    /// detached earlier in the pass.
-    fn retire_caps(&mut self, desired_udp: &BTreeSet<&str>) {
+    /// Retire the caps region of every stream with no binding wanted on
+    /// this node any more (deleted, disabled, deselected): its memfd
+    /// closes, and the region stays mapped while its connections or
+    /// sessions drain. Held bindings that are no longer wanted were
+    /// detached earlier in the pass. A stream that changes protocol keeps
+    /// its region, replaced when its new cap moves the table sizes.
+    fn retire_caps(&mut self, desired: &BTreeSet<&str>) {
         let mut caps = lock_caps(&self.caps);
         let gone: Vec<String> = caps
             .stream_ids()
-            .filter(|id| !desired_udp.contains(id))
+            .filter(|id| !desired.contains(id))
             .map(str::to_string)
             .collect();
         for id in gone {
@@ -932,28 +932,20 @@ impl<L: WorkerLink> StreamPlane<L> {
         }
     }
 
-    /// Replace the region of every held UDP binding whose stream's
-    /// `udp.max_sessions` moved its table sizes, and hand the new one to
-    /// every worker; sessions counted in the old one stay counted there
-    /// until they end (D-d).
+    /// Replace the region of every held binding whose stream's
+    /// [`admitted_cap`] moved its table sizes, and hand the new one to
+    /// every worker; connections and sessions counted in the old one stay
+    /// counted there until they end (D-d).
     async fn resize_caps(&mut self, streams: &[Stream]) {
         let mut replaced: Vec<String> = Vec::new();
-        for b in self
-            .held
-            .values()
-            .filter(|b| b.key.protocol == StreamProtocol::Udp)
-        {
+        for b in self.held.values() {
             let id = &b.key.stream_id;
-            let Some(max_sessions) = streams
-                .iter()
-                .find(|s| s.id == *id)
-                .and_then(udp_max_sessions)
-            else {
+            let Some(cap) = streams.iter().find(|s| s.id == *id).and_then(admitted_cap) else {
                 continue;
             };
-            match lock_caps(&self.caps).ensure(id, max_sessions) {
+            match lock_caps(&self.caps).ensure(id, cap, REGION_LINKS) {
                 Ok(Some(caps_gen)) => {
-                    info!(stream_id = %id, caps_gen, max_sessions, "stream caps region replaced");
+                    info!(stream_id = %id, caps_gen, cap, "stream caps region replaced");
                     replaced.push(id.clone());
                 }
                 Ok(None) => {}
@@ -1026,33 +1018,23 @@ impl<L: WorkerLink> StreamPlane<L> {
         }
     }
 
-    /// What `worker` is sent for binding `stream_id`: for UDP the
-    /// stream's `caps`, then its `attach` messages; nothing when either
-    /// cannot be built, so the worker never holds sockets it cannot
-    /// serve.
+    /// What `worker` is sent for binding `stream_id`: the stream's
+    /// `caps`, then its `attach` messages; nothing when either cannot be
+    /// built, so the worker never holds sockets it cannot serve.
     fn binding_messages(&mut self, stream_id: &str, worker: u32) -> Vec<StreamCtlMsg> {
-        let udp = self
-            .held
-            .get(stream_id)
-            .is_some_and(|b| b.key.protocol == StreamProtocol::Udp);
-        let caps = if udp {
-            match self.caps_message(stream_id, worker) {
-                Some(msg) => Some(msg),
-                None => return Vec::new(),
-            }
-        } else {
-            None
+        let Some(caps) = self.caps_message(stream_id, worker) else {
+            return Vec::new();
         };
         let attaches = self.attach_messages(stream_id, worker);
         if attaches.is_empty() {
             return Vec::new();
         }
-        caps.into_iter().chain(attaches).collect()
+        std::iter::once(caps).chain(attaches).collect()
     }
 
     /// A worker came back after a crash: release what its predecessor
     /// held in the caps regions, take its new channel and replay every
-    /// live binding (each UDP one's `caps` ahead of its `attach`), then a
+    /// live binding (each one's `caps` ahead of its `attach`), then a
     /// `refresh` (D-a, Story 12.5 D-d).
     pub(crate) async fn replay_worker(&mut self, worker: u32, link: L, pass: PassSettings) {
         self.release_worker(worker);
@@ -1301,24 +1283,22 @@ impl<L: WorkerLink> StreamPlane<L> {
             );
             return;
         }
-        if key.protocol == StreamProtocol::Udp {
-            let ensured = match stream_of(&key.stream_id).and_then(udp_max_sessions) {
-                None => Err("the UDP stream carries no udp settings".to_string()),
-                Some(max_sessions) => lock_caps(&self.caps)
-                    .ensure(&id, max_sessions)
-                    .map_err(|e| format!("the stream caps region could not be created: {e}")),
-            };
-            if let Err(reason) = ensured {
-                self.fail(
-                    &key,
-                    name,
-                    BindFailureKind::Other,
-                    reason,
-                    key.port_first,
-                    events,
-                );
-                return;
-            }
+        let ensured = match stream_of(&key.stream_id).and_then(admitted_cap) {
+            None => Err("the UDP stream carries no udp settings".to_string()),
+            Some(cap) => lock_caps(&self.caps)
+                .ensure(&id, cap, REGION_LINKS)
+                .map_err(|e| format!("the stream caps region could not be created: {e}")),
+        };
+        if let Err(reason) = ensured {
+            self.fail(
+                &key,
+                name,
+                BindFailureKind::Other,
+                reason,
+                key.port_first,
+                events,
+            );
+            return;
         }
         let ports = match self.take_inherited(&key) {
             Some(ports) => ports,
@@ -1456,7 +1436,7 @@ impl<L: WorkerLink> StreamPlane<L> {
                                 worker_id = worker,
                                 %stream_id,
                                 reason = reason.as_str(),
-                                "stream caps region refused by the worker; it admits no session of the stream"
+                                "stream caps region refused by the worker; it admits no connection or session of the stream"
                             );
                         } else {
                             debug!(
@@ -1511,7 +1491,7 @@ impl<L: WorkerLink> StreamPlane<L> {
     }
 
     /// A `caps` that `worker` refused or left unanswered: the worker
-    /// holds the stream's sockets but admits no session of it.
+    /// holds the stream's sockets but admits no connection or session of it.
     fn caps_not_adopted(&mut self, worker: u32, pending: &Pending) {
         if let Pending::Caps { stream_id } = pending {
             if let Some(b) = self.held.get_mut(stream_id) {
@@ -2145,10 +2125,18 @@ mod tests {
             }]
         );
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-        for log in [&seen0, &seen1] {
+        for (slot, log) in [&seen0, &seen1].into_iter().enumerate() {
             assert_eq!(
                 seen(log),
                 vec![
+                    // A TCP stream's region precedes its attach, as a UDP
+                    // one's does (Story 12.6 D-e).
+                    Seen::Caps {
+                        stream_id: "s1".into(),
+                        caps_gen: 1,
+                        slot: u32::try_from(slot).unwrap(),
+                        total: 0,
+                    },
                     Seen::Attach {
                         stream_id: "s1".into(),
                         bind_gen: 1,
@@ -2515,6 +2503,12 @@ mod tests {
         assert_eq!(
             seen(&seen1),
             vec![
+                Seen::Caps {
+                    stream_id: "s1".into(),
+                    caps_gen: 1,
+                    slot: 1,
+                    total: 0,
+                },
                 Seen::Attach {
                     stream_id: "s1".into(),
                     bind_gen: 1,
@@ -2995,7 +2989,10 @@ mod tests {
             "{events:?}"
         );
         assert!(matches!(states.get("s1"), Some(BindState::Bound { .. })));
-        assert!(matches!(&seen(&seen0)[0], Seen::Attach { .. }));
+        assert!(matches!(
+            seen(&seen0).as_slice(),
+            [Seen::Caps { .. }, Seen::Attach { .. }, ..]
+        ));
         assert!(!bindable(wanted));
         assert!(
             bindable(unwanted),

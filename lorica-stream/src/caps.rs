@@ -12,33 +12,46 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The stream-caps regions of UDP streams on both sides of the control
-//! channel (Story 12.5 D-d).
+//! The stream-caps regions on both sides of the control channel (Story
+//! 12.5 D-d, made protocol-neutral by Story 12.6 D-e).
 //!
 //! - [`NodeCapsRegions`], in the supervisor (or the single-process
-//!   driver): one region per UDP stream on the node, created from its
-//!   `udp.max_sessions` and the worker count, replaced with the next
-//!   `caps_gen` when a size change moves the table sizes, kept while a
-//!   retired region still counts sessions, and the one place a dead
-//!   worker's sessions are released before its respawn replay.
+//!   driver): one region per stream on the node, created from its
+//!   [`admitted_cap`], its link count and the worker count, replaced with
+//!   the next `caps_gen` when a change moves the table sizes, kept while
+//!   a retired region still counts connections or sessions, and the one
+//!   place a dead worker's counts are released before its respawn
+//!   replay.
 //! - [`CapsRegistry`], in a worker: what the `caps` messages handed it,
-//!   by stream id, which the UDP engine reads at each session creation.
+//!   by stream id, which the engines read at each TCP accept and each
+//!   UDP session creation.
 //!
 //! One region per stream, not per binding, so caps stay exact across a
-//! rebind's drain. A session keeps the region it was counted in through
-//! its permit, so replacing a region never moves a live session.
+//! rebind's drain. A connection or session keeps the region it was
+//! counted in through its permit, so replacing a region never moves it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use lorica_shmem::{layout_for, StreamCapsError, StreamCapsRegion, WorkerCaps};
+use lorica_config::models::{Stream, StreamProtocol};
+use lorica_shmem::{layout_with_links, StreamCapsError, StreamCapsRegion, WorkerCaps};
 use lorica_worker::stream_ctl::StreamCtlMsg;
 
-/// A worker's view of one UDP stream's regions: the current one, through
-/// which it admits new sessions under its slot, and the retired ones
-/// still counting sessions.
+/// The cap a stream's region is sized from (Story 12.6 D-e): its
+/// `max_connections` on TCP, its `udp.max_sessions` on UDP; `None` for a
+/// UDP stream without its settings, which validation never stores.
+pub fn admitted_cap(stream: &Stream) -> Option<u64> {
+    match stream.protocol {
+        StreamProtocol::Tcp => Some(u64::from(stream.max_connections)),
+        StreamProtocol::Udp => stream.udp.as_ref().map(|u| u64::from(u.max_sessions)),
+    }
+}
+
+/// A worker's view of one stream's regions: the current one, through
+/// which it admits new connections or sessions under its slot, and the
+/// retired ones still counting some.
 #[derive(Debug, Clone)]
 pub struct StreamCaps {
     current: WorkerCaps,
@@ -60,10 +73,26 @@ impl StreamCaps {
     }
 
     /// The stream cap the current region admits against: `max_sessions`
-    /// less what the retired regions still count, so the stream's total
-    /// across its regions stays exact while one drains.
+    /// (or `max_connections`) less what the retired regions still count,
+    /// so the stream's total across its regions stays exact while one
+    /// drains.
     pub fn stream_cap_left(&self, max_sessions: u64) -> u64 {
         max_sessions.saturating_sub(self.retired_sessions())
+    }
+
+    /// Connections the stream still holds in phase 2 on the node in its
+    /// retired regions.
+    pub fn retired_pending(&self) -> u64 {
+        self.retired
+            .iter()
+            .fold(0u64, |acc, r| acc.saturating_add(r.pending()))
+    }
+
+    /// The pending cap the current region admits against: `pending_cap`
+    /// less what the retired regions still hold in phase 2, as
+    /// [`StreamCaps::stream_cap_left`] does for the stream total.
+    pub fn pending_cap_left(&self, pending_cap: u64) -> u64 {
+        pending_cap.saturating_sub(self.retired_pending())
     }
 }
 
@@ -135,18 +164,19 @@ impl CapsRegistry {
     }
 }
 
-/// One UDP stream's regions in the supervisor.
+/// One stream's regions in the supervisor.
 #[derive(Debug)]
 struct NodeStreamCaps {
     current: Arc<StreamCapsRegion>,
     /// The current region's memfd, kept to send it again: to a respawned
-    /// worker, and to the first `attach` of a later binding. One per UDP
-    /// stream, which the budget counts in the supervisor's fds.
+    /// worker, and to the first `attach` of a later binding. One per
+    /// stream with a region, which the budget counts in the supervisor's
+    /// fds.
     fd: OwnedFd,
     retired: Vec<Arc<StreamCapsRegion>>,
 }
 
-/// The supervisor's regions, one per UDP stream on the node.
+/// The supervisor's regions, one per stream on the node.
 #[derive(Debug)]
 pub struct NodeCapsRegions {
     workers: u32,
@@ -168,12 +198,14 @@ impl NodeCapsRegions {
         }
     }
 
-    /// Give `stream_id` a region sized for `max_sessions`. Creates the
-    /// first one, or a replacement with the next `caps_gen` when the
-    /// table sizes move (the old one then counts its sessions down as
-    /// retired); a change within the same sizes needs nothing, since the
-    /// limits are read from the stream at each admission. Returns the
-    /// `caps_gen` to send to every worker, `None` when nothing changed.
+    /// Give `stream_id` a region sized for `max_admitted` (its
+    /// [`admitted_cap`]) and `links` backend links. Creates the first
+    /// one, or a replacement with the next `caps_gen` when the table
+    /// sizes move (the old one then counts its connections or sessions
+    /// down as retired); a change within the same sizes needs nothing,
+    /// since the limits are read from the stream at each admission.
+    /// Returns the `caps_gen` to send to every worker, `None` when
+    /// nothing changed.
     ///
     /// A stream that comes back while a region [`NodeCapsRegions::retire`]
     /// kept still counts sessions (disabled then enabled within its
@@ -188,7 +220,8 @@ impl NodeCapsRegions {
     pub fn ensure(
         &mut self,
         stream_id: &str,
-        max_sessions: u64,
+        max_admitted: u64,
+        links: u64,
     ) -> Result<Option<u64>, StreamCapsError> {
         let caps_gen = match self.streams.get(stream_id) {
             None => self
@@ -197,17 +230,18 @@ impl NodeCapsRegions {
                 .and_then(|regions| regions.iter().map(|r| r.caps_gen()).max())
                 .map_or(1, |last| last + 1),
             Some(held) => {
-                let wanted = layout_for(max_sessions, self.workers)?;
+                let wanted = layout_with_links(max_admitted, self.workers, links)?;
                 let layout = held.current.layout();
-                if (wanted.rate_slots, wanted.shard_slots)
-                    == (layout.rate_slots, layout.shard_slots)
+                if (wanted.rate_slots, wanted.shard_slots, wanted.backend_slots)
+                    == (layout.rate_slots, layout.shard_slots, layout.backend_slots)
                 {
                     return Ok(None);
                 }
                 held.current.caps_gen() + 1
             }
         };
-        let (region, fd) = StreamCapsRegion::create(max_sessions, self.workers, caps_gen)?;
+        let (region, fd) =
+            StreamCapsRegion::create_with_links(max_admitted, self.workers, links, caps_gen)?;
         let region = Arc::new(region);
         match self.streams.get_mut(stream_id) {
             Some(held) => {
@@ -274,9 +308,10 @@ impl NodeCapsRegions {
     }
 
     /// Release what dead worker `slot` held in every live region: its
-    /// shards emptied, its sessions subtracted from each total. Before
-    /// the respawn replay, while no process writes that slot. Returns
-    /// the sessions released.
+    /// shards emptied, its connections or sessions (pending ones
+    /// included) subtracted from each total. Before the respawn replay,
+    /// while no process writes that slot. Returns the connections or
+    /// sessions released.
     pub fn release_worker(&self, slot: u32) -> u64 {
         self.regions().fold(0u64, |acc, r| {
             acc.saturating_add(r.release_worker(slot).unwrap_or(0))
@@ -298,8 +333,8 @@ impl NodeCapsRegions {
         });
     }
 
-    /// Sessions `stream_id` holds on the node, exact, over its live
-    /// regions.
+    /// Connections or sessions `stream_id` holds on the node, exact, over
+    /// its live regions.
     pub fn sessions(&self, stream_id: &str) -> u64 {
         self.streams.get(stream_id).map_or(0, |held| {
             held.retired
@@ -308,7 +343,7 @@ impl NodeCapsRegions {
         })
     }
 
-    /// Memfds the supervisor holds, one per UDP stream with a region.
+    /// Memfds the supervisor holds, one per stream with a region.
     pub fn memfds(&self) -> usize {
         self.streams.len()
     }
@@ -345,8 +380,12 @@ mod tests {
     #[test]
     fn a_size_change_replaces_the_region_and_the_old_one_drains() {
         let mut node = NodeCapsRegions::new(2);
-        assert_eq!(node.ensure("dns", 4096).unwrap(), Some(1));
-        assert_eq!(node.ensure("dns", 4000).unwrap(), None, "same table sizes");
+        assert_eq!(node.ensure("dns", 4096, 0).unwrap(), Some(1));
+        assert_eq!(
+            node.ensure("dns", 4000, 0).unwrap(),
+            None,
+            "same table sizes"
+        );
         assert_eq!(node.memfds(), 1);
 
         let registry = CapsRegistry::new();
@@ -359,7 +398,7 @@ mod tests {
             .unwrap();
         assert_eq!(node.sessions("dns"), 1);
 
-        assert_eq!(node.ensure("dns", 16_384).unwrap(), Some(2));
+        assert_eq!(node.ensure("dns", 16_384, 0).unwrap(), Some(2));
         registry.adopt("dns", worker_view(&node, "dns", 0));
         let caps = registry.get("dns").unwrap();
         assert_eq!(caps.current().region().caps_gen(), 2);
@@ -377,8 +416,8 @@ mod tests {
     #[test]
     fn a_dead_workers_sessions_are_released_in_every_live_region() {
         let mut node = NodeCapsRegions::new(2);
-        node.ensure("a", 64).unwrap();
-        node.ensure("b", 64).unwrap();
+        node.ensure("a", 64, 0).unwrap();
+        node.ensure("b", 64, 0).unwrap();
         let dead_a = worker_view(&node, "a", 1);
         let dead_b = worker_view(&node, "b", 1);
         let alive = worker_view(&node, "a", 0);
@@ -401,7 +440,7 @@ mod tests {
     #[test]
     fn a_stream_back_while_its_retired_region_counts_continues_its_caps_gen() {
         let mut node = NodeCapsRegions::new(1);
-        node.ensure("dns", 64).unwrap();
+        node.ensure("dns", 64, 0).unwrap();
         let registry = CapsRegistry::new();
         registry.adopt("dns", worker_view(&node, "dns", 0));
         let permit = registry
@@ -413,7 +452,7 @@ mod tests {
         node.retire("dns");
         assert!(!node.holds("dns"));
 
-        assert_eq!(node.ensure("dns", 64).unwrap(), Some(2));
+        assert_eq!(node.ensure("dns", 64, 0).unwrap(), Some(2));
         assert_eq!(node.sessions("dns"), 1, "the old region still counts");
         registry.adopt("dns", worker_view(&node, "dns", 0));
         let caps = registry.get("dns").unwrap();
@@ -426,7 +465,7 @@ mod tests {
         node.retire("dns");
         node.tick(lorica_shmem::now_ns());
         assert_eq!(
-            node.ensure("dns", 64).unwrap(),
+            node.ensure("dns", 64, 0).unwrap(),
             Some(1),
             "nothing left to count beside"
         );
@@ -435,7 +474,7 @@ mod tests {
     #[test]
     fn a_replayed_caps_gen_replaces_and_a_gone_stream_is_forgotten() {
         let mut node = NodeCapsRegions::new(1);
-        node.ensure("dns", 64).unwrap();
+        node.ensure("dns", 64, 0).unwrap();
         let registry = CapsRegistry::new();
         registry.adopt("dns", worker_view(&node, "dns", 0));
         registry.adopt("dns", worker_view(&node, "dns", 0));
@@ -443,5 +482,64 @@ mod tests {
         assert!(node.caps_message("absent", 1, 0).unwrap().is_none());
         registry.retain(|id| id != "dns");
         assert!(registry.is_empty());
+    }
+
+    fn stream(protocol: StreamProtocol) -> Stream {
+        Stream::new(
+            "s".into(),
+            "s".into(),
+            protocol,
+            "0.0.0.0".parse().unwrap(),
+            5432,
+            5432,
+            chrono::Utc::now(),
+        )
+    }
+
+    #[test]
+    fn a_region_is_sized_from_the_protocols_cap_and_its_link_count() {
+        let mut tcp = stream(StreamProtocol::Tcp);
+        tcp.max_connections = 1_000;
+        assert_eq!(admitted_cap(&tcp), Some(1_000));
+        let udp = stream(StreamProtocol::Udp);
+        let max_sessions = udp.udp.as_ref().map(|u| u64::from(u.max_sessions));
+        assert!(max_sessions.is_some());
+        assert_eq!(admitted_cap(&udp), max_sessions);
+
+        let mut node = NodeCapsRegions::new(8);
+        assert_eq!(node.ensure("pg", 1_000, 3).unwrap(), Some(1));
+        use lorica_shmem::stream_caps::{BACKEND_SLOTS_PER_LINK, MIN_BACKEND_SLOTS};
+        let floor = MIN_BACKEND_SLOTS / BACKEND_SLOTS_PER_LINK;
+        assert_eq!(
+            node.ensure("pg", 1_000, floor).unwrap(),
+            None,
+            "links within the backend floor keep the region"
+        );
+        assert_eq!(
+            node.ensure("pg", 1_000, floor + 1).unwrap(),
+            Some(2),
+            "a link count past the floor replaces it"
+        );
+    }
+
+    #[test]
+    fn the_pending_cap_left_discounts_what_retired_regions_hold_in_phase_2() {
+        let mut node = NodeCapsRegions::new(1);
+        node.ensure("pg", 64, 0).unwrap();
+        let registry = CapsRegistry::new();
+        registry.adopt("pg", worker_view(&node, "pg", 0));
+        let pending = registry
+            .get("pg")
+            .unwrap()
+            .current()
+            .admit_stream(64, true, 8)
+            .unwrap();
+        assert_eq!(node.ensure("pg", 4_096, 0).unwrap(), Some(2));
+        registry.adopt("pg", worker_view(&node, "pg", 0));
+        let caps = registry.get("pg").unwrap();
+        assert_eq!(caps.retired_pending(), 1);
+        assert_eq!(caps.pending_cap_left(8), 7);
+        drop(pending);
+        assert_eq!(caps.pending_cap_left(8), 8);
     }
 }

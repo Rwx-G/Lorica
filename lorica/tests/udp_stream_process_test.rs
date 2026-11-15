@@ -371,7 +371,7 @@ fn a_dead_workers_session_is_released_before_its_replacement_serves() {
         "{output}"
     );
     let released = output
-        .find("UDP sessions of a dead worker released")
+        .find("connections and sessions of a dead worker released")
         .unwrap_or_else(|| panic!("no release logged:\n{output}"));
     let replaced = output
         .find("worker restarted, reconnecting channel")

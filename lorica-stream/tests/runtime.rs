@@ -824,7 +824,7 @@ async fn a_wildcard_socket_reports_the_address_the_client_targeted() {
 async fn a_caps_region_is_adopted_and_a_bad_one_is_refused() {
     let (mut peer, handle, probe) = udp_runtime();
     let mut node = NodeCapsRegions::new(2);
-    assert_eq!(node.ensure("dns", 64).unwrap(), Some(1));
+    assert_eq!(node.ensure("dns", 64, 0).unwrap(), Some(1));
 
     let caps = node.caps_message("dns", 1, 1).unwrap().expect("a region");
     peer.to_runtime.send(caps).await.unwrap();

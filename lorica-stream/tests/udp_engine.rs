@@ -376,7 +376,7 @@ impl Harness {
         };
         for (n, (stream, _)) in streams.iter().enumerate() {
             let max_sessions = u64::from(stream.udp.as_ref().unwrap().max_sessions);
-            harness.node.ensure(&stream.id, max_sessions).unwrap();
+            harness.node.ensure(&stream.id, max_sessions, 0).unwrap();
             let seq = harness.next_seq();
             let caps = harness
                 .node
