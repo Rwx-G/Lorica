@@ -726,9 +726,8 @@ pub(crate) fn spawn_ocsp_refresh_loop(
 
 /// Spawn the backend health-check loop (audit H-9 dedup).
 ///
-/// Reads `default_health_check_interval_s` from `GlobalSettings`
-/// (default 10 s) as the loop's fallback and spawns
-/// `health::health_check_loop`, which re-reads it every cycle.
+/// Spawns `health::health_check_loop`, which probes each backend at its
+/// own `health_check_interval_s`.
 ///
 /// Mode differences are explicit parameters:
 /// - `backend_connections`: `Some` in single-process mode (direct
@@ -752,17 +751,10 @@ pub(crate) async fn spawn_health_check_loop(
 ) -> tokio::task::JoinHandle<()> {
     let health_store = Arc::clone(store);
     let health_config = Arc::clone(proxy_config);
-    let health_interval = {
-        let s = store.lock().await;
-        s.get_global_settings()
-            .map(|gs| gs.default_health_check_interval_s as u64)
-            .unwrap_or(10)
-    };
     tokio::spawn(async move {
         crate::health::health_check_loop(
             health_store,
             health_config,
-            health_interval,
             backend_connections,
             Some(alert_sender),
             config_reload_tx,

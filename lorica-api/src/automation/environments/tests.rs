@@ -431,6 +431,37 @@ async fn create_returns_201_and_an_identical_put_returns_200_with_the_same_route
     assert_eq!(counts.environments, 1);
 }
 
+#[tokio::test]
+async fn environment_backends_get_the_default_health_check_interval_of_their_put() {
+    let state = crate::tests::test_state().await.0;
+    seed_wildcard(&state).await;
+    let token = writer(&state, "acme-ci").await;
+    let stored_intervals = |state: AppState| async move {
+        let store = state.store.lock().await;
+        store
+            .list_backends()
+            .expect("backends read")
+            .iter()
+            .map(|backend| backend.health_check_interval_s)
+            .collect::<Vec<_>>()
+    };
+
+    crate::tests::set_default_health_check_interval(&state, 30).await;
+    let response = put(&state, &token, "pr-42", env_body()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(stored_intervals(state.clone()).await, vec![30]);
+
+    // The setting is read when a row is written, never applied to one.
+    crate::tests::set_default_health_check_interval(&state, 45).await;
+    assert_eq!(stored_intervals(state.clone()).await, vec![30]);
+
+    // A PUT replaces the environment's backend rows, so the new rows
+    // take the setting of that PUT.
+    let response = put(&state, &token, "pr-42", env_body()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(stored_intervals(state.clone()).await, vec![45]);
+}
+
 // ---- Inheritance from the route an environment displaces ----
 
 /// The Basic auth hash a protected route carries here, a value no

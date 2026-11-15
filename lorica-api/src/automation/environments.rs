@@ -115,10 +115,6 @@ const DEFAULT_BACKEND_WEIGHT: i32 = 1;
 /// real pool needs and keeps every weight sum inside an `i32`.
 const AUTOMATION_MAX_BACKEND_WEIGHT: i32 = 1_000;
 
-/// Health-check cadence for automation backends, the same default the
-/// backend API applies.
-const DEFAULT_HEALTH_CHECK_INTERVAL_S: i32 = 10;
-
 /// The `error.code` of a 412, which [`ApiError`] has no variant for.
 const PRECONDITION_FAILED_CODE: &str = "precondition_failed";
 
@@ -876,8 +872,16 @@ fn environment_route(
     }
 }
 
-/// One backend row, exclusively owned by the environment.
-fn environment_backend(input: &WriteInput, index: usize, backend: &ValidatedBackend) -> Backend {
+/// One backend row, exclusively owned by the environment, probed every
+/// `health_check_interval_s`: the stored
+/// `default_health_check_interval_s`, as for a backend the backend API
+/// creates without an interval.
+fn environment_backend(
+    input: &WriteInput,
+    index: usize,
+    backend: &ValidatedBackend,
+    health_check_interval_s: i32,
+) -> Backend {
     Backend {
         id: uuid::Uuid::new_v4().to_string(),
         address: backend.address.clone(),
@@ -886,7 +890,7 @@ fn environment_backend(input: &WriteInput, index: usize, backend: &ValidatedBack
         weight: backend.weight,
         health_status: HealthStatus::Unknown,
         health_check_enabled: true,
-        health_check_interval_s: DEFAULT_HEALTH_CHECK_INTERVAL_S,
+        health_check_interval_s,
         health_check_path: None,
         health_check: lorica_config::models::HealthCheck::TcpConnect,
         lifecycle_state: LifecycleState::Normal,
@@ -1035,9 +1039,10 @@ fn write_environment(store: &ConfigStore, input: &WriteInput) -> Result<PutOutco
             _ => store.unlink_route_backend(&route_id, &backend_id)?,
         }
     }
+    let health_check_interval_s = store.get_global_settings()?.default_health_check_interval_s;
     let mut backend_ids = Vec::with_capacity(input.backends.len());
     for (index, backend) in input.backends.iter().enumerate() {
-        let row = environment_backend(input, index, backend);
+        let row = environment_backend(input, index, backend, health_check_interval_s);
         store.create_backend(&row)?;
         store.link_route_backend(&route_id, &row.id)?;
         backend_ids.push(row.id);

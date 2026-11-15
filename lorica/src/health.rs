@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -92,27 +92,22 @@ impl ProbeResult {
     }
 }
 
-/// The pause before the next health-loop cycle: the stored
-/// `default_health_check_interval_s`, re-read every cycle so a change
-/// acts from the next one without a restart, or `fallback` when the
-/// store cannot be read. Never below five seconds.
-async fn next_interval(store: &Mutex<ConfigStore>, fallback: u64) -> Duration {
-    let stored = store
-        .lock()
-        .await
-        .get_global_settings()
-        .map(|settings| u64::try_from(settings.default_health_check_interval_s).unwrap_or(fallback))
-        .unwrap_or(fallback);
-    Duration::from_secs(stored.max(5))
-}
+/// How often the health loop wakes to run a cycle: the drain pass, and
+/// the probes of the backends due one.
+const HEALTH_LOOP_TICK: Duration = Duration::from_secs(1);
+
+/// The shortest pause between two probes of one backend, whatever its
+/// `health_check_interval_s` says.
+const MIN_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Run TCP health checks and backend drain monitoring in a loop.
 ///
 /// - Health checks: probe each backend, update status (Healthy/Degraded/Down)
 /// - Drain checks: transition Closing backends to Closed when connections reach 0 or timeout expires
 ///
-/// `default_interval_s` is the pause used when the store cannot be
-/// read; otherwise every cycle waits the interval stored at its start.
+/// A cycle runs every [`HEALTH_LOOP_TICK`] and probes the backends due
+/// a probe (`take_due`): each one at its own `health_check_interval_s`,
+/// never more often than [`MIN_PROBE_INTERVAL`].
 ///
 /// `on_change` is called once per cycle that persisted a confirmed
 /// health flip or a lifecycle transition, beside the `config_reload_tx`
@@ -121,7 +116,6 @@ async fn next_interval(store: &Mutex<ConfigStore>, fallback: u64) -> Duration {
 pub async fn health_check_loop(
     store: Arc<Mutex<ConfigStore>>,
     proxy_config: Arc<ArcSwap<ProxyConfig>>,
-    default_interval_s: u64,
     backend_connections: Option<Arc<BackendConnections>>,
     alert_sender: Option<lorica_notify::AlertSender>,
     config_reload_tx: Option<tokio::sync::broadcast::Sender<u64>>,
@@ -136,9 +130,16 @@ pub async fn health_check_loop(
         on_change,
     };
     let mut state = HealthLoopState::default();
+    let mut ticks = tokio::time::interval_at(
+        tokio::time::Instant::now() + HEALTH_LOOP_TICK,
+        HEALTH_LOOP_TICK,
+    );
+    // A cycle outlasting a tick (a probe waiting out its timeout) must
+    // not be followed by a burst of catch-up cycles.
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tokio::time::sleep(next_interval(&health.store, default_interval_s).await).await;
-        run_health_cycle(&health, &mut state).await;
+        ticks.tick().await;
+        run_health_cycle(&health, &mut state, Instant::now()).await;
     }
 }
 
@@ -163,12 +164,60 @@ struct HealthLoopState {
     /// does not flip the stored status. See `confirm_status_flip` and
     /// `HEALTH_FLIP_THRESHOLD`.
     pending_health: HashMap<String, (HealthStatus, u32)>,
+    /// When the last probe of each backend started, which decides when
+    /// it is due the next one (`take_due`).
+    last_probe: HashMap<String, Instant>,
 }
 
-/// One health cycle: list the backends, close the drained ones, probe
-/// the eligible ones, persist the confirmed flips, and signal the
-/// reload when anything was persisted. Returns whether it was.
-async fn run_health_cycle(health: &HealthLoop, state: &mut HealthLoopState) -> bool {
+impl HealthLoopState {
+    /// Drop everything tracked for a backend absent from `backends`,
+    /// so a deleted backend leaves nothing behind.
+    fn forget_unlisted(&mut self, backends: &[Backend]) {
+        let listed: HashSet<&str> = backends.iter().map(|b| b.id.as_str()).collect();
+        self.drain_start
+            .retain(|id, _| listed.contains(id.as_str()));
+        self.pending_health
+            .retain(|id, _| listed.contains(id.as_str()));
+        self.last_probe.retain(|id, _| listed.contains(id.as_str()));
+    }
+}
+
+/// The pause `backend` asks for between two of its probes: its own
+/// `health_check_interval_s`, never below [`MIN_PROBE_INTERVAL`].
+fn probe_interval(backend: &Backend) -> Duration {
+    let own = u64::try_from(backend.health_check_interval_s).unwrap_or(0);
+    Duration::from_secs(own).max(MIN_PROBE_INTERVAL)
+}
+
+/// The backends of `eligible` due a probe at `now`: never probed yet,
+/// or whose last probe started at least their [`probe_interval`]
+/// before `now`. Each one returned is recorded as probed at `now`.
+///
+/// The interval is read from the backend as listed this cycle, so an
+/// edited interval acts from the next probe.
+fn take_due(
+    last_probe: &mut HashMap<String, Instant>,
+    eligible: Vec<Backend>,
+    now: Instant,
+) -> Vec<Backend> {
+    let mut due = Vec::new();
+    for backend in eligible {
+        let is_due = last_probe
+            .get(&backend.id)
+            .is_none_or(|last| now.saturating_duration_since(*last) >= probe_interval(&backend));
+        if is_due {
+            last_probe.insert(backend.id.clone(), now);
+            due.push(backend);
+        }
+    }
+    due
+}
+
+/// One health cycle at `now`: list the backends, close the drained
+/// ones, probe the eligible ones due a probe, persist the confirmed
+/// flips, and signal the reload when anything was persisted. Returns
+/// whether it was.
+async fn run_health_cycle(health: &HealthLoop, state: &mut HealthLoopState, now: Instant) -> bool {
     let backends = {
         let store = health.store.lock().await;
         match store.list_backends() {
@@ -179,29 +228,33 @@ async fn run_health_cycle(health: &HealthLoop, state: &mut HealthLoopState) -> b
             }
         }
     };
+    state.forget_unlisted(&backends);
 
     let mut changed = close_drained_backends(health, state, &backends).await;
 
-    // --- Phase A: probe eligible backends concurrently ---
+    // --- Phase A: probe the eligible backends due a probe, concurrently ---
+    // Clone them so each probe future owns its data; this keeps the
+    // spawned `health_check_loop` future free of borrows that the stream
+    // combinators cannot prove `Send` across the await points.
+    let eligible: Vec<Backend> = backends
+        .iter()
+        .filter(|b| b.lifecycle_state != LifecycleState::Closing && b.health_check_enabled)
+        .cloned()
+        .collect();
+    let due = take_due(&mut state.last_probe, eligible, now);
     // One slow or timing-out backend must not delay every other backend's
-    // probe or overrun the loop interval. Bound concurrency with the
-    // operator-tunable `health_max_concurrent_probes` (default 32).
-    let max_concurrent = {
+    // probe. Bound concurrency with the operator-tunable
+    // `health_max_concurrent_probes` (default 32).
+    let max_concurrent = if due.is_empty() {
+        1
+    } else {
         let store = health.store.lock().await;
         store
             .get_global_settings()
             .map(|s| s.health_max_concurrent_probes.clamp(1, 512) as usize)
             .unwrap_or(32)
     };
-    // Clone the eligible backends so each probe future owns its data; this
-    // keeps the spawned `health_check_loop` future free of borrows that the
-    // stream combinators cannot prove `Send` across the await points.
-    let eligible: Vec<Backend> = backends
-        .iter()
-        .filter(|b| b.lifecycle_state != LifecycleState::Closing && b.health_check_enabled)
-        .cloned()
-        .collect();
-    let probe_results: Vec<(Backend, HealthStatus)> = futures_util::stream::iter(eligible)
+    let probe_results: Vec<(Backend, HealthStatus)> = futures_util::stream::iter(due)
         .map(|backend| async move {
             let probe = match probe_for(&backend) {
                 ProbeTarget::Http { url } => http_probe(&url).await,
@@ -564,26 +617,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_interval_is_read_from_the_store_every_cycle_and_never_below_five_seconds() {
-        let store = Mutex::new(ConfigStore::open_in_memory().expect("in-memory store"));
-        let mut settings = store.lock().await.get_global_settings().expect("settings");
-        settings.default_health_check_interval_s = 30;
-        store
-            .lock()
-            .await
-            .update_global_settings(&settings)
-            .expect("stored");
-        assert_eq!(next_interval(&store, 10).await, Duration::from_secs(30));
-        settings.default_health_check_interval_s = 1;
-        store
-            .lock()
-            .await
-            .update_global_settings(&settings)
-            .expect("stored");
-        assert_eq!(next_interval(&store, 10).await, Duration::from_secs(5));
-    }
-
-    #[tokio::test]
     async fn test_tcp_probe_unreachable_address() {
         // Use a non-routable address to guarantee failure
         let result = tcp_probe("192.0.2.1:1").await;
@@ -694,6 +727,157 @@ mod tests {
             probe_for(&backend),
             ProbeTarget::TcpConnect { .. }
         ));
+    }
+
+    // ---- Per-backend cadence ----
+
+    fn backend_probed_every(id: &str, interval_s: i32) -> Backend {
+        let mut backend = backend_checked_by(None, false);
+        backend.id = id.to_string();
+        backend.health_check_interval_s = interval_s;
+        backend
+    }
+
+    /// How many times each backend of `backends` is probed by one cycle
+    /// a second over `seconds` seconds, `edit` applied to the listing
+    /// before each cycle (at its second).
+    fn probes_over(
+        seconds: u64,
+        backends: &mut [Backend],
+        mut edit: impl FnMut(u64, &mut [Backend]),
+    ) -> HashMap<String, usize> {
+        let start = Instant::now();
+        let mut last_probe = HashMap::new();
+        let mut probes: HashMap<String, usize> = HashMap::new();
+        for second in 0..seconds {
+            edit(second, backends);
+            let now = start + Duration::from_secs(second);
+            for probed in take_due(&mut last_probe, backends.to_vec(), now) {
+                *probes.entry(probed.id).or_default() += 1;
+            }
+        }
+        probes
+    }
+
+    #[test]
+    fn each_backend_is_probed_at_its_own_interval() {
+        let mut backends = [
+            backend_probed_every("fast", 5),
+            backend_probed_every("slow", 15),
+        ];
+        let probes = probes_over(30, &mut backends, |_, _| {});
+        assert_eq!(probes["fast"], 6);
+        assert_eq!(probes["slow"], 2);
+    }
+
+    #[test]
+    fn an_interval_below_the_floor_is_probed_at_the_floor() {
+        let mut backends = [backend_probed_every("eager", 1)];
+        let probes = probes_over(30, &mut backends, |_, _| {});
+        assert_eq!(
+            probes["eager"] as u64,
+            30 / MIN_PROBE_INTERVAL.as_secs(),
+            "one probe per floor interval"
+        );
+    }
+
+    #[test]
+    fn an_interval_edited_between_cycles_acts_from_the_next_probe() {
+        // Probed at 0 every 15 s, shortened to 5 s at second 3: the next
+        // probe is the first second at least 5 s after the last one.
+        let mut backends = [backend_probed_every("edited", 15)];
+        let start = Instant::now();
+        let mut last_probe = HashMap::new();
+        let mut probed_at = Vec::new();
+        for second in 0..12u64 {
+            if second == 3 {
+                backends[0].health_check_interval_s = 5;
+            }
+            let now = start + Duration::from_secs(second);
+            if !take_due(&mut last_probe, backends.to_vec(), now).is_empty() {
+                probed_at.push(second);
+            }
+        }
+        assert_eq!(probed_at, vec![0, 5, 10]);
+
+        // Lengthened from 5 s to 30 s after its probe at 0: not due at 5.
+        let mut backends = [backend_probed_every("lengthened", 5)];
+        let probes = probes_over(30, &mut backends, |second, listed| {
+            if second == 1 {
+                listed[0].health_check_interval_s = 30;
+            }
+        });
+        assert_eq!(probes["lengthened"], 1);
+    }
+
+    #[test]
+    fn a_backend_that_leaves_the_list_leaves_no_state() {
+        let kept = backend_probed_every("kept", 5);
+        let mut state = HealthLoopState::default();
+        let now = Instant::now();
+        for id in ["kept", "deleted"] {
+            state.drain_start.insert(id.to_string(), now);
+            state
+                .pending_health
+                .insert(id.to_string(), (HealthStatus::Down, 1));
+            state.last_probe.insert(id.to_string(), now);
+        }
+
+        state.forget_unlisted(std::slice::from_ref(&kept));
+
+        for map_keys in [
+            state.drain_start.keys().collect::<Vec<_>>(),
+            state.pending_health.keys().collect::<Vec<_>>(),
+            state.last_probe.keys().collect::<Vec<_>>(),
+        ] {
+            assert_eq!(map_keys, vec!["kept"]);
+        }
+    }
+
+    /// An HTTP backend answering every request `200` and counting them.
+    async fn serve_200_counting(
+        listener: tokio::net::TcpListener,
+        served: Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut socket, _)) = listener.accept().await {
+            served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&chunk[..read]),
+                }
+            }
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cycle_probes_only_the_backends_due_a_probe() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test setup: listener");
+        let mut backend = backend_checked_by(Some("/healthz"), false);
+        backend.address = listener
+            .local_addr()
+            .expect("test setup: local address")
+            .to_string();
+        backend.health_check_interval_s = 15;
+        let store = store_holding(&backend).await;
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(serve_200_counting(listener, Arc::clone(&served)));
+
+        let health = health_loop_over(&store);
+        let mut state = HealthLoopState::default();
+        let start = Instant::now();
+        for second in 0..30u64 {
+            run_health_cycle(&health, &mut state, start + Duration::from_secs(second)).await;
+        }
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     // ---- The cycle's writes ----
@@ -865,10 +1049,12 @@ mod tests {
             })
         });
         let mut state = HealthLoopState::default();
+        let start = Instant::now();
+        let probe_due = |cycle: u32| start + probe_interval(&backend) * cycle;
 
         for cycle in 1..HEALTH_FLIP_THRESHOLD {
             assert!(
-                !run_health_cycle(&health, &mut state).await,
+                !run_health_cycle(&health, &mut state, probe_due(cycle)).await,
                 "cycle {cycle} is below the flip threshold"
             );
             assert_eq!(
@@ -878,7 +1064,7 @@ mod tests {
         }
         assert_eq!(signals.load(std::sync::atomic::Ordering::SeqCst), 0);
 
-        assert!(run_health_cycle(&health, &mut state).await);
+        assert!(run_health_cycle(&health, &mut state, probe_due(HEALTH_FLIP_THRESHOLD)).await);
         let after = stored(&store, &backend.id).await;
         assert_eq!(after.health_status, HealthStatus::Down);
         assert_edit_kept(&after);

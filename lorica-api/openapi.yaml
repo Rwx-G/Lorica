@@ -7509,7 +7509,9 @@ components:
           default: true
         health_check_interval_s:
           type: integer
-          default: 10
+          description: >-
+            Seconds between two probes. When absent, the stored
+            `default_health_check_interval_s` at the time of the create.
         health_check:
           $ref: "#/components/schemas/HealthCheck"
         health_check_path:

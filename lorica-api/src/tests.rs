@@ -4506,6 +4506,87 @@ async fn test_create_backend_empty_address_returns_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+/// Store `interval_s` as `default_health_check_interval_s`.
+pub(crate) async fn set_default_health_check_interval(state: &AppState, interval_s: i32) {
+    let store = state.store.lock().await;
+    let mut settings = store
+        .get_global_settings()
+        .expect("test setup: settings read");
+    settings.default_health_check_interval_s = interval_s;
+    store
+        .update_global_settings(&settings)
+        .expect("test setup: settings stored");
+}
+
+/// Every stored backend's `health_check_interval_s`, by address.
+async fn stored_intervals_by_address(state: &AppState) -> std::collections::HashMap<String, i32> {
+    let store = state.store.lock().await;
+    store
+        .list_backends()
+        .expect("test setup: backends read")
+        .into_iter()
+        .map(|backend| (backend.address, backend.health_check_interval_s))
+        .collect()
+}
+
+#[tokio::test]
+async fn test_a_backend_created_without_an_interval_gets_the_default_setting() {
+    let f = crate::automation::test_support::a_node_with_something_to_write().await;
+    // The fixture's backend was created at the setting's default.
+    let before = stored_intervals_by_address(&f.state).await;
+    assert_eq!(before.len(), 1);
+    let (seeded_address, seeded_interval) = before
+        .into_iter()
+        .next()
+        .expect("test setup: the fixture's backend");
+    assert_eq!(
+        seeded_interval,
+        lorica_config::models::GlobalSettings::default().default_health_check_interval_s
+    );
+
+    set_default_health_check_interval(&f.state, 30).await;
+    for (address, interval) in [("10.0.0.21:8080", None), ("10.0.0.22:8080", Some(15))] {
+        let mut body = serde_json::json!({ "address": address });
+        if let Some(interval) = interval {
+            body["health_check_interval_s"] = interval.into();
+        }
+        let created = send(
+            &f.state,
+            &f.session_store,
+            &f.rate_limiter,
+            "POST",
+            "/api/v1/backends",
+            &f.admin,
+            Some(body),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED, "{address}");
+        assert_eq!(
+            parse_data(created).await["health_check_interval_s"],
+            interval.unwrap_or(30),
+            "{address}"
+        );
+    }
+    let created = crate::automation::test_support::automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/backends",
+        &f.bearer,
+        Some(serde_json::json!({ "address": "10.0.0.23:8080" })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    // The setting is read at create only: changing it moves no stored
+    // backend.
+    set_default_health_check_interval(&f.state, 45).await;
+    let stored = stored_intervals_by_address(&f.state).await;
+    assert_eq!(stored[&seeded_address], seeded_interval);
+    assert_eq!(stored["10.0.0.21:8080"], 30);
+    assert_eq!(stored["10.0.0.22:8080"], 15);
+    assert_eq!(stored["10.0.0.23:8080"], 30, "the automation create");
+}
+
 #[tokio::test]
 async fn test_a_backend_cannot_claim_an_automation_group_name_by_hand() {
     // The route path has refused a colon in a group name since v1.2;

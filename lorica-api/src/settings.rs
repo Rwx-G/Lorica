@@ -473,7 +473,7 @@ pub struct UpdateSettingsRequest {
     pub management_port: Option<u16>,
     /// `tracing` subscriber filter.
     pub log_level: Option<String>,
-    /// Fallback health-check interval (s).
+    /// Default health-check interval (s) for new backends.
     pub default_health_check_interval_s: Option<i32>,
     /// Cap on concurrent backend health-check probes.
     pub health_max_concurrent_probes: Option<i32>,

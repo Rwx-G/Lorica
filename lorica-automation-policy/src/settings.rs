@@ -298,9 +298,9 @@ pub const SETTINGS_ALLOWLIST: &[AdminSetting] = &[
     },
     AdminSetting {
         name: "default_health_check_interval_s",
-        why: "the fallback health-check interval; a probe budget read on every cycle, bounded \
-              far below the dashboard's own ceiling because a dead backend keeps its traffic \
-              for three probes of whatever interval is set",
+        why: "the health-check interval a backend created without one gets, bounded far \
+              below the dashboard's own ceiling because a dead backend keeps its traffic for \
+              three probes of its interval",
         min: 5,
         max: 60,
         direction: Direction::Either,

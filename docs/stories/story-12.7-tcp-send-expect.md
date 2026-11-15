@@ -637,14 +637,14 @@ Commit 1, `fix(health): stop the health loop overwriting backend edits made duri
 
 Commit 2, `fix(health): probe each backend at its own health_check_interval_s`:
 
-- [ ] The loop wakes on a fixed one-second tick and probes, each tick,
+- [x] The loop wakes on a fixed one-second tick and probes, each tick,
       the eligible backends whose last probe started at least their own
       `health_check_interval_s` ago (at least the existing 5 s floor), a
       backend never probed yet being due at once. Last-probe instants
       live in loop state beside `pending_health` and are dropped for a
       backend that leaves the list. Concurrency, hysteresis and the
       `Closing` exclusion are unchanged.
-- [ ] The global `default_health_check_interval_s` no longer paces the
+- [x] The global `default_health_check_interval_s` no longer paces the
       loop and becomes what its name says (resolved 7): the interval a
       backend gets when its create names none. `create_backend_as`
       reads it from the stored settings inside its store closure in
@@ -657,14 +657,14 @@ Commit 2, `fix(health): probe each backend at its own health_check_interval_s`:
       threshold times "the operator's `health_check_interval_s`", becomes
       true, and the setting's own doc comments (model, API defaults
       block) say "default for new backends".
-- [ ] Tests: two backends at 5 s and 15 s over 30 simulated seconds are
+- [x] Tests: two backends at 5 s and 15 s over 30 simulated seconds are
       probed 6 and 2 times; an interval edited between cycles takes
       effect from the next probe; a deleted backend's state is dropped;
       with the setting at 30, a management create without an interval
       stores 30 and one naming 15 stores 15; an automation create and an
       environment `PUT` without one store 30; changing the setting leaves
       every stored backend's interval as it was.
-- [ ] CHANGELOG Fixed, one entry covering both effects: a backend's own
+- [x] CHANGELOG Fixed, one entry covering both effects: a backend's own
       health-check interval is honoured, where every backend used to be
       probed at the global interval; and `default_health_check_interval_s`
       is now the interval a backend created without one gets, where such
@@ -1045,6 +1045,27 @@ None open.
   testable with a stale listing. `on_change` and the reload signal still
   fire only when a write succeeded, so a flip of a backend deleted during
   the cycle (`NotFound`) signals nothing.
+- Lot 0, commit 2: `run_health_cycle` takes `now`; `take_due` (pure)
+  picks the due backends and records their probe start, and
+  `HealthLoopState::forget_unlisted` drops the drain, flip and
+  last-probe state of a backend gone from the listing. The loop ticks
+  with `interval_at(now + 1 s)` and `MissedTickBehavior::Delay`, so the
+  first cycle runs one tick after start and a cycle outlasting a tick
+  (a probe timing out) is not followed by catch-up cycles. The drain
+  pass now runs every tick. `health_check_loop` lost its
+  `default_interval_s` parameter, so `spawn_health_check_loop`
+  (`lorica/src/startup/mod.rs`) no longer reads the setting.
+- Lot 0, commit 2, outside the allowlist, all doc text: the setting's
+  doc comments in `lorica-config/src/models/settings.rs`,
+  `lorica-config/src/canonical.rs` and `lorica-api/src/settings.rs`,
+  its `why` in `lorica-automation-policy/src/settings.rs` (it said "a
+  probe budget read on every cycle"), and `openapi.yaml`'s create
+  schema, which documented `default: 10`.
+- An environment `PUT` replaces the environment's backend rows, so its
+  backends take the setting of the latest `PUT`; pinned by the test.
+- Not done here: the dashboard's backend form still starts its interval
+  field at 10 (`Backends.svelte`), so a dashboard create always names
+  an interval and never gets the setting.
 
 ## File List
 
@@ -1052,6 +1073,16 @@ None open.
 - `lorica-config/src/store/backends.rs` (Lot 0)
 - `lorica-config/src/tests.rs` (Lot 0)
 - `CHANGELOG.md` (Lot 0)
+- `lorica/src/startup/mod.rs` (Lot 0)
+- `lorica-api/src/backends.rs` (Lot 0)
+- `lorica-api/src/automation/environments.rs` (Lot 0)
+- `lorica-api/src/tests.rs` (Lot 0)
+- `lorica-api/src/automation/environments/tests.rs` (Lot 0)
+- `lorica-api/src/settings.rs` (Lot 0, doc comment)
+- `lorica-api/openapi.yaml` (Lot 0, create schema)
+- `lorica-config/src/models/settings.rs` (Lot 0, doc comment)
+- `lorica-config/src/canonical.rs` (Lot 0, doc comment)
+- `lorica-automation-policy/src/settings.rs` (Lot 0, `why` text)
 
 ## Change Log
 
@@ -1061,3 +1092,4 @@ None open.
 | 2026-11-14 | 0.2 | Maintainer answers folded in: `-NOAUTH` healthy, `send` masked for Viewer on the management API, catalogue in the policy crate, Lot 0 with the two pre-existing `fix(health)` defects (affected releases verified per tag), last-failure view out, Redis image added to 12.12 AC #6. OQ-7 raised. Status Draft. | Romain G. |
 | 2026-11-14 | 0.3 | OQ-7 resolved: `default_health_check_interval_s` becomes the default for new backends in Lot 0's second commit (`backends.rs` and `environments.rs` added to its allowlist, tests and CHANGELOG entry extended). Status Draft. | Romain G. |
 | 2026-11-15 | 0.4 | Lot 0 commit 1: the health loop writes the health status and the lifecycle state alone (`set_backend_health_status`, `set_backend_lifecycle_state`), cycle extracted into `run_health_cycle`. Status InProgress. | Romain G. |
+| 2026-11-15 | 0.5 | Lot 0 commit 2: each backend probed at its own `health_check_interval_s` on a one-second tick; `default_health_check_interval_s` is the interval of a backend created without one (management, automation, environment). Lot 0 done. Status InProgress. | Romain G. |

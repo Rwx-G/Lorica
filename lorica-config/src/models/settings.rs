@@ -95,8 +95,10 @@ pub struct GlobalSettings {
     /// `tracing` subscriber filter, e.g. `"info"`, `"debug"`,
     /// `"lorica=debug,hyper=warn"`.
     pub log_level: String,
-    /// Fallback health-check interval applied when a backend has
-    /// none set of its own.
+    /// Default health-check interval (s) for new backends: what a
+    /// backend created without an interval of its own stores. Read at
+    /// create only; a stored backend keeps its own interval, which is
+    /// what the health loop probes it at.
     pub default_health_check_interval_s: i32,
     /// Days-to-expiry at which the cert expiry task emits a WARN
     /// alert.

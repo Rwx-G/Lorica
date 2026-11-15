@@ -260,7 +260,7 @@ impl CanonicalCaptureRule {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalGlobalSettings {
-    /// Fallback health-check interval (s).
+    /// Default health-check interval (s) for new backends.
     pub default_health_check_interval_s: i32,
     /// Certificate expiry warning threshold (days).
     pub cert_warning_days: i32,

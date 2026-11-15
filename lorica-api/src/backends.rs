@@ -97,7 +97,8 @@ pub struct CreateBackendRequest {
     pub weight: Option<i32>,
     /// Enable the health-check loop.
     pub health_check_enabled: Option<bool>,
-    /// Health-check interval (s).
+    /// Health-check interval (s); the stored
+    /// `default_health_check_interval_s` when absent.
     pub health_check_interval_s: Option<i32>,
     /// What one probe is; `tcp_connect` when neither this nor
     /// `health_check_path` is sent.
@@ -360,6 +361,7 @@ pub(crate) async fn create_backend_as(
     let health_check =
         requested_health_check(body.health_check, body.health_check_path.as_deref())?
             .unwrap_or_default();
+    let requested_interval = body.health_check_interval_s;
 
     let now = Utc::now();
     let backend = lorica_config::models::Backend {
@@ -377,7 +379,9 @@ pub(crate) async fn create_backend_as(
         weight: body.weight.unwrap_or(100),
         health_status: lorica_config::models::HealthStatus::Unknown,
         health_check_enabled: body.health_check_enabled.unwrap_or(true),
-        health_check_interval_s: body.health_check_interval_s.unwrap_or(10),
+        // Set from the stored setting in the store closure below when
+        // the body names none.
+        health_check_interval_s: requested_interval.unwrap_or_default(),
         health_check_path: health_check.legacy_path().map(str::to_string),
         health_check,
         lifecycle_state: lorica_config::models::LifecycleState::Normal,
@@ -395,6 +399,10 @@ pub(crate) async fn create_backend_as(
 
     let backend = db_blocking(&state.store, move |store| {
         let mut backend = backend;
+        if requested_interval.is_none() {
+            backend.health_check_interval_s =
+                store.get_global_settings()?.default_health_check_interval_s;
+        }
         guard.restore_withheld(None, &mut backend)?;
         guard.check(
             store,
