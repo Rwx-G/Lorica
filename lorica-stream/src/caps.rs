@@ -151,9 +151,10 @@ struct NodeStreamCaps {
 pub struct NodeCapsRegions {
     workers: u32,
     streams: BTreeMap<String, NodeStreamCaps>,
-    /// Regions of streams no longer on the node, kept mapped while they
-    /// count sessions so a dead worker's can still be released.
-    orphans: Vec<Arc<StreamCapsRegion>>,
+    /// Regions of streams no longer on the node, by stream, kept mapped
+    /// while they count sessions so a dead worker's can still be
+    /// released.
+    orphans: BTreeMap<String, Vec<Arc<StreamCapsRegion>>>,
 }
 
 impl NodeCapsRegions {
@@ -163,7 +164,7 @@ impl NodeCapsRegions {
         NodeCapsRegions {
             workers,
             streams: BTreeMap::new(),
-            orphans: Vec::new(),
+            orphans: BTreeMap::new(),
         }
     }
 
@@ -173,6 +174,12 @@ impl NodeCapsRegions {
     /// retired); a change within the same sizes needs nothing, since the
     /// limits are read from the stream at each admission. Returns the
     /// `caps_gen` to send to every worker, `None` when nothing changed.
+    ///
+    /// A stream that comes back while a region [`NodeCapsRegions::retire`]
+    /// kept still counts sessions (disabled then enabled within its
+    /// drain) continues that region's `caps_gen` and counts it as
+    /// retired, so a worker adopts the new region beside the old one
+    /// rather than in its place, and the stream's total stays exact.
     ///
     /// # Errors
     ///
@@ -184,7 +191,11 @@ impl NodeCapsRegions {
         max_sessions: u64,
     ) -> Result<Option<u64>, StreamCapsError> {
         let caps_gen = match self.streams.get(stream_id) {
-            None => 1,
+            None => self
+                .orphans
+                .get(stream_id)
+                .and_then(|regions| regions.iter().map(|r| r.caps_gen()).max())
+                .map_or(1, |last| last + 1),
             Some(held) => {
                 let wanted = layout_for(max_sessions, self.workers)?;
                 let layout = held.current.layout();
@@ -210,12 +221,22 @@ impl NodeCapsRegions {
                     NodeStreamCaps {
                         current: region,
                         fd,
-                        retired: Vec::new(),
+                        retired: self.orphans.remove(stream_id).unwrap_or_default(),
                     },
                 );
             }
         }
         Ok(Some(caps_gen))
+    }
+
+    /// Whether `stream_id` has a region.
+    pub fn holds(&self, stream_id: &str) -> bool {
+        self.streams.contains_key(stream_id)
+    }
+
+    /// The streams with a region, in id order.
+    pub fn stream_ids(&self) -> impl Iterator<Item = &str> {
+        self.streams.keys().map(String::as_str)
     }
 
     /// The `caps` message handing worker `slot` the current region of
@@ -246,8 +267,9 @@ impl NodeCapsRegions {
     /// only while they count sessions.
     pub fn retire(&mut self, stream_id: &str) {
         if let Some(held) = self.streams.remove(stream_id) {
-            self.orphans.push(held.current);
-            self.orphans.extend(held.retired);
+            let orphans = self.orphans.entry(stream_id.to_string()).or_default();
+            orphans.push(held.current);
+            orphans.extend(held.retired);
         }
     }
 
@@ -270,7 +292,10 @@ impl NodeCapsRegions {
         for held in self.streams.values_mut() {
             held.retired.retain(|r| r.total() > 0);
         }
-        self.orphans.retain(|r| r.total() > 0);
+        self.orphans.retain(|_, regions| {
+            regions.retain(|r| r.total() > 0);
+            !regions.is_empty()
+        });
     }
 
     /// Sessions `stream_id` holds on the node, exact, over its live
@@ -292,7 +317,7 @@ impl NodeCapsRegions {
         self.streams
             .values()
             .flat_map(|held| std::iter::once(&held.current).chain(held.retired.iter()))
-            .chain(self.orphans.iter())
+            .chain(self.orphans.values().flatten())
     }
 }
 
@@ -371,6 +396,40 @@ mod tests {
         assert_eq!(node.sessions("a"), 1, "the live worker's session stays");
         assert_eq!(dead_a.region().source_sessions(source(0)), 0);
         std::mem::forget(leaked);
+    }
+
+    #[test]
+    fn a_stream_back_while_its_retired_region_counts_continues_its_caps_gen() {
+        let mut node = NodeCapsRegions::new(1);
+        node.ensure("dns", 64).unwrap();
+        let registry = CapsRegistry::new();
+        registry.adopt("dns", worker_view(&node, "dns", 0));
+        let permit = registry
+            .get("dns")
+            .unwrap()
+            .current()
+            .admit_session(source(1), 8, 64)
+            .unwrap();
+        node.retire("dns");
+        assert!(!node.holds("dns"));
+
+        assert_eq!(node.ensure("dns", 64).unwrap(), Some(2));
+        assert_eq!(node.sessions("dns"), 1, "the old region still counts");
+        registry.adopt("dns", worker_view(&node, "dns", 0));
+        let caps = registry.get("dns").unwrap();
+        assert_eq!(caps.retired_sessions(), 1);
+        assert_eq!(caps.stream_cap_left(64), 63);
+
+        drop(permit);
+        node.tick(lorica_shmem::now_ns());
+        assert_eq!(node.sessions("dns"), 0);
+        node.retire("dns");
+        node.tick(lorica_shmem::now_ns());
+        assert_eq!(
+            node.ensure("dns", 64).unwrap(),
+            Some(1),
+            "nothing left to count beside"
+        );
     }
 
     #[test]
