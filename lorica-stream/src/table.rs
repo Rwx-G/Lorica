@@ -17,41 +17,115 @@
 //! New accepts read the current table; `refresh` swaps it whole. A live
 //! connection holds the `Arc<Stream>` it was accepted with, so an edit
 //! never reaches it (Story 12.2 AC #8, D-g).
+//!
+//! Since Story 12.3 (D-i) the table also carries the [`Backend`] rows
+//! linked to its streams, with each link's backup flag: an engine reads
+//! addresses, weights, health and lifecycle from the table its
+//! connection was accepted against, never from the store.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, PoisonError, RwLock};
 
-use lorica_config::models::{Stream, StreamBackend};
+use lorica_config::models::{Backend, Stream, StreamBackend};
+
+/// One backend linked to a stream, as an engine selects among them.
+#[derive(Debug, Clone)]
+pub struct LinkedBackend {
+    /// The backend row.
+    pub backend: Arc<Backend>,
+    /// Whether the link makes it a backup of the stream (D-f).
+    pub backup: bool,
+}
 
 /// The streams and their backend links, as one snapshot of the store.
 #[derive(Debug, Clone, Default)]
 pub struct StreamTable {
     streams: HashMap<String, Arc<Stream>>,
-    backends: HashMap<String, BTreeSet<String>>,
+    links: HashMap<String, BTreeSet<String>>,
+    linked: HashMap<String, Vec<LinkedBackend>>,
+    backends: HashMap<String, Arc<Backend>>,
 }
 
 impl StreamTable {
-    /// A table of `streams` with the backend `links` that name them.
+    /// A table of `streams` with the backend `links` that name them, and
+    /// no backend row: the shape of Story 12.2, enough for the drain
+    /// test. [`StreamTable::with_backends`] is what an engine needs.
     pub fn new(streams: Vec<Stream>, links: &[StreamBackend]) -> Self {
-        let mut backends: HashMap<String, BTreeSet<String>> = HashMap::new();
-        for link in links {
-            backends
+        Self::with_backends(streams, links, Vec::new())
+    }
+
+    /// A table of `streams`, their `links`, and the `backends` rows. A
+    /// link naming a backend absent from `backends` still counts for
+    /// [`StreamTable::holds`] and is left out of
+    /// [`StreamTable::linked_backends`]; a row no link names is dropped.
+    pub fn with_backends(
+        streams: Vec<Stream>,
+        links: &[StreamBackend],
+        backends: Vec<Backend>,
+    ) -> Self {
+        let rows: HashMap<String, Arc<Backend>> = backends
+            .into_iter()
+            .map(|b| (b.id.clone(), Arc::new(b)))
+            .collect();
+        let mut link_sets: HashMap<String, BTreeSet<String>> = HashMap::new();
+        let mut linked: HashMap<String, Vec<LinkedBackend>> = HashMap::new();
+        let mut kept: HashMap<String, Arc<Backend>> = HashMap::new();
+        let mut ordered: Vec<&StreamBackend> = links.iter().collect();
+        ordered.sort();
+        for link in ordered {
+            if !link_sets
                 .entry(link.stream_id.clone())
                 .or_default()
-                .insert(link.backend_id.clone());
+                .insert(link.backend_id.clone())
+            {
+                continue;
+            }
+            if let Some(row) = rows.get(&link.backend_id) {
+                kept.insert(link.backend_id.clone(), Arc::clone(row));
+                linked
+                    .entry(link.stream_id.clone())
+                    .or_default()
+                    .push(LinkedBackend {
+                        backend: Arc::clone(row),
+                        backup: link.backup,
+                    });
+            }
         }
         StreamTable {
             streams: streams
                 .into_iter()
                 .map(|s| (s.id.clone(), Arc::new(s)))
                 .collect(),
-            backends,
+            links: link_sets,
+            linked,
+            backends: kept,
         }
     }
 
     /// The snapshot of `stream_id` new connections are accepted with.
     pub fn stream(&self, stream_id: &str) -> Option<Arc<Stream>> {
         self.streams.get(stream_id).cloned()
+    }
+
+    /// Every stream of the table, in no particular order.
+    pub fn streams(&self) -> impl Iterator<Item = &Arc<Stream>> {
+        self.streams.values()
+    }
+
+    /// The backends linked to `stream_id` whose row the table holds, in
+    /// a stable order (by backend id), primaries and backups together.
+    pub fn linked_backends(&self, stream_id: &str) -> &[LinkedBackend] {
+        self.linked.get(stream_id).map_or(&[], Vec::as_slice)
+    }
+
+    /// The row of a backend linked to any stream of the table.
+    pub fn backend(&self, backend_id: &str) -> Option<&Arc<Backend>> {
+        self.backends.get(backend_id)
+    }
+
+    /// Every backend row linked to a stream of the table.
+    pub fn backends(&self) -> impl Iterator<Item = &Arc<Backend>> {
+        self.backends.values()
     }
 
     /// Whether a connection of `stream_id` on `backend_id` (if the engine
@@ -67,10 +141,7 @@ impl StreamTable {
         }
         match backend_id {
             None => true,
-            Some(b) => self
-                .backends
-                .get(stream_id)
-                .is_some_and(|set| set.contains(b)),
+            Some(b) => self.links.get(stream_id).is_some_and(|set| set.contains(b)),
         }
     }
 }

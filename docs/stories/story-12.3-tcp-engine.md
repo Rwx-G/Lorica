@@ -1039,19 +1039,19 @@ only, `nix` `ifaddrs`), `lorica-worker/Cargo.toml` (that `nix` feature
 only), `Cargo.lock`.
 Depends on: A, B.
 
-- [ ] Seams (D-a), with in-crate fakes for tests.
-- [ ] Pipeline (D-b), forwarding (D-c, with `DirectionState` and
+- [x] Seams (D-a), with in-crate fakes for tests.
+- [x] Pipeline (D-b), forwarding (D-c, with `DirectionState` and
       `held_bytes`), timers (D-d), retry (D-h), PROXY accept and send
       (D-j, D-k), source binding (D-l), connect-time local check (D-m,
       with `BoundPorts` filled by the accept loop into
       `AcceptedConnection`), resolver cache and schedule over the
       `Resolve` seam (D-n), token buckets (D-o), cap and `held_fds`
       (D-p), counters and record (D-r).
-- [ ] `StreamTable::with_backends`, backup flags, accessors; runtime:
+- [x] `StreamTable::with_backends`, backup flags, accessors; runtime:
       `table_changed` after every reload, the `backend_down` drain
       (D-i); `StreamHandler::table_changed` defaulted.
-- [ ] `ConnectionObserver` with a debug-logging default.
-- [ ] Tests (Linux, real sockets, fake seams): echo through the engine
+- [x] `ConnectionObserver` with a debug-logging default.
+- [x] Tests (Linux, real sockets, fake seams): echo through the engine
       both ways; half-close each way (client FIN then backend still
       sends; backend FIN then client still sends) with the right end
       reason; a non-reading client stalls the backend writer and the
@@ -1352,6 +1352,109 @@ performance phase.
 
 ### Completion Notes
 
+**Lot C (the engine in `lorica-stream`).**
+
+- Layout. Story 12.5 Interface edits E2 and E3 are done here: the
+  seams, the local check, the resolver cache and the counters are
+  protocol-neutral modules at the crate root, `lorica_stream::{seams,
+  local, resolver, counters}`, not under `tcp`, so 12.5 Lot E has no
+  move to make. `lorica_stream::tcp` holds `engine.rs` (the pipeline of
+  D-b), `connect.rs` (D-e to D-h, D-l, D-m), `forward.rs` (D-c, D-d),
+  `proxy_header.rs` (D-j, D-k), `bandwidth.rs` (D-o) and `cap.rs` (D-p,
+  `held_fds`).
+- Seams (`lorica_stream::seams`): `BackendSelector { select(&SelectionRequest)
+  -> usize, connected(stream_id, &Backend, SocketAddr, connect_latency),
+  closed(stream_id, &Backend, SocketAddr), table_changed(&StreamTable) }`,
+  where `SelectionRequest { stream, candidates: &[Candidate { backend,
+  ring_address }], client: IpAddr, accepted_at: std::time::Instant }`;
+  `BreakerGate { admit(stream_id, &Backend) -> Admission, record(stream_id,
+  &Backend, success, was_probe) }` with `Admission::{Allow, AllowProbe,
+  Deny}`; `Resolve { lookup(host) -> Result<Resolved { addresses, ttl },
+  ResolveError> }`. The async methods return `SeamFuture` (a boxed
+  future); no `async-trait` edge.
+- Entry point: `TcpEngine::new(TcpEngineParts { selector, breaker,
+  resolver: Arc<ResolverCache>, counters: Arc<StreamCounters>, observer:
+  Arc<dyn ConnectionObserver>, reserved_ports: Option<ReservedPorts> })`,
+  a `StreamHandler`. `ResolverCache::new(Arc<dyn Resolve>,
+  Arc<StreamCounters>)` is built once per process and handed to both
+  engines as an `Arc` (E3); so is the selector.
+- `Engines` gains `counters: Arc<StreamCounters>`, which
+  `StreamRuntimeHandle::counters()` snapshots: the `Arc` handed to the
+  engine must be the same one. `lorica-stream/tests/runtime.rs` builds
+  `Engines` with `..Engines::default()` now (two literal sites, outside
+  the allowlist, no behaviour).
+- `AcceptedConnection` gains `table: Arc<StreamTable>` (the table read at
+  accept: backends, links, health) beside `bound_ports: BoundPorts`. The
+  runtime counts every adopted socket's port in `BoundPorts` on attach
+  and forgets it when the binding stops.
+- `StreamHandler::table_changed` is called after every load (start,
+  `refresh`, `attach` of an unknown stream); the engine prunes counters,
+  caps, rotations and exclusions, tells the selector, and has the
+  resolver track the table's host names. The runtime then drains with
+  `backend_down`, deadline now, every connection whose accepted snapshot
+  sets `close_on_backend_down` and whose backend is `Down` in the new
+  table.
+- `ConnectionRecord` and `ConnectionObserver` (debug-logging default
+  method, `LogObserver`) are in `lorica_stream::handler`. A refused
+  connection (cap, PROXY) gets a record too.
+- Order inside the connect loop: select, local check, source family,
+  then `admit`, so a half-open breaker's probe is never spent on a
+  destination the engine would not connect. A breaker `Deny`, a local
+  refusal and a family mismatch each remove the backend for this
+  connection without an attempt. Each backend is tried at most once per
+  connection (D-e); D-n's "a failed address is not tried again" is
+  therefore met by construction, and the address within a backend
+  rotates across connections through one process-wide counter. Zero
+  attempts made ends `no_healthy_backend`, otherwise `connect_failed`.
+- IV4's exclusion is per (stream, backend) and reported (warn line,
+  `dns_local_excluded`) at the first connection that finds every
+  address refused, not at the resolution: the rule depends on the
+  stream's flag and the port, which the resolver does not know. A backend
+  with some local and some remote addresses keeps the remote ones.
+- `dns_failures` counts every failed or empty resolution; the warn line
+  is per transition, as D-n says. On-demand resolution (a name used
+  before the schedule reached it) happens only while no resolution of
+  the name was tried yet: a name whose resolutions all failed is left to
+  the schedule, so a dead name in a stream's list does not hold every
+  new connection for its connect timeout.
+- Token buckets wait for `min(1_024, capacity)` tokens before a read
+  rather than one: a per-byte wake-up at 16 KiB/s would be 16,384 wakes
+  a second. The smallest rate is 1,024 B/s, so the wait stays under a
+  second; 64 KiB at 16 KiB/s still measures 3.0 s.
+- Untrusted sniff: a client that sends FIN inside an unfinished
+  signature gets its held bytes forwarded, then the FIN (it sent no
+  header). A trusted peer that closes before a complete header counts
+  `refused_malformed`; an accepted header without addresses (`LOCAL`,
+  `UNKNOWN`, `AF_UNSPEC`, `AF_UNIX`) counts `accepted_local`.
+- The quiesce point: `Forwarder::run` is cancel-safe at every await, so
+  it can be dropped and resumed with nothing lost; `upload()` and
+  `download()` expose `DirectionState::held_bytes()`,
+  `at_quiesce_point()` reads both. The 64 MiB paused-reader test lives
+  in `tcp::forward`'s unit tests for that reason (it parks the loop and
+  reads the states). The family-mismatch send is a unit test of
+  `proxy_header::send_header`: a real socket's peer and local address
+  share a family, so no integration case reaches it.
+- Counters' keyed families are `HashMap`s: `StreamEndKind` and
+  `StreamRefusal` derive no `Ord`, and `lorica-config` is outside this
+  Lot. `ProxyHeaderOutcome::ALL` and `ConnectFailureKind::ALL` carry
+  their own word lists.
+- `lorica-worker/src/stream_sockets.rs` gains
+  `set_bind_address_no_port` beside the interface reader: `socket2` 0.6
+  does not expose `IP_BIND_ADDRESS_NO_PORT`, and Pitfalls names this
+  file for the `nix` call. `nix` gains the `net` feature for both.
+- What Lot D2 implements: the three seams in `lorica/src/stream_engine.rs`
+  (the selector over `select_index` with `ring_addresses` from each
+  `Candidate::ring_address`, `client` as text, `lb::random_seed` of
+  `accepted_at`, per-stream `SmoothWrrState` pruned in its
+  `table_changed`, least-conn counted in `connected` / `closed`, EWMA fed
+  the connect latency in `connected`; the breaker with the `stream:` key
+  and the late-bound slot; hickory with TTLs); one `ResolverCache` and
+  one selector per process; `Engines { tcp: Some(Arc::new(engine)),
+  counters, ..Engines::default() }` with the same counters `Arc`;
+  `StoreStreamTable::load` through `StreamTable::with_backends`;
+  `demand_of` through `lorica_stream::tcp::held_fds`; the reserved ports
+  into `TcpEngineParts::reserved_ports`.
+
 **Lot D1 (the shared selection function).**
 
 - `lorica::proxy_wiring::lb::select_index(algorithm: &LoadBalancing,
@@ -1470,6 +1573,23 @@ performance phase.
 
 ## File List
 
+Lot C:
+
+- `lorica-stream/src/seams.rs`, `lorica-stream/src/local.rs`,
+  `lorica-stream/src/resolver.rs`, `lorica-stream/src/counters.rs` (new,
+  crate root per Story 12.5 Interface edits E2 and E3)
+- `lorica-stream/src/tcp/{mod,engine,connect,forward,proxy_header,bandwidth,cap}.rs`
+  (new)
+- `lorica-stream/src/handler.rs`, `lorica-stream/src/table.rs`,
+  `lorica-stream/src/runtime.rs`, `lorica-stream/src/listener.rs`,
+  `lorica-stream/src/lib.rs`, `lorica-stream/Cargo.toml`
+- `lorica-stream/tests/tcp_engine.rs`, `lorica-stream/tests/tcp_runtime.rs`
+  (new)
+- `lorica-stream/tests/runtime.rs` (the two `Engines` literal sites)
+- `lorica-worker/src/stream_sockets.rs`, `lorica-worker/Cargo.toml`
+- `Cargo.lock`
+- `docs/stories/story-12.3-tcp-engine.md`
+
 Lot D1:
 
 - `lorica/src/proxy_wiring/lb.rs`
@@ -1515,3 +1635,4 @@ Lot B:
 | 2026-11-14 | 0.3 | Lot B landed: the D-q fields, migration 75, validation, rule A and the backup and source-family rules, `local_backend_conflicts`, store, canonical digest, diff, export and import. D-s corrected: the PROXY header is written in plaintext right after connect and before any upstream TLS handshake. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.4 | Lot A landed: the PROXY v1 and v2 encoder beside the parser, with `encode_v2_dgram` for Story 12.5, round-trip tests and fuzz arm, FORK.md entry. | Romain G. |
 | 2026-11-14 | 0.5 | Lot D1 landed: HTTP's selection block extracted into `lb::select_index`, behaviour unchanged, `ring_addresses` refined to an `Option`. | Romain G. |
+| 2026-11-15 | 0.6 | Lot C landed: the TCP engine in `lorica_stream::tcp`, the protocol-neutral seams, local check, resolver cache and counters at the crate root (Story 12.5 E2, E3), `StreamTable::with_backends`, `table_changed` and the `backend_down` drain, the connection record and its observer. | Romain G. |

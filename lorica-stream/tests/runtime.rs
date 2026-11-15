@@ -122,7 +122,7 @@ impl StreamHandler for Echo {
 fn tcp_engines(echo: Echo) -> Engines {
     Engines {
         tcp: Some(Arc::new(echo)),
-        udp: None,
+        ..Engines::default()
     }
 }
 
@@ -531,11 +531,11 @@ async fn two_runtimes_sharing_a_udp_group_each_receive_only_their_slot() {
         let handle = StreamRuntime::spawn(
             transport,
             Engines {
-                tcp: None,
                 udp: Some(Arc::new(Recorder {
                     runtime: slot,
                     seen: Arc::clone(&seen),
                 })),
+                ..Engines::default()
             },
             Source::with(vec![stream("dns", StreamProtocol::Udp)], &[]),
         )

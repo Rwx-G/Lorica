@@ -32,6 +32,7 @@ use tracing::{debug, warn};
 use lorica_worker::fd_passing::StreamProto;
 
 use crate::handler::{AcceptedConnection, Datagram, Engines};
+use crate::local::BoundPorts;
 use crate::table::SharedTable;
 use crate::tracker::ConnectionTracker;
 
@@ -50,6 +51,7 @@ pub(crate) struct LoopContext {
     pub(crate) table: SharedTable,
     pub(crate) tracker: ConnectionTracker,
     pub(crate) engines: Engines,
+    pub(crate) bound_ports: BoundPorts,
 }
 
 /// A socket adopted from an `attach`, ready for its loop.
@@ -57,6 +59,16 @@ pub(crate) struct LoopContext {
 pub(crate) enum AdoptedSocket {
     Tcp(TcpListener),
     Udp(Arc<UdpSocket>),
+}
+
+impl AdoptedSocket {
+    /// The port the socket listens on.
+    pub(crate) fn port(&self) -> io::Result<u16> {
+        match self {
+            AdoptedSocket::Tcp(listener) => listener.local_addr().map(|a| a.port()),
+            AdoptedSocket::Udp(socket) => socket.local_addr().map(|a| a.port()),
+        }
+    }
 }
 
 /// Adopt a passed socket for `proto`, checking that the kernel agrees on
@@ -125,7 +137,8 @@ async fn accept_loop(listener: TcpListener, ctx: LoopContext, mut stop: watch::R
                    "no TCP stream engine installed: connection closed");
             continue;
         };
-        let Some(snapshot) = ctx.table.current().stream(&ctx.stream_id) else {
+        let table = ctx.table.current();
+        let Some(snapshot) = table.stream(&ctx.stream_id) else {
             debug!(stream_id = %ctx.stream_id, %peer,
                    "stream not in the table: connection closed");
             continue;
@@ -136,6 +149,8 @@ async fn accept_loop(listener: TcpListener, ctx: LoopContext, mut stop: watch::R
             peer,
             bind_gen: ctx.bind_gen,
             tracked,
+            table,
+            bound_ports: ctx.bound_ports.clone(),
         }));
     }
 }

@@ -3363,6 +3363,7 @@ version = "1.10.6"
 dependencies = [
  "chrono",
  "lorica-config",
+ "lorica-core",
  "lorica-worker",
  "serde",
  "serde_json",

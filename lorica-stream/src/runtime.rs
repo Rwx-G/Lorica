@@ -39,6 +39,12 @@
 //! A `detach` is acknowledged only once its sockets are closed, so the
 //! port is free in this worker when the supervisor reads the `ack`.
 //!
+//! After every table load (start, `refresh`, the `attach` of an unknown
+//! stream) the TCP engine is told ([`crate::StreamHandler::table_changed`]),
+//! and every connection whose accepted snapshot sets
+//! `close_on_backend_down` and whose backend is `Down` in the new table
+//! is closed at once with `backend_down` (Story 12.3 D-i).
+//!
 //! Every drain duration is capped at
 //! [`GlobalSettings::WORKER_DRAIN_TIMEOUT_MAX_S`], the setting's hard
 //! maximum, whatever the message says.
@@ -49,16 +55,18 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use lorica_config::models::{GlobalSettings, StreamEndReason};
+use lorica_config::models::{GlobalSettings, HealthStatus, StreamEndReason};
 use lorica_worker::stream_ctl::{NackReason, StreamCtlMsg, StreamSocket};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
+use crate::counters::{CountersSnapshot, StreamCounters};
 use crate::handler::Engines;
 use crate::listener::{self, AdoptedSocket, LoopContext};
-use crate::table::{SharedTable, StreamTableSource};
+use crate::local::BoundPorts;
+use crate::table::{SharedTable, StreamTable, StreamTableSource};
 use crate::tracker::ConnectionTracker;
 use crate::transport::{ActiveTransport, ControlTransport, TransportError};
 
@@ -88,6 +96,7 @@ enum Command {
 #[derive(Debug)]
 pub struct StreamRuntimeHandle {
     tracker: ConnectionTracker,
+    counters: Arc<StreamCounters>,
     quiesced: watch::Receiver<Option<Duration>>,
     commands: mpsc::UnboundedSender<Command>,
     thread: Option<thread::JoinHandle<()>>,
@@ -98,6 +107,11 @@ impl StreamRuntimeHandle {
     /// to be empty.
     pub fn tracker(&self) -> &ConnectionTracker {
         &self.tracker
+    }
+
+    /// The engines' counters as they stand (Story 12.3 D-r).
+    pub fn counters(&self) -> CountersSnapshot {
+        self.counters.snapshot()
     }
 
     /// Turns `Some(drain)` once the runtime is quiesced, by a `quiesce`
@@ -149,12 +163,14 @@ pub struct StreamRuntime {
     table: SharedTable,
     tracker: ConnectionTracker,
     bindings: HashMap<(String, u64), Binding>,
+    bound_ports: BoundPorts,
     quiesced: watch::Sender<Option<Duration>>,
 }
 
 struct Binding {
     stop: watch::Sender<bool>,
     loops: Vec<JoinHandle<()>>,
+    ports: Vec<u16>,
 }
 
 fn drain_duration(drain_ms: u64) -> Duration {
@@ -190,6 +206,7 @@ impl StreamRuntime {
         let tracker = ConnectionTracker::new();
         let (quiesced_tx, quiesced_rx) = watch::channel(None);
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let counters = Arc::clone(&engines.counters);
         let runtime = StreamRuntime {
             transport,
             engines,
@@ -197,6 +214,7 @@ impl StreamRuntime {
             table: SharedTable::default(),
             tracker: tracker.clone(),
             bindings: HashMap::new(),
+            bound_ports: BoundPorts::new(),
             quiesced: quiesced_tx,
         };
         let thread = thread::Builder::new()
@@ -205,6 +223,7 @@ impl StreamRuntime {
             .map_err(StreamRuntimeError::Thread)?;
         Ok(StreamRuntimeHandle {
             tracker,
+            counters,
             quiesced: quiesced_rx,
             commands: commands_tx,
             thread: Some(thread),
@@ -245,8 +264,9 @@ impl StreamRuntime {
             }
         }
         reaper.abort();
-        for (_, binding) in self.bindings.drain() {
-            stop_binding(binding).await;
+        let bindings: Vec<Binding> = self.bindings.drain().map(|(_, b)| b).collect();
+        for binding in bindings {
+            self.stop_binding(binding).await;
         }
     }
 
@@ -254,12 +274,41 @@ impl StreamRuntime {
         match self.source.load() {
             Ok(table) => {
                 self.table.replace(table);
+                self.table_changed(&self.table.current());
                 true
             }
             Err(e) => {
                 error!(error = %e, "stream table not loaded; keeping the previous one");
                 false
             }
+        }
+    }
+
+    /// Tell the engine, then close the connections whose accepted
+    /// snapshot asks to follow their backend down (D-i). Lifecycle
+    /// `closing` and `closed` do not count: they are an operator's
+    /// drain, which keeps established connections.
+    fn table_changed(&self, table: &StreamTable) {
+        if let Some(tcp) = &self.engines.tcp {
+            tcp.table_changed(table);
+        }
+        let now = Instant::now();
+        let down = self.tracker.drain_where(
+            |e| {
+                e.snapshot.close_on_backend_down
+                    && e.backend_id
+                        .and_then(|b| table.backend(b))
+                        .is_some_and(|b| b.health_status == HealthStatus::Down)
+            },
+            now,
+            StreamEndReason::BackendDown,
+        );
+        if down > 0 {
+            self.tracker.close_expired(now);
+            info!(
+                connections = down,
+                "stream connections closed: their backend is down"
+            );
         }
     }
 
@@ -309,9 +358,13 @@ impl StreamRuntime {
             };
         }
         let mut adopted: Vec<AdoptedSocket> = Vec::with_capacity(sockets.len());
+        let mut ports: Vec<u16> = Vec::with_capacity(sockets.len());
         for socket in sockets {
             match listener::adopt(socket.proto, socket.fd) {
-                Ok(a) => adopted.push(a),
+                Ok(a) => {
+                    ports.push(a.port().unwrap_or(socket.addr.port()));
+                    adopted.push(a);
+                }
                 Err(e) => {
                     warn!(%stream_id, bind_gen, addr = %socket.addr, error = %e,
                           "stream socket not adopted; attach refused");
@@ -334,13 +387,19 @@ impl StreamRuntime {
             .or_insert_with(|| Binding {
                 stop: watch::channel(false).0,
                 loops: Vec::new(),
+                ports: Vec::new(),
             });
+        for port in ports {
+            self.bound_ports.add(port);
+            binding.ports.push(port);
+        }
         let ctx = LoopContext {
             stream_id: stream_id.clone(),
             bind_gen,
             table: self.table.clone(),
             tracker: self.tracker.clone(),
             engines: self.engines.clone(),
+            bound_ports: self.bound_ports.clone(),
         };
         for socket in adopted {
             binding.loops.push(tokio::spawn(listener::run(
@@ -369,7 +428,7 @@ impl StreamRuntime {
                 reason: NackReason::UnknownBinding,
             };
         };
-        let closed = stop_binding(binding).await;
+        let closed = self.stop_binding(binding).await;
         let deadline = Instant::now() + drain_duration(drain_ms);
         let draining = self.tracker.drain_binding(
             &stream_id,
@@ -414,7 +473,7 @@ impl StreamRuntime {
         let bindings: Vec<Binding> = self.bindings.drain().map(|(_, b)| b).collect();
         let stopped = bindings.len();
         for binding in bindings {
-            stop_binding(binding).await;
+            self.stop_binding(binding).await;
         }
         self.tracker
             .drain_all(Instant::now() + drain, StreamEndReason::NodeShutdown);
@@ -422,20 +481,23 @@ impl StreamRuntime {
         self.quiesced.send_replace(Some(drain));
         stopped
     }
-}
 
-/// Stop a binding's loops and wait until each has closed its socket.
-/// Returns the sockets closed.
-async fn stop_binding(binding: Binding) -> usize {
-    binding.stop.send_replace(true);
-    let mut closed = 0;
-    for task in binding.loops {
-        if let Err(e) = task.await {
-            error!(error = %e, "stream loop ended abnormally");
+    /// Stop a binding's loops, wait until each has closed its socket, and
+    /// forget its ports. Returns the sockets closed.
+    async fn stop_binding(&self, binding: Binding) -> usize {
+        binding.stop.send_replace(true);
+        let mut closed = 0;
+        for task in binding.loops {
+            if let Err(e) = task.await {
+                error!(error = %e, "stream loop ended abnormally");
+            }
+            closed += 1;
         }
-        closed += 1;
+        for port in binding.ports {
+            self.bound_ports.remove(port);
+        }
+        closed
     }
-    closed
 }
 
 /// Close each draining connection at its deadline.

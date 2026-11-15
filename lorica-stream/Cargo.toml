@@ -16,9 +16,13 @@ description = "Stream data plane for Lorica: the worker-side stream runtime, its
 [dependencies]
 lorica-config = { version = "1.10.6", path = "../lorica-config" }
 lorica-worker = { version = "1.10.6", path = "../lorica-worker" }
+# The PROXY protocol parser and encoder (Story 12.3 D-j, D-k), shared
+# with the HTTP listeners. Default features off: no TLS stack.
+lorica-core = { version = "0.1.0", path = "../lorica-core", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
-# Puts the stream control end in non-blocking mode for `AsyncFd`.
+# Puts the stream control end in non-blocking mode for `AsyncFd`; TCP
+# keepalive and shutdown on the engine's sockets.
 socket2 = { version = "0.6", features = ["all"] }
 thiserror = "2"
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
