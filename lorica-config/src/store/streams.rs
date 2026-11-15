@@ -29,7 +29,87 @@ const STREAM_COLUMNS: &str = "id, name, group_name, protocol, enabled, listen_ad
      max_connect_attempts, backend_keepalive, backend_keepalive_idle_s, \
      close_on_backend_down, proxy_protocol_send, proxy_protocol_accept, \
      proxy_protocol_trusted_cidrs, source_addresses, allow_local_backend, \
-     upload_rate_bps, download_rate_bps, max_connections";
+     upload_rate_bps, download_rate_bps, max_connections, \
+     udp_max_sessions, udp_source_session_cap, udp_requests_per_session, \
+     udp_responses_per_request, udp_response_bytes_ratio, udp_unbounded_responses, \
+     udp_source_datagram_rate, udp_source_byte_rate, udp_max_datagram_bytes";
+
+/// The `udp_*` columns of one row (Story 12.5 D-l), in `STREAM_COLUMNS`
+/// order, every one NULL on a TCP row.
+type UdpColumns = (
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<bool>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+);
+
+/// The `udp_*` column values of `udp`, all NULL for `None` (a TCP
+/// stream). `requests_per_session` and `source_session_cap` are NULL on
+/// a UDP row too when unset; the protocol tells the two apart.
+fn udp_to_columns(udp: Option<&UdpSettings>) -> UdpColumns {
+    match udp {
+        None => (None, None, None, None, None, None, None, None, None),
+        Some(u) => (
+            Some(u.max_sessions),
+            u.source_session_cap,
+            u.requests_per_session,
+            Some(u.responses_per_request),
+            Some(u.response_bytes_ratio),
+            Some(u.unbounded_responses),
+            Some(u.source_datagram_rate),
+            Some(u.source_byte_rate),
+            Some(u.max_datagram_bytes),
+        ),
+    }
+}
+
+/// The UDP settings of a row of `protocol`: present on a UDP row, which
+/// must carry every non-nullable one, absent on a TCP row, which must
+/// carry none.
+fn udp_from_columns(protocol: StreamProtocol, columns: UdpColumns) -> Result<Option<UdpSettings>> {
+    let (
+        max_sessions,
+        source_session_cap,
+        requests_per_session,
+        responses_per_request,
+        response_bytes_ratio,
+        unbounded_responses,
+        source_datagram_rate,
+        source_byte_rate,
+        max_datagram_bytes,
+    ) = columns;
+    let required = |value: Option<u32>, column: &str| {
+        value.ok_or_else(|| ConfigError::Corrupt(format!("stored UDP stream has no {column}")))
+    };
+    match protocol {
+        StreamProtocol::Tcp => {
+            if columns != udp_to_columns(None) {
+                return Err(ConfigError::Corrupt(
+                    "stored TCP stream carries UDP settings".to_string(),
+                ));
+            }
+            Ok(None)
+        }
+        StreamProtocol::Udp => Ok(Some(UdpSettings {
+            max_sessions: required(max_sessions, "udp_max_sessions")?,
+            source_session_cap,
+            requests_per_session,
+            responses_per_request: required(responses_per_request, "udp_responses_per_request")?,
+            response_bytes_ratio: required(response_bytes_ratio, "udp_response_bytes_ratio")?,
+            unbounded_responses: unbounded_responses.ok_or_else(|| {
+                ConfigError::Corrupt("stored UDP stream has no udp_unbounded_responses".to_string())
+            })?,
+            source_datagram_rate: required(source_datagram_rate, "udp_source_datagram_rate")?,
+            source_byte_rate: required(source_byte_rate, "udp_source_byte_rate")?,
+            max_datagram_bytes: required(max_datagram_bytes, "udp_max_datagram_bytes")?,
+        })),
+    }
+}
 
 /// A stored JSON list column, refused as corrupt when it does not
 /// decode.
@@ -63,12 +143,27 @@ fn row_to_stream(row: &rusqlite::Row<'_>) -> Result<Stream> {
     let selector: String = row.get(8)?;
     let load_balancing: String = row.get(11)?;
     let proxy_protocol_send: String = row.get(19)?;
+    let protocol = StreamProtocol::from_str(&protocol)
+        .map_err(|e| ConfigError::Corrupt(format!("stored stream protocol is invalid: {e}")))?;
+    let udp = udp_from_columns(
+        protocol,
+        (
+            row.get(27)?,
+            row.get(28)?,
+            row.get(29)?,
+            row.get(30)?,
+            row.get(31)?,
+            row.get(32)?,
+            row.get(33)?,
+            row.get(34)?,
+            row.get(35)?,
+        ),
+    )?;
     Ok(Stream {
         id: row.get(0)?,
         name: row.get(1)?,
         group_name: row.get(2)?,
-        protocol: StreamProtocol::from_str(&protocol)
-            .map_err(|e| ConfigError::Corrupt(format!("stored stream protocol is invalid: {e}")))?,
+        protocol,
         enabled: row.get(4)?,
         listen_address: IpAddr::from_str(&listen_address).map_err(|e| {
             ConfigError::Corrupt(format!("stored stream listen_address is invalid: {e}"))
@@ -99,6 +194,7 @@ fn row_to_stream(row: &rusqlite::Row<'_>) -> Result<Stream> {
         upload_rate_bps: rate_from_column(row.get(24)?, "upload_rate_bps")?,
         download_rate_bps: rate_from_column(row.get(25)?, "download_rate_bps")?,
         max_connections: row.get(26)?,
+        udp,
         created_at: parse_datetime(&row.get::<_, String>(9)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(10)?)?,
     })
@@ -143,12 +239,14 @@ impl ConfigStore {
             &stream.proxy_protocol_trusted_cidrs,
         )?;
         let sources = serialize_field("source_addresses", &stream.source_addresses)?;
+        let udp = udp_to_columns(stream.udp.as_ref());
         self.conn
             .execute(
                 &format!(
                     "INSERT INTO streams ({STREAM_COLUMNS}) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
-                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)"
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
+                     ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)"
                 ),
                 params![
                     stream.id,
@@ -178,6 +276,15 @@ impl ConfigStore {
                     rate_to_column(stream.upload_rate_bps, "upload_rate_bps")?,
                     rate_to_column(stream.download_rate_bps, "download_rate_bps")?,
                     stream.max_connections,
+                    udp.0,
+                    udp.1,
+                    udp.2,
+                    udp.3,
+                    udp.4,
+                    udp.5,
+                    udp.6,
+                    udp.7,
+                    udp.8,
                 ],
             )
             .map_err(|e| name_taken(e, &stream.name))?;
@@ -232,6 +339,7 @@ impl ConfigStore {
             &stream.proxy_protocol_trusted_cidrs,
         )?;
         let sources = serialize_field("source_addresses", &stream.source_addresses)?;
+        let udp = udp_to_columns(stream.udp.as_ref());
         let changed = self
             .conn
             .execute(
@@ -243,7 +351,11 @@ impl ConfigStore {
                  close_on_backend_down = ?18, proxy_protocol_send = ?19, \
                  proxy_protocol_accept = ?20, proxy_protocol_trusted_cidrs = ?21, \
                  source_addresses = ?22, allow_local_backend = ?23, upload_rate_bps = ?24, \
-                 download_rate_bps = ?25, max_connections = ?26 WHERE id = ?1",
+                 download_rate_bps = ?25, max_connections = ?26, udp_max_sessions = ?27, \
+                 udp_source_session_cap = ?28, udp_requests_per_session = ?29, \
+                 udp_responses_per_request = ?30, udp_response_bytes_ratio = ?31, \
+                 udp_unbounded_responses = ?32, udp_source_datagram_rate = ?33, \
+                 udp_source_byte_rate = ?34, udp_max_datagram_bytes = ?35 WHERE id = ?1",
                 params![
                     stream.id,
                     stream.name,
@@ -271,6 +383,15 @@ impl ConfigStore {
                     rate_to_column(stream.upload_rate_bps, "upload_rate_bps")?,
                     rate_to_column(stream.download_rate_bps, "download_rate_bps")?,
                     stream.max_connections,
+                    udp.0,
+                    udp.1,
+                    udp.2,
+                    udp.3,
+                    udp.4,
+                    udp.5,
+                    udp.6,
+                    udp.7,
+                    udp.8,
                 ],
             )
             .map_err(|e| name_taken(e, &stream.name))?;
@@ -696,6 +817,99 @@ mod tests {
             .set_stream_backend_links(&sid("s-1"), &["b-1".to_string()], &["b-1".to_string()])
             .is_err());
         assert_eq!(store.list_stream_backends().expect("links"), links);
+    }
+
+    #[test]
+    fn the_udp_settings_round_trip_and_a_tcp_row_carries_none() {
+        let store = store_with_backends(&[]);
+        let mut dns = sample_stream("s-1", "dns", StreamProtocol::Udp, 53);
+        // Private, so the per-source cap may go back to its default.
+        dns.listen_address = "10.0.0.53".parse().expect("test setup: address");
+        let udp = dns.udp.as_mut().expect("test setup: udp");
+        udp.max_sessions = 9_000;
+        udp.source_session_cap = Some(12);
+        udp.requests_per_session = None;
+        udp.responses_per_request = 0;
+        udp.response_bytes_ratio = 4;
+        udp.unbounded_responses = true;
+        udp.source_datagram_rate = 50;
+        udp.source_byte_rate = 65_507;
+        udp.max_datagram_bytes = 65_507;
+        dns.idle_timeout_s = 3_600;
+        dns.total_timeout_s = Some(60);
+        store.create_stream(&dns).expect("create");
+        assert_eq!(
+            store.get_stream(&sid("s-1")).expect("get"),
+            Some(dns.clone())
+        );
+
+        let udp = dns.udp.as_mut().expect("test setup: udp");
+        udp.source_session_cap = None;
+        udp.requests_per_session = Some(1);
+        udp.unbounded_responses = false;
+        store.update_stream(&dns).expect("update");
+        assert_eq!(store.get_stream(&sid("s-1")).expect("get"), Some(dns));
+
+        let smtp = sample_stream("s-2", "smtp", StreamProtocol::Tcp, 25);
+        store.create_stream(&smtp).expect("create");
+        let nulls: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM streams WHERE id = ?1 AND udp_max_sessions IS NULL \
+                 AND udp_source_session_cap IS NULL AND udp_requests_per_session IS NULL \
+                 AND udp_responses_per_request IS NULL AND udp_response_bytes_ratio IS NULL \
+                 AND udp_unbounded_responses IS NULL AND udp_source_datagram_rate IS NULL \
+                 AND udp_source_byte_rate IS NULL AND udp_max_datagram_bytes IS NULL",
+                params![sid("s-2")],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(nulls, 1, "a TCP row stores no UDP setting");
+        assert_eq!(store.get_stream(&sid("s-2")).expect("get"), Some(smtp));
+    }
+
+    #[test]
+    fn a_row_whose_udp_columns_disagree_with_its_protocol_is_corrupt() {
+        let store = store_with_backends(&[]);
+        store
+            .create_stream(&sample_stream("s-1", "dns", StreamProtocol::Udp, 53))
+            .expect("create");
+        store
+            .create_stream(&sample_stream("s-2", "smtp", StreamProtocol::Tcp, 25))
+            .expect("create");
+        store
+            .conn
+            .execute(
+                "UPDATE streams SET udp_max_sessions = NULL WHERE id = ?1",
+                params![sid("s-1")],
+            )
+            .expect("test setup: a UDP row without its cap");
+        assert!(matches!(
+            store.get_stream(&sid("s-1")),
+            Err(ConfigError::Corrupt(m)) if m.contains("udp_max_sessions")
+        ));
+        store
+            .conn
+            .execute(
+                "UPDATE streams SET udp_max_sessions = 4096 WHERE id = ?1",
+                params![sid("s-2")],
+            )
+            .expect("test setup: a TCP row with a UDP value");
+        assert!(matches!(
+            store.get_stream(&sid("s-2")),
+            Err(ConfigError::Corrupt(m)) if m.contains("TCP stream carries UDP settings")
+        ));
+    }
+
+    #[test]
+    fn a_udp_stream_takes_a_backup() {
+        let store = store_with_backends(&[("b-1", "192.0.2.10:53"), ("b-2", "192.0.2.20:53")]);
+        store
+            .create_stream(&sample_stream("s-1", "dns", StreamProtocol::Udp, 53))
+            .expect("create");
+        store
+            .set_stream_backend_links(&sid("s-1"), &["b-1".to_string()], &["b-2".to_string()])
+            .expect("a primary and a backup on UDP");
     }
 
     #[test]

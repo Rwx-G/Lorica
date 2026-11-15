@@ -129,24 +129,26 @@ pub struct Stream {
     // and each states in its doc comment which protocols it applies to;
     // [`TCP_ENGINE_FIELDS`] is where a UDP stream's refusal of them is
     // decided.
-    /// How a backend is chosen for a connection. TCP; on UDP it must
-    /// stay `round_robin` until Story 12.5.
+    /// How a backend is chosen for a connection or a UDP session. Both
+    /// protocols; `peak_ewma` is refused on UDP, which has no connect
+    /// latency to feed it (Story 12.5 D-i), and `least_conn` counts
+    /// sessions there.
     #[serde(default = "default_load_balancing")]
     pub load_balancing: LoadBalancing,
     /// Per connect attempt, in milliseconds,
     /// [`Stream::CONNECT_TIMEOUT_MS_RANGE`]. TCP only.
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u32,
-    /// A connection with no forwarded byte either way for this long is
-    /// closed, in seconds. Its default and range depend on the protocol:
-    /// [`Stream::default_idle_timeout_s`] and
-    /// [`Stream::idle_timeout_s_range`]. TCP; on UDP it must hold the
-    /// UDP default until Story 12.5.
+    /// A connection or UDP session with no forwarded byte either way for
+    /// this long is closed, in seconds. Its default and range depend on
+    /// the protocol: [`Stream::default_idle_timeout_s`] and
+    /// [`Stream::idle_timeout_s_range`]. Both protocols.
     #[serde(default = "default_tcp_idle_timeout_s")]
     pub idle_timeout_s: u32,
-    /// The longest a connection may last from accept, in seconds,
-    /// [`Stream::TOTAL_TIMEOUT_S_RANGE`]; `None` for no limit. TCP; on
-    /// UDP it must stay `None` until Story 12.5.
+    /// The longest a connection may last from accept, or a UDP session
+    /// from its first datagram, in seconds,
+    /// [`Stream::TOTAL_TIMEOUT_S_RANGE`]; `None` for no limit. Both
+    /// protocols.
     #[serde(default)]
     pub total_timeout_s: Option<u32>,
     /// Connect attempts per connection, the first one included,
@@ -160,14 +162,14 @@ pub struct Stream {
     /// [`Stream::BACKEND_KEEPALIVE_IDLE_S_RANGE`]. TCP only.
     #[serde(default = "default_backend_keepalive_idle_s")]
     pub backend_keepalive_idle_s: u32,
-    /// Whether established connections to a backend that goes down are
-    /// closed with `backend_down` (HAProxy's `on-marked-down
-    /// shutdown-sessions`). TCP; on UDP it must stay off until Story
-    /// 12.5.
+    /// Whether established connections or sessions to a backend that
+    /// goes down are closed with `backend_down` (HAProxy's
+    /// `on-marked-down shutdown-sessions`). Both protocols.
     #[serde(default)]
     pub close_on_backend_down: bool,
-    /// The PROXY protocol header sent to the backend after connect. TCP;
-    /// on UDP it must stay off until Story 12.5.
+    /// The PROXY protocol header sent to the backend: after connect on
+    /// TCP, in front of every datagram on UDP. `v1` is refused on UDP:
+    /// its text format has no UDP transport (Story 12.5 D-j).
     #[serde(default)]
     pub proxy_protocol_send: StreamProxyProtocol,
     /// Whether a PROXY header is required from a peer of
@@ -181,17 +183,17 @@ pub struct Stream {
     /// (`crate::connection_filter::validate_proxy_protocol`). TCP only.
     #[serde(default)]
     pub proxy_protocol_trusted_cidrs: Vec<String>,
-    /// Local addresses backend connections leave from, used in turn per
-    /// attempt among those of the destination's family (nginx's
-    /// `proxy_bind`, as a list); empty lets the kernel choose. At most
-    /// [`Stream::SOURCE_ADDRESSES_MAX`] unicast literals. TCP; on UDP it
-    /// must stay empty until Story 12.5.
+    /// Local addresses backend connections or UDP sessions leave from,
+    /// used in turn per attempt or per session among those of the
+    /// destination's family (nginx's `proxy_bind`, as a list); empty lets
+    /// the kernel choose. At most [`Stream::SOURCE_ADDRESSES_MAX`] unicast
+    /// literals. Both protocols.
     #[serde(default)]
     pub source_addresses: Vec<IpAddr>,
     /// Whether a backend on a local address (loopback, link-local,
     /// unspecified, `localhost`, or an address of the node) may be
-    /// reached. Never settable from the automation or MCP surfaces. TCP;
-    /// on UDP it must stay off until Story 12.5.
+    /// reached. Never settable from the automation or MCP surfaces. Both
+    /// protocols.
     #[serde(default)]
     pub allow_local_backend: bool,
     /// Client-to-backend bytes per second per connection,
@@ -208,6 +210,12 @@ pub struct Stream {
     /// TCP only: a UDP stream's session cap is its own setting.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+
+    /// The UDP settings (Story 12.5 D-l): present on every UDP stream,
+    /// absent on every TCP one, so no UDP field is ever stored on a TCP
+    /// stream or ignored on one. [`Stream::new`] fills the defaults.
+    #[serde(default)]
+    pub udp: Option<UdpSettings>,
 
     /// First-insert timestamp.
     pub created_at: DateTime<Utc>,
@@ -285,14 +293,313 @@ impl StreamProxyProtocol {
     }
 }
 
+/// The settings of a UDP stream (Story 12.5 D-l), each with its default,
+/// its range and, in its doc comment, what the PRD's survey of other
+/// proxies found (2026-09-28). The defaults and ranges are the associated
+/// constants, which every surface reads.
+///
+/// The bound towards one source key per node and per second (IV1's
+/// documented bound) is
+/// `min(source_byte_rate x response_bytes_ratio, source_datagram_rate x
+/// responses_per_request x max_datagram_bytes)` bytes, plus one second's
+/// worth again as burst; [`UdpSettings::reflection_bound`] computes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UdpSettings {
+    /// Concurrent sessions of the stream per node, exact across workers:
+    /// the stream's share of the node's session ceiling,
+    /// [`UdpSettings::MAX_SESSIONS_RANGE`]. Not surveyed as a
+    /// per-listener default.
+    #[serde(default = "UdpSettings::default_max_sessions")]
+    pub max_sessions: u32,
+    /// Concurrent sessions per source key (an IPv4 address or an IPv6
+    /// /64) per node, [`UdpSettings::SOURCE_SESSION_CAP_RANGE`]; `None`
+    /// is [`UdpSettings::DEFAULT_SOURCE_SESSION_CAP`]. Workers admitting
+    /// one source at once can pass it by at most the worker count minus
+    /// one. Only an explicit value at or below
+    /// [`UDP_EXPOSED_SOURCE_SESSION_CAP_MAX`] satisfies the
+    /// listen-address rule ([`udp_exposure_check`]). Survey: nginx
+    /// `limit_conn` (no default); HAProxy Enterprise and Envoy not
+    /// surveyed for UDP.
+    #[serde(default)]
+    pub source_session_cap: Option<u32>,
+    /// Client datagrams forwarded per session before it is retired and
+    /// the next datagram opens a new one,
+    /// [`UdpSettings::REQUESTS_PER_SESSION_RANGE`]; `None` for no bound.
+    /// It shortens a session's life and bounds no reflection, so no
+    /// bound needs no badge. Survey: nginx `proxy_requests`, default 0
+    /// (unbounded).
+    ///
+    /// Absent from a document, it reads as no bound: TOML has no null, so
+    /// an exported `None` is an absent key, and reading it back as the
+    /// default would turn an unbounded stream bounded on re-import. A
+    /// document without the whole `udp` object takes every default
+    /// ([`Stream::fill_protocol_defaults`]).
+    #[serde(default)]
+    pub requests_per_session: Option<u32>,
+    /// Backend datagrams forwarded per client datagram,
+    /// [`UdpSettings::RESPONSES_PER_REQUEST_RANGE`]; 0 for a one-way
+    /// protocol (syslog). Survey: nginx `proxy_responses` (unbounded
+    /// unless set); HAProxy Enterprise exposes a bound; Traefik, Envoy
+    /// and caddy-l4 none.
+    #[serde(default = "UdpSettings::default_responses_per_request")]
+    pub responses_per_request: u32,
+    /// Response bytes forwarded per request byte of the session,
+    /// [`UdpSettings::RESPONSE_BYTES_RATIO_RANGE`]. The default serves a
+    /// DNSSEC or large TXT answer (about 25 times a 50-byte query inside
+    /// the 1,232-byte EDNS buffer of the 2020 DNS flag day). No surveyed
+    /// product bounds bytes.
+    #[serde(default = "UdpSettings::default_response_bytes_ratio")]
+    pub response_bytes_ratio: u32,
+    /// Lifts both response bounds, for protocols whose backend speaks
+    /// unasked (games, VoIP signalling). `responses_per_request` and
+    /// `response_bytes_ratio` keep their stored values, unapplied, and
+    /// apply again when it is cleared. Shown as a permanent badge.
+    #[serde(default)]
+    pub unbounded_responses: bool,
+    /// Client datagrams per second per source key per node, burst one
+    /// second, [`UdpSettings::SOURCE_DATAGRAM_RATE_RANGE`]. None in the
+    /// survey.
+    #[serde(default = "UdpSettings::default_source_datagram_rate")]
+    pub source_datagram_rate: u32,
+    /// Client bytes per second per source key per node, burst one
+    /// second, [`UdpSettings::SOURCE_BYTE_RATE_RANGE`], and at least
+    /// `max_datagram_bytes` so a datagram of the largest size can pass.
+    /// None in the survey.
+    #[serde(default = "UdpSettings::default_source_byte_rate")]
+    pub source_byte_rate: u32,
+    /// The largest payload forwarded, both directions; a larger datagram
+    /// is dropped and counted, [`UdpSettings::MAX_DATAGRAM_BYTES_RANGE`].
+    /// Not surveyed.
+    #[serde(default = "UdpSettings::default_max_datagram_bytes")]
+    pub max_datagram_bytes: u32,
+}
+
+impl Default for UdpSettings {
+    fn default() -> Self {
+        Self {
+            max_sessions: Self::DEFAULT_MAX_SESSIONS,
+            source_session_cap: None,
+            requests_per_session: Some(Self::DEFAULT_REQUESTS_PER_SESSION),
+            responses_per_request: Self::DEFAULT_RESPONSES_PER_REQUEST,
+            response_bytes_ratio: Self::DEFAULT_RESPONSE_BYTES_RATIO,
+            unbounded_responses: false,
+            source_datagram_rate: Self::DEFAULT_SOURCE_DATAGRAM_RATE,
+            source_byte_rate: Self::DEFAULT_SOURCE_BYTE_RATE,
+            max_datagram_bytes: Self::DEFAULT_MAX_DATAGRAM_BYTES,
+        }
+    }
+}
+
+impl UdpSettings {
+    /// Default of `max_sessions`.
+    pub const DEFAULT_MAX_SESSIONS: u32 = 4_096;
+    /// Accepted `max_sessions`; the node ceiling bounds it further.
+    pub const MAX_SESSIONS_RANGE: RangeInclusive<u32> = 1..=1_048_576;
+    /// The per-source cap an absent `source_session_cap` means.
+    pub const DEFAULT_SOURCE_SESSION_CAP: u32 = 256;
+    /// Accepted `source_session_cap` when set.
+    pub const SOURCE_SESSION_CAP_RANGE: RangeInclusive<u32> = 1..=65_535;
+    /// Default of `requests_per_session`.
+    pub const DEFAULT_REQUESTS_PER_SESSION: u32 = 64;
+    /// Accepted `requests_per_session` when set.
+    pub const REQUESTS_PER_SESSION_RANGE: RangeInclusive<u32> = 1..=65_535;
+    /// Default of `responses_per_request`.
+    pub const DEFAULT_RESPONSES_PER_REQUEST: u32 = 1;
+    /// Accepted `responses_per_request`.
+    pub const RESPONSES_PER_REQUEST_RANGE: RangeInclusive<u32> = 0..=64;
+    /// Default of `response_bytes_ratio`.
+    pub const DEFAULT_RESPONSE_BYTES_RATIO: u32 = 32;
+    /// Accepted `response_bytes_ratio`.
+    pub const RESPONSE_BYTES_RATIO_RANGE: RangeInclusive<u32> = 1..=64;
+    /// Default of `source_datagram_rate`, per second.
+    pub const DEFAULT_SOURCE_DATAGRAM_RATE: u32 = 1_000;
+    /// Accepted `source_datagram_rate`.
+    pub const SOURCE_DATAGRAM_RATE_RANGE: RangeInclusive<u32> = 1..=1_000_000;
+    /// Default of `source_byte_rate`, bytes per second (512 KiB/s).
+    pub const DEFAULT_SOURCE_BYTE_RATE: u32 = 524_288;
+    /// Accepted `source_byte_rate`.
+    pub const SOURCE_BYTE_RATE_RANGE: RangeInclusive<u32> = 1_024..=1_073_741_824;
+    /// Default of `max_datagram_bytes`.
+    pub const DEFAULT_MAX_DATAGRAM_BYTES: u32 = 8_192;
+    /// Accepted `max_datagram_bytes`: the largest UDP payload over IPv4
+    /// tops it.
+    pub const MAX_DATAGRAM_BYTES_RANGE: RangeInclusive<u32> = 512..=65_507;
+
+    fn default_max_sessions() -> u32 {
+        Self::DEFAULT_MAX_SESSIONS
+    }
+
+    fn default_responses_per_request() -> u32 {
+        Self::DEFAULT_RESPONSES_PER_REQUEST
+    }
+
+    fn default_response_bytes_ratio() -> u32 {
+        Self::DEFAULT_RESPONSE_BYTES_RATIO
+    }
+
+    fn default_source_datagram_rate() -> u32 {
+        Self::DEFAULT_SOURCE_DATAGRAM_RATE
+    }
+
+    fn default_source_byte_rate() -> u32 {
+        Self::DEFAULT_SOURCE_BYTE_RATE
+    }
+
+    fn default_max_datagram_bytes() -> u32 {
+        Self::DEFAULT_MAX_DATAGRAM_BYTES
+    }
+
+    /// The per-source session cap the engine applies.
+    pub fn effective_source_session_cap(&self) -> u32 {
+        self.source_session_cap
+            .unwrap_or(Self::DEFAULT_SOURCE_SESSION_CAP)
+    }
+
+    /// Response bytes per second Lorica forwards at most towards one
+    /// source key on one node, burst excluded; `None` with
+    /// `unbounded_responses`, which lifts the bound.
+    pub fn reflection_bound(&self) -> Option<u64> {
+        if self.unbounded_responses {
+            return None;
+        }
+        let by_bytes = u64::from(self.source_byte_rate) * u64::from(self.response_bytes_ratio);
+        let by_datagrams = u64::from(self.source_datagram_rate)
+            * u64::from(self.responses_per_request)
+            * u64::from(self.max_datagram_bytes);
+        Some(by_bytes.min(by_datagrams))
+    }
+
+    /// Ranges, and a byte rate that lets a datagram of the largest size
+    /// through.
+    fn validate(&self, stream: &str) -> Result<(), String> {
+        within(
+            stream,
+            "udp.max_sessions",
+            self.max_sessions,
+            &Self::MAX_SESSIONS_RANGE,
+        )?;
+        if let Some(cap) = self.source_session_cap {
+            within(
+                stream,
+                "udp.source_session_cap",
+                cap,
+                &Self::SOURCE_SESSION_CAP_RANGE,
+            )?;
+        }
+        if let Some(requests) = self.requests_per_session {
+            within(
+                stream,
+                "udp.requests_per_session",
+                requests,
+                &Self::REQUESTS_PER_SESSION_RANGE,
+            )?;
+        }
+        within(
+            stream,
+            "udp.responses_per_request",
+            self.responses_per_request,
+            &Self::RESPONSES_PER_REQUEST_RANGE,
+        )?;
+        within(
+            stream,
+            "udp.response_bytes_ratio",
+            self.response_bytes_ratio,
+            &Self::RESPONSE_BYTES_RATIO_RANGE,
+        )?;
+        within(
+            stream,
+            "udp.source_datagram_rate",
+            self.source_datagram_rate,
+            &Self::SOURCE_DATAGRAM_RATE_RANGE,
+        )?;
+        within(
+            stream,
+            "udp.source_byte_rate",
+            self.source_byte_rate,
+            &Self::SOURCE_BYTE_RATE_RANGE,
+        )?;
+        within(
+            stream,
+            "udp.max_datagram_bytes",
+            self.max_datagram_bytes,
+            &Self::MAX_DATAGRAM_BYTES_RANGE,
+        )?;
+        if self.source_byte_rate < self.max_datagram_bytes {
+            return Err(format!(
+                "stream `{stream}`: udp.source_byte_rate ({}) is below udp.max_datagram_bytes \
+                 ({}): a datagram of the largest size could never pass the per-source byte rate",
+                self.source_byte_rate, self.max_datagram_bytes
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The highest explicit `udp.source_session_cap` that lets a UDP stream
+/// listen on an exposed address without a source allowlist (Story 12.5
+/// D-k): it bounds the upstream sockets one spoofed address can pin on a
+/// node while leaving room for a NATed site with dozens of queries in
+/// flight.
+pub const UDP_EXPOSED_SOURCE_SESSION_CAP_MAX: u32 = 64;
+
+/// Whether `address` is loopback, RFC 1918 or ULA, the addresses a UDP
+/// stream may listen on with no further condition. Everything else is
+/// exposed, the unspecified addresses (they bind every address of the
+/// host), link-local and shared address space included.
+pub fn is_unexposed_udp_listen_address(address: IpAddr) -> bool {
+    match address.to_canonical() {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
+        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
+/// The listen-address rule of a UDP stream (Story 12.5 D-k, PRD AC #3):
+/// on an exposed address ([`is_unexposed_udp_listen_address`]) the
+/// stream needs a source allowlist or an explicit `udp.source_session_cap`
+/// at or below [`UDP_EXPOSED_SOURCE_SESSION_CAP_MAX`]. The default cap
+/// does not count: the rule makes the operator choose a number. A TCP
+/// stream, or a UDP stream without its settings, passes; the latter is
+/// [`Stream::validate`]'s to refuse.
+///
+/// Called by `Stream::validate` from Story 12.5 Lot G, with
+/// `has_source_allowlist = false` until Story 12.6 adds the allowlist.
+///
+/// # Errors
+///
+/// The refusal, naming the address, the rule and both remedies.
+pub fn udp_exposure_check(stream: &Stream, has_source_allowlist: bool) -> Result<(), String> {
+    let Some(udp) = stream
+        .udp
+        .filter(|_| stream.protocol == StreamProtocol::Udp)
+    else {
+        return Ok(());
+    };
+    if has_source_allowlist || is_unexposed_udp_listen_address(stream.listen_address) {
+        return Ok(());
+    }
+    if udp
+        .source_session_cap
+        .is_some_and(|cap| cap <= UDP_EXPOSED_SOURCE_SESSION_CAP_MAX)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "stream `{}`: UDP listen address {} is exposed (not loopback, RFC 1918 or ULA), so the \
+         stream needs a source allowlist or an explicit udp.source_session_cap of at most \
+         {UDP_EXPOSED_SOURCE_SESSION_CAP_MAX}",
+        stream.name, stream.listen_address
+    ))
+}
+
 /// What a UDP stream may do with one Story 12.3 setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnUdp {
-    /// It must hold its default until Story 12.5 gives it a UDP meaning
-    /// or decides it has none.
-    UntilStory12_5,
-    /// It is refused for good, for the reason given.
-    Refused(&'static str),
+    /// It has a UDP meaning (Story 12.5 D-l) and is validated on UDP
+    /// as on TCP, plus any UDP-only refusal of a value.
+    Applies,
+    /// It must hold its default on a UDP stream, for the reason given.
+    KeepsDefault(&'static str),
 }
 
 /// One Story 12.3 setting as the UDP rule sees it.
@@ -307,90 +614,95 @@ pub struct TcpEngineField {
 }
 
 /// Every Story 12.3 setting, in declaration order, with what a UDP
-/// stream may do with it (D-q). Story 12.5 lifts an entry by changing
-/// its [`OnUdp`], not by adding a second rule somewhere else.
+/// stream may do with it (Story 12.3 D-q, Story 12.5 D-l). A setting
+/// gains or loses a UDP meaning by changing its [`OnUdp`] here, not by
+/// adding a second rule somewhere else.
 pub const TCP_ENGINE_FIELDS: &[TcpEngineField] = &[
     TcpEngineField {
         name: "load_balancing",
         at_default: |s| s.load_balancing == LoadBalancing::RoundRobin,
-        on_udp: OnUdp::UntilStory12_5,
+        on_udp: OnUdp::Applies,
     },
     TcpEngineField {
         name: "connect_timeout_ms",
         at_default: |s| s.connect_timeout_ms == Stream::DEFAULT_CONNECT_TIMEOUT_MS,
-        on_udp: OnUdp::UntilStory12_5,
+        on_udp: OnUdp::KeepsDefault("a UDP session opens no connection to time"),
     },
     TcpEngineField {
         name: "idle_timeout_s",
         at_default: |s| s.idle_timeout_s == Stream::default_idle_timeout_s(s.protocol),
-        on_udp: OnUdp::UntilStory12_5,
+        on_udp: OnUdp::Applies,
     },
     TcpEngineField {
         name: "total_timeout_s",
         at_default: |s| s.total_timeout_s.is_none(),
-        on_udp: OnUdp::UntilStory12_5,
+        on_udp: OnUdp::Applies,
     },
     TcpEngineField {
         name: "max_connect_attempts",
         at_default: |s| s.max_connect_attempts == Stream::DEFAULT_MAX_CONNECT_ATTEMPTS,
-        on_udp: OnUdp::UntilStory12_5,
+        on_udp: OnUdp::KeepsDefault(
+            "a UDP session is never retried once its first datagram is sent",
+        ),
     },
     TcpEngineField {
         name: "backend_keepalive",
         at_default: |s| s.backend_keepalive == Stream::DEFAULT_BACKEND_KEEPALIVE,
-        on_udp: OnUdp::UntilStory12_5,
+        on_udp: OnUdp::KeepsDefault("TCP keepalive has no UDP counterpart"),
     },
     TcpEngineField {
         name: "backend_keepalive_idle_s",
         at_default: |s| s.backend_keepalive_idle_s == Stream::DEFAULT_BACKEND_KEEPALIVE_IDLE_S,
-        on_udp: OnUdp::UntilStory12_5,
+        on_udp: OnUdp::KeepsDefault("TCP keepalive has no UDP counterpart"),
     },
     TcpEngineField {
         name: "close_on_backend_down",
         at_default: |s| !s.close_on_backend_down,
-        on_udp: OnUdp::UntilStory12_5,
+        on_udp: OnUdp::Applies,
     },
     TcpEngineField {
         name: "proxy_protocol_send",
         at_default: |s| s.proxy_protocol_send == StreamProxyProtocol::Off,
-        on_udp: OnUdp::UntilStory12_5,
+        on_udp: OnUdp::Applies,
     },
     TcpEngineField {
         name: "proxy_protocol_accept",
         at_default: |s| !s.proxy_protocol_accept,
-        on_udp: OnUdp::Refused(
+        on_udp: OnUdp::KeepsDefault(
             "a UDP source address is spoofable, so a trusted PROXY source means nothing on UDP",
         ),
     },
     TcpEngineField {
         name: "proxy_protocol_trusted_cidrs",
         at_default: |s| s.proxy_protocol_trusted_cidrs.is_empty(),
-        on_udp: OnUdp::UntilStory12_5,
+        on_udp: OnUdp::KeepsDefault("PROXY accept is refused on UDP, so there is no peer to trust"),
     },
     TcpEngineField {
         name: "source_addresses",
         at_default: |s| s.source_addresses.is_empty(),
-        on_udp: OnUdp::UntilStory12_5,
+        on_udp: OnUdp::Applies,
     },
     TcpEngineField {
         name: "allow_local_backend",
         at_default: |s| !s.allow_local_backend,
-        on_udp: OnUdp::UntilStory12_5,
+        on_udp: OnUdp::Applies,
     },
     TcpEngineField {
         name: "upload_rate_bps",
         at_default: |s| s.upload_rate_bps.is_none(),
-        on_udp: OnUdp::UntilStory12_5,
+        on_udp: OnUdp::KeepsDefault("a UDP stream is bounded per source by udp.source_byte_rate"),
     },
     TcpEngineField {
         name: "download_rate_bps",
         at_default: |s| s.download_rate_bps.is_none(),
-        on_udp: OnUdp::UntilStory12_5,
+        on_udp: OnUdp::KeepsDefault(
+            "a UDP stream's responses are bounded by udp.response_bytes_ratio",
+        ),
     },
     TcpEngineField {
         name: "max_connections",
         at_default: |s| s.max_connections == Stream::DEFAULT_MAX_CONNECTIONS,
-        on_udp: OnUdp::UntilStory12_5,
+        on_udp: OnUdp::KeepsDefault("a UDP stream's session cap is udp.max_sessions"),
     },
 ];
 
@@ -432,6 +744,13 @@ impl Stream {
     pub const DEFAULT_TCP_IDLE_TIMEOUT_S: u32 = 600;
     /// Accepted `idle_timeout_s` on a TCP stream.
     pub const TCP_IDLE_TIMEOUT_S_RANGE: RangeInclusive<u32> = 1..=86_400;
+    /// Default of `idle_timeout_s` on a UDP stream (Story 12.5 D-l).
+    /// Survey: Traefik 3 s, HAProxy Enterprise 10 s, caddy-l4 30 s, Envoy
+    /// 1 min; nginx `proxy_timeout` 10 min.
+    pub const DEFAULT_UDP_IDLE_TIMEOUT_S: u32 = 10;
+    /// Accepted `idle_timeout_s` on a UDP stream: a session holds an
+    /// upstream socket and an ephemeral port for as long as it idles.
+    pub const UDP_IDLE_TIMEOUT_S_RANGE: RangeInclusive<u32> = 1..=3_600;
     /// Accepted `total_timeout_s` when set.
     pub const TOTAL_TIMEOUT_S_RANGE: RangeInclusive<u32> = 1..=604_800;
     /// Default of `max_connect_attempts`.
@@ -456,9 +775,10 @@ impl Stream {
     pub const MAX_CONNECTIONS_RANGE: RangeInclusive<u32> = 1..=65_535;
 
     /// A stream with every setting at its default for `protocol`:
-    /// enabled, fleet-wide, no group, and the Story 12.3 defaults. The
-    /// one place a writer that builds a new stream takes its defaults
-    /// from, so a protocol-dependent default cannot be missed.
+    /// enabled, fleet-wide, no group, the Story 12.3 defaults, and on UDP
+    /// the default [`UdpSettings`]. The one place a writer that builds a
+    /// new stream takes its defaults from, so a protocol-dependent
+    /// default cannot be missed.
     pub fn new(
         id: String,
         name: String,
@@ -494,27 +814,47 @@ impl Stream {
             upload_rate_bps: None,
             download_rate_bps: None,
             max_connections: Self::DEFAULT_MAX_CONNECTIONS,
+            udp: Self::default_udp_settings(protocol),
             created_at: at,
             updated_at: at,
         }
     }
 
-    /// The default `idle_timeout_s` of a stream of `protocol`.
-    ///
-    /// A function of the protocol rather than one constant because
-    /// Story 12.5 gives UDP its own default (Interface edit E1); until
-    /// then UDP holds the TCP value, which the UDP rule requires.
-    pub fn default_idle_timeout_s(protocol: StreamProtocol) -> u32 {
+    /// The UDP settings a new stream of `protocol` holds: the defaults
+    /// on UDP, none on TCP.
+    pub fn default_udp_settings(protocol: StreamProtocol) -> Option<UdpSettings> {
         match protocol {
-            StreamProtocol::Tcp | StreamProtocol::Udp => Self::DEFAULT_TCP_IDLE_TIMEOUT_S,
+            StreamProtocol::Tcp => None,
+            StreamProtocol::Udp => Some(UdpSettings::default()),
         }
     }
 
-    /// The accepted `idle_timeout_s` of a stream of `protocol`, for the
-    /// reason given on [`Stream::default_idle_timeout_s`].
+    /// Give a stream decoded from a document the protocol-dependent
+    /// defaults a serde default cannot know: the [`UdpSettings`] of a UDP
+    /// stream that carries none. A UDP stream's `idle_timeout_s` is the
+    /// reader's to fill before decoding, where an absent key is still
+    /// visible (`crate::import`).
+    pub fn fill_protocol_defaults(&mut self) {
+        if self.udp.is_none() {
+            self.udp = Self::default_udp_settings(self.protocol);
+        }
+    }
+
+    /// The default `idle_timeout_s` of a stream of `protocol`: one field
+    /// whose default depends on the protocol (Story 12.5 Interface edit
+    /// E1), read by the create path, the import and migration 76.
+    pub fn default_idle_timeout_s(protocol: StreamProtocol) -> u32 {
+        match protocol {
+            StreamProtocol::Tcp => Self::DEFAULT_TCP_IDLE_TIMEOUT_S,
+            StreamProtocol::Udp => Self::DEFAULT_UDP_IDLE_TIMEOUT_S,
+        }
+    }
+
+    /// The accepted `idle_timeout_s` of a stream of `protocol`.
     pub fn idle_timeout_s_range(protocol: StreamProtocol) -> RangeInclusive<u32> {
         match protocol {
-            StreamProtocol::Tcp | StreamProtocol::Udp => Self::TCP_IDLE_TIMEOUT_S_RANGE,
+            StreamProtocol::Tcp => Self::TCP_IDLE_TIMEOUT_S_RANGE,
+            StreamProtocol::Udp => Self::UDP_IDLE_TIMEOUT_S_RANGE,
         }
     }
 
@@ -533,8 +873,11 @@ impl Stream {
     }
 
     /// The stream's own rules: id ([`is_canonical_stream_id`]), name,
-    /// group, listen address, ports, the [`STREAM_PORT_RANGE_MAX`] cap
-    /// and the selector rule shared with routes. Which backends it may
+    /// group, listen address, ports, the [`STREAM_PORT_RANGE_MAX`] cap,
+    /// the selector rule shared with routes, the engine settings, and on
+    /// UDP its settings. The listen-address rule
+    /// ([`udp_exposure_check`]) joins it with Story 12.5 Lot G, which
+    /// makes `udp.source_session_cap` settable from the management API. Which backends it may
     /// reach is [`check_backend_attachments`]; which ports it may hold
     /// on a node is `crate::listen_ports::stream_port_conflicts`.
     ///
@@ -607,27 +950,13 @@ impl Stream {
     }
 
     /// The Story 12.3 settings (D-q): ranges, the PROXY trust list
-    /// (D-k), the source addresses (D-l), and the UDP rule over
-    /// [`TCP_ENGINE_FIELDS`].
+    /// (D-k), the source addresses (D-l), the UDP rule over
+    /// [`TCP_ENGINE_FIELDS`], and the UDP settings of Story 12.5.
     fn validate_engine_settings(&self) -> Result<(), String> {
         let name = self.name.as_str();
         // First, so a UDP stream is told a setting does not apply rather
         // than how to make it valid.
-        if self.protocol == StreamProtocol::Udp {
-            if let Some(field) = TCP_ENGINE_FIELDS.iter().find(|f| !(f.at_default)(self)) {
-                return Err(match field.on_udp {
-                    OnUdp::Refused(reason) => format!(
-                        "stream `{name}`: {} is refused on a UDP stream: {reason}",
-                        field.name
-                    ),
-                    OnUdp::UntilStory12_5 => format!(
-                        "stream `{name}`: {} must keep its default on a UDP stream; UDP \
-                         settings arrive with Story 12.5",
-                        field.name
-                    ),
-                });
-            }
-        }
+        self.validate_protocol_settings()?;
         within(
             name,
             "connect_timeout_ms",
@@ -671,6 +1000,53 @@ impl Stream {
         )?;
         self.validate_proxy_protocol_trust()?;
         self.validate_source_addresses()
+    }
+
+    /// What a protocol allows: on TCP no UDP settings; on UDP its
+    /// settings present and valid, every Story 12.3 setting without a
+    /// UDP meaning at its default, and the values a UDP stream cannot
+    /// use of the ones it has (Story 12.5 D-i, D-j).
+    fn validate_protocol_settings(&self) -> Result<(), String> {
+        let name = self.name.as_str();
+        match self.protocol {
+            StreamProtocol::Tcp => {
+                if self.udp.is_some() {
+                    return Err(format!(
+                        "stream `{name}`: udp settings are refused on a TCP stream"
+                    ));
+                }
+                Ok(())
+            }
+            StreamProtocol::Udp => {
+                let refused_default = TCP_ENGINE_FIELDS.iter().find_map(|f| match f.on_udp {
+                    OnUdp::KeepsDefault(reason) if !(f.at_default)(self) => Some((f.name, reason)),
+                    _ => None,
+                });
+                if let Some((field, reason)) = refused_default {
+                    return Err(format!(
+                        "stream `{name}`: {field} must keep its default on a UDP stream: {reason}"
+                    ));
+                }
+                if self.load_balancing == LoadBalancing::PeakEwma {
+                    return Err(format!(
+                        "stream `{name}`: load_balancing peak_ewma is refused on a UDP stream: \
+                         a session has no connect latency to feed it"
+                    ));
+                }
+                if self.proxy_protocol_send == StreamProxyProtocol::V1 {
+                    return Err(format!(
+                        "stream `{name}`: proxy_protocol_send v1 is refused on a UDP stream: the \
+                         v1 text format has no UDP transport; use v2"
+                    ));
+                }
+                let Some(udp) = &self.udp else {
+                    return Err(format!(
+                        "stream `{name}`: a UDP stream carries its udp settings"
+                    ));
+                };
+                udp.validate(name)
+            }
+        }
     }
 
     /// The trust list by the rule of the HTTP listeners' list (Story
@@ -759,9 +1135,9 @@ pub struct StreamBackend {
     /// ID of the associated `Backend`.
     pub backend_id: String,
     /// Whether the backend is a backup of the stream (Story 12.3, D-f):
-    /// a candidate only when no primary is. A stream with links has at
-    /// least one primary, and a UDP stream has no backup until Story
-    /// 12.5 ([`check_backend_attachments`]).
+    /// a candidate only when no primary is, on either protocol. A stream
+    /// with links has at least one primary
+    /// ([`check_backend_attachments`]).
     #[serde(default)]
     pub backup: bool,
 }
@@ -865,9 +1241,6 @@ pub enum AttachmentRule {
     /// Every backend linked to the stream is a backup, so none would
     /// ever be selected first (Story 12.3, D-f).
     NoPrimaryBackend,
-    /// A backend is a backup of a UDP stream, which has no backups
-    /// until Story 12.5.
-    BackupOnUdpStream,
     /// An IP-literal backend's family is none of the stream's
     /// `source_addresses` (Story 12.3, D-l): no attempt could leave for
     /// it.
@@ -945,11 +1318,6 @@ impl std::fmt::Display for AttachmentConflict {
                 "every backend of {on_stream} is a backup ({backend} included); make at least \
                  one a primary"
             ),
-            AttachmentRule::BackupOnUdpStream => write!(
-                f,
-                "backend {backend} cannot be a backup of UDP {on_stream}; UDP backups arrive \
-                 with Story 12.5"
-            ),
             AttachmentRule::SourceFamilyMismatch => write!(
                 f,
                 "backend {backend} is of an address family none of the source_addresses of \
@@ -976,9 +1344,9 @@ impl std::error::Error for AttachmentConflict {}
 ///    single-port stream or a route, or portless with active checks on;
 /// 4. (Story 12.3) a local backend on a stream without
 ///    `allow_local_backend` (D-m rule A, IP literals and `localhost`
-///    names: a name is not resolved here), a backup link on a UDP stream
-///    or on a stream with no primary (D-f), and an IP-literal backend of
-///    a family none of the stream's `source_addresses` has (D-l).
+///    names: a name is not resolved here), a backup link on a stream
+///    with no primary (D-f), and an IP-literal backend of a family none
+///    of the stream's `source_addresses` has (D-l).
 ///
 /// Backends are checked in snapshot order and their streams by name, so
 /// the first conflict reported is deterministic.
@@ -1101,9 +1469,6 @@ pub fn check_backend_attachments(
             .map(|ip| ip.to_canonical().is_ipv4());
         for stream in &streams {
             let backup = backup_links.contains(&(stream.id.as_str(), backend.id.as_str()));
-            if backup && stream.protocol == StreamProtocol::Udp {
-                return Err(conflict(Some(stream), AttachmentRule::BackupOnUdpStream));
-            }
             if backup && !streams_with_a_primary.contains(stream.id.as_str()) {
                 return Err(conflict(Some(stream), AttachmentRule::NoPrimaryBackend));
             }
@@ -1136,6 +1501,52 @@ pub enum StreamRefusal {
     /// The stream's `max_connections` was reached (Story 12.3, D-p):
     /// per worker process until Story 12.6, per node from then on.
     ConnectionCap,
+    /// The UDP stream holds its `udp.max_sessions` on this node (Story
+    /// 12.5 D-n).
+    SessionCap,
+    /// The source key holds its `udp.source_session_cap` on this node.
+    SourceSessionCap,
+    /// The stream's session table on this node has no room for the
+    /// source (its probe window is full); other streams are unaffected.
+    SessionTableFull,
+}
+
+/// Why a UDP datagram was dropped rather than forwarded (Story 12.5
+/// D-n). A datagram whose session is refused is counted as the
+/// [`StreamRefusal`], never also as a drop. Every surface derives its
+/// word list from [`DatagramDropReason::VARIANTS`].
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, IntoStaticStr, VariantArray,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum DatagramDropReason {
+    /// A client datagram over `udp.max_datagram_bytes`, or one the PROXY
+    /// v2 header would push past the largest UDP payload.
+    RequestOversize,
+    /// A backend datagram over `udp.max_datagram_bytes`.
+    ResponseOversize,
+    /// Over the source key's `udp.source_datagram_rate`.
+    SourceDatagramRate,
+    /// Over the source key's `udp.source_byte_rate`.
+    SourceByteRate,
+    /// A response past `udp.responses_per_request` times the session's
+    /// requests.
+    ResponseCountBound,
+    /// A response past `udp.response_bytes_ratio` times the session's
+    /// request bytes.
+    ResponseByteBound,
+    /// A datagram that would open a session on a draining binding.
+    BindingDraining,
+    /// A send that found the socket's buffer full or failed.
+    SendFailed,
+}
+
+impl DatagramDropReason {
+    /// The snake_case word this reason is published as.
+    pub fn as_str(&self) -> &'static str {
+        self.into()
+    }
 }
 
 /// How a stream connection or session ended (Story 12.1 AC #8): the one
@@ -1169,9 +1580,11 @@ pub enum StreamEndReason {
     ProxyHeaderInvalid,
     /// Protocol detection did not conclude in time.
     DetectionTimeout,
-    /// The per-connection request byte bound was reached.
+    /// A UDP session took its `udp.requests_per_session` datagrams and
+    /// received every response they were owed (Story 12.5 D-b).
     RequestBoundReached,
-    /// The per-connection response byte bound was reached.
+    /// A UDP session spent its response allowance: every response owed
+    /// arrived, or one was dropped for the byte bound (Story 12.5 D-b).
     ResponseBoundReached,
     /// The backend serving the connection went down.
     BackendDown,
@@ -1290,9 +1703,11 @@ pub(crate) mod tests {
     }
 
     /// A valid enabled fleet-wide stream on `0.0.0.0:port`, whose id is
-    /// [`stream_id`] of `label`.
+    /// [`stream_id`] of `label`. A UDP one sets the highest explicit
+    /// per-source cap the listen-address rule accepts on an exposed
+    /// address, so it validates there.
     pub(crate) fn stream(label: &str, name: &str, protocol: StreamProtocol, port: u16) -> Stream {
-        Stream::new(
+        let mut s = Stream::new(
             stream_id(label),
             name.to_string(),
             protocol,
@@ -1300,7 +1715,11 @@ pub(crate) mod tests {
             port,
             port,
             at(),
-        )
+        );
+        if let Some(udp) = &mut s.udp {
+            udp.source_session_cap = Some(UDP_EXPOSED_SOURCE_SESSION_CAP_MAX);
+        }
+        s
     }
 
     /// A backend at `address` with active checks off.
@@ -1842,7 +2261,6 @@ pub(crate) mod tests {
             let s = stream("s", "edge", protocol, 5000);
             assert_eq!(s.load_balancing, LoadBalancing::RoundRobin);
             assert_eq!(s.connect_timeout_ms, 5_000);
-            assert_eq!(s.idle_timeout_s, 600);
             assert_eq!(s.idle_timeout_s, Stream::default_idle_timeout_s(protocol));
             assert_eq!(s.total_timeout_s, None);
             assert_eq!(s.max_connect_attempts, 3);
@@ -1862,6 +2280,316 @@ pub(crate) mod tests {
             }
             assert!(s.validate().is_ok(), "{protocol:?}");
         }
+        assert_eq!(Stream::default_idle_timeout_s(StreamProtocol::Tcp), 600);
+        assert_eq!(Stream::default_idle_timeout_s(StreamProtocol::Udp), 10);
+        assert_eq!(stream("s", "edge", StreamProtocol::Tcp, 5000).udp, None);
+    }
+
+    #[test]
+    fn a_new_udp_stream_holds_the_documented_udp_defaults() {
+        let s = Stream::new(
+            stream_id("s"),
+            "dns".to_string(),
+            StreamProtocol::Udp,
+            "10.0.0.53".parse().expect("test setup: address"),
+            53,
+            53,
+            at(),
+        );
+        let udp = s.udp.expect("a UDP stream carries its settings");
+        assert_eq!(udp, UdpSettings::default());
+        assert_eq!(udp.max_sessions, 4_096);
+        assert_eq!(udp.source_session_cap, None);
+        assert_eq!(udp.effective_source_session_cap(), 256);
+        assert_eq!(udp.requests_per_session, Some(64));
+        assert_eq!(udp.responses_per_request, 1);
+        assert_eq!(udp.response_bytes_ratio, 32);
+        assert!(!udp.unbounded_responses);
+        assert_eq!(udp.source_datagram_rate, 1_000);
+        assert_eq!(udp.source_byte_rate, 524_288);
+        assert_eq!(udp.max_datagram_bytes, 8_192);
+        assert_eq!(s.idle_timeout_s, 10);
+        assert!(s.validate().is_ok(), "{:?}", s.validate());
+        // The documented reflection bound at the defaults.
+        assert_eq!(udp.reflection_bound(), Some(8_192_000));
+        let unbounded = UdpSettings {
+            unbounded_responses: true,
+            ..udp
+        };
+        assert_eq!(unbounded.reflection_bound(), None);
+        // An empty `udp` object reads the defaults, but for the request
+        // bound, which a document spells by its absence.
+        let read: UdpSettings = serde_json::from_value(serde_json::json!({})).expect("defaults");
+        assert_eq!(
+            read,
+            UdpSettings {
+                requests_per_session: None,
+                ..udp
+            }
+        );
+    }
+
+    #[test]
+    fn every_udp_range_holds_at_both_bounds_and_refuses_one_past() {
+        type Setter = fn(&mut UdpSettings, u32);
+        let cases: [(&str, Setter, RangeInclusive<u32>); 8] = [
+            (
+                "udp.max_sessions",
+                |u, v| u.max_sessions = v,
+                UdpSettings::MAX_SESSIONS_RANGE,
+            ),
+            (
+                "udp.source_session_cap",
+                |u, v| u.source_session_cap = Some(v),
+                UdpSettings::SOURCE_SESSION_CAP_RANGE,
+            ),
+            (
+                "udp.requests_per_session",
+                |u, v| u.requests_per_session = Some(v),
+                UdpSettings::REQUESTS_PER_SESSION_RANGE,
+            ),
+            (
+                "udp.responses_per_request",
+                |u, v| u.responses_per_request = v,
+                UdpSettings::RESPONSES_PER_REQUEST_RANGE,
+            ),
+            (
+                "udp.response_bytes_ratio",
+                |u, v| u.response_bytes_ratio = v,
+                UdpSettings::RESPONSE_BYTES_RATIO_RANGE,
+            ),
+            (
+                "udp.source_datagram_rate",
+                |u, v| u.source_datagram_rate = v,
+                UdpSettings::SOURCE_DATAGRAM_RATE_RANGE,
+            ),
+            (
+                "udp.source_byte_rate",
+                |u, v| {
+                    u.source_byte_rate = v;
+                    // Keep the datagram size under the rate, a rule of
+                    // its own tested below.
+                    u.max_datagram_bytes = *UdpSettings::MAX_DATAGRAM_BYTES_RANGE.start();
+                },
+                UdpSettings::SOURCE_BYTE_RATE_RANGE,
+            ),
+            (
+                "udp.max_datagram_bytes",
+                |u, v| u.max_datagram_bytes = v,
+                UdpSettings::MAX_DATAGRAM_BYTES_RANGE,
+            ),
+        ];
+        // A private address, so the listen-address rule is not what
+        // answers whatever the per-source cap.
+        let private = || {
+            let mut s = stream("s", "edge", StreamProtocol::Udp, 5000);
+            s.listen_address = "10.0.0.1".parse().expect("test setup: address");
+            s
+        };
+        for (field, set, range) in cases {
+            let (low, high) = (*range.start(), *range.end());
+            let mut probes = vec![(low, true), (high, true), (high + 1, false)];
+            if low > 0 {
+                probes.push((low - 1, false));
+            }
+            for (value, accepted) in probes {
+                let mut s = private();
+                set(s.udp.as_mut().expect("test setup: udp"), value);
+                match s.validate() {
+                    Ok(()) => assert!(accepted, "{field} = {value} was accepted"),
+                    Err(e) => {
+                        assert!(!accepted, "{field} = {value} was refused: {e}");
+                        assert!(e.contains(field), "{e}");
+                    }
+                }
+            }
+        }
+        // The two nullable ones also accept null.
+        let mut s = private();
+        let udp = s.udp.as_mut().expect("test setup: udp");
+        udp.source_session_cap = None;
+        udp.requests_per_session = None;
+        assert!(s.validate().is_ok());
+        // And the UDP idle range, which stops below the TCP one.
+        let udp_idle = Stream::idle_timeout_s_range(StreamProtocol::Udp);
+        assert_eq!(udp_idle, Stream::UDP_IDLE_TIMEOUT_S_RANGE);
+        for (value, accepted) in [
+            (*udp_idle.start(), true),
+            (*udp_idle.end(), true),
+            (*udp_idle.start() - 1, false),
+            (*udp_idle.end() + 1, false),
+        ] {
+            let mut s = private();
+            s.idle_timeout_s = value;
+            assert_eq!(s.validate().is_ok(), accepted, "idle_timeout_s = {value}");
+        }
+    }
+
+    #[test]
+    fn a_byte_rate_below_the_largest_datagram_is_refused() {
+        let mut s = stream("s", "edge", StreamProtocol::Udp, 5000);
+        let udp = s.udp.as_mut().expect("test setup: udp");
+        udp.max_datagram_bytes = 4_096;
+        udp.source_byte_rate = 4_095;
+        let err = s
+            .validate()
+            .expect_err("no datagram of the largest size could pass");
+        assert!(err.contains("udp.source_byte_rate"), "{err}");
+        assert!(err.contains("udp.max_datagram_bytes"), "{err}");
+        s.udp.as_mut().expect("test setup: udp").source_byte_rate = 4_096;
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn the_udp_object_is_required_on_udp_and_refused_on_tcp() {
+        let mut udp = stream("s", "dns", StreamProtocol::Udp, 53);
+        let settings = udp.udp.take();
+        let err = udp
+            .validate()
+            .expect_err("a UDP stream without its settings");
+        assert!(err.contains("udp settings"), "{err}");
+        udp.fill_protocol_defaults();
+        assert_eq!(udp.udp, Some(UdpSettings::default()));
+
+        let mut tcp = stream("t", "smtp", StreamProtocol::Tcp, 25);
+        tcp.udp = settings;
+        let err = tcp.validate().expect_err("udp settings on a TCP stream");
+        assert!(err.contains("refused on a TCP stream"), "{err}");
+        tcp.udp = None;
+        tcp.fill_protocol_defaults();
+        assert_eq!(tcp.udp, None, "nothing to fill on TCP");
+    }
+
+    /// The listen-address rule of D-k over each kind of address, with the
+    /// per-source cap absent, at the maximum and one past, and with an
+    /// allowlist.
+    #[test]
+    fn an_exposed_udp_listen_address_needs_an_allowlist_or_a_low_explicit_cap() {
+        let unexposed = [
+            "127.0.0.1",
+            "127.255.0.9",
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.1.1",
+            "::1",
+            "fc00::1",
+            "fd12:3456::1",
+        ];
+        let exposed = [
+            "0.0.0.0",
+            "::",
+            "192.0.2.10",
+            "172.32.0.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "2001:db8::1",
+            "fe80::1",
+        ];
+        let with = |address: &str, cap: Option<u32>| {
+            let mut s = stream("s", "dns", StreamProtocol::Udp, 53);
+            s.listen_address = address.parse().expect("test setup: address");
+            s.udp.as_mut().expect("test setup: udp").source_session_cap = cap;
+            s
+        };
+        let max = UDP_EXPOSED_SOURCE_SESSION_CAP_MAX;
+        let check = |s: &Stream| udp_exposure_check(s, false);
+        for address in unexposed {
+            assert!(is_unexposed_udp_listen_address(
+                address.parse().expect("test setup: address")
+            ));
+            for cap in [None, Some(max), Some(max + 1)] {
+                let s = with(address, cap);
+                assert!(check(&s).is_ok(), "{address} {cap:?}: {:?}", check(&s));
+                assert!(s.validate().is_ok(), "{address} {cap:?}");
+            }
+        }
+        for address in exposed {
+            assert!(!is_unexposed_udp_listen_address(
+                address.parse().expect("test setup: address")
+            ));
+            let refused = with(address, None);
+            let err = check(&refused).expect_err(address);
+            assert!(err.contains(address), "{err}");
+            assert!(err.contains("source allowlist"), "{err}");
+            assert!(err.contains("udp.source_session_cap"), "{err}");
+            assert!(udp_exposure_check(&refused, true).is_ok(), "{address}");
+            assert!(check(&with(address, Some(max))).is_ok(), "{address}");
+            assert!(check(&with(address, Some(1))).is_ok(), "{address}");
+            assert!(
+                check(&with(address, Some(max + 1))).is_err(),
+                "{address} at {}",
+                max + 1
+            );
+        }
+        // A TCP stream is not concerned.
+        let tcp = stream("t", "smtp", StreamProtocol::Tcp, 25);
+        assert!(udp_exposure_check(&tcp, false).is_ok());
+    }
+
+    #[test]
+    fn udp_refuses_peak_ewma_and_proxy_protocol_v1() {
+        let mut s = stream("s", "dns", StreamProtocol::Udp, 53);
+        for algorithm in [
+            LoadBalancing::RoundRobin,
+            LoadBalancing::ConsistentHash,
+            LoadBalancing::Random,
+            LoadBalancing::LeastConn,
+        ] {
+            s.load_balancing = algorithm.clone();
+            assert!(s.validate().is_ok(), "{algorithm:?}: {:?}", s.validate());
+        }
+        s.load_balancing = LoadBalancing::PeakEwma;
+        let err = s.validate().expect_err("peak_ewma on UDP");
+        assert!(err.contains("peak_ewma"), "{err}");
+        let mut tcp = stream("t", "smtp", StreamProtocol::Tcp, 25);
+        tcp.load_balancing = LoadBalancing::PeakEwma;
+        assert!(tcp.validate().is_ok(), "peak_ewma stays a TCP choice");
+        s.load_balancing = LoadBalancing::RoundRobin;
+        for &mode in StreamProxyProtocol::VARIANTS {
+            s.proxy_protocol_send = mode;
+            let verdict = s.validate();
+            if mode == StreamProxyProtocol::V1 {
+                let err = verdict.expect_err("v1 on UDP");
+                assert!(err.contains("v1"), "{err}");
+            } else {
+                assert!(verdict.is_ok(), "{mode:?}: {verdict:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_refusal_and_drop_words_come_from_their_enums() {
+        for &refusal in StreamRefusal::VARIANTS {
+            let word: &'static str = refusal.into();
+            assert_eq!(serde_json::to_value(refusal).expect("serialize"), word);
+        }
+        let udp_refusals: Vec<&'static str> = [
+            StreamRefusal::SessionCap,
+            StreamRefusal::SourceSessionCap,
+            StreamRefusal::SessionTableFull,
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        assert_eq!(
+            udp_refusals,
+            ["session_cap", "source_session_cap", "session_table_full"]
+        );
+        for &reason in DatagramDropReason::VARIANTS {
+            assert_eq!(
+                serde_json::to_value(reason).expect("serialize"),
+                reason.as_str()
+            );
+            let back: DatagramDropReason =
+                serde_json::from_value(serde_json::json!(reason.as_str())).expect("deserialize");
+            assert_eq!(back, reason);
+        }
+        assert_eq!(
+            DatagramDropReason::RequestOversize.as_str(),
+            "request_oversize"
+        );
+        assert_eq!(DatagramDropReason::SendFailed.as_str(), "send_failed");
     }
 
     #[test]
@@ -2011,7 +2739,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_udp_stream_holds_every_engine_setting_at_its_default() {
+    fn a_udp_stream_keeps_the_settings_without_a_udp_meaning_at_their_default() {
         let tcp = every_engine_setting_off_default(stream("s", "edge", StreamProtocol::Tcp, 5000));
         assert!(tcp.validate().is_ok(), "{:?}", tcp.validate());
         // The fixture moves every entry of the table, so the loop below
@@ -2040,16 +2768,38 @@ pub(crate) mod tests {
                 .map(|f| f.name)
                 .collect();
             assert_eq!(moved, vec![field.name]);
-            let err = udp.validate().expect_err(field.name);
-            assert!(err.contains(field.name), "{err}");
             match field.on_udp {
-                OnUdp::UntilStory12_5 => assert!(err.contains("12.5"), "{err}"),
-                OnUdp::Refused(reason) => assert!(err.contains(reason), "{err}"),
+                OnUdp::KeepsDefault(reason) => {
+                    let err = udp.validate().expect_err(field.name);
+                    assert!(err.contains(field.name), "{err}");
+                    assert!(err.contains(reason), "{err}");
+                }
+                OnUdp::Applies => assert!(
+                    udp.validate().is_ok(),
+                    "{} has a UDP meaning: {:?}",
+                    field.name,
+                    udp.validate()
+                ),
             }
         }
-        assert!(TCP_ENGINE_FIELDS
+        let lifted: Vec<&str> = TCP_ENGINE_FIELDS
             .iter()
-            .any(|f| f.name == "proxy_protocol_accept" && matches!(f.on_udp, OnUdp::Refused(_))));
+            .filter(|f| f.on_udp == OnUdp::Applies)
+            .map(|f| f.name)
+            .collect();
+        // Story 12.5 D-l's list of what it gives a UDP meaning.
+        assert_eq!(
+            lifted,
+            [
+                "load_balancing",
+                "idle_timeout_s",
+                "total_timeout_s",
+                "close_on_backend_down",
+                "proxy_protocol_send",
+                "source_addresses",
+                "allow_local_backend",
+            ]
+        );
     }
 
     #[test]
@@ -2123,7 +2873,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn backups_need_a_primary_and_a_tcp_stream() {
+    fn backups_need_a_primary_on_either_protocol() {
         let tcp = stream("t", "pg", StreamProtocol::Tcp, 5432);
         let mut f = fixture(backend("b-1", "192.0.2.10:5432"), vec![tcp.clone()], &[]);
         f.stream_backends = vec![backup(&tcp.id, "b-1")];
@@ -2138,9 +2888,9 @@ pub(crate) mod tests {
         let mut f = fixture(backend("b-1", "192.0.2.10:53"), vec![udp.clone()], &[]);
         f.backends.push(backend("b-2", "192.0.2.20:53"));
         f.stream_backends.push(backup(&udp.id, "b-2"));
-        let conflict = refused(&f);
-        assert_eq!(conflict.rule, AttachmentRule::BackupOnUdpStream);
-        assert!(conflict.to_string().contains("12.5"), "{conflict}");
+        assert!(f.check().is_ok(), "a UDP stream takes backups (Story 12.5)");
+        f.stream_backends = vec![backup(&udp.id, "b-1"), backup(&udp.id, "b-2")];
+        assert_eq!(refused(&f).rule, AttachmentRule::NoPrimaryBackend);
     }
 
     #[test]

@@ -565,6 +565,9 @@ async fn the_view_publishes_every_model_field_but_the_withheld_ones() {
         .expect("an object")
         .keys()
         .filter(|k| !STREAM_WITHHELD_FIELDS.contains(&k.as_str()))
+        // Story 12.5 Lot G publishes `udp` field by field; until then
+        // the view leaves it out. Lot G drops this filter.
+        .filter(|k| k.as_str() != "udp")
         .cloned()
         .chain(LINK_FIELDS.iter().map(|k| k.to_string()))
         .collect();
@@ -1192,6 +1195,9 @@ fn udp_range(name: &str, first: u16, last: u16) -> lorica_config::models::Stream
     lorica_config::models::Stream {
         protocol: lorica_config::models::StreamProtocol::Udp,
         port_last: last,
+        udp: lorica_config::models::Stream::default_udp_settings(
+            lorica_config::models::StreamProtocol::Udp,
+        ),
         ..source_stream(name, first)
     }
 }

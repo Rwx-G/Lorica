@@ -55,17 +55,45 @@ pub struct ImportData {
 
 /// Parse a TOML string into import data.
 pub fn parse_toml(content: &str) -> Result<ImportData> {
-    let data: ImportData = toml::from_str(content)
-        .map_err(|e| ConfigError::Serialization(format!("TOML parse failed: {e}")))?;
+    let data = decode(content)?;
     validate(&data)?;
     Ok(data)
 }
 
 /// Parse TOML for preview/diff only - skips redaction validation.
 pub fn parse_toml_for_preview(content: &str) -> Result<ImportData> {
-    let data: ImportData = toml::from_str(content)
-        .map_err(|e| ConfigError::Serialization(format!("TOML parse failed: {e}")))?;
+    let data = decode(content)?;
     validate_structure(&data)?;
+    Ok(data)
+}
+
+/// Decode a TOML export, giving every UDP stream the protocol-dependent
+/// defaults a serde default cannot know (Story 12.5 Interface edit E1):
+/// the UDP `idle_timeout_s` when the key is absent, which only the
+/// document still shows, and the UDP settings when absent.
+fn decode(content: &str) -> Result<ImportData> {
+    let parse_failed =
+        |e: toml::de::Error| ConfigError::Serialization(format!("TOML parse failed: {e}"));
+    let mut document: toml::Value = toml::from_str(content).map_err(parse_failed)?;
+    let udp = StreamProtocol::Udp;
+    if let Some(streams) = document
+        .get_mut("streams")
+        .and_then(toml::Value::as_array_mut)
+    {
+        for stream in streams.iter_mut().filter_map(toml::Value::as_table_mut) {
+            let is_udp = stream.get("protocol").and_then(toml::Value::as_str) == Some(udp.as_str());
+            if is_udp && !stream.contains_key("idle_timeout_s") {
+                stream.insert(
+                    "idle_timeout_s".to_string(),
+                    toml::Value::Integer(i64::from(Stream::default_idle_timeout_s(udp))),
+                );
+            }
+        }
+    }
+    let mut data: ImportData = document.try_into().map_err(parse_failed)?;
+    for stream in &mut data.streams {
+        stream.fill_protocol_defaults();
+    }
     Ok(data)
 }
 
@@ -474,6 +502,59 @@ mod tests {
             target.list_stream_backends().expect("links"),
             source.list_stream_backends().expect("links")
         );
+    }
+
+    /// A UDP stream on a private address with its settings at their
+    /// defaults, exported, then stripped of `udp` and `idle_timeout_s`
+    /// as a file written before Story 12.5 would be: it imports with the
+    /// UDP defaults, the UDP idle timeout included.
+    #[test]
+    fn a_udp_stream_without_its_udp_keys_imports_with_the_udp_defaults() {
+        let source = ConfigStore::open_in_memory().expect("test setup: store");
+        let mut dns = sample_stream("s-dns", "dns", StreamProtocol::Udp, 53);
+        dns.listen_address = "10.0.0.53".parse().expect("test setup: address");
+        dns.udp = Stream::default_udp_settings(StreamProtocol::Udp);
+        source.create_stream(&dns).expect("test setup: stream");
+        let mut value = exported(&source);
+        let table = value
+            .get_mut("streams")
+            .and_then(toml::Value::as_array_mut)
+            .and_then(|streams| streams[0].as_table_mut())
+            .expect("test setup: the stream table");
+        assert!(table.remove("udp").is_some(), "udp in the export");
+        assert!(
+            table.remove("idle_timeout_s").is_some(),
+            "idle in the export"
+        );
+        let older = toml::to_string(&value).expect("re-encode");
+
+        let data = parse_toml(&older).expect("parses");
+        assert_eq!(data.streams, vec![dns.clone()]);
+        assert_eq!(data.streams[0].idle_timeout_s, 10);
+        let target = ConfigStore::open_in_memory().expect("target");
+        import_to_store(&target, &data).expect("imports");
+        assert_eq!(target.list_streams().expect("streams"), vec![dns]);
+    }
+
+    #[test]
+    fn udp_settings_round_trip_through_export_and_import() {
+        let source = store_with_streams();
+        let mut game = source
+            .get_stream(&sid("s-game"))
+            .expect("test setup: read")
+            .expect("test setup: stream");
+        let udp = game.udp.as_mut().expect("test setup: udp");
+        udp.max_sessions = 100;
+        udp.source_session_cap = Some(8);
+        udp.requests_per_session = None;
+        udp.responses_per_request = 0;
+        udp.unbounded_responses = true;
+        game.idle_timeout_s = 120;
+        source.update_stream(&game).expect("test setup: settings");
+        let target = ConfigStore::open_in_memory().expect("target");
+        let data = parse_toml(&export_to_toml(&source).expect("export")).expect("parses");
+        import_to_store(&target, &data).expect("imports");
+        assert_eq!(target.get_stream(&sid("s-game")).expect("read"), Some(game));
     }
 
     #[test]

@@ -435,6 +435,31 @@ mod tests {
     use crate::models::{sample_stream, sample_stream_backend, sample_stream_id as sid};
 
     #[test]
+    fn compute_diff_reports_a_changed_udp_setting() {
+        let store = ConfigStore::open_in_memory().expect("test setup: store");
+        store
+            .create_stream(&sample_stream("s-dns", "dns", StreamProtocol::Udp, 53))
+            .expect("test setup: stream");
+        let toml_text = export_to_toml(&store).expect("export");
+        let unchanged = parse_toml_for_preview(&toml_text).expect("preview");
+        assert!(compute_diff(&store, &unchanged)
+            .expect("diff")
+            .streams
+            .is_empty());
+        let mut incoming = parse_toml_for_preview(&toml_text).expect("preview");
+        incoming.streams[0]
+            .udp
+            .as_mut()
+            .expect("test setup: udp")
+            .response_bytes_ratio = 4;
+        let diff = compute_diff(&store, &incoming).expect("diff");
+        assert_eq!(
+            diff.streams.modified,
+            vec![format!("dns ({})", sid("s-dns"))]
+        );
+    }
+
+    #[test]
     fn compute_diff_reports_an_added_a_changed_and_a_removed_stream() {
         let store = ConfigStore::open_in_memory().expect("test setup: store");
         store

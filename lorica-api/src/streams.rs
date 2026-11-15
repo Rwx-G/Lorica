@@ -1094,6 +1094,11 @@ pub(crate) async fn update_stream_as(
             stream.group_name = group_name;
         }
         if let Some(protocol) = protocol {
+            if protocol != stream.protocol {
+                // The UDP settings exist on a UDP stream only: a switch
+                // takes the new protocol's (Story 12.5 D-l).
+                stream.udp = Stream::default_udp_settings(protocol);
+            }
             stream.protocol = protocol;
         }
         if let Some(enabled) = enabled {

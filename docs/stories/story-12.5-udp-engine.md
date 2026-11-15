@@ -898,27 +898,30 @@ Allowlist: `lorica-config/src/models/stream.rs`, `lorica-config/src/models/mod.r
 `lorica-config/src/import.rs`.
 Depends on: 12.3 Lot B (same files; the fields of 12.3 D-q must exist).
 
-- [ ] `UdpSettings` with the fields, defaults and ranges of D-l as
+- [x] `UdpSettings` with the fields, defaults and ranges of D-l as
       associated constants; `Stream.udp`; validation: required for UDP
       (defaults filled by the create path), refused for TCP, ranges.
-- [ ] 12.3's fields on UDP (D-l): lift the "must hold its default" rule
+- [x] 12.3's fields on UDP (D-l): lift the "must hold its default" rule
       for the fields this story gives a UDP meaning and for backup links;
       `peak_ewma` and `proxy_protocol_send = v1` refused on UDP;
       `idle_timeout_s` with its protocol default (10 UDP, 600 TCP) through
       one `Stream::default_idle_timeout_s(protocol)` the create path, the
       import and the migration use, and its UDP range (Interface edit E1).
-- [ ] `udp_exposure_check` (D-k) with
-      `UDP_EXPOSED_SOURCE_SESSION_CAP_MAX = 64`, called from
-      `Stream::validate` with `has_source_allowlist = false`.
-- [ ] `StreamRefusal::{SessionCap, SourceSessionCap, SessionTableFull}`;
+- [x] `udp_exposure_check` (D-k) with
+      `UDP_EXPOSED_SOURCE_SESSION_CAP_MAX = 64`, defined and tested here.
+      *Amended:* the call from `Stream::validate` moves to Lot G (see its
+      first task): until the API body carries `udp`, no API-created UDP
+      stream on an exposed address could satisfy the rule, and every API
+      test binding UDP on `0.0.0.0` or `[::]` would fail.
+- [x] `StreamRefusal::{SessionCap, SourceSessionCap, SessionTableFull}`;
       `DatagramDropReason` with `VariantArray`; the two end-reason doc
       comments reworded (D-b).
-- [ ] Migration at the next free number: the UDP columns on `streams`,
+- [x] Migration at the next free number: the UDP columns on `streams`,
       NULL for TCP rows, idempotent; existing UDP rows get the defaults,
       including `idle_timeout_s = 10` where it still holds 12.3's 600.
-- [ ] Canonical (`#[serde(default)]`, shape digest moved on purpose, a
+- [x] Canonical (`#[serde(default)]`, shape digest moved on purpose, a
       blob without `udp` decodes), diff, export and import.
-- [ ] Tests: every bound at both ends and one past; exposure rule over
+- [x] Tests: every bound at both ends and one past; exposure rule over
       each private range, loopback, ULA, `0.0.0.0`, `[::]`, a public v4
       and v6, with the cap absent, at 64 and at 65; refusal words derived
       from the enums.
@@ -1044,12 +1047,22 @@ Depends on: E; 12.3 Lot D2 (same files).
 Allowlist: `lorica-api/src/streams.rs`, `lorica-api/src/streams/tests.rs`,
 `lorica-api/src/stream_budget.rs`, `lorica-api/openapi.yaml`,
 `lorica-cluster/src/messages.rs`, `lorica-cluster/proto/cluster.proto`,
-`lorica/src/startup/cluster_follower.rs`.
+`lorica/src/startup/cluster_follower.rs`, `lorica-config/src/models/stream.rs`
+(the `udp_exposure_check` call only), and the UDP test fixtures that
+bind an exposed address (an explicit `source_session_cap` of 64).
 Depends on: C; 12.2 Lots E2 and E3 and 12.3 Lot E (same files).
 
 - [ ] `StreamResponse.udp` field by field (the key-set test of 12.1 D-10
-      moves with it); create fills the defaults; refusals as `400` with
-      the rule's text.
+      moves with it: drop the `udp` filter Lot C left in
+      `the_view_publishes_every_model_field_but_the_withheld_ones`);
+      create fills the defaults; the update takes a `udp` object, and a
+      protocol switch takes the new protocol's settings (Lot C already
+      resets `udp` to `Stream::default_udp_settings` on a switch);
+      refusals with the rule's text.
+- [ ] Call `udp_exposure_check(self, false)` at the end of
+      `Stream::validate` (deferred from Lot C), in the commit that lets
+      the bodies carry `udp.source_session_cap`, with the fixtures it
+      needs.
 - [ ] Budget check on create and update with the D-e constraints, per
       reporting targeted node; `usable_source_ports` on
       `StreamPlaneReport` at its next free tag, decode test without it.
@@ -1200,6 +1213,23 @@ every mismatch as a concrete edit, naming the story that makes it.
   Resolved 1). `admit_session` and its owned permit are protocol-neutral
   for that reason; 12.6 may bump `STREAM_CAPS_LAYOUT_VERSION` to add TCP
   and per-backend counters, with no upgrade consequence (D-d).
+
+### Status after Story 12.3 landed (read at `770b66d0`)
+
+- Done by 12.3: E2 and E3 (the seams, the local check, the resolver
+  cache and the counters are crate-root modules, `lorica_stream::{seams,
+  local, resolver, counters}`, and one `ResolverCache` and one selector
+  per process are handed to the engines), E4 (`encode_v2_dgram` exists
+  beside `encode_v2` with its round trip and fuzz arm: Lot E's encoder
+  task and its move are moot), E1's shape (`Stream::default_idle_timeout_s`
+  and `Stream::idle_timeout_s_range` were functions of the protocol
+  returning the TCP values; Lot C changed their UDP arm), and E8's shape
+  (`TCP_ENGINE_FIELDS` with an `OnUdp` per field; Lot C replaced the
+  variants).
+- Shaped differently: E5. `StreamDemand::of` itself declares
+  `tcp::held_fds` and is the one demand function the API and the driver
+  call; Lot D adds the UDP arm there (or the dispatching `held_fds` it
+  calls) rather than switching two call sites.
 
 ### Edits, and who makes them
 
@@ -1452,6 +1482,84 @@ decision.
   Lot D maps regions, a `caps` is answered `nack adopt_failed` and its fd
   closes with the message; no supervisor sends one before Lot F.
 
+**Lot C (`lorica-config`).**
+
+- Model. `Stream.udp: Option<UdpSettings>` (`#[serde(default)]`):
+  `Some` on every UDP stream, `None` on every TCP one, both enforced by
+  `Stream::validate` ("a UDP stream carries its udp settings", "udp
+  settings are refused on a TCP stream"). `UdpSettings { max_sessions,
+  source_session_cap: Option, requests_per_session: Option,
+  responses_per_request, response_bytes_ratio, unbounded_responses,
+  source_datagram_rate, source_byte_rate, max_datagram_bytes }`, every
+  field `u32` (or `bool`), `deny_unknown_fields`; defaults and ranges as
+  associated constants (`UdpSettings::DEFAULT_*`, `*_RANGE`) with the
+  survey values in the doc comments; `effective_source_session_cap()`
+  and `reflection_bound()` (8,192,000 at the defaults, pinned).
+  `Stream::new` fills `Stream::default_udp_settings(protocol)`;
+  `Stream::fill_protocol_defaults()` gives a decoded UDP stream without
+  `udp` the defaults.
+- `requests_per_session` reads an absent key as no bound (serde default
+  `None`), unlike every other field: TOML has no null, so an exported
+  `None` is an absent key, and a default of 64 would bound an unbounded
+  stream on re-import (the round-trip test caught it). A document
+  without the whole `udp` object still gets 64 through
+  `fill_protocol_defaults`.
+- One more rule beyond D-l's ranges: `udp.source_byte_rate` at least
+  `udp.max_datagram_bytes`, since the rate cells' burst is one second
+  (Lot B) and a larger datagram could never pass.
+- `idle_timeout_s`: UDP default 10 and range 1 to 3,600 through the two
+  protocol functions 12.3 left (`DEFAULT_UDP_IDLE_TIMEOUT_S`,
+  `UDP_IDLE_TIMEOUT_S_RANGE`). The import fills 10 for a UDP stream whose
+  document lacks the key (it inspects the TOML before decoding, where the
+  absence is still visible); the migration fills it on UDP rows that
+  still hold 12.3's 600.
+- `TCP_ENGINE_FIELDS`: `OnUdp` is now `Applies` or `KeepsDefault(reason)`
+  (12.3's `UntilStory12_5` and `Refused` are gone; `proxy_protocol_accept`
+  keeps its reason). `Applies`: `load_balancing`, `idle_timeout_s`,
+  `total_timeout_s`, `close_on_backend_down`, `proxy_protocol_send`,
+  `source_addresses`, `allow_local_backend`, as D-l lists them (a test
+  pins the list). The others carry a per-field reason in the refusal.
+  UDP refuses `peak_ewma` and `proxy_protocol_send = v1`. Backup links
+  are allowed on UDP: `AttachmentRule::BackupOnUdpStream` is removed.
+- `udp_exposure_check(stream, has_source_allowlist)` and
+  `is_unexposed_udp_listen_address` with
+  `UDP_EXPOSED_SOURCE_SESSION_CAP_MAX = 64`, tested over every private
+  range, loopback, ULA, `0.0.0.0`, `[::]`, link-local, shared space, a
+  public v4 and v6, with the cap absent, at 1, 64 and 65 and with an
+  allowlist. **Not yet called by `Stream::validate`** (deviation, story
+  amended): the management API cannot carry `udp` before Lot G, so the
+  rule would refuse every API-created UDP stream on an exposed address
+  and break the API tests binding UDP on `0.0.0.0` or `[::]`, with no
+  way to satisfy it. Lot G wires it with the field. No release carries
+  the interim.
+- `StreamRefusal::{SessionCap, SourceSessionCap, SessionTableFull}`
+  (`session_cap`, `source_session_cap`, `session_table_full`);
+  `DatagramDropReason` (`VariantArray`, `as_str`); the two
+  end-reason doc comments reworded to D-b's meaning.
+- Migration **76** (`migrate_stream_udp_settings`, after 12.3's 75):
+  nine nullable `INTEGER` columns `udp_*` (`STREAM_UDP_COLUMNS`), NULL on
+  TCP rows; UDP rows not yet filled get the frozen defaults and
+  `idle_timeout_s = 10` where it is 600. Idempotent (columns through
+  `add_column_if_absent`, the fill guarded by `udp_max_sessions IS
+  NULL`). The store reads them through `STREAM_COLUMNS`; a UDP row
+  missing a required one, or a TCP row carrying any, is `Corrupt`.
+- Canonical: format stays 3 and `CANONICAL_SHAPE_DIGEST` moves, the
+  reason written beside it: no released blob is stamped 3, a 1.10.x peer
+  is refused by version and schema first, and a 1.11.0 build from before
+  this is refused by schema (migration 76) at the handshake.
+  `UdpSettings` joins the shape inventory. `decode_canonical` fills a
+  UDP stream without `udp` with the defaults, as the import does.
+  `compute_diff` compares streams whole, so a `udp` change reads as
+  modified (tested); the TOML export carries `[streams.udp]`.
+- Outside the allowlist, needed for the gates: the API update resets
+  `udp` to the new protocol's settings on a protocol switch (otherwise
+  every TCP-to-UDP switch is refused for want of `udp`), and the view
+  key-set test filters `udp` until Lot G publishes it, as 12.3 Lot B did
+  for its fields.
+- The model test fixture `stream()` gives a UDP stream an explicit
+  `source_session_cap` of 64, so it satisfies the listen-address rule on
+  `0.0.0.0` once Lot G wires it.
+
 **Lot B (`lorica-shmem`).**
 
 - Probe factored. `table.rs` holds the window and the WAF slot
@@ -1510,6 +1618,18 @@ decision.
 
 ## File List
 
+Lot C:
+
+- `lorica-config/src/models/stream.rs`, `lorica-config/src/models/mod.rs`
+- `lorica-config/src/store/streams.rs`, `lorica-config/src/store/mod.rs`
+  (migration 76)
+- `lorica-config/src/canonical.rs`, `lorica-config/src/diff.rs` (a
+  test), `lorica-config/src/import.rs`
+- `lorica-api/src/streams.rs` (a protocol switch resets `udp`) and
+  `lorica-api/src/streams/tests.rs` (the view key-set filter), outside
+  the allowlist
+- `docs/stories/story-12.5-udp-engine.md`
+
 Lot B:
 
 - `lorica-shmem/src/stream_caps.rs` (new), `lorica-shmem/src/table.rs`,
@@ -1534,3 +1654,4 @@ Lot A:
 | 2026-11-14 | 0.2 | Maintainer answers folded in (Resolved 1 to 8: ratio 32 and the reflection bound recomputed, `source_addresses`); aligned with the Story 12.3 draft (seams, breaker key, fields, counters, record) with the remaining mismatches listed as edits E1 to E9. Status Draft. | Romain G. |
 | 2026-11-15 | 0.3 | Lot A landed: the `caps` message and its `stream-caps` fd tag, `IP_PKTINFO` / `IPV6_RECVPKTINFO` on wildcard UDP groups (the dual-stack assumption of D-g pinned), `usable_udp_source_ports`, `BindFailureKind::SourcePorts`. Status InProgress. | Romain G. |
 | 2026-11-15 | 0.4 | Lot B landed: the stream-caps region (`StreamCapsRegion`, its own layout version, per-stream sizing, exact totals, per-worker session shards never evicted, shared GCRA rate cells), the probe factored out of `AtomicHashTable`, multi-process tests. | Romain G. |
+| 2026-11-15 | 0.5 | Lot C landed: `UdpSettings` on `Stream`, the UDP idle default and range, 12.3's settings lifted on UDP, backups on UDP, the refusal and drop vocabularies, migration 76, canonical digest, import and diff. The listen-address rule's call from `Stream::validate` moves to Lot G; status of the Interface edits after 12.3 recorded. | Romain G. |

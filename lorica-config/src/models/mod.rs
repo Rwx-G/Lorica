@@ -106,7 +106,9 @@ pub(crate) use stream::tests::{
 };
 pub use stream::{
     binds_here, binds_here_when_enabled, check_backend_attachments, is_canonical_stream_id,
-    AttachmentConflict, AttachmentRule, AttachmentSnapshot, NodeRole, OnUdp, Stream, StreamBackend,
-    StreamEndKind, StreamEndReason, StreamProtocol, StreamProxyProtocol, StreamRefusal,
-    TcpEngineField, STREAM_ID_LEN, STREAM_NAME_MAX_LEN, STREAM_PORT_RANGE_MAX, TCP_ENGINE_FIELDS,
+    is_unexposed_udp_listen_address, udp_exposure_check, AttachmentConflict, AttachmentRule,
+    AttachmentSnapshot, DatagramDropReason, NodeRole, OnUdp, Stream, StreamBackend, StreamEndKind,
+    StreamEndReason, StreamProtocol, StreamProxyProtocol, StreamRefusal, TcpEngineField,
+    UdpSettings, STREAM_ID_LEN, STREAM_NAME_MAX_LEN, STREAM_PORT_RANGE_MAX, TCP_ENGINE_FIELDS,
+    UDP_EXPOSED_SOURCE_SESSION_CAP_MAX,
 };

@@ -203,6 +203,7 @@ const MIGRATIONS: &[Migration] = &[
     (73, migrate_cluster_node_reserved_ports),
     (74, migrate_subscribe_stream_alerts),
     (75, migrate_stream_engine_settings),
+    (76, migrate_stream_udp_settings),
 ];
 
 /// The newest schema version, the last entry of [`MIGRATIONS`].
@@ -1735,6 +1736,52 @@ fn migrate_stream_engine_settings(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// The `streams` columns migration 76 adds: the UDP settings (Story
+/// 12.5 D-l), one column each, all nullable. NULL on every TCP row; on a
+/// UDP row only `udp_source_session_cap` and `udp_requests_per_session`
+/// may be NULL, meaning the default cap and no request bound.
+const STREAM_UDP_COLUMNS: [&str; 9] = [
+    "udp_max_sessions",
+    "udp_source_session_cap",
+    "udp_requests_per_session",
+    "udp_responses_per_request",
+    "udp_response_bytes_ratio",
+    "udp_unbounded_responses",
+    "udp_source_datagram_rate",
+    "udp_source_byte_rate",
+    "udp_max_datagram_bytes",
+];
+
+/// The UDP settings of a stream (Story 12.5 D-l) as columns of
+/// `streams`, and the defaults on the UDP rows that exist when it runs.
+///
+/// A UDP row written before it held every Story 12.3 default, the TCP
+/// idle timeout included (12.3's UDP rule required it), so such a row
+/// gets the UDP settings' defaults and the UDP idle timeout where it
+/// still holds the TCP one. The defaults are frozen here on purpose, as
+/// migration 75's are: the migration records what this release shipped,
+/// and `a_udp_stream_stored_before_migration_76_reads_with_the_udp_defaults`
+/// holds them equal to `Stream::new`. Idempotent: the columns through
+/// `add_column_if_absent`, the fill only on UDP rows it has not filled.
+///
+/// 1.10.6 opening this database after a rollback never names `streams`
+/// (12.1 D-2), so the new columns are invisible to it.
+fn migrate_stream_udp_settings(conn: &Connection) -> rusqlite::Result<()> {
+    for column in STREAM_UDP_COLUMNS {
+        add_column_if_absent(conn, "streams", column, "INTEGER")?;
+    }
+    conn.execute(
+        "UPDATE streams SET udp_max_sessions = 4096, udp_requests_per_session = 64, \
+         udp_responses_per_request = 1, udp_response_bytes_ratio = 32, \
+         udp_unbounded_responses = 0, udp_source_datagram_rate = 1000, \
+         udp_source_byte_rate = 524288, udp_max_datagram_bytes = 8192, \
+         idle_timeout_s = CASE WHEN idle_timeout_s = 600 THEN 10 ELSE idle_timeout_s END \
+         WHERE protocol = 'udp' AND udp_max_sessions IS NULL",
+        [],
+    )?;
+    Ok(())
+}
+
 /// A stored wildcard pattern whose body names an address (`*.0.2.10`),
 /// which the matchers no longer let cover one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2904,6 +2951,69 @@ mod migration_tests {
         let links = store.list_stream_backends().expect("links read");
         assert_eq!(links.len(), 1);
         assert!(!links[0].backup);
+    }
+
+    /// A UDP stream written before migration 76, with every Story 12.3
+    /// default (the TCP idle timeout included, which 12.3 required of a
+    /// UDP stream), reads back once 76 has run (twice) as `Stream::new`
+    /// builds a UDP stream; a TCP row keeps no UDP setting.
+    #[test]
+    fn a_udp_stream_stored_before_migration_76_reads_with_the_udp_defaults() {
+        let store = ConfigStore::open_in_memory().expect("fresh store at head");
+        for column in STREAM_UDP_COLUMNS {
+            store
+                .conn
+                .execute(&format!("ALTER TABLE streams DROP COLUMN {column}"), [])
+                .expect("test setup: back to the 12.3 shape");
+        }
+        let udp_id = crate::models::sample_stream_id("s-1");
+        let tcp_id = crate::models::sample_stream_id("s-2");
+        store
+            .conn
+            .execute_batch(&format!(
+                "INSERT INTO streams (id, name, group_name, protocol, enabled, listen_address,
+                     port_first, port_last, node_selector, created_at, updated_at)
+                 VALUES ('{udp_id}', 'dns', '', 'udp', 1, '10.0.0.53', 53, 53, '[]',
+                     '2026-11-14T00:00:00+00:00', '2026-11-14T00:00:00+00:00');
+                 INSERT INTO streams (id, name, group_name, protocol, enabled, listen_address,
+                     port_first, port_last, node_selector, created_at, updated_at)
+                 VALUES ('{tcp_id}', 'smtp', '', 'tcp', 1, '0.0.0.0', 25, 25, '[]',
+                     '2026-11-14T00:00:00+00:00', '2026-11-14T00:00:00+00:00');"
+            ))
+            .expect("test setup: 12.3 rows");
+        for _ in 0..2 {
+            migrate_stream_udp_settings(&store.conn).expect("migration 76 runs");
+        }
+        let mut expected =
+            crate::models::sample_stream("s-1", "dns", crate::models::StreamProtocol::Udp, 53);
+        expected.listen_address = "10.0.0.53".parse().expect("test setup: address");
+        expected.udp = crate::models::Stream::default_udp_settings(expected.protocol);
+        let read = store.get_stream(&udp_id).expect("reads").expect("kept");
+        assert_eq!(read, expected);
+        assert_eq!(read.idle_timeout_s, 10);
+        assert_eq!(
+            store.get_stream(&tcp_id).expect("reads").expect("kept"),
+            crate::models::sample_stream("s-2", "smtp", crate::models::StreamProtocol::Tcp, 25)
+        );
+
+        // A UDP row whose idle timeout an operator moved off the TCP
+        // default keeps it.
+        store
+            .conn
+            .execute(
+                "UPDATE streams SET udp_max_sessions = NULL, idle_timeout_s = 45 WHERE id = ?1",
+                params![udp_id],
+            )
+            .expect("test setup: unfilled again");
+        migrate_stream_udp_settings(&store.conn).expect("migration 76 runs");
+        assert_eq!(
+            store
+                .get_stream(&udp_id)
+                .expect("reads")
+                .expect("kept")
+                .idle_timeout_s,
+            45
+        );
     }
 
     /// One column as `pragma_table_info` reports it: (type, notnull,

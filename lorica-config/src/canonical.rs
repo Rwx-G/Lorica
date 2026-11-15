@@ -1040,13 +1040,19 @@ pub fn decode_canonical(bytes: &[u8]) -> Result<CanonicalConfig> {
             peek.version, CANONICAL_FORMAT_VERSION
         )));
     }
-    serde_json::from_slice(bytes).map_err(|e| {
+    let mut config: CanonicalConfig = serde_json::from_slice(bytes).map_err(|e| {
         ConfigError::Validation(format!(
             "canonical decode failed at line {} column {}",
             e.line(),
             e.column()
         ))
-    })
+    })?;
+    // A blob without `udp` on a UDP stream reads the UDP defaults, as an
+    // import does; one carrying them is untouched.
+    for stream in &mut config.streams {
+        stream.fill_protocol_defaults();
+    }
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -1637,6 +1643,33 @@ mod tests {
         assert_eq!(decoded.stream_backends, cfg.stream_backends);
     }
 
+    /// A version-3 blob written before Story 12.5 carries no `udp`
+    /// object: a TCP stream decodes as it was, a UDP one with the UDP
+    /// defaults, and a blob carrying them decodes them unchanged.
+    #[test]
+    fn a_blob_without_the_udp_settings_decodes_to_their_defaults() {
+        let mut cfg = fleet_config();
+        let mut dns =
+            crate::models::sample_stream("s-dns", "dns", crate::models::StreamProtocol::Udp, 53);
+        dns.listen_address = "10.0.0.53".parse().expect("test setup: address");
+        dns.udp = crate::models::Stream::default_udp_settings(dns.protocol);
+        cfg.streams.push(dns);
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        assert_eq!(
+            decode_canonical(&bytes).expect("decodes").streams,
+            cfg.streams
+        );
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
+        for stream in root["streams"].as_array_mut().expect("test setup: streams") {
+            let object = stream.as_object_mut().expect("test setup: an object");
+            assert!(object.remove("udp").is_some(), "udp on the wire");
+        }
+        let older = serde_json::to_vec(&root).expect("test setup: re-encode");
+        let decoded = decode_canonical(&older).expect("a 12.3-shaped blob still decodes");
+        assert_eq!(decoded.streams, cfg.streams);
+    }
+
     #[test]
     fn the_stream_plane_settings_replicate_through_apply_to() {
         let source = GlobalSettings {
@@ -1742,8 +1775,20 @@ mod tests {
     /// schema before it meets them, and a 1.11.0 build from before them
     /// is refused by schema (migration 75) at the handshake. Pinned by
     /// `a_blob_without_the_stream_engine_settings_decodes_to_their_defaults`.
+    ///
+    /// Story 12.5 (1.11.0) moved it again inside the same cycle: `Stream`
+    /// gained `udp`, an `Option<UdpSettings>` with a serde default, and
+    /// `UdpSettings` joined the inventory, each of its fields with a serde
+    /// default (`requests_per_session` reads an absent key as no bound,
+    /// as TOML forces). No version step, for Story 12.3's
+    /// reasons: no released blob is stamped 3, a 1.10.x peer is refused by
+    /// version and by schema before it meets the field, and a 1.11.0 build
+    /// from before it is refused by schema (migration 76) at the
+    /// handshake. A blob without `udp` still decodes, a UDP stream in it
+    /// with the UDP defaults. Pinned by
+    /// `a_blob_without_the_udp_settings_decodes_to_their_defaults`.
     const CANONICAL_SHAPE_DIGEST: &str =
-        "597ffb9a3be69a1cb8902c34fcaac3a670e01e76a6dbc3f431c1b92373e75816";
+        "370ef7621ee7210ab94caea9b8217c9e7321e63b3f9b859ceed4f2c08202d95e";
 
     /// Every field name `T` accepts, read from the type itself rather
     /// than from the JSON of some fixture.
@@ -1832,6 +1877,7 @@ mod tests {
             crate::models::CaptureRedaction,
             crate::models::Stream,
             crate::models::StreamBackend,
+            crate::models::UdpSettings,
         ]
     }
 
