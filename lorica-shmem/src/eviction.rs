@@ -19,9 +19,10 @@
 //! `last_update_ns` is older than 5 minutes; eviction CAS's the `key`
 //! from `h` to `0` to release the slot. `value` and `last_update_ns`
 //! are *not* reset at eviction time: the next `increment` that claims
-//! the slot subtracts the value it found there and stamps
-//! `last_update_ns`, which is safe because the claim CAS serialises
-//! reuse (§ 5.3).
+//! the slot holds it as `CLAIMING` while it sets the count and stamps
+//! `last_update_ns`, so no other writer touches it in between. A slot
+//! left `CLAIMING` by a claimer that died is evicted like any other once
+//! its stamp, written before the claim, is stale.
 //!
 //! A writer that raced with eviction (read `cur_key == h`, then
 //! eviction CAS'd to 0, then a new key claimed the slot) may pollute
@@ -101,10 +102,8 @@ fn evict_table<const N: usize>(
             .is_ok()
         {
             evicted += 1;
-            // Intentionally do not reset `value` or `last_update_ns`.
-            // The next increment() that claims this slot via CAS from
-            // 0 to a new tagged hash starts the counter at `by` and
-            // stamps last_update_ns. See design § 5.3.
+            // Intentionally do not reset `value` or `last_update_ns`:
+            // the next increment() that claims this slot sets both.
         }
     });
     (scanned, evicted)
@@ -266,6 +265,29 @@ mod tests {
         assert_eq!(table.read(idle), None);
         assert_eq!(table.read(active), Some(5));
         assert_eq!(table.increment(active, 1, NOW), 6);
+    }
+
+    #[test]
+    fn a_claim_its_claimer_never_published_is_skipped_then_evicted() {
+        // A claimer that died between its claim and its publish left the
+        // slot CLAIMING, stamped long ago. A writer waits for it a bounded
+        // while, then counts in the next slot; the eviction pass then
+        // frees the stuck slot.
+        const NOW: u64 = 1_000_000_000_000;
+        const STALE_AFTER: u64 = 5_000_000_000;
+        let table: Box<AtomicHashTable<1024>> = AtomicHashTable::new_zeroed();
+        let h = crate::table::tagged_hash(0x0000_0000_0000_0401);
+        let stuck = &table.slots[(h as usize) & 1023];
+        stuck
+            .last_update_ns
+            .store(NOW - 100 * STALE_AFTER, Ordering::Release);
+        stuck.key.store(crate::table::CLAIMING, Ordering::Release);
+
+        assert_eq!(table.increment(h, 1, NOW), 1);
+        assert_eq!(table.read(h), Some(1));
+        assert_eq!(evict_table(&*table, NOW, STALE_AFTER).1, 1);
+        assert_eq!(stuck.key.load(Ordering::Acquire), 0);
+        assert_eq!(table.increment(h, 1, NOW), 2);
     }
 
     #[test]

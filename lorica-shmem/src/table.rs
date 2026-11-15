@@ -34,6 +34,16 @@
 //! window before it claims. A claim racing a release can still give a
 //! key a second slot; the sum keeps its count whole, and the slot no
 //! longer written to ages out through eviction like any idle one.
+//!
+//! A claim holds the slot exclusively while it sets the count: it moves
+//! the key from `0` to `CLAIMING`, stores the count, then publishes the
+//! key. Since 1.10.3 a claim had instead subtracted the count it read
+//! before taking the slot, which went wrong whenever another key claimed
+//! and released the slot in between (an ABA on the free `0`): the new
+//! key started off by the difference, wrapping to near `u64::MAX` when
+//! the difference was negative. A claimer that dies mid-claim leaves the
+//! slot `CLAIMING` with its stale stamp until eviction releases it;
+//! writers waiting on it give up after a bounded spin.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -70,9 +80,10 @@ pub const SATURATED: u64 = u64::MAX;
 /// shared memory. Do not reorder or resize the fields.
 #[repr(C, align(64))]
 pub struct Slot {
-    /// Occupied key. `0` means empty; any non-zero value is a tagged
-    /// hash of the key (LSB set to 1 by [`tagged_hash`]). CAS from `0`
-    /// to `h` claims the slot; CAS from `h` to `0` releases it.
+    /// Occupied key. `0` means empty; an odd value is a tagged hash of
+    /// the key (LSB set to 1 by [`tagged_hash`]); the even `CLAIMING`
+    /// marks a claim in flight. A claim CASes `0` to `CLAIMING`, sets
+    /// the count, then CASes to `h`; a release CASes `h` back to `0`.
     pub key: AtomicU64,
     /// Counter value. Under concurrent writers, updated via
     /// `fetch_add`; each read is a single `AtomicU64::load`.
@@ -153,9 +164,23 @@ pub(crate) fn holding<C: Keyed>(cells: &[C], tagged_hash: u64) -> impl Iterator<
     window(cells, tagged_hash).filter(move |c| c.key().load(Ordering::Acquire) == tagged_hash)
 }
 
+/// Key word of a slot being claimed. Even, so no tagged hash equals it:
+/// readers, writers of any key and `reset` all see a key that is not
+/// theirs, and only the claimer touches the slot until it publishes.
+pub(crate) const CLAIMING: u64 = 2;
+
+/// How long a writer waits, in spins, for a claim in flight on a slot it
+/// wants to weigh. A claim is three stores, so the wait only runs long
+/// when the claimer was descheduled; past the bound the writer probes on,
+/// which can give its key a second slot, summed like any other.
+const CLAIM_SPINS: u32 = 4_096;
+
 /// [`AtomicHashTable::increment`] over a slice of slots.
 pub(crate) fn increment(slots: &[Slot], tagged_hash: u64, by: u64, now_ns: u64) -> u64 {
-    debug_assert!(tagged_hash != 0, "tagged_hash must be non-zero");
+    debug_assert!(
+        tagged_hash != 0 && tagged_hash != CLAIMING,
+        "tagged_hash must be a tagged hash"
+    );
     // The whole window is searched before anything is claimed. A
     // release frees a slot in the middle of the window, so the first
     // free slot is no sign that the key lies nowhere beyond it, and
@@ -166,45 +191,51 @@ pub(crate) fn increment(slots: &[Slot], tagged_hash: u64, by: u64, now_ns: u64) 
         return add(s, by, now_ns);
     }
     for s in window(slots, tagged_hash) {
-        let mut cur = s.key.load(Ordering::Acquire);
-        if cur == 0 {
-            // A released slot keeps the value it had (eviction and
-            // `reset` only clear the key), so the claim must start
-            // the counter from `by`. It cannot store `by`: other
-            // writers see the key as soon as the CAS lands and add
-            // to `value` at once, and a store would erase their
-            // adds. It subtracts what the slot held instead, read
-            // before the CAS while no writer of this key exists.
-            //
-            // The timestamp is written before the CAS, not after:
-            // the slot still carries its previous occupant's stamp
-            // (0 if never used), and an eviction pass that saw the
-            // new key beside that stale stamp would release the
-            // claim at once. The evictor reads the key with Acquire,
-            // so seeing this CAS means seeing this stamp. A CAS lost
-            // to another key leaves it a fresher stamp, which at
-            // worst delays that slot's eviction by one pass.
-            s.last_update_ns.store(now_ns, Ordering::Release);
-            let left_over = s.value.load(Ordering::Acquire);
-            match s
-                .key
-                .compare_exchange(0, tagged_hash, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => {
-                    let delta = by.wrapping_sub(left_over);
-                    return s
-                        .value
-                        .fetch_add(delta, Ordering::AcqRel)
-                        .wrapping_add(delta);
+        loop {
+            match s.key.load(Ordering::Acquire) {
+                0 => {
+                    // Stamped before the claim: the slot still carries
+                    // its previous occupant's stamp (0 if never used),
+                    // and an eviction pass that saw the claim beside that
+                    // stale stamp would release it at once. A claim lost
+                    // to another key leaves it a fresher stamp, which at
+                    // worst delays that slot's eviction by one pass.
+                    s.last_update_ns.store(now_ns, Ordering::Release);
+                    if s.key
+                        .compare_exchange(0, CLAIMING, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        // A released slot keeps the count it had, and no
+                        // one adds to a slot while it reads CLAIMING, so
+                        // the count is set, not adjusted: an adjustment
+                        // computed from a value read before the claim was
+                        // wrong whenever another key claimed and released
+                        // the slot in between.
+                        s.value.store(by, Ordering::Release);
+                        if s.key
+                            .compare_exchange(
+                                CLAIMING,
+                                tagged_hash,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            return by;
+                        }
+                        // Evicted as a claim left unpublished: look again.
+                    }
                 }
-                // Another writer claimed this slot first, often for
-                // this same key. Weigh the key it wrote rather than
-                // probing on, which would claim a second slot for it.
-                Err(claimed) => cur = claimed,
+                // Often this same key, claimed by another writer: weigh
+                // what it publishes rather than probing on.
+                CLAIMING => {
+                    if !claim_settles(s) {
+                        break;
+                    }
+                }
+                k if k == tagged_hash => return add(s, by, now_ns),
+                _ => break,
             }
-        }
-        if cur == tagged_hash {
-            return add(s, by, now_ns);
         }
     }
     tracing::warn!(
@@ -213,6 +244,22 @@ pub(crate) fn increment(slots: &[Slot], tagged_hash: u64, by: u64, now_ns: u64) 
         "shmem hashtable saturated at probe limit"
     );
     SATURATED
+}
+
+/// Wait for the claim in flight on `s` to publish its key or be evicted.
+/// Returns `false` if it is still in flight after [`CLAIM_SPINS`].
+fn claim_settles(s: &Slot) -> bool {
+    for spin in 1..=CLAIM_SPINS {
+        if s.key.load(Ordering::Acquire) != CLAIMING {
+            return true;
+        }
+        if spin % 64 == 0 {
+            std::thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+    false
 }
 
 /// [`AtomicHashTable::read`] over a slice of slots.
@@ -667,6 +714,73 @@ mod tests {
         for n in 0..STABLE {
             assert_eq!(t.read(key(n)), Some(WRITERS * PER_WRITER), "key {n}");
         }
+    }
+
+    #[test]
+    fn a_claim_racing_a_release_and_reclaim_of_its_slot_counts_exactly() {
+        // A claim reads what a free slot holds, then takes the slot. A
+        // churner keeps claiming and releasing the slots in front of the
+        // claims, leaving 1 or 1 000 behind it in turn, so a claim that
+        // took a slot another key had used and released in between
+        // would start from the wrong count. Each round, every writer
+        // adds 1 to a fresh key; the key must read one per writer.
+        const WRITERS: usize = 4;
+        const ROUNDS: u64 = 20_000;
+        let t: Arc<AtomicHashTable<1024>> = Arc::from(AtomicHashTable::new_zeroed());
+        let key = |n: u64| tagged_hash((n << 10) | 0x55);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churner = {
+            let t = t.clone();
+            let done = done.clone();
+            thread::spawn(move || {
+                let mut generation = 1_000_000u64;
+                while !done.load(Ordering::Relaxed) {
+                    let by = if generation.is_multiple_of(2) {
+                        1
+                    } else {
+                        1_000
+                    };
+                    t.increment(key(generation), by, 0);
+                    t.reset(key(generation));
+                    generation += 1;
+                }
+            })
+        };
+        let round = Arc::new(std::sync::Barrier::new(WRITERS + 1));
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let t = t.clone();
+                let round = round.clone();
+                thread::spawn(move || {
+                    for n in 1..=ROUNDS {
+                        round.wait();
+                        t.increment(key(n), 1, 0);
+                        round.wait();
+                    }
+                })
+            })
+            .collect();
+        let mut wrong = Vec::new();
+        for n in 1..=ROUNDS {
+            round.wait();
+            round.wait();
+            let read = t.read(key(n));
+            if read != Some(WRITERS as u64) {
+                wrong.push((n, read));
+            }
+            t.reset(key(n));
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        churner.join().unwrap();
+        assert!(
+            wrong.is_empty(),
+            "{} of {ROUNDS} keys miscounted, first (round, read) {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(5)]
+        );
     }
 
     /// SplitMix64: a fixed stream of well-mixed keys, so a fill test
