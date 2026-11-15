@@ -462,20 +462,17 @@ async fn a_break_glass_window_that_fails_to_persist_opens_nothing_and_leaves_the
 // ---- The stream plane on the fleet view (Story 12.2 Lot E2) ----
 
 fn stream(name: &str, port: u16, selector: &[&str]) -> lorica_config::models::Stream {
-    let now = Utc::now();
-    lorica_config::models::Stream {
-        id: uuid::Uuid::new_v4().to_string(),
-        name: name.to_string(),
-        group_name: String::new(),
-        protocol: lorica_config::models::StreamProtocol::Tcp,
-        enabled: true,
-        listen_address: "0.0.0.0".parse().expect("an address"),
-        port_first: port,
-        port_last: port,
-        node_selector: selector.iter().map(|s| s.to_string()).collect(),
-        created_at: now,
-        updated_at: now,
-    }
+    let mut stream = lorica_config::models::Stream::new(
+        uuid::Uuid::new_v4().to_string(),
+        name.to_string(),
+        lorica_config::models::StreamProtocol::Tcp,
+        "0.0.0.0".parse().expect("an address"),
+        port,
+        port,
+        Utc::now(),
+    );
+    stream.node_selector = selector.iter().map(|s| s.to_string()).collect();
+    stream
 }
 
 fn node_row(name: &str, status: NodeStatus) -> ClusterNode {
