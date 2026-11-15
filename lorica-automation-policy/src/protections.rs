@@ -167,6 +167,26 @@ pub mod backend {
               the address inside the grant hands the leg to whoever holds a certificate for the \
               new name",
     };
+
+    /// The bytes a custom health check sends (Story 12.7, D-7; D9 of
+    /// the Epic 12 PRD).
+    ///
+    /// Not one of [`super::BACKEND_PROTECTION_RULES`]: it does not move
+    /// toward stronger, it names a value a token may not author. Moving
+    /// a backend away from a custom check is allowed, since a health
+    /// check is not an access control and switching checks off is
+    /// already a token's right. `lorica-api` enforces it in the backend
+    /// write guard through `HealthCheck::carries_raw_payload`, and
+    /// `lorica-mcp` withholds the payload's keys from the tool schema.
+    pub const HEALTH_CHECK_PAYLOAD: ProtectionRule = ProtectionRule {
+        fields: &["health_check"],
+        rule: "any check whose bytes ship with the release, a named template included, is set \
+               freely, and a stored custom send/expect check may be kept exactly as it is or \
+               replaced; a custom send/expect check is never created or changed",
+        why: "a custom check makes the node send bytes an operator chose to the backend's \
+              address on every probe, so it is written in the dashboard, while a template's \
+              bytes are the release's",
+    };
 }
 
 /// Every route control an automation token may only strengthen, in the
@@ -279,6 +299,21 @@ mod tests {
         }
         for (field, why) in WITHHELD_ROUTE_FIELDS {
             assert!(!why.trim().is_empty(), "{field}");
+        }
+    }
+
+    #[test]
+    fn the_payload_rule_has_words_and_weighs_a_field_no_backend_rule_weighs() {
+        let payload = backend::HEALTH_CHECK_PAYLOAD;
+        assert!(!payload.fields.is_empty());
+        assert!(!payload.rule.trim().is_empty() && !payload.why.trim().is_empty());
+        for field in payload.fields {
+            assert!(
+                BACKEND_PROTECTION_RULES
+                    .iter()
+                    .all(|rule| !rule.fields.contains(field)),
+                "{field} is weighed by a protection rule too"
+            );
         }
     }
 }

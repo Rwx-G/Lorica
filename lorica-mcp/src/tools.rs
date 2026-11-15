@@ -78,7 +78,10 @@
 
 use std::sync::OnceLock;
 
-use lorica_automation_policy::{AutomationScope, SETTINGS_ALLOWLIST, SETTINGS_ALLOWLIST_NAMES};
+use lorica_automation_policy::protections::backend::HEALTH_CHECK_PAYLOAD;
+use lorica_automation_policy::{
+    AutomationScope, SETTINGS_ALLOWLIST, SETTINGS_ALLOWLIST_NAMES, TCP_CHECK_TEMPLATES,
+};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde_json::{json, Map, Value};
 
@@ -275,7 +278,20 @@ pub struct Nested {
     pub fields: &'static [&'static str],
     /// The fields among [`Self::fields`] that are objects themselves.
     pub nested: &'static [Nested],
+    /// Keys the object's request type accepts that this tier withholds,
+    /// each with the reason a refusal gives. Refused by name, which is
+    /// this crate's word and never the caller's, so a model learns why
+    /// rather than reading a typo refusal.
+    pub withheld: &'static [(&'static str, &'static str)],
+    /// The fields among [`Self::fields`] whose value is one of a closed
+    /// set of names, each with the set, rendered as the field's `enum`
+    /// when the schema is built.
+    pub choices: &'static [(&'static str, Choices)],
 }
+
+/// The closed set of names a field of a [`Nested`] object takes, read
+/// when the schema is built so it is the set the release ships.
+pub type Choices = fn() -> Vec<&'static str>;
 
 /// One mutation of the write surface, as a tool carries it.
 #[derive(Debug, Clone, Copy)]
@@ -551,7 +567,7 @@ impl ToolSpec {
         }
         let mut required: Vec<&str> = self.resource.iter().map(|param| param.name).collect();
         if let Some(body) = self.body() {
-            let fields = field_schemas(body.fields, body.nested);
+            let fields = field_schemas(body.fields, body.nested, &[]);
             properties.insert(
                 body.argument.to_string(),
                 json!({
@@ -715,11 +731,16 @@ impl ToolSpec {
 }
 
 /// The schema of each field in `fields`: `{}` for a field whose value
-/// the plane alone judges, and for a field `nested` declares an object
-/// (or an array of objects) listing its own fields the same way,
-/// admitting nothing undeclared, so a client reads where an object's
-/// keys are declared and [`keys_declared`] refuses the same thing.
-fn field_schemas(fields: &[&str], nested: &[Nested]) -> Map<String, Value> {
+/// the plane alone judges, the `enum` of a field `choices` closes, and
+/// for a field `nested` declares an object (or an array of objects)
+/// listing its own fields the same way, admitting nothing undeclared,
+/// so a client reads where an object's keys are declared and
+/// [`keys_declared`] refuses the same thing.
+fn field_schemas(
+    fields: &[&str],
+    nested: &[Nested],
+    choices: &[(&str, Choices)],
+) -> Map<String, Value> {
     fields
         .iter()
         .map(|field| {
@@ -727,7 +748,7 @@ fn field_schemas(fields: &[&str], nested: &[Nested]) -> Map<String, Value> {
                 Some(entry) => {
                     let object = json!({
                         "type": "object",
-                        "properties": field_schemas(entry.fields, entry.nested),
+                        "properties": field_schemas(entry.fields, entry.nested, entry.choices),
                         "additionalProperties": false,
                     });
                     if entry.list {
@@ -736,11 +757,55 @@ fn field_schemas(fields: &[&str], nested: &[Nested]) -> Map<String, Value> {
                         object
                     }
                 }
-                None => json!({}),
+                None => match choices.iter().find(|(name, _)| name == field) {
+                    Some((_, names)) => json!({ "enum": names() }),
+                    None => json!({}),
+                },
             };
             ((*field).to_string(), schema)
         })
         .collect()
+}
+
+/// The first object under `value` carrying a key a [`Nested`] under
+/// `nested` withholds, at any depth: every such key it carries, by its
+/// dotted path from `path`, and the reason the first of them gives.
+fn first_withheld(
+    value: &Value,
+    nested: &[Nested],
+    path: &str,
+) -> Option<(Vec<String>, &'static str)> {
+    let object = value.as_object()?;
+    nested.iter().find_map(|entry| {
+        let inner = object.get(entry.field)?;
+        let here = format!("{path}.{}", entry.field);
+        let items: Vec<&Value> = match inner {
+            Value::Array(items) if entry.list => items.iter().collect(),
+            other => vec![other],
+        };
+        items.into_iter().find_map(|item| {
+            let carried: Vec<&(&str, &'static str)> = item
+                .as_object()
+                .map(|keys| {
+                    entry
+                        .withheld
+                        .iter()
+                        .filter(|(key, _)| keys.contains_key(*key))
+                        .collect()
+                })
+                .unwrap_or_default();
+            match carried.first() {
+                Some((_, why)) => Some((
+                    carried
+                        .iter()
+                        .map(|(key, _)| format!("`{here}.{key}`"))
+                        .collect(),
+                    *why,
+                )),
+                None => first_withheld(item, entry.nested, &here),
+            }
+        })
+    })
 }
 
 /// Whether every key of `value` is in `fields`, and the same for every
@@ -769,10 +834,11 @@ fn keys_declared(value: &Value, fields: &[&str], nested: &[Nested]) -> bool {
 /// The body argument, checked for shape and size and nothing else.
 ///
 /// The values are the plane's to judge (Story 11.2 AC #5). What this
-/// refuses is a key the handler behind the path does not deserialise,
-/// at the top level and inside every object the body declares, which
-/// the plane would silently drop, and a weight the listener would
-/// refuse with a 413 in its own words.
+/// refuses is a key the tier withholds ([`Nested::withheld`], which the
+/// plane refuses too), a key the handler behind the path does not
+/// deserialise, at the top level and inside every object the body
+/// declares, which the plane would silently drop, and a weight the
+/// listener would refuse with a 413 in its own words.
 fn checked_body(body: &Body, value: Option<&Value>) -> Result<Value, ToolInputError> {
     let Some(value) = value else {
         return Err(ToolInputError::new(format!(
@@ -784,6 +850,18 @@ fn checked_body(body: &Body, value: Option<&Value>) -> Result<Value, ToolInputEr
         return Err(ToolInputError::new(format!(
             "`{}` takes an object",
             body.argument
+        )));
+    }
+    // A withheld key is this crate's own word, so it is named, with the
+    // reason: a model told only "undeclared" would retry its spelling.
+    if let Some((paths, why)) = first_withheld(value, body.nested, body.argument) {
+        return Err(ToolInputError::new(format!(
+            "{} not this tool's to set: {why}",
+            if paths.len() == 1 {
+                format!("{} is", paths[0])
+            } else {
+                format!("{} are", paths.join(" and "))
+            }
         )));
     }
     // The field name is the caller's text and is not repeated back.
@@ -1024,7 +1102,8 @@ pub const READS: &[ToolSpec] = &[
                   and its live EWMA score. The active check is `health_check`, by `kind`; \
                   `health_check_path` is its deprecated twin. Every query value of the probe \
                   path, in `health_check.path` and `health_check_path` alike, reads as \
-                  `[redacted]`.",
+                  `[redacted]`, and so does the whole `send` of a custom send/expect check; its \
+                  `expect` and a template's name are shown.",
         scope: AutomationScope::BackendsRead,
         path: "/automation/v1/backends",
         resource: None,
@@ -1330,31 +1409,43 @@ const ROUTE_NESTED: &[Nested] = &[
             list: false,
             fields: BOT_BYPASS_FIELDS,
             nested: &[],
+            withheld: &[],
+            choices: &[],
         }],
+        withheld: &[],
+        choices: &[],
     },
     Nested {
         field: "geoip",
         list: false,
         fields: GEOIP_FIELDS,
         nested: &[],
+        withheld: &[],
+        choices: &[],
     },
     Nested {
         field: "header_rules",
         list: true,
         fields: HEADER_RULE_FIELDS,
         nested: &[],
+        withheld: &[],
+        choices: &[],
     },
     Nested {
         field: "path_rules",
         list: true,
         fields: PATH_RULE_FIELDS,
         nested: &[],
+        withheld: &[],
+        choices: &[],
     },
     Nested {
         field: "rate_limit",
         list: false,
         fields: RATE_LIMIT_FIELDS,
         nested: &[],
+        withheld: &[],
+        choices: &[],
     },
     Nested {
         field: "response_rewrite",
@@ -1365,13 +1456,19 @@ const ROUTE_NESTED: &[Nested] = &[
             list: true,
             fields: RESPONSE_REWRITE_RULE_FIELDS,
             nested: &[],
+            withheld: &[],
+            choices: &[],
         }],
+        withheld: &[],
+        choices: &[],
     },
     Nested {
         field: "traffic_splits",
         list: true,
         fields: TRAFFIC_SPLIT_FIELDS,
         nested: &[],
+        withheld: &[],
+        choices: &[],
     },
 ];
 
@@ -1394,6 +1491,39 @@ const BACKEND_FIELDS: &[&str] = &[
     "tls_upstream",
     "weight",
 ];
+
+/// The fields of a backend's `health_check` this tier offers: those of
+/// every kind whose bytes ship with the release. A custom send/expect
+/// check's own fields are [`HEALTH_CHECK_PAYLOAD_FIELDS`], withheld.
+const HEALTH_CHECK_FIELDS: &[&str] = &["kind", "path", "template", "timeout_ms"];
+
+/// The fields only a custom send/expect check has, which a token may
+/// not author (`HEALTH_CHECK_PAYLOAD` in `lorica-automation-policy`):
+/// refused here by name, and by the plane whatever the caller.
+const HEALTH_CHECK_PAYLOAD_FIELDS: &[(&str, &str)] = &[
+    ("expect", HEALTH_CHECK_PAYLOAD.why),
+    ("send", HEALTH_CHECK_PAYLOAD.why),
+];
+
+/// The names a `tcp_template` check may reference, read from the
+/// release's catalogue when the schema is built.
+fn template_names() -> Vec<&'static str> {
+    TCP_CHECK_TEMPLATES
+        .iter()
+        .map(|template| template.name)
+        .collect()
+}
+
+/// The nested object of a backend body, on the create and on the update
+/// alike.
+const BACKEND_NESTED: &[Nested] = &[Nested {
+    field: "health_check",
+    list: false,
+    fields: HEALTH_CHECK_FIELDS,
+    nested: &[],
+    withheld: HEALTH_CHECK_PAYLOAD_FIELDS,
+    choices: &[("template", template_names)],
+}];
 
 /// The mutations of the config tier (Story 11.2), one per write path
 /// of that tier the automation plane mounts, each declared once.
@@ -1525,9 +1655,13 @@ pub const MUTATIONS: &[Mutation] = &[
                   be an ip:port inside the token's allowed_backend_cidrs; a name cannot be \
                   checked against a CIDR and is refused. `tls_skip_verify` may not be set: an \
                   upstream a token creates verifies its certificate whenever TLS is on. The \
-                  active check is `health_check`: `{\"kind\": \"http\", \"path\": \"/healthz\"}` \
-                  or `{\"kind\": \"tcp_connect\"}`. `health_check_path` is deprecated; sent \
-                  beside `health_check`, it must be the same path.",
+                  active check is `health_check`: `{\"kind\": \"http\", \"path\": \"/healthz\"}`, \
+                  `{\"kind\": \"tcp_connect\"}`, or a protocol check the release ships, \
+                  `{\"kind\": \"tcp_template\", \"template\": ...}` with a `template` its schema \
+                  lists (plaintext TCP, so not on a backend with `tls_upstream` on). A custom \
+                  send/expect check, bytes of the caller's own, is set in the dashboard and \
+                  refused here. `health_check_path` is deprecated; sent beside `health_check`, \
+                  it must be the same path.",
         scope: AutomationScope::BackendsWrite,
         verb: Verb::Post,
         path: "/automation/v1/backends",
@@ -1537,7 +1671,7 @@ pub const MUTATIONS: &[Mutation] = &[
             argument: "backend",
             schema: "CreateBackendRequest",
             fields: BACKEND_FIELDS,
-            nested: &[],
+            nested: BACKEND_NESTED,
             doc: "The backend to create: `address` is required, every other field falls back \
                   to the management API's default.",
         }),
@@ -1553,11 +1687,15 @@ pub const MUTATIONS: &[Mutation] = &[
                   `tls_skip_verify` off, never on, a create included; `tls_sni` left unchanged \
                   while the upstream certificate is verified. A write in the other direction is \
                   refused, preview included; it is made in the dashboard. The active check is \
-                  `health_check`, by `kind` (`http` with a `path`, or `tcp_connect`), replaced \
-                  whole; `health_check_path` is deprecated and, sent beside it, must be the \
-                  same path. A probe path sent back exactly as read, in either shape, its \
+                  `health_check`, by `kind` (`http` with a `path`, `tcp_connect`, or \
+                  `tcp_template` with a `template` its schema lists), replaced whole; \
+                  `health_check_path` is deprecated and, sent beside it, must be the same \
+                  path. A probe path sent back exactly as read, in either shape, its \
                   `[redacted]` values included, keeps the stored path; any other path carrying \
-                  `[redacted]` is refused.",
+                  `[redacted]` is refused. A custom send/expect check is set in the dashboard: \
+                  a patch of other fields keeps one, and so does the check sent back exactly as \
+                  read, its `send` `[redacted]`, while creating or changing one is refused. \
+                  Moving a backend from one to a template or a connect is allowed.",
         scope: AutomationScope::BackendsWrite,
         verb: Verb::Put,
         path: "/automation/v1/backends",
@@ -1567,7 +1705,7 @@ pub const MUTATIONS: &[Mutation] = &[
             argument: "backend",
             schema: "UpdateBackendRequest",
             fields: BACKEND_FIELDS,
-            nested: &[],
+            nested: BACKEND_NESTED,
             doc: "The fields to change; a field absent leaves the backend's value alone.",
         }),
     },
@@ -1823,6 +1961,102 @@ mod tests {
             update.nested.iter().map(|n| n.field).collect::<Vec<_>>()
         );
         assert!(!create.nested.is_empty());
+    }
+
+    #[test]
+    fn a_custom_health_check_payload_is_refused_by_the_tool_naming_it_and_a_template_passes() {
+        // Story 12.7 D-7 at the tool: `send` and `expect` are what a
+        // custom send/expect check is made of, and no token authors one.
+        // Refused before a request leaves, by name and with the policy's
+        // reason, on every backend write tool, previews included.
+        let mut tools = 0usize;
+        for spec in catalogue() {
+            let Some(body) = spec.body().filter(|body| body.argument == "backend") else {
+                continue;
+            };
+            tools += 1;
+            let arguments = |check: Value| {
+                let mut arguments = minimal_arguments(spec);
+                arguments[body.argument] = json!({ "health_check": check });
+                arguments
+            };
+            for (key, check) in [
+                (
+                    "send",
+                    json!({ "kind": "tcp_send_expect", "send": { "text": "PING\r\n" },
+                            "expect": [{ "match": "prefix", "bytes": { "text": "+PONG" } }] }),
+                ),
+                (
+                    "expect",
+                    json!({ "kind": "tcp_send_expect",
+                            "expect": [{ "match": "prefix", "bytes": { "text": "220" } }] }),
+                ),
+            ] {
+                let refused = spec
+                    .call_for(&arguments(check))
+                    .expect_err("a payload never leaves the tool");
+                assert!(
+                    refused
+                        .message
+                        .contains(&format!("`backend.health_check.{key}`")),
+                    "{}: {}",
+                    spec.name,
+                    refused.message
+                );
+                assert!(
+                    refused.message.contains(HEALTH_CHECK_PAYLOAD.why),
+                    "{}: {}",
+                    spec.name,
+                    refused.message
+                );
+                assert!(!refused.message.contains("PING"), "{}", refused.message);
+            }
+            for template in TCP_CHECK_TEMPLATES {
+                let check = json!({ "kind": "tcp_template", "template": template.name,
+                                    "timeout_ms": 2000 });
+                let call = spec
+                    .call_for(&arguments(check.clone()))
+                    .expect("a template is the tier's to set");
+                assert_eq!(
+                    call.body.as_ref().map(|body| &body["health_check"]),
+                    Some(&check)
+                );
+            }
+        }
+        assert_eq!(tools, 4, "the create, the update and their previews");
+    }
+
+    #[test]
+    fn the_health_check_schema_offers_the_catalogue_s_templates_and_no_payload() {
+        let names: Vec<&str> = TCP_CHECK_TEMPLATES.iter().map(|t| t.name).collect();
+        assert!(!names.is_empty());
+        for tool in ["lorica_backend_create", "lorica_backend_update"] {
+            let spec = spec(tool);
+            let schema = spec.input_schema();
+            let check = &schema["properties"]["backend"]["properties"]["health_check"];
+            assert_eq!(check["additionalProperties"], json!(false), "{tool}");
+            assert_eq!(
+                check["properties"]["template"]["enum"],
+                json!(names),
+                "{tool}: the enum is the catalogue's"
+            );
+            let offered: BTreeSet<&str> = check["properties"]
+                .as_object()
+                .expect("the check lists its fields")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let body = spec.body().expect("a body");
+            for entry in body.nested {
+                for (withheld, _) in entry.withheld {
+                    assert!(
+                        !entry.fields.contains(withheld) && !offered.contains(withheld),
+                        "{tool}: `{withheld}` is both withheld and offered"
+                    );
+                }
+            }
+            assert!(!offered.contains("send") && !offered.contains("expect"));
+        }
     }
 
     #[test]

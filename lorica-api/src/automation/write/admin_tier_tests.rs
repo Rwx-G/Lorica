@@ -689,3 +689,61 @@ async fn every_proxy_protocol_setting_is_refused_by_the_plane_and_by_the_mcp_too
     }
     assert!(audit_rows_under(&f.state, "settings.").await.is_empty());
 }
+
+#[tokio::test]
+async fn the_admin_tier_carries_no_health_check_and_so_no_payload() {
+    // Story 12.7 D-7, the admin-tier row: the settings document holds no
+    // health check, so no allowlisted key can carry a payload, and a
+    // check sent as a setting is a key outside the allowlist, refused by
+    // the plane and by the tool before a request leaves.
+    let f = a_node_with_something_to_write().await;
+    let (admin_bearer, _public_id) = an_admin_tier_token(&f).await;
+    let document =
+        serde_json::to_value(lorica_config::models::GlobalSettings::default()).expect("settings");
+    for name in allowlisted_settings() {
+        assert!(
+            !document[&name].is_object(),
+            "{name} is an object, and an object is where a payload would ride"
+        );
+    }
+    let before = canonical_now(&f.state).await;
+    let before_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
+    let check = serde_json::json!({
+        "kind": "tcp_send_expect",
+        "send": { "text": "PING\r\n" },
+        "expect": [{ "match": "prefix", "bytes": { "text": "+PONG" } }],
+    });
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        "/automation/v1/settings",
+        &admin_bearer,
+        Some(serde_json::json!({ "health_check": check.clone() })),
+    )
+    .await;
+    assert_forbidden_naming(response, "`health_check`", "a check sent as a setting").await;
+    for spec in lorica_mcp::tools::catalogue()
+        .iter()
+        .filter(|spec| spec.scope == lorica_config::models::AutomationScope::SettingsWrite)
+    {
+        let argument = spec.body().expect("an admin tool carries a body").argument;
+        let answered = mcp_call(
+            &f.state,
+            &admin_bearer,
+            spec.name,
+            serde_json::json!({ argument: { "health_check": check.clone() } }),
+        )
+        .await;
+        assert_eq!(
+            answered["error"]["code"],
+            serde_json::json!(-32602),
+            "{}: {answered}",
+            spec.name
+        );
+    }
+    let after = canonical_now(&f.state).await;
+    assert_eq!(
+        before_bytes,
+        lorica_config::canonical::encode_canonical(&after).expect("encodes")
+    );
+}

@@ -1491,3 +1491,88 @@ async fn the_fields_an_environment_names_are_withheld_with_its_mark() {
     assert_eq!(backend["name"], "pr-12-0");
     assert_eq!(selected, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn a_custom_payload_reads_masked_on_every_token_read_and_its_answers_and_templates_do_not() {
+    // Story 12.7 D-8: the listing, a preview and the MCP read tool each
+    // answer a custom check's `send` as `{"text": "[redacted]"}`, and
+    // its `expect` and a template's name as stored.
+    let f = a_node_with_something_to_write().await;
+    let check = serde_json::json!({
+        "kind": "tcp_send_expect",
+        "send": { "text": "AUTH s3cr3t\r\nPING\r\n" },
+        "expect": [{ "match": "prefix", "bytes": { "text": "+PONG" } }],
+        "timeout_ms": 2000,
+    });
+    let response = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "PUT",
+        &format!("/api/v1/backends/{}", f.backend_id),
+        &f.admin,
+        Some(serde_json::json!({ "health_check": check })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let template = serde_json::json!({ "kind": "tcp_template", "template": "postgresql_ssl_request",
+                                       "timeout_ms": 2000 });
+    let response = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "POST",
+        "/api/v1/backends",
+        &f.admin,
+        Some(serde_json::json!({ "address": "10.0.0.11:5432", "health_check": template })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let mut masked = check.clone();
+    masked["send"] = serde_json::json!({ "text": "[redacted]" });
+
+    let listing = body_json(
+        automation_send(&f.state, "/automation/v1/backends", Some(&f.bearer), None).await,
+    )
+    .await;
+    let rows = listing["data"]["items"].as_array().expect("a page");
+    let check_of = |rows: &[serde_json::Value], address: &str| {
+        rows.iter()
+            .find(|row| row["address"] == address)
+            .map(|row| row["health_check"].clone())
+            .expect("the backend is listed")
+    };
+    assert_eq!(check_of(rows, "10.0.0.10:8080"), masked, "the listing");
+    assert_eq!(check_of(rows, "10.0.0.11:5432"), template, "a template");
+
+    let preview = body_json(
+        automation_call(
+            &f.state,
+            "DELETE",
+            &format!("/automation/v1/backends/{}?dry_run=true", f.backend_id),
+            &f.bearer,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        preview["data"]["before"]["health_check"], masked,
+        "a preview"
+    );
+
+    let answered = mcp_call(
+        &f.state,
+        &f.mcp_bearer,
+        "lorica_backends",
+        serde_json::json!({}),
+    )
+    .await;
+    let items = answered["result"]["structuredContent"]["untrusted"]["data"]["items"]
+        .as_array()
+        .expect("the tool answers the page");
+    assert_eq!(check_of(items, "10.0.0.10:8080"), masked, "the MCP read");
+    for answer in [&listing, &preview, &answered] {
+        assert!(!answer.to_string().contains("s3cr3t"), "{answer}");
+    }
+}

@@ -81,7 +81,10 @@
 //!
 //! The fields of [`WITHHELD_ROUTE_FIELDS`] are refused from a token
 //! outright, whatever their value, each for the reason beside it there;
-//! the config tier's tools offer none of them.
+//! the config tier's tools offer none of them. A backend's custom
+//! send/expect health check is the backend side's one such value (D9 of
+//! the Epic 12 PRD): a token selects a named template, and never creates
+//! or changes a payload of its own ([`ensure_no_new_raw_payload`]).
 //!
 //! # Protections move one way
 //!
@@ -203,6 +206,7 @@ use axum::extract::{Extension, Path, Query};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use lorica_automation_policy::admin_setting;
+use lorica_automation_policy::protections::backend as backend_rule;
 use lorica_config::models::{AutomationScope, Backend, ManagedBy, Route};
 use lorica_config::ConfigStore;
 use serde::Deserialize;
@@ -684,12 +688,15 @@ fn ensure_new_certificate_granted(
 
 /// The token's grant as the guard a backend write runs inside its
 /// store closure, on the row as stored and on the row as it would be,
-/// and the direction each of [`BACKEND_PROTECTIONS`] may move between
+/// the direction each of [`BACKEND_PROTECTIONS`] may move between
 /// them, a create weighed against the backend the management create
-/// stores by default. A health-check path sent back as the mask this
-/// plane answered it with keeps the stored path
+/// stores by default, and the payload rule
+/// ([`ensure_no_new_raw_payload`]). A health-check path sent back as
+/// the mask this plane answered it with keeps the stored path
 /// ([`redact::restore_health_check_path`]) before any of that is
-/// weighed.
+/// weighed; a masked payload is put back by the management write path
+/// itself, on every plane, before this guard runs
+/// ([`redact::restore_health_check_payload`]).
 fn backend_guard(principal: &AutomationPrincipal) -> BackendGuard {
     let principal = principal.clone();
     BackendGuard::bounded(move |store, target| {
@@ -698,6 +705,7 @@ fn backend_guard(principal: &AutomationPrincipal) -> BackendGuard {
         }
         if let Some(after) = target.after {
             ensure_backend_row_granted(store, &principal, after)?;
+            ensure_no_new_raw_payload(target.before, after)?;
             let created;
             let before = match target.before {
                 Some(before) => before,
@@ -714,6 +722,34 @@ fn backend_guard(principal: &AutomationPrincipal) -> BackendGuard {
         Ok(())
     })
     .restoring_withheld(redact::restore_health_check_path)
+}
+
+/// D9 of the Epic 12 PRD (Story 12.7, D-7): a token never creates or
+/// changes a health check carrying bytes an operator chose
+/// ([`HealthCheck::carries_raw_payload`], the one predicate every
+/// enforcement point calls), and may leave a stored one exactly as it
+/// is.
+///
+/// Weighed on the row after the patch, never on the body: a patch of
+/// the weight alone carries the stored payload in `after`, and refusing
+/// "a payload in `after`" would lock every token edit of such a
+/// backend. Moving away from a custom check (to a template, a connect,
+/// or checks off) is allowed: a health check is not an access control.
+/// The refusal names the field and the rule, never the payload.
+///
+/// [`HealthCheck::carries_raw_payload`]: lorica_config::models::HealthCheck::carries_raw_payload
+fn ensure_no_new_raw_payload(before: Option<&Backend>, after: &Backend) -> Result<(), ApiError> {
+    let kept_as_stored = before.is_some_and(|before| before.health_check == after.health_check);
+    if !after.health_check.carries_raw_payload() || kept_as_stored {
+        return Ok(());
+    }
+    let rule = backend_rule::HEALTH_CHECK_PAYLOAD;
+    Err(ApiError::Forbidden(format!(
+        "{}: {}, because {}; a custom send/expect check is set in the dashboard",
+        rule.fields.join(" / "),
+        rule.rule,
+        rule.why
+    )))
 }
 
 /// A token may not change the address of a backend that a stream with
@@ -962,7 +998,9 @@ pub async fn bind_certificate(
 /// rule the environment resource applies to its backends, and an
 /// unverified upstream (`tls_skip_verify`) is refused (403), the create
 /// weighed against [`BACKEND_PROTECTIONS`] from the management create's
-/// default. With `?dry_run=true`, which needs `backends:read` (403), the
+/// default, and a custom send/expect health check is refused (403,
+/// [`ensure_no_new_raw_payload`]): a token picks a template instead.
+/// With `?dry_run=true`, which needs `backends:read` (403), the
 /// backend it would have created, and nothing created.
 ///
 /// # Errors
@@ -1000,7 +1038,11 @@ pub async fn create_backend(
 /// is checked against the grant exactly as on create, a control of
 /// [`BACKEND_PROTECTIONS`] may only be strengthened (403), and the
 /// address of a backend a stream allowing local backends forwards to
-/// does not move (403 naming the stream, Story 12.3 D-m). With
+/// does not move (403 naming the stream, Story 12.3 D-m). A custom
+/// send/expect health check is neither created nor changed (403,
+/// [`ensure_no_new_raw_payload`]); a stored one rides a patch of other
+/// fields untouched, and its payload sent back as the mask this plane
+/// answered it with keeps the stored check. With
 /// `?dry_run=true`, which needs `backends:read` (403), the backend
 /// before and after the patch, and nothing changed.
 ///

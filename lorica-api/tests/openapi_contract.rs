@@ -1808,6 +1808,28 @@ fn pin_nested(
             ));
             continue;
         };
+        if let Some(accepted) = tagged_enum_vocabulary(&child) {
+            // A tagged enum is no struct this scan parses: its field names
+            // are read off its own values, and every one of them is either
+            // offered or withheld by name, never both.
+            let listed: BTreeSet<String> =
+                declared.fields.iter().map(|f| (*f).to_string()).collect();
+            let withheld: BTreeSet<String> = declared
+                .withheld
+                .iter()
+                .map(|(key, _)| (*key).to_string())
+                .collect();
+            let covered: BTreeSet<String> = listed.union(&withheld).cloned().collect();
+            if covered != accepted || !listed.is_disjoint(&withheld) || list != declared.list {
+                drift.push_str(&format!(
+                    "\n{tool}: `{}` (`{child}`, a tagged enum):\n  accepted across its kinds: \
+                     {accepted:?}\n  offered: {listed:?}\n  withheld: {withheld:?}\n",
+                    declared.field
+                ));
+            }
+            *pinned += 1;
+            continue;
+        }
         if source_declaring(&child).is_none() {
             drift.push_str(&format!(
                 "\n{tool}: `{}` is declared nested but `{child}` is declared in no source this \
@@ -1859,6 +1881,286 @@ fn pin_nested(
                 ));
             }
         }
+    }
+}
+
+/// The field names a tagged enum a request body nests accepts across
+/// its kinds, its tag included, for each such enum a tool declares
+/// nested; `None` for every other type.
+fn tagged_enum_vocabulary(name: &str) -> Option<BTreeSet<String>> {
+    match name {
+        "HealthCheck" => Some(field_names_of(&every_health_check_kind())),
+        _ => None,
+    }
+}
+
+/// One value of each `HealthCheck` kind, every optional field set, so
+/// its serialisation carries every field the kind takes.
+/// [`every_health_check_kind_is_sampled`] holds it to the kinds the
+/// type decodes.
+fn every_health_check_kind() -> Vec<lorica_config::models::HealthCheck> {
+    use lorica_config::models::{
+        Expectation, HealthCheck, MatchAnchor, Payload, TcpCheckTemplateName,
+        PROBE_TIMEOUT_MS_DEFAULT,
+    };
+    let template = lorica_automation_policy::TCP_CHECK_TEMPLATES
+        .first()
+        .and_then(|template| TcpCheckTemplateName::new(template.name))
+        .expect("the release ships a template");
+    vec![
+        HealthCheck::Http {
+            path: "/healthz".to_string(),
+        },
+        HealthCheck::TcpConnect,
+        HealthCheck::TcpTemplate {
+            template,
+            timeout_ms: PROBE_TIMEOUT_MS_DEFAULT,
+        },
+        HealthCheck::TcpSendExpect {
+            send: Some(Payload::Text("PING\r\n".to_string())),
+            expect: vec![Expectation {
+                anchor: MatchAnchor::Prefix,
+                bytes: Payload::Text("+PONG".to_string()),
+            }],
+            timeout_ms: PROBE_TIMEOUT_MS_DEFAULT,
+        },
+    ]
+}
+
+/// Every top-level key the serialisations of `checks` carry.
+fn field_names_of(checks: &[lorica_config::models::HealthCheck]) -> BTreeSet<String> {
+    checks
+        .iter()
+        .flat_map(|check| {
+            serde_json::to_value(check)
+                .expect("a check serialises")
+                .as_object()
+                .expect("a check is an object")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[test]
+fn every_health_check_kind_is_sampled() {
+    // The kinds the type decodes, from serde's own refusal of a kind it
+    // does not know, so a kind added to the enum fails here until the
+    // sample above carries it.
+    let refusal = serde_json::from_value::<lorica_config::models::HealthCheck>(
+        serde_json::json!({ "kind": "no_such_kind" }),
+    )
+    .expect_err("an unknown kind is refused")
+    .to_string();
+    let decoded: BTreeSet<String> = refusal
+        .split("expected one of")
+        .nth(1)
+        .unwrap_or_else(|| panic!("serde names the kinds it expects: {refusal}"))
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect();
+    let sampled: BTreeSet<String> = every_health_check_kind()
+        .iter()
+        .map(|check| check.kind().to_string())
+        .collect();
+    assert!(decoded.len() >= 4, "{refusal}");
+    assert_eq!(sampled, decoded);
+}
+
+/// The lines of `components.schemas.<name>`, its own line excluded.
+fn schema_block<'a>(yaml: &'a str, name: &str) -> Vec<&'a str> {
+    let opening = format!("\n    {name}:\n");
+    let start = yaml
+        .find(&opening)
+        .unwrap_or_else(|| panic!("components.schemas.{name} is not in the document"))
+        + opening.len();
+    yaml[start..]
+        .lines()
+        .take_while(|line| line.trim().is_empty() || line.len() - line.trim_start().len() > 4)
+        .collect()
+}
+
+/// The value of `keyword` on the property `property` of
+/// `components.schemas.<schema>`, as written.
+fn schema_property_keyword(
+    yaml: &str,
+    schema: &str,
+    property: &str,
+    keyword: &str,
+) -> Option<String> {
+    let block = schema_block(yaml, schema);
+    let opening = format!("        {property}:");
+    let at = block.iter().position(|line| *line == opening)?;
+    block[at + 1..]
+        .iter()
+        .take_while(|line| line.trim().is_empty() || line.len() - line.trim_start().len() > 8)
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix(&format!("{keyword}:"))
+                .map(|value| value.trim().to_string())
+        })
+}
+
+/// The schema names `components.schemas.<schema>` lists under `oneOf`.
+fn one_of_refs(yaml: &str, schema: &str) -> Vec<String> {
+    let block = schema_block(yaml, schema);
+    let at = block
+        .iter()
+        .position(|line| *line == "      oneOf:")
+        .unwrap_or_else(|| panic!("{schema} has no oneOf"));
+    block[at + 1..]
+        .iter()
+        .take_while(|line| line.starts_with("        - "))
+        .filter_map(|line| line.trim().strip_prefix("- $ref: \"#/components/schemas/"))
+        .map(|rest| rest.trim_end_matches('"').to_string())
+        .collect()
+}
+
+const MANAGEMENT_DOCUMENT: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.yaml"));
+const AUTOMATION_DOCUMENT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/openapi-automation.yaml"
+));
+
+#[test]
+fn both_documents_publish_the_template_catalogue_and_the_check_limits() {
+    // Story 12.7 D-12: the template names and the limits a write is held
+    // to are the code's, and each document restating them is pinned to
+    // the constants here rather than retyped beside them.
+    use lorica_config::models::{
+        EXPECT_MAX_ALTERNATIVES, EXPECT_MAX_BYTES, PROBE_TIMEOUT_MS_DEFAULT, PROBE_TIMEOUT_MS_MAX,
+        PROBE_TIMEOUT_MS_MIN, SEND_MAX_BYTES,
+    };
+    let names: Vec<&str> = lorica_automation_policy::TCP_CHECK_TEMPLATES
+        .iter()
+        .map(|template| template.name)
+        .collect();
+    let catalogue = format!("[{}]", names.join(", "));
+    for (document, yaml) in [
+        ("openapi.yaml", MANAGEMENT_DOCUMENT),
+        ("openapi-automation.yaml", AUTOMATION_DOCUMENT),
+    ] {
+        assert_eq!(
+            schema_property_keyword(yaml, "TcpTemplateHealthCheck", "template", "enum"),
+            Some(catalogue.clone()),
+            "{document}: the template enum is not the catalogue"
+        );
+        for schema in ["TcpTemplateHealthCheck", "TcpSendExpectHealthCheck"] {
+            let bounds = extract_schema_property_bounds(yaml, schema);
+            assert_eq!(
+                bounds.get("timeout_ms"),
+                Some(&(
+                    Some(i64::from(PROBE_TIMEOUT_MS_MIN)),
+                    Some(i64::from(PROBE_TIMEOUT_MS_MAX))
+                )),
+                "{document}: {schema}.timeout_ms"
+            );
+            assert_eq!(
+                schema_property_keyword(yaml, schema, "timeout_ms", "default"),
+                Some(PROBE_TIMEOUT_MS_DEFAULT.to_string()),
+                "{document}: {schema}.timeout_ms default"
+            );
+        }
+        assert_eq!(
+            schema_property_keyword(yaml, "TcpSendExpectHealthCheck", "expect", "maxItems"),
+            Some(EXPECT_MAX_ALTERNATIVES.to_string()),
+            "{document}: expect.maxItems"
+        );
+    }
+    for (schema, property, limit) in [
+        ("TcpSendExpectHealthCheck", "send", SEND_MAX_BYTES),
+        ("HealthCheckExpectation", "bytes", EXPECT_MAX_BYTES),
+    ] {
+        assert_eq!(
+            schema_property_keyword(MANAGEMENT_DOCUMENT, schema, property, "x-max-decoded-bytes"),
+            Some(limit.to_string()),
+            "openapi.yaml: {schema}.{property}"
+        );
+    }
+}
+
+#[test]
+fn a_token_s_check_schema_carries_no_payload_and_is_the_config_tier_s_vocabulary() {
+    // Story 12.7 D-7 and D-11 on the documents: the automation write
+    // schema lists the kinds that carry no custom payload and nothing
+    // else, a read lists every kind, and the MCP config tier offers the
+    // fields of exactly the write schema's kinds and withholds the
+    // fields only a payload kind has.
+    let kinds = every_health_check_kind();
+    let (payload, plain): (Vec<_>, Vec<_>) = kinds
+        .iter()
+        .cloned()
+        .partition(lorica_config::models::HealthCheck::carries_raw_payload);
+    assert!(!payload.is_empty() && !plain.is_empty());
+    let kind_enum = |yaml: &str, schema: &str| {
+        schema_property_keyword(yaml, schema, "kind", "enum")
+            .unwrap_or_else(|| panic!("{schema} has no kind enum"))
+    };
+    let kinds_of = |checks: &[lorica_config::models::HealthCheck]| -> BTreeSet<String> {
+        checks
+            .iter()
+            .map(|check| format!("[{}]", check.kind()))
+            .collect()
+    };
+
+    let writes = one_of_refs(AUTOMATION_DOCUMENT, "AutomationHealthCheck");
+    let written: BTreeSet<String> = writes
+        .iter()
+        .map(|schema| kind_enum(AUTOMATION_DOCUMENT, schema))
+        .collect();
+    assert_eq!(written, kinds_of(&plain), "the automation write kinds");
+    assert!(
+        !schema_block(AUTOMATION_DOCUMENT, "AutomationHealthCheck")
+            .iter()
+            .any(|line| line.contains(payload[0].kind())),
+        "AutomationHealthCheck names a payload kind"
+    );
+    for (document, yaml) in [
+        ("openapi.yaml", MANAGEMENT_DOCUMENT),
+        ("openapi-automation.yaml", AUTOMATION_DOCUMENT),
+    ] {
+        let read: BTreeSet<String> = one_of_refs(yaml, "HealthCheck")
+            .iter()
+            .map(|schema| kind_enum(yaml, schema))
+            .collect();
+        assert_eq!(
+            read,
+            kinds_of(&kinds),
+            "{document}: the kinds a read carries"
+        );
+    }
+
+    let offered_by_the_schema: BTreeSet<String> = writes
+        .iter()
+        .flat_map(|schema| extract_schema_properties(AUTOMATION_DOCUMENT, schema))
+        .collect();
+    let plain_fields = field_names_of(&plain);
+    assert_eq!(offered_by_the_schema, plain_fields);
+    let payload_only: BTreeSet<String> = field_names_of(&payload)
+        .difference(&plain_fields)
+        .cloned()
+        .collect();
+    for tool in ["lorica_backend_create", "lorica_backend_update"] {
+        let body = lorica_mcp::tools::find(tool)
+            .and_then(|spec| spec.body())
+            .unwrap_or_else(|| panic!("{tool} carries a body"));
+        let check = body
+            .nested
+            .iter()
+            .find(|entry| entry.field == "health_check")
+            .unwrap_or_else(|| panic!("{tool} declares health_check nested"));
+        let offered: BTreeSet<String> = check.fields.iter().map(|f| (*f).to_string()).collect();
+        let withheld: BTreeSet<String> = check
+            .withheld
+            .iter()
+            .map(|(key, _)| (*key).to_string())
+            .collect();
+        assert_eq!(offered, plain_fields, "{tool}: the offered fields");
+        assert_eq!(withheld, payload_only, "{tool}: the withheld fields");
     }
 }
 

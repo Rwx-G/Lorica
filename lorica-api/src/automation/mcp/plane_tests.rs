@@ -1878,3 +1878,78 @@ async fn a_write_through_the_config_tier_lands_the_management_row_and_the_mcp_ro
         "a refused write landed a management row"
     );
 }
+
+#[tokio::test]
+async fn iv2_on_this_binding_a_payload_is_refused_by_the_tool_and_a_template_is_applied() {
+    // Story 12.7 IV2, MCP half, on the Streamable HTTP binding: the
+    // backend tools refuse a custom check's `send` by name before the
+    // in-process plane is called, and a template goes through to the
+    // store. The stdio binding runs the same tool check
+    // (`lorica-mcp`'s stdio tests); the plane behind both refuses a
+    // payload whatever the caller (`write/plane_tests.rs`).
+    let f = a_node_with_something_to_write().await;
+    let stored = || async {
+        let store = f.state.store.lock().await;
+        store
+            .get_backend(&f.backend_id)
+            .expect("store")
+            .expect("the backend")
+            .health_check
+    };
+    let before = stored().await;
+    let management_rows = audit_rows_under(&f.state, "backend.").await.len();
+    for tool in ["lorica_backend_update", "lorica_backend_update_preview"] {
+        let answered = mcp_call(
+            &f.state,
+            &f.mcp_bearer,
+            tool,
+            serde_json::json!({ "id": f.backend_id, "backend": { "health_check": {
+                "kind": "tcp_send_expect",
+                "send": { "text": "PING\r\n" },
+                "expect": [{ "match": "prefix", "bytes": { "text": "+PONG" } }],
+            } } }),
+        )
+        .await;
+        assert_eq!(
+            answered["error"]["code"],
+            serde_json::json!(-32602),
+            "{tool}: {answered}"
+        );
+        assert!(
+            answered["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("`backend.health_check.send`")),
+            "{tool}: {answered}"
+        );
+    }
+    assert_eq!(stored().await, before);
+    assert_eq!(
+        audit_rows_under(&f.state, "backend.").await.len(),
+        management_rows,
+        "a refused tool call reached the management handler"
+    );
+
+    let answered = mcp_call(
+        &f.state,
+        &f.mcp_bearer,
+        "lorica_backend_update",
+        serde_json::json!({ "id": f.backend_id, "backend": {
+            "health_check": { "kind": "tcp_template", "template": "redis_ping" },
+        } }),
+    )
+    .await;
+    assert_eq!(
+        answered["result"]["isError"],
+        serde_json::json!(false),
+        "{answered}"
+    );
+    assert_eq!(
+        plane_answer(&answered)["health_check"]["template"],
+        "redis_ping"
+    );
+    assert_eq!(
+        stored().await.template_name(),
+        Some("redis_ping"),
+        "the template is applied"
+    );
+}

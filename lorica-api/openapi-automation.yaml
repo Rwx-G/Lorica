@@ -783,7 +783,9 @@ paths:
         be inside that grant (403). `managed_by` is refused (422) as it
         is on the management path. `tls_skip_verify: true` is refused
         from a token (403): an upstream a token creates verifies its
-        certificate whenever TLS is on.
+        certificate whenever TLS is on. A custom send/expect health
+        check is refused (403 naming `health_check`): a token picks a
+        `tcp_template` instead (see `AutomationHealthCheck`).
 
 
         With `?dry_run=true`, the backend it would have created, and
@@ -829,7 +831,8 @@ paths:
         the view the dashboard's backend table reads, with the query
         values of the probe path withheld (`[redacted]`), in the typed
         `health_check.path` and the deprecated `health_check_path`
-        alike. A backend
+        alike, and the `send` of a custom send/expect check withheld
+        whole (`{"text": "[redacted]"}`, see `HealthCheck`). A backend
         an environment owns carries `managed_by`; the environment's name
         in it is `[redacted]` unless `GET
         /automation/v1/environments/{name}` would answer this credential
@@ -876,7 +879,10 @@ paths:
         `tls_skip_verify` off, never on; `tls_sni` unchanged while the
         upstream certificate is verified. A probe path sent back exactly
         as read, in `health_check` or the deprecated `health_check_path`,
-        keeps the stored path.
+        keeps the stored path. A custom send/expect check is neither
+        created nor changed (403 naming `health_check`); a stored one
+        rides a patch of other fields, and sent back exactly as read
+        keeps the stored payload (see `AutomationHealthCheck`).
 
 
         With `?dry_run=true`, the backend before and after the patch,
@@ -1893,11 +1899,12 @@ components:
         same way as `ManagementRouteCreate`. On this plane `address`
         must be an `ip:port` inside the token's `allowed_backend_cidrs`.
         Only the active check is restated below, because it changed
-        shape in 1.11.0; every other field is as `openapi.yaml` states
-        it.
+        shape in 1.11.0 and this plane takes fewer kinds of it than the
+        management API does; every other field is as `openapi.yaml`
+        states it.
       properties:
         health_check:
-          $ref: "#/components/schemas/HealthCheck"
+          $ref: "#/components/schemas/AutomationHealthCheck"
         health_check_path:
           type: string
           deprecated: true
@@ -1917,7 +1924,7 @@ components:
         restated as on `ManagementBackendCreate`.
       properties:
         health_check:
-          $ref: "#/components/schemas/HealthCheck"
+          $ref: "#/components/schemas/AutomationHealthCheck"
         health_check_path:
           type: string
           deprecated: true
@@ -1928,34 +1935,138 @@ components:
 
     HealthCheck:
       description: >-
-        What one active probe of a backend is, tagged by `kind`, as
-        `HealthCheck` in `openapi.yaml` states it. A later release adds
-        kinds as new `kind` values. Every query value of an `http`
-        check's `path` reads as `[redacted]` on this plane; sent back
-        exactly as read, the stored path is kept, and any other path
-        carrying `[redacted]` is refused (400).
+        What one active probe of a backend is, tagged by `kind`, as a
+        backend read on this plane carries it and as `HealthCheck` in
+        `openapi.yaml` states it. A later release adds kinds as new
+        `kind` values. Every query value of an `http` check's `path`
+        reads as `[redacted]` on this plane, and the whole `send` of a
+        `tcp_send_expect` check reads as `{"text": "[redacted]"}`; its
+        `expect` and a template's name are shown.
       oneOf:
-        - type: object
-          description: >-
-            An HTTP GET of `path` on the backend; a 2xx answer is
-            healthy. HTTP routes only.
-          required: [kind, path]
-          additionalProperties: false
+        - $ref: "#/components/schemas/HttpHealthCheck"
+        - $ref: "#/components/schemas/TcpConnectHealthCheck"
+        - $ref: "#/components/schemas/TcpTemplateHealthCheck"
+        - $ref: "#/components/schemas/TcpSendExpectHealthCheck"
+      discriminator:
+        propertyName: kind
+        mapping:
+          http: "#/components/schemas/HttpHealthCheck"
+          tcp_connect: "#/components/schemas/TcpConnectHealthCheck"
+          tcp_template: "#/components/schemas/TcpTemplateHealthCheck"
+          tcp_send_expect: "#/components/schemas/TcpSendExpectHealthCheck"
+
+    AutomationHealthCheck:
+      description: >-
+        The active check a backend write on this plane takes: every
+        kind whose bytes ship with the release. A custom send/expect
+        check is written from the management API only (D9 of the
+        Epic 12 PRD): a body creating or changing one is refused (403)
+        naming `health_check`, preview included, and the MCP config
+        tier's backend tools refuse its `send` and `expect` before a
+        call leaves. A backend that already has one keeps it through a
+        patch of other fields, or through the check sent back exactly
+        as read, its `send` `{"text": "[redacted]"}` included; a
+        `[redacted]` send on any other check is refused (400). Moving
+        such a backend to a template or a connect check is allowed.
+        Every query value of an `http` check's `path` reads as
+        `[redacted]`; sent back exactly as read, the stored path is
+        kept, and any other path carrying `[redacted]` is refused (400).
+      oneOf:
+        - $ref: "#/components/schemas/HttpHealthCheck"
+        - $ref: "#/components/schemas/TcpConnectHealthCheck"
+        - $ref: "#/components/schemas/TcpTemplateHealthCheck"
+      discriminator:
+        propertyName: kind
+        mapping:
+          http: "#/components/schemas/HttpHealthCheck"
+          tcp_connect: "#/components/schemas/TcpConnectHealthCheck"
+          tcp_template: "#/components/schemas/TcpTemplateHealthCheck"
+
+    HttpHealthCheck:
+      type: object
+      description: >-
+        An HTTP GET of `path` on the backend; a 2xx answer is healthy.
+        HTTP routes only.
+      required: [kind, path]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum: [http]
+        path:
+          type: string
+          minLength: 1
+
+    TcpConnectHealthCheck:
+      type: object
+      description: A TCP connection that completes is healthy.
+      required: [kind]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum: [tcp_connect]
+
+    TcpTemplateHealthCheck:
+      type: object
+      description: >-
+        A protocol check the release ships, referenced by name, as
+        `TcpTemplateHealthCheck` in `openapi.yaml` states it. Plaintext
+        TCP only: refused (422) on a backend with `tls_upstream` on.
+      required: [kind, template]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum: [tcp_template]
+        template:
+          type: string
+          enum: [redis_ping, smtp_banner, postgresql_ssl_request]
+        timeout_ms:
+          type: integer
+          minimum: 100
+          maximum: 10000
+          default: 5000
+
+    TcpSendExpectHealthCheck:
+      type: object
+      description: >-
+        A custom send/expect check as a read on this plane answers it:
+        `send` is always `{"text": "[redacted]"}` when the check sends
+        anything. Written from the management API only; see
+        `AutomationHealthCheck`.
+      required: [kind, expect]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum: [tcp_send_expect]
+        send:
+          type: object
+          description: Masked whole on this plane.
           properties:
-            kind:
+            text:
               type: string
-              enum: [http]
-            path:
-              type: string
-              minLength: 1
-        - type: object
-          description: A TCP connection that completes is healthy.
-          required: [kind]
-          additionalProperties: false
-          properties:
-            kind:
-              type: string
-              enum: [tcp_connect]
+              enum: ["[redacted]"]
+        expect:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items:
+            type: object
+            required: [match, bytes]
+            properties:
+              match:
+                type: string
+                enum: [prefix, contains]
+              bytes:
+                type: object
+                description: "`{\"text\": ...}` or `{\"hex\": ...}`, as `openapi.yaml` states."
+        timeout_ms:
+          type: integer
+          minimum: 100
+          maximum: 10000
+          default: 5000
 
     BindCertificateRequest:
       type: object

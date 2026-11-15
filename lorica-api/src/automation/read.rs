@@ -658,7 +658,8 @@ pub async fn list_backends(
     Query(page): Query<PageQuery>,
 ) -> Result<Response, ApiError> {
     let page = page.page();
-    let answer = crate::backends::list_backends(Extension(state.clone())).await?;
+    let answer =
+        crate::backends::list_backends_as(&state, lorica_config::models::Role::Viewer).await?;
     let rows = within_the_grant(&principal, rows(answer, Some("backends"))?, |row| {
         ensure_backend_address_granted(&principal, "address", text(row, "address")).is_ok()
     });

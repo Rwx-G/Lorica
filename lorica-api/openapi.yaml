@@ -7392,15 +7392,22 @@ components:
         A later release adds kinds as new `kind` values: a client should
         show a check of a kind it does not know as such rather than fail
         on it, and leave `health_check` out of a write it does not mean
-        to change it with.
+        to change it with. A `tcp_template` or `tcp_send_expect` check
+        speaks plaintext TCP and is refused (422) on a backend with
+        `tls_upstream` on, as is a check outside its limits, the
+        refusal naming the field (`health_check.expect[2].bytes`).
       oneOf:
         - $ref: "#/components/schemas/HttpHealthCheck"
         - $ref: "#/components/schemas/TcpConnectHealthCheck"
+        - $ref: "#/components/schemas/TcpTemplateHealthCheck"
+        - $ref: "#/components/schemas/TcpSendExpectHealthCheck"
       discriminator:
         propertyName: kind
         mapping:
           http: "#/components/schemas/HttpHealthCheck"
           tcp_connect: "#/components/schemas/TcpConnectHealthCheck"
+          tcp_template: "#/components/schemas/TcpTemplateHealthCheck"
+          tcp_send_expect: "#/components/schemas/TcpSendExpectHealthCheck"
 
     HttpHealthCheck:
       type: object
@@ -7431,6 +7438,108 @@ components:
         kind:
           type: string
           enum: [tcp_connect]
+
+    TcpTemplateHealthCheck:
+      type: object
+      description: >-
+        A protocol check the release ships, referenced by name: the
+        probe sends the template's bytes and is healthy when the
+        backend answers one of the template's answers within
+        `timeout_ms`. A template corrected in a later release reaches
+        every backend that names it. Plaintext TCP only. The automation
+        plane and the MCP config tier may set one; see
+        `docs/health-checks.md` for each template's bytes.
+      required: [kind, template]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum: [tcp_template]
+        template:
+          type: string
+          enum: [redis_ping, smtp_banner, postgresql_ssl_request]
+          description: The template, by name.
+        timeout_ms:
+          type: integer
+          minimum: 100
+          maximum: 10000
+          default: 5000
+          description: The deadline of the whole probe, connect, send and read.
+
+    TcpSendExpectHealthCheck:
+      type: object
+      description: >-
+        Bytes of the operator's own to send, if any, and the answers
+        that make the probe healthy, any one of them, within
+        `timeout_ms`. Plaintext TCP only. Written from this API only,
+        by an Operator or a SuperAdmin: the automation plane and the
+        MCP config tier never create or change one (403). A Viewer
+        session reads `send` as `{"text": "[redacted]"}`, as every
+        automation token does; a check sent back exactly as read keeps
+        the stored payload, and a `[redacted]` send on any other check
+        is refused (400), so the mask is never stored. Never put a
+        credential in a payload: it is stored in clear, replicated,
+        exported and shown to every Operator.
+      required: [kind, expect]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum: [tcp_send_expect]
+        send:
+          description: >-
+            What the probe sends once connected; absent sends nothing,
+            and an empty payload is refused.
+          x-max-decoded-bytes: 1024
+          allOf:
+            - $ref: "#/components/schemas/HealthCheckPayload"
+        expect:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items:
+            $ref: "#/components/schemas/HealthCheckExpectation"
+        timeout_ms:
+          type: integer
+          minimum: 100
+          maximum: 10000
+          default: 5000
+          description: The deadline of the whole probe, connect, send and read.
+
+    HealthCheckPayload:
+      type: object
+      description: >-
+        Bytes on the wire, in exactly one of two spellings: `text`, the
+        UTF-8 bytes of the string sent as is, or `hex`, an even number
+        of hexadecimal digits for bytes a JSON string cannot carry as
+        themselves (stored lowercased).
+      minProperties: 1
+      maxProperties: 1
+      additionalProperties: false
+      properties:
+        text:
+          type: string
+        hex:
+          type: string
+          pattern: "^([0-9a-fA-F]{2})+$"
+
+    HealthCheckExpectation:
+      type: object
+      description: >-
+        One accepted answer: `prefix` when the bytes read start with
+        `bytes`, `contains` when `bytes` occurs anywhere in what the
+        probe reads. Literal bytes, no pattern language.
+      required: [match, bytes]
+      additionalProperties: false
+      properties:
+        match:
+          type: string
+          enum: [prefix, contains]
+        bytes:
+          description: The bytes, matched literally; an empty alternative is refused.
+          x-max-decoded-bytes: 256
+          allOf:
+            - $ref: "#/components/schemas/HealthCheckPayload"
 
     Backend:
       type: object
@@ -7561,8 +7670,10 @@ components:
             Deprecated since 1.11.0 in favour of `health_check`, read as
             on create: a path sets an `http` check, the empty string
             `tcp_connect`, and beside `health_check` it must agree with
-            it (400 otherwise). With neither field the stored check is
-            kept.
+            it (400 otherwise). Sent alone, the empty string speaks of
+            the HTTP path only and leaves a check without one (a TCP
+            connect, a template, a custom send/expect check) as stored.
+            With neither field the stored check is kept.
         tls_upstream:
           type: boolean
           description: HTTP routes only; streams ignore it.

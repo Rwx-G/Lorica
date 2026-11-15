@@ -3683,3 +3683,203 @@ async fn a_masked_health_check_path_sent_back_keeps_the_stored_probe_and_is_neve
         "a refused create stored a backend"
     );
 }
+
+/// A custom send/expect check sending `send`, as a body spells it.
+fn a_custom_check(send: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "tcp_send_expect",
+        "send": { "text": send },
+        "expect": [{ "match": "prefix", "bytes": { "text": "+PONG" } }],
+        "timeout_ms": 2000,
+    })
+}
+
+/// The check `backend_id` stores, as the wire spells it.
+async fn stored_check(state: &AppState, backend_id: &str) -> serde_json::Value {
+    let store = state.store.lock().await;
+    let backend = store
+        .get_backend(backend_id)
+        .expect("store")
+        .expect("the backend");
+    serde_json::to_value(&backend.health_check).expect("serialises")
+}
+
+/// A 403 naming the payload rule's field and quoting none of `payload`.
+async fn assert_payload_refused(response: axum::response::Response, payload: &str, what: &str) {
+    assert_eq!(response.status(), StatusCode::FORBIDDEN, "{what}");
+    let refusal = body_json(response).await;
+    let message = refusal["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("forbidden: health_check:"),
+        "{what}: {message}"
+    );
+    assert!(
+        message.contains(lorica_automation_policy::protections::backend::HEALTH_CHECK_PAYLOAD.rule),
+        "{what}: {message}"
+    );
+    assert!(!message.contains(payload), "{what}: {message}");
+}
+
+#[tokio::test]
+async fn iv2_a_token_sets_a_template_and_never_authors_a_custom_payload() {
+    // Story 12.7 IV2 and D-7, on every row of the backend write surface:
+    // a stored payload rides a patch of other fields and its masked read
+    // sent back; creating or changing one is a 403, preview included,
+    // that stores nothing and quotes nothing; the mask beside a changed
+    // `expect` is a 400; moving to a template is the token's to do.
+    let f = a_node_with_something_to_write().await;
+    let backend_path = format!("/automation/v1/backends/{}", f.backend_id);
+    let custom = a_custom_check("AUTH s3cr3t\r\nPING\r\n");
+    let response = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "PUT",
+        &format!("/api/v1/backends/{}", f.backend_id),
+        &f.admin,
+        Some(serde_json::json!({ "health_check": custom })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "the dashboard sets one");
+    assert_eq!(stored_check(&f.state, &f.backend_id).await, custom);
+
+    // A weight-only patch, previewed and applied: the payload rides it.
+    for suffix in ["?dry_run=true", ""] {
+        let response = automation_call(
+            &f.state,
+            "PUT",
+            &format!("{backend_path}{suffix}"),
+            &f.bearer,
+            Some(serde_json::json!({ "weight": 40 })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "weight{suffix}");
+        let answer = body_json(response).await;
+        assert!(!answer.to_string().contains("s3cr3t"), "{suffix}: {answer}");
+    }
+    assert_eq!(stored_check(&f.state, &f.backend_id).await, custom);
+
+    // The check as the listing reads it, mask and all, sent back: kept.
+    let listed = parse_data(
+        automation_send(&f.state, "/automation/v1/backends", Some(&f.bearer), None).await,
+    )
+    .await;
+    let as_read = listed["items"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == f.backend_id.as_str()))
+        .map(|row| row["health_check"].clone())
+        .expect("the listing carries the backend");
+    assert_eq!(as_read["send"], serde_json::json!({ "text": "[redacted]" }));
+    assert_eq!(as_read["expect"], custom["expect"]);
+    for suffix in ["?dry_run=true", ""] {
+        let response = automation_call(
+            &f.state,
+            "PUT",
+            &format!("{backend_path}{suffix}"),
+            &f.bearer,
+            Some(serde_json::json!({ "health_check": as_read, "weight": 60 })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "read back{suffix}");
+    }
+    assert_eq!(stored_check(&f.state, &f.backend_id).await, custom);
+
+    // Creating or changing a payload, applied or previewed.
+    let mut stored_payload_new_answer = custom.clone();
+    stored_payload_new_answer["expect"][0]["bytes"] = serde_json::json!({ "text": "-NOAUTH" });
+    for (what, method, path, body) in [
+        (
+            "a changed payload",
+            "PUT",
+            backend_path.clone(),
+            serde_json::json!({ "health_check": a_custom_check("PING\r\n") }),
+        ),
+        (
+            "a changed payload, previewed",
+            "PUT",
+            format!("{backend_path}?dry_run=true"),
+            serde_json::json!({ "health_check": a_custom_check("PING\r\n") }),
+        ),
+        (
+            "the payload with another answer",
+            "PUT",
+            backend_path.clone(),
+            serde_json::json!({ "health_check": stored_payload_new_answer }),
+        ),
+        (
+            "a create with a payload",
+            "POST",
+            "/automation/v1/backends".to_string(),
+            serde_json::json!({ "address": "10.0.0.14:8080", "health_check": a_custom_check("PING\r\n") }),
+        ),
+        (
+            "a create with a payload, previewed",
+            "POST",
+            "/automation/v1/backends?dry_run=true".to_string(),
+            serde_json::json!({ "address": "10.0.0.14:8080", "health_check": a_custom_check("PING\r\n") }),
+        ),
+    ] {
+        let response = automation_call(&f.state, method, &path, &f.bearer, Some(body)).await;
+        assert_payload_refused(response, "PING", what).await;
+    }
+    assert_eq!(stored_check(&f.state, &f.backend_id).await, custom);
+
+    // The mask beside a changed answer is no check read back.
+    let mut masked_new_answer = as_read.clone();
+    masked_new_answer["expect"][0]["bytes"] = serde_json::json!({ "text": "-NOAUTH" });
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &backend_path,
+        &f.bearer,
+        Some(serde_json::json!({ "health_check": masked_new_answer })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let refusal = body_json(response).await;
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("health_check.send:")),
+        "{refusal}"
+    );
+    assert_eq!(stored_check(&f.state, &f.backend_id).await, custom);
+
+    // Away from a payload to a template, and a template on a create.
+    let template = serde_json::json!({ "kind": "tcp_template", "template": "redis_ping",
+                                       "timeout_ms": 2000 });
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &backend_path,
+        &f.bearer,
+        Some(serde_json::json!({ "health_check": template })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(stored_check(&f.state, &f.backend_id).await, template);
+    let response = automation_call(
+        &f.state,
+        "POST",
+        "/automation/v1/backends",
+        &f.bearer,
+        Some(serde_json::json!({
+            "address": "10.0.0.15:8080",
+            "health_check": { "kind": "tcp_template", "template": "smtp_banner" },
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created = parse_data(response).await;
+    assert_eq!(created["health_check"]["template"], "smtp_banner");
+
+    let store = f.state.store.lock().await;
+    assert!(
+        store
+            .list_backends()
+            .expect("store")
+            .iter()
+            .all(|backend| backend.address != "10.0.0.14:8080"),
+        "a refused create stored a backend"
+    );
+}

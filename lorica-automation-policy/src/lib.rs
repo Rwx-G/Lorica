@@ -37,8 +37,11 @@
 //! the rule that resolves a scope set to one tier ([`tier`]), the admin
 //! tier's settings allowlist ([`settings`]), and the config tier's
 //! withheld route fields and one-way protection rules
-//! ([`protections`]), and the named TCP health-check templates a token
-//! may select in place of a custom payload ([`health_templates`]).
+//! ([`protections`]), the rule that keeps a custom health-check
+//! payload out of a token's writes
+//! ([`protections::backend::HEALTH_CHECK_PAYLOAD`]), and the named TCP
+//! health-check templates a token may select in its place
+//! ([`health_templates`]).
 //!
 //! Not here: anything that reads a row, a request or a clock. The
 //! predicates that weigh a patched route against the stored one need

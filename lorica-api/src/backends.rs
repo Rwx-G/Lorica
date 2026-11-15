@@ -12,12 +12,23 @@
 //! still accepted on input and still answered, kept equal to the typed
 //! check's path; a request sending both must send them agreeing
 //! ([`requested_health_check`]).
+//!
+//! A custom check's payload (`health_check.send` of a `tcp_send_expect`
+//! check, Story 12.7 D-8) is shown to Operator and SuperAdmin and
+//! withheld from a Viewer session, as the automation plane withholds
+//! it from every token: a payload is where a credential would go, and
+//! the Viewer role's contract is that secrets are scrubbed. The two
+//! reads that answer a backend to a Viewer, [`list_backends`] and
+//! [`get_backend`], mask it; the writes are Operator and above, and put
+//! the stored payload back for a mask sent back unchanged
+//! (`crate::automation::redact::restore_health_check_payload`), so the
+//! mask is never stored.
 
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
-use lorica_config::models::HealthCheck;
+use lorica_config::models::{HealthCheck, Role};
 use serde::{Deserialize, Serialize};
 
 use crate::db::db_blocking;
@@ -140,7 +151,9 @@ pub struct UpdateBackendRequest {
     pub health_check: Option<HealthCheck>,
     /// Deprecated since 1.11.0 in favour of `health_check`, read as on
     /// create: a path sets an `http` check, the empty string
-    /// `tcp_connect`.
+    /// `tcp_connect`. Sent alone, the empty string speaks of the HTTP
+    /// path only: on a backend whose check has no path (a TCP connect,
+    /// a template, a custom send/expect check) it changes nothing.
     pub health_check_path: Option<String>,
     /// Upstream TLS toggle. HTTP routes only.
     pub tls_upstream: Option<bool>,
@@ -183,6 +196,18 @@ fn backend_to_response(
         created_at: b.created_at.to_rfc3339(),
         updated_at: b.updated_at.to_rfc3339(),
     }
+}
+
+/// `response` as a session of `role` may read it: below Operator, a
+/// custom check's payload withheld
+/// (`crate::automation::redact::health_check_payload_withheld`, the
+/// mask the automation plane answers with).
+fn as_read_by(mut response: BackendResponse, role: Role) -> BackendResponse {
+    if role < Role::Operator {
+        response.health_check =
+            crate::automation::redact::health_check_payload_withheld(&response.health_check);
+    }
+    response
 }
 
 /// The active check a create or an update asks for, from the typed
@@ -291,11 +316,25 @@ impl MergedWorkerMetrics {
 }
 
 /// GET /api/v1/backends - list every backend with its live EWMA score and active connection count.
+///
+/// A Viewer session reads a custom check's payload masked (see the
+/// module doc).
 pub async fn list_backends(
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    list_backends_as(&state, session.role).await
+}
+
+/// The whole of [`list_backends`] as read by `reader`: the automation
+/// plane's listing reads it as a Viewer would, below Operator, and
+/// masks the rows again for everything else a token is not shown.
+pub(crate) async fn list_backends_as(
+    state: &AppState,
+    reader: Role,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let backends = db_blocking(&state.store, move |store| store.list_backends()).await?;
-    let merged = MergedWorkerMetrics::collect(&state).await;
+    let merged = MergedWorkerMetrics::collect(state).await;
     let responses: Vec<BackendResponse> = backends
         .iter()
         .map(|b| {
@@ -313,7 +352,7 @@ pub async fn list_backends(
                 .map(|bc| bc.get(&b.address) as i32)
                 .or_else(|| merged.connections.get(&b.address).map(|c| *c as i32))
                 .unwrap_or(0);
-            backend_to_response(b, score, conns)
+            as_read_by(backend_to_response(b, score, conns), reader)
         })
         .collect();
     Ok(json_data(serde_json::json!({ "backends": responses })))
@@ -403,6 +442,7 @@ pub(crate) async fn create_backend_as(
             backend.health_check_interval_s =
                 store.get_global_settings()?.default_health_check_interval_s;
         }
+        crate::automation::redact::restore_health_check_payload(None, &mut backend)?;
         guard.restore_withheld(None, &mut backend)?;
         guard.check(
             store,
@@ -445,8 +485,12 @@ pub(crate) async fn create_backend_as(
 }
 
 /// GET /api/v1/backends/:id - fetch a single backend by id.
+///
+/// A Viewer session reads a custom check's payload masked (see the
+/// module doc).
 pub async fn get_backend(
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let backend = db_blocking(&state.store, move |store| {
@@ -457,7 +501,10 @@ pub async fn get_backend(
     .await?;
     let score = get_ewma_score_async(&state, &backend.address).await;
     let conns = get_backend_connections_async(&state, &backend.address).await;
-    Ok(json_data(backend_to_response(&backend, score, conns)))
+    Ok(json_data(as_read_by(
+        backend_to_response(&backend, score, conns),
+        session.role,
+    )))
 }
 
 /// PUT /api/v1/backends/:id - patch backend fields and trigger a proxy reload.
@@ -497,6 +544,7 @@ pub(crate) async fn update_backend_as(
     guard: crate::target::BackendGuard,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     refuse_client_managed_by(body.managed_by.as_ref())?;
+    let legacy_only = body.health_check.is_none();
     let health_check =
         requested_health_check(body.health_check, body.health_check_path.as_deref())?;
     let role = crate::streams::LocalRole::of(state);
@@ -544,7 +592,16 @@ pub(crate) async fn update_backend_as(
             backend.health_check_interval_s = interval;
         }
         if let Some(check) = health_check {
-            backend.set_health_check(check);
+            // The deprecated field speaks of the HTTP path alone: emptied
+            // on a backend whose check has no path, it asks for nothing,
+            // and replacing a template or a custom check with a TCP
+            // connect would answer a question the client never asked.
+            let clears_an_absent_path = legacy_only
+                && check == HealthCheck::TcpConnect
+                && backend.health_check.legacy_path().is_none();
+            if !clears_an_absent_path {
+                backend.set_health_check(check);
+            }
         }
         if let Some(tls) = body.tls_upstream {
             backend.tls_upstream = tls;
@@ -559,6 +616,10 @@ pub(crate) async fn update_backend_as(
             backend.h2_upstream = h2;
         }
         backend.updated_at = Utc::now();
+        crate::automation::redact::restore_health_check_payload(
+            Some(&before_backend),
+            &mut backend,
+        )?;
         guard.restore_withheld(Some(&before_backend), &mut backend)?;
         guard.check(
             store,
@@ -1037,6 +1098,379 @@ mod tests {
             assert!(message.contains("`dns-udp`"), "{message}");
         }
         assert!(!node.stored(&id).await.health_check_enabled);
+    }
+
+    /// A custom send/expect check sending `send`, as a body spells it.
+    fn custom(send: &str) -> Value {
+        json!({
+            "kind": "tcp_send_expect",
+            "send": { "text": send },
+            "expect": [{ "match": "prefix", "bytes": { "hex": "2b504f4e47" } }],
+            "timeout_ms": 2000,
+        })
+    }
+
+    fn template(name: &str) -> Value {
+        json!({ "kind": "tcp_template", "template": name, "timeout_ms": 2000 })
+    }
+
+    impl Node {
+        /// A session of `role` on this node, as its cookie.
+        async fn session_of(&self, username: &str, role: lorica_config::models::Role) -> String {
+            crate::tests::create_user_and_login(
+                &self.state,
+                &self.sessions,
+                &self.limiter,
+                username,
+                role,
+            )
+            .await
+        }
+
+        /// `GET uri` as the session `cookie`, its whole answer.
+        async fn read_as(&self, cookie: &str, uri: &str) -> Value {
+            let response = send(
+                &self.state,
+                &self.sessions,
+                &self.limiter,
+                "GET",
+                uri,
+                cookie,
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            body_json(response).await
+        }
+
+        /// `(status, whole answer)` of a write as the session `cookie`.
+        async fn write_as(
+            &self,
+            cookie: &str,
+            method: &str,
+            uri: &str,
+            body: Value,
+        ) -> (StatusCode, Value) {
+            let response = send(
+                &self.state,
+                &self.sessions,
+                &self.limiter,
+                method,
+                uri,
+                cookie,
+                Some(body),
+            )
+            .await;
+            let status = response.status();
+            (status, body_json(response).await)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_operator_creates_every_kind_and_each_check_limit_is_a_422_naming_its_field() {
+        // The store's validation (Story 12.7 D-6) is a refusal on the
+        // merits, the 422 every store rule answers (`ApiError` from
+        // `ConfigError::Validation`).
+        let node = Node::new().await;
+        let operator = node
+            .session_of("operator01", lorica_config::models::Role::Operator)
+            .await;
+        for (index, check) in [
+            http("/healthz"),
+            json!({ "kind": "tcp_connect" }),
+            template("redis_ping"),
+            custom("PING\r\n"),
+            json!({ "kind": "tcp_send_expect",
+                    "expect": [{ "match": "contains", "bytes": { "text": "220" } }] }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (status, answer) = node
+                .write_as(
+                    &operator,
+                    "POST",
+                    "/api/v1/backends",
+                    json!({ "address": format!("192.0.2.{}:6379", 20 + index), "health_check": check }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{check}: {answer}");
+            let stored = node
+                .stored(answer["data"]["id"].as_str().expect("an id"))
+                .await;
+            let mut expected = check.clone();
+            if expected["kind"] == "tcp_send_expect" && expected.get("timeout_ms").is_none() {
+                expected["timeout_ms"] = json!(lorica_config::models::PROBE_TIMEOUT_MS_DEFAULT);
+            }
+            assert_eq!(
+                serde_json::to_value(&stored.health_check).expect("serialises"),
+                expected
+            );
+        }
+
+        let over_send = "a".repeat(lorica_config::models::SEND_MAX_BYTES + 1);
+        let alternatives: Vec<Value> = (0..=lorica_config::models::EXPECT_MAX_ALTERNATIVES)
+            .map(|_| json!({ "match": "prefix", "bytes": { "text": "+" } }))
+            .collect();
+        let over_answer = "a".repeat(lorica_config::models::EXPECT_MAX_BYTES + 1);
+        for (field, check, tls_upstream) in [
+            ("health_check.send", custom(&over_send), false),
+            ("health_check.send", custom(""), false),
+            (
+                "health_check.expect",
+                json!({ "kind": "tcp_send_expect", "expect": alternatives }),
+                false,
+            ),
+            (
+                "health_check.expect",
+                json!({ "kind": "tcp_send_expect", "expect": [] }),
+                false,
+            ),
+            (
+                "health_check.expect[0].bytes",
+                json!({ "kind": "tcp_send_expect",
+                        "expect": [{ "match": "prefix", "bytes": { "text": over_answer } }] }),
+                false,
+            ),
+            (
+                "health_check.expect[0].bytes",
+                json!({ "kind": "tcp_send_expect",
+                        "expect": [{ "match": "prefix", "bytes": { "hex": "abc" } }] }),
+                false,
+            ),
+            (
+                "health_check.timeout_ms",
+                json!({ "kind": "tcp_template", "template": "smtp_banner",
+                        "timeout_ms": lorica_config::models::PROBE_TIMEOUT_MS_MAX + 1 }),
+                false,
+            ),
+            ("tls_upstream", template("redis_ping"), true),
+        ] {
+            let (status, answer) = node
+                .write_as(
+                    &operator,
+                    "POST",
+                    "/api/v1/backends",
+                    json!({
+                        "address": "192.0.2.40:6379",
+                        "health_check": check,
+                        "tls_upstream": tls_upstream,
+                    }),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{field}: {answer}"
+            );
+            let message = answer["error"]["message"].as_str().expect("a message");
+            assert!(message.contains(field), "{field}: {message}");
+            assert!(!message.contains("aaaa"), "{field}: the payload is echoed");
+        }
+        assert!(node
+            .state
+            .store
+            .lock()
+            .await
+            .list_backends()
+            .expect("store read")
+            .iter()
+            .all(|backend| backend.address != "192.0.2.40:6379"));
+    }
+
+    #[tokio::test]
+    async fn a_viewer_reads_a_custom_payload_masked_and_an_operator_reads_it_whole() {
+        let node = Node::new().await;
+        let (status, created) = node
+            .create(
+                json!({ "address": "192.0.2.10:6379", "health_check": custom("AUTH s3cr3t\r\n") }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["data"]["id"].as_str().expect("an id").to_string();
+        let (_, templated) = node
+            .create(json!({ "address": "192.0.2.11:6379", "health_check": template("redis_ping") }))
+            .await;
+        let template_id = templated["data"]["id"].as_str().expect("an id").to_string();
+
+        let viewer = node
+            .session_of("viewer01", lorica_config::models::Role::Viewer)
+            .await;
+        let operator = node
+            .session_of("operator01", lorica_config::models::Role::Operator)
+            .await;
+        let whole = custom("AUTH s3cr3t\r\n");
+        let mut masked = whole.clone();
+        masked["send"] = json!({ "text": crate::automation::redact::REDACTED });
+
+        for (who, cookie, expected) in [
+            ("viewer", viewer.as_str(), &masked),
+            ("operator", operator.as_str(), &whole),
+            ("superadmin", node.cookie.as_str(), &whole),
+        ] {
+            let one = node
+                .read_as(cookie, &format!("/api/v1/backends/{id}"))
+                .await;
+            assert_eq!(&one["data"]["health_check"], expected, "{who}: GET one");
+            let listed = node.read_as(cookie, "/api/v1/backends").await;
+            let rows = listed["data"]["backends"].as_array().expect("a list");
+            let row = |wanted: &str| {
+                rows.iter()
+                    .find(|row| row["id"] == wanted)
+                    .map(|row| row["health_check"].clone())
+                    .expect("the backend is listed")
+            };
+            assert_eq!(&row(&id), expected, "{who}: the listing");
+            assert_eq!(
+                row(&template_id),
+                template("redis_ping"),
+                "{who}: a template"
+            );
+            if who == "viewer" {
+                assert!(!listed.to_string().contains("s3cr3t"), "{listed}");
+                assert!(!one.to_string().contains("s3cr3t"), "{one}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_masked_payload_sent_back_by_an_operator_keeps_the_stored_one_and_is_never_stored() {
+        // A Viewer's masked view can reach an Operator's form; the mask
+        // sent back with the rest of the check unchanged keeps the
+        // stored payload, anything else carrying it is a 400.
+        let node = Node::new().await;
+        let (_, created) = node
+            .create(
+                json!({ "address": "192.0.2.10:6379", "health_check": custom("AUTH s3cr3t\r\n") }),
+            )
+            .await;
+        let id = created["data"]["id"].as_str().expect("an id").to_string();
+        let stored_check = node.stored(&id).await.health_check;
+        let viewer = node
+            .session_of("viewer01", lorica_config::models::Role::Viewer)
+            .await;
+        let as_read = node
+            .read_as(&viewer, &format!("/api/v1/backends/{id}"))
+            .await["data"]["health_check"]
+            .clone();
+
+        let (status, answer) = node
+            .update(&id, json!({ "health_check": as_read, "weight": 70 }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        let kept = node.stored(&id).await;
+        assert_eq!(kept.health_check, stored_check);
+        assert_eq!(kept.weight, 70);
+
+        let mut changed_answer = as_read.clone();
+        changed_answer["expect"][0]["bytes"] = json!({ "text": "-NOAUTH" });
+        for (what, status_and_answer) in [
+            (
+                "the mask with another answer",
+                node.update(&id, json!({ "health_check": changed_answer }))
+                    .await,
+            ),
+            (
+                "the mask on a create",
+                node.create(json!({ "address": "192.0.2.12:6379", "health_check": as_read }))
+                    .await,
+            ),
+        ] {
+            let (status, answer) = status_and_answer;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {answer}");
+            assert!(answer["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("health_check.send:")));
+        }
+        assert_eq!(node.stored(&id).await.health_check, stored_check);
+        let stored = node
+            .state
+            .store
+            .lock()
+            .await
+            .list_backends()
+            .expect("store read");
+        assert!(stored
+            .iter()
+            .all(|backend| backend.address != "192.0.2.12:6379"));
+        assert!(stored
+            .iter()
+            .all(|backend| !serde_json::to_string(&backend.health_check)
+                .expect("serialises")
+                .contains(crate::automation::redact::REDACTED)));
+    }
+
+    #[tokio::test]
+    async fn an_empty_legacy_path_speaks_of_the_http_path_only_and_leaves_a_template_alone() {
+        let node = Node::new().await;
+        let (_, created) = node
+            .create(json!({ "address": "192.0.2.10:6379", "health_check": template("redis_ping") }))
+            .await;
+        let id = created["data"]["id"].as_str().expect("an id").to_string();
+        let (status, answer) = node.update(&id, json!({ "health_check_path": "" })).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["data"]["health_check"], template("redis_ping"));
+
+        // On an HTTP check it still clears the path, as it always has.
+        let (_, answer) = node
+            .update(&id, json!({ "health_check": http("/ready") }))
+            .await;
+        assert_eq!(answer["data"]["health_check"], http("/ready"));
+        let (_, answer) = node.update(&id, json!({ "health_check_path": "" })).await;
+        assert_eq!(
+            answer["data"]["health_check"],
+            json!({ "kind": "tcp_connect" })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_custom_check_exports_and_imports_through_the_management_api() {
+        // The TOML import row of Story 12.7 D-7: an operator's file is the
+        // management plane's, so a payload in it is allowed, validated.
+        let node = Node::new().await;
+        let (_, created) = node
+            .create(json!({ "address": "192.0.2.10:6379", "health_check": custom("PING\r\n") }))
+            .await;
+        let id = created["data"]["id"].as_str().expect("an id").to_string();
+        let stored_check = node.stored(&id).await.health_check;
+        let response = send(
+            &node.state,
+            &node.sessions,
+            &node.limiter,
+            "POST",
+            "/api/v1/config/export",
+            &node.cookie,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let exported = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("the export reads")
+                .to_vec(),
+        )
+        .expect("the export is text");
+        // The users section carries a redacted hash an import refuses,
+        // and the export writes it last.
+        let exported: String = exported
+            .lines()
+            .take_while(|line| !line.starts_with("[[users]]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        {
+            let store = node.state.store.lock().await;
+            store.delete_backend(&id).expect("the row leaves");
+        }
+        let (status, answer) = node
+            .call(
+                "POST",
+                "/api/v1/config/import",
+                json!({ "toml_content": exported }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(node.stored(&id).await.health_check, stored_check);
     }
 
     #[tokio::test]

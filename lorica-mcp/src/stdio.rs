@@ -694,4 +694,53 @@ mod tests {
             )]
         );
     }
+
+    #[tokio::test]
+    async fn over_stdio_a_custom_health_check_payload_never_leaves_and_a_template_crosses() {
+        // Story 12.7 D-7 on this transport: the backend tool refuses a
+        // custom check's `send`, naming it, before anything reaches the
+        // plane, and a template crosses as the body the tool declared.
+        let plane = Plane::always("{\"data\":{\"id\":\"b-1\"}}");
+        let server = server_carrying(&["backends:write", "backends:read"]);
+        let answers = exchange(
+            &server,
+            &plane,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\
+              \"params\":{\"name\":\"lorica_backend_update\",\"arguments\":{\"id\":\"b-1\",\
+              \"backend\":{\"health_check\":{\"kind\":\"tcp_send_expect\",\
+              \"send\":{\"text\":\"PING\"},\
+              \"expect\":[{\"match\":\"prefix\",\"bytes\":{\"text\":\"+PONG\"}}]}}}}}\n\
+             {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\
+              \"params\":{\"name\":\"lorica_backend_update\",\"arguments\":{\"id\":\"b-1\",\
+              \"backend\":{\"health_check\":{\"kind\":\"tcp_template\",\
+              \"template\":\"redis_ping\"}}}}}\n",
+        )
+        .await;
+
+        assert_eq!(
+            answers[0]["error"]["code"],
+            json!(jsonrpc::code::INVALID_PARAMS),
+            "{}",
+            answers[0]
+        );
+        let refusal = answers[0]["error"]["message"].as_str().unwrap_or_default();
+        assert!(refusal.contains("`backend.health_check.send`"), "{refusal}");
+        assert_eq!(
+            answers[1]["result"]["isError"],
+            json!(false),
+            "{}",
+            answers[1]
+        );
+        assert_eq!(
+            plane.sent(),
+            vec![(
+                Verb::Put,
+                "/automation/v1/backends/b-1".to_string(),
+                Some(
+                    json!({ "health_check": { "kind": "tcp_template", "template": "redis_ping" } })
+                )
+            )],
+            "only the template reached the plane"
+        );
+    }
 }

@@ -40,6 +40,14 @@
 //!   whatever the verifier needs;
 //! - a backend's probe path, the typed `health_check.path` and the
 //!   deprecated `health_check_path` alike: every query value;
+//! - a backend's custom health-check payload, `health_check.send` of a
+//!   `tcp_send_expect` check (Story 12.7, D-8): the whole payload,
+//!   answered as `{"text": "[redacted]"}` so the row still decodes. A
+//!   payload is where an operator who did not read the docs puts a
+//!   credential (`AUTH <password>`). Its `expect` and a template are
+//!   not withheld: they are what the backend answers, or bytes the
+//!   release ships. The management plane withholds it from a Viewer
+//!   session with the same function ([`health_check_payload_withheld`]);
 //! - an access-log row's `path`: every query value and the fragment;
 //! - a route's or a backend's `managed_by.environment`, unless the
 //!   reader may look that environment up
@@ -62,7 +70,9 @@
 //! masked views, so it names no field whose only change is a withheld
 //! value. The dashboard
 //! and the log sinks are unchanged: they sit behind a session or an
-//! operator's own export, not behind a model.
+//! operator's own export, not behind a model. The one exception is the
+//! health-check payload, which the management plane withholds from a
+//! Viewer session as well.
 //!
 //! # A masked header-rule value may be sent back
 //!
@@ -93,6 +103,15 @@
 //! ([`restore_health_check_path`]), and refused otherwise, a create
 //! included, so the caller sends the path itself.
 //!
+//! # A masked health-check payload may be sent back
+//!
+//! The same holds for a custom check's `send`, on every plane: a
+//! check whose `send` is the mask keeps the stored check when the whole
+//! check is the stored one exactly as this module answers it, and is
+//! refused otherwise ([`restore_health_check_payload`]). The management
+//! write path runs it too, since a Viewer's masked view can reach an
+//! Operator's form, so the mask is never stored whichever plane sent it.
+//!
 //! # What is not masked, and why
 //!
 //! A route's `response_headers` go to every visitor, and
@@ -102,6 +121,7 @@
 //! key material never enter these views at all.
 
 use axum::Json;
+use lorica_config::models::{Backend, HealthCheck, Payload};
 use serde_json::Value;
 
 /// What a withheld value reads as.
@@ -289,6 +309,85 @@ pub fn restore_health_check_path(
     Ok(())
 }
 
+/// What a withheld health-check payload reads as: a `Payload` still, so
+/// a row copied back decodes.
+fn withheld_payload() -> Payload {
+    Payload::Text(REDACTED.to_string())
+}
+
+/// `check` as a reader below Operator, a token included, is shown it
+/// (Story 12.7, D-8): a custom check's `send` replaced whole by
+/// `{"text": "[redacted]"}`, everything else as stored.
+///
+/// The one statement of the mask: [`backend_row`] applies it to the
+/// automation plane's and the MCP server's answers, and the management
+/// plane to a Viewer session's reads.
+pub fn health_check_payload_withheld(check: &HealthCheck) -> HealthCheck {
+    match check {
+        HealthCheck::TcpSendExpect {
+            send: Some(_),
+            expect,
+            timeout_ms,
+        } => HealthCheck::TcpSendExpect {
+            send: Some(withheld_payload()),
+            expect: expect.clone(),
+            timeout_ms: *timeout_ms,
+        },
+        HealthCheck::TcpSendExpect { send: None, .. }
+        | HealthCheck::Http { .. }
+        | HealthCheck::TcpConnect
+        | HealthCheck::TcpTemplate { .. } => check.clone(),
+    }
+}
+
+/// Whether `check` sends the mask [`health_check_payload_withheld`]
+/// answers with.
+fn sends_the_mask(check: &HealthCheck) -> bool {
+    match check {
+        HealthCheck::TcpSendExpect { send, .. } => send.as_ref() == Some(&withheld_payload()),
+        HealthCheck::Http { .. } | HealthCheck::TcpConnect | HealthCheck::TcpTemplate { .. } => {
+            false
+        }
+    }
+}
+
+/// `after`'s check put back to the check `before` stores when its
+/// `send` is the mask and the whole check is the stored one exactly as
+/// [`health_check_payload_withheld`] answers it. `before` is `None` on
+/// a create.
+///
+/// Run by the management write path on every plane, the automation one
+/// and the MCP server's included, under the store lock on the row the
+/// write replaces, so the check put back is the check stored and the
+/// mask is never stored. A check that differs from the masked stored
+/// one anywhere, an `expect` or a timeout included, is not a check read
+/// back, and nothing tells which payload the caller meant to keep.
+///
+/// # Errors
+///
+/// `BadRequest` for a mask that is not the stored check read back;
+/// nothing the caller sent and nothing stored is echoed.
+pub fn restore_health_check_payload(
+    before: Option<&Backend>,
+    after: &mut Backend,
+) -> Result<(), crate::error::ApiError> {
+    if !sends_the_mask(&after.health_check) {
+        return Ok(());
+    }
+    let stored = before
+        .map(|backend| &backend.health_check)
+        .filter(|stored| health_check_payload_withheld(stored) == after.health_check);
+    let Some(stored) = stored else {
+        return Err(crate::error::ApiError::BadRequest(format!(
+            "health_check.send: `{{\"text\": \"{REDACTED}\"}}` keeps the stored payload only when \
+             the whole check is sent back exactly as it was read, and this one is not; send the \
+             payload itself"
+        )));
+    };
+    after.set_health_check(stored.clone());
+    Ok(())
+}
+
 /// The environment `row`'s `managed_by` mark names, when it names one.
 pub fn managed_by_environment(row: &Value) -> Option<&str> {
     row.get("managed_by")?.get("environment")?.as_str()
@@ -357,10 +456,25 @@ pub fn certificate_row(row: &mut Value) {
 /// A backend row as the automation plane may answer it: the query
 /// values of its probe path withheld in both shapes, the typed
 /// `health_check.path` and the deprecated `health_check_path`, which
-/// carry the same string.
+/// carry the same string, and a custom check's payload withheld whole
+/// ([`health_check_payload_withheld`]).
+///
+/// A check this release cannot decode (none it wrote) still loses any
+/// `send` it carries: the payload rule fails closed.
 pub fn backend_row(row: &mut Value) {
     mask_string(row, "health_check_path", query_values);
     if let Some(check) = row.get_mut("health_check") {
+        let masked = serde_json::from_value::<HealthCheck>(check.clone())
+            .ok()
+            .and_then(|decoded| serde_json::to_value(health_check_payload_withheld(&decoded)).ok());
+        match masked {
+            Some(masked) => *check = masked,
+            None => {
+                if let Some(send) = check.get_mut("send") {
+                    *send = serde_json::json!({ "text": REDACTED });
+                }
+            }
+        }
         mask_string(check, "path", query_values);
     }
 }
@@ -835,6 +949,131 @@ mod tests {
         let before = tcp.clone();
         backend_row(&mut tcp);
         assert_eq!(tcp, before);
+    }
+
+    fn custom_check(send: Option<&str>, expect: &str) -> HealthCheck {
+        HealthCheck::TcpSendExpect {
+            send: send.map(|text| Payload::Text(text.to_string())),
+            expect: vec![lorica_config::models::Expectation {
+                anchor: lorica_config::models::MatchAnchor::Prefix,
+                bytes: Payload::Hex(expect.to_string()),
+            }],
+            timeout_ms: lorica_config::models::PROBE_TIMEOUT_MS_DEFAULT,
+        }
+    }
+
+    fn redis_template() -> HealthCheck {
+        HealthCheck::TcpTemplate {
+            template: lorica_config::models::TcpCheckTemplateName::new("redis_ping")
+                .expect("test setup: a catalogue name"),
+            timeout_ms: lorica_config::models::PROBE_TIMEOUT_MS_DEFAULT,
+        }
+    }
+
+    fn backend_checked_by(check: HealthCheck) -> Backend {
+        let mut backend = backend_probing(None);
+        backend.set_health_check(check);
+        backend
+    }
+
+    #[test]
+    fn a_backend_row_withholds_a_custom_payload_whole_and_keeps_its_answers_and_templates() {
+        let stored = custom_check(Some("AUTH s3cr3t\r\nPING\r\n"), "2b504f4e47");
+        let mut row = json!({ "id": "b-1", "health_check": stored, "health_check_path": null });
+        backend_row(&mut row);
+        assert_eq!(
+            row["health_check"]["send"],
+            json!({ "text": REDACTED }),
+            "{row}"
+        );
+        assert_eq!(
+            row["health_check"]["expect"][0]["bytes"]["hex"],
+            "2b504f4e47"
+        );
+        assert!(!row.to_string().contains("s3cr3t"), "{row}");
+        assert_eq!(
+            serde_json::from_value::<HealthCheck>(row["health_check"].clone())
+                .expect("the masked check still decodes"),
+            health_check_payload_withheld(&stored),
+            "the JSON row and the typed view mask alike"
+        );
+
+        // A check without a payload, and every kind that carries none,
+        // is answered as stored.
+        for unmasked in [
+            custom_check(None, "323230"),
+            redis_template(),
+            HealthCheck::TcpConnect,
+        ] {
+            let as_stored = serde_json::to_value(&unmasked).expect("serialises");
+            let mut row = json!({ "health_check": as_stored.clone() });
+            backend_row(&mut row);
+            assert_eq!(row["health_check"], as_stored);
+            assert_eq!(health_check_payload_withheld(&unmasked), unmasked);
+        }
+
+        // A check this release cannot decode loses its `send` all the same.
+        let mut later = json!({ "health_check": {
+            "kind": "udp_send_expect", "send": { "text": "s3cr3t" }, "expect": []
+        } });
+        backend_row(&mut later);
+        assert_eq!(later["health_check"]["send"], json!({ "text": REDACTED }));
+    }
+
+    #[test]
+    fn a_masked_payload_sent_back_as_read_keeps_the_stored_check_and_nothing_else() {
+        let stored = backend_checked_by(custom_check(Some("AUTH s3cr3t\r\n"), "2b"));
+        let as_read = health_check_payload_withheld(&stored.health_check);
+
+        let mut sent_back = backend_checked_by(as_read.clone());
+        restore_health_check_payload(Some(&stored), &mut sent_back).expect("read back as is");
+        assert_eq!(sent_back.health_check, stored.health_check);
+        assert_eq!(sent_back.health_check_path, None);
+
+        // A real payload, a template and a check without the mask are
+        // the caller's own, set as sent.
+        for own in [
+            custom_check(Some("PING\r\n"), "2b"),
+            redis_template(),
+            HealthCheck::TcpConnect,
+        ] {
+            let mut after = backend_checked_by(own.clone());
+            restore_health_check_payload(Some(&stored), &mut after).expect("no mask");
+            assert_eq!(after.health_check, own);
+        }
+
+        // The mask on anything but the stored check read back is refused.
+        let changed_expect = custom_check(Some(REDACTED), "2d");
+        let changed_timeout = match as_read.clone() {
+            HealthCheck::TcpSendExpect { send, expect, .. } => HealthCheck::TcpSendExpect {
+                send,
+                expect,
+                timeout_ms: lorica_config::models::PROBE_TIMEOUT_MS_MIN,
+            },
+            other => panic!("test setup: a custom check, got {other:?}"),
+        };
+        let no_payload_stored = backend_checked_by(custom_check(None, "2b"));
+        for (what, before, sent) in [
+            ("an expect changed", Some(&stored), changed_expect),
+            ("a timeout changed", Some(&stored), changed_timeout),
+            ("a create", None, as_read.clone()),
+            (
+                "a stored check sending nothing",
+                Some(&no_payload_stored),
+                as_read.clone(),
+            ),
+        ] {
+            let mut after = backend_checked_by(sent);
+            let refused = restore_health_check_payload(before, &mut after).expect_err(what);
+            let crate::error::ApiError::BadRequest(message) = refused else {
+                panic!("{what}: the refusal is a 400")
+            };
+            assert!(
+                message.starts_with("health_check.send:"),
+                "{what}: {message}"
+            );
+            assert!(!message.contains("s3cr3t"), "{what}: {message}");
+        }
     }
 
     #[test]

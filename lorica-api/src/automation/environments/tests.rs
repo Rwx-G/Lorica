@@ -1047,6 +1047,41 @@ async fn a_ttl_over_the_token_ceiling_is_refused() {
 }
 
 #[tokio::test]
+async fn an_environment_backend_takes_no_health_check_and_so_no_payload() {
+    // Story 12.7 D-7: the environment resource builds its backends with a
+    // TCP connect check and its backend body has no check field at all,
+    // so neither a custom payload nor a template reaches a backend here.
+    let state = crate::tests::test_state().await.0;
+    seed_wildcard(&state).await;
+    let token = writer(&state, "acme-ci").await;
+    for check in [
+        serde_json::json!({ "kind": "tcp_send_expect", "send": { "text": "PING\r\n" },
+                            "expect": [{ "match": "prefix", "bytes": { "text": "+PONG" } }] }),
+        serde_json::json!({ "kind": "tcp_template", "template": "redis_ping" }),
+    ] {
+        let mut body = env_body();
+        body["backends"][0]["health_check"] = check.clone();
+        let response = put(&state, &token, "pr-42", body).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{check}"
+        );
+    }
+    assert_no_rows(&row_counts(&state).await);
+
+    let response = put(&state, &token, "pr-42", env_body()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let store = state.store.lock().await;
+    let backends = store.list_backends().expect("store read");
+    assert_eq!(backends.len(), 1);
+    assert_eq!(
+        backends[0].health_check,
+        lorica_config::models::HealthCheck::TcpConnect
+    );
+}
+
+#[tokio::test]
 async fn an_unknown_field_is_refused() {
     let state = crate::tests::test_state().await.0;
     seed_wildcard(&state).await;
