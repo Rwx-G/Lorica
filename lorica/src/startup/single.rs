@@ -552,8 +552,9 @@ pub(crate) fn run_single_process(cli: Cli) {
             lorica_stream::ControlTransport::in_process_pair(STREAM_CHANNEL_CAPACITY);
         let stream_runtime = match lorica_stream::StreamRuntime::spawn(
             stream_transport,
-            // The TCP engine (Story 12.3); no UDP engine until Story 12.5.
-            lorica::stream_engine::tcp_engines(
+            // The TCP engine (Story 12.3) and the UDP engine (Story
+            // 12.5), over one selector and one resolver cache.
+            lorica::stream_engine::stream_engines(
                 Arc::new(lorica::stream_engine::StreamBreakerGate::with_engine(
                     stream_breaker_engine,
                 )),
@@ -740,6 +741,7 @@ pub(crate) fn run_single_process(cli: Cli) {
         // state, never a delay.
         stream_plane.after_commit().await;
         let _stream_bind_retry = stream_plane.spawn_retry_loop();
+        let _stream_caps_tick = stream_plane.spawn_caps_tick();
 
         // Tell systemd we are accepting. REQUIRED for `Type=notify` or
         // systemd times the unit out and marks the start failed. No-op

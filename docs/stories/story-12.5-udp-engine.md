@@ -1023,22 +1023,22 @@ process handed to both engines, Interface edit E3), `lorica/Cargo.toml`,
 `Cargo.lock`.
 Depends on: E; 12.3 Lot D2 (same files).
 
-- [ ] Regions: create per UDP stream on first bind, `caps` before
+- [x] Regions: create per UDP stream on first bind, `caps` before
       `attach`, replace on a size change, retire at `total == 0`, the
       supervisor memfd counted; single-process over the in-process
       transport.
-- [ ] Respawn: `release_worker(slot)` on every live region of the slot,
+- [x] Respawn: `release_worker(slot)` on every live region of the slot,
       then `caps` replay, then the `attach` replay of 12.2 D-a.
-- [ ] A 1 s stream-caps tick: `evict_rates` on every region, retired
+- [x] A 1 s stream-caps tick: `evict_rates` on every region, retired
       regions dropped.
-- [ ] The UDP `draining` registry state and its expiry (D-m).
-- [ ] Node backstop: the D-e check before every bind through
+- [x] The UDP `draining` registry state and its expiry (D-m).
+- [x] Node backstop: the D-e check before every bind through
       `lorica_stream::held_fds` in the driver's `demand_of`,
       `source_ports` failure kind, `usable_udp_source_ports` read at each
       reconcile.
-- [ ] Install `UdpEngine` in `Engines.udp` in `run_worker` and
+- [x] Install `UdpEngine` in `Engines.udp` in `run_worker` and
       `run_single_process`.
-- [ ] Tests against 12.2's fake transport: `caps` precedes `attach`;
+- [x] Tests against 12.2's fake transport: `caps` precedes `attach`;
       respawn order (release, `caps`, `attach`); a size change sends a new
       `caps` and keeps the old region until its total is 0.
 
@@ -1448,6 +1448,97 @@ decision.
 
 ### Completion Notes
 
+**Lot F (`lorica`).**
+
+- Engines. `lorica::stream_engine::stream_engines` (was `tcp_engines`)
+  builds the `TcpEngine` and the `UdpEngine` over one `StreamSelector`,
+  one `ResolverCache`, one `LogObserver`, the breaker gate and one
+  counters `Arc` (E3), and fills `Engines.udp`. `run_worker` and
+  `run_single_process` call it; nothing else changed in either.
+- Regions (`stream_plane.rs`). The plane owns a `NodeCapsRegions` of
+  `worker_count` slots (1 single-process) behind its own mutex, shared
+  with the handle so the tick and a worker's death never wait on a pass
+  that holds the plane on a worker's answer. `bind_one` creates the
+  stream's region after the budget check and before binding (no region
+  for a refused stream); every worker then gets `caps <slot = its id>`
+  ahead of its `attach` messages, from `binding_messages`, the one path
+  of a first bind and of a respawn replay. A worker whose `caps` is
+  refused or unanswered holds the sockets but is not counted serving
+  (`k/W`), as D-d says. Each pass replaces the region of every held UDP
+  binding whose `udp.max_sessions` moved the table sizes and sends the
+  new `caps` to every worker, with no rebind; a change within the same
+  sizes sends nothing. A stream with no UDP binding wanted on the node
+  any more (deleted, disabled, deselected, switched to TCP) has its
+  region retired at the end of the pass's detaches; a rebind keeps it.
+  The supervisor memfd was already counted by Lot D's demand.
+- Respawn. `StreamPlaneHandle::worker_lost(id)` releases the dead
+  slot's sessions in every live region as soon as the monitor sees the
+  death, before the backoff and whether or not the restart succeeds;
+  `replay_worker` releases again first thing (finding nothing), then
+  sends each UDP binding's `caps` and its `attach`, then `refresh`.
+  Logged once per death with the count (`UDP sessions of a dead worker
+  released`).
+- Tick. `spawn_caps_tick` every `STREAM_CAPS_TICK_INTERVAL` (1 s):
+  `NodeCapsRegions::tick(now_ns())`, in the supervisor and in
+  single-process mode.
+- Draining (D-m). A detached UDP binding stays in the plane's
+  `draining` list until `now + drain + UDP_DRAIN_RELEASE_MARGIN` (2 s).
+  A desired UDP binding whose ports overlap one (any stream, itself
+  included) is not bound: it stays pending, recorded as a retryable
+  `address_in_use` failure so the 10 s retry binds it once the drain is
+  over. **Decision:** no `stream.bind_failed` row and no alert for this
+  wait; D-m reads it as a wait, and an alert on every UDP listen-address
+  edit would be noise. The registry entry is the plane's own list, not
+  a new `BindState`: the API's bind states, `openapi.yaml` and the
+  dashboard are unchanged, and the stream shows `pending` meanwhile.
+- Backstop (D-e). `bind_one` calls `FdBudget::check_node` with `U`
+  read through `usable_udp_source_ports` at the start of every
+  `bind_desired` pass (a read failure is logged and leaves the fd
+  constraints only); a `SourcePorts` violation fails the binding
+  `source_ports`, the fd constraints `fd_budget`, both retried on change
+  only. Not done: "refuse raises, allow lowers" at the node. The bind
+  check counts every held binding plus the new one, so on a node already
+  past its ceiling (a narrowed range) a rebind that raises nothing is
+  refused too; the API's write check is where `raises` applies (Lot G).
+- `lorica-stream/src/caps.rs`, outside the allowlist: retired regions
+  are kept per stream, and a stream that comes back while one still
+  counts sessions (disabled then enabled inside its drain) continues
+  its `caps_gen` and counts it as retired. Without it the new region
+  restarted at `caps_gen` 1, a worker took it for a replay of the old
+  one and dropped the old one from `stream_cap_left`, so the stream
+  could exceed `max_sessions` by the draining sessions. `holds` and
+  `stream_ids` added for the plane. Tested.
+- `lorica-stream/src/udp/session.rs`, outside the allowlist, a Lot E
+  race the process test caught: `on_response` sent the last owed
+  response to the client and only the task's later `end()` stopped the
+  session taking datagrams, so a client that sent again the moment its
+  answer landed (a stub resolver, IV2's load generator) joined the
+  ending session and its answer was lost. The session now turns `Ended`
+  under the same lock as that send (and on a byte-bound end), so the
+  next datagram opens a new session (D-b). Pinned in the session unit
+  tests.
+- Tests. Fake transport (`stream_plane.rs`): `caps` (slot = worker id,
+  `caps_gen` 1) precedes the `attach` on every worker; a worker that
+  refuses its `caps` is not serving; respawn: three leaked sessions of
+  the dead slot are released before the respawn's `caps` arrives (the
+  fake reads the region's total at receipt: 1, the live worker's), then
+  `attach`, then `refresh`, and a second release finds 0; a size change
+  sends `caps_gen` 2 to every worker without a rebind, keeps one memfd,
+  counts the old region's session until it ends and the tick drops it;
+  a same-port UDP rebind waits for the drain without an event and binds
+  at the retry once it is over, and a deleted stream's region is
+  retired; a TCP bind never waits for a draining UDP binding;
+  `source_ports` refusal with no region created, and an unreadable range
+  binds on the fds alone. Process (`lorica/tests/udp_stream_process_test.rs`,
+  real binary): `--workers 0` and `--workers 2`, a UDP stream to a
+  loopback echo backend, eleven datagrams from ten client sockets all
+  answered from the stream port (two back to back from one socket, the
+  second opening a new session on the first's answer); worker death: `max_sessions = 1` with
+  unbounded responses and an hour of idle, the session's upstream socket
+  found in `/proc` and its worker `kill -9`ed, another client refused
+  before and answered after, and the log shows the release before
+  `worker restarted, reconnecting channel`.
+
 **Lot E (`lorica-stream`).**
 
 - Moot tasks. E2, E3 and E4 were done by Story 12.3 (see "Status after
@@ -1827,6 +1918,17 @@ decision.
 
 ## File List
 
+Lot F:
+
+- `lorica/src/stream_engine.rs`, `lorica/src/startup/stream_plane.rs`,
+  `lorica/src/startup/supervisor.rs`, `lorica/src/startup/worker.rs`,
+  `lorica/src/startup/single.rs`
+- `lorica/tests/udp_stream_process_test.rs` (new)
+- `lorica-stream/src/caps.rs` (per-stream retired regions) and
+  `lorica-stream/src/udp/session.rs` (a session ends under the lock of
+  its last response), outside the allowlist
+- `docs/stories/story-12.5-udp-engine.md`
+
 Lot E:
 
 - `lorica-stream/src/udp/mod.rs`, `lorica-stream/src/udp/engine.rs`,
@@ -1889,3 +1991,4 @@ Lot A:
 | 2026-11-15 | 0.5 | Lot C landed: `UdpSettings` on `Stream`, the UDP idle default and range, 12.3's settings lifted on UDP, backups on UDP, the refusal and drop vocabularies, migration 76, canonical digest, import and diff. The listen-address rule's call from `Stream::validate` moves to Lot G; status of the Interface edits after 12.3 recorded. | Romain G. |
 | 2026-11-15 | 0.6 | Lot D landed: the UDP demand (`held_fds`, one fd per session), the source-port constraint and the node session ceiling with its view fields, the synchronous `DatagramHandler` borrowing from one receive buffer per worker, the wildcard destination, caps adoption (`CapsRegistry`) and the supervisor's regions (`NodeCapsRegions`, the per-worker release), UDP drain mode with the sockets kept open. | Romain G. |
 | 2026-11-15 | 0.7 | Lot E landed: the UDP engine (`UdpEngine`), sessions per key with one connected upstream socket each, the D-b bounds, per-source rates and session caps on the region, PROXY v2 per datagram, reply source on wildcard addresses, ICMP and no-response failures, the UDP counters, drop reasons, `ceiling_reached` edge and the record's datagram counts. Selection and breaker admission run in the session task (the breaker seam is async). | Romain G. |
+| 2026-11-15 | 0.8 | Lot F landed: the UDP engine installed in worker and single-process mode over the TCP engine's selector and resolver cache, a caps region per UDP stream sent ahead of every `attach` and replaced on a size change, a dead worker's sessions released before its respawn is replayed, the 1 s caps tick, draining UDP bindings holding their ports until the drain ends, the node's source-port backstop. | Romain G. |

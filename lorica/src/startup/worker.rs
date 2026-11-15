@@ -162,10 +162,12 @@ pub(crate) fn run_worker(
             std::process::exit(1);
         }
     };
-    // The TCP engine (Story 12.3). Its breaker gate admits until the
-    // RPC endpoint, created well after this, installs the supervisor's
-    // registry below (D-g). No UDP engine until Story 12.5: a datagram
-    // is dropped.
+    // The TCP engine (Story 12.3) and the UDP engine (Story 12.5), over
+    // one selector and one resolver cache. Their breaker gate admits
+    // until the RPC endpoint, created well after this, installs the
+    // supervisor's registry below (D-g). The UDP engine opens no session
+    // on a stream before the supervisor's `caps` hands it the stream's
+    // region, which it sends ahead of every `attach`.
     if reserved_ports.is_none() {
         warn!(
             worker_id = id,
@@ -175,7 +177,7 @@ pub(crate) fn run_worker(
     let stream_breaker = Arc::new(lorica::stream_engine::StreamBreakerGate::new());
     let stream_runtime = match lorica_stream::StreamRuntime::spawn(
         lorica_stream::ControlTransport::Seqpacket(stream_ctl_fd),
-        lorica::stream_engine::tcp_engines(
+        lorica::stream_engine::stream_engines(
             Arc::clone(&stream_breaker),
             Arc::new(lorica::stream_engine::HickoryResolve::from_system_conf()),
             reserved_ports,

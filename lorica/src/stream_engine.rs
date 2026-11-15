@@ -30,10 +30,10 @@
 //!   configuration with the hosts file, which returns the record TTLs a
 //!   TTL-bounded schedule needs (D-n).
 //!
-//! [`tcp_engines`] assembles them into the [`Engines`] a process's
-//! stream runtime serves with: one selector and one resolver cache per
-//! process, and one counters `Arc` shared by the engine and the runtime
-//! handle that snapshots it.
+//! [`stream_engines`] assembles them into the [`Engines`] a process's
+//! stream runtime serves with: a TCP and a UDP engine over one selector
+//! and one resolver cache per process, and one counters `Arc` shared by
+//! both engines and the runtime handle that snapshots it.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -48,8 +48,9 @@ use lorica_config::listen_ports::ReservedPorts;
 use lorica_config::models::{Backend, LoadBalancing};
 use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
-    Admission, BackendSelector, BreakerGate, Engines, LogObserver, Resolve, ResolveError, Resolved,
-    ResolverCache, SelectionRequest, StreamCounters, StreamTable, TcpEngine, TcpEngineParts,
+    Admission, BackendSelector, BreakerGate, ConnectionObserver, Engines, LogObserver, Resolve,
+    ResolveError, Resolved, ResolverCache, SelectionRequest, StreamCounters, StreamTable,
+    TcpEngine, TcpEngineParts, UdpEngine, UdpEngineParts,
 };
 use tracing::warn;
 
@@ -348,29 +349,44 @@ impl Resolve for HickoryResolve {
     }
 }
 
-/// The [`Engines`] of one process's stream runtime: a [`TcpEngine`] over
-/// a [`StreamSelector`] seeded with the process id, `breaker`, a
-/// [`ResolverCache`] over `resolver`, a debug-logging observer and the
-/// node's `reserved_ports` for the connect-time local check (`None`
-/// when the process was not told them: the stream listen ports are
-/// still refused). The engine and the runtime share one counters `Arc`.
-pub fn tcp_engines(
+/// The [`Engines`] of one process's stream runtime: a [`TcpEngine`] and
+/// a [`UdpEngine`] over the same parts (Story 12.5 Interface edit E3):
+/// one [`StreamSelector`] seeded with the process id, so least
+/// connections counts a backend's TCP connections and UDP sessions
+/// together and round-robin state is per stream whatever its protocol;
+/// `breaker`; one [`ResolverCache`] over `resolver`, so a host named by
+/// a TCP and a UDP stream is resolved once; a debug-logging observer;
+/// and the node's `reserved_ports` for the local check (`None` when the
+/// process was not told them: the stream listen ports are still
+/// refused). Both engines and the runtime share one counters `Arc`.
+pub fn stream_engines(
     breaker: Arc<StreamBreakerGate>,
     resolver: Arc<dyn Resolve>,
     reserved_ports: Option<ReservedPorts>,
 ) -> Engines {
     let counters = Arc::new(StreamCounters::new());
-    let engine = TcpEngine::new(TcpEngineParts {
-        selector: Arc::new(StreamSelector::new(std::process::id() as usize)),
-        breaker,
-        resolver: ResolverCache::new(resolver, Arc::clone(&counters)),
+    let selector = Arc::new(StreamSelector::new(std::process::id() as usize));
+    let resolver = ResolverCache::new(resolver, Arc::clone(&counters));
+    let observer = Arc::new(LogObserver);
+    let tcp = TcpEngine::new(TcpEngineParts {
+        selector: Arc::clone(&selector) as Arc<dyn BackendSelector>,
+        breaker: Arc::clone(&breaker) as Arc<dyn BreakerGate>,
+        resolver: Arc::clone(&resolver),
         counters: Arc::clone(&counters),
-        observer: Arc::new(LogObserver),
+        observer: Arc::clone(&observer) as Arc<dyn ConnectionObserver>,
+        reserved_ports,
+    });
+    let udp = UdpEngine::new(UdpEngineParts {
+        selector,
+        breaker,
+        resolver,
+        counters: Arc::clone(&counters),
+        observer,
         reserved_ports,
     });
     Engines {
-        tcp: Some(Arc::new(engine)),
+        tcp: Some(Arc::new(tcp)),
+        udp: Some(Arc::new(udp)),
         counters,
-        ..Engines::default()
     }
 }

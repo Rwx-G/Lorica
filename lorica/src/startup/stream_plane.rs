@@ -38,13 +38,33 @@
 //! A failure is a value in the registry, never an error returned up the
 //! reconcile path: one stream's bind never blocks another's, and nothing
 //! here can stop the process.
+//!
+//! UDP streams (Story 12.5) add three things the plane owns:
+//!
+//! - **Caps regions** (D-d): one [`NodeCapsRegions`] entry per UDP
+//!   stream on the node, created at its first bind, replaced when a size
+//!   change moves its table sizes, retired once no binding of the stream
+//!   is held or wanted. Its `caps` message goes to a worker ahead of every
+//!   `attach` of the stream, and again to every worker when the region is
+//!   replaced. A worker that dies has its sessions released from every
+//!   live region before its respawn is sent anything ([`WORKER_RELEASE`]).
+//! - **Draining bindings** (D-m): a detached UDP binding keeps its
+//!   workers' slot sockets open while its sessions drain, so the plane
+//!   keeps it as draining until the drain ends plus
+//!   [`UDP_DRAIN_RELEASE_MARGIN`], and binds nothing over its ports
+//!   until then: the `address_in_use` retry binds it afterwards.
+//! - **The source-port constraint** (D-e), read from the host's port
+//!   range at every pass and checked with the fd constraints before
+//!   every bind.
+//!
+//! [`WORKER_RELEASE`]: StreamPlane::release_worker
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
 use lorica_config::listen_ports::ReservedPorts;
@@ -52,15 +72,15 @@ use lorica_config::models::{GlobalSettings, NodeRole, Stream, StreamProtocol};
 use lorica_config::ConfigStore;
 use lorica_stream::reconcile::desired_bindings;
 use lorica_stream::{
-    diff, BindFailureKind, BindKey, BindState, BoundBinding, Detach, FdBudget, InProcessPeer,
-    ReleaseCause, StreamBindStates, StreamDemand,
+    diff, BindFailureKind, BindKey, BindState, BoundBinding, BudgetViolation, Detach, FdBudget,
+    InProcessPeer, NodeCapsRegions, ReleaseCause, StreamBindStates, StreamDemand,
 };
 use lorica_worker::fd_passing::StreamProto;
 use lorica_worker::stream_ctl::{
     self, check_stream_id, chunk_sockets, NackReason, QuiesceReason, StreamCtlError, StreamCtlMsg,
     StreamSocket,
 };
-use lorica_worker::stream_sockets::{bind_range, BoundPort};
+use lorica_worker::stream_sockets::{bind_range, usable_udp_source_ports, BoundPort};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -74,6 +94,32 @@ pub(crate) const STREAM_CTL_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often a binding that failed on an error that may clear by itself
 /// (`address_in_use`, `address_not_available`) is retried.
 pub(crate) const STREAM_BIND_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How often every caps region's settled rate cells are evicted and its
+/// retired regions that count no session dropped (Story 12.5 D-d).
+pub(crate) const STREAM_CAPS_TICK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long past its drain a detached UDP binding still holds its ports
+/// in the plane (Story 12.5 D-m): the workers close their slot sockets
+/// at the drain deadline at the latest, and this covers the time each
+/// takes to notice it.
+pub(crate) const UDP_DRAIN_RELEASE_MARGIN: Duration = Duration::from_secs(2);
+
+/// Reads `U`, the usable UDP source ports per source address, or `None`
+/// when the host's figures cannot be read (the source-port constraint is
+/// then left out, never guessed).
+pub(crate) type SourcePortsReader = Box<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// [`usable_udp_source_ports`], with a failure logged.
+fn read_usable_source_ports() -> Option<u64> {
+    match usable_udp_source_ports() {
+        Ok(usable) => Some(u64::from(usable)),
+        Err(e) => {
+            warn!(error = %e, "usable UDP source ports unreadable; the source-port constraint is not checked");
+            None
+        }
+    }
+}
 
 /// The fleet role a stream plane binds for, owned: the supervisor reads
 /// it once from its cluster runtime.
@@ -369,6 +415,7 @@ pub(crate) enum PlaneEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Pending {
     Attach { stream_id: String, bind_gen: u64 },
+    Caps { stream_id: String },
     Other,
 }
 
@@ -382,6 +429,9 @@ impl Pending {
             } => Pending::Attach {
                 stream_id: stream_id.clone(),
                 bind_gen: *bind_gen,
+            },
+            StreamCtlMsg::Caps { stream_id, .. } => Pending::Caps {
+                stream_id: stream_id.clone(),
             },
             _ => Pending::Other,
         }
@@ -497,14 +547,20 @@ struct HeldBinding {
     chunks: usize,
     /// `attach` messages each worker acknowledged.
     acked: BTreeMap<u32, usize>,
+    /// Workers whose last `caps` for this UDP binding's stream was not
+    /// acknowledged: they hold the sockets but admit no session, so they
+    /// do not count as serving (D-d).
+    caps_refused: BTreeSet<u32>,
 }
 
 impl HeldBinding {
     fn serving(&self) -> u32 {
         let n = self
             .acked
-            .values()
-            .filter(|acked| self.chunks > 0 && **acked >= self.chunks)
+            .iter()
+            .filter(|(worker, acked)| {
+                self.chunks > 0 && **acked >= self.chunks && !self.caps_refused.contains(worker)
+            })
             .count();
         u32::try_from(n).unwrap_or(u32::MAX)
     }
@@ -555,11 +611,71 @@ fn demand_of(key: &BindKey, stream: Option<&Stream>) -> StreamDemand {
     }
 }
 
+fn release_worker_sessions(caps: &SharedCaps, worker: u32) -> u64 {
+    let released = lock_caps(caps).release_worker(worker);
+    if released > 0 {
+        info!(
+            worker_id = worker,
+            sessions = released,
+            "UDP sessions of a dead worker released from the stream caps regions"
+        );
+    }
+    released
+}
+
+/// `udp.max_sessions` of a UDP stream, which sizes its caps region.
+fn udp_max_sessions(stream: &Stream) -> Option<u64> {
+    match stream.protocol {
+        StreamProtocol::Tcp => None,
+        StreamProtocol::Udp => stream.udp.as_ref().map(|u| u64::from(u.max_sessions)),
+    }
+}
+
+/// The failure kind a node-side budget refusal is reported with.
+fn budget_failure_kind(violation: &BudgetViolation) -> BindFailureKind {
+    match violation {
+        BudgetViolation::SourcePorts { .. } => BindFailureKind::SourcePorts,
+        BudgetViolation::ListenSocketCap { .. }
+        | BudgetViolation::WorkerFds { .. }
+        | BudgetViolation::SupervisorFds { .. } => BindFailureKind::FdBudget,
+    }
+}
+
+/// A detached UDP binding whose workers still hold their slot sockets
+/// while its sessions drain (D-m).
+#[derive(Debug, Clone)]
+struct DrainingBinding {
+    key: BindKey,
+    bind_gen: u64,
+    /// The drain deadline plus [`UDP_DRAIN_RELEASE_MARGIN`]: from then
+    /// on no worker holds its ports.
+    until: Instant,
+}
+
+/// The caps regions a plane and its handle share. Never held across an
+/// await.
+type SharedCaps = Arc<StdMutex<NodeCapsRegions>>;
+
+fn lock_caps(caps: &SharedCaps) -> MutexGuard<'_, NodeCapsRegions> {
+    // A panic while holding the lock leaves counts no worse than a dead
+    // worker does, which the regions are built to survive.
+    caps.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// The stream plane of one process. See the module doc.
 pub(crate) struct StreamPlane<L> {
     workers: BTreeMap<u32, WorkerSlot<L>>,
     worker_count: u32,
     held: BTreeMap<String, HeldBinding>,
+    /// Detached UDP bindings still draining in the workers.
+    draining: Vec<DrainingBinding>,
+    /// See [`UDP_DRAIN_RELEASE_MARGIN`]; a field so tests can shorten it.
+    drain_margin: Duration,
+    /// One caps region per UDP stream on the node.
+    caps: SharedCaps,
+    source_ports: SourcePortsReader,
+    /// `U` as read at the start of the current pass.
+    usable_source_ports: Option<u64>,
     /// TCP listeners inherited from the outgoing supervisor, adopted by
     /// the first pass that wants them and closed by it otherwise.
     inherited: Vec<(String, SocketAddr, OwnedFd)>,
@@ -593,6 +709,11 @@ impl<L: WorkerLink> StreamPlane<L> {
                 .collect(),
             worker_count,
             held: BTreeMap::new(),
+            draining: Vec::new(),
+            drain_margin: UDP_DRAIN_RELEASE_MARGIN,
+            caps: Arc::new(StdMutex::new(NodeCapsRegions::new(worker_count))),
+            source_ports: Box::new(read_usable_source_ports),
+            usable_source_ports: None,
             inherited: Vec::new(),
             states,
             failures: BTreeMap::new(),
@@ -614,6 +735,24 @@ impl<L: WorkerLink> StreamPlane<L> {
             self.next_gen = self.next_gen.max(entry.bind_gen.saturating_add(1));
             self.inherited.push((entry.stream_id, entry.addr, fd));
         }
+    }
+
+    /// Read `U` through `reader` instead of the host's `/proc` files.
+    #[cfg(test)]
+    fn with_source_ports(mut self, reader: SourcePortsReader) -> Self {
+        self.source_ports = reader;
+        self
+    }
+
+    /// Release what dead worker `worker` held in every caps region: its
+    /// session shards emptied and its sessions subtracted from each
+    /// stream's total (D-d). Called when the worker is found dead and
+    /// again first thing in its respawn's replay, while no process
+    /// writes its slot (the respawn is sent no region before this);
+    /// the second call finds nothing left. Returns the sessions
+    /// released.
+    pub(crate) fn release_worker(&self, worker: u32) -> u64 {
+        release_worker_sessions(&self.caps, worker)
     }
 
     fn seq(&mut self) -> u64 {
@@ -674,17 +813,25 @@ impl<L: WorkerLink> StreamPlane<L> {
     ) -> Vec<PlaneEvent> {
         let actions = diff(streams, role, &self.bound_list());
         let mut events = self.detach(actions.detach, pass).await;
+        self.usable_source_ports = (self.source_ports)();
+        let now = Instant::now();
+        self.draining.retain(|d| d.until > now);
 
-        let desired: BTreeSet<String> = desired_bindings(streams, role)
-            .into_iter()
-            .map(|k| k.stream_id)
+        let desired_keys = desired_bindings(streams, role);
+        let desired_udp: BTreeSet<&str> = desired_keys
+            .iter()
+            .filter(|k| k.protocol == StreamProtocol::Udp)
+            .map(|k| k.stream_id.as_str())
             .collect();
+        self.retire_caps(&desired_udp);
+        let desired: BTreeSet<&str> = desired_keys.iter().map(|k| k.stream_id.as_str()).collect();
         for id in self.states.snapshot().into_keys() {
-            if !desired.contains(&id) && !self.held.contains_key(&id) {
+            if !desired.contains(id.as_str()) && !self.held.contains_key(&id) {
                 self.states.remove(&id);
                 self.failures.remove(&id);
             }
         }
+        self.resize_caps(streams).await;
 
         let names: BTreeMap<&str, &str> = streams
             .iter()
@@ -711,7 +858,7 @@ impl<L: WorkerLink> StreamPlane<L> {
                     .failures
                     .get(&key.stream_id)
                     .is_some_and(|kind| !retryable(*kind));
-            if skip {
+            if skip || self.waits_for_drain(&key) {
                 continue;
             }
             let name = names.get(key.stream_id.as_str()).copied().unwrap_or("");
@@ -748,18 +895,157 @@ impl<L: WorkerLink> StreamPlane<L> {
         self.send_all(per_worker).await;
     }
 
-    /// A worker came back after a crash: take its new channel and replay
-    /// every live binding, then a `refresh` (D-a).
+    /// Retire the caps region of every stream with no UDP binding wanted
+    /// on this node any more (deleted, disabled, deselected, switched to
+    /// TCP): its memfd closes, and the region stays mapped while its
+    /// sessions drain. Held UDP bindings that are no longer wanted were
+    /// detached earlier in the pass.
+    fn retire_caps(&mut self, desired_udp: &BTreeSet<&str>) {
+        let mut caps = lock_caps(&self.caps);
+        let gone: Vec<String> = caps
+            .stream_ids()
+            .filter(|id| !desired_udp.contains(id))
+            .map(str::to_string)
+            .collect();
+        for id in gone {
+            caps.retire(&id);
+        }
+    }
+
+    /// Replace the region of every held UDP binding whose stream's
+    /// `udp.max_sessions` moved its table sizes, and hand the new one to
+    /// every worker; sessions counted in the old one stay counted there
+    /// until they end (D-d).
+    async fn resize_caps(&mut self, streams: &[Stream]) {
+        let mut replaced: Vec<String> = Vec::new();
+        for b in self
+            .held
+            .values()
+            .filter(|b| b.key.protocol == StreamProtocol::Udp)
+        {
+            let id = &b.key.stream_id;
+            let Some(max_sessions) = streams
+                .iter()
+                .find(|s| s.id == *id)
+                .and_then(udp_max_sessions)
+            else {
+                continue;
+            };
+            match lock_caps(&self.caps).ensure(id, max_sessions) {
+                Ok(Some(caps_gen)) => {
+                    info!(stream_id = %id, caps_gen, max_sessions, "stream caps region replaced");
+                    replaced.push(id.clone());
+                }
+                Ok(None) => {}
+                Err(e) => warn!(stream_id = %id, error = %e,
+                                "stream caps region not replaced; the stream keeps its current one"),
+            }
+        }
+        if replaced.is_empty() {
+            return;
+        }
+        let mut per_worker: BTreeMap<u32, Vec<StreamCtlMsg>> = BTreeMap::new();
+        for worker in self.workers.keys().copied().collect::<Vec<_>>() {
+            for id in &replaced {
+                if let Some(msg) = self.caps_message(id, worker) {
+                    per_worker.entry(worker).or_default().push(msg);
+                }
+            }
+        }
+        self.send_all(per_worker).await;
+        for id in &replaced {
+            if let Some(b) = self.held.get(id) {
+                self.states.set_bound(id, b.serving(), self.worker_count);
+            }
+        }
+    }
+
+    /// Whether `key` must wait for a draining UDP binding over its ports
+    /// to let them go (D-m). It then stays pending, its own state
+    /// untouched, and is retried as an `address_in_use` failure would
+    /// be, without the alert: waiting for a drain is not a failure.
+    fn waits_for_drain(&mut self, key: &BindKey) -> bool {
+        let Some((draining, port)) = self
+            .draining
+            .iter()
+            .find_map(|d| key.overlap_port(&d.key).map(|port| (d, port)))
+        else {
+            return false;
+        };
+        info!(
+            stream_id = %key.stream_id,
+            port,
+            draining_stream_id = %draining.key.stream_id,
+            draining_bind_gen = draining.bind_gen,
+            "UDP binding waits for a draining binding to release its port"
+        );
+        if self.states.get(&key.stream_id).is_none() {
+            self.states.set_pending(&key.stream_id);
+        }
+        self.failures
+            .insert(key.stream_id.clone(), BindFailureKind::AddressInUse);
+        true
+    }
+
+    /// The `caps` message handing `worker` the current region of
+    /// `stream_id`, or `None`, logged, when there is none to send.
+    fn caps_message(&mut self, stream_id: &str, worker: u32) -> Option<StreamCtlMsg> {
+        let seq = self.seq();
+        match lock_caps(&self.caps).caps_message(stream_id, seq, worker) {
+            Ok(Some(msg)) => Some(msg),
+            Ok(None) => {
+                warn!(%stream_id, worker_id = worker,
+                      "no stream caps region; this worker will not serve the binding");
+                None
+            }
+            Err(e) => {
+                warn!(%stream_id, worker_id = worker, error = %e,
+                      "stream caps region not duplicated; this worker will not serve the binding");
+                None
+            }
+        }
+    }
+
+    /// What `worker` is sent for binding `stream_id`: for UDP the
+    /// stream's `caps`, then its `attach` messages; nothing when either
+    /// cannot be built, so the worker never holds sockets it cannot
+    /// serve.
+    fn binding_messages(&mut self, stream_id: &str, worker: u32) -> Vec<StreamCtlMsg> {
+        let udp = self
+            .held
+            .get(stream_id)
+            .is_some_and(|b| b.key.protocol == StreamProtocol::Udp);
+        let caps = if udp {
+            match self.caps_message(stream_id, worker) {
+                Some(msg) => Some(msg),
+                None => return Vec::new(),
+            }
+        } else {
+            None
+        };
+        let attaches = self.attach_messages(stream_id, worker);
+        if attaches.is_empty() {
+            return Vec::new();
+        }
+        caps.into_iter().chain(attaches).collect()
+    }
+
+    /// A worker came back after a crash: release what its predecessor
+    /// held in the caps regions, take its new channel and replay every
+    /// live binding (each UDP one's `caps` ahead of its `attach`), then a
+    /// `refresh` (D-a, Story 12.5 D-d).
     pub(crate) async fn replay_worker(&mut self, worker: u32, link: L, pass: PassSettings) {
+        self.release_worker(worker);
         self.workers.insert(worker, WorkerSlot::new(link));
         let mut msgs = Vec::new();
         let ids: Vec<String> = self.held.keys().cloned().collect();
         for id in ids {
-            let attaches = self.attach_messages(&id, worker);
+            let binding = self.binding_messages(&id, worker);
             if let Some(b) = self.held.get_mut(&id) {
                 b.acked.remove(&worker);
+                b.caps_refused.remove(&worker);
             }
-            msgs.extend(attaches);
+            msgs.extend(binding);
         }
         let seq = self.seq();
         msgs.push(StreamCtlMsg::Refresh {
@@ -816,7 +1102,15 @@ impl<L: WorkerLink> StreamPlane<L> {
                 continue;
             }
             // The supervisor's copies close first; the port is free once
-            // the last worker closes its copy on `detach`.
+            // the last worker closes its copy on `detach`, which for UDP
+            // is when the binding's sessions have drained (D-m).
+            if d.binding.key.protocol == StreamProtocol::Udp {
+                self.draining.push(DrainingBinding {
+                    key: d.binding.key.clone(),
+                    bind_gen: d.binding.bind_gen,
+                    until: Instant::now() + pass.drain + self.drain_margin,
+                });
+            }
             drop(self.held.remove(&id));
             for slot in self.workers.values_mut() {
                 slot.outstanding.retain(|_, p| {
@@ -961,19 +1255,42 @@ impl<L: WorkerLink> StreamPlane<L> {
             .map(|b| demand_of(&b.key, stream_of(&b.key.stream_id)))
             .collect();
         demands.push(demand_of(&key, stream_of(&key.stream_id)));
-        if let Err(violation) =
-            self.budget
-                .check(&demands, self.worker_count, pass.listen_socket_cap)
-        {
+        // The node's backstop of the API's write check (Story 12.5 D-e),
+        // with `U` as read at the start of this pass.
+        if let Err(violation) = self.budget.check_node(
+            &demands,
+            self.worker_count,
+            pass.listen_socket_cap,
+            self.usable_source_ports,
+        ) {
             self.fail(
                 &key,
                 name,
-                BindFailureKind::FdBudget,
+                budget_failure_kind(&violation),
                 violation.to_string(),
                 key.port_first,
                 events,
             );
             return;
+        }
+        if key.protocol == StreamProtocol::Udp {
+            let ensured = match stream_of(&key.stream_id).and_then(udp_max_sessions) {
+                None => Err("the UDP stream carries no udp settings".to_string()),
+                Some(max_sessions) => lock_caps(&self.caps)
+                    .ensure(&id, max_sessions)
+                    .map_err(|e| format!("the stream caps region could not be created: {e}")),
+            };
+            if let Err(reason) = ensured {
+                self.fail(
+                    &key,
+                    name,
+                    BindFailureKind::Other,
+                    reason,
+                    key.port_first,
+                    events,
+                );
+                return;
+            }
         }
         let ports = match self.take_inherited(&key) {
             Some(ports) => ports,
@@ -1008,11 +1325,12 @@ impl<L: WorkerLink> StreamPlane<L> {
                 ports,
                 chunks: 0,
                 acked: BTreeMap::new(),
+                caps_refused: BTreeSet::new(),
             },
         );
         let mut per_worker: BTreeMap<u32, Vec<StreamCtlMsg>> = BTreeMap::new();
         for worker in self.workers.keys().copied().collect::<Vec<_>>() {
-            let msgs = self.attach_messages(&id, worker);
+            let msgs = self.binding_messages(&id, worker);
             per_worker.insert(worker, msgs);
         }
         self.send_all(per_worker).await;
@@ -1102,14 +1420,26 @@ impl<L: WorkerLink> StreamPlane<L> {
                 match sent.answer {
                     Answer::Ack => self.credit(worker, &sent.pending),
                     Answer::Nack(reason) => {
-                        debug!(
-                            worker_id = worker,
-                            seq = sent.seq,
-                            reason = reason.as_str(),
-                            "stream control message refused by the worker"
-                        );
+                        self.caps_not_adopted(worker, &sent.pending);
+                        if let Pending::Caps { stream_id } = &sent.pending {
+                            warn!(
+                                worker_id = worker,
+                                %stream_id,
+                                reason = reason.as_str(),
+                                "stream caps region refused by the worker; it admits no session of the stream"
+                            );
+                        } else {
+                            debug!(
+                                worker_id = worker,
+                                seq = sent.seq,
+                                reason = reason.as_str(),
+                                "stream control message refused by the worker"
+                            );
+                        }
                     }
                     Answer::Timeout => {
+                        // Not serving until its late answer says so.
+                        self.caps_not_adopted(worker, &sent.pending);
                         warn!(
                             worker_id = worker,
                             seq = sent.seq,
@@ -1130,16 +1460,32 @@ impl<L: WorkerLink> StreamPlane<L> {
     }
 
     fn credit(&mut self, worker: u32, pending: &Pending) {
-        let Pending::Attach {
-            stream_id,
-            bind_gen,
-        } = pending
-        else {
-            return;
-        };
-        if let Some(b) = self.held.get_mut(stream_id) {
-            if b.bind_gen == *bind_gen {
-                *b.acked.entry(worker).or_default() += 1;
+        match pending {
+            Pending::Attach {
+                stream_id,
+                bind_gen,
+            } => {
+                if let Some(b) = self.held.get_mut(stream_id) {
+                    if b.bind_gen == *bind_gen {
+                        *b.acked.entry(worker).or_default() += 1;
+                    }
+                }
+            }
+            Pending::Caps { stream_id } => {
+                if let Some(b) = self.held.get_mut(stream_id) {
+                    b.caps_refused.remove(&worker);
+                }
+            }
+            Pending::Other => {}
+        }
+    }
+
+    /// A `caps` that `worker` refused or left unanswered: the worker
+    /// holds the stream's sockets but admits no session of it.
+    fn caps_not_adopted(&mut self, worker: u32, pending: &Pending) {
+        if let Pending::Caps { stream_id } = pending {
+            if let Some(b) = self.held.get_mut(stream_id) {
+                b.caps_refused.insert(worker);
             }
         }
     }
@@ -1168,7 +1514,7 @@ impl<L: WorkerLink> StreamPlane<L> {
             return;
         }
         self.credit(worker, &pending);
-        if let Pending::Attach { stream_id, .. } = &pending {
+        if let Pending::Attach { stream_id, .. } | Pending::Caps { stream_id } = &pending {
             if let Some(b) = self.held.get(stream_id) {
                 if matches!(self.states.get(stream_id), Some(BindState::Bound { .. })) {
                     self.states
@@ -1185,6 +1531,9 @@ impl<L: WorkerLink> StreamPlane<L> {
 /// the alert channel).
 pub(crate) struct StreamPlaneHandle<L> {
     plane: Arc<Mutex<StreamPlane<L>>>,
+    /// The plane's caps regions, reached without waiting for a pass that
+    /// holds the plane on a worker's answer.
+    caps: SharedCaps,
     store: Arc<Mutex<ConfigStore>>,
     role: Arc<PlaneRole>,
     audit: Option<lorica_api::server::LogStoreSlot>,
@@ -1195,6 +1544,7 @@ impl<L> Clone for StreamPlaneHandle<L> {
     fn clone(&self) -> Self {
         StreamPlaneHandle {
             plane: Arc::clone(&self.plane),
+            caps: Arc::clone(&self.caps),
             store: Arc::clone(&self.store),
             role: Arc::clone(&self.role),
             audit: self.audit.clone(),
@@ -1215,6 +1565,7 @@ impl<L: WorkerLink + 'static> StreamPlaneHandle<L> {
         alerts: lorica_notify::AlertSender,
     ) -> Self {
         StreamPlaneHandle {
+            caps: Arc::clone(&plane.caps),
             plane: Arc::new(Mutex::new(plane)),
             store,
             role: Arc::new(role),
@@ -1313,6 +1664,29 @@ impl<L: WorkerLink + 'static> StreamPlaneHandle<L> {
                 }
             }
         })
+    }
+
+    /// Every [`STREAM_CAPS_TICK_INTERVAL`], for the life of the process:
+    /// evict the settled rate cells of every caps region and drop the
+    /// retired regions that count no session (D-d).
+    pub(crate) fn spawn_caps_tick(&self) -> tokio::task::JoinHandle<()> {
+        let caps = Arc::clone(&self.caps);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(STREAM_CAPS_TICK_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                lock_caps(&caps).tick(lorica_shmem::now_ns());
+            }
+        })
+    }
+
+    /// Worker `worker` was found dead: release its UDP sessions from
+    /// every caps region now, so its share of each stream's cap is free
+    /// for the live workers during the respawn backoff, and whether or
+    /// not a respawn follows. See [`StreamPlane::release_worker`].
+    pub(crate) fn worker_lost(&self, worker: u32) -> u64 {
+        release_worker_sessions(&self.caps, worker)
     }
 
     /// A worker came back: replay the live bindings to it.
@@ -1490,6 +1864,14 @@ mod tests {
         Quiesce {
             drain_ms: u64,
         },
+        /// `total` is the region's session total when the message
+        /// arrived.
+        Caps {
+            stream_id: String,
+            caps_gen: u64,
+            slot: u32,
+            total: u64,
+        },
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -1499,6 +1881,8 @@ mod tests {
         Silent,
         /// Answers when the next message arrives.
         Late,
+        /// Refuses with `adopt_failed`.
+        Refuse,
     }
 
     /// A worker that answers from a script (acks once it runs out), and
@@ -1563,6 +1947,22 @@ mod tests {
                     self.holding.clear();
                     Seen::Quiesce { drain_ms }
                 }
+                StreamCtlMsg::Caps {
+                    stream_id,
+                    caps_gen,
+                    slot,
+                    region,
+                    ..
+                } => {
+                    let region =
+                        lorica_shmem::StreamCapsRegion::open(region).expect("a caps region");
+                    Seen::Caps {
+                        stream_id,
+                        caps_gen,
+                        slot,
+                        total: region.total(),
+                    }
+                }
                 other => panic!("a driver never sends {other:?}"),
             };
             self.seen.lock().unwrap().push(seen);
@@ -1571,6 +1971,10 @@ mod tests {
                 Reply::Ack => self.outbox.push_back(answer),
                 Reply::Silent => {}
                 Reply::Late => self.late.push(answer),
+                Reply::Refuse => self.outbox.push_back(StreamCtlMsg::Nack {
+                    seq,
+                    reason: NackReason::AdoptFailed,
+                }),
             }
             Ok(())
         }
@@ -1609,8 +2013,44 @@ mod tests {
             reserved(),
             states.clone(),
             TEST_ACK_TIMEOUT,
-        );
+        )
+        .with_source_ports(Box::new(|| Some(DEFAULT_RANGE_USABLE_PORTS)));
         (plane, states)
+    }
+
+    /// `U` at the default `ip_local_port_range` and no reserved port.
+    const DEFAULT_RANGE_USABLE_PORTS: u64 = 27_208;
+
+    fn udp(id: &str, port: u16) -> Stream {
+        stream(id, StreamProtocol::Udp, port, port)
+    }
+
+    /// A UDP port free on 127.0.0.1 right now.
+    fn free_udp_port() -> u16 {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    }
+
+    /// The view of the worker in `slot` of `stream_id`'s current region,
+    /// as a worker maps it from its `caps`.
+    fn worker_caps(
+        plane: &StreamPlane<FakeLink>,
+        stream_id: &str,
+        slot: u32,
+    ) -> lorica_shmem::WorkerCaps {
+        let Some(StreamCtlMsg::Caps { region, .. }) = lock_caps(&plane.caps)
+            .caps_message(stream_id, 0, slot)
+            .unwrap()
+        else {
+            panic!("a caps message for {stream_id}");
+        };
+        Arc::new(lorica_shmem::StreamCapsRegion::open(region).unwrap())
+            .worker(slot)
+            .unwrap()
+    }
+
+    fn client(n: u8) -> lorica_shmem::SourceKey {
+        lorica_shmem::SourceKey::of(std::net::IpAddr::from([192, 0, 2, n]))
     }
 
     fn stream(id: &str, protocol: StreamProtocol, first: u16, last: u16) -> Stream {
@@ -2063,22 +2503,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_gives_each_worker_one_slot_socket_per_port() {
+    async fn udp_sends_each_worker_its_caps_slot_then_one_slot_socket_per_port() {
         let (w0, seen0) = FakeLink::new(&[]);
         let (w1, seen1) = FakeLink::new(&[]);
         let (mut plane, states) = plane(vec![w0, w1]);
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        let s = stream("u1", StreamProtocol::Udp, port, port);
+        let s = udp("u1", free_udp_port());
 
         plane
             .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
             .await;
 
-        for log in [&seen0, &seen1] {
+        for (slot, log) in [(0u32, &seen0), (1, &seen1)] {
+            let seen = seen(log);
+            assert_eq!(
+                seen[0],
+                Seen::Caps {
+                    stream_id: "u1".into(),
+                    caps_gen: 1,
+                    slot,
+                    total: 0,
+                },
+                "the region comes before the sockets"
+            );
             assert!(matches!(
-                &seen(log)[0],
+                &seen[1],
                 Seen::Attach { addrs, .. } if addrs.len() == 1
             ));
         }
@@ -2089,7 +2537,295 @@ mod tests {
                 ..
             })
         ));
+        assert_eq!(lock_caps(&plane.caps).memfds(), 1);
         assert!(plane.tcp_handoff_fds().is_empty(), "UDP is not handed over");
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_refuses_the_caps_region_does_not_count_as_serving() {
+        let (w0, _) = FakeLink::new(&[]);
+        let (w1, _) = FakeLink::new(&[Reply::Refuse]);
+        let (mut plane, states) = plane(vec![w0, w1]);
+        let s = udp("u1", free_udp_port());
+
+        plane
+            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .await;
+
+        assert_eq!(
+            states.get("u1"),
+            Some(BindState::Bound {
+                workers_serving: 1,
+                workers: 2
+            }),
+            "it holds the sockets but admits no session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_respawned_worker_is_released_then_sent_its_caps_then_its_attach() {
+        let (w0, _) = FakeLink::new(&[]);
+        let (w1, _) = FakeLink::new(&[]);
+        let (mut plane, states) = plane(vec![w0, w1]);
+        let port = free_udp_port();
+        let s = udp("u1", port);
+        plane
+            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .await;
+        // Worker 1 holds three sessions when it dies: its permits are
+        // never dropped, its process is gone. Worker 0 holds one.
+        let dead = worker_caps(&plane, "u1", 1);
+        let leaked: Vec<_> = (1..=3)
+            .map(|n| dead.admit_session(client(n), 8, 4096).unwrap())
+            .collect();
+        let _live = worker_caps(&plane, "u1", 0)
+            .admit_session(client(9), 8, 4096)
+            .unwrap();
+        assert_eq!(lock_caps(&plane.caps).sessions("u1"), 4);
+
+        let (respawned, seen1) = FakeLink::new(&[]);
+        plane.replay_worker(1, respawned, PASS).await;
+
+        assert_eq!(
+            seen(&seen1),
+            vec![
+                Seen::Caps {
+                    stream_id: "u1".into(),
+                    caps_gen: 1,
+                    slot: 1,
+                    total: 1,
+                },
+                Seen::Attach {
+                    stream_id: "u1".into(),
+                    bind_gen: 1,
+                    addrs: vec![([127, 0, 0, 1], port).into()],
+                },
+                Seen::Refresh { drain_ms: 30_000 },
+            ],
+            "released before the region is handed to the respawn, which gets it before its socket"
+        );
+        assert_eq!(lock_caps(&plane.caps).sessions("u1"), 1);
+        assert_eq!(dead.region().source_sessions(client(1)), 0);
+        assert_eq!(plane.release_worker(1), 0, "a second release finds nothing");
+        assert_eq!(
+            states.get("u1"),
+            Some(BindState::Bound {
+                workers_serving: 2,
+                workers: 2
+            })
+        );
+        std::mem::forget(leaked);
+    }
+
+    #[tokio::test]
+    async fn a_size_change_sends_a_new_caps_and_keeps_the_old_region_until_it_drains() {
+        let (w0, seen0) = FakeLink::new(&[]);
+        let (w1, seen1) = FakeLink::new(&[]);
+        let (mut plane, states) = plane(vec![w0, w1]);
+        let mut s = udp("u1", free_udp_port());
+        plane
+            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .await;
+        let permit = worker_caps(&plane, "u1", 0)
+            .admit_session(client(1), 8, 4096)
+            .unwrap();
+        let before = seen(&seen0).len();
+
+        if let Some(udp) = s.udp.as_mut() {
+            udp.max_sessions = 16_384;
+        }
+        plane
+            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .await;
+
+        for (slot, log) in [(0u32, &seen0), (1, &seen1)] {
+            assert_eq!(
+                seen(log)[before..],
+                [
+                    Seen::Caps {
+                        stream_id: "u1".into(),
+                        caps_gen: 2,
+                        slot,
+                        total: 0,
+                    },
+                    Seen::Refresh { drain_ms: 30_000 },
+                ],
+                "a new region, no rebind"
+            );
+        }
+        assert_eq!(
+            lock_caps(&plane.caps).sessions("u1"),
+            1,
+            "the old region still counts"
+        );
+        assert_eq!(lock_caps(&plane.caps).memfds(), 1, "one memfd per stream");
+        assert!(matches!(
+            states.get("u1"),
+            Some(BindState::Bound {
+                workers_serving: 2,
+                ..
+            })
+        ));
+
+        // Within the same table sizes: nothing to send.
+        if let Some(udp) = s.udp.as_mut() {
+            udp.max_sessions = 16_000;
+        }
+        plane
+            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .await;
+        assert!(!seen(&seen0)
+            .iter()
+            .any(|s| matches!(s, Seen::Caps { caps_gen: 3, .. })));
+
+        drop(permit);
+        lock_caps(&plane.caps).tick(lorica_shmem::now_ns());
+        assert_eq!(lock_caps(&plane.caps).sessions("u1"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_udp_rebind_on_the_same_port_waits_for_the_drain_without_an_alert() {
+        let (w0, seen0) = FakeLink::new(&[]);
+        let (mut plane, states) = plane(vec![w0]);
+        plane.drain_margin = Duration::from_millis(200);
+        let pass = PassSettings {
+            drain: Duration::ZERO,
+            ..PASS
+        };
+        let port = free_udp_port();
+        let before = udp("u1", port);
+        plane
+            .bind_desired(
+                std::slice::from_ref(&before),
+                STANDALONE,
+                pass,
+                Trigger::Change,
+            )
+            .await;
+        // A listen-address change that keeps the port.
+        let mut after = before.clone();
+        after.listen_address = "0.0.0.0".parse().unwrap();
+
+        let mut events = plane
+            .release_stale(std::slice::from_ref(&after), STANDALONE, pass)
+            .await;
+        events.extend(
+            plane
+                .bind_desired(
+                    std::slice::from_ref(&after),
+                    STANDALONE,
+                    pass,
+                    Trigger::Change,
+                )
+                .await,
+        );
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [PlaneEvent::Released {
+                    cause: ReleaseCause::Rebind,
+                    ..
+                }]
+            ),
+            "no bind and no failure while the old binding drains: {events:?}"
+        );
+        assert_eq!(states.get("u1"), Some(BindState::Pending));
+        assert!(plane.has_retryable_failure());
+        assert_eq!(
+            lock_caps(&plane.caps).memfds(),
+            1,
+            "a rebind keeps the stream's region"
+        );
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let retried = plane
+            .bind_desired(
+                std::slice::from_ref(&after),
+                STANDALONE,
+                pass,
+                Trigger::RetryTick,
+            )
+            .await;
+        assert!(
+            matches!(retried.as_slice(), [PlaneEvent::Bound { bind_gen: 2, .. }]),
+            "{retried:?}"
+        );
+        assert!(!plane.has_retryable_failure());
+        assert!(matches!(
+            seen(&seen0).as_slice(),
+            [
+                Seen::Caps { caps_gen: 1, .. },
+                Seen::Attach { bind_gen: 1, .. },
+                Seen::Refresh { .. },
+                Seen::Detach { .. },
+                Seen::Refresh { .. },
+                Seen::Caps { caps_gen: 1, .. },
+                Seen::Attach { bind_gen: 2, .. },
+            ]
+        ));
+
+        // Deleted: the binding drains and the region is retired.
+        plane.release_stale(&[], STANDALONE, pass).await;
+        plane
+            .bind_desired(&[], STANDALONE, pass, Trigger::Change)
+            .await;
+        assert_eq!(lock_caps(&plane.caps).memfds(), 0);
+        assert!(states.get("u1").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_tcp_binding_never_waits_for_a_draining_udp_one() {
+        let (w0, _) = FakeLink::new(&[]);
+        let (mut plane, states) = plane(vec![w0]);
+        let port = free_ports(1);
+        let u = udp("u1", port);
+        plane
+            .bind_desired(std::slice::from_ref(&u), STANDALONE, PASS, Trigger::Change)
+            .await;
+        plane.release_stale(&[], STANDALONE, PASS).await;
+        let t = tcp("t1", port);
+
+        plane
+            .bind_desired(std::slice::from_ref(&t), STANDALONE, PASS, Trigger::Change)
+            .await;
+
+        assert!(matches!(states.get("t1"), Some(BindState::Bound { .. })));
+    }
+
+    #[tokio::test]
+    async fn the_node_refuses_a_udp_binding_past_its_source_ports() {
+        let (w0, _) = FakeLink::new(&[]);
+        let (plane, states) = plane(vec![w0]);
+        let mut plane = plane.with_source_ports(Box::new(|| Some(1_000)));
+        let s = udp("u1", free_udp_port());
+
+        let events = plane
+            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .await;
+
+        match events.as_slice() {
+            [PlaneEvent::BindFailed {
+                kind: BindFailureKind::SourcePorts,
+                os_error,
+                ..
+            }] => assert!(os_error.contains("1000 usable"), "{os_error}"),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(states.get("u1"), Some(BindState::Failed(_))));
+        assert!(!plane.has_retryable_failure(), "retried on change only");
+        assert_eq!(lock_caps(&plane.caps).memfds(), 0, "no region created");
+
+        // A port range the node cannot read leaves the fds alone to
+        // decide.
+        let mut plane = plane.with_source_ports(Box::new(|| None));
+        let events = plane
+            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .await;
+        assert!(
+            matches!(events.as_slice(), [PlaneEvent::Bound { .. }]),
+            "{events:?}"
+        );
     }
 
     #[tokio::test]

@@ -1292,6 +1292,13 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     // counters need this reset.
                     lorica_api::metrics::forget_worker_generic_counters(id);
 
+                    // The dead worker's UDP sessions are gone with its
+                    // process: release their counts from every stream
+                    // caps region now (Story 12.5 D-d), whether or not a
+                    // respawn follows. The replay releases again first
+                    // thing, which then finds nothing.
+                    monitor_stream_plane.worker_lost(id);
+
                     // Re-check shutdown flag before respawning - a
                     // crash detected just before SIGTERM should not
                     // trigger a respawn that races shutdown.
@@ -1342,7 +1349,8 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     };
 
                     // Replay every live stream binding to the new worker
-                    // (D-a). Its UDP slot sockets never closed: the
+                    // (D-a), each UDP stream's caps region ahead of its
+                    // `attach`. Its UDP slot sockets never closed: the
                     // supervisor kept them through the crash, so the
                     // group, and every other client's worker, is
                     // unchanged.
@@ -1425,6 +1433,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // never a delay.
         stream_plane.after_commit().await;
         let _stream_bind_retry = stream_plane.spawn_retry_loop();
+        let _stream_caps_tick = stream_plane.spawn_caps_tick();
 
         // Hot upgrade (Story 8.4), NEW supervisor side: now that workers
         // are forked from the inherited sockets and the API task is
