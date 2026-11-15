@@ -54,6 +54,7 @@ pub mod handler;
 pub mod listener;
 pub mod local;
 pub mod reconcile;
+pub mod refusal_log;
 pub mod resolver;
 pub mod runtime;
 pub mod seams;
@@ -77,6 +78,7 @@ pub use handler::{
 };
 pub use local::BoundPorts;
 pub use reconcile::{diff, Actions, BindKey, BoundBinding, Detach, ReleaseCause, UdpOverlap};
+pub use refusal_log::{RefusalLogDecision, RefusalLogLimiter, REFUSAL_LOG_WINDOW};
 pub use resolver::ResolverCache;
 pub use runtime::{StreamRuntime, StreamRuntimeError, StreamRuntimeHandle};
 pub use seams::{
