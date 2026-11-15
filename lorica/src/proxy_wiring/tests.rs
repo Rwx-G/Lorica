@@ -1461,66 +1461,20 @@ fn test_global_rate_tracks_requests() {
 }
 
 #[test]
-fn test_flood_threshold_halves_effective_limit() {
-    // When flood_threshold_rps > 0 and global RPS exceeds it,
-    // the effective per-IP rate limit should be halved.
-    let config = ProxyConfig::from_store(
-        vec![],
-        vec![],
-        vec![],
-        vec![],
-        ProxyConfigGlobals {
-            flood_threshold_rps: 100,
-            ..Default::default()
-        },
-    );
-    assert_eq!(config.flood_threshold_rps, 100);
-
-    // Simulate: route has rate_limit_rps=50, burst=10 -> effective=60
-    // Under flood (global > 100), effective should become 30
-    let base_limit: f64 = (50 + 10) as f64;
-    let threshold = config.flood_threshold_rps;
-
-    // Normal conditions: global RPS below threshold
-    let global_rps_normal = 80.0;
-    let mut effective = base_limit;
-    if threshold > 0 && global_rps_normal > threshold as f64 {
-        effective *= 0.5;
-    }
-    assert_eq!(effective, 60.0, "No halving when below threshold");
-
-    // Flood conditions: global RPS above threshold
-    let global_rps_flood = 150.0;
-    let mut effective = base_limit;
-    if threshold > 0 && global_rps_flood > threshold as f64 {
-        effective *= 0.5;
-    }
-    assert_eq!(effective, 30.0, "Limit halved during flood");
-}
-
-#[test]
 fn test_flood_threshold_zero_disables_defense() {
-    // When flood_threshold_rps is 0, adaptive defense is disabled
-    let config = ProxyConfig::from_store(
-        vec![],
-        vec![],
-        vec![],
-        vec![],
-        ProxyConfigGlobals::default(),
-    );
-    assert_eq!(config.flood_threshold_rps, 0);
-
-    let base_limit: f64 = 100.0;
-    let threshold = config.flood_threshold_rps;
-    let global_rps = 999999.0;
-    let mut effective = base_limit;
-    if threshold > 0 && global_rps > threshold as f64 {
-        effective *= 0.5;
+    // 120 requests per second on the shared counter, counted while the
+    // defence was on, then the threshold set to 0: no request costs
+    // more than one token, however high the proxy-wide rate.
+    let (region, _fd) = lorica_shmem::SharedRegion::create_supervisor().expect("region");
+    let worker = flood_proxy(Some(region));
+    let second = 9_200_000 * SECOND_NS;
+    for n in 0..120u64 {
+        worker.count_request_for_flood_defence(100, second + n * 8_000_000);
     }
-    assert_eq!(
-        effective, 100.0,
-        "No halving when threshold is 0 (disabled)"
-    );
+    let next = second + SECOND_NS;
+    assert_eq!(worker.proxy_wide_rps(next), 120.0);
+    assert_eq!(worker.flood_cost(&flood_config(100), next), 2);
+    assert_eq!(worker.flood_cost(&flood_config(0), next), 1);
 }
 
 #[test]
@@ -1629,6 +1583,7 @@ fn single_process_mode_weighs_its_own_requests_over_the_last_second() {
     std::thread::sleep(Duration::from_millis(1100));
     assert!(proxy.proxy_wide_rps(0) >= 140.0);
     assert_eq!(proxy.flood_cost(&flood_config(100), 0), 2);
+    assert_eq!(proxy.flood_cost(&flood_config(0), 0), 1, "defence off");
     assert_eq!(proxy.flood_cost(&flood_config(200), 0), 1);
 }
 
