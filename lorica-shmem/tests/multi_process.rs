@@ -30,9 +30,10 @@
 #![cfg(target_os = "linux")]
 
 use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use lorica_shmem::{SharedRegion, SATURATED};
+use lorica_shmem::{SharedRegion, MAX_PROBE, SATURATED, WAF_SLOTS};
 
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitStatus};
@@ -123,16 +124,41 @@ fn children_racing_on_the_first_increment_of_fresh_keys_lose_nothing() {
         .collect();
     wait_all(&pids);
 
-    let short: Vec<u64> = (0..KEYS)
-        .filter(|&k| region.waf_flood.read(region.tagged(k)) != Some(CHILDREN))
+    // A key whose whole probe window is held by other keys is refused
+    // by every child (`increment` returns `SATURATED`, the fail-safe
+    // deny), so it reads `None` with nothing counted and nothing lost.
+    // With this many random keys in a production-size table that was
+    // measured at about one run in a thousand, and it is not the race
+    // under test. Any other key must read exactly one increment per
+    // child.
+    let lost: Vec<(u64, Option<u64>)> = (0..KEYS)
+        .map(|k| (k, region.tagged(k)))
+        .filter(|&(_, h)| !probe_window_held_by_other_keys(region, h))
+        .map(|(k, h)| (k, region.waf_flood.read(h)))
+        .filter(|&(_, read)| read != Some(CHILDREN))
         .collect();
     assert!(
-        short.is_empty(),
-        "{} of {KEYS} keys lost an increment, first {:?}",
-        short.len(),
-        &short[..short.len().min(5)]
+        lost.is_empty(),
+        "{} of {KEYS} keys lost an increment, first (key, read) {:?}",
+        lost.len(),
+        &lost[..lost.len().min(5)]
     );
     drop(fd);
+}
+
+/// Whether every slot `increment` may probe for `h` holds another key,
+/// which is the one case where it refuses `h` with `SATURATED`. Only
+/// meaningful once no writer is left, since a free slot can still be
+/// claimed while one runs.
+fn probe_window_held_by_other_keys(region: &SharedRegion, h: u64) -> bool {
+    let mask = WAF_SLOTS - 1;
+    let start = (h as usize) & mask;
+    (0..MAX_PROBE).all(|probe| {
+        let key = region.waf_flood.slots[(start + probe) & mask]
+            .key
+            .load(Ordering::Acquire);
+        key != 0 && key != h
+    })
 }
 
 #[test]
