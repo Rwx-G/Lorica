@@ -31,7 +31,7 @@ pub struct MtlsConfigRequest {
 /// store. The allowed-organizations list is trimmed and deduplicated;
 /// empty entries are rejected because they would silently widen the
 /// allowlist in unexpected ways.
-pub(super) fn build_mtls_config(
+pub(crate) fn build_mtls_config(
     body: &MtlsConfigRequest,
 ) -> Result<lorica_config::models::MtlsConfig, ApiError> {
     let pem_text = body.ca_cert_pem.trim();
@@ -127,7 +127,7 @@ pub(super) fn build_mtls_config(
 /// widen the trust. Issuance is read from the names (an issuer name
 /// equal to another certificate's subject), without checking the
 /// signature, which is enough for a warning.
-pub(super) fn mtls_bundle_trust_warnings(pem_text: &str) -> Vec<String> {
+pub(crate) fn mtls_bundle_trust_warnings(pem_text: &str) -> Vec<String> {
     let Ok(blocks) = pem::parse_many(pem_text.trim().as_bytes()) else {
         return Vec::new();
     };
@@ -175,7 +175,7 @@ pub(super) fn mtls_bundle_trust_warnings(pem_text: &str) -> Vec<String> {
 /// answers with the route alone, so the warnings go to the log, where an
 /// operator who saved through the API without validating first still
 /// finds them.
-pub(super) fn log_mtls_bundle_trust_warnings(config: &lorica_config::models::MtlsConfig) {
+pub(crate) fn log_mtls_bundle_trust_warnings(config: &lorica_config::models::MtlsConfig) {
     for warning in mtls_bundle_trust_warnings(&config.ca_cert_pem) {
         tracing::warn!(%warning, "mtls: the CA bundle trusts more than the CAs it lists");
     }
