@@ -2605,4 +2605,50 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn no_tool_reaches_a_stream_or_offers_the_local_backend_flag() {
+        // Story 12.3 D-m: `allow_local_backend` is never settable from
+        // MCP. No tool calls a stream path, none declares the field at
+        // any depth of its input schema, and a body naming it is refused
+        // here, before a request leaves. `lorica-api` proves the plane
+        // mounts no stream path either, and refuses a token moving a
+        // backend that a stream with the flag forwards to; the backend
+        // tool below is the request that reaches that refusal.
+        const FLAG: &str = "allow_local_backend";
+        for spec in catalogue() {
+            assert!(
+                !spec.path.contains("stream"),
+                "{} calls {}",
+                spec.name,
+                spec.path
+            );
+            let mut names = Vec::new();
+            property_names(&spec.input_schema(), &mut names);
+            assert!(
+                names.iter().all(|name| name != FLAG),
+                "{} offers {FLAG}",
+                spec.name
+            );
+            if let Some(body) = spec.body() {
+                let mut arguments = minimal_arguments(spec);
+                arguments[body.argument] = json!({ FLAG: true });
+                assert!(
+                    spec.call_for(&arguments).is_err(),
+                    "{} carries {FLAG}",
+                    spec.name
+                );
+            }
+        }
+        for (tool, query) in [
+            ("lorica_backend_update", ""),
+            ("lorica_backend_update_preview", "?dry_run=true"),
+        ] {
+            let call = spec(tool)
+                .call_for(&json!({ "id": "b-1", "backend": { "address": "192.0.2.10:80" } }))
+                .expect("a backend update builds");
+            assert_eq!(call.verb, Verb::Put);
+            assert_eq!(call.path, format!("/automation/v1/backends/b-1{query}"));
+        }
+    }
 }

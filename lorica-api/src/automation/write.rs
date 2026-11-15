@@ -708,9 +708,46 @@ fn backend_guard(principal: &AutomationPrincipal) -> BackendGuard {
             };
             ensure_not_weakened(BACKEND_PROTECTIONS, "backend", &after.id, before, after)?;
         }
+        if let (Some(before), Some(after)) = (target.before, target.after) {
+            ensure_not_moved_under_a_local_stream(store, before, after)?;
+        }
         Ok(())
     })
     .restoring_withheld(redact::restore_health_check_path)
+}
+
+/// A token may not change the address of a backend that a stream with
+/// `allow_local_backend` forwards to (Story 12.3 D-m, D9 of the PRD).
+///
+/// The flag itself is a stream field, and no automation or MCP path
+/// writes a stream. Without this a token holding `backends:write` could
+/// still repoint such a backend anywhere its CIDR grant reaches, the
+/// node's own addresses included, under a permission an operator gave
+/// the stream and never the token. Narrow on purpose: a backend of a
+/// stream without the flag stays the token's to move, since rule A then
+/// refuses a local address on its own. The refusal names the stream and
+/// never the address.
+fn ensure_not_moved_under_a_local_stream(
+    store: &ConfigStore,
+    before: &Backend,
+    after: &Backend,
+) -> Result<(), ApiError> {
+    if before.address == after.address {
+        return Ok(());
+    }
+    for stream_id in store.list_streams_for_backend(&after.id)? {
+        if let Some(stream) = store
+            .get_stream(&stream_id)?
+            .filter(|stream| stream.allow_local_backend)
+        {
+            return Err(ApiError::Forbidden(format!(
+                "backend `{}` serves stream `{}`, which allows local backends: its address \
+                 is changed in the dashboard, not with an automation token",
+                after.id, stream.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The token's grant as the guard a renewal runs on the certificate
@@ -960,8 +997,10 @@ pub async fn create_backend(
 /// refusal (409) included. The backend named must sit inside the
 /// token's `allowed_backend_cidrs` on its stored address and belong to
 /// no other principal's environment (403); an address the patch names
-/// is checked against the grant exactly as on create, and a control of
-/// [`BACKEND_PROTECTIONS`] may only be strengthened (403). With
+/// is checked against the grant exactly as on create, a control of
+/// [`BACKEND_PROTECTIONS`] may only be strengthened (403), and the
+/// address of a backend a stream allowing local backends forwards to
+/// does not move (403 naming the stream, Story 12.3 D-m). With
 /// `?dry_run=true`, which needs `backends:read` (403), the backend
 /// before and after the patch, and nothing changed.
 ///

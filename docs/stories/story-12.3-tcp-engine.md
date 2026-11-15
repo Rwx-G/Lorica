@@ -1138,15 +1138,15 @@ port check only), `lorica-api/src/automation/write.rs`,
 only), `lorica-api/openapi.yaml`, `lorica-api/src/tests.rs`.
 Depends on: B; after 12.2 Lot E3 (same files).
 
-- [ ] Request and response fields, `backup_backend_ids` (D-q).
-- [ ] Rule B (`local_backend_conflicts`) on stream create and update,
+- [x] Request and response fields, `backup_backend_ids` (D-q).
+- [x] Rule B (`local_backend_conflicts`) on stream create and update,
       backend update (each linked stream) and import, answering 409.
-- [ ] The automation guard of D-m, and confirmation that the MCP backend
+- [x] The automation guard of D-m, and confirmation that the MCP backend
       tool reaches it (Completion Notes say how).
-- [ ] `openapi.yaml`, contract test green; the `max_connections`
+- [x] `openapi.yaml`, contract test green; the `max_connections`
       description reads "per worker process until Story 12.6, per node
       from then on" (Resolved 1).
-- [ ] Tests: IV4's first half (`127.0.0.1:<management port>` refused at
+- [x] Tests: IV4's first half (`127.0.0.1:<management port>` refused at
       creation, with and without the flag); a backend update moving a
       linked backend onto a stream port refused; the automation guard
       refuses a token's address change on a backend of a flagged stream
@@ -1351,6 +1351,109 @@ performance phase.
 ### Debug Log
 
 ### Completion Notes
+
+**Lot E (API surfaces).**
+
+- Status codes follow the house rule the stream handlers already
+  documented, not D-q's "400 for validation": a body that parses and
+  breaks a model rule (a range, the trust list, the UDP rule, rule A,
+  the backup and source-family rules, a backend in both lists) is
+  `422`, as `ConfigError::Validation` maps it; rule B is `409` with a
+  code of its own, `stream_local_backend`, beside `stream_port_conflict`,
+  so a client tells a local backend on a node's port from a listener
+  conflict. A refusal names the first conflict only, as a port conflict
+  does.
+- API shape. `StreamResponse` carries the sixteen settings field by field
+  under their model names (`load_balancing` snake_case,
+  `proxy_protocol_send` `off`/`v1`/`v2`, `total_timeout_s`,
+  `upload_rate_bps` and `download_rate_bps` `null` for no limit,
+  `source_addresses` as canonical text), `backend_ids` (primaries) and
+  `backup_backend_ids`, each sorted. `CreateStreamRequest` and
+  `UpdateStreamRequest` take every setting as optional; an absent one
+  is `Stream::new`'s default on create and the stored value on update,
+  and `null` lifts the three nullable limits on update (`Option<Option<_>>`
+  through a `nullable` deserializer). One `EngineSettings` type applies
+  the settings for both bodies. On update `backend_ids` replaces the
+  primaries and `backup_backend_ids` the backups; a list left out keeps
+  its stored half. `STREAM_WITHHELD_FIELDS` stays empty.
+- Update write order. When the links change, the update unlinks, writes
+  the row, then writes the new links, in one transaction. The former
+  order (links, then row) judged the new links against the old row, so
+  setting `allow_local_backend` together with the local backend it
+  allows was refused; the reverse order would refuse dropping both.
+  Unlinking first means each check sees the final row against the final
+  links.
+- Rule B, where it runs. `refuse_local_backends` on stream create and
+  update, under the store lock, after the port check and before the
+  budget: the candidate's own local backends against the nodes that
+  would bind it (`local_backend_conflicts` over `nodes_checking`, the
+  nodes of the port check), and the other way round, every stored
+  stream's local backend that would now reach a port the candidate
+  takes (the stream being written moved onto a port another stream
+  forwards to through loopback); the refusal names the stream whose
+  backend it is. Backend update (`update_backend_as`, so every plane,
+  automation included, and its preview): `refuse_local_backend_on_its_streams`
+  checks the backend as it would be written as a link of each stream
+  linking it. Import and its preview: `check_imported_streams` runs
+  `first_local_backend_conflict` per file stream over the file's own
+  backends and links, after the port check.
+- IV4's first half, `lorica-api/src/streams/tests.rs`: a stream whose
+  backend is `127.0.0.1:<management port>` is refused `409`
+  `stream_local_backend` at creation with and without the flag, as a
+  backup too, and spelled `localhost:` and `[::1]:`; a loopback backend
+  on a free port is `422` without the flag and created with it. Rule B
+  both ways on stream ports, the stream's own port included; a backend
+  update moving a linked backend onto another stream's port, its own
+  stream's port or the management port refused, nothing moved; an
+  import and its preview refusing alike.
+- D9 on automation and MCP. `backend_guard` (`automation/write.rs`)
+  gains `ensure_not_moved_under_a_local_stream`: a token's write that
+  changes the address of a backend linked to any stream with
+  `allow_local_backend` is `403`, naming the backend id and the stream,
+  never an address; the preview runs the same guard. The MCP backend
+  tool reaches it because the in-process MCP binding dispatches each
+  tool to its plane path (`lorica_backend_update` and its preview build
+  `PUT /automation/v1/backends/{id}`, pinned in `lorica-mcp`'s
+  `no_tool_reaches_a_stream_or_offers_the_local_backend_flag`), and
+  `automation::tests::a_token_cannot_move_a_backend_a_stream_allowing_local_backends_forwards_to`
+  drives both tools through the MCP endpoint and gets the `403` text.
+  The field itself: no automation route path names a stream
+  (`no_automation_path_reaches_a_stream`, over `route_table()`), and no
+  MCP tool calls a stream path or declares `allow_local_backend` at any
+  depth of its schema, a body naming it being refused before a request
+  leaves.
+- Budget, the Lot D2 hand-off. `StreamDemand::of` itself now declares
+  `tcp::held_fds`, so it is the one demand function: the API's write
+  check, the heartbeat's committed totals and the budget view build on
+  it, and the driver's `demand_of` is `StreamDemand::of` of the stream
+  with the binding's protocol and ports (a binding whose stream is gone
+  still declares nothing). Its test asserts `demand_of == StreamDemand::of`.
+  `adds_no_demand` (a write never refused on a node already over budget)
+  also requires no more fds at the cap, so raising `max_connections` is
+  new demand and lowering it is not. Tests in `stream_budget.rs`: at the
+  packaged limit a single-port TCP stream with `(S - 1) / 2` connections
+  passes and one more is refused, the API's verdict equal to the
+  arithmetic over `StreamDemand::of` either way; fifteen default TCP
+  streams fit and the sixteenth is refused `worker_fds` (D-p's "about
+  fifteen"); and through the API at 4,096 fds, 511 connections fit and
+  512 are refused on create and on update.
+- `openapi.yaml`: the stream schemas carry every field, its range, enum
+  and default; `StreamProxyProtocol` is a schema (`"off"` quoted, a YAML
+  1.1 boolean otherwise); the request schemas reference the response's
+  property definitions rather than repeating them. Tests read the
+  document: the response, create and update schemas name exactly the
+  fields the API answers and accepts (the create and update bodies are
+  also fed the whole written view back, so a view field neither takes
+  fails), every view field is required, each published range and
+  `maxItems` is the model's constant, each published default is
+  `Stream::new`'s, and both enums are the Rust enums'. The refusal enum
+  (`connection_cap`) is not published: no endpoint answers it before
+  Story 12.9's metrics and logs. `openapi-automation.yaml` is untouched,
+  as D-q says, though its backend update can now answer the D9 `403`;
+  the refusal's message carries the reason.
+- The view key-set test drops the `TCP_ENGINE_FIELDS` filter Lot B left.
+- Not fixed here, seen while writing the stream enum: the route schemas
+  of `openapi.yaml` publish `load_balancing` without `least_conn`.
 
 **Lot C (the engine in `lorica-stream`).**
 
@@ -1674,6 +1777,19 @@ performance phase.
 
 ## File List
 
+Lot E:
+
+- `lorica-api/src/streams.rs`, `lorica-api/src/streams/tests.rs`
+- `lorica-api/src/backends.rs` (rule B on backend update)
+- `lorica-api/src/config.rs` (rule B on import)
+- `lorica-api/src/automation/write.rs`, `lorica-api/src/automation/tests.rs`
+- `lorica-mcp/src/tools.rs` (a test)
+- `lorica-api/openapi.yaml`
+- `lorica-api/src/stream_budget.rs`, `lorica-stream/src/budget.rs`,
+  `lorica-stream/src/tcp/cap.rs` (doc), `lorica/src/startup/stream_plane.rs`
+  (the Lot D2 budget hand-off, outside the Lot's allowlist)
+- `docs/stories/story-12.3-tcp-engine.md`
+
 Lot C:
 
 - `lorica-stream/src/seams.rs`, `lorica-stream/src/local.rs`,
@@ -1751,4 +1867,5 @@ Lot B:
 | 2026-11-14 | 0.4 | Lot A landed: the PROXY v1 and v2 encoder beside the parser, with `encode_v2_dgram` for Story 12.5, round-trip tests and fuzz arm, FORK.md entry. | Romain G. |
 | 2026-11-14 | 0.5 | Lot D1 landed: HTTP's selection block extracted into `lb::select_index`, behaviour unchanged, `ring_addresses` refined to an `Option`. | Romain G. |
 | 2026-11-15 | 0.7 | Lot D2 landed: the selector, breaker gate and hickory resolver in `lorica::stream_engine`, the engine installed in worker and single-process modes, the stream table carrying backends, `held_fds` in the budget, health flips refreshing every stream table, `--reserved-ports` for workers; the real binary forwards a TCP stream in both modes. | Romain G. |
+| 2026-11-15 | 0.8 | Lot E landed: the engine settings and `backup_backend_ids` on the stream API and in `openapi.yaml`, rule B (`stream_local_backend`, 409) on stream writes both ways, backend updates and imports, the D9 automation guard reached by the MCP backend tool, and one budget demand function for the API and the node. | Romain G. |
 | 2026-11-15 | 0.6 | Lot C landed: the TCP engine in `lorica_stream::tcp`, the protocol-neutral seams, local check, resolver cache and counters at the crate root (Story 12.5 E2, E3), `StreamTable::with_backends`, `table_changed` and the `backend_down` drain, the connection record and its observer. | Romain G. |

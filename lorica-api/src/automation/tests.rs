@@ -381,3 +381,136 @@ async fn every_automation_request_lands_in_the_audit_log() {
         .filter(|row| row.action == "automation.request.unauthenticated")
         .all(|row| row.operator_username == "-"));
 }
+
+// ---- Story 12.3 D-m: `allow_local_backend` is never a token's ----
+
+/// No path of the automation plane names a stream, so no token and no
+/// MCP tool (each a request to one of these paths) writes a stream
+/// field, `allow_local_backend` included. Story 12.10 brings streams to
+/// this plane and must keep the flag out of it.
+#[test]
+fn no_automation_path_reaches_a_stream() {
+    let table = crate::automation::route_table();
+    assert!(!table.is_empty());
+    for route in table {
+        assert!(
+            !route.path.contains("stream"),
+            "{} {} reaches a stream",
+            route.method,
+            route.path
+        );
+    }
+}
+
+/// The address of a backend a stream with `allow_local_backend`
+/// forwards to does not move under a token, on the plane's path, its
+/// preview and the MCP tool that drives it; the refusal names the
+/// stream, never an address. The same token keeps every other write on
+/// that backend, and the address of a backend of an ordinary stream.
+#[tokio::test]
+async fn a_token_cannot_move_a_backend_a_stream_allowing_local_backends_forwards_to() {
+    use crate::automation::test_support::{
+        a_node_with_something_to_write, automation_call, mcp_call,
+    };
+
+    let f = a_node_with_something_to_write().await;
+    let created = crate::tests::send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "POST",
+        "/api/v1/streams",
+        &f.admin,
+        Some(serde_json::json!({
+            "name": "pg",
+            "protocol": "tcp",
+            "listen_address": "0.0.0.0",
+            "port_first": 5432,
+            "allow_local_backend": true,
+            "backend_ids": [f.backend_id],
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let stream_id = body_json(created).await["data"]["id"]
+        .as_str()
+        .expect("an id")
+        .to_string();
+    let stored_address = || async {
+        f.state
+            .store
+            .lock()
+            .await
+            .get_backend(&f.backend_id)
+            .expect("read")
+            .expect("stored")
+            .address
+    };
+    let original = stored_address().await;
+    let moved = serde_json::json!({ "address": "10.0.0.11:8080" });
+    let path = format!("/automation/v1/backends/{}", f.backend_id);
+
+    for suffix in ["", "?dry_run=true"] {
+        let response = automation_call(
+            &f.state,
+            "PUT",
+            &format!("{path}{suffix}"),
+            &f.bearer,
+            Some(moved.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{suffix}");
+        let refusal = body_json(response).await;
+        let message = refusal["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("stream `pg`"), "{suffix}: {message}");
+        assert!(!message.contains("10.0.0."), "no address: {message}");
+    }
+    for tool in ["lorica_backend_update", "lorica_backend_update_preview"] {
+        let refused = mcp_call(
+            &f.state,
+            &f.mcp_bearer,
+            tool,
+            serde_json::json!({ "id": f.backend_id, "backend": moved.clone() }),
+        )
+        .await;
+        assert_eq!(
+            refused["result"]["isError"],
+            serde_json::json!(true),
+            "{refused}"
+        );
+        let text = refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains("HTTP 403"), "{tool}: {text}");
+        assert!(text.contains("stream `pg`"), "{tool}: {text}");
+    }
+    assert_eq!(stored_address().await, original, "nothing moved");
+
+    // The rest of the row stays the token's.
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &path,
+        &f.bearer,
+        Some(serde_json::json!({ "name": "renamed" })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // An ordinary stream's backend is the token's to move: rule A still
+    // refuses a local address on its own.
+    let dropped = crate::tests::send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "PUT",
+        &format!("/api/v1/streams/{stream_id}"),
+        &f.admin,
+        Some(serde_json::json!({ "allow_local_backend": false })),
+    )
+    .await;
+    assert_eq!(dropped.status(), StatusCode::OK);
+    let response = automation_call(&f.state, "PUT", &path, &f.bearer, Some(moved)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(stored_address().await, "10.0.0.11:8080");
+}
