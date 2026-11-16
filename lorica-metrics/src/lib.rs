@@ -61,8 +61,10 @@ use prometheus::{
 
 /// Namespace prepended to every metric registered through the helpers
 /// below. Matches the historical `lorica-api` convention so existing
-/// scrape names (e.g. `lorica_http_requests_total`) are unchanged.
-const NAMESPACE: &str = "lorica";
+/// scrape names (e.g. `lorica_http_requests_total`) are unchanged. A
+/// custom [`prometheus::core::Collector`] that builds its own families
+/// prefixes their names with it too.
+pub const NAMESPACE: &str = "lorica";
 
 /// Process-global metrics registry.
 ///
@@ -428,9 +430,230 @@ pub fn reset_generic_counter_snapshot_for_test() {
     SUPERVISOR_GENERIC_SNAPSHOT.write().clear();
 }
 
+// ---------------------------------------------------------------------------
+// Cross-worker gauge aggregation (Story 12.9 D-f).
+//
+// A gauge is a state, not a running total, so the counter delta
+// machinery above cannot carry it: a value that goes down is the news,
+// not a reset to swallow. Each process sets its own value; a worker
+// ships it in the same generic list the counters ride (so no wire
+// change), and the supervisor renders, per label set, the aggregate of
+// its own value and every worker's last report.
+// ---------------------------------------------------------------------------
+
+/// How the supervisor combines the per-process values of one gauge into
+/// the node's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GaugeAggregation {
+    /// The lowest value: a state where one process down means the node
+    /// is down for that process's share of the work.
+    Min,
+    /// The highest value.
+    Max,
+    /// The sum: each process holds its own share of the quantity.
+    Sum,
+}
+
+impl GaugeAggregation {
+    /// Combine `values`; `None` when there is none.
+    pub fn combine(self, values: impl IntoIterator<Item = i64>) -> Option<i64> {
+        let mut values = values.into_iter();
+        let first: i64 = values.next()?;
+        Some(values.fold(first, |acc, v| match self {
+            Self::Min => acc.min(v),
+            Self::Max => acc.max(v),
+            Self::Sum => acc.saturating_add(v),
+        }))
+    }
+
+    /// Whether a dead worker's last values keep counting until its
+    /// replacement, which takes the same id, reports. A state (`Min`,
+    /// `Max`) does: dropping it would read "every process is fine" for
+    /// the length of a respawn. A share (`Sum`) does not: what a dead
+    /// process held died with it.
+    pub fn outlives_its_worker(self) -> bool {
+        !matches!(self, Self::Sum)
+    }
+}
+
+/// Positional label values of one series.
+type GaugeLabelValues = Vec<String>;
+
+#[derive(Debug, Default)]
+struct AggregatedGaugeState {
+    /// This process's own values.
+    local: std::collections::BTreeMap<GaugeLabelValues, i64>,
+    /// Each worker's last report, by worker id.
+    workers: std::collections::BTreeMap<u32, std::collections::BTreeMap<GaugeLabelValues, i64>>,
+    /// The label sets the registry renders now, so one that no process
+    /// holds any more is removed.
+    rendered: std::collections::BTreeSet<GaugeLabelValues>,
+}
+
+/// An [`IntGaugeVec`] whose rendered value, per label set, is the
+/// [`GaugeAggregation`] of this process's value and every worker's.
+///
+/// In a worker, and in a single process, nothing reports to it, so it
+/// renders the process's own value. A worker ships that value with
+/// [`AggregatedGauge::snapshot_local`]; the supervisor applies each
+/// report with [`AggregatedGauge::apply_worker`].
+#[derive(Debug)]
+pub struct AggregatedGauge {
+    name: String,
+    label_names: &'static [&'static str],
+    aggregation: GaugeAggregation,
+    gauge: IntGaugeVec,
+    state: parking_lot::Mutex<AggregatedGaugeState>,
+}
+
+impl AggregatedGauge {
+    /// Build the gauge under the `lorica` namespace and register it
+    /// against the shared [`REGISTRY`].
+    pub fn register(
+        name: &str,
+        help: &str,
+        label_names: &'static [&'static str],
+        aggregation: GaugeAggregation,
+    ) -> AggregatedGauge {
+        Self::with_gauge(
+            name,
+            register_int_gauge_vec(name, help, label_names),
+            label_names,
+            aggregation,
+        )
+    }
+
+    fn with_gauge(
+        name: &str,
+        gauge: IntGaugeVec,
+        label_names: &'static [&'static str],
+        aggregation: GaugeAggregation,
+    ) -> AggregatedGauge {
+        AggregatedGauge {
+            name: format!("{NAMESPACE}_{name}"),
+            label_names,
+            aggregation,
+            gauge,
+            state: parking_lot::Mutex::new(AggregatedGaugeState::default()),
+        }
+    }
+
+    /// The registered name, namespace included, as a scrape and the wire
+    /// spell it.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Set this process's value for `label_values`, given in the
+    /// registered label order.
+    pub fn set_local(&self, label_values: &[&str], value: i64) {
+        let mut state = self.state.lock();
+        state.local.insert(owned(label_values), value);
+        self.render(&mut state);
+    }
+
+    /// This process no longer holds a value for `label_values`.
+    pub fn clear_local(&self, label_values: &[&str]) {
+        let mut state = self.state.lock();
+        state.local.remove(&owned(label_values));
+        self.render(&mut state);
+    }
+
+    /// This process's own values as wire entries, zeros included: for a
+    /// state, 0 is the news. Negative values are sent as 0, the wire
+    /// being unsigned; no aggregated gauge holds a negative value.
+    pub fn snapshot_local(&self) -> Vec<GenericCounterTuple> {
+        let state = self.state.lock();
+        state
+            .local
+            .iter()
+            .map(|(values, value)| {
+                let pairs: Vec<(String, String)> = self
+                    .label_names
+                    .iter()
+                    .zip(values)
+                    .map(|(name, value)| ((*name).to_string(), value.clone()))
+                    .collect();
+                (self.name.clone(), pairs, u64::try_from(*value).unwrap_or(0))
+            })
+            .collect()
+    }
+
+    /// Record a worker's report. The report is the worker's whole state
+    /// for this gauge: a label set it no longer carries is dropped from
+    /// that worker. Entries of other names are ignored, so the whole
+    /// generic list can be passed; an entry missing one of the gauge's
+    /// labels is skipped.
+    pub fn apply_worker(&self, worker_id: u32, entries: &[GenericCounterTuple]) {
+        let reported: std::collections::BTreeMap<GaugeLabelValues, i64> = entries
+            .iter()
+            .filter(|(name, _, _)| *name == self.name)
+            .filter_map(|(_, pairs, value)| {
+                let values: Option<GaugeLabelValues> = self
+                    .label_names
+                    .iter()
+                    .map(|expected| {
+                        pairs
+                            .iter()
+                            .find(|(name, _)| name == expected)
+                            .map(|(_, value)| value.clone())
+                    })
+                    .collect();
+                values.map(|v| (v, i64::try_from(*value).unwrap_or(i64::MAX)))
+            })
+            .collect();
+        let mut state = self.state.lock();
+        state.workers.insert(worker_id, reported);
+        self.render(&mut state);
+    }
+
+    /// A worker died. Its values leave the aggregate at once for a
+    /// [`GaugeAggregation::Sum`], and stand until its replacement
+    /// reports otherwise ([`GaugeAggregation::outlives_its_worker`]).
+    pub fn forget_worker(&self, worker_id: u32) {
+        if self.aggregation.outlives_its_worker() {
+            return;
+        }
+        let mut state = self.state.lock();
+        state.workers.remove(&worker_id);
+        self.render(&mut state);
+    }
+
+    fn render(&self, state: &mut AggregatedGaugeState) {
+        let mut keys: std::collections::BTreeSet<GaugeLabelValues> =
+            state.local.keys().cloned().collect();
+        for values in state.workers.values() {
+            keys.extend(values.keys().cloned());
+        }
+        for stale in state.rendered.difference(&keys) {
+            let refs: Vec<&str> = stale.iter().map(String::as_str).collect();
+            // Absent already is the state this asks for.
+            let _ = self.gauge.remove_label_values(&refs);
+        }
+        for key in &keys {
+            let values = state
+                .local
+                .get(key)
+                .into_iter()
+                .chain(state.workers.values().filter_map(|w| w.get(key)))
+                .copied();
+            if let Some(value) = self.aggregation.combine(values) {
+                let refs: Vec<&str> = key.iter().map(String::as_str).collect();
+                self.gauge.with_label_values(&refs).set(value);
+            }
+        }
+        state.rendered = keys;
+    }
+}
+
+fn owned(values: &[&str]) -> GaugeLabelValues {
+    values.iter().map(|v| (*v).to_string()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prometheus::core::Collector;
 
     // The two aggregation tests below each reset the process-global
     // SUPERVISOR_GENERIC_SNAPSHOT. Rust runs tests in parallel, so without
@@ -607,5 +830,116 @@ mod tests {
         forget_worker_generic_counters(1);
         apply_worker_generic_counters(1, &entry(3), resolve);
         assert_eq!(TEST_VEC.with_label_values(&["fgt"]).get(), base + 8);
+    }
+
+    /// A gauge over a vec of its own, outside the shared registry, so
+    /// each test owns its state.
+    fn aggregated(aggregation: GaugeAggregation) -> AggregatedGauge {
+        const NAME: &str = "metrics_unit_aggregated";
+        let opts = prometheus::Opts::new(NAME, "aggregated gauge unit test").namespace(NAMESPACE);
+        let vec = IntGaugeVec::new(opts, &["sink"]).expect("a valid definition");
+        AggregatedGauge::with_gauge(NAME, vec, &["sink"], aggregation)
+    }
+
+    /// The rendered value of `gauge` for `sink`, `None` without a series.
+    fn rendered(gauge: &AggregatedGauge, sink: &str) -> Option<i64> {
+        gauge
+            .gauge
+            .collect()
+            .iter()
+            .flat_map(|family| family.get_metric())
+            .find(|m| m.get_label().iter().any(|l| l.value() == sink))
+            .map(|m| m.get_gauge().value() as i64)
+    }
+
+    /// What worker `value` would ship for `sink`, through the snapshot a
+    /// real worker builds, so the wire shape is the one under test.
+    fn report(sink: &str, value: i64) -> Vec<GenericCounterTuple> {
+        let worker = aggregated(GaugeAggregation::Min);
+        worker.set_local(&[sink], value);
+        worker.snapshot_local()
+    }
+
+    #[test]
+    fn combine_follows_each_aggregation_and_is_none_without_a_value() {
+        assert_eq!(GaugeAggregation::Min.combine([1, 0, 1]), Some(0));
+        assert_eq!(GaugeAggregation::Max.combine([1, 0, 1]), Some(1));
+        assert_eq!(GaugeAggregation::Sum.combine([1, 0, 1]), Some(2));
+        assert_eq!(GaugeAggregation::Min.combine(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn min_reads_down_as_soon_as_one_process_is_down() {
+        let gauge = aggregated(GaugeAggregation::Min);
+        gauge.set_local(&["syslog"], 1);
+        gauge.apply_worker(1, &report("syslog", 1));
+        assert_eq!(rendered(&gauge, "syslog"), Some(1));
+        gauge.apply_worker(2, &report("syslog", 0));
+        assert_eq!(rendered(&gauge, "syslog"), Some(0));
+        gauge.apply_worker(2, &report("syslog", 1));
+        assert_eq!(rendered(&gauge, "syslog"), Some(1));
+        gauge.set_local(&["syslog"], 0);
+        assert_eq!(
+            rendered(&gauge, "syslog"),
+            Some(0),
+            "the local value counts"
+        );
+    }
+
+    #[test]
+    fn a_dead_worker_value_stands_for_a_state_and_leaves_for_a_share() {
+        let state = aggregated(GaugeAggregation::Min);
+        state.set_local(&["syslog"], 1);
+        state.apply_worker(3, &report("syslog", 0));
+        state.forget_worker(3);
+        assert_eq!(rendered(&state, "syslog"), Some(0), "stands until replaced");
+        state.apply_worker(3, &report("syslog", 1));
+        assert_eq!(
+            rendered(&state, "syslog"),
+            Some(1),
+            "the replacement reports"
+        );
+
+        let share = aggregated(GaugeAggregation::Sum);
+        share.apply_worker(1, &report("syslog", 4));
+        share.apply_worker(2, &report("syslog", 3));
+        assert_eq!(rendered(&share, "syslog"), Some(7));
+        share.forget_worker(2);
+        assert_eq!(rendered(&share, "syslog"), Some(4));
+    }
+
+    #[test]
+    fn a_label_set_no_process_holds_is_removed() {
+        let gauge = aggregated(GaugeAggregation::Min);
+        gauge.set_local(&["otlp"], 1);
+        gauge.apply_worker(1, &report("syslog", 1));
+        assert_eq!(rendered(&gauge, "syslog"), Some(1));
+        gauge.apply_worker(1, &[]);
+        assert_eq!(
+            rendered(&gauge, "syslog"),
+            None,
+            "the worker no longer has it"
+        );
+        gauge.clear_local(&["otlp"]);
+        assert_eq!(rendered(&gauge, "otlp"), None);
+    }
+
+    #[test]
+    fn a_report_carries_zeros_and_ignores_other_names_and_partial_labels() {
+        assert_eq!(
+            report("syslog", 0),
+            vec![(
+                "lorica_metrics_unit_aggregated".to_string(),
+                vec![("sink".to_string(), "syslog".to_string())],
+                0
+            )]
+        );
+        let gauge = aggregated(GaugeAggregation::Max);
+        let mut entries = report("syslog", 1);
+        entries.push(("lorica_other".to_string(), Vec::new(), 9));
+        entries.push(("lorica_metrics_unit_aggregated".to_string(), Vec::new(), 9));
+        gauge.apply_worker(1, &entries);
+        assert_eq!(rendered(&gauge, "syslog"), Some(1));
+        assert_eq!(gauge.gauge.collect()[0].get_metric().len(), 1);
     }
 }

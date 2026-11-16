@@ -1589,6 +1589,9 @@ pub fn snapshot_per_worker_counters() -> Vec<GenericCounterTuple> {
 /// The worker's [`snapshot_log_store_up`] entry is recorded here as the
 /// gauge it is; [`resolve_per_worker_counter`] knows no such counter, so
 /// the delta machinery skips it.
+///
+/// The [`PER_WORKER_GAUGES`] entries are recorded as gauges, each by its
+/// own aggregation; the counter resolver knows none of their names.
 pub fn apply_worker_generic_counters(worker_id: u32, entries: &[GenericCounterTuple]) {
     if let Some((_, _, value)) = entries
         .iter()
@@ -1596,6 +1599,9 @@ pub fn apply_worker_generic_counters(worker_id: u32, entries: &[GenericCounterTu
         .find(|(name, _, _)| name == LOG_STORE_UP_NAME)
     {
         record_worker_log_store_up(worker_id, *value > 0);
+    }
+    for gauge in PER_WORKER_GAUGES {
+        gauge.apply_worker(worker_id, entries);
     }
     lorica_metrics::apply_worker_generic_counters(worker_id, entries, resolve_per_worker_counter);
 }
@@ -1611,11 +1617,71 @@ pub fn apply_worker_generic_counters(worker_id: u32, entries: &[GenericCounterTu
 /// Forgetting it would read as "every worker is fine" for the length of
 /// a respawn, and the log-store alerts would announce a recovery that
 /// never happened, then the outage again.
+///
+/// Each [`PER_WORKER_GAUGES`] entry forgets the worker by its own
+/// aggregation ([`lorica_metrics::GaugeAggregation::outlives_its_worker`]).
 pub fn forget_worker_generic_counters(worker_id: u32) {
     lorica_metrics::forget_worker_generic_counters(worker_id);
     if WORKER_LOG_STORE_UP.lock().contains_key(&worker_id) {
         let _ = LOG_STORE_UP.remove_label_values(&["worker", &worker_id.to_string()]);
     }
+    for gauge in PER_WORKER_GAUGES {
+        gauge.forget_worker(worker_id);
+    }
+}
+
+/// The gauges whose per-process values reach the supervisor and are
+/// aggregated there (Story 12.9 D-f). Each carries its own
+/// [`lorica_metrics::GaugeAggregation`], so a name cannot be listed with
+/// the wrong one. A worker ships them through
+/// [`snapshot_per_worker_gauges`], beside the counters; a gauge name never
+/// belongs in [`PER_WORKER_COUNTERS`], whose delta machinery would read
+/// its drops as restarts.
+///
+/// `lorica_log_store_up` is not one of them: it keeps one series per
+/// process (see [`set_log_store_up`]).
+pub static PER_WORKER_GAUGES: &[&Lazy<lorica_metrics::AggregatedGauge>] = &[&LOG_SINK_UP];
+
+/// This process's [`PER_WORKER_GAUGES`] values, for its metrics report.
+/// Unlike the counters' snapshot it carries zeros: for a state, 0 is the
+/// news.
+pub fn snapshot_per_worker_gauges() -> Vec<GenericCounterTuple> {
+    PER_WORKER_GAUGES
+        .iter()
+        .flat_map(|gauge| gauge.snapshot_local())
+        .collect()
+}
+
+/// Gauge: whether a log-export sink is up (Story 12.9 AC #6), 1 up, 0
+/// down, labelled `sink`. One series per configured sink, aggregated
+/// across processes with [`lorica_metrics::GaugeAggregation::Min`]: each
+/// worker ships its own share of the rows and the supervisor the audit
+/// rows, so one process with a dead sink loses that process's share, and
+/// the node reads 0. Which process it is shows in its own warn line and
+/// in `lorica_log_sink_dropped_total`. A sink no process configures has
+/// no series.
+static LOG_SINK_UP: Lazy<lorica_metrics::AggregatedGauge> = Lazy::new(|| {
+    lorica_metrics::AggregatedGauge::register(
+        "log_sink_up",
+        "Whether a log-export sink is up on every process that ships through it (1 up, 0 down)",
+        &["sink"],
+        lorica_metrics::GaugeAggregation::Min,
+    )
+});
+
+/// Publish this process's state of the log-export `sink` (the label the
+/// sink counters use). A process calls it for every sink its
+/// configuration sets up, whatever the kind toggles, and reports 0, never
+/// nothing, for one whose consumer failed for good: a lane that
+/// disappears must not read as "not configured".
+pub fn set_log_sink_up(sink: &str, up: bool) {
+    LOG_SINK_UP.set_local(&[sink], i64::from(up));
+}
+
+/// This process no longer configures `sink`: its value leaves the
+/// aggregate.
+pub fn clear_log_sink_up(sink: &str) {
+    LOG_SINK_UP.clear_local(&[sink]);
 }
 
 /// Test-only helper that wipes the supervisor's generic-counter
@@ -3749,5 +3815,90 @@ mod tests {
         apply_worker_generic_counters(WORKER, std::slice::from_ref(&up));
         forget_worker_generic_counters(WORKER);
         assert!(!workers_without_log_store().contains(&WORKER));
+    }
+
+    // ---- Per-worker gauges (lorica_log_sink_up) ----
+
+    /// The rendered `lorica_log_sink_up` of `sink`, `None` without a
+    /// series.
+    fn rendered_log_sink_up(sink: &str) -> Option<f64> {
+        REGISTRY
+            .gather()
+            .iter()
+            .find(|family| family.name() == "lorica_log_sink_up")
+            .and_then(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .find(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|pair| pair.name() == "sink" && pair.value() == sink)
+                    })
+                    .map(|metric| metric.get_gauge().value())
+            })
+    }
+
+    /// One worker's report entry for `sink`, in the wire shape a worker's
+    /// [`snapshot_per_worker_gauges`] produces.
+    fn sink_report(sink: &str, up: bool) -> GenericCounterTuple {
+        (
+            LOG_SINK_UP.name().to_string(),
+            vec![("sink".to_string(), sink.to_string())],
+            u64::from(up),
+        )
+    }
+
+    #[test]
+    fn the_sink_gauge_reads_down_when_one_process_is_down_and_a_dead_worker_stands() {
+        // A label no other test publishes, so the process-global gauge is
+        // this test's alone.
+        const SINK: &str = "c2-test-sink";
+        set_log_sink_up(SINK, true);
+        assert_eq!(rendered_log_sink_up(SINK), Some(1.0));
+        assert!(snapshot_per_worker_gauges().contains(&sink_report(SINK, true)));
+
+        apply_worker_generic_counters(9_201, &[sink_report(SINK, true)]);
+        apply_worker_generic_counters(9_202, &[sink_report(SINK, false)]);
+        assert_eq!(
+            rendered_log_sink_up(SINK),
+            Some(0.0),
+            "min across processes"
+        );
+
+        forget_worker_generic_counters(9_202);
+        assert_eq!(
+            rendered_log_sink_up(SINK),
+            Some(0.0),
+            "a dead worker's last value stands until its replacement reports"
+        );
+        apply_worker_generic_counters(9_202, &[sink_report(SINK, true)]);
+        assert_eq!(rendered_log_sink_up(SINK), Some(1.0));
+
+        set_log_sink_up(SINK, false);
+        assert_eq!(
+            rendered_log_sink_up(SINK),
+            Some(0.0),
+            "the supervisor's own"
+        );
+        assert!(snapshot_per_worker_gauges().contains(&sink_report(SINK, false)));
+
+        clear_log_sink_up(SINK);
+        apply_worker_generic_counters(9_201, &[]);
+        apply_worker_generic_counters(9_202, &[]);
+        assert_eq!(rendered_log_sink_up(SINK), None, "no process configures it");
+    }
+
+    #[test]
+    fn no_per_worker_gauge_rides_the_counter_machinery() {
+        for gauge in PER_WORKER_GAUGES {
+            assert!(
+                !PER_WORKER_COUNTERS.contains(&gauge.name()),
+                "{} is a gauge",
+                gauge.name()
+            );
+            assert!(resolve_per_worker_counter(gauge.name()).is_none());
+        }
     }
 }
