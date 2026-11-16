@@ -19,6 +19,14 @@ Author: Rwx-G
 
 ### Security
 
+## [1.10.7] - 2026-11-16
+
+A WebSocket left idle stays open for the route's Read timeout instead of 60 seconds. No schema migration.
+
+### Fixed
+
+- **A WebSocket follows the route's Read and Send timeouts instead of being cut after 60 seconds idle** ([#56](https://github.com/Rwx-G/Lorica/issues/56)). The route's `read_timeout_s` and `send_timeout_s` applied to the backend side of an upgraded (`101`) connection only. The client side kept the HTTP/1.1 session's own 60 s read timeout, so an idle WebSocket was closed with `Downstream ReadTimedout ... reading body, timeout: 60s` even with both route timeouts at 3600, and a write to a client that stopped reading had no bound. Once the backend accepts the upgrade, the client side now takes `read_timeout_s` for its reads and `send_timeout_s` for its writes: a tunnel closes when nothing has crossed it in either direction for `read_timeout_s`, which is what already happened below 60 s. Ordinary requests are unchanged, and a streamed request body keeps its 60 s per-read bound.
+
 ## [1.10.6] - 2026-11-14
 
 Lorica installs and upgrades from signed apt and dnf repositories, and the `.rpm` carries a signature RHEL 9 reads again. No schema migration.

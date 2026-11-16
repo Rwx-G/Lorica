@@ -2442,6 +2442,49 @@ impl ProxyHttp for LoricaProxy {
         Ok(())
     }
 
+    // An upgraded (101) connection tunnels frames through the downstream
+    // request-body channel, whose read timeout is bounded by the core H1
+    // session default and whose write timeout is unset. Neither follows the
+    // route's Read/Send settings. Align both directions of the downstream
+    // session to the matched route once the upgrade is accepted.
+    // Only upgraded requests are affected; a 101 connection is never reused,
+    // so there is nothing to restore afterwards.
+    async fn upstream_response_filter(
+        &self,
+        session: &mut Session,
+        upstream_response: &mut lorica_http::ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if upstream_response.status == 101 {
+            if let Some(entry) = ctx.matched_route_entry.as_ref() {
+                let previous_read = session.downstream_session.get_read_timeout();
+                let read_timeout = Duration::from_secs(entry.route.read_timeout_s as u64);
+                session
+                    .downstream_session
+                    .set_read_timeout(Some(read_timeout));
+
+                let previous_write = session.downstream_session.get_write_timeout();
+                let write_timeout = Duration::from_secs(entry.route.send_timeout_s as u64);
+                session
+                    .downstream_session
+                    .set_write_timeout(Some(write_timeout));
+
+                tracing::debug!(
+                    request_id = %ctx.request_id,
+                    previous_read = ?previous_read,
+                    new_read = ?Some(read_timeout),
+                    previous_write = ?previous_write,
+                    new_write = ?Some(write_timeout),
+                    "upgrade tunnel: downstream read/write timeouts aligned to route"
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(
         name = "response_filter",
         parent = &ctx.root_tracing_span,
