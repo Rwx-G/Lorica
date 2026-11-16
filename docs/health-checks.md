@@ -261,7 +261,7 @@ in the backend's logging.
 
 ## Rolling back, and checks a binary does not know
 
-Rolled back to 1.10.6, a node probes a backend with a template or a
+Rolled back to 1.10.7, a node probes a backend with a template or a
 custom check by TCP connect, and the check comes back on re-upgrade
 unless a probe path was set meanwhile: `docs/hot-upgrade.md`,
 "Rollback".

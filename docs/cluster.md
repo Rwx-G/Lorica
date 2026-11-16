@@ -1396,9 +1396,9 @@ follower, and each would delete its streams. A rollback of one node
 would remove listeners fleet-wide. Strict refusal keeps every follower
 on the configuration it holds instead.
 
-**Rolling the control plane alone back to 1.10.6** (a hot-upgrade
+**Rolling the control plane alone back to 1.10.7** (a hot-upgrade
 rollback, `docs/hot-upgrade.md`) is a documented state, not an outage.
-1.10.6 opens the migrated database, keeps the stream rows it cannot
+1.10.7 opens the migrated database, keeps the stream rows it cannot
 see, and admits the 1.11.0 followers, whose schema is ahead. Every round
 then aborts on their version refusal, so configuration changes stop
 replicating again until the control plane runs 1.11.0, while every node

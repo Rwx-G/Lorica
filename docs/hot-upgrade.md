@@ -133,15 +133,15 @@ port: the failure is closed, and the message blames another process.
 Delete `served-cert.pem` in that case; the CLI then pins what the older
 node serves, as above. A token minted by 1.9.0 is unreadable by 1.8.0.
 
-**From 1.11.0 back to 1.10.6.** The new supervisor runs the database
+**From 1.11.0 back to 1.10.7.** The new supervisor runs the database
 migrations before it forks its workers, so a 1.11.0 process that is
 rolled back has usually already taken `lorica.db` to schema 73, and a
-package downgrade always finds it there. 1.10.6 opens that database
+package downgrade always finds it there. 1.10.7 opens that database
 and serves HTTP as before. Its migration runner applies nothing above
 its own last migration (70), and migrations 71 to 73 are additive by
 construction: two new tables (`streams`, `stream_backends`) and two
 nullable columns (`backends.health_check_json`,
-`cluster_nodes.reserved_ports_json`) that 1.10.6 never names, with no
+`cluster_nodes.reserved_ports_json`) that 1.10.7 never names, with no
 `UNIQUE` index, trigger or `NOT NULL` column added to a table it writes.
 A test (`migrations_after_1_10_6_are_additive`) holds every later
 migration to that.
@@ -153,24 +153,24 @@ What the rolled-back node does not do:
 - **It reads a backend's active check from `health_check_path` only**:
   a path is an HTTP check, no path a TCP connect. 1.11.0 keeps writing
   that column beside the typed `health_check` for exactly this case.
-  A probe path edited under 1.10.6 is the one 1.11.0 honours when it
+  A probe path edited under 1.10.7 is the one 1.11.0 honours when it
   comes back: the typed definition is trusted only while it still
   agrees with `health_check_path`.
 - **It probes a protocol check by TCP connect.** A backend with a
   template (`tcp_template`) or a custom send/expect check
-  (`tcp_send_expect`) has no `health_check_path`, so 1.10.6 probes it
+  (`tcp_send_expect`) has no `health_check_path`, so 1.10.7 probes it
   by TCP connect: weaker, since a hung backend whose port still accepts
   stays in rotation, and never the other way, since a healthy backend is
-  not marked down by it. 1.10.6 never writes the typed column, so the
+  not marked down by it. 1.10.7 never writes the typed column, so the
   check survives the rollback, and 1.11.0 probes with it again on
-  re-upgrade, unless a probe path was set under 1.10.6 meanwhile, in
+  re-upgrade, unless a probe path was set under 1.10.7 meanwhile, in
   which case that HTTP check is the one kept.
-- **A configuration import run under 1.10.6** deletes every backend,
+- **A configuration import run under 1.10.7** deletes every backend,
   which removes the streams' backend links with them; the streams
-  remain, without backends. And a 1.11.0 export is refused by 1.10.6,
+  remain, without backends. And a 1.11.0 export is refused by 1.10.7,
   which does not know the `health_check` field it carries.
 
-In a fleet, rolling the control plane alone back to 1.10.6 stops
+In a fleet, rolling the control plane alone back to 1.10.7 stops
 configuration replication until it runs 1.11.0 again; the nodes keep
 serving. `docs/cluster.md`, "From 1.10.x to 1.11.0", has the reason
 and the upgrade order.
