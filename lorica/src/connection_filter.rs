@@ -42,11 +42,10 @@
 //! runs this filter on the client address the header carried, so the
 //! allow and deny lists and the per-IP cap judge the real client.
 
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -57,6 +56,7 @@ use lorica_core::listeners::{
     AcceptPermit, AcceptVerdict, ConnectionFilter, ProxyHeaderOutcome, ProxyProtocolMode,
     ProxyProtocolPolicy,
 };
+use lorica_stream::refusal_log::{RefusalLogDecision, RefusalLogLimiter, REFUSAL_LOG_WINDOW};
 use tracing::warn;
 
 /// The policy this filter evaluates. Re-exported so the accept-loop
@@ -328,97 +328,14 @@ fn parse_trust_list(entries: &[String]) -> Vec<IpNet> {
         .collect()
 }
 
-/// How long one refusal line per listener and reason holds back the
-/// next ones (Story 12.8 D-j).
-pub const REFUSAL_LOG_WINDOW: Duration = Duration::from_secs(10);
-
-/// What the refusal log does with one refusal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefusalLogDecision {
-    /// Write the refusal line, after a line reporting `suppressed`
-    /// refusals of the same listener and reason that the window just
-    /// closed held back and nobody has reported yet.
-    Write {
-        /// Refusals held back and not yet reported, 0 for none.
-        suppressed: u64,
-    },
-    /// Hold the line back. `first` is true for the first refusal held back
-    /// in this window: its caller arranges the report due at `window_ends`.
-    Suppress {
-        /// Whether this is the window's first held-back refusal.
-        first: bool,
-        /// When the window closes.
-        window_ends: Instant,
-    },
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RefusalWindow {
-    opened: Instant,
-    suppressed: u64,
-}
-
-/// At most one refusal line per listener and reason per
-/// [`REFUSAL_LOG_WINDOW`], then one line counting what the window held
-/// back. Refusals from an untrusted peer are attacker-driven, so an
-/// unthrottled line per refusal would let anyone write the log at will;
-/// the counters still count every refusal.
-#[derive(Debug, Default)]
-pub struct RefusalLogLimiter {
-    windows: parking_lot::Mutex<HashMap<(HttpListener, ProxyHeaderOutcome), RefusalWindow>>,
-}
-
-impl RefusalLogLimiter {
-    /// Decides on one refusal of `reason` on `listener` at `now`.
-    pub fn admit(
-        &self,
-        listener: HttpListener,
-        reason: ProxyHeaderOutcome,
-        now: Instant,
-    ) -> RefusalLogDecision {
-        let mut windows = self.windows.lock();
-        let fresh = RefusalWindow {
-            opened: now,
-            suppressed: 0,
-        };
-        match windows.get_mut(&(listener, reason)) {
-            Some(window) if now < window.opened + REFUSAL_LOG_WINDOW => {
-                window.suppressed += 1;
-                RefusalLogDecision::Suppress {
-                    first: window.suppressed == 1,
-                    window_ends: window.opened + REFUSAL_LOG_WINDOW,
-                }
-            }
-            Some(window) => {
-                let suppressed = window.suppressed;
-                *window = fresh;
-                RefusalLogDecision::Write { suppressed }
-            }
-            None => {
-                windows.insert((listener, reason), fresh);
-                RefusalLogDecision::Write { suppressed: 0 }
-            }
-        }
-    }
-
-    /// Takes the count the window ending at `window_ends` held back, once:
-    /// 0 when it was already taken, or when a later refusal opened a new
-    /// window and reported it with its own line.
-    pub fn close(
-        &self,
-        listener: HttpListener,
-        reason: ProxyHeaderOutcome,
-        window_ends: Instant,
-    ) -> u64 {
-        let mut windows = self.windows.lock();
-        match windows.get_mut(&(listener, reason)) {
-            Some(window) if window.opened + REFUSAL_LOG_WINDOW == window_ends => {
-                std::mem::take(&mut window.suppressed)
-            }
-            _ => 0,
-        }
-    }
-}
+/// The refusal log of the PROXY protocol gate (Story 12.8 D-j): at most
+/// one line per listener and outcome per window, then one line counting
+/// what the window held back. Refusals from an untrusted peer are
+/// attacker-driven, so an unthrottled line per refusal would let anyone
+/// write the log at will; the counters still count every refusal. The
+/// limiter is the one the stream engines key by stream and refusal
+/// (Story 12.6 D-j).
+type ProxyRefusalLog = RefusalLogLimiter<(HttpListener, ProxyHeaderOutcome)>;
 
 /// The node's PROXY protocol policy for its HTTP and HTTPS listeners
 /// (Story 12.8): the two listener modes and the trust list behind an
@@ -427,7 +344,7 @@ impl RefusalLogLimiter {
 #[derive(Debug)]
 pub struct ProxyProtocolGate {
     policy: ArcSwap<GatePolicy>,
-    refusal_log: RefusalLogLimiter,
+    refusal_log: ProxyRefusalLog,
 }
 
 impl Default for ProxyProtocolGate {
@@ -441,7 +358,7 @@ impl ProxyProtocolGate {
     pub fn new() -> Self {
         Self {
             policy: ArcSwap::from_pointee(GatePolicy::default()),
-            refusal_log: RefusalLogLimiter::default(),
+            refusal_log: ProxyRefusalLog::default(),
         }
     }
 
@@ -487,7 +404,7 @@ impl ProxyProtocolGate {
             return;
         }
         lorica_api::metrics::inc_proxy_protocol_refused(listener.as_str(), outcome.as_str());
-        match self.refusal_log.admit(listener, outcome, Instant::now()) {
+        match self.refusal_log.admit((listener, outcome), Instant::now()) {
             RefusalLogDecision::Write { suppressed } => {
                 if suppressed > 0 {
                     log_suppressed(listener, outcome, suppressed);
@@ -523,7 +440,7 @@ impl ProxyProtocolGate {
         let gate = Arc::clone(self);
         runtime.spawn(async move {
             tokio::time::sleep_until(tokio::time::Instant::from_std(window_ends)).await;
-            let suppressed = gate.refusal_log.close(listener, outcome, window_ends);
+            let suppressed = gate.refusal_log.close((listener, outcome), window_ends);
             if suppressed > 0 {
                 log_suppressed(listener, outcome, suppressed);
             }
@@ -785,66 +702,6 @@ mod tests {
                 &["10.0.0.0/24"]
             )
         );
-    }
-
-    #[test]
-    fn the_refusal_log_writes_one_line_per_window_and_reports_what_it_held_back_once() {
-        let log = RefusalLogLimiter::default();
-        let (http, https) = (HttpListener::Http, HttpListener::Https);
-        let untrusted = ProxyHeaderOutcome::UntrustedPeer;
-        let t0 = Instant::now();
-        let at = |s: u64| t0 + Duration::from_secs(s);
-        let first_window_ends = t0 + REFUSAL_LOG_WINDOW;
-
-        assert_eq!(
-            log.admit(http, untrusted, t0),
-            RefusalLogDecision::Write { suppressed: 0 }
-        );
-        assert_eq!(
-            log.admit(http, untrusted, at(1)),
-            RefusalLogDecision::Suppress {
-                first: true,
-                window_ends: first_window_ends
-            }
-        );
-        assert_eq!(
-            log.admit(http, untrusted, at(2)),
-            RefusalLogDecision::Suppress {
-                first: false,
-                window_ends: first_window_ends
-            }
-        );
-        // Each listener and each reason has its own window.
-        assert_eq!(
-            log.admit(https, untrusted, at(2)),
-            RefusalLogDecision::Write { suppressed: 0 }
-        );
-        assert_eq!(
-            log.admit(http, ProxyHeaderOutcome::Timeout, at(2)),
-            RefusalLogDecision::Write { suppressed: 0 }
-        );
-
-        // The window's end reports its two held-back refusals, once.
-        assert_eq!(log.close(http, untrusted, first_window_ends), 2);
-        assert_eq!(log.close(http, untrusted, first_window_ends), 0);
-        // Already reported: the next window opens with nothing owed.
-        assert_eq!(
-            log.admit(http, untrusted, first_window_ends),
-            RefusalLogDecision::Write { suppressed: 0 }
-        );
-
-        // A refusal after the window, before its report ran, carries the
-        // count itself, and the late report then finds nothing to say.
-        let second_window_ends = first_window_ends + REFUSAL_LOG_WINDOW;
-        assert!(matches!(
-            log.admit(http, untrusted, first_window_ends + Duration::from_secs(1)),
-            RefusalLogDecision::Suppress { first: true, .. }
-        ));
-        assert_eq!(
-            log.admit(http, untrusted, second_window_ends + Duration::from_secs(1)),
-            RefusalLogDecision::Write { suppressed: 1 }
-        );
-        assert_eq!(log.close(http, untrusted, second_window_ends), 0);
     }
 
     #[test]
