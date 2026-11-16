@@ -1,6 +1,6 @@
 # Lorica - Competitive Feature Comparison
 
-> Last updated: 2026-11-14 | Lorica v1.10.6
+> Last updated: 2026-11-16 | Lorica v1.10.7
 >
 > **Legend:** Y = Yes | N = No | P = Partial | Paid = Paid/Enterprise only | Plug = Plugin, third-party module or external agent (not built-in) | ? = not verified | - = not applicable
 >
