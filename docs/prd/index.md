@@ -25,3 +25,4 @@
 - [Epic 11: Management MCP Server with Tiered Access (v1.9.0)](./epic-11-v1.9.0.md)
 - [Epic 12: TCP and UDP Stream Proxying (v1.11.0 and v1.12.0)](./epic-12-v1.11.0.md)
 - [Epic 13: AD CS Certificate Enrollment over CES (v1.10.0)](./epic-13-v1.10.0.md)
+- [Epic 14: Single Sign-On for the Management Plane (OIDC, v1.13.0)](./epic-14-sso.md)
