@@ -14,21 +14,30 @@
 
 //! The TCP engine and its connection pipeline (Story 12.3 D-b):
 //!
-//! 1. **Admit**: canonicalise the peer, take a slot of the stream's cap
-//!    or end `refused(connection_cap)`. Story 12.6's filters go here.
+//! 1. **Admit** (Story 12.6 D-a): canonicalise the peer and run the
+//!    admission sequence of [`crate::admission`] before the socket is
+//!    read: the stream's region, the node's and the stream's source
+//!    controls, the open rates, the stream cap and, when phase 2 has
+//!    work, the pending cap; then the source cap and the source's share
+//!    of the pending cap. A trusted PROXY peer is admitted for the
+//!    stream only; its carried client gets the source checks once the
+//!    header is read (D-b).
 //! 2. **Pre-forwarding**: reads that must finish before a backend is
 //!    chosen, bounded in bytes and time, keeping what they read past
 //!    their need as the preamble. Here, a trusted peer's PROXY header,
 //!    then on a TLS stream the ClientHello, the rule it matches and, on
 //!    a terminating stream, the handshake (Story 12.4); Story 12.15 adds
-//!    detection.
+//!    detection. The whole phase holds one pending slot, given back when
+//!    phase 3 starts or the connection ends.
 //! 3. **Connect** ([`super::connect`]) over the matched rule's links,
 //!    then the PROXY header to the backend in plaintext, before anything
 //!    else on the socket; with upstream TLS the header and the handshake
 //!    are part of the attempt.
 //! 4. **Forward** ([`super::forward`]).
-//! 5. **End**: the end reason, the record to the observer, the cap slot
-//!    and gauges released by drop.
+//! 5. **End**: the end reason; the record to the observer, or, for a
+//!    connection that ends `refused(_)`, a row through the refusal log
+//!    and no record (Story 12.6 D-j); the region's counts and the gauges
+//!    released by drop.
 //!
 //! The tracker's close and the total timeout are watched beside every
 //! await of phases 2 to 4, so a drain ends a connection in any phase.
@@ -53,7 +62,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use lorica_config::listen_ports::ReservedPorts;
-use lorica_config::models::{Stream, StreamEndReason, StreamRefusal, StreamTlsMode};
+use lorica_config::models::{
+    Stream, StreamEndReason, StreamProtocol, StreamRefusal, StreamTlsMode,
+};
 use lorica_config::route_selection::canonical_hostname;
 use lorica_core::protocols::proxy_protocol::{
     classify_prefix, Prefix, HEADER_READ_TIMEOUT, MAX_HEADER_LEN,
@@ -64,20 +75,20 @@ use tokio::net::TcpStream;
 use tokio::time::Instant;
 use tracing::debug;
 
-use super::cap::ConnectionCaps;
 use super::connect::{Connected, Request, Rotation, Shared, UpstreamAttempt};
 use super::forward::{close, Forwarder};
 use super::proxy_header::{canonical, is_trusted, read_trusted, send_header, HeaderRead};
+use crate::admission::{AdmissionControl, Admitted};
 use crate::counters::{
     ClientHelloOutcome, HandshakeOutcome, ProxyHeaderOutcome, StreamCounters, StreamStats,
 };
 use crate::handler::{
     AcceptedConnection, ClientCertificateOutcome, ConnectionObserver, ConnectionRecord,
-    HandlerFuture, StreamHandler, TlsRecord,
+    HandlerFuture, RefusalRecord, StreamHandler, TlsRecord,
 };
 use crate::local::BoundPorts;
 use crate::resolver::{LocalExclusions, ResolverCache};
-use crate::seams::{BackendSelector, BreakerGate};
+use crate::seams::{BackendSelector, BreakerGate, SourceGate};
 use crate::table::StreamTable;
 use crate::tls::client_hello::{
     parse, ClientHelloError, InvalidClientHello, Parsed, CLIENTHELLO_BUFFER,
@@ -103,12 +114,15 @@ pub struct TcpEngineParts {
     pub resolver: Arc<ResolverCache>,
     /// The process's stream counters.
     pub counters: Arc<StreamCounters>,
-    /// Where each connection's record goes.
+    /// Where each connection's record and each admitted refusal goes.
     pub observer: Arc<dyn ConnectionObserver>,
     /// The node's reserved ports, for the connect-time local check;
     /// `None` until the process knows them (rule B then covers the
     /// stream listen ports only).
     pub reserved_ports: Option<ReservedPorts>,
+    /// The node's source controls (Story 12.6 D-d), shared with the UDP
+    /// engine.
+    pub source_gate: Arc<dyn SourceGate>,
 }
 
 /// The TCP stream engine, a [`StreamHandler`].
@@ -126,7 +140,7 @@ impl std::fmt::Debug for TcpEngine {
 struct Inner {
     shared: Shared,
     observer: Arc<dyn ConnectionObserver>,
-    caps: ConnectionCaps,
+    admission: AdmissionControl,
     tls: TlsContext,
 }
 
@@ -155,8 +169,8 @@ impl TcpEngine {
                     exclusions: LocalExclusions::default(),
                     rotation: Rotation::default(),
                 },
+                admission: AdmissionControl::new(parts.source_gate, Arc::clone(&parts.observer)),
                 observer: parts.observer,
-                caps: ConnectionCaps::default(),
                 tls: TlsContext::new(tls),
             }),
         }
@@ -176,7 +190,7 @@ impl StreamHandler for TcpEngine {
         shared.counters.retain(table);
         shared.exclusions.retain(table);
         shared.rotation.retain(table);
-        self.inner.caps.retain(table);
+        self.inner.admission.table_changed(table);
         self.inner.tls.table_changed(table);
     }
 }
@@ -222,6 +236,9 @@ struct Conn {
     accepted_at: Instant,
     total: Option<Instant>,
     record: ConnectionRecord,
+    /// The connection's counts in its stream's region, given back when
+    /// it ends; the pending slot is given back when phase 3 starts.
+    admitted: Admitted,
 }
 
 impl Conn {
@@ -262,6 +279,36 @@ impl Inner {
         let _active = stats.accept();
         let peer = canonical(conn.peer);
         let local = conn.stream.local_addr().map(canonical).unwrap_or(peer);
+        let trusted = snapshot.proxy_protocol_accept
+            && is_trusted(peer.ip(), &snapshot.proxy_protocol_trusted_cidrs);
+        let pending = trusted || snapshot.tls_mode.reads_client_hello();
+        let admitted = match self.admission.admit_connection(
+            &conn.caps,
+            &snapshot,
+            &stats,
+            peer.ip(),
+            trusted,
+            pending,
+        ) {
+            Ok(admitted) => admitted,
+            Err(refusal) => {
+                stats.refused(refusal);
+                close(&conn.stream);
+                let reason = conn.tracked.finish(StreamEndReason::Refused(refusal));
+                stats.ended(reason.kind());
+                self.admission.report(RefusalRecord {
+                    stream_id: snapshot.id.clone(),
+                    stream_name: snapshot.name.clone(),
+                    protocol: StreamProtocol::Tcp,
+                    listen_port: local.port(),
+                    client: peer,
+                    proxied_from: None,
+                    refusal,
+                    at: Utc::now(),
+                });
+                return;
+            }
+        };
         let tls = (snapshot.tls_mode != StreamTlsMode::None || snapshot.upstream_tls.is_some())
             .then(|| TlsRecord {
                 mode: snapshot.tls_mode,
@@ -304,34 +351,46 @@ impl Inner {
                     end_reason: StreamEndReason::ClientClose,
                     tls,
                 },
+                admitted,
             },
         };
 
-        let natural = match self
-            .caps
-            .try_acquire(&snapshot.id, snapshot.max_connections)
-        {
-            None => {
-                stats.refused(StreamRefusal::ConnectionCap);
-                StreamEndReason::Refused(StreamRefusal::ConnectionCap)
-            }
-            Some(_slot) => self.pipeline(&mut live).await,
-        };
+        let natural = self.pipeline(&mut live, trusted).await;
         close(&live.client);
         let Conn {
             tracked,
             mut record,
+            admitted,
             ..
         } = live.conn;
+        drop(admitted);
         let reason = tracked.finish(natural);
         stats.ended(reason.kind());
-        record.end_reason = reason;
         record.ended_at = Utc::now();
-        self.observer.observe(record);
+        match reason {
+            // A refused connection is a row through the refusal log, not
+            // a record (D-j): whoever connects chooses how often it is
+            // refused.
+            StreamEndReason::Refused(refusal) => self.admission.report(RefusalRecord {
+                stream_id: record.stream_id,
+                stream_name: record.stream_name,
+                protocol: StreamProtocol::Tcp,
+                listen_port: record.local.port(),
+                client: record.client,
+                proxied_from: record.proxied_from,
+                refusal,
+                at: record.ended_at,
+            }),
+            reason => {
+                record.end_reason = reason;
+                self.observer.observe(record);
+            }
+        }
     }
 
-    /// Phases 2 to 4; returns the natural end reason.
-    async fn pipeline(&self, live: &mut Live) -> StreamEndReason {
+    /// Phases 2 to 4; returns the natural end reason. `trusted`: the
+    /// peer is a trusted PROXY peer, admitted for the stream only.
+    async fn pipeline(&self, live: &mut Live, trusted: bool) -> StreamEndReason {
         let snapshot = Arc::clone(live.conn.tracked.snapshot());
         let stats = self.shared.counters.stream(&snapshot.id);
         let accepted_at = live.conn.accepted_at;
@@ -343,11 +402,6 @@ impl Inner {
         // Phase 2: a trusted peer's PROXY header. On a TLS stream it is
         // bounded by the ClientHello deadline too: phase 2 as a whole
         // ends by that instant.
-        let trusted = snapshot.proxy_protocol_accept
-            && is_trusted(
-                live.conn.record.peer.ip(),
-                &snapshot.proxy_protocol_trusted_cidrs,
-            );
         let mut destination = live.conn.record.local;
         let mut preamble = Vec::new();
         if trusted {
@@ -385,6 +439,17 @@ impl Inner {
                         destination = carried_destination;
                     }
                     preamble = rest;
+                    // The source checks the peer skipped, on the client
+                    // the header carried (D-b), before any byte moves.
+                    if let Err(refusal) = self.admission.admit_carried(
+                        &mut live.conn.admitted,
+                        &snapshot,
+                        &stats,
+                        live.conn.record.client.ip(),
+                    ) {
+                        stats.refused(refusal);
+                        return StreamEndReason::Refused(refusal);
+                    }
                 }
             }
         }
@@ -653,6 +718,10 @@ impl Inner {
     where
         C: AsyncRead + AsyncWrite + Unpin,
     {
+        // Phase 2 is over: its pending slot goes back before the connect,
+        // whose own bound is the connect timeout.
+        conn.admitted.end_pending();
+        let backend_caps = conn.admitted.worker_caps();
         let header = send_header(
             snapshot.proxy_protocol_send,
             conn.record.client,
@@ -682,6 +751,7 @@ impl Inner {
             stats,
             rule: route.rule,
             upstream_tls,
+            backend_caps: backend_caps.as_ref(),
         };
         let mut attempts = 0;
         let connected = guarded(
@@ -696,6 +766,7 @@ impl Inner {
             address,
             socket: mut upstream,
             latency,
+            backend_slot: _backend_slot,
         } = match connected {
             Err(reason) | Ok(Err(reason)) => return reason,
             Ok(Ok(connected)) => connected,

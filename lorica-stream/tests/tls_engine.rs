@@ -36,6 +36,8 @@ use lorica_config::models::{
     StreamRefusal, StreamTlsMode, StreamTlsTerminate, StreamUpstreamTls, UpstreamServerName,
 };
 use lorica_core::protocols::proxy_protocol::{encode_v2, parse, Addresses, Parsed};
+use lorica_shmem::StreamCapsRegion;
+use lorica_stream::caps::admitted_cap;
 use lorica_stream::counters::{
     ClientHelloOutcome, HandshakeOutcome, StreamCountersSnapshot, UpstreamTlsFailure,
 };
@@ -43,10 +45,11 @@ use lorica_stream::seams::SeamFuture;
 use lorica_stream::tls::rewind::Rewind;
 use lorica_stream::tls::server::{accept, TerminateConfigs};
 use lorica_stream::{
-    AcceptedConnection, Admission, BackendSelector, BoundPorts, BreakerGate,
+    AcceptedConnection, Admission, BackendSelector, BoundPorts, BreakerGate, CapsRegistry,
     ClientCertificateOutcome, ClientIdentity, ConnectionObserver, ConnectionRecord,
-    ConnectionTracker, Resolve, ResolveError, Resolved, ResolverCache, SelectionRequest,
-    StreamCounters, StreamHandler, StreamTable, TcpEngine, TcpEngineParts, TlsParts,
+    ConnectionTracker, NodeCapsRegions, RefusalRecord, Resolve, ResolveError, Resolved,
+    ResolverCache, SelectionRequest, SourceGate, StreamCounters, StreamHandler, StreamTable,
+    TcpEngine, TcpEngineParts, TlsParts,
 };
 use lorica_tls::cert_resolver::{CertData, CertResolver, ResolvesServerCertByLocalIp};
 use lorica_tls::http_client::{config_builder, crypto_provider};
@@ -54,6 +57,7 @@ use lorica_tls::{
     CertificateDer, ClientTlsStream, PrivateKeyDer, RootCertStore, ServerConfig, ServerName,
     TlsAcceptor, TlsConnector, WebPkiClientVerifier,
 };
+use lorica_worker::stream_ctl::StreamCtlMsg;
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -132,11 +136,31 @@ impl Resolve for Dns {
     }
 }
 
-struct Records(mpsc::UnboundedSender<ConnectionRecord>);
+struct Records {
+    ended: mpsc::UnboundedSender<ConnectionRecord>,
+    refused: mpsc::UnboundedSender<RefusalRecord>,
+}
 
 impl ConnectionObserver for Records {
     fn observe(&self, record: ConnectionRecord) {
-        let _ = self.0.send(record);
+        let _ = self.ended.send(record);
+    }
+
+    fn refused(&self, record: RefusalRecord) {
+        let _ = self.refused.send(record);
+    }
+}
+
+/// No node-wide source control.
+struct Ungated;
+
+impl SourceGate for Ungated {
+    fn global(&self, _: IpAddr) -> Option<StreamRefusal> {
+        None
+    }
+
+    fn country(&self, _: IpAddr) -> Option<[u8; 2]> {
+        None
     }
 }
 
@@ -324,6 +348,10 @@ struct Harness {
     engine: TcpEngine,
     tracker: ConnectionTracker,
     records: mpsc::UnboundedReceiver<ConnectionRecord>,
+    refusals: mpsc::UnboundedReceiver<RefusalRecord>,
+    /// Every stream's caps region, on a node of one worker.
+    node: Mutex<NodeCapsRegions>,
+    caps: CapsRegistry,
     counters: Arc<StreamCounters>,
     breaker: Arc<Breaker>,
     resolver: Arc<CertResolver>,
@@ -335,15 +363,17 @@ impl Harness {
         let counters = Arc::new(StreamCounters::new());
         let breaker = Arc::new(Breaker::default());
         let resolver = Arc::new(CertResolver::new());
-        let (tx, records) = mpsc::unbounded_channel();
+        let (ended, records) = mpsc::unbounded_channel();
+        let (refused, refusals) = mpsc::unbounded_channel();
         let engine = TcpEngine::with_tls(
             TcpEngineParts {
                 selector: Arc::new(FirstCandidate),
                 breaker: Arc::clone(&breaker) as Arc<dyn BreakerGate>,
                 resolver: ResolverCache::new(Arc::new(Dns), Arc::clone(&counters)),
                 counters: Arc::clone(&counters),
-                observer: Arc::new(Records(tx)),
+                observer: Arc::new(Records { ended, refused }),
                 reserved_ports: None,
+                source_gate: Arc::new(Ungated),
             },
             TlsParts {
                 resolver: Arc::clone(&resolver) as Arc<dyn ResolvesServerCertByLocalIp>,
@@ -354,6 +384,9 @@ impl Harness {
             engine,
             tracker: ConnectionTracker::new(),
             records,
+            refusals,
+            node: Mutex::new(NodeCapsRegions::new(1)),
+            caps: CapsRegistry::new(),
             counters,
             breaker,
             resolver,
@@ -362,6 +395,21 @@ impl Harness {
     }
 
     fn set(&self, table: StreamTable) {
+        let mut node = self.node.lock().unwrap();
+        for stream in table.streams() {
+            let created = node
+                .ensure(&stream.id, admitted_cap(stream).unwrap(), 0)
+                .unwrap();
+            if created.is_some() {
+                let Some(StreamCtlMsg::Caps { region, slot, .. }) =
+                    node.caps_message(&stream.id, 1, 0).unwrap()
+                else {
+                    panic!("test setup: a caps message");
+                };
+                let region = Arc::new(StreamCapsRegion::open(region).unwrap());
+                self.caps.adopt(&stream.id, region.worker(slot).unwrap());
+            }
+        }
         self.engine.table_changed(&table);
         *self.table.lock().unwrap() = Arc::new(table);
     }
@@ -370,10 +418,11 @@ impl Harness {
     async fn listen(&self, stream_id: &str) -> SocketAddr {
         let listener = TcpListener::bind((LOOPBACK, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (engine, tracker, table) = (
+        let (engine, tracker, table, caps) = (
             self.engine.clone(),
             self.tracker.clone(),
             Arc::clone(&self.table),
+            self.caps.clone(),
         );
         let stream_id = stream_id.to_string();
         tokio::spawn(async move {
@@ -389,6 +438,7 @@ impl Harness {
                     tracked,
                     table,
                     bound_ports: BoundPorts::new(),
+                    caps: caps.clone(),
                 }));
             }
         });
@@ -399,6 +449,16 @@ impl Harness {
         tokio::time::timeout(WAIT, self.records.recv())
             .await
             .expect("a connection record in time")
+            .expect("the engine is alive")
+    }
+
+    /// The next refusal row: a refused connection hands no record (Story
+    /// 12.6 D-j), and the refusal log writes one row per stream and
+    /// refusal per window.
+    async fn refusal(&mut self) -> RefusalRecord {
+        tokio::time::timeout(WAIT, self.refusals.recv())
+            .await
+            .expect("a refusal row in time")
             .expect("the engine is alive")
     }
 
@@ -663,10 +723,6 @@ async fn next(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<u8> {
         .expect("backend alive")
 }
 
-fn refused(refusal: StreamRefusal) -> StreamEndReason {
-    StreamEndReason::Refused(refusal)
-}
-
 // ---- passthrough -----------------------------------------------------
 
 /// IV1 in-crate: one port, two names, two backends, each receiving the
@@ -712,10 +768,7 @@ async fn passthrough_routes_two_names_and_replays_the_hello_unchanged() {
     }
 
     send_raw(listen, &client_hello("c.example.com", &[])).await;
-    let record = h.record().await;
-    assert_eq!(record.end_reason, refused(StreamRefusal::NoMatch));
-    assert_eq!(record.backend_id, None);
-    assert_eq!(record.bytes_upload, 0);
+    assert_eq!(h.refusal().await.refusal, StreamRefusal::NoMatch);
     assert!(a_rx.try_recv().is_err() && b_rx.try_recv().is_err());
     let stats = h.stats("s");
     assert_eq!(stats.refused[&StreamRefusal::NoMatch], 1);
@@ -795,7 +848,7 @@ async fn a_client_without_sni_is_refused_without_a_no_sni_rule_and_routed_with_o
     let hello = client_hello("127.0.0.1", &[]);
 
     send_raw(named_listen, &hello).await;
-    assert_eq!(h.record().await.end_reason, refused(StreamRefusal::NoMatch));
+    assert_eq!(h.refusal().await.refusal, StreamRefusal::NoMatch);
 
     send_raw(bare_listen, &hello).await;
     let record = h.record().await;
@@ -901,10 +954,7 @@ async fn bytes_that_are_no_hello_are_refused_and_counted() {
     ));
     let listen = h.listen("s").await;
     send_raw(listen, b"GET / HTTP/1.1\r\n\r\n").await;
-    assert_eq!(
-        h.record().await.end_reason,
-        refused(StreamRefusal::InvalidClientHello)
-    );
+    assert_eq!(h.refusal().await.refusal, StreamRefusal::InvalidClientHello);
     assert_eq!(h.stats("s").clienthello[&ClientHelloOutcome::Invalid], 1);
 }
 
@@ -999,10 +1049,7 @@ async fn a_name_no_certificate_serves_is_refused_no_certificate() {
     )
     .await;
     assert!(outcome.is_err());
-    assert_eq!(
-        h.record().await.end_reason,
-        refused(StreamRefusal::NoCertificate)
-    );
+    assert_eq!(h.refusal().await.refusal, StreamRefusal::NoCertificate);
     assert_eq!(h.stats("s").handshakes[&HandshakeOutcome::NoCertificate], 1);
 }
 
@@ -1044,6 +1091,7 @@ async fn two_streams_trusting_different_cas_never_admit_each_other_s_clients() {
     let b = h.listen("b").await;
     let optional = h.listen("optional").await;
 
+    let mut refused_count = 0u64;
     for (listen, identity, admitted) in [
         (a, Some(&client_a), true),
         (b, Some(&client_a), false),
@@ -1061,9 +1109,9 @@ async fn two_streams_trusting_different_cas_never_admit_each_other_s_clients() {
             }
             Err(_) => false,
         };
-        let record = h.record().await;
-        assert_eq!(served, admitted, "{listen} {:?}", record.end_reason);
+        assert_eq!(served, admitted, "{listen}");
         if admitted {
+            let record = h.record().await;
             let expected = if identity.is_some() {
                 ClientCertificateOutcome::Verified
             } else {
@@ -1071,7 +1119,25 @@ async fn two_streams_trusting_different_cas_never_admit_each_other_s_clients() {
             };
             assert_eq!(record.tls.unwrap().client_certificate, Some(expected));
         } else {
-            assert_eq!(record.end_reason, refused(StreamRefusal::ClientCertificate));
+            // A second refusal of a stream within the window writes no
+            // row: the counter is what counts every one.
+            refused_count += 1;
+            let deadline = Instant::now() + WAIT;
+            while ["a", "b"]
+                .iter()
+                .map(|id| {
+                    h.stats(id)
+                        .refused
+                        .get(&StreamRefusal::ClientCertificate)
+                        .copied()
+                        .unwrap_or(0)
+                })
+                .sum::<u64>()
+                < refused_count
+            {
+                assert!(Instant::now() < deadline, "{listen}: refusal not counted");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
     }
 }
@@ -1107,11 +1173,11 @@ async fn the_organization_allowlist_admits_a_listed_o_and_refuses_another() {
             .unwrap();
         let served = round_trip(&mut client, b"hello").await.is_ok();
         let _ = client.shutdown().await;
-        let record = h.record().await;
         assert_eq!(served, admitted, "{organization}");
-        if !admitted {
-            assert_eq!(record.end_reason, refused(StreamRefusal::ClientCertificate));
-            assert_eq!(record.backend_id, None);
+        if admitted {
+            assert_eq!(h.record().await.backend_id.as_deref(), Some("app"));
+        } else {
+            assert_eq!(h.refusal().await.refusal, StreamRefusal::ClientCertificate);
         }
     }
 }

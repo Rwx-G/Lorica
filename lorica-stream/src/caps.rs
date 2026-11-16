@@ -359,8 +359,20 @@ impl NodeCapsRegions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lorica_shmem::SourceKey;
+    use lorica_shmem::{AdmitRefusal, SourceKey, StreamPermit};
     use std::net::IpAddr;
+
+    /// A UDP session's admission: the stream part, then the source part
+    /// with no pending share.
+    fn session(
+        caps: &WorkerCaps,
+        source: SourceKey,
+        source_cap: u64,
+        stream_cap: u64,
+    ) -> Result<StreamPermit, AdmitRefusal> {
+        caps.admit_stream(stream_cap, false, 0)?
+            .admit_source(source, source_cap, u64::MAX)
+    }
 
     fn source(n: u8) -> SourceKey {
         SourceKey::of(IpAddr::from([192, 0, 2, n]))
@@ -390,12 +402,7 @@ mod tests {
 
         let registry = CapsRegistry::new();
         registry.adopt("dns", worker_view(&node, "dns", 0));
-        let permit = registry
-            .get("dns")
-            .unwrap()
-            .current()
-            .admit_session(source(1), 256, 4096)
-            .unwrap();
+        let permit = session(registry.get("dns").unwrap().current(), source(1), 256, 4096).unwrap();
         assert_eq!(node.sessions("dns"), 1);
 
         assert_eq!(node.ensure("dns", 16_384, 0).unwrap(), Some(2));
@@ -423,12 +430,10 @@ mod tests {
         let alive = worker_view(&node, "a", 0);
         // The dead worker's permits are never dropped: its process is gone.
         let leaked: Vec<_> = (0..3)
-            .map(|n| dead_a.admit_session(source(n), 8, 64).unwrap())
-            .chain(std::iter::once(
-                dead_b.admit_session(source(9), 8, 64).unwrap(),
-            ))
+            .map(|n| session(&dead_a, source(n), 8, 64).unwrap())
+            .chain(std::iter::once(session(&dead_b, source(9), 8, 64).unwrap()))
             .collect();
-        let _kept = alive.admit_session(source(1), 8, 64).unwrap();
+        let _kept = session(&alive, source(1), 8, 64).unwrap();
         node.retire("b");
         assert_eq!(node.memfds(), 1);
         assert_eq!(node.release_worker(1), 4);
@@ -443,12 +448,7 @@ mod tests {
         node.ensure("dns", 64, 0).unwrap();
         let registry = CapsRegistry::new();
         registry.adopt("dns", worker_view(&node, "dns", 0));
-        let permit = registry
-            .get("dns")
-            .unwrap()
-            .current()
-            .admit_session(source(1), 8, 64)
-            .unwrap();
+        let permit = session(registry.get("dns").unwrap().current(), source(1), 8, 64).unwrap();
         node.retire("dns");
         assert!(!node.holds("dns"));
 

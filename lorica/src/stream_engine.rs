@@ -50,12 +50,14 @@ use hickory_resolver::config::{ResolveHosts, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::{Resolver, TokioResolver};
 use lorica_config::listen_ports::ReservedPorts;
+use lorica_config::models::StreamRefusal;
 use lorica_config::models::{Backend, Certificate, LoadBalancing, Stream};
 use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
     Admission, BackendSelector, BreakerGate, Candidate, ClientIdentity, ConnectionObserver,
     Engines, LogObserver, Resolve, ResolveError, Resolved, ResolverCache, SelectionRequest,
-    StreamCounters, StreamTable, TcpEngine, TcpEngineParts, TlsParts, UdpEngine, UdpEngineParts,
+    SourceGate, StreamCounters, StreamTable, TcpEngine, TcpEngineParts, TlsParts, UdpEngine,
+    UdpEngineParts,
 };
 use lorica_tls::cert_resolver::{CertResolver, ResolvesServerCertByLocalIp};
 use tracing::{info, warn};
@@ -406,6 +408,23 @@ impl Resolve for HickoryResolve {
     }
 }
 
+/// The node-wide source controls of the stream engines until Story 12.6
+/// Lot D builds the gate over the process's connection filter, IP
+/// blocklist, WAF whitelist and GeoIP resolver: none, so a stream applies
+/// its own controls (CIDRs, GeoIP list with every country unknown, rates
+/// and caps) and nothing of the node's.
+struct NodeControlsPending;
+
+impl SourceGate for NodeControlsPending {
+    fn global(&self, _client: IpAddr) -> Option<StreamRefusal> {
+        None
+    }
+
+    fn country(&self, _client: IpAddr) -> Option<[u8; 2]> {
+        None
+    }
+}
+
 /// The [`Engines`] of one process's stream runtime: a [`TcpEngine`] and
 /// a [`UdpEngine`] over the same parts (Story 12.5 Interface edit E3):
 /// one [`StreamSelector`] seeded with the process id, so least
@@ -431,6 +450,7 @@ pub fn stream_engines(
     let selector = Arc::new(StreamSelector::new(std::process::id() as usize));
     let resolver = ResolverCache::new(resolver, Arc::clone(&counters));
     let observer = Arc::new(LogObserver);
+    let source_gate: Arc<dyn SourceGate> = Arc::new(NodeControlsPending);
     let tcp = TcpEngine::with_tls(
         TcpEngineParts {
             selector: Arc::clone(&selector) as Arc<dyn BackendSelector>,
@@ -439,6 +459,7 @@ pub fn stream_engines(
             counters: Arc::clone(&counters),
             observer: Arc::clone(&observer) as Arc<dyn ConnectionObserver>,
             reserved_ports,
+            source_gate: Arc::clone(&source_gate),
         },
         tls,
     );
@@ -449,6 +470,7 @@ pub fn stream_engines(
         counters: Arc::clone(&counters),
         observer,
         reserved_ports,
+        source_gate,
     });
     Engines {
         tcp: Some(Arc::new(tcp)),

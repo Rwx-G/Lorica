@@ -45,12 +45,13 @@ use lorica::stream_engine::{HickoryResolve, StreamBreakerGate, StreamSelector};
 use lorica_config::listen_ports::ReservedPorts;
 use lorica_config::models::{
     Backend, HealthCheck, HealthStatus, LifecycleState, LoadBalancing, Stream, StreamBackend,
-    StreamEndReason, StreamProtocol,
+    StreamEndReason, StreamProtocol, StreamRefusal,
 };
 use lorica_stream::{
     BackendSelector, Candidate, ConnectionObserver, ConnectionRecord, ControlTransport, Engines,
-    InProcessPeer, Resolve, ResolverCache, SelectionRequest, StreamCounters, StreamRuntime,
-    StreamRuntimeHandle, StreamTable, StreamTableSource, TcpEngine, TcpEngineParts,
+    InProcessPeer, NodeCapsRegions, Resolve, ResolverCache, SelectionRequest, SourceGate,
+    StreamCounters, StreamRuntime, StreamRuntimeHandle, StreamTable, StreamTableSource, TcpEngine,
+    TcpEngineParts,
 };
 use lorica_worker::fd_passing::StreamProto;
 use lorica_worker::stream_ctl::{StreamCtlMsg, StreamSocket};
@@ -346,10 +347,26 @@ async fn counting_echo() -> (SocketAddr, Arc<AtomicU64>) {
     (addr, accepted)
 }
 
+/// No node-wide source control: these tests exercise selection, the
+/// breaker and resolution.
+struct Ungated;
+
+impl SourceGate for Ungated {
+    fn global(&self, _: IpAddr) -> Option<StreamRefusal> {
+        None
+    }
+
+    fn country(&self, _: IpAddr) -> Option<[u8; 2]> {
+        None
+    }
+}
+
 /// A real TCP engine over the binary's seams, in a stream runtime fed
 /// from `source`.
 struct Harness {
     peer: InProcessPeer,
+    /// The streams' caps regions, as the supervisor holds them.
+    node: NodeCapsRegions,
     runtime: Option<StreamRuntimeHandle>,
     records: mpsc::UnboundedReceiver<ConnectionRecord>,
     seq: u64,
@@ -371,6 +388,7 @@ impl Harness {
             counters: Arc::clone(&counters),
             observer: Arc::new(Records(tx)),
             reserved_ports,
+            source_gate: Arc::new(Ungated),
         });
         let (peer, transport) = ControlTransport::in_process_pair(8);
         let runtime = StreamRuntime::spawn(
@@ -385,6 +403,7 @@ impl Harness {
         .unwrap();
         Harness {
             peer,
+            node: NodeCapsRegions::new(1),
             runtime: Some(runtime),
             records,
             seq: 0,
@@ -399,8 +418,23 @@ impl Harness {
             .expect("the runtime is alive")
     }
 
-    /// Attach a fresh listener to `stream_id`; returns its address.
+    /// Hand `stream_id` its caps region, then attach a fresh listener to
+    /// it, as the supervisor does (Story 12.6 D-e); returns its address.
     async fn attach(&mut self, stream_id: &str) -> SocketAddr {
+        self.node
+            .ensure(stream_id, u64::from(Stream::DEFAULT_MAX_CONNECTIONS), 0)
+            .unwrap();
+        self.seq += 1;
+        let caps = self
+            .node
+            .caps_message(stream_id, self.seq, 0)
+            .unwrap()
+            .expect("a region");
+        self.peer.to_runtime.send(caps).await.unwrap();
+        assert!(matches!(
+            self.answer().await,
+            StreamCtlMsg::Ack { count: 1, .. }
+        ));
         let fd = bind_tcp_stream_listener("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = std::net::TcpListener::from(fd.try_clone().unwrap())
             .local_addr()

@@ -45,8 +45,9 @@ use lorica_config::models::{
 use lorica_config::ConfigStore;
 use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
-    BackendSelector, Candidate, ControlTransport, InProcessPeer, Resolve, ResolveError, Resolved,
-    SelectionRequest, StreamRuntime, StreamRuntimeHandle, StreamTable, StreamTableSource, TlsParts,
+    BackendSelector, Candidate, ControlTransport, InProcessPeer, NodeCapsRegions, Resolve,
+    ResolveError, Resolved, SelectionRequest, StreamRuntime, StreamRuntimeHandle, StreamTable,
+    StreamTableSource, TlsParts,
 };
 use lorica_tls::cert_resolver::{CertResolver, ResolvesServerCertByLocalIp};
 use lorica_tls::RootCertStore;
@@ -236,6 +237,8 @@ async fn echo_backend() -> SocketAddr {
 /// A stream runtime over the binary's engines, fed from `source`.
 struct Harness {
     peer: InProcessPeer,
+    /// The streams' caps regions, as the supervisor holds them.
+    node: NodeCapsRegions,
     runtime: Option<StreamRuntimeHandle>,
     seq: u64,
     _listeners: Vec<OwnedFd>,
@@ -261,13 +264,34 @@ impl Harness {
         .unwrap();
         Harness {
             peer,
+            node: NodeCapsRegions::new(1),
             runtime: Some(runtime),
             seq: 0,
             _listeners: Vec::new(),
         }
     }
 
+    /// Hand `stream_id` its caps region, then attach a fresh listener to
+    /// it, as the supervisor does (Story 12.6 D-e).
     async fn attach(&mut self, stream_id: &str) -> SocketAddr {
+        self.node
+            .ensure(stream_id, u64::from(Stream::DEFAULT_MAX_CONNECTIONS), 0)
+            .unwrap();
+        self.seq += 1;
+        let caps = self
+            .node
+            .caps_message(stream_id, self.seq, 0)
+            .unwrap()
+            .expect("a region");
+        self.peer.to_runtime.send(caps).await.unwrap();
+        let adopted = tokio::time::timeout(WAIT, self.peer.from_runtime.recv())
+            .await
+            .expect("the runtime answers")
+            .expect("the runtime is alive");
+        assert!(
+            matches!(adopted, StreamCtlMsg::Ack { count: 1, .. }),
+            "{adopted:?}"
+        );
         let fd = bind_tcp_stream_listener("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = std::net::TcpListener::from(fd.try_clone().unwrap())
             .local_addr()

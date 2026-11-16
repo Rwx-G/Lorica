@@ -45,6 +45,9 @@ pub struct LinkedBackend {
     /// The rule of a TLS stream the link serves (Story 12.4 D-d); `None`
     /// on a stream that reads no ClientHello.
     pub rule: Option<String>,
+    /// The most connections or sessions the stream holds to the backend
+    /// on one node (Story 12.6 D-h); `None` for no cap.
+    pub max_active: Option<u32>,
 }
 
 /// A stored certificate and its private key, which a stream's upstream
@@ -147,6 +150,7 @@ impl StreamTable {
                         backend: Arc::clone(row),
                         backup: link.backup,
                         rule: link.rule.clone(),
+                        max_active: link.max_active,
                     });
             }
         }

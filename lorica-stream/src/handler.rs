@@ -15,7 +15,9 @@
 //! The traits the stream engines implement: [`StreamHandler`] for TCP
 //! (Story 12.3), [`DatagramHandler`] for UDP (Story 12.5), and the
 //! [`ConnectionObserver`] an engine hands each finished connection's
-//! [`ConnectionRecord`] to (Story 12.3 D-r).
+//! [`ConnectionRecord`] to (Story 12.3 D-r), and each refusal the
+//! refusal log admits as a [`RefusalRecord`] (Story 12.6 D-j, as Story
+//! 12.9 D-c amends it).
 //!
 //! Until an engine is installed, [`Engines`] holds `None` and the loops
 //! close an accepted TCP connection at once and drop a datagram, both
@@ -27,7 +29,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use lorica_config::models::{Stream, StreamEndReason, StreamTlsMode};
+use lorica_config::models::{
+    Stream, StreamEndReason, StreamProtocol, StreamRefusal, StreamTlsMode,
+};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::debug;
 
@@ -61,6 +65,10 @@ pub struct AcceptedConnection {
     /// The listen ports this process holds, the connect-time local check
     /// refuses a local destination on any of them (Story 12.3 D-m).
     pub bound_ports: BoundPorts,
+    /// The stream-caps regions this worker was handed, by stream id: the
+    /// connection is counted in its stream's current one (Story 12.6
+    /// D-e), or refused `caps_unavailable` when there is none.
+    pub caps: CapsRegistry,
 }
 
 /// What serves TCP connections (Story 12.3).
@@ -227,9 +235,68 @@ pub enum ClientCertificateOutcome {
     Verified,
 }
 
-/// Where an engine hands each [`ConnectionRecord`]. The default method
-/// logs it at debug; Story 12.9 installs the access-log writer.
+/// One refusal the refusal log admitted (Story 12.6 D-j, Story 12.9
+/// D-c): what the engine knows when it refuses. A refused connection or
+/// session hands no [`ConnectionRecord`]; at most one of these per
+/// stream and refusal per [`crate::REFUSAL_LOG_WINDOW`] per process
+/// reaches the observer, so whoever connects cannot choose the rate at
+/// which they are written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusalRecord {
+    /// The stream's id.
+    pub stream_id: String,
+    /// The stream's name as the refusing snapshot had it.
+    pub stream_name: String,
+    /// The stream's protocol.
+    pub protocol: StreamProtocol,
+    /// The local port the connection or datagram arrived on.
+    pub listen_port: u16,
+    /// The address judged (Story 12.6 D-b): the client a trusted PROXY
+    /// header carried, otherwise the socket peer or datagram source.
+    /// Canonical.
+    pub client: SocketAddr,
+    /// The socket peer when a PROXY header replaced it as the client.
+    pub proxied_from: Option<SocketAddr>,
+    /// Why it was refused.
+    pub refusal: StreamRefusal,
+    /// When it was refused.
+    pub at: DateTime<Utc>,
+}
+
+/// The refusals one window of the refusal log held back (Story 12.6
+/// D-j, Story 12.9 D-c), reported once when the window closes, or with
+/// the first refusal after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuppressedRecord {
+    /// The stream's id.
+    pub stream_id: String,
+    /// The stream's name.
+    pub stream_name: String,
+    /// The stream's protocol.
+    pub protocol: StreamProtocol,
+    /// The refusal the window counted.
+    pub refusal: StreamRefusal,
+    /// Refusals held back, at least 1.
+    pub suppressed: u64,
+    /// When the count was reported: the window's end, or the first
+    /// refusal of the key after it.
+    pub reported_at: DateTime<Utc>,
+}
+
+/// Where an engine hands each [`ConnectionRecord`], each admitted
+/// [`RefusalRecord`] and each [`SuppressedRecord`]. The default
+/// `observe` logs at debug; the engine has already logged the other two
+/// at debug when it calls them, so their defaults do nothing. Story 12.9
+/// installs the access-log writer.
 pub trait ConnectionObserver: Send + Sync + 'static {
+    /// Take one refusal the refusal log admitted. Runs on the stream
+    /// runtime's thread, so it must not block.
+    fn refused(&self, _record: RefusalRecord) {}
+
+    /// Take the count of refusals one window of the refusal log held
+    /// back. Runs on the stream runtime's thread, so it must not block.
+    fn refusals_suppressed(&self, _record: SuppressedRecord) {}
+
     /// Take the record of a connection that just ended. Runs on the
     /// stream runtime's thread, so it must not block.
     fn observe(&self, record: ConnectionRecord) {

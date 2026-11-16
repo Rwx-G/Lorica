@@ -32,6 +32,15 @@
 //! timeout, and it is connected when the handshake completes (Interface
 //! edits I1 and I4): a failed handshake is a failed attempt and the next
 //! candidate is tried, no client byte having been forwarded.
+//!
+//! A link at its `max_active` on the node (Story 12.6 D-h, nginx's
+//! `max_conns`) leaves the candidates before selection, so backups serve
+//! once every primary is at its cap. The chosen backend's place is
+//! claimed before its first attempt and held to the end of the
+//! connection, given back on a failed attempt; a claim that loses the
+//! race for the last place passes over the backend, which is neither an
+//! attempt nor reported to the breaker. No candidate left, with a cap
+//! among the reasons and no attempt made: `refused(backend_cap)`.
 
 use std::collections::HashSet;
 use std::io;
@@ -44,8 +53,9 @@ use std::time::Duration;
 use lorica_config::listen_ports::ReservedPorts;
 use lorica_config::models::{
     backend_address_host, backend_address_port, Backend, HealthStatus, LifecycleState, Stream,
-    StreamEndReason, StreamUpstreamTls,
+    StreamEndReason, StreamRefusal, StreamUpstreamTls,
 };
+use lorica_shmem::{BackendSlot, WorkerCaps};
 use lorica_tls::{ClientConfig, ClientTlsStream};
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -53,6 +63,7 @@ use tokio::net::{TcpSocket, TcpStream};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
+use crate::admission::{backend_at_cap, claim_backend};
 use crate::counters::{ConnectFailureKind, StreamCounters, StreamStats, UpstreamTlsFailure};
 use crate::local::{BoundPorts, LocalRefusal, NodeLocality};
 use crate::resolver::{LocalExclusions, ResolverCache};
@@ -127,6 +138,9 @@ pub(crate) struct Request<'a> {
     pub(crate) rule: Option<&'a str>,
     /// The stream's upstream TLS, when it originates TLS.
     pub(crate) upstream_tls: Option<UpstreamAttempt<'a>>,
+    /// The region the connection is counted in, under this worker's
+    /// slot: where its link caps are counted.
+    pub(crate) backend_caps: Option<&'a WorkerCaps>,
 }
 
 /// What an attempt with upstream TLS needs.
@@ -208,6 +222,9 @@ pub(crate) struct Connected {
     pub(crate) address: SocketAddr,
     pub(crate) socket: Upstream,
     pub(crate) latency: Duration,
+    /// The connection's place on its link's `max_active`, if the link
+    /// has one; held to the end of the connection.
+    pub(crate) backend_slot: Option<BackendSlot>,
 }
 
 struct Eligible<'a> {
@@ -244,11 +261,14 @@ fn backend_port(backend: &Backend, listen_port: u16) -> u16 {
 }
 
 impl Shared {
+    /// The candidates of the next selection. Sets `capped` when a link
+    /// at its `max_active` was left out.
     async fn eligible<'a>(
         &self,
         request: &Request<'a>,
         excluded: &HashSet<String>,
         resolve_deadline: Instant,
+        capped: &mut bool,
     ) -> Vec<Eligible<'a>> {
         let mut eligible = Vec::new();
         for link in request.table.linked_backends(&request.stream.id) {
@@ -258,6 +278,10 @@ impl Shared {
                 || backend.health_status == HealthStatus::Down
                 || backend.lifecycle_state != LifecycleState::Normal
             {
+                continue;
+            }
+            if backend_at_cap(request.backend_caps, link) {
+                *capped = true;
                 continue;
             }
             let host = backend_address_host(&backend.address);
@@ -292,22 +316,31 @@ impl Shared {
         let connect_timeout = Duration::from_millis(u64::from(stream.connect_timeout_ms));
         let max_attempts = u32::from(stream.max_connect_attempts);
         let mut excluded: HashSet<String> = HashSet::new();
-        let end = |attempts: u32| {
-            if attempts == 0 {
-                StreamEndReason::NoHealthyBackend
-            } else {
+        let mut capped = false;
+        let end = |attempts: u32, capped: bool| {
+            if attempts > 0 {
                 StreamEndReason::ConnectFailed
+            } else if capped {
+                request.stats.refused(StreamRefusal::BackendCap);
+                StreamEndReason::Refused(StreamRefusal::BackendCap)
+            } else {
+                StreamEndReason::NoHealthyBackend
             }
         };
         loop {
             if *attempts >= max_attempts {
-                return Err(end(*attempts));
+                return Err(end(*attempts, capped));
             }
             let eligible = self
-                .eligible(request, &excluded, Instant::now() + connect_timeout)
+                .eligible(
+                    request,
+                    &excluded,
+                    Instant::now() + connect_timeout,
+                    &mut capped,
+                )
                 .await;
             if eligible.is_empty() {
-                return Err(end(*attempts));
+                return Err(end(*attempts, capped));
             }
             let candidates: Vec<Candidate<'_>> = eligible
                 .iter()
@@ -328,6 +361,12 @@ impl Shared {
             let chosen = &eligible[index];
             let backend = Arc::clone(&chosen.link.backend);
             excluded.insert(backend.id.clone());
+            let Ok(backend_slot) = claim_backend(request.backend_caps, chosen.link) else {
+                capped = true;
+                debug!(stream_id = %stream.id, backend_id = %backend.id,
+                       "backend reached its max_active meanwhile: candidate skipped");
+                continue;
+            };
 
             let Some(destinations) = self.destinations(request, chosen) else {
                 continue;
@@ -417,6 +456,7 @@ impl Shared {
                         address,
                         socket,
                         latency: started.elapsed(),
+                        backend_slot,
                     });
                 }
                 Err(AttemptError::Local(e, bind)) => {

@@ -38,15 +38,18 @@
 //! The TCP engine of Story 12.3 is [`tcp`], the UDP engine of Story 12.5
 //! is [`udp`]; what a TLS stream reads before forwarding (Story 12.4) is
 //! [`tls`]. What they share sits beside them: the [`seams`] the binary
-//! implements (selection, breaker, resolution), the connect-time
-//! [`local`] check, the host-name [`resolver`] cache and the
-//! [`counters`]. The UDP streams' per-node caps live on the stream-caps
-//! regions of [`caps`] (Story 12.5 D-d): created by the supervisor,
-//! mapped by every worker.
+//! implements (selection, breaker, resolution, the node's source
+//! controls), the connect-time [`local`] check, the host-name
+//! [`resolver`] cache and the [`counters`]. Every stream's per-node caps
+//! and open rates live on the stream-caps regions of [`caps`] (Story
+//! 12.5 D-d, Story 12.6 D-e): created by the supervisor, mapped by every
+//! worker. Both engines admit through one sequence (Story 12.6 D-a), and
+//! report refusals through the [`refusal_log`] limiter.
 //!
 //! The crate opens no store and spawns nothing on its own: the binary
 //! composes it (Story 12.2 Lot D), the API reads its types (Lot E3).
 
+mod admission;
 pub mod budget;
 pub mod caps;
 pub mod counters;
@@ -74,7 +77,8 @@ pub use caps::{CapsRegistry, NodeCapsRegions, StreamCaps};
 pub use counters::{CountersSnapshot, StreamCounters};
 pub use handler::{
     AcceptedConnection, ClientCertificateOutcome, ConnectionObserver, ConnectionRecord, Datagram,
-    DatagramHandler, Engines, LogObserver, StreamHandler, TlsRecord,
+    DatagramHandler, Engines, LogObserver, RefusalRecord, StreamHandler, SuppressedRecord,
+    TlsRecord,
 };
 pub use local::BoundPorts;
 pub use reconcile::{diff, Actions, BindKey, BoundBinding, Detach, ReleaseCause, UdpOverlap};
@@ -83,7 +87,7 @@ pub use resolver::ResolverCache;
 pub use runtime::{StreamRuntime, StreamRuntimeError, StreamRuntimeHandle};
 pub use seams::{
     Admission, BackendSelector, BreakerGate, Candidate, Resolve, ResolveError, Resolved,
-    SelectionRequest,
+    SelectionRequest, SourceGate,
 };
 pub use state::{BindFailure, BindFailureKind, BindState, BindStateKind, StreamBindStates};
 pub use table::{ClientIdentity, StreamTable, StreamTableSource};

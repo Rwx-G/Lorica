@@ -15,7 +15,12 @@
 //! The TCP engine against real sockets (Linux), with fake seams: the
 //! selector always takes the first candidate (backend id order), the
 //! breaker admits unless told to deny, the resolver answers from a map
-//! and hangs on any other name.
+//! and hangs on any other name, the source gate refuses the addresses it
+//! is given and places the ones it has a country for.
+//!
+//! Every stream gets its caps region on a node of one worker, as the
+//! supervisor would hand it. Clients connect from distinct loopback
+//! addresses (`127.0.0.N`) where a test needs several sources.
 //!
 //! The 64 MiB backpressure case lives beside the forwarding loop
 //! (`tcp::forward` unit tests), where the direction states are readable
@@ -24,7 +29,7 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -32,21 +37,26 @@ use std::time::Duration;
 use chrono::Utc;
 use lorica_config::listen_ports::ReservedPorts;
 use lorica_config::models::{
-    Backend, HealthCheck, HealthStatus, LifecycleState, Stream, StreamBackend, StreamEndKind,
-    StreamEndReason, StreamProtocol, StreamProxyProtocol, StreamRefusal,
+    Backend, GeoIpConfig, GeoIpMode, HealthCheck, HealthStatus, LifecycleState, Stream,
+    StreamBackend, StreamEndKind, StreamEndReason, StreamProtocol, StreamProxyProtocol,
+    StreamRefusal, StreamTlsMode,
 };
 use lorica_core::protocols::proxy_protocol::{
     encode_v2, encode_v2_dgram, parse, Addresses, Parsed, V2_SIGNATURE,
 };
+use lorica_shmem::StreamCapsRegion;
+use lorica_stream::caps::admitted_cap;
 use lorica_stream::counters::{ConnectFailureKind, ProxyHeaderOutcome, StreamCountersSnapshot};
 use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
-    AcceptedConnection, Admission, BackendSelector, BoundPorts, BreakerGate, ConnectionObserver,
-    ConnectionRecord, ConnectionTracker, Resolve, ResolveError, Resolved, ResolverCache,
-    SelectionRequest, StreamCounters, StreamHandler, StreamTable, TcpEngine, TcpEngineParts,
+    AcceptedConnection, Admission, BackendSelector, BoundPorts, BreakerGate, CapsRegistry,
+    ConnectionObserver, ConnectionRecord, ConnectionTracker, NodeCapsRegions, RefusalRecord,
+    Resolve, ResolveError, Resolved, ResolverCache, SelectionRequest, SourceGate, StreamCounters,
+    StreamHandler, StreamTable, SuppressedRecord, TcpEngine, TcpEngineParts,
 };
+use lorica_worker::stream_ctl::StreamCtlMsg;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -127,11 +137,47 @@ impl Resolve for Dns {
     }
 }
 
-struct Records(mpsc::UnboundedSender<ConnectionRecord>);
+/// Refuses the addresses it holds; knows the countries it is told.
+#[derive(Default)]
+struct Gate {
+    filtered: Mutex<HashSet<IpAddr>>,
+    blocked: Mutex<HashSet<IpAddr>>,
+    countries: Mutex<HashMap<IpAddr, [u8; 2]>>,
+}
+
+impl SourceGate for Gate {
+    fn global(&self, client: IpAddr) -> Option<StreamRefusal> {
+        if self.filtered.lock().unwrap().contains(&client) {
+            Some(StreamRefusal::ConnectionFilter)
+        } else if self.blocked.lock().unwrap().contains(&client) {
+            Some(StreamRefusal::IpBlocklist)
+        } else {
+            None
+        }
+    }
+
+    fn country(&self, client: IpAddr) -> Option<[u8; 2]> {
+        self.countries.lock().unwrap().get(&client).copied()
+    }
+}
+
+struct Records {
+    ended: mpsc::UnboundedSender<ConnectionRecord>,
+    refused: mpsc::UnboundedSender<RefusalRecord>,
+    suppressed: mpsc::UnboundedSender<SuppressedRecord>,
+}
 
 impl ConnectionObserver for Records {
     fn observe(&self, record: ConnectionRecord) {
-        let _ = self.0.send(record);
+        let _ = self.ended.send(record);
+    }
+
+    fn refused(&self, record: RefusalRecord) {
+        let _ = self.refused.send(record);
+    }
+
+    fn refusals_suppressed(&self, record: SuppressedRecord) {
+        let _ = self.suppressed.send(record);
     }
 }
 
@@ -182,12 +228,19 @@ struct Harness {
     engine: TcpEngine,
     tracker: ConnectionTracker,
     records: mpsc::UnboundedReceiver<ConnectionRecord>,
+    refusals: mpsc::UnboundedReceiver<RefusalRecord>,
+    suppressed: mpsc::UnboundedReceiver<SuppressedRecord>,
     counters: Arc<StreamCounters>,
     breaker: Arc<Breaker>,
     dns: Arc<Dns>,
     selector: Arc<FirstCandidate>,
+    gate: Arc<Gate>,
     bound: BoundPorts,
     table: Arc<Mutex<Arc<StreamTable>>>,
+    /// The supervisor's side of the stream's region, on a node of one
+    /// worker, and the worker's.
+    node: Mutex<NodeCapsRegions>,
+    caps: CapsRegistry,
     listen: SocketAddr,
 }
 
@@ -201,7 +254,10 @@ impl Harness {
         let breaker = Arc::new(Breaker::default());
         let dns = Arc::new(Dns::default());
         let selector = Arc::new(FirstCandidate::default());
-        let (tx, records) = mpsc::unbounded_channel();
+        let gate = Arc::new(Gate::default());
+        let (ended, records) = mpsc::unbounded_channel();
+        let (refused, refusals) = mpsc::unbounded_channel();
+        let (held_back, suppressed) = mpsc::unbounded_channel();
         let engine = TcpEngine::new(TcpEngineParts {
             selector: Arc::clone(&selector) as Arc<dyn BackendSelector>,
             breaker: Arc::clone(&breaker) as Arc<dyn BreakerGate>,
@@ -210,20 +266,27 @@ impl Harness {
                 Arc::clone(&counters),
             ),
             counters: Arc::clone(&counters),
-            observer: Arc::new(Records(tx)),
+            observer: Arc::new(Records {
+                ended,
+                refused,
+                suppressed: held_back,
+            }),
             reserved_ports,
+            source_gate: Arc::clone(&gate) as Arc<dyn SourceGate>,
         });
         let tracker = ConnectionTracker::new();
         let bound = BoundPorts::new();
         let table: Arc<Mutex<Arc<StreamTable>>> = Arc::default();
+        let caps = CapsRegistry::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen = listener.local_addr().unwrap();
         {
-            let (engine, tracker, bound, table) = (
+            let (engine, tracker, bound, table, caps) = (
                 engine.clone(),
                 tracker.clone(),
                 bound.clone(),
                 Arc::clone(&table),
+                caps.clone(),
             );
             tokio::spawn(async move {
                 loop {
@@ -238,6 +301,7 @@ impl Harness {
                         tracked,
                         table,
                         bound_ports: bound.clone(),
+                        caps: caps.clone(),
                     }));
                 }
             });
@@ -246,36 +310,79 @@ impl Harness {
             engine,
             tracker,
             records,
+            refusals,
+            suppressed,
             counters,
             breaker,
             dns,
             selector,
+            gate,
             bound,
             table,
+            node: Mutex::new(NodeCapsRegions::new(1)),
+            caps,
             listen,
         }
     }
 
     /// Serve `stream` with `backends`, each `(row, backup)`.
     fn set(&self, stream: Stream, backends: Vec<(Backend, bool)>) {
+        self.set_links(
+            stream,
+            backends
+                .into_iter()
+                .map(|(backend, backup)| (backend, backup, None))
+                .collect(),
+        );
+    }
+
+    /// Serve `stream` with `backends`, each `(row, backup, max_active)`,
+    /// in its region, created or replaced as the supervisor would.
+    fn set_links(&self, stream: Stream, backends: Vec<(Backend, bool, Option<u32>)>) {
         let links: Vec<StreamBackend> = backends
             .iter()
-            .map(|(b, backup)| StreamBackend {
-                stream_id: stream.id.clone(),
-                backend_id: b.id.clone(),
-                backup: *backup,
-                rule: None,
-                max_active: None,
+            .map(|(b, backup, max_active)| {
+                let mut link = StreamBackend::primary(&stream.id, &b.id);
+                link.backup = *backup;
+                link.max_active = *max_active;
+                link
             })
             .collect();
-        let rows = backends.into_iter().map(|(b, _)| b).collect();
+        self.ensure_region(&stream);
+        let rows = backends.into_iter().map(|(b, _, _)| b).collect();
         let table = StreamTable::with_backends(vec![stream], &links, rows);
         self.engine.table_changed(&table);
         *self.table.lock().unwrap() = Arc::new(table);
     }
 
+    fn ensure_region(&self, stream: &Stream) {
+        let mut node = self.node.lock().unwrap();
+        let created = node
+            .ensure(&stream.id, admitted_cap(stream).unwrap(), 0)
+            .unwrap();
+        if created.is_some() {
+            let Some(StreamCtlMsg::Caps { region, slot, .. }) =
+                node.caps_message(&stream.id, 1, 0).unwrap()
+            else {
+                panic!("test setup: a caps message");
+            };
+            let region = Arc::new(StreamCapsRegion::open(region).unwrap());
+            self.caps.adopt(&stream.id, region.worker(slot).unwrap());
+        }
+    }
+
     async fn connect(&self) -> TcpStream {
         TcpStream::connect(self.listen).await.unwrap()
+    }
+
+    /// A connection from `127.0.0.<n>`, another source than the default
+    /// client's `127.0.0.1`.
+    async fn connect_from(&self, n: u8) -> TcpStream {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket
+            .bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, n)), 0))
+            .unwrap();
+        socket.connect(self.listen).await.unwrap()
     }
 
     async fn record(&mut self) -> ConnectionRecord {
@@ -283,6 +390,18 @@ impl Harness {
             .await
             .expect("a connection record in time")
             .expect("the engine is alive")
+    }
+
+    /// The next refusal row the refusal log admitted.
+    async fn refusal(&mut self) -> RefusalRecord {
+        tokio::time::timeout(WAIT, self.refusals.recv())
+            .await
+            .expect("a refusal row in time")
+            .expect("the engine is alive")
+    }
+
+    fn refused(&self, refusal: StreamRefusal) -> u64 {
+        self.stats().refused.get(&refusal).copied().unwrap_or(0)
     }
 
     fn stats(&self) -> StreamCountersSnapshot {
@@ -1107,17 +1226,18 @@ async fn connection_1025_of_a_1024_cap_is_refused_and_counted() {
     })
     .await;
 
+    // A refusal is a row through the refusal log, never a record (Story
+    // 12.6 D-j).
     let mut refused = h.connect().await;
-    let record = h.record().await;
-    assert_eq!(
-        record.end_reason,
-        StreamEndReason::Refused(StreamRefusal::ConnectionCap)
-    );
-    assert_eq!(record.attempts, 0);
+    let row = h.refusal().await;
+    assert_eq!(row.refusal, StreamRefusal::ConnectionCap);
+    assert_eq!(row.client, refused.local_addr().unwrap());
+    assert_eq!(row.listen_port, h.listen.port());
     assert!(read_to_end(&mut refused).await.is_empty());
     let stats = h.stats();
     assert_eq!(stats.refused.get(&StreamRefusal::ConnectionCap), Some(&1));
     assert_eq!(ended(&stats, StreamEndKind::Refused), 1);
+    assert!(h.records.try_recv().is_err(), "no record for a refusal");
 
     // A slot freed is a slot taken again.
     drop(clients.pop());
@@ -1176,4 +1296,329 @@ async fn a_drain_ends_a_connection_in_each_phase_with_the_drain_reason() {
     assert_eq!(record.backend_id.as_deref(), Some("b1"));
     assert!(read_to_end(&mut client).await.is_empty());
     assert_eq!(ended(&h.stats(), StreamEndKind::ConfigRemoved), 3);
+}
+
+// ---- admission (Story 12.6) ---------------------------------------------
+
+fn loopback(n: u8) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(127, 0, 0, n))
+}
+
+/// `client` is refused `refusal` at accept: closed before any byte is
+/// forwarded, one row naming it, the refusal counted once.
+async fn refused_at_accept(h: &mut Harness, mut client: TcpStream, refusal: StreamRefusal) {
+    let from = client.local_addr().unwrap();
+    let _ = client.write_all(b"never forwarded").await;
+    assert!(read_to_end(&mut client).await.is_empty(), "{refusal:?}");
+    let row = h.refusal().await;
+    assert_eq!((row.refusal, row.client), (refusal, from));
+    assert_eq!(row.protocol, StreamProtocol::Tcp);
+    assert_eq!(row.proxied_from, None);
+    assert_eq!(h.refused(refusal), 1, "{refusal:?} counted once");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_source_control_refuses_at_accept_and_an_unknown_country_passes() {
+    let mut h = Harness::new().await;
+    let (addr, accepted) = echo().await;
+    h.gate.filtered.lock().unwrap().insert(loopback(2));
+    h.gate.blocked.lock().unwrap().insert(loopback(3));
+    h.gate
+        .countries
+        .lock()
+        .unwrap()
+        .extend([(loopback(5), *b"US"), (loopback(7), *b"FR")]);
+    let mut s = stream();
+    s.source_deny_cidrs = vec!["127.0.0.4".into()];
+    s.geoip = Some(GeoIpConfig {
+        mode: GeoIpMode::Denylist,
+        countries: vec!["US".into()],
+    });
+    h.set(s, vec![(backend("b1", addr), false)]);
+
+    for (n, refusal) in [
+        (2, StreamRefusal::ConnectionFilter),
+        (3, StreamRefusal::IpBlocklist),
+        (4, StreamRefusal::SourceDenied),
+        (5, StreamRefusal::Geoip),
+    ] {
+        let client = h.connect_from(n).await;
+        refused_at_accept(&mut h, client, refusal).await;
+    }
+    assert_eq!(accepted.load(Ordering::SeqCst), 0, "no backend was opened");
+
+    // A country the list does not name passes; one the database does not
+    // know passes too, counted.
+    for n in [7, 6] {
+        let mut client = h.connect_from(n).await;
+        echo_once(&mut client, b"served").await;
+    }
+    assert_eq!(h.stats().geoip_unknown, 1);
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_without_its_region_refuses_caps_unavailable() {
+    let mut h = Harness::new().await;
+    let (addr, accepted) = echo().await;
+    let s = stream();
+    let links = vec![StreamBackend::primary(&s.id, "b1")];
+    let table = StreamTable::with_backends(vec![s], &links, vec![backend("b1", addr)]);
+    h.engine.table_changed(&table);
+    *h.table.lock().unwrap() = Arc::new(table);
+    let client = h.connect().await;
+    refused_at_accept(&mut h, client, StreamRefusal::CapsUnavailable).await;
+    assert_eq!(accepted.load(Ordering::SeqCst), 0);
+}
+
+/// IV1 at this level: a source over its new-connection rate is refused
+/// at accept while another source of the same stream is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_over_its_open_rate_is_refused_while_another_is_served() {
+    let mut h = Harness::new().await;
+    let (addr, _) = echo().await;
+    let mut s = stream();
+    s.source_open_rate = Some(5);
+    h.set(s, vec![(backend("b1", addr), false)]);
+
+    let mut held = Vec::new();
+    for _ in 0..10 {
+        held.push(h.connect_from(2).await);
+    }
+    let row = h.refusal().await;
+    assert_eq!(row.refusal, StreamRefusal::SourceOpenRate);
+    assert_eq!(row.client.ip(), loopback(2));
+    wait_until("every connection admitted or refused and closed", || {
+        let stats = h.stats();
+        let refused = stats.refused.values().sum::<u64>();
+        stats.accepted == 10 && refused + stats.active == 10
+    })
+    .await;
+    let refused = h.refused(StreamRefusal::SourceOpenRate);
+    assert!(
+        (4..=5).contains(&refused),
+        "one second of burst at five per second, {refused} refused"
+    );
+
+    let mut other = h.connect_from(3).await;
+    echo_once(&mut other, b"another source").await;
+    assert!(
+        h.refusals.try_recv().is_err(),
+        "one row for the window, whatever the refusals"
+    );
+
+    // The window's end hands over what it held back, once.
+    let held_back = tokio::time::timeout(
+        lorica_stream::REFUSAL_LOG_WINDOW + WAIT,
+        h.suppressed.recv(),
+    )
+    .await
+    .expect("a suppressed row when the window closes")
+    .expect("the engine is alive");
+    assert_eq!(held_back.refusal, StreamRefusal::SourceOpenRate);
+    assert_eq!(held_back.suppressed, refused - 1);
+    assert!(h.suppressed.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_stream_open_rate_refuses_every_source_past_it() {
+    let mut h = Harness::new().await;
+    let (addr, _) = echo().await;
+    let mut s = stream();
+    s.open_rate = Some(1);
+    h.set(s, vec![(backend("b1", addr), false)]);
+    let mut first = h.connect_from(2).await;
+    echo_once(&mut first, b"first").await;
+    let second = h.connect_from(3).await;
+    refused_at_accept(&mut h, second, StreamRefusal::OpenRate).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_at_source_max_connections_is_refused_and_another_served() {
+    let mut h = Harness::new().await;
+    let (addr, _) = echo().await;
+    let mut s = stream();
+    s.source_max_connections = Some(1);
+    h.set(s, vec![(backend("b1", addr), false)]);
+    let mut first = h.connect_from(2).await;
+    echo_once(&mut first, b"held").await;
+    let second = h.connect_from(2).await;
+    refused_at_accept(&mut h, second, StreamRefusal::SourceConnectionCap).await;
+    let mut other = h.connect_from(3).await;
+    echo_once(&mut other, b"another source").await;
+}
+
+/// A TLS stream: every connection reads a ClientHello, so it is pending
+/// from accept. The deadline is the longest, so no read expires during a
+/// test.
+fn tls_passthrough() -> Stream {
+    let mut s = stream();
+    s.tls_mode = StreamTlsMode::Passthrough;
+    s.clienthello_timeout_ms = Some(60_000);
+    s
+}
+
+fn region_pending(h: &Harness) -> u64 {
+    h.caps
+        .get(STREAM_ID)
+        .expect("test setup: a region")
+        .current()
+        .region()
+        .pending()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_at_its_pending_share_is_refused_while_another_is_admitted() {
+    let mut h = Harness::new().await;
+    let (addr, _) = echo().await;
+    let mut s = tls_passthrough();
+    s.max_pending_connections = 16;
+    let share = u64::from(s.source_pending_share());
+    assert_eq!(share, 2);
+    h.set(s, vec![(backend("b1", addr), false)]);
+
+    let mut silent = Vec::new();
+    for _ in 0..share {
+        silent.push(h.connect_from(2).await);
+    }
+    wait_until("the source's share pending", || region_pending(&h) == share).await;
+    let over = h.connect_from(2).await;
+    refused_at_accept(&mut h, over, StreamRefusal::SourcePendingCap).await;
+    silent.push(h.connect_from(3).await);
+    wait_until("another source admitted", || {
+        region_pending(&h) == share + 1
+    })
+    .await;
+    assert_eq!(h.stats().pending, share + 1);
+    drop(silent);
+    wait_until("every pending slot given back", || {
+        region_pending(&h) == 0 && h.stats().pending == 0
+    })
+    .await;
+}
+
+/// IV3 at this level: 2,000 silent connections never take more than the
+/// pending cap, and the ones past it are refused at accept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_thousand_silent_connections_never_pass_the_pending_cap() {
+    const SOURCES: u8 = 100;
+    const PER_SOURCE: usize = 20;
+    let h = Harness::new().await;
+    let (addr, _) = echo().await;
+    let s = tls_passthrough();
+    let cap = u64::from(s.effective_pending_connections());
+    assert!(PER_SOURCE as u64 <= u64::from(s.source_pending_share()));
+    h.set(s, vec![(backend("b1", addr), false)]);
+
+    let mut silent = Vec::with_capacity(usize::from(SOURCES) * PER_SOURCE);
+    for n in 0..SOURCES {
+        for _ in 0..PER_SOURCE {
+            silent.push(h.connect_from(n + 2).await);
+        }
+        assert!(region_pending(&h) <= cap, "past the cap after source {n}");
+    }
+    let total = silent.len() as u64;
+    wait_until("every connection admitted or refused", || {
+        let stats = h.stats();
+        stats.accepted == total
+            && stats.refused.get(&StreamRefusal::PendingCap).copied() == Some(total - cap)
+    })
+    .await;
+    assert_eq!(region_pending(&h), cap);
+    assert_eq!(h.stats().pending, cap);
+    drop(silent);
+    wait_until("every pending slot given back", || region_pending(&h) == 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trusted_peer_is_not_judged_and_its_carried_client_is() {
+    let mut h = Harness::new().await;
+    let (addr, mut received) = sink().await;
+    // The load balancer's own range is denied: as a trusted peer it is
+    // never judged as a source.
+    let mut s = accepting(&["127.0.0.0/8"], StreamProxyProtocol::Off);
+    s.source_deny_cidrs = vec!["127.0.0.0/8".into(), "192.0.2.66".into()];
+    h.set(s, vec![(backend("b1", addr), false)]);
+
+    let mut client = h.connect().await;
+    client
+        .write_all(b"PROXY TCP4 192.0.2.10 198.51.100.1 51000 443\r\nhello")
+        .await
+        .unwrap();
+    client.shutdown().await.unwrap();
+    let got = tokio::time::timeout(WAIT, received.recv()).await.unwrap();
+    assert_eq!(got.as_deref(), Some(b"hello".as_slice()));
+    assert_eq!(h.record().await.client.ip().to_string(), "192.0.2.10");
+
+    let mut client = h.connect().await;
+    let peer = client.local_addr().unwrap();
+    client
+        .write_all(b"PROXY TCP4 192.0.2.66 198.51.100.1 51000 443\r\nhello")
+        .await
+        .unwrap();
+    assert!(read_to_end(&mut client).await.is_empty());
+    let row = h.refusal().await;
+    assert_eq!(row.refusal, StreamRefusal::SourceDenied);
+    assert_eq!(row.client, "192.0.2.66:51000".parse().unwrap());
+    assert_eq!(row.proxied_from, Some(peer));
+
+    // A header carrying no client leaves the peer the source judged.
+    let mut client = h.connect().await;
+    client.write_all(b"PROXY UNKNOWN\r\nhello").await.unwrap();
+    assert!(read_to_end(&mut client).await.is_empty());
+    assert_eq!(
+        h.refused(StreamRefusal::SourceDenied),
+        2,
+        "the LOCAL header's peer refused too"
+    );
+    assert!(received.try_recv().is_err(), "nothing forwarded");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backend_at_its_cap_is_skipped_and_all_at_cap_refuse_backend_cap() {
+    let mut h = Harness::new().await;
+    let (first, first_hits) = echo().await;
+    let (second, second_hits) = echo().await;
+    h.set_links(
+        stream(),
+        vec![
+            (backend("b1", first), false, Some(1)),
+            (backend("b2", second), false, Some(1)),
+        ],
+    );
+
+    let mut a = h.connect().await;
+    echo_once(&mut a, b"a").await;
+    let mut b = h.connect().await;
+    echo_once(&mut b, b"b").await;
+    assert_eq!(
+        (
+            first_hits.load(Ordering::SeqCst),
+            second_hits.load(Ordering::SeqCst)
+        ),
+        (1, 1),
+        "b1 at its cap left the candidates, b2 took the second"
+    );
+
+    let c = h.connect().await;
+    refused_at_accept(&mut h, c, StreamRefusal::BackendCap).await;
+    assert_eq!(
+        h.stats().connect_attempts,
+        2,
+        "a backend at its cap is no attempt"
+    );
+    assert_eq!(
+        *h.breaker.records.lock().unwrap(),
+        vec![
+            ("b1".to_string(), true, false),
+            ("b2".to_string(), true, false)
+        ],
+        "nor a breaker report"
+    );
+
+    drop(a);
+    assert_eq!(h.record().await.backend_id.as_deref(), Some("b1"));
+    let mut d = h.connect().await;
+    echo_once(&mut d, b"d").await;
+    assert_eq!(first_hits.load(Ordering::SeqCst), 2, "b1's place came back");
 }

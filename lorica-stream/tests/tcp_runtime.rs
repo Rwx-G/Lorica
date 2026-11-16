@@ -28,14 +28,14 @@ use std::time::Duration;
 use chrono::Utc;
 use lorica_config::models::{
     Backend, HealthCheck, HealthStatus, LifecycleState, Stream, StreamBackend, StreamEndReason,
-    StreamProtocol,
+    StreamProtocol, StreamRefusal,
 };
 use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
     Admission, BackendSelector, BreakerGate, ConnectionObserver, ConnectionRecord,
-    ControlTransport, Engines, InProcessPeer, Resolve, ResolveError, Resolved, ResolverCache,
-    SelectionRequest, StreamCounters, StreamRuntime, StreamTable, StreamTableSource, TcpEngine,
-    TcpEngineParts,
+    ControlTransport, Engines, InProcessPeer, NodeCapsRegions, Resolve, ResolveError, Resolved,
+    ResolverCache, SelectionRequest, SourceGate, StreamCounters, StreamRuntime, StreamTable,
+    StreamTableSource, TcpEngine, TcpEngineParts,
 };
 use lorica_worker::fd_passing::StreamProto;
 use lorica_worker::stream_ctl::{StreamCtlMsg, StreamSocket};
@@ -73,6 +73,18 @@ struct NoDns;
 impl Resolve for NoDns {
     fn lookup<'a>(&'a self, host: &'a str) -> SeamFuture<'a, Result<Resolved, ResolveError>> {
         Box::pin(async move { Err(ResolveError(format!("{host}: no resolver in this test"))) })
+    }
+}
+
+/// No node-wide source control.
+struct Ungated;
+
+impl SourceGate for Ungated {
+    fn global(&self, _: std::net::IpAddr) -> Option<StreamRefusal> {
+        None
+    }
+    fn country(&self, _: std::net::IpAddr) -> Option<[u8; 2]> {
+        None
     }
 }
 
@@ -183,7 +195,25 @@ async fn answer(peer: &mut InProcessPeer) -> StreamCtlMsg {
         .expect("the runtime is alive")
 }
 
-async fn attach(peer: &mut InProcessPeer, seq: u64, stream_id: &str) -> (OwnedFd, SocketAddr) {
+/// The stream's caps region, as the supervisor sends it ahead of the
+/// stream's first `attach` (Story 12.6 D-e), then the `attach`.
+async fn attach(
+    peer: &mut InProcessPeer,
+    node: &mut NodeCapsRegions,
+    seq: u64,
+    stream_id: &str,
+) -> (OwnedFd, SocketAddr) {
+    node.ensure(stream_id, u64::from(Stream::DEFAULT_MAX_CONNECTIONS), 0)
+        .unwrap();
+    let caps = node
+        .caps_message(stream_id, seq * 100, 0)
+        .unwrap()
+        .expect("a region");
+    peer.to_runtime.send(caps).await.unwrap();
+    assert!(matches!(
+        answer(peer).await,
+        StreamCtlMsg::Ack { count: 1, .. }
+    ));
     let fd = bind_tcp_stream_listener("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = SockRef::from(&fd)
         .local_addr()
@@ -235,6 +265,7 @@ async fn a_backend_going_down_closes_only_the_connections_that_follow_it() {
         counters: Arc::clone(&counters),
         observer: Arc::new(Records(tx)),
         reserved_ports: None,
+        source_gate: Arc::new(Ungated),
     });
     let (mut peer, transport) = ControlTransport::in_process_pair(8);
     let handle = StreamRuntime::spawn(
@@ -247,8 +278,9 @@ async fn a_backend_going_down_closes_only_the_connections_that_follow_it() {
         Arc::clone(&source) as Arc<dyn StreamTableSource>,
     )
     .unwrap();
-    let (_follows_fd, follows_addr) = attach(&mut peer, 1, "follows").await;
-    let (_stays_fd, stays_addr) = attach(&mut peer, 2, "stays").await;
+    let mut node = NodeCapsRegions::new(1);
+    let (_follows_fd, follows_addr) = attach(&mut peer, &mut node, 1, "follows").await;
+    let (_stays_fd, stays_addr) = attach(&mut peer, &mut node, 2, "stays").await;
 
     let mut follows = TcpStream::connect(follows_addr).await.unwrap();
     let mut stays = TcpStream::connect(stays_addr).await.unwrap();

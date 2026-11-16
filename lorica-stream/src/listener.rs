@@ -197,6 +197,7 @@ async fn accept_loop(listener: TcpListener, ctx: LoopContext, mut mode: watch::R
             tracked,
             table,
             bound_ports: ctx.bound_ports.clone(),
+            caps: ctx.caps.clone(),
         }));
     }
 }

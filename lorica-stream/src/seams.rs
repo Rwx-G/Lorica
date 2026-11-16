@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The three things a stream engine needs from the binary (Story 12.3
-//! D-a), as narrow traits: backend selection, the circuit breaker and
-//! DNS resolution. `lorica` implements them over the code HTTP already
-//! runs (`lorica/src/stream_engine.rs`, Lot D2); the engines' tests use
-//! fakes.
+//! The things a stream engine needs from the binary (Story 12.3 D-a), as
+//! narrow traits: backend selection, the circuit breaker, DNS resolution
+//! and, since Story 12.6 D-d, the node's source controls. `lorica`
+//! implements them over the code HTTP already runs
+//! (`lorica/src/stream_engine.rs`); the engines' tests use fakes.
 //!
 //! Protocol-neutral by design (Story 12.5 Interface edit E2): the UDP
 //! engine selects, admits and resolves through the same traits, and the
@@ -28,7 +28,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use lorica_config::models::{Backend, Stream};
+use lorica_config::models::{Backend, Stream, StreamRefusal};
 
 use crate::table::StreamTable;
 
@@ -145,4 +145,29 @@ pub struct ResolveError(pub String);
 pub trait Resolve: Send + Sync + 'static {
     /// Resolve `host`, a name, never an IP literal.
     fn lookup<'a>(&'a self, host: &'a str) -> SeamFuture<'a, Result<Resolved, ResolveError>>;
+}
+
+/// The node's source controls a stream applies beside its own (Story
+/// 12.6 D-d): the global connection filter, the global IP blocklist with
+/// the global WAF whitelist's exemption, and the GeoIP database. The
+/// implementation reads the instances the HTTP listeners read in the
+/// same process, so a reload of any of them reaches the next stream
+/// accept with no stream message.
+///
+/// Synchronous, because the UDP receive path is (Story 12.5 D-c): each
+/// call is a lookup in memory, never a wait. `client` is canonical (no
+/// IPv4-mapped form), and is the address Story 12.6 D-b judges: the
+/// socket peer, or the client a trusted PROXY header carried.
+pub trait SourceGate: Send + Sync + 'static {
+    /// Steps 2 and 3 of the admission sequence (D-a): `Some` with
+    /// [`StreamRefusal::ConnectionFilter`] when the global connection
+    /// filter refuses `client`, else with [`StreamRefusal::IpBlocklist`]
+    /// when the global blocklist holds it and the global WAF whitelist
+    /// does not; `None` when both let it through.
+    fn global(&self, client: IpAddr) -> Option<StreamRefusal>;
+
+    /// The ISO 3166-1 alpha-2 code of `client`'s country, uppercase;
+    /// `None` when it is unknown (no database on this node, or no entry
+    /// for the address). Called only for a stream with a `geoip` list.
+    fn country(&self, client: IpAddr) -> Option<[u8; 2]>;
 }

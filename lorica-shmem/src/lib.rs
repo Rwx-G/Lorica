@@ -66,10 +66,10 @@ pub use eviction::{evict_once, EvictionStats, DEFAULT_SCAN_INTERVAL, DEFAULT_STA
 pub use hash::{random_key, siphash13_u64};
 pub use region::{SharedRegion, SharedRegionError, LAYOUT_VERSION, MAGIC, REGION_SIZE, WAF_SLOTS};
 pub use stream_caps::{
-    layout_for, layout_with_links, AdmitRefusal, BackendKey, BackendSlot, CapRefusal,
-    NewSessionVerdict, OpenLimits, OpenVerdict, RateEvictionStats, RateLimits, RateVerdict,
-    SessionPermit, SourceKey, StreamCapsError, StreamCapsLayout, StreamCapsRegion, StreamPermit,
-    WorkerCaps, STREAM_CAPS_LAYOUT_VERSION, STREAM_CAPS_MAGIC,
+    layout_for, layout_with_links, AdmitRefusal, BackendKey, BackendSlot, NewSessionVerdict,
+    OpenLimits, OpenVerdict, RateEvictionStats, RateLimits, RateVerdict, SourceKey,
+    StreamCapsError, StreamCapsLayout, StreamCapsRegion, StreamPermit, WorkerCaps,
+    STREAM_CAPS_LAYOUT_VERSION, STREAM_CAPS_MAGIC,
 };
 pub use table::{now_ns, tagged_hash, AtomicHashTable, Slot, MAX_PROBE, SATURATED};
 pub use window::{CountKind, WindowedCount};

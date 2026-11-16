@@ -18,22 +18,25 @@
 //! socket by an `attach`, as Lot F will send them. The seams are fakes:
 //! the selector picks the first candidate, the fewest sessions or a hash
 //! of the client; the breaker admits unless told to deny or to hang; no
-//! name is ever resolved (every backend is an IP literal).
+//! name is ever resolved (every backend is an IP literal); the source
+//! gate refuses the addresses it is given and places the ones it has a
+//! country for. Clients send from `127.0.0.N` where a test needs several
+//! sources.
 
 #![cfg(target_os = "linux")]
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
 use lorica_config::models::{
-    Backend, DatagramDropReason, HealthCheck, HealthStatus, LifecycleState, Stream, StreamBackend,
-    StreamEndKind, StreamEndReason, StreamProtocol, StreamProxyProtocol, StreamRefusal,
-    UdpSettings,
+    Backend, DatagramDropReason, GeoIpConfig, GeoIpMode, HealthCheck, HealthStatus, LifecycleState,
+    Stream, StreamBackend, StreamEndKind, StreamEndReason, StreamProtocol, StreamProxyProtocol,
+    StreamRefusal, UdpSettings,
 };
 use lorica_core::protocols::proxy_protocol::V2_SIGNATURE;
 use lorica_shmem::{RateLimits, SourceKey, StreamCapsRegion};
@@ -41,9 +44,9 @@ use lorica_stream::counters::{ConnectFailureKind, LinkCountersSnapshot, StreamCo
 use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
     Admission, BackendSelector, BreakerGate, ConnectionObserver, ConnectionRecord,
-    ControlTransport, Engines, InProcessPeer, NodeCapsRegions, Resolve, ResolveError, Resolved,
-    ResolverCache, SelectionRequest, StreamCounters, StreamRuntime, StreamRuntimeHandle,
-    StreamTable, StreamTableSource, UdpEngine, UdpEngineParts,
+    ControlTransport, Engines, InProcessPeer, NodeCapsRegions, RefusalRecord, Resolve,
+    ResolveError, Resolved, ResolverCache, SelectionRequest, SourceGate, StreamCounters,
+    StreamRuntime, StreamRuntimeHandle, StreamTable, StreamTableSource, UdpEngine, UdpEngineParts,
 };
 use lorica_worker::fd_passing::StreamProto;
 use lorica_worker::stream_ctl::{StreamCtlMsg, StreamSocket};
@@ -179,11 +182,42 @@ impl Resolve for NoDns {
     }
 }
 
-struct Records(mpsc::UnboundedSender<ConnectionRecord>);
+struct Records {
+    ended: mpsc::UnboundedSender<ConnectionRecord>,
+    refused: mpsc::UnboundedSender<RefusalRecord>,
+}
 
 impl ConnectionObserver for Records {
     fn observe(&self, record: ConnectionRecord) {
-        let _ = self.0.send(record);
+        let _ = self.ended.send(record);
+    }
+
+    fn refused(&self, record: RefusalRecord) {
+        let _ = self.refused.send(record);
+    }
+}
+
+/// Refuses the addresses it holds; knows the countries it is told.
+#[derive(Default)]
+struct Gate {
+    filtered: Mutex<HashSet<IpAddr>>,
+    blocked: Mutex<HashSet<IpAddr>>,
+    countries: Mutex<HashMap<IpAddr, [u8; 2]>>,
+}
+
+impl SourceGate for Gate {
+    fn global(&self, client: IpAddr) -> Option<StreamRefusal> {
+        if self.filtered.lock().unwrap().contains(&client) {
+            Some(StreamRefusal::ConnectionFilter)
+        } else if self.blocked.lock().unwrap().contains(&client) {
+            Some(StreamRefusal::IpBlocklist)
+        } else {
+            None
+        }
+    }
+
+    fn country(&self, client: IpAddr) -> Option<[u8; 2]> {
+        self.countries.lock().unwrap().get(&client).copied()
     }
 }
 
@@ -307,8 +341,10 @@ struct Harness {
     peer: InProcessPeer,
     handle: StreamRuntimeHandle,
     records: mpsc::UnboundedReceiver<ConnectionRecord>,
+    refusals: mpsc::UnboundedReceiver<RefusalRecord>,
     selector: Arc<Selector>,
     breaker: Arc<Breaker>,
+    gate: Arc<Gate>,
     node: NodeCapsRegions,
     listens: Vec<SocketAddr>,
     seq: u64,
@@ -322,29 +358,44 @@ impl Harness {
     /// A runtime serving `streams`, each with its region and one slot
     /// socket on its listen address (port chosen by the kernel).
     async fn start(streams: Vec<(Stream, Vec<Backend>)>, pick: Pick, breaker: Breaker) -> Self {
+        Self::start_capped(streams, pick, breaker, &[], &[]).await
+    }
+
+    /// [`Harness::start`] with the links of `capped` backend ids at the
+    /// given `max_active`, and no region sent for the streams of
+    /// `without_region`.
+    async fn start_capped(
+        streams: Vec<(Stream, Vec<Backend>)>,
+        pick: Pick,
+        breaker: Breaker,
+        capped: &[(&str, u32)],
+        without_region: &[&str],
+    ) -> Self {
         let counters = Arc::new(StreamCounters::new());
         let selector = Arc::new(Selector::new(pick));
         let breaker = Arc::new(breaker);
-        let (tx, records) = mpsc::unbounded_channel();
+        let gate = Arc::new(Gate::default());
+        let (ended, records) = mpsc::unbounded_channel();
+        let (refused, refusals) = mpsc::unbounded_channel();
         let engine = UdpEngine::new(UdpEngineParts {
             selector: Arc::clone(&selector) as Arc<dyn BackendSelector>,
             breaker: Arc::clone(&breaker) as Arc<dyn BreakerGate>,
             resolver: ResolverCache::new(Arc::new(NoDns), Arc::clone(&counters)),
             counters: Arc::clone(&counters),
-            observer: Arc::new(Records(tx)),
+            observer: Arc::new(Records { ended, refused }),
             reserved_ports: None,
+            source_gate: Arc::clone(&gate) as Arc<dyn SourceGate>,
         });
         let mut links = Vec::new();
         let mut rows = Vec::new();
         for (stream, backends) in &streams {
             for b in backends {
-                links.push(StreamBackend {
-                    stream_id: stream.id.clone(),
-                    backend_id: b.id.clone(),
-                    backup: false,
-                    rule: None,
-                    max_active: None,
-                });
+                let mut link = StreamBackend::primary(&stream.id, &b.id);
+                link.max_active = capped
+                    .iter()
+                    .find(|(id, _)| *id == b.id)
+                    .map(|(_, cap)| *cap);
+                links.push(link);
                 rows.push(b.clone());
             }
         }
@@ -368,22 +419,26 @@ impl Harness {
             peer,
             handle,
             records,
+            refusals,
             selector,
             breaker,
+            gate,
             node: NodeCapsRegions::new(1),
             listens: Vec::new(),
             seq: 0,
         };
         for (n, (stream, _)) in streams.iter().enumerate() {
-            let max_sessions = u64::from(stream.udp.as_ref().unwrap().max_sessions);
-            harness.node.ensure(&stream.id, max_sessions, 0).unwrap();
-            let seq = harness.next_seq();
-            let caps = harness
-                .node
-                .caps_message(&stream.id, seq, 0)
-                .unwrap()
-                .expect("a region");
-            harness.exchange(caps).await;
+            if !without_region.contains(&stream.id.as_str()) {
+                let max_sessions = u64::from(stream.udp.as_ref().unwrap().max_sessions);
+                harness.node.ensure(&stream.id, max_sessions, 0).unwrap();
+                let seq = harness.next_seq();
+                let caps = harness
+                    .node
+                    .caps_message(&stream.id, seq, 0)
+                    .unwrap()
+                    .expect("a region");
+                harness.exchange(caps).await;
+            }
             let fd = bind_udp_group(SocketAddr::new(stream.listen_address, 0), 1)
                 .unwrap()
                 .remove(0);
@@ -437,6 +492,14 @@ impl Harness {
         tokio::time::timeout(WAIT, self.records.recv())
             .await
             .expect("a session record in time")
+            .expect("the engine is alive")
+    }
+
+    /// The next refusal row the refusal log admitted.
+    async fn refusal(&mut self) -> RefusalRecord {
+        tokio::time::timeout(WAIT, self.refusals.recv())
+            .await
+            .expect("a refusal row in time")
             .expect("the engine is alive")
     }
 
@@ -930,6 +993,156 @@ async fn a_full_rate_table_refuses_new_sources_on_that_stream_only() {
     .await;
     c.send_to(b"q", h.listens[1]).await.unwrap();
     assert_eq!(reply(&c).await, b"q", "the other stream still serves");
+    h.stop();
+}
+
+// ---- source controls, open rates, link caps (Story 12.6) ---------------
+
+fn loopback(n: u8) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(127, 0, 0, n))
+}
+
+/// A client sending from `127.0.0.<n>`.
+async fn client_from(n: u8) -> UdpSocket {
+    UdpSocket::bind(SocketAddr::new(loopback(n), 0))
+        .await
+        .unwrap()
+}
+
+/// `c`'s first datagram is refused `refusal`: no session, no answer, one
+/// row naming the client, the refusal counted once and as nothing else.
+async fn refused_session(h: &mut Harness, c: &UdpSocket, refusal: StreamRefusal) {
+    c.send_to(b"q", h.listen()).await.unwrap();
+    let row = h.refusal().await;
+    assert_eq!(row.refusal, refusal);
+    assert_eq!(row.client, c.local_addr().unwrap());
+    assert_eq!(row.protocol, StreamProtocol::Udp);
+    assert_eq!(
+        h.stats("dns").refused.get(&refusal).copied(),
+        Some(1),
+        "{refusal:?} counted once"
+    );
+    assert_silent(c).await;
+}
+
+#[tokio::test]
+async fn every_source_control_refuses_a_new_session_and_an_unknown_country_passes() {
+    let b1 = UdpBackend::echo().await;
+    let mut stream = udp_stream("dns", "127.0.0.1");
+    stream.source_deny_cidrs = vec!["127.0.0.4".into()];
+    stream.geoip = Some(GeoIpConfig {
+        mode: GeoIpMode::Denylist,
+        countries: vec!["US".into()],
+    });
+    let mut h = Harness::one(stream, vec![backend("b1", b1.addr)]).await;
+    h.gate.filtered.lock().unwrap().insert(loopback(2));
+    h.gate.blocked.lock().unwrap().insert(loopback(3));
+    h.gate.countries.lock().unwrap().insert(loopback(5), *b"US");
+
+    for (n, refusal) in [
+        (2, StreamRefusal::ConnectionFilter),
+        (3, StreamRefusal::IpBlocklist),
+        (4, StreamRefusal::SourceDenied),
+        (5, StreamRefusal::Geoip),
+    ] {
+        let c = client_from(n).await;
+        refused_session(&mut h, &c, refusal).await;
+    }
+    assert!(b1.received().is_empty(), "no session was opened");
+    let stats = h.stats("dns");
+    assert_eq!(stats.accepted, 0);
+    assert!(stats.dropped.is_empty(), "a refusal is not also a drop");
+
+    let c = client_from(6).await;
+    c.send_to(b"unknown country", h.listen()).await.unwrap();
+    assert_eq!(reply(&c).await, b"unknown country");
+    assert_eq!(h.stats("dns").geoip_unknown, 1);
+    h.stop();
+}
+
+#[tokio::test]
+async fn a_datagram_before_the_region_is_refused_caps_unavailable_and_counted() {
+    let b1 = UdpBackend::echo().await;
+    let mut h = Harness::start_capped(
+        vec![(udp_stream("dns", "127.0.0.1"), vec![backend("b1", b1.addr)])],
+        Pick::First,
+        Breaker::default(),
+        &[],
+        &["dns"],
+    )
+    .await;
+    let c = client().await;
+    refused_session(&mut h, &c, StreamRefusal::CapsUnavailable).await;
+    assert!(b1.received().is_empty());
+    h.stop();
+}
+
+#[tokio::test]
+async fn the_source_open_rate_refuses_one_address_and_serves_another() {
+    let b1 = UdpBackend::echo().await;
+    let mut stream = udp_stream("dns", "127.0.0.1");
+    stream.source_open_rate = Some(2);
+    let mut h = Harness::one(stream, vec![backend("b1", b1.addr)]).await;
+    // Two sessions in one second of burst, from two ports of one address.
+    for _ in 0..2 {
+        let c = client_from(2).await;
+        c.send_to(b"q", h.listen()).await.unwrap();
+        assert_eq!(reply(&c).await, b"q");
+    }
+    let third = client_from(2).await;
+    refused_session(&mut h, &third, StreamRefusal::SourceOpenRate).await;
+    let other = client_from(3).await;
+    other.send_to(b"q", h.listen()).await.unwrap();
+    assert_eq!(reply(&other).await, b"q", "another source is served");
+    h.stop();
+}
+
+#[tokio::test]
+async fn the_stream_open_rate_refuses_every_source_past_it() {
+    let b1 = UdpBackend::echo().await;
+    let mut stream = udp_stream("dns", "127.0.0.1");
+    stream.open_rate = Some(1);
+    let mut h = Harness::one(stream, vec![backend("b1", b1.addr)]).await;
+    let first = client_from(2).await;
+    first.send_to(b"q", h.listen()).await.unwrap();
+    assert_eq!(reply(&first).await, b"q");
+    let second = client_from(3).await;
+    refused_session(&mut h, &second, StreamRefusal::OpenRate).await;
+    h.stop();
+}
+
+#[tokio::test]
+async fn a_backend_at_its_cap_is_skipped_and_all_at_cap_refuse_backend_cap() {
+    let b1 = UdpBackend::sink().await;
+    let b2 = UdpBackend::sink().await;
+    let mut h = Harness::start_capped(
+        vec![(
+            udp_stream("dns", "127.0.0.1"),
+            vec![backend("b1", b1.addr), backend("b2", b2.addr)],
+        )],
+        Pick::First,
+        Breaker::default(),
+        &[("b1", 1), ("b2", 1)],
+        &[],
+    )
+    .await;
+    let (first, second) = (client().await, client().await);
+    first.send_to(b"one", h.listen()).await.unwrap();
+    wait_until("b1 holds a session", || b1.received().len() == 1).await;
+    second.send_to(b"two", h.listen()).await.unwrap();
+    wait_until("b2 took the second", || b2.received().len() == 1).await;
+
+    let third = client().await;
+    third.send_to(b"three", h.listen()).await.unwrap();
+    let row = h.refusal().await;
+    assert_eq!(row.refusal, StreamRefusal::BackendCap);
+    assert_eq!(row.client, third.local_addr().unwrap());
+    assert_eq!(
+        h.stats("dns").refused.get(&StreamRefusal::BackendCap),
+        Some(&1)
+    );
+    assert!(h.breaker_records().is_empty(), "no breaker report");
+    assert_eq!((b1.received().len(), b2.received().len()), (1, 1));
     h.stop();
 }
 

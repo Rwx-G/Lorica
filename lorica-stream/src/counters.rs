@@ -37,6 +37,11 @@
 //! meaning (`accepted` counts sessions, `active` live sessions, the bytes
 //! what was forwarded) and adds the datagram counts, the drops and the
 //! "ceiling reached" edge.
+//!
+//! Stream protection (Story 12.6 D-i) counts every refusal under its
+//! reason, keeps a `pending` gauge of the connections in their
+//! pre-forwarding reads, and counts `geoip_unknown`: clients a stream's
+//! GeoIP list could not place, which pass.
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
@@ -333,6 +338,8 @@ pub struct StreamStats {
     ech_offered: AtomicU64,
     handshakes: Keyed<HandshakeOutcome>,
     sni_mismatch: AtomicU64,
+    pending: Arc<AtomicU64>,
+    geoip_unknown: AtomicU64,
 }
 
 impl StreamStats {
@@ -461,6 +468,18 @@ impl StreamStats {
         bump(&self.sni_mismatch);
     }
 
+    /// Count a connection in its pre-forwarding reads (Story 12.6 D-f),
+    /// pending until the guard drops.
+    pub fn pending(&self) -> ActiveGuard {
+        ActiveGuard::new(&self.pending)
+    }
+
+    /// Count a client whose country the stream's GeoIP list could not
+    /// know, and let through (Story 12.6 D-d).
+    pub fn geoip_unknown(&self) {
+        bump(&self.geoip_unknown);
+    }
+
     pub(crate) fn snapshot(&self) -> StreamCountersSnapshot {
         StreamCountersSnapshot {
             clienthello: self.clienthello.snapshot(),
@@ -485,6 +504,8 @@ impl StreamStats {
             datagrams_download: get(&self.datagrams_download),
             dropped: self.dropped.snapshot(),
             ceiling_reached: get(&self.ceiling_reached),
+            pending: get(&self.pending),
+            geoip_unknown: get(&self.geoip_unknown),
         }
     }
 }
@@ -840,6 +861,11 @@ pub struct StreamCountersSnapshot {
     /// TLS: handshakes whose server name, as rustls read it, differed
     /// from the one the rule was chosen by.
     pub sni_mismatch: u64,
+    /// TCP: this process's connections in their pre-forwarding reads now
+    /// (a gauge); the node's total is the region's.
+    pub pending: u64,
+    /// Clients the stream's GeoIP list could not place, let through.
+    pub geoip_unknown: u64,
 }
 
 /// The cumulative counts of a latency histogram.
@@ -892,6 +918,18 @@ mod tests {
         drop(first);
         drop(second);
         assert_eq!(counters.snapshot().streams["s"].active, 0);
+    }
+
+    #[test]
+    fn the_pending_gauge_follows_its_guards_and_geoip_unknown_counts() {
+        let stats = StreamStats::default();
+        let pending = stats.pending();
+        stats.geoip_unknown();
+        stats.geoip_unknown();
+        let snap = stats.snapshot();
+        assert_eq!((snap.pending, snap.geoip_unknown), (1, 2));
+        drop(pending);
+        assert_eq!(stats.snapshot().pending, 0);
     }
 
     #[test]

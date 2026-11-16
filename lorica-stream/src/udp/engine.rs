@@ -24,17 +24,22 @@
 //!    retires at its last request.
 //! 3. **Drain**: on a draining binding a datagram that would open a
 //!    session is dropped (`binding_draining`, D-m).
-//! 4. **Admission** on the stream-caps region (D-d): the source's rates,
-//!    then the stream and per-source session caps. A refusal is counted
-//!    once, as the refusal.
+//! 4. **Admission**, the sequence of Story 12.6 D-a: the stream's region
+//!    (`caps_unavailable` without one), the node's and the stream's
+//!    source controls, then on the region the stream's and the source's
+//!    open rates with the source's datagram and byte rates in one
+//!    charge, then the stream and per-source session caps. A refusal is
+//!    counted once, as the refusal, and goes to the refusal log; a
+//!    datagram over its source's datagram or byte rate is a drop.
 //! 5. **Spawn** the session task with the datagram held.
 //!
-//! The session task: selection and breaker admission through the seams
-//! (D-i), the local check, the upstream socket from `source_addresses`
-//! (D-a, D-f), the held datagrams sent; then responses within the bounds
-//! of D-b, idle and total timers, ICMP errors, the tracker's close; and
-//! at the end the breaker report, the record, and the session's counts
-//! given back.
+//! The session task: selection (a link at its `max_active` left out,
+//! Story 12.6 D-h) and breaker admission through the seams (D-i), the
+//! local check, the upstream socket from `source_addresses` (D-a, D-f),
+//! the held datagrams sent; then responses within the bounds of D-b,
+//! idle and total timers, ICMP errors, the tracker's close; and at the
+//! end the breaker report, the record, and the session's counts given
+//! back.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -47,10 +52,11 @@ use chrono::{DateTime, Utc};
 use lorica_config::listen_ports::ReservedPorts;
 use lorica_config::models::{
     backend_address_host, backend_address_port, Backend, DatagramDropReason, HealthStatus,
-    LifecycleState, Stream, StreamEndReason, StreamProxyProtocol, StreamRefusal, UdpSettings,
+    LifecycleState, Stream, StreamEndReason, StreamProtocol, StreamProxyProtocol, StreamRefusal,
+    UdpSettings,
 };
 use lorica_core::protocols::proxy_protocol::encode_v2_dgram;
-use lorica_shmem::{now_ns, CapRefusal, RateVerdict, SessionPermit, SourceKey};
+use lorica_shmem::{now_ns, BackendSlot, NewSessionVerdict, SourceKey, StreamPermit, WorkerCaps};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
@@ -61,12 +67,19 @@ use super::session::{
     fits, icmp_kind, rate_limits, send_to_client, Bounds, Ending, Offer, Session, SessionKey,
 };
 use super::UPSTREAM_RECEIVE_BUFFER;
+use crate::admission::{
+    backend_at_cap, claim_backend, open_limits, udp_cap_refusal, AdmissionControl,
+};
 use crate::counters::{ActiveGuard, ConnectFailureKind, LinkStats, StreamCounters, StreamStats};
-use crate::handler::{ConnectionObserver, ConnectionRecord, Datagram, DatagramHandler};
+use crate::handler::{
+    ConnectionObserver, ConnectionRecord, Datagram, DatagramHandler, RefusalRecord,
+};
 use crate::listener::with_receive_buffer;
 use crate::local::{BoundPorts, LocalRefusal, NodeLocality};
 use crate::resolver::{LocalExclusions, ResolverCache};
-use crate::seams::{Admission, BackendSelector, BreakerGate, Candidate, SelectionRequest};
+use crate::seams::{
+    Admission, BackendSelector, BreakerGate, Candidate, SelectionRequest, SourceGate,
+};
 use crate::table::{LinkedBackend, StreamTable};
 use crate::tracker::TrackedConnection;
 
@@ -82,11 +95,14 @@ pub struct UdpEngineParts {
     pub resolver: Arc<ResolverCache>,
     /// The process's stream counters.
     pub counters: Arc<StreamCounters>,
-    /// Where each session's record goes.
+    /// Where each session's record and each admitted refusal goes.
     pub observer: Arc<dyn ConnectionObserver>,
     /// The node's reserved ports, for the local check; `None` until the
     /// process knows them.
     pub reserved_ports: Option<ReservedPorts>,
+    /// The node's source controls (Story 12.6 D-d), shared with the TCP
+    /// engine.
+    pub source_gate: Arc<dyn SourceGate>,
 }
 
 /// The UDP stream engine, a [`DatagramHandler`].
@@ -111,6 +127,7 @@ struct Inner {
     observer: Arc<dyn ConnectionObserver>,
     reserved: Option<ReservedPorts>,
     exclusions: LocalExclusions,
+    admission: AdmissionControl,
     /// The per-stream turn among `source_addresses` (D-f).
     source_turns: Mutex<HashMap<String, usize>>,
     /// The turn among a backend's resolved addresses.
@@ -129,6 +146,7 @@ impl UdpEngine {
                 breaker: parts.breaker,
                 resolver: parts.resolver,
                 counters: parts.counters,
+                admission: AdmissionControl::new(parts.source_gate, Arc::clone(&parts.observer)),
                 observer: parts.observer,
                 reserved: parts.reserved_ports,
                 exclusions: LocalExclusions::default(),
@@ -151,6 +169,7 @@ impl DatagramHandler for UdpEngine {
         inner.selector.table_changed(table);
         inner.counters.retain(table);
         inner.exclusions.retain(table);
+        inner.admission.table_changed(table);
         inner
             .source_turns
             .lock()
@@ -186,7 +205,7 @@ struct SessionTask {
     session: Arc<Session>,
     tracked: TrackedConnection,
     /// Holds the session's place in the region's counts until the end.
-    permit: SessionPermit,
+    permit: StreamPermit,
     active: ActiveGuard,
     stats: Arc<StreamStats>,
     /// The slot socket replies leave from. Dropped before `tracked`, so
@@ -209,6 +228,9 @@ struct Opened {
     address: SocketAddr,
     socket: Arc<UdpSocket>,
     was_probe: bool,
+    /// The session's place on its link's `max_active`, if the link has
+    /// one; held to the end of the session.
+    _backend_slot: Option<BackendSlot>,
 }
 
 /// Why an upstream socket was not opened.
@@ -291,10 +313,23 @@ impl Inner {
         stats: Arc<StreamStats>,
     ) {
         let snapshot = d.snapshot;
+        let refuse = |refusal: StreamRefusal| {
+            stats.refused(refusal);
+            self.admission.report(RefusalRecord {
+                stream_id: snapshot.id.clone(),
+                stream_name: snapshot.name.clone(),
+                protocol: StreamProtocol::Udp,
+                listen_port: key.local.port(),
+                client: key.client,
+                proxied_from: None,
+                refusal,
+                at: Utc::now(),
+            });
+        };
         let Some(caps) = d.caps.get(&snapshot.id) else {
             // The supervisor sends `caps` before a stream's first `attach`
             // (D-d), so this is a stream whose region has not arrived.
-            debug!(stream_id = %snapshot.id, "no stream-caps region yet: session refused");
+            refuse(StreamRefusal::CapsUnavailable);
             return;
         };
         let header = match snapshot.proxy_protocol_send {
@@ -309,40 +344,51 @@ impl Inner {
             stats.dropped(DatagramDropReason::RequestOversize);
             return;
         }
-        let source = SourceKey::of(key.client.ip());
+        let client = key.client.ip();
+        if let Err(refusal) = self.admission.judge(snapshot, &stats, client) {
+            refuse(refusal);
+            return;
+        }
+        let source = SourceKey::of(client);
         let limits = rate_limits(udp);
         let current = caps.current();
         let region = current.region();
-        match region.charge_rate(source, d.payload.len() as u64, limits, now_ns()) {
-            RateVerdict::Allowed => {}
-            RateVerdict::DatagramRate => {
+        let charged = region.charge_new_session(
+            source,
+            d.payload.len() as u64,
+            limits,
+            open_limits(snapshot),
+            now_ns(),
+        );
+        match charged {
+            NewSessionVerdict::Allowed => {}
+            NewSessionVerdict::OpenRate => return refuse(StreamRefusal::OpenRate),
+            NewSessionVerdict::SourceOpenRate => return refuse(StreamRefusal::SourceOpenRate),
+            NewSessionVerdict::DatagramRate => {
                 stats.dropped(DatagramDropReason::SourceDatagramRate);
                 return;
             }
-            RateVerdict::ByteRate => {
+            NewSessionVerdict::ByteRate => {
                 stats.dropped(DatagramDropReason::SourceByteRate);
                 return;
             }
-            RateVerdict::TableFull => {
-                stats.refused(StreamRefusal::SessionTableFull);
-                return;
-            }
+            NewSessionVerdict::TableFull => return refuse(StreamRefusal::SessionTableFull),
         }
         let max_sessions = u64::from(udp.max_sessions);
-        let admitted = current.admit_session(
-            source,
-            u64::from(udp.effective_source_session_cap()),
-            caps.stream_cap_left(max_sessions),
-        );
+        let admitted = current
+            .admit_stream(caps.stream_cap_left(max_sessions), false, 0)
+            .and_then(|permit| {
+                permit.admit_source(
+                    source,
+                    u64::from(udp.effective_source_session_cap()),
+                    u64::MAX,
+                )
+            });
         let permit = match admitted {
             Ok(permit) => permit,
             Err(refusal) => {
-                let refusal = match refusal {
-                    CapRefusal::SessionCap => StreamRefusal::SessionCap,
-                    CapRefusal::SourceSessionCap => StreamRefusal::SourceSessionCap,
-                    CapRefusal::TableFull => StreamRefusal::SessionTableFull,
-                };
-                stats.refused(refusal);
+                let refusal = udp_cap_refusal(refusal);
+                refuse(refusal);
                 if refusal == StreamRefusal::SessionCap && stats.session_cap_refused() {
                     info!(stream_id = %snapshot.id, stream = %snapshot.name, max_sessions,
                           "UDP stream reached its session ceiling on this node");
@@ -432,11 +478,12 @@ impl Inner {
             tls: None,
         };
 
+        let backend_caps = permit.region().worker(permit.slot());
         let opening = tokio::select! {
             biased;
             reason = tracked.closed() => Err(reason),
             _ = sleep_until_opt(total) => Err(StreamEndReason::TotalTimeout),
-            opened = self.open(&snapshot, &table, &bound_ports, &stats, session.key, accepted_at) => opened,
+            opened = self.open(&snapshot, &table, &bound_ports, &stats, session.key, accepted_at, backend_caps.as_ref()) => opened,
         };
         let natural = match opening {
             Err(reason) => reason,
@@ -487,16 +534,35 @@ impl Inner {
         record.bytes_download = forwarded.bytes_download;
         record.datagrams_upload = Some(forwarded.datagrams_upload);
         record.datagrams_download = Some(forwarded.datagrams_download);
-        record.end_reason = reason;
         record.ended_at = Utc::now();
-        self.observer.observe(record);
+        match reason {
+            // A refused session is a row through the refusal log, not a
+            // record (Story 12.6 D-j).
+            StreamEndReason::Refused(refusal) => self.admission.report(RefusalRecord {
+                stream_id: record.stream_id,
+                stream_name: record.stream_name,
+                protocol: StreamProtocol::Udp,
+                listen_port: record.local.port(),
+                client: record.client,
+                proxied_from: None,
+                refusal,
+                at: record.ended_at,
+            }),
+            reason => {
+                record.end_reason = reason;
+                self.observer.observe(record);
+            }
+        }
     }
 
     /// Select a backend, admit it through the breaker, check it is not a
     /// refused local destination and open the upstream socket. Each
-    /// backend is considered once per session; a `Deny`, a local refusal
-    /// or no source address of its family passes over it without opening
-    /// anything. Never retried once a socket is connected (D-i).
+    /// backend is considered once per session; a link at its `max_active`
+    /// (counted in `backend_caps`), a `Deny`, a local refusal or no
+    /// source address of its family passes over it without opening
+    /// anything. Never retried once a socket is connected (D-i). No
+    /// candidate left, with a cap among the reasons: `refused(backend_cap)`.
+    #[allow(clippy::too_many_arguments)] // one session's whole context, read once
     async fn open(
         &self,
         stream: &Stream,
@@ -505,11 +571,24 @@ impl Inner {
         stats: &StreamStats,
         key: SessionKey,
         accepted_at: Instant,
+        backend_caps: Option<&WorkerCaps>,
     ) -> Result<Opened, StreamEndReason> {
         let mut excluded: HashSet<String> = HashSet::new();
+        let mut capped = false;
         loop {
-            let eligible = self.eligible(stream, table, key.local.port(), &excluded);
+            let eligible = self.eligible(
+                stream,
+                table,
+                key.local.port(),
+                &excluded,
+                backend_caps,
+                &mut capped,
+            );
             if eligible.is_empty() {
+                if capped {
+                    stats.refused(StreamRefusal::BackendCap);
+                    return Err(StreamEndReason::Refused(StreamRefusal::BackendCap));
+                }
                 return Err(StreamEndReason::NoHealthyBackend);
             }
             let index = {
@@ -532,6 +611,12 @@ impl Inner {
             let chosen = &eligible[index];
             let backend = Arc::clone(&chosen.link.backend);
             excluded.insert(backend.id.clone());
+            let Ok(backend_slot) = claim_backend(backend_caps, chosen.link) else {
+                capped = true;
+                debug!(stream_id = %stream.id, backend_id = %backend.id,
+                       "backend reached its max_active meanwhile: candidate skipped");
+                continue;
+            };
 
             let Some(destinations) = self.destinations(stream, bound, stats, chosen) else {
                 continue;
@@ -556,6 +641,7 @@ impl Inner {
                     address,
                     socket: Arc::new(socket),
                     was_probe,
+                    _backend_slot: backend_slot,
                 }),
                 Err(OpenError::Socket(e)) => {
                     warn!(stream_id = %stream.id, backend_id = %backend.id, %address, error = %e,
@@ -586,8 +672,9 @@ impl Inner {
     }
 
     /// The candidates of a session: linked, not passed over yet, not
-    /// down, in the normal lifecycle, with an address known now (a name
-    /// not resolved yet waits for the resolver's schedule, never for this
+    /// down, in the normal lifecycle, below its link's `max_active` (one
+    /// at it sets `capped`), with an address known now (a name not
+    /// resolved yet waits for the resolver's schedule, never for this
     /// session), the backups only when no primary is left (12.3 D-f).
     fn eligible<'a>(
         &self,
@@ -595,6 +682,8 @@ impl Inner {
         table: &'a StreamTable,
         listen_port: u16,
         excluded: &HashSet<String>,
+        backend_caps: Option<&WorkerCaps>,
+        capped: &mut bool,
     ) -> Vec<Eligible<'a>> {
         let mut eligible: Vec<Eligible<'a>> = table
             .linked_backends(&stream.id)
@@ -604,6 +693,11 @@ impl Inner {
                 !excluded.contains(&backend.id)
                     && backend.health_status != HealthStatus::Down
                     && backend.lifecycle_state == LifecycleState::Normal
+            })
+            .filter(|link| {
+                let at_cap = backend_at_cap(backend_caps, link);
+                *capped |= at_cap;
+                !at_cap
             })
             .filter_map(|link| {
                 let addresses = self

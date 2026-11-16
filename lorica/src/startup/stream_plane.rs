@@ -2063,6 +2063,18 @@ mod tests {
         lorica_shmem::SourceKey::of(std::net::IpAddr::from([192, 0, 2, n]))
     }
 
+    /// A UDP session's admission: the stream part, then the source part
+    /// with no pending share.
+    fn session(
+        caps: &lorica_shmem::WorkerCaps,
+        source: lorica_shmem::SourceKey,
+        source_cap: u64,
+        stream_cap: u64,
+    ) -> Result<lorica_shmem::StreamPermit, lorica_shmem::AdmitRefusal> {
+        caps.admit_stream(stream_cap, false, 0)?
+            .admit_source(source, source_cap, u64::MAX)
+    }
+
     fn stream(id: &str, protocol: StreamProtocol, first: u16, last: u16) -> Stream {
         Stream::new(
             id.into(),
@@ -2600,11 +2612,9 @@ mod tests {
         // never dropped, its process is gone. Worker 0 holds one.
         let dead = worker_caps(&plane, "u1", 1);
         let leaked: Vec<_> = (1..=3)
-            .map(|n| dead.admit_session(client(n), 8, 4096).unwrap())
+            .map(|n| session(&dead, client(n), 8, 4096).unwrap())
             .collect();
-        let _live = worker_caps(&plane, "u1", 0)
-            .admit_session(client(9), 8, 4096)
-            .unwrap();
+        let _live = session(&worker_caps(&plane, "u1", 0), client(9), 8, 4096).unwrap();
         assert_eq!(lock_caps(&plane.caps).sessions("u1"), 4);
 
         let (respawned, seen1) = FakeLink::new(&[]);
@@ -2650,9 +2660,7 @@ mod tests {
         plane
             .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
             .await;
-        let permit = worker_caps(&plane, "u1", 0)
-            .admit_session(client(1), 8, 4096)
-            .unwrap();
+        let permit = session(&worker_caps(&plane, "u1", 0), client(1), 8, 4096).unwrap();
         let before = seen(&seen0).len();
 
         if let Some(udp) = s.udp.as_mut() {

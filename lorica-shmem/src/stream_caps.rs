@@ -530,20 +530,6 @@ impl BackendKey {
 /// IPv4 address and an IPv6 prefix of the same numeric value hash apart.
 const V6_KEY_DOMAIN: u64 = 0x7636_5f70_7265_6678;
 
-/// Why [`WorkerCaps::admit_session`] refused a session: the refusals of
-/// the Story 12.5 UDP path, kept until that path moves to
-/// [`WorkerCaps::admit_stream`] and [`StreamPermit::admit_source`],
-/// which refuse with [`AdmitRefusal`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CapRefusal {
-    /// The stream holds its `max_sessions` on this node.
-    SessionCap,
-    /// The source holds its per-source cap on this node.
-    SourceSessionCap,
-    /// The source's probe window in this worker's shard is full.
-    TableFull,
-}
-
 /// Why an admission was refused, by [`WorkerCaps::admit_stream`] or
 /// [`StreamPermit::admit_source`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1355,31 +1341,6 @@ impl WorkerCaps {
             cell,
         })
     }
-
-    /// The Story 12.5 UDP admission in one call, as
-    /// [`WorkerCaps::admit_stream`] (no pending) then
-    /// [`StreamPermit::admit_source`] with no pending share: kept until
-    /// the UDP engine moves to those two.
-    ///
-    /// # Errors
-    ///
-    /// The cap that refused, or a full window in this worker's shard.
-    pub fn admit_session(
-        &self,
-        source: SourceKey,
-        source_cap: u64,
-        stream_cap: u64,
-    ) -> Result<SessionPermit, CapRefusal> {
-        let permit = self
-            .admit_stream(stream_cap, false, 0)
-            .map_err(|_| CapRefusal::SessionCap)?;
-        permit
-            .admit_source(source, source_cap, u64::MAX)
-            .map_err(|refusal| match refusal {
-                AdmitRefusal::TableFull => CapRefusal::TableFull,
-                _ => CapRefusal::SourceSessionCap,
-            })
-    }
 }
 
 /// One admitted connection's or session's counts, released when dropped:
@@ -1394,10 +1355,6 @@ pub struct StreamPermit {
     pending: bool,
     source_cell: Option<usize>,
 }
-
-/// The permit of a UDP session, the name Story 12.5 gave
-/// [`StreamPermit`].
-pub type SessionPermit = StreamPermit;
 
 impl StreamPermit {
     /// The region the admission is counted in.
@@ -1714,6 +1671,18 @@ fn shard_release<C: Counted>(cell: &C) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A UDP session's admission: the stream part, then the source part
+    /// with no pending share.
+    fn session(
+        caps: &WorkerCaps,
+        source: SourceKey,
+        source_cap: u64,
+        stream_cap: u64,
+    ) -> Result<StreamPermit, AdmitRefusal> {
+        caps.admit_stream(stream_cap, false, 0)?
+            .admit_source(source, source_cap, u64::MAX)
+    }
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::AtomicBool;
     use std::sync::Barrier;
@@ -2083,26 +2052,6 @@ mod tests {
     }
 
     #[test]
-    fn the_session_wrapper_keeps_the_story_12_5_refusals() {
-        let r = region(2, 1);
-        let caps = r.worker(0).unwrap();
-        let a = caps.admit_session(v4(1), 1, 2).unwrap();
-        assert_eq!(
-            caps.admit_session(v4(1), 1, 2).unwrap_err(),
-            CapRefusal::SourceSessionCap
-        );
-        let b = caps.admit_session(v4(2), 1, 2).unwrap();
-        assert_eq!(
-            caps.admit_session(v4(3), 1, 2).unwrap_err(),
-            CapRefusal::SessionCap
-        );
-        assert_eq!(r.total(), 2);
-        assert_eq!(r.pending(), 0);
-        drop((a, b));
-        assert_eq!(r.total(), 0);
-    }
-
-    #[test]
     fn backend_claims_count_per_backend_and_free_on_drop() {
         let r = region(16, 2);
         let a = BackendKey::of("a");
@@ -2137,7 +2086,7 @@ mod tests {
             r.charge_rate(source, 100, limits, SECOND),
             RateVerdict::Allowed
         );
-        let permit = r.worker(1).unwrap().admit_session(source, 8, 16).unwrap();
+        let permit = session(&r.worker(1).unwrap(), source, 8, 16).unwrap();
         for now in [10 * SECOND, u64::MAX / 2, u64::MAX] {
             let stats = r.evict_rates(now);
             assert_eq!((stats.evicted, stats.held), (0, 1), "at {now}");
@@ -2188,11 +2137,11 @@ mod tests {
         let r = region(64, 3);
         let dead = r.worker(1).unwrap();
         let alive = r.worker(2).unwrap();
-        let kept = alive.admit_session(v4(5), 8, 64).unwrap();
+        let kept = session(&alive, v4(5), 8, 64).unwrap();
         let kept_backend = alive.claim_backend(BackendKey::of("x"), 8).unwrap();
         for _ in 0..3 {
             // The worker dies holding its admissions: nothing drops them.
-            std::mem::forget(dead.admit_session(v4(5), 8, 64).unwrap());
+            std::mem::forget(session(&dead, v4(5), 8, 64).unwrap());
         }
         std::mem::forget(
             dead.admit_stream(64, true, 64)
@@ -2505,8 +2454,8 @@ mod tests {
     fn a_released_cell_is_never_revived_and_a_count_survives_its_neighbours() {
         let r = region(16, 1);
         let caps = r.worker(0).unwrap();
-        let first = caps.admit_session(v4(1), 8, 16).unwrap();
-        let second = caps.admit_session(v4(1), 8, 16).unwrap();
+        let first = session(&caps, v4(1), 8, 16).unwrap();
+        let second = session(&caps, v4(1), 8, 16).unwrap();
         assert_eq!(first.source_cell, second.source_cell);
         drop(first);
         assert_eq!(r.source_sessions(v4(1)), 1);

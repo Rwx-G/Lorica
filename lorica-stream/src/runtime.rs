@@ -28,7 +28,7 @@
 //! | `detach` | TCP: stop the binding's loops, close its sockets; UDP: put its loops in drain mode; then drain its connections or sessions with `config_removed` | TCP: sockets closed; UDP: sockets put in drain |
 //! | `refresh` | reload the table, drain what it no longer holds with `config_removed` | connections newly draining |
 //! | `quiesce` | stop every TCP loop, put every UDP loop in drain mode, drain everything with `node_shutdown` | bindings stopped or draining |
-//! | `caps` | map the UDP stream's caps region and make it the stream's current one in the [`CapsRegistry`] the engine reads | 1 |
+//! | `caps` | map the stream's caps region and make it the stream's current one in the [`CapsRegistry`] the engines read | 1 |
 //!
 //! A refused message is answered with a `nack`: `unknown_binding` for a
 //! `detach` of a binding it does not hold, `shutting_down` for an
@@ -592,7 +592,7 @@ impl StreamRuntime {
         stopped
     }
 
-    /// Map the caps region of UDP stream `stream_id` and make it the
+    /// Map the caps region of stream `stream_id` and make it the
     /// stream's current one under worker slot `slot` (D-d).
     fn adopt_caps(
         &self,

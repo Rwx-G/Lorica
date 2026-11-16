@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use lorica_shmem::{
     AdmitRefusal, BackendKey, OpenLimits, OpenVerdict, RateLimits, RateVerdict, SourceKey,
-    StreamCapsError, StreamCapsRegion, STREAM_CAPS_LAYOUT_VERSION,
+    StreamCapsError, StreamCapsRegion, StreamPermit, WorkerCaps, STREAM_CAPS_LAYOUT_VERSION,
 };
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, ForkResult};
@@ -66,23 +66,31 @@ fn in_child(fd: &OwnedFd, body: impl FnOnce(Arc<StreamCapsRegion>)) {
     }
 }
 
+/// A UDP session's admission: the stream part, then the source part
+/// with no pending share.
+fn session(
+    caps: &WorkerCaps,
+    source: SourceKey,
+    source_cap: u64,
+    stream_cap: u64,
+) -> Result<StreamPermit, AdmitRefusal> {
+    caps.admit_stream(stream_cap, false, 0)?
+        .admit_source(source, source_cap, u64::MAX)
+}
+
 #[test]
 fn a_forked_worker_counts_in_the_creators_region() {
     let (region, fd) = StreamCapsRegion::create(64, 4, 1).expect("create");
     let region = Arc::new(region);
-    let mine = region
-        .worker(0)
-        .unwrap()
-        .admit_session(source(1), 8, 64)
-        .unwrap();
+    let mine = session(&region.worker(0).unwrap(), source(1), 8, 64).unwrap();
 
     in_child(&fd, |child| {
         assert_eq!(child.total(), 1, "the creator's session is seen");
         let caps = child.worker(2).unwrap();
         for _ in 0..3 {
-            std::mem::forget(caps.admit_session(source(1), 8, 64).unwrap());
+            std::mem::forget(session(&caps, source(1), 8, 64).unwrap());
         }
-        std::mem::forget(caps.admit_session(source(2), 8, 64).unwrap());
+        std::mem::forget(session(&caps, source(2), 8, 64).unwrap());
     });
 
     assert_eq!(region.total(), 5);
