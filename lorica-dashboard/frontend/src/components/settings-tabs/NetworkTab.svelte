@@ -414,6 +414,9 @@
         <span class="hint">
           Max simultaneous connections from a single client IP,
           dropped at accept time above the cap. Empty or 0 = no cap.
+          Counted per worker process: with N workers a client can hold
+          up to N times this value. Stream listeners do not use this
+          limit; each stream has its own per-node caps.
         </span>
       </div>
 

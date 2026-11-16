@@ -236,6 +236,17 @@ describe('NetworkTab defense-in-depth bounds', () => {
     expect(screen.queryAllByRole('alert')).toHaveLength(0);
   });
 
+  it('says the per-IP connection limit is per process and does not cover streams', () => {
+    // The cap lives in each worker's memory, so an operator reading it
+    // as a node-wide bound under-estimates what one client holds by the
+    // worker count; streams bound their sources per node instead.
+    render(NetworkTab, { props: props() });
+    const row = screen.getByLabelText('Connection limit per IP').parentElement;
+    const text = (row?.textContent ?? '').replace(/\s+/g, ' ');
+    expect(text).toContain('Counted per worker process: with N workers a client can hold up to N times this value.');
+    expect(text).toContain('Stream listeners do not use this limit; each stream has its own per-node caps.');
+  });
+
   it('accepts 0 as an audit retention, which keeps the trail forever', async () => {
     render(NetworkTab, { props: props() });
     const field = screen.getByLabelText('Audit log retention (days)');

@@ -682,7 +682,7 @@ Allowlist: `lorica-dashboard/frontend/src/components/settings-tabs/NetworkTab.sv
 (the hint only), `lorica-dashboard/frontend/src/components/settings-tabs/NetworkTab.test.ts`.
 Depends on: nothing.
 
-- [ ] The D-k text; a test asserting it. `pnpm` gates clean
+- [x] The D-k text; a test asserting it. `pnpm` gates clean
       (`tsc`, `svelte-check`, `eslint`, `vitest`).
 
 ### Lot H: documentation - no cargo
@@ -1189,6 +1189,12 @@ skip the node's controls.
   GeoIP words and limit, and the pending share's divisor read from the
   model.
 
+**Lot G (dashboard, the settings hint).** The "Connection limit per IP"
+hint of the Network tab carries D-k's two sentences;
+`NetworkTab.test.ts` asserts both. Gates run in `node:22` on a copy of
+the frontend with the frozen lockfile: `pnpm run check`, `pnpm run
+lint` and `vitest run` clean.
+
 ## File List
 
 Lot A:
@@ -1256,6 +1262,13 @@ Lot E:
 - `lorica-api/src/streams/tests.rs` (modified)
 - `lorica-api/openapi.yaml` (modified)
 
+Lot G:
+
+- `lorica-dashboard/frontend/src/components/settings-tabs/NetworkTab.svelte`
+  (modified, the hint only)
+- `lorica-dashboard/frontend/src/components/settings-tabs/NetworkTab.test.ts`
+  (modified)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1267,3 +1280,4 @@ Lot E:
 | 2026-11-16 | 0.5 | Lot C: the admission sequence in both engines, the `SourceGate` seam, per-node `max_connections`, the pending cap and per-source share, open rates, link caps, refusal rows through the generic limiter with the Story 12.9 observer methods, `caps_unavailable` counted on UDP; regions for every stream in the plane (the region part of Lot D). | Romain G. |
 | 2026-11-16 | 0.6 | Lot D: `StreamSourceGate` over the process's connection filter, IP blocklist with the WAF whitelist exemption, and GeoIP resolver in both modes, the interim pass-through gate deleted; the worker loads its source controls before its stream runtime starts; regions sized for their capped links; the HTTP PROXY refusal log on the shared limiter; the stream protection process test. | Romain G. |
 | 2026-11-16 | 0.7 | Lot E: the source controls on the stream API and in `openapi.yaml`, `backend_max_active` per link at the stream level and per rule, `max_connections` documented per node, the interim view filter removed. | Romain G. |
+| 2026-11-16 | 0.8 | Lot G: the Network tab says the per-IP connection limit is per worker process and does not apply to streams. | Romain G. |
