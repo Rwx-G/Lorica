@@ -62,7 +62,11 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 const STREAM_ID: &str = "s";
-const WAIT: Duration = Duration::from_secs(10);
+/// How long an expected event may take before the test calls it lost. It
+/// bounds a hang, never a duration: a loaded machine (a full gate run on
+/// a busy host, parallel test binaries) delays every event, and no
+/// assertion here may depend on how much.
+const WAIT: Duration = Duration::from_secs(60);
 
 // ---- fake seams ------------------------------------------------------
 
@@ -500,10 +504,28 @@ async fn sink() -> (SocketAddr, mpsc::UnboundedReceiver<Vec<u8>>) {
     (addr, rx)
 }
 
-/// An address nothing listens on.
-fn refusing() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+/// An address nothing listens on, for as long as the value lives: its
+/// socket stays bound and never listens, so a connect to it is refused,
+/// and no other socket, of this test binary or of another process, can
+/// bind the port and answer in its place. A port bound and released at
+/// once is free for the next `bind(0)` anywhere on the host: under load
+/// another test's listener took it, and a connect meant to be refused
+/// reached a stranger.
+struct Refusing(socket2::Socket);
+
+impl Refusing {
+    fn addr(&self) -> SocketAddr {
+        self.0.local_addr().unwrap().as_socket().unwrap()
+    }
+}
+
+fn refusing() -> Refusing {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+    socket
+        .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+        .unwrap();
+    Refusing(socket)
 }
 
 /// A listener whose accept queue is full: a SYN to it is dropped, so a
@@ -668,16 +690,21 @@ async fn an_idle_connection_ends_with_idle_timeout() {
     s.idle_timeout_s = 1;
     h.set(s, vec![(backend("b1", addr), false)]);
 
+    // Nothing is sent: an echo first would have to land within the idle
+    // second, which a loaded host does not promise.
     let started = Instant::now();
     let mut client = h.connect().await;
-    echo_once(&mut client, b"x").await;
     let record = h.record().await;
     assert_eq!(record.end_reason, StreamEndReason::IdleTimeout);
-    let took = started.elapsed();
-    assert!(
-        took >= Duration::from_secs(1) && took < Duration::from_secs(3),
-        "{took:?}"
+    assert_eq!(
+        record.backend_id.as_deref(),
+        Some("b1"),
+        "it was forwarding"
     );
+    // Never before the idle timeout. How soon after it is pinned on a
+    // paused clock beside the forwarder: here it is the host's load.
+    let took = started.elapsed();
+    assert!(took >= Duration::from_secs(1), "{took:?}");
     assert!(read_to_end(&mut client).await.is_empty());
 }
 
@@ -701,11 +728,10 @@ async fn a_busy_connection_ends_with_total_timeout() {
     });
     let record = h.record().await;
     assert_eq!(record.end_reason, StreamEndReason::TotalTimeout);
+    // Never before the total timeout; how soon after is pinned on a
+    // paused clock beside the forwarder.
     let took = started.elapsed();
-    assert!(
-        took >= Duration::from_secs(1) && took < Duration::from_secs(2),
-        "{took:?}"
-    );
+    assert!(took >= Duration::from_secs(1), "{took:?}");
     chatter.abort();
 }
 
@@ -723,7 +749,9 @@ async fn a_silent_backend_ends_with_the_connect_timeout() {
     let record = h.record().await;
     assert_eq!(record.end_reason, StreamEndReason::ConnectFailed);
     assert_eq!(record.attempts, 1);
-    assert!(started.elapsed() < Duration::from_secs(2));
+    // The kernel's own SYN retries would take minutes; the record came
+    // within WAIT, so the 200 ms connect timeout ended the attempt.
+    assert!(started.elapsed() < WAIT);
     let link = &h.counters.snapshot().links[&(STREAM_ID.to_string(), "b1".to_string())];
     assert_eq!(
         link.connect_failures.get(&ConnectFailureKind::Timeout),
@@ -741,10 +769,11 @@ async fn a_silent_backend_ends_with_the_connect_timeout() {
 async fn a_refused_attempt_retries_and_the_early_bytes_arrive_once() {
     let mut h = Harness::new().await;
     let (good, mut received) = sink().await;
+    let dead = refusing();
     h.set(
         stream(),
         vec![
-            (backend("b1", refusing()), false),
+            (backend("b1", dead.addr()), false),
             (backend("b2", good), false),
         ],
     );
@@ -777,11 +806,12 @@ async fn a_refused_attempt_retries_and_the_early_bytes_arrive_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_refusal_is_connect_failed_and_no_candidate_is_no_healthy_backend() {
     let mut h = Harness::new().await;
+    let (dead, dead_too) = (refusing(), refusing());
     h.set(
         stream(),
         vec![
-            (backend("b1", refusing()), false),
-            (backend("b2", refusing()), false),
+            (backend("b1", dead.addr()), false),
+            (backend("b2", dead_too.addr()), false),
         ],
     );
     let _client = h.connect().await;
@@ -824,11 +854,12 @@ async fn backups_serve_only_once_the_primaries_are_exhausted() {
     assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
     assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
 
+    let dead = refusing();
     h.set(
         stream(),
         vec![
             (backend("b0", backup_addr), true),
-            (backend("b1", refusing()), false),
+            (backend("b1", dead.addr()), false),
         ],
     );
     let mut client = h.connect().await;
@@ -1044,11 +1075,10 @@ async fn a_trickled_header_ends_at_five_seconds() {
     });
     let record = h.record().await;
     assert_eq!(record.end_reason, StreamEndReason::ProxyHeaderInvalid);
+    // The header's five seconds, never fewer: the trickle never completes
+    // it, so the refusal below is the deadline's.
     let took = started.elapsed();
-    assert!(
-        took >= Duration::from_secs(5) && took < Duration::from_secs(6),
-        "{took:?}"
-    );
+    assert!(took >= Duration::from_secs(5), "{took:?}");
     assert_eq!(
         h.stats()
             .proxy_header
@@ -1119,10 +1149,11 @@ async fn an_untrusted_peer_header_forwards_nothing_and_ping_is_forwarded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_local_destination_needs_the_flag_and_never_a_node_port() {
     let (addr, accepted) = echo().await;
+    let held = [refusing(), refusing(), refusing()];
     let reserved = ReservedPorts {
-        management: refusing().port(),
-        http: refusing().port(),
-        https: refusing().port(),
+        management: held[0].addr().port(),
+        http: held[1].addr().port(),
+        https: held[2].addr().port(),
         cluster: None,
         enrollment: None,
         automation: None,
@@ -1202,8 +1233,13 @@ async fn a_name_resolving_to_loopback_is_excluded_and_never_connected() {
 
 // ---- bandwidth, cap ------------------------------------------------------
 
+/// The limit holds end to end, each way: 64 KiB at 16 KiB/s cannot take
+/// less than the three seconds the bucket allows after its one-second
+/// burst. Each clock starts before the connect, so it can only read
+/// long. How close to three seconds the forwarder keeps is pinned on a
+/// paused clock beside it, where the host's load cannot add to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sixty_four_kib_at_sixteen_kib_per_second_take_three_to_five_seconds_each_way() {
+async fn sixty_four_kib_at_sixteen_kib_per_second_take_three_seconds_or_more_each_way() {
     const SIZE: usize = 64 * 1024;
     let mut limited = stream();
     limited.upload_rate_bps = Some(16 * 1024);
@@ -1213,8 +1249,8 @@ async fn sixty_four_kib_at_sixteen_kib_per_second_take_three_to_five_seconds_eac
         let h = Harness::new().await;
         let (addr, mut received) = sink().await;
         h.set(limited.clone(), vec![(backend("b1", addr), false)]);
-        let mut client = h.connect().await;
         let started = Instant::now();
+        let mut client = h.connect().await;
         client.write_all(&vec![1u8; SIZE]).await.unwrap();
         client.shutdown().await.unwrap();
         let got = tokio::time::timeout(WAIT, received.recv())
@@ -1233,18 +1269,15 @@ async fn sixty_four_kib_at_sixteen_kib_per_second_take_three_to_five_seconds_eac
             socket.write_all(&vec![2u8; SIZE]).await.unwrap();
         });
         h.set(limited.clone(), vec![(backend("b1", addr), false)]);
-        let mut client = h.connect().await;
         let started = Instant::now();
+        let mut client = h.connect().await;
         let got = read_to_end(&mut client).await;
         assert_eq!(got.len(), SIZE);
         started.elapsed()
     };
     let (up, down) = tokio::join!(up, down);
     for (way, took) in [("upload", up), ("download", down)] {
-        assert!(
-            took >= Duration::from_millis(2_900) && took <= Duration::from_secs(5),
-            "{way}: {took:?}"
-        );
+        assert!(took >= Duration::from_millis(2_900), "{way}: {took:?}");
     }
 }
 
@@ -1417,54 +1450,84 @@ async fn a_stream_without_its_region_refuses_caps_unavailable() {
 }
 
 /// IV1 at this level: a source over its new-connection rate is refused
-/// at accept while another source of the same stream is served.
+/// at accept while another source of the same stream is served, and its
+/// refusals are rows or counted once in a suppressed row, never both.
+///
+/// The bucket holds one second of burst and refills at the rate, so how
+/// many connections of a burst it admits depends on how long the burst
+/// took to arrive, which a loaded host stretches: the bound is read from
+/// the clock, and the test connects until it has refusals to count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_source_over_its_open_rate_is_refused_while_another_is_served() {
+    const RATE: u32 = 5;
+    const BURST: u64 = 10;
     let mut h = Harness::new().await;
-    let (addr, _) = echo().await;
+    let (addr, backend_hits) = echo().await;
     let mut s = stream();
-    s.source_open_rate = Some(5);
+    s.source_open_rate = Some(RATE);
     h.set(s, vec![(backend("b1", addr), false)]);
 
+    // A connection is settled once the backend accepted it or its refusal
+    // is counted. The `active` gauge cannot tell: it holds a connection
+    // from its accept, so one being refused reads as admitted until then.
+    let admitted = || backend_hits.load(Ordering::SeqCst) as u64;
+    let started = Instant::now();
     let mut held = Vec::new();
-    for _ in 0..10 {
-        held.push(h.connect_from(2).await);
+    let mut refused = 0;
+    while refused < 2 {
+        for _ in 0..BURST {
+            held.push(h.connect_from(2).await);
+        }
+        let total = held.len() as u64;
+        wait_until("every connection admitted or refused", || {
+            admitted() + h.stats().refused.values().sum::<u64>() == total
+        })
+        .await;
+        refused = h.refused(StreamRefusal::SourceOpenRate);
+        assert!(Instant::now() < started + WAIT, "no burst outran the rate");
     }
+    let took = started.elapsed();
+    let admitted = admitted();
+    assert_eq!(admitted + refused, held.len() as u64);
+    let refill = (took.as_secs_f64() * f64::from(RATE)).ceil() as u64;
+    assert!(
+        admitted >= u64::from(RATE) && admitted <= u64::from(RATE) + refill,
+        "{admitted} admitted in {took:?} at {RATE} per second with one second of burst"
+    );
+
     let row = h.refusal().await;
     assert_eq!(row.refusal, StreamRefusal::SourceOpenRate);
     assert_eq!(row.client.ip(), loopback(2));
-    wait_until("every connection admitted or refused and closed", || {
-        let stats = h.stats();
-        let refused = stats.refused.values().sum::<u64>();
-        stats.accepted == 10 && refused + stats.active == 10
-    })
-    .await;
-    let refused = h.refused(StreamRefusal::SourceOpenRate);
-    assert!(
-        (4..=5).contains(&refused),
-        "one second of burst at five per second, {refused} refused"
-    );
-
     let mut other = h.connect_from(3).await;
     echo_once(&mut other, b"another source").await;
-    assert!(
-        h.refusals.try_recv().is_err(),
-        "one row for the window, whatever the refusals"
-    );
 
-    // The window's end hands over what it held back, once.
-    let held_back = tokio::time::timeout(
-        lorica_stream::REFUSAL_LOG_WINDOW + WAIT,
-        h.suppressed.recv(),
-    )
-    .await
-    .expect("a suppressed row when the window closes")
-    .expect("the engine is alive");
-    assert_eq!(
-        held_back.key,
-        StreamLogKey::Refused(StreamRefusal::SourceOpenRate)
-    );
-    assert_eq!(held_back.suppressed, refused - 1);
+    // Every refusal is a row or counted in one suppressed row, once. A
+    // window opens per row, so the rows are at most the windows the
+    // refusals spanned.
+    let (mut rows, mut counted) = (1, 0);
+    let deadline = Instant::now() + lorica_stream::REFUSAL_LOG_WINDOW + WAIT;
+    while rows + counted < refused {
+        tokio::select! {
+            Some(row) = h.refusals.recv() => {
+                assert_eq!(row.refusal, StreamRefusal::SourceOpenRate);
+                rows += 1;
+            }
+            Some(held_back) = h.suppressed.recv() => {
+                assert_eq!(
+                    held_back.key,
+                    StreamLogKey::Refused(StreamRefusal::SourceOpenRate)
+                );
+                counted += held_back.suppressed;
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                panic!("{rows} rows and {counted} suppressed for {refused} refusals")
+            }
+        }
+    }
+    assert_eq!(rows + counted, refused);
+    let windows = 1 + took.as_secs() / lorica_stream::REFUSAL_LOG_WINDOW.as_secs();
+    assert!(rows <= windows, "{rows} rows over {windows} windows");
+    assert!(h.refusals.try_recv().is_err());
     assert!(h.suppressed.try_recv().is_err());
 }
 
@@ -1691,7 +1754,8 @@ async fn each_connection_reaching_selection_reports_one_connect_outcome() {
         "{heard:?}"
     );
 
-    h.set(stream(), vec![(backend("b1", refusing()), false)]);
+    let dead = refusing();
+    h.set(stream(), vec![(backend("b1", dead.addr()), false)]);
     let _client = h.connect().await;
     assert_eq!(h.record().await.end_reason, StreamEndReason::ConnectFailed);
     assert_eq!(h.outcomes(), vec![ConnectOutcome::NotConnected]);

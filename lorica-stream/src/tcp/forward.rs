@@ -733,4 +733,118 @@ mod tests {
         assert_eq!(reason, StreamEndReason::ClientClose);
         assert_eq!((up, down), (9, 6));
     }
+
+    /// A stream for the paused-clock tests below, `edit` applied.
+    fn stream_with(edit: impl FnOnce(&mut Stream)) -> Stream {
+        let mut s = Arc::unwrap_or_clone(stream());
+        edit(&mut s);
+        s
+    }
+
+    /// A quiet connection ends `idle_timeout` no sooner than its idle
+    /// timeout and no later than one check interval after it. On a
+    /// paused clock the host's load cannot stretch the bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_connection_ends_within_one_check_interval_of_its_idle_timeout() {
+        let (_client_peer, mut client) = tokio::io::duplex(64);
+        let (mut backend, _backend_peer) = tokio::io::duplex(64);
+        let snapshot = stream_with(|s| s.idle_timeout_s = 2);
+        let tracker = ConnectionTracker::new();
+        let mut tracked = tracker.register(1, Arc::new(snapshot.clone()));
+        let started = Instant::now();
+        let mut forwarder = Forwarder::new(
+            &snapshot,
+            started,
+            &[],
+            false,
+            Arc::new(StreamStats::default()),
+        );
+        let reason = forwarder.run(&mut client, &mut backend, &mut tracked).await;
+        let took = started.elapsed();
+        assert_eq!(reason, StreamEndReason::IdleTimeout);
+        assert!(
+            took >= Duration::from_secs(2) && took <= Duration::from_secs(2) + IDLE_CHECK_INTERVAL,
+            "{took:?}"
+        );
+    }
+
+    /// A busy connection ends `total_timeout` at its total timeout,
+    /// counted from the accept, whatever its traffic.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_connection_ends_at_its_total_timeout() {
+        let (mut client_peer, mut client) = tokio::io::duplex(1_024);
+        let (mut backend, mut backend_peer) = tokio::io::duplex(1_024);
+        let snapshot = stream_with(|s| {
+            s.idle_timeout_s = 1;
+            s.total_timeout_s = Some(3);
+        });
+        let tracker = ConnectionTracker::new();
+        let mut tracked = tracker.register(1, Arc::new(snapshot.clone()));
+        let chatter = tokio::spawn(async move {
+            while client_peer.write_all(b"tick").await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        let drain = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            while matches!(backend_peer.read(&mut buf).await, Ok(n) if n > 0) {}
+        });
+        let accepted_at = Instant::now();
+        let mut forwarder = Forwarder::new(
+            &snapshot,
+            accepted_at,
+            &[],
+            false,
+            Arc::new(StreamStats::default()),
+        );
+        let reason = forwarder.run(&mut client, &mut backend, &mut tracked).await;
+        let took = accepted_at.elapsed();
+        assert_eq!(reason, StreamEndReason::TotalTimeout);
+        assert!(
+            took >= Duration::from_secs(3) && took < Duration::from_secs(3) + IDLE_CHECK_INTERVAL,
+            "{took:?}"
+        );
+        assert!(
+            forwarder.upload().forwarded() > 0,
+            "the connection was busy"
+        );
+        chatter.abort();
+        drain.abort();
+    }
+
+    /// 64 KiB at 16 KiB/s through the forwarder: one second of burst,
+    /// then three seconds at the rate.
+    #[tokio::test(start_paused = true)]
+    async fn sixty_four_kib_at_sixteen_kib_per_second_take_three_seconds_through_the_forwarder() {
+        const SIZE: usize = 64 * 1024;
+        let (mut client_peer, mut client) = tokio::io::duplex(SIZE);
+        let (mut backend, mut backend_peer) = tokio::io::duplex(SIZE);
+        let snapshot = stream_with(|s| s.upload_rate_bps = Some(16 * 1024));
+        let tracker = ConnectionTracker::new();
+        let mut tracked = tracker.register(1, Arc::new(snapshot.clone()));
+        let started = Instant::now();
+        let mut forwarder = Forwarder::new(
+            &snapshot,
+            started,
+            &[],
+            false,
+            Arc::new(StreamStats::default()),
+        );
+        let run =
+            tokio::spawn(
+                async move { forwarder.run(&mut client, &mut backend, &mut tracked).await },
+            );
+        client_peer.write_all(&vec![1u8; SIZE]).await.unwrap();
+        client_peer.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        backend_peer.read_to_end(&mut got).await.unwrap();
+        let took = started.elapsed();
+        assert_eq!(got.len(), SIZE);
+        assert!(
+            took >= Duration::from_millis(2_990) && took <= Duration::from_millis(3_100),
+            "{took:?}"
+        );
+        backend_peer.shutdown().await.unwrap();
+        assert_eq!(run.await.unwrap(), StreamEndReason::ClientClose);
+    }
 }

@@ -1039,8 +1039,31 @@ edited here.
   the three `cargo test` lines and the TLS-featured one) green, and
   `cargo audit` clean: 3,615 product, 955 `lorica`, 910 forked and 592
   TLS-featured tests.
-
-### Completion Notes
+- The `tcp_engine` timeouts of the Lot C2 gate, reproduced: copies of
+  the test binary in parallel on one core (32 at a time, 24 test
+  threads each) failed 191 of 192 runs; 16 at a time on two cores, 0 of
+  80. Every failure was the tests' own assumption, none an engine
+  defect: `refusing()` released the port it named, so another listener
+  on the host (another test, another copy) took it and answered connects
+  meant to be refused, and other copies' engines reached this one's
+  listeners; the open-rate test assumed ten connects land within one
+  second of burst and settled on the `active` gauge, which counts a
+  connection being refused as admitted; wall-clock upper bounds on the
+  idle, total, header and bandwidth timers measured the host; the
+  bandwidth clocks started after the connect, so they read short. Fixed
+  in the tests, separate commit: the port held bound and never
+  listening, the open-rate bound read from the clock and settled on the
+  backend's accepts, lower bounds only in the integration tests and
+  three paused-clock forwarder tests for the windows, `WAIT` 60 s. Under
+  the same 32-on-one-core contention: 0 failures in 800 runs.
+- Not fixed, outside this Lot: the same contention at the moderate level
+  (16 copies on two cores) fails `tests/runtime.rs`
+  `one_receive_buffer_serves_a_64_port_range` in 49 of 80 runs (63 to
+  66 datagrams where 64 are expected, so foreign datagrams arrive, the
+  signature of the released-port pattern) and `tests/udp_engine.rs` in
+  4 of 80 runs (late replies, a session counted twice);
+  `tls_engine.rs` 0 of 80. Gate runs share the host's loopback with
+  other agents' test binaries, so these can fail a gate the same way.
 
 - **Lot B.** Settings: `stream_access_log_retention` (default
   `GlobalSettings::DEFAULT_STREAM_ACCESS_LOG_RETENTION`, 100,000, `0`
@@ -1266,6 +1289,8 @@ edited here.
 - `lorica-stream/tests/tcp_engine.rs`, `udp_engine.rs`, `tls_engine.rs`
   (Lot A)
 - `lorica-api/src/stream_metrics.rs` (Lot A, `lorica_stream_backend_bytes_total`)
+- `lorica-stream/tests/tcp_engine.rs`, `lorica-stream/src/tcp/forward.rs`
+  (the load-proof tests)
 
 ## Change Log
 
@@ -1278,3 +1303,4 @@ edited here.
 | 2026-11-16 | 0.5 | Route SLA minute loss proven and fixed (`SlaCollector` keeps a finished minute until flushed). D-g amended: a UDP session that expects no response is judged at its end, a success unless an ICMP error ended it. | Romain G. |
 | 2026-11-16 | 0.6 | Lot C2: `AggregatedGauge` and `GaugeAggregation` in `lorica-metrics`, `PER_WORKER_GAUGES` and `lorica_log_sink_up{sink}` with `Min`; `StreamMetricsCollector` rendering the D-e families from `CountersSnapshot` with monotone retired totals, node gauges and table pruning. The per-link bytes family waits for Lot A. | Romain G. |
 | 2026-11-16 | 0.7 | Lot A: `protocol` and `detected_protocol` on the record, `client_certificate` null on a stream that does not verify, `connect_outcome` and `ConnectOutcome`, `StreamLogKey` widening the limiter key with pre-forwarding ends passed through it, per-backend bytes and `lorica_stream_backend_bytes_total`. | Romain G. |
+| 2026-11-16 | 0.8 | The `tcp_engine` timeouts traced to the tests (a released port answered by strangers, a burst assumed to fit one second, wall-clock upper bounds); fixed in the tests, 0 failures in 800 contended runs. | Romain G. |
