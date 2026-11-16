@@ -676,16 +676,16 @@ Allowlist: `lorica-api/src/stream_logs.rs` (new), `lorica-api/src/log_store.rs`,
 Allowlist: `lorica-api/src/metrics.rs`, `lorica-api/src/stream_metrics.rs`
 (new), `lorica-metrics/src/*.rs`.
 
-- [ ] `PER_WORKER_GAUGES`, `GaugeAggregation`, supervisor-side per-worker
+- [x] `PER_WORKER_GAUGES`, `GaugeAggregation`, supervisor-side per-worker
       gauge state and recompute on report and forget (D-f).
-- [ ] `lorica_log_sink_up{sink}` with `Min`, and
+- [x] `lorica_log_sink_up{sink}` with `Min`, and
       `set_log_sink_up(sink: &str, up: bool)`, called by C1's syslog
       consumer and F's OTLP wrapper. `metrics.rs` is this Lot's file
       alone.
-- [ ] `StreamMetricsCollector` with every family of D-e, built from the
+- [x] `StreamMetricsCollector` with every family of D-e, built from the
       enums; monotone `retired` folding; pruning on table change; the
       single-process path.
-- [ ] Tests: min across workers with one down; a dead worker's last value
+- [x] Tests: min across workers with one down; a dead worker's last value
       stands for `Min` and leaves for `Sum`; a worker restart does not
       make a counter go down; histogram buckets sum; a removed stream's
       series disappear; no family has a label outside the allowed set
@@ -1005,6 +1005,24 @@ edited here.
   CI chain (`cargo fmt --check`, workspace clippy with `lorica/otel`,
   the three `cargo test` lines and the TLS-featured one) green, and
   `cargo audit` clean. `lorica-bench`: 69 tests, 9 of them Lot D's.
+- Lot C2, 2026-11-16, on `eb607591`: `lorica-api` already depends on
+  `lorica-stream`, so the collector takes `CountersSnapshot` itself and
+  the report's typed field (Lot E) only has to round-trip that type.
+  No `Backend` or `StreamMatchRule` constructor exists; the collector
+  tests build both from their serialised form with the required fields
+  only, so a new defaulted field does not touch them.
+- The existing counter delta machinery swallows a restarted worker's
+  values until they climb past the old high-water mark unless `forget`
+  ran first; the stream collector does not share that gap, since a drop
+  of any series folds the old value into `retired`
+  (`a_worker_restart_or_death_never_makes_a_counter_go_down`).
+- Lot C2 gates, `rust:1-bookworm` with `CARGO_BUILD_WARNINGS=deny`, on
+  each committed tree (the gauges alone, then the collector): the CI
+  chain green and `cargo audit` clean. Whole Lot: 3,611 product, 948
+  `lorica`, 910 forked and 592 TLS-featured tests. One run of the first
+  tree failed three `lorica-stream` `tcp_engine` tests on a timeout
+  (`Elapsed`), a crate this Lot does not touch; they passed twice in
+  isolation and in the full rerun.
 
 ### Completion Notes
 
@@ -1088,6 +1106,53 @@ edited here.
   judged something read 0 %. Its sessions are now judged at their end,
   a success unless an ICMP error ended them
   (`udp_without_expected_responses_is_a_success_at_its_end_unless_icmp_failed_it`).
+- **Lot C2, gauges.** `lorica_metrics::AggregatedGauge` with
+  `GaugeAggregation` (`Min`, `Max`, `Sum`): each process sets its own
+  value (`set_local` / `clear_local`), a worker ships it with
+  `snapshot_local` (zeros included) in the generic list, the supervisor
+  records each report as the worker's whole state for that gauge
+  (`apply_worker`) and renders the aggregate of its own value and every
+  worker's. `forget_worker` drops a `Sum` worker's share at once; a
+  `Min`/`Max` worker's last value stands until its replacement reports
+  (`GaugeAggregation::outlives_its_worker`).
+- **Deviation:** `PER_WORKER_GAUGES` is `&[&Lazy<AggregatedGauge>]`, not
+  `&[(&str, GaugeAggregation)]`: the aggregation lives on the gauge, so
+  no resolver keyed by name has to stay in step with the list.
+  `apply_worker_generic_counters` and `forget_worker_generic_counters`
+  drive every listed gauge, so the supervisor side needs no new call.
+- **`lorica_log_sink_up{sink}`**, `Min`: `set_log_sink_up(sink, up)`
+  and, beside it, `clear_log_sink_up(sink)` for a process whose
+  configuration no longer sets the sink up (a reload). What Lot F adds
+  to the worker report: `.chain(lorica_api::metrics::snapshot_per_worker_gauges())`
+  beside `snapshot_per_worker_counters()`.
+- **Lot C2, streams.** `lorica_api::stream_metrics::StreamMetricsCollector`,
+  registered on the process registry by `stream_metrics()`. The family
+  list is `StreamFamily::VARIANTS` (name, type, labels, help per
+  variant); label words come from the keys of the snapshot maps, so from
+  the enums. `CandidateSkip` and `Direction` are new enums for the two
+  label sets that had no enum. The rule label is the rule's 0-based
+  position in `match_rules`, read from the last table.
+- **The report shape for Lot E** is `lorica_stream::CountersSnapshot`,
+  unchanged: streams, links, backends and rules, every
+  `StreamCountersSnapshot`, `LinkCountersSnapshot` (histogram included:
+  cumulative `le` per bound of `CONNECT_LATENCY_BUCKETS_S`, `count`,
+  `sum`), `BackendCountersSnapshot` and `RuleCountersSnapshot` field,
+  keyed maps by their enum word. The supervisor decodes it back and calls
+  `stream_metrics().apply_worker(worker_id, &snapshot)`.
+- **What Lot F calls.** Supervisor: `apply_worker` per report;
+  `retain(&table)` on every table change (it also feeds
+  `lorica_stream_info`); `set_bind_states(states)` once;
+  `set_node_gauges` with `NodeStreamGauges::udp(sessions, pending)` or
+  `::tcp(pending)` per stream from the regions; `counter_total(StreamFamily::CeilingReached, &[id])`
+  for the ceiling alert. A dead worker is already forgotten by
+  `forget_worker_generic_counters`. Single process:
+  `set_local_counters(counters)` and `retain(&table)`.
+- **Not rendered:** `lorica_stream_backend_bytes_total`. `LinkStats` has
+  no bytes until Lot A adds them; Lot A's change to `LinkCountersSnapshot`
+  will not compile here until the family is added, which is the intent
+  of the whole-struct destructuring.
+- **Outside the allowlist:** `lorica-api/src/lib.rs`, one line
+  (`pub mod stream_metrics;`), which the new module needs.
 
 ## File List
 
@@ -1113,6 +1178,10 @@ edited here.
   `tests.rs` (the route minute fix)
 - `CHANGELOG.md` (the route minute fix, `[Unreleased]` Fixed)
 - `lorica-bench/src/metrics.rs` (`lorica_stream_sla_breach_total`)
+- `lorica-metrics/src/lib.rs` (Lot C2, `AggregatedGauge`)
+- `lorica-api/src/metrics.rs` (Lot C2, `PER_WORKER_GAUGES`, `lorica_log_sink_up`)
+- `lorica-api/src/stream_metrics.rs` (new, Lot C2)
+- `lorica-api/src/lib.rs` (Lot C2, the module line)
 
 ## Change Log
 
@@ -1123,3 +1192,4 @@ edited here.
 | 2026-11-16 | 0.3 | Lot B: the three settings, the stream SLA model and storage (migration 79, with `connected_count`), stream SLA targets replicated with their stream (Resolved 8), `stream_backend_down` and `stream_udp_ceiling_reached` with migration 80. Status InProgress. | Romain G. |
 | 2026-11-16 | 0.4 | Lot D: `StreamSlaCollector` and `StreamSlaOutcome` in `lorica-bench`, minutes kept until flushed, the D-g judging rules, breach and recovery on `sla_breached` / `sla_recovered` with stream details. | Romain G. |
 | 2026-11-16 | 0.5 | Route SLA minute loss proven and fixed (`SlaCollector` keeps a finished minute until flushed). D-g amended: a UDP session that expects no response is judged at its end, a success unless an ICMP error ended it. | Romain G. |
+| 2026-11-16 | 0.6 | Lot C2: `AggregatedGauge` and `GaugeAggregation` in `lorica-metrics`, `PER_WORKER_GAUGES` and `lorica_log_sink_up{sink}` with `Min`; `StreamMetricsCollector` rendering the D-e families from `CountersSnapshot` with monotone retired totals, node gauges and table pruning. The per-link bytes family waits for Lot A. | Romain G. |

@@ -1619,7 +1619,9 @@ pub fn apply_worker_generic_counters(worker_id: u32, entries: &[GenericCounterTu
 /// never happened, then the outage again.
 ///
 /// Each [`PER_WORKER_GAUGES`] entry forgets the worker by its own
-/// aggregation ([`lorica_metrics::GaugeAggregation::outlives_its_worker`]).
+/// aggregation ([`lorica_metrics::GaugeAggregation::outlives_its_worker`]),
+/// and the stream collector folds the worker's stream counters into its
+/// retired totals, so they stay monotone across the respawn.
 pub fn forget_worker_generic_counters(worker_id: u32) {
     lorica_metrics::forget_worker_generic_counters(worker_id);
     if WORKER_LOG_STORE_UP.lock().contains_key(&worker_id) {
@@ -1628,6 +1630,7 @@ pub fn forget_worker_generic_counters(worker_id: u32) {
     for gauge in PER_WORKER_GAUGES {
         gauge.forget_worker(worker_id);
     }
+    crate::stream_metrics::stream_metrics().forget_worker(worker_id);
 }
 
 /// The gauges whose per-process values reach the supervisor and are
