@@ -15,6 +15,8 @@ Author: Rwx-G
 
 ### Fixed
 
+- **WebSocket tunnels now follow the route's Read and Send timeouts instead of being cut at 60 seconds.** An upgraded HTTP/1.1 connection (`101 Switching Protocols`) keeps reading and writing the client side through the downstream request-body channel. The route's `read_timeout_s` and `send_timeout_s` were applied to the upstream peer only, while the downstream session's read timeout was fixed at 60 s and its write timeout had no bound at all. An idle WebSocket was therefore disconnected with `Downstream ReadTimedout ... reading body, timeout: 60s` even with both route timeouts set to 3600, and a client that stopped reading could hold a write on the tunnel open indefinitely. The product layer's `ProxyHttp::upstream_response_filter` now applies the matched route's `read_timeout_s` and `send_timeout_s` to the downstream session when the upstream accepts the upgrade. Only upgraded requests are affected: ordinary request bodies keep the 60 s read bound that backs slow-body protection, and a 101 connection is never reused, so nothing has to be restored afterwards.
+
 ### Removed
 
 ### Security

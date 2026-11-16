@@ -103,7 +103,8 @@ Each worker runs an independent proxy engine. SO_REUSEPORT is enabled automatica
 | `cache_ttl_s` | 300 | Cache lifetime in seconds. |
 | `compression_enabled` | false | Gzip response compression. Saves bandwidth at CPU cost. |
 | `connect_timeout_s` | 5 | Backend connection timeout. Lower values fail-fast on dead backends. |
-| `read_timeout_s` | 60 | Backend response timeout. Also the total time a request body held for Blocking-mode WAF inspection may take to arrive (408 past it): the same time a streamed body has, since the backend answers only once the body is complete. |
+| `read_timeout_s` | 60 | Backend response timeout. Also the total time a request body held for Blocking-mode WAF inspection may take to arrive (408 past it): the same time a streamed body has, since the backend answers only once the body is complete. On a route with WebSocket support it also bounds the upgraded (`101`) tunnel in both directions: the client side of an upgraded connection is read and written through the downstream request-body channel, whose read timeout used to be fixed at 60 s regardless of this setting and whose write timeout had no bound. An upgrade accepted by the backend now uses this value for reads from the client and `send_timeout_s` for writes back to it. |
+| `send_timeout_s` | 60 | Max time between two consecutive bytes written to the backend; bounds uploads and other long request bodies. On an upgraded (`101`) WebSocket route it also bounds writes back to the client, where the downstream write timeout used to be unset. |
 
 ### Per-Backend Settings
 
