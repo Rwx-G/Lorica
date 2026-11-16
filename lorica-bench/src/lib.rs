@@ -10,4 +10,4 @@ pub mod scheduler;
 
 pub use active_probes::ProbeScheduler;
 pub use load_test::LoadTestEngine;
-pub use passive_sla::SlaCollector;
+pub use passive_sla::{SlaCollector, StreamSlaCollector, StreamSlaOutcome};

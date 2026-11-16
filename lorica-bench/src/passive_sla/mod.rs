@@ -20,14 +20,18 @@
 //! - [`bucket`]: the in-memory `RouteBucket` aggregator (internal).
 //! - [`collector`]: the public `SlaCollector` struct and its hot-path API.
 //! - [`persistence`]: DB flushing and threshold alert dispatch.
+//! - [`stream`]: the stream SLA collector, the same machinery for TCP
+//!   and UDP streams (Story 12.9).
 
 mod bucket;
 mod collector;
 mod helpers;
 mod persistence;
+mod stream;
 
 #[cfg(test)]
 mod tests;
 
 pub use collector::SlaCollector;
 pub use helpers::compute_percentiles;
+pub use stream::{StreamSlaCollector, StreamSlaOutcome};

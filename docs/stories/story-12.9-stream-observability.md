@@ -685,9 +685,9 @@ Allowlist: `lorica-api/src/metrics.rs`, `lorica-api/src/stream_metrics.rs`
 Allowlist: `lorica-bench/src/passive_sla/stream.rs` (new),
 `lorica-bench/src/passive_sla/mod.rs`, `lorica-bench/src/lib.rs`.
 
-- [ ] `StreamSlaCollector` (record, flush, breach evaluation with
+- [x] `StreamSlaCollector` (record, flush, breach evaluation with
       `sla_breached` / `sla_recovered` carrying stream details) (D-g).
-- [ ] Tests: judged, success, failure and latency-bound counting for TCP;
+- [x] Tests: judged, success, failure and latency-bound counting for TCP;
       UDP with and without expected responses; breach edge once; two
       collectors flushing into one bucket sum.
 
@@ -974,6 +974,19 @@ edited here.
   the three `cargo test` lines and the TLS-featured one) green, and
   `cargo audit` clean. Whole Lot: 3,552 product, 948 `lorica`, 910
   forked and 592 TLS-featured tests.
+- Lot D, 2026-11-16, on `90ac7ba4`. Read, not run: the route
+  `SlaCollector::record` replaces a route's bucket when the minute
+  changes, before the 60 s flush task has taken it, so under steady
+  traffic most completed route minutes are dropped unflushed. The
+  stream collector does not copy that: it keys a minute by
+  `(stream_id, minute start)` and a minute stays until a flush takes it
+  (`the_current_minute_waits_and_a_past_one_survives_a_new_minute`). The
+  route collector is outside Lot D's allowlist and is left as it is;
+  handed to the maintainer.
+- Lot D gates, `rust:1-bookworm` with `CARGO_BUILD_WARNINGS=deny`: the
+  CI chain (`cargo fmt --check`, workspace clippy with `lorica/otel`,
+  the three `cargo test` lines and the TLS-featured one) green, and
+  `cargo audit` clean. `lorica-bench`: 69 tests, 9 of them Lot D's.
 
 ### Completion Notes
 
@@ -1014,6 +1027,40 @@ edited here.
   `lorica-notify`'s test), `adcs.generated.ts` (pinned by
   `adcs_vocabulary_fixture.rs`). Also `lorica-config/src/store/replica.rs`,
   which Resolved 8 needs.
+- **Lot D.** `lorica_bench::StreamSlaCollector`
+  (`lorica-bench/src/passive_sla/stream.rs`), one per process, and
+  `StreamSlaOutcome`, the collector's own vocabulary so `lorica-bench`
+  takes no dependency on `lorica-stream`. What Lot F calls:
+  `record(stream_id, outcome)` from the observer's `connect_outcome`
+  (in-memory map, brief lock, no store); `load_configs(store)` at start
+  and on reload; `set_sla_config` and `clear_stream` from the SLA API
+  (Lot C3); `start_flush_task(store, dispatcher)` with a dispatcher in
+  the supervisor and the single process, `None` in a worker. `flush`
+  and `check_thresholds` are public for a caller that drives them.
+- **Definitions as implemented.** `TcpConnected { connect_latency_ms }`
+  is judged, a success when `StreamSlaConfig::connect_within_bound`
+  holds (inclusive), and is a latency sample either way;
+  `TcpNotConnected` (`connect_failed`, `no_healthy_backend`) is a
+  failure with no sample. `UdpIcmpError` is a failure;
+  `UdpAnswered` a success and `UdpNoResponse` a failure, both only when
+  `responses_expected`, otherwise not judged. Lot F maps Lot A's
+  `ConnectOutcome` onto these and supplies `responses_expected` as the
+  UDP engine's `Bounds::expects_responses` does
+  (`responses_per_request >= 1` and responses not unbounded), which is
+  also when the engine reports a no-response failure. No latency on UDP:
+  the latency columns stay `None`.
+- **Breach evaluation** mirrors the route one: every stream with a
+  stored target, the last hour of `passive` buckets, an alert only on a
+  state edge, a stream that judged nothing keeps its state. Details:
+  `target = stream`, `stream_id`, `stream_name`, `sla_pct`,
+  `target_pct` (the summary's, the bucket snapshot), `judged_count` in
+  place of the route's `total_requests`. `lorica_sla_breach_total` is
+  not incremented for streams: its label is `route_id` and its file is
+  outside the Lot.
+- **Consequence of D-g to know** (not a deviation): a UDP stream that
+  owes no response is judged on ICMP failures only, so any window in
+  which it judged something reads 0 %, and one ICMP error in the hour
+  raises `sla_breached` once its target is stored.
 
 ## File List
 
@@ -1032,6 +1079,9 @@ edited here.
 - `lorica-api/src/vocabulary.rs`
 - `lorica-api/openapi.yaml` (the `alert_types` description line)
 - `lorica-dashboard/frontend/src/lib/adcs.generated.ts`
+- `lorica-bench/src/passive_sla/stream.rs` (new, Lot D)
+- `lorica-bench/src/passive_sla/mod.rs`
+- `lorica-bench/src/lib.rs`
 
 ## Change Log
 
@@ -1040,3 +1090,4 @@ edited here.
 | 2026-11-15 | 0.1 | Draft: row shape and its own table, refusal and pre-forwarding rows through the 12.6 limiter, the stream sink kind, the Prometheus families with a typed report and a monotone collector, per-worker gauge aggregation with `Min` for `lorica_log_sink_up`, stream SLA tables and definitions, `stream_backend_down` and `stream_udp_ceiling_reached`, fleet fan-in, Lots A to J. | Romain G. |
 | 2026-11-15 | 0.2 | Maintainer answers folded in as Resolved 1 to 7: fan-in kept, UDP SLA availability only, no DNS alert, no certificate subject (the HTTP access log records none, verified), stream rows on automation and MCP need `logs:read` and `streams:read`, access severity on syslog, the 12.6 amendment accepted and assigned to 12.6 Lot C (or this story's Lot A if C landed first). Status Draft. | Romain G. |
 | 2026-11-16 | 0.3 | Lot B: the three settings, the stream SLA model and storage (migration 79, with `connected_count`), stream SLA targets replicated with their stream (Resolved 8), `stream_backend_down` and `stream_udp_ceiling_reached` with migration 80. Status InProgress. | Romain G. |
+| 2026-11-16 | 0.4 | Lot D: `StreamSlaCollector` and `StreamSlaOutcome` in `lorica-bench`, minutes kept until flushed, the D-g judging rules, breach and recovery on `sla_breached` / `sla_recovered` with stream details. | Romain G. |
