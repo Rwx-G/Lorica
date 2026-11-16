@@ -207,6 +207,7 @@ const MIGRATIONS: &[Migration] = &[
     (77, migrate_stream_tls),
     (78, migrate_stream_protection),
     (79, migrate_stream_sla),
+    (80, migrate_subscribe_stream_observability_alerts),
 ];
 
 /// The newest schema version, the last entry of [`MIGRATIONS`].
@@ -1909,6 +1910,21 @@ fn migrate_stream_sla(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// The alert types Story 12.9 introduced, as migration 80 subscribes
+/// existing channels to them. Frozen for the reason given on
+/// `LOG_STORE_ALERT_TYPES`.
+const STREAM_OBSERVABILITY_ALERT_TYPES: [&str; 2] =
+    ["stream_backend_down", "stream_udp_ceiling_reached"];
+
+/// Subscribe every notification channel saved with an explicit
+/// alert-type list to the stream backend-down and UDP ceiling alerts,
+/// for the reason migration 63 gave: a channel saved before the types
+/// existed never had the box to tick, and a stream whose backend stopped
+/// answering would page nobody.
+fn migrate_subscribe_stream_observability_alerts(conn: &Connection) -> rusqlite::Result<()> {
+    subscribe_explicit_channels(conn, &STREAM_OBSERVABILITY_ALERT_TYPES)
+}
+
 /// A stored wildcard pattern whose body names an address (`*.0.2.10`),
 /// which the matchers no longer let cover one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3035,6 +3051,41 @@ mod migration_tests {
             );
             assert_eq!(stored("everything"), "[]");
             assert_eq!(stored("wildcard"), r#"["*"]"#);
+        }
+    }
+
+    /// Migration 80 subscribes an explicit channel to the Story 12.9
+    /// types once, after what it already holds.
+    #[test]
+    fn the_stream_observability_alert_subscription_is_idempotent() {
+        let store = ConfigStore::open_in_memory().expect("fresh store at head");
+        store
+            .conn
+            .execute_batch(
+                r#"
+                INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+                VALUES ('explicit', 'webhook', 1, '{"url":"https://hooks.example.com/a"}',
+                        '["stream_bind_failed"]');
+                "#,
+            )
+            .expect("test setup: channel");
+        for _ in 0..2 {
+            migrate_subscribe_stream_observability_alerts(&store.conn).expect("migration 80 runs");
+            let stored: String = store
+                .conn
+                .query_row(
+                    "SELECT alert_types FROM notification_configs WHERE id = 'explicit'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("test setup: alert_types reads");
+            let expected: Vec<&str> = std::iter::once("stream_bind_failed")
+                .chain(STREAM_OBSERVABILITY_ALERT_TYPES)
+                .collect();
+            assert_eq!(
+                serde_json::from_str::<Vec<String>>(&stored).expect("a JSON list"),
+                expected
+            );
         }
     }
 

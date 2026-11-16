@@ -1,7 +1,7 @@
 # Story 12.9: Stream Observability
 
 **Epic:** [Epic 12 - TCP and UDP Stream Proxying (v1.11.0 and v1.12.0)](../prd/epic-12-v1.11.0.md)
-**Status:** Draft
+**Status:** InProgress
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:**
@@ -623,16 +623,16 @@ Allowlist: `lorica-config/src/models/settings.rs`,
 `lorica-config/src/tests.rs`, `lorica-config/tests/config_db_upgrade.rs`,
 `lorica-notify/src/events.rs`, `lorica-notify/src/channels/*.rs`.
 
-- [ ] `stream_access_log_retention` (replicated, canonical),
+- [x] `stream_access_log_retention` (replicated, canonical),
       `syslog_stream_enabled`, `otlp_logs_stream_enabled` (node-local),
       defaults, KV load and save (D-b, D-d).
-- [ ] `StreamSlaConfig`, `StreamSlaBucket`, `StreamSlaSummary`; store
+- [x] `StreamSlaConfig`, `StreamSlaBucket`, `StreamSlaSummary`; store
       functions mirroring the route ones; migration for the two tables
       (D-g).
-- [ ] `StreamBackendDown`, `StreamUdpCeilingReached` in `AlertType` and
+- [x] `StreamBackendDown`, `StreamUdpCeilingReached` in `AlertType` and
       every match on it in `lorica-notify`; the subscription migration
       (D-h).
-- [ ] Tests: settings round-trip and canonical classification; migrations
+- [x] Tests: settings round-trip and canonical classification; migrations
       idempotent; a 1.10.6-shaped open of the migrated DB; bucket upsert
       sums two writers; config cascade on stream delete; alert type
       round-trip through `ALL`.
@@ -945,14 +945,93 @@ edited here.
 7. **The 12.6 conflict resolution is accepted** (D-c): refusal rows come
    from the limiter, with suppressed rows; Dev Notes record the
    amendment to 12.6 and the Lot that carries it.
+8. **Stream SLA targets are replicated to followers** (raised by Lot B,
+   2026-11-16), as route SLA targets are: a stream is a full citizen.
+   `CanonicalConfig.stream_sla_configs` (serde default, format stays 3,
+   shape digest moved) is cut per recipient with its stream, and the
+   replica apply writes the targets of the streams the follower keeps.
 
 ## Dev Agent Record
 
 ### Debug Log
 
+- Lot B, 2026-11-15/16, on `875b3d80`: paused once on 2026-11-15 with
+  the settings fields written, resumed the next day. The open question
+  it raised (stream SLA targets were not replicated, route ones are)
+  was answered by the maintainer as Resolved 8.
+- SQLite's scalar `MIN(a, b)` and `MAX(a, b)` answer NULL when either
+  argument is NULL, so the stream bucket merge wraps each in
+  `COALESCE(MIN(a, b), a, b)`; a sum is `COALESCE(a + b, a, b)`. A slice
+  where nothing connected therefore leaves the other slice's latencies
+  as they were (`stream_sla_slices_of_one_minute_add_up`).
+- `apply_replica_streams` deletes every local stream, which cascades
+  every local stream SLA target away; the target pass after it only
+  inserts the blob's targets for the kept streams, with the blob's
+  timestamps, so a follower re-encodes the control plane's bytes.
+- Lot B gates, `rust:1-bookworm` with `CARGO_BUILD_WARNINGS=deny`, on
+  each committed tree (the config half alone, then the whole Lot): the
+  CI chain (`cargo fmt --check`, workspace clippy with `lorica/otel`,
+  the three `cargo test` lines and the TLS-featured one) green, and
+  `cargo audit` clean. Whole Lot: 3,552 product, 948 `lorica`, 910
+  forked and 592 TLS-featured tests.
+
 ### Completion Notes
 
+- **Lot B.** Settings: `stream_access_log_retention` (default
+  `GlobalSettings::DEFAULT_STREAM_ACCESS_LOG_RETENTION`, 100,000, `0`
+  unlimited) replicated through `CanonicalGlobalSettings` with a serde
+  default to the shipped value; `syslog_stream_enabled` and
+  `otlp_logs_stream_enabled` (default `true`) node-local. All three are
+  key/value rows, no migration; a stored retention that is not a number
+  reads as `Corrupt`. No API validation or OpenAPI field yet: Lot C1.
+- **Stream SLA storage.** Migration 79 creates `stream_sla_configs`
+  (cascades from `streams`) and `stream_sla_buckets` (no foreign key,
+  unique on `(stream_id, bucket_start, source)`). Store functions mirror
+  the route ones: `get_`/`upsert_`/`list_stream_sla_config(s)`,
+  `merge_stream_sla_bucket` (additive), `query_stream_sla_buckets`,
+  `compute_stream_sla_summary`, `delete_stream_sla_buckets`,
+  `export_stream_sla_data`. `prune_sla_buckets` now prunes both bucket
+  tables, so the `sla_purge_*` settings cover stream history with no
+  caller change. Constructors for Lot D: `StreamSlaConfig::default_for_stream`,
+  `StreamSlaBucket::empty`, `StreamSlaConfig::connect_within_bound`.
+- **Deviation, accepted by the maintainer:** `stream_sla_buckets` carries
+  `connected_count`, beside the D-g columns. A judged connection that
+  failed to connect has no connect latency, so the mean divides by what
+  connected, not by what was judged; the latency columns are NULL where
+  nothing connected (every UDP bucket).
+- **Replication (Resolved 8).** `CanonicalConfig.stream_sla_configs`
+  (serde default), cut with its stream in `restrict_for_recipient`,
+  applied for the kept streams (`ReplicaOutcome.stream_sla_configs`).
+  `CANONICAL_SHAPE_DIGEST` moved, `CANONICAL_FORMAT_VERSION` stays 3.
+- **Alerts.** `AlertType::StreamBackendDown` (`stream_backend_down`) and
+  `StreamUdpCeilingReached` (`stream_udp_ceiling_reached`), last in
+  `ALL`; migration 80 subscribes every channel with an explicit list to
+  both. Labels "Stream backend down" and "UDP session ceiling reached",
+  tone problem, no recovery pair. Nothing raises them yet: Lot F.
+- **Outside the allowlist, approved as for 12.2 Lot E1:**
+  `lorica-api/src/vocabulary.rs` (exhaustive matches),
+  the `alert_types` line of `lorica-api/openapi.yaml` (read by
+  `lorica-notify`'s test), `adcs.generated.ts` (pinned by
+  `adcs_vocabulary_fixture.rs`). Also `lorica-config/src/store/replica.rs`,
+  which Resolved 8 needs.
+
 ## File List
+
+- `lorica-config/src/models/settings.rs`
+- `lorica-config/src/models/sla.rs`
+- `lorica-config/src/models/mod.rs`
+- `lorica-config/src/store/mod.rs` (migrations 79 and 80)
+- `lorica-config/src/store/settings.rs`
+- `lorica-config/src/store/sla.rs`
+- `lorica-config/src/store/replica.rs`
+- `lorica-config/src/canonical.rs`
+- `lorica-config/src/tests.rs`
+- `lorica-config/tests/config_db_upgrade.rs`
+- `lorica-notify/src/events.rs`
+- `lorica-notify/src/channels/slack.rs`
+- `lorica-api/src/vocabulary.rs`
+- `lorica-api/openapi.yaml` (the `alert_types` description line)
+- `lorica-dashboard/frontend/src/lib/adcs.generated.ts`
 
 ## Change Log
 
@@ -960,3 +1039,4 @@ edited here.
 |---|---|---|---|
 | 2026-11-15 | 0.1 | Draft: row shape and its own table, refusal and pre-forwarding rows through the 12.6 limiter, the stream sink kind, the Prometheus families with a typed report and a monotone collector, per-worker gauge aggregation with `Min` for `lorica_log_sink_up`, stream SLA tables and definitions, `stream_backend_down` and `stream_udp_ceiling_reached`, fleet fan-in, Lots A to J. | Romain G. |
 | 2026-11-15 | 0.2 | Maintainer answers folded in as Resolved 1 to 7: fan-in kept, UDP SLA availability only, no DNS alert, no certificate subject (the HTTP access log records none, verified), stream rows on automation and MCP need `logs:read` and `streams:read`, access severity on syslog, the 12.6 amendment accepted and assigned to 12.6 Lot C (or this story's Lot A if C landed first). Status Draft. | Romain G. |
+| 2026-11-16 | 0.3 | Lot B: the three settings, the stream SLA model and storage (migration 79, with `connected_count`), stream SLA targets replicated with their stream (Resolved 8), `stream_backend_down` and `stream_udp_ceiling_reached` with migration 80. Status InProgress. | Romain G. |

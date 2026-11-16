@@ -44,6 +44,8 @@ pub async fn send(config: &WebhookConfig, event: &AlertEvent) -> Result<(), Noti
         crate::events::AlertType::AdcsAuthorityFailed => ":key:",
         crate::events::AlertType::CertIssuanceFailed => ":warning:",
         crate::events::AlertType::StreamBindFailed => ":electric_plug:",
+        crate::events::AlertType::StreamBackendDown => ":red_circle:",
+        crate::events::AlertType::StreamUdpCeilingReached => ":no_entry:",
     };
 
     let mut text = format!(

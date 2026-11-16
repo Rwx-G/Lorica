@@ -245,7 +245,9 @@ fn an_upgrade_subscribes_explicit_channels_to_the_log_store_alerts() {
             "log_store_recovered",
             "adcs_authority_failed",
             "cert_issuance_failed",
-            "stream_bind_failed"
+            "stream_bind_failed",
+            "stream_backend_down",
+            "stream_udp_ceiling_reached"
         ]
     );
     assert!(alert_types_of(&store, "everything").is_empty());
@@ -257,7 +259,9 @@ fn an_upgrade_subscribes_explicit_channels_to_the_log_store_alerts() {
             "log_store_unavailable",
             "adcs_authority_failed",
             "cert_issuance_failed",
-            "stream_bind_failed"
+            "stream_bind_failed",
+            "stream_backend_down",
+            "stream_udp_ceiling_reached"
         ],
         "a type already ticked is not added twice"
     );
@@ -311,7 +315,9 @@ fn an_upgrade_subscribes_explicit_channels_to_the_adcs_alerts() {
             "log_store_unavailable",
             "adcs_authority_failed",
             "cert_issuance_failed",
-            "stream_bind_failed"
+            "stream_bind_failed",
+            "stream_backend_down",
+            "stream_udp_ceiling_reached"
         ]
     );
     assert!(alert_types_of(&store, "everything").is_empty());
@@ -321,7 +327,9 @@ fn an_upgrade_subscribes_explicit_channels_to_the_adcs_alerts() {
         [
             "cert_issuance_failed",
             "adcs_authority_failed",
-            "stream_bind_failed"
+            "stream_bind_failed",
+            "stream_backend_down",
+            "stream_udp_ceiling_reached"
         ],
         "a type already ticked is not added twice"
     );
@@ -369,15 +377,89 @@ fn an_upgrade_subscribes_explicit_channels_to_the_stream_alert() {
     let store = ConfigStore::open(&path, None).expect("a version 73 lorica.db must open");
     assert_eq!(
         alert_types_of(&store, "explicit"),
-        ["backend_down", "stream_bind_failed"]
+        [
+            "backend_down",
+            "stream_bind_failed",
+            "stream_backend_down",
+            "stream_udp_ceiling_reached"
+        ]
     );
     assert!(alert_types_of(&store, "everything").is_empty());
     assert_eq!(alert_types_of(&store, "wildcard"), ["*"]);
     assert_eq!(
         alert_types_of(&store, "partial"),
-        ["stream_bind_failed"],
+        [
+            "stream_bind_failed",
+            "stream_backend_down",
+            "stream_udp_ceiling_reached"
+        ],
         "a type already ticked is not added twice"
     );
+
+    let mut explicit = store
+        .get_notification_config("explicit")
+        .expect("channel reads")
+        .expect("channel kept");
+    explicit.alert_types = vec!["backend_down".to_string()];
+    store
+        .update_notification_config(&explicit)
+        .expect("operator edit");
+    drop(store);
+    let reopened = ConfigStore::open(&path, None).expect("an upgraded file reopens");
+    assert_eq!(alert_types_of(&reopened, "explicit"), ["backend_down"]);
+}
+
+/// Migration 80 does for the stream backend-down and UDP ceiling alerts
+/// (Story 12.9) what migration 74 did for the bind failure. The file is
+/// rewound to version 78, before both of Story 12.9's migrations, with
+/// the SLA tables gone as such a node holds it.
+#[test]
+fn an_upgrade_from_version_78_adds_the_stream_sla_tables_and_subscribes_explicit_channels() {
+    let dir = tempfile::tempdir().expect("test setup: tempdir");
+    let path = dir.path().join("lorica.db");
+    drop(ConfigStore::open(&path, None).expect("test setup: fresh store"));
+    Connection::open(&path)
+        .expect("test setup: raw open")
+        .execute_batch(
+            r#"
+            DELETE FROM schema_migrations WHERE version >= 79;
+            DROP TABLE stream_sla_configs;
+            DROP TABLE stream_sla_buckets;
+            INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+            VALUES ('explicit', 'webhook', 1, '{"url":"https://hooks.example.com/a"}',
+                    '["backend_down","stream_bind_failed"]');
+            INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+            VALUES ('everything', 'webhook', 1, '{"url":"https://hooks.example.com/b"}', '[]');
+            INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+            VALUES ('wildcard', 'slack', 1, '{"url":"https://hooks.example.com/c"}', '["*"]');
+            INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+            VALUES ('partial', 'webhook', 0, '{"url":"https://hooks.example.com/d"}',
+                    '["stream_udp_ceiling_reached"]');
+            "#,
+        )
+        .expect("test setup: a node at version 78");
+
+    let store = ConfigStore::open(&path, None).expect("a version 78 lorica.db must open");
+    assert_eq!(
+        alert_types_of(&store, "explicit"),
+        [
+            "backend_down",
+            "stream_bind_failed",
+            "stream_backend_down",
+            "stream_udp_ceiling_reached"
+        ]
+    );
+    assert!(alert_types_of(&store, "everything").is_empty());
+    assert_eq!(alert_types_of(&store, "wildcard"), ["*"]);
+    assert_eq!(
+        alert_types_of(&store, "partial"),
+        ["stream_udp_ceiling_reached", "stream_backend_down"],
+        "a type already ticked is not added twice"
+    );
+    assert!(store
+        .list_stream_sla_configs()
+        .expect("the stream SLA targets read")
+        .is_empty());
 
     let mut explicit = store
         .get_notification_config("explicit")

@@ -65,6 +65,22 @@ pub enum AlertType {
     /// state, never on each retry while it lasts. The event carries the
     /// stream id and name, the node, the failure kind and the OS error.
     StreamBindFailed,
+    /// A stream backend's circuit breaker opened (Story 12.9, D-h): the
+    /// passive down signal, the only one a UDP backend has, and the one
+    /// that catches a TCP backend whose port answers but whose connects
+    /// fail. Raised by the supervisor, or the single process, once per
+    /// incident (a re-trip before the circuit closes is the same one)
+    /// and at most once per stream and backend per hold period. The
+    /// event carries the stream id and name, the backend id, name and
+    /// address, the node and the breaker threshold.
+    StreamBackendDown,
+    /// A UDP stream reached its per-node session ceiling (Story 12.9,
+    /// D-h), so new sessions are refused. Raised once per node per
+    /// incident, re-armed when the node's session total falls back below
+    /// the re-arm fraction of the ceiling. The event carries the stream
+    /// id and name, the node, `max_sessions` and the limit that bound the
+    /// ceiling.
+    StreamUdpCeilingReached,
 }
 
 impl AlertType {
@@ -90,12 +106,14 @@ impl AlertType {
             Self::AdcsAuthorityFailed => "adcs_authority_failed",
             Self::CertIssuanceFailed => "cert_issuance_failed",
             Self::StreamBindFailed => "stream_bind_failed",
+            Self::StreamBackendDown => "stream_backend_down",
+            Self::StreamUdpCeilingReached => "stream_udp_ceiling_reached",
         }
     }
 
     /// Every alert type, in declaration order: the vocabulary a
     /// notification channel can subscribe to.
-    pub const ALL: [AlertType; 15] = [
+    pub const ALL: [AlertType; 17] = [
         Self::CertExpiring,
         Self::BackendDown,
         Self::WafAlert,
@@ -111,6 +129,8 @@ impl AlertType {
         Self::AdcsAuthorityFailed,
         Self::CertIssuanceFailed,
         Self::StreamBindFailed,
+        Self::StreamBackendDown,
+        Self::StreamUdpCeilingReached,
     ];
 }
 
@@ -133,6 +153,8 @@ impl std::str::FromStr for AlertType {
             "adcs_authority_failed" => Ok(Self::AdcsAuthorityFailed),
             "cert_issuance_failed" => Ok(Self::CertIssuanceFailed),
             "stream_bind_failed" => Ok(Self::StreamBindFailed),
+            "stream_backend_down" => Ok(Self::StreamBackendDown),
+            "stream_udp_ceiling_reached" => Ok(Self::StreamUdpCeilingReached),
             other => Err(format!("unknown alert type: {other}")),
         }
     }
@@ -194,6 +216,8 @@ mod tests {
             AlertType::AdcsAuthorityFailed => 12,
             AlertType::CertIssuanceFailed => 13,
             AlertType::StreamBindFailed => 14,
+            AlertType::StreamBackendDown => 15,
+            AlertType::StreamUdpCeilingReached => 16,
         }
     }
 
