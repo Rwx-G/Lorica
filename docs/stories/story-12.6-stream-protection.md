@@ -611,22 +611,22 @@ engines), `lorica-stream/src/tcp/engine.rs`, `lorica-stream/src/tcp/cap.rs`
 (removing the `admit_session` wrapper only).
 Depends on: A, B; sequential with 12.4 Lot D.
 
-- [ ] `SourceGate` seam (D-d); test fake in the tests.
-- [ ] `admission.rs`: the D-a order, per-stream policies built in
+- [x] `SourceGate` seam (D-d); test fake in the tests.
+- [x] `admission.rs`: the D-a order, per-stream policies built in
       `table_changed`, the D-b split for trusted PROXY peers.
-- [ ] `NodeCapsRegions` creates TCP regions from `max_connections`
+- [x] `NodeCapsRegions` creates TCP regions from `max_connections`
       and passes the link count; `CapsRegistry` unchanged otherwise.
-- [ ] TCP: admit at D-b step 1, pending slot around phase 2, source
+- [x] TCP: admit at D-b step 1, pending slot around phase 2, source
       checks after an accepted header, backend claims, refused
       connections without a record (D-j).
-- [ ] UDP: steps 1 to 5 before `charge_rate`, open rates, `caps_unavailable`
+- [x] UDP: steps 1 to 5 before `charge_rate`, open rates, `caps_unavailable`
       counted, backend claims; then the `admit_session` wrapper is
       removed from `lorica-shmem/src/stream_caps.rs` (that removal is
       the only edit this Lot makes there; Lot A has landed before).
-- [ ] Generic `RefusalLogLimiter<K>` and its tests (12.8's, moved);
+- [x] Generic `RefusalLogLimiter<K>` and its tests (12.8's, moved);
       the stream rows and the suppressed task.
-- [ ] Counters: refusals, `pending`, `geoip_unknown`.
-- [ ] Tests: each refusal reason on both protocols where it applies;
+- [x] Counters: refusals, `pending`, `geoip_unknown`.
+- [x] Tests: each refusal reason on both protocols where it applies;
       trusted PROXY peer judged on the carried client; a source at its
       pending share refused while another is admitted; the pending
       total never past its cap under 2,000 concurrent silent
@@ -842,6 +842,21 @@ All eight recommendations of the draft accepted as written.
   runs; with the check, 0. In production a shard has one writer (its
   worker's single-threaded runtime), so the race needed test threads to
   show; the fix costs one load per join.
+- Lot C, the region of a TCP stream. The engines refuse
+  `caps_unavailable` without a region, and the binary created regions
+  for UDP streams only, so Lot C alone would have left every TCP stream
+  of a running node refusing every connection (the process tests
+  `stream_engine_process_test` and `stream_tls_process_test` with it).
+  The region part of Lot D (create, resize, retire and send a region for
+  every stream) is folded into Lot C for that reason.
+- Lot C, a paused clock and a wall-clock window. The refusal-log window
+  opens on `std::time::Instant`, a little after a paused tokio clock's
+  start, so a test sleeping exactly one window on the paused clock does
+  not reach the window's end; the test sleeps one second past it.
+- Lot C was paused once (2026-11-15) between its second and third
+  commits and resumed the next day; the first gate run on the region
+  commit failed only `udp_stream_process_test`, which looked for the
+  release log line the commit had renamed (fixed in that commit).
 
 ### Completion Notes
 
@@ -958,6 +973,88 @@ of Lot F ship here, as the Order paragraph provides.
   `lorica/tests/stream_engine_adapters.rs`, without which the
   workspace does not compile.
 
+**Lot C (`lorica-stream`, admission in the engines).** Four commits on
+the branch (see the Change Log); the region part of Lot D folded in
+(Debug Log).
+
+- **Check order as implemented** (`lorica-stream/src/admission.rs`):
+  1 region present (`caps_unavailable`); 2-3 `SourceGate::global`
+  (`connection_filter`, then `ip_blocklist`); 4 stream deny then allow
+  CIDRs (`source_denied`); 5 stream GeoIP (`geoip`, unknown passes and
+  counts `geoip_unknown`, `country` asked only when the stream has a
+  list); 6 `charge_open` (stream rate, then source rate: `open_rate`,
+  `source_open_rate`, full window `connection_table_full`); 7
+  `admit_stream` (stream cap `connection_cap`, then the pending cap
+  `pending_cap`), then `admit_source` (`source_connection_cap`, then
+  the pending share `source_pending_cap`). Lot A's order inside the
+  split API stands: `pending_cap` is named before
+  `source_connection_cap` when both apply. UDP: steps 1 to 5, then
+  `charge_new_session` (stream and source open rates with the source's
+  datagram and byte rates in one charge; the two datagram rates stay
+  drops), then the session caps (`session_cap`, `source_session_cap`,
+  `session_table_full`).
+- **D-b.** A trusted PROXY peer is admitted with steps 1, the stream
+  open rate, the stream cap and the pending cap; once its header is
+  accepted, `admit_carried` runs steps 2 to 5, the source open rate,
+  the source cap and the pending share on the carried client, or on
+  the peer for a `LOCAL` / `UNKNOWN` header.
+- **Pending.** A connection is pending from accept when it has phase 2
+  work: a trusted PROXY header or a ClientHello. The slot (region and
+  this process's `pending` gauge) is given back when phase 3 starts,
+  after a terminating handshake, or when the connection ends, whatever
+  the exit (`Admitted` drops it). The connect phase is bounded by its
+  own timeout, not by the pending cap.
+- **`SourceGate`** (`seams.rs`): `global(client) ->
+  Option<StreamRefusal>` and `country(client) -> Option<[u8; 2]>`,
+  synchronous, on the canonical judged address. Lot D implements it in
+  `lorica/src/stream_engine.rs` over `GlobalConnectionFilter::snapshot`
+  (refusal `connection_filter`), `waf_engine.ip_blocklist()` with the
+  global WAF whitelist exemption (`ip_blocklist`) and the process's
+  `geoip_resolver`, and replaces `NodeControlsPending`, the pass-through
+  gate the binary hands both engines meanwhile (a stream applies its
+  own controls only until then).
+- **Refusals.** Every refusal is counted once, under its reason, where
+  it is decided (`caps_unavailable` on UDP included, which 12.5 dropped
+  uncounted). A connection or session ending `refused(_)` hands no
+  `ConnectionRecord`: that includes 12.4's own refusals (`no_match`,
+  `invalid_client_hello`, `no_certificate`, `tls_handshake`,
+  `client_certificate`), since `invalid_client_hello` is a refusal in
+  the code, not a separate end as D-j's text assumed; the TLS engine
+  tests read those as refusal rows now.
+- **Observer, per the Story 12.9 amendment.** `ConnectionObserver`
+  gains the defaulted `refused(RefusalRecord)` (stream id and name,
+  protocol, listen port, judged client, `proxied_from`, refusal,
+  instant) and `refusals_suppressed(SuppressedRecord)` (stream id and
+  name, protocol, refusal, count, `reported_at`). Their defaults do
+  nothing: the engine writes the former `warn` line at `debug` itself.
+  The limiter key is `(stream index, StreamRefusal)`, the index stable
+  per stream id while the table holds it; `RefusalKey` in
+  `admission.rs` is the one place Story 12.9 widens to `StreamLogKey`.
+- **Link caps.** Counted only on links with `max_active`; a backend at
+  its cap leaves the candidates before selection (backups then serve);
+  the claim before the first attempt is held to the end and given back
+  on a failed attempt; a lost race is neither an attempt nor a breaker
+  report; no candidate left with a cap among the reasons and no attempt
+  made refuses `backend_cap`. The plane sizes every region for no links
+  (`REGION_LINKS = 0`, the 32-cell floor per worker); passing the link
+  count is Lot D's.
+- **Removed:** `tcp::cap::ConnectionCaps` (`held_fds` stays, ceiling
+  `max_connections` per process); `WorkerCaps::admit_session`,
+  `CapRefusal`, `SessionPermit`.
+- **IV1 and IV3 at this level.** IV1:
+  `a_source_over_its_open_rate_is_refused_while_another_is_served`
+  (TCP, ten connects from one loopback address, the ones past the burst
+  refused at accept, another address served, one row then one
+  suppressed row) and its UDP twin. IV3:
+  `two_thousand_silent_connections_never_pass_the_pending_cap` (100
+  sources of 20 silent TLS connections: the region's pending total
+  never above 256, exactly 2,000 - 256 refused `pending_cap`) and
+  `a_source_at_its_pending_share_is_refused_while_another_is_admitted`.
+  The handshake of an outside client during the flood is Lot I's e2e.
+- **Not covered by an engine test:** `connection_table_full` (it needs a
+  probe window of the source shard filled, which the region tests of
+  Lot A cover for the same refusal path).
+
 ## File List
 
 Lot A:
@@ -986,6 +1083,27 @@ Lot B (and Lot F):
   `lorica-stream/tests/udp_engine.rs`, `lorica/tests/stream_engine_adapters.rs`
   (modified, `max_active: None` in link literals; outside the allowlist)
 
+Lot C (and the region part of Lot D):
+
+- `lorica-stream/src/admission.rs` (new)
+- `lorica-stream/src/refusal_log.rs` (new)
+- `lorica-stream/src/seams.rs`, `caps.rs`, `counters.rs`, `handler.rs`,
+  `lib.rs`, `tcp/engine.rs`, `tcp/connect.rs`, `tcp/cap.rs`,
+  `udp/engine.rs` (modified)
+- `lorica-stream/tests/tcp_engine.rs`, `lorica-stream/tests/udp_engine.rs`
+  (modified)
+- `lorica-shmem/src/stream_caps.rs`, `lorica-shmem/src/lib.rs` (modified,
+  the `admit_session` wrapper removed)
+- Outside the allowlist: `lorica-stream/src/table.rs` (`max_active` on
+  `LinkedBackend`), `listener.rs` (the caps registry into
+  `AcceptedConnection`), `runtime.rs` (doc line);
+  `lorica-stream/tests/{tls_engine, tcp_runtime, runtime}.rs`;
+  `lorica-shmem/tests/stream_caps.rs`; `lorica/src/startup/stream_plane.rs`
+  (regions for every stream, the region part of Lot D);
+  `lorica/src/stream_engine.rs` (the interim gate);
+  `lorica/tests/stream_engine_adapters.rs`, `lorica/tests/stream_tls_wiring.rs`,
+  `lorica/tests/udp_stream_process_test.rs` (modified)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -994,3 +1112,4 @@ Lot B (and Lot F):
 | 2026-11-15 | 0.2 | Maintainer answers folded in as Resolved 1 to 8: reasons and costs of new-connections-only filters and of no auto-ban on streams stated in D-a and D-d and made explicit in Lot H; the two `/1` halves accepted in D-c. Status Draft. | Romain G. |
 | 2026-11-15 | 0.3 | Lot A: stream-caps region layout version 2 (pending totals, stream and source open rates, 32-byte source cells, backend shards), the split admission API, the join ABA closed and tested. Status InProgress. | Romain G. |
 | 2026-11-15 | 0.4 | Lot B with Lot F folded in: the source controls on `Stream` and `max_active` on the link, their validation, `GeoIpConfig::normalised`, migration 78, canonical digest (format 3), diff and import; the two allowlist hook-ups. | Romain G. |
+| 2026-11-16 | 0.5 | Lot C: the admission sequence in both engines, the `SourceGate` seam, per-node `max_connections`, the pending cap and per-source share, open rates, link caps, refusal rows through the generic limiter with the Story 12.9 observer methods, `caps_unavailable` counted on UDP; regions for every stream in the plane (the region part of Lot D). | Romain G. |
