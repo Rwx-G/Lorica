@@ -41,8 +41,9 @@
 //!
 //! **Caps regions** (Story 12.5 D-d, every protocol since Story 12.6
 //! D-e): one [`NodeCapsRegions`] entry per stream on the node, sized from
-//! its [`admitted_cap`], created at its first bind, replaced when a size
-//! change moves its table sizes, retired once no binding of the stream is
+//! its [`admitted_cap`] and its [`capped_links`], created at its first
+//! bind, replaced when either moves its table sizes, retired once no
+//! binding of the stream is
 //! held or wanted. Its `caps` message goes to a worker ahead of every
 //! `attach` of the stream, and again to every worker when the region is
 //! replaced. A worker that dies has its connections and sessions
@@ -73,7 +74,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
 use lorica_config::listen_ports::ReservedPorts;
-use lorica_config::models::{GlobalSettings, NodeRole, Stream, StreamProtocol};
+use lorica_config::models::{GlobalSettings, NodeRole, Stream, StreamBackend, StreamProtocol};
 use lorica_config::ConfigStore;
 use lorica_stream::caps::admitted_cap;
 use lorica_stream::reconcile::desired_bindings;
@@ -640,13 +641,18 @@ fn release_worker_sessions(caps: &SharedCaps, worker: u32) -> u64 {
     released
 }
 
-/// The backend links a region is sized for. The plane reads streams, not
-/// their links, so every region takes the backend floor
-/// (`lorica_shmem::stream_caps::MIN_BACKEND_SLOTS` cells per worker,
-/// one per backend counted). The engines count a backend only on a link
-/// with `max_active`, so only a stream with more capped links than that
-/// can find a worker's backend shard full.
-const REGION_LINKS: u64 = 0;
+/// The backend links the region of `stream_id` is sized for: its links
+/// with a `max_active`, the only ones the engines count in the region's
+/// backend shards (Story 12.6 D-h). A link gaining or losing its cap
+/// past the region's floor replaces the region, as a size change does;
+/// uncapped links never move it.
+fn capped_links(links: &[StreamBackend], stream_id: &str) -> u64 {
+    let capped = links
+        .iter()
+        .filter(|link| link.stream_id == stream_id && link.max_active.is_some())
+        .count();
+    u64::try_from(capped).unwrap_or(u64::MAX)
+}
 
 /// The failure kind a node-side budget refusal is reported with.
 fn budget_failure_kind(violation: &BudgetViolation) -> BindFailureKind {
@@ -826,10 +832,12 @@ impl<L: WorkerLink> StreamPlane<L> {
 
     /// D-d step 3, after the workers commit: detach what step 1 could
     /// not see, bind and attach every desired binding not held yet, and
-    /// on a [`Trigger::Change`] refresh every worker.
+    /// on a [`Trigger::Change`] refresh every worker. `links` are the
+    /// stored stream-to-backend links, which size each caps region.
     pub(crate) async fn bind_desired(
         &mut self,
         streams: &[Stream],
+        links: &[StreamBackend],
         role: NodeRole<'_>,
         pass: PassSettings,
         trigger: Trigger,
@@ -850,7 +858,7 @@ impl<L: WorkerLink> StreamPlane<L> {
                 self.failures.remove(&id);
             }
         }
-        self.resize_caps(streams).await;
+        self.resize_caps(streams, links).await;
 
         let names: BTreeMap<&str, &str> = streams
             .iter()
@@ -881,7 +889,8 @@ impl<L: WorkerLink> StreamPlane<L> {
                 continue;
             }
             let name = names.get(key.stream_id.as_str()).copied().unwrap_or("");
-            self.bind_one(key, name, streams, pass, &mut events).await;
+            self.bind_one(key, name, streams, links, pass, &mut events)
+                .await;
         }
 
         // Inherited listeners serve the first pass only: whatever it did
@@ -933,19 +942,21 @@ impl<L: WorkerLink> StreamPlane<L> {
     }
 
     /// Replace the region of every held binding whose stream's
-    /// [`admitted_cap`] moved its table sizes, and hand the new one to
-    /// every worker; connections and sessions counted in the old one stay
-    /// counted there until they end (D-d).
-    async fn resize_caps(&mut self, streams: &[Stream]) {
+    /// [`admitted_cap`] or [`capped_links`] moved its table sizes, and
+    /// hand the new one to every worker; connections and sessions counted
+    /// in the old one stay counted there until they end (D-d).
+    async fn resize_caps(&mut self, streams: &[Stream], links: &[StreamBackend]) {
         let mut replaced: Vec<String> = Vec::new();
         for b in self.held.values() {
             let id = &b.key.stream_id;
             let Some(cap) = streams.iter().find(|s| s.id == *id).and_then(admitted_cap) else {
                 continue;
             };
-            match lock_caps(&self.caps).ensure(id, cap, REGION_LINKS) {
+            let capped = capped_links(links, id);
+            match lock_caps(&self.caps).ensure(id, cap, capped) {
                 Ok(Some(caps_gen)) => {
-                    info!(stream_id = %id, caps_gen, cap, "stream caps region replaced");
+                    info!(stream_id = %id, caps_gen, cap, capped_links = capped,
+                          "stream caps region replaced");
                     replaced.push(id.clone());
                 }
                 Ok(None) => {}
@@ -1223,6 +1234,7 @@ impl<L: WorkerLink> StreamPlane<L> {
         key: BindKey,
         name: &str,
         streams: &[Stream],
+        links: &[StreamBackend],
         pass: PassSettings,
         events: &mut Vec<PlaneEvent>,
     ) {
@@ -1286,7 +1298,7 @@ impl<L: WorkerLink> StreamPlane<L> {
         let ensured = match stream_of(&key.stream_id).and_then(admitted_cap) {
             None => Err("the UDP stream carries no udp settings".to_string()),
             Some(cap) => lock_caps(&self.caps)
-                .ensure(&id, cap, REGION_LINKS)
+                .ensure(&id, cap, capped_links(links, &id))
                 .map_err(|e| format!("the stream caps region could not be created: {e}")),
         };
         if let Err(reason) = ensured {
@@ -1584,13 +1596,16 @@ impl<L: WorkerLink + 'static> StreamPlaneHandle<L> {
         }
     }
 
-    async fn inputs(&self) -> Option<(Vec<Stream>, PassSettings)> {
+    async fn inputs(&self) -> Option<(Vec<Stream>, Vec<StreamBackend>, PassSettings)> {
         let store = self.store.lock().await;
         let streams = store.list_streams();
+        let links = store.list_stream_backends();
         let settings = store.get_global_settings();
-        match (streams, settings) {
-            (Ok(streams), Ok(settings)) => Some((streams, PassSettings::of(&settings))),
-            (Err(e), _) | (_, Err(e)) => {
+        match (streams, links, settings) {
+            (Ok(streams), Ok(links), Ok(settings)) => {
+                Some((streams, links, PassSettings::of(&settings)))
+            }
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
                 warn!(error = %e, "stream plane: configuration unreadable; bindings left as they are");
                 None
             }
@@ -1599,7 +1614,7 @@ impl<L: WorkerLink + 'static> StreamPlaneHandle<L> {
 
     /// D-d step 1: before the workers commit a change.
     pub(crate) async fn before_commit(&self) {
-        let Some((streams, pass)) = self.inputs().await else {
+        let Some((streams, _, pass)) = self.inputs().await else {
             return;
         };
         let events = self
@@ -1618,14 +1633,14 @@ impl<L: WorkerLink + 'static> StreamPlaneHandle<L> {
     }
 
     async fn bind_pass(&self, trigger: Trigger) {
-        let Some((streams, pass)) = self.inputs().await else {
+        let Some((streams, links, pass)) = self.inputs().await else {
             return;
         };
         let events = self
             .plane
             .lock()
             .await
-            .bind_desired(&streams, self.role.as_node_role(), pass, trigger)
+            .bind_desired(&streams, &links, self.role.as_node_role(), pass, trigger)
             .await;
         self.record(events).await;
     }
@@ -1701,7 +1716,7 @@ impl<L: WorkerLink + 'static> StreamPlaneHandle<L> {
 
     /// A worker came back: replay the live bindings to it.
     pub(crate) async fn replay(&self, worker: u32, link: L) {
-        let Some((_, pass)) = self.inputs().await else {
+        let Some((_, _, pass)) = self.inputs().await else {
             return;
         };
         self.plane
@@ -2124,7 +2139,13 @@ mod tests {
         let s = tcp("s1", port);
 
         let events = plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
 
         assert_eq!(
@@ -2176,7 +2197,13 @@ mod tests {
         let port = free_ports(1);
         let s = tcp("s1", port);
         plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
         assert!(!bindable(port));
 
@@ -2210,6 +2237,7 @@ mod tests {
         plane
             .bind_desired(
                 std::slice::from_ref(&before),
+                &[],
                 STANDALONE,
                 PASS,
                 Trigger::Change,
@@ -2225,6 +2253,7 @@ mod tests {
             plane
                 .bind_desired(
                     std::slice::from_ref(&after),
+                    &[],
                     STANDALONE,
                     PASS,
                     Trigger::Change,
@@ -2260,7 +2289,13 @@ mod tests {
 
         let start = std::time::Instant::now();
         plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
 
         // One ack timeout for the attach and one for the refresh, the
@@ -2284,7 +2319,13 @@ mod tests {
         // The attach times out; its answer reaches the driver while it
         // waits for the refresh's.
         plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
 
         assert_eq!(
@@ -2305,7 +2346,13 @@ mod tests {
         let s = stream("s1", StreamProtocol::Tcp, first, first + 2);
 
         let events = plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
 
         match events.as_slice() {
@@ -2333,6 +2380,7 @@ mod tests {
         let again = plane
             .bind_desired(
                 std::slice::from_ref(&s),
+                &[],
                 STANDALONE,
                 PASS,
                 Trigger::RetryTick,
@@ -2345,6 +2393,7 @@ mod tests {
         let recovered = plane
             .bind_desired(
                 std::slice::from_ref(&s),
+                &[],
                 STANDALONE,
                 PASS,
                 Trigger::RetryTick,
@@ -2431,7 +2480,13 @@ mod tests {
         let s = tcp(&id, port);
 
         let events = plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
 
         match events.as_slice() {
@@ -2456,7 +2511,13 @@ mod tests {
         let s = tcp("s1", reserved().http);
 
         let events = plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
 
         match events.as_slice() {
@@ -2483,7 +2544,7 @@ mod tests {
         };
 
         let events = plane
-            .bind_desired(&streams, STANDALONE, pass, Trigger::Change)
+            .bind_desired(&streams, &[], STANDALONE, pass, Trigger::Change)
             .await;
 
         assert!(matches!(events[0], PlaneEvent::Bound { .. }));
@@ -2506,7 +2567,13 @@ mod tests {
         let port = free_ports(1);
         let s = tcp("s1", port);
         plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
 
         let (respawned, seen1) = FakeLink::new(&[]);
@@ -2546,7 +2613,13 @@ mod tests {
         let s = udp("u1", free_udp_port());
 
         plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
 
         for (slot, log) in [(0u32, &seen0), (1, &seen1)] {
@@ -2585,7 +2658,13 @@ mod tests {
         let s = udp("u1", free_udp_port());
 
         plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
 
         assert_eq!(
@@ -2606,7 +2685,13 @@ mod tests {
         let port = free_udp_port();
         let s = udp("u1", port);
         plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
         // Worker 1 holds three sessions when it dies: its permits are
         // never dropped, its process is gone. Worker 0 holds one.
@@ -2658,7 +2743,13 @@ mod tests {
         let (mut plane, states) = plane(vec![w0, w1]);
         let mut s = udp("u1", free_udp_port());
         plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
         let permit = session(&worker_caps(&plane, "u1", 0), client(1), 8, 4096).unwrap();
         let before = seen(&seen0).len();
@@ -2667,7 +2758,13 @@ mod tests {
             udp.max_sessions = 16_384;
         }
         plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
 
         for (slot, log) in [(0u32, &seen0), (1, &seen1)] {
@@ -2704,7 +2801,13 @@ mod tests {
             udp.max_sessions = 16_000;
         }
         plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
         assert!(!seen(&seen0)
             .iter()
@@ -2713,6 +2816,118 @@ mod tests {
         drop(permit);
         lock_caps(&plane.caps).tick(lorica_shmem::now_ns());
         assert_eq!(lock_caps(&plane.caps).sessions("u1"), 0);
+    }
+
+    /// The backend cells per worker of `stream_id`'s current region, as a
+    /// worker maps it from its `caps`.
+    fn backend_slots(plane: &StreamPlane<FakeLink>, stream_id: &str) -> u64 {
+        let Some(StreamCtlMsg::Caps { region, .. }) = lock_caps(&plane.caps)
+            .caps_message(stream_id, 0, 0)
+            .unwrap()
+        else {
+            panic!("a caps message for {stream_id}");
+        };
+        lorica_shmem::StreamCapsRegion::open(region)
+            .unwrap()
+            .layout()
+            .backend_slots
+    }
+
+    /// `count` links of `stream_id`, the first `capped` of them with a
+    /// `max_active`.
+    fn links(stream_id: &str, count: usize, capped: usize) -> Vec<StreamBackend> {
+        (0..count)
+            .map(|i| StreamBackend {
+                max_active: (i < capped).then_some(4),
+                ..StreamBackend::primary(stream_id, &format!("b-{i}"))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_region_is_sized_for_the_capped_links_and_replaced_when_they_cross_its_floor() {
+        use lorica_shmem::stream_caps::{BACKEND_SLOTS_PER_LINK, MIN_BACKEND_SLOTS};
+
+        let (w0, seen0) = FakeLink::new(&[]);
+        let (mut plane, _) = plane(vec![w0]);
+        let s = tcp("t1", free_ports(1));
+        let at_floor = usize::try_from(MIN_BACKEND_SLOTS / BACKEND_SLOTS_PER_LINK).unwrap();
+        let past_floor = at_floor + 1;
+
+        // Uncapped links are never counted, so they never size a region.
+        let uncapped = links("t1", past_floor * 2, 0);
+        plane
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &uncapped,
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
+            .await;
+        assert_eq!(backend_slots(&plane, "t1"), MIN_BACKEND_SLOTS);
+
+        // Capped links within the floor move nothing.
+        plane
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &links("t1", past_floor * 2, at_floor),
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
+            .await;
+        let caps_sent = |log: &Arc<StdMutex<Vec<Seen>>>| {
+            seen(log)
+                .iter()
+                .filter(|s| matches!(s, Seen::Caps { .. }))
+                .count()
+        };
+        assert_eq!(caps_sent(&seen0), 1, "the first region only");
+
+        // One capped link past the floor: the next region, sent ahead of
+        // the refresh, with the cells for it.
+        plane
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &links("t1", past_floor * 2, past_floor),
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
+            .await;
+        assert_eq!(
+            backend_slots(&plane, "t1"),
+            (u64::try_from(past_floor).unwrap() * BACKEND_SLOTS_PER_LINK).next_power_of_two()
+        );
+        assert!(seen(&seen0).contains(&Seen::Caps {
+            stream_id: "t1".into(),
+            caps_gen: 2,
+            slot: 0,
+            total: 0,
+        }));
+
+        // The caps lifted again: back to the floor, in a third region.
+        plane
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &uncapped,
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
+            .await;
+        assert_eq!(backend_slots(&plane, "t1"), MIN_BACKEND_SLOTS);
+        assert_eq!(caps_sent(&seen0), 3);
+    }
+
+    #[test]
+    fn only_the_links_of_the_stream_with_a_cap_are_counted() {
+        let mut all = links("t1", 5, 3);
+        all.extend(links("t2", 4, 4));
+        assert_eq!(capped_links(&all, "t1"), 3);
+        assert_eq!(capped_links(&all, "t2"), 4);
+        assert_eq!(capped_links(&all, "t3"), 0);
     }
 
     #[tokio::test]
@@ -2729,6 +2944,7 @@ mod tests {
         plane
             .bind_desired(
                 std::slice::from_ref(&before),
+                &[],
                 STANDALONE,
                 pass,
                 Trigger::Change,
@@ -2745,6 +2961,7 @@ mod tests {
             plane
                 .bind_desired(
                     std::slice::from_ref(&after),
+                    &[],
                     STANDALONE,
                     pass,
                     Trigger::Change,
@@ -2774,6 +2991,7 @@ mod tests {
         let retried = plane
             .bind_desired(
                 std::slice::from_ref(&after),
+                &[],
                 STANDALONE,
                 pass,
                 Trigger::RetryTick,
@@ -2800,7 +3018,7 @@ mod tests {
         // Deleted: the binding drains and the region is retired.
         plane.release_stale(&[], STANDALONE, pass).await;
         plane
-            .bind_desired(&[], STANDALONE, pass, Trigger::Change)
+            .bind_desired(&[], &[], STANDALONE, pass, Trigger::Change)
             .await;
         assert_eq!(lock_caps(&plane.caps).memfds(), 0);
         assert!(states.get("u1").is_none());
@@ -2813,13 +3031,25 @@ mod tests {
         let port = free_ports(1);
         let u = udp("u1", port);
         plane
-            .bind_desired(std::slice::from_ref(&u), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&u),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
         plane.release_stale(&[], STANDALONE, PASS).await;
         let t = tcp("t1", port);
 
         plane
-            .bind_desired(std::slice::from_ref(&t), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&t),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
 
         assert!(matches!(states.get("t1"), Some(BindState::Bound { .. })));
@@ -2833,7 +3063,13 @@ mod tests {
         let s = udp("u1", free_udp_port());
 
         let events = plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
 
         match events.as_slice() {
@@ -2852,7 +3088,13 @@ mod tests {
         // decide.
         let mut plane = plane.with_source_ports(Box::new(|| None));
         let events = plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
         assert!(
             matches!(events.as_slice(), [PlaneEvent::Bound { .. }]),
@@ -2873,7 +3115,7 @@ mod tests {
         }));
         let mut streams = vec![udp("u1", free_udp_port()), udp("u2", free_udp_port())];
         plane
-            .bind_desired(&streams, STANDALONE, PASS, Trigger::Change)
+            .bind_desired(&streams, &[], STANDALONE, PASS, Trigger::Change)
             .await;
         assert!(matches!(states.get("u1"), Some(BindState::Bound { .. })));
         assert!(matches!(states.get("u2"), Some(BindState::Bound { .. })));
@@ -2893,7 +3135,7 @@ mod tests {
         rebind(&mut streams, 4096);
         plane.release_stale(&streams, STANDALONE, PASS).await;
         let events = plane
-            .bind_desired(&streams, STANDALONE, PASS, Trigger::Change)
+            .bind_desired(&streams, &[], STANDALONE, PASS, Trigger::Change)
             .await;
         assert!(
             matches!(events.as_slice(), [PlaneEvent::Bound { .. }]),
@@ -2904,7 +3146,7 @@ mod tests {
         rebind(&mut streams, 4097);
         plane.release_stale(&streams, STANDALONE, PASS).await;
         let events = plane
-            .bind_desired(&streams, STANDALONE, PASS, Trigger::Change)
+            .bind_desired(&streams, &[], STANDALONE, PASS, Trigger::Change)
             .await;
         match events.as_slice() {
             [PlaneEvent::BindFailed {
@@ -2918,7 +3160,7 @@ mod tests {
         // for the stream's last binding, not with nothing.
         streams[0].udp.as_mut().unwrap().max_sessions = 2048;
         let events = plane
-            .bind_desired(&streams, STANDALONE, PASS, Trigger::Change)
+            .bind_desired(&streams, &[], STANDALONE, PASS, Trigger::Change)
             .await;
         assert!(
             matches!(events.as_slice(), [PlaneEvent::Bound { .. }]),
@@ -2928,7 +3170,7 @@ mod tests {
         // A stream the node never held is all new demand.
         streams.push(udp("u3", free_udp_port()));
         let events = plane
-            .bind_desired(&streams, STANDALONE, PASS, Trigger::Change)
+            .bind_desired(&streams, &[], STANDALONE, PASS, Trigger::Change)
             .await;
         match events.as_slice() {
             [PlaneEvent::BindFailed {
@@ -2946,7 +3188,13 @@ mod tests {
         let (mut plane, states) = plane(vec![w0, w1]);
         let s = tcp("s1", free_ports(1));
         plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
 
         let events = plane.quiesce(Duration::from_secs(20)).await;
@@ -2989,7 +3237,13 @@ mod tests {
         let s = tcp("s1", wanted);
 
         let events = plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
 
         assert!(
@@ -3030,7 +3284,13 @@ mod tests {
         );
 
         plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
 
         assert_eq!(
@@ -3067,7 +3327,13 @@ mod tests {
         );
 
         plane
-            .bind_desired(std::slice::from_ref(&s), STANDALONE, PASS, Trigger::Change)
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
             .await;
         assert_eq!(
             states.get("s1"),
