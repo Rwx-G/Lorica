@@ -15,9 +15,10 @@
 //! The traits the stream engines implement: [`StreamHandler`] for TCP
 //! (Story 12.3), [`DatagramHandler`] for UDP (Story 12.5), and the
 //! [`ConnectionObserver`] an engine hands each finished connection's
-//! [`ConnectionRecord`] to (Story 12.3 D-r), and each refusal the
-//! refusal log admits as a [`RefusalRecord`] (Story 12.6 D-j, as Story
-//! 12.9 D-c amends it).
+//! [`ConnectionRecord`] to (Story 12.3 D-r), each refusal the refusal
+//! log admits as a [`RefusalRecord`] (Story 12.6 D-j, as Story 12.9 D-c
+//! amends it), and each connect phase's [`ConnectOutcome`] (Story 12.9
+//! D-g).
 //!
 //! Until an engine is installed, [`Engines`] holds `None` and the loops
 //! close an accepted TCP connection at once and drop a datagram, both
@@ -27,10 +28,11 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use lorica_config::models::{
-    Stream, StreamEndReason, StreamProtocol, StreamRefusal, StreamTlsMode,
+    Stream, StreamEndKind, StreamEndReason, StreamProtocol, StreamRefusal, StreamTlsMode,
 };
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::debug;
@@ -158,6 +160,9 @@ pub struct ConnectionRecord {
     pub stream_id: String,
     /// The stream's name as the connection's snapshot had it.
     pub stream_name: String,
+    /// The stream's protocol: a UDP session is a record too, and nothing
+    /// else in it may stand for the protocol (Story 12.9 D-a).
+    pub protocol: StreamProtocol,
     /// The binding the connection arrived on.
     pub bind_gen: u64,
     /// The client: the source a trusted PROXY header carried, otherwise
@@ -195,6 +200,9 @@ pub struct ConnectionRecord {
     /// What TLS the connection read, terminated or originated (Story
     /// 12.4 D-m); `None` on a stream with no TLS at all and on UDP.
     pub tls: Option<TlsRecord>,
+    /// The application protocol detection named (Story 12.15); `None`
+    /// until that story fills it, and on a stream that does not detect.
+    pub detected_protocol: Option<String>,
 }
 
 /// The TLS side of a [`ConnectionRecord`] (Story 12.4 D-m). Story 12.9
@@ -216,16 +224,17 @@ pub struct TlsRecord {
     /// extension.
     pub ech_offered: bool,
     /// What a terminating handshake made of the client's certificate;
-    /// `None` when the stream does not terminate or the handshake did
-    /// not complete.
+    /// `None` when the stream does not terminate, does not verify client
+    /// certificates, or the handshake did not complete (Story 12.9 D-a:
+    /// the row's `client_cert` is null on a stream that does not verify).
     pub client_certificate: Option<ClientCertificateOutcome>,
     /// Whether the connection to the backend is TLS Lorica originates.
     pub upstream_tls: bool,
 }
 
-/// The client certificate of a completed terminating handshake. The
-/// subject is not recorded; whether it joins the access log is Story
-/// 12.9's decision.
+/// The client certificate of a completed terminating handshake on a
+/// stream that verifies them. The subject is not recorded: the HTTP
+/// access log records none either (Story 12.9 D-a).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientCertificateOutcome {
     /// The client presented none.
@@ -263,9 +272,64 @@ pub struct RefusalRecord {
     pub at: DateTime<Utc>,
 }
 
-/// The refusals one window of the refusal log held back (Story 12.6
-/// D-j, Story 12.9 D-c), reported once when the window closes, or with
-/// the first refusal after it.
+/// What the refusal log limits per stream (Story 12.9 D-c): the ends
+/// whoever connects chooses before any backend work, so a row per end
+/// would let them choose the write rate of the access log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamLogKey {
+    /// A refusal, which hands a [`RefusalRecord`] instead of a record.
+    Refused(StreamRefusal),
+    /// An end before forwarding, which hands its [`ConnectionRecord`]
+    /// when the limiter admits it.
+    PreForwarding(StreamEndKind),
+}
+
+impl StreamLogKey {
+    /// The key of a connection or session that ended `reason`; `None`
+    /// for an end whose row is written unconditionally, its rate being
+    /// bounded by the stream's own admission.
+    pub fn of(reason: StreamEndReason) -> Option<StreamLogKey> {
+        match reason {
+            StreamEndReason::Refused(refusal) => Some(StreamLogKey::Refused(refusal)),
+            StreamEndReason::ClienthelloTimeout
+            | StreamEndReason::ProxyHeaderInvalid
+            | StreamEndReason::DetectionTimeout => Some(StreamLogKey::PreForwarding(reason.kind())),
+            StreamEndReason::ClientClose
+            | StreamEndReason::BackendClose
+            | StreamEndReason::IdleTimeout
+            | StreamEndReason::TotalTimeout
+            | StreamEndReason::ConnectFailed
+            | StreamEndReason::NoHealthyBackend
+            | StreamEndReason::RequestBoundReached
+            | StreamEndReason::ResponseBoundReached
+            | StreamEndReason::BackendDown
+            | StreamEndReason::ConfigRemoved
+            | StreamEndReason::DrainedByUpgrade
+            | StreamEndReason::NodeShutdown => None,
+        }
+    }
+
+    /// The end kind a row of this key carries: `refused`, or the
+    /// pre-forwarding end itself.
+    pub fn end_kind(&self) -> StreamEndKind {
+        match self {
+            StreamLogKey::Refused(_) => StreamEndKind::Refused,
+            StreamLogKey::PreForwarding(kind) => *kind,
+        }
+    }
+
+    /// The refusal, for a refusal's key.
+    pub fn refusal(&self) -> Option<StreamRefusal> {
+        match self {
+            StreamLogKey::Refused(refusal) => Some(*refusal),
+            StreamLogKey::PreForwarding(_) => None,
+        }
+    }
+}
+
+/// The rows one window of the refusal log held back (Story 12.6 D-j,
+/// Story 12.9 D-c), reported once when the window closes, or with the
+/// first row of the key after it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuppressedRecord {
     /// The stream's id.
@@ -274,35 +338,80 @@ pub struct SuppressedRecord {
     pub stream_name: String,
     /// The stream's protocol.
     pub protocol: StreamProtocol,
-    /// The refusal the window counted.
-    pub refusal: StreamRefusal,
-    /// Refusals held back, at least 1.
+    /// What the window counted: a refusal, or a pre-forwarding end.
+    pub key: StreamLogKey,
+    /// Rows held back, at least 1.
     pub suppressed: u64,
-    /// When the count was reported: the window's end, or the first
-    /// refusal of the key after it.
+    /// When the count was reported: the window's end, or the first row
+    /// of the key after it.
     pub reported_at: DateTime<Utc>,
 }
 
+/// How the connect phase of a connection or session resolved (Story
+/// 12.9 D-g), reported once at the decision, not at the end: a TCP
+/// connection can last hours, and its availability belongs to the
+/// minute it connected in.
+///
+/// A connection that never reaches backend selection (a refusal, a
+/// pre-forwarding end, a drain before the connect) reports nothing, nor
+/// does one whose connect phase a drain or the total timeout cut short:
+/// neither says anything about the backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectOutcome {
+    /// TCP: a backend connected after `latency`, from the start of the
+    /// connect phase to the attempt that connected, retries included.
+    /// The pre-forwarding reads before it are paced by the client, not
+    /// the backends, so they are not part of it.
+    Connected {
+        /// Connect-phase start to connected.
+        latency: Duration,
+    },
+    /// The connect phase ended without a backend: the connection or
+    /// session ends `connect_failed` or `no_healthy_backend`.
+    NotConnected,
+    /// UDP: the session's first backend datagram arrived.
+    Answered,
+    /// UDP: an ICMP error came back from the backend before any datagram.
+    IcmpError,
+    /// UDP: a session owed responses went idle without any.
+    NoResponse,
+}
+
 /// Where an engine hands each [`ConnectionRecord`], each admitted
-/// [`RefusalRecord`] and each [`SuppressedRecord`]. The default
-/// `observe` logs at debug; the engine has already logged the other two
-/// at debug when it calls them, so their defaults do nothing. Story 12.9
-/// installs the access-log writer.
+/// [`RefusalRecord`], each [`SuppressedRecord`] and each
+/// [`ConnectOutcome`]. The default `observe` logs at debug; the engine
+/// has already logged refusals and suppressed counts at debug when it
+/// calls them, so those defaults do nothing, as does `connect_outcome`'s.
+/// Story 12.9 installs the access-log writer.
 pub trait ConnectionObserver: Send + Sync + 'static {
     /// Take one refusal the refusal log admitted. Runs on the stream
     /// runtime's thread, so it must not block.
     fn refused(&self, _record: RefusalRecord) {}
 
-    /// Take the count of refusals one window of the refusal log held
-    /// back. Runs on the stream runtime's thread, so it must not block.
+    /// Take the count of rows one window of the refusal log held back.
+    /// Runs on the stream runtime's thread, so it must not block.
     fn refusals_suppressed(&self, _record: SuppressedRecord) {}
 
-    /// Take the record of a connection that just ended. Runs on the
-    /// stream runtime's thread, so it must not block.
+    /// Take how the connect phase of a connection or session of
+    /// `stream_id` resolved, once per connection or session at most.
+    /// Runs on the stream runtime's thread, so it must not block.
+    fn connect_outcome(
+        &self,
+        _stream_id: &str,
+        _protocol: StreamProtocol,
+        _outcome: ConnectOutcome,
+    ) {
+    }
+
+    /// Take the record of a connection that just ended. A connection
+    /// that ended before forwarding hands its record only when the
+    /// refusal log admits it ([`StreamLogKey::PreForwarding`]). Runs on
+    /// the stream runtime's thread, so it must not block.
     fn observe(&self, record: ConnectionRecord) {
         debug!(
             stream_id = %record.stream_id,
             stream = %record.stream_name,
+            protocol = record.protocol.as_str(),
             bind_gen = record.bind_gen,
             client = %record.client,
             peer = %record.peer,
@@ -320,6 +429,7 @@ pub trait ConnectionObserver: Send + Sync + 'static {
             ended_at = %record.ended_at,
             end_reason = record.end_reason.kind().as_str(),
             tls = ?record.tls,
+            detected_protocol = ?record.detected_protocol,
             "stream connection ended"
         );
     }

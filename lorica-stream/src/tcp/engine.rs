@@ -36,8 +36,12 @@
 //! 4. **Forward** ([`super::forward`]).
 //! 5. **End**: the end reason; the record to the observer, or, for a
 //!    connection that ends `refused(_)`, a row through the refusal log
-//!    and no record (Story 12.6 D-j); the region's counts and the gauges
-//!    released by drop.
+//!    and no record (Story 12.6 D-j); a connection that ended before
+//!    forwarding hands its record through the same log (Story 12.9 D-c);
+//!    the region's counts and the gauges released by drop.
+//!
+//! The observer also hears how phase 3 resolved, once, when it does
+//! ([`ConnectOutcome`], Story 12.9 D-g).
 //!
 //! The tracker's close and the total timeout are watched beside every
 //! await of phases 2 to 4, so a drain ends a connection in any phase.
@@ -83,8 +87,8 @@ use crate::counters::{
     ClientHelloOutcome, HandshakeOutcome, ProxyHeaderOutcome, StreamCounters, StreamStats,
 };
 use crate::handler::{
-    AcceptedConnection, ClientCertificateOutcome, ConnectionObserver, ConnectionRecord,
-    HandlerFuture, RefusalRecord, StreamHandler, TlsRecord,
+    AcceptedConnection, ConnectOutcome, ConnectionObserver, ConnectionRecord, HandlerFuture,
+    RefusalRecord, StreamHandler, TlsRecord,
 };
 use crate::local::BoundPorts;
 use crate::resolver::{LocalExclusions, ResolverCache};
@@ -333,6 +337,7 @@ impl Inner {
                 record: ConnectionRecord {
                     stream_id: snapshot.id.clone(),
                     stream_name: snapshot.name.clone(),
+                    protocol: StreamProtocol::Tcp,
                     bind_gen: conn.bind_gen,
                     client: peer,
                     peer,
@@ -350,6 +355,7 @@ impl Inner {
                     ended_at: Utc::now(),
                     end_reason: StreamEndReason::ClientClose,
                     tls,
+                    detected_protocol: None,
                 },
                 admitted,
             },
@@ -367,25 +373,12 @@ impl Inner {
         let reason = tracked.finish(natural);
         stats.ended(reason.kind());
         record.ended_at = Utc::now();
-        match reason {
-            // A refused connection is a row through the refusal log, not
-            // a record (D-j): whoever connects chooses how often it is
-            // refused.
-            StreamEndReason::Refused(refusal) => self.admission.report(RefusalRecord {
-                stream_id: record.stream_id,
-                stream_name: record.stream_name,
-                protocol: StreamProtocol::Tcp,
-                listen_port: record.local.port(),
-                client: record.client,
-                proxied_from: record.proxied_from,
-                refusal,
-                at: record.ended_at,
-            }),
-            reason => {
-                record.end_reason = reason;
-                self.observer.observe(record);
-            }
-        }
+        record.end_reason = reason;
+        // A refused connection is a row through the refusal log, not a
+        // record (D-j), and one that ended before forwarding passes the
+        // same log (Story 12.9 D-c): whoever connects chooses how often
+        // either happens.
+        self.admission.ended(record);
     }
 
     /// Phases 2 to 4; returns the natural end reason. `trusted`: the
@@ -578,20 +571,24 @@ impl Inner {
                     .tls_terminate
                     .as_ref()
                     .and_then(|terminate| terminate.client_auth.as_ref());
-                let certificate = match client_auth {
-                    None => Some(ClientCertificateOutcome::Absent),
-                    Some(auth) => client_auth::admit(auth, connection.peer_certificates()),
-                };
                 let negotiated = connection.alpn_protocol().map(<[u8]>::to_vec);
+                // `None` on a stream that does not verify: its row says
+                // null there, not `absent` (Story 12.9 D-a).
+                let certificate = match client_auth {
+                    None => None,
+                    Some(auth) => match client_auth::admit(auth, connection.peer_certificates()) {
+                        Some(outcome) => Some(outcome),
+                        None => {
+                            stats.refused(StreamRefusal::ClientCertificate);
+                            debug!(stream_id = %snapshot.id, peer = %live.conn.record.peer,
+                                   "client certificate organization not admitted");
+                            return StreamEndReason::Refused(StreamRefusal::ClientCertificate);
+                        }
+                    },
+                };
                 if let Some(record) = live.conn.tls_record() {
                     record.negotiated_alpn = negotiated;
                     record.client_certificate = certificate;
-                }
-                if certificate.is_none() {
-                    stats.refused(StreamRefusal::ClientCertificate);
-                    debug!(stream_id = %snapshot.id, peer = %live.conn.record.peer,
-                           "client certificate organization not admitted");
-                    return StreamEndReason::Refused(StreamRefusal::ClientCertificate);
                 }
                 let route = Route {
                     rule: Some(rule),
@@ -754,6 +751,7 @@ impl Inner {
             backend_caps: backend_caps.as_ref(),
         };
         let mut attempts = 0;
+        let connect_started = Instant::now();
         let connected = guarded(
             &mut conn.tracked,
             conn.total,
@@ -768,9 +766,29 @@ impl Inner {
             latency,
             backend_slot: _backend_slot,
         } = match connected {
-            Err(reason) | Ok(Err(reason)) => return reason,
+            Err(reason) => return reason,
+            Ok(Err(reason)) => {
+                if matches!(
+                    reason,
+                    StreamEndReason::ConnectFailed | StreamEndReason::NoHealthyBackend
+                ) {
+                    self.observer.connect_outcome(
+                        &snapshot.id,
+                        StreamProtocol::Tcp,
+                        ConnectOutcome::NotConnected,
+                    );
+                }
+                return reason;
+            }
             Ok(Ok(connected)) => connected,
         };
+        self.observer.connect_outcome(
+            &snapshot.id,
+            StreamProtocol::Tcp,
+            ConnectOutcome::Connected {
+                latency: connect_started.elapsed(),
+            },
+        );
         conn.tracked.set_backend(&backend.id);
         conn.record.backend_id = Some(backend.id.clone());
         conn.record.backend_address = Some(address);
@@ -778,11 +796,8 @@ impl Inner {
         self.shared
             .selector
             .connected(&snapshot.id, &backend, address, latency);
-        let _link_active = self
-            .shared
-            .counters
-            .link(&snapshot.id, &backend.id)
-            .connected(latency);
+        let link = self.shared.counters.link(&snapshot.id, &backend.id);
+        let _link_active = link.connected(latency);
 
         // The PROXY header goes first, in plaintext. Committed: a failure
         // here is the backend's close, never a retry. With upstream TLS
@@ -808,7 +823,8 @@ impl Inner {
                     route.preamble,
                     route.classify,
                     Arc::clone(stats),
-                );
+                )
+                .counting_link(link);
                 let reason = forwarder
                     .run(client, &mut upstream, &mut conn.tracked)
                     .await;

@@ -72,7 +72,7 @@ use crate::admission::{
 };
 use crate::counters::{ActiveGuard, ConnectFailureKind, LinkStats, StreamCounters, StreamStats};
 use crate::handler::{
-    ConnectionObserver, ConnectionRecord, Datagram, DatagramHandler, RefusalRecord,
+    ConnectOutcome, ConnectionObserver, ConnectionRecord, Datagram, DatagramHandler, RefusalRecord,
 };
 use crate::listener::with_receive_buffer;
 use crate::local::{BoundPorts, LocalRefusal, NodeLocality};
@@ -459,6 +459,7 @@ impl Inner {
         let mut record = ConnectionRecord {
             stream_id: snapshot.id.clone(),
             stream_name: snapshot.name.clone(),
+            protocol: StreamProtocol::Udp,
             bind_gen: session.key.bind_gen,
             client: session.key.client,
             peer: session.key.client,
@@ -476,6 +477,7 @@ impl Inner {
             ended_at: accepted_wall,
             end_reason: StreamEndReason::IdleTimeout,
             tls: None,
+            detected_protocol: None,
         };
 
         let backend_caps = permit.region().worker(permit.slot());
@@ -486,7 +488,21 @@ impl Inner {
             opened = self.open(&snapshot, &table, &bound_ports, &stats, session.key, accepted_at, backend_caps.as_ref()) => opened,
         };
         let natural = match opening {
-            Err(reason) => reason,
+            Err(reason) => {
+                // Only the selection can end it so; a drain or the total
+                // timeout says nothing about the backends.
+                if matches!(
+                    reason,
+                    StreamEndReason::ConnectFailed | StreamEndReason::NoHealthyBackend
+                ) {
+                    self.observer.connect_outcome(
+                        &snapshot.id,
+                        StreamProtocol::Udp,
+                        ConnectOutcome::NotConnected,
+                    );
+                }
+                reason
+            }
             Ok(opened) => {
                 tracked.set_backend(&opened.backend.id);
                 record.backend_id = Some(opened.backend.id.clone());
@@ -501,6 +517,7 @@ impl Inner {
                 );
                 let link = self.counters.link(&snapshot.id, &opened.backend.id);
                 let _link_active = link.session_opened();
+                session.counting_link(Arc::clone(&link));
                 session.opened(&opened.socket);
                 let serving = Serving {
                     session: &session,
@@ -535,24 +552,10 @@ impl Inner {
         record.datagrams_upload = Some(forwarded.datagrams_upload);
         record.datagrams_download = Some(forwarded.datagrams_download);
         record.ended_at = Utc::now();
-        match reason {
-            // A refused session is a row through the refusal log, not a
-            // record (Story 12.6 D-j).
-            StreamEndReason::Refused(refusal) => self.admission.report(RefusalRecord {
-                stream_id: record.stream_id,
-                stream_name: record.stream_name,
-                protocol: StreamProtocol::Udp,
-                listen_port: record.local.port(),
-                client: record.client,
-                proxied_from: None,
-                refusal,
-                at: record.ended_at,
-            }),
-            reason => {
-                record.end_reason = reason;
-                self.observer.observe(record);
-            }
-        }
+        record.end_reason = reason;
+        // A refused session is a row through the refusal log, not a
+        // record (Story 12.6 D-j).
+        self.admission.ended(record);
     }
 
     /// Select a backend, admit it through the breaker, check it is not a
@@ -824,7 +827,7 @@ impl Inner {
                     if s.session.last_activity() + s.idle <= Instant::now() {
                         if s.session.bounds().expects_responses() && !s.session.received_any() {
                             s.link.connect_failed(ConnectFailureKind::NoResponse);
-                            self.report(s, false).await;
+                            self.report(s, ConnectOutcome::NoResponse).await;
                         }
                         return StreamEndReason::IdleTimeout;
                     }
@@ -859,7 +862,7 @@ impl Inner {
                         Ok(response) => {
                             if response.first && !reported {
                                 reported = true;
-                                self.report(s, true).await;
+                                self.report(s, ConnectOutcome::Answered).await;
                             }
                             if let Some(end) = response.end {
                                 return end;
@@ -893,15 +896,20 @@ impl Inner {
         }
         s.link.connect_failed(kind);
         if !reported {
-            self.report(s, false).await;
+            self.report(s, ConnectOutcome::IcmpError).await;
         }
         StreamEndReason::ConnectFailed
     }
 
-    async fn report(&self, s: &Serving<'_>, success: bool) {
+    /// The session's one breaker outcome (D-i), which is also its connect
+    /// outcome (Story 12.9 D-g).
+    async fn report(&self, s: &Serving<'_>, outcome: ConnectOutcome) {
+        let success = outcome == ConnectOutcome::Answered;
         self.breaker
             .record(s.stream_id, &s.opened.backend, success, s.opened.was_probe)
             .await;
+        self.observer
+            .connect_outcome(s.stream_id, StreamProtocol::Udp, outcome);
     }
 }
 

@@ -610,16 +610,16 @@ Allowlist: `lorica-stream/src/handler.rs`, `lorica-stream/src/counters.rs`,
 `lorica-stream/src/refusal_log.rs`, `lorica-stream/src/tcp/*.rs`,
 `lorica-stream/src/udp/*.rs`, `lorica-stream/src/lib.rs`.
 
-- [ ] `ConnectionRecord` gains `protocol` and `detected_protocol` (D-a).
-- [ ] `ConnectionObserver` gains defaulted `refused`, `refusals_suppressed`,
+- [x] `ConnectionRecord` gains `protocol` and `detected_protocol` (D-a).
+- [x] `ConnectionObserver` gains defaulted `refused`, `refusals_suppressed`,
       `connect_outcome` (D-c, D-g), with `RefusalRecord`,
       `SuppressedRecord`, `ConnectOutcome`; the engines call them where
       12.6 writes its refusal line and where the connect phase or UDP
       breaker outcome resolves.
-- [ ] `StreamLogKey` and the widened stream limiter key; pre-forwarding
+- [x] `StreamLogKey` and the widened stream limiter key; pre-forwarding
       ends pass the limiter before `observe` (D-c).
-- [ ] `LinkStats` gains bytes each way, in the snapshot (D-e).
-- [ ] Tests: each hook fires exactly once per connection or session with
+- [x] `LinkStats` gains bytes each way, in the snapshot (D-e).
+- [x] Tests: each hook fires exactly once per connection or session with
       the right values (TCP connected, connect_failed, no_healthy_backend;
       UDP success, ICMP, no-response, `K = 0`); a refusal flood past the
       window yields `limit` `refused` calls and one `refusals_suppressed`
@@ -1023,6 +1023,22 @@ edited here.
   tree failed three `lorica-stream` `tcp_engine` tests on a timeout
   (`Elapsed`), a crate this Lot does not touch; they passed twice in
   isolation and in the full rerun.
+- Lot A, 2026-11-16, on `46d802c6`: the stream limiter lives in
+  `lorica-stream/src/admission.rs` (`RefusalLog`, since 12.6 Lot C), not
+  in `refusal_log.rs`, which holds only the generic `RefusalLogLimiter`;
+  the widened key had to be built there. A suppressed pre-forwarding end
+  needs no record kept back: the window's report is built from the
+  stream id, name and protocol alone, as a refusal's is.
+- Existing `tcp_engine` tests read three `proxy_header_invalid` records
+  in one window from one stream; under D-c only the first is a record,
+  so they now read the end from the counters
+  (`a_trusted_peer_header_that_is_oversized_or_dgram_is_refused`,
+  `an_untrusted_peer_header_forwards_nothing_and_ping_is_forwarded`).
+- Lot A gates, `rust:1-bookworm` with `CARGO_BUILD_WARNINGS=deny`: the
+  CI chain (`cargo fmt --check`, workspace clippy with `lorica/otel`,
+  the three `cargo test` lines and the TLS-featured one) green, and
+  `cargo audit` clean: 3,615 product, 955 `lorica`, 910 forked and 592
+  TLS-featured tests.
 
 ### Completion Notes
 
@@ -1153,6 +1169,67 @@ edited here.
   of the whole-struct destructuring.
 - **Outside the allowlist:** `lorica-api/src/lib.rs`, one line
   (`pub mod stream_metrics;`), which the new module needs.
+- **Lot A, the record.** `ConnectionRecord.protocol: StreamProtocol` and
+  `ConnectionRecord.detected_protocol: Option<String>` (always `None`
+  until 12.15). `TlsRecord.client_certificate` is now `None` on a stream
+  that does not verify client certificates, where it read `Absent`: D-a
+  wants the row's `client_cert` null there, and the record is the row's
+  only source. `Absent` and `Verified` remain for a verifying stream; no
+  subject is recorded.
+- **Lot A, the observer.** `ConnectionObserver` keeps `refused` and
+  `refusals_suppressed` (12.6 Lot C) and gains
+  `connect_outcome(stream_id: &str, protocol: StreamProtocol, outcome: ConnectOutcome)`,
+  defaulted to nothing. `ConnectOutcome` is `Connected { latency }` (TCP),
+  `NotConnected` (the connect phase ended `connect_failed` or
+  `no_healthy_backend`, either protocol), and `Answered`, `IcmpError`,
+  `NoResponse` (UDP, exactly where the breaker outcome is reported). It
+  is reported at most once per connection or session, before the record;
+  a refusal, a pre-forwarding end, and a connect phase cut short by a
+  drain or the total timeout report none. A UDP stream owing no response
+  reports nothing at its idle end, so Lot F judges it from `observe`, as
+  the D-g amendment says. Lot F's mapping onto Lot D's
+  `StreamSlaOutcome`: `Connected` to `TcpConnected`, `NotConnected` to
+  `TcpNotConnected` (a failure without a sample, on either protocol),
+  the three UDP outcomes to their namesakes.
+- **Lot A, `StreamLogKey`.** `Refused(StreamRefusal)` or
+  `PreForwarding(StreamEndKind)`; `StreamLogKey::of(reason)` is an
+  exhaustive match on `StreamEndReason`, so a new end reason does not
+  compile until it is classed. Pre-forwarding: `clienthello_timeout`,
+  `proxy_header_invalid`, `detection_timeout`; 12.4's invalid ClientHello
+  end is `refused(invalid_clienthello)` and already a refusal. The
+  limiter key is `(stream index, StreamLogKey)`. Both engines hand every
+  finished record to `AdmissionControl::ended`: a refusal becomes a
+  refusal row, a pre-forwarding end is observed only when the limiter
+  admits it, any other end is observed unconditionally.
+  `SuppressedRecord.refusal` became `SuppressedRecord.key`
+  (`key.end_kind()`, `key.refusal()` give the row's two columns); the
+  debug line is "stream log rows suppressed".
+- **Lot A, per-backend bytes.** `LinkStats::add_upload` /
+  `add_download` and `LinkCountersSnapshot.bytes_upload` /
+  `bytes_download`, added per completed write as the stream's are: the
+  TCP forwarder counts both through `Forwarder::counting_link`, a UDP
+  session through `Session::counting_link` set before its held
+  datagrams are sent. `lorica_stream_backend_bytes_total{stream_id,
+  backend_id, direction}` is rendered by `StreamMetricsCollector` (the
+  `BackendBytes` family; the whole-struct destructuring made it a
+  compile error until then).
+- **Deviation:** `Connected.latency` runs from the start of the connect
+  phase, not from the accept as D-g words it. The pre-forwarding reads
+  (PROXY header, ClientHello, a terminating handshake) are paced by the
+  client and bounded by `clienthello_timeout_ms` (up to 60 s): counted
+  in, a slow client or an mTLS prompt would breach a backend's 500 ms
+  target. On a stream with no pre-forwarding read the two are the same.
+  The row's `connect_ms` (accepted to connected) is unaffected. One line
+  to change in `connect_and_forward` if the maintainer prefers the text.
+- **For Lot F, a gap in D-g, not decided here:** a UDP session of a
+  stream owing no response that ends `no_healthy_backend` is judged a
+  success by `UdpUnansweredEnded { icmp_error: false }`. The engine
+  reports `NotConnected` for it; Lot F can use it to judge a failure.
+- **Outside the allowlist:** `lorica-stream/src/admission.rs` (the
+  limiter, see the Debug Log), `lorica-stream/tests/tcp_engine.rs`,
+  `udp_engine.rs`, `tls_engine.rs` (Lot A's tests, and the `Absent`
+  assertion above), and `lorica-api/src/stream_metrics.rs` (the bytes
+  family, as Lot C2 planned).
 
 ## File List
 
@@ -1182,6 +1259,13 @@ edited here.
 - `lorica-api/src/metrics.rs` (Lot C2, `PER_WORKER_GAUGES`, `lorica_log_sink_up`)
 - `lorica-api/src/stream_metrics.rs` (new, Lot C2)
 - `lorica-api/src/lib.rs` (Lot C2, the module line)
+- `lorica-stream/src/handler.rs`, `lib.rs`, `admission.rs`, `counters.rs`
+  (Lot A)
+- `lorica-stream/src/tcp/engine.rs`, `tcp/forward.rs`, `udp/engine.rs`,
+  `udp/session.rs` (Lot A)
+- `lorica-stream/tests/tcp_engine.rs`, `udp_engine.rs`, `tls_engine.rs`
+  (Lot A)
+- `lorica-api/src/stream_metrics.rs` (Lot A, `lorica_stream_backend_bytes_total`)
 
 ## Change Log
 
@@ -1193,3 +1277,4 @@ edited here.
 | 2026-11-16 | 0.4 | Lot D: `StreamSlaCollector` and `StreamSlaOutcome` in `lorica-bench`, minutes kept until flushed, the D-g judging rules, breach and recovery on `sla_breached` / `sla_recovered` with stream details. | Romain G. |
 | 2026-11-16 | 0.5 | Route SLA minute loss proven and fixed (`SlaCollector` keeps a finished minute until flushed). D-g amended: a UDP session that expects no response is judged at its end, a success unless an ICMP error ended it. | Romain G. |
 | 2026-11-16 | 0.6 | Lot C2: `AggregatedGauge` and `GaugeAggregation` in `lorica-metrics`, `PER_WORKER_GAUGES` and `lorica_log_sink_up{sink}` with `Min`; `StreamMetricsCollector` rendering the D-e families from `CountersSnapshot` with monotone retired totals, node gauges and table pruning. The per-link bytes family waits for Lot A. | Romain G. |
+| 2026-11-16 | 0.7 | Lot A: `protocol` and `detected_protocol` on the record, `client_certificate` null on a stream that does not verify, `connect_outcome` and `ConnectOutcome`, `StreamLogKey` widening the limiter key with pre-forwarding ends passed through it, per-backend bytes and `lorica_stream_backend_bytes_total`. | Romain G. |

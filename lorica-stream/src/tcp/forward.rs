@@ -53,7 +53,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use super::bandwidth::TokenBucket;
 use super::FORWARD_BUFFER_SIZE;
-use crate::counters::{ProxyHeaderOutcome, StreamStats};
+use crate::counters::{LinkStats, ProxyHeaderOutcome, StreamStats};
 use crate::tracker::TrackedConnection;
 
 /// How often the idle timeout is checked against the last activity: it
@@ -337,6 +337,30 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
     }
 }
 
+/// Where forwarded bytes are counted: the stream, and the backend's link
+/// (Story 12.9 D-e) when the forwarder was given it.
+#[derive(Clone, Copy)]
+struct Tally<'a> {
+    stream: &'a StreamStats,
+    link: Option<&'a LinkStats>,
+}
+
+impl Tally<'_> {
+    fn upload(&self, bytes: u64) {
+        self.stream.add_upload(bytes);
+        if let Some(link) = self.link {
+            link.add_upload(bytes);
+        }
+    }
+
+    fn download(&self, bytes: u64) {
+        self.stream.add_download(bytes);
+        if let Some(link) = self.link {
+            link.add_download(bytes);
+        }
+    }
+}
+
 /// Poll the open directions once each, starting with `first`, until one
 /// completes a step; returns its outcome and the side it reads from.
 fn poll_directions<C, B>(
@@ -346,7 +370,7 @@ fn poll_directions<C, B>(
     first: &mut Side,
     client: &mut C,
     backend: &mut B,
-    stats: &StreamStats,
+    tally: Tally<'_>,
 ) -> Poll<(Result<Step, Side>, Side)>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -359,10 +383,10 @@ where
     for side in order {
         let stepped = match side {
             Side::Client if !upload.is_closed() => {
-                upload.poll_step(cx, client, backend, &|n| stats.add_upload(n))
+                upload.poll_step(cx, client, backend, &|n| tally.upload(n))
             }
             Side::Backend if !download.is_closed() => {
-                download.poll_step(cx, backend, client, &|n| stats.add_download(n))
+                download.poll_step(cx, backend, client, &|n| tally.download(n))
             }
             _ => Poll::Pending,
         };
@@ -384,6 +408,7 @@ pub struct Forwarder {
     last_activity: Instant,
     first_end: Option<Side>,
     stats: Arc<StreamStats>,
+    link: Option<Arc<LinkStats>>,
 }
 
 impl Forwarder {
@@ -430,7 +455,15 @@ impl Forwarder {
             last_activity: Instant::now(),
             first_end: None,
             stats,
+            link: None,
         }
+    }
+
+    /// Count the forwarded bytes on the backend's link too (Story 12.9
+    /// D-e), as they are written, beside the stream's.
+    pub fn counting_link(mut self, link: Arc<LinkStats>) -> Self {
+        self.link = Some(link);
+        self
     }
 
     /// Client to backend.
@@ -474,12 +507,11 @@ impl Forwarder {
             if self.upload.is_closed() && self.download.is_closed() {
                 return self.natural_end();
             }
-            let (upload, download, first, stats) = (
-                &mut self.upload,
-                &mut self.download,
-                &mut self.first,
-                &self.stats,
-            );
+            let (upload, download, first) = (&mut self.upload, &mut self.download, &mut self.first);
+            let tally = Tally {
+                stream: &self.stats,
+                link: self.link.as_deref(),
+            };
             let (stepped, from) = tokio::select! {
                 biased;
                 reason = tracked.closed() => return reason,
@@ -491,7 +523,7 @@ impl Forwarder {
                     continue;
                 }
                 stepped = std::future::poll_fn(|cx| {
-                    poll_directions(cx, upload, download, first, client, backend, stats)
+                    poll_directions(cx, upload, download, first, client, backend, tally)
                 }) => stepped,
             };
             match stepped {

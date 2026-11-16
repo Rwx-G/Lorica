@@ -39,7 +39,8 @@
 //! Per-stream policies are built in `table_changed`, never per
 //! connection. Every refusal is counted by its caller and reported to
 //! the [`RefusalLog`], which writes at most one row per stream and
-//! refusal per window.
+//! [`StreamLogKey`] per window: a refusal, or an end before forwarding
+//! (Story 12.9 D-c).
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -48,7 +49,7 @@ use std::time::Instant;
 
 use chrono::Utc;
 use lorica_config::connection_filter::{parse_cidr, ConnectionFilterPolicy};
-use lorica_config::models::{GeoIpConfig, Stream, StreamRefusal};
+use lorica_config::models::{GeoIpConfig, Stream, StreamProtocol, StreamRefusal};
 use lorica_shmem::{
     now_ns, AdmitRefusal, BackendKey, BackendSlot, OpenLimits, OpenVerdict, SourceKey,
     StreamPermit, WorkerCaps,
@@ -57,7 +58,9 @@ use tracing::debug;
 
 use crate::caps::CapsRegistry;
 use crate::counters::{ActiveGuard, StreamStats};
-use crate::handler::{ConnectionObserver, RefusalRecord, SuppressedRecord};
+use crate::handler::{
+    ConnectionObserver, ConnectionRecord, RefusalRecord, StreamLogKey, SuppressedRecord,
+};
 use crate::refusal_log::{RefusalLogDecision, RefusalLogLimiter};
 use crate::seams::SourceGate;
 use crate::table::{LinkedBackend, StreamTable};
@@ -348,6 +351,14 @@ impl AdmissionControl {
     pub(crate) fn report(&self, record: RefusalRecord) {
         self.log.report(record);
     }
+
+    /// Hand over the record of a connection or session that ended
+    /// (Story 12.9 D-c): a refusal becomes a refusal row, an end before
+    /// forwarding passes the refusal log, any other end goes to the
+    /// observer unconditionally.
+    pub(crate) fn ended(&self, record: ConnectionRecord) {
+        self.log.ended(record);
+    }
 }
 
 /// A TCP stream's per-source cap: `source_max_connections`, or no bound
@@ -362,9 +373,18 @@ fn source_pending_cap(stream: &Stream) -> u64 {
 }
 
 /// The refusal log's key on the stream engines: the stream's index (see
-/// [`StreamIndices`]) and the refusal. Story 12.9 widens the second part
-/// to pre-forwarding ends.
-type RefusalKey = (u32, StreamRefusal);
+/// [`StreamIndices`]) and what it limits, a refusal or a pre-forwarding
+/// end (Story 12.9 D-c).
+type RefusalKey = (u32, StreamLogKey);
+
+/// What a row of the refusal log is about, borrowed until a window's
+/// count has to outlive the call that opened it.
+#[derive(Clone, Copy)]
+struct Subject<'a> {
+    stream_id: &'a str,
+    stream_name: &'a str,
+    protocol: StreamProtocol,
+}
 
 /// A small, stable number per stream id, so the limiter's key stays
 /// `Copy`: kept for as long as the table holds the stream, never reused
@@ -389,8 +409,9 @@ impl StreamIndices {
 
 /// The stream refusal rows (D-j, as Story 12.9 D-c amends it): each
 /// refusal the limiter admits goes to the observer as a
-/// [`RefusalRecord`] and to the debug log; the first refusal a window
-/// holds back spawns one task that hands the window's count over as a
+/// [`RefusalRecord`] and to the debug log, each pre-forwarding end it
+/// admits as its [`ConnectionRecord`]; the first row a window holds back
+/// spawns one task that hands the window's count over as a
 /// [`SuppressedRecord`] when it closes.
 pub(crate) struct RefusalLog {
     observer: Arc<dyn ConnectionObserver>,
@@ -424,64 +445,124 @@ impl RefusalLog {
     }
 
     fn report(self: &Arc<Self>, record: RefusalRecord) {
-        let key = (self.indices().of(&record.stream_id), record.refusal);
-        match self.limiter.admit(key, Instant::now()) {
-            RefusalLogDecision::Write { suppressed } => {
-                if suppressed > 0 {
-                    self.suppressed(&record, suppressed);
-                }
-                debug!(
-                    stream_id = %record.stream_id,
-                    stream = %record.stream_name,
-                    protocol = record.protocol.as_str(),
-                    listen_port = record.listen_port,
-                    reason = <&'static str>::from(record.refusal),
-                    client = %record.client,
-                    proxied_from = ?record.proxied_from,
-                    "stream connection refused"
-                );
-                self.observer.refused(record);
-            }
-            RefusalLogDecision::Suppress {
-                first: true,
-                window_ends,
-            } => self.report_at(key, record, window_ends),
-            RefusalLogDecision::Suppress { first: false, .. } => {}
-        }
-    }
-
-    /// Hand over the count the window ending at `window_ends` held back,
-    /// when it closes. Without a runtime to wait on, the next refusal of
-    /// the key after the window reports it instead.
-    fn report_at(self: &Arc<Self>, key: RefusalKey, record: RefusalRecord, window_ends: Instant) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
+        let subject = Subject {
+            stream_id: &record.stream_id,
+            stream_name: &record.stream_name,
+            protocol: record.protocol,
         };
-        let log = Arc::clone(self);
-        runtime.spawn(async move {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(window_ends)).await;
-            let suppressed = log.limiter.close(key, window_ends);
-            if suppressed > 0 {
-                log.suppressed(&record, suppressed);
-            }
-        });
-    }
-
-    fn suppressed(&self, record: &RefusalRecord, suppressed: u64) {
+        if !self.admit(StreamLogKey::Refused(record.refusal), subject) {
+            return;
+        }
         debug!(
             stream_id = %record.stream_id,
             stream = %record.stream_name,
             protocol = record.protocol.as_str(),
+            listen_port = record.listen_port,
             reason = <&'static str>::from(record.refusal),
+            client = %record.client,
+            proxied_from = ?record.proxied_from,
+            "stream connection refused"
+        );
+        self.observer.refused(record);
+    }
+
+    fn ended(self: &Arc<Self>, record: ConnectionRecord) {
+        match StreamLogKey::of(record.end_reason) {
+            None => self.observer.observe(record),
+            Some(StreamLogKey::Refused(refusal)) => self.report(RefusalRecord {
+                listen_port: record.local.port(),
+                at: record.ended_at,
+                refusal,
+                stream_id: record.stream_id,
+                stream_name: record.stream_name,
+                protocol: record.protocol,
+                client: record.client,
+                proxied_from: record.proxied_from,
+            }),
+            Some(key) => {
+                let subject = Subject {
+                    stream_id: &record.stream_id,
+                    stream_name: &record.stream_name,
+                    protocol: record.protocol,
+                };
+                if self.admit(key, subject) {
+                    self.observer.observe(record);
+                }
+            }
+        }
+    }
+
+    /// Whether the row of `key` about `subject` is written. Before it,
+    /// the count a closed window of the key still owed is handed over;
+    /// the first row a window holds back arranges that window's report.
+    fn admit(self: &Arc<Self>, key: StreamLogKey, subject: Subject<'_>) -> bool {
+        let limited = (self.indices().of(subject.stream_id), key);
+        match self.limiter.admit(limited, Instant::now()) {
+            RefusalLogDecision::Write { suppressed } => {
+                if suppressed > 0 {
+                    self.suppressed(subject, key, suppressed);
+                }
+                true
+            }
+            RefusalLogDecision::Suppress {
+                first: true,
+                window_ends,
+            } => {
+                self.report_at(limited, subject, window_ends);
+                false
+            }
+            RefusalLogDecision::Suppress { first: false, .. } => false,
+        }
+    }
+
+    /// Hand over the count the window ending at `window_ends` held back,
+    /// when it closes. Without a runtime to wait on, the next row of the
+    /// key after the window reports it instead.
+    fn report_at(
+        self: &Arc<Self>,
+        limited: RefusalKey,
+        subject: Subject<'_>,
+        window_ends: Instant,
+    ) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let log = Arc::clone(self);
+        let (stream_id, stream_name, protocol) = (
+            subject.stream_id.to_string(),
+            subject.stream_name.to_string(),
+            subject.protocol,
+        );
+        runtime.spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(window_ends)).await;
+            let suppressed = log.limiter.close(limited, window_ends);
+            if suppressed > 0 {
+                let subject = Subject {
+                    stream_id: &stream_id,
+                    stream_name: &stream_name,
+                    protocol,
+                };
+                log.suppressed(subject, limited.1, suppressed);
+            }
+        });
+    }
+
+    fn suppressed(&self, subject: Subject<'_>, key: StreamLogKey, suppressed: u64) {
+        debug!(
+            stream_id = %subject.stream_id,
+            stream = %subject.stream_name,
+            protocol = subject.protocol.as_str(),
+            end_reason = key.end_kind().as_str(),
+            refusal = key.refusal().map(<&'static str>::from),
             suppressed,
             window_s = crate::refusal_log::REFUSAL_LOG_WINDOW.as_secs(),
-            "stream refusals suppressed"
+            "stream log rows suppressed"
         );
         self.observer.refusals_suppressed(SuppressedRecord {
-            stream_id: record.stream_id.clone(),
-            stream_name: record.stream_name.clone(),
-            protocol: record.protocol,
-            refusal: record.refusal,
+            stream_id: subject.stream_id.to_string(),
+            stream_name: subject.stream_name.to_string(),
+            protocol: subject.protocol,
+            key,
             suppressed,
             reported_at: Utc::now(),
         });
@@ -889,7 +970,10 @@ mod tests {
         let suppressed = recorder.suppressed.lock().unwrap().clone();
         assert_eq!(suppressed.len(), 1);
         assert_eq!(suppressed[0].suppressed, 999);
-        assert_eq!(suppressed[0].refusal, StreamRefusal::SourceOpenRate);
+        assert_eq!(
+            suppressed[0].key,
+            StreamLogKey::Refused(StreamRefusal::SourceOpenRate)
+        );
         assert_eq!(suppressed[0].stream_id, "s");
         let refused = recorder.refused.lock().unwrap();
         assert_eq!(refused[0].refusal, StreamRefusal::SourceOpenRate);

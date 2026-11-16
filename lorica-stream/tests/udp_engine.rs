@@ -43,7 +43,7 @@ use lorica_shmem::{RateLimits, SourceKey, StreamCapsRegion};
 use lorica_stream::counters::{ConnectFailureKind, LinkCountersSnapshot, StreamCountersSnapshot};
 use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
-    Admission, BackendSelector, BreakerGate, ConnectionObserver, ConnectionRecord,
+    Admission, BackendSelector, BreakerGate, ConnectOutcome, ConnectionObserver, ConnectionRecord,
     ControlTransport, Engines, InProcessPeer, NodeCapsRegions, RefusalRecord, Resolve,
     ResolveError, Resolved, ResolverCache, SelectionRequest, SourceGate, StreamCounters,
     StreamRuntime, StreamRuntimeHandle, StreamTable, StreamTableSource, UdpEngine, UdpEngineParts,
@@ -185,11 +185,19 @@ impl Resolve for NoDns {
 struct Records {
     ended: mpsc::UnboundedSender<ConnectionRecord>,
     refused: mpsc::UnboundedSender<RefusalRecord>,
+    outcomes: Arc<Mutex<Vec<(String, StreamProtocol, ConnectOutcome)>>>,
 }
 
 impl ConnectionObserver for Records {
     fn observe(&self, record: ConnectionRecord) {
         let _ = self.ended.send(record);
+    }
+
+    fn connect_outcome(&self, stream_id: &str, protocol: StreamProtocol, outcome: ConnectOutcome) {
+        self.outcomes
+            .lock()
+            .unwrap()
+            .push((stream_id.to_string(), protocol, outcome));
     }
 
     fn refused(&self, record: RefusalRecord) {
@@ -342,6 +350,7 @@ struct Harness {
     handle: StreamRuntimeHandle,
     records: mpsc::UnboundedReceiver<ConnectionRecord>,
     refusals: mpsc::UnboundedReceiver<RefusalRecord>,
+    outcomes: Arc<Mutex<Vec<(String, StreamProtocol, ConnectOutcome)>>>,
     selector: Arc<Selector>,
     breaker: Arc<Breaker>,
     gate: Arc<Gate>,
@@ -377,12 +386,17 @@ impl Harness {
         let gate = Arc::new(Gate::default());
         let (ended, records) = mpsc::unbounded_channel();
         let (refused, refusals) = mpsc::unbounded_channel();
+        let outcomes = Arc::default();
         let engine = UdpEngine::new(UdpEngineParts {
             selector: Arc::clone(&selector) as Arc<dyn BackendSelector>,
             breaker: Arc::clone(&breaker) as Arc<dyn BreakerGate>,
             resolver: ResolverCache::new(Arc::new(NoDns), Arc::clone(&counters)),
             counters: Arc::clone(&counters),
-            observer: Arc::new(Records { ended, refused }),
+            observer: Arc::new(Records {
+                ended,
+                refused,
+                outcomes: Arc::clone(&outcomes),
+            }),
             reserved_ports: None,
             source_gate: Arc::clone(&gate) as Arc<dyn SourceGate>,
         });
@@ -420,6 +434,7 @@ impl Harness {
             handle,
             records,
             refusals,
+            outcomes,
             selector,
             breaker,
             gate,
@@ -521,6 +536,20 @@ impl Harness {
             .unwrap_or_default()
     }
 
+    /// The connect outcomes `stream_id` reported so far, each a UDP one.
+    fn outcomes(&self, stream_id: &str) -> Vec<ConnectOutcome> {
+        self.outcomes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _, _)| id == stream_id)
+            .map(|(_, protocol, outcome)| {
+                assert_eq!(*protocol, StreamProtocol::Udp);
+                *outcome
+            })
+            .collect()
+    }
+
     fn breaker_records(&self) -> Vec<(String, bool, bool)> {
         self.breaker.records.lock().unwrap().clone()
     }
@@ -589,7 +618,10 @@ async fn a_query_closes_on_its_answer_and_its_record_counts_datagrams() {
     assert_eq!(record.backend_address, Some(b1.addr));
     assert_eq!(record.attempts, 1);
     assert!(record.connected_at.is_some());
+    assert_eq!(record.protocol, StreamProtocol::Udp);
+    assert_eq!(record.detected_protocol, None);
     assert_eq!(h.breaker_records(), vec![("b1".to_string(), true, false)]);
+    assert_eq!(h.outcomes("dns"), vec![ConnectOutcome::Answered]);
 
     let stats = h.stats("dns");
     assert_eq!((stats.accepted, stats.active), (1, 0));
@@ -597,6 +629,12 @@ async fn a_query_closes_on_its_answer_and_its_record_counts_datagrams() {
     assert_eq!((stats.datagrams_upload, stats.datagrams_download), (1, 1));
     let link = h.link("dns", "b1");
     assert_eq!((link.connects, link.active), (1, 0));
+    assert_eq!(
+        (link.bytes_upload, link.bytes_download),
+        (stats.bytes_upload, stats.bytes_download),
+        "the one backend carried every byte"
+    );
+    assert_eq!((link.bytes_upload, link.bytes_download), (5, 5));
     assert_eq!(*h.selector.connected.lock().unwrap(), vec!["b1"]);
     assert_eq!(*h.selector.closed.lock().unwrap(), vec!["b1"]);
 
@@ -711,6 +749,7 @@ async fn a_silent_backend_ends_the_session_idle_and_reports_one_failure() {
     assert_eq!(record.end_reason, StreamEndReason::IdleTimeout);
     assert!(started.elapsed() >= Duration::from_secs(1));
     assert_eq!(h.breaker_records(), vec![("b1".to_string(), false, false)]);
+    assert_eq!(h.outcomes("dns"), vec![ConnectOutcome::NoResponse]);
     assert_eq!(
         h.link("dns", "b1").connect_failures[&ConnectFailureKind::NoResponse],
         1
@@ -736,6 +775,11 @@ async fn the_total_timeout_ends_a_session_that_never_idles() {
         h.breaker_records().is_empty(),
         "no response was expected, so silence is no failure"
     );
+    assert!(
+        h.outcomes("syslog").is_empty(),
+        "judged at its end from the record, not at a connect"
+    );
+    assert!(h.records.try_recv().is_err(), "one record for the session");
     h.stop();
 }
 
@@ -751,6 +795,7 @@ async fn an_icmp_refusal_before_any_answer_fails_the_session() {
     let record = h.record().await;
     assert_eq!(record.end_reason, StreamEndReason::ConnectFailed);
     assert_eq!(h.breaker_records(), vec![("b1".to_string(), false, false)]);
+    assert_eq!(h.outcomes("dns"), vec![ConnectOutcome::IcmpError]);
     assert_eq!(
         h.link("dns", "b1").connect_failures[&ConnectFailureKind::Refused],
         1
@@ -1329,5 +1374,45 @@ async fn a_draining_binding_serves_its_sessions_and_opens_none() {
     .await;
     assert_silent(&newcomer).await;
     assert_eq!(h.stats("game").accepted, 1);
+    h.stop();
+}
+
+// ---- what the access log is handed (Story 12.9 Lot A) --------------------
+
+/// A session with no backend to open reports one `not_connected`; one
+/// that expects no response and ends normally reports nothing but its
+/// record.
+#[tokio::test]
+async fn no_healthy_backend_is_not_connected_and_a_silent_stream_reports_only_its_record() {
+    let b1 = UdpBackend::sink().await;
+    let mut down = backend("b1", b1.addr);
+    down.health_status = HealthStatus::Down;
+    let mut syslog = udp_stream("syslog", "127.0.0.1");
+    udp(&mut syslog).responses_per_request = 0;
+    udp(&mut syslog).requests_per_session = Some(1);
+    let mut h = Harness::start(
+        vec![
+            (udp_stream("dns", "127.0.0.1"), vec![down]),
+            (syslog, vec![backend("b2", b1.addr)]),
+        ],
+        Pick::First,
+        Breaker::default(),
+    )
+    .await;
+    let c = client().await;
+    c.send_to(b"query", h.listens[0]).await.unwrap();
+    let record = h.record().await;
+    assert_eq!(record.end_reason, StreamEndReason::NoHealthyBackend);
+    assert_eq!(h.outcomes("dns"), vec![ConnectOutcome::NotConnected]);
+
+    c.send_to(b"<13>message", h.listens[1]).await.unwrap();
+    let record = h.record().await;
+    assert_eq!(record.stream_id, "syslog");
+    assert_eq!(record.end_reason, StreamEndReason::RequestBoundReached);
+    assert_eq!(record.protocol, StreamProtocol::Udp);
+    assert!(h.outcomes("syslog").is_empty());
+    assert!(h.records.try_recv().is_err(), "one record per session");
+    let link = h.link("syslog", "b2");
+    assert_eq!((link.bytes_upload, link.bytes_download), (11, 0));
     h.stop();
 }

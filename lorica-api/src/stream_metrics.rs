@@ -124,6 +124,8 @@ pub enum StreamFamily {
     BackendActive,
     /// Connections established per backend of a stream.
     BackendConnects,
+    /// Bytes forwarded per backend of a stream, per direction.
+    BackendBytes,
     /// Failed connect attempts per backend of a stream, per kind.
     BackendConnectFailures,
     /// Connect latency per backend of a stream.
@@ -165,6 +167,7 @@ impl StreamFamily {
             Self::RuleMatched => "stream_rule_matched_total",
             Self::BackendActive => "stream_backend_active",
             Self::BackendConnects => "stream_backend_connects_total",
+            Self::BackendBytes => "stream_backend_bytes_total",
             Self::BackendConnectFailures => "stream_backend_connect_failures_total",
             Self::BackendConnectSeconds => "stream_backend_connect_seconds",
             Self::BackendUpstreamTlsFailures => "stream_backend_upstream_tls_failures_total",
@@ -208,6 +211,7 @@ impl StreamFamily {
             Self::BackendConnectFailures | Self::BackendUpstreamTlsFailures => {
                 &["stream_id", "backend_id", "kind"]
             }
+            Self::BackendBytes => &["stream_id", "backend_id", "direction"],
             Self::BackendDnsFailures | Self::BackendDnsLocalExcluded => &["backend_id"],
             Self::ListenerUp
             | Self::Active
@@ -255,6 +259,7 @@ impl StreamFamily {
             Self::RuleMatched => "ClientHellos a stream rule matched, per rule position",
             Self::BackendActive => "Open connections per backend of a stream",
             Self::BackendConnects => "Connections established per backend of a stream",
+            Self::BackendBytes => "Bytes forwarded per backend of a stream, per direction",
             Self::BackendConnectFailures => {
                 "Failed connect attempts per backend of a stream, per kind"
             }
@@ -270,7 +275,8 @@ impl StreamFamily {
     }
 }
 
-/// The direction label of the byte and datagram families.
+/// The direction label of the byte and datagram families, per stream and
+/// per backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr, VariantArray)]
 #[strum(serialize_all = "snake_case")]
 pub enum Direction {
@@ -511,10 +517,23 @@ impl Flat {
             connect_failures,
             connect_latency,
             upstream_tls_failures,
+            bytes_upload,
+            bytes_download,
         } = link;
         let ids: [&str; 2] = [stream_id, backend_id];
         self.gauge(F::BackendActive, &ids, *active);
         self.counter(F::BackendConnects, &ids, *connects);
+        for &direction in Direction::VARIANTS {
+            let bytes = match direction {
+                Direction::Upload => bytes_upload,
+                Direction::Download => bytes_download,
+            };
+            self.counter(
+                F::BackendBytes,
+                &[stream_id, backend_id, direction.as_str()],
+                *bytes,
+            );
+        }
         for (kind, n) in connect_failures {
             self.counter(
                 F::BackendConnectFailures,
@@ -1080,6 +1099,8 @@ mod tests {
             link.upstream_tls_failed(kind);
         }
         drop(link.connected(Duration::from_millis(3)));
+        link.add_upload(40);
+        link.add_download(400);
         counters.backend(BACKEND).dns_failure();
         counters.rule(STREAM, RULE).matched();
         counters
@@ -1157,6 +1178,7 @@ mod tests {
         for direction in Direction::VARIANTS {
             at(StreamFamily::Bytes, "direction", direction.as_str());
             at(StreamFamily::Datagrams, "direction", direction.as_str());
+            at(StreamFamily::BackendBytes, "direction", direction.as_str());
         }
         for outcome in ProxyHeaderOutcome::ALL {
             at(StreamFamily::ProxyHeader, "outcome", outcome.as_str());
@@ -1187,6 +1209,18 @@ mod tests {
                 ]
             ),
             Some(400.0)
+        );
+        assert_eq!(
+            sample(
+                &collector,
+                StreamFamily::BackendBytes,
+                &[
+                    ("stream_id", STREAM),
+                    ("backend_id", BACKEND),
+                    ("direction", Direction::Upload.as_str())
+                ]
+            ),
+            Some(40.0)
         );
     }
 

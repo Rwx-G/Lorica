@@ -1010,8 +1010,8 @@ async fn termination_serves_the_named_certificate_and_the_ip_certificate_without
     let tls = record.tls.unwrap();
     assert_eq!(tls.negotiated_alpn.as_deref(), Some(&b"h2"[..]));
     assert_eq!(
-        tls.client_certificate,
-        Some(ClientCertificateOutcome::Absent)
+        tls.client_certificate, None,
+        "a stream that does not verify records no outcome (Story 12.9 D-a)"
     );
     assert_eq!(record.bytes_upload, 4, "plaintext is counted");
 

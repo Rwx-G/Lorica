@@ -576,9 +576,22 @@ pub struct LinkStats {
     /// Whether the last upstream handshake on the link failed
     /// verification, so the failure is logged once per transition.
     verify_failing: AtomicBool,
+    bytes_upload: AtomicU64,
+    bytes_download: AtomicU64,
 }
 
 impl LinkStats {
+    /// Add client-to-backend bytes forwarded to this backend, alongside
+    /// the stream's own count (Story 12.9 D-e).
+    pub fn add_upload(&self, bytes: u64) {
+        self.bytes_upload.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Add backend-to-client bytes forwarded from this backend.
+    pub fn add_download(&self, bytes: u64) {
+        self.bytes_download.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     /// Count an upstream TLS failure of `kind`. For `verify`, returns
     /// whether the link was not already failing verification, which is
     /// when the failure deserves a log line.
@@ -620,6 +633,8 @@ impl LinkStats {
             connects: get(&self.connects),
             connect_failures: self.connect_failures.snapshot(),
             connect_latency: self.connect_latency.snapshot(),
+            bytes_upload: get(&self.bytes_upload),
+            bytes_download: get(&self.bytes_download),
         }
     }
 }
@@ -893,6 +908,11 @@ pub struct LinkCountersSnapshot {
     pub connect_latency: HistogramSnapshot,
     /// Failed upstream TLS handshakes, per kind (Story 12.4).
     pub upstream_tls_failures: HashMap<UpstreamTlsFailure, u64>,
+    /// Client-to-backend bytes forwarded to this backend, added per
+    /// completed write as the stream's are (Story 12.9).
+    pub bytes_upload: u64,
+    /// Backend-to-client bytes forwarded from this backend.
+    pub bytes_download: u64,
 }
 
 /// One backend's counters.

@@ -48,7 +48,7 @@ use tokio::time::Instant;
 use tracing::debug;
 
 use super::{MAX_UDP_PAYLOAD, OPENING_QUEUE_DATAGRAMS};
-use crate::counters::{ConnectFailureKind, StreamStats};
+use crate::counters::{ConnectFailureKind, LinkStats, StreamStats};
 
 /// What identifies a session (D-a): the binding, the local address the
 /// client targeted and the client, both canonical.
@@ -156,6 +156,9 @@ struct State {
     retired: bool,
     last_activity: Instant,
     pending_end: Option<Ending>,
+    /// The backend's link once the session has one: its bytes are
+    /// counted there too (Story 12.9 D-e).
+    link: Option<Arc<LinkStats>>,
 }
 
 /// What became of a client datagram offered to a session.
@@ -237,6 +240,7 @@ impl Session {
                 retired: bounds.requests.is_some_and(|r| counts.taken >= r),
                 last_activity: Instant::now(),
                 pending_end: None,
+                link: None,
             }),
             wake: Notify::new(),
         }
@@ -314,6 +318,12 @@ impl Session {
         }
     }
 
+    /// Count the bytes forwarded from now on on `link` too, the
+    /// backend's: called before [`Session::opened`] sends what was held.
+    pub(crate) fn counting_link(&self, link: Arc<LinkStats>) {
+        self.lock().link = Some(link);
+    }
+
     /// The upstream socket is connected: send what was held, in order,
     /// and from now on forward at once.
     pub(crate) fn opened(&self, socket: &Arc<UdpSocket>) {
@@ -339,6 +349,9 @@ impl Session {
                 st.counts.qb += len;
                 st.last_activity = Instant::now();
                 self.stats.datagram_upload(len);
+                if let Some(link) = &st.link {
+                    link.add_upload(len);
+                }
             }
             Err(e) => match icmp_kind(&e) {
                 Some(kind) => {
@@ -400,6 +413,9 @@ impl Session {
                 st.counts.rb += len;
                 st.last_activity = Instant::now();
                 self.stats.datagram_download(len);
+                if let Some(link) = &st.link {
+                    link.add_download(len);
+                }
             }
             Err(e) => {
                 if e.kind() != io::ErrorKind::WouldBlock {

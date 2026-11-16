@@ -76,9 +76,9 @@ pub use budget::{
 pub use caps::{CapsRegistry, NodeCapsRegions, StreamCaps};
 pub use counters::{CountersSnapshot, StreamCounters};
 pub use handler::{
-    AcceptedConnection, ClientCertificateOutcome, ConnectionObserver, ConnectionRecord, Datagram,
-    DatagramHandler, Engines, LogObserver, RefusalRecord, StreamHandler, SuppressedRecord,
-    TlsRecord,
+    AcceptedConnection, ClientCertificateOutcome, ConnectOutcome, ConnectionObserver,
+    ConnectionRecord, Datagram, DatagramHandler, Engines, LogObserver, RefusalRecord,
+    StreamHandler, StreamLogKey, SuppressedRecord, TlsRecord,
 };
 pub use local::BoundPorts;
 pub use reconcile::{diff, Actions, BindKey, BoundBinding, Detach, ReleaseCause, UdpOverlap};

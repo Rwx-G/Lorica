@@ -50,9 +50,10 @@ use lorica_stream::counters::{ConnectFailureKind, ProxyHeaderOutcome, StreamCoun
 use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
     AcceptedConnection, Admission, BackendSelector, BoundPorts, BreakerGate, CapsRegistry,
-    ConnectionObserver, ConnectionRecord, ConnectionTracker, NodeCapsRegions, RefusalRecord,
-    Resolve, ResolveError, Resolved, ResolverCache, SelectionRequest, SourceGate, StreamCounters,
-    StreamHandler, StreamTable, SuppressedRecord, TcpEngine, TcpEngineParts,
+    ConnectOutcome, ConnectionObserver, ConnectionRecord, ConnectionTracker, NodeCapsRegions,
+    RefusalRecord, Resolve, ResolveError, Resolved, ResolverCache, SelectionRequest, SourceGate,
+    StreamCounters, StreamHandler, StreamLogKey, StreamTable, SuppressedRecord, TcpEngine,
+    TcpEngineParts,
 };
 use lorica_worker::stream_ctl::StreamCtlMsg;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -161,15 +162,25 @@ impl SourceGate for Gate {
     }
 }
 
+/// A connect outcome as the observer heard it.
+type Outcome = (String, StreamProtocol, ConnectOutcome);
+
 struct Records {
     ended: mpsc::UnboundedSender<ConnectionRecord>,
     refused: mpsc::UnboundedSender<RefusalRecord>,
     suppressed: mpsc::UnboundedSender<SuppressedRecord>,
+    outcomes: mpsc::UnboundedSender<Outcome>,
 }
 
 impl ConnectionObserver for Records {
     fn observe(&self, record: ConnectionRecord) {
         let _ = self.ended.send(record);
+    }
+
+    fn connect_outcome(&self, stream_id: &str, protocol: StreamProtocol, outcome: ConnectOutcome) {
+        let _ = self
+            .outcomes
+            .send((stream_id.to_string(), protocol, outcome));
     }
 
     fn refused(&self, record: RefusalRecord) {
@@ -230,6 +241,7 @@ struct Harness {
     records: mpsc::UnboundedReceiver<ConnectionRecord>,
     refusals: mpsc::UnboundedReceiver<RefusalRecord>,
     suppressed: mpsc::UnboundedReceiver<SuppressedRecord>,
+    outcomes: mpsc::UnboundedReceiver<Outcome>,
     counters: Arc<StreamCounters>,
     breaker: Arc<Breaker>,
     dns: Arc<Dns>,
@@ -258,6 +270,7 @@ impl Harness {
         let (ended, records) = mpsc::unbounded_channel();
         let (refused, refusals) = mpsc::unbounded_channel();
         let (held_back, suppressed) = mpsc::unbounded_channel();
+        let (outcome, outcomes) = mpsc::unbounded_channel();
         let engine = TcpEngine::new(TcpEngineParts {
             selector: Arc::clone(&selector) as Arc<dyn BackendSelector>,
             breaker: Arc::clone(&breaker) as Arc<dyn BreakerGate>,
@@ -270,6 +283,7 @@ impl Harness {
                 ended,
                 refused,
                 suppressed: held_back,
+                outcomes: outcome,
             }),
             reserved_ports,
             source_gate: Arc::clone(&gate) as Arc<dyn SourceGate>,
@@ -312,6 +326,7 @@ impl Harness {
             records,
             refusals,
             suppressed,
+            outcomes,
             counters,
             breaker,
             dns,
@@ -398,6 +413,21 @@ impl Harness {
             .await
             .expect("a refusal row in time")
             .expect("the engine is alive")
+    }
+
+    /// The connect outcomes heard so far. The engine reports one before
+    /// it hands the connection's record, so once a record is in, its
+    /// outcome is too.
+    fn outcomes(&mut self) -> Vec<ConnectOutcome> {
+        let mut heard = Vec::new();
+        while let Ok((stream_id, protocol, outcome)) = self.outcomes.try_recv() {
+            assert_eq!(
+                (stream_id.as_str(), protocol),
+                (STREAM_ID, StreamProtocol::Tcp)
+            );
+            heard.push(outcome);
+        }
+        heard
     }
 
     fn refused(&self, refusal: StreamRefusal) -> u64 {
@@ -543,6 +573,9 @@ async fn echo_through_the_engine_both_ways_with_its_record() {
     assert_eq!(record.end_reason, StreamEndReason::ClientClose);
     assert_eq!(record.stream_id, STREAM_ID);
     assert_eq!(record.stream_name, "pg");
+    assert_eq!(record.protocol, StreamProtocol::Tcp);
+    assert_eq!(record.detected_protocol, None);
+    assert_eq!(record.tls, None);
     assert_eq!(record.bind_gen, 1);
     assert_eq!(record.client, client.local_addr().unwrap());
     assert_eq!(record.peer, record.client);
@@ -564,6 +597,7 @@ async fn echo_through_the_engine_both_ways_with_its_record() {
     let link = &h.counters.snapshot().links[&(STREAM_ID.to_string(), "b1".to_string())];
     assert_eq!(link.connects, 1);
     assert_eq!(link.connect_latency.count, 1);
+    assert_eq!((link.bytes_upload, link.bytes_download), (9, 9));
     wait_until("the gauges released", || {
         let snap = h.counters.snapshot();
         snap.streams[STREAM_ID].active == 0
@@ -933,16 +967,17 @@ async fn a_send_without_accept_carries_the_socket_addresses() {
     assert_eq!(h.record().await.bytes_upload, 4);
 }
 
-async fn refused_header(h: &mut Harness, bytes: &[u8], outcome: ProxyHeaderOutcome) {
+/// A trusted peer sending `bytes` ends `proxy_header_invalid`, counted
+/// with `outcome`, before any backend: the `nth` such end of the test.
+/// Only the first of a window hands a record (Story 12.9 D-c), so the
+/// end is read from the counters.
+async fn refused_header(h: &mut Harness, bytes: &[u8], outcome: ProxyHeaderOutcome, nth: u64) {
     let mut client = h.connect().await;
     client.write_all(bytes).await.unwrap();
-    let record = h.record().await;
-    assert_eq!(
-        record.end_reason,
-        StreamEndReason::ProxyHeaderInvalid,
-        "{outcome:?}"
-    );
-    assert_eq!(record.backend_id, None, "{outcome:?}");
+    wait_until("the end counted", || {
+        ended(&h.stats(), StreamEndKind::ProxyHeaderInvalid) == nth
+    })
+    .await;
     assert_eq!(
         h.stats().proxy_header.get(&outcome),
         Some(&1),
@@ -963,21 +998,30 @@ async fn a_trusted_peer_header_that_is_oversized_or_dgram_is_refused() {
     oversized.extend_from_slice(&[0x21, 0x11]);
     oversized.extend_from_slice(&u16::try_from(4_097 - 16).unwrap().to_be_bytes());
     oversized.resize(4_097, 0);
-    refused_header(&mut h, &oversized, ProxyHeaderOutcome::RefusedOversized).await;
+    refused_header(&mut h, &oversized, ProxyHeaderOutcome::RefusedOversized, 1).await;
+    let record = h.record().await;
+    assert_eq!(record.end_reason, StreamEndReason::ProxyHeaderInvalid);
+    assert_eq!(record.backend_id, None);
 
     let dgram = encode_v2_dgram(
         "192.0.2.10:53".parse().unwrap(),
         "198.51.100.1:53".parse().unwrap(),
     );
-    refused_header(&mut h, &dgram, ProxyHeaderOutcome::RefusedUnsupported).await;
+    refused_header(&mut h, &dgram, ProxyHeaderOutcome::RefusedUnsupported, 2).await;
 
     refused_header(
         &mut h,
         b"PROXY TCP4 nonsense\r\n",
         ProxyHeaderOutcome::RefusedMalformed,
+        3,
     )
     .await;
+    assert!(
+        h.records.try_recv().is_err(),
+        "the window's first end was its one record"
+    );
     assert_eq!(accepted.load(Ordering::SeqCst), 0);
+    assert!(h.outcomes().is_empty(), "no connect phase, no outcome");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1045,10 +1089,11 @@ async fn an_untrusted_peer_header_forwards_nothing_and_ping_is_forwarded() {
     client.write_all(&header[..5]).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     client.write_all(&header[5..]).await.unwrap();
-    assert_eq!(
-        h.record().await.end_reason,
-        StreamEndReason::ProxyHeaderInvalid
-    );
+    // The second end of the window: counted, its record held back.
+    wait_until("the second end counted", || {
+        ended(&h.stats(), StreamEndKind::ProxyHeaderInvalid) == 2
+    })
+    .await;
     let got = tokio::time::timeout(WAIT, received.recv()).await.unwrap();
     assert_eq!(got.as_deref(), Some(b"".as_slice()));
     assert_eq!(
@@ -1415,7 +1460,10 @@ async fn a_source_over_its_open_rate_is_refused_while_another_is_served() {
     .await
     .expect("a suppressed row when the window closes")
     .expect("the engine is alive");
-    assert_eq!(held_back.refusal, StreamRefusal::SourceOpenRate);
+    assert_eq!(
+        held_back.key,
+        StreamLogKey::Refused(StreamRefusal::SourceOpenRate)
+    );
     assert_eq!(held_back.suppressed, refused - 1);
     assert!(h.suppressed.try_recv().is_err());
 }
@@ -1621,4 +1669,147 @@ async fn a_backend_at_its_cap_is_skipped_and_all_at_cap_refuse_backend_cap() {
     let mut d = h.connect().await;
     echo_once(&mut d, b"d").await;
     assert_eq!(first_hits.load(Ordering::SeqCst), 2, "b1's place came back");
+}
+
+// ---- what the access log is handed (Story 12.9 Lot A) --------------------
+
+/// Each connection that reaches backend selection reports its connect
+/// outcome once, before its record; one that never does reports none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_connection_reaching_selection_reports_one_connect_outcome() {
+    let mut h = Harness::new().await;
+    let (addr, _) = echo().await;
+
+    h.set(stream(), vec![(backend("b1", addr), false)]);
+    let mut client = h.connect().await;
+    echo_once(&mut client, b"x").await;
+    drop(client);
+    assert_eq!(h.record().await.end_reason, StreamEndReason::ClientClose);
+    let heard = h.outcomes();
+    assert!(
+        matches!(heard.as_slice(), [ConnectOutcome::Connected { .. }]),
+        "{heard:?}"
+    );
+
+    h.set(stream(), vec![(backend("b1", refusing()), false)]);
+    let _client = h.connect().await;
+    assert_eq!(h.record().await.end_reason, StreamEndReason::ConnectFailed);
+    assert_eq!(h.outcomes(), vec![ConnectOutcome::NotConnected]);
+
+    let mut down = backend("b1", addr);
+    down.health_status = HealthStatus::Down;
+    h.set(stream(), vec![(down, false)]);
+    let _client = h.connect().await;
+    assert_eq!(
+        h.record().await.end_reason,
+        StreamEndReason::NoHealthyBackend
+    );
+    assert_eq!(h.outcomes(), vec![ConnectOutcome::NotConnected]);
+
+    // Refused at accept, or ended before forwarding: no connect phase.
+    let mut denied = stream();
+    denied.source_deny_cidrs = vec!["127.0.0.2".into()];
+    h.set(denied, vec![(backend("b1", addr), false)]);
+    let client = h.connect_from(2).await;
+    refused_at_accept(&mut h, client, StreamRefusal::SourceDenied).await;
+    h.set(
+        accepting(&["127.0.0.1"], StreamProxyProtocol::Off),
+        vec![(backend("b1", addr), false)],
+    );
+    let mut client = h.connect().await;
+    client.write_all(b"PROXY TCP4 nonsense\r\n").await.unwrap();
+    assert_eq!(
+        h.record().await.end_reason,
+        StreamEndReason::ProxyHeaderInvalid
+    );
+    assert!(h.outcomes().is_empty());
+}
+
+/// A flood of ends before forwarding is one record per window and one
+/// suppressed row counting the rest, keyed by the end; every end is
+/// still counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flood_of_pre_forwarding_ends_is_one_record_and_one_suppressed_row() {
+    const FLOOD: u64 = 20;
+    let mut h = Harness::new().await;
+    let (addr, accepted) = echo().await;
+    h.set(
+        accepting(&["127.0.0.1"], StreamProxyProtocol::Off),
+        vec![(backend("b1", addr), false)],
+    );
+    for nth in 1..=FLOOD {
+        let mut client = h.connect().await;
+        client.write_all(b"PROXY TCP4 nonsense\r\n").await.unwrap();
+        wait_until("the end counted", || {
+            ended(&h.stats(), StreamEndKind::ProxyHeaderInvalid) == nth
+        })
+        .await;
+    }
+    let record = h.record().await;
+    assert_eq!(record.end_reason, StreamEndReason::ProxyHeaderInvalid);
+    assert!(h.records.try_recv().is_err(), "one record for the window");
+    assert_eq!(accepted.load(Ordering::SeqCst), 0);
+
+    let held_back = tokio::time::timeout(
+        lorica_stream::REFUSAL_LOG_WINDOW + WAIT,
+        h.suppressed.recv(),
+    )
+    .await
+    .expect("a suppressed row when the window closes")
+    .expect("the engine is alive");
+    assert_eq!(
+        held_back.key,
+        StreamLogKey::PreForwarding(StreamEndKind::ProxyHeaderInvalid)
+    );
+    assert_eq!(held_back.key.end_kind(), StreamEndKind::ProxyHeaderInvalid);
+    assert_eq!(held_back.key.refusal(), None);
+    assert_eq!(held_back.suppressed, FLOOD - 1);
+    assert_eq!(held_back.protocol, StreamProtocol::Tcp);
+    assert!(h.suppressed.try_recv().is_err());
+    assert!(h.refusals.try_recv().is_err(), "not a refusal row");
+}
+
+/// The bytes of a stream are the sum of its backends', each counted on
+/// the backend that carried them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_backend_bytes_add_up_to_the_streams() {
+    let mut h = Harness::new().await;
+    let (first, _) = echo().await;
+    let (second, _) = echo().await;
+    h.set(
+        stream(),
+        vec![
+            (backend("b1", first), false),
+            (backend("b2", second), false),
+        ],
+    );
+    let mut client = h.connect().await;
+    echo_once(&mut client, b"to the first").await;
+    drop(client);
+    assert_eq!(h.record().await.backend_id.as_deref(), Some("b1"));
+
+    // `b1` down: the next connection is `b2`'s, `b1`'s link is kept.
+    let mut down = backend("b1", first);
+    down.health_status = HealthStatus::Down;
+    h.set(
+        stream(),
+        vec![(down, false), (backend("b2", second), false)],
+    );
+    let mut client = h.connect().await;
+    echo_once(&mut client, b"to the second, longer").await;
+    drop(client);
+    let record = h.record().await;
+    assert_eq!(record.backend_id.as_deref(), Some("b2"));
+
+    let snapshot = h.counters.snapshot();
+    let link = |id: &str| &snapshot.links[&(STREAM_ID.to_string(), id.to_string())];
+    assert_eq!(link("b1").bytes_upload, 12);
+    assert_eq!(link("b2").bytes_upload, 21);
+    let stream = &snapshot.streams[STREAM_ID];
+    let upload: u64 = snapshot.links.values().map(|l| l.bytes_upload).sum();
+    let download: u64 = snapshot.links.values().map(|l| l.bytes_download).sum();
+    assert_eq!(
+        (upload, download),
+        (stream.bytes_upload, stream.bytes_download)
+    );
 }
