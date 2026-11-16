@@ -658,9 +658,9 @@ Allowlist: `lorica-api/src/streams.rs`, `lorica-api/src/streams/tests.rs`,
 `lorica-api/openapi.yaml`.
 Depends on: B; sequential with 12.5 Lot G and 12.4 Lot F.
 
-- [ ] Requests and `StreamResponse` with every D-m field;
+- [x] Requests and `StreamResponse` with every D-m field;
       `backend_max_active`; the view key-set test covers them.
-- [ ] `openapi.yaml`: fields, ranges, the link map, the refusal enum,
+- [x] `openapi.yaml`: fields, ranges, the link map, the refusal enum,
       `max_connections` described "per node"; contract test green.
 
 ### Lot F: the allowlist hook-ups (`lorica-config`) - cargo
@@ -1137,6 +1137,58 @@ skip the node's controls.
   pass-through gate for the new `stream_engines` argument) and the new
   `lorica/tests/stream_protection_process_test.rs`.
 
+**Lot E (`lorica-api`, the API surfaces).**
+
+- **Shape.** `StreamResponse`, `CreateStreamRequest` and
+  `UpdateStreamRequest` carry the seven source controls after
+  `max_connections`, field by field (`source_max_connections`,
+  `max_pending_connections`, `source_allow_cidrs`, `source_deny_cidrs`,
+  `geoip`, `source_open_rate`, `open_rate`); `geoip` is the route's
+  `GeoIpConfig` shape, answered in its stored form (the write applies
+  `canonicalise_geoip`, so the view and the audit row are the row).
+  The four options are nullable on both bodies: absent keeps (update)
+  or defaults (create), `null` clears.
+- **Link caps.** `backend_max_active: {backend_id: n}` beside
+  `backend_ids` and `backup_backend_ids`, at the stream level and,
+  **deviation from D-h's letter**, inside each rule of a TLS stream too,
+  since on a TLS stream the two lists live in the rules: a stream-level
+  map would be the one link attribute that does not travel with its
+  link. A stream-level map on a TLS stream is refused like a
+  stream-level list. On an update, the map replaces every cap; left
+  out, each link still written keeps its stored cap and a removed link
+  takes its cap with it; the map alone rewrites the links with their
+  lists unchanged. A key naming a backend the body does not link is
+  refused by the API (422, naming `backend_max_active` and the rule);
+  a cap out of range is left to the store's `StreamBackend::validate`
+  (422 with its own message), inside the write's transaction.
+- **Status codes.** D-m says 400 for validation; every model rule of
+  the stream API answers 422 (`ApiError::Unprocessable`, the module's
+  documented rule since 12.1), so the source controls do too. 400 stays
+  for a body that does not parse.
+- **The fd budget.** Unchanged, as D-f states: a pending connection is
+  one of `max_connections`, which the budget already counts per
+  worker. `openapi.yaml` says so on `max_pending_connections`.
+- **`openapi.yaml`.** The fields with ranges and defaults, a
+  `StreamGeoIp` schema, `backend_max_active` on the view, the requests
+  and `StreamMatchRule`; `max_connections` described per node; the
+  `no_sni_acknowledged` and UDP listen-address prose name the allowlist
+  that Lot F made a remedy; the update path and the 422 response name
+  the new refusals. The refusal enum already held the twelve words
+  (Lot B); its test against `StreamRefusal::VARIANTS` is unchanged.
+- **Tests.** The view key-set test runs without Lot B's
+  `protection_field_names` filter, on a stream with every control off
+  its default (a fixture pinned to `protection_field_names`), and
+  `LINK_FIELDS` gains `backend_max_active`, which also holds the
+  `StreamMatchRule` schema to it. New: the round trip of every control
+  and cap through create, update and read (nulls, list replacement,
+  caps kept, dropped with their link, replaced alone); every refusal
+  answering 422 with its field and storing nothing, on create and
+  update; a TLS stream's caps per rule and the stream-level refusal;
+  an exposed UDP stream with an allowlist and no explicit cap, refused
+  once the allowlist is removed; the published ranges, `maxItems`,
+  GeoIP words and limit, and the pending share's divisor read from the
+  model.
+
 ## File List
 
 Lot A:
@@ -1198,6 +1250,12 @@ Lot D:
 - Outside the allowlist: `lorica/tests/stream_protection_process_test.rs`
   (new), `lorica/tests/stream_tls_wiring.rs` (modified)
 
+Lot E:
+
+- `lorica-api/src/streams.rs` (modified)
+- `lorica-api/src/streams/tests.rs` (modified)
+- `lorica-api/openapi.yaml` (modified)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1208,3 +1266,4 @@ Lot D:
 | 2026-11-15 | 0.4 | Lot B with Lot F folded in: the source controls on `Stream` and `max_active` on the link, their validation, `GeoIpConfig::normalised`, migration 78, canonical digest (format 3), diff and import; the two allowlist hook-ups. | Romain G. |
 | 2026-11-16 | 0.5 | Lot C: the admission sequence in both engines, the `SourceGate` seam, per-node `max_connections`, the pending cap and per-source share, open rates, link caps, refusal rows through the generic limiter with the Story 12.9 observer methods, `caps_unavailable` counted on UDP; regions for every stream in the plane (the region part of Lot D). | Romain G. |
 | 2026-11-16 | 0.6 | Lot D: `StreamSourceGate` over the process's connection filter, IP blocklist with the WAF whitelist exemption, and GeoIP resolver in both modes, the interim pass-through gate deleted; the worker loads its source controls before its stream runtime starts; regions sized for their capped links; the HTTP PROXY refusal log on the shared limiter; the stream protection process test. | Romain G. |
+| 2026-11-16 | 0.7 | Lot E: the source controls on the stream API and in `openapi.yaml`, `backend_max_active` per link at the stream level and per rule, `max_connections` documented per node, the interim view filter removed. | Romain G. |

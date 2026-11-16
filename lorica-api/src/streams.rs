@@ -25,12 +25,19 @@
 //! that reads no ClientHello. Its PEM bundles and the certificates it
 //! names are checked by [`tls_checks`] on every write.
 //!
+//! The source controls of Story 12.6 (the CIDR lists, GeoIP, the
+//! per-source and pending caps, the open rates) are stream fields like
+//! any other; a link's cap (`max_active`, D-h) travels beside the lists
+//! that make the link, as `backend_max_active`, a map from backend id to
+//! cap, at the stream level or in each rule of a TLS stream.
+//!
 //! Status codes: `400` for a body this API's shared route validators
 //! refuse (group name, selector) and for a body that does not parse;
 //! `422` for a body that parses and breaks a model rule
 //! (`Stream::validate`, the UDP listen-address rule of Story 12.5 D-k
-//! and the `udp` settings' ranges included, a backend id naming no
-//! backend, a name already
+//! and the `udp` settings' ranges included, the source controls, a
+//! link's `max_active` out of its range or naming a backend the body
+//! does not link, a backend id naming no backend, a name already
 //! taken, the attachment rules of D-6 and of Story 12.3, a local backend
 //! without `allow_local_backend` among them, the TLS field a mode does
 //! not take, a PEM bundle that does not parse, a certificate that does
@@ -53,9 +60,10 @@ use lorica_config::listen_ports::{
     NodeLabel, NodePorts, PortConflict, ReservedPorts,
 };
 use lorica_config::models::{
-    binds_here_when_enabled, Backend, ClusterNode, LoadBalancing, MtlsConfig, NodeRole, NodeStatus,
-    Stream, StreamBackend, StreamMatchRule, StreamMatcher, StreamProtocol, StreamProxyProtocol,
-    StreamTlsMode, StreamTlsTerminate, StreamUpstreamTls, UdpSettings, UpstreamServerName,
+    binds_here_when_enabled, Backend, ClusterNode, GeoIpConfig, LoadBalancing, MtlsConfig,
+    NodeRole, NodeStatus, Stream, StreamBackend, StreamMatchRule, StreamMatcher, StreamProtocol,
+    StreamProxyProtocol, StreamTlsMode, StreamTlsTerminate, StreamUpstreamTls, UdpSettings,
+    UpstreamServerName,
 };
 use lorica_config::ConfigStore;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -146,8 +154,24 @@ pub struct StreamResponse {
     pub upload_rate_bps: Option<u64>,
     /// Mirror of `Stream.download_rate_bps`; `null` for no limit.
     pub download_rate_bps: Option<u64>,
-    /// Mirror of `Stream.max_connections`.
+    /// Mirror of `Stream.max_connections`, per node.
     pub max_connections: u32,
+    /// Mirror of `Stream.source_max_connections`; `null` bounds a source
+    /// by `max_connections` alone.
+    pub source_max_connections: Option<u32>,
+    /// Mirror of `Stream.max_pending_connections`.
+    pub max_pending_connections: u32,
+    /// Mirror of `Stream.source_allow_cidrs`.
+    pub source_allow_cidrs: Vec<String>,
+    /// Mirror of `Stream.source_deny_cidrs`.
+    pub source_deny_cidrs: Vec<String>,
+    /// Mirror of `Stream.geoip`, in the route's shape (`mode`,
+    /// `countries`), the codes as stored; `null` for none.
+    pub geoip: Option<GeoIpConfig>,
+    /// Mirror of `Stream.source_open_rate`; `null` for no limit.
+    pub source_open_rate: Option<u32>,
+    /// Mirror of `Stream.open_rate`; `null` for no limit.
+    pub open_rate: Option<u32>,
     /// Mirror of `Stream.udp`: the settings of a UDP stream, `null` on a
     /// TCP stream, which carries none (Story 12.5 D-l).
     pub udp: Option<StreamUdpResponse>,
@@ -177,6 +201,10 @@ pub struct StreamResponse {
     /// IDs of the backup backends, sorted: candidates only when no
     /// primary is (Story 12.3 D-f); empty on a TLS stream.
     pub backup_backend_ids: Vec<String>,
+    /// The cap of each link in `backend_ids` and `backup_backend_ids`
+    /// that has one (`StreamBackend.max_active`), by backend id; a link
+    /// absent from it is uncapped. Empty on a TLS stream.
+    pub backend_max_active: BTreeMap<String, u32>,
     /// RFC 3339 creation timestamp.
     pub created_at: String,
     /// RFC 3339 last-write timestamp.
@@ -196,6 +224,8 @@ pub struct StreamMatchRuleResponse {
     pub backend_ids: Vec<String>,
     /// IDs of the backup backends serving the rule, sorted.
     pub backup_backend_ids: Vec<String>,
+    /// The cap of each of the rule's links that has one, by backend id.
+    pub backend_max_active: BTreeMap<String, u32>,
 }
 
 /// The `tls_terminate` object of a stream's view (Story 12.4 D-f, D-h).
@@ -353,11 +383,13 @@ pub(crate) struct RuleLinks {
     pub(crate) primaries: Vec<String>,
     /// The backups, likewise.
     pub(crate) backups: Vec<String>,
+    /// The cap of each capped link, by backend id (Story 12.6 D-h).
+    pub(crate) caps: BTreeMap<String, u32>,
 }
 
 /// The backends a stream links, by role (Story 12.3 D-f): the links
 /// serving no rule, and on a TLS stream the links of each rule (Story
-/// 12.4 D-d).
+/// 12.4 D-d), each with its cap when it has one (Story 12.6 D-h).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct StreamLinks {
     /// The primaries serving no rule, in the order given or sorted when
@@ -365,6 +397,8 @@ pub(crate) struct StreamLinks {
     pub(crate) primaries: Vec<String>,
     /// The backups serving no rule, likewise.
     pub(crate) backups: Vec<String>,
+    /// The cap of each capped link serving no rule, by backend id.
+    pub(crate) caps: BTreeMap<String, u32>,
     /// The links of each rule, by rule name.
     pub(crate) rules: BTreeMap<String, RuleLinks>,
 }
@@ -375,13 +409,16 @@ impl StreamLinks {
         let mut by_stream: HashMap<String, StreamLinks> = HashMap::new();
         for row in rows {
             let links = by_stream.entry(row.stream_id).or_default();
-            let (primaries, backups) = match row.rule {
+            let (primaries, backups, caps) = match row.rule {
                 Some(rule) => {
                     let rule = links.rules.entry(rule).or_default();
-                    (&mut rule.primaries, &mut rule.backups)
+                    (&mut rule.primaries, &mut rule.backups, &mut rule.caps)
                 }
-                None => (&mut links.primaries, &mut links.backups),
+                None => (&mut links.primaries, &mut links.backups, &mut links.caps),
             };
+            if let Some(cap) = row.max_active {
+                caps.insert(row.backend_id.clone(), cap);
+            }
             if row.backup {
                 backups.push(row.backend_id);
             } else {
@@ -432,21 +469,33 @@ impl StreamLinks {
     /// # Errors
     ///
     /// `422` naming the stream when one backend is both a primary and a
-    /// backup of the same rule (or of no rule). A backend serving two
-    /// rules is refused by the store, which names it.
+    /// backup of the same rule (or of no rule), or when a cap names a
+    /// backend its rule (or no rule) does not link. A backend serving two
+    /// rules is refused by the store, which names it, as it refuses a cap
+    /// out of its range.
     fn rows(&self, stream: &Stream) -> Result<Vec<StreamBackend>, ApiError> {
-        let groups = std::iter::once((None, &self.primaries, &self.backups)).chain(
+        let groups = std::iter::once((None, &self.primaries, &self.backups, &self.caps)).chain(
             self.rules
                 .iter()
-                .map(|(rule, links)| (Some(rule), &links.primaries, &links.backups)),
+                .map(|(rule, links)| (Some(rule), &links.primaries, &links.backups, &links.caps)),
         );
         let mut rows: Vec<StreamBackend> = Vec::new();
-        for (rule, primaries, backups) in groups {
+        for (rule, primaries, backups, caps) in groups {
+            let serving = rule.map_or(String::new(), |rule| format!(" for rule `{rule}`"));
             if let Some(both) = primaries.iter().find(|id| backups.contains(id)) {
-                let serving = rule.map_or(String::new(), |rule| format!(" for rule `{rule}`"));
                 return Err(ApiError::Unprocessable(format!(
                     "stream `{}`: backend {both} is listed both as a primary and as a \
                      backup{serving}",
+                    stream.name
+                )));
+            }
+            if let Some(unlinked) = caps
+                .keys()
+                .find(|id| !primaries.contains(id) && !backups.contains(id))
+            {
+                return Err(ApiError::Unprocessable(format!(
+                    "stream `{}`: backend_max_active names backend {unlinked}, which is \
+                     neither a primary nor a backup{serving}",
                     stream.name
                 )));
             }
@@ -458,6 +507,7 @@ impl StreamLinks {
                 rows.push(StreamBackend {
                     backup,
                     rule: rule.cloned(),
+                    max_active: caps.get(backend_id).copied(),
                     ..StreamBackend::primary(&stream.id, backend_id)
                 });
             }
@@ -471,6 +521,7 @@ pub(crate) fn stream_to_response(stream: &Stream, links: StreamLinks) -> StreamR
     let StreamLinks {
         primaries,
         backups,
+        caps,
         mut rules,
     } = links;
     let match_rules = stream
@@ -483,6 +534,7 @@ pub(crate) fn stream_to_response(stream: &Stream, links: StreamLinks) -> StreamR
                 matcher: rule.matcher.clone(),
                 backend_ids: links.primaries,
                 backup_backend_ids: links.backups,
+                backend_max_active: links.caps,
             }
         })
         .collect();
@@ -512,6 +564,13 @@ pub(crate) fn stream_to_response(stream: &Stream, links: StreamLinks) -> StreamR
         upload_rate_bps: stream.upload_rate_bps,
         download_rate_bps: stream.download_rate_bps,
         max_connections: stream.max_connections,
+        source_max_connections: stream.source_max_connections,
+        max_pending_connections: stream.max_pending_connections,
+        source_allow_cidrs: stream.source_allow_cidrs.clone(),
+        source_deny_cidrs: stream.source_deny_cidrs.clone(),
+        geoip: stream.geoip.clone(),
+        source_open_rate: stream.source_open_rate,
+        open_rate: stream.open_rate,
         udp: stream.udp.as_ref().map(StreamUdpResponse::of),
         tls_mode: stream.tls_mode,
         match_rules,
@@ -528,6 +587,7 @@ pub(crate) fn stream_to_response(stream: &Stream, links: StreamLinks) -> StreamR
         drains_on_upgrade: stream.drains_on_upgrade(),
         backend_ids: primaries,
         backup_backend_ids: backups,
+        backend_max_active: caps,
         created_at: stream.created_at.to_rfc3339(),
         updated_at: stream.updated_at.to_rfc3339(),
     }
@@ -601,6 +661,24 @@ pub struct CreateStreamRequest {
     pub download_rate_bps: Option<Option<u64>>,
     /// `Stream.max_connections`.
     pub max_connections: Option<u32>,
+    /// `Stream.source_max_connections`; absent or `null` for none.
+    #[serde(default, deserialize_with = "nullable")]
+    pub source_max_connections: Option<Option<u32>>,
+    /// `Stream.max_pending_connections`.
+    pub max_pending_connections: Option<u32>,
+    /// `Stream.source_allow_cidrs`; absent is none.
+    pub source_allow_cidrs: Option<Vec<String>>,
+    /// `Stream.source_deny_cidrs`; absent is none.
+    pub source_deny_cidrs: Option<Vec<String>>,
+    /// `Stream.geoip`; absent or `null` for none.
+    #[serde(default, deserialize_with = "nullable")]
+    pub geoip: Option<Option<GeoIpConfig>>,
+    /// `Stream.source_open_rate`; absent or `null` for no limit.
+    #[serde(default, deserialize_with = "nullable")]
+    pub source_open_rate: Option<Option<u32>>,
+    /// `Stream.open_rate`; absent or `null` for no limit.
+    #[serde(default, deserialize_with = "nullable")]
+    pub open_rate: Option<Option<u32>>,
     /// `Stream.udp`, UDP streams only: each setting absent takes its
     /// default, and the object absent (or `null`) takes every default.
     /// Refused on a TCP stream.
@@ -629,6 +707,10 @@ pub struct CreateStreamRequest {
     /// is none. A backend may not be in both lists. Empty on a TLS
     /// stream.
     pub backup_backend_ids: Option<Vec<String>>,
+    /// The cap of each capped link, by backend id, every key in
+    /// `backend_ids` or `backup_backend_ids`; absent caps none. Empty on
+    /// a TLS stream, whose caps are listed per rule.
+    pub backend_max_active: Option<BTreeMap<String, u32>>,
 }
 
 /// A rule of a TLS stream as a create or an update writes it (Story
@@ -647,18 +729,26 @@ pub struct StreamMatchRuleRequest {
     /// primaries is a candidate; absent is none.
     #[serde(default)]
     pub backup_backend_ids: Vec<String>,
+    /// The cap of each of the rule's capped links, by backend id, every
+    /// key one of the rule's backends; absent caps none.
+    #[serde(default)]
+    pub backend_max_active: BTreeMap<String, u32>,
 }
 
 /// Body of `PUT /api/v1/streams/{id}`: every field optional, an absent
-/// field keeps its stored value, and `null` on `total_timeout_s`,
-/// `upload_rate_bps` or `download_rate_bps` removes the limit.
+/// field keeps its stored value, and `null` on a nullable field
+/// (`total_timeout_s`, `upload_rate_bps`, `download_rate_bps`,
+/// `source_max_connections`, `geoip`, `source_open_rate`, `open_rate`)
+/// removes the limit.
 ///
 /// The ports move together, as on create: `port_first` without
 /// `port_last` makes the stream a single port, so moving a single-port
 /// stream never turns it into a range by accident. `port_last` alone
 /// moves the end of the range and keeps its start. `backend_ids`
 /// replaces the primaries and `backup_backend_ids` the backups; a list
-/// left out keeps its stored half. On a TLS stream `match_rules`
+/// left out keeps its stored half. `backend_max_active` replaces every
+/// cap; left out, each link still written keeps its stored cap. On a
+/// TLS stream `match_rules`
 /// replaces the rules and every link with the ones its rules carry, and
 /// left out keeps both.
 #[derive(Debug, Default, Deserialize)]
@@ -715,6 +805,24 @@ pub struct UpdateStreamRequest {
     pub download_rate_bps: Option<Option<u64>>,
     /// New `Stream.max_connections`.
     pub max_connections: Option<u32>,
+    /// New `Stream.source_max_connections`; `null` removes the cap.
+    #[serde(default, deserialize_with = "nullable")]
+    pub source_max_connections: Option<Option<u32>>,
+    /// New `Stream.max_pending_connections`.
+    pub max_pending_connections: Option<u32>,
+    /// New `Stream.source_allow_cidrs`, replacing the list.
+    pub source_allow_cidrs: Option<Vec<String>>,
+    /// New `Stream.source_deny_cidrs`, replacing the list.
+    pub source_deny_cidrs: Option<Vec<String>>,
+    /// New `Stream.geoip`, replacing the object; `null` removes it.
+    #[serde(default, deserialize_with = "nullable")]
+    pub geoip: Option<Option<GeoIpConfig>>,
+    /// New `Stream.source_open_rate`; `null` removes the limit.
+    #[serde(default, deserialize_with = "nullable")]
+    pub source_open_rate: Option<Option<u32>>,
+    /// New `Stream.open_rate`; `null` removes the limit.
+    #[serde(default, deserialize_with = "nullable")]
+    pub open_rate: Option<Option<u32>>,
     /// New `Stream.udp` settings, each absent one kept (after a switch
     /// to UDP, each absent one takes its default); the object absent or
     /// `null` keeps them all. Refused on a TCP stream.
@@ -741,6 +849,8 @@ pub struct UpdateStreamRequest {
     pub backend_ids: Option<Vec<String>>,
     /// New backups, replacing the stored ones; empty on a TLS stream.
     pub backup_backend_ids: Option<Vec<String>>,
+    /// New link caps, replacing every stored one; empty on a TLS stream.
+    pub backend_max_active: Option<BTreeMap<String, u32>>,
 }
 
 /// The `udp` object of a create or an update (Story 12.5 D-l): every
@@ -891,6 +1001,49 @@ impl EngineSettings {
     }
 }
 
+/// The Story 12.6 source controls a create or an update carries, each
+/// `None` when the body left it out. One type for both bodies, as
+/// [`EngineSettings`].
+struct SourceControls {
+    source_max_connections: Option<Option<u32>>,
+    max_pending_connections: Option<u32>,
+    source_allow_cidrs: Option<Vec<String>>,
+    source_deny_cidrs: Option<Vec<String>>,
+    geoip: Option<Option<GeoIpConfig>>,
+    source_open_rate: Option<Option<u32>>,
+    open_rate: Option<Option<u32>>,
+}
+
+impl SourceControls {
+    /// Write every control the body carried onto `stream`, its GeoIP
+    /// list in the form it is stored in, so the view a write answers is
+    /// the row it wrote.
+    fn apply(self, stream: &mut Stream) {
+        if let Some(v) = self.source_max_connections {
+            stream.source_max_connections = v;
+        }
+        if let Some(v) = self.max_pending_connections {
+            stream.max_pending_connections = v;
+        }
+        if let Some(v) = self.source_allow_cidrs {
+            stream.source_allow_cidrs = v;
+        }
+        if let Some(v) = self.source_deny_cidrs {
+            stream.source_deny_cidrs = v;
+        }
+        if let Some(v) = self.geoip {
+            stream.geoip = v;
+            stream.canonicalise_geoip();
+        }
+        if let Some(v) = self.source_open_rate {
+            stream.source_open_rate = v;
+        }
+        if let Some(v) = self.open_rate {
+            stream.open_rate = v;
+        }
+    }
+}
+
 /// The Story 12.4 fields a create or an update carries, each `None`
 /// when the body left it out. One type for both bodies, as
 /// [`EngineSettings`].
@@ -933,6 +1086,7 @@ impl TlsSettings {
                     RuleLinks {
                         primaries: rule.backend_ids,
                         backups: rule.backup_backend_ids,
+                        caps: rule.backend_max_active,
                     },
                 );
                 StreamMatchRule {
@@ -950,26 +1104,42 @@ impl TlsSettings {
 ///
 /// On a stream that reads a ClientHello the links are the rules':
 /// `rules` when the body sent `match_rules`, and the stream-level lists
-/// must be absent or empty. On any other stream they are the
-/// stream-level lists, a list left out keeping its `stored` half.
+/// and caps must be absent or empty. On any other stream they are the
+/// stream-level lists, a list left out keeping its `stored` half, and
+/// the caps left out keeping the stored cap of each link still written.
 ///
 /// # Errors
 ///
-/// `422` naming the list and the mode when a TLS stream's body carries
-/// a stream-level backend.
+/// `422` naming the field and the mode when a TLS stream's body carries
+/// a stream-level backend or cap.
 fn written_links(
     stream: &Stream,
     backend_ids: Option<Vec<String>>,
     backup_backend_ids: Option<Vec<String>>,
+    backend_max_active: Option<BTreeMap<String, u32>>,
     rules: Option<BTreeMap<String, RuleLinks>>,
     stored: &StreamLinks,
 ) -> Result<Option<StreamLinks>, ApiError> {
     if stream.tls_mode.reads_client_hello() {
-        for (field, ids) in [
-            ("backend_ids", &backend_ids),
-            ("backup_backend_ids", &backup_backend_ids),
+        for (field, given) in [
+            (
+                "backend_ids",
+                backend_ids.as_ref().is_some_and(|ids| !ids.is_empty()),
+            ),
+            (
+                "backup_backend_ids",
+                backup_backend_ids
+                    .as_ref()
+                    .is_some_and(|ids| !ids.is_empty()),
+            ),
+            (
+                "backend_max_active",
+                backend_max_active
+                    .as_ref()
+                    .is_some_and(|caps| !caps.is_empty()),
+            ),
         ] {
-            if ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
+            if given {
                 return Err(ApiError::Unprocessable(format!(
                     "stream `{}`: {field} is refused on a stream whose tls_mode is {}: its \
                      backends are listed in each of match_rules",
@@ -983,12 +1153,23 @@ fn written_links(
             ..StreamLinks::default()
         }));
     }
-    if backend_ids.is_none() && backup_backend_ids.is_none() {
+    if backend_ids.is_none() && backup_backend_ids.is_none() && backend_max_active.is_none() {
         return Ok(None);
     }
+    let primaries = backend_ids.unwrap_or_else(|| stored.primaries.clone());
+    let backups = backup_backend_ids.unwrap_or_else(|| stored.backups.clone());
+    let caps = backend_max_active.unwrap_or_else(|| {
+        stored
+            .caps
+            .iter()
+            .filter(|(id, _)| primaries.contains(id) || backups.contains(id))
+            .map(|(id, cap)| (id.clone(), *cap))
+            .collect()
+    });
     Ok(Some(StreamLinks {
-        primaries: backend_ids.unwrap_or_else(|| stored.primaries.clone()),
-        backups: backup_backend_ids.unwrap_or_else(|| stored.backups.clone()),
+        primaries,
+        backups,
+        caps,
         rules: BTreeMap::new(),
     }))
 }
@@ -1423,6 +1604,13 @@ pub(crate) async fn create_stream_as(
         upload_rate_bps,
         download_rate_bps,
         max_connections,
+        source_max_connections,
+        max_pending_connections,
+        source_allow_cidrs,
+        source_deny_cidrs,
+        geoip,
+        source_open_rate,
+        open_rate,
         udp,
         tls_mode,
         match_rules,
@@ -1432,6 +1620,7 @@ pub(crate) async fn create_stream_as(
         upstream_tls,
         backend_ids,
         backup_backend_ids,
+        backend_max_active,
     } = body;
     let roster = match node_selector.as_deref() {
         Some(names) if !names.is_empty() => selector_roster(state).await?,
@@ -1473,6 +1662,16 @@ pub(crate) async fn create_stream_as(
         udp,
     }
     .apply(&mut stream);
+    SourceControls {
+        source_max_connections,
+        max_pending_connections,
+        source_allow_cidrs,
+        source_deny_cidrs,
+        geoip,
+        source_open_rate,
+        open_rate,
+    }
+    .apply(&mut stream);
     let rule_links = TlsSettings {
         tls_mode,
         match_rules,
@@ -1488,6 +1687,7 @@ pub(crate) async fn create_stream_as(
         &stream,
         backend_ids,
         backup_backend_ids,
+        backend_max_active,
         rule_links,
         &StreamLinks::default(),
     )?
@@ -1591,6 +1791,13 @@ pub(crate) async fn update_stream_as(
         upload_rate_bps,
         download_rate_bps,
         max_connections,
+        source_max_connections,
+        max_pending_connections,
+        source_allow_cidrs,
+        source_deny_cidrs,
+        geoip,
+        source_open_rate,
+        open_rate,
         udp,
         tls_mode,
         match_rules,
@@ -1600,6 +1807,7 @@ pub(crate) async fn update_stream_as(
         upstream_tls,
         backend_ids,
         backup_backend_ids,
+        backend_max_active,
     } = body;
     let selector = match node_selector.as_deref() {
         Some(names) => {
@@ -1627,6 +1835,15 @@ pub(crate) async fn update_stream_as(
         download_rate_bps,
         max_connections,
         udp,
+    };
+    let controls = SourceControls {
+        source_max_connections,
+        max_pending_connections,
+        source_allow_cidrs,
+        source_deny_cidrs,
+        geoip,
+        source_open_rate,
+        open_rate,
     };
     let tls = TlsSettings {
         tls_mode,
@@ -1679,6 +1896,7 @@ pub(crate) async fn update_stream_as(
             stream.node_selector = selector;
         }
         engine.apply(&mut stream);
+        controls.apply(&mut stream);
         let rule_links = tls.apply(&mut stream);
         stream.updated_at = Utc::now();
         validated(&stream)?;
@@ -1687,6 +1905,7 @@ pub(crate) async fn update_stream_as(
             &stream,
             backend_ids,
             backup_backend_ids,
+            backend_max_active,
             rule_links,
             &stored_links,
         )?;

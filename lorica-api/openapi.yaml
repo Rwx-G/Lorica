@@ -1711,8 +1711,12 @@ paths:
         the stream a single port, `port_last` alone moves the end of the
         range. `backend_ids` replaces the primaries and
         `backup_backend_ids` the backups; a list left out keeps its
-        stored half. `null` on `total_timeout_s`, `upload_rate_bps` or
-        `download_rate_bps` removes the limit. The result is checked as
+        stored half. `backend_max_active` replaces every link cap; left
+        out, each link still written keeps its stored cap, and a link
+        removed takes its cap with it. `null` on `total_timeout_s`,
+        `upload_rate_bps`, `download_rate_bps`, `source_max_connections`,
+        `source_open_rate` or `open_rate` removes the limit, on `geoip`
+        the country list. The result is checked as
         on create, except that an update adding nothing to what a node
         already binds (the same protocol, no more ports, no higher
         `max_connections` or `udp.max_sessions`, no more ports from any
@@ -7727,13 +7731,20 @@ components:
       type: object
       description: >-
         A stream. The engine settings (Story 12.3), from
-        `load_balancing` to `max_connections`, apply to TCP streams. A
-        UDP stream (Story 12.5) takes the ones with a UDP meaning, per
-        session, and refuses a non-default value of the others with a
-        422 naming the field and why; `proxy_protocol_accept` is refused
-        on UDP for good, a UDP source address being spoofable, as are
-        `peak_ewma` and `proxy_protocol_send` `v1`. Its own settings are
-        `udp`. The TLS fields (Story 12.4), from `tls_mode` to
+        `load_balancing` to `max_pending_connections`, apply to TCP
+        streams. A UDP stream (Story 12.5) takes the ones with a UDP
+        meaning, per session, and refuses a non-default value of the
+        others with a 422 naming the field and why; `proxy_protocol_accept`
+        is refused on UDP for good, a UDP source address being spoofable,
+        as are `peak_ewma` and `proxy_protocol_send` `v1`. Its own
+        settings are `udp`. The source controls (Story 12.6), from
+        `source_allow_cidrs` to `open_rate`, apply to both protocols:
+        they judge a TCP connection before any byte is forwarded and a
+        UDP session before it is created, after the node's global
+        connection filter and IP blocklist, and only connections and
+        sessions admitted after a change. Every cap and rate is per
+        node: a stream placed on several nodes admits up to its values
+        on each. The TLS fields (Story 12.4), from `tls_mode` to
         `upstream_tls`, apply to TCP streams only (no DTLS: each is
         refused on UDP), and a field the chosen `tls_mode` does not take
         is refused with a 422 naming the field and the mode, never
@@ -7766,6 +7777,13 @@ components:
         - upload_rate_bps
         - download_rate_bps
         - max_connections
+        - source_max_connections
+        - max_pending_connections
+        - source_allow_cidrs
+        - source_deny_cidrs
+        - geoip
+        - source_open_rate
+        - open_rate
         - udp
         - tls_mode
         - match_rules
@@ -7776,6 +7794,7 @@ components:
         - drains_on_upgrade
         - backend_ids
         - backup_backend_ids
+        - backend_max_active
         - created_at
         - updated_at
       properties:
@@ -7941,11 +7960,102 @@ components:
           maximum: 65535
           default: 1024
           description: >-
-            The most concurrent connections of the stream, per worker
-            process until Story 12.6, per node from then on; the next one
-            is refused and counted (`connection_cap`). Each connection
-            counts two fds against the node's stream budget
-            (`GET /api/v1/streams/budget`).
+            The most concurrent connections of the stream per node,
+            counted across the node's workers: a stream placed on several
+            nodes holds up to this many on each. The next one is refused
+            and counted (`connection_cap`). One worker may hold them all,
+            so each connection counts two fds against the node's stream
+            budget (`GET /api/v1/streams/budget`).
+        source_max_connections:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 65535
+          default: null
+          description: >-
+            The most concurrent connections one source (an IPv4 address,
+            or the /64 of an IPv6 one) holds on the stream per node,
+            pending ones included; the next one is refused
+            (`source_connection_cap`). `null` bounds a source by
+            `max_connections` alone. Workers admitting one source at once
+            may pass it by the worker count minus one. A source behind a
+            trusted PROXY peer is the client its header carries, never the
+            peer. TCP only: a UDP stream's per-source cap is
+            `udp.source_session_cap`.
+        max_pending_connections:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          default: 256
+          description: >-
+            The most connections of the stream per node still in their
+            pre-forwarding reads (a trusted peer's PROXY header, a
+            ClientHello), from accept to the choice of a backend; the next
+            one is refused (`pending_cap`). A plain TCP stream reads
+            nothing before forwarding and never holds one. The cap
+            enforced is `min(max_pending_connections, max_connections)`,
+            and one source holds at most `max(1, cap / 8)` of it
+            (`source_pending_cap`), so no single source fills it. Pending
+            connections are counted within `max_connections`, so the
+            setting adds nothing to the fd budget; it bounds how many read
+            buffers wait on slow clients. TCP only.
+        source_allow_cidrs:
+          type: array
+          maxItems: 1024
+          items:
+            type: string
+          description: >-
+            Sources admitted when non-empty: a client inside no entry is
+            refused (`source_denied`). CIDRs or bare IPs (a host prefix);
+            `0.0.0.0/0` and `::/0`, blank entries and IPv4-mapped networks
+            are refused (422). A non-empty list is the source allowlist
+            that lets a UDP stream listen on an exposed address without an
+            explicit `udp.source_session_cap`, and a `no_sni` rule go
+            without `no_sni_acknowledged`; removing it from a stream that
+            relies on it is refused (422).
+        source_deny_cidrs:
+          type: array
+          maxItems: 1024
+          items:
+            type: string
+          description: >-
+            Sources refused (`source_denied`), before the allowlist: a
+            deny entry always wins. Same syntax and refusals as
+            `source_allow_cidrs`; to refuse every address, set `enabled`
+            to false.
+        geoip:
+          nullable: true
+          default: null
+          allOf:
+            - $ref: "#/components/schemas/StreamGeoIp"
+          description: >-
+            A country allow or deny list, as a route's; a refused client
+            is counted `geoip`. A client whose country is unknown (no
+            database on the node, or an address it does not cover)
+            passes. Not an address allowlist: it satisfies neither rule
+            `source_allow_cidrs` does.
+        source_open_rate:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 1000000
+          default: null
+          description: >-
+            New connections (TCP) or sessions (UDP) per second one source
+            may open on the stream per node, with one second of burst;
+            past it the opening is refused (`source_open_rate`). Charged
+            before the caps: an opening a cap then refuses has still
+            spent its token. `null` for no limit.
+        open_rate:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 1000000
+          default: null
+          description: >-
+            New connections (TCP) or sessions (UDP) per second on the
+            stream per node, with one second of burst; past it the
+            opening is refused (`open_rate`). `null` for no limit.
         udp:
           nullable: true
           allOf:
@@ -7984,9 +8094,9 @@ components:
           default: false
           description: >-
             The operator's acknowledgement that a `no_sni` rule admits
-            clients naming no server. A stream with a `no_sni` rule needs
-            it until source allowlists exist (Story 12.6), and a stream
-            without one refuses it (422).
+            clients naming no server. A stream with a `no_sni` rule and no
+            source allowlist (`source_allow_cidrs`) needs it, and a stream
+            without a `no_sni` rule refuses it (422).
         clienthello_timeout_ms:
           type: integer
           nullable: true
@@ -8043,6 +8153,23 @@ components:
           description: >-
             IDs of the linked backup backends, sorted: candidates only
             when no primary is. Empty on a TLS stream.
+        backend_max_active:
+          type: object
+          additionalProperties:
+            type: integer
+            minimum: 1
+            maximum: 65535
+          description: >-
+            The cap of each capped link, by backend id: the most
+            connections (TCP) or sessions (UDP) the stream holds to that
+            backend per node, nginx's `max_conns`. HTTP routes sharing the
+            backend do not count against it. A backend at its cap is no
+            candidate for the next connection; with every candidate at its
+            cap the connection is refused (`backend_cap`). A link absent
+            from the map is uncapped. In a write, every key is a backend
+            the body links in `backend_ids` or `backup_backend_ids` (422
+            otherwise), and a cap out of range is refused (422). Empty on
+            a TLS stream, whose caps are listed per rule.
         created_at:
           type: string
           format: date-time
@@ -8094,6 +8221,34 @@ components:
           description: >-
             IDs of the backup backends serving the rule, candidates only
             when none of its primaries is; none may also be a primary.
+        backend_max_active:
+          allOf:
+            - $ref: "#/components/schemas/StreamResponse/properties/backend_max_active"
+          description: >-
+            The cap of each of the rule's capped links, by backend id,
+            every key one of the rule's backends (422 otherwise).
+
+    StreamGeoIp:
+      type: object
+      additionalProperties: false
+      required: [mode, countries]
+      description: >-
+        A country list, as on a route. Codes are ISO 3166-1 alpha-2,
+        stored uppercase and deduplicated, blank entries dropped.
+      properties:
+        mode:
+          type: string
+          enum: [allowlist, denylist]
+          description: >-
+            `allowlist` admits only the listed countries, `denylist`
+            refuses them. A client whose country is unknown passes either
+            way.
+        countries:
+          type: array
+          maxItems: 300
+          items:
+            type: string
+          description: Two-letter codes; an empty `allowlist` is refused (422).
 
     StreamMatcher:
       description: >-
@@ -8295,8 +8450,9 @@ components:
         counted under a `StreamRefusal` word, a datagram dropped under a
         `StreamDatagramDropReason` word, never both. On a listen address
         other than loopback, RFC 1918 or ULA (`0.0.0.0` and `::`
-        included), the stream needs an explicit `source_session_cap` of
-        at most 64 (422 otherwise).
+        included), the stream needs a source allowlist
+        (`source_allow_cidrs`) or an explicit `source_session_cap` of at
+        most 64 (422 otherwise).
       required:
         - max_sessions
         - source_session_cap
@@ -8873,6 +9029,20 @@ components:
           $ref: "#/components/schemas/StreamResponse/properties/download_rate_bps"
         max_connections:
           $ref: "#/components/schemas/StreamResponse/properties/max_connections"
+        source_max_connections:
+          $ref: "#/components/schemas/StreamResponse/properties/source_max_connections"
+        max_pending_connections:
+          $ref: "#/components/schemas/StreamResponse/properties/max_pending_connections"
+        source_allow_cidrs:
+          $ref: "#/components/schemas/StreamResponse/properties/source_allow_cidrs"
+        source_deny_cidrs:
+          $ref: "#/components/schemas/StreamResponse/properties/source_deny_cidrs"
+        geoip:
+          $ref: "#/components/schemas/StreamResponse/properties/geoip"
+        source_open_rate:
+          $ref: "#/components/schemas/StreamResponse/properties/source_open_rate"
+        open_rate:
+          $ref: "#/components/schemas/StreamResponse/properties/open_rate"
         udp:
           nullable: true
           allOf:
@@ -8910,6 +9080,14 @@ components:
             candidate, on a stream with at least one primary (422
             otherwise); none may also be in `backend_ids`. Absent or
             empty on a TLS stream.
+        backend_max_active:
+          allOf:
+            - $ref: "#/components/schemas/StreamResponse/properties/backend_max_active"
+          description: >-
+            The cap of each capped link, every key in `backend_ids` or
+            `backup_backend_ids` (422 otherwise); absent caps none.
+            Absent or empty on a TLS stream (422 naming the field and the
+            mode otherwise).
 
     UpdateStreamRequest:
       type: object
@@ -8970,6 +9148,20 @@ components:
           $ref: "#/components/schemas/StreamResponse/properties/download_rate_bps"
         max_connections:
           $ref: "#/components/schemas/StreamResponse/properties/max_connections"
+        source_max_connections:
+          $ref: "#/components/schemas/StreamResponse/properties/source_max_connections"
+        max_pending_connections:
+          $ref: "#/components/schemas/StreamResponse/properties/max_pending_connections"
+        source_allow_cidrs:
+          $ref: "#/components/schemas/StreamResponse/properties/source_allow_cidrs"
+        source_deny_cidrs:
+          $ref: "#/components/schemas/StreamResponse/properties/source_deny_cidrs"
+        geoip:
+          $ref: "#/components/schemas/StreamResponse/properties/geoip"
+        source_open_rate:
+          $ref: "#/components/schemas/StreamResponse/properties/source_open_rate"
+        open_rate:
+          $ref: "#/components/schemas/StreamResponse/properties/open_rate"
         udp:
           nullable: true
           allOf:
@@ -9013,6 +9205,13 @@ components:
           description: >-
             Replaces the backups; absent keeps them. Absent or empty on
             a TLS stream.
+        backend_max_active:
+          allOf:
+            - $ref: "#/components/schemas/StreamResponse/properties/backend_max_active"
+          description: >-
+            Replaces every cap, each key a backend the stream links once
+            the update is applied (422 otherwise); absent, each link still
+            written keeps its stored cap. Absent or empty on a TLS stream.
 
     Certificate:
       type: object
@@ -9707,7 +9906,9 @@ components:
     StreamUnprocessable:
       description: >-
         The body parsed but a model rule refuses its content (a setting
-        out of its range, a backend the stream may not link, a local
+        out of its range, a source CIDR list or country list the stream
+        may not hold, a link cap out of its range or naming a backend the
+        stream does not link, a backend the stream may not link, a local
         backend without `allow_local_backend`, a TLS field its
         `tls_mode` does not take, a PEM bundle that does not parse, a
         certificate that does not exist or does not serve a rule's

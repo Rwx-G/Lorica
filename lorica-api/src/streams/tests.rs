@@ -24,8 +24,9 @@ use crate::tests::{
     test_follower_runtime, test_state,
 };
 
-/// The view fields that are not model fields: the links, by role.
-const LINK_FIELDS: &[&str] = &["backend_ids", "backup_backend_ids"];
+/// The view fields that are not model fields: the links, by role, and
+/// their caps.
+const LINK_FIELDS: &[&str] = &["backend_ids", "backup_backend_ids", "backend_max_active"];
 
 /// The view fields a client never writes: the server mints the id and
 /// stamps the times.
@@ -598,23 +599,24 @@ fn keys(object: &Value) -> BTreeSet<String> {
 async fn the_view_publishes_every_model_field_but_the_withheld_ones() {
     let node = Node::standalone().await;
     let terminating = terminating_body(&node).await;
-    for body in [tcp("smtp", 2525), udp("dns", 53), terminating] {
+    let guarded = merged(tcp("smtp", 2525), &source_controls_off_default());
+    for body in [guarded, udp("dns", 53), terminating] {
         let created = node.created(body).await;
         let stored = stored_stream(&node, created["id"].as_str().expect("an id")).await;
         let model_json = serde_json::to_value(&stored).expect("the model serialises");
         let model: BTreeSet<String> = keys(&model_json)
             .into_iter()
             .filter(|k| !STREAM_WITHHELD_FIELDS.contains(&k.as_str()))
-            // Story 12.6 Lot E publishes the source controls; until then
-            // the view leaves them out. Lot E drops this filter.
-            .filter(|k| {
-                !lorica_config::models::Stream::protection_field_names().contains(&k.as_str())
-            })
             .chain(LINK_FIELDS.iter().map(|k| k.to_string()))
             .chain(DERIVED_FIELDS.iter().map(|k| k.to_string()))
             .collect();
         assert_eq!(keys(&created), model);
         assert_eq!(created["drains_on_upgrade"], stored.drains_on_upgrade());
+        // The source controls are the stored values, the GeoIP object in
+        // the model's own shape.
+        for field in lorica_config::models::Stream::protection_field_names() {
+            assert_eq!(created[field], model_json[field], "{field}");
+        }
         // The TLS objects are built field by field too, each the stored
         // value; a rule is the model's plus the backends serving it.
         for field in ["tls_mode", "no_sni_acknowledged", "clienthello_timeout_ms"] {
@@ -1511,6 +1513,35 @@ fn engine_settings_off_default() -> Value {
     })
 }
 
+/// A body that moves every Story 12.6 source control off its default,
+/// valid on a TCP stream, its country list in a form the store
+/// canonicalises (see [`STORED_COUNTRIES`]).
+fn source_controls_off_default() -> Value {
+    json!({
+        "source_max_connections": 16,
+        "max_pending_connections": 64,
+        "source_allow_cidrs": ["192.0.2.0/24", "2001:db8::/32"],
+        "source_deny_cidrs": ["192.0.2.66"],
+        "geoip": { "mode": "denylist", "countries": ["us", " fr ", "US"] },
+        "source_open_rate": 50,
+        "open_rate": 500,
+    })
+}
+
+/// The country list of [`source_controls_off_default`] as it is stored
+/// and answered: uppercased, trimmed, deduplicated.
+const STORED_COUNTRIES: [&str; 2] = ["US", "FR"];
+
+#[test]
+fn the_source_controls_fixture_moves_every_protection_field() {
+    let fixture: BTreeSet<String> = keys(&source_controls_off_default());
+    let fields: BTreeSet<String> = lorica_config::models::Stream::protection_field_names()
+        .iter()
+        .map(|f| f.to_string())
+        .collect();
+    assert_eq!(fixture, fields);
+}
+
 /// `body` with every key of `patch` set on it.
 fn merged(mut body: Value, patch: &Value) -> Value {
     for (key, value) in patch.as_object().expect("an object") {
@@ -1631,8 +1662,12 @@ async fn a_create_without_engine_settings_answers_the_model_defaults() {
 async fn every_written_view_field_is_accepted_back_on_create_and_update() {
     let node = Node::standalone().await;
     let primary = node.backend("192.0.2.32:5432").await;
-    let mut body = merged(tcp("pg", 5432), &engine_settings_off_default());
+    let mut body = merged(
+        merged(tcp("pg", 5432), &engine_settings_off_default()),
+        &source_controls_off_default(),
+    );
     body["backend_ids"] = json!([primary]);
+    body["backend_max_active"] = json!({ primary.as_str(): 3 });
     let created = node.created(body).await;
     let id = created["id"].as_str().expect("an id").to_string();
 
@@ -1838,6 +1873,315 @@ async fn every_engine_and_link_refusal_answers_422_and_stores_nothing() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{answer}");
+}
+
+// ---- Source controls and link caps (Story 12.6 Lot E) ----
+
+/// The `max_active` of each stored link of stream `id`, by backend id.
+async fn stored_caps(node: &Node, id: &str) -> Vec<(String, Option<u32>)> {
+    let mut caps: Vec<(String, Option<u32>)> = node
+        .state
+        .store
+        .lock()
+        .await
+        .list_stream_backends()
+        .expect("links")
+        .into_iter()
+        .filter(|link| link.stream_id == id)
+        .map(|link| (link.backend_id, link.max_active))
+        .collect();
+    caps.sort();
+    caps
+}
+
+#[tokio::test]
+async fn every_source_control_and_link_cap_round_trips_through_create_update_and_read() {
+    let node = Node::standalone().await;
+    let primary = node.backend("192.0.2.80:5432").await;
+    let backup = node.backend("192.0.2.81:5432").await;
+    let controls = source_controls_off_default();
+    let mut body = merged(tcp("pg", 5432), &controls);
+    body["backend_ids"] = json!([primary]);
+    body["backup_backend_ids"] = json!([backup]);
+    body["backend_max_active"] = json!({ primary.as_str(): 8, backup.as_str(): 2 });
+    let created = node.created(body).await;
+    for (key, value) in controls.as_object().expect("an object") {
+        if key != "geoip" {
+            assert_eq!(&created[key], value, "{key}: {created}");
+        }
+    }
+    assert_eq!(
+        created["geoip"],
+        json!({ "mode": "denylist", "countries": STORED_COUNTRIES }),
+        "a country list is answered as it is stored"
+    );
+    assert_eq!(
+        created["backend_max_active"],
+        json!({ primary.as_str(): 8, backup.as_str(): 2 })
+    );
+    let id = created["id"].as_str().expect("an id").to_string();
+    let mut expected = vec![(primary.clone(), Some(8)), (backup.clone(), Some(2))];
+    expected.sort();
+    assert_eq!(stored_caps(&node, &id).await, expected);
+    let stored = serde_json::to_value(stored_stream(&node, &id).await).expect("serialises");
+    for field in lorica_config::models::Stream::protection_field_names() {
+        assert_eq!(stored[field], created[field], "{field}");
+    }
+    let (_, read) = node
+        .call("GET", &format!("/api/v1/streams/{id}"), None)
+        .await;
+    assert_eq!(without_bind(&read["data"]), created);
+
+    // `null` lifts a limit, a list replaces the stored one, and an
+    // absent field keeps its value.
+    let (status, patched) = node
+        .update(
+            &id,
+            json!({
+                "source_max_connections": null,
+                "geoip": null,
+                "source_open_rate": null,
+                "open_rate": null,
+                "source_allow_cidrs": [],
+                "max_pending_connections": 32,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    let patched = &patched["data"];
+    for field in [
+        "source_max_connections",
+        "geoip",
+        "source_open_rate",
+        "open_rate",
+    ] {
+        assert_eq!(patched[field], Value::Null, "{field}");
+    }
+    assert_eq!(patched["source_allow_cidrs"], json!([]));
+    assert_eq!(patched["max_pending_connections"], 32);
+    assert_eq!(patched["source_deny_cidrs"], created["source_deny_cidrs"]);
+    assert_eq!(patched["backend_max_active"], created["backend_max_active"]);
+
+    // A link removed takes its cap with it; the others keep theirs.
+    let (status, unlinked) = node.update(&id, json!({ "backup_backend_ids": [] })).await;
+    assert_eq!(status, StatusCode::OK, "{unlinked}");
+    assert_eq!(
+        unlinked["data"]["backend_max_active"],
+        json!({ primary.as_str(): 8 })
+    );
+    assert_eq!(
+        stored_caps(&node, &id).await,
+        vec![(primary.clone(), Some(8))]
+    );
+
+    // The caps alone replace every cap and keep the links.
+    let (status, recapped) = node
+        .update(
+            &id,
+            json!({ "backend_max_active": { primary.as_str(): 4 } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{recapped}");
+    assert_eq!(recapped["data"]["backend_ids"], json!([primary]));
+    assert_eq!(
+        stored_caps(&node, &id).await,
+        vec![(primary.clone(), Some(4))]
+    );
+    let (status, uncapped) = node.update(&id, json!({ "backend_max_active": {} })).await;
+    assert_eq!(status, StatusCode::OK, "{uncapped}");
+    assert_eq!(uncapped["data"]["backend_max_active"], json!({}));
+    assert_eq!(stored_caps(&node, &id).await, vec![(primary.clone(), None)]);
+}
+
+#[tokio::test]
+async fn every_source_control_and_link_cap_refusal_answers_422_and_stores_nothing() {
+    let node = Node::standalone().await;
+    let first = node.backend("192.0.2.82:5432").await;
+    let second = node.backend("192.0.2.83:5432").await;
+    let on = |patch: Value| merged(tcp("pg", 5432), &patch);
+    type S = lorica_config::models::Stream;
+    let below = |range: std::ops::RangeInclusive<u32>| range.start() - 1;
+    let above = |range: std::ops::RangeInclusive<u32>| range.end() + 1;
+    let capped = |caps: Value| on(json!({ "backend_ids": [first], "backend_max_active": caps }));
+    for (what, body, word) in [
+        (
+            "an allowlist of everyone",
+            on(json!({ "source_allow_cidrs": ["0.0.0.0/0"] })),
+            "source_allow_cidrs",
+        ),
+        (
+            "a denylist of everyone",
+            on(json!({ "source_deny_cidrs": ["::/0"] })),
+            "source_deny_cidrs",
+        ),
+        (
+            "a CIDR that does not parse",
+            on(json!({ "source_deny_cidrs": ["192.0.2.0/33"] })),
+            "source_deny_cidrs",
+        ),
+        (
+            "a per-source cap below its range",
+            on(json!({ "source_max_connections": below(S::SOURCE_MAX_CONNECTIONS_RANGE) })),
+            "source_max_connections",
+        ),
+        (
+            "a pending cap above its range",
+            on(json!({ "max_pending_connections": above(S::MAX_PENDING_CONNECTIONS_RANGE) })),
+            "max_pending_connections",
+        ),
+        (
+            "a stream open rate below its range",
+            on(json!({ "open_rate": below(S::OPEN_RATE_RANGE) })),
+            "open_rate",
+        ),
+        (
+            "a source open rate above its range",
+            on(json!({ "source_open_rate": above(S::OPEN_RATE_RANGE) })),
+            "source_open_rate",
+        ),
+        (
+            "a country code of three letters",
+            on(json!({ "geoip": { "mode": "denylist", "countries": ["USA"] } })),
+            "geoip.countries",
+        ),
+        (
+            "an empty country allowlist",
+            on(json!({ "geoip": { "mode": "allowlist", "countries": [] } })),
+            "geoip.countries",
+        ),
+        (
+            "a per-source cap on UDP",
+            on(json!({ "protocol": "udp", "udp": exposed_udp(), "source_max_connections": 4 })),
+            "source_max_connections",
+        ),
+        (
+            "a cap naming a backend the stream does not link",
+            capped(json!({ second.as_str(): 4 })),
+            "backend_max_active",
+        ),
+        (
+            "a cap below its range",
+            capped(json!({ first.as_str(): below(S::MAX_ACTIVE_RANGE) })),
+            "max_active",
+        ),
+        (
+            "a cap above its range",
+            capped(json!({ first.as_str(): above(S::MAX_ACTIVE_RANGE) })),
+            "max_active",
+        ),
+    ] {
+        let (status, answer) = node.create(body).await;
+        let message = unprocessable(status, &answer);
+        assert!(message.contains(word), "{what}: {word}: {message}");
+    }
+    assert!(
+        node.state
+            .store
+            .lock()
+            .await
+            .list_streams()
+            .expect("list")
+            .is_empty(),
+        "no refused create left a row"
+    );
+
+    // On an update, a cap must name a link the update leaves, and a
+    // refused update moves nothing.
+    let created = node.created(capped(json!({ first.as_str(): 4 }))).await;
+    let id = created["id"].as_str().expect("an id");
+    for (what, body) in [
+        (
+            "a cap on a backend the update unlinks",
+            json!({ "backend_ids": [second], "backend_max_active": { first.as_str(): 3 } }),
+        ),
+        (
+            "a cap out of range",
+            json!({ "backend_max_active": { first.as_str(): 0 } }),
+        ),
+        ("an open rate out of range", json!({ "open_rate": 0 })),
+    ] {
+        let (status, answer) = node.update(id, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{what}: {answer}");
+        let (_, read) = node
+            .call("GET", &format!("/api/v1/streams/{id}"), None)
+            .await;
+        assert_eq!(without_bind(&read["data"]), created, "{what}");
+        assert_eq!(
+            stored_caps(&node, id).await,
+            vec![(first.clone(), Some(4))],
+            "{what}"
+        );
+    }
+}
+
+/// A source allowlist is what lets a UDP stream listen on an exposed
+/// address without an explicit per-source cap (Story 12.6 D-l), and the
+/// API holds a stream relying on it to it.
+#[tokio::test]
+async fn an_allowlist_lets_an_exposed_udp_stream_go_without_an_explicit_source_cap() {
+    let node = Node::standalone().await;
+    let mut body = tcp("dns", 53);
+    body["protocol"] = json!("udp");
+    body["source_allow_cidrs"] = json!(["198.51.100.0/24"]);
+    let created = node.created(body).await;
+    assert_eq!(created["udp"]["source_session_cap"], Value::Null);
+    let id = created["id"].as_str().expect("an id");
+    let (status, answer) = node.update(id, json!({ "source_allow_cidrs": [] })).await;
+    assert!(
+        unprocessable(status, &answer).contains("source_allow_cidrs"),
+        "{answer}"
+    );
+}
+
+#[tokio::test]
+async fn a_tls_streams_link_caps_travel_inside_its_rules() {
+    let node = Node::standalone().await;
+    let first = node.backend("192.0.2.84:443").await;
+    let second = node.backend("192.0.2.85:443").await;
+    let mut web = tls_rule("web", &["a.example.com"], &[&first]);
+    web["backup_backend_ids"] = json!([second]);
+    web["backend_max_active"] = json!({ first.as_str(): 5 });
+    let created = node
+        .created(tls_stream("sni", 8443, "passthrough", json!([web])))
+        .await;
+    assert_eq!(
+        created["match_rules"][0]["backend_max_active"],
+        json!({ first.as_str(): 5 })
+    );
+    assert_eq!(
+        created["backend_max_active"],
+        json!({}),
+        "the caps are per rule"
+    );
+    let id = created["id"].as_str().expect("an id").to_string();
+    let mut expected = vec![(first.clone(), Some(5)), (second.clone(), None)];
+    expected.sort();
+    assert_eq!(stored_caps(&node, &id).await, expected);
+
+    for (what, body, words) in [
+        (
+            "a stream-level cap",
+            json!({ "backend_max_active": { first.as_str(): 1 } }),
+            vec!["backend_max_active", "passthrough"],
+        ),
+        (
+            "a rule's cap on a backend the rule does not link",
+            json!({ "match_rules": [{
+                "name": "web",
+                "matcher": { "kind": "tls", "server_names": ["a.example.com"] },
+                "backend_ids": [first],
+                "backend_max_active": { second.as_str(): 1 },
+            }] }),
+            vec!["backend_max_active", "`web`", second.as_str()],
+        ),
+    ] {
+        let (status, answer) = node.update(&id, body).await;
+        let message = unprocessable(status, &answer);
+        for word in words {
+            assert!(message.contains(word), "{what}: {word}: {message}");
+        }
+        assert_eq!(stored_caps(&node, &id).await, expected, "{what}");
+    }
 }
 
 /// IV4, first half: a stream pointed at this node's management API
@@ -2568,6 +2912,31 @@ fn the_published_enums_and_ranges_are_the_models() {
             u64::from(*Stream::MAX_CONNECTIONS_RANGE.start()),
             u64::from(*Stream::MAX_CONNECTIONS_RANGE.end()),
         ),
+        (
+            "source_max_connections",
+            u64::from(*Stream::SOURCE_MAX_CONNECTIONS_RANGE.start()),
+            u64::from(*Stream::SOURCE_MAX_CONNECTIONS_RANGE.end()),
+        ),
+        (
+            "max_pending_connections",
+            u64::from(*Stream::MAX_PENDING_CONNECTIONS_RANGE.start()),
+            u64::from(*Stream::MAX_PENDING_CONNECTIONS_RANGE.end()),
+        ),
+        (
+            "source_open_rate",
+            u64::from(*Stream::OPEN_RATE_RANGE.start()),
+            u64::from(*Stream::OPEN_RATE_RANGE.end()),
+        ),
+        (
+            "open_rate",
+            u64::from(*Stream::OPEN_RATE_RANGE.start()),
+            u64::from(*Stream::OPEN_RATE_RANGE.end()),
+        ),
+        (
+            "backend_max_active",
+            u64::from(*Stream::MAX_ACTIVE_RANGE.start()),
+            u64::from(*Stream::MAX_ACTIVE_RANGE.end()),
+        ),
     ] {
         let block = property_block("StreamResponse", field);
         assert_eq!(
@@ -2587,6 +2956,8 @@ fn the_published_enums_and_ranges_are_the_models() {
             Stream::PROXY_PROTOCOL_TRUSTED_CIDRS_MAX,
         ),
         ("source_addresses", Stream::SOURCE_ADDRESSES_MAX),
+        ("source_allow_cidrs", Stream::SOURCE_CIDRS_MAX),
+        ("source_deny_cidrs", Stream::SOURCE_CIDRS_MAX),
     ] {
         let block = property_block("StreamResponse", field);
         assert_eq!(
@@ -2595,6 +2966,51 @@ fn the_published_enums_and_ranges_are_the_models() {
             "{field}"
         );
     }
+}
+
+#[test]
+fn the_published_source_controls_are_the_models() {
+    use lorica_config::models::{GeoIpConfig, GeoIpMode, Stream};
+
+    // The pending share the prose states is the model's divisor.
+    let pending = prose(&property_block("StreamResponse", "max_pending_connections"));
+    assert!(
+        pending.contains(&format!(
+            "max(1, cap / {})",
+            Stream::PENDING_SOURCE_SHARE_DIVISOR
+        )),
+        "{pending}"
+    );
+
+    // The GeoIP object publishes the model's fields, words and limit.
+    // `GeoIpMode` lists no variants; this match fails to compile when
+    // one is added, which is when this list must grow with it.
+    let every_mode = |mode: &GeoIpMode| match mode {
+        GeoIpMode::Allowlist | GeoIpMode::Denylist => (),
+    };
+    let modes = [GeoIpMode::Allowlist, GeoIpMode::Denylist];
+    modes.iter().for_each(every_mode);
+    let words: Vec<String> = modes
+        .iter()
+        .map(|mode| {
+            serde_json::to_value(mode)
+                .expect("serialises")
+                .as_str()
+                .expect("a word")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(enum_words(&property_block("StreamGeoIp", "mode")), words);
+    let geoip = serde_json::to_value(GeoIpConfig {
+        mode: GeoIpMode::Denylist,
+        countries: Vec::new(),
+    })
+    .expect("serialises");
+    assert_eq!(schema_properties("StreamGeoIp"), keys(&geoip));
+    assert_eq!(
+        scalar(&property_block("StreamGeoIp", "countries"), "maxItems"),
+        Some(GeoIpConfig::COUNTRIES_MAX.to_string().as_str())
+    );
 }
 
 /// Every `default:` the description publishes for a stream setting is
