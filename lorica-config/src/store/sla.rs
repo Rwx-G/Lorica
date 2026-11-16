@@ -293,13 +293,21 @@ impl ConfigStore {
         })
     }
 
-    /// Delete SLA buckets older than a given timestamp (for data retention).
+    /// Delete route and stream SLA buckets older than a given timestamp
+    /// (for data retention). One pass for both tables, so the
+    /// `sla_purge_*` settings govern stream history too (Story 12.9).
+    /// Returns the rows removed from both.
     pub fn prune_sla_buckets(&self, before: &DateTime<Utc>) -> Result<usize> {
-        let count = self.conn.execute(
+        let cutoff = before.to_rfc3339();
+        let routes = self.conn.execute(
             "DELETE FROM sla_buckets WHERE bucket_start < ?1",
-            params![before.to_rfc3339()],
+            params![cutoff],
         )?;
-        Ok(count)
+        let streams = self.conn.execute(
+            "DELETE FROM stream_sla_buckets WHERE bucket_start < ?1",
+            params![cutoff],
+        )?;
+        Ok(routes + streams)
     }
 
     /// Delete all SLA buckets for a specific route.
@@ -328,4 +336,316 @@ impl ConfigStore {
             "buckets": buckets,
         }))
     }
+
+    // ---- Stream SLA Configuration (Story 12.9) ----
+
+    /// Get the SLA target of a stream. Returns the default when none is
+    /// configured.
+    pub fn get_stream_sla_config(&self, stream_id: &str) -> Result<StreamSlaConfig> {
+        let row = self
+            .conn
+            .query_row(
+                &format!("SELECT {STREAM_SLA_CONFIG_COLUMNS} FROM stream_sla_configs WHERE stream_id = ?1"),
+                params![stream_id],
+                row_to_stream_sla_config,
+            )
+            .optional()?;
+        match row {
+            Some(config) => config,
+            None => Ok(StreamSlaConfig::default_for_stream(stream_id)),
+        }
+    }
+
+    /// Upsert the SLA target of a stream. On conflict the stored
+    /// `created_at` is kept. A stream the store does not hold is refused
+    /// by the foreign key.
+    pub fn upsert_stream_sla_config(&self, config: &StreamSlaConfig) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO stream_sla_configs (stream_id, target_pct, max_connect_latency_ms,
+             created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(stream_id) DO UPDATE SET
+                target_pct = excluded.target_pct,
+                max_connect_latency_ms = excluded.max_connect_latency_ms,
+                updated_at = excluded.updated_at",
+            params![
+                config.stream_id,
+                config.target_pct,
+                config.max_connect_latency_ms,
+                config.created_at.to_rfc3339(),
+                config.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List every stored stream SLA target, by stream id.
+    pub fn list_stream_sla_configs(&self) -> Result<Vec<StreamSlaConfig>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {STREAM_SLA_CONFIG_COLUMNS} FROM stream_sla_configs ORDER BY stream_id"
+        ))?;
+        let rows = stmt.query_map([], row_to_stream_sla_config)?;
+        let mut configs = Vec::new();
+        for row in rows {
+            configs.push(row??);
+        }
+        Ok(configs)
+    }
+
+    // ---- Stream SLA Buckets (Story 12.9) ----
+
+    /// Merge one slice of a minute into its stream SLA bucket, keyed by
+    /// `(stream_id, bucket_start, source)`, on the rules
+    /// [`Self::merge_sla_bucket`] gives for routes: the counters and the
+    /// latency sum add up, the minimum and the maximum take the extreme
+    /// of the two slices, the percentiles take the maximum, and the
+    /// configuration snapshot follows the newest writer.
+    ///
+    /// The latency columns are NULL where nothing connected, and a NULL
+    /// is "no sample", never 0: a slice with no sample leaves the
+    /// other's value as it is. SQLite's scalar `MIN` and `MAX` answer
+    /// NULL when either argument is NULL, hence the `COALESCE` around
+    /// each.
+    pub fn merge_stream_sla_bucket(&self, bucket: &StreamSlaBucket) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO stream_sla_buckets
+             (stream_id, bucket_start, source, judged_count, success_count, failure_count,
+              connected_count, connect_latency_sum_ms, connect_latency_min_ms,
+              connect_latency_max_ms, connect_latency_p50_ms, connect_latency_p95_ms,
+              connect_latency_p99_ms, cfg_target_pct, cfg_max_connect_latency_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             ON CONFLICT(stream_id, bucket_start, source) DO UPDATE SET
+              judged_count    = stream_sla_buckets.judged_count    + excluded.judged_count,
+              success_count   = stream_sla_buckets.success_count   + excluded.success_count,
+              failure_count   = stream_sla_buckets.failure_count   + excluded.failure_count,
+              connected_count = stream_sla_buckets.connected_count + excluded.connected_count,
+              connect_latency_sum_ms = COALESCE(
+                  stream_sla_buckets.connect_latency_sum_ms + excluded.connect_latency_sum_ms,
+                  stream_sla_buckets.connect_latency_sum_ms, excluded.connect_latency_sum_ms),
+              connect_latency_min_ms = COALESCE(
+                  MIN(stream_sla_buckets.connect_latency_min_ms, excluded.connect_latency_min_ms),
+                  stream_sla_buckets.connect_latency_min_ms, excluded.connect_latency_min_ms),
+              connect_latency_max_ms = COALESCE(
+                  MAX(stream_sla_buckets.connect_latency_max_ms, excluded.connect_latency_max_ms),
+                  stream_sla_buckets.connect_latency_max_ms, excluded.connect_latency_max_ms),
+              connect_latency_p50_ms = COALESCE(
+                  MAX(stream_sla_buckets.connect_latency_p50_ms, excluded.connect_latency_p50_ms),
+                  stream_sla_buckets.connect_latency_p50_ms, excluded.connect_latency_p50_ms),
+              connect_latency_p95_ms = COALESCE(
+                  MAX(stream_sla_buckets.connect_latency_p95_ms, excluded.connect_latency_p95_ms),
+                  stream_sla_buckets.connect_latency_p95_ms, excluded.connect_latency_p95_ms),
+              connect_latency_p99_ms = COALESCE(
+                  MAX(stream_sla_buckets.connect_latency_p99_ms, excluded.connect_latency_p99_ms),
+                  stream_sla_buckets.connect_latency_p99_ms, excluded.connect_latency_p99_ms),
+              cfg_target_pct             = excluded.cfg_target_pct,
+              cfg_max_connect_latency_ms = excluded.cfg_max_connect_latency_ms",
+            params![
+                bucket.stream_id,
+                bucket.bucket_start.to_rfc3339(),
+                bucket.source,
+                bucket.judged_count,
+                bucket.success_count,
+                bucket.failure_count,
+                bucket.connected_count,
+                bucket.connect_latency_sum_ms,
+                bucket.connect_latency_min_ms,
+                bucket.connect_latency_max_ms,
+                bucket.connect_latency_p50_ms,
+                bucket.connect_latency_p95_ms,
+                bucket.connect_latency_p99_ms,
+                bucket.cfg_target_pct,
+                bucket.cfg_max_connect_latency_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Query the SLA buckets of a stream within `[from, to)`, oldest
+    /// first.
+    pub fn query_stream_sla_buckets(
+        &self,
+        stream_id: &str,
+        from: &DateTime<Utc>,
+        to: &DateTime<Utc>,
+        source: &str,
+    ) -> Result<Vec<StreamSlaBucket>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {STREAM_SLA_BUCKET_COLUMNS} FROM stream_sla_buckets
+             WHERE stream_id = ?1 AND bucket_start >= ?2 AND bucket_start < ?3 AND source = ?4
+             ORDER BY bucket_start ASC"
+        ))?;
+        let rows = stmt.query_map(
+            params![stream_id, from.to_rfc3339(), to.to_rfc3339(), source],
+            row_to_stream_sla_bucket,
+        )?;
+        let mut buckets = Vec::new();
+        for row in rows {
+            buckets.push(row??);
+        }
+        Ok(buckets)
+    }
+
+    /// Compute the SLA summary of a stream over `[from, to)`.
+    ///
+    /// The mean connect latency divides by the connections that
+    /// connected, not by the judged ones; the percentiles are the
+    /// highest of the window's buckets, as for routes.
+    pub fn compute_stream_sla_summary(
+        &self,
+        stream_id: &str,
+        from: &DateTime<Utc>,
+        to: &DateTime<Utc>,
+        window_label: &str,
+        source: &str,
+    ) -> Result<StreamSlaSummary> {
+        let (from, to) = (from.to_rfc3339(), to.to_rfc3339());
+        let window = params![stream_id, from, to, source];
+        let (judged, success, failure, connected, latency_sum, p50, p95, p99) =
+            self.conn.query_row(
+                "SELECT COALESCE(SUM(judged_count), 0),
+                        COALESCE(SUM(success_count), 0),
+                        COALESCE(SUM(failure_count), 0),
+                        COALESCE(SUM(connected_count), 0),
+                        SUM(connect_latency_sum_ms),
+                        MAX(connect_latency_p50_ms),
+                        MAX(connect_latency_p95_ms),
+                        MAX(connect_latency_p99_ms)
+                 FROM stream_sla_buckets
+                 WHERE stream_id = ?1 AND bucket_start >= ?2 AND bucket_start < ?3 AND source = ?4",
+                window,
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                    ))
+                },
+            )?;
+
+        let snapshot_target: Option<f64> = self
+            .conn
+            .query_row(
+                "SELECT cfg_target_pct FROM stream_sla_buckets
+                 WHERE stream_id = ?1 AND bucket_start >= ?2 AND bucket_start < ?3 AND source = ?4
+                 ORDER BY bucket_start DESC LIMIT 1",
+                window,
+                |row| row.get(0),
+            )
+            .optional()?;
+        let target_pct = match snapshot_target {
+            Some(target) => target,
+            None => self.get_stream_sla_config(stream_id)?.target_pct,
+        };
+
+        let sla_pct = if judged > 0 {
+            (success as f64 / judged as f64) * 100.0
+        } else {
+            0.0
+        };
+        let avg_connect_latency_ms = match latency_sum {
+            Some(sum) if connected > 0 => Some(sum as f64 / connected as f64),
+            _ => None,
+        };
+        Ok(StreamSlaSummary {
+            stream_id: stream_id.to_string(),
+            window: window_label.to_string(),
+            judged_count: judged,
+            success_count: success,
+            failure_count: failure,
+            sla_pct,
+            avg_connect_latency_ms,
+            p50_connect_latency_ms: p50,
+            p95_connect_latency_ms: p95,
+            p99_connect_latency_ms: p99,
+            target_pct,
+            meets_target: sla_pct >= target_pct,
+        })
+    }
+
+    /// Delete every SLA bucket of a stream.
+    pub fn delete_stream_sla_buckets(&self, stream_id: &str) -> Result<usize> {
+        let count = self.conn.execute(
+            "DELETE FROM stream_sla_buckets WHERE stream_id = ?1",
+            params![stream_id],
+        )?;
+        Ok(count)
+    }
+
+    /// Export the passive SLA data of a stream over `[from, to)` as JSON,
+    /// in the shape [`Self::export_sla_data`] gives a route.
+    pub fn export_stream_sla_data(
+        &self,
+        stream_id: &str,
+        from: &DateTime<Utc>,
+        to: &DateTime<Utc>,
+    ) -> Result<serde_json::Value> {
+        let buckets = self.query_stream_sla_buckets(stream_id, from, to, "passive")?;
+        let config = self.get_stream_sla_config(stream_id)?;
+        Ok(serde_json::json!({
+            "stream_id": stream_id,
+            "from": from.to_rfc3339(),
+            "to": to.to_rfc3339(),
+            "config": config,
+            "buckets": buckets,
+        }))
+    }
+}
+
+/// The `stream_sla_configs` columns, in the order
+/// [`row_to_stream_sla_config`] reads them.
+const STREAM_SLA_CONFIG_COLUMNS: &str =
+    "stream_id, target_pct, max_connect_latency_ms, created_at, updated_at";
+
+/// The `stream_sla_buckets` columns, in the order
+/// [`row_to_stream_sla_bucket`] reads them.
+const STREAM_SLA_BUCKET_COLUMNS: &str = "id, stream_id, bucket_start, source, judged_count, \
+     success_count, failure_count, connected_count, connect_latency_sum_ms, \
+     connect_latency_min_ms, connect_latency_max_ms, connect_latency_p50_ms, \
+     connect_latency_p95_ms, connect_latency_p99_ms, cfg_target_pct, cfg_max_connect_latency_ms";
+
+fn row_to_stream_sla_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<StreamSlaConfig>> {
+    let created: String = row.get(3)?;
+    let updated: String = row.get(4)?;
+    let stream_id: String = row.get(0)?;
+    let target_pct: f64 = row.get(1)?;
+    let max_connect_latency_ms: i64 = row.get(2)?;
+    Ok(parse_datetime(&created).and_then(|created_at| {
+        Ok(StreamSlaConfig {
+            stream_id,
+            target_pct,
+            max_connect_latency_ms,
+            created_at,
+            updated_at: parse_datetime(&updated)?,
+        })
+    }))
+}
+
+fn row_to_stream_sla_bucket(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<StreamSlaBucket>> {
+    let bucket_start = match parse_datetime(&row.get::<_, String>(2)?) {
+        Ok(at) => at,
+        Err(e) => return Ok(Err(e)),
+    };
+    Ok(Ok(StreamSlaBucket {
+        id: row.get(0)?,
+        stream_id: row.get(1)?,
+        bucket_start,
+        source: row.get(3)?,
+        judged_count: row.get(4)?,
+        success_count: row.get(5)?,
+        failure_count: row.get(6)?,
+        connected_count: row.get(7)?,
+        connect_latency_sum_ms: row.get(8)?,
+        connect_latency_min_ms: row.get(9)?,
+        connect_latency_max_ms: row.get(10)?,
+        connect_latency_p50_ms: row.get(11)?,
+        connect_latency_p95_ms: row.get(12)?,
+        connect_latency_p99_ms: row.get(13)?,
+        cfg_target_pct: row.get(14)?,
+        cfg_max_connect_latency_ms: row.get(15)?,
+    }))
 }

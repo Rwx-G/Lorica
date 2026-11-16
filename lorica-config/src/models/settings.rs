@@ -182,6 +182,15 @@ pub struct GlobalSettings {
     /// Older entries are purged periodically. 0 = unlimited. Default: 100000.
     #[serde(default = "default_access_log_retention")]
     pub access_log_retention: i64,
+    /// Maximum number of stream access-log rows (Story 12.9) to retain
+    /// in the persistent store, one row per TCP connection or UDP
+    /// session. Its own cap rather than a share of
+    /// `access_log_retention`, so a chatty UDP stream cannot evict HTTP
+    /// rows, nor the reverse. Older rows are purged periodically.
+    /// 0 = unlimited. Default [`Self::DEFAULT_STREAM_ACCESS_LOG_RETENTION`].
+    /// Replicated fleet policy, like `access_log_retention`.
+    #[serde(default = "default_stream_access_log_retention")]
+    pub stream_access_log_retention: i64,
     /// Maximum number of WAF event entries to retain in the persistent store.
     /// Older entries are purged periodically. 0 = unlimited. Default: 100000.
     #[serde(default = "default_waf_event_retention")]
@@ -524,6 +533,11 @@ pub struct GlobalSettings {
     /// the setting appeared (backlog #50).
     #[serde(default = "default_true")]
     pub syslog_capture_enabled: bool,
+    /// Export stream access-log rows (Story 12.9) to the syslog sink.
+    /// Default `true` like every kind: a node only has such rows once
+    /// it serves a stream.
+    #[serde(default = "default_true")]
+    pub syslog_stream_enabled: bool,
     /// PEM CA bundle trusted when `syslog_transport` is `tcp-tls`.
     /// `None` = platform trust store. Not a secret (public
     /// certificates only).
@@ -570,6 +584,10 @@ pub struct GlobalSettings {
     /// `true`.
     #[serde(default = "default_true")]
     pub otlp_logs_capture_enabled: bool,
+    /// Ship stream access-log rows (Story 12.9) on the OTLP logs lane.
+    /// Default `true`.
+    #[serde(default = "default_true")]
+    pub otlp_logs_stream_enabled: bool,
     /// Ceiling on the bytes every in-flight WAF body buffer may hold
     /// at once, summed across all routes. Default 268_435_456
     /// (256 MiB).
@@ -641,6 +659,10 @@ impl GlobalSettings {
     /// whatever the cap says. The ceiling keeps a mistyped value from
     /// turning the per-node limit into one nobody chose.
     pub const STREAM_LISTEN_SOCKET_CAP_MAX: u32 = 16_384;
+
+    /// The shipped [`GlobalSettings::stream_access_log_retention`], in
+    /// rows: the HTTP access log's default.
+    pub const DEFAULT_STREAM_ACCESS_LOG_RETENTION: i64 = 100_000;
 }
 
 fn default_worker_drain_timeout_s() -> u32 {
@@ -649,6 +671,10 @@ fn default_worker_drain_timeout_s() -> u32 {
 
 fn default_stream_listen_socket_cap() -> u32 {
     GlobalSettings::DEFAULT_STREAM_LISTEN_SOCKET_CAP
+}
+
+fn default_stream_access_log_retention() -> i64 {
+    GlobalSettings::DEFAULT_STREAM_ACCESS_LOG_RETENTION
 }
 
 /// `true` since v1.7.0. See the field doc on
@@ -906,6 +932,7 @@ impl Default for GlobalSettings {
             waf_ban_duration_s: default_waf_ban_duration_s(),
             custom_security_presets: Vec::new(),
             access_log_retention: default_access_log_retention(),
+            stream_access_log_retention: default_stream_access_log_retention(),
             waf_event_retention: default_waf_event_retention(),
             sla_purge_enabled: default_sla_purge_enabled(),
             sla_purge_retention_days: default_sla_purge_retention_days(),
@@ -958,6 +985,7 @@ impl Default for GlobalSettings {
             syslog_waf_enabled: true,
             syslog_audit_enabled: true,
             syslog_capture_enabled: true,
+            syslog_stream_enabled: true,
             syslog_tls_ca_pem: None,
             syslog_tls_client_cert_pem: None,
             syslog_tls_client_key_pem: None,
@@ -968,6 +996,7 @@ impl Default for GlobalSettings {
             otlp_logs_waf_enabled: true,
             otlp_logs_audit_enabled: true,
             otlp_logs_capture_enabled: true,
+            otlp_logs_stream_enabled: true,
             waf_body_scan_max_inflight_bytes: default_waf_body_scan_max_inflight_bytes(),
             worker_drain_timeout_s: default_worker_drain_timeout_s(),
             stream_listen_socket_cap: default_stream_listen_socket_cap(),

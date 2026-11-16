@@ -161,6 +161,13 @@ impl ConfigStore {
                         ))
                     })?;
                 }
+                "stream_access_log_retention" => {
+                    settings.stream_access_log_retention = value.parse().map_err(|e| {
+                        ConfigError::Corrupt(format!(
+                            "stored stream_access_log_retention {value:?} is not a number: {e}"
+                        ))
+                    })?;
+                }
                 "waf_event_retention" => {
                     settings.waf_event_retention = value.parse().map_err(|e| {
                         ConfigError::Corrupt(format!(
@@ -382,6 +389,9 @@ impl ConfigStore {
                 "syslog_capture_enabled" => {
                     settings.syslog_capture_enabled = value == "true" || value == "1";
                 }
+                "syslog_stream_enabled" => {
+                    settings.syslog_stream_enabled = value == "true" || value == "1";
+                }
                 "syslog_tls_ca_pem" => {
                     settings.syslog_tls_ca_pem = if value.is_empty() { None } else { Some(value) };
                 }
@@ -427,6 +437,9 @@ impl ConfigStore {
                 }
                 "otlp_logs_capture_enabled" => {
                     settings.otlp_logs_capture_enabled = value == "true" || value == "1";
+                }
+                "otlp_logs_stream_enabled" => {
+                    settings.otlp_logs_stream_enabled = value == "true" || value == "1";
                 }
                 "waf_body_scan_max_inflight_bytes" => {
                     // A stored value that no longer parses (hand-edited
@@ -520,6 +533,10 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('access_log_retention', ?1)",
             params![settings.access_log_retention.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('stream_access_log_retention', ?1)",
+            params![settings.stream_access_log_retention.to_string()],
         )?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('waf_event_retention', ?1)",
@@ -789,6 +806,10 @@ impl ConfigStore {
             params![settings.syslog_capture_enabled.to_string()],
         )?;
         self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_stream_enabled', ?1)",
+            params![settings.syslog_stream_enabled.to_string()],
+        )?;
+        self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('syslog_tls_ca_pem', ?1)",
             params![settings.syslog_tls_ca_pem.as_deref().unwrap_or("")],
         )?;
@@ -838,6 +859,10 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_logs_capture_enabled', ?1)",
             params![settings.otlp_logs_capture_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_logs_stream_enabled', ?1)",
+            params![settings.otlp_logs_stream_enabled.to_string()],
         )?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('waf_body_scan_max_inflight_bytes', ?1)",
@@ -950,8 +975,42 @@ mod stream_settings_tests {
     }
 
     #[test]
+    fn the_stream_observability_settings_read_as_their_defaults_until_written_then_round_trip() {
+        let store = ConfigStore::open_in_memory().expect("in-memory store");
+        let settings = store.get_global_settings().expect("settings");
+        assert_eq!(
+            settings.stream_access_log_retention,
+            GlobalSettings::DEFAULT_STREAM_ACCESS_LOG_RETENTION
+        );
+        assert!(settings.syslog_stream_enabled);
+        assert!(settings.otlp_logs_stream_enabled);
+
+        let mut updated = settings;
+        updated.stream_access_log_retention = 0;
+        updated.syslog_stream_enabled = false;
+        updated.otlp_logs_stream_enabled = false;
+        store.update_global_settings(&updated).expect("write");
+
+        let fetched = store.get_global_settings().expect("settings");
+        assert_eq!(fetched.stream_access_log_retention, 0, "0 is unlimited");
+        assert!(!fetched.syslog_stream_enabled);
+        assert!(!fetched.otlp_logs_stream_enabled);
+        // The HTTP kinds and the HTTP retention are separate settings.
+        assert!(fetched.syslog_access_enabled);
+        assert!(fetched.otlp_logs_access_enabled);
+        assert_eq!(
+            fetched.access_log_retention,
+            GlobalSettings::default().access_log_retention
+        );
+    }
+
+    #[test]
     fn a_stored_stream_setting_that_is_not_a_number_is_reported_as_corrupt() {
-        for key in ["worker_drain_timeout_s", "stream_listen_socket_cap"] {
+        for key in [
+            "worker_drain_timeout_s",
+            "stream_listen_socket_cap",
+            "stream_access_log_retention",
+        ] {
             let store = ConfigStore::open_in_memory().expect("in-memory store");
             store
                 .conn

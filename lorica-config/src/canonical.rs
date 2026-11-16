@@ -69,7 +69,7 @@ use crate::models::{
     AutomationEnvironment, Backend, CaptureEmit, CaptureLimits, CaptureMatch, CaptureOutput,
     CaptureRedaction, CaptureRule, CaptureScope, CertExportAcl, Certificate, CustomCrawler,
     DnsProvider, GlobalSettings, NotificationConfig, ProbeConfig, Route, RouteBackend,
-    SecurityHeaderPreset, SlaConfig, SpoofedFallback, Stream, StreamBackend,
+    SecurityHeaderPreset, SlaConfig, SpoofedFallback, Stream, StreamBackend, StreamSlaConfig,
 };
 use crate::store::ConfigStore;
 
@@ -122,6 +122,10 @@ fn default_worker_drain_timeout_s() -> u32 {
 
 fn default_stream_listen_socket_cap() -> u32 {
     GlobalSettings::DEFAULT_STREAM_LISTEN_SOCKET_CAP
+}
+
+fn default_stream_access_log_retention() -> i64 {
+    GlobalSettings::DEFAULT_STREAM_ACCESS_LOG_RETENTION
 }
 
 /// One WAF custom rule in canonical form. The store keeps these as
@@ -307,6 +311,11 @@ pub struct CanonicalGlobalSettings {
     pub custom_security_presets: Vec<SecurityHeaderPreset>,
     /// Access-log retention row cap.
     pub access_log_retention: i64,
+    /// Stream access-log retention row cap, Story 12.9. Replicated like
+    /// `access_log_retention`, and defaulted on the reasoning
+    /// `worker_drain_timeout_s` gives.
+    #[serde(default = "default_stream_access_log_retention")]
+    pub stream_access_log_retention: i64,
     /// WAF-event retention row cap.
     pub waf_event_retention: i64,
     /// Whether SLA bucket purging runs.
@@ -382,6 +391,7 @@ impl From<&GlobalSettings> for CanonicalGlobalSettings {
             waf_ban_duration_s: s.waf_ban_duration_s,
             custom_security_presets: s.custom_security_presets.clone(),
             access_log_retention: s.access_log_retention,
+            stream_access_log_retention: s.stream_access_log_retention,
             waf_event_retention: s.waf_event_retention,
             sla_purge_enabled: s.sla_purge_enabled,
             sla_purge_retention_days: s.sla_purge_retention_days,
@@ -436,6 +446,7 @@ impl CanonicalGlobalSettings {
         settings.waf_ban_duration_s = self.waf_ban_duration_s;
         settings.custom_security_presets = self.custom_security_presets.clone();
         settings.access_log_retention = self.access_log_retention;
+        settings.stream_access_log_retention = self.stream_access_log_retention;
         settings.waf_event_retention = self.waf_event_retention;
         settings.sla_purge_enabled = self.sla_purge_enabled;
         settings.sla_purge_retention_days = self.sla_purge_retention_days;
@@ -545,6 +556,13 @@ pub struct CanonicalConfig {
     pub streams: Vec<Stream>,
     /// Stream-to-backend links, cut with their stream.
     pub stream_backends: Vec<StreamBackend>,
+    /// Stream SLA targets (Story 12.9), cut with their stream: a
+    /// follower judges the streams it serves against the target the
+    /// control plane holds, and a row for a stream it does not hold
+    /// would have nothing to cascade from. Defaulted to none, so a
+    /// 1.11.0 blob encoded before the field existed still decodes.
+    #[serde(default)]
+    pub stream_sla_configs: Vec<StreamSlaConfig>,
 }
 
 /// Recursively rewrite every JSON object with its keys in sorted
@@ -718,6 +736,7 @@ pub fn canonical_config(store: &ConfigStore) -> Result<CanonicalConfig> {
         automation_environments: store.list_automation_environments()?,
         streams: store.list_streams()?,
         stream_backends: store.list_stream_backends()?,
+        stream_sla_configs: store.list_stream_sla_configs()?,
     };
 
     // Replace secret material with digests BEFORE sorting so the
@@ -751,6 +770,7 @@ pub fn canonical_config(store: &ConfigStore) -> Result<CanonicalConfig> {
     sort_by_canonical_repr(&mut cfg.automation_environments);
     sort_by_canonical_repr(&mut cfg.streams);
     sort_by_canonical_repr(&mut cfg.stream_backends);
+    sort_by_canonical_repr(&mut cfg.stream_sla_configs);
 
     Ok(cfg)
 }
@@ -855,7 +875,8 @@ impl SelectorResolution {
 ///
 /// Streams are cut by their own `node_selector` with the route
 /// predicate, enabled or not (Story 12.1, D-8: only the bind reads
-/// `enabled`), their links travel with them, and the backends are the
+/// `enabled`), their links and their SLA targets (Story 12.9) travel
+/// with them, and the backends are the
 /// union of what the kept routes and the kept streams reference. A
 /// node serving only a stream would otherwise receive the stream and
 /// none of its backends, and the apply would delete them.
@@ -890,6 +911,12 @@ pub fn restrict_for_recipient(
         .stream_backends
         .iter()
         .filter(|sb| kept_streams.contains(sb.stream_id.as_str()))
+        .cloned()
+        .collect();
+    let stream_sla_configs: Vec<StreamSlaConfig> = cfg
+        .stream_sla_configs
+        .iter()
+        .filter(|sla| kept_streams.contains(sla.stream_id.as_str()))
         .cloned()
         .collect();
 
@@ -956,6 +983,7 @@ pub fn restrict_for_recipient(
         automation_environments,
         streams,
         stream_backends,
+        stream_sla_configs,
     }
 }
 
@@ -1318,6 +1346,7 @@ mod tests {
             environment: "env-b".to_string(),
         });
         let (stream, stream_backend, stream_link) = edge_b_stream();
+        let stream_sla = edge_b_stream_sla(&stream);
 
         CanonicalConfig {
             version: CANONICAL_FORMAT_VERSION,
@@ -1356,6 +1385,83 @@ mod tests {
             ],
             streams: vec![stream],
             stream_backends: vec![stream_link],
+            stream_sla_configs: vec![stream_sla],
+        }
+    }
+
+    /// The SLA target of [`edge_b_stream`], off the shipped defaults so
+    /// a test can tell it travelled.
+    fn edge_b_stream_sla(stream: &Stream) -> StreamSlaConfig {
+        let mut sla = StreamSlaConfig::default_for_stream(&stream.id);
+        sla.target_pct = 99.5;
+        sla.max_connect_latency_ms = 250;
+        sla.created_at = fixed_now();
+        sla.updated_at = fixed_now();
+        sla
+    }
+
+    #[test]
+    fn a_stream_sla_target_is_cut_with_its_stream() {
+        let fleet = fleet_config();
+        let cut = restrict_for_recipient(&fleet, "id-b", &resolution());
+        assert_eq!(cut.stream_sla_configs, fleet.stream_sla_configs);
+        let elsewhere = restrict_for_recipient(&fleet, "id-a", &resolution());
+        assert!(
+            elsewhere.streams.is_empty() && elsewhere.stream_sla_configs.is_empty(),
+            "a node not serving the stream receives neither it nor its target"
+        );
+        let bytes = encode_canonical(&cut).expect("encode");
+        let decoded = decode_canonical(&bytes).expect("decodes");
+        assert_eq!(decoded.stream_sla_configs, cut.stream_sla_configs);
+    }
+
+    /// A version-3 blob written before Story 12.9 carries neither the
+    /// stream SLA targets nor the stream access-log retention; it decodes
+    /// to no target and the shipped retention.
+    #[test]
+    fn a_blob_without_the_stream_observability_fields_decodes_to_their_defaults() {
+        let mut cfg = fleet_config();
+        cfg.global.stream_access_log_retention = 7;
+        let bytes = encode_canonical(&cfg).expect("test setup: encode");
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("test setup: the blob is JSON");
+        let top = root
+            .as_object_mut()
+            .expect("test setup: the blob is an object");
+        assert!(top.remove("stream_sla_configs").is_some());
+        let global = top["global"]
+            .as_object_mut()
+            .expect("test setup: global is an object");
+        assert!(global.remove("stream_access_log_retention").is_some());
+        let older = serde_json::to_vec(&root).expect("test setup: re-encode");
+        let decoded = decode_canonical(&older).expect("a blob without them still decodes");
+        assert!(decoded.stream_sla_configs.is_empty());
+        assert_eq!(
+            decoded.global.stream_access_log_retention,
+            GlobalSettings::DEFAULT_STREAM_ACCESS_LOG_RETENTION
+        );
+    }
+
+    #[test]
+    fn the_stream_access_log_retention_replicates_and_the_stream_sink_toggles_do_not() {
+        let source = GlobalSettings {
+            stream_access_log_retention: 0,
+            syslog_stream_enabled: false,
+            otlp_logs_stream_enabled: false,
+            ..GlobalSettings::default()
+        };
+        let canonical = CanonicalGlobalSettings::from(&source);
+        let mut target = GlobalSettings::default();
+        assert!(canonical.apply_to(&mut target), "the retention changed");
+        assert_eq!(target.stream_access_log_retention, 0);
+        assert!(target.syslog_stream_enabled, "node-local, left alone");
+        assert!(target.otlp_logs_stream_enabled, "node-local, left alone");
+        let wire = serde_json::to_value(&canonical).expect("encode");
+        for node_local in ["syslog_stream_enabled", "otlp_logs_stream_enabled"] {
+            assert!(
+                wire.get(node_local).is_none(),
+                "{node_local} is not on the wire"
+            );
         }
     }
 
@@ -1990,8 +2096,19 @@ mod tests {
     /// at the handshake. A blob without them decodes to streams with no
     /// source control and uncapped links. Pinned by
     /// `a_blob_without_the_stream_protection_fields_decodes_to_their_defaults`.
+    ///
+    /// Story 12.9 (1.11.0) moved it again inside the same cycle:
+    /// `CanonicalGlobalSettings` gained `stream_access_log_retention` and
+    /// `CanonicalConfig` gained `stream_sla_configs`, `StreamSlaConfig`
+    /// joining the inventory, each with a serde default (the shipped
+    /// retention, no target). No version step, for Story 12.3's reasons:
+    /// no released blob is stamped 3, a 1.10.x peer is refused by
+    /// version and by schema before it meets them, and a 1.11.0 build
+    /// from before them is refused by schema (migration 79) at the
+    /// handshake. Pinned by
+    /// `a_blob_without_the_stream_observability_fields_decodes_to_their_defaults`.
     const CANONICAL_SHAPE_DIGEST: &str =
-        "fdccb2993c119eca4def668b78f0648d9b7ed1a56f99115feecde5609c9da10e";
+        "15883c35aaf50a34afd21b65e457906e5095f374c6c1a46b7b204bc8b0457c08";
 
     /// Every field name `T` accepts, read from the type itself rather
     /// than from the JSON of some fixture.
@@ -2210,6 +2327,7 @@ mod tests {
             crate::models::StreamUpstreamTls,
             crate::models::MtlsConfig,
             crate::models::GeoIpConfig,
+            crate::models::StreamSlaConfig,
         ];
         lines.extend(health_check_shape_lines(template_names));
         lines.extend(stream_tls_shape_lines());
@@ -2572,6 +2690,7 @@ mod tests {
                 automation_environments: Vec::new(),
                 streams: Vec::new(),
                 stream_backends: Vec::new(),
+                stream_sla_configs: Vec::new(),
             };
             let resolution = SelectorResolution::from_rows(rows.clone());
 
@@ -2879,6 +2998,7 @@ fleet_bytes={fleet_bytes} per_recipient_mean_bytes={mean_bytes}",
             waf_ban_duration_s: _,
             custom_security_presets: _,
             access_log_retention: _,
+            stream_access_log_retention: _,
             waf_event_retention: _,
             sla_purge_enabled: _,
             sla_purge_retention_days: _,
@@ -2936,6 +3056,7 @@ fleet_bytes={fleet_bytes} per_recipient_mean_bytes={mean_bytes}",
             syslog_waf_enabled: _,
             syslog_audit_enabled: _,
             syslog_capture_enabled: _,
+            syslog_stream_enabled: _,
             syslog_tls_ca_pem: _,
             syslog_tls_client_cert_pem: _,
             syslog_tls_client_key_pem: _,
@@ -2946,6 +3067,7 @@ fleet_bytes={fleet_bytes} per_recipient_mean_bytes={mean_bytes}",
             otlp_logs_waf_enabled: _,
             otlp_logs_audit_enabled: _,
             otlp_logs_capture_enabled: _,
+            otlp_logs_stream_enabled: _,
             // The automation listener only ever runs on a control
             // plane (a follower refuses to start it), and the set of
             // machines allowed to reach THIS node's socket is a

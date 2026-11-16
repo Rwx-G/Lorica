@@ -23,8 +23,9 @@
 //! waf_custom_rules, waf_disabled_rules, cert_export_acls,
 //! ai_crawlers_custom (keyed on its UNIQUE `name`, not its
 //! autoincrement id), probe_configs, sla_configs, capture_rules,
-//! automation_environments, streams and stream_backends. Rows absent
-//! from the blob are deleted in exactly those tables.
+//! automation_environments, streams, stream_backends and
+//! stream_sla_configs. Rows absent from the blob are deleted in exactly
+//! those tables.
 //!
 //! # One check on the snapshot, unchecked writes (Story 12.1, D-6)
 //!
@@ -45,8 +46,8 @@
 //!
 //! Never written: `users`, `user_preferences`, `sessions`,
 //! `notification_configs`, `dns_providers`, every `cluster_*` table,
-//! load tests and all telemetry (`sla_buckets`, `probe_results`,
-//! access and WAF logs).
+//! load tests and all telemetry (`sla_buckets`, `stream_sla_buckets`,
+//! `probe_results`, access and WAF logs).
 //!
 //! Telemetry is genuinely untouched since 1.7.1. It was not before:
 //! `sla_buckets.route_id` was `REFERENCES routes(id) ON DELETE CASCADE`
@@ -155,6 +156,8 @@ pub struct ReplicaOutcome {
     pub streams_skipped_by_selector: usize,
     /// Stream-to-backend links written.
     pub stream_backends: usize,
+    /// Stream SLA targets written (Story 12.9), for the kept streams.
+    pub stream_sla_configs: usize,
     /// Whether any fleet-policy global setting differed from the
     /// local value and was overwritten.
     pub global_fields_changed: bool,
@@ -347,6 +350,7 @@ impl ConfigStore {
         outcome.streams = kept_streams.len();
         outcome.streams_skipped_by_selector = config.streams.len() - kept_streams.len();
         outcome.stream_backends = self.apply_replica_streams(config, &kept_streams)?;
+        outcome.stream_sla_configs = self.apply_replica_stream_sla(config, &kept_streams)?;
 
         // 7. WAF: both sets are wholesale replacements.
         self.conn.execute("DELETE FROM waf_custom_rules", [])?;
@@ -603,6 +607,31 @@ impl ConfigStore {
         Ok(written)
     }
 
+    /// Stream SLA targets for the kept streams. Returns how many were
+    /// written.
+    ///
+    /// Runs after [`Self::apply_replica_streams`], whose `DELETE FROM
+    /// streams` has already cascaded every local target away, so this
+    /// pass only inserts: the node holds exactly the blob's targets for
+    /// the streams it keeps, with the blob's timestamps. A target for a
+    /// stream this node does not keep is skipped, as a route SLA target
+    /// is: the foreign key would refuse it and roll the generation back.
+    fn apply_replica_stream_sla(
+        &self,
+        config: &CanonicalConfig,
+        kept: &[&Stream],
+    ) -> Result<usize> {
+        let kept_ids: HashSet<&str> = kept.iter().map(|s| s.id.as_str()).collect();
+        let mut written = 0usize;
+        for sla in &config.stream_sla_configs {
+            if kept_ids.contains(sla.stream_id.as_str()) {
+                self.upsert_stream_sla_config(sla)?;
+                written += 1;
+            }
+        }
+        Ok(written)
+    }
+
     /// AI crawlers, keyed on `name` (D2: nothing references the
     /// autoincrement id). Returns how many rows were written.
     ///
@@ -811,7 +840,7 @@ mod tests {
         CaptureRedaction, CaptureRule, CaptureScope, CertExportAcl, CertificateMode, CustomCrawler,
         CustomVerification, EnvironmentOwner, GlobalSettings, HealthStatus, LifecycleState,
         LoadBalancing, ManagedBy, OwnerKind, ProbeConfig, SlaConfig, StatusMatch, StreamProtocol,
-        WafMode,
+        StreamSlaConfig, WafMode,
     };
     use crate::store::new_id;
 
@@ -2038,6 +2067,94 @@ mod tests {
                 .is_none(),
             "edge-2 does not hold it either"
         );
+    }
+
+    /// Story 12.9: a follower receives the SLA target of each stream it
+    /// serves and of none other, holds it with the control plane's
+    /// timestamps (the harness checks the re-encode is byte-identical),
+    /// and an edit on the control plane reaches it on the next round.
+    #[test]
+    fn a_follower_receives_the_sla_target_of_each_stream_it_serves() {
+        let control_plane = ConfigStore::open_in_memory().expect("control plane opens");
+        seed_stream_fleet(&control_plane, true);
+        let target = |label: &str, target_pct: f64| {
+            let mut sla = StreamSlaConfig::default_for_stream(&sid(label));
+            sla.target_pct = target_pct;
+            sla.max_connect_latency_ms = 120;
+            sla.created_at = fixed_now();
+            sla.updated_at = fixed_now();
+            sla
+        };
+        for sla in [target("s-targeted", 99.0), target("s-fleet", 98.0)] {
+            control_plane
+                .upsert_stream_sla_config(&sla)
+                .expect("test setup: stream SLA target");
+        }
+
+        let followers = replicate_to_followers(&control_plane);
+        let (_, edge_1, _) = &followers[0];
+        let (_, edge_2, edge_2_payload) = &followers[1];
+        assert_eq!(
+            edge_1
+                .get_stream_sla_config(&sid("s-targeted"))
+                .expect("read"),
+            target("s-targeted", 99.0)
+        );
+        assert_eq!(
+            edge_1.get_stream_sla_config(&sid("s-fleet")).expect("read"),
+            target("s-fleet", 98.0)
+        );
+        let held: Vec<String> = edge_2
+            .list_stream_sla_configs()
+            .expect("read")
+            .into_iter()
+            .map(|sla| sla.stream_id)
+            .collect();
+        assert_eq!(held, vec![sid("s-fleet")]);
+        assert!(
+            !edge_2_payload
+                .stream_sla_configs
+                .iter()
+                .any(|sla| sla.stream_id == sid("s-targeted")),
+            "edge-2 is never sent the target of a stream it does not serve"
+        );
+
+        // An edit on the control plane replaces the follower's copy.
+        let mut edited = target("s-targeted", 95.0);
+        edited.updated_at = fixed_now() + chrono::Duration::hours(1);
+        control_plane
+            .upsert_stream_sla_config(&edited)
+            .expect("edit");
+        let followers = replicate_to_followers(&control_plane);
+        let (_, edge_1, _) = &followers[0];
+        assert_eq!(
+            edge_1
+                .get_stream_sla_config(&sid("s-targeted"))
+                .expect("read")
+                .target_pct,
+            95.0
+        );
+    }
+
+    /// A second apply onto a follower that already holds the targets
+    /// leaves exactly the blob's: the stream pass cascades the old rows
+    /// away before the targets are written again.
+    #[test]
+    fn reapplying_a_generation_keeps_one_target_per_kept_stream() {
+        let control_plane = ConfigStore::open_in_memory().expect("control plane opens");
+        seed_stream_fleet(&control_plane, true);
+        control_plane
+            .upsert_stream_sla_config(&StreamSlaConfig::default_for_stream(&sid("s-fleet")))
+            .expect("test setup: stream SLA target");
+        let config = prepared(&control_plane).expect("prepare");
+        let follower = ConfigStore::open_in_memory().expect("follower opens");
+        for generation in 1..=2 {
+            let outcome = follower
+                .apply_replica(&config, "edge-1", generation, "h")
+                .expect("apply");
+            assert_eq!(outcome.stream_sla_configs, 1);
+        }
+        assert_eq!(follower.list_stream_sla_configs().expect("read").len(), 1);
     }
 
     #[test]

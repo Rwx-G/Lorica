@@ -206,6 +206,7 @@ const MIGRATIONS: &[Migration] = &[
     (76, migrate_stream_udp_settings),
     (77, migrate_stream_tls),
     (78, migrate_stream_protection),
+    (79, migrate_stream_sla),
 ];
 
 /// The newest schema version, the last entry of [`MIGRATIONS`].
@@ -1852,6 +1853,60 @@ fn migrate_stream_protection(conn: &Connection) -> rusqlite::Result<()> {
         add_column_if_absent(conn, "streams", column, ddl)?;
     }
     add_column_if_absent(conn, "stream_backends", "max_active", "INTEGER")
+}
+
+/// Story 12.9: the stream SLA target and its minute buckets, tables of
+/// their own rather than new keys in `sla_configs` and `sla_buckets`,
+/// so no route query has to tell a stream row from a route row.
+///
+/// `stream_sla_configs` cascades from `streams`, the `sla_configs`
+/// stance: configuration for a stream goes with the stream.
+/// `stream_sla_buckets` has no foreign key, for the reason migration 55
+/// gives for `sla_buckets`: a replica apply deletes and rewrites every
+/// stream, and a record of what a stream served must not go with it.
+/// History leaves by time only, through `prune_sla_buckets`.
+///
+/// The latency columns are nullable: a UDP session has no connect, and a
+/// minute in which nothing connected has no latency to report.
+/// `connected_count` is their sample count, since a judged connection
+/// that failed to connect has none. The merge is additive on
+/// `(stream_id, bucket_start, source)`, as for routes.
+///
+/// New tables only: 1.10.6 opening this database after a rollback never
+/// names them.
+fn migrate_stream_sla(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS stream_sla_configs (
+            stream_id              TEXT PRIMARY KEY REFERENCES streams(id) ON DELETE CASCADE,
+            target_pct             REAL NOT NULL DEFAULT 99.9,
+            max_connect_latency_ms INTEGER NOT NULL DEFAULT 500,
+            created_at             TEXT NOT NULL,
+            updated_at             TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS stream_sla_buckets (
+            id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+            stream_id                  TEXT NOT NULL,
+            bucket_start               TEXT NOT NULL,
+            source                     TEXT NOT NULL DEFAULT 'passive',
+            judged_count               INTEGER NOT NULL DEFAULT 0,
+            success_count              INTEGER NOT NULL DEFAULT 0,
+            failure_count              INTEGER NOT NULL DEFAULT 0,
+            connected_count            INTEGER NOT NULL DEFAULT 0,
+            connect_latency_sum_ms     INTEGER,
+            connect_latency_min_ms     INTEGER,
+            connect_latency_max_ms     INTEGER,
+            connect_latency_p50_ms     INTEGER,
+            connect_latency_p95_ms     INTEGER,
+            connect_latency_p99_ms     INTEGER,
+            cfg_target_pct             REAL NOT NULL DEFAULT 99.9,
+            cfg_max_connect_latency_ms INTEGER NOT NULL DEFAULT 500,
+            UNIQUE(stream_id, bucket_start, source)
+        );
+        CREATE INDEX IF NOT EXISTS idx_stream_sla_buckets_stream_time
+            ON stream_sla_buckets(stream_id, bucket_start);
+        CREATE INDEX IF NOT EXISTS idx_stream_sla_buckets_time
+            ON stream_sla_buckets(bucket_start);",
+    )
 }
 
 /// A stored wildcard pattern whose body names an address (`*.0.2.10`),

@@ -990,3 +990,141 @@ fn a_1_10_6_rollback_probes_send_expect_backends_by_tcp_connect_and_keeps_their_
         "a flip does not write the definition this binary could not read"
     );
 }
+
+// ---- The stream SLA tables across a 1.10.6 rollback (Story 12.9, D-g) ----
+//
+// Frozen released artefacts, copied from
+// `git show v1.10.6:lorica-config/src/store/sla.rs` (`merge_sla_bucket`,
+// `prune_sla_buckets`) and `.../row_helpers.rs` (the `alert_types` read).
+// Never edit them to follow the current code.
+
+const V1_10_6_MERGE_SLA_BUCKET: &str = "INSERT INTO sla_buckets
+             (route_id, bucket_start, request_count, success_count, error_count,
+              latency_sum_ms, latency_min_ms, latency_max_ms,
+              latency_p50_ms, latency_p95_ms, latency_p99_ms, source,
+              cfg_max_latency_ms, cfg_status_min, cfg_status_max, cfg_target_pct)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+             ON CONFLICT(route_id, bucket_start, source) DO UPDATE SET
+              request_count  = sla_buckets.request_count  + excluded.request_count,
+              success_count  = sla_buckets.success_count  + excluded.success_count,
+              error_count    = sla_buckets.error_count    + excluded.error_count,
+              latency_sum_ms = sla_buckets.latency_sum_ms + excluded.latency_sum_ms,
+              latency_min_ms = MIN(sla_buckets.latency_min_ms, excluded.latency_min_ms),
+              latency_max_ms = MAX(sla_buckets.latency_max_ms, excluded.latency_max_ms),
+              latency_p50_ms = MAX(sla_buckets.latency_p50_ms, excluded.latency_p50_ms),
+              latency_p95_ms = MAX(sla_buckets.latency_p95_ms, excluded.latency_p95_ms),
+              latency_p99_ms = MAX(sla_buckets.latency_p99_ms, excluded.latency_p99_ms),
+              cfg_max_latency_ms = excluded.cfg_max_latency_ms,
+              cfg_status_min     = excluded.cfg_status_min,
+              cfg_status_max     = excluded.cfg_status_max,
+              cfg_target_pct     = excluded.cfg_target_pct";
+
+const V1_10_6_PRUNE_SLA_BUCKETS: &str = "DELETE FROM sla_buckets WHERE bucket_start < ?1";
+
+/// A 1.10.6 binary rolled back onto a database Story 12.9 migrated keeps
+/// writing and pruning its route SLA buckets, reads every channel's
+/// alert list (which now names types it does not know) as the plain
+/// string list it always parsed, and never touches the stream SLA rows,
+/// which the re-upgrade finds as they were.
+#[test]
+fn a_1_10_6_binary_keeps_its_route_sla_on_a_database_holding_stream_sla() {
+    use lorica_config::models::{Stream, StreamProtocol, StreamSlaBucket, StreamSlaConfig};
+
+    let dir = tempfile::tempdir().expect("test setup: tempdir");
+    let path = dir.path().join("lorica.db");
+    let store = ConfigStore::open(&path, None).expect("test setup: a database at head");
+    let minute = Utc.with_ymd_and_hms(2026, 11, 1, 12, 0, 0).unwrap();
+    let stream = Stream::new(
+        "5a5a5a5a-0000-4000-8000-000000000001".to_string(),
+        "postgres".to_string(),
+        StreamProtocol::Tcp,
+        "0.0.0.0".parse().expect("test setup: address"),
+        5432,
+        5432,
+        minute,
+    );
+    store.create_stream(&stream).expect("test setup: stream");
+    let mut target = StreamSlaConfig::default_for_stream(&stream.id);
+    target.created_at = minute;
+    target.updated_at = minute;
+    store
+        .upsert_stream_sla_config(&target)
+        .expect("test setup: stream SLA target");
+    let mut bucket = StreamSlaBucket::empty(&target, minute, "passive");
+    bucket.judged_count = 3;
+    bucket.success_count = 3;
+    store
+        .merge_stream_sla_bucket(&bucket)
+        .expect("test setup: stream SLA bucket");
+    let raw = Connection::open(&path).expect("test setup: raw open");
+    raw.execute(
+        "INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
+         VALUES ('explicit', 'webhook', 1, '{}', ?1)",
+        rusqlite::params![r#"["backend_down","stream_backend_down","stream_udp_ceiling_reached"]"#],
+    )
+    .expect("test setup: a channel subscribed to the new types");
+    drop(store);
+
+    // The rollback: 1.10.6's own statements on the 1.11.0 file.
+    for slice in [10, 5] {
+        raw.execute(
+            V1_10_6_MERGE_SLA_BUCKET,
+            rusqlite::params![
+                "route-1",
+                minute.to_rfc3339(),
+                slice,
+                slice,
+                0,
+                slice * 20,
+                20,
+                20,
+                20,
+                20,
+                20,
+                "passive",
+                500,
+                200,
+                399,
+                99.9
+            ],
+        )
+        .expect("the 1.10.6 SLA merge runs on a 1.11.0 database");
+    }
+    let alert_json: String = raw
+        .query_row(
+            "SELECT alert_types FROM notification_configs WHERE id = 'explicit'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the 1.10.6 channel read runs");
+    let alert_types: Vec<String> =
+        serde_json::from_str(&alert_json).expect("1.10.6 parses the list it always parsed");
+    assert_eq!(alert_types.len(), 3);
+    let pruned = raw
+        .execute(
+            V1_10_6_PRUNE_SLA_BUCKETS,
+            rusqlite::params![(minute - chrono::Duration::days(1)).to_rfc3339()],
+        )
+        .expect("the 1.10.6 prune runs");
+    assert_eq!(pruned, 0);
+    drop(raw);
+
+    let store = ConfigStore::open(&path, None).expect("the re-upgrade opens");
+    let from = minute - chrono::Duration::minutes(1);
+    let to = minute + chrono::Duration::minutes(1);
+    let routes = store
+        .query_sla_buckets("route-1", &from, &to, "passive")
+        .expect("route buckets read");
+    assert_eq!(routes[0].request_count, 15, "1.10.6's slices summed");
+    assert_eq!(
+        store
+            .get_stream_sla_config(&stream.id)
+            .expect("target reads"),
+        target
+    );
+    let streams = store
+        .query_stream_sla_buckets(&stream.id, &from, &to, "passive")
+        .expect("stream buckets read");
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0].judged_count, 3);
+}

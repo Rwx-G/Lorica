@@ -5248,6 +5248,294 @@ cert_critical_days = 3
             .is_empty());
     }
 
+    // ---- Story 12.9: stream SLA ----
+
+    /// A stored TCP stream for the stream SLA tests, and its id.
+    fn stored_stream(store: &ConfigStore, label: &str) -> String {
+        let stream = crate::models::sample_stream(label, label, StreamProtocol::Tcp, 5432);
+        store.create_stream(&stream).expect("test setup: stream");
+        stream.id
+    }
+
+    fn this_minute() -> chrono::DateTime<Utc> {
+        Utc::now()
+            .with_nanosecond(0)
+            .expect("test setup")
+            .with_second(0)
+            .expect("test setup")
+    }
+
+    /// One writer's slice of a minute: `judged` connections, `failed` of
+    /// them failed, and every connected one at `latency_ms`, or nothing
+    /// connected when `latency_ms` is `None` (a UDP slice).
+    fn stream_sla_slice(
+        stream_id: &str,
+        minute: chrono::DateTime<Utc>,
+        judged: i64,
+        failed: i64,
+        latency_ms: Option<i64>,
+    ) -> StreamSlaBucket {
+        let config = StreamSlaConfig::default_for_stream(stream_id);
+        let mut bucket = StreamSlaBucket::empty(&config, minute, "passive");
+        bucket.judged_count = judged;
+        bucket.success_count = judged - failed;
+        bucket.failure_count = failed;
+        if let Some(latency) = latency_ms {
+            let connected = judged - failed;
+            bucket.connected_count = connected;
+            bucket.connect_latency_sum_ms = Some(latency * connected);
+            bucket.connect_latency_min_ms = Some(latency);
+            bucket.connect_latency_max_ms = Some(latency);
+            bucket.connect_latency_p50_ms = Some(latency);
+            bucket.connect_latency_p95_ms = Some(latency);
+            bucket.connect_latency_p99_ms = Some(latency);
+        }
+        bucket
+    }
+
+    #[test]
+    fn a_stream_without_a_stored_sla_target_reads_the_shipped_default() {
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let id = stored_stream(&store, "sla-default");
+        let config = store.get_stream_sla_config(&id).expect("read");
+        assert_eq!(config.target_pct, StreamSlaConfig::DEFAULT_TARGET_PCT);
+        assert_eq!(
+            config.max_connect_latency_ms,
+            StreamSlaConfig::DEFAULT_MAX_CONNECT_LATENCY_MS
+        );
+        assert!(store.list_stream_sla_configs().expect("list").is_empty());
+        assert!(config.connect_within_bound(500));
+        assert!(!config.connect_within_bound(501));
+        assert!(!config.connect_within_bound(u64::MAX));
+    }
+
+    #[test]
+    fn a_stream_sla_target_round_trips_and_keeps_its_creation_time() {
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let id = stored_stream(&store, "sla-upsert");
+        let mut config = StreamSlaConfig::default_for_stream(&id);
+        config.target_pct = 99.0;
+        config.max_connect_latency_ms = 50;
+        store.upsert_stream_sla_config(&config).expect("insert");
+        let stored = store.get_stream_sla_config(&id).expect("read");
+        assert_eq!(stored.target_pct, 99.0);
+        assert_eq!(stored.max_connect_latency_ms, 50);
+
+        let mut edited = stored.clone();
+        edited.target_pct = 95.0;
+        edited.created_at = stored.created_at + chrono::Duration::days(1);
+        store.upsert_stream_sla_config(&edited).expect("update");
+        let reread = store.get_stream_sla_config(&id).expect("read");
+        assert_eq!(reread.target_pct, 95.0);
+        assert_eq!(
+            reread.created_at, stored.created_at,
+            "an edit is not a create"
+        );
+        assert_eq!(store.list_stream_sla_configs().expect("list"), vec![reread]);
+    }
+
+    #[test]
+    fn a_stream_sla_target_for_an_unknown_stream_is_refused() {
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let config =
+            StreamSlaConfig::default_for_stream(&crate::models::sample_stream_id("no-stream"));
+        assert!(store.upsert_stream_sla_config(&config).is_err());
+    }
+
+    #[test]
+    fn deleting_a_stream_removes_its_sla_target_and_leaves_its_history() {
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let id = stored_stream(&store, "sla-cascade");
+        let kept = stored_stream(&store, "sla-kept");
+        for stream_id in [&id, &kept] {
+            store
+                .upsert_stream_sla_config(&StreamSlaConfig::default_for_stream(stream_id))
+                .expect("target");
+        }
+        let minute = this_minute();
+        store
+            .merge_stream_sla_bucket(&stream_sla_slice(&id, minute, 4, 0, Some(10)))
+            .expect("bucket");
+
+        store.delete_stream(&id).expect("delete stream");
+        let held: Vec<String> = store
+            .list_stream_sla_configs()
+            .expect("list")
+            .into_iter()
+            .map(|c| c.stream_id)
+            .collect();
+        assert_eq!(held, vec![kept], "the target goes with its stream");
+
+        let from = minute - chrono::Duration::minutes(1);
+        let to = minute + chrono::Duration::minutes(1);
+        assert_eq!(
+            store
+                .query_stream_sla_buckets(&id, &from, &to, "passive")
+                .expect("query")
+                .len(),
+            1,
+            "the history outlives the stream, as a route's does"
+        );
+        assert_eq!(store.prune_sla_buckets(&to).expect("prune"), 1);
+        assert!(store
+            .query_stream_sla_buckets(&id, &from, &to, "passive")
+            .expect("query")
+            .is_empty());
+    }
+
+    #[test]
+    fn stream_sla_slices_of_one_minute_add_up() {
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let id = stored_stream(&store, "sla-merge");
+        let minute = this_minute();
+        // Two workers' slices of one minute, and a third with nothing
+        // connected: its NULL latencies must not erase the others'.
+        store
+            .merge_stream_sla_bucket(&stream_sla_slice(&id, minute, 10, 1, Some(40)))
+            .expect("first worker");
+        store
+            .merge_stream_sla_bucket(&stream_sla_slice(&id, minute, 20, 0, Some(90)))
+            .expect("second worker");
+        store
+            .merge_stream_sla_bucket(&stream_sla_slice(&id, minute, 3, 3, None))
+            .expect("a slice where nothing connected");
+
+        let from = minute - chrono::Duration::minutes(1);
+        let to = minute + chrono::Duration::minutes(1);
+        let buckets = store
+            .query_stream_sla_buckets(&id, &from, &to, "passive")
+            .expect("query");
+        assert_eq!(buckets.len(), 1, "one row per minute and source");
+        let b = &buckets[0];
+        assert_eq!(b.judged_count, 33);
+        assert_eq!(b.success_count, 29);
+        assert_eq!(b.failure_count, 4);
+        assert_eq!(b.connected_count, 29);
+        assert_eq!(b.connect_latency_sum_ms, Some(9 * 40 + 20 * 90));
+        assert_eq!(b.connect_latency_min_ms, Some(40));
+        assert_eq!(b.connect_latency_max_ms, Some(90));
+        assert_eq!(b.connect_latency_p50_ms, Some(90));
+        assert_eq!(b.connect_latency_p99_ms, Some(90));
+
+        let summary = store
+            .compute_stream_sla_summary(&id, &from, &to, "1h", "passive")
+            .expect("summary");
+        assert_eq!(summary.judged_count, 33);
+        assert_eq!(summary.success_count, 29);
+        assert_eq!(summary.failure_count, 4);
+        assert_eq!(
+            summary.avg_connect_latency_ms,
+            Some((9.0 * 40.0 + 20.0 * 90.0) / 29.0),
+            "the mean divides by what connected, not by what was judged"
+        );
+        assert_eq!(summary.p95_connect_latency_ms, Some(90));
+        assert_eq!(summary.target_pct, StreamSlaConfig::DEFAULT_TARGET_PCT);
+        assert!(!summary.meets_target);
+    }
+
+    #[test]
+    fn a_udp_stream_sla_reports_availability_without_latency() {
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let id = stored_stream(&store, "sla-udp");
+        let minute = this_minute();
+        for _ in 0..2 {
+            store
+                .merge_stream_sla_bucket(&stream_sla_slice(&id, minute, 50, 0, None))
+                .expect("a UDP slice");
+        }
+        let from = minute - chrono::Duration::minutes(1);
+        let to = minute + chrono::Duration::minutes(1);
+        let bucket = &store
+            .query_stream_sla_buckets(&id, &from, &to, "passive")
+            .expect("query")[0];
+        assert_eq!(bucket.judged_count, 100);
+        assert_eq!(bucket.connected_count, 0);
+        assert_eq!(bucket.connect_latency_sum_ms, None);
+        assert_eq!(bucket.connect_latency_min_ms, None);
+        let summary = store
+            .compute_stream_sla_summary(&id, &from, &to, "1h", "passive")
+            .expect("summary");
+        assert_eq!(summary.sla_pct, 100.0);
+        assert!(summary.meets_target);
+        assert_eq!(summary.avg_connect_latency_ms, None);
+        assert_eq!(summary.p50_connect_latency_ms, None);
+    }
+
+    #[test]
+    fn an_empty_stream_sla_window_reads_the_live_target() {
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let id = stored_stream(&store, "sla-empty");
+        let mut config = StreamSlaConfig::default_for_stream(&id);
+        config.target_pct = 90.0;
+        store.upsert_stream_sla_config(&config).expect("target");
+        let minute = this_minute();
+        let summary = store
+            .compute_stream_sla_summary(
+                &id,
+                &(minute - chrono::Duration::hours(1)),
+                &minute,
+                "1h",
+                "passive",
+            )
+            .expect("summary");
+        assert_eq!(summary.judged_count, 0);
+        assert_eq!(summary.target_pct, 90.0);
+        assert_eq!(summary.avg_connect_latency_ms, None);
+        let export = store
+            .export_stream_sla_data(&id, &(minute - chrono::Duration::hours(1)), &minute)
+            .expect("export");
+        assert_eq!(export["stream_id"], id.as_str());
+        assert_eq!(export["config"]["target_pct"], 90.0);
+        assert_eq!(store.delete_stream_sla_buckets(&id).expect("delete"), 0);
+    }
+
+    /// The migration's column defaults are the model's: a row written
+    /// with none of the snapshot columns reads as the shipped target.
+    #[test]
+    fn the_stream_sla_column_defaults_are_the_model_defaults() {
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let id = stored_stream(&store, "sla-columns");
+        let minute = this_minute();
+        store
+            .conn
+            .execute(
+                "INSERT INTO stream_sla_buckets (stream_id, bucket_start) VALUES (?1, ?2)",
+                rusqlite::params![id, minute.to_rfc3339()],
+            )
+            .expect("bare bucket");
+        store
+            .conn
+            .execute(
+                "INSERT INTO stream_sla_configs (stream_id, created_at, updated_at) \
+                 VALUES (?1, ?2, ?2)",
+                rusqlite::params![id, minute.to_rfc3339()],
+            )
+            .expect("bare target");
+        let bucket = &store
+            .query_stream_sla_buckets(
+                &id,
+                &(minute - chrono::Duration::minutes(1)),
+                &(minute + chrono::Duration::minutes(1)),
+                "passive",
+            )
+            .expect("query")[0];
+        let shipped =
+            StreamSlaBucket::empty(&StreamSlaConfig::default_for_stream(&id), minute, "passive");
+        assert_eq!(
+            StreamSlaBucket {
+                id: None,
+                ..bucket.clone()
+            },
+            shipped
+        );
+        let config = store.get_stream_sla_config(&id).expect("read");
+        assert_eq!(config.target_pct, StreamSlaConfig::DEFAULT_TARGET_PCT);
+        assert_eq!(
+            config.max_connect_latency_ms,
+            StreamSlaConfig::DEFAULT_MAX_CONNECT_LATENCY_MS
+        );
+    }
+
     #[test]
     fn a_key_digest_follows_the_material_not_the_pem_formatting() {
         // Backlog #60: the control plane announces a digest over its copy of
