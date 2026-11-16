@@ -434,18 +434,30 @@ the snapshot type. Instead:
   - **UDP**: a session is judged when 12.5's breaker outcome is known:
     success at the first backend datagram, failure on an ICMP error
     before any or a no-response idle on a stream with
-    `responses_per_request >= 1`. A `responses_per_request = 0` session
-    (syslog, NetFlow) is judged only on an ICMP failure; otherwise it is
-    not judged, since silence is its normal answer. No latency on UDP
-    (there is no connect); the latency columns stay null and the view
-    shows availability only (Resolved 2).
+    `responses_per_request >= 1`. A session of a stream that expects no
+    response (syslog, NetFlow: `responses_per_request = 0`, or responses
+    unbounded, the engine's `expects_responses` being false) is judged
+    at its end: a success unless it ended on an ICMP error
+    (`connect_failed`). No latency on UDP (there is no connect); the
+    latency columns stay null and the view shows availability only
+    (Resolved 2).
+  - *Amendment (maintainer, 2026-11-16, after Lot D):* the first text
+    judged such a session only on an ICMP failure and never otherwise.
+    Every judged session was then a failure, so any window in which the
+    stream judged something read 0 %, and a single ICMP error raised
+    `sla_breached`. Judging the session at its end gives the silent
+    sessions their success, and availability is again the share of
+    sessions the backend did not refuse.
 - **Recorded at the decision, not at the end.** A TCP connection can
   last hours; judging it at its end would put its availability in the
   wrong bucket. `ConnectionObserver` gains a defaulted
   `connect_outcome(stream_id, protocol, ConnectOutcome)` called by the
   engine where the connect phase resolves (TCP) and where the breaker
   outcome is reported (UDP). `StreamLogObserver` forwards it to the
-  collector.
+  collector. The one session judged at its end is the UDP session that
+  expects no response (amendment above): `StreamLogObserver` reports it
+  from `observe`, from the record's end reason, and ignores its
+  `connect_outcome`.
 - **Storage**, in the config DB as the route SLA is: `stream_sla_configs`
   (`stream_id` primary key, foreign key to `streams` with `ON DELETE
   CASCADE`, `target_pct` default 99.9, `max_connect_latency_ms` default
@@ -1047,14 +1059,16 @@ edited here.
   is judged, a success when `StreamSlaConfig::connect_within_bound`
   holds (inclusive), and is a latency sample either way;
   `TcpNotConnected` (`connect_failed`, `no_healthy_backend`) is a
-  failure with no sample. `UdpIcmpError` is a failure;
-  `UdpAnswered` a success and `UdpNoResponse` a failure, both only when
-  `responses_expected`, otherwise not judged. Lot F maps Lot A's
-  `ConnectOutcome` onto these and supplies `responses_expected` as the
-  UDP engine's `Bounds::expects_responses` does
-  (`responses_per_request >= 1` and responses not unbounded), which is
-  also when the engine reports a no-response failure. No latency on UDP:
-  the latency columns stay `None`.
+  failure with no sample. On a UDP stream that expects responses (the
+  engine's `Bounds::expects_responses`: `responses_per_request >= 1`
+  and responses not unbounded), Lot F maps Lot A's `ConnectOutcome`
+  onto `UdpAnswered` (success), `UdpIcmpError` and `UdpNoResponse`
+  (failures). On one that expects none, Lot F ignores the
+  `connect_outcome` and reports `UdpUnansweredEnded { icmp_error }` from
+  `observe`, `icmp_error` being an end reason of `connect_failed`: a
+  success unless `icmp_error` (the D-g amendment). Every variant is one
+  judged connection, so each is reported once. No latency on UDP: the
+  latency columns stay `None`.
 - **Breach evaluation** mirrors the route one: every stream with a
   stored target, the last hour of `passive` buckets, an alert only on a
   state edge, a stream that judged nothing keeps its state. Details:
@@ -1063,10 +1077,11 @@ edited here.
   place of the route's `total_requests`. `lorica_sla_breach_total` is
   not incremented for streams: its label is `route_id` and its file is
   outside the Lot.
-- **Consequence of D-g to know** (not a deviation): a UDP stream that
-  owes no response is judged on ICMP failures only, so any window in
-  which it judged something reads 0 %, and one ICMP error in the hour
-  raises `sla_breached` once its target is stored.
+- **D-g amended after Lot D** (maintainer): a UDP stream that owes no
+  response was judged on ICMP failures only, so any window in which it
+  judged something read 0 %. Its sessions are now judged at their end,
+  a success unless an ICMP error ended them
+  (`udp_without_expected_responses_is_a_success_at_its_end_unless_icmp_failed_it`).
 
 ## File List
 
@@ -1100,3 +1115,4 @@ edited here.
 | 2026-11-15 | 0.2 | Maintainer answers folded in as Resolved 1 to 7: fan-in kept, UDP SLA availability only, no DNS alert, no certificate subject (the HTTP access log records none, verified), stream rows on automation and MCP need `logs:read` and `streams:read`, access severity on syslog, the 12.6 amendment accepted and assigned to 12.6 Lot C (or this story's Lot A if C landed first). Status Draft. | Romain G. |
 | 2026-11-16 | 0.3 | Lot B: the three settings, the stream SLA model and storage (migration 79, with `connected_count`), stream SLA targets replicated with their stream (Resolved 8), `stream_backend_down` and `stream_udp_ceiling_reached` with migration 80. Status InProgress. | Romain G. |
 | 2026-11-16 | 0.4 | Lot D: `StreamSlaCollector` and `StreamSlaOutcome` in `lorica-bench`, minutes kept until flushed, the D-g judging rules, breach and recovery on `sla_breached` / `sla_recovered` with stream details. | Romain G. |
+| 2026-11-16 | 0.5 | Route SLA minute loss proven and fixed (`SlaCollector` keeps a finished minute until flushed). D-g amended: a UDP session that expects no response is judged at its end, a success unless an ICMP error ended it. | Romain G. |

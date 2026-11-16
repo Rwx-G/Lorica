@@ -18,8 +18,10 @@
 //! A stream SLA judges connections, not bytes, and judges each one when
 //! its connect phase resolves rather than when it ends: a TCP connection
 //! can last hours, and judging it at its end would put its availability
-//! in the wrong minute. The engine reports that moment, the binary turns
-//! it into a [`StreamSlaOutcome`] and hands it to
+//! in the wrong minute. The one exception is a UDP session that owes no
+//! response, whose only verdict is known at its end. The engine reports
+//! that moment, the binary turns it into a [`StreamSlaOutcome`] and
+//! hands it to
 //! [`StreamSlaCollector::record`], which only touches an in-memory map.
 //! Completed minutes are merged into `stream_sla_buckets` by the flush
 //! task with the store's additive merge, so the slices every process
@@ -41,14 +43,23 @@ use super::helpers::{compute_percentiles, current_bucket_start};
 /// The `source` of every bucket this collector writes: observed traffic.
 const PASSIVE_SOURCE: &str = "passive";
 
-/// How the connect phase of one stream connection or UDP session
-/// resolved, as the engine reports it.
+/// The judged outcome of one stream connection or UDP session, as the
+/// engine reports it. Each connection or session is reported once, so
+/// each variant is one judged connection.
 ///
 /// The TCP variants are reported once a connection reaches backend
 /// selection: a refusal or any other end before it never reaches the
-/// collector, since it says nothing about the backends. The UDP variants
-/// are the breaker outcome of Story 12.5 (D-i), reported where the
-/// engine reports it to the breaker.
+/// collector, since it says nothing about the backends.
+///
+/// A UDP stream is reported one of two ways, by what it owes its
+/// clients. A stream that owes responses (`responses_per_request >= 1`,
+/// responses bounded: the engine's `expects_responses`) reports the
+/// breaker outcome of Story 12.5 (D-i), where the engine reports it to
+/// the breaker: [`Self::UdpAnswered`], [`Self::UdpIcmpError`] or
+/// [`Self::UdpNoResponse`]. A stream that owes none (syslog, NetFlow)
+/// reports [`Self::UdpUnansweredEnded`] when the session ends, and
+/// nothing else: silence is its normal answer, so the decision waits
+/// for the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamSlaOutcome {
     /// The connection connected to a backend `connect_latency_ms` after
@@ -59,19 +70,20 @@ pub enum StreamSlaOutcome {
     },
     /// The connection ended `connect_failed` or `no_healthy_backend`.
     TcpNotConnected,
-    /// The session received its first backend datagram.
-    UdpAnswered {
-        /// Whether the stream owes its client responses
-        /// (`responses_per_request >= 1`, responses bounded).
-        responses_expected: bool,
-    },
-    /// The backend sent an ICMP error before any datagram.
+    /// A session of a stream that owes responses received its first
+    /// backend datagram.
+    UdpAnswered,
+    /// A session of a stream that owes responses met an ICMP error from
+    /// the backend before any datagram.
     UdpIcmpError,
-    /// The session went idle without a backend datagram.
-    UdpNoResponse {
-        /// Whether the stream owes its client responses
-        /// (`responses_per_request >= 1`, responses bounded).
-        responses_expected: bool,
+    /// A session of a stream that owes responses went idle without a
+    /// backend datagram.
+    UdpNoResponse,
+    /// A session of a stream that owes no response ended.
+    UdpUnansweredEnded {
+        /// Whether the session ended on an ICMP error from the backend
+        /// (`connect_failed`): the one failure such a session can show.
+        icmp_error: bool,
     },
 }
 
@@ -84,29 +96,22 @@ struct Judgement {
 }
 
 impl StreamSlaOutcome {
-    /// The verdict under `config`, or `None` when the outcome is not
-    /// judged. A session that owes no response (syslog, NetFlow) is
-    /// judged only on an ICMP failure: silence is its normal answer, and
-    /// so is the backend datagram it does not owe.
-    fn judge(self, config: &StreamSlaConfig) -> Option<Judgement> {
+    /// The verdict under `config`.
+    fn judge(self, config: &StreamSlaConfig) -> Judgement {
         let verdict = |success: bool| Judgement {
             success,
             connect_latency_ms: None,
         };
         match self {
-            StreamSlaOutcome::TcpConnected { connect_latency_ms } => Some(Judgement {
+            StreamSlaOutcome::TcpConnected { connect_latency_ms } => Judgement {
                 success: config.connect_within_bound(connect_latency_ms),
                 connect_latency_ms: Some(connect_latency_ms),
-            }),
-            StreamSlaOutcome::TcpNotConnected | StreamSlaOutcome::UdpIcmpError => {
-                Some(verdict(false))
-            }
-            StreamSlaOutcome::UdpAnswered { responses_expected } => {
-                responses_expected.then(|| verdict(true))
-            }
-            StreamSlaOutcome::UdpNoResponse { responses_expected } => {
-                responses_expected.then(|| verdict(false))
-            }
+            },
+            StreamSlaOutcome::TcpNotConnected
+            | StreamSlaOutcome::UdpIcmpError
+            | StreamSlaOutcome::UdpNoResponse => verdict(false),
+            StreamSlaOutcome::UdpAnswered => verdict(true),
+            StreamSlaOutcome::UdpUnansweredEnded { icmp_error } => verdict(!icmp_error),
         }
     }
 }
@@ -196,8 +201,8 @@ impl StreamSlaCollector {
         }
     }
 
-    /// Record how the connect phase of one connection or session of
-    /// `stream_id` resolved. An outcome that is not judged is ignored.
+    /// Record the judged outcome of one connection or session of
+    /// `stream_id`, in the current minute.
     ///
     /// Called on the stream runtime: it touches an in-memory map under a
     /// brief lock, never the store.
@@ -206,9 +211,7 @@ impl StreamSlaCollector {
     }
 
     fn record_at(&self, stream_id: &str, outcome: StreamSlaOutcome, minute: DateTime<Utc>) {
-        let Some(judgement) = self.judge(stream_id, outcome) else {
-            return;
-        };
+        let judgement = self.judge(stream_id, outcome);
         if let Ok(mut minutes) = self.minutes.lock() {
             minutes
                 .entry((stream_id.to_string(), minute))
@@ -247,7 +250,7 @@ impl StreamSlaCollector {
         }
     }
 
-    fn judge(&self, stream_id: &str, outcome: StreamSlaOutcome) -> Option<Judgement> {
+    fn judge(&self, stream_id: &str, outcome: StreamSlaOutcome) -> Judgement {
         if let Ok(configs) = self.sla_configs.lock() {
             if let Some(config) = configs.get(stream_id) {
                 return outcome.judge(config);
@@ -524,13 +527,9 @@ mod tests {
         let collector = StreamSlaCollector::new();
         let minute = previous_minute();
         for outcome in [
-            StreamSlaOutcome::UdpAnswered {
-                responses_expected: true,
-            },
+            StreamSlaOutcome::UdpAnswered,
             StreamSlaOutcome::UdpIcmpError,
-            StreamSlaOutcome::UdpNoResponse {
-                responses_expected: true,
-            },
+            StreamSlaOutcome::UdpNoResponse,
         ] {
             collector.record_at(STREAM_ID, outcome, minute);
         }
@@ -546,35 +545,36 @@ mod tests {
     }
 
     #[test]
-    fn udp_without_expected_responses_is_judged_only_on_an_icmp_failure() {
+    fn udp_without_expected_responses_is_a_success_at_its_end_unless_icmp_failed_it() {
         let store = store_with_stream(STREAM_ID, "syslog");
         let collector = StreamSlaCollector::new();
         let minute = previous_minute();
-        collector.record_at(
-            STREAM_ID,
-            StreamSlaOutcome::UdpAnswered {
-                responses_expected: false,
-            },
-            minute,
-        );
-        collector.record_at(
-            STREAM_ID,
-            StreamSlaOutcome::UdpNoResponse {
-                responses_expected: false,
-            },
-            minute,
-        );
-        assert_eq!(
-            collector.flush_before(&store, current_bucket_start()),
-            0,
-            "nothing judged, nothing written"
-        );
-
-        collector.record_at(STREAM_ID, StreamSlaOutcome::UdpIcmpError, minute);
+        for icmp_error in [false, false, false, true] {
+            collector.record_at(
+                STREAM_ID,
+                StreamSlaOutcome::UdpUnansweredEnded { icmp_error },
+                minute,
+            );
+        }
         collector.flush_before(&store, current_bucket_start());
+
         let bucket = stored_bucket(&store, minute);
-        assert_eq!(bucket.judged_count, 1);
+        assert_eq!(bucket.judged_count, 4);
+        assert_eq!(bucket.success_count, 3, "silent sessions are successes");
         assert_eq!(bucket.failure_count, 1);
+        assert_eq!(bucket.connected_count, 0);
+        assert_eq!(bucket.connect_latency_sum_ms, None);
+
+        let summary = store
+            .compute_stream_sla_summary(
+                STREAM_ID,
+                &minute,
+                &current_bucket_start(),
+                "1m",
+                PASSIVE_SOURCE,
+            )
+            .expect("summary");
+        assert_eq!(summary.sla_pct, 75.0, "one ICMP failure in four");
     }
 
     #[test]
