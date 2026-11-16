@@ -39,15 +39,15 @@ use lorica::stream_engine::{
 };
 use lorica_config::models::{
     Backend, Certificate, HealthCheck, HealthStatus, LifecycleState, LoadBalancing, Stream,
-    StreamBackend, StreamMatchRule, StreamMatcher, StreamProtocol, StreamTlsMode,
+    StreamBackend, StreamMatchRule, StreamMatcher, StreamProtocol, StreamRefusal, StreamTlsMode,
     StreamTlsTerminate, StreamUpstreamTls,
 };
 use lorica_config::ConfigStore;
 use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
     BackendSelector, Candidate, ControlTransport, InProcessPeer, NodeCapsRegions, Resolve,
-    ResolveError, Resolved, SelectionRequest, StreamRuntime, StreamRuntimeHandle, StreamTable,
-    StreamTableSource, TlsParts,
+    ResolveError, Resolved, SelectionRequest, SourceGate, StreamRuntime, StreamRuntimeHandle,
+    StreamTable, StreamTableSource, TlsParts,
 };
 use lorica_tls::cert_resolver::{CertResolver, ResolvesServerCertByLocalIp};
 use lorica_tls::RootCertStore;
@@ -192,6 +192,19 @@ impl Resolve for NoDns {
     }
 }
 
+/// No node-wide source control: these tests exercise TLS.
+struct Ungated;
+
+impl SourceGate for Ungated {
+    fn global(&self, _: IpAddr) -> Option<StreamRefusal> {
+        None
+    }
+
+    fn country(&self, _: IpAddr) -> Option<[u8; 2]> {
+        None
+    }
+}
+
 #[derive(Default)]
 struct Source(Mutex<StreamTable>);
 
@@ -254,6 +267,7 @@ impl Harness {
                 resolver: resolver as Arc<dyn ResolvesServerCertByLocalIp>,
                 public_roots: None,
             },
+            Arc::new(Ungated),
         );
         let (peer, transport) = ControlTransport::in_process_pair(8);
         let runtime = StreamRuntime::spawn(

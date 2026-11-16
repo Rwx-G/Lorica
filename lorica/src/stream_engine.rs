@@ -30,6 +30,9 @@
 //! - [`HickoryResolve`]: `hickory-resolver` from the system
 //!   configuration with the hosts file, which returns the record TTLs a
 //!   TTL-bounded schedule needs (D-n).
+//! - [`StreamSourceGate`]: the node's source controls (Story 12.6 D-d),
+//!   over the connection filter, IP blocklist, WAF whitelist and GeoIP
+//!   resolver the process's HTTP listeners read.
 //!
 //! [`stream_engines`] assembles them into the [`Engines`] a process's
 //! stream runtime serves with: a TCP and a UDP engine over one selector
@@ -45,13 +48,14 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use hickory_resolver::config::{ResolveHosts, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::{Resolver, TokioResolver};
 use lorica_config::listen_ports::ReservedPorts;
 use lorica_config::models::StreamRefusal;
 use lorica_config::models::{Backend, Certificate, LoadBalancing, Stream};
+use lorica_geoip::GeoIpResolver;
 use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
     Admission, BackendSelector, BreakerGate, Candidate, ClientIdentity, ConnectionObserver,
@@ -60,11 +64,13 @@ use lorica_stream::{
     UdpEngineParts,
 };
 use lorica_tls::cert_resolver::{CertResolver, ResolvesServerCertByLocalIp};
+use lorica_waf::WafEngine;
 use tracing::{info, warn};
 
+use crate::connection_filter::GlobalConnectionFilter;
 use crate::proxy_wiring::lb::{random_seed, select_index, SelectionState};
 use crate::proxy_wiring::{
-    BackendConnections, BreakerAdmission, BreakerEngine, EwmaTracker, SmoothWrrState,
+    BackendConnections, BreakerAdmission, BreakerEngine, EwmaTracker, ProxyConfig, SmoothWrrState,
 };
 
 /// The prefix of a stream's circuit-breaker key. A route is keyed by its
@@ -408,20 +414,83 @@ impl Resolve for HickoryResolve {
     }
 }
 
-/// The node-wide source controls of the stream engines until Story 12.6
-/// Lot D builds the gate over the process's connection filter, IP
-/// blocklist, WAF whitelist and GeoIP resolver: none, so a stream applies
-/// its own controls (CIDRs, GeoIP list with every country unknown, rates
-/// and caps) and nothing of the node's.
-struct NodeControlsPending;
+/// The node's source controls of the stream engines (Story 12.6 D-d):
+/// the global connection filter, the global IP blocklist with the global
+/// WAF whitelist's exemption, and the GeoIP database, read from the very
+/// instances this process's HTTP listeners read. A reload of any of them
+/// (the filter and the whitelist with the proxy configuration, the
+/// blocklist by its refresh or a settings toggle, the database by its
+/// hot swap) reaches the next stream accept or UDP session with no
+/// stream message.
+///
+/// The Story 8.9 per-IP cap of the connection filter is not applied
+/// (streams have per-node per-source caps), nor is the WAF auto-ban list
+/// (Story 12.6 Resolved 2).
+pub struct StreamSourceGate {
+    connection_filter: Arc<GlobalConnectionFilter>,
+    waf_engine: Arc<WafEngine>,
+    proxy_config: Arc<ArcSwap<ProxyConfig>>,
+    geoip: Arc<GeoIpResolver>,
+}
 
-impl SourceGate for NodeControlsPending {
-    fn global(&self, _client: IpAddr) -> Option<StreamRefusal> {
+impl std::fmt::Debug for StreamSourceGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamSourceGate")
+            .field(
+                "blocklist_enabled",
+                &self.waf_engine.ip_blocklist().is_enabled(),
+            )
+            .field("geoip_loaded", &self.geoip.status().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl StreamSourceGate {
+    /// A gate over the process's `connection_filter`, the IP blocklist of
+    /// `waf_engine`, the WAF whitelist of the live `proxy_config` and the
+    /// `geoip` resolver: the handles the HTTP proxy service of the same
+    /// process holds, never copies of them.
+    pub fn new(
+        connection_filter: Arc<GlobalConnectionFilter>,
+        waf_engine: Arc<WafEngine>,
+        proxy_config: Arc<ArcSwap<ProxyConfig>>,
+        geoip: Arc<GeoIpResolver>,
+    ) -> Self {
+        StreamSourceGate {
+            connection_filter,
+            waf_engine,
+            proxy_config,
+            geoip,
+        }
+    }
+
+    /// Whether the global WAF whitelist holds `client`, which exempts it
+    /// from the IP blocklist on both planes.
+    fn whitelisted(&self, client: IpAddr) -> bool {
+        self.proxy_config
+            .load()
+            .waf_whitelist
+            .iter()
+            .any(|net| net.contains(&client))
+    }
+}
+
+impl SourceGate for StreamSourceGate {
+    fn global(&self, client: IpAddr) -> Option<StreamRefusal> {
+        if !self.connection_filter.snapshot().accepts(client) {
+            return Some(StreamRefusal::ConnectionFilter);
+        }
+        // The whitelist is read only for a blocked address: most clients
+        // are not on the blocklist, and a disabled one blocks nobody.
+        if self.waf_engine.ip_blocklist().is_blocked(&client) && !self.whitelisted(client) {
+            return Some(StreamRefusal::IpBlocklist);
+        }
         None
     }
 
-    fn country(&self, _client: IpAddr) -> Option<[u8; 2]> {
-        None
+    fn country(&self, client: IpAddr) -> Option<[u8; 2]> {
+        let code = self.geoip.lookup_country(client)?;
+        <[u8; 2]>::try_from(code.as_str().as_bytes()).ok()
     }
 }
 
@@ -440,17 +509,21 @@ impl SourceGate for NodeControlsPending {
 /// (Story 12.4): [`stream_tls_parts`] over the process's certificate
 /// resolver, so every reload of that resolver (a renewal, an upload, a
 /// hot swap) reaches the next handshake of a terminating stream.
+///
+/// `source_gate` holds the node's source controls both engines apply
+/// beside each stream's own (Story 12.6 D-d): a [`StreamSourceGate`] in
+/// the binary.
 pub fn stream_engines(
     breaker: Arc<StreamBreakerGate>,
     resolver: Arc<dyn Resolve>,
     reserved_ports: Option<ReservedPorts>,
     tls: TlsParts,
+    source_gate: Arc<dyn SourceGate>,
 ) -> Engines {
     let counters = Arc::new(StreamCounters::new());
     let selector = Arc::new(StreamSelector::new(std::process::id() as usize));
     let resolver = ResolverCache::new(resolver, Arc::clone(&counters));
     let observer = Arc::new(LogObserver);
-    let source_gate: Arc<dyn SourceGate> = Arc::new(NodeControlsPending);
     let tcp = TcpEngine::with_tls(
         TcpEngineParts {
             selector: Arc::clone(&selector) as Arc<dyn BackendSelector>,
@@ -542,4 +615,147 @@ pub fn stream_client_identities<E>(
         }
     }
     Ok(identities)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lorica_config::connection_filter::ConnectionFilterPolicy;
+
+    /// The MaxMind country test database the e2e GeoIP profile mounts.
+    const GEOIP_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tests-e2e-docker/fixtures/GeoIP2-Country-Test.mmdb"
+    );
+    /// In the fixture's US range.
+    const US_CLIENT: &str = "214.78.120.5";
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().expect("an address")
+    }
+
+    /// A gate over fresh process instances, which the test keeps to
+    /// reload as the HTTP side would.
+    struct Process {
+        filter: Arc<GlobalConnectionFilter>,
+        waf: Arc<WafEngine>,
+        config: Arc<ArcSwap<ProxyConfig>>,
+        geoip: Arc<GeoIpResolver>,
+        gate: StreamSourceGate,
+    }
+
+    fn process() -> Process {
+        let filter = Arc::new(GlobalConnectionFilter::empty());
+        let waf = Arc::new(WafEngine::new());
+        let config = Arc::new(ArcSwap::from_pointee(ProxyConfig::default()));
+        let geoip = Arc::new(GeoIpResolver::empty());
+        let gate = StreamSourceGate::new(
+            Arc::clone(&filter),
+            Arc::clone(&waf),
+            Arc::clone(&config),
+            Arc::clone(&geoip),
+        );
+        Process {
+            filter,
+            waf,
+            config,
+            geoip,
+            gate,
+        }
+    }
+
+    fn whitelist(config: &ArcSwap<ProxyConfig>, cidrs: &[&str]) {
+        config.store(Arc::new(ProxyConfig {
+            waf_whitelist: cidrs.iter().map(|c| c.parse().expect("a CIDR")).collect(),
+            ..ProxyConfig::default()
+        }));
+    }
+
+    #[test]
+    fn a_connection_filter_reload_reaches_the_next_admission() {
+        let p = process();
+        let client = ip("203.0.113.9");
+        assert_eq!(p.gate.global(client), None);
+
+        p.filter.reload(ConnectionFilterPolicy::from_cidrs(
+            &[],
+            &["203.0.113.0/24".to_string()],
+        ));
+        assert_eq!(p.gate.global(client), Some(StreamRefusal::ConnectionFilter));
+        assert_eq!(p.gate.global(ip("198.51.100.7")), None);
+
+        // An allow list refuses every address outside it.
+        p.filter.reload(ConnectionFilterPolicy::from_cidrs(
+            &["198.51.100.0/24".to_string()],
+            &[],
+        ));
+        assert_eq!(p.gate.global(client), Some(StreamRefusal::ConnectionFilter));
+        assert_eq!(p.gate.global(ip("198.51.100.7")), None);
+
+        p.filter.reload(ConnectionFilterPolicy::default());
+        assert_eq!(p.gate.global(client), None);
+    }
+
+    #[test]
+    fn the_blocklist_refuses_unless_the_waf_whitelist_holds_the_client() {
+        let p = process();
+        let blocked = ip("192.0.2.10");
+        p.waf
+            .ip_blocklist()
+            .load_from_text("192.0.2.10\n2001:db8::10\n");
+        assert_eq!(p.gate.global(blocked), Some(StreamRefusal::IpBlocklist));
+        assert_eq!(
+            p.gate.global(ip("2001:db8::10")),
+            Some(StreamRefusal::IpBlocklist)
+        );
+        assert_eq!(p.gate.global(ip("192.0.2.11")), None);
+
+        // The HTTP exemption, read from the live proxy configuration.
+        whitelist(&p.config, &["192.0.2.0/28"]);
+        assert_eq!(p.gate.global(blocked), None);
+        assert_eq!(
+            p.gate.global(ip("2001:db8::10")),
+            Some(StreamRefusal::IpBlocklist)
+        );
+        whitelist(&p.config, &[]);
+        assert_eq!(p.gate.global(blocked), Some(StreamRefusal::IpBlocklist));
+
+        // A disabled blocklist blocks nobody, its entries kept.
+        p.waf.ip_blocklist().set_enabled(false);
+        assert_eq!(p.gate.global(blocked), None);
+    }
+
+    #[test]
+    fn the_connection_filter_is_named_before_the_blocklist() {
+        let p = process();
+        let client = ip("192.0.2.10");
+        p.waf.ip_blocklist().load_from_text("192.0.2.10\n");
+        p.filter.reload(ConnectionFilterPolicy::from_cidrs(
+            &[],
+            &["192.0.2.0/24".to_string()],
+        ));
+        assert_eq!(p.gate.global(client), Some(StreamRefusal::ConnectionFilter));
+        // The whitelist exempts from the blocklist only, never from the
+        // connection filter.
+        whitelist(&p.config, &["192.0.2.0/24"]);
+        assert_eq!(p.gate.global(client), Some(StreamRefusal::ConnectionFilter));
+    }
+
+    #[test]
+    fn the_country_follows_the_resolver_the_reload_path_swaps() {
+        let p = process();
+        let us = ip(US_CLIENT);
+        // No database on this node: every country is unknown.
+        assert_eq!(p.gate.country(us), None);
+
+        p.geoip
+            .load_from_path(GEOIP_FIXTURE)
+            .expect("the GeoIP fixture loads");
+        assert_eq!(p.gate.country(us), Some(*b"US"));
+        // An address the database does not hold stays unknown.
+        assert_eq!(p.gate.country(ip("127.0.0.1")), None);
+
+        p.geoip.unload();
+        assert_eq!(p.gate.country(us), None);
+    }
 }

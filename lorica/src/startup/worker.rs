@@ -155,60 +155,7 @@ pub(crate) fn run_worker(
     let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
     worker_load_certs_into_resolver(&store, &cert_resolver, id);
 
-    // The stream runtime (Story 12.2 D-b), started as soon as the store
-    // opens so the supervisor's first `attach` is answered well inside
-    // its ack timeout. The handle lives as long as the worker: dropping
-    // it stops the runtime.
-    let Some(stream_ctl_fd) = stream_ctl_fd else {
-        error!(worker_id = id, "worker received no stream control FD");
-        std::process::exit(1);
-    };
-    let stream_source = match StoreStreamTable::open(&db_path, encryption_key) {
-        Ok(source) => Arc::new(source),
-        Err(e) => {
-            error!(error = %e, "worker failed to open the stream table");
-            std::process::exit(1);
-        }
-    };
-    // The TCP engine (Story 12.3) and the UDP engine (Story 12.5), over
-    // one selector and one resolver cache. Their breaker gate admits
-    // until the RPC endpoint, created well after this, installs the
-    // supervisor's registry below (D-g). The UDP engine opens no session
-    // on a stream before the supervisor's `caps` hands it the stream's
-    // region, which it sends ahead of every `attach`. The TCP engine
-    // terminates TLS on the resolver above and verifies upstream TLS on
-    // this worker's public roots (Story 12.4).
-    if reserved_ports.is_none() {
-        warn!(
-            worker_id = id,
-            "started without --reserved-ports; stream connects refuse only the stream listen ports"
-        );
-    }
-    let stream_breaker = Arc::new(lorica::stream_engine::StreamBreakerGate::new());
-    let stream_runtime = match lorica_stream::StreamRuntime::spawn(
-        lorica_stream::ControlTransport::Seqpacket(stream_ctl_fd),
-        lorica::stream_engine::stream_engines(
-            Arc::clone(&stream_breaker),
-            Arc::new(lorica::stream_engine::HickoryResolve::from_system_conf()),
-            reserved_ports,
-            lorica::stream_engine::stream_tls_parts(Arc::clone(&cert_resolver)),
-        ),
-        Arc::clone(&stream_source) as Arc<dyn lorica_stream::StreamTableSource>,
-    ) {
-        Ok(handle) => Arc::new(handle),
-        Err(e) => {
-            error!(worker_id = id, error = %e, "worker failed to start the stream runtime");
-            std::process::exit(1);
-        }
-    };
-    match lorica_worker::stream_sockets::process_fd_limit() {
-        Ok(limit) => info!(worker_id = id, fd_limit = limit, "process fd limit"),
-        Err(e) => warn!(worker_id = id, error = %e, "process fd limit unreadable"),
-    }
-
     let store = Arc::new(Mutex::new(store));
-    let log_buffer = Arc::new(LogBuffer::new(10_000));
-    let active_connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let proxy_config = Arc::new(ArcSwap::from_pointee(ProxyConfig::default()));
     // Listener-level connection filter with hot-reloadable CIDR policy.
     // The supervisor broadcasts settings changes via the command channel; the
@@ -236,11 +183,91 @@ pub(crate) fn run_worker(
         // a malformed custom row is dropped, logged, and counted, never
         // blanking the live registry. Scoped to the registry (rather than
         // the full `apply_per_process_reload_state` bundle) because worker
-        // boot already applies OTel above and GeoIP/ASN below through
+        // boot applies OTel and GeoIP/ASN below through
         // mode-specific code; routing the whole bundle here would re-init
         // OTel and race the not-yet-registered resolver handles.
         lorica::reload::rebuild_merged_crawlers(&store).await;
     });
+
+    // Create shared WAF engine for worker (must be before command channel setup)
+    let waf_engine = Arc::new(lorica_waf::WafEngine::new());
+    // Every event must reach the supervisor, which alerts and bans:
+    // number them from the first request on.
+    waf_engine.enable_forwarding();
+    worker_restore_waf_state(&store, &waf_engine);
+
+    // GeoIP: the DB from `GlobalSettings.geoip_db_path`, so lookups can
+    // resolve client IPs to country codes. Each worker keeps its own copy
+    // (the DB is small - ~3 MiB for DB-IP Lite Country). The proxy and the
+    // stream engines read this one resolver, which the config-reload path
+    // hot-swaps through the per-worker `lorica::geoip` static registered
+    // below. Silent no-op when the path is unset.
+    let geoip_resolver = Arc::new(lorica_geoip::GeoIpResolver::empty());
+    worker_load_geoip(&store, &geoip_resolver);
+
+    // The stream runtime (Story 12.2 D-b), started once the store, the
+    // proxy configuration and the source controls above are loaded, so
+    // the first stream accept is judged as the first HTTP request is, and
+    // still early enough for the supervisor's first `attach` to be
+    // answered inside its ack timeout. The handle lives as long as the
+    // worker: dropping it stops the runtime.
+    let Some(stream_ctl_fd) = stream_ctl_fd else {
+        error!(worker_id = id, "worker received no stream control FD");
+        std::process::exit(1);
+    };
+    let stream_source = match StoreStreamTable::open(&db_path, encryption_key) {
+        Ok(source) => Arc::new(source),
+        Err(e) => {
+            error!(error = %e, "worker failed to open the stream table");
+            std::process::exit(1);
+        }
+    };
+    // The TCP engine (Story 12.3) and the UDP engine (Story 12.5), over
+    // one selector and one resolver cache. Their breaker gate admits
+    // until the RPC endpoint, created well after this, installs the
+    // supervisor's registry below (D-g). The UDP engine opens no session
+    // on a stream before the supervisor's `caps` hands it the stream's
+    // region, which it sends ahead of every `attach`. The TCP engine
+    // terminates TLS on the resolver above and verifies upstream TLS on
+    // this worker's public roots (Story 12.4). Both judge sources by the
+    // connection filter, IP blocklist, WAF whitelist and GeoIP resolver
+    // the proxy service below reads (Story 12.6).
+    if reserved_ports.is_none() {
+        warn!(
+            worker_id = id,
+            "started without --reserved-ports; stream connects refuse only the stream listen ports"
+        );
+    }
+    let stream_breaker = Arc::new(lorica::stream_engine::StreamBreakerGate::new());
+    let stream_runtime = match lorica_stream::StreamRuntime::spawn(
+        lorica_stream::ControlTransport::Seqpacket(stream_ctl_fd),
+        lorica::stream_engine::stream_engines(
+            Arc::clone(&stream_breaker),
+            Arc::new(lorica::stream_engine::HickoryResolve::from_system_conf()),
+            reserved_ports,
+            lorica::stream_engine::stream_tls_parts(Arc::clone(&cert_resolver)),
+            Arc::new(lorica::stream_engine::StreamSourceGate::new(
+                Arc::clone(&connection_filter),
+                Arc::clone(&waf_engine),
+                Arc::clone(&proxy_config),
+                Arc::clone(&geoip_resolver),
+            )),
+        ),
+        Arc::clone(&stream_source) as Arc<dyn lorica_stream::StreamTableSource>,
+    ) {
+        Ok(handle) => Arc::new(handle),
+        Err(e) => {
+            error!(worker_id = id, error = %e, "worker failed to start the stream runtime");
+            std::process::exit(1);
+        }
+    };
+    match lorica_worker::stream_sockets::process_fd_limit() {
+        Ok(limit) => info!(worker_id = id, fd_limit = limit, "process fd limit"),
+        Err(e) => warn!(worker_id = id, error = %e, "process fd limit unreadable"),
+    }
+
+    let log_buffer = Arc::new(LogBuffer::new(10_000));
+    let active_connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Initialise the OTel exporter in this worker's runtime. Must run
     // *after* fork and *inside* the worker's runtime so the batch
@@ -267,13 +294,6 @@ pub(crate) fn run_worker(
         Arc::new(dashmap::DashMap::new());
     let worker_waf_counts: Arc<dashmap::DashMap<(String, String), std::sync::atomic::AtomicU64>> =
         Arc::new(dashmap::DashMap::new());
-
-    // Create shared WAF engine for worker (must be before command channel setup)
-    let waf_engine = Arc::new(lorica_waf::WafEngine::new());
-    // Every event must reach the supervisor, which alerts and bans:
-    // number them from the first request on.
-    waf_engine.enable_forwarding();
-    worker_restore_waf_state(&store, &waf_engine);
 
     // Start the command channel listener in a background thread
     // (the proxy server's run_forever blocks the main thread)
@@ -654,14 +674,12 @@ pub(crate) fn run_worker(
     // the supervisor via the pipelined RPC channel every 100 ms. See
     // `spawn_rate_limit_sync` below and design doc § 6.
     lorica_proxy.rate_limit_buckets = lorica::proxy_wiring::RateLimitEngine::local();
-    // GeoIP: load the DB from `GlobalSettings.geoip_db_path` so worker
-    // lookups can resolve client IPs to country codes. Each worker
-    // keeps its own copy (the DB is small - ~3 MiB for DB-IP Lite
-    // Country). The resolver handle is stashed in the per-worker
-    // `lorica::geoip` static so the config-reload path can hot-swap
-    // the DB on setting change, and a periodic 24-hour reload task
-    // below picks up updater-written files on disk. Silent no-op
-    // when the path is unset.
+    // The GeoIP resolver loaded before the stream runtime started, which
+    // the stream engines read too. Its handle is stashed in the
+    // per-worker `lorica::geoip` static so the config-reload path can
+    // hot-swap the DB on setting change, and a periodic 24-hour reload
+    // task below picks up updater-written files on disk.
+    lorica_proxy.geoip_resolver = geoip_resolver;
     // Handle registration + rDNS init are shared across all three
     // modes (audit H-9, see `startup::init_geo_resolver_handles`).
     // The rDNS resolver (v1.4.0 follow-up) must be built inside the
@@ -679,18 +697,6 @@ pub(crate) fn run_worker(
     {
         let s = store.blocking_lock();
         if let Ok(settings) = s.get_global_settings() {
-            if let Some(ref path) = settings.geoip_db_path {
-                if !path.trim().is_empty() {
-                    match lorica_proxy.geoip_resolver.load_from_path(path) {
-                        Ok(()) => info!(path = %path, "worker: GeoIP database loaded"),
-                        Err(e) => warn!(
-                            path = %path,
-                            error = %e,
-                            "worker: GeoIP database load failed; lookups will return None"
-                        ),
-                    }
-                }
-            }
             if let Some(ref path) = settings.asn_db_path {
                 if !path.trim().is_empty() {
                     match lorica_proxy.asn_resolver.load_from_path(path) {
@@ -1038,6 +1044,28 @@ pub(crate) fn apply_ban_ip(
         },
     );
     true
+}
+
+/// Load the GeoIP database `GlobalSettings.geoip_db_path` names into
+/// `resolver`; a failure is logged and leaves every lookup unknown.
+/// Synchronous - called outside a runtime, so it takes the store's
+/// blocking lock.
+fn worker_load_geoip(store: &Arc<Mutex<ConfigStore>>, resolver: &Arc<lorica_geoip::GeoIpResolver>) {
+    let path = match store.blocking_lock().get_global_settings() {
+        Ok(settings) => settings.geoip_db_path,
+        Err(_) => None,
+    };
+    let Some(path) = path.filter(|path| !path.trim().is_empty()) else {
+        return;
+    };
+    match resolver.load_from_path(&path) {
+        Ok(()) => info!(path = %path, "worker: GeoIP database loaded"),
+        Err(e) => warn!(
+            path = %path,
+            error = %e,
+            "worker: GeoIP database load failed; lookups will return None"
+        ),
+    }
 }
 
 /// Restore WAF runtime state for a worker from persisted settings: the IP

@@ -293,6 +293,10 @@ pub(crate) fn run_single_process(cli: Cli) {
         // The stream engine's breaker is HTTP's local one, keyed
         // `stream:<id>` (Story 12.3 D-g).
         let stream_breaker_engine = lorica_proxy.circuit_breaker_engine.clone();
+        // The stream engines judge sources against the very instances
+        // the proxy reads: this resolver is the one the settings reload
+        // hot-swaps (Story 12.6 D-d).
+        let stream_geoip_resolver = Arc::clone(&lorica_proxy.geoip_resolver);
         let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
         let health_backend_conns = Arc::clone(&backend_conns);
         let proxy_cache_hits = Arc::clone(&lorica_proxy.cache_hits);
@@ -556,7 +560,10 @@ pub(crate) fn run_single_process(cli: Cli) {
             // 12.5), over one selector and one resolver cache. TLS
             // streams terminate on the resolver the HTTPS listener
             // answers from, which the reload loop below swaps on every
-            // certificate change (Story 12.4).
+            // certificate change (Story 12.4). Sources are judged by the
+            // HTTP listeners' connection filter, IP blocklist, WAF
+            // whitelist and GeoIP resolver, every one loaded above and
+            // reloaded in place by the same paths (Story 12.6).
             lorica::stream_engine::stream_engines(
                 Arc::new(lorica::stream_engine::StreamBreakerGate::with_engine(
                     stream_breaker_engine,
@@ -564,6 +571,12 @@ pub(crate) fn run_single_process(cli: Cli) {
                 Arc::new(lorica::stream_engine::HickoryResolve::from_system_conf()),
                 Some(process_reserved_ports),
                 lorica::stream_engine::stream_tls_parts(Arc::clone(&cert_resolver)),
+                Arc::new(lorica::stream_engine::StreamSourceGate::new(
+                    Arc::clone(&connection_filter),
+                    Arc::clone(&waf_engine),
+                    Arc::clone(&proxy_config),
+                    stream_geoip_resolver,
+                )),
             ),
             stream_source as Arc<dyn lorica_stream::StreamTableSource>,
         ) {
