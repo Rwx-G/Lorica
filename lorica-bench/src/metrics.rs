@@ -67,6 +67,39 @@ pub fn record_sla_breach(route_id: &str, threshold_kind: &str) {
         .inc();
 }
 
+/// `lorica_stream_sla_breach_total{stream_id, threshold_kind}`, the
+/// stream sibling of `lorica_sla_breach_total` (Story 12.9). A sibling
+/// rather than a `stream_id` label on the route family, so that no
+/// route series carries an empty `stream_id` and every stream family
+/// keeps the `stream_` prefix.
+fn stream_sla_breach_counter() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        lorica_metrics::register_int_counter_vec(
+            "stream_sla_breach_total",
+            "Passive-SLA breach transitions per stream and threshold kind",
+            &["stream_id", "threshold_kind"],
+        )
+    })
+}
+
+/// Record a passive-SLA breach transition for `stream_id`, under the
+/// same contract as [`record_sla_breach`]: once per OK -> breached
+/// transition.
+pub fn record_stream_sla_breach(stream_id: &str, threshold_kind: &str) {
+    stream_sla_breach_counter()
+        .with_label_values(&[stream_id, threshold_kind])
+        .inc();
+}
+
+/// Remove the breach series of a stream that no longer exists, so a
+/// churn of streams does not grow `/metrics` (Story 12.9 D-e). Call on
+/// the table change that removes the stream.
+pub fn forget_stream_sla_breaches(stream_id: &str) {
+    // A stream that never breached has no series: nothing to remove.
+    let _ = stream_sla_breach_counter().remove_label_values(&[stream_id, SLA_THRESHOLD_TARGET_PCT]);
+}
+
 /// `lorica_active_probe_outcome_total{probe_id, outcome}`.
 ///
 /// Incremented once per active-probe execution. `probe_id` is an
@@ -121,5 +154,34 @@ mod tests {
             .with_label_values(&["metrics-test-probe", "timeout"])
             .get();
         assert_eq!(value, 1);
+    }
+
+    #[test]
+    fn a_stream_breach_counts_under_its_own_family_until_forgotten() {
+        let stream_id = "metrics-test-sla-stream";
+        let labels = [stream_id, SLA_THRESHOLD_TARGET_PCT];
+        record_stream_sla_breach(stream_id, SLA_THRESHOLD_TARGET_PCT);
+        assert_eq!(
+            stream_sla_breach_counter().with_label_values(&labels).get(),
+            1
+        );
+        let family = |name: &str| {
+            lorica_metrics::gather()
+                .into_iter()
+                .find(|mf| mf.name() == name)
+        };
+        let streams = family("lorica_stream_sla_breach_total").expect("registered");
+        assert!(streams
+            .get_metric()
+            .iter()
+            .any(|m| m.get_label().iter().any(|l| l.value() == stream_id)));
+
+        forget_stream_sla_breaches(stream_id);
+        let streams = family("lorica_stream_sla_breach_total");
+        assert!(streams.is_none_or(|mf| !mf
+            .get_metric()
+            .iter()
+            .any(|m| m.get_label().iter().any(|l| l.value() == stream_id))));
+        forget_stream_sla_breaches(stream_id);
     }
 }

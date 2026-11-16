@@ -350,7 +350,13 @@ impl StreamSlaCollector {
                 .unwrap_or(false);
             let is_breached = !summary.meets_target;
             let alert = match (was_breached, is_breached) {
-                (false, true) => Some((AlertType::SlaBreached, "SLA breach")),
+                (false, true) => {
+                    crate::metrics::record_stream_sla_breach(
+                        &config.stream_id,
+                        crate::metrics::SLA_THRESHOLD_TARGET_PCT,
+                    );
+                    Some((AlertType::SlaBreached, "SLA breach"))
+                }
                 (true, false) => Some((AlertType::SlaRecovered, "SLA recovered")),
                 _ => None,
             };
@@ -668,6 +674,14 @@ mod tests {
         assert_eq!(breach.details["stream_name"], "pg");
         assert_eq!(breach.details["judged_count"], "10");
         assert!(!breach.details.contains_key("route_id"));
+        let breaches = lorica_metrics::gather()
+            .into_iter()
+            .find(|mf| mf.name() == "lorica_stream_sla_breach_total")
+            .expect("the breach is counted");
+        assert!(breaches
+            .get_metric()
+            .iter()
+            .any(|m| m.get_label().iter().any(|l| l.value() == STREAM_ID)));
         assert!(
             evaluator.check_thresholds(&store).is_empty(),
             "still breached: no second alert"

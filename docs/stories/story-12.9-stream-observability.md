@@ -1074,9 +1074,15 @@ edited here.
   state edge, a stream that judged nothing keeps its state. Details:
   `target = stream`, `stream_id`, `stream_name`, `sla_pct`,
   `target_pct` (the summary's, the bucket snapshot), `judged_count` in
-  place of the route's `total_requests`. `lorica_sla_breach_total` is
-  not incremented for streams: its label is `route_id` and its file is
-  outside the Lot.
+  place of the route's `total_requests`. Each breach edge also counts
+  in `lorica_stream_sla_breach_total{stream_id, threshold_kind}`
+  (`lorica-bench/src/metrics.rs`), a sibling of the route family rather
+  than a `stream_id` label on it, so no route series carries an empty
+  `stream_id`. It lives in the supervisor or the single process, where
+  the evaluation runs, and needs no per-worker aggregation. Lot F calls
+  `lorica_bench::metrics::forget_stream_sla_breaches(stream_id)` on the
+  table change that removes a stream, as D-e asks of every stream
+  series.
 - **D-g amended after Lot D** (maintainer): a UDP stream that owes no
   response was judged on ICMP failures only, so any window in which it
   judged something read 0 %. Its sessions are now judged at their end,
@@ -1106,6 +1112,7 @@ edited here.
 - `lorica-bench/src/passive_sla/collector.rs`, `persistence.rs`,
   `tests.rs` (the route minute fix)
 - `CHANGELOG.md` (the route minute fix, `[Unreleased]` Fixed)
+- `lorica-bench/src/metrics.rs` (`lorica_stream_sla_breach_total`)
 
 ## Change Log
 
