@@ -974,15 +974,21 @@ edited here.
   the three `cargo test` lines and the TLS-featured one) green, and
   `cargo audit` clean. Whole Lot: 3,552 product, 948 `lorica`, 910
   forked and 592 TLS-featured tests.
-- Lot D, 2026-11-16, on `90ac7ba4`. Read, not run: the route
-  `SlaCollector::record` replaces a route's bucket when the minute
-  changes, before the 60 s flush task has taken it, so under steady
-  traffic most completed route minutes are dropped unflushed. The
-  stream collector does not copy that: it keys a minute by
-  `(stream_id, minute start)` and a minute stays until a flush takes it
-  (`the_current_minute_waits_and_a_past_one_survives_a_new_minute`). The
-  route collector is outside Lot D's allowlist and is left as it is;
-  handed to the maintainer.
+- Lot D, 2026-11-16, on `90ac7ba4`: the route `SlaCollector::record`
+  replaced a route's bucket when the minute changed, before the 60 s
+  flush task had taken it, so under steady traffic most completed route
+  minutes were dropped unflushed. The stream collector does not copy
+  that: it keys a minute by `(stream_id, minute start)` and a minute
+  stays until a flush takes it
+  (`the_current_minute_waits_and_a_past_one_survives_a_new_minute`).
+- The route loss was then proven and fixed in the same cycle, at the
+  maintainer's request (allowlist widened to `lorica-bench/**` and
+  `CHANGELOG.md`): `a_finished_minute_reaches_the_store_when_the_next_one_starts_before_the_flush`
+  failed on the old code (0 buckets flushed, the finished minute
+  replaced) and passes once `SlaCollector` keys its buckets by
+  `(route_id, minute start)`. The replacement dates from `288ff10e`, the
+  commit that created `lorica-bench`; every tag from `v0.1.2` to
+  `v1.10.6` contains it.
 - Lot D gates, `rust:1-bookworm` with `CARGO_BUILD_WARNINGS=deny`: the
   CI chain (`cargo fmt --check`, workspace clippy with `lorica/otel`,
   the three `cargo test` lines and the TLS-featured one) green, and
@@ -1082,6 +1088,9 @@ edited here.
 - `lorica-bench/src/passive_sla/stream.rs` (new, Lot D)
 - `lorica-bench/src/passive_sla/mod.rs`
 - `lorica-bench/src/lib.rs`
+- `lorica-bench/src/passive_sla/collector.rs`, `persistence.rs`,
+  `tests.rs` (the route minute fix)
+- `CHANGELOG.md` (the route minute fix, `[Unreleased]` Fixed)
 
 ## Change Log
 

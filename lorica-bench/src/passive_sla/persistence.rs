@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use lorica_config::ConfigStore;
 use lorica_notify::events::{AlertEvent, AlertType};
 use lorica_notify::NotifyDispatcher;
@@ -25,25 +25,33 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, error, info};
 
 use super::bucket::RouteBucket;
-use super::collector::SlaCollector;
+use super::collector::{MinuteKey, SlaCollector};
 use super::helpers::current_bucket_start;
 
 /// Flush all completed (past-minute) buckets to the database.
 /// Returns the number of buckets flushed.
 pub(super) fn flush(collector: &SlaCollector, store: &ConfigStore) -> usize {
-    let now_bucket = current_bucket_start();
+    flush_before(collector, store, current_bucket_start())
+}
+
+/// Flush every bucket that started before `now_bucket`.
+pub(super) fn flush_before(
+    collector: &SlaCollector,
+    store: &ConfigStore,
+    now_bucket: DateTime<Utc>,
+) -> usize {
     let mut to_flush: Vec<(String, Arc<RouteBucket>)> = Vec::new();
 
     if let Ok(mut buckets) = collector.buckets.lock() {
-        let mut expired_keys = Vec::new();
-        for (route_id, bucket) in buckets.iter() {
-            if bucket.bucket_start < now_bucket {
-                to_flush.push((route_id.clone(), Arc::clone(bucket)));
-                expired_keys.push(route_id.clone());
-            }
-        }
+        let expired_keys: Vec<MinuteKey> = buckets
+            .keys()
+            .filter(|(_, start)| *start < now_bucket)
+            .cloned()
+            .collect();
         for key in expired_keys {
-            buckets.remove(&key);
+            if let Some(((route_id, _), bucket)) = buckets.remove_entry(&key) {
+                to_flush.push((route_id, bucket));
+            }
         }
     }
 

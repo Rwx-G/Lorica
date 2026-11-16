@@ -93,6 +93,33 @@ fn test_collector_record_and_flush() {
 }
 
 #[test]
+fn a_finished_minute_reaches_the_store_when_the_next_one_starts_before_the_flush() {
+    let collector = SlaCollector::new();
+    let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
+    let now = current_bucket_start();
+    let finished = now - chrono::Duration::minutes(1);
+
+    collector.record_at("route-1", 200, 10, finished);
+    collector.record_at("route-1", 200, 20, finished);
+    // The next minute's first request lands before the flush task runs.
+    collector.record_at("route-1", 200, 30, now);
+
+    assert_eq!(super::persistence::flush_before(&collector, &store, now), 1);
+    let stored = store
+        .query_sla_buckets("route-1", &finished, &now, "passive")
+        .expect("query");
+    assert_eq!(stored.len(), 1, "the finished minute is stored");
+    assert_eq!(stored[0].request_count, 2);
+
+    let next = now + chrono::Duration::minutes(1);
+    assert_eq!(
+        super::persistence::flush_before(&collector, &store, next),
+        1,
+        "the started minute is kept for the next flush"
+    );
+}
+
+#[test]
 fn test_collector_default_success_criteria() {
     let collector = SlaCollector::new();
     assert!(collector.is_success("any", 200, 100));

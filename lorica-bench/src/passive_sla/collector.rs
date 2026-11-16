@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, Utc};
 use lorica_config::models::SlaConfig;
 use lorica_config::ConfigStore;
 use lorica_notify::NotifyDispatcher;
@@ -28,13 +29,18 @@ use super::bucket::RouteBucket;
 use super::helpers::current_bucket_start;
 use super::persistence;
 
+/// A route's minute: its route id and the minute's start.
+pub(super) type MinuteKey = (String, DateTime<Utc>);
+
 /// SLA metrics collector for passive (real traffic) monitoring.
 ///
 /// Records per-request metrics in lock-free atomic counters (hot path),
 /// then flushes completed minute-buckets to SQLite via a background task.
 pub struct SlaCollector {
-    /// Per-route current minute bucket.
-    pub(super) buckets: Arc<Mutex<HashMap<String, Arc<RouteBucket>>>>,
+    /// Per-route minute buckets not flushed yet, keyed by route and
+    /// minute start: a finished minute stays until a flush takes it,
+    /// even once the next minute has started.
+    pub(super) buckets: Arc<Mutex<HashMap<MinuteKey, Arc<RouteBucket>>>>,
     /// Per-route SLA configuration cache.
     pub(super) sla_configs: Arc<Mutex<HashMap<String, SlaConfig>>>,
     /// Per-route breach state for edge-triggered notifications.
@@ -56,7 +62,16 @@ impl SlaCollector {
     /// This is called in the hot path - it only touches atomic counters
     /// and a brief mutex for the bucket lookup.
     pub fn record(&self, route_id: &str, status: u16, latency_ms: u64) {
-        let bucket_start = current_bucket_start();
+        self.record_at(route_id, status, latency_ms, current_bucket_start());
+    }
+
+    pub(super) fn record_at(
+        &self,
+        route_id: &str,
+        status: u16,
+        latency_ms: u64,
+        bucket_start: DateTime<Utc>,
+    ) {
         let is_success = self.is_success(route_id, status, latency_ms);
 
         let bucket = {
@@ -65,14 +80,8 @@ impl SlaCollector {
                 Err(_) => return,
             };
             let entry = buckets
-                .entry(route_id.to_string())
+                .entry((route_id.to_string(), bucket_start))
                 .or_insert_with(|| Arc::new(RouteBucket::new(bucket_start)));
-
-            // If we've moved to a new minute, the old bucket will be flushed
-            // by the background task. Create a new one for the current minute.
-            if entry.bucket_start != bucket_start {
-                *entry = Arc::new(RouteBucket::new(bucket_start));
-            }
             Arc::clone(entry)
         };
 
@@ -82,7 +91,7 @@ impl SlaCollector {
     /// Remove all in-memory buckets for a route (after clearing DB data).
     pub fn clear_route(&self, route_id: &str) {
         if let Ok(mut buckets) = self.buckets.lock() {
-            buckets.remove(route_id);
+            buckets.retain(|(id, _), _| id != route_id);
         }
     }
 
