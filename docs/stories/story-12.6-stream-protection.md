@@ -643,13 +643,13 @@ Allowlist: `lorica/src/stream_engine.rs`,
 `lorica_stream::refusal_log`, behaviour unchanged).
 Depends on: C, 12.5 Lot F; sequential with 12.4 Lot E.
 
-- [ ] `StreamSourceGate` over the process's filter, blocklist,
+- [x] `StreamSourceGate` over the process's filter, blocklist,
       whitelist and GeoIP resolver, handed to both engines.
-- [ ] Regions for TCP streams on first bind, replaced on a size or link
+- [x] Regions for TCP streams on first bind, replaced on a size or link
       count change, through 12.5 Lot F's lifecycle.
-- [ ] 12.8's limiter tests still green from their new home; the HTTP
+- [x] 12.8's limiter tests still green from their new home; the HTTP
       PROXY refusal log unchanged.
-- [ ] Tests against the fake transport: a TCP stream's `caps` precedes
+- [x] Tests against the fake transport: a TCP stream's `caps` precedes
       its `attach`; a filter reload reaches the next stream accept.
 
 ### Lot E: API surfaces (`lorica-api`) - cargo
@@ -857,6 +857,18 @@ All eight recommendations of the draft accepted as written.
   commits and resumed the next day; the first gate run on the region
   commit failed only `udp_stream_process_test`, which looked for the
   release log line the commit had renamed (fixed in that commit).
+- Lot D, the worker's boot order. A worker started its stream runtime
+  as soon as its store opened, before its proxy configuration, its
+  connection filter, its WAF engine and its GeoIP database existed, so
+  a gate over them would have judged the first stream accepts against
+  empty controls (a window in which a denied source got through). The
+  worker now builds and loads all four first, then starts the stream
+  runtime: the initial `reload_proxy_config` runs before the first
+  `attach` is read instead of after. A late `attach` answer is still
+  credited (12.2), so the supervisor's ack timeout is not at risk.
+- Lot D, the combined head. 12.9 Lot B and 12.6 Lot C were gated
+  together for the first time at `22f00222` before Lot D started: every
+  cargo gate of CI and `cargo audit` green.
 
 ### Completion Notes
 
@@ -1055,6 +1067,76 @@ the branch (see the Change Log); the region part of Lot D folded in
   probe window of the source shard filled, which the region tests of
   Lot A cover for the same refusal path).
 
+**Lot D (`lorica`, the wiring).** The interim pass-through gate
+(`NodeControlsPending`) is deleted: no tree after Lot D lets a stream
+skip the node's controls.
+
+- **`StreamSourceGate`** (`lorica/src/stream_engine.rs`), the fifth
+  argument of `stream_engines`, over four handles the HTTP proxy
+  service of the same process holds: the `GlobalConnectionFilter`
+  (`snapshot().accepts`, refusal `connection_filter`), the
+  `WafEngine`'s IP blocklist (`ip_blocklist`, skipped when the WAF
+  whitelist of the live `ProxyConfig` holds the client, read only for
+  a blocked address), and the `GeoIpResolver` (`country`, the
+  uppercase code as two bytes). Neither the Story 8.9 per-IP cap nor
+  the auto-ban list is consulted (D-d, Resolved 2).
+- **Reload paths, unchanged and shared.** The filter and the whitelist
+  move with `reload_proxy_config` (the legacy `ConfigReload`, the
+  two-phase commit of the worker RPC listener, the single-process
+  reload loop); the blocklist with its 6-hourly refresh and the
+  settings toggle; the GeoIP database with
+  `apply_geoip_settings_from_store` through the `lorica::geoip` handle.
+  Every one swaps the instance the gate holds, so a reload reaches the
+  next stream accept with no stream message, in both modes.
+- **Worker mode.** The proxy configuration, the connection filter, the
+  WAF engine and the GeoIP resolver are built and loaded before the
+  stream runtime starts (Debug Log); the GeoIP load moved to
+  `worker_load_geoip`, and the proxy takes the same resolver.
+  **Single-process mode** already loaded all four before its stream
+  runtime; it hands the gate clones of them.
+- **Regions sized for their links.** The plane reads the stored links
+  with the streams on every pass (`StreamPlaneHandle::inputs`), and
+  sizes each region for `capped_links`: the stream's links with a
+  `max_active`, the only ones the engines count in the backend shards
+  (Lot C). A capped-link count crossing the 32-cell floor replaces the
+  region through the existing `caps_gen` path; uncapped links never
+  move it. `REGION_LINKS` is deleted. Deviation: the story says "the
+  link count"; counting every link would replace a region (one burst
+  more, D-g) for links the region never counts.
+- **The refusal log.** `lorica/src/connection_filter.rs` keeps the
+  PROXY protocol gate's limiter as
+  `RefusalLogLimiter<(HttpListener, ProxyHeaderOutcome)>` from
+  `lorica_stream::refusal_log`; its own copy of the type, of
+  `REFUSAL_LOG_WINDOW`, of `RefusalLogDecision` and of 12.8's limiter
+  test are deleted (the test lives in `refusal_log.rs` since Lot C).
+  The lines, the window and the once-only handover are unchanged.
+- **Tests.** The gate: a filter reload reaches the next admission
+  (deny, then an allow list, then none); the blocklist refuses unless
+  the whitelist holds the client, IPv6 included, and a disabled one
+  refuses nobody; the filter is named before the blocklist and the
+  whitelist never exempts from it; the country follows the resolver
+  the reload path swaps (the e2e GeoIP fixture, `214.78.120.5` is
+  `US`). The plane: a region sized for its capped links and replaced
+  when they cross its floor, then back; `capped_links` counts one
+  stream's capped links only. That a TCP stream's `caps` precedes its
+  `attach` was pinned by Lot C
+  (`a_new_stream_is_bound_attached_to_every_worker_then_refreshed`).
+  The process test `lorica/tests/stream_protection_process_test.rs`,
+  single-process and two workers: a stream trusting PROXY headers from
+  `127.0.0.1` and denying `US`, on a node whose connection filter
+  denies `203.0.113.0/24` and `127.0.0.2` and whose GeoIP database is
+  the fixture; a carried client in the denied network, a carried US
+  client and the denied loopback peer are closed with no echo, an
+  allowed carried client and an allowed loopback peer are served, and
+  the node's refusal rows name `connection_filter` and `geoip` and
+  nothing else.
+- **Not driven at process level: the IP blocklist.** It loads only
+  from its remote feed, which a test cannot point at; its refusal and
+  the whitelist exemption are the gate's unit tests above.
+- **Outside the allowlist:** `lorica/tests/stream_tls_wiring.rs` (a
+  pass-through gate for the new `stream_engines` argument) and the new
+  `lorica/tests/stream_protection_process_test.rs`.
+
 ## File List
 
 Lot A:
@@ -1104,6 +1186,18 @@ Lot C (and the region part of Lot D):
   `lorica/tests/stream_engine_adapters.rs`, `lorica/tests/stream_tls_wiring.rs`,
   `lorica/tests/udp_stream_process_test.rs` (modified)
 
+Lot D:
+
+- `lorica/src/stream_engine.rs` (modified: `StreamSourceGate`, the
+  interim gate removed)
+- `lorica/src/startup/worker.rs`, `lorica/src/startup/single.rs`
+  (modified)
+- `lorica/src/startup/stream_plane.rs` (modified: regions sized for
+  their capped links)
+- `lorica/src/connection_filter.rs` (modified: the shared limiter)
+- Outside the allowlist: `lorica/tests/stream_protection_process_test.rs`
+  (new), `lorica/tests/stream_tls_wiring.rs` (modified)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1113,3 +1207,4 @@ Lot C (and the region part of Lot D):
 | 2026-11-15 | 0.3 | Lot A: stream-caps region layout version 2 (pending totals, stream and source open rates, 32-byte source cells, backend shards), the split admission API, the join ABA closed and tested. Status InProgress. | Romain G. |
 | 2026-11-15 | 0.4 | Lot B with Lot F folded in: the source controls on `Stream` and `max_active` on the link, their validation, `GeoIpConfig::normalised`, migration 78, canonical digest (format 3), diff and import; the two allowlist hook-ups. | Romain G. |
 | 2026-11-16 | 0.5 | Lot C: the admission sequence in both engines, the `SourceGate` seam, per-node `max_connections`, the pending cap and per-source share, open rates, link caps, refusal rows through the generic limiter with the Story 12.9 observer methods, `caps_unavailable` counted on UDP; regions for every stream in the plane (the region part of Lot D). | Romain G. |
+| 2026-11-16 | 0.6 | Lot D: `StreamSourceGate` over the process's connection filter, IP blocklist with the WAF whitelist exemption, and GeoIP resolver in both modes, the interim pass-through gate deleted; the worker loads its source controls before its stream runtime starts; regions sized for their capped links; the HTTP PROXY refusal log on the shared limiter; the stream protection process test. | Romain G. |
