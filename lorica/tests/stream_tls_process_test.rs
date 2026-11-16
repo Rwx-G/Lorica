@@ -43,6 +43,10 @@ use lorica_tls::RootCertStore;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 
+mod common;
+
+use common::reserve_port;
+
 /// Longer than the startup of an empty node, which runs its migrations
 /// and generates the management certificate before it binds.
 const START_DEADLINE: Duration = Duration::from_secs(90);
@@ -60,13 +64,6 @@ const NAME_A: &str = "a.stream-tls.test";
 const NAME_B: &str = "b.stream-tls.test";
 const NAME_UNROUTED: &str = "c.stream-tls.test";
 const NAME_TERMINATED: &str = "t.stream-tls.test";
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .expect("test setup: a free port")
-        .port()
-}
 
 fn crypto() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
@@ -239,7 +236,7 @@ struct Ports {
 /// Write both streams, their backends and the terminating stream's
 /// certificate into the store of `data_dir`, keyed as the node will
 /// open it.
-fn seed(data_dir: &Path, pki: &Pki, avoid: &[u16]) -> Ports {
+fn seed(data_dir: &Path, pki: &Pki) -> Ports {
     let key = EncryptionKey::load_or_create(&data_dir.join("encryption.key"))
         .expect("test setup: encryption key");
     let store =
@@ -249,11 +246,9 @@ fn seed(data_dir: &Path, pki: &Pki, avoid: &[u16]) -> Ports {
     let backend_a = tls_backend(pki, NAME_A);
     let backend_b = tls_backend(pki, NAME_B);
     let echo = echo_backend();
-    let mut free = std::iter::repeat_with(free_port).filter(|port| !avoid.contains(port));
-    let passthrough = free.next().expect("a free port");
     let ports = Ports {
-        passthrough,
-        terminate: free.find(|port| *port != passthrough).expect("a free port"),
+        passthrough: reserve_port(),
+        terminate: reserve_port(),
     };
     for (id, addr) in [
         (BACKEND_A_ID, backend_a),
@@ -374,10 +369,10 @@ fn a_node_carries_tls_streams(workers: &str) {
     let data_dir = tempfile::tempdir().expect("test setup: data dir");
     let pki = Pki::new();
     let client = pki.client();
-    let management = free_port();
-    let http = free_port();
-    let https = free_port();
-    let ports = seed(data_dir.path(), &pki, &[management, http, https]);
+    let management = reserve_port();
+    let http = reserve_port();
+    let https = reserve_port();
+    let ports = seed(data_dir.path(), &pki);
     let log_path = data_dir.path().join("node.log");
     let log = std::fs::File::create(&log_path).expect("test setup: log file");
 

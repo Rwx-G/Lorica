@@ -42,6 +42,10 @@ use lorica_config::models::{Backend, GeoIpConfig, Stream, StreamProtocol};
 use lorica_config::ConfigStore;
 use serde_json::json;
 
+mod common;
+
+use common::reserve_port;
+
 /// Longer than the startup of an empty node, which runs its migrations
 /// and generates the management certificate before it binds.
 const START_DEADLINE: Duration = Duration::from_secs(90);
@@ -69,13 +73,6 @@ const ALLOWED_CLIENT: &str = "198.51.100.7";
 const DENIED_PEER: &str = "127.0.0.2";
 /// A loopback source no control refuses, judged on its socket address.
 const ALLOWED_PEER: &str = "127.0.0.3";
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .expect("test setup: a free port")
-        .port()
-}
 
 fn ip(s: &str) -> IpAddr {
     s.parse().expect("an address")
@@ -277,11 +274,9 @@ fn refusal_reasons(output: &str) -> Vec<&'static str> {
 fn a_node_applies_its_source_controls_to_a_stream(workers: &str) {
     let data_dir = tempfile::tempdir().expect("test setup: data dir");
     let backend = echo_backend();
-    // A port the backend does not hold, so an echo can only come
-    // through the node.
-    let port = std::iter::repeat_with(free_port)
-        .find(|port| *port != backend.port())
-        .expect("a free port");
+    // Never the backend's port (an ephemeral one), so an echo can only
+    // come through the node.
+    let port = reserve_port();
     seed(data_dir.path(), port, backend);
     let log_path = data_dir.path().join("node.log");
     let log = std::fs::File::create(&log_path).expect("test setup: log file");
@@ -290,9 +285,9 @@ fn a_node_applies_its_source_controls_to_a_stream(workers: &str) {
         .arg("--data-dir")
         .arg(data_dir.path())
         .args(["--workers", workers])
-        .args(["--management-port", &free_port().to_string()])
-        .args(["--http-port", &free_port().to_string()])
-        .args(["--https-port", &free_port().to_string()])
+        .args(["--management-port", &reserve_port().to_string()])
+        .args(["--http-port", &reserve_port().to_string()])
+        .args(["--https-port", &reserve_port().to_string()])
         .args(["--log-format", "text"])
         // The stream refusal rows are written at debug.
         .env("RUST_LOG", "info,lorica_stream=debug")

@@ -23,7 +23,7 @@
 #![cfg(target_os = "linux")]
 
 use std::io::Read;
-use std::net::{SocketAddr, TcpListener, UdpSocket};
+use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -36,6 +36,10 @@ use lorica_config::models::{
 };
 use lorica_config::ConfigStore;
 
+mod common;
+
+use common::reserve_port;
+
 /// Longer than the startup of an empty node, which runs its migrations
 /// and generates the management certificate before it binds.
 const START_DEADLINE: Duration = Duration::from_secs(90);
@@ -46,20 +50,6 @@ const RESPAWN_DEADLINE: Duration = Duration::from_secs(60);
 const REPLY_TIMEOUT: Duration = Duration::from_millis(500);
 /// Small enough for the fd budget of any test container.
 const TEST_MAX_SESSIONS: u32 = 16;
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .expect("test setup: a free port")
-        .port()
-}
-
-fn free_udp_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .and_then(|socket| socket.local_addr())
-        .expect("test setup: a free UDP port")
-        .port()
-}
 
 /// A UDP echo backend on loopback. The returned slot holds the source of
 /// the last datagram it received: the session's upstream socket.
@@ -146,9 +136,9 @@ fn start_node(data_dir: &Path, workers: &str) -> (Child, PathBuf) {
         .arg("--data-dir")
         .arg(data_dir)
         .args(["--workers", workers])
-        .args(["--management-port", &free_port().to_string()])
-        .args(["--http-port", &free_port().to_string()])
-        .args(["--https-port", &free_port().to_string()])
+        .args(["--management-port", &reserve_port().to_string()])
+        .args(["--http-port", &reserve_port().to_string()])
+        .args(["--https-port", &reserve_port().to_string()])
         .args(["--log-format", "text"])
         .stdin(Stdio::null())
         .stdout(log.try_clone().expect("test setup: log handle"))
@@ -226,18 +216,10 @@ fn stop(node: &mut Child) {
     let _ = node.wait();
 }
 
-/// A port the backend does not hold, so an answer can only come through
-/// the node.
-fn stream_port(backend: SocketAddr) -> u16 {
-    std::iter::repeat_with(free_udp_port)
-        .find(|port| *port != backend.port())
-        .expect("a free port")
-}
-
 fn a_node_forwards_udp_datagrams(workers: &str) {
     let data_dir = tempfile::tempdir().expect("test setup: data dir");
     let (backend, _) = echo_backend();
-    let port = stream_port(backend);
+    let port = reserve_port();
     seed_stream(data_dir.path(), port, backend, |_| {});
     let (mut node, log_path) = start_node(data_dir.path(), workers);
 
@@ -315,7 +297,7 @@ fn udp_socket_owner(local_port: u16) -> Option<u32> {
 fn a_dead_workers_session_is_released_before_its_replacement_serves() {
     let data_dir = tempfile::tempdir().expect("test setup: data dir");
     let (backend, last_peer) = echo_backend();
-    let port = stream_port(backend);
+    let port = reserve_port();
     // One session on the node, kept open: it ends only on idle, after an
     // hour, so the stream stays at its cap until something releases it.
     seed_stream(data_dir.path(), port, backend, |stream| {

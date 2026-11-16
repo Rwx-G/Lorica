@@ -32,18 +32,15 @@ use lorica_config::models::{
 };
 use lorica_config::ConfigStore;
 
+mod common;
+
+use common::reserve_port;
+
 /// Longer than the startup of an empty node, which runs its migrations
 /// and generates the management certificate before it binds.
 const START_DEADLINE: Duration = Duration::from_secs(90);
 const STOP_DEADLINE: Duration = Duration::from_secs(30);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .expect("test setup: a free port")
-        .port()
-}
 
 /// An echo server on loopback, one thread per connection.
 fn echo_backend() -> SocketAddr {
@@ -146,11 +143,9 @@ fn stop(node: &mut Child) {
 fn a_node_forwards_stream_bytes(workers: &str) {
     let data_dir = tempfile::tempdir().expect("test setup: data dir");
     let backend = echo_backend();
-    // A port the backend does not hold, so an echo can only come
-    // through the node.
-    let stream_port = std::iter::repeat_with(free_port)
-        .find(|port| *port != backend.port())
-        .expect("a free port");
+    // Never the backend's port (an ephemeral one), so an echo can only
+    // come through the node.
+    let stream_port = reserve_port();
     seed_stream(data_dir.path(), stream_port, backend);
     let log_path = data_dir.path().join("node.log");
     let log = std::fs::File::create(&log_path).expect("test setup: log file");
@@ -159,9 +154,9 @@ fn a_node_forwards_stream_bytes(workers: &str) {
         .arg("--data-dir")
         .arg(data_dir.path())
         .args(["--workers", workers])
-        .args(["--management-port", &free_port().to_string()])
-        .args(["--http-port", &free_port().to_string()])
-        .args(["--https-port", &free_port().to_string()])
+        .args(["--management-port", &reserve_port().to_string()])
+        .args(["--http-port", &reserve_port().to_string()])
+        .args(["--https-port", &reserve_port().to_string()])
         .args(["--log-format", "text"])
         .stdin(Stdio::null())
         .stdout(log.try_clone().expect("test setup: log handle"))

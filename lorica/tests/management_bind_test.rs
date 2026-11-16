@@ -26,17 +26,13 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod common;
+
+use common::reserve_port;
+
 /// Longer than the startup of an empty node, which runs its migrations
 /// and generates the management certificate before it binds.
 const EXIT_DEADLINE: Duration = Duration::from_secs(60);
-
-/// A loopback port nothing listens on at the time of the call.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .expect("test setup: a free port")
-        .port()
-}
 
 #[test]
 fn a_single_process_node_exits_when_its_management_port_is_taken() {
@@ -51,8 +47,8 @@ fn a_single_process_node_exits_when_its_management_port_is_taken() {
         .arg(data_dir.path())
         .args(["--workers", "0"])
         .args(["--management-port", &management_port.to_string()])
-        .args(["--http-port", &free_port().to_string()])
-        .args(["--https-port", &free_port().to_string()])
+        .args(["--http-port", &reserve_port().to_string()])
+        .args(["--https-port", &reserve_port().to_string()])
         .stdin(Stdio::null())
         .stdout(log.try_clone().expect("test setup: log handle"))
         .stderr(log)
