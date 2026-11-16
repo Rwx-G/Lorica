@@ -156,6 +156,15 @@ What the rolled-back node does not do:
   A probe path edited under 1.10.6 is the one 1.11.0 honours when it
   comes back: the typed definition is trusted only while it still
   agrees with `health_check_path`.
+- **It probes a protocol check by TCP connect.** A backend with a
+  template (`tcp_template`) or a custom send/expect check
+  (`tcp_send_expect`) has no `health_check_path`, so 1.10.6 probes it
+  by TCP connect: weaker, since a hung backend whose port still accepts
+  stays in rotation, and never the other way, since a healthy backend is
+  not marked down by it. 1.10.6 never writes the typed column, so the
+  check survives the rollback, and 1.11.0 probes with it again on
+  re-upgrade, unless a probe path was set under 1.10.6 meanwhile, in
+  which case that HTTP check is the one kept.
 - **A configuration import run under 1.10.6** deletes every backend,
   which removes the streams' backend links with them; the streams
   remain, without backends. And a 1.11.0 export is refused by 1.10.6,

@@ -1,7 +1,7 @@
 # Story 12.7: TCP Health Checks that Speak the Protocol
 
 **Epic:** [Epic 12 - TCP and UDP Stream Proxying (v1.11.0 and v1.12.0)](../prd/epic-12-v1.11.0.md)
-**Status:** InProgress
+**Status:** Review
 **Priority:** P1
 **Author:** Romain G.
 **Depends on:**
@@ -779,27 +779,27 @@ Allowlist: `docs/health-checks.md` (outside the marked section),
 `docs/security/threat-model.md`, `docs/architecture/source-tree.md`,
 `CHANGELOG.md`.
 
-- [ ] `docs/health-checks.md`: the four TCP-side kinds, how a probe
+- [x] `docs/health-checks.md`: the four TCP-side kinds, how a probe
       decides (D-3, D-9), the per-backend interval (Lot 0), the TLS
       refusal, the reasons of D-10 and where to read them, backend-side
       noise, and "never put a credential in a payload: it is masked for
       Viewer and tokens, but stored in clear, replicated, exported and
       shown to every Operator" (D-8).
-- [ ] `docs/automation.md` and `docs/mcp.md`: the D-7 rule beside the
+- [x] `docs/automation.md` and `docs/mcp.md`: the D-7 rule beside the
       backend one-way rules, the masked `send` beside the masked
       `health_check_path`.
-- [ ] `docs/hot-upgrade.md`: a backend with a template or a custom
+- [x] `docs/hot-upgrade.md`: a backend with a template or a custom
       send/expect check is probed by TCP connect while rolled back to
       1.10.6, and gets its check back on re-upgrade unless a path was set.
-- [ ] `docs/security/threat-model.md`: payloads as an operator-chosen
+- [x] `docs/security/threat-model.md`: payloads as an operator-chosen
       traffic source (management only; tokens bounded to the catalogue
       and their CIDR grant), payload confidentiality, bounded reads and
       bounded logging of backend bytes.
-- [ ] `CHANGELOG.md` `[Unreleased]`: Added (send/expect checks,
+- [x] `CHANGELOG.md` `[Unreleased]`: Added (send/expect checks,
       templates, the failure counter); Security (payloads refused on
       every automation and MCP surface, masked for Viewer and on every
       token read). The two Fixed entries are Lot 0's.
-- [ ] `docs/architecture/source-tree.md`: the new files.
+- [x] `docs/architecture/source-tree.md`: the new files.
 
 ## Dev Notes
 
@@ -1194,6 +1194,36 @@ None open.
   that section with CRLF folded to LF, since Markdown files check out
   CRLF on a Windows clone and `.gitattributes` (outside the allowlist)
   pins only `*.generated.ts` and the OpenAPI documents to LF.
+- Lot 4: `docs/health-checks.md` written around the rendered section,
+  which is unchanged byte for byte (checked against `HEAD` with CRLF
+  folded). The reasons, the limits, the templates and the thresholds
+  are named by their constant or pointed at (`ProbeFailure`,
+  `MIN_PROBE_INTERVAL`, `HEALTH_FLIP_THRESHOLD`, `DEGRADED_THRESHOLD_MS`,
+  `LOGGED_READ_BYTES`, the rendered tables), never retyped. "Backend-side
+  noise" says it was not checked: Story 12.12 has not run.
+- Lot 4, the docs follow the code where the story differs: a D-2 limit
+  and the TLS refusal are `422` (Lot 2's deviation); the MCP tools
+  refuse a `send` or an `expect` key by name, so through MCP a custom
+  check cannot be sent back masked at all and is kept by leaving
+  `health_check` out of the patch, while the masked echo is a REST
+  path (management and automation) only. The `lorica_backend_update`
+  tool summary (`lorica-mcp/src/tools.rs`, outside the allowlist) says
+  the check sent back as read keeps one, which the tool's own key check
+  refuses; left as found, raised for the orchestrator.
+- Lot 4, `docs/mcp.md`: the `HEALTH_CHECK_PAYLOAD` rule is a paragraph
+  after the protections table, not a row, since
+  `the_operator_reference_states_every_protection_rule_as_the_plane_holds_it`
+  holds the table to `ROUTE_PROTECTIONS` and `BACKEND_PROTECTIONS`
+  exactly and the rule is in neither. The paragraph saying the tools
+  declare no vocabulary for `health_check` was false since Lot 2 and is
+  rewritten.
+- Lot 4, `docs/automation.md`: the environment resource's backends were
+  documented as "health-checked every 10 seconds", false since Lot 0's
+  second commit; they now read as probed by TCP connect at the
+  `default_health_check_interval_s` of the `PUT`.
+- Lot 4, `docs/security/threat-model.md`: section T11, the two T9
+  masked-value lists extended with `send`, residual risk 16 (a payload
+  is stored in clear), version 1.4.
 
 ## File List
 
@@ -1248,6 +1278,14 @@ None open.
 - `lorica-dashboard/frontend/src/lib/api.ts` (Lot 3)
 - `lorica-dashboard/frontend/src/routes/Backends.svelte` (Lot 3)
 - `lorica-dashboard/frontend/src/routes/Backends.test.ts` (Lot 3)
+- `docs/health-checks.md` (Lot 4, outside the marked section)
+- `docs/automation.md` (Lot 4)
+- `docs/mcp.md` (Lot 4)
+- `docs/hot-upgrade.md` (Lot 4)
+- `docs/security/threat-model.md` (Lot 4)
+- `docs/architecture/source-tree.md` (Lot 4)
+- `CHANGELOG.md` (Lot 4, Added and Security)
+- `docs/stories/story-12.7-tcp-send-expect.md` (Lot 4, Dev Agent Record)
 
 ## Change Log
 
@@ -1262,3 +1300,4 @@ None open.
 | 2026-11-15 | 0.7 | Lot 1: template catalogue, `tcp_template` and `tcp_send_expect` validated by every writer, shape guard over kinds and template names, send/expect probe with failure reasons, counter, log line and alert details, IV1 automated. Status InProgress. | Romain G. |
 | 2026-11-15 | 0.8 | Lot 2: D9 on every automation and MCP surface (a token never creates or changes a custom payload), `send` masked for tokens and for Viewer with restore on echo, MCP schema offers templates and withholds payload keys, both OpenAPI documents and their contract assertions. Status InProgress. | Romain G. |
 | 2026-11-15 | 0.9 | Lot 3: rendered template module and documentation section with their fixture test, dashboard template and send/expect editors with client-side limits. Status InProgress. | Romain G. |
+| 2026-11-16 | 1.0 | Lot 4: `docs/health-checks.md` around the rendered section, the D-7 rule and the masked `send` in `docs/automation.md` and `docs/mcp.md`, the rollback consequence in `docs/hot-upgrade.md`, threat model T11, the new files in the source tree, CHANGELOG Added and Security. Every Lot done. Status Review. | Romain G. |

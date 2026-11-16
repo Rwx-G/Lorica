@@ -318,7 +318,9 @@ sees that a route sends one), the match `value` of each of a route's
 goes; the header name, match type and backends stay), the userinfo and
 query values of a route's `forward_auth` address, the query values of a
 backend's probe path in both shapes (the typed `health_check.path` and
-the deprecated `health_check_path`), and the query values and fragment of an
+the deprecated `health_check_path`), the whole `send` of a backend's
+custom send/expect check, read as `{"text": "[redacted]"}` (its
+`expect` and a template's name are shown), and the query values and fragment of an
 access-log row's `path`. It does so wherever it answers such a row: the
 listings, every write answer and every preview. A preview's list of
 changed fields is computed on the masked views, so a change confined to
@@ -334,7 +336,11 @@ by position, and the marker is never stored. A backend's probe path,
 `[redacted]` query values and sent unchanged keeps the stored path in
 both fields; one whose masked form differs from the stored path's is
 refused, and a create carrying the marker is refused, so a
-read-modify-write cannot replace a probe credential with the marker. The environment a route or
+read-modify-write cannot replace a probe credential with the marker. A
+custom send/expect check cannot be sent back at all through the tools,
+which refuse its `send` and `expect` keys by name: a model keeps one by
+leaving `health_check` out of its patch, and the payload is never
+replaced by the marker. The environment a route or
 backend belongs to (its `managed_by` mark) is named only to a token the
 environment endpoint would answer for that environment; every other
 token reads the mark with the name `[redacted]`, so the row still says
@@ -429,12 +435,18 @@ with nothing said. The one query the plane reads on a write,
 `?dry_run`, is strict on its side: a key it does not declare is a 400,
 so `?dryrun=true` typed into a direct client is not an apply.
 
-A backend's `health_check` is the one nested value the plane checks
-itself rather than the tool: it is `{"kind": "http", "path": "..."}` or
-`{"kind": "tcp_connect"}`, a closed set the node refuses (`422`) on an
-unknown kind or on a key an `http` check does not have, so the tool
-declares no vocabulary for it and a mistyped `path` is refused rather
-than dropped. The deprecated
+A backend's `health_check` is a nested object the tools declare: its
+keys are `kind`, `path`, `template` and `timeout_ms`, and the schema's
+`enum` for `template` is rendered from the release's catalogue
+(`TCP_CHECK_TEMPLATES`) when the schema is built, so a model reads the
+template names the node accepts. That is `{"kind": "http", "path":
+"..."}`, `{"kind": "tcp_connect"}` or `{"kind": "tcp_template",
+"template": "..."}` (`docs/health-checks.md`). The keys of a custom
+send/expect check, `send` and `expect`, are refused by the tool by name,
+with the reason the policy gives, before the call leaves; the node
+refuses the same check on its own (next section), whatever the client.
+The values are the node's to judge: an unknown kind or template, or a
+key the kind does not have, is a `422`. The deprecated
 `health_check_path` is still accepted beside it and must then be the
 same path. Streams (v1.11.0) are not on this server: no read tool and
 no mutation names them.
@@ -560,6 +572,22 @@ route already admits and is on the list of what not to delegate below;
 the AI-crawler policy, a content policy toward clients that declare
 themselves, which a hostile client does not; and the routing fields,
 where a request goes, bounded by the hostname and CIDR grants.
+
+**A custom health-check payload has no direction: a token never writes
+one.** Beside the table, and not in it, since it is not a control that
+strengthens one way: `HEALTH_CHECK_PAYLOAD`
+(`lorica-automation-policy/src/protections.rs`) says that a check whose
+bytes ship with the release, a template included, is set freely, and a
+stored custom send/expect check may be kept exactly as it is or
+replaced, but never created or changed by a token. A custom check makes
+the node send bytes an operator chose to the backend's address on every
+probe (PRD D9), so a model that read attacker text must not be the one
+choosing them; the template set is the whole of what a token can make
+the node send, and the CIDR grant bounds where. The plane holds the
+rule in the guard of every backend write, preview included, with a
+`403` naming `health_check` and echoing no byte, on both MCP bindings
+and on a direct automation client alike; the tools refuse the keys
+before that.
 
 **A deleted route is still weighed.** The rule would bound a write in
 place and not a sequence of them if a token could delete a protected

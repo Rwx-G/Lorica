@@ -498,7 +498,10 @@ prefix, WAF flag, HTTPS flag and certificate are the request's and
 whose every other setting is the route API's own default, so an
 environment's route behaves like one an operator created with the same
 four settings. One `Backend` row per entry, named `<name>-<index>`,
-health-checked every 10 seconds, exclusively owned. The route-to-backend
+probed by TCP connect at the `default_health_check_interval_s` the node
+holds when the `PUT` runs, exclusively owned. The request takes no
+health-check field, so an environment's backend never carries a custom
+health-check payload (a `health_check` key is a 422). The route-to-backend
 joins. And one `automation_environments` row: the name, the route id,
 the owner, the certificate mode, the labels, `expires_at`, `created_at`,
 `updated_at`, the last pipeline id, and for an ID token the job
@@ -908,7 +911,10 @@ the userinfo and query values of a
 route's `forward_auth` address, the query values of a backend's probe
 path in both of the shapes it is answered in (the typed
 `health_check.path` and the deprecated `health_check_path`, which carry
-the same string), and the query values and fragment of an access-log
+the same string), the whole `send` of a backend's custom send/expect
+check, answered as `{"text": "[redacted]"}` so the row still decodes
+(its `expect` and a template's name are shown: they are what the
+backend answers, or bytes the release ships), and the query values and fragment of an access-log
 row's `path` (the proxy records the path without its query string, so
 that last one is a guard for rows from any other producer). The same
 holds on every write answer and preview (`lorica-api/src/automation/redact.rs`),
@@ -1064,15 +1070,21 @@ behind the write scope beside it:
 | `POST /automation/v1/certificates/{id}/renew` | `certificates:write` | Renew one ACME certificate in place. |
 
 A backend's active check is `health_check` since v1.11.0, as on the
-management API: `{"kind": "http", "path": "/healthz"}` or
-`{"kind": "tcp_connect"}`, replaced whole by an update. The older
+management API: `{"kind": "http", "path": "/healthz"}`,
+`{"kind": "tcp_connect"}`, or a protocol template the release ships,
+`{"kind": "tcp_template", "template": "redis_ping"}` with an optional
+`timeout_ms`, replaced whole by an update (`docs/health-checks.md` has
+the templates and what each kind does). The older
 `health_check_path` is deprecated and still accepted: alone, a path is
 an `http` check and the empty string a `tcp_connect`; beside
 `health_check`, it must be the same path (empty for `tcp_connect`) or
 the write is a `400` naming both fields. Every backend answer carries
-both. An unknown `kind`, an `http` check without a path, or a key an
-`http` check does not have is a `422`. Streams (v1.11.0) are
-not on this plane, for reading or writing.
+both. An unknown `kind` or template, an `http` check without a path, or
+a key the kind does not have is a `422`, and so is a `timeout_ms`
+outside its bounds or a template check on a backend with `tls_upstream`
+on. A custom send/expect check (`tcp_send_expect`) is the dashboard's:
+see "A custom health-check payload is set in the dashboard" below.
+Streams (v1.11.0) are not on this plane, for reading or writing.
 
 **Each one is the management handler itself, run as the token.** The
 management handlers were split into the axum wrapper that reads the
@@ -1163,7 +1175,11 @@ in either shape: an `http` `health_check` whose `path`, or a
 `[redacted]` query values, keeps the stored path, and both fields are
 put back to it; a marker in any other path, or on a create, is a `400`
 naming both fields, so a probe credential is never replaced by the
-marker. The dashboard reads the values and is not subject to any of
+marker. A custom check's `send`, read as `{"text": "[redacted]"}`,
+follows it too: a `tcp_send_expect` check sent back exactly as it was
+read, `expect` and `timeout_ms` included, keeps the stored check; the
+marker with anything else changed, or on a create, is a `400` naming
+`health_check.send`, and the marker is never stored. The dashboard reads the values and is not subject to any of
 this.
 
 **Access control and upstream trust move one way.** The controls of
@@ -1177,6 +1193,21 @@ verification and its SNI on a backend, a create included. The other
 direction is a 403 naming the field and the rule. `docs/mcp.md`
 ("Protections move one way") holds the rule for each, pinned to the
 constants by a test, and what is deliberately outside it.
+
+**A custom health-check payload is set in the dashboard.** A
+`tcp_send_expect` check makes the node send bytes an operator chose to
+the backend's address on every probe (PRD D9), so a token never authors
+one: a backend create carrying one, and an update that would create one
+or change a stored one, is a 403 naming `health_check` and the rule,
+preview included, and nothing is written. A token may set
+`tcp_connect`, `http` or `tcp_template` freely, which also moves a
+backend away from a custom check, and a stored custom check survives a
+token's patch of other fields, or the check sent back as read (above).
+The guard compares the check after the patch with the stored one and
+never matches a kind of its own: the rule is
+`HEALTH_CHECK_PAYLOAD` in `lorica-automation-policy/src/protections.rs`,
+and the CIDR grant bounds where a template check may point as it bounds
+every backend address.
 
 **The scopes bound each other.** A route write naming
 `certificate_id`, the empty string included, needs `certificates:write`
