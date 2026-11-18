@@ -239,13 +239,17 @@
           <div class="detail-header">
             <h2>{getRouteHostname(selectedRouteId)}</h2>
             <div class="detail-actions">
-              {#if $canWrite && !selectedNode}
-                <button class="btn btn-small" onclick={openConfigModal}>Configure</button>
-              {/if}
-              <button class="btn btn-small" onclick={() => handleExport('csv')}>Export CSV</button>
-              <button class="btn btn-small" onclick={() => handleExport('json')}>Export JSON</button>
-              {#if $canWrite}
-                <button class="btn btn-small btn-danger" onclick={() => (showClearModal = true)}>Clear SLA</button>
+              <!-- The export and the clear take no ?node=: they act on
+                   this node's store, never on a picked follower's. -->
+              {#if !selectedNode}
+                {#if $canWrite}
+                  <button class="btn btn-small" onclick={openConfigModal}>Configure</button>
+                {/if}
+                <button class="btn btn-small" onclick={() => handleExport('csv')}>Export CSV</button>
+                <button class="btn btn-small" onclick={() => handleExport('json')}>Export JSON</button>
+                {#if $canWrite}
+                  <button class="btn btn-small btn-danger" onclick={() => (showClearModal = true)}>Clear SLA</button>
+                {/if}
               {/if}
             </div>
           </div>
