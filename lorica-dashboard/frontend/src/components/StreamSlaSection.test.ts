@@ -102,7 +102,26 @@ describe('StreamSlaSection', () => {
 
   it('opens on the stream a link named', async () => {
     render(StreamSlaSection, { props: { initialStreamId: 'dns-id' } });
-    await waitFor(() => expect(api.getStreamSla).toHaveBeenCalledWith('dns-id'));
+    await waitFor(() => expect(api.getStreamSla).toHaveBeenCalledWith('dns-id', undefined));
+  });
+
+  it("reads a picked follower's own figures and offers nothing that acts on this node", async () => {
+    render(StreamSlaSection, { props: { initialStreamId: 'pg-id', node: 'node-2' } });
+    await waitFor(() => expect(api.getStreamSla).toHaveBeenCalledWith('pg-id', 'node-2'));
+    expect(api.getStreamSlaOverview).toHaveBeenCalledWith('node-2');
+    expect(api.getStreamSlaBuckets).toHaveBeenCalledWith('pg-id', { node: 'node-2' });
+    await screen.findByRole('columnheader', { name: 'p95' });
+    for (const name of ['Configure', 'Export CSV', 'Export JSON', 'Clear SLA']) {
+      expect(screen.queryByRole('button', { name })).toBeNull();
+    }
+  });
+
+  it('re-reads the open stream on the node the picker moves to', async () => {
+    const { rerender } = render(StreamSlaSection, { props: { initialStreamId: 'pg-id' } });
+    await waitFor(() => expect(api.getStreamSla).toHaveBeenCalledWith('pg-id', undefined));
+    await rerender({ initialStreamId: 'pg-id', node: 'node-2' });
+    await waitFor(() => expect(api.getStreamSla).toHaveBeenCalledWith('pg-id', 'node-2'));
+    expect(api.getStreamSlaOverview).toHaveBeenLastCalledWith('node-2');
   });
 
   it('saves a target and leaves the latency bound out on UDP', async () => {

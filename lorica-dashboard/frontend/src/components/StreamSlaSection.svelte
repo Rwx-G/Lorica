@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import {
     api,
     type StreamSlaBucket,
@@ -14,9 +14,15 @@
   interface Props {
     /** The stream a link opened the page on, `''` for none. */
     initialStreamId?: string;
+    /**
+     * A follower's node id to read that node's own figures, or none for
+     * this node's. The target is changed, and the export and the clear
+     * act, on this node only, as the route section does.
+     */
+    node?: string;
   }
 
-  let { initialStreamId = '' }: Props = $props();
+  let { initialStreamId = '', node }: Props = $props();
 
   const REFRESH_MS = 30_000;
 
@@ -60,7 +66,7 @@
 
   async function loadOverview() {
     const [overviewRes, statusRes] = await Promise.all([
-      api.getStreamSlaOverview(),
+      api.getStreamSlaOverview(node),
       api.getStreamStatus(),
     ]);
     if (overviewRes.data) overview = overviewRes.data;
@@ -76,8 +82,9 @@
     // one's answers arriving last.
     const captured = id;
     const [windowsRes, bucketsRes, configRes] = await Promise.all([
-      api.getStreamSla(id),
-      api.getStreamSlaBuckets(id),
+      api.getStreamSla(id, node),
+      api.getStreamSlaBuckets(id, { node }),
+      // Replicated fleet policy: this node's copy is the follower's.
       api.getStreamSlaConfig(id),
     ]);
     if (selectedId !== captured) return;
@@ -92,8 +99,14 @@
     if (selectedId) await select(selectedId);
   }
 
+  // The first run is the first load; a later one is the node picker
+  // moving, which re-reads the open stream on the node picked.
+  $effect(() => {
+    void node;
+    untrack(() => void refresh());
+  });
+
   onMount(() => {
-    void loadOverview();
     if (initialStreamId) void select(initialStreamId);
     const timer = setInterval(() => void refresh(), REFRESH_MS);
     return () => clearInterval(timer);
@@ -188,7 +201,8 @@
   <p class="text-muted intro">
     A stream judges connections, not bytes: a TCP connection succeeds when it
     connects to a backend within the latency bound, a UDP session when its
-    backend answers. UDP is availability only. These are this node's figures.
+    backend answers. UDP is availability only.
+    {node ? "These are the picked node's own figures." : "These are this node's figures."}
   </p>
 
   {#if error}
@@ -225,13 +239,15 @@
         <div class="detail-header">
           <h3>{nameOf(selectedId)}</h3>
           <div class="detail-actions">
-            {#if $canWrite}
-              <button class="btn btn-secondary" onclick={openConfig} disabled={!config}>Configure</button>
-            {/if}
-            <button class="btn btn-secondary" onclick={() => void exportData('csv')}>Export CSV</button>
-            <button class="btn btn-secondary" onclick={() => void exportData('json')}>Export JSON</button>
-            {#if $canWrite}
-              <button class="btn btn-danger" onclick={() => (showClear = true)}>Clear SLA</button>
+            {#if !node}
+              {#if $canWrite}
+                <button class="btn btn-secondary" onclick={openConfig} disabled={!config}>Configure</button>
+              {/if}
+              <button class="btn btn-secondary" onclick={() => void exportData('csv')}>Export CSV</button>
+              <button class="btn btn-secondary" onclick={() => void exportData('json')}>Export JSON</button>
+              {#if $canWrite}
+                <button class="btn btn-danger" onclick={() => (showClear = true)}>Clear SLA</button>
+              {/if}
             {/if}
           </div>
         </div>

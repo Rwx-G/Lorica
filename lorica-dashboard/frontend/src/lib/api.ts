@@ -2327,20 +2327,23 @@ export const api = {
     return fetch(url, { credentials: 'same-origin' });
   },
 
-  // Stream SLA (Story 12.9): this node's figures only, no `?node=`.
+  // Stream SLA (Story 12.9). The three reads take `node` as the route
+  // reads do, a follower's own figures read over its session; the
+  // configuration, export and clear act on this node only.
   /** The 1h and 24h summaries of every stream with a target or data. */
-  getStreamSlaOverview: () =>
-    request<StreamSlaSummary[]>('GET', '/sla/streams'),
+  getStreamSlaOverview: (node?: string) =>
+    request<StreamSlaSummary[]>('GET', `/sla/streams${nodeQuery(node)}`),
 
   /** One stream's summaries over every standard window. */
-  getStreamSla: (streamId: string) =>
-    request<StreamSlaSummary[]>('GET', `/sla/streams/${streamId}`),
+  getStreamSla: (streamId: string, node?: string) =>
+    request<StreamSlaSummary[]>('GET', `/sla/streams/${streamId}${nodeQuery(node)}`),
 
   /** Raw minute buckets, the last 24 hours unless `from` and `to` say otherwise. */
-  getStreamSlaBuckets: (streamId: string, params?: { from?: string; to?: string }) => {
+  getStreamSlaBuckets: (streamId: string, params?: { from?: string; to?: string; node?: string }) => {
     const query = new URLSearchParams();
     if (params?.from) query.set('from', params.from);
     if (params?.to) query.set('to', params.to);
+    if (params?.node) query.set('node', params.node);
     const qs = query.toString();
     return request<StreamSlaBucket[]>('GET', `/sla/streams/${streamId}/buckets${qs ? `?${qs}` : ''}`);
   },
