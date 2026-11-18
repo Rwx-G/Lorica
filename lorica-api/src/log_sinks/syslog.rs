@@ -15,11 +15,19 @@
 //! drops the message, bumps the drop counter, and backs off
 //! exponentially (1 s doubling to 30 s cap). The request path is
 //! never affected.
+//!
+//! The consumer connects when it starts, not at the first event, and
+//! retries on its backoff timer whether events arrive or not; on TCP and
+//! TLS it also notices the collector closing the connection while idle.
+//! So `lorica_log_sink_up{sink="syslog"}` (Story 12.9 D-f) follows the
+//! collector rather than the traffic: 1 while a connection is
+//! established, or on UDP while the socket is open and its last send did
+//! not fail. UDP proves no delivery.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc::Receiver;
 use tokio::time::Instant;
@@ -100,6 +108,7 @@ pub(super) fn spawn_syslog_sink(
                 Ok(rt) => rt.block_on(consumer_loop(id, rx, config, node_id, node_name)),
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to build syslog sink runtime; sink disabled");
+                    super::report_syslog_up(id, false);
                     super::remove_lane(id);
                 }
             }
@@ -122,6 +131,94 @@ enum Conn {
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
+/// The consumer's connection to the collector, its reconnect schedule,
+/// and the up state it last published.
+struct Link {
+    lane: u64,
+    conn: Option<Conn>,
+    backoff: Duration,
+    next_attempt: Instant,
+    published: Option<bool>,
+}
+
+impl Link {
+    fn new(lane: u64) -> Self {
+        Self {
+            lane,
+            conn: None,
+            backoff: BACKOFF_INITIAL,
+            next_attempt: Instant::now(),
+            published: None,
+        }
+    }
+
+    /// Publish the up state when it changed.
+    fn report(&mut self, up: bool) {
+        if self.published != Some(up) {
+            self.published = Some(up);
+            super::report_syslog_up(self.lane, up);
+        }
+    }
+
+    async fn connect(&mut self, config: &SyslogSinkConfig, tls: Option<&TlsConnector>) {
+        match connect(config, tls).await {
+            Ok(conn) => {
+                self.conn = Some(conn);
+                self.backoff = BACKOFF_INITIAL;
+                self.report(true);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    endpoint = %config.endpoint,
+                    "syslog collector unreachable; backing off"
+                );
+                self.retry_later();
+                self.report(false);
+            }
+        }
+    }
+
+    fn retry_later(&mut self) {
+        self.next_attempt = Instant::now() + self.backoff;
+        self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
+    }
+
+    /// The connection broke: drop it and reconnect on the backoff timer.
+    fn lost(&mut self) {
+        self.conn = None;
+        self.retry_later();
+        self.report(false);
+    }
+}
+
+/// What the consumer woke for.
+enum Wake {
+    /// An event, or `None` once the lane's senders are gone.
+    Event(Option<SinkEvent>),
+    /// The backoff timer ran out with no connection.
+    RetryDue,
+    /// The collector closed the connection.
+    PeerClosed,
+}
+
+/// Resolves when the collector closes a stream connection (end of
+/// stream or a read error); never on UDP. A syslog collector sends
+/// nothing, so whatever it does send is read and ignored.
+async fn peer_closed(conn: &mut Conn) {
+    let mut buf = [0u8; 256];
+    loop {
+        let read = match conn {
+            Conn::Udp(_) => return std::future::pending().await,
+            Conn::Tcp(stream) => stream.read(&mut buf).await,
+            Conn::Tls(stream) => stream.read(&mut buf).await,
+        };
+        if matches!(read, Ok(0) | Err(_)) {
+            return;
+        }
+    }
+}
+
 async fn consumer_loop(
     id: u64,
     mut rx: Receiver<SinkEvent>,
@@ -140,60 +237,69 @@ async fn consumer_loop(
             // Terminal: the lane must not survive its consumer, or
             // every event becomes a counted drop forever.
             tracing::warn!(error = %e, "invalid syslog TLS configuration; sink disabled");
+            super::report_syslog_up(id, false);
             super::remove_lane(id);
             return;
         }
     };
-    let mut conn: Option<Conn> = None;
-    let mut backoff = BACKOFF_INITIAL;
-    let mut next_attempt = Instant::now();
+    let mut link = Link::new(id);
 
-    while let Some(event) = rx.recv().await {
+    loop {
+        // Cancel-safe on every branch: `recv` and `read` take nothing
+        // when another branch wins.
+        let wake = match link.conn.as_mut() {
+            None => tokio::select! {
+                event = rx.recv() => Wake::Event(event),
+                () = tokio::time::sleep_until(link.next_attempt) => Wake::RetryDue,
+            },
+            Some(conn) => tokio::select! {
+                event = rx.recv() => Wake::Event(event),
+                () = peer_closed(conn) => Wake::PeerClosed,
+            },
+        };
+        let event = match wake {
+            Wake::Event(Some(event)) => event,
+            Wake::Event(None) => break,
+            Wake::RetryDue => {
+                link.connect(&config, tls.as_ref()).await;
+                continue;
+            }
+            Wake::PeerClosed => {
+                tracing::warn!(
+                    endpoint = %config.endpoint,
+                    "syslog collector closed the connection; reconnecting"
+                );
+                link.lost();
+                continue;
+            }
+        };
         let kind = event.kind();
 
         // Backoff / connect decisions come BEFORE encoding, so a dead
         // collector does not burn CPU serialising events that are
         // about to be dropped anyway (QA finding).
-        if conn.is_none() {
-            if Instant::now() < next_attempt {
-                crate::metrics::inc_log_sink_dropped("syslog", kind.as_str());
-                continue;
-            }
-            match connect(&config, tls.as_ref()).await {
-                Ok(c) => {
-                    conn = Some(c);
-                    backoff = BACKOFF_INITIAL;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        endpoint = %config.endpoint,
-                        "syslog collector unreachable; backing off"
-                    );
-                    next_attempt = Instant::now() + backoff;
-                    backoff = (backoff * 2).min(BACKOFF_MAX);
-                    crate::metrics::inc_log_sink_dropped("syslog", kind.as_str());
-                    continue;
-                }
-            }
+        if link.conn.is_none() && Instant::now() >= link.next_attempt {
+            link.connect(&config, tls.as_ref()).await;
         }
+        let Some(conn) = link.conn.as_mut() else {
+            crate::metrics::inc_log_sink_dropped("syslog", kind.as_str());
+            continue;
+        };
 
         let message = encode_rfc5424(&event, &config, &hostname, &node_id, &node_name);
-        let send_failed = match conn.as_mut() {
-            Some(c) => send_message(c, &message).await.is_err(),
-            None => true,
-        };
-        if send_failed {
+        if send_message(conn, &message).await.is_err() {
             crate::metrics::inc_log_sink_dropped("syslog", kind.as_str());
             // A UDP socket survives transient send errors (ICMP port
-            // unreachable); a broken stream must reconnect.
-            if config.transport != SyslogTransport::Udp {
-                conn = None;
-                next_attempt = Instant::now() + backoff;
-                backoff = (backoff * 2).min(BACKOFF_MAX);
+            // unreachable) and is down until a send succeeds; a broken
+            // stream must reconnect.
+            if config.transport == SyslogTransport::Udp {
+                link.report(false);
+            } else {
+                link.lost();
             }
         } else {
             crate::metrics::inc_log_sink_sent("syslog", kind.as_str());
+            link.report(true);
         }
     }
 }
@@ -355,6 +461,8 @@ fn encode_rfc5424(
         // carries that row's severity; there is no
         // `syslog_severity_capture` setting, only the toggle.
         SinkKind::Capture => config.severity_access,
+        // A stream row is an access row too (Story 12.9 Resolved 6).
+        SinkKind::Stream => config.severity_access,
     };
     let pri = u32::from(config.facility) * 8 + u32::from(severity);
     let timestamp = event_timestamp(event);
@@ -449,6 +557,7 @@ fn event_timestamp(event: &SinkEvent) -> String {
         super::SinkPayload::Waf(waf) => waf.timestamp.as_str(),
         super::SinkPayload::Audit(audit) => audit.timestamp.as_str(),
         super::SinkPayload::Capture(capture) => capture.timestamp.as_str(),
+        super::SinkPayload::Stream(row) => row.timestamp.as_str(),
     };
     match chrono::DateTime::parse_from_rfc3339(raw) {
         Ok(ts) => ts.to_rfc3339(),
@@ -551,6 +660,7 @@ mod tests {
             waf_enabled: true,
             audit_enabled: true,
             capture_enabled: true,
+            stream_enabled: true,
             tls_ca_pem: None,
             tls_client_cert_pem: None,
             tls_client_key_pem: None,
@@ -606,6 +716,111 @@ mod tests {
         assert!(msg.contains("env=\"prod\""));
         // JSON body carries the event fields.
         assert!(msg.contains("\"action\":\"route.create\""));
+    }
+
+    #[test]
+    fn a_stream_row_goes_out_with_its_own_msgid_at_the_access_severity() {
+        use lorica_config::models::StreamEndReason;
+
+        let row = crate::stream_logs::StreamLogEntry::from_connection(
+            &crate::stream_logs::test_support::tcp_connection(StreamEndReason::IdleTimeout),
+        );
+        let event = SinkEvent {
+            payload: std::sync::Arc::new(SinkPayload::Stream(Box::new(row.clone()))),
+            trace_id: None,
+            span_id: None,
+        };
+        let config = test_config("host01:514", SyslogTransport::Udp);
+        let msg = encode_rfc5424(&event, &config, "edge01", "", "");
+        let pri = u32::from(config.facility) * 8 + u32::from(config.severity_access);
+        assert!(
+            msg.starts_with(&format!(
+                "<{pri}>1 {} ",
+                row.timestamp.replace('Z', "+00:00")
+            )),
+            "{msg}"
+        );
+        let msgid = SinkKind::Stream.as_str();
+        assert!(
+            msg.contains(&format!(" {msgid} [lorica@32473 kind=\"{msgid}\"")),
+            "{msg}"
+        );
+        assert!(!msg.contains("trace_id"), "{msg}");
+    }
+
+    /// This process's published `lorica_log_sink_up{sink="syslog"}`.
+    fn syslog_up() -> Option<u64> {
+        crate::metrics::snapshot_per_worker_gauges()
+            .into_iter()
+            .find(|(name, labels, _)| {
+                name.ends_with("log_sink_up")
+                    && labels.iter().any(|(k, v)| k == "sink" && v == "syslog")
+            })
+            .map(|(_, _, value)| value)
+    }
+
+    async fn wait_for_syslog_up(expected: Option<u64>, within: Duration) {
+        let deadline = Instant::now() + within;
+        while syslog_up() != expected {
+            assert!(
+                Instant::now() < deadline,
+                "syslog up state {:?}, expected {expected:?}",
+                syslog_up()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_up_state_follows_a_collector_that_leaves_and_returns_without_traffic() {
+        let _guard = super::super::test_hub_lock().lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind collector");
+        let addr = listener.local_addr().expect("collector addr");
+        super::super::install(&LogSinksConfig {
+            syslog: Some(test_config(&addr.to_string(), SyslogTransport::Tcp)),
+            ..LogSinksConfig::default()
+        });
+
+        // Connected at start, with no event to send.
+        let (accepted, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("the consumer connects without an event")
+            .expect("accept");
+        wait_for_syslog_up(Some(1), Duration::from_secs(5)).await;
+
+        // The collector goes away: down, still with no event.
+        drop(accepted);
+        drop(listener);
+        wait_for_syslog_up(Some(0), Duration::from_secs(5)).await;
+
+        // It comes back: the backoff timer reconnects on its own.
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("rebind collector");
+        let _accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .expect("the consumer reconnects without an event")
+            .expect("accept");
+        wait_for_syslog_up(Some(1), Duration::from_secs(5)).await;
+
+        // A process that no longer configures the sink has no series.
+        super::super::install(&LogSinksConfig::default());
+        assert_eq!(syslog_up(), None);
+    }
+
+    #[tokio::test]
+    async fn a_configured_sink_whose_consumer_cannot_start_reads_down() {
+        let _guard = super::super::test_hub_lock().lock().await;
+        let mut config = test_config("host01:6514", SyslogTransport::TcpTls);
+        config.tls_client_key_pem = Some("-----BEGIN PRIVATE KEY-----".to_string());
+        super::super::install(&LogSinksConfig {
+            syslog: Some(config),
+            ..LogSinksConfig::default()
+        });
+        wait_for_syslog_up(Some(0), Duration::from_secs(5)).await;
+        super::super::install(&LogSinksConfig::default());
     }
 
     #[test]

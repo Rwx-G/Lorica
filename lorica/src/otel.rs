@@ -574,13 +574,7 @@ mod imp {
         // exist to publish into. Registering earlier is what left a
         // queue with no reader behind it (backlog #51).
         let kinds = cfg.kinds;
-        let mut rx = lorica_api::log_sinks::register_lane(
-            "otlp",
-            kinds.access,
-            kinds.waf,
-            kinds.audit,
-            kinds.capture,
-        );
+        let mut rx = lorica_api::log_sinks::register_lane("otlp", kinds);
         let spawned = std::thread::Builder::new()
             .name("lorica-otlp-logs-sink".into())
             .spawn(move || {
@@ -654,6 +648,7 @@ mod imp {
             SinkPayload::Waf(waf) => (Severity::Warn, "WARN", waf.timestamp.as_str()),
             SinkPayload::Audit(audit) => (Severity::Info, "INFO", audit.timestamp.as_str()),
             SinkPayload::Capture(capture) => (Severity::Info, "INFO", capture.timestamp.as_str()),
+            SinkPayload::Stream(row) => (Severity::Info, "INFO", row.timestamp.as_str()),
         };
         let mut record = logger.create_log_record();
         record.set_severity_number(severity);

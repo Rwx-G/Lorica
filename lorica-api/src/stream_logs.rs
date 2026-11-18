@@ -1136,11 +1136,21 @@ mod tests {
 
     use super::test_support::*;
     use super::*;
+    use crate::log_sinks::{body_json, SinkEvent, SinkPayload};
 
     fn store() -> (LogStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = LogStore::open(dir.path()).expect("open log store");
         (store, dir)
+    }
+
+    fn sink_body(entry: &StreamLogEntry) -> serde_json::Value {
+        let event = SinkEvent {
+            payload: Arc::new(SinkPayload::Stream(Box::new(entry.clone()))),
+            trace_id: None,
+            span_id: None,
+        };
+        serde_json::from_str(&body_json(&event)).expect("the body is JSON")
     }
 
     fn all_rows(store: &LogStore) -> Vec<StreamLogEntry> {
@@ -1154,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn every_end_reason_word_round_trips_the_store() {
+    fn every_end_reason_word_round_trips_the_store_and_the_sink_body() {
         let (store, _dir) = store();
         let written: Vec<StreamLogEntry> = StreamEndKind::VARIANTS
             .iter()
@@ -1165,6 +1175,10 @@ mod tests {
         assert_eq!(read.len(), StreamEndKind::VARIANTS.len());
         for (kind, row) in StreamEndKind::VARIANTS.iter().zip(&read) {
             assert_eq!(row.end_reason, kind.as_str());
+            let body = sink_body(row);
+            assert_eq!(body["end_reason"], kind.as_str());
+            assert_eq!(body["kind"], crate::log_sinks::SinkKind::Stream.as_str());
+            assert_eq!(body["v"], crate::log_sinks::SINK_BODY_VERSION);
             let filtered = store
                 .query_stream_logs(&StreamLogFilter {
                     end_reason: Some(kind.as_str().to_string()),
@@ -1176,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn every_refusal_word_round_trips_the_store() {
+    fn every_refusal_word_round_trips_the_store_and_the_sink_body() {
         let (store, _dir) = store();
         let written: Vec<StreamLogEntry> = StreamRefusal::VARIANTS
             .iter()
@@ -1189,6 +1203,7 @@ mod tests {
             assert_eq!(row.refusal_reason, refusal_word(r));
             assert_eq!(row.end_reason, StreamEndKind::Refused.as_str());
             assert_eq!(row.entry, StreamLogEntryKind::Ended.as_str());
+            assert_eq!(sink_body(row)["refusal_reason"], refusal_word(r));
         }
     }
 

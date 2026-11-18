@@ -626,6 +626,8 @@ fn node_dir_writer() -> &'static CaptureDirWriter {
 
 #[cfg(test)]
 mod tests {
+    use lorica_api::log_sinks::SinkKindToggles;
+
     use super::*;
     use crate::capture::{BodyEncoding, CapturedRequest, CapturedResponse, CAPTURE_RECORD_KIND};
     use crate::otel::log_sink_hub_test_lock as hub_lock;
@@ -733,7 +735,13 @@ mod tests {
         log_sinks::install(&log_sinks::LogSinksConfig::default());
         let writer = CaptureDirWriter::spawn(4, CAPTURE_DIR_QUEUE_MAX_BYTES);
 
-        let mut off = log_sinks::register_lane("otlp", true, true, true, false);
+        let mut off = log_sinks::register_lane(
+            "otlp",
+            SinkKindToggles {
+                capture: false,
+                ..SinkKindToggles::ALL
+            },
+        );
         emit_one(
             emission("cap-lane-off", None),
             None,
@@ -751,7 +759,7 @@ mod tests {
             "not wanting a kind is not a drop"
         );
 
-        let mut on = log_sinks::register_lane("otlp", false, false, false, true);
+        let mut on = log_sinks::register_lane("otlp", SinkKindToggles::only(SinkKind::Capture));
         emit_one(
             emission("cap-lane-on", None),
             Some("4bf9"),
@@ -779,7 +787,7 @@ mod tests {
         let _guard = hub_lock().blocking_lock();
         log_sinks::install(&log_sinks::LogSinksConfig::default());
         let writer = CaptureDirWriter::spawn(4, CAPTURE_DIR_QUEUE_MAX_BYTES);
-        let rx = log_sinks::register_lane("otlp", false, false, false, true);
+        let rx = log_sinks::register_lane("otlp", SinkKindToggles::only(SinkKind::Capture));
         drop(rx);
         emit_one(
             emission("cap-lane-gone", None),
@@ -1233,7 +1241,7 @@ mod tests {
         );
         let handle = lorica_api::log_writer::spawn_log_writer(Arc::clone(&store));
         let writer = CaptureDirWriter::spawn(4, CAPTURE_DIR_QUEUE_MAX_BYTES);
-        let mut lane = log_sinks::register_lane("otlp", true, true, true, true);
+        let mut lane = log_sinks::register_lane("otlp", SinkKindToggles::ALL);
 
         emit_one(
             emission("cap-sqlite", None),

@@ -19,8 +19,9 @@
 //! hot path (the consumer thread has no ambient span context), and
 //! carried on the [`SinkEvent`] envelope.
 //!
-//! Process topology: access logs and WAF events are produced in the
-//! proxy process (worker or single-process), audit entries in the
+//! Process topology: access logs, WAF events and stream rows are
+//! produced in the proxy process (worker or single-process), audit
+//! entries in the
 //! management process (supervisor or single-process). The hub is
 //! installed per process by the reload path
 //! (`lorica::reload::apply_per_process_reload_state`), so each
@@ -29,11 +30,11 @@
 //! # Per-kind toggles (backlog #50)
 //!
 //! Every lane carries one flag per [`SinkKind`], and every flag is a
-//! `GlobalSettings` field of its own: `syslog_{access,waf,audit,
-//! capture}_enabled` for the syslog lane, `otlp_logs_{access,waf,
-//! audit,capture}_enabled` for the OTLP lane. The four kinds are
-//! symmetric on both sinks; [`SinkKind::Capture`] (Story 10.2 AC #3)
-//! rides the same filter as the three original kinds. The toggles are
+//! `GlobalSettings` field of its own: `syslog_<kind>_enabled` for the
+//! syslog lane, `otlp_logs_<kind>_enabled` for the OTLP lane. The kinds
+//! are symmetric on both sinks; [`SinkKind::Capture`] (Story 10.2 AC #3)
+//! and [`SinkKind::Stream`] (Story 12.9 D-d) ride the same filter as the
+//! three original kinds. The toggles are
 //! node-local (a sink is where THIS node ships its logs), which is the
 //! decision `lorica_config::canonical` forces per field.
 
@@ -46,6 +47,7 @@ use lorica_config::models::GlobalSettings;
 use serde::Serialize;
 
 use crate::logs::LogEntry;
+use crate::stream_logs::StreamLogEntry;
 
 /// Bounded per-sink queue capacity. Same order of magnitude as
 /// `log_writer::QUEUE_CAP`: at ~500 bytes per encoded event the
@@ -64,17 +66,21 @@ pub enum SinkKind {
     Audit,
     /// Traffic capture record (Story 10.2).
     Capture,
+    /// Stream access-log row (Story 12.9 D-d).
+    Stream,
 }
 
 impl SinkKind {
-    /// Stable label value (`access` / `waf` / `audit` / `capture`)
-    /// used in metrics and as the syslog MSGID.
+    /// Stable label value used in metrics, as the syslog MSGID, as the
+    /// `kind` key of the exported body and as the OTLP `lorica.kind`
+    /// attribute.
     pub fn as_str(self) -> &'static str {
         match self {
             SinkKind::Access => "access",
             SinkKind::Waf => "waf",
             SinkKind::Audit => "audit",
             SinkKind::Capture => "capture",
+            SinkKind::Stream => "stream",
         }
     }
 }
@@ -93,6 +99,47 @@ pub struct SinkKindToggles {
     pub audit: bool,
     /// Ship traffic capture records.
     pub capture: bool,
+    /// Ship stream access-log rows.
+    pub stream: bool,
+}
+
+impl SinkKindToggles {
+    /// Every kind on.
+    pub const ALL: SinkKindToggles = SinkKindToggles {
+        access: true,
+        waf: true,
+        audit: true,
+        capture: true,
+        stream: true,
+    };
+
+    /// `kind` on and every other kind off.
+    pub fn only(kind: SinkKind) -> Self {
+        let mut toggles = Self::default();
+        *toggles.flag_mut(kind) = true;
+        toggles
+    }
+
+    /// Whether `kind` is on.
+    pub fn wants(&self, kind: SinkKind) -> bool {
+        match kind {
+            SinkKind::Access => self.access,
+            SinkKind::Waf => self.waf,
+            SinkKind::Audit => self.audit,
+            SinkKind::Capture => self.capture,
+            SinkKind::Stream => self.stream,
+        }
+    }
+
+    fn flag_mut(&mut self, kind: SinkKind) -> &mut bool {
+        match kind {
+            SinkKind::Access => &mut self.access,
+            SinkKind::Waf => &mut self.waf,
+            SinkKind::Audit => &mut self.audit,
+            SinkKind::Capture => &mut self.capture,
+            SinkKind::Stream => &mut self.stream,
+        }
+    }
 }
 
 /// A capture record as exported to sinks: the record's JSON document
@@ -162,6 +209,10 @@ pub enum SinkPayload {
     Audit(AuditSinkRecord),
     /// Traffic capture record.
     Capture(CaptureSinkRecord),
+    /// Stream access-log row (Story 12.9 D-d), flattened like every
+    /// other kind. Boxed: the row is the largest payload by far, and
+    /// every event's allocation is the size of the largest variant.
+    Stream(Box<StreamLogEntry>),
 }
 
 /// Envelope delivered to sink consumers: the payload plus the trace
@@ -196,6 +247,7 @@ impl SinkEvent {
             SinkPayload::Waf(_) => SinkKind::Waf,
             SinkPayload::Audit(_) => SinkKind::Audit,
             SinkPayload::Capture(_) => SinkKind::Capture,
+            SinkPayload::Stream(_) => SinkKind::Stream,
         }
     }
 }
@@ -272,6 +324,9 @@ pub struct SyslogSinkConfig {
     pub audit_enabled: bool,
     /// Ship capture records.
     pub capture_enabled: bool,
+    /// Ship stream access-log rows, at the access-log severity (Story
+    /// 12.9 D-d: a stream row is an access row).
+    pub stream_enabled: bool,
     /// PEM CA bundle for `tcp-tls`; `None` = platform trust store.
     pub tls_ca_pem: Option<String>,
     /// PEM client certificate chain for collector mTLS.
@@ -295,6 +350,7 @@ impl std::fmt::Debug for SyslogSinkConfig {
             .field("waf_enabled", &self.waf_enabled)
             .field("audit_enabled", &self.audit_enabled)
             .field("capture_enabled", &self.capture_enabled)
+            .field("stream_enabled", &self.stream_enabled)
             .field("tls_ca_pem", &self.tls_ca_pem.as_ref().map(|_| "<pem>"))
             .field(
                 "tls_client_cert_pem",
@@ -360,6 +416,7 @@ impl LogSinksConfig {
                     waf_enabled: settings.syslog_waf_enabled,
                     audit_enabled: settings.syslog_audit_enabled,
                     capture_enabled: settings.syslog_capture_enabled,
+                    stream_enabled: settings.syslog_stream_enabled,
                     tls_ca_pem: settings.syslog_tls_ca_pem.clone(),
                     tls_client_cert_pem: settings.syslog_tls_client_cert_pem.clone(),
                     tls_client_key_pem: settings.syslog_tls_client_key_pem.clone(),
@@ -380,6 +437,7 @@ impl LogSinksConfig {
                 waf: settings.otlp_logs_waf_enabled,
                 audit: settings.otlp_logs_audit_enabled,
                 capture: settings.otlp_logs_capture_enabled,
+                stream: settings.otlp_logs_stream_enabled,
             },
             node_id: String::new(),
             node_name: String::new(),
@@ -441,21 +499,13 @@ enum LaneOutcome {
 struct SinkLane {
     id: u64,
     tx: tokio::sync::mpsc::Sender<SinkEvent>,
-    access: bool,
-    waf: bool,
-    audit: bool,
-    capture: bool,
+    kinds: SinkKindToggles,
     label: &'static str,
 }
 
 impl SinkLane {
     fn wants(&self, kind: SinkKind) -> bool {
-        match kind {
-            SinkKind::Access => self.access,
-            SinkKind::Waf => self.waf,
-            SinkKind::Audit => self.audit,
-            SinkKind::Capture => self.capture,
-        }
+        self.kinds.wants(kind)
     }
 
     fn offer(&self, event: &SinkEvent) -> LaneOutcome {
@@ -535,6 +585,28 @@ fn syslog_thread_slot() -> &'static parking_lot::Mutex<Option<std::thread::JoinH
     SLOT.get_or_init(|| parking_lot::Mutex::new(None))
 }
 
+/// The id of the syslog lane whose consumer may publish
+/// `lorica_log_sink_up{sink="syslog"}`, 0 for none. A consumer of a
+/// replaced lane drains and exits on its own time; checking its id under
+/// this lock keeps its last connect or disconnect from overwriting the
+/// state of the lane that replaced it.
+fn syslog_reporter() -> &'static parking_lot::Mutex<u64> {
+    static REPORTER: OnceLock<parking_lot::Mutex<u64>> = OnceLock::new();
+    REPORTER.get_or_init(|| parking_lot::Mutex::new(0))
+}
+
+/// Publish the syslog sink's state for this process, if lane `id` is
+/// still the installed one (Story 12.9 D-f).
+pub(super) fn report_syslog_up(id: u64, up: bool) {
+    let current = syslog_reporter().lock();
+    if *current == id {
+        crate::metrics::set_log_sink_up(SYSLOG_LABEL, up);
+    }
+}
+
+/// The `sink` label of the syslog lane.
+const SYSLOG_LABEL: &str = "syslog";
+
 /// Install (or replace) this process's sink hub from a configuration
 /// snapshot.
 ///
@@ -552,9 +624,15 @@ pub fn install(config: &LogSinksConfig) {
     use std::sync::atomic::Ordering;
 
     let mut state = HubState::default();
+    let mut reporter = syslog_reporter().lock();
     if let Some(syslog_cfg) = &config.syslog {
         let (tx, rx) = tokio::sync::mpsc::channel::<SinkEvent>(SINK_QUEUE_CAP);
         let id = LANE_ID.fetch_add(1, Ordering::Relaxed) + 1;
+        // Down until the new consumer has connected: a configured sink
+        // always has a value, and a consumer that never starts leaves
+        // it at 0 rather than reading as "not configured".
+        *reporter = id;
+        crate::metrics::set_log_sink_up(SYSLOG_LABEL, false);
         if let Some(handle) = syslog::spawn_syslog_sink(
             id,
             rx,
@@ -565,15 +643,24 @@ pub fn install(config: &LogSinksConfig) {
             state.lanes.push(SinkLane {
                 id,
                 tx,
-                access: syslog_cfg.access_enabled,
-                waf: syslog_cfg.waf_enabled,
-                audit: syslog_cfg.audit_enabled,
-                capture: syslog_cfg.capture_enabled,
-                label: "syslog",
+                kinds: SinkKindToggles {
+                    access: syslog_cfg.access_enabled,
+                    waf: syslog_cfg.waf_enabled,
+                    audit: syslog_cfg.audit_enabled,
+                    capture: syslog_cfg.capture_enabled,
+                    stream: syslog_cfg.stream_enabled,
+                },
+                label: SYSLOG_LABEL,
             });
             *syslog_thread_slot().lock() = Some(handle);
+        } else {
+            *reporter = 0;
         }
+    } else {
+        *reporter = 0;
+        crate::metrics::clear_log_sink_up(SYSLOG_LABEL);
     }
+    drop(reporter);
     *hub_slot().write() = Arc::new(state);
 }
 
@@ -593,10 +680,7 @@ pub fn install(config: &LogSinksConfig) {
 /// survives a consumer that dies as well as one that never started.
 pub fn register_lane(
     label: &'static str,
-    access: bool,
-    waf: bool,
-    audit: bool,
-    capture: bool,
+    kinds: SinkKindToggles,
 ) -> tokio::sync::mpsc::Receiver<SinkEvent> {
     use std::sync::atomic::Ordering;
 
@@ -609,10 +693,7 @@ pub fn register_lane(
     next.lanes.push(SinkLane {
         id,
         tx,
-        access,
-        waf,
-        audit,
-        capture,
+        kinds,
         label,
     });
     *guard = Arc::new(next);
@@ -744,6 +825,20 @@ pub fn publish_capture(
     })
 }
 
+/// Publish a stream access-log row (Story 12.9 D-d). A stream has no
+/// request span, so no trace context. Same non-blocking contract as
+/// [`publish_access`]; the row is cloned only when a lane wants it.
+pub fn publish_stream(entry: &StreamLogEntry) {
+    let Some(state) = state_if_wants(SinkKind::Stream) else {
+        return;
+    };
+    state.offer_all(&SinkEvent {
+        payload: Arc::new(SinkPayload::Stream(Box::new(entry.clone()))),
+        trace_id: None,
+        span_id: None,
+    });
+}
+
 /// Serialises tests that install the process-global hub (this module
 /// and `syslog::tests`), so parallel test threads cannot replace each
 /// other's hub between install and publish.
@@ -868,6 +963,7 @@ mod tests {
             waf_enabled: true,
             audit_enabled: true,
             capture_enabled: true,
+            stream_enabled: true,
             tls_ca_pem: None,
             tls_client_cert_pem: None,
             tls_client_key_pem: Some("-----BEGIN PRIVATE KEY-----\ntopsecret".into()),
@@ -909,7 +1005,7 @@ mod tests {
     async fn a_registered_lane_receives_published_events() {
         let _guard = test_hub_lock().lock().await;
         install(&LogSinksConfig::default());
-        let mut rx = register_lane("otlp", true, true, true, true);
+        let mut rx = register_lane("otlp", SinkKindToggles::ALL);
         publish_audit(AuditSinkRecord {
             timestamp: "2026-06-10T00:00:00Z".into(),
             operator_username: "admin".into(),
@@ -950,7 +1046,7 @@ mod tests {
         // leave the hub counting every event as a drop forever.
         let _guard = test_hub_lock().lock().await;
         install(&LogSinksConfig::default());
-        let rx = register_lane("otlp", true, true, true, true);
+        let rx = register_lane("otlp", SinkKindToggles::ALL);
         assert!(wants(SinkKind::Audit));
         drop(rx);
         publish_audit(AuditSinkRecord {
@@ -1013,12 +1109,7 @@ mod tests {
         s.otlp_endpoint = Some("http://collector:4318".into());
         assert_eq!(
             LogSinksConfig::from_settings(&s, true).otlp_kinds,
-            SinkKindToggles {
-                access: true,
-                waf: true,
-                audit: true,
-                capture: true,
-            },
+            SinkKindToggles::ALL,
             "every kind ships by default"
         );
         s.otlp_logs_audit_enabled = false;
@@ -1026,10 +1117,9 @@ mod tests {
         assert_eq!(
             LogSinksConfig::from_settings(&s, true).otlp_kinds,
             SinkKindToggles {
-                access: true,
-                waf: true,
                 audit: false,
                 capture: false,
+                ..SinkKindToggles::ALL
             }
         );
     }
@@ -1047,7 +1137,7 @@ mod tests {
         s.otlp_endpoint = Some("http://collector:4318".into());
         s.otlp_logs_audit_enabled = false;
         let kinds = LogSinksConfig::from_settings(&s, true).otlp_kinds;
-        let mut rx = register_lane("otlp", kinds.access, kinds.waf, kinds.audit, kinds.capture);
+        let mut rx = register_lane("otlp", kinds);
 
         assert!(!wants(SinkKind::Audit));
         publish_audit(AuditSinkRecord {
@@ -1095,6 +1185,63 @@ mod tests {
     }
 
     #[test]
+    fn the_stream_toggles_follow_their_settings_on_both_sinks() {
+        let mut s = base_settings();
+        s.syslog_endpoint = Some("host01:514".into());
+        let defaults = LogSinksConfig::from_settings(&s, true);
+        assert!(defaults.syslog.expect("syslog").stream_enabled);
+        assert!(defaults.otlp_kinds.stream);
+        s.syslog_stream_enabled = false;
+        s.otlp_logs_stream_enabled = false;
+        let off = LogSinksConfig::from_settings(&s, true);
+        assert!(!off.syslog.expect("syslog").stream_enabled);
+        assert!(!off.otlp_kinds.stream);
+        assert!(
+            off.otlp_kinds.access,
+            "the other kinds keep their own toggle"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_row_reaches_a_lane_with_the_flag_on_and_not_one_with_it_off() {
+        use lorica_config::models::StreamEndReason;
+
+        let _guard = test_hub_lock().lock().await;
+        install(&LogSinksConfig::default());
+        let row = StreamLogEntry::from_connection(
+            &crate::stream_logs::test_support::tcp_connection(StreamEndReason::IdleTimeout),
+        );
+
+        let mut off = register_lane(
+            "otlp",
+            SinkKindToggles {
+                stream: false,
+                ..SinkKindToggles::ALL
+            },
+        );
+        assert!(!wants(SinkKind::Stream));
+        publish_stream(&row);
+        assert!(
+            matches!(
+                off.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "a lane with the stream flag off receives nothing"
+        );
+
+        let mut on = register_lane("otlp", SinkKindToggles::only(SinkKind::Stream));
+        publish_stream(&row);
+        let event = on.recv().await.expect("the row is delivered");
+        assert_eq!(event.kind(), SinkKind::Stream);
+        assert!(event.trace_id.is_none(), "a stream has no request span");
+        match &*event.payload {
+            SinkPayload::Stream(delivered) => assert_eq!(**delivered, row),
+            other => panic!("expected a stream payload, got {other:?}"),
+        }
+        install(&LogSinksConfig::default());
+    }
+
+    #[test]
     fn body_json_flattens_a_capture_document_and_stamps_its_kind() {
         let event = SinkEvent {
             payload: Arc::new(SinkPayload::Capture(capture_record("cap-1"))),
@@ -1117,7 +1264,13 @@ mod tests {
         let _guard = test_hub_lock().lock().await;
         install(&LogSinksConfig::default());
 
-        let mut off = register_lane("otlp", true, true, true, false);
+        let mut off = register_lane(
+            "otlp",
+            SinkKindToggles {
+                capture: false,
+                ..SinkKindToggles::ALL
+            },
+        );
         assert!(!wants(SinkKind::Capture));
         assert_eq!(publish_capture(capture_record("cap-1"), None, None), 0);
         assert!(
@@ -1128,7 +1281,7 @@ mod tests {
             "a lane with the capture flag off receives nothing"
         );
 
-        let mut on = register_lane("otlp", true, true, true, true);
+        let mut on = register_lane("otlp", SinkKindToggles::ALL);
         assert!(wants(SinkKind::Capture));
         assert_eq!(
             publish_capture(capture_record("cap-1"), Some("4bf9"), Some("00f0")),
@@ -1149,7 +1302,7 @@ mod tests {
         let _guard = test_hub_lock().lock().await;
         install(&LogSinksConfig::default());
         // The receiver is held and never drained, so the lane fills.
-        let _rx = register_lane("otlp", false, false, false, true);
+        let _rx = register_lane("otlp", SinkKindToggles::only(SinkKind::Capture));
         for _ in 0..SINK_QUEUE_CAP {
             assert_eq!(publish_capture(capture_record("cap-full"), None, None), 0);
         }
