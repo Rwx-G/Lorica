@@ -6,7 +6,14 @@ sockets to a freshly exec'd new supervisor over a Unix-socket
 `SCM_RIGHTS` transfer; both sets of workers accept from the same kernel
 sockets during the overlap, so there is always an acceptor and no
 connection is lost. The old supervisor then drains its in-flight
-connections and exits 0.
+connections for `worker_drain_timeout_s` at most and exits 0.
+
+Since 1.11.0 the same handoff carries the stream listeners (TCP and
+UDP, see [docs/streams.md](streams.md)): their ports never close during
+an upgrade, and every established stream connection the old generation
+still holds is drained, then closed with the end reason
+`drained_by_upgrade`. No established connection moves to the new
+binary in 1.11.0; live transfer is Phase 2 of Epic 12 (v1.12.0).
 
 This is opt-in: until you configure a signing public key, the upgrade
 endpoint rejects every upload.
@@ -27,11 +34,20 @@ but no live swap happens: the API response's `handoff` field reports
 2. **Upload it.** Either:
    - Dashboard: Settings -> Binary upgrade panel (SuperAdmin only). Pick
      the binary and its signature, review the verification result and the
-     current-vs-uploaded version, then Start upgrade. A confirmation
-     dialog warns that traffic drains over up to 30s.
+     current-vs-uploaded version, then Start upgrade. The confirmation
+     dialog loads the upgrade preview (below): the drain delay that will
+     apply, the streams holding connections and what the upgrade does to
+     them, and a warning when an earlier generation is still draining.
+     A preview that cannot be read is said in one line and does not
+     block the upgrade.
    - CLI: `lorica upgrade --binary <path> --signature <path>` (the admin
      password comes from `--password-file`, `--password-stdin` or
-     `LORICA_ADMIN_PASSWORD`).
+     `LORICA_ADMIN_PASSWORD`). It prints the preview to stderr before it
+     uploads, without prompting, so scripts are unchanged; a node too old
+     to answer the preview gets a one-line note and the upload anyway.
+     `lorica upgrade --preview` prints the preview and exits without
+     uploading (no `--binary` needed), and fails if the preview cannot be
+     read.
    Both post a `multipart/form-data` body to
    `POST /api/v1/system/upgrade` (the `binary` part is the raw executable,
    the `signature` part is the 128-hex-char detached signature).
@@ -52,10 +68,150 @@ but no live swap happens: the API response's `handoff` field reports
    MAINPID=`) and record `lorica_hot_upgrade_total{outcome="completed"}`.
    Deferring the MainPID handover until the old has acked is what keeps a
    lost datagram from stranding systemd on a killed PID.
-5. **Drain.** Once it has acked the new process, the old supervisor stops
-   its worker monitor, drains in-flight connections on
-   `worker_drain_timeout_s` (default 30s), records the drain histogram,
-   and exits 0. The new process owns the unit from that point.
+   The listening sockets cross on `<data_dir>/upgrade/transfer.sock`. A
+   table that fits the legacy single message (at most 32 descriptors,
+   keys within 2,048 bytes) is sent in it, so a node without streams
+   still hands over to a 1.10.x binary; a larger table, which a node
+   with streams reaches quickly (a TCP stream holds one socket per port,
+   a UDP stream one per port per worker), is sent in acknowledged chunks
+   of at most 32 descriptors (`lorica-fds/2`). A receiver that meets any
+   framing error closes everything it received and fails the pull, and
+   the upgrade rolls back.
+5. **Drain.** Once it has acked the new process, the old supervisor
+   shuts its cluster planes down, stops its worker monitor and **stops
+   serving its management and automation APIs**: the new supervisor
+   holds its own copies of those sockets, so every request from then on
+   reaches the new binary, and the old one ends its open API
+   connections (a response in flight completes, an idle keep-alive
+   closes, a log or load-test WebSocket gets a `1001` close). Its health
+   loop and its periodic background loops (probe scheduler, SLA flush,
+   retention, load-test cron, GeoIP and ASN updaters, blocklist refresh,
+   certificate checks, prunes) stop with them; what its draining
+   workers still call stays up (their command and RPC channels, the
+   log and WAF fan-in, the stream plane, the shared-memory eviction,
+   the alert dispatcher). It then reads `worker_drain_timeout_s` once,
+   tells every worker to drain for that long (next section), waits for
+   them with a 10 s kill margin, collects their drain reports, writes
+   the generation's report for the new supervisor, and exits 0. The new
+   process owns the unit from the ack on.
+
+## What the drain does
+
+`D` is `worker_drain_timeout_s` (global setting, default 30 s, 1 to
+3,600 s; replicated fleet policy), read by the old supervisor at the
+handoff. The drain an operator previewed is the one applied, unless the
+setting changed in between. Each worker ends as soon as it has no HTTP
+request and no stream connection in flight, or at `D`; `D` is a
+deadline, not a length.
+
+- **HTTP.** Each old worker stops accepting; requests in flight
+  complete. A request still open at `D` is cut when the worker exits.
+  HTTP has no end-reason field: the cut requests are counted in the
+  drain report (`http_cut`) and in the new supervisor's summary line.
+- **TCP streams.** The listening socket is one kernel object both
+  generations hold, so a connection belongs for life to the generation
+  that accepted it. An old worker closes its own descriptor of each
+  stream listener (never `shutdown`, which would stop the new
+  generation's accepts too); the port stays open through the new
+  generation. Every connection it still holds, in any phase
+  (forwarding, connecting, reading a PROXY header or a ClientHello), is
+  marked draining with the deadline `D` and closed then with
+  `drained_by_upgrade`. A connection that ends on its own keeps its
+  natural reason, and one already draining for a configuration change
+  keeps `config_removed`. Streams that terminate or originate TLS drain
+  the same way.
+- **UDP streams.** The slot sockets of each UDP stream are handed to
+  the new generation slot by slot, worker `k`'s to worker `k`, so the
+  `SO_REUSEPORT` group keeps its size and no client is moved to another
+  worker. (If the slot count does not match the new worker count, the
+  inherited sockets are closed, a warning names the stream, and a fresh
+  group is bound.) The old workers stop reading; what happens to their
+  sessions depends on the stream:
+  - responses bounded and at least one per request (`relay_in_flight`
+    in the preview): a session keeps its upstream socket only to relay
+    responses already owed. It ends at its request or response bound
+    with that natural reason, otherwise at the earlier of its idle
+    timeout and `D`, with `drained_by_upgrade`;
+  - `udp.unbounded_responses`, or no response expected
+    (`udp.responses_per_request = 0`) (`close` in the preview): every
+    session ends at once with `drained_by_upgrade`, since nothing is
+    owed and a session kept open would serve one client flow from two
+    generations.
+- During the drain each generation counts a stream's caps in its own
+  shared-memory regions, so a stream may briefly hold up to twice its
+  caps on the node.
+
+| Event | End reason of a stream connection it closes |
+|---|---|
+| Hot upgrade, handoff succeeded | `drained_by_upgrade` |
+| Hot upgrade rolled back | none: nothing drains, the old generation never stopped |
+| Stop (`systemctl stop`, `SIGTERM`, single-process shutdown) and `systemctl restart` | `node_shutdown` |
+| Configuration change that removes a stream, a stream's backend or a listen address | `config_removed` |
+| A worker `SIGTERM`ed without the drain message reaching it (degraded path, logged with the worker id) | `node_shutdown` |
+
+Each closed connection writes its stream access-log row with that end
+reason, from the old worker. At the deadline an old worker also logs
+one warning per stream with the count it closed, and one for the HTTP
+requests it cut.
+
+## The upgrade preview
+
+`GET /api/v1/system/upgrade/preview` (management API, SuperAdmin, the
+role of the upload itself; never on the automation plane or the MCP
+server) answers what an upgrade started now would do on **this node**:
+
+- `drain_timeout_s`: the stored `worker_drain_timeout_s`, the delay
+  that will apply;
+- `handoff_available`: `false` in single-process mode, where an upload
+  is only staged;
+- `previous_generation`: `null`, or `{ "pid": ... }` while an earlier
+  generation of this node is still draining (see "Chained upgrades");
+- `streams`: one entry per stream bound on this node, with its
+  `stream_id`, `name`, `protocol`, `established` (open connections on
+  TCP, live sessions on UDP, read after the workers' counters are
+  pulled), `on_upgrade` (`drain`, `relay_in_flight` or `close`, as
+  above) and `drains_on_upgrade` (the stream terminates or originates
+  TLS, so the live transfer of Phase 2 will never move it; in 1.11.0
+  every stream drains whatever this flag says);
+- `as_of`: when the figures were read.
+
+The dashboard's confirmation dialog and `lorica upgrade` show the same
+answer. An upgrade is per node, and so is its preview: on a fleet, ask
+each node you upgrade.
+
+## The drain report
+
+Each old worker sends its supervisor, before it exits, the counts of
+its drain per stream; the old supervisor sums them and writes
+`<data_dir>/upgrade/drain-report.<new_pid>.json` (mode 0600, temp file
+then rename): both pids, `drain_timeout_s`, the drain's length, how it
+ended (`idle`, `deadline`, or `killed` when a worker had to be
+`SIGKILL`ed), the workers that sent no report, `http_cut`, and per
+stream the connections `closed` by the upgrade and those `finished` on
+their own during it. The new supervisor polls for its own report every
+second, records the metrics below from it, logs one summary line and
+deletes the file. It gives up with a warning when its predecessor is no
+longer its parent, or after the longest drain plus the kill margin plus
+60 s. A supervisor at start deletes reports addressed to another
+process once they are older than that bound.
+
+## Chained upgrades and stops
+
+- **A second upgrade while an earlier generation still drains is
+  allowed.** The preview names the draining generation and the
+  dashboard warns, but nothing refuses: a security upgrade must not
+  wait up to an hour. The cost is a third generation holding its
+  connections' descriptors until its own deadline.
+- **A stop ends an earlier generation's drain.** The unit's
+  `KillMode=mixed` sends `SIGTERM` to the main process, the new
+  supervisor, and `SIGKILL`s the rest of the cgroup once it has exited.
+  A generation still draining is in that rest: its remaining
+  connections are cut without an end reason.
+- **A stop on its own** drains for the same `worker_drain_timeout_s`,
+  closing what is left with `node_shutdown`, and extends systemd's stop
+  timeout while it drains ([docs/installation.md](installation.md#unit-directives-that-make-it-work)).
+  The management API stops answering when the stop begins, not when it
+  ends.
 
 **From 1.8.0 to 1.9.0.** The CLI pins the certificate the node records
 at `<data-dir>/management/served-cert.pem`. A node older than 1.9.0
@@ -121,8 +277,20 @@ forked, the upgrade rolls back with zero impact:
   stages a fresh `lorica.new` and the failed image is preserved.
 - The old supervisor resumes its normal control loop and keeps serving.
 
-A drain that overruns its window (stragglers force-killed) records the
-`drain_timeout` outcome but is still a completed upgrade, not a rollback.
+A drain that reaches `worker_drain_timeout_s` with traffic still open
+records the `drain_timeout` outcome but is still a completed upgrade,
+not a rollback.
+
+**Hot-downgrading a node that serves streams.** Uploading an older
+binary is an upgrade like any other, and a 1.10.x binary does not know
+the stream entries of the transfer table. A table too large for the
+legacy single message makes the 1.10.x receiver fail, so the new
+process never signals ready and the downgrade rolls back
+(`exec_failed`), which is the safe failure. A smaller table does reach
+it, but 1.10.x has no stream plane to serve the stream sockets it
+receives (read from the 1.10.x code, not run). Disable the streams
+first, which closes their sockets, or downgrade by package with a
+restart.
 
 After a rollback from 1.9.0 to an older binary, or a package downgrade,
 `<data-dir>/management/served-cert.pem` stays behind, and the older
@@ -135,16 +303,20 @@ node serves, as above. A token minted by 1.9.0 is unreadable by 1.8.0.
 
 **From 1.11.0 back to 1.10.7.** The new supervisor runs the database
 migrations before it forks its workers, so a 1.11.0 process that is
-rolled back has usually already taken `lorica.db` to schema 73, and a
+rolled back has usually already taken `lorica.db` to schema 80, and a
 package downgrade always finds it there. 1.10.7 opens that database
 and serves HTTP as before. Its migration runner applies nothing above
-its own last migration (70), and migrations 71 to 73 are additive by
-construction: two new tables (`streams`, `stream_backends`) and two
-nullable columns (`backends.health_check_json`,
-`cluster_nodes.reserved_ports_json`) that 1.10.7 never names, with no
-`UNIQUE` index, trigger or `NOT NULL` column added to a table it writes.
-A test (`migrations_after_1_10_6_are_additive`) holds every later
-migration to that.
+its own last migration (70), and migrations 71 to 80 are additive by
+construction: new tables (the streams, their backend links and their
+SLA targets and buckets), nullable or defaulted columns on them and on
+`backends` and `cluster_nodes`, and the new stream alert types appended
+to the notification channels saved with an explicit type list, which
+1.10.7 reads as strings and never raises. No `UNIQUE` index, trigger or
+`NOT NULL` column without a default is added to a table 1.10.7 writes,
+and no column it knows changes. A test
+(`migrations_after_1_10_6_are_additive`) holds every later migration to
+that. The access-log database gains a stream log table, created on open
+with no numbered migration, which 1.10.7 does not see.
 
 What the rolled-back node does not do:
 
@@ -186,9 +358,25 @@ and the upgrade order.
 - `lorica_hot_upgrade_total{outcome="exec_failed"}` - the new process did
   not signal ready in time and the upgrade rolled back.
 - `lorica_hot_upgrade_total{outcome="drain_timeout"}` - the handoff
-  succeeded but the connection drain overran and stragglers were killed.
-- `lorica_hot_upgrade_drain_seconds` - histogram of drain duration; alert
-  if it approaches `worker_drain_timeout_s`.
+  succeeded but the drain reached `worker_drain_timeout_s` with traffic
+  still open (or a worker had to be killed). Since 1.11.0 a worker ends
+  its drain as soon as nothing is in flight, so this no longer fires on
+  idle upstream keep-alives alone.
+- `lorica_hot_upgrade_drain_seconds` - histogram of drain duration, with
+  buckets up to 3,600 s; alert if it approaches `worker_drain_timeout_s`.
+- `lorica_hot_upgrade_stream_connections_total{stream_id, outcome}` -
+  per stream, the connections and sessions an upgrade drained:
+  `outcome="drained"` counts those it closed with `drained_by_upgrade`,
+  `outcome="finished"` those that ended on their own during the drain.
+  It counts connections; `lorica_hot_upgrade_total` counts upgrades and
+  is unchanged. The label is the stream id, never its name, and a
+  deleted stream's series are removed.
+
+The drain metrics are recorded by the **new** process, from the old
+generation's drain report, so they appear on the `/metrics` that is
+scraped after the upgrade (before 1.11.0 the old process recorded them
+just before it exited, and they were lost with it). They appear once
+the report has arrived, at the end of the old generation's drain.
 
 After an upgrade, confirm the new PID is live at `GET /api/v1/system`.
 
@@ -196,7 +384,9 @@ After an upgrade, confirm the new PID is live at `GET /api/v1/system`.
 
 The packaged unit is configured for the MainPID handover:
 `Type=notify` + `NotifyAccess=all` + `KillMode=mixed` +
-`TimeoutStopSec=90`. See
+`TimeoutStopSec=90`. An upgrade involves no stop job, so
+`TimeoutStopSec` does not bound its drain: the old supervisor bounds it
+itself, at `worker_drain_timeout_s` plus a 10 s kill margin. See
 [docs/installation.md](installation.md#hot-binary-upgrade) for the per-directive
 rationale. When the new process is accepting it sends
 `sd_notify READY=1\nMAINPID=<newpid>`, and systemd reassigns the unit's
@@ -229,10 +419,15 @@ key, and the container running Lorica in multi-process mode
 (`--workers auto`), exactly as on a bare-metal install. Outside systemd
 there is no `$NOTIFY_SOCKET`, so the MainPID notify is skipped, but the
 new-to-old readiness ack handshake still runs (it is independent of
-systemd), and the zero-downtime drain is unchanged.
+systemd), and the zero-downtime drain is unchanged. A `docker stop`,
+on the other hand, is bounded by Docker, not by the drain: set
+`stop_grace_period` above `worker_drain_timeout_s` (the hardening guide,
+"The drain on a stop", has the figure).
 
 ## See also
 
 - [docs/installation.md](installation.md#hot-binary-upgrade) - unit directives and signing setup
 - [docs/worker-mode.md](worker-mode.md) - supervisor / worker drain behaviour
+- [docs/streams.md](streams.md) - stream listeners, their end reasons and their upgrade policy
+- [docs/security/hardening-guide.md](security/hardening-guide.md) - the drain on a stop, under systemd and Docker
 - [docs/security.md](security.md) - security posture overview

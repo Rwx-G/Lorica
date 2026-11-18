@@ -626,6 +626,132 @@ slow path involves a SQLite read and TLS material parsing. A worker
 that exceeds the budget is treated as failed; the reload is
 aborted rather than left in a half-committed state.
 
+## 7a. The stream plane (v1.11.0)
+
+Epic 12 added two cross-process mechanisms beside the three above, for
+the stream listeners (`lorica-stream`). Neither reuses (A) or (B)
+as they stood, for the reasons given in each part.
+
+### 7a.1 The stream control channel
+
+**Why a third channel.** The command and RPC channels are framed
+`SOCK_STREAM` byte streams read by codecs that ignore ancillary data.
+On a stream socket, `SCM_RIGHTS` attaches to a byte position, and a
+reader that does not expect it drops or misattributes the descriptors.
+Stream sockets are bound at runtime and must reach live workers, so
+each worker gets a third socketpair, `AF_UNIX` / `SOCK_SEQPACKET` /
+`SOCK_CLOEXEC`, created in `spawn_worker` beside `cmd` and `rpc`. Its
+worker end travels in the fork bundle under its own typed tag; the
+supervisor keeps the other end on the worker handle. A seqpacket
+message keeps one payload, its tokens and its descriptors atomic, so the
+typed-tag discipline of the fork bundle carries over unchanged.
+
+**Messages.** A message is a text payload of space-separated tokens
+plus, for the two messages that carry descriptors, one `SCM_RIGHTS`
+descriptor per socket token. The supervisor attaches a binding's
+sockets to a worker, detaches a binding, asks the worker to reload its
+stream table (`refresh`), hands it a stream's caps region (`caps`, one
+memfd, 7a.2), and quiesces it for a stop or an upgrade. The worker
+answers each with an ack and a count, or a nack whose reason is a fixed
+token, never free text; after an upgrade quiesce it also sends its
+drain report. The message type, the tokens and their size bounds are
+`lorica-worker/src/stream_ctl.rs`, shared by worker mode and
+single-process mode, where the same type crosses an in-process channel
+with owned descriptors instead of `SCM_RIGHTS`.
+
+**Flow control.** Stop-and-wait per worker: the supervisor sends the
+next message only after the previous one's answer or its 2 s timeout.
+An attach carries at most 32 descriptors, so a 1,024-port range is
+chunked, and stop-and-wait bounds the descriptors in flight to 32 per
+worker. That matters because descriptors in flight are charged to the
+sending user and refused (`ETOOMANYREFS`) past its `RLIMIT_NOFILE`.
+Messages queue in the socketpair until the worker's stream thread reads
+them, so the supervisor never waits for a worker to be ready before it
+sends; a binding is `bound` once the supervisor holds its sockets, with
+the count of workers serving it from the acks.
+
+**Crash behaviour.**
+
+- **A worker dies.** A respawned worker gets a fresh stream control
+  pair like the other two. Before it counts as serving, the supervisor
+  releases the dead worker's share of every caps region, sends the
+  regions, replays one attach per live binding (a TCP stream's shared
+  listener, a UDP stream's socket for that worker slot) and a refresh.
+  The connections the dead worker held are gone with its process and
+  end without an access-log row: that is a crash, not a drain.
+- **UDP slots across a worker death.** The supervisor keeps every UDP
+  slot socket for the binding's whole life. The kernel picks a socket
+  of a `SO_REUSEPORT` group by a hash of the 4-tuple scaled to the
+  group size, and closing one would move the others: keeping the group
+  size constant is what keeps every other client on its worker. The
+  cost: while a slot's worker is down (its respawn backoff), the clients
+  hashed to it wait in that socket's receive buffer.
+- **A worker `SIGTERM`ed without a quiesce** (the message did not reach
+  it) still stops its accept loops and drains, on the stored drain
+  setting, ending what remains with `node_shutdown`, and the worker
+  logs it.
+- **A hot upgrade** hands the stream listeners and the UDP slot
+  sockets to the new generation in the upgrade transfer table, slot
+  `k` to worker `k` ([hot-upgrade.md](../hot-upgrade.md#what-the-drain-does)).
+
+### 7a.2 The stream-caps region
+
+**Why not the WAF region.** `SharedRegion` (§ 5) is a compile-time
+struct: it cannot be sized per stream at runtime, and per-stream tables
+inside it would let one stream's flood fill another's slots. So a
+second region type, `StreamCapsRegion` (`lorica-shmem/src/stream_caps.rs`),
+holds the per-node caps and rates of one stream, TCP or UDP: one
+anonymous memfd per stream on the node, created by the supervisor (or
+the single-process driver), sized from the stream's cap, its backend
+link count and the worker count, mapped `MAP_SHARED` by every worker.
+Its layout and what each part counts are in the module's doc; it
+carries its own magic and `STREAM_CAPS_LAYOUT_VERSION`, checked by
+every worker when it maps a region, and the WAF region's
+`LAYOUT_VERSION` is untouched by it.
+
+**What is exact and what is not.**
+
+- The stream total (connections or sessions) and the pending total are
+  exact: an admission adds 1 by compare-and-swap only while the total
+  is below the cap, attributed per worker so a dead worker's share can
+  be subtracted.
+- Per-source and per-backend counts live in per-worker shards: a
+  worker writes only its own shard and a check sums the key over every
+  shard. Two workers admitting the same key at the same instant can
+  both pass, so a key holds at most `cap + (W - 1)` on the node, and
+  exactly `cap` with one process.
+- Rates are GCRA arrival times advanced by compare-and-swap against
+  `CLOCK_MONOTONIC`, which is comparable across processes, so a rate is
+  exact across the node's workers with no message.
+
+**Never evicted while held.** A shard cell is freed only by the release
+that brings its count to 0, or by the supervisor releasing a dead
+worker's shards; the eviction pass, run every second, frees only rate
+cells whose buckets are full again and whose source no shard holds. A
+full probe window refuses the new source on that stream only.
+
+**Lifetime.** One region per stream, not per binding, so caps stay
+exact across a rebind's drain. A cap edit that changes the table sizes
+creates a new region generation; live connections keep the region they
+were counted in, the cap check sums the totals of the stream's live
+regions, and a retired region is dropped once its total is 0. Regions
+are never shared across process generations (the upgrade transfer table
+carries no memfd), so a layout version change has no consequence across
+a hot upgrade, and during an upgrade's drain each generation counts in
+its own regions.
+
+### 7a.3 What stays per process
+
+The stream engines' counters (connections, bytes, refusals and the
+rest) are per process, as HTTP's are, and reach the supervisor's
+`/metrics` through the metrics report of § 7 (WPAR-7), aggregated there.
+The one exception is the live session count of a UDP stream, which the
+supervisor reads exactly from each region's total. The refusal-log
+limiter is per process too: each worker writes at most one refusal row
+per stream and reason per 10 s window, so a node writes at most `W`,
+bounded and independent of the attacker's rate; a shared limiter would
+buy a factor of `W` for a cross-process lock.
+
 ## 8. Concurrency invariants
 
 Stated explicitly so reviewers can sanity-check.
@@ -660,11 +786,16 @@ Stated explicitly so reviewers can sanity-check.
 | Worker crashes, supervisor keeps running | Supervisor restarts the worker (existing crash backoff). Worker restarts with empty local caches. Shmem state survives. Authoritative state on supervisor unaffected. |
 | Channel goes silent (UDS broken) but processes alive | RPC requests time out. Worker logs warn + falls back. Supervisor's worker monitor will eventually kill + respawn the worker. |
 | Shmem layout mismatch (binary upgrade with new layout) | Supervisor refuses to mmap a region with a different `magic` / `layout_version`, logs error, exits. systemd restarts; new layout fresh. |
+| Stream-caps region version mismatch (a worker respawned from a newer binary on disk) | The worker answers the `caps` message with a nack; the binding reports fewer workers serving than it has, and the other workers serve on. |
+| Worker dies while holding stream connections | Its connections end with the process, without an access-log row. The supervisor subtracts its share of every caps region before the respawned worker is attached again (§ 7a.1). |
 
 ## 10. Migration story
 
 - Layout changes -> bump `layout_version` in the shmem header,
-  document in `docs/BUMP-CHECKLIST.md`. No online migration.
+  document in `docs/BUMP-CHECKLIST.md`. No online migration. The
+  stream-caps region (§ 7a.2) has its own version,
+  `STREAM_CAPS_LAYOUT_VERSION`, bumped on a change of its own layout
+  and never because the WAF region's moved.
 - Wire format changes -> additive only (new oneof variants on the
   prost schema). Workers built against the old schema gracefully
   ignore unknown variants (prost default behaviour).

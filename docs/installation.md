@@ -249,9 +249,24 @@ the operator guide is [docs/hot-upgrade.md](hot-upgrade.md).
 - `KillMode=mixed` sends `SIGTERM` to the main process only, so the
   supervisor orchestrates the worker drain itself instead of systemd
   killing the whole cgroup at once.
-- `TimeoutStopSec=90` exceeds the worker drain window
-  (`worker_drain_timeout_s`, default 30s) with headroom, so a legitimate
-  drain is never cut short.
+- `TimeoutStopSec=90` bounds a stop that makes no progress, not the
+  drain. A stop drains HTTP requests and stream connections for
+  `worker_drain_timeout_s` (global setting, default 30 s, 1 to
+  3,600 s), ending as soon as nothing is in flight, and while it drains
+  the supervisor sends systemd `EXTEND_TIMEOUT_USEC` every 10 s, each
+  asking for 30 s more. A drain set above 90 s is therefore never cut
+  short, and no drop-in is needed for it; a supervisor that hangs stops
+  renewing and is killed 30 s after its last extension or at
+  `TimeoutStopSec`, whichever is later. This needs systemd 236 or later
+  (Debian 12, Ubuntu 22.04 and 24.04 and RHEL 9 all ship one).
+- A hot upgrade involves no stop job: the old supervisor is no longer
+  the unit's main PID once the new one has taken over, it sends no
+  extension, and it bounds its own drain at `worker_drain_timeout_s`
+  plus a 10 s kill margin ([docs/hot-upgrade.md](hot-upgrade.md#what-the-drain-does)).
+- `LimitNOFILE=65536` sets the descriptors HTTP and streams share; half
+  of them, plus a fixed reserve, are kept from streams. Raise it with a
+  drop-in when streams need more capacity
+  ([hardening guide](security/hardening-guide.md#stream-capacity-descriptors-and-source-ports)).
 - `Restart=on-failure` is kept. A clean hot-upgrade exit is code 0 (the
   new process has already taken over the MainPID), which does not trigger
   a restart; a real crash exits non-zero and still restarts.
@@ -299,6 +314,12 @@ The container image honours the same handoff (see
 stays "rebuild the image and `docker compose up -d`", but an in-place
 `docker exec lorica upgrade --binary ...` swap works when the container
 runs the supervisor.
+
+A container has no systemd notify socket, so nothing extends a stop:
+`docker stop` sends `SIGKILL` 10 s after `SIGTERM` by default, which
+cuts any drain longer than that. Set `stop_grace_period` (Compose) or
+`docker stop --time` above `worker_drain_timeout_s`; the hardening
+guide, "The drain on a stop", has the figure.
 
 ## See also
 

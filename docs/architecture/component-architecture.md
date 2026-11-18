@@ -17,7 +17,8 @@
 > with TLS channel binding and WS-Trust over CES, a leaf crate), and
 > `lorica-fleet` (the v1.11.0 fleet runtime: control-plane and follower
 > runtimes, the cluster telemetry store and the ingest policy, between
-> `lorica-cluster` and its two consumers `lorica-api` and `lorica`).
+> `lorica-cluster` and its two consumers `lorica-api` and `lorica`), and
+> `lorica-stream` (the v1.11.0 stream data plane, described below).
 > See [FORK.md](../../FORK.md) and the README architecture table for the
 > current crate roster, which is authoritative over the count above.
 
@@ -39,7 +40,7 @@
 
 **Dependencies:**
 - **Existing Components:** lorica-core, lorica-proxy, lorica-runtime, lorica-tls, lorica-lb
-- **New Components:** lorica-config, lorica-api, lorica-dashboard, lorica-worker (Phase 2), lorica-command (Phase 2), lorica-cluster (v1.7.0, opt-in), lorica-fleet (v1.11.0: the fleet runtime the cluster plane composes), lorica-mcp (v1.9.0: the tool catalogue `lorica mcp token create` reads; the `lorica-mcp` binary itself is a separate process the MCP client launches), lorica-automation-policy (v1.9.0: the tier table and the settings allowlist the same command prints)
+- **New Components:** lorica-config, lorica-api, lorica-dashboard, lorica-worker (Phase 2), lorica-command (Phase 2), lorica-cluster (v1.7.0, opt-in), lorica-fleet (v1.11.0: the fleet runtime the cluster plane composes), lorica-stream (v1.11.0: the stream data plane the supervisor drives and every worker runs), lorica-mcp (v1.9.0: the tool catalogue `lorica mcp token create` reads; the `lorica-mcp` binary itself is a separate process the MCP client launches), lorica-automation-policy (v1.9.0: the tier table and the settings allowlist the same command prints)
 
 **Technology Stack:** Rust, clap, tracing
 
@@ -126,6 +127,23 @@
 
 **Technology Stack:** Rust, nix (fork, exec, SCM_RIGHTS)
 
+### lorica-stream (v1.11.0)
+
+**Responsibility:** The layer-4 data plane of Epic 12: TCP and UDP listeners an operator opens and closes at runtime, served beside the HTTP listeners rather than inside them, because Pingora's listener set is fixed before the server runs.
+**Integration Points:** The supervisor (or the single-process driver, `lorica/src/startup/stream_plane.rs`) reads the streams this node binds from `lorica-config`, binds their sockets itself (so the unit's `CAP_NET_BIND_SERVICE` covers privileged ports), and hands them to each worker over a third, `SOCK_SEQPACKET` socketpair per worker, the stream control channel. Each worker runs a `StreamRuntime` on a thread and tokio runtime of its own, applying what that channel sends. A TCP stream is one listening socket every worker shares; a UDP stream is one socket per worker in a `SO_REUSEPORT` group. Per-node caps and rates live in one shared-memory region per stream (`lorica-shmem`). The engines reach what the binary owns (backend selection, the circuit breaker, DNS resolution, the global connection filter, the IP blocklist and GeoIP) through narrow seams `lorica/src/stream_engine.rs` implements over the instances HTTP already uses, and hand a record per connection or session to an observer that writes the stream access log and the stream SLA.
+
+**Key Interfaces:**
+- Stream control messages (`lorica-worker/src/stream_ctl.rs`): attach a binding's sockets, detach it, refresh the stream table, hand over a caps region, quiesce for a stop or an upgrade; each answered by an ack or a fixed-token nack, and a worker's drain report after an upgrade
+- `StreamHandler` / `DatagramHandler`: the TCP and UDP engines behind the accept and receive loops; the UDP handler is synchronous, so a flood cannot queue work inside the receive loop
+- The admission sequence every connection or session passes before a byte is forwarded, and the connection tracker that drains and closes with a closed set of end reasons (`StreamEndReason`, `lorica-config`)
+- The fd budget, bind states and budget view the management API serves
+
+**Dependencies:**
+- **Existing Components:** lorica-core (the PROXY protocol parser and encoder), lorica-tls (the certificate resolver, the outbound TLS policy)
+- **New Components:** lorica-config (the stream model), lorica-worker (the control messages), lorica-shmem (the caps regions)
+
+**Technology Stack:** Rust, tokio, rustls (through lorica-tls), nix (`SCM_RIGHTS`, socket options)
+
 ### lorica-waf (Phase 2+)
 
 **Responsibility:** Optional WAF engine. Load and evaluate OWASP CRS rules against incoming requests.
@@ -189,6 +207,14 @@ graph TB
         WAF -->|Block| CLIENT
         LB --> POOL[lorica-pool<br>Connection Pool]
         POOL --> BACKEND[Backend Servers]
+    end
+
+    subgraph "Stream Plane (v1.11.0, per stream)"
+        L4CLIENT[TCP / UDP client] --> L4LISTEN[Stream listener<br>bound by the supervisor]
+        L4LISTEN --> ADMIT{admission<br>filters, rates, per-node caps}
+        ADMIT -->|refused| L4CLIENT
+        ADMIT --> ENGINE[lorica-stream<br>TCP / UDP / TLS engines]
+        ENGINE --> L4BACKEND[Stream backends]
     end
 
     subgraph "Management Plane (localhost:9443)"
