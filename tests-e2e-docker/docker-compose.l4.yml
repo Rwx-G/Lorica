@@ -75,6 +75,50 @@ services:
     volumes:
       - l4-shared:/shared:ro
 
+  # The single-process node's probe, as streams-probe is the worker
+  # node's (Story 12.2 Lot H: each profile has a runner in Lorica's
+  # namespaces). Holds the squatter of 12.2 IV2 and signals Lorica for
+  # the stop path.
+  streams-single-probe:
+    <<: *l4-runner
+    profiles: ["streams-single"]
+    network_mode: "service:lorica-streams-single"
+    pid: "service:lorica-streams-single"
+    user: root
+    depends_on:
+      - lorica-streams-single
+    volumes:
+      - l4-shared:/shared:ro
+
+  # Budget nodes (Story 12.2 AC #5, Story 12.12 D-f): worker mode like
+  # lorica-streams, with a fd limit low enough that the stream budget,
+  # not the ephemeral ports, binds. No `l4-node` alias and a /shared of
+  # their own: the scenarios address them by service name and read the
+  # bootstrap password from the node itself.
+  lorica-budget-4k:
+    <<: *lorica-node
+    profiles: ["streams"]
+    entrypoint: ["/entrypoint-streams.sh"]
+    ulimits:
+      nofile: 4096
+    volumes:
+      - budget-4k-shared:/shared
+      - budget-4k-data:/var/lib/lorica
+    networks:
+      - l4
+
+  lorica-budget-8k:
+    <<: *lorica-node
+    profiles: ["streams"]
+    entrypoint: ["/entrypoint-streams.sh"]
+    ulimits:
+      nofile: 8192
+    volumes:
+      - budget-8k-shared:/shared
+      - budget-8k-data:/var/lib/lorica
+    networks:
+      - l4
+
   # Has its own addresses: every source-address scenario needs a client
   # that is not the node's loopback.
   streams-client:
@@ -104,6 +148,10 @@ volumes:
   l4-shared:
   streams-data:
   streams-single-data:
+  budget-4k-shared:
+  budget-4k-data:
+  budget-8k-shared:
+  budget-8k-data:
 
 networks:
   l4:

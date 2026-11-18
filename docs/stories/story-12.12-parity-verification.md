@@ -686,8 +686,8 @@ the squatter only), `docs/stories/story-12.2-stream-listeners.md`
 (Lot H checkboxes only).
 Depends on: A; 12.2 Lots D, E3 and G.
 
-- [ ] Every item of 12.2 Lot H as the scenarios of D-d.
-- [ ] `12.12-fd-reserve-http-unaffected` per D-f.
+- [x] Every item of 12.2 Lot H as the scenarios of D-d.
+- [x] `12.12-fd-reserve-http-unaffected` per D-f.
 
 ### Lot C: Story 12.3 scenarios and the TCP matrix rows - Docker e2e
 
@@ -1037,6 +1037,15 @@ pulled images.
   executable path, not their name, and found the supervisor alone. The
   self-test now counts `ps -o comm`. Kept as the first proof that a
   `FAIL` reaches the report.
+- Paused 2026-11-19 (machine shutdown). Lot B committed and passing.
+  Lot C written but never run, left uncommitted in the worktree
+  (`l4/scenarios/12.3.sh`, `test-runner/l4/tcp_backend.py`,
+  `l4/coredns/Corefile`, the Lot C services in
+  `docker-compose.l4.yml`); its registry rows are still `pending`. Next:
+  mark the Lot C rows `live`, then from `tests-e2e-docker/`
+  `./run.sh --only-l4 --build` (runner image rebuild; the Lorica image
+  is cached), starting with `12.3-iv1-pg-balance-and-failover`. Lot D
+  not started.
 
 ### Completion Notes
 
@@ -1123,6 +1132,81 @@ pulled images.
 
 - **Lot A gains a task, 2026-11-18:** `stop_grace_period` on the two Lorica services of `docker-compose.l4.yml`, above the drain under test. Story 12.2 D-f says the e2e compose sets it and no compose file does; 12.2 carries a dated note pointing here. The file is already on Lot A's allowlist.
 
+- **Lot B, 2026-11-19.** Story 12.2's scenarios and the fd reserve.
+  - **Verdicts** (`./run.sh --only-l4`, both profiles, 199 s for the
+    phase with the report): `12.2-iv1-bind-and-release-within-5s` PASS
+    in both profiles (listening about 50 ms after the create, released
+    about 50 ms after the delete, both timed in the probe from the API
+    call to `ss`; HTTP loop of about 90 requests, zero failures; same
+    supervisor pid); `12.2-iv2-port-in-use-fails-cleanly` PASS in both
+    (`address_in_use` with `Address already in use (os error 98)`, one
+    `stream.bind_failed` audit row, HTTP 200, bound 2.4 to 4.4 s after
+    the squatter left); `12.2-ac3-privileged-port-853` PARTIAL with its
+    D-d note (bound as uid 999 with `CapAmb` 0x400; an unprivileged
+    process in the same namespace is refused 853, so the sysctl is not
+    what passes it); `12.2-ac1-udp-group-survives-worker-respawn` PASS;
+    `12.2-ac1-dual-stack-conflict` PASS (409 `stream_port_conflict`,
+    echoes over IPv4 and IPv6); `12.2-ac7-stop-drains-then-exits` PASS
+    in both (idle stop 0.014 to 0.21 s; a request answering after 8 s
+    completes, the process exits 0.07 to 0.27 s after it, about 6 s
+    after SIGTERM); `12.2-ac5-budget-refuses-range` PASS;
+    `12.12-fd-reserve-http-unaffected` PASS (fd limit 8192, `R` 4096,
+    `C` 3071: 3071 of 3378 sessions held for 12 rounds, 307 refused,
+    every refusal counted as `session_cap`; HTTP loop of about 2,500
+    requests with zero failures; 4,032 keep-alive connections answered
+    twice; no EMFILE or accept error in the log).
+  - **No product defect found.** Three first-run failures were the
+    scenarios': (1) the UDP default `responses_per_request` of 1 ends a
+    session on its answer (`response_bound_reached`, docs/streams.md
+    "How a session ends"), so an echo client never held more than a few
+    sessions and the ceiling was never reached. The fd-reserve and
+    respawn streams set `unbounded_responses` (D-j already says so for
+    the perf UDP hold; D-f did not). (2) 4,032 keep-alive connections
+    opened one request at a time took longer than the 75 s
+    `downstream_idle_timeout_s`, so the first ones were closed before
+    their second request: `http_loop.py hold` now runs its requests 32 at
+    a time, which keeps one upstream connection per window rather than
+    one per held connection. (3) The idle stop measured 25 s once: the
+    respawn scenario's deleted stream still held a session draining with
+    `config_removed`, and a stop keeps the earlier deadline (12.2 D-g),
+    as designed. The stop scenario now waits until the node holds no
+    stream connection or session before its idle stop.
+  - **Deviations.** (1) `12.2-ac5-budget-refuses-range`: 12.2 Lot H
+    reads "a 1,024-port UDP range refused with the supervisor constraint
+    named", written before 12.5 gave a UDP session one fd. At fd limit
+    4096 (`S` = 1024), 1,024 ports plus at least one session is 1,025
+    fds in one worker, and the worker constraint is checked first, so
+    that range is refused `worker_fds`. The scenario asserts that, then a
+    600-port range (fits one worker, 1,201 supervisor fds) refused
+    `supervisor_fds`, then a 100-port range accepted. (2) A
+    `streams-single-probe` service: 12.2 Lot H asks for a runner in each
+    profile's namespaces, and IV2 and the stop path need one in
+    single-process mode. (3) The probe cannot tell which worker owns a
+    socket: it is root without `CAP_SYS_PTRACE`, and the workers, started
+    with an ambient capability, are not dumpable. The respawn scenario
+    kills workers one at a time, waiting for each respawn, until the
+    client's session socket is gone (one kill or two), so the killed set
+    always includes the worker that served the client. (4) The stop
+    path's exit time is Docker's `FinishedAt` against the SIGTERM time
+    the probe prints, both the VM's clock: the probe cannot time the exit
+    itself, since it shares the node's pid namespace and dies with it.
+  - **Helpers for later Lots** live in `l4/scenarios/12.2.sh` (`l4s_*`):
+    a client-side prelude with `api` and `api_try` that wait out a 429
+    of the management API's rate limits (stream writes 100 per minute,
+    backends 60, settings 30), `l4s_node_api_script` (lib.sh's API
+    script aimed at another node), `l4s_wait_bind`,
+    `l4s_create_stream`/`backend` (they return the refusal instead of
+    calling `fail`: a verdict printed inside a command substitution
+    would land in the variable and the report would see no line),
+    `l4s_http_ready` (the `l4-http.test` route to `http_loop.py serve`),
+    the loop, the echo backends, `l4s_cleanup_streams <prefix>`. A
+    deleted UDP stream with live sessions keeps its port for the drain:
+    give every scenario its own ports.
+  - **The fd-reserve test client**: one address, 3,378 UDP sockets and
+    4,032 TCP connections, within Docker's default `nofile`; the budget
+    nodes are `lorica-budget-4k` and `lorica-budget-8k`, worker mode,
+    their own `/shared`, no `l4-node` alias.
+
 ## File List
 
 Lot A:
@@ -1148,6 +1232,17 @@ Lot A:
   `story-12.9-stream-observability.md`, `story-12.10-stream-surfaces.md`,
   `story-12.11-upgrade-drain.md` (the "Delivered by" line)
 
+Lot B:
+
+- `tests-e2e-docker/l4/scenarios/12.2.sh` (new)
+- `tests-e2e-docker/l4/scenarios/12.12.sh` (the fd-reserve scenario)
+- `tests-e2e-docker/l4/scenarios.tsv` (Lot B rows `live`)
+- `tests-e2e-docker/test-runner/l4/udp_hold.py` (new)
+- `tests-e2e-docker/test-runner/l4/http_loop.py` (new)
+- `tests-e2e-docker/docker-compose.l4.yml` (`lorica-budget-4k`,
+  `lorica-budget-8k`, `streams-single-probe`)
+- `docs/stories/story-12.2-stream-listeners.md` (Lot H checkboxes)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1156,3 +1251,4 @@ Lot A:
 | 2026-11-18 | 0.2 | Maintainer decisions folded in as Resolved 1 to 16: artefacts approved (digests and checksums recorded by Lot A), three CI jobs, every recommendation accepted except SMTP, now verified against a standard-library banner server (new scenario `12.7-x-smtp-banner-template`); release machine has 24 CPUs, larger cpuset layout. Status Draft. | Romain G. |
 | 2026-11-18 | 0.3 | Lot A gains the `stop_grace_period` task Story 12.2 D-f assumed was done. | Romain G. |
 | 2026-11-18 | 0.4 | Lot A implemented: L4 compose project, driver, scenario registry with pending rows, report gated on the registry and the PRD matrix, `perf-tools` and `baseline` images, toolchain pin, `run.sh` flags; digests and checksums recorded. The full pre-existing suite with the pin is still to run. Status InProgress. | Romain G. |
+| 2026-11-19 | 0.5 | Lot B implemented: Story 12.2's scenarios in both profiles and the fd-reserve scenario, all passing (AC #3 partial as D-d says); budget nodes, a single-process probe, `udp_hold.py` and `http_loop.py`. No product defect. The budget item asserts `worker_fds` for 1,024 ports and `supervisor_fds` for 600, since a UDP session now holds an fd. | Romain G. |

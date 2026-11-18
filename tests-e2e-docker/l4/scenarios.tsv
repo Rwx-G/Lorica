@@ -26,14 +26,14 @@ name	source	story	profiles	level	lot	state	matrix
 12.1-iv2-follower-https-port-refused	12.1 IV2	12.1	cluster	full	L	pending	-
 12.1-ac3-rollback-cold-1.10.7	12.1 AC #3	12.1	streams-single	full	L	pending	-
 12.1-ac3-rollback-hot-1.10.7	12.1 AC #3	12.1	hot-upgrade	full	L	pending	-
-12.2-iv1-bind-and-release-within-5s	12.2 IV1	12.2	streams,streams-single	full	B	pending	TCP proxying;Dynamic reconfiguration
-12.2-iv2-port-in-use-fails-cleanly	12.2 IV2	12.2	streams,streams-single	full	B	pending	-
-12.2-ac3-privileged-port-853	12.2 AC #3	12.2	streams	partial	B	pending	-
-12.2-ac1-udp-group-survives-worker-respawn	12.2 AC #1	12.2	streams	full	B	pending	-
-12.2-ac1-dual-stack-conflict	12.2 AC #1	12.2	streams	full	B	pending	IPv6
-12.2-ac7-stop-drains-then-exits	12.2 AC #7	12.2	streams,streams-single	full	B	pending	Connection draining
-12.2-ac5-budget-refuses-range	12.2 AC #5	12.2	streams	full	B	pending	Port ranges
-12.12-fd-reserve-http-unaffected	12.12 AC #1	12.12	streams	full	B	pending	-
+12.2-iv1-bind-and-release-within-5s	12.2 IV1	12.2	streams,streams-single	full	B	live	TCP proxying;Dynamic reconfiguration
+12.2-iv2-port-in-use-fails-cleanly	12.2 IV2	12.2	streams,streams-single	full	B	live	-
+12.2-ac3-privileged-port-853	12.2 AC #3	12.2	streams	partial	B	live	-
+12.2-ac1-udp-group-survives-worker-respawn	12.2 AC #1	12.2	streams	full	B	live	-
+12.2-ac1-dual-stack-conflict	12.2 AC #1	12.2	streams	full	B	live	IPv6
+12.2-ac7-stop-drains-then-exits	12.2 AC #7	12.2	streams,streams-single	full	B	live	Connection draining
+12.2-ac5-budget-refuses-range	12.2 AC #5	12.2	streams	full	B	live	Port ranges
+12.12-fd-reserve-http-unaffected	12.12 AC #1	12.12	streams	full	B	live	-
 12.3-iv1-pg-balance-and-failover	12.3 IV1	12.3	streams	full	C	pending	TCP proxying;Round robin, least conn;Hash / consistent hash on source;Random / power of two;Passive failure detection;Session persistence
 12.3-iv2-shared-backend-down-both-planes	12.3 IV2	12.3	streams	full	C	pending	Active health: TCP connect
 12.3-iv3-proxy-v2-send-and-accept	12.3 IV3	12.3	streams	full	C	pending	PROXY protocol v1/v2 send;PROXY protocol v1/v2 accept on streams

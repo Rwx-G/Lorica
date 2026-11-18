@@ -956,34 +956,34 @@ Allowlist: `tests-e2e-docker/entrypoint-streams.sh` (new, LF),
 Depends on: D, E3. The machine to itself, orphan containers torn down
 first.
 
-- [ ] A `streams` profile in worker mode and a `streams-single` profile,
+- [x] A `streams` profile in worker mode and a `streams-single` profile,
       each with a runner sharing Lorica's network and pid namespaces
       (`network_mode` and `pid` set to `service:<lorica service>`), so
       the runner can run `ss` and signal processes, and a
       `stop_grace_period` above the drain under test.
-- [ ] IV1: an HTTP load loop runs throughout; create a TCP stream on
+- [x] IV1: an HTTP load loop runs throughout; create a TCP stream on
       5432 through the API; poll `ss -ltnH 'sport = :5432'` until present,
       assert within 5 s and a TCP connect accepted; delete; poll until
       absent, assert within 5 s; assert the HTTP loop saw zero failures.
-- [ ] IV2: a squatter process listening on 6000 in Lorica's namespace;
+- [x] IV2: a squatter process listening on 6000 in Lorica's namespace;
       create a stream on 6000; assert `bind.state = failed`,
       `kind = address_in_use`, the OS error text, a `stream.bind_failed`
       audit row, HTTP still 200; stop the squatter; assert `bound` within
       the retry interval plus 5 s.
-- [ ] AC #3: the profile's entrypoint starts as root and drops to
+- [x] AC #3: the profile's entrypoint starts as root and drops to
       `lorica` with `setpriv --ambient-caps +net_bind_service`, the way
       systemd does; a stream on port 853 binds.
-- [ ] AC #1 respawn: a UDP stream on 2 workers; `kill -9` one worker; after
+- [x] AC #1 respawn: a UDP stream on 2 workers; `kill -9` one worker; after
       respawn `ss -uan` still shows the same number of sockets on the
       port and a client that was served before is served again.
-- [ ] Dual stack: a stream on `[::]:7000` refuses a second one on
+- [x] Dual stack: a stream on `[::]:7000` refuses a second one on
       `0.0.0.0:7000`, and IPv4 and IPv6 clients both reach the first.
-- [ ] Stop, both modes: with no traffic, SIGTERM ends the process in
+- [x] Stop, both modes: with no traffic, SIGTERM ends the process in
       under 10 s (the 300 s and the fixed 30 s are gone); with
       `worker_drain_timeout_s = 20` and an HTTP request to a backend that
       answers after 8 s, the request completes and the process exits
       shortly after it, before 20 s.
-- [ ] Budget: a compose `ulimits: nofile` of 4,096 makes a 1,024-port UDP
+- [x] Budget: a compose `ulimits: nofile` of 4,096 makes a 1,024-port UDP
       range refused with the supervisor constraint named.
 
 ## Dev Notes
