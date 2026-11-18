@@ -2,11 +2,68 @@
 # run from the workspace root (no CLI flag needed - the same call the
 # GitHub Actions CI job runs).
 #
-# The ignore list is empty. An entry needs a written rationale here
-# (dependency path, runtime exposure, revisit trigger) and a mirror in
-# `deny.toml`. The last four entries went in 1.9.2, when the optional
-# `route53` feature stopped pulling the AWS SDK's legacy rustls 0.21 /
-# hyper 0.14 client (see `lorica-acme/Cargo.toml`).
+# The ignore list holds one entry, the `chrono` unmaintained notice
+# (1.11.0). An entry needs a written rationale here (dependency path,
+# runtime exposure, revisit trigger) and a mirror in `deny.toml`. The
+# four entries before it went in 1.9.2, when the optional `route53`
+# feature stopped pulling the AWS SDK's legacy rustls 0.21 / hyper 0.14
+# client (see `lorica-acme/Cargo.toml`).
 
 [advisories]
-ignore = []
+# RUSTSEC-2026-0543 "chrono is unmaintained" (informational,
+# unmaintained, issued 2026-11-17). Every version is affected and none
+# is patched: the notice is about the crate having no maintainer, not
+# about a known defect. The advisory names `jiff` and `time` as
+# alternatives.
+#
+# Dependency path: chrono 0.4.45 is a direct dependency of twelve
+# workspace crates and of nothing else. `cargo tree -i chrono
+# --workspace --all-features -e normal,build` lists only lorica,
+# lorica-api, lorica-bench, lorica-challenge, lorica-cluster,
+# lorica-config, lorica-core, lorica-fleet, lorica-geoip,
+# lorica-notify, lorica-stream and lorica-waf; no third-party crate
+# pulls it, `route53` and `otel` included. `lorica` also takes it as a
+# dev-dependency. `lorica-core` is the forked Pingora crate, which uses
+# it only to format the HTTP `Date` response header.
+#
+# Runtime exposure:
+# - Proxy data plane: no chrono parse. Traffic from unauthenticated
+#   clients only reaches chrono through `lorica-core` formatting the
+#   `Date` header from the system clock.
+# - chrono does parse external input, always behind authentication or
+#   an authenticated peer:
+#   - management API (authenticated session): the automation token
+#     create body deserializes `expires_at` as a `DateTime`
+#     (`lorica-api/src/automation_tokens.rs`), and the SLA `from` /
+#     `to` query parameters go through `parse_from_rfc3339`
+#     (`lorica-api/src/sla.rs`);
+#   - automation plane (bearer token): the `expiring_before` query
+#     parameter (`lorica-api/src/automation/environments.rs`);
+#   - TOML configuration import and cluster replication: the config
+#     models deserialize their `DateTime` fields with serde;
+#   - cluster channel (mutual TLS): the certificate `notAfter` in the
+#     enrollment and renewal answers (`lorica/src/cli_cluster.rs`,
+#     `lorica/src/startup/cluster_follower.rs`) and the SLA rows a
+#     follower returns (`lorica-api/src/sla.rs`);
+#   - ACME: the `retry after` stamp in a rate-limit error from the
+#     configured ACME directory, over TLS, parsed with
+#     `NaiveDateTime::parse_from_str` and clamped to 7 days
+#     (`lorica-api/src/acme/renewal.rs`);
+#   - automation plane OIDC: the integer `exp` / `iat` claims become a
+#     `DateTime` through `from_timestamp`, after the token's signature
+#     has verified (`lorica-api/src/automation/oidc/mod.rs`).
+# - Everything else is formatting, arithmetic and reading back the
+#   RFC 3339 strings Lorica itself wrote to SQLite.
+# - Certificate validity dates are decoded by the X.509 parsers, not by
+#   chrono; chrono only receives the resulting timestamp.
+#
+# Revisit trigger: remove this entry and migrate when any of these
+# happens. A RUSTSEC or CVE vulnerability (not an unmaintained notice)
+# is published against chrono, which turns this into a forced
+# migration; a maintained successor becomes the ecosystem default
+# (candidates today: `jiff`, `time`); or upstream Pingora moves
+# `pingora-core` off chrono, which removes the forked crate's use and
+# leaves only first-party code to port.
+ignore = [
+    "RUSTSEC-2026-0543",
+]

@@ -7,7 +7,12 @@ version = 2
 # Mirror of `.cargo/audit.toml` (the authoritative source for the
 # rationale). `cargo deny check` reads this file independently of
 # `cargo audit`, so an advisory ignored there must be ignored here too.
-ignore = []
+# RUSTSEC-2026-0543: `chrono` unmaintained, no patched version; see
+# `.cargo/audit.toml` for the dependency path, exposure and revisit
+# trigger.
+ignore = [
+    "RUSTSEC-2026-0543",
+]
 
 [licenses]
 version = 2
