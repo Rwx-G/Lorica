@@ -559,6 +559,21 @@ lives in.
   this same accept path, so any later upstream commit building on it
   conflicts here first. Tests: `lorica-core/tests/proxy_protocol.rs`,
   run by the rustls line of CI.
+- **`lorica-timeout`, a timer stub subscribes before it checks
+  (v1.11.0), a port of upstream PR #983 ahead of its merge.** Site:
+  `TimerStub::poll` and `poll_impl` in `lorica-timeout/src/timer.rs`,
+  ported as the PR's head `12fc297b` wrote them, with its test
+  `test_timer_stub_poll_does_not_miss_fire`. Upstream `main` (checked
+  at `13ad3297`) reads the timer's fired flag and only then calls
+  `Notify::notified()`. `Timer::fire` wakes with `notify_waiters`, which
+  reaches only a `Notified` that already exists, so a timer firing
+  between the two steps woke nobody and the stub waited forever: every
+  `lorica_timeout::timeout` and `sleep` sits on this path. A probe firing
+  the timer on another thread during the stub's first poll lost 20
+  wakeups in 200,000 races on the old order and none in 1,000,000 on the
+  new one. On an upstream sync, once #983 is merged this entry goes and
+  the merge commit is recorded in the sync record; until then, keep the
+  `Notified` created before the flag read.
 
 ## Upstream sync record
 
