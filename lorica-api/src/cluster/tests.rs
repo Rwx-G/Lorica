@@ -779,7 +779,7 @@ async fn an_activation_records_the_stream_ports_the_node_starts_binding() {
     );
 }
 
-// ---- Stream names on the bindings (Story 12.10 Lot A) ----
+// ---- Stream names and per-node states (Story 12.10 Lot A) ----
 
 /// The name lookup the roster builds from the stored streams.
 fn names_of<'a>(streams: &[&'a lorica_config::models::Stream]) -> HashMap<&'a str, &'a str> {
@@ -828,5 +828,115 @@ fn every_binding_names_its_stream_and_one_no_longer_held_is_null() {
     assert_eq!(
         rendered["bindings"][1]["stream_name"],
         serde_json::Value::Null
+    );
+}
+
+fn sight<'a>(
+    node: &'a ClusterNode,
+    report: Option<&'a lorica_cluster::StreamPlaneReport>,
+    drifted: bool,
+) -> super::NodeStreamSight<'a> {
+    super::NodeStreamSight {
+        node,
+        report,
+        drifted,
+    }
+}
+
+fn state_on(
+    states: &HashMap<String, Vec<super::StreamNodeState>>,
+    stream: &lorica_config::models::Stream,
+) -> Vec<(String, BindStateKind)> {
+    states
+        .get(&stream.id)
+        .map(|nodes| {
+            nodes
+                .iter()
+                .map(|n| (n.node_name.clone(), n.bind.state))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_streams_state_per_node_follows_the_fleet_views_rule() {
+    let pg = stream("pg", 5432, &[]);
+    let dns = stream("dns", 6000, &[]);
+    let streams = [pg.clone(), dns.clone()];
+    let in_sync = node_row("edge-c", NodeStatus::Active);
+    let drifting = node_row("edge-b", NodeStatus::Active);
+    let silent = node_row("edge-a", NodeStatus::Active);
+    let pending = node_row("edge-d", NodeStatus::Pending);
+    let revoked = node_row("edge-e", NodeStatus::Revoked);
+    let failing = report(vec![failed_binding(&dns.id, "address_in_use")]);
+
+    let states = super::stream_node_states(
+        &[
+            sight(&in_sync, Some(&failing), false),
+            sight(&drifting, Some(&failing), true),
+            sight(&silent, None, false),
+            sight(&pending, Some(&failing), false),
+            sight(&revoked, Some(&failing), false),
+        ],
+        &streams,
+    );
+
+    assert_eq!(
+        state_on(&states, &pg),
+        vec![
+            ("edge-a".to_string(), BindStateKind::Unknown),
+            ("edge-b".to_string(), BindStateKind::Unknown),
+            ("edge-c".to_string(), BindStateKind::Bound),
+        ],
+        "by node name: no report yet, unlisted under drift, unlisted in sync; \
+         a pending or revoked node binds nothing"
+    );
+    assert_eq!(
+        state_on(&states, &dns),
+        vec![
+            ("edge-a".to_string(), BindStateKind::Unknown),
+            ("edge-b".to_string(), BindStateKind::Failed),
+            ("edge-c".to_string(), BindStateKind::Failed),
+        ],
+        "a listed failure is read as listed, drift or not"
+    );
+    let failed = &states[&dns.id][2];
+    assert_eq!(failed.node_id, in_sync.node_id);
+    assert_eq!(
+        failed.bind,
+        super::node_bind_state(Some(&failing), false, &dns.id),
+        "the same rule the fleet view's bindings use"
+    );
+    assert_eq!(failed.bind.port, Some(6000));
+}
+
+#[test]
+fn a_node_a_stream_does_not_target_is_not_listed_for_it() {
+    let pinned = stream("pg", 5432, &["edge-1"]);
+    let one = node_row("edge-1", NodeStatus::Active);
+    let two = node_row("edge-2", NodeStatus::Active);
+    let states = super::stream_node_states(
+        &[sight(&one, None, false), sight(&two, None, false)],
+        std::slice::from_ref(&pinned),
+    );
+    assert_eq!(
+        state_on(&states, &pinned),
+        vec![("edge-1".to_string(), BindStateKind::Unknown)]
+    );
+}
+
+#[test]
+fn a_cut_list_vouches_for_no_unlisted_stream() {
+    let pg = stream("pg", 5432, &[]);
+    let node = node_row("edge-1", NodeStatus::Active);
+    let mut cut = report(vec![]);
+    cut.truncated = true;
+    let states = super::stream_node_states(
+        &[sight(&node, Some(&cut), false)],
+        std::slice::from_ref(&pg),
+    );
+    assert_eq!(
+        state_on(&states, &pg),
+        vec![("edge-1".to_string(), BindStateKind::Unknown)]
     );
 }

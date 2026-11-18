@@ -1696,6 +1696,45 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
 
+  /api/v1/streams/status:
+    get:
+      tags: [Streams]
+      summary: Every stream's bind state per node and this node's live counters
+      description: >-
+        One answer for every stream, ordered by name, so a page makes one
+        call per refresh (Story 12.10). `bind` is this node's state, the
+        value the stream reads carry. On a control plane `nodes` lists
+        the stream's state on every active enrolled node that binds it,
+        by node name, read by the rule the cluster node view's
+        `stream_plane` follows: `pending` or `failed` as the node's
+        heartbeat lists it, `bound` for a stream an in-sync node does not
+        list, and `unknown` while the node drifts from this control
+        plane's configuration, after its list was cut, or before it has
+        reported (offline, or not reported yet). A pending node binds
+        nothing yet and is not listed. Standalone and on a follower
+        `nodes` is `null`. `counters` are the answering node's own, the
+        values its `/metrics` renders for the stream: the other nodes'
+        traffic is in the stream SLA, not here.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: One entry per stream
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      streams:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/StreamStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /api/v1/streams/{id}:
     parameters:
       - $ref: "#/components/parameters/ResourceId"
@@ -9352,6 +9391,136 @@ components:
           type: string
           format: date-time
           description: "`failed` only."
+
+    StreamStatus:
+      type: object
+      description: One stream's status (`GET /api/v1/streams/status`).
+      required: [id, name, protocol, bind, nodes, counters]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        protocol:
+          $ref: "#/components/schemas/StreamProtocol"
+        bind:
+          nullable: true
+          description: >-
+            This node's bind state, the value the stream reads carry;
+            `null` when this node does not bind the stream.
+          allOf:
+            - $ref: "#/components/schemas/StreamBindState"
+        nodes:
+          type: array
+          nullable: true
+          description: >-
+            On a control plane, the stream's state on every active
+            enrolled node that binds it, by node name; empty when no node
+            binds it. `null` on a standalone node and on a follower.
+          items:
+            $ref: "#/components/schemas/StreamNodeState"
+        counters:
+          nullable: true
+          description: >-
+            This node's live counters of the stream; `null` while nothing
+            has counted it on this node.
+          allOf:
+            - $ref: "#/components/schemas/StreamLiveCounters"
+
+    StreamNodeState:
+      type: object
+      description: One node's bind state of a stream, read from its heartbeat report.
+      required: [node_id, node_name, state]
+      properties:
+        node_id:
+          type: string
+        node_name:
+          type: string
+        state:
+          type: string
+          enum: [pending, bound, failed, unknown]
+          description: >-
+            `pending` or `failed` as the node lists it, `bound` when an
+            in-sync node does not list it, `unknown` while the node
+            drifts, after its list was cut, before it has reported, or
+            for a state only a newer node knows.
+        kind:
+          $ref: "#/components/schemas/StreamBindFailureKind"
+        os_error:
+          type: string
+          description: "`failed` only, as on `StreamBindState`."
+        port:
+          type: integer
+          description: "`failed` only."
+        since:
+          type: string
+          format: date-time
+          description: "`failed` only."
+
+    StreamLiveCounters:
+      type: object
+      description: >-
+        One stream's counters on the answering node, the values its
+        `/metrics` renders for the stream's series. Totals are monotone
+        across worker restarts and start again at a process restart.
+      required: [node_name, active, pending, accepted_total, bytes_upload_total, bytes_download_total, refused, ended, datagrams_dropped]
+      properties:
+        node_name:
+          type: string
+          nullable: true
+          description: >-
+            The answering node's name on a follower; `null` on a
+            standalone node and on a control plane, which have no roster
+            name.
+        active:
+          type: integer
+          format: int64
+          description: Open connections, or live UDP sessions (`lorica_stream_active`).
+        pending:
+          type: integer
+          format: int64
+          description: Connections in their pre-forwarding reads (`lorica_stream_pending`).
+        accepted_total:
+          type: integer
+          format: int64
+          description: Connections or sessions accepted (`lorica_stream_accepted_total`).
+        bytes_upload_total:
+          type: integer
+          format: int64
+          description: Bytes from clients to backends (`lorica_stream_bytes_total`, `direction="upload"`).
+        bytes_download_total:
+          type: integer
+          format: int64
+          description: Bytes from backends to clients (`direction="download"`).
+        refused:
+          type: array
+          description: Refusals per reason, non-zero ones only (`lorica_stream_refused_total`).
+          items:
+            $ref: "#/components/schemas/StreamReasonCount"
+        ended:
+          type: array
+          description: Ends per reason, non-zero ones only (`lorica_stream_ended_total`).
+          items:
+            $ref: "#/components/schemas/StreamReasonCount"
+        datagrams_dropped:
+          type: array
+          description: Dropped datagrams per reason, non-zero ones only (`lorica_stream_datagrams_dropped_total`).
+          items:
+            $ref: "#/components/schemas/StreamReasonCount"
+
+    StreamReasonCount:
+      type: object
+      description: >-
+        A count under one reason word, the `reason` label of the metric
+        family named on the field that holds it. An array of these rather
+        than a map keyed by reason, so a reason word is never a key name.
+      required: [reason, count]
+      properties:
+        reason:
+          type: string
+        count:
+          type: integer
+          format: int64
 
     CreateStreamRequest:
       type: object

@@ -56,6 +56,7 @@ use lorica_stream::{
 };
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use serde::Serialize;
 use strum::VariantArray;
 
 /// The type of a family as Prometheus renders it.
@@ -342,6 +343,86 @@ impl NodeStreamGauges {
     }
 }
 
+/// One stream's live counters on the node, as `GET /api/v1/streams/status`
+/// answers them (Story 12.10 D-e): the values the next scrape renders
+/// for its series.
+///
+/// The per-reason counts are arrays of `{reason, count}` rather than
+/// maps keyed by reason, so a reason word never becomes a key name of an
+/// answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct StreamLiveCounters {
+    /// Open connections, or live UDP sessions (`lorica_stream_active`).
+    pub active: u64,
+    /// Connections in their pre-forwarding reads (`lorica_stream_pending`).
+    pub pending: u64,
+    /// Connections or sessions accepted (`lorica_stream_accepted_total`).
+    pub accepted_total: u64,
+    /// Bytes from clients to backends (`lorica_stream_bytes_total`,
+    /// `direction="upload"`).
+    pub bytes_upload_total: u64,
+    /// Bytes from backends to clients (`direction="download"`).
+    pub bytes_download_total: u64,
+    /// Refusals per reason, non-zero ones only
+    /// (`lorica_stream_refused_total`).
+    pub refused: Vec<ReasonCount>,
+    /// Ends per reason, non-zero ones only (`lorica_stream_ended_total`).
+    pub ended: Vec<ReasonCount>,
+    /// Dropped datagrams per reason, non-zero ones only
+    /// (`lorica_stream_datagrams_dropped_total`).
+    pub datagrams_dropped: Vec<ReasonCount>,
+}
+
+/// A count under one reason word.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReasonCount {
+    /// The `reason` label's word.
+    pub reason: String,
+    /// The total.
+    pub count: u64,
+}
+
+impl StreamLiveCounters {
+    /// Take the counter series `family` with its label values past the
+    /// stream id, `rest`, at `value`. A family the status does not
+    /// answer is ignored.
+    fn take_counter(&mut self, family: StreamFamily, rest: &[String], value: u64) {
+        let (reasons, reason) = match (family, rest) {
+            (StreamFamily::Accepted, []) => {
+                self.accepted_total = value;
+                return;
+            }
+            (StreamFamily::Bytes, [word]) => {
+                match Direction::VARIANTS.iter().find(|d| d.as_str() == word) {
+                    Some(Direction::Upload) => self.bytes_upload_total = value,
+                    Some(Direction::Download) => self.bytes_download_total = value,
+                    None => {}
+                }
+                return;
+            }
+            (StreamFamily::Refused, [reason]) => (&mut self.refused, reason),
+            (StreamFamily::Ended, [reason]) => (&mut self.ended, reason),
+            (StreamFamily::DatagramsDropped, [reason]) => (&mut self.datagrams_dropped, reason),
+            _ => return,
+        };
+        if value > 0 {
+            reasons.push(ReasonCount {
+                reason: reason.clone(),
+                count: value,
+            });
+        }
+    }
+
+    /// Take the gauge series `family` of the stream at `value`.
+    fn take_gauge(&mut self, family: StreamFamily, value: u64) {
+        match family {
+            StreamFamily::Active => self.active = value,
+            StreamFamily::Pending => self.pending = value,
+            _ => {}
+        }
+    }
+}
+
 /// One series: a family and its label values, positional to
 /// [`StreamFamily::labels`]. A [`StreamFamily::RuleMatched`] series
 /// carries the rule's name until it is rendered as its position.
@@ -357,6 +438,15 @@ impl Series {
             family,
             values: values.iter().map(|v| (*v).to_string()).collect(),
         }
+    }
+
+    /// The stream id of a series scoped to a stream, and its label
+    /// values past it.
+    fn of_stream(&self) -> Option<(&String, &[String])> {
+        if self.family.labels().first() != Some(&"stream_id") {
+            return None;
+        }
+        self.values.split_first()
     }
 
     /// Whether `table` still holds what the series counts, by the rules
@@ -642,32 +732,64 @@ impl State {
         }
     }
 
-    fn render(&self) -> BTreeMap<StreamFamily, Vec<proto::Metric>> {
-        let mut out: BTreeMap<StreamFamily, Vec<proto::Metric>> = BTreeMap::new();
-
+    /// Every counter series as a scrape renders it: retired plus every
+    /// live source.
+    fn counter_totals(&self) -> BTreeMap<&Series, u64> {
         let mut counters: BTreeMap<&Series, u64> =
             self.retired_counters.iter().map(|(s, v)| (s, *v)).collect();
-        let mut histograms: BTreeMap<&Series, HistogramSnapshot> = self
-            .retired_histograms
-            .iter()
-            .map(|(s, h)| (s, h.clone()))
-            .collect();
-        let mut gauges: BTreeMap<&Series, u64> = BTreeMap::new();
         for flat in self.sources.values() {
             for (series, value) in &flat.counters {
                 let total = counters.entry(series).or_default();
                 *total = total.saturating_add(*value);
             }
-            for (series, hist) in &flat.histograms {
-                add_histogram(histograms.entry(series).or_default(), hist);
-            }
+        }
+        counters
+    }
+
+    /// Every gauge series as a scrape renders it: the sum over the live
+    /// sources, where the node's exact value of a stream the table holds
+    /// replaces it.
+    fn gauge_values(&self) -> BTreeMap<Series, u64> {
+        let mut gauges: BTreeMap<Series, u64> = BTreeMap::new();
+        for flat in self.sources.values() {
             for (series, value) in &flat.gauges {
-                let total = gauges.entry(series).or_default();
+                let total = gauges.entry(series.clone()).or_default();
                 *total = total.saturating_add(*value);
             }
         }
+        for (stream_id, node) in &self.node {
+            if !self
+                .table
+                .as_ref()
+                .is_none_or(|t| t.stream(stream_id).is_some())
+            {
+                continue;
+            }
+            if let Some(sessions) = node.udp_sessions {
+                gauges.insert(Series::new(StreamFamily::Active, &[stream_id]), sessions);
+            }
+            if let Some(pending) = node.pending {
+                gauges.insert(Series::new(StreamFamily::Pending, &[stream_id]), pending);
+            }
+        }
+        gauges
+    }
 
-        for (series, value) in counters {
+    fn render(&self) -> BTreeMap<StreamFamily, Vec<proto::Metric>> {
+        let mut out: BTreeMap<StreamFamily, Vec<proto::Metric>> = BTreeMap::new();
+
+        let mut histograms: BTreeMap<&Series, HistogramSnapshot> = self
+            .retired_histograms
+            .iter()
+            .map(|(s, h)| (s, h.clone()))
+            .collect();
+        for flat in self.sources.values() {
+            for (series, hist) in &flat.histograms {
+                add_histogram(histograms.entry(series).or_default(), hist);
+            }
+        }
+
+        for (series, value) in self.counter_totals() {
             if let Some(labels) = self.rendered_labels(series) {
                 out.entry(series.family).or_default().push(counter_metric(
                     series.family,
@@ -686,26 +808,7 @@ impl State {
             }
         }
 
-        let mut node_gauges: BTreeMap<Series, u64> = gauges
-            .into_iter()
-            .map(|(series, value)| (series.clone(), value))
-            .collect();
-        for (stream_id, node) in &self.node {
-            if !self
-                .table
-                .as_ref()
-                .is_none_or(|t| t.stream(stream_id).is_some())
-            {
-                continue;
-            }
-            if let Some(sessions) = node.udp_sessions {
-                node_gauges.insert(Series::new(StreamFamily::Active, &[stream_id]), sessions);
-            }
-            if let Some(pending) = node.pending {
-                node_gauges.insert(Series::new(StreamFamily::Pending, &[stream_id]), pending);
-            }
-        }
-        for (series, value) in &node_gauges {
+        for (series, value) in &self.gauge_values() {
             out.entry(series.family).or_default().push(gauge_metric(
                 series.family,
                 &series.values,
@@ -938,6 +1041,33 @@ impl StreamMetricsCollector {
         let mut values = state.retired_counters.get(&series).into_iter().chain(live);
         let first: u64 = *values.next()?;
         Some(values.fold(first, |acc, v| acc.saturating_add(*v)))
+    }
+
+    /// The live counters of every stream the node holds a series of, by
+    /// stream id, read in one pass from the aggregate a scrape renders
+    /// (Story 12.10 D-e), so the status and `/metrics` cannot disagree.
+    /// A stream nothing has counted yet is absent.
+    pub fn live_counters(&self) -> BTreeMap<String, StreamLiveCounters> {
+        let mut state = self.inner.state.lock();
+        if let Some(local) = state.local.clone() {
+            state.apply(Source::Local, &local.snapshot());
+        }
+        let mut out: BTreeMap<String, StreamLiveCounters> = BTreeMap::new();
+        for (series, value) in state.counter_totals() {
+            if let Some((stream_id, rest)) = series.of_stream() {
+                out.entry(stream_id.clone())
+                    .or_default()
+                    .take_counter(series.family, rest, value);
+            }
+        }
+        for (series, value) in state.gauge_values() {
+            if let Some((stream_id, _)) = series.of_stream() {
+                out.entry(stream_id.clone())
+                    .or_default()
+                    .take_gauge(series.family, value);
+            }
+        }
+        out
     }
 
     fn families(&self) -> Vec<proto::MetricFamily> {

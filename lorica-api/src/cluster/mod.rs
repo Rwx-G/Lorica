@@ -474,7 +474,7 @@ impl NodeBindState {
 /// The state of `stream_id`, a stream this control plane expects the
 /// node to bind, from the node's `report` (`None` before one) and its
 /// drift verdict (Story 12.10 D-d). The one rule the fleet view's
-/// bindings read a node by: a listed
+/// bindings and `GET /api/v1/streams/status` read a node by: a listed
 /// binding is in the state listed; an unlisted one is bound while the
 /// node is in sync and its list whole, as [`ReportedBindings`] reads it;
 /// without a report nothing can be vouched for.
@@ -614,6 +614,80 @@ fn drift_of(
         &node.applied_config_hash,
         session.map(|s| &s.applied),
     )
+}
+
+/// One node's bind state of one stream, as `GET /api/v1/streams/status`
+/// lists it (Story 12.10 D-d).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StreamNodeState {
+    /// The node's id.
+    pub node_id: String,
+    /// The node's name.
+    pub node_name: String,
+    /// The stream's state on the node.
+    #[serde(flatten)]
+    pub bind: NodeBindState,
+}
+
+/// What this control plane holds of an enrolled node's stream plane.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NodeStreamSight<'a> {
+    /// The node's roster row.
+    pub(crate) node: &'a ClusterNode,
+    /// The report its open session last carried, `None` while it has
+    /// none (offline, or connected and not reported yet).
+    pub(crate) report: Option<&'a StreamPlaneReport>,
+    /// Its drift verdict.
+    pub(crate) drifted: bool,
+}
+
+/// Each stream's state on every active node that binds it, by stream id
+/// and each list by node name: the nodes of `stream_ports`, read by
+/// [`node_bind_state`]. A pending node binds nothing yet and a revoked
+/// one nothing at all, so neither is listed.
+pub(crate) fn stream_node_states(
+    sights: &[NodeStreamSight<'_>],
+    streams: &[Stream],
+) -> HashMap<String, Vec<StreamNodeState>> {
+    let mut active: Vec<&NodeStreamSight<'_>> = sights
+        .iter()
+        .filter(|s| s.node.status == NodeStatus::Active)
+        .collect();
+    active.sort_by(|a, b| a.node.name.cmp(&b.node.name));
+    let mut states: HashMap<String, Vec<StreamNodeState>> = HashMap::new();
+    for sight in active {
+        for target in stream_ports(sight.node, streams) {
+            let bind = node_bind_state(sight.report, sight.drifted, &target.id);
+            states.entry(target.id).or_default().push(StreamNodeState {
+                node_id: sight.node.node_id.clone(),
+                node_name: sight.node.name.clone(),
+                bind,
+            });
+        }
+    }
+    states
+}
+
+/// [`stream_node_states`] over the roster `nodes`, each read from its
+/// open session on `control`.
+pub(crate) fn fleet_stream_states(
+    control: &ControlPlane,
+    nodes: &[ClusterNode],
+    streams: &[Stream],
+) -> HashMap<String, Vec<StreamNodeState>> {
+    let live = live_sessions(control);
+    let sights: Vec<NodeStreamSight<'_>> = nodes
+        .iter()
+        .map(|node| {
+            let session = live.get(&node.node_id);
+            NodeStreamSight {
+                node,
+                report: session.and_then(|s| s.stream_plane.as_ref()),
+                drifted: drift_of(control, node, session).drifted,
+            }
+        })
+        .collect();
+    stream_node_states(&sights, streams)
 }
 
 /// JSON shape of a registered node: the registry row plus the live

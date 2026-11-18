@@ -75,9 +75,12 @@ use crate::routes::crud::{selector_roster, validate_group_name, validate_node_se
 use crate::server::AppState;
 use crate::stream_budget::{check_write, reported_fds, BudgetNode, NodeFds, StreamPlaneState};
 
+pub mod status;
 #[cfg(test)]
 mod tests;
 pub(crate) mod tls_checks;
+
+pub use status::get_stream_status;
 
 /// The `error.code` of a `409` refusing a stream's ports, so a client
 /// tells it from the follower read-only `409` without reading the

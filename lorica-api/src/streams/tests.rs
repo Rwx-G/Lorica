@@ -4026,3 +4026,373 @@ fn the_published_tls_words_and_limits_are_the_models() {
         .collect();
     assert_eq!(schema_properties("StreamMatchRule"), rule);
 }
+
+// ---- The stream status (Story 12.10 Lot A) ----
+
+/// Store `stream` directly, past the write checks the status does not
+/// concern.
+async fn stored(node: &Node, stream: &lorica_config::models::Stream) {
+    node.state
+        .store
+        .lock()
+        .await
+        .create_stream(stream)
+        .expect("test setup: stream");
+}
+
+/// The status entry of `id` in an answer of `GET /api/v1/streams/status`.
+fn status_entry(answer: &Value, id: &str) -> Value {
+    answer["data"]["streams"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .find(|s| s["id"] == id)
+        .unwrap_or_else(|| panic!("{id} has no status: {answer}"))
+        .clone()
+}
+
+/// A Viewer's cookie on `node`.
+async fn viewer(node: &Node) -> String {
+    create_user_and_login(
+        &node.state,
+        &node.sessions,
+        &node.limiter,
+        "viewer01",
+        Role::Viewer,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_viewer_reads_the_status_of_a_standalone_node_without_nodes() {
+    let mut node = Node::standalone().await;
+    let states = lorica_stream::StreamBindStates::new();
+    node.state.stream_plane = plane_at(states.clone(), 65_536, 2);
+    let pg = source_stream("pg", 5432);
+    let off = source_stream("off", 5433);
+    stored(&node, &pg).await;
+    stored(&node, &off).await;
+    states.set_bound(&pg.id, 2, 2);
+
+    let cookie = viewer(&node).await;
+    let (status, answer) = node
+        .call_as(&cookie, "GET", "/api/v1/streams/status", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let entry = status_entry(&answer, &pg.id);
+    assert_eq!(entry["name"], "pg");
+    assert_eq!(entry["protocol"], "tcp");
+    assert_eq!(
+        entry["bind"],
+        serde_json::to_value(states.get(&pg.id)).expect("serialises"),
+        "the value the stream reads carry"
+    );
+    assert_eq!(entry["nodes"], Value::Null, "no fleet to list");
+    assert_eq!(entry["counters"], Value::Null, "nothing counted it yet");
+    assert_eq!(status_entry(&answer, &off.id)["bind"], Value::Null);
+}
+
+#[tokio::test]
+async fn a_follower_answers_its_own_counters_labelled_with_its_name_and_no_nodes() {
+    let node = Node::follower().await;
+    let pg = source_stream("pg", 5432);
+    stored(&node, &pg).await;
+    let counters = lorica_stream::StreamCounters::new();
+    drop(counters.stream(&pg.id).accept());
+    let collector = crate::stream_metrics::StreamMetricsCollector::new();
+    collector.apply_worker(1, &counters.snapshot());
+
+    let statuses = super::status::stream_statuses(&node.state, &collector)
+        .await
+        .expect("statuses");
+    let entry = serde_json::to_value(&statuses[0]).expect("serialises");
+    let crate::cluster::ClusterRuntime::Follower(follower) = &node.state.cluster else {
+        panic!("a follower");
+    };
+    assert_eq!(entry["nodes"], Value::Null);
+    assert_eq!(entry["counters"]["node_name"], follower.node_name.as_str());
+    assert_eq!(entry["counters"]["accepted_total"], 1);
+}
+
+#[tokio::test]
+async fn a_control_plane_lists_each_active_node_that_binds_the_stream() {
+    let node = Node::control_plane().await;
+    node.enrol("edge-2", NodeStatus::Active, None).await;
+    node.enrol("edge-1", NodeStatus::Active, None).await;
+    node.enrol("edge-3", NodeStatus::Pending, None).await;
+    let fleet_wide = source_stream("dns", 5353);
+    let mut pinned = source_stream("pg", 5432);
+    pinned.node_selector = vec!["edge-2".to_string()];
+    let mut nowhere = source_stream("smtp", 2525);
+    nowhere.node_selector = vec!["edge-9".to_string()];
+    for s in [&fleet_wide, &pinned, &nowhere] {
+        stored(&node, s).await;
+    }
+
+    let cookie = viewer(&node).await;
+    let (status, answer) = node
+        .call_as(&cookie, "GET", "/api/v1/streams/status", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let on = |id: &str| -> Vec<(String, String)> {
+        status_entry(&answer, id)["nodes"]
+            .as_array()
+            .expect("nodes on a control plane")
+            .iter()
+            .map(|n| {
+                (
+                    n["node_name"].as_str().expect("a name").to_string(),
+                    n["state"].as_str().expect("a state").to_string(),
+                )
+            })
+            .collect()
+    };
+    let unknown = |name: &str| (name.to_string(), "unknown".to_string());
+    assert_eq!(
+        on(&fleet_wide.id),
+        vec![unknown("edge-1"), unknown("edge-2")],
+        "every active node by name, unknown before a report; the pending node binds nothing"
+    );
+    assert_eq!(on(&pinned.id), vec![unknown("edge-2")]);
+    assert!(on(&nowhere.id).is_empty(), "a stream no node binds");
+    assert_eq!(
+        status_entry(&answer, &fleet_wide.id)["nodes"][0]["node_id"],
+        "id-edge-1"
+    );
+}
+
+/// Every rendered series of `family` for `stream_id`: its other labels
+/// and its value, as a scrape shows them.
+fn rendered(
+    collector: &crate::stream_metrics::StreamMetricsCollector,
+    family: crate::stream_metrics::StreamFamily,
+    stream_id: &str,
+) -> Vec<(BTreeSet<(String, String)>, u64)> {
+    use lorica_metrics::prometheus::core::Collector;
+    collector
+        .collect()
+        .into_iter()
+        .filter(|mf| mf.name() == family.qualified_name())
+        .flat_map(|mf| mf.get_metric().to_vec())
+        .filter(|m| {
+            m.get_label()
+                .iter()
+                .any(|l| l.name() == "stream_id" && l.value() == stream_id)
+        })
+        .map(|m| {
+            let labels = m
+                .get_label()
+                .iter()
+                .filter(|l| l.name() != "stream_id")
+                .map(|l| (l.name().to_string(), l.value().to_string()))
+                .collect();
+            let value = match family.family_type() {
+                crate::stream_metrics::FamilyType::Counter => m.get_counter().value(),
+                crate::stream_metrics::FamilyType::Gauge => m.get_gauge().value(),
+                crate::stream_metrics::FamilyType::Histogram => {
+                    panic!("the status answers no histogram")
+                }
+            };
+            (labels, value as u64)
+        })
+        .collect()
+}
+
+/// The rendered value of the series of `family` for `stream_id` whose
+/// other labels are exactly `labels`.
+fn rendered_value(
+    collector: &crate::stream_metrics::StreamMetricsCollector,
+    family: crate::stream_metrics::StreamFamily,
+    stream_id: &str,
+    labels: &[(&str, &str)],
+) -> u64 {
+    let wanted: BTreeSet<(String, String)> = labels
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    rendered(collector, family, stream_id)
+        .into_iter()
+        .find(|(have, _)| *have == wanted)
+        .map(|(_, value)| value)
+        .unwrap_or_else(|| panic!("{} renders no {labels:?}", family.qualified_name()))
+}
+
+/// The non-zero rendered reasons of `family` for `stream_id`.
+fn rendered_reasons(
+    collector: &crate::stream_metrics::StreamMetricsCollector,
+    family: crate::stream_metrics::StreamFamily,
+    stream_id: &str,
+) -> BTreeSet<(String, u64)> {
+    rendered(collector, family, stream_id)
+        .into_iter()
+        .filter(|(_, value)| *value > 0)
+        .map(|(labels, value)| {
+            let (_, reason) = labels
+                .into_iter()
+                .find(|(name, _)| name == "reason")
+                .expect("a reason label");
+            (reason, value)
+        })
+        .collect()
+}
+
+fn reasons_of(counters: &Value, key: &str) -> BTreeSet<(String, u64)> {
+    counters[key]
+        .as_array()
+        .unwrap_or_else(|| panic!("{key} is an array: {counters}"))
+        .iter()
+        .map(|entry| {
+            (
+                entry["reason"].as_str().expect("a reason").to_string(),
+                entry["count"].as_u64().expect("a count"),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_counters_are_what_the_collector_renders_for_the_stream() {
+    use crate::stream_metrics::{Direction, StreamFamily};
+    use lorica_config::models::{DatagramDropReason, StreamEndKind, StreamRefusal};
+    use strum::VariantArray;
+
+    let node = Node::standalone().await;
+    let dns = source_stream("dns", 5353);
+    stored(&node, &dns).await;
+    let counters = lorica_stream::StreamCounters::new();
+    let stats = counters.stream(&dns.id);
+    let _open = stats.accept();
+    let _reading = stats.pending();
+    drop(stats.accept());
+    stats.add_upload(40);
+    stats.add_download(400);
+    for (n, &kind) in StreamEndKind::VARIANTS.iter().enumerate().skip(1) {
+        for _ in 0..n {
+            stats.ended(kind);
+        }
+    }
+    for &refusal in StreamRefusal::VARIANTS {
+        stats.refused(refusal);
+    }
+    stats.dropped(DatagramDropReason::VARIANTS[0]);
+    let mut snapshot = counters.snapshot();
+    let unseen = StreamEndKind::VARIANTS[0];
+    snapshot
+        .streams
+        .get_mut(&dns.id)
+        .expect("the stream's counters")
+        .ended
+        .insert(unseen, 0);
+    let collector = crate::stream_metrics::StreamMetricsCollector::new();
+    collector.apply_worker(7, &snapshot);
+
+    let statuses = super::status::stream_statuses(&node.state, &collector)
+        .await
+        .expect("statuses");
+    let entry = serde_json::to_value(&statuses[0]).expect("serialises");
+    let live = &entry["counters"];
+    assert_eq!(live["node_name"], Value::Null, "a standalone node");
+
+    let single = |family: StreamFamily, labels: &[(&str, &str)]| {
+        rendered_value(&collector, family, &dns.id, labels)
+    };
+    assert_eq!(live["active"], single(StreamFamily::Active, &[]));
+    assert_eq!(live["pending"], single(StreamFamily::Pending, &[]));
+    assert_eq!(live["accepted_total"], single(StreamFamily::Accepted, &[]));
+    assert_eq!(
+        live["bytes_upload_total"],
+        single(
+            StreamFamily::Bytes,
+            &[("direction", Direction::Upload.as_str())]
+        )
+    );
+    assert_eq!(
+        live["bytes_download_total"],
+        single(
+            StreamFamily::Bytes,
+            &[("direction", Direction::Download.as_str())]
+        )
+    );
+    for (key, family) in [
+        ("refused", StreamFamily::Refused),
+        ("ended", StreamFamily::Ended),
+        ("datagrams_dropped", StreamFamily::DatagramsDropped),
+    ] {
+        let answered = reasons_of(live, key);
+        assert!(!answered.is_empty(), "{key} counted something");
+        assert_eq!(
+            answered,
+            rendered_reasons(&collector, family, &dns.id),
+            "{key}"
+        );
+    }
+    assert!(
+        !reasons_of(live, "ended")
+            .iter()
+            .any(|(reason, _)| reason == unseen.as_str()),
+        "a zero count is not answered"
+    );
+}
+
+#[tokio::test]
+async fn the_published_status_schemas_name_exactly_the_fields_the_status_answers() {
+    let node = Node::control_plane().await;
+    node.enrol("edge-1", NodeStatus::Active, None).await;
+    let pg = source_stream("pg", 5432);
+    stored(&node, &pg).await;
+    let counters = lorica_stream::StreamCounters::new();
+    drop(counters.stream(&pg.id).accept());
+    let collector = crate::stream_metrics::StreamMetricsCollector::new();
+    collector.apply_worker(1, &counters.snapshot());
+    let statuses = super::status::stream_statuses(&node.state, &collector)
+        .await
+        .expect("statuses");
+    let entry = serde_json::to_value(&statuses[0]).expect("serialises");
+    assert_eq!(schema_properties("StreamStatus"), keys(&entry));
+    assert_eq!(
+        schema_properties("StreamLiveCounters"),
+        keys(&entry["counters"])
+    );
+
+    let failed = lorica_cluster::StreamBindingReport {
+        stream_id: pg.id.clone(),
+        state: lorica_cluster::StreamBindingState::Failed as i32,
+        kind: "address_in_use".to_string(),
+        os_error: "Address already in use (os error 98)".to_string(),
+        port: 5432,
+        failed_since_ms: 1_763_100_000_000,
+    };
+    let report = lorica_cluster::StreamPlaneReport {
+        bindings: vec![failed],
+        ..Default::default()
+    };
+    let row = node
+        .state
+        .store
+        .lock()
+        .await
+        .get_cluster_node("id-edge-1")
+        .expect("read")
+        .expect("the enrolled node");
+    let states = crate::cluster::stream_node_states(
+        &[crate::cluster::NodeStreamSight {
+            node: &row,
+            report: Some(&report),
+            drifted: false,
+        }],
+        std::slice::from_ref(&pg),
+    );
+    let node_state = serde_json::to_value(&states[&pg.id][0]).expect("serialises");
+    assert_eq!(schema_properties("StreamNodeState"), keys(&node_state));
+    let names = std::collections::HashMap::from([(pg.id.as_str(), pg.name.as_str())]);
+    let plane = crate::cluster::stream_plane_view(&report, &[], &names, false, Role::Viewer);
+    let binding = serde_json::to_value(&plane.bindings[0]).expect("serialises");
+    assert_eq!(schema_properties("NodeStreamBinding"), keys(&binding));
+
+    let reason = serde_json::to_value(crate::stream_metrics::ReasonCount {
+        reason: String::new(),
+        count: 0,
+    })
+    .expect("serialises");
+    assert_eq!(schema_properties("StreamReasonCount"), keys(&reason));
+}

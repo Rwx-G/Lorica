@@ -855,6 +855,10 @@ pub fn build_router(
             get(crate::stream_budget::get_stream_budget),
         )
         .route(
+            "/api/v1/streams/status",
+            get(crate::streams::get_stream_status),
+        )
+        .route(
             "/api/v1/streams",
             post(crate::streams::create_stream)
                 .layer(bl(BODY_CAP_DEFAULT))

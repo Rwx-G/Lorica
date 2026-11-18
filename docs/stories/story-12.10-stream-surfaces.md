@@ -1,7 +1,7 @@
 # Story 12.10: Streams on Every Surface
 
 **Epic:** [Epic 12 - TCP and UDP Stream Proxying (v1.11.0 and v1.12.0)](../prd/epic-12-v1.11.0.md)
-**Status:** Draft
+**Status:** InProgress
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:**
@@ -269,6 +269,24 @@ Verified on `e275a00e`.
 - **AC #4 is met twice**: per node in the Cluster drawer (12.2, names now
   complete), and per stream on the Streams page (bound on N of M nodes,
   each failed node listed), both from one rule.
+- **Amended by Lot A, against the code** (2026-11-18):
+  - The rule already existed in 12.2 as `ReportedBindings`
+    (`stream_budget.rs`), which the budget view uses. Lot A wraps it in
+    `node_bind_state(report, drifted, stream_id)` in `cluster/mod.rs`
+    (a report-less node reads `unknown`), called by `stream_plane_view`
+    for the drift entries and by `stream_node_states` for the status.
+  - `nodes` lists **active** nodes only: a pending node binds nothing
+    until activated, and showing it `unknown` would read as a fault.
+  - A targeted node **without a report** (offline, or not reported yet)
+    is listed `unknown`, as the bullet above says; the Lot A test line
+    "before a report absent" is read that way, since an absent node
+    would make "bound on N of M" count it out silently. The budget view
+    of 12.2 still omits such a node; it answers a different question.
+  - **`nodes_truncated` is dropped.** No cap bounds the roster below the
+    fleet, so the flag could never be true.
+  - `NodeStreamBinding` keeps its JSON shape plus `stream_name`; in Rust
+    its state and failure fields moved into a flattened `NodeBindState`,
+    which `StreamNodeState` (the status entry) shares.
 
 ### D-e. Live counters: this node's, from 12.9's collector
 
@@ -296,6 +314,26 @@ Verified on `e275a00e`.
   page; a sample whose total went down (a restart) shows `-` for one
   interval, never a negative rate. `lib/streams.ts` `ratesBetween(a, b)`,
   tested.
+- **Amended by Lot A, against the code** (2026-11-18):
+  - The accessor is `StreamMetricsCollector::live_counters()`, every
+    stream in one pass (`BTreeMap<String, StreamLiveCounters>`), not
+    `snapshot_for(stream_id)`: the status answers every stream, and a
+    per-stream call would re-aggregate every series once per stream.
+    `render` and the accessor share `counter_totals` and `gauge_values`,
+    so the two read one aggregate.
+  - `counters` is `null` while the collector holds no series of the
+    stream on this node, which is what "before the stream plane reports"
+    comes to in the collector's terms.
+  - `node_name` is `null` on a control plane too: like a standalone node
+    it has no roster row (`get_stream_budget` names it the same way).
+  - In Rust `node_name` sits on `StreamStatusCounters`, which flattens
+    the collector's `StreamLiveCounters`; `openapi.yaml` documents the
+    object as answered, under `StreamLiveCounters`, plus
+    `StreamReasonCount`.
+  - Until 12.9 Lot F wires the collector in the binary (`apply_worker`,
+    `set_local_counters`), a running node holds no series, so `counters`
+    is `null` on every stream in production. The endpoint and its tests
+    do not depend on that wiring.
 
 ### D-f. `streams:read`: the scope, its tier, its two paths
 
@@ -476,15 +514,16 @@ Allowlist: `lorica-api/src/streams/status.rs` (new),
 `lorica-api/openapi.yaml`, `lorica-api/tests/openapi_contract.rs` (only
 if it lists paths by hand).
 
-- [ ] `NodeStreamBinding.stream_name` resolved from the stored streams;
+- [x] `NodeStreamBinding.stream_name` resolved from the stored streams;
       the per-node state rule factored into one `pub(crate)` function the
       roster and the status share (D-d).
-- [ ] `StreamMetricsCollector::snapshot_for` and `StreamLiveCounters`
-      (D-e), reason arrays with non-zero entries only.
-- [ ] `GET /api/v1/streams/status` (D-d, D-e); `openapi.yaml`:
+- [x] `StreamMetricsCollector::snapshot_for` and `StreamLiveCounters`
+      (D-e), reason arrays with non-zero entries only (built as
+      `live_counters`, see D-e's amendment).
+- [x] `GET /api/v1/streams/status` (D-d, D-e); `openapi.yaml`:
       `StreamStatus`, `StreamNodeState`, `StreamLiveCounters`,
       `NodeStreamBinding.stream_name`.
-- [ ] Tests: standalone, follower and control-plane shapes (`nodes`
+- [x] Tests: standalone, follower and control-plane shapes (`nodes`
       present only on a control plane); a node in sync not listing a
       targeted stream reads `bound`, under drift `unknown`, before a
       report absent; a binding for a stream the control plane no longer
@@ -796,9 +835,65 @@ each one as "Resolved N".
 
 ### Debug Log
 
+- Lot A, 2026-11-18, on `a29a12b2`. Gates, `rust:1-bookworm` with
+  `CARGO_BUILD_WARNINGS=deny`, on the final tree: `cargo fmt --check`
+  and the workspace clippy green; the CI test lines green (3,662
+  product, 957 `lorica`, 911 forked, 592 TLS-featured tests).
+  `cargo audit` fails on `lettre` 0.11.23 (RUSTSEC-2026-0560 to 0565),
+  left to the dependency bump running beside this Lot.
+- The first product test run failed once on
+  `lorica-stream/tests/tcp_engine.rs`
+  `two_thousand_silent_connections_never_pass_the_pending_cap` ("past
+  the cap after source 83") while another agent's build shared the
+  machine. Not touched by this Lot; five isolated reruns and the full
+  rerun passed. Recorded because a pending-cap overshoot under load is
+  worth a look by whoever owns 12.6's admission.
+
 ### Completion Notes
 
+- **Lot A, the shared rule.** `cluster::node_bind_state(report, drifted,
+  stream_id)` wraps 12.2's `ReportedBindings`; `stream_plane_view` uses
+  it for its drift entries, `stream_node_states` for the status. The
+  latter is pure over `NodeStreamSight { node, report, drifted }`, so it
+  is tested without a live session (a session needs an `RpcEndpoint`,
+  which `lorica-api` cannot build without a dependency on
+  `lorica-command`); `fleet_stream_states` reads the sessions and the
+  drift verdicts (`drift_of`, now shared with `node_responses`) and
+  calls it.
+- **Binding names.** `stream_plane_view` takes the stored streams' names
+  by id; `node_responses` builds that map once per roster.
+- **Counters.** `StreamMetricsCollector::live_counters()`;
+  `StreamLiveCounters` and `ReasonCount` in `stream_metrics.rs`. The
+  status test compares every answered field with what `collect()`
+  renders for the same stream, the reasons derived from the rendered
+  series rather than listed.
+- **Endpoint.** `streams/status.rs`: `stream_statuses(state, collector)`,
+  the testable core that Lot B's automation wrapper can call, and
+  `get_stream_status`, which reads the process collector. No change to
+  `required_role`: the GET default is Viewer.
+- **For Lot B:** the status answer's keys are `id`, `name`, `protocol`,
+  `bind` (and the `StreamBindState` keys), `nodes` (`node_id`,
+  `node_name`, the bind keys), `counters` (`node_name`, `active`,
+  `pending`, `accepted_total`, `bytes_upload_total`,
+  `bytes_download_total`, `refused`, `ended`, `datagrams_dropped`,
+  each entry `reason`, `count`). `openapi.yaml` holds them, and
+  `the_published_status_schemas_name_exactly_the_fields_the_status_answers`
+  pins the document to the answer.
+- **For Lot F:** `NodeStreamBinding.stream_name` is always present,
+  `null` for a stream the control plane no longer holds.
+- **Outside the allowlist:** none. `openapi_contract.rs` derives the
+  paths from `server.rs` and was not touched.
+
 ## File List
+
+- `lorica-api/src/streams/status.rs` (new, Lot A)
+- `lorica-api/src/streams.rs` (Lot A, the module line and re-export)
+- `lorica-api/src/streams/tests.rs` (Lot A)
+- `lorica-api/src/cluster/mod.rs` (Lot A)
+- `lorica-api/src/cluster/tests.rs` (Lot A)
+- `lorica-api/src/stream_metrics.rs` (Lot A, the accessor)
+- `lorica-api/src/server.rs` (Lot A, one route line)
+- `lorica-api/openapi.yaml` (Lot A)
 
 ## Change Log
 
@@ -806,3 +901,4 @@ each one as "Resolved N".
 |---|---|---|---|
 | 2026-11-15 | 0.1 | Draft: the Streams page with a drawer covering every stored field and a derived badge map that reserves 12.13's and 12.15's kinds by type rather than by dead code, `GET /api/v1/streams/status` with per-node bind state and this node's live counters, stream names on the fleet view's bindings, the `streams:read` scope with its two automation paths and two MCP read tools in one commit after the field-adding API Lots, per-stream audit rows for imports and backend cascades, the refusal of a token's delete of a stream's backend, the backend page's usage column and portless addresses, IV1 in the MCP smoke, Lots A to H. | Romain G. |
 | 2026-11-15 | 0.2 | Maintainer answers folded in as Resolved 1 to 5 (token delete of a stream's backend refused, address updates allowed; this node's counters only; no automatic `streams:read`, re-minting stated in the CHANGELOG as an operator action; node names revealed and documented; per-stream import rows for streams only), plus Resolved 6 (the corrected artefact list) and 7 (12.9 Lot C3 after Lot B) recorded in Dev Notes. Status Draft. | Romain G. |
+| 2026-11-18 | 0.3 | Lot A: `GET /api/v1/streams/status` (this node's bind state, per-node states on a control plane, this node's live counters with per-reason arrays), `StreamMetricsCollector::live_counters`, `node_bind_state` shared by the fleet view and the status, `NodeStreamBinding.stream_name`, `openapi.yaml`. D-d and D-e amended against the code (active nodes only, `unknown` before a report, no `nodes_truncated`, one-pass accessor, `node_name` null on a control plane). Status InProgress. | Romain G. |
