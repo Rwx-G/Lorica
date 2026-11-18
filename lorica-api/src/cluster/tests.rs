@@ -4,6 +4,7 @@
 //! the fleet view (Story 12.2 Lot E2): the enrollment preview's
 //! `stream_ports`, each node's bind states, and the activation row.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -593,7 +594,13 @@ fn the_fleet_view_renders_a_nodes_bindings_and_withholds_its_figures_from_viewer
     );
     let reported = report(vec![failed_binding(&dns.id, "address_in_use")]);
 
-    let operator = super::stream_plane_view(&reported, &targeted, false, Role::Operator);
+    let operator = super::stream_plane_view(
+        &reported,
+        &targeted,
+        &names_of(&[&pg, &dns]),
+        false,
+        Role::Operator,
+    );
     assert_eq!(
         serde_json::to_value(&operator).expect("serialises"),
         serde_json::json!({
@@ -601,6 +608,7 @@ fn the_fleet_view_renders_a_nodes_bindings_and_withholds_its_figures_from_viewer
             "listen_sockets_used": 3,
             "bindings": [{
                 "stream_id": dns.id,
+                "stream_name": "dns",
                 "state": "failed",
                 "kind": "address_in_use",
                 "os_error": "Address already in use (os error 98)",
@@ -615,7 +623,13 @@ fn the_fleet_view_renders_a_nodes_bindings_and_withholds_its_figures_from_viewer
         "pg is not listed and the node is in sync: bound"
     );
 
-    let viewer = super::stream_plane_view(&reported, &targeted, false, Role::Viewer);
+    let viewer = super::stream_plane_view(
+        &reported,
+        &targeted,
+        &names_of(&[&pg, &dns]),
+        false,
+        Role::Viewer,
+    );
     let viewer = serde_json::to_value(&viewer).expect("serialises");
     assert!(viewer.get("fd_limit").is_none(), "{viewer}");
     assert!(viewer.get("worker_count").is_none(), "{viewer}");
@@ -634,11 +648,17 @@ fn under_drift_a_targeted_stream_the_node_does_not_list_is_unknown() {
         &[pg.clone(), dns.clone()],
     );
     let reported = report(vec![failed_binding(&dns.id, "fd_budget")]);
-    let view = super::stream_plane_view(&reported, &targeted, true, Role::Operator);
+    let view = super::stream_plane_view(
+        &reported,
+        &targeted,
+        &names_of(&[&pg, &dns]),
+        true,
+        Role::Operator,
+    );
     let states: Vec<(&str, BindStateKind)> = view
         .bindings
         .iter()
-        .map(|b| (b.stream_id.as_str(), b.state))
+        .map(|b| (b.stream_id.as_str(), b.bind.state))
         .collect();
     assert_eq!(
         states,
@@ -647,7 +667,7 @@ fn under_drift_a_targeted_stream_the_node_does_not_list_is_unknown() {
             (pg.id.as_str(), BindStateKind::Unknown),
         ]
     );
-    assert_eq!(view.bindings[1].kind, None);
+    assert_eq!(view.bindings[1].bind.kind, None);
 }
 
 #[test]
@@ -660,9 +680,9 @@ fn a_kind_or_a_state_only_a_newer_node_knows_reads_as_other_and_unknown() {
             ..lorica_cluster::StreamBindingReport::default()
         },
     ]);
-    let view = super::stream_plane_view(&newer, &[], false, Role::Operator);
-    assert_eq!(view.bindings[0].kind, Some("other"));
-    assert_eq!(view.bindings[1].state, BindStateKind::Unknown);
+    let view = super::stream_plane_view(&newer, &[], &HashMap::new(), false, Role::Operator);
+    assert_eq!(view.bindings[0].bind.kind, Some("other"));
+    assert_eq!(view.bindings[1].bind.state, BindStateKind::Unknown);
 }
 
 #[test]
@@ -678,7 +698,13 @@ fn unknown_entries_past_the_bound_cut_the_list_and_say_so() {
         })
         .collect();
     let targeted = super::stream_ports(&node_row("edge-1", NodeStatus::Active), &streams);
-    let view = super::stream_plane_view(&report(vec![]), &targeted, true, Role::Operator);
+    let view = super::stream_plane_view(
+        &report(vec![]),
+        &targeted,
+        &HashMap::new(),
+        true,
+        Role::Operator,
+    );
     assert_eq!(
         view.bindings.len(),
         lorica_cluster::MAX_STREAM_PLANE_BINDINGS
@@ -750,5 +776,57 @@ async fn an_activation_records_the_stream_ports_the_node_starts_binding() {
         row.after_payload_hash,
         crate::audit::hash_payload(Some(&expected)),
         "the row's hashed payload names every port the activation opened"
+    );
+}
+
+// ---- Stream names on the bindings (Story 12.10 Lot A) ----
+
+/// The name lookup the roster builds from the stored streams.
+fn names_of<'a>(streams: &[&'a lorica_config::models::Stream]) -> HashMap<&'a str, &'a str> {
+    streams
+        .iter()
+        .map(|s| (s.id.as_str(), s.name.as_str()))
+        .collect()
+}
+
+#[test]
+fn every_binding_names_its_stream_and_one_no_longer_held_is_null() {
+    let pg = stream("pg", 5432, &["edge-1"]);
+    let elsewhere = stream("smtp", 2525, &["edge-2"]);
+    let targeted = super::stream_ports(
+        &node_row("edge-1", NodeStatus::Active),
+        &[pg.clone(), elsewhere.clone()],
+    );
+    let deleted = uuid::Uuid::new_v4().to_string();
+    let reported = report(vec![
+        failed_binding(&elsewhere.id, "address_in_use"),
+        failed_binding(&deleted, "address_in_use"),
+    ]);
+    let view = super::stream_plane_view(
+        &reported,
+        &targeted,
+        &names_of(&[&pg, &elsewhere]),
+        true,
+        Role::Viewer,
+    );
+    let named: Vec<(&str, Option<&str>)> = view
+        .bindings
+        .iter()
+        .map(|b| (b.stream_id.as_str(), b.stream_name.as_deref()))
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            (elsewhere.id.as_str(), Some("smtp")),
+            (deleted.as_str(), None),
+            (pg.id.as_str(), Some("pg")),
+        ],
+        "a stream outside `stream_ports` is named, a deleted one is null, \
+         and the drift entry is named too"
+    );
+    let rendered = serde_json::to_value(&view).expect("serialises");
+    assert_eq!(
+        rendered["bindings"][1]["stream_name"],
+        serde_json::Value::Null
     );
 }

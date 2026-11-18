@@ -415,14 +415,15 @@ pub(crate) fn stream_ports(node: &ClusterNode, streams: &[Stream]) -> Vec<Stream
         .collect()
 }
 
-/// One binding that is not bound on a node, as the fleet view shows it.
+/// One stream's bind state on one node, as the control plane reads it
+/// from the node's report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct NodeStreamBinding {
-    /// The stream's id.
-    pub stream_id: String,
-    /// `pending` or `failed` as the node reported it, `unknown` for a
-    /// stream the node did not list while it drifts, or a state only a
-    /// newer node knows.
+pub struct NodeBindState {
+    /// `pending` or `failed` as the node reported it, `bound` for a
+    /// targeted stream an in-sync node did not list, `unknown` for one
+    /// it did not list while it drifts or after its list was cut, for a
+    /// node that has not reported, or for a state only a newer node
+    /// knows.
     pub state: BindStateKind,
     /// `failed` only: why. A kind this build does not know is `other`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -438,11 +439,10 @@ pub struct NodeStreamBinding {
     pub since: Option<DateTime<Utc>>,
 }
 
-impl NodeStreamBinding {
-    fn unknown(stream_id: &str) -> Self {
-        NodeStreamBinding {
-            stream_id: stream_id.to_string(),
-            state: BindStateKind::Unknown,
+impl NodeBindState {
+    fn without_detail(state: BindStateKind) -> Self {
+        NodeBindState {
+            state,
             kind: None,
             os_error: None,
             port: None,
@@ -453,13 +453,9 @@ impl NodeStreamBinding {
     fn listed(binding: &lorica_cluster::StreamBindingReport) -> Self {
         let state = listed_state(binding);
         if state != BindStateKind::Failed {
-            return NodeStreamBinding {
-                state,
-                ..Self::unknown(&binding.stream_id)
-            };
+            return Self::without_detail(state);
         }
-        NodeStreamBinding {
-            stream_id: binding.stream_id.clone(),
+        NodeBindState {
             state,
             kind: Some(
                 BindFailureKind::from_name(&binding.kind)
@@ -473,6 +469,42 @@ impl NodeStreamBinding {
                 .and_then(DateTime::<Utc>::from_timestamp_millis),
         }
     }
+}
+
+/// The state of `stream_id`, a stream this control plane expects the
+/// node to bind, from the node's `report` (`None` before one) and its
+/// drift verdict (Story 12.10 D-d). The one rule the fleet view's
+/// bindings read a node by: a listed
+/// binding is in the state listed; an unlisted one is bound while the
+/// node is in sync and its list whole, as [`ReportedBindings`] reads it;
+/// without a report nothing can be vouched for.
+pub(crate) fn node_bind_state(
+    report: Option<&StreamPlaneReport>,
+    drifted: bool,
+    stream_id: &str,
+) -> NodeBindState {
+    let Some(report) = report else {
+        return NodeBindState::without_detail(BindStateKind::Unknown);
+    };
+    let reported = ReportedBindings::new(report, drifted);
+    match reported.listed(stream_id) {
+        Some(binding) => NodeBindState::listed(binding),
+        None => NodeBindState::without_detail(reported.state_of(stream_id)),
+    }
+}
+
+/// One binding that is not bound on a node, as the fleet view shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NodeStreamBinding {
+    /// The stream's id.
+    pub stream_id: String,
+    /// The stream's name in this control plane's configuration, `null`
+    /// for a stream it no longer holds (a node still reporting one
+    /// deleted since).
+    pub stream_name: Option<String>,
+    /// The binding's state.
+    #[serde(flatten)]
+    pub bind: NodeBindState,
 }
 
 /// A node's stream plane as the fleet view shows it (Story 12.2 D-i,
@@ -501,7 +533,10 @@ pub struct NodeStreamPlane {
 
 /// The fleet view of a node's `report`, against the streams this
 /// control plane expects it to bind (`targeted`, its `stream_ports`),
-/// `drifted` its drift verdict, as `role` may see it.
+/// `drifted` its drift verdict, as `role` may see it. `names` holds
+/// the name of every stream this control plane stores, by id: a node
+/// may list a binding for a stream it no longer targets, or one
+/// deleted since.
 ///
 /// Under drift a targeted stream the node did not list cannot be
 /// vouched for: the node may not hold it yet. It is listed `unknown`
@@ -509,21 +544,27 @@ pub struct NodeStreamPlane {
 pub(crate) fn stream_plane_view(
     report: &StreamPlaneReport,
     targeted: &[StreamPortsEntry],
+    names: &HashMap<&str, &str>,
     drifted: bool,
     role: Role,
 ) -> NodeStreamPlane {
     let reported = ReportedBindings::new(report, drifted);
+    let named = |stream_id: &str, bind: NodeBindState| NodeStreamBinding {
+        stream_id: stream_id.to_string(),
+        stream_name: names.get(stream_id).map(|name| (*name).to_string()),
+        bind,
+    };
     let mut bindings: Vec<NodeStreamBinding> = report
         .bindings
         .iter()
-        .map(NodeStreamBinding::listed)
+        .map(|binding| named(&binding.stream_id, NodeBindState::listed(binding)))
         .collect();
     if drifted {
         bindings.extend(
             targeted
                 .iter()
                 .filter(|s| reported.listed(&s.id).is_none())
-                .map(|s| NodeStreamBinding::unknown(&s.id)),
+                .map(|s| named(&s.id, node_bind_state(Some(report), drifted, &s.id))),
         );
     }
     let truncated = report.truncated || bindings.len() > MAX_STREAM_PLANE_BINDINGS;
@@ -549,6 +590,30 @@ fn streams_for_review(store: &lorica_config::ConfigStore) -> Vec<Stream> {
         tracing::warn!(error = %e, "cluster roster: streams unreadable; stream_ports shown empty");
         Vec::new()
     })
+}
+
+/// The control plane's open sessions, by node id.
+fn live_sessions(control: &ControlPlane) -> HashMap<String, LiveSessionSnapshot> {
+    control
+        .sessions
+        .snapshot()
+        .into_iter()
+        .map(|s| (s.node_id.clone(), s))
+        .collect()
+}
+
+/// The drift verdict of `node`, from its open session when it has one.
+fn drift_of(
+    control: &ControlPlane,
+    node: &ClusterNode,
+    session: Option<&LiveSessionSnapshot>,
+) -> lorica_fleet::runtime::DriftVerdict {
+    lorica_fleet::runtime::evaluate_drift(
+        &control.expected_config_version(&node.node_id),
+        node.applied_config_generation,
+        &node.applied_config_hash,
+        session.map(|s| &s.applied),
+    )
 }
 
 /// JSON shape of a registered node: the registry row plus the live
@@ -634,29 +699,22 @@ fn node_responses(
     streams: &[Stream],
     role: Role,
 ) -> Vec<NodeResponse> {
-    let live: HashMap<String, LiveSessionSnapshot> = control
-        .sessions
-        .snapshot()
-        .into_iter()
-        .map(|s| (s.node_id.clone(), s))
+    let live = live_sessions(control);
+    let names: HashMap<&str, &str> = streams
+        .iter()
+        .map(|s| (s.id.as_str(), s.name.as_str()))
         .collect();
     nodes
         .into_iter()
         .map(|node| {
             let session = live.get(&node.node_id);
-            let expected = control.expected_config_version(&node.node_id);
-            let drift = lorica_fleet::runtime::evaluate_drift(
-                &expected,
-                node.applied_config_generation,
-                &node.applied_config_hash,
-                session.map(|s| &s.applied),
-            );
+            let drift = drift_of(control, &node, session);
             let stream_ports = stream_ports(&node, streams);
             NodeResponse {
                 connected: session.is_some(),
-                stream_plane: session
-                    .and_then(|s| s.stream_plane.as_ref())
-                    .map(|report| stream_plane_view(report, &stream_ports, drift.drifted, role)),
+                stream_plane: session.and_then(|s| s.stream_plane.as_ref()).map(|report| {
+                    stream_plane_view(report, &stream_ports, &names, drift.drifted, role)
+                }),
                 stream_ports,
                 drift,
                 session_peer: session.map(|s| s.peer_addr.to_string()),

@@ -9326,10 +9326,17 @@ components:
     NodeStreamBinding:
       type: object
       description: One binding that is not bound on a node.
-      required: [stream_id, state]
+      required: [stream_id, stream_name, state]
       properties:
         stream_id:
           type: string
+        stream_name:
+          type: string
+          nullable: true
+          description: >-
+            The stream's name in this control plane's configuration;
+            `null` for a stream it no longer holds (a node still
+            reporting one deleted since).
         state:
           type: string
           enum: [pending, failed, unknown]
