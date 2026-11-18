@@ -19,6 +19,8 @@ Author: Rwx-G
 
 ### Security
 
+- **`lettre` 0.11.24** ([RUSTSEC-2026-0560](https://rustsec.org/advisories/RUSTSEC-2026-0560), [RUSTSEC-2026-0561](https://rustsec.org/advisories/RUSTSEC-2026-0561), [RUSTSEC-2026-0562](https://rustsec.org/advisories/RUSTSEC-2026-0562), [RUSTSEC-2026-0563](https://rustsec.org/advisories/RUSTSEC-2026-0563), [RUSTSEC-2026-0564](https://rustsec.org/advisories/RUSTSEC-2026-0564), [RUSTSEC-2026-0565](https://rustsec.org/advisories/RUSTSEC-2026-0565), published 2026-11-17), the SMTP client behind email notification channels; the `lettre` floor in `lorica-notify` moves to 0.11.24. Three of them were reachable. With `smtp_encryption` set to `starttls`, the default, a man-in-the-middle between Lorica and the relay could append replies to the cleartext `STARTTLS` reply and have a message the relay refused counted as delivered (0560). With `starttls` or `none`, a man-in-the-middle, and with any setting a hostile or compromised relay, could make Lorica panic with a blank `EHLO` reply line (0562), which ended the task that delivers every notification, on every channel, until the next restart, or send a reply line that never ends, which Lorica buffered until memory ran out (0565). The other three were not: alert text reaches only the subject and the plain-text body, whose bare CR is encoded and bare LF turned into CRLF before the unstuffed-dot path of 0561 is reached, and the only addresses and display names (0563, 0564) are the `from_address` and `to_address` a SuperAdmin configures. Affected releases: 0.1.2 to 1.10.7.
+
 ## [1.10.7] - 2026-11-16
 
 A WebSocket left idle stays open for the route's Read timeout instead of 60 seconds. No schema migration.
