@@ -694,11 +694,11 @@ Allowlist: `docs/streams.md` (a "Protecting a stream" section, and every
 (the region version line), `CHANGELOG.md`.
 Depends on: C, D, E, F; after 12.4 Lot G and 12.5 Lot H.
 
-- [ ] `docs/streams.md`: the D-a order; which address is judged (D-b);
+- [x] `docs/streams.md`: the D-a order; which address is judged (D-b);
       per node, not per cluster; the defaults and why rates are off;
       the pending bound and its memory; the GeoIP unknown rule; what
       counts as an allowlist; the Story 8.9 cap does not apply.
-- [ ] `docs/streams.md`, stated plainly where an operator looks for
+- [x] `docs/streams.md`, stated plainly where an operator looks for
       them, because both contradict what an operator will expect:
       "A filter change does not end connections already open: disable
       and re-enable the stream to cut them" (D-a), and "The WAF
@@ -709,7 +709,7 @@ Depends on: C, D, E, F; after 12.4 Lot G and 12.5 Lot H.
       cap and per-source share), log amplification (D-j), random-source
       table fill (filters before tables, open rates), handshake CPU
       (12.4's pointer to the open rates).
-- [ ] CHANGELOG under Added and Security.
+- [x] CHANGELOG under Added and Security.
 
 ### Lot I: end-to-end, IV1 to IV3 - Docker e2e
 
@@ -1197,6 +1197,10 @@ lint` and `vitest run` clean.
 
 - Lot H, security, operations and architecture documentation, 2026-11-18: Threat model T12: slow ClientHello and slow PROXY header (the pending cap, `PENDING_SOURCE_SHARE_DIVISOR`), log amplification (the refusal limiter, per process, and the stream writer queue), random-source table fill (table-free filters first, the open rates), handshake CPU, and the WAF auto-ban list not applying to streams; residual risk 18 (per-node caps, `cap + (W - 1)`). `worker-shared-state.md` section 7a.2 describes region version 2. Not done, outside this agent's files: the region version line of both bump checklists. The other documentation agent of this cycle owns `docs/streams.md`, `README.md` and `CHANGELOG.md`; the items of this Lot in those files are theirs and stay unticked here until they land. Commits `9473b7d6` (security), `c17ff277` (worker), `df122844` (cluster), `619b55bb` (mcp), `5e4d0d69` (security, `stream_listen_socket_cap`).
 
+- **Lot H, the parts in `docs/streams.md` and `CHANGELOG.md` (2026-11-18).** `docs/streams.md` (new), "Protecting a stream": the order of the checks as built (the pending cap named before the source cap), which address is judged, per node and not per cluster, allow and deny lists and what counts as an allowlist, the GeoIP unknown rule, the global filter and blocklist, the HTTP per-IP cap (`connection_limits_per_ip`) not applying, caps, pending connections and their memory, rates and why they are off, refusal counters and the log limiter. The two sentences of the second box are quoted at the top of the section. No "per worker process until Story 12.6" sentence was ever written: `docs/streams.md` is new and states per node throughout.
+- `CHANGELOG.md` `[Unreleased]`: Added (stream protection) and Security (the WAF auto-ban does not apply, filter changes judge new connections only).
+- The threat model and `worker-shared-state.md` the other documentation pass of this cycle covered (commit `11b46697` and those it names); the bump checklists' region line is outside this pass.
+
 ## File List
 
 Lot A:
@@ -1271,6 +1275,7 @@ Lot G:
 - `lorica-dashboard/frontend/src/components/settings-tabs/NetworkTab.test.ts`
   (modified)
 - `docs/security/threat-model.md`, `docs/architecture/worker-shared-state.md` (Lot H, threat model and architecture part)
+- `docs/streams.md` (new), `CHANGELOG.md` (Lot H, the protection parts)
 
 ## Change Log
 
@@ -1286,3 +1291,4 @@ Lot G:
 | 2026-11-16 | 0.8 | Lot G: the Network tab says the per-IP connection limit is per worker process and does not apply to streams. | Romain G. |
 | 2026-11-18 | 0.9 | The stream and pending totals admit by compare-and-swap instead of an add taken back past the cap: a refused admission no longer shows in the totals for an instant, which IV3's engine test read as 257 pending against a cap of 256 under load and which could refuse an admission while a release had freed a slot. No slot was ever held past the cap. | Romain G. |
 | 2026-11-18 | 0.10 | Lot H, threat model and architecture part: slow reads, log amplification, table fill and handshake CPU in T12; region version 2 in `worker-shared-state.md`. The bump-checklist line, `docs/streams.md` and `CHANGELOG.md` stay open. | Romain G. |
+| 2026-11-18 | 0.11 | Lot H, the `docs/streams.md` and CHANGELOG parts: "Protecting a stream" documented with the two plain statements; with the other documentation pass's boxes, every box of the Lot is ticked. Status InProgress. | Romain G. |

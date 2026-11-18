@@ -1170,7 +1170,7 @@ Allowlist: `docs/streams.md` (the TCP engine sections),
 (source addresses and capacity), `CHANGELOG.md`.
 Depends on: C, D2, E.
 
-- [ ] **Verify the survey values first (Resolved 9).** For every
+- [x] **Verify the survey values first (Resolved 9).** For every
       competitor value in D-d's table, open the source the PRD links
       ("Sources" under "Prior Art") for that product and setting, read
       the documented default, and record value and URL. A value the
@@ -1178,7 +1178,7 @@ Depends on: C, D2, E.
       from memory. Correct D-d's table in this story where a value
       differs, and list each check (setting, product, value, URL) in
       the Completion Notes.
-- [ ] `docs/streams.md`: the pipeline; algorithms with the weights
+- [x] `docs/streams.md`: the pipeline; algorithms with the weights
       sentence and the per-process least-conn note; backups; breaker;
       retry and the two end reasons; the defaults table of D-d with
       the URL it was verified from beside every competitor value;
@@ -1196,7 +1196,7 @@ Depends on: C, D2, E.
       (same node refused; across nodes not detected, bounded by caps);
       DNS rebinding of stream backends; PROXY-header spoofing on
       streams.
-- [ ] `CHANGELOG.md` `[Unreleased]`: Added (the TCP engine), Security
+- [x] `CHANGELOG.md` `[Unreleased]`: Added (the TCP engine), Security
       (local backends refused, PROXY trust per stream).
 
 ### Lot G: end-to-end, IV1 to IV4 - Docker e2e
@@ -1787,6 +1787,19 @@ performance phase.
 
 - Lot F, security, operations and architecture documentation, 2026-11-18: Threat model T12: a stream exposing local services (rules A and B, the three checks), forwarding loops (same node refused by rule B, across nodes bounded and not detected), DNS rebinding of stream backends (connect-time check after every resolution, the per-stream exclusion that is not written to the shared health), PROXY-header spoofing on streams. The hardening guide's capacity section covers source addresses. The survey check and the `docs/streams.md` sections are the other agent's and stay open. The other documentation agent of this cycle owns `docs/streams.md`, `README.md` and `CHANGELOG.md`; the items of this Lot in those files are theirs and stay unticked here until they land. Commits `9473b7d6` (security), `c17ff277` (worker), `df122844` (cluster), `619b55bb` (mcp), `5e4d0d69` (security, `stream_listen_socket_cap`).
 
+**Lot F, the parts in `docs/streams.md` and `CHANGELOG.md` (2026-11-18).**
+
+- Survey values verified against the PRD's sources (nginx stream module pages as published on 2026-11-18, the HAProxy 3.4 configuration manual (3.4.7), Envoy `latest` (1.41.0-dev), Traefik 3.7, the caddy-l4 repository; each value and its URL is in `docs/streams.md`, "Defaults compared"). Each check, setting / product / documented value:
+  - connect: nginx `proxy_connect_timeout` 60 s; HAProxy `timeout connect` unset means infinite, with a startup warning; Envoy cluster `connect_timeout` 5 s; Traefik `dialTimeout` 30 s;
+  - idle: nginx `proxy_timeout` 10 min; HAProxy `timeout client` / `timeout server` unset means infinite, with a warning; Envoy `idle_timeout` 1 h; Traefik: not documented for TCP routers (only `respondingTimeouts.idleTimeout`, described as keep-alive);
+  - total: nginx none; HAProxy none; Envoy `max_downstream_connection_duration` unset; Traefik not documented;
+  - attempts: nginx `proxy_next_upstream_tries 0` (no limit); HAProxy `retries`: no default stated in its section; Envoy `max_connect_attempts` 1; Traefik not documented;
+  - backend keepalive: nginx `proxy_socket_keepalive off`; HAProxy `option srvtcpka`: no default stated; Envoy not documented; Traefik `dialKeepAlive` 15 s.
+- Differences from D-d's table, recorded here rather than by rewriting the Decision: HAProxy `retries` 3 and `srvtcpka` off are not stated by the 3.4 manual and are written "not documented"; Traefik's idle and attempts, "not verified" in D-d, are not documented. Every other value matched.
+- `docs/streams.md` (new) covers, under "TCP streams": the pipeline, the algorithms with the weights sentence and the per-worker `least_conn` / `peak_ewma` note, candidates, backups, the breaker, retry and its two end reasons, timeouts, keepalive and why it is on, `close_on_backend_down`, buffers, half-close and why no splice, PROXY send, PROXY accept (untrusted peer, no `optional` mode, UDP refused and why), source addresses and `IP_BIND_ADDRESS_NO_PORT`, local backends (rules A and B, the interface check, what validation cannot see, the stream-only exclusion), DNS and the NSS limit, bandwidth, and `max_connections` with its budget arithmetic. `max_connections` is documented as per node: Story 12.6 made it so and the code's doc comment says it, so the interim "per worker process until Story 12.6" wording appears nowhere. The defaults table cites the constant beside each Lorica value.
+- `CHANGELOG.md` `[Unreleased]`: Added (TCP streams) and Security (local backends refused, PROXY trusted per stream).
+- The threat-model entries the other documentation pass of this cycle covered (commit `11b46697` and those it names).
+
 ## File List
 
 Lot E:
@@ -1869,6 +1882,7 @@ Lot B:
   (literal sites)
 - `docs/stories/story-12.3-tcp-engine.md`
 - `docs/security/threat-model.md`, `docs/security/hardening-guide.md` (Lot F, threat model and hardening part)
+- `docs/streams.md` (new), `CHANGELOG.md` (Lot F, the TCP engine parts)
 
 ## Change Log
 
@@ -1884,3 +1898,4 @@ Lot B:
 | 2026-11-15 | 0.6 | Lot C landed: the TCP engine in `lorica_stream::tcp`, the protocol-neutral seams, local check, resolver cache and counters at the crate root (Story 12.5 E2, E3), `StreamTable::with_backends`, `table_changed` and the `backend_down` drain, the connection record and its observer. | Romain G. |
 | 2026-11-18 | 0.9 | D9 amended: the local-backend refusal of a token's address change names the stream only to a token holding `streams:read` and its id otherwise, through `streams_as_seen_by`, the helper Story 12.10's backend delete refusal uses; reason: 12.10 D-j keeps stream names from a config-tier token and the refusal must not undo it. Tests both ways on REST, the stdio-shaped request and both MCP tools, apply and preview. Gates: the CI chain green, `cargo audit` clean. | Romain G. |
 | 2026-11-18 | 0.10 | Lot F, threat-model part: local services, forwarding loops, DNS rebinding and PROXY-header spoofing on streams in T12; source addresses in the hardening guide. The survey check, `docs/streams.md` and `CHANGELOG.md` stay open. | Romain G. |
+| 2026-11-18 | 0.11 | Lot F, the `docs/streams.md` and CHANGELOG parts: survey values verified with a URL each (two D-d values not documented by HAProxy 3.4, recorded in the Completion Notes), the TCP engine documented; with the other documentation pass's boxes, every box of the Lot is ticked. Status InProgress. | Romain G. |

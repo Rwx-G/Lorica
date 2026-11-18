@@ -1094,7 +1094,7 @@ Allowlist: `docs/streams.md` (the UDP sections), `docs/security/threat-model.md`
 both copies), `CHANGELOG.md`.
 Depends on: F and G (documents what was built).
 
-- [ ] `docs/streams.md`: the D-l table with the survey column, the session
+- [x] `docs/streams.md`: the D-l table with the survey column, the session
       lifecycle of D-b, the reflection bound, the capacity formula
       (`max_sessions / idle_timeout_s` sessions per second for a protocol
       whose backend never answers; IV2 shows why answered request/response
@@ -1109,7 +1109,7 @@ Depends on: F and G (documents what was built).
 - [x] Threat model: reflection and amplification (what is bounded, by
       which field, per node; the random-source table fill and its
       mitigations; per-source controls are courtesy, D6).
-- [ ] `CHANGELOG.md` `[Unreleased]`: Added (UDP streams), Security (the
+- [x] `CHANGELOG.md` `[Unreleased]`: Added (UDP streams), Security (the
       default bounds).
 
 ### Lot I: end-to-end, IV1 and IV2 - Docker e2e
@@ -2019,6 +2019,12 @@ decision.
 
 - Lot H, security, operations and architecture documentation, 2026-11-18: Threat model T12: reflection and amplification with the per-session bounds, the per-source rates and the reflection bound computed from the defaults (8,192,000 bytes a second per source key and node, arithmetic from the constants of `UdpSettings`, not a measurement: IV1 of Lot I is still open), the exposed-address rule, the random-source table fill and its mitigations, per-source controls as a courtesy (residual risk 17). The hardening guide covers raising UDP session capacity (`LimitNOFILE`, `ip_local_port_range`, `source_addresses`); `worker-shared-state.md` section 7a.2 covers the stream-caps region, at its current layout version 2. Not done, outside this agent's files: the region version line in `docs/BUMP-CHECKLIST.md` and `.claude/skills/bump-version/bump-checklist.md` (neither lists `STREAM_CAPS_LAYOUT_VERSION` today). The other documentation agent of this cycle owns `docs/streams.md`, `README.md` and `CHANGELOG.md`; the items of this Lot in those files are theirs and stay unticked here until they land. Commits `9473b7d6` (security), `c17ff277` (worker), `df122844` (cluster), `619b55bb` (mcp), `5e4d0d69` (security, `stream_listen_socket_cap`).
 
+- **Lot H, the parts in `docs/streams.md` and `CHANGELOG.md` (2026-11-18).** `docs/streams.md` (new), "UDP streams": sessions, the lifecycle of D-b, the defaults and why (the DNS ratio note), the reflection bound with its default figure, the listen-address rule, the per-source formula `source_session_cap + (W - 1)`, the caps-region memory at the UDP default (1 MiB of rate cells and 2 MiB of source cells on 8 workers, from `layout_with_links` and the cell sizes the code asserts), the capacity formula and why answered traffic goes past it, the PROXY v2 convention, the reply source on wildcard addresses, drain mode and the rebind gap, and the upgrade overlap; the node ceiling and its preconditions are under "The fd budget", with the six-streams figure held by `six_default_udp_streams_fit_and_the_seventh_breaks_the_source_ports`.
+- Survey values for UDP verified: Traefik 3 s, Envoy 1 min, caddy-l4 30 s (in its `docs/servers.md`; the README states none), nginx `proxy_timeout` 10 min, `proxy_requests 0`, `proxy_responses` unlimited unless set. **HAProxy Enterprise's 10 s UDP idle is not stated** on the module page the PRD links: the docs write "not documented". The doc comment of `Stream::DEFAULT_UDP_IDLE_TIMEOUT_S` (and the PRD's survey line) still quote it; not changed here (docs-only pass).
+- PROXY v2 over UDP, receivers whose own documentation states it (read on 2026-11-18): Unbound (`proxy-protocol-port`) and PowerDNS Recursor (`proxy-protocol-from`). dnsdist's page refused the fetch (403) and Knot Resolver was not checked, so neither is listed. None was run against Lorica.
+- `CHANGELOG.md` `[Unreleased]`: Added (UDP streams) and Security (bounded against reflection by default, the listen-address rule).
+- The threat-model entry, the hardening guide and `worker-shared-state.md` the other documentation pass of this cycle covered (commit `11b46697` and those it names); the bump checklists' region line is outside this pass.
+
 ## File List
 
 Lot J:
@@ -2110,6 +2116,7 @@ Lot A:
 - `lorica-stream/src/runtime.rs` (the `caps` arm, outside the allowlist)
 - `docs/stories/story-12.5-udp-engine.md`
 - `docs/security/threat-model.md`, `docs/security/hardening-guide.md`, `docs/architecture/worker-shared-state.md` (Lot H, threat model, hardening and architecture part)
+- `docs/streams.md` (new), `CHANGELOG.md` (Lot H, the UDP parts)
 
 ## Change Log
 
@@ -2126,3 +2133,4 @@ Lot A:
 | 2026-11-15 | 0.9 | Lot G landed: the `udp` settings on the stream view and both bodies, the listen-address rule called by `Stream::validate`, the usable source ports in the heartbeat and in the API's budget check and view, one "refuse raises, allow lowers" rule (`FdBudget::check_change`) for the API's write check and the node's bind, `openapi.yaml` with the UDP schemas, the refusal and drop words and `source_ports` pinned to their enums. | Romain G. |
 | 2026-11-18 | 0.10 | Lot J landed: the System page's budget panel shows each node's UDP session ceiling, what bound it, the usable source ports, the committed sessions, the source pools and `over_ceiling`, and each UDP stream's share; `source_ports` in the bind failure kinds. Frontend gates green (check, lint, Vitest 911). | Romain G. |
 | 2026-11-18 | 0.11 | Lot H, threat model, hardening and architecture part: UDP reflection and amplification in T12, raising UDP session capacity in the hardening guide, the stream-caps region in `worker-shared-state.md`. The bump-checklist line, `docs/streams.md` and `CHANGELOG.md` stay open. | Romain G. |
+| 2026-11-18 | 0.12 | Lot H, the `docs/streams.md` and CHANGELOG parts: UDP streams documented, survey values and PROXY v2 receivers verified from their documentation (HAProxy Enterprise's 10 s not documented); with the other documentation pass's boxes, every box of the Lot is ticked. Status InProgress. | Romain G. |

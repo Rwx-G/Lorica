@@ -1119,12 +1119,12 @@ Allowlist: `docs/streams.md` (the TLS sections), `docs/security/threat-model.md`
 certificate entitlement paragraph), `CHANGELOG.md`.
 Depends on: D, E, F.
 
-- [ ] **Verify the survey values first**, as 12.3 Resolved 9: each
+- [x] **Verify the survey values first**, as 12.3 Resolved 9: each
       competitor value of D-k's table read from the PRD's sources, the
       URL beside it in `docs/streams.md`, "not documented" where the
       source states none, D-k corrected where a value differs, each
       check listed in the Completion Notes.
-- [ ] `docs/streams.md`: the three modes and the D-g table; rules,
+- [x] `docs/streams.md`: the three modes and the D-g table; rules,
       precedence, ALPN by client preference, wildcard depth and the
       certificate one-label difference; `clienthello_timeout_ms` with
       its minimum and maximum and their NFR2 reason (Resolved 7); the
@@ -1143,7 +1143,7 @@ Depends on: D, E, F.
       check); SNI is a routing hint, not an identity; ECH hides the
       true name from routing; no 0-RTT.
 - [x] `docs/cluster.md`: a stream's certificates entitle its nodes.
-- [ ] `CHANGELOG.md` `[Unreleased]`: Added (TLS passthrough with SNI and
+- [x] `CHANGELOG.md` `[Unreleased]`: Added (TLS passthrough with SNI and
       ALPN routing, termination, upstream TLS and mTLS); Security
       (per-stream client CA, no default backend for clients without
       SNI, certificate keys entitled by streams only to their nodes).
@@ -1832,6 +1832,13 @@ The decisions above cite each one as "Resolved N".
 
 - Lot G, security, operations and architecture documentation, 2026-11-18: Threat model T12: slow ClientHello against the pending cap and its per-source share, handshake CPU bounded by the pending phase and the open rates, the preread and rustls agreement check (terminating streams only; a passthrough stream runs no handshake), SNI as a routing hint, ECH routing on the outer name, no 0-RTT (`max_early_data_size = 0`, verified in `lorica-stream/src/tls/server.rs`). `docs/cluster.md` "Need to know": `tls_terminate.certificate_ids` entitle the stream's selector through `cert_key_recipients` and `certificates_entitling_node` (verified in `lorica-config/src/store/cluster_nodes.rs`). The `docs/hot-upgrade.md` D8 paragraph is covered by the upgrade section (TLS streams drain the same way; `drains_on_upgrade` is the Phase 2 transfer exclusion). The survey check, `docs/streams.md` and `CHANGELOG.md` are the other agent's and stay open. The other documentation agent of this cycle owns `docs/streams.md`, `README.md` and `CHANGELOG.md`; the items of this Lot in those files are theirs and stay unticked here until they land. Commits `9473b7d6` (security), `c17ff277` (worker), `df122844` (cluster), `619b55bb` (mcp), `5e4d0d69` (security, `stream_listen_socket_cap`).
 
+**Lot G, the parts in `docs/streams.md` and `CHANGELOG.md` (2026-11-18).**
+
+- Survey values verified (nginx stream module pages as published on 2026-11-18, the HAProxy 3.4 configuration manual (3.4.7), Envoy `latest` (1.41.0-dev), Traefik 3.7, the caddy-l4 repository; each value and its URL is in `docs/streams.md`, "Defaults compared"): ClientHello time, nginx `preread_timeout` 30 s; HAProxy `tcp-request inspect-delay` has no default and HAProxy does not wait at all when it is unset; Envoy `listener_filters_timeout` 15 s; Traefik not documented. ClientHello size, nginx `preread_buffer_size` 16k; HAProxy `tune.bufsize` 16384; Envoy `tls_inspector` 64 KiB ("not verified" in D-k, now documented); Traefik not documented. Also: nginx `proxy_protocol_timeout` 30 s, `ssl_handshake_timeout` 60 s. D-k's table is otherwise right; the correction is recorded here rather than by rewriting the Decision.
+- `docs/streams.md` (new), "TLS at layer 4": the three modes and the per-mode field table, rules and precedence, ALPN by client preference, wildcard depth against one-label certificates, `clienthello_timeout_ms` with its range and the reason for both ends, the `no_sni` matcher, its acknowledgement and the certificate by local address, ClientHello bounds, server-first and STARTTLS openings, ECH, termination and certificate entitlement, client certificates and the `required = false` difference from routes, upstream TLS with the three `server_name` modes, `skip_verify` and its badge, the PROXY-before-TLS order and the breaker rule, which bytes are counted, and what `drains_on_upgrade` does and does not promise in 1.11.0.
+- `CHANGELOG.md` `[Unreleased]`: Added (TLS at layer 4) and Security (no default backend on a TLS stream, per-stream client CA, keys entitled only to a stream's nodes).
+- The threat model, `docs/cluster.md` and the D8 paragraph of `docs/hot-upgrade.md` the other documentation pass of this cycle covered (commit `11b46697` and those it names).
+
 ## File List
 
 Lot F:
@@ -1905,6 +1912,7 @@ Lot A:
 - `lorica-tls/src/cert_resolver.rs`, `lorica-tls/src/http_client.rs`
 - `docs/stories/story-12.4-tls-l4.md`
 - `docs/security/threat-model.md`, `docs/cluster.md`, `docs/hot-upgrade.md` (Lot G, threat model, cluster and upgrade part)
+- `docs/streams.md` (new), `CHANGELOG.md` (Lot G, the TLS parts)
 
 ## Change Log
 
@@ -1919,3 +1927,4 @@ Lot A:
 | 2026-11-15 | 0.7 | Lot E landed: the TCP engine built with the process's certificate resolver and public roots in both process modes (the worker's resolver now filled before its stream runtime starts), client identities in the stream table, round-robin per (stream, rule), `evaluate_mtls` over `organizations_admitted`, and the resolver reload keeping the certificates terminating streams name. | Romain G. |
 | 2026-11-15 | 0.8 | Lot F landed: the TLS fields and `drains_on_upgrade` on the stream API with links per rule, the bundle and certificate checks of `tls_checks.rs` on create, update and import (422, coverage by the handshake's lookup, IP SAN for `no_sni`, trust and wildcard-depth warnings), the certificate delete guard for streams, and `openapi.yaml`. A rule with no backend is accepted. | Romain G. |
 | 2026-11-18 | 0.9 | Lot G, threat model, cluster and upgrade part: the TLS rows of T12, the certificate entitlement of a terminating stream in `docs/cluster.md`, `drains_on_upgrade` in `docs/hot-upgrade.md`. The survey check, `docs/streams.md` and `CHANGELOG.md` stay open. | Romain G. |
+| 2026-11-18 | 0.10 | Lot G, the `docs/streams.md` and CHANGELOG parts: survey values verified with a URL each (Envoy's ClientHello size now documented), TLS at layer 4 documented; with the other documentation pass's boxes, every box of the Lot is ticked. Status InProgress. | Romain G. |

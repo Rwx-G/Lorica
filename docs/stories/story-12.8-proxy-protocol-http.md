@@ -777,7 +777,7 @@ Depends on: D.
       cross-cutting deliverable), the loopback trust of D-l.
 - [x] `docs/cluster.md`: the PROXY protocol settings join the node-local
       family.
-- [ ] `CHANGELOG.md` `[Unreleased]`: Added (PROXY accept on the HTTP
+- [x] `CHANGELOG.md` `[Unreleased]`: Added (PROXY accept on the HTTP
       listeners), Security (spoofing refused and counted).
 
 ### Lot G: end-to-end, IV1 to IV3 - Docker e2e
@@ -1231,6 +1231,8 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 
 - Lot F, security, operations and architecture documentation, 2026-11-18: `docs/security.md` "Client address from a PROXY header (v1.11.0)": when to use it rather than `trusted_proxies`, the three settings and modes, mixed listeners (D-c), the precedence of D-g, what changes for `connection_allow_cidrs` (D-h), node-local and how to set it on a follower, the outcome enum named rather than transcribed, the two counters and the rate-limited log. Threat model T12: PROXY-header spoofing on the HTTP listeners and the loopback trust of D-l. `docs/cluster.md`: the PROXY settings join `trusted_proxies` as node-local trust lists, the stream trust list being the replicated exception. The hardening guide gains a PROXY bullet. The other documentation agent of this cycle owns `docs/streams.md`, `README.md` and `CHANGELOG.md`; the items of this Lot in those files are theirs and stay unticked here until they land. Commits `9473b7d6` (security), `c17ff277` (worker), `df122844` (cluster), `619b55bb` (mcp), `5e4d0d69` (security, `stream_listen_socket_cap`).
 
+- **Lot F, the `CHANGELOG.md` part (2026-11-18).** `[Unreleased]`: Added (PROXY protocol on the HTTP and HTTPS listeners, its settings and counters) and Security (a PROXY header believed only from the listed peers, shared with the stream entry). `docs/streams.md` points at `docs/security.md` for the HTTP listeners. `docs/security.md`, the threat model and `docs/cluster.md` the other documentation pass of this cycle covered (commit `11b46697` and those it names); with this, every box of Lot F is ticked.
+
 ## File List
 
 - `.github/workflows/ci.yml` (Lot 0: the rustls test line and its comment)
@@ -1280,6 +1282,7 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 - `lorica-api/src/metrics.rs` (Lot D: the two counters, `PER_WORKER_COUNTERS`, tests)
 - `lorica-config/src/canonical.rs` (the `CanonicalGlobalSettings` doc comment)
 - `docs/security.md`, `docs/security/threat-model.md`, `docs/cluster.md`, `docs/security/hardening-guide.md` (Lot F, all but README and CHANGELOG)
+- `CHANGELOG.md` (Lot F, the CHANGELOG part)
 
 ## Change Log
 
@@ -1295,3 +1298,4 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 | 2026-11-14 | 0.8 | Lot C2: the PROXY protocol settings refused on the automation plane and by the MCP tools, by test, and named in the refused family. Status InProgress. | Romain G. |
 | 2026-11-15 | 0.9 | Lot D: PROXY accept wired on the HTTP and HTTPS listeners through a live gate on the connection filter, one `X-Forwarded-For` trust rule, the two per-worker counters and the rate-limited refusal log. Status InProgress. | Romain G. |
 | 2026-11-18 | 0.10 | Lot F, all but `README.md` and `CHANGELOG.md`: the PROXY header section of `docs/security.md`, PROXY-header spoofing and loopback trust in the threat model, the node-local family in `docs/cluster.md`. | Romain G. |
+| 2026-11-18 | 0.11 | Lot F, the CHANGELOG part: Added and Security entries for PROXY accept on the HTTP listeners; with the other documentation pass's boxes, every box of the Lot is ticked. Status InProgress. | Romain G. |

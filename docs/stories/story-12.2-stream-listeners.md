@@ -924,7 +924,7 @@ Depends on: B for the crate lists; its final pass after H.
       hardening guide (no drop-in needed for longer drains; why
       `TimeoutStopSec` stays; `LimitNOFILE` as the way to grow stream
       capacity; Docker's `stop_grace_period`).
-- [ ] `docs/streams.md`: the budget formula, bind states, and the
+- [x] `docs/streams.md`: the budget formula, bind states, and the
       listen-address rule of D-c (`[::]` is dual-stack and exclusive on
       its port).
 - [x] `worker-shared-state.md`: a section for the stream control channel
@@ -1646,6 +1646,8 @@ the budget view stays Operator and SuperAdmin.
 
 - Lot G, security, operations and architecture documentation, 2026-11-18: `docs/installation.md` (`TimeoutStopSec` bounds a stop without progress, the `EXTEND_TIMEOUT_USEC` keepalive, systemd 236+, `LimitNOFILE`), `docs/hot-upgrade.md` (the drain as 12.11 built it, which supersedes "stays 30 s until 12.11"), the hardening guide (no drop-in for longer drains, why `TimeoutStopSec` stays, `LimitNOFILE` as the way to grow stream capacity, `stream_listen_socket_cap`, Docker `stop_grace_period`), and `worker-shared-state.md` section 7a.1 (the stream control channel, its flow control and its crash behaviour). The crate lists, `FORK.md`, backlog #81 and the `docs/streams.md` budget and bind-state sections are not in this agent's files and stay open. Not verified: no compose file in the repository sets `stop_grace_period`, although D-f says the e2e compose does (Lot H is still open). The other documentation agent of this cycle owns `docs/streams.md`, `README.md` and `CHANGELOG.md`; the items of this Lot in those files are theirs and stay unticked here until they land. Commits `9473b7d6` (security), `c17ff277` (worker), `df122844` (cluster), `619b55bb` (mcp), `5e4d0d69` (security, `stream_listen_socket_cap`).
 
+- **Lot G, the parts in `docs/streams.md`, `README.md` and `CHANGELOG.md` (2026-11-18).** `docs/streams.md` (new) carries "Listeners and binding" (bind states, failure kinds and their retry, audit rows, the alert) and "The fd budget" (`B`, `H`, `S`, the four constraints, the budget view, the refusal, raising capacity), with the listen-address rule (`::` dual-stack and exclusive on its port, any other IPv6 literal IPv6-only) under "Concepts", and the stop path under "Configuration changes, stops and upgrades". Figures quoted are the constants' and the tests' (`packaged_limit_gives_the_documented_figures`). `CHANGELOG.md` `[Unreleased]`: Added (stream listeners and bind states, the fd budget and `stream_listen_socket_cap`, `worker_drain_timeout_s` and the stop drain) and Fixed (single-process mode drains HTTP on a stop); "a stop waited on a hard-coded delay" was already there. Still open in Lot G: the crate lists and the README product-crate test count, `FORK.md` and backlog #81, which still lists `5104a3e0` and `4a9d66d8` as deferred, so the last box (FORK.md, backlog, CHANGELOG) stays open though its CHANGELOG part is done. The `installation.md`, `hot-upgrade.md`, hardening-guide and `worker-shared-state.md` items the other documentation pass of this cycle covered (commit `11b46697` and those it names).
+
 ## File List
 
 - `lorica-worker/Cargo.toml` (nix `resource` feature)
@@ -1691,6 +1693,7 @@ the budget view stays Operator and SuperAdmin.
 - `lorica-dashboard/frontend/src/components/settings-tabs/GlobalConfigTab.svelte`, `lorica-dashboard/frontend/src/components/settings-tabs/GlobalConfigTab.test.ts`, `lorica-dashboard/frontend/src/routes/Settings.svelte` (Lot F: the two settings)
 - `lorica-dashboard/frontend/src/components/NodeFilter.test.ts`, `lorica-dashboard/frontend/src/routes/Security.test.ts` (Lot F: the node fixtures' two new fields)
 - `docs/installation.md`, `docs/hot-upgrade.md`, `docs/security/hardening-guide.md`, `docs/architecture/worker-shared-state.md`, `docs/architecture/source-tree.md`, `docs/architecture/component-architecture.md` (Lot G, security, operations and architecture part)
+- `docs/streams.md` (new), `README.md`, `CHANGELOG.md` (Lot G, the listener, budget and drain parts)
 
 ## Change Log
 
@@ -1708,3 +1711,4 @@ the budget view stays Operator and SuperAdmin.
 | 2026-11-14 | 0.10 | Lot E2 implemented: the heartbeat's stream plane report (tag 7, compatible with 1.10.6 both ways), each stream's bind state per node and `stream_ports` on the cluster node view, the activation row's stream ports, control-plane budget checks and budget view from reported figures, and the fd budget check on the config import and its preview. D-i amended: `stream_ports` carries `port_first`/`port_last`. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.11 | Lot F implemented: the stream fd budget on the System page for Operators and above, stream bind states in the Cluster roster and node drawer, the pending node's stream ports, `worker_drain_timeout_s` and `stream_listen_socket_cap` in the global config tab. Status InProgress. | Romain G. |
 | 2026-11-18 | 0.12 | Lot G, security, operations and architecture part: the drain setting and the stop path in the installation, hot-upgrade and hardening documents, the stream control channel in `worker-shared-state.md`, `lorica-stream` in the source tree and the component architecture. The crate lists, `FORK.md`, backlog #81, `docs/streams.md` and `CHANGELOG.md` stay open. | Romain G. |
+| 2026-11-18 | 0.13 | Lot G, the `docs/streams.md`, README and CHANGELOG parts: bind states, the fd budget, the listen-address rule and the stop drain documented; the other Lot G items stay open. Status InProgress. | Romain G. |

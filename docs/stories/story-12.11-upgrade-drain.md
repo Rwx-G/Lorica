@@ -650,9 +650,9 @@ Depends on: C, D, E.
 - [x] `installation.md`: `TimeoutStopSec` and the drain as they now
       relate (a stop extends its own timeout, an upgrade involves no
       stop job).
-- [ ] `streams.md`: the upgrade section, "every stream drains in
+- [x] `streams.md`: the upgrade section, "every stream drains in
       1.11.0", the UDP policy and why.
-- [ ] `CHANGELOG.md`: Added (preview,
+- [x] `CHANGELOG.md`: Added (preview,
       `lorica_hot_upgrade_stream_connections_total`), Changed
       (upgrade drain from the setting, `drain_timeout` meaning, histogram
       buckets, old API stops at handoff, UDP sockets handed over), Fixed
@@ -1195,6 +1195,8 @@ otel` (989), the forked crates (915), the rustls line (592) and
 
 - Lot F, security, operations and architecture documentation, 2026-11-18: `docs/hot-upgrade.md`: the drain step with `D` read at the handoff, the old generation's APIs, connections and loops stopping there and what stays up (Lot C's list), the per-stream behaviour by `upgrade_policy()` and HTTP's `http_cut`, the reasons table, the preview (API, dashboard, CLI), the drain report and `lorica_hot_upgrade_stream_connections_total`, `drain_timeout`'s new meaning and the buckets to 3,600 s, chained upgrades, a stop ending an earlier drain, the chunked transfer and the hot-downgrade consequence, the rollback to 1.10.7 over migrations 71 to 80. `docs/installation.md`: a stop extends its own timeout, an upgrade has no stop job, Docker needs `stop_grace_period`. Not verified by a run: the whole upgrade path end to end (Lot G is open), and that a 1.10.x binary receiving stream sockets in a legacy-sized table leaves them unserved (read from the 1.10.x `partition_inherited_fds`, which files unknown keys with the proxy listeners); the document says so. The other documentation agent of this cycle owns `docs/streams.md`, `README.md` and `CHANGELOG.md`; the items of this Lot in those files are theirs and stay unticked here until they land. Commits `9473b7d6` (security), `c17ff277` (worker), `df122844` (cluster), `619b55bb` (mcp), `5e4d0d69` (security, `stream_listen_socket_cap`).
 
+- **Lot F, the parts in `docs/streams.md` and `CHANGELOG.md` (2026-11-18).** `docs/streams.md` (new), "Configuration changes, stops and upgrades": every stream drains in 1.11.0, the per-stream policy table read from `Stream::upgrade_policy` (`drain`, `relay_in_flight`, `close`) and why UDP is handed over rather than drained like TCP (D-e as amended in Lot B1), the overlap, the preview (API, CLI, dashboard), the drain counter, and the end-reason table. `CHANGELOG.md` `[Unreleased]`: Added (the preview and `lorica_hot_upgrade_stream_connections_total`), Changed (the drain from the setting, the `drain_timeout` meaning, the histogram buckets, the old binary stopping its APIs at the handoff, and the chunked transfer table with its no-downgrade consequence) and Fixed (the drain metrics lost with the old process). Per the correction in the Debug Log (Lot A, "Which releases could reach it"), "fd transfer past 32 sockets" is not a Fixed entry: it never shipped, and the format appears under Changed. `hot-upgrade.md` and `installation.md` the other documentation pass of this cycle covered (commit `11b46697` and those it names); with this, every box of Lot F is ticked. `docs/worker-mode.md`'s drain paragraph was outside this pass.
+
 ## File List
 
 - `lorica/src/startup/fd_transfer.rs` (new, Lot A)
@@ -1235,6 +1237,7 @@ otel` (989), the forked crates (915), the rustls line (592) and
 - `lorica/src/startup/single.rs` (`DrainProbe::new`, Lot B2)
 - `docs/stories/story-12.11-upgrade-drain.md`
 - `docs/hot-upgrade.md`, `docs/installation.md` (Lot F, all but streams.md and CHANGELOG)
+- `docs/streams.md` (new), `CHANGELOG.md` (Lot F, the upgrade parts)
 
 ## Change Log
 
@@ -1249,3 +1252,4 @@ otel` (989), the forked crates (915), the rustls line (592) and
 | 2026-11-18 | 0.7 | Lot D: `GET /api/v1/system/upgrade/preview` at the upload's SuperAdmin floor, pulling the workers' counters first: the stored drain delay, `handoff_available`, a draining previous generation, and per bound stream its open connections from the 12.9 aggregate and `upgrade_policy()`; published in `openapi.yaml`; `lorica upgrade` prints it to stderr before uploading and `--preview` prints it alone. | Romain G. |
 | 2026-11-18 | 0.8 | Lot E: the Binary Upgrade confirmation loads the preview when it opens, states the drain delay from the setting instead of "up to 30 seconds", lists the streams holding connections and what the upgrade does to them, says a single-process node only stages, and warns of a previous generation still draining in the warning toast's colours; Enter no longer confirms. | Romain G. |
 | 2026-11-18 | 0.9 | Lot F, all but `docs/streams.md` and `CHANGELOG.md`: the upgrade drain, the preview, the drain report and its metric, chained upgrades, the stop path and the rollback in `docs/hot-upgrade.md`; `TimeoutStopSec` and the drain in `docs/installation.md`. | Romain G. |
+| 2026-11-18 | 0.10 | Lot F, the `docs/streams.md` and CHANGELOG parts: the upgrade section and the Added, Changed and Fixed entries (no fd-transfer Fixed line, per the Lot A correction); with the other documentation pass's boxes, every box of the Lot is ticked. Status InProgress. | Romain G. |
