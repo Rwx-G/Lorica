@@ -36,8 +36,9 @@ pub use messages::{
     BreakerReport, BreakerResult, Command, CommandType, ConfigReloadAbort, ConfigReloadCommit,
     ConfigReloadPrepare, Envelope, EwmaReportEntry, ForwardAuthHeader, GenericCounterEntry,
     MetricsReport, RateLimitDelta, RateLimitDeltaResult, RateLimitEntry, RateLimitQuery,
-    RateLimitResult, RateLimitSnapshot, RequestCountEntry, Response, ResponseStatus, Verdict,
-    VerdictLookup, VerdictPush, VerdictResult, WafCountEntry,
+    RateLimitResult, RateLimitSnapshot, RequestCountEntry, Response, ResponseStatus,
+    StreamBackendCountersEntry, StreamCountersEntry, StreamCountersReport, StreamLinkCountersEntry,
+    StreamRuleCountersEntry, Verdict, VerdictLookup, VerdictPush, VerdictResult, WafCountEntry,
 };
 pub use rpc::{
     Frame, FrameKind, IncomingCommand, IncomingCommands, IncomingRequest, IncomingRequests,

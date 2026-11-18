@@ -728,9 +728,9 @@ Allowlist: `lorica-api/src/sla.rs`, `lorica-api/src/vocabulary.rs`,
 Allowlist: `lorica-command/src/messages.rs`, the proto file it is
 generated from if any, `lorica-command/src/lib.rs`.
 
-- [ ] `MetricsReport.stream_counters` and its message types mirroring
+- [x] `MetricsReport.stream_counters` and its message types mirroring
       `CountersSnapshot` (D-e).
-- [ ] Tests: encode/decode round-trip of a snapshot with every map
+- [x] Tests: encode/decode round-trip of a snapshot with every map
       non-empty.
 
 ### Lot F: wiring in the binary (`lorica`) - cargo
@@ -1423,6 +1423,23 @@ edited here.
   Story 12.10's record has the design note. Still open in C3: the
   overview `streams` field (maintainer to decide, above).
 
+- Lot E, 2026-11-18, on `91c045d1`. `MetricsReport.stream_counters`
+  (tag 16, `Option<Box<StreamCountersReport>>`) and its entries
+  (`StreamCountersEntry`, `StreamLinkCountersEntry` with the histogram as
+  `latency_le`, `latency_count`, `latency_sum_ns`,
+  `StreamBackendCountersEntry`, `StreamRuleCountersEntry`), every keyed
+  family a `btree_map<string, uint64>` keyed by the enum's word, so
+  `lorica-command` takes no dependency on `lorica-stream`. Boxed:
+  clippy's `large_enum_variant` refused the report in `Response`'s
+  payload enum once it grew by four vectors. The conversion both ways
+  is Lot F's (`lorica/src/stream_report.rs`), the one crate that sees
+  both types. The gauges need no wire change: they ride the generic
+  list (C2). `proto/command.proto` documents no `MetricsReport` and is
+  left alone.
+- Lot E gates, `rust:1-bookworm` with `CARGO_BUILD_WARNINGS=deny`: the
+  CI chain green (3,665 product, 957 `lorica`, 915 forked, 592
+  TLS-featured tests) and `cargo audit` clean.
+
 ## File List
 
 - `lorica-config/src/models/settings.rs`
@@ -1484,6 +1501,7 @@ edited here.
   `audit.rs`, `mod.rs`, `tests.rs`, `read/plane_tests.rs`,
   `lorica-api/src/stream_logs.rs`, `lorica-mcp/src/tools.rs`, both
   OpenAPI documents (Lot C3, the stream log, with Story 12.10 Lot B)
+- `lorica-command/src/messages.rs`, `lorica-command/src/lib.rs` (Lot E)
 
 ## Change Log
 
@@ -1499,4 +1517,5 @@ edited here.
 | 2026-11-16 | 0.8 | The `tcp_engine` timeouts traced to the tests (a released port answered by strangers, a burst assumed to fit one second, wall-clock upper bounds); fixed in the tests, 0 failures in 800 contended runs. | Romain G. |
 | 2026-11-18 | 0.10 | Lot C3, in part: the stream SLA management routes, `GET /automation/v1/sla/streams/{id}` under `sla:read` and the MCP tool `lorica_sla_stream`, both OpenAPI documents. The overview `streams` field is not buildable as D-g words it (maintainer to decide); the stream-log reads wait for 12.10 Lot B. Gates on the final tree: the CI chain green (3,653 product, 957 `lorica`, 910 forked, 592 TLS-featured tests) and `cargo audit` clean after lettre 0.11.24. | Romain G. |
 | 2026-11-18 | 0.11 | Lot C3, the stream log: `GET /automation/v1/stream-logs` behind `streams:read` and `logs:read`, empty for a hostname-confined token, the 403 and the audit row naming the scope missing, and the MCP tool `lorica_stream_logs`, both OpenAPI documents; shipped with Story 12.10 Lot B. The overview `streams` field stays open. | Romain G. |
+| 2026-11-18 | 0.12 | Lot E: the worker metrics report carries the stream counters, typed, every keyed family by its enum's word. | Romain G. |
 | 2026-11-18 | 0.9 | Lot C1: `stream_access_logs` with its own retention and writer queue, `StreamLogEntry` built from the stream records, `/api/v1/stream-logs` with export and clear, the three settings in the settings API, the `stream` sink kind, and a syslog up state that follows the collector without traffic. | Romain G. |

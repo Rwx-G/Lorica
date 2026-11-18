@@ -486,6 +486,145 @@ pub struct MetricsReport {
     /// copy of the ceiling, so the supervisor sums these.
     #[prost(uint64, tag = "15")]
     pub waf_body_scan_inflight_bytes: u64,
+    /// This worker's stream counters (Story 12.9 D-e), cumulative, as its
+    /// stream engines count them. Worker and supervisor are always the
+    /// same binary, so the field needs no version negotiation; a report
+    /// without it reads as no stream counted. Boxed: a report rides in
+    /// `Response`'s payload enum, which it would otherwise widen for
+    /// every other variant.
+    #[prost(message, optional, boxed, tag = "16")]
+    pub stream_counters: Option<Box<StreamCountersReport>>,
+}
+
+/// A process's stream counters on the wire: `lorica_stream::CountersSnapshot`
+/// with every map keyed by the word of its enum, so this crate needs no
+/// dependency on the stream engines. The binary converts both ways.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct StreamCountersReport {
+    /// One entry per stream.
+    #[prost(message, repeated, tag = "1")]
+    pub streams: Vec<StreamCountersEntry>,
+    /// One entry per (stream, backend).
+    #[prost(message, repeated, tag = "2")]
+    pub links: Vec<StreamLinkCountersEntry>,
+    /// One entry per backend.
+    #[prost(message, repeated, tag = "3")]
+    pub backends: Vec<StreamBackendCountersEntry>,
+    /// One entry per (stream, rule) of a TLS stream.
+    #[prost(message, repeated, tag = "4")]
+    pub rules: Vec<StreamRuleCountersEntry>,
+}
+
+/// One stream's counters. Keyed families map an enum word to its count.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct StreamCountersEntry {
+    #[prost(string, tag = "1")]
+    pub stream_id: String,
+    /// A gauge: open connections or live sessions now.
+    #[prost(uint64, tag = "2")]
+    pub active: u64,
+    #[prost(uint64, tag = "3")]
+    pub accepted: u64,
+    #[prost(btree_map = "string, uint64", tag = "4")]
+    pub ended: std::collections::BTreeMap<String, u64>,
+    #[prost(btree_map = "string, uint64", tag = "5")]
+    pub refused: std::collections::BTreeMap<String, u64>,
+    #[prost(uint64, tag = "6")]
+    pub bytes_upload: u64,
+    #[prost(uint64, tag = "7")]
+    pub bytes_download: u64,
+    #[prost(uint64, tag = "8")]
+    pub connect_attempts: u64,
+    #[prost(uint64, tag = "9")]
+    pub retries: u64,
+    #[prost(uint64, tag = "10")]
+    pub breaker_denied: u64,
+    #[prost(btree_map = "string, uint64", tag = "11")]
+    pub proxy_header: std::collections::BTreeMap<String, u64>,
+    #[prost(uint64, tag = "12")]
+    pub local_destination_refused: u64,
+    #[prost(uint64, tag = "13")]
+    pub source_family_mismatch: u64,
+    #[prost(uint64, tag = "14")]
+    pub source_bind_failed: u64,
+    #[prost(uint64, tag = "15")]
+    pub datagrams_upload: u64,
+    #[prost(uint64, tag = "16")]
+    pub datagrams_download: u64,
+    #[prost(btree_map = "string, uint64", tag = "17")]
+    pub dropped: std::collections::BTreeMap<String, u64>,
+    #[prost(uint64, tag = "18")]
+    pub ceiling_reached: u64,
+    #[prost(btree_map = "string, uint64", tag = "19")]
+    pub clienthello: std::collections::BTreeMap<String, u64>,
+    #[prost(uint64, tag = "20")]
+    pub no_sni_matched: u64,
+    #[prost(uint64, tag = "21")]
+    pub ech_offered: u64,
+    #[prost(btree_map = "string, uint64", tag = "22")]
+    pub handshakes: std::collections::BTreeMap<String, u64>,
+    #[prost(uint64, tag = "23")]
+    pub sni_mismatch: u64,
+    /// A gauge: connections in their pre-forwarding reads now.
+    #[prost(uint64, tag = "24")]
+    pub pending: u64,
+    #[prost(uint64, tag = "25")]
+    pub geoip_unknown: u64,
+}
+
+/// One (stream, backend)'s counters, the connect latency histogram
+/// included.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct StreamLinkCountersEntry {
+    #[prost(string, tag = "1")]
+    pub stream_id: String,
+    #[prost(string, tag = "2")]
+    pub backend_id: String,
+    /// A gauge: open connections now.
+    #[prost(uint64, tag = "3")]
+    pub active: u64,
+    #[prost(uint64, tag = "4")]
+    pub connects: u64,
+    #[prost(btree_map = "string, uint64", tag = "5")]
+    pub connect_failures: std::collections::BTreeMap<String, u64>,
+    /// Cumulative observations at or below each histogram bound, in the
+    /// order of the bounds.
+    #[prost(uint64, repeated, tag = "6")]
+    pub latency_le: Vec<u64>,
+    /// Every observation, `+Inf` included.
+    #[prost(uint64, tag = "7")]
+    pub latency_count: u64,
+    /// The sum of the observations, in nanoseconds.
+    #[prost(uint64, tag = "8")]
+    pub latency_sum_ns: u64,
+    #[prost(btree_map = "string, uint64", tag = "9")]
+    pub upstream_tls_failures: std::collections::BTreeMap<String, u64>,
+    #[prost(uint64, tag = "10")]
+    pub bytes_upload: u64,
+    #[prost(uint64, tag = "11")]
+    pub bytes_download: u64,
+}
+
+/// One backend's counters.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct StreamBackendCountersEntry {
+    #[prost(string, tag = "1")]
+    pub backend_id: String,
+    #[prost(uint64, tag = "2")]
+    pub dns_failures: u64,
+    #[prost(uint64, tag = "3")]
+    pub dns_local_excluded: u64,
+}
+
+/// One rule's counters.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct StreamRuleCountersEntry {
+    #[prost(string, tag = "1")]
+    pub stream_id: String,
+    #[prost(string, tag = "2")]
+    pub rule: String,
+    #[prost(uint64, tag = "3")]
+    pub matched: u64,
 }
 
 /// One generic counter delta in a [`MetricsReport`]. `labels` is
@@ -526,6 +665,7 @@ impl MetricsReport {
             capture_rules_active: 0,
             capture_inflight_bytes: 0,
             waf_body_scan_inflight_bytes: 0,
+            stream_counters: None,
         }
     }
 }
@@ -888,6 +1028,7 @@ mod tests {
             capture_rules_active: 3,
             capture_inflight_bytes: 4096,
             waf_body_scan_inflight_bytes: 8192,
+            stream_counters: None,
         };
         let encoded = report.encode_to_vec();
         let decoded = MetricsReport::decode(&encoded[..]).expect("decode failed");
@@ -898,6 +1039,89 @@ mod tests {
         assert_eq!(decoded.capture_rules_active, 3);
         assert_eq!(decoded.capture_inflight_bytes, 4096);
         assert_eq!(decoded.waf_body_scan_inflight_bytes, 8192);
+    }
+
+    /// Every map and list of the stream counters non-empty, each value
+    /// distinct, so a field the codec dropped or swapped shows.
+    fn stream_counters_fixture() -> StreamCountersReport {
+        let words = |base: u64| -> std::collections::BTreeMap<String, u64> {
+            [
+                ("first".to_string(), base),
+                ("second".to_string(), base + 1),
+            ]
+            .into()
+        };
+        StreamCountersReport {
+            streams: vec![StreamCountersEntry {
+                stream_id: "s1".into(),
+                active: 1,
+                accepted: 2,
+                ended: words(3),
+                refused: words(5),
+                bytes_upload: 7,
+                bytes_download: 8,
+                connect_attempts: 9,
+                retries: 10,
+                breaker_denied: 11,
+                proxy_header: words(12),
+                local_destination_refused: 14,
+                source_family_mismatch: 15,
+                source_bind_failed: 16,
+                datagrams_upload: 17,
+                datagrams_download: 18,
+                dropped: words(19),
+                ceiling_reached: 21,
+                clienthello: words(22),
+                no_sni_matched: 24,
+                ech_offered: 25,
+                handshakes: words(26),
+                sni_mismatch: 28,
+                pending: 29,
+                geoip_unknown: 30,
+            }],
+            links: vec![StreamLinkCountersEntry {
+                stream_id: "s1".into(),
+                backend_id: "b1".into(),
+                active: 31,
+                connects: 32,
+                connect_failures: words(33),
+                latency_le: vec![35, 36, 37],
+                latency_count: 38,
+                latency_sum_ns: 39,
+                upstream_tls_failures: words(40),
+                bytes_upload: 42,
+                bytes_download: 43,
+            }],
+            backends: vec![StreamBackendCountersEntry {
+                backend_id: "b1".into(),
+                dns_failures: 44,
+                dns_local_excluded: 45,
+            }],
+            rules: vec![StreamRuleCountersEntry {
+                stream_id: "s1".into(),
+                rule: "r1".into(),
+                matched: 46,
+            }],
+        }
+    }
+
+    #[test]
+    fn stream_counters_round_trip_in_a_metrics_report() {
+        use prost::Message;
+
+        let mut report = MetricsReport::new(3, 0, 0);
+        report.stream_counters = Some(Box::new(stream_counters_fixture()));
+        let decoded = MetricsReport::decode(&report.encode_to_vec()[..]).expect("a report decodes");
+        assert_eq!(decoded, report);
+    }
+
+    #[test]
+    fn a_report_without_stream_counters_reads_as_none() {
+        use prost::Message;
+
+        let report = MetricsReport::new(3, 0, 0);
+        let decoded = MetricsReport::decode(&report.encode_to_vec()[..]).expect("a report decodes");
+        assert_eq!(decoded.stream_counters, None);
     }
 
     #[test]
