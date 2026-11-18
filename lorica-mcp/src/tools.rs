@@ -1718,8 +1718,8 @@ pub const MUTATIONS: &[Mutation] = &[
                   path. A probe path sent back exactly as read, in either shape, its \
                   `[redacted]` values included, keeps the stored path; any other path carrying \
                   `[redacted]` is refused. A custom send/expect check is set in the dashboard: \
-                  a patch of other fields keeps one, and so does the check sent back exactly as \
-                  read, its `send` `[redacted]`, while creating or changing one is refused. \
+                  this tool refuses its `send` and `expect` keys, so it cannot send one back, \
+                  even exactly as read; a patch that leaves `health_check` out keeps it. \
                   Moving a backend from one to a template or a connect is allowed.",
         scope: AutomationScope::BackendsWrite,
         verb: Verb::Put,
@@ -2015,6 +2015,15 @@ mod tests {
                     "expect",
                     json!({ "kind": "tcp_send_expect",
                             "expect": [{ "match": "prefix", "bytes": { "text": "220" } }] }),
+                ),
+                // The check exactly as a read answers it: the plane would
+                // keep the stored payload, and the tool still refuses it,
+                // which is what `lorica_backend_update`'s summary says.
+                (
+                    "send",
+                    json!({ "kind": "tcp_send_expect", "send": { "text": "[redacted]" },
+                            "expect": [{ "match": "prefix", "bytes": { "text": "+PONG" } }],
+                            "timeout_ms": 2000 }),
                 ),
             ] {
                 let refused = spec
