@@ -1163,8 +1163,9 @@ impl Stream {
     /// Accepted `idle_timeout_s` on a TCP stream.
     pub const TCP_IDLE_TIMEOUT_S_RANGE: RangeInclusive<u32> = 1..=86_400;
     /// Default of `idle_timeout_s` on a UDP stream (Story 12.5 D-l).
-    /// Survey: Traefik 3 s, HAProxy Enterprise 10 s, caddy-l4 30 s, Envoy
-    /// 1 min; nginx `proxy_timeout` 10 min.
+    /// Survey: Traefik 3 s, HAProxy Enterprise 10 s (`timeout client` of
+    /// a `udp-lb` section, client side only), caddy-l4 30 s, Envoy 1 min;
+    /// nginx `proxy_timeout` 10 min.
     pub const DEFAULT_UDP_IDLE_TIMEOUT_S: u32 = 10;
     /// Accepted `idle_timeout_s` on a UDP stream: a session holds an
     /// upstream socket and an ephemeral port for as long as it idles.

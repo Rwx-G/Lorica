@@ -176,7 +176,7 @@ it was read from.
 | ClientHello size | 16 KiB (`CLIENTHELLO_MAX_LEN`) | 16k, `preread_buffer_size` ([source][n-preread-buf]) | 16384, `tune.bufsize` ([source][h-bufsize]) | 64 KiB, `tls_inspector` ([source][e-tls-inspector]) | not documented |
 | PROXY header wait (accept) | 5 s (`HEADER_READ_TIMEOUT`) | 30 s, `proxy_protocol_timeout` ([source][n-pp-timeout]) | not documented | not documented | not documented |
 | Forwarding buffer | 16 KiB per direction (`FORWARD_BUFFER_SIZE`) | 16k ([source][n-buf]) | 16384 ([source][h-bufsize]) | not documented | not documented |
-| Idle, UDP | 10 s (`DEFAULT_UDP_IDLE_TIMEOUT_S`) | 10 min, `proxy_timeout` ([source][n-timeout]) | not documented on the Enterprise module's page ([source][hx-udp-module]) | 1 min ([source][e-udp-idle]) | 3 s ([source][t-udp]) |
+| Idle, UDP | 10 s (`DEFAULT_UDP_IDLE_TIMEOUT_S`) | 10 min, `proxy_timeout` ([source][n-timeout]) | Enterprise only: 10 s on the client side, `timeout client` of a `udp-lb` section; no default stated for `timeout server` ([source][hx-udp-ref]) | 1 min ([source][e-udp-idle]) | 3 s ([source][t-udp]) |
 | UDP responses per request | 1 (`DEFAULT_RESPONSES_PER_REQUEST`) | unlimited unless set ([source][n-responses]) | not documented | not documented | not documented |
 | UDP requests per session | 64 (`DEFAULT_REQUESTS_PER_SESSION`) | 0, no limit ([source][n-requests]) | not documented | not documented | not documented |
 
@@ -302,7 +302,7 @@ not rely on it.
 [h-rate-limit]: https://docs.haproxy.org/3.4/configuration.html#4.2-rate-limit%20sessions
 [h-tcplog]: https://docs.haproxy.org/3.4/configuration.html#4.2-option%20tcplog
 [hx-udp]: https://www.haproxy.com/solutions/udp-load-balancing
-[hx-udp-module]: https://www.haproxy.com/documentation/haproxy-enterprise/enterprise-modules/udp-load-balancing/overview/
+[hx-udp-ref]: https://www.haproxy.com/documentation/haproxy-enterprise/enterprise-modules/udp-load-balancing/reference/
 [e-connect]: https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/cluster/v3/cluster.proto#envoy-v3-api-field-config-cluster-v3-cluster-connect-timeout
 [e-idle]: https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/network/tcp_proxy/v3/tcp_proxy.proto#envoy-v3-api-field-extensions-filters-network-tcp-proxy-v3-tcpproxy-idle-timeout
 [e-attempts]: https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/network/tcp_proxy/v3/tcp_proxy.proto#envoy-v3-api-field-extensions-filters-network-tcp-proxy-v3-tcpproxy-max-connect-attempts
