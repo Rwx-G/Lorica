@@ -499,6 +499,13 @@ after its last extension or at `TimeoutStopSec`, whichever is later.
 - An abstract-namespace `$NOTIFY_SOCKET` (`@` prefix) is skipped, as the
   existing helper already does; systemd's own socket is a path.
 
+*Note (2026-11-18):* "and the e2e compose does" is not true yet: no
+compose file in the repository sets `stop_grace_period`. Story 12.12
+Lot A sets it on the e2e compose services that run Lorica, above the
+drain under test (this story's Lot H asks the same of its own stream
+profiles and is still open); the documentation half, in the hardening
+guide, landed with Lot G.
+
 ### D-g. Draining established connections
 
 Every connection or session registers in the worker's tracker with its

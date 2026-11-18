@@ -665,6 +665,11 @@ Depends on: nothing (artefacts approved, Resolved 1 to 3).
       registry check and the Markdown output.
 - [ ] `run.sh` flags; the L4 phase guarded like every phase; a
       `dump_node_log` equivalent for the L4 project.
+- [ ] `stop_grace_period` on `lorica-streams` and
+      `lorica-streams-single` in `docker-compose.l4.yml`, above the
+      drain under test, which Story 12.2 D-f claims the e2e compose sets
+      and none does (12.2's note of 2026-11-18). Without it `docker
+      stop` SIGKILLs a drain after 10 s.
 - [ ] Self-test: the self-test scenario passes; a registry row with no
       line fails the phase; a row printed twice fails it.
 - [ ] The full pre-existing suite passes with the toolchain pin (AC #7
@@ -1008,6 +1013,8 @@ this file points at the decision it took.
 
 ### Completion Notes
 
+- **Lot A gains a task, 2026-11-18:** `stop_grace_period` on the two Lorica services of `docker-compose.l4.yml`, above the drain under test. Story 12.2 D-f says the e2e compose sets it and no compose file does; 12.2 carries a dated note pointing here. The file is already on Lot A's allowlist.
+
 ## File List
 
 ## Change Log
@@ -1016,3 +1023,4 @@ this file points at the decision it took.
 |---|---|---|---|
 | 2026-11-18 | 0.1 | Draft: one L4 phase absorbing the nine story e2e Lots, IV-to-scenario map with automation levels, parity-matrix scenarios, fd-reserve scenario, 1.10.7 from the signed package with toolchain parity, cold and hot rollback scenarios, perf topology, measurements, statistics and verdicts, NFR1 arms, three CI jobs, local release procedure, runtime estimates, artefacts for approval, 16 open questions. | Romain G. |
 | 2026-11-18 | 0.2 | Maintainer decisions folded in as Resolved 1 to 16: artefacts approved (digests and checksums recorded by Lot A), three CI jobs, every recommendation accepted except SMTP, now verified against a standard-library banner server (new scenario `12.7-x-smtp-banner-template`); release machine has 24 CPUs, larger cpuset layout. Status Draft. | Romain G. |
+| 2026-11-18 | 0.3 | Lot A gains the `stop_grace_period` task Story 12.2 D-f assumed was done. | Romain G. |
