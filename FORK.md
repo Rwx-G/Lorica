@@ -86,6 +86,7 @@ These crates do not exist in upstream Pingora:
 | `lorica-automation-policy` | The automation plane's policy as data: scope vocabulary, MCP tier table, admin settings allowlist, one-way protections |
 | `lorica-adcs` | AD CS enrollment client: CSR to issued certificate through CES, WS-Trust over HTTPS with Kerberos SPNEGO bound to the TLS channel |
 | `lorica-fleet` | Fleet runtime: the control-plane and follower runtimes, the cluster telemetry store and the ingest policy, between the transport crate and the management API |
+| `lorica-stream` | Stream data plane: layer-4 TCP and UDP listeners served outside Pingora's, their engines, layer-4 TLS, the connection tracker and the fd budget |
 
 ## Comparing with Upstream
 

@@ -25,12 +25,12 @@ When bumping the version, update ALL of these files:
 - [ ] `lorica-stream/Cargo.toml` - `version` (first-party; follows product since v1.11.0)
 
 ## Internal dependency references (cross-crate deps)
-- [ ] `lorica/Cargo.toml` - lorica-config, lorica-api, lorica-bench, lorica-worker, lorica-command, lorica-cluster, lorica-fleet, lorica-shmem, lorica-geoip, lorica-challenge, lorica-waf, lorica-notify, lorica-mcp, lorica-automation-policy versions
-- [ ] `lorica-api/Cargo.toml` - lorica-acme, lorica-config, lorica-dashboard, lorica-bench, lorica-cluster, lorica-fleet, lorica-metrics, lorica-waf, lorica-notify, lorica-mcp, lorica-automation-policy versions
+- [ ] `lorica/Cargo.toml` - lorica-config, lorica-api, lorica-adcs, lorica-bench, lorica-worker, lorica-command, lorica-cluster, lorica-fleet, lorica-stream, lorica-shmem, lorica-geoip, lorica-challenge, lorica-waf, lorica-notify, lorica-mcp, lorica-automation-policy versions
+- [ ] `lorica-api/Cargo.toml` - lorica-acme, lorica-adcs, lorica-config, lorica-dashboard, lorica-bench, lorica-cluster, lorica-fleet, lorica-stream, lorica-metrics, lorica-waf, lorica-notify, lorica-mcp, lorica-automation-policy versions
 - [ ] `lorica-config/Cargo.toml` - lorica-automation-policy version
 - [ ] `lorica-mcp/Cargo.toml` - lorica-automation-policy version
 - [ ] `lorica-fleet/Cargo.toml` - lorica-cluster, lorica-config versions
-- [ ] `lorica-stream/Cargo.toml` - lorica-config, lorica-worker versions
+- [ ] `lorica-stream/Cargo.toml` - lorica-config, lorica-worker, lorica-shmem versions
 - [ ] `lorica-bench/Cargo.toml` - lorica-config, lorica-metrics, lorica-notify versions
 - [ ] `lorica-notify/Cargo.toml` - lorica-metrics version
 
