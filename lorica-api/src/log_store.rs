@@ -568,6 +568,9 @@ impl LogStore {
         ))
         .map_err(|e| format!("failed to initialize the audit fan-in schema: {e}"))?;
 
+        // Story 12.9: the stream access log, a table of its own.
+        crate::stream_logs::create_schema(&conn)?;
+
         let conn = Arc::new(Mutex::new(conn));
         let (audit_tx, audit_rx) = tokio::sync::mpsc::channel(AUDIT_QUEUE_CAPACITY);
         Self::spawn_audit_writer(Arc::clone(&conn), audit_rx);
@@ -722,6 +725,13 @@ impl LogStore {
     #[cfg(test)]
     pub(crate) fn block_audit_writer_for_test(&self) -> parking_lot::MutexGuard<'_, Connection> {
         self.conn.lock()
+    }
+
+    /// The connection every table of the file is written through, for
+    /// the stores that keep their SQL beside their types
+    /// ([`crate::stream_logs`]).
+    pub(crate) fn conn(&self) -> &Mutex<Connection> {
+        &self.conn
     }
 
     /// Insert a log entry.
@@ -3256,7 +3266,7 @@ impl LogStore {
 /// SQLite has no default escape character, so a pattern containing a
 /// backslash means nothing without this clause; it is part of the
 /// predicate, not a decoration on it.
-const LIKE_ESCAPE: &str = r"ESCAPE '\'";
+pub(crate) const LIKE_ESCAPE: &str = r"ESCAPE '\'";
 
 /// `text` as a `LIKE` operand that matches itself and nothing else.
 ///
@@ -3265,7 +3275,7 @@ const LIKE_ESCAPE: &str = r"ESCAPE '\'";
 /// `%` matches every row while reading as a narrow filter, which is a
 /// result an operator or a model draws a conclusion from. The
 /// backslash goes first, or it would escape the escapes added after it.
-fn like_operand(text: &str) -> String {
+pub(crate) fn like_operand(text: &str) -> String {
     text.replace('\\', r"\\")
         .replace('%', r"\%")
         .replace('_', r"\_")

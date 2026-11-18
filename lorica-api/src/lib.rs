@@ -59,6 +59,7 @@ pub mod status;
 /// The stream plane as the API reads it: bind states, the fd budget
 /// check of stream writes and its view (Story 12.2).
 pub mod stream_budget;
+pub mod stream_logs;
 pub mod stream_metrics;
 pub mod streams;
 pub mod system;

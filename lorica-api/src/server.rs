@@ -1147,6 +1147,26 @@ pub fn build_router(
         )
         .route("/api/v1/logs/export", get(crate::logs::export_logs))
         .route("/api/v1/logs/ws", get(crate::logs::logs_ws))
+        // Story 12.9 D-b: the stream access log, at the roles of its
+        // `/api/v1/logs` counterparts (the authorize middleware's GET
+        // default and Operator default). Its wipe has the same cap in a
+        // bucket of its own, for the reason the WAF events wipe gives.
+        .route(
+            "/api/v1/stream-logs",
+            get(crate::stream_logs::get_stream_logs),
+        )
+        .route(
+            "/api/v1/stream-logs",
+            delete(crate::stream_logs::clear_stream_logs).layer(rl(
+                "stream_logs_clear",
+                RL_LOGS_CLEAR,
+                RL_WINDOW_S,
+            )),
+        )
+        .route(
+            "/api/v1/stream-logs/export",
+            get(crate::stream_logs::export_stream_logs),
+        )
         .route("/api/v1/system", get(crate::system::get_system))
         // Story 8.4 hot binary upgrade: upload + Ed25519-verify + stage
         // a new `lorica` executable. Generous body cap (carries a full

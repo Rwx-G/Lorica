@@ -21,12 +21,19 @@
 //! (`compute_chain_hash` is byte-identical from v1.6.0 to v1.9.1), not
 //! with the current crate's, so a change to the live formula that broke
 //! the chains already on disk fails here.
+//!
+//! The other direction is checked too: Story 12.9 adds the
+//! `stream_access_logs` table, and the whole of v1.10.6's `open`, run
+//! on a file the current release wrote, must leave that table and its
+//! rows alone, so a hot-upgrade rollback keeps its log store.
 
 use std::path::Path;
 
 use lorica_api::audit::{AuditQuery, NewAuditEntry, GENESIS_HASH};
 use lorica_api::log_store::LogStore;
 use lorica_api::logs::{LogEntry, LogsQuery};
+use lorica_api::stream_logs::{StreamLogEntry, StreamLogFilter};
+use lorica_config::models::{StreamProtocol, StreamRefusal};
 use rusqlite::{params, Connection};
 
 /// `access_logs` as v1.0.0 to v1.2.0 created it.
@@ -570,10 +577,192 @@ fn assert_upgrades(release: &Released) {
     assert!(local.verified, "{tag}: chain after the new row: {local:?}");
     assert_eq!(local.total_rows, written.local_rows + 1, "{tag}");
 
+    // The stream access log exists on the upgraded file and takes rows.
+    store
+        .insert_stream_batch(&[stream_row()])
+        .expect("stream row insert");
+    assert_eq!(stream_rows(&store).len(), 1, "{tag}: stream log");
+
     // A second open of the upgraded file is a no-op.
     drop(store);
     let reopened = LogStore::open(dir.path()).expect("an upgraded file reopens");
     assert!(reopened.verify_audit_chain().expect("verify").verified);
+    assert_eq!(stream_rows(&reopened).len(), 1, "{tag}: stream log kept");
+}
+
+/// A refused connection's row, the one stream row these tests write.
+fn stream_row() -> StreamLogEntry {
+    StreamLogEntry::from_refusal(&lorica_stream::RefusalRecord {
+        stream_id: "stream-1".into(),
+        stream_name: "postgres".into(),
+        protocol: StreamProtocol::Tcp,
+        listen_port: 5432,
+        client: "192.0.2.10:40000".parse().expect("fixture address"),
+        proxied_from: None,
+        refusal: StreamRefusal::NoMatch,
+        at: chrono::DateTime::parse_from_rfc3339("2026-11-16T10:00:00Z")
+            .expect("fixture time")
+            .with_timezone(&chrono::Utc),
+    })
+}
+
+fn stream_rows(store: &LogStore) -> Vec<StreamLogEntry> {
+    store
+        .query_stream_logs(&StreamLogFilter::default())
+        .expect("stream log read")
+        .0
+}
+
+/// Every statement v1.10.6's `LogStore::open` ran, in its order, with
+/// its constants expanded. Its column additions are left out: each one
+/// checks the column first, and every column it adds is already on a
+/// file the current release wrote.
+const OPEN_V1_10_6: &str = "
+    CREATE TABLE IF NOT EXISTS access_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        method TEXT NOT NULL,
+        path TEXT NOT NULL,
+        host TEXT NOT NULL,
+        status INTEGER NOT NULL,
+        latency_ms INTEGER NOT NULL,
+        backend TEXT NOT NULL,
+        error TEXT,
+        client_ip TEXT NOT NULL DEFAULT '',
+        is_xff INTEGER NOT NULL DEFAULT 0,
+        xff_proxy_ip TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_access_logs_timestamp ON access_logs(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_access_logs_host ON access_logs(host);
+    CREATE INDEX IF NOT EXISTS idx_access_logs_status ON access_logs(status);
+    CREATE INDEX IF NOT EXISTS idx_access_logs_host_timestamp ON access_logs(host, timestamp);
+    CREATE TABLE IF NOT EXISTS waf_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        rule_id INTEGER NOT NULL,
+        description TEXT NOT NULL,
+        category TEXT NOT NULL,
+        severity INTEGER NOT NULL,
+        matched_field TEXT NOT NULL,
+        matched_value TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        client_ip TEXT NOT NULL DEFAULT '',
+        route_hostname TEXT NOT NULL DEFAULT '',
+        action TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_waf_events_timestamp ON waf_events(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_waf_events_category ON waf_events(category);
+    CREATE TABLE IF NOT EXISTS notification_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        alert_type TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        details TEXT NOT NULL DEFAULT '{}',
+        timestamp TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_notif_history_timestamp ON notification_history(timestamp);
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        node_id TEXT NOT NULL DEFAULT '',
+        origin_id INTEGER NOT NULL DEFAULT 0,
+        timestamp TEXT NOT NULL,
+        operator_username TEXT NOT NULL,
+        operator_role TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        before_payload_hash TEXT NOT NULL DEFAULT '',
+        after_payload_hash TEXT NOT NULL DEFAULT '',
+        ip TEXT NOT NULL DEFAULT '',
+        user_agent TEXT NOT NULL DEFAULT '',
+        prev_chain_hash TEXT NOT NULL,
+        chain_hash TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action);
+    CREATE INDEX IF NOT EXISTS idx_audit_log_operator ON audit_log(operator_username);
+    CREATE TABLE IF NOT EXISTS audit_log_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_log_node ON audit_log(node_id, origin_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_log_origin
+        ON audit_log(node_id, origin_id) WHERE node_id != '';
+    CREATE INDEX IF NOT EXISTS idx_audit_log_node_age
+        ON audit_log(node_id, COALESCE(NULLIF(received_at, ''), timestamp), origin_id);
+    CREATE TABLE IF NOT EXISTS audit_log_fanned_in_backup (
+        id INTEGER PRIMARY KEY,
+        node_id TEXT NOT NULL,
+        origin_id INTEGER NOT NULL,
+        timestamp TEXT NOT NULL,
+        operator_username TEXT NOT NULL,
+        operator_role TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        before_payload_hash TEXT NOT NULL DEFAULT '',
+        after_payload_hash TEXT NOT NULL DEFAULT '',
+        ip TEXT NOT NULL DEFAULT '',
+        user_agent TEXT NOT NULL DEFAULT '',
+        prev_chain_hash TEXT NOT NULL,
+        chain_hash TEXT NOT NULL,
+        received_at TEXT NOT NULL DEFAULT ''
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_backup_origin
+        ON audit_log_fanned_in_backup(node_id, origin_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_backup_age
+        ON audit_log_fanned_in_backup(node_id, COALESCE(NULLIF(received_at, ''), timestamp), origin_id);";
+
+/// A hot-upgrade rollback: v1.10.6 opens a file the current release
+/// wrote, stream rows included, and the current release opens it again
+/// afterwards with every row where it was.
+#[test]
+fn a_v1_10_6_open_of_a_file_with_stream_rows_keeps_them() {
+    let dir = tempfile::tempdir().expect("test setup: tempdir");
+    {
+        let store = LogStore::open(dir.path()).expect("current open");
+        store
+            .insert_stream_batch(&[stream_row(), stream_row()])
+            .expect("stream rows");
+        store
+            .insert(&LogEntry {
+                id: 0,
+                timestamp: "2026-11-16T10:00:00+00:00".into(),
+                method: "GET".into(),
+                path: "/".into(),
+                host: "app.example.com".into(),
+                status: 200,
+                latency_ms: 5,
+                backend: "192.0.2.20:8080".into(),
+                error: None,
+                client_ip: "192.0.2.10".into(),
+                is_xff: false,
+                xff_proxy_ip: String::new(),
+                source: String::new(),
+                request_id: "req-1".into(),
+            })
+            .expect("access row");
+    }
+    {
+        let conn = Connection::open(dir.path().join("access-log.db")).expect("raw open");
+        conn.execute_batch(
+            "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
+        )
+        .expect("v1.10.6 pragmas");
+        conn.execute_batch(OPEN_V1_10_6)
+            .expect("v1.10.6 opens a file holding the stream table");
+        let access: i64 = conn
+            .query_row("SELECT COUNT(*) FROM access_logs", [], |row| row.get(0))
+            .expect("v1.10.6 reads its access rows");
+        assert_eq!(access, 1);
+    }
+    let store = LogStore::open(dir.path()).expect("the current release reopens");
+    assert_eq!(stream_rows(&store), {
+        let mut expected = vec![stream_row(), stream_row()];
+        for (n, row) in expected.iter_mut().enumerate() {
+            row.id = u64::try_from(n + 1).expect("fits");
+        }
+        expected
+    });
 }
 
 #[test]

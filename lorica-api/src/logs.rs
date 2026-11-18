@@ -383,7 +383,7 @@ impl LogExportQuery {
 /// apostrophe itself is consumed by the spreadsheet parser, so a
 /// human-readable export still shows `=...` in the rendered cell.
 /// v1.5.2 audit M-2.
-fn csv_escape(s: &str) -> String {
+pub(crate) fn csv_escape(s: &str) -> String {
     let needs_formula_guard = s
         .as_bytes()
         .first()
@@ -398,7 +398,7 @@ fn csv_escape(s: &str) -> String {
 }
 
 /// Maximum number of entries for a single export request.
-const EXPORT_MAX_ENTRIES: usize = 100_000;
+pub(crate) const EXPORT_MAX_ENTRIES: usize = 100_000;
 
 /// GET /api/v1/logs/export - download matching access logs as CSV (default) or JSON.
 pub async fn export_logs(

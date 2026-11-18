@@ -61,6 +61,8 @@ const WAF_BAN_DURATION_S_MIN: i32 = 0;
 // ceiling one WAF false positive banned an address for 68 years.
 const WAF_BAN_DURATION_S_MAX: i32 = 2_592_000;
 const ACCESS_LOG_RETENTION_MIN: i64 = 0;
+// Story 12.9 D-b. `0` keeps every row, as for the HTTP access log.
+const STREAM_ACCESS_LOG_RETENTION_MIN: i64 = 0;
 const WAF_EVENT_RETENTION_MIN: i64 = 0;
 // Story 10.6 AC #7. The budget is a byte ceiling over every in-flight
 // WAF body buffer in one process. The floor is the crate's own
@@ -286,6 +288,11 @@ pub fn settings_schema() -> serde_json::Value {
             "type": "integer",
             "min": WAF_EVENT_RETENTION_MIN,
             "default": d.waf_event_retention,
+        },
+        "stream_access_log_retention": {
+            "type": "integer",
+            "min": STREAM_ACCESS_LOG_RETENTION_MIN,
+            "default": d.stream_access_log_retention,
         },
         "waf_body_scan_max_inflight_bytes": {
             "type": "integer",
@@ -530,6 +537,10 @@ pub struct UpdateSettingsRequest {
     pub access_log_retention: Option<i64>,
     /// Retention cap on the persistent WAF-event buffer.
     pub waf_event_retention: Option<i64>,
+    /// Retention cap on the stream access log (Story 12.9), `0`
+    /// unlimited. Its own setting so a chatty UDP stream cannot evict
+    /// HTTP rows, nor the reverse.
+    pub stream_access_log_retention: Option<i64>,
     /// Toggle the periodic SLA bucket purge.
     pub sla_purge_enabled: Option<bool>,
     /// SLA bucket retention window (days).
@@ -643,6 +654,8 @@ pub struct UpdateSettingsRequest {
     pub syslog_audit_enabled: Option<bool>,
     /// Backlog #50. Ship traffic capture records to syslog.
     pub syslog_capture_enabled: Option<bool>,
+    /// Story 12.9 D-d. Ship stream access-log rows to syslog.
+    pub syslog_stream_enabled: Option<bool>,
     /// Story 9.8 AC #1. PEM CA bundle trusted for `tcp-tls`. Empty
     /// clears it (platform trust store).
     pub syslog_tls_ca_pem: Option<String>,
@@ -673,6 +686,9 @@ pub struct UpdateSettingsRequest {
     /// Backlog #50. Ship traffic capture records on the OTLP logs
     /// lane.
     pub otlp_logs_capture_enabled: Option<bool>,
+    /// Story 12.9 D-d. Ship stream access-log rows on the OTLP logs
+    /// lane.
+    pub otlp_logs_stream_enabled: Option<bool>,
     /// Story 10.6 AC #7. Process-wide ceiling, in bytes, on every
     /// in-flight WAF body-scan buffer taken together. A request that
     /// would push the total past it is forwarded UNSCANNED rather than
@@ -978,6 +994,12 @@ pub(crate) async fn update_settings_as(
             WAF_EVENT_RETENTION_MIN,
             "waf_event_retention",
         )?;
+        apply_min_i64(
+            body.stream_access_log_retention,
+            &mut settings.stream_access_log_retention,
+            STREAM_ACCESS_LOG_RETENTION_MIN,
+            "stream_access_log_retention",
+        )?;
         // Story 10.6 AC #7. Not a secret and not masked: the budget is
         // a capacity figure an operator has to be able to read back to
         // reason about the `skipped_budget` scan outcome.
@@ -1151,6 +1173,10 @@ pub(crate) async fn update_settings_as(
             body.syslog_capture_enabled,
             &mut settings.syslog_capture_enabled,
         );
+        apply_plain(
+            body.syslog_stream_enabled,
+            &mut settings.syslog_stream_enabled,
+        );
         apply_optional_pem(
             body.syslog_tls_ca_pem,
             &mut settings.syslog_tls_ca_pem,
@@ -1188,6 +1214,10 @@ pub(crate) async fn update_settings_as(
         apply_plain(
             body.otlp_logs_capture_enabled,
             &mut settings.otlp_logs_capture_enabled,
+        );
+        apply_plain(
+            body.otlp_logs_stream_enabled,
+            &mut settings.otlp_logs_stream_enabled,
         );
 
         caller_bounds(&before, &settings)?;
@@ -2580,6 +2610,50 @@ mod tests {
         let lifted =
             parse_data(put(serde_json::json!({ "connection_limits_per_ip": 0 })).await).await;
         assert!(lifted["connection_limits_per_ip"].is_null(), "{lifted}");
+    }
+
+    #[tokio::test]
+    async fn the_stream_log_settings_are_written_and_a_negative_retention_is_refused() {
+        // Story 12.9 Lot C1: the retention and the two sink toggles.
+        let (state, sessions, limiter) = test_state().await;
+        let admin = setup_admin_and_login(&state, &sessions, &limiter).await;
+        let put = |body: serde_json::Value| {
+            send(
+                &state,
+                &sessions,
+                &limiter,
+                "PUT",
+                "/api/v1/settings",
+                &admin,
+                Some(body),
+            )
+        };
+        let defaults = lorica_config::models::GlobalSettings::default();
+        let flipped = serde_json::json!({
+            "stream_access_log_retention": 0,
+            "syslog_stream_enabled": !defaults.syslog_stream_enabled,
+            "otlp_logs_stream_enabled": !defaults.otlp_logs_stream_enabled,
+        });
+        let answer = put(flipped.clone()).await;
+        assert_eq!(answer.status(), StatusCode::OK);
+        let stored = parse_data(answer).await;
+        for (field, value) in flipped.as_object().expect("an object") {
+            assert_eq!(&stored[field], value, "{field}");
+        }
+        let schema = super::settings_schema();
+        let min = schema["stream_access_log_retention"]["min"]
+            .as_i64()
+            .expect("a published min");
+        let refused = put(serde_json::json!({ "stream_access_log_retention": min - 1 })).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let message = String::from_utf8(
+            axum::body::to_bytes(refused.into_body(), usize::MAX)
+                .await
+                .expect("body")
+                .to_vec(),
+        )
+        .expect("utf-8");
+        assert!(message.contains("stream_access_log_retention"), "{message}");
     }
 
     #[tokio::test]

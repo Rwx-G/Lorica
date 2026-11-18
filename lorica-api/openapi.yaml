@@ -554,6 +554,22 @@ paths:
                   type: boolean
                   default: true
                   description: Ship traffic capture records on the OTLP logs lane.
+                syslog_stream_enabled:
+                  type: boolean
+                  default: true
+                  description: Ship stream access-log rows to the syslog sink (Story 12.9), MSGID `stream`, at the access-log severity. Node-local.
+                otlp_logs_stream_enabled:
+                  type: boolean
+                  default: true
+                  description: Ship stream access-log rows on the OTLP logs lane (Story 12.9). Node-local.
+                stream_access_log_retention:
+                  type: integer
+                  minimum: 0
+                  default: 100000
+                  description: >-
+                    Stream access-log rows kept (Story 12.9), `0` unlimited.
+                    Its own setting, so a chatty UDP stream cannot evict HTTP
+                    rows nor the reverse. Replicated to every node.
                 flood_strict_rps:
                   type: integer
                   description: >-
@@ -2605,6 +2621,184 @@ paths:
       responses:
         "101":
           description: WebSocket upgrade for real-time log streaming
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/stream-logs:
+    get:
+      tags: [Logs]
+      summary: Get stream access-log rows
+      description: >-
+        One row per TCP connection or UDP session at its end, per refusal
+        the refusal log admitted, and per window of refusals it held back
+        (`entry` = `refusals_suppressed`, the count in `suppressed`)
+        (Story 12.9). The newest page matching the filters, oldest first,
+        and the match count. Viewer and above, as `GET /api/v1/logs`. A
+        process with no log store answers an empty page.
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: stream_id
+          in: query
+          schema:
+            type: string
+          description: Exact stream id.
+        - name: end_reason
+          in: query
+          schema:
+            type: string
+          description: >-
+            An end reason word (`StreamEndKind`). An unknown word is a 400
+            naming the words accepted.
+        - name: refusal_reason
+          in: query
+          schema:
+            type: string
+          description: >-
+            A refusal reason word (`StreamRefusal`). An unknown word is a
+            400 naming the words accepted.
+        - name: client_ip
+          in: query
+          schema:
+            type: string
+          description: Client address prefix.
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: RFC 3339 lower bound on the row's timestamp, inclusive.
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: RFC 3339 upper bound on the row's timestamp, inclusive.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 200
+            maximum: 10000
+        - name: after_id
+          in: query
+          schema:
+            type: integer
+          description: Rows above this id.
+        - name: before_id
+          in: query
+          schema:
+            type: integer
+          description: Rows below this id, the cursor for walking back in time.
+      responses:
+        "200":
+          description: Stream log rows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      entries:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/StreamLogEntry"
+                      total:
+                        type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    delete:
+      tags: [Logs]
+      summary: Clear the stream access log
+      description: >-
+        Removes every stream log row once the log writer has persisted
+        what it held. Operator and above, as `DELETE /api/v1/logs`, and
+        audited as `stream_logs.clear`.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Stream logs cleared
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/stream-logs/export:
+    get:
+      tags: [Logs]
+      summary: Export stream access-log rows (CSV / JSON)
+      description: >-
+        The rows matching the filters of `GET /api/v1/stream-logs`,
+        oldest first, up to the HTTP export's ceiling. Every CSV cell is
+        escaped against spreadsheet formulas.
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: stream_id
+          in: query
+          schema:
+            type: string
+          description: Exact stream id.
+        - name: end_reason
+          in: query
+          schema:
+            type: string
+          description: >-
+            An end reason word (`StreamEndKind`). An unknown word is a 400
+            naming the words accepted.
+        - name: refusal_reason
+          in: query
+          schema:
+            type: string
+          description: >-
+            A refusal reason word (`StreamRefusal`). An unknown word is a
+            400 naming the words accepted.
+        - name: client_ip
+          in: query
+          schema:
+            type: string
+          description: Client address prefix.
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: RFC 3339 lower bound on the row's timestamp, inclusive.
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: RFC 3339 upper bound on the row's timestamp, inclusive.
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [csv, json]
+            default: csv
+      responses:
+        "200":
+          description: Rows as a downloadable file
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StreamLogEntry"
+            text/csv:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -9718,6 +9912,88 @@ components:
             message:
               type: string
 
+    StreamLogEntry:
+      type: object
+      description: >-
+        One stream access-log row (Story 12.9). Word fields carry the
+        words of their enums; a word a later release wrote reads back as
+        it is.
+      properties:
+        id:
+          type: integer
+        timestamp:
+          type: string
+          description: RFC 3339 UTC with milliseconds; the end, the refusal, or the report of a suppressed count.
+        entry:
+          type: string
+          description: "`ended`, or `refusals_suppressed` for a count of held-back refusals."
+        stream_id:
+          type: string
+        stream_name:
+          type: string
+        protocol:
+          type: string
+          description: The stream protocol word.
+        listen_port:
+          type: integer
+          description: The local port reached; 0 on a `refusals_suppressed` row.
+        client_ip:
+          type: string
+          description: The client after PROXY protocol where accepted.
+        client_port:
+          type: integer
+        proxied_from:
+          type: string
+          description: The socket peer (`ip:port`) when a PROXY header replaced it, else empty.
+        backend_id:
+          type: string
+        backend_address:
+          type: string
+          description: The address connected (`ip:port`), else empty.
+        attempts:
+          type: integer
+        bytes_upload:
+          type: integer
+        bytes_download:
+          type: integer
+        datagrams_upload:
+          type: integer
+          nullable: true
+          description: Null on TCP.
+        datagrams_download:
+          type: integer
+          nullable: true
+          description: Null on TCP.
+        duration_ms:
+          type: integer
+        connect_ms:
+          type: integer
+          nullable: true
+          description: Accepted to connected; null when nothing connected.
+        tls_mode:
+          type: string
+          description: "`none`, `passthrough` or `terminate`; empty on refusal and suppressed rows."
+        sni:
+          type: string
+        alpn:
+          type: string
+          description: The negotiated protocol when terminating, the first offered in passthrough.
+        client_cert:
+          type: string
+          nullable: true
+          description: "`absent` or `verified`; null when the stream does not verify client certificates. The subject is never logged."
+        detected_protocol:
+          type: string
+          nullable: true
+          description: Null until protocol detection exists.
+        end_reason:
+          type: string
+        refusal_reason:
+          type: string
+          description: The refusal word when `end_reason` is `refused`, else empty.
+        suppressed:
+          type: integer
+          description: The count on a `refusals_suppressed` row, else 0.
     SettingsFieldSchema:
       type: object
       description: |
