@@ -284,21 +284,41 @@ mod tests {
         assert!(t.not_after(131));
     }
 
+    // Lorica: a deadline is truncated to whole milliseconds before it is
+    // rounded up to a slot, so a timer may fire up to 1 ms short of its
+    // duration. The timer tests bound elapsed time from below with that
+    // allowance and never from above, which a stalled host can overrun.
+    const TRUNCATION_ALLOWANCE: Duration = Duration::from_millis(1);
+
+    // Lorica: upstream asserted whole seconds of wall clock on both sides,
+    // which a host stalling this test or the clock thread for a second
+    // fails. Sharing and firing are asserted on the timers themselves.
     #[tokio::test]
     async fn test_timer_manager() {
         let tm_a = Arc::new(TimerManager::new());
         let tm = tm_a.clone();
         std::thread::spawn(move || tm_a.clock_thread());
 
-        let now = Instant::now();
-        let t1 = tm.register_timer(Duration::from_secs(1));
-        let t2 = tm.register_timer(Duration::from_secs(1));
+        let delay = Duration::from_secs(1);
+        let slot = |at: Instant| Time::from(at + delay - tm.zero);
+        // Two registrations share a timer only if no slot boundary passes
+        // between them, which a preempted thread can cross: retry until the
+        // whole pair provably fell in one slot.
+        let (start, t1, t2) = loop {
+            let start = Instant::now();
+            let t1 = tm.register_timer(delay);
+            let t2 = tm.register_timer(delay);
+            if slot(start) == slot(Instant::now()) {
+                break (start, t1, t2);
+            }
+        };
+        assert!(Arc::ptr_eq(&t1.1, &t2.1), "one slot, one shared timer");
+
         t1.poll().await;
-        assert_eq!(now.elapsed().as_secs(), 1);
-        let now = Instant::now();
-        t2.poll().await;
+        assert!(start.elapsed() + TRUNCATION_ALLOWANCE > delay);
         // t2 fired along t1 so no extra wait time
-        assert_eq!(now.elapsed().as_secs(), 0);
+        assert!(t2.1.load(Ordering::SeqCst));
+        t2.poll().await;
     }
 
     #[test]
@@ -321,26 +341,36 @@ mod tests {
         assert!(tm.should_i_start_clock());
     }
 
+    // Lorica: upstream asserted whole seconds of wall clock, which a host
+    // stalling this test or the clock thread for a second fails. The clock
+    // starts already paused, so nothing a slow host does can fire a timer
+    // before the unpause, and the assertions are on the timers themselves.
     #[tokio::test]
     async fn test_timer_manager_pause() {
         let tm_a = Arc::new(TimerManager::new());
         let tm = tm_a.clone();
-        std::thread::spawn(move || tm_a.clock_thread());
 
-        let now = Instant::now();
-        let t1 = tm.register_timer(Duration::from_secs(2));
+        let start = Instant::now();
+        let short = tm.register_timer(Duration::from_millis(500));
+        let long_delay = Duration::from_secs(1);
+        let long = tm.register_timer(long_delay);
         tm.pause_for_fork();
         // no actual fork happen, we just test that pause and unpause work
+        std::thread::spawn(move || tm_a.clock_thread());
 
         // any timer in this critical section is timed out right away
-        let t2 = tm.register_timer(Duration::from_secs(2));
-        t2.poll().await;
-        assert_eq!(now.elapsed().as_secs(), 0);
+        let during_pause = tm.register_timer(long_delay);
+        assert!(during_pause.1.load(Ordering::SeqCst));
+        during_pause.poll().await;
 
-        std::thread::sleep(Duration::from_secs(1));
+        // a paused clock fires nothing, even past a deadline
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(!short.1.load(Ordering::SeqCst));
+
         tm.unpause();
-        t1.poll().await;
-        assert_eq!(now.elapsed().as_secs(), 2);
+        short.poll().await;
+        long.poll().await;
+        assert!(start.elapsed() + TRUNCATION_ALLOWANCE > long_delay);
     }
 
     // Lorica: from upstream PR #983, with the fix above.

@@ -574,6 +574,25 @@ lives in.
   new one. On an upstream sync, once #983 is merged this entry goes and
   the merge commit is recorded in the sync record; until then, keep the
   `Notified` created before the flag read.
+- **`lorica-timeout`, the timer manager tests assert no wall-clock
+  ceiling (v1.11.0, tests only).** Sites: `test_timer_manager` and
+  `test_timer_manager_pause` in `lorica-timeout/src/timer.rs`, with
+  `TRUNCATION_ALLOWANCE` beside them. Upstream asserts elapsed whole
+  seconds on both sides (`as_secs() == 1`, `== 0`, `== 2`), so a stall
+  of a second in the test or its clock thread fails them: injected
+  1.2 s stalls failed 23 of 120 runs (`left: 2, right: 1` and
+  `left: 3, right: 2`), and both failed this way under load in full gate
+  runs. The fork asserts the timers instead: the two shared registrations
+  are one timer (retried until both provably fall in one 10 ms slot) and
+  the second is fired once the first returns; the pause test starts its
+  clock already paused, checks that a timer past its deadline does not
+  fire before the unpause, and that a later one still waits for its own
+  deadline. Elapsed time is bounded from below only, less 1 ms, because
+  a deadline is truncated to whole milliseconds before it is rounded up
+  to a slot (a probe of 7,200 timers saw 36 fire early, by up to
+  0.9 ms). With the same stalls on four contended cores: 0 failures in
+  480 runs of the two tests and in 720 runs of the whole crate. Upstream `main` still has the old tests (checked at
+  `13ad3297`). On an upstream sync, keep these two tests.
 
 ## Upstream sync record
 
