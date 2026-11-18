@@ -1,8 +1,8 @@
 # Lorica Hardening Guide
 
 **Author:** Romain G.
-**Version:** 1.1
-**Date:** 2026-09-30
+**Version:** 1.2
+**Date:** 2026-11-18
 
 ## Overview
 
@@ -48,6 +48,18 @@ close the tab and find the process holding it (`sudo ss -ltnp 'sport = :9443'`).
 
 - **HTTP (8080)**: Use for redirect-to-HTTPS only, or for internal-only traffic
 - **HTTPS (8443)**: Primary public-facing port with TLS termination
+- **PROXY protocol (v1.11.0+)**: leave `proxy_protocol_http` and `proxy_protocol_https` at `off` unless a layer-4 balancer sits in front, and then list only that balancer's addresses in `proxy_protocol_trusted_cidrs`. Never put loopback there unless the 443 hairpin needs it: any local process could then present any client address. The settings are node-local, so set them on each node (`docs/security.md`, "Client address from a PROXY header").
+
+### Stream Listeners (v1.11.0+)
+
+A stream opens a TCP or UDP port on every node it targets, from the moment it is created. Treat each one as a firewall change, and review it as one: the PRD keeps stream writes on the management plane for that reason, and no automation token or MCP client can create one.
+
+- **Restrict sources.** Give every stream that does not serve the whole Internet a `source_allow_cidrs`, and use `source_deny_cidrs` or the global connection filter for addresses you want off it. The WAF auto-ban list does not apply to streams.
+- **UDP on an exposed address needs a reason.** A UDP stream on anything other than loopback, RFC 1918 or ULA is refused without a source allowlist or an explicit `udp.source_session_cap` at or below the documented maximum. Keep the response bounds on; `udp.unbounded_responses` is for stateful protocols (games, VoIP signalling) only, and lower `udp.response_bytes_ratio` for protocols that never need large answers (RADIUS, NTP).
+- **Leave `allow_local_backend` off.** A stream that forwards to the node itself can expose the management API, the cluster plane or a loopback-only database. The flag is badged in the dashboard; audit every stream that carries it.
+- **PROXY accept on a stream** trusts exactly the CIDRs you list; list the balancer and nothing else.
+- **Set open rates on public streams.** `open_rate` and `source_open_rate` are off by default because the right value depends on the protocol; on a stream reachable from the Internet, set them from the traffic you expect.
+- **Mirror streams in the firewall.** A host firewall that drops everything not listed must list each stream port, or the stream binds and serves nobody; a firewall that allows everything gives no second layer. Either way, the process-side source lists are the ones that still hold when a firewall rule is flushed by mistake.
 
 ### Cluster Plane (v1.7.0+, opt-in)
 
@@ -426,6 +438,43 @@ An operator who wants to verify the sandbox is active :
 systemctl show lorica | grep -E '(Protect|Restrict|Private|Capability|SystemCall)'
 ```
 
+**What the unit does not grant (v1.11.0).** Streams need no capability beyond `CAP_NET_BIND_SERVICE`: the supervisor binds stream ports, privileged ones included, with the ambient capability the unit already gives. Transparent proxying, where a stream connects to its backend from the client's own address, is Phase 2 of Epic 12 (v1.12.0) and does not exist in 1.11.0; the drop-in it will need (`CAP_NET_RAW` on both `CapabilityBoundingSet` and `AmbientCapabilities`) is documented when it ships, with its cost: every worker, HTTP workers included, could then open raw IP sockets if compromised. Do not add it for 1.11.0.
+
+### The drain on a stop
+
+A stop drains established HTTP requests and stream connections for `worker_drain_timeout_s` (global setting, default 30 s, 1 to 3,600 s), and ends as soon as nothing is in flight; it waits the whole delay only when traffic stays open. A stream connection still open at the deadline is closed with the end reason `node_shutdown`.
+
+- **Under systemd, no drop-in is needed for a longer drain.** From the moment a stop begins, the supervisor sends `EXTEND_TIMEOUT_USEC` to systemd every 10 s, each message asking for 30 s more, until the process exits. The unit's `TimeoutStopSec=90` stays and keeps its meaning for a stop that makes no progress: a supervisor that hangs stops renewing and is killed 30 s after its last extension or at `TimeoutStopSec`, whichever is later. This needs systemd 236 or later, which Debian 12, Ubuntu 22.04 and 24.04 and RHEL 9 ship. A hot upgrade involves no stop job and sends no extension.
+- **Under Docker there is no notify socket**, so whatever stops the container bounds the drain: `docker stop` sends `SIGKILL` 10 s after `SIGTERM` by default. Set `stop_grace_period` (Compose) or `--time` (`docker stop`) above the drain: the supervisor waits up to `worker_drain_timeout_s` plus a 10 s kill margin for its workers, then up to 10 s more for its background work, so `worker_drain_timeout_s` + 20 s covers the worst case.
+- **Pick the delay for the longest connection that must survive a stop or an upgrade**, not longer: a draining generation holds its descriptors and memory beside the live one for that long, and during a hot upgrade each generation counts a stream's caps on its own, so a stream may briefly hold up to twice its caps.
+- The setting is fleet policy (replicated) and is not on the automation admin tier.
+
+### Stream capacity: descriptors and source ports
+
+Streams share the process's file-descriptor limit with HTTP, and never all of it. From the soft `RLIMIT_NOFILE` `L` (the unit sets `LimitNOFILE=65536`), a fixed base reserve of 1,024 and half of `L` are kept for the process and for HTTP; the rest is the stream budget of one process, 31,744 at the packaged limit. A TCP stream commits `max_connections` x 2 descriptors to it (1,024 x 2 by default), a UDP stream `udp.max_sessions` x 1 (4,096 by default), each stream also its listening sockets, and every UDP session holds one ephemeral source port of the host. `GET /api/v1/streams/budget` and the System page show each node's figures and what bound its UDP session ceiling; a stream that does not fit is refused with the constraint and the numbers. `docs/streams.md` has the formulas.
+
+To raise it:
+
+- **More descriptors: raise `LimitNOFILE` with a drop-in**, which grows the stream budget and the HTTP reserve together; the halving is a constant, not a setting. The limit is read once at start, so the change takes a restart (a hot upgrade inherits the old process's limit).
+
+  ```ini
+  # /etc/systemd/system/lorica.service.d/nofile.conf
+  [Service]
+  LimitNOFILE=262144
+  ```
+
+  then `systemctl daemon-reload && systemctl restart lorica`. Under Docker, set `ulimits: nofile` on the service.
+- **More UDP source ports: widen `net.ipv4.ip_local_port_range`** (it also governs IPv6), or reserve fewer ports in `net.ipv4.ip_local_reserved_ports`. Lorica keeps 1,024 of the range for the host's own UDP clients and reads both files at every reconcile, so a sysctl change applies without a restart. The default range, 32768 to 60999, leaves 27,208 sessions per source address.
+
+  ```ini
+  # /etc/sysctl.d/90-lorica-streams.conf
+  net.ipv4.ip_local_port_range = 10240 65000
+  ```
+
+  Keep the range clear of every port a service on the host listens on, Lorica's stream ports included.
+- **More source addresses: set the stream's `source_addresses`** (nginx's `proxy_bind`, at most 16), each an address configured on the node. A UDP stream spreads its sessions evenly over them, and each address is a pool of its own.
+- A sysctl narrowed under bound streams does not unbind them; the budget view flags the node `over_ceiling` and refuses any change that raises the demand until it fits again.
+
 ## 6. Monitoring
 
 ### SLA Monitoring
@@ -529,3 +578,7 @@ Run this checklist periodically:
 - [ ] (MCP) Config-tier grants no wider than the change; MCP audit rows (`spans_tiers`, `forbidden` from an MCP token, `rate_limited`, `settings.update` under `automation`) alerted on
 - [ ] (Capture) No rule left armed past the investigation that justified it, and every `output.dir` sized, pruned and off shared storage
 - [ ] (Capture) `lorica_captures_total{outcome="dropped_sink"}` alerted on
+- [ ] (Streams) Every stream reviewed as a firewall change: a source allowlist where the service is not public, no `allow_local_backend` without a reason, no `udp.unbounded_responses` outside stateful UDP protocols
+- [ ] (Streams) Stream refusals (`lorica_stream_refused_total`) and the `stream_bind_failed` and `stream_udp_ceiling_reached` notifications watched
+- [ ] (PROXY protocol) `proxy_protocol_trusted_cidrs` holds the balancer's addresses only, on each node; loopback absent unless the 443 hairpin is configured
+- [ ] (Drain) `worker_drain_timeout_s` sized for the longest connection that must survive a stop or an upgrade; Docker `stop_grace_period` above it

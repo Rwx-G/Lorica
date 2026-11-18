@@ -3,10 +3,12 @@
 ## Threat Model
 
 The threat model lives in [docs/security/threat-model.md](security/threat-model.md):
-assets, trust boundaries, and the threat categories T1 to T9 with one
+assets, trust boundaries, and the threat categories T1 to T12 with one
 mitigation table each (network, application, management API, data at rest,
 supply chain, cluster plane, operational, automation plane and request
-capture, and the management MCP server), followed by the residual risks. It is one document rather than a
+capture, the management MCP server, the AD CS authority, active health
+checks that send bytes, and stream listeners with the PROXY protocol),
+followed by the residual risks. It is one document rather than a
 summary here and a copy there, because the copy that used to sit in this
 section stopped being true two releases before anyone noticed.
 
@@ -35,12 +37,17 @@ The unit also carries `Type=notify` + `NotifyAccess=all` + `KillMode=mixed`
 + `TimeoutStopSec=90` for the zero-downtime hot binary upgrade. Upgrade
 uploads are gated on an operator-managed Ed25519 signature; see
 [hot-upgrade.md](hot-upgrade.md) and
-[installation.md](installation.md#hot-binary-upgrade).
+[installation.md](installation.md#hot-binary-upgrade). Since 1.11.0 a stop
+drains for `worker_drain_timeout_s` and extends systemd's stop timeout while
+it does, so `TimeoutStopSec` no longer has to exceed the drain.
 
 ### Network
 - Management API binds to **localhost only** (127.0.0.1)
 - Use socat or SSH tunnel for remote administration
-- Proxy ports (80/443) are the only externally exposed services
+- Proxy ports (80/443) are the only externally exposed services by default.
+  Since 1.11.0 every stream an operator creates opens one more port, or a
+  range of them, on the nodes it targets ([streams.md](streams.md)); review a
+  stream as a firewall change ([hardening guide](security/hardening-guide.md#stream-listeners-v1110))
 
 ### Access control (RBAC, v1.6.0)
 
@@ -129,6 +136,116 @@ Story 8.9 hardening knobs, all live-reloadable via settings:
   mirror sub-requests use a per-route semaphore plus a coarse global
   net, so one slow shadow target cannot starve every other route's
   mirrors.
+
+### Client address from a PROXY header (v1.11.0)
+
+Behind a layer-4 load balancer (a cloud NLB, HAProxy in `mode tcp`, a
+Lorica stream), every connection reaches Lorica from the balancer's
+address. The HTTP and HTTPS listeners can take the real client address
+from a PROXY protocol header (v1 or v2) the balancer writes at the start
+of each connection, so that access logs, WAF and bot verdicts, rate
+limits, GeoIP, the connection filter and the per-IP connection cap all
+see the client rather than the balancer, and so does the
+`X-Forwarded-For` Lorica sends upstream.
+
+**PROXY header or `trusted_proxies`.** They answer the same question at
+two different layers. `trusted_proxies` trusts an HTTP proxy's
+`X-Forwarded-For` header, read once the request is parsed; that works
+only for a proxy that terminates HTTP. A layer-4 balancer forwards
+bytes and cannot write a header into an HTTPS request it never
+decrypts: use the PROXY header there. Use `trusted_proxies` behind an
+HTTP proxy or a CDN.
+
+**Settings** (Settings, Network tab, "PROXY protocol"; management API
+`PUT /api/v1/settings`):
+
+| Setting | Values | Default |
+|---|---|---|
+| `proxy_protocol_http` | `off`, `required`, `optional` | `off` |
+| `proxy_protocol_https` | `off`, `required`, `optional` | `off` |
+| `proxy_protocol_trusted_cidrs` | CIDRs; a bare IP is a host prefix | empty |
+
+- `required`: a peer in the trust list must send a header, or its
+  connection is closed. `optional`: a peer in the trust list may send
+  none (a balancer's health check that sends no header), and is then
+  served on its own socket address. HTTP and HTTPS are set apart
+  because one balancer commonly fronts 443 only while 80 stays direct.
+- A mode other than `off` with an empty trust list is refused, and so
+  are `0.0.0.0/0` and `::/0`: trusting every address is no trust check.
+- A change applies to connections accepted after it, with no restart.
+
+**Mixed listeners: direct clients keep working.** A listener with PROXY
+on still serves peers outside the trust list, as direct clients whose
+address is their socket address. What they may not do is send a PROXY
+header: the first bytes of a direct connection are classified before
+the TLS handshake or the HTTP parser sees them, and a v1 or v2 signature
+closes the connection, counted as `untrusted_peer`. A real client is
+decided on its first byte or within a few more, inside the handshake
+timeout every direct client already has.
+
+**Precedence: no stacking.** On a connection whose client address came
+from a PROXY header, the client's `X-Forwarded-For` is never read,
+whatever `trusted_proxies` holds, even when the carried address is
+itself in `trusted_proxies`. A trusted peer whose header carried no
+address (`LOCAL`, `UNKNOWN`) or that sent none under `optional` is a
+direct connection from that peer and follows the `trusted_proxies` rule
+on its socket address, as before. The two lists may overlap; nothing
+refuses it. Upstream, `X-Real-IP` is the client address and Lorica
+appends it to whatever `X-Forwarded-For` the client sent, exactly as for
+a direct connection, so a backend that reads the rightmost entry gets
+the same guarantee with or without a balancer in front.
+
+**What changes for `connection_allow_cidrs`.** For a trusted peer, the
+global connection filter and the per-IP connection cap run on the
+carried client address, after the header, and the balancer itself is
+not filtered: the trust list is its gate. A node in allowlist mode does
+not need the balancer in `connection_allow_cidrs`, and does need the
+real clients there. Turning PROXY on therefore changes what that list is
+matched against; review it in the same change.
+
+**Bounds.** The header is read only from a trusted peer, at most 4,096
+bytes, complete within 5 s of accept (constants of
+`lorica-core/src/protocols/proxy_protocol.rs`, shared with the stream
+listeners). A v2 header's TLVs are checked for structure and otherwise
+ignored, and an IPv4-mapped carried address is read as IPv4. The
+balancer's own address is not in the access log; it appears in the
+refusal log.
+
+**Node-local, on purpose.** The three settings never replicate, like
+`trusted_proxies`: a replicated trust list would let one control-plane
+compromise make every edge trust forged addresses from a network of
+the attacker's choosing. Set them on each node. On a follower, whose
+local writes are refused, set them before enrollment or inside a
+break-glass window ([cluster.md](cluster.md#follower-read-only-and-break-glass)).
+They are refused on every automation and MCP surface: they are not on
+the admin tier's settings allowlist, and a test keeps every
+`proxy_protocol_` key off it.
+
+**Watching it.** Every header read ends in one outcome of the closed
+`ProxyHeaderOutcome` enum (`lorica-core/src/listeners/proxy_protocol.rs`):
+an accepted one (a v1 or v2 header with an address, a header with none,
+no header under `optional`) or a refusal (a header from an untrusted
+peer, none under `required`, malformed, oversized, unsupported, or too
+late). They are counted per listener (`http`, `https`) on
+`lorica_proxy_protocol_accepted_total{listener,kind}` and
+`lorica_proxy_protocol_refused_total{listener,reason}`, summed across
+workers. A refusal also writes a `warn` line with the listener, the
+reason, the socket peer and the parser's detail, at most one per
+listener and reason every 10 s, then one line counting what the window
+held back, so a spoofing attempt cannot set the log's write rate. A
+rising `untrusted_peer` count is someone sending headers from outside
+the trust list.
+
+**Loopback.** Never trusted by default. Putting `127.0.0.1/32` or
+`::1/128` in the trust list lets any local process present any client
+address to that listener; do it only for the 443 hairpin of a stream in
+front of Lorica's own HTTPS listener, with that listener in `optional`
+so local tools that send no header keep working as the loopback client
+they are.
+
+Streams have a PROXY accept of their own, per stream and replicated with
+it, with no `optional` mode and never on UDP; [streams.md](streams.md)
+describes it.
 
 ### Request authority validation
 
