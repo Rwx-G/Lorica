@@ -336,6 +336,15 @@ F checks each one against the sources the PRD links ("Sources" under
 `docs/streams.md`, corrects this table where a value differs, and
 writes "not documented" where the source states none (Resolved 9).
 
+*Note (2026-11-18):* two HAProxy cells of the table are not in the
+HAProxy 3.4 configuration manual. Its `retries` section states no
+default (and its value counts retries after a failure, not attempts),
+and its `option srvtcpka` section states no default either. "3
+(`retries`)" and "off (`option srvtcpka`)" are recollections; the
+survey table of `docs/streams.md`, which Lot F wrote from the sources,
+says "not documented" for both. Lorica's own defaults do not depend on
+either value.
+
 - **Connect 5 s, in milliseconds.** With retries, a failover costs at
   most `attempts x connect timeout`; nginx's 60 s would hold a client
   for three minutes before `connect_failed`. Milliseconds because LAN
@@ -823,6 +832,14 @@ shared with 12.10's backend delete refusal.
   about fifteen TCP streams per node before the budget refuses one; the
   refusal names the stream, the numbers and the constraint, and the
   budget view shows each stream's share.
+
+*Note (2026-11-18):* the interim above is over. Story 12.6 (D-f) moved
+the cap onto the stream-caps region, so `max_connections` is the most
+concurrent connections of the stream on one node, counted across its
+workers, as the field's doc comment, `openapi.yaml` and the settings
+table of `docs/streams.md` now say. A node no longer holds
+`W x max_connections`. The fd budget still sizes each worker for the
+stream's whole cap, since one worker may hold all of it.
 
 ### D-q. The new fields, the migration, and every surface they reach
 
@@ -1800,6 +1817,8 @@ performance phase.
 - `CHANGELOG.md` `[Unreleased]`: Added (TCP streams) and Security (local backends refused, PROXY trusted per stream).
 - The threat-model entries the other documentation pass of this cycle covered (commit `11b46697` and those it names).
 
+- **Decisions checked against the code, 2026-11-18.** Two dated notes, the Decisions left as written: under D-p, `max_connections` is per node since Story 12.6 D-f (the field's doc comment, `openapi.yaml`, `docs/streams.md`), and the fd budget still counts a stream's whole cap in any one worker; under D-d, the HAProxy `retries` 3 and `option srvtcpka` off defaults are stated nowhere in the HAProxy 3.4 configuration manual (both sections re-read), as `docs/streams.md` already says.
+
 ## File List
 
 Lot E:
@@ -1899,3 +1918,4 @@ Lot B:
 | 2026-11-18 | 0.9 | D9 amended: the local-backend refusal of a token's address change names the stream only to a token holding `streams:read` and its id otherwise, through `streams_as_seen_by`, the helper Story 12.10's backend delete refusal uses; reason: 12.10 D-j keeps stream names from a config-tier token and the refusal must not undo it. Tests both ways on REST, the stdio-shaped request and both MCP tools, apply and preview. Gates: the CI chain green, `cargo audit` clean. | Romain G. |
 | 2026-11-18 | 0.10 | Lot F, threat-model part: local services, forwarding loops, DNS rebinding and PROXY-header spoofing on streams in T12; source addresses in the hardening guide. The survey check, `docs/streams.md` and `CHANGELOG.md` stay open. | Romain G. |
 | 2026-11-18 | 0.11 | Lot F, the `docs/streams.md` and CHANGELOG parts: survey values verified with a URL each (two D-d values not documented by HAProxy 3.4, recorded in the Completion Notes), the TCP engine documented; with the other documentation pass's boxes, every box of the Lot is ticked. Status InProgress. | Romain G. |
+| 2026-11-18 | 0.12 | Dated notes under D-d (HAProxy `retries` and `srvtcpka` defaults not in the 3.4 manual) and D-p (`max_connections` per node since Story 12.6). | Romain G. |
