@@ -387,6 +387,13 @@ With that, the outcome never depends on rule order.
 - **Badged**: the badge is Story 12.10 AC #1's ("no SNI"), read from
   the rule kinds; this story adds nothing the badge cannot derive.
 
+*Note (2026-11-18):* the interim of the "Acknowledged" bullet is over.
+Story 12.6 landed `source_allow_cidrs`, and validation now calls
+`Stream::no_sni_needs_acknowledgement` with `has_source_allowlist()`, so
+a stream with a `no_sni` rule is accepted with either a non-empty
+source allowlist or `no_sni_acknowledged = true`. A GeoIP allowlist and
+the PROXY trust list do not count as a source allowlist.
+
 ### D-e. Passthrough
 
 - Phase 2 reads the ClientHello (D-b), the matcher picks a rule (D-d),
@@ -1839,6 +1846,8 @@ The decisions above cite each one as "Resolved N".
 - `CHANGELOG.md` `[Unreleased]`: Added (TLS at layer 4) and Security (no default backend on a TLS stream, per-stream client CA, keys entitled only to a stream's nodes).
 - The threat model, `docs/cluster.md` and the D8 paragraph of `docs/hot-upgrade.md` the other documentation pass of this cycle covered (commit `11b46697` and those it names).
 
+- **D-d checked against the code, 2026-11-18.** A dated note under D-d, the Decision left as written: since Story 12.6, `Stream::validate` calls `no_sni_needs_acknowledgement` with `has_source_allowlist()`, so a non-empty `source_allow_cidrs` satisfies a `no_sni` rule as well as `no_sni_acknowledged` does.
+
 ## File List
 
 Lot F:
@@ -1928,3 +1937,4 @@ Lot A:
 | 2026-11-15 | 0.8 | Lot F landed: the TLS fields and `drains_on_upgrade` on the stream API with links per rule, the bundle and certificate checks of `tls_checks.rs` on create, update and import (422, coverage by the handshake's lookup, IP SAN for `no_sni`, trust and wildcard-depth warnings), the certificate delete guard for streams, and `openapi.yaml`. A rule with no backend is accepted. | Romain G. |
 | 2026-11-18 | 0.9 | Lot G, threat model, cluster and upgrade part: the TLS rows of T12, the certificate entitlement of a terminating stream in `docs/cluster.md`, `drains_on_upgrade` in `docs/hot-upgrade.md`. The survey check, `docs/streams.md` and `CHANGELOG.md` stay open. | Romain G. |
 | 2026-11-18 | 0.10 | Lot G, the `docs/streams.md` and CHANGELOG parts: survey values verified with a URL each (Envoy's ClientHello size now documented), TLS at layer 4 documented; with the other documentation pass's boxes, every box of the Lot is ticked. Status InProgress. | Romain G. |
+| 2026-11-18 | 0.11 | Dated note under D-d: a source allowlist, not only the acknowledgement, admits a `no_sni` rule since Story 12.6. | Romain G. |
