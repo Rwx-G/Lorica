@@ -272,7 +272,8 @@ when it was last presented.
 enum in `lorica-api/openapi.yaml` and offered by the mint form: the two
 environment grants, `routes:read` and `certificates:read`, the read
 grants the management MCP server's read tier is built on (`logs:read`,
-`waf:read`, `sla:read`, `cluster:read`, `backends:read`), the three
+`waf:read`, `sla:read`, `cluster:read`, `backends:read`, and since
+1.11.0 `streams:read`), the three
 write grants its config tier is built on (`routes:write`,
 `backends:write`, `certificates:write`), and `settings:write`, the one
 grant its admin tier is built on. An unknown scope string fails
@@ -821,6 +822,37 @@ nothing else:
 | `/automation/v1/backends` | `backends:read` | Every backend with its health, connections and EWMA score. |
 | `/automation/v1/routes` | `routes:read` | Every route with its linked backend ids, optionally one group. |
 | `/automation/v1/certificates` | `certificates:read` | Certificate metadata: domain, SANs, fingerprint, issuer, validity, ACME settings. |
+| `/automation/v1/streams` | `streams:read` | Every stream (v1.11.0) as the management list answers it: its listen address and ports, protocol, backends, every setting, and this node's bind state. Filters `?group=`, `?protocol=tcp\|udp`, `?name=` (exact). |
+| `/automation/v1/streams/status` | `streams:read` | Every stream's bind state on this node, on a control plane its state on every active node that binds it, named, and this node's live counters. Same filters. |
+| `/automation/v1/stream-logs` | `streams:read` and `logs:read` | Stream log rows (one per connection or UDP session, and the refusal rows), newest first, with the management read's filters; `before_id` walks back by keyset as on `/logs`. |
+
+**Streams are read here and written nowhere on this plane (v1.11.0).**
+`streams:read` is the read tier's scope for them; there is no stream
+write scope, and no method but `GET` is declared on those paths, so
+any other method falls on the scope gate's fail-closed default and
+answers `403` (`no_declared_scope`) to a token holding every scope. The reason is the PRD's D9: a stream opens a port, which is a
+perimeter change, and a token has no axis that could confine a listen
+address or a port the way `allowed_hostnames` confines a route. What it
+gives up is creating streams from CI. What to know about the reads:
+
+- **Nothing in a stream is withheld.** Its source CIDR lists, its PROXY
+  trust list and its `allow_local_backend` flag are what a reviewer of
+  a stream must see, and its two PEM fields are public CA certificates,
+  as a route's `mtls.ca_cert_pem` is.
+- **`streams:read` reveals node names.** The status read names the
+  nodes that bind each stream without `cluster:read`, because a bind
+  state per node means nothing without the node.
+- **A credential with grants reads no stream.** A stream has no hostname
+  and no backend address of its own to weigh against a grant, so a
+  principal carrying a grant-bounded scope gets an empty page on all
+  three paths. The MCP tier rule keeps `streams:read` off a config-tier
+  token anyway.
+- **Stream rows need both scopes**, `logs:read` because they are
+  access-log rows and `streams:read` because each one names a stream.
+
+`streams:read` is new in 1.11.0: a read token minted before carries
+none, and none is added to it. Re-mint a read token that should see
+streams.
 
 **Each one is the management API's own answer, not a second
 implementation of it.** The handler on this listener calls the
@@ -1086,7 +1118,26 @@ a key the kind does not have is a `422`, and so is a `timeout_ms`
 outside its bounds or a template check on a backend with `tls_upstream`
 on. A custom send/expect check (`tcp_send_expect`) is the dashboard's:
 see "A custom health-check payload is set in the dashboard" below.
-Streams (v1.11.0) are not on this plane, for reading or writing.
+
+**A token does not reach a stream through its backends (v1.11.0).**
+Streams are read on this plane (`streams:read`, above) and never
+written, and two backend writes would otherwise write one:
+
+- **Deleting a backend a stream uses is a `409`**, preview included:
+  the delete would unlink it from the stream, and a stream's backend
+  set is a stream field. Unlink it in the dashboard first; a backend no
+  stream uses is the token's to delete as before.
+- **Changing the address of a backend that a stream with
+  `allow_local_backend` uses is a `403`**: the stream's permission to
+  forward to the node itself was given to the stream, never to the
+  token. A backend of any other stream stays the token's to move, and a
+  local address is refused for it on its own.
+
+Both refusals name the streams **only to a token holding
+`streams:read`**; any other token, which is every config-tier token,
+reads their ids and that it lacks `streams:read` to read the names. The
+refusal does not hand out what the reads withhold. Neither names the
+address.
 
 **Each one is the management handler itself, run as the token.** The
 management handlers were split into the axum wrapper that reads the
@@ -1688,7 +1739,7 @@ translating:
 | `environments:write` | The path writes environments and the credential does not carry the scope. |
 | `routes:read` | Same, for the routes an environment resolves to. |
 | `certificates:read` | Same, for certificate metadata. |
-| `logs:read`, `waf:read`, `sla:read`, `cluster:read`, `backends:read` | Same, for the read views the MCP server's read tier is built on. On `POST /automation/v1/mcp`, the scope the tool the call named needed and the credential does not carry. |
+| `logs:read`, `waf:read`, `sla:read`, `cluster:read`, `backends:read`, `streams:read` | Same, for the read views the MCP server's read tier is built on. On `POST /automation/v1/mcp`, the scope the tool the call named needed and the credential does not carry. The stream log needs both `logs:read` and `streams:read`. |
 | `routes:write`, `backends:write`, `certificates:write` | Same, for the write surface the MCP server's config tier is built on. |
 | `settings:write` | Same, for the settings write the MCP server's admin tier is built on. |
 | `no_declared_scope` | The path has no entry in the scope matrix, so no token can reach it. A bug in Lorica, not in the caller: the scope gate also logs it at ERROR. |

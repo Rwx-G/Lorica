@@ -290,6 +290,30 @@ Each tool sits behind the read scope of its family. The catalogue is
 `READS` in `lorica-mcp/src/tools.rs`; `lorica mcp token create --tier
 read` prints it with each tool's scope, and `tools/list` answers it.
 
+**Streams (v1.11.0) are in this tier and in no other.** `streams:read`
+registers `lorica_streams` (every stream with its listen endpoint,
+backends, settings and this node's bind state, the flags an operator
+must notice named as such: unbounded UDP responses, a rule serving
+clients without SNI, `allow_local_backend`, `drains_on_upgrade`) and
+`lorica_stream_status` (the bind state on every node a control plane
+targets, named, and this node's live counters), both paginated and
+capped like the other reads, filtered by group, protocol and name, and
+`lorica_stream_logs`, the stream log rows, which the plane answers only
+to a token that also holds `logs:read` (a token minted with `--tier
+read` holds both). Nothing about a stream is withheld, and `streams:read` reveals
+the names of the nodes that bind streams. No tier has a stream
+mutation, and the config and admin tiers do not tolerate
+`streams:read`: a stream opens a port, which stays a management-plane
+decision ([automation.md](automation.md#the-read-surface)). Stream names
+and group names are operator-authored text and arrive through the same
+untrusted-data fence as every answer.
+
+**A read-tier token minted before 1.11.0 does not see streams.** It
+carries no `streams:read`, so the stream tools are simply not
+registered for it, and no migration adds a scope an operator never
+wrote down. Mint a new read-tier token (`lorica mcp token create --tier
+read`), which carries it, and revoke the old one.
+
 Over stdio which tools register is decided once, at startup, from the
 token the server was started with: a server whose token carries a
 scope of the tier that no tool uses starts with no tools and says so on
@@ -448,8 +472,15 @@ refuses the same check on its own (next section), whatever the client.
 The values are the node's to judge: an unknown kind or template, or a
 key the kind does not have, is a `422`. The deprecated
 `health_check_path` is still accepted beside it and must then be the
-same path. Streams (v1.11.0) are not on this server: no read tool and
-no mutation names them.
+same path.
+
+No config-tier tool names a stream (v1.11.0), and a backend tool does
+not reach one either: deleting a backend a stream uses is refused with
+a `409`, preview included, and changing the address of a backend that
+a stream with `allow_local_backend` uses with a `403`. Since the tier
+rule keeps `streams:read` off a config-tier token, both refusals list
+the streams by id, not by name; unlink the backend, or move it, in the
+dashboard.
 
 **The token's grants bound what a write claims and what it targets.**
 A hostname and every alias a route write claims must be inside the
