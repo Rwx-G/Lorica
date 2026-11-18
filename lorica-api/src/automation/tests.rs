@@ -453,20 +453,54 @@ async fn a_token_cannot_move_a_backend_a_stream_allowing_local_backends_forwards
     let moved = serde_json::json!({ "address": "10.0.0.11:8080" });
     let path = format!("/automation/v1/backends/{}", f.backend_id);
 
+    // The stream is named only to a token holding `streams:read` (the
+    // fixture's every-scope token); the config-tier token, which never
+    // holds it, reads its id and the scope it lacks (Story 12.3 D-m as
+    // amended), on REST and on the request the stdio server sends.
+    use lorica_mcp::TierTools as _;
+    use tower::ServiceExt as _;
+    assert!(!lorica_mcp::Tier::Config
+        .minted_scopes()
+        .contains(&lorica_config::models::AutomationScope::StreamsRead));
+    let by_id = format!("stream `{stream_id}` (by id: this token lacks `streams:read`");
     for suffix in ["", "?dry_run=true"] {
-        let response = automation_call(
-            &f.state,
-            "PUT",
-            &format!("{path}{suffix}"),
-            &f.bearer,
-            Some(moved.clone()),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{suffix}");
-        let refusal = body_json(response).await;
-        let message = refusal["error"]["message"].as_str().unwrap_or_default();
-        assert!(message.contains("stream `pg`"), "{suffix}: {message}");
-        assert!(!message.contains("10.0.0."), "no address: {message}");
+        let uri = format!("{path}{suffix}");
+        let named = automation_call(&f.state, "PUT", &uri, &f.bearer, Some(moved.clone())).await;
+        let rest = automation_call(&f.state, "PUT", &uri, &f.mcp_bearer, Some(moved.clone())).await;
+        let stdio = crate::automation::build_automation_router(f.state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(&uri)
+                    .header(http::header::AUTHORIZATION, &f.mcp_bearer)
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .header(
+                        crate::automation::audit::ASSERTED_TRANSPORT_HEADER,
+                        "mcp-stdio",
+                    )
+                    .header(
+                        crate::automation::audit::ASSERTED_TOOL_HEADER,
+                        "lorica_backend_update",
+                    )
+                    .body(axum::body::Body::from(moved.to_string()))
+                    .expect("test setup"),
+            )
+            .await
+            .expect("test setup");
+        for (door, response, expected) in [
+            ("named", named, "stream `pg`".to_string()),
+            ("rest", rest, by_id.clone()),
+            ("stdio", stdio, by_id.clone()),
+        ] {
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{door}{suffix}");
+            let refusal = body_json(response).await;
+            let message = refusal["error"]["message"].as_str().unwrap_or_default();
+            assert!(message.contains(&expected), "{door}{suffix}: {message}");
+            assert!(!message.contains("10.0.0."), "no address: {message}");
+            if door != "named" {
+                assert!(!message.contains("`pg`"), "{door}{suffix}: {message}");
+            }
+        }
     }
     for tool in ["lorica_backend_update", "lorica_backend_update_preview"] {
         let refused = mcp_call(
@@ -485,7 +519,8 @@ async fn a_token_cannot_move_a_backend_a_stream_allowing_local_backends_forwards
             .as_str()
             .unwrap_or_default();
         assert!(text.contains("HTTP 403"), "{tool}: {text}");
-        assert!(text.contains("stream `pg`"), "{tool}: {text}");
+        assert!(text.contains(&by_id), "{tool}: {text}");
+        assert!(!text.contains("`pg`"), "{tool}: {text}");
     }
     assert_eq!(stored_address().await, original, "nothing moved");
 

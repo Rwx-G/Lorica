@@ -207,7 +207,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use lorica_automation_policy::admin_setting;
 use lorica_automation_policy::protections::backend as backend_rule;
-use lorica_config::models::{AutomationScope, Backend, ManagedBy, Route};
+use lorica_config::models::{AutomationScope, Backend, ManagedBy, Route, Stream};
 use lorica_config::ConfigStore;
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -743,7 +743,7 @@ fn check_backend_target(
         ensure_not_weakened(BACKEND_PROTECTIONS, "backend", &after.id, before, after)?;
     }
     if let (Some(before), Some(after)) = (target.before, target.after) {
-        ensure_not_moved_under_a_local_stream(store, before, after)?;
+        ensure_not_moved_under_a_local_stream(store, principal, before, after)?;
     }
     Ok(())
 }
@@ -772,36 +772,53 @@ fn ensure_not_unlinked_from_a_stream(
     principal: &AutomationPrincipal,
     backend: &Backend,
 ) -> Result<(), ApiError> {
-    let names_visible = principal.has_scope(AutomationScope::StreamsRead);
-    let mut streams: Vec<String> = Vec::new();
+    let mut streams: Vec<Stream> = Vec::new();
     for stream_id in store.list_streams_for_backend(&backend.id)? {
-        if let Some(stream) = store.get_stream(&stream_id)? {
-            let shown = if names_visible {
-                stream.name
-            } else {
-                stream.id
-            };
-            streams.push(format!("`{shown}`"));
-        }
+        streams.extend(store.get_stream(&stream_id)?);
     }
     if streams.is_empty() {
         return Ok(());
     }
-    streams.sort_unstable();
-    let named = if names_visible {
-        String::new()
+    Err(ApiError::Conflict(format!(
+        "backend `{}` serves streams {}: a stream's backends are changed in the dashboard, \
+         not with an automation token; unlink it from them there first",
+        backend.id,
+        streams_as_seen_by(principal, &streams)
+    )))
+}
+
+/// How a refusal spells `streams` to `principal`: their names, quoted
+/// and sorted, to a token holding `streams:read`; to any other, their
+/// ids and a clause naming the scope that reads the names.
+///
+/// One rule for every token-facing refusal that mentions a stream
+/// (Story 12.10 D-i and Story 12.3 D-m, both amended): a stream's name
+/// is what `streams:read` exists to reveal, and the reads keep it from
+/// a token without that scope (Story 12.10 D-j), which is every
+/// config-tier token; a refusal must not hand it out instead.
+fn streams_as_seen_by(principal: &AutomationPrincipal, streams: &[Stream]) -> String {
+    let names_visible = principal.has_scope(AutomationScope::StreamsRead);
+    let mut shown: Vec<String> = streams
+        .iter()
+        .map(|stream| {
+            let spelling = if names_visible {
+                &stream.name
+            } else {
+                &stream.id
+            };
+            format!("`{spelling}`")
+        })
+        .collect();
+    shown.sort_unstable();
+    let listed = shown.join(", ");
+    if names_visible {
+        listed
     } else {
         format!(
-            " (by id: this token lacks `{}` to read their names)",
+            "{listed} (by id: this token lacks `{}`, which reads stream names)",
             AutomationScope::StreamsRead.as_str()
         )
-    };
-    Err(ApiError::Conflict(format!(
-        "backend `{}` serves streams {}{named}: a stream's backends are changed in the \
-         dashboard, not with an automation token; unlink it from them there first",
-        backend.id,
-        streams.join(", ")
-    )))
+    }
 }
 
 /// D9 of the Epic 12 PRD (Story 12.7, D-7): a token never creates or
@@ -841,10 +858,11 @@ fn ensure_no_new_raw_payload(before: Option<&Backend>, after: &Backend) -> Resul
 /// node's own addresses included, under a permission an operator gave
 /// the stream and never the token. Narrow on purpose: a backend of a
 /// stream without the flag stays the token's to move, since rule A then
-/// refuses a local address on its own. The refusal names the stream and
-/// never the address.
+/// refuses a local address on its own. The refusal lists the stream as
+/// [`streams_as_seen_by`] spells it to the token, and never the address.
 fn ensure_not_moved_under_a_local_stream(
     store: &ConfigStore,
+    principal: &AutomationPrincipal,
     before: &Backend,
     after: &Backend,
 ) -> Result<(), ApiError> {
@@ -857,9 +875,10 @@ fn ensure_not_moved_under_a_local_stream(
             .filter(|stream| stream.allow_local_backend)
         {
             return Err(ApiError::Forbidden(format!(
-                "backend `{}` serves stream `{}`, which allows local backends: its address \
+                "backend `{}` serves stream {}, which allows local backends: its address \
                  is changed in the dashboard, not with an automation token",
-                after.id, stream.name
+                after.id,
+                streams_as_seen_by(principal, std::slice::from_ref(&stream))
             )));
         }
     }

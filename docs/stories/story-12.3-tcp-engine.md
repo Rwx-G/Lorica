@@ -718,6 +718,16 @@ backend linked to any stream with `allow_local_backend` on is refused
 (to confirm in Lot E). Narrow on purpose: tokens keep managing backends
 of ordinary streams, whose rule A still refuses a local address.
 
+*Amendment (maintainer, 2026-11-18, with Story 12.10's D-i):* the 403
+names the stream **only to a token holding `streams:read`**; any other
+token reads the stream's id and that it lacks `streams:read`, on REST,
+both MCP transports, apply and dry run. Reason: Story 12.10 D-j keeps
+stream names out of the reads for a token without `streams:read`, which
+is every config-tier token (the tier rule refuses that scope beside a
+write scope), and a refusal must not hand the name out instead. The
+spelling is one helper, `streams_as_seen_by` in `automation/write.rs`,
+shared with 12.10's backend delete refusal.
+
 ### D-n. DNS re-resolution
 
 - **Per process**, inside the engine: one `ResolverCache` per worker
@@ -1869,3 +1879,4 @@ Lot B:
 | 2026-11-15 | 0.7 | Lot D2 landed: the selector, breaker gate and hickory resolver in `lorica::stream_engine`, the engine installed in worker and single-process modes, the stream table carrying backends, `held_fds` in the budget, health flips refreshing every stream table, `--reserved-ports` for workers; the real binary forwards a TCP stream in both modes. | Romain G. |
 | 2026-11-15 | 0.8 | Lot E landed: the engine settings and `backup_backend_ids` on the stream API and in `openapi.yaml`, rule B (`stream_local_backend`, 409) on stream writes both ways, backend updates and imports, the D9 automation guard reached by the MCP backend tool, and one budget demand function for the API and the node. | Romain G. |
 | 2026-11-15 | 0.6 | Lot C landed: the TCP engine in `lorica_stream::tcp`, the protocol-neutral seams, local check, resolver cache and counters at the crate root (Story 12.5 E2, E3), `StreamTable::with_backends`, `table_changed` and the `backend_down` drain, the connection record and its observer. | Romain G. |
+| 2026-11-18 | 0.9 | D9 amended: the local-backend refusal of a token's address change names the stream only to a token holding `streams:read` and its id otherwise, through `streams_as_seen_by`, the helper Story 12.10's backend delete refusal uses; reason: 12.10 D-j keeps stream names from a config-tier token and the refusal must not undo it. Tests both ways on REST, the stdio-shaped request and both MCP tools, apply and preview. Gates: the CI chain green, `cargo audit` clean. | Romain G. |

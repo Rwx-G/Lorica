@@ -1063,7 +1063,7 @@ paths:
               example:
                 error:
                   code: conflict
-                  message: "conflict: backend `<UUID>` serves streams `<UUID>` (by id: this token lacks `streams:read` to read their names): a stream's backends are changed in the dashboard, not with an automation token; unlink it from them there first"
+                  message: "conflict: backend `<UUID>` serves streams `<UUID>` (by id: this token lacks `streams:read`, which reads stream names): a stream's backends are changed in the dashboard, not with an automation token; unlink it from them there first"
         "429":
           $ref: "#/components/responses/WriteBudget"
 

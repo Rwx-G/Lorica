@@ -1016,9 +1016,9 @@ each one as "Resolved N".
   fixture's every-scope token (names, no id) and its config-tier token
   (ids and the clause, no name), both MCP Streamable HTTP tools with
   the config-tier token, with one and two streams. 12.3's address
-  refusal (`ensure_not_moved_under_a_local_stream`) still names its
-  stream to any token; it is outside this amendment and left as 12.3
-  decided.
+  refusal (`ensure_not_moved_under_a_local_stream`) follows the same
+  rule since 12.3's D9 amendment: both spell their streams through one
+  helper, `streams_as_seen_by`.
 - **Lot C2, the tests** (`write/plane_tests.rs`):
   `a_token_cannot_delete_a_backend_a_stream_uses_on_any_door` drives
   apply and `?dry_run=true` over REST, the same request carrying the
