@@ -2814,6 +2814,7 @@ export type StreamBindFailureKind =
   | 'address_not_available'
   | 'reserved_port'
   | 'fd_budget'
+  | 'source_ports'
   | 'other';
 
 /** One stream's share of a node's fd budget. */
@@ -2853,7 +2854,30 @@ export interface NodeStreamBudget {
   worker_fds_committed: number;
   supervisor_fds_committed: number;
   worker_drain_timeout_s: number;
+  /**
+   * The UDP source ports one source address can use (Story 12.5 D-e);
+   * `null` when the node could not read its range or has not reported
+   * it, which leaves its writes checked on fds alone.
+   */
+  usable_source_ports: number | null;
+  /** The UDP sessions the node can hold across its UDP streams. */
+  session_ceiling: number;
+  /** The limit that set `session_ceiling`, `fd_budget` on a tie. */
+  session_ceiling_bound_by: 'fd_budget' | 'source_ports';
+  /** The UDP streams' shares added up, each its `udp.max_sessions`. */
+  udp_sessions_committed: number;
+  /** Committed sessions past the ceiling or a pool's ports: writes that raise the demand are refused. */
+  over_ceiling: boolean;
+  source_pools: StreamSourcePool[];
   streams: StreamBudgetShare[];
+}
+
+/** The UDP sessions leaving from one source address, or `default` for streams without one. */
+export interface StreamSourcePool {
+  pool: string;
+  committed: number;
+  /** `usable_source_ports`, `null` as there. */
+  usable: number | null;
 }
 
 export interface StreamBudgetView {

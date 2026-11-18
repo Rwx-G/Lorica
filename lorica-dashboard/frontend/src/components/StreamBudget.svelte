@@ -13,6 +13,19 @@
   const NO_CEILING =
     'No ceiling declared: the stream engine declares none yet, so the stream counts only its listening sockets.';
 
+  const UDP_SHARE = "This UDP stream's share of the node's session ceiling (udp.max_sessions).";
+
+  /** What set a node's UDP session ceiling, keyed by the API's word so a new one is a type error here. */
+  const BOUND_BY: Record<NodeStreamBudget['session_ceiling_bound_by'], string> = {
+    fd_budget: 'the fd budget',
+    source_ports: 'the usable source ports',
+  };
+
+  /** A node shows its UDP figures once a UDP stream counts on it, or when it is past them. */
+  function carriesUdp(node: NodeStreamBudget): boolean {
+    return node.over_ceiling || node.udp_sessions_committed > 0 || node.streams.some((s) => s.protocol === 'udp');
+  }
+
   function count(n: number): string {
     return n.toLocaleString('en-US');
   }
@@ -97,6 +110,59 @@
         </div>
       {/each}
 
+      {#if carriesUdp(node)}
+        {@const percent = gaugePercent(node.udp_sessions_committed, node.session_ceiling)}
+        <div class="udp-block" aria-label="UDP sessions of {node.node_name ?? 'this node'}">
+          {#if node.over_ceiling}
+            <p class="warn-text" role="alert">
+              Past its UDP session ceiling: the committed sessions, or a source pool's,
+              no longer fit, as a narrowed port range or a lowered fd limit leaves a node.
+              Bound streams stay bound; a stream write that raises the demand is refused
+              until it fits again, one that lowers it passes.
+            </p>
+          {/if}
+          <div class="gauge">
+            <span class="gauge-label">UDP sessions</span>
+            <div class="gauge-track">
+              <div class="gauge-fill" style="width: {Math.min(percent ?? 0, 100)}%; background: {gaugeColor(percent)}"></div>
+            </div>
+            <span class="gauge-value" title="The UDP streams' shares against the node's session ceiling">
+              {count(node.udp_sessions_committed)} / {count(node.session_ceiling)}
+            </span>
+          </div>
+          <p class="ceiling-line">
+            Session ceiling {count(node.session_ceiling)}, bound by
+            <strong>{BOUND_BY[node.session_ceiling_bound_by]}</strong>.
+            Usable source ports per source address:
+            {#if node.usable_source_ports === null}
+              <span title="The node could not read its port range or has not reported it: its writes are checked on fds alone.">unknown</span>
+            {:else}
+              {count(node.usable_source_ports)}
+            {/if}
+          </p>
+          {#if node.source_pools.length > 0}
+            <table class="share-table pool-table">
+              <thead>
+                <tr>
+                  <th>Source pool</th>
+                  <th class="num">Committed sessions</th>
+                  <th class="num">Usable ports</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each node.source_pools as pool (pool.pool)}
+                  <tr class:over={pool.usable !== null && pool.committed > pool.usable}>
+                    <td class="mono">{pool.pool}</td>
+                    <td class="num">{count(pool.committed)}</td>
+                    <td class="num">{pool.usable === null ? '-' : count(pool.usable)}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          {/if}
+        </div>
+      {/if}
+
       {#if node.streams.length === 0}
         <p class="muted">No stream binds on this node.</p>
       {:else}
@@ -121,6 +187,8 @@
                 <td class="num">
                   {#if share.ceiling === null}
                     <span class="none" title={NO_CEILING}>-</span>
+                  {:else if share.protocol === 'udp'}
+                    <span title={UDP_SHARE}>{count(share.ceiling)}</span>
                   {:else}
                     {count(share.ceiling)}
                   {/if}
@@ -242,6 +310,20 @@
     margin: var(--space-3) 0 0;
   }
   .warn-text {
+    color: var(--color-orange-text);
+  }
+  .udp-block {
+    margin-top: var(--space-3);
+  }
+  .ceiling-line {
+    font-size: 0.8125rem;
+    color: var(--color-text-muted);
+    margin: var(--space-2) 0;
+  }
+  .ceiling-line strong {
+    color: var(--color-text);
+  }
+  .pool-table tr.over td {
     color: var(--color-orange-text);
   }
   @media (max-width: 640px) {

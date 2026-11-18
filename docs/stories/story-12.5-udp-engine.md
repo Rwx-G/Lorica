@@ -1078,7 +1078,7 @@ Allowlist: `lorica-dashboard/frontend/src/lib/api.ts`,
 `lorica-dashboard/frontend/src/components/StreamBudget.svelte` (+ `.test.ts`).
 Depends on: G; Story 12.2 Lot F (same files).
 
-- [ ] Types (the bind failure-kind union gains `source_ports`); the
+- [x] Types (the bind failure-kind union gains `source_ports`); the
       panel shows the node ceiling, `bound_by`, `over_ceiling`,
       the source pools and each UDP stream's share; Vitest for each.
 - [ ] The stream form and the unbounded-responses badge are Story 12.10's
@@ -1447,6 +1447,31 @@ decision.
 ### Debug Log
 
 ### Completion Notes
+
+**Lot J (dashboard).**
+
+- Types. `NodeStreamBudget` gains `usable_source_ports`,
+  `session_ceiling`, `session_ceiling_bound_by`,
+  `udp_sessions_committed`, `over_ceiling` and `source_pools`
+  (`StreamSourcePool`), as `openapi.yaml` documents them;
+  `StreamBindFailureKind` gains `source_ports`. The dashboard renders a
+  failure kind as its word everywhere (no label map), so the new kind
+  shows in the Cluster drawer and the Streams page with no other edit.
+- Panel. A node that holds a UDP stream, has sessions committed or is
+  `over_ceiling` shows a "UDP sessions" gauge (committed against
+  `session_ceiling`), a line naming what bound the ceiling (a
+  `Record` keyed on the `session_ceiling_bound_by` union, so a new word
+  is a `tsc` error) and the usable source ports (`unknown` when `null`),
+  the source pools table (a pool past its usable ports in the warning
+  colour), and an alert while `over_ceiling` saying bound streams stay
+  bound and only writes that raise the demand are refused. A UDP
+  stream's row keeps its share in the Ceiling column, titled as its
+  share of the node ceiling. A TCP-only node shows no UDP figure.
+- Tests (`StreamBudget.test.ts`): no UDP block on a TCP-only node; the
+  gauge and the bound for each `bound_by`; unknown usable ports; the
+  pools with one past its ports; the `over_ceiling` alert; the UDP
+  share's title. `System.test.ts` and `StreamBudget.test.ts` fixtures
+  carry the new fields. Gates: see the Change Log row.
 
 **Lot G (`lorica-api`, `lorica-cluster`).**
 
@@ -1994,6 +2019,15 @@ decision.
 
 ## File List
 
+Lot J:
+
+- `lorica-dashboard/frontend/src/lib/api.ts`
+- `lorica-dashboard/frontend/src/components/StreamBudget.svelte`,
+  `StreamBudget.test.ts`
+- `lorica-dashboard/frontend/src/routes/System.test.ts` (the fixture),
+  outside the allowlist
+- `docs/stories/story-12.5-udp-engine.md`
+
 Lot G:
 
 - `lorica-api/src/streams.rs`, `lorica-api/src/streams/tests.rs`,
@@ -2087,3 +2121,4 @@ Lot A:
 | 2026-11-15 | 0.7 | Lot E landed: the UDP engine (`UdpEngine`), sessions per key with one connected upstream socket each, the D-b bounds, per-source rates and session caps on the region, PROXY v2 per datagram, reply source on wildcard addresses, ICMP and no-response failures, the UDP counters, drop reasons, `ceiling_reached` edge and the record's datagram counts. Selection and breaker admission run in the session task (the breaker seam is async). | Romain G. |
 | 2026-11-15 | 0.8 | Lot F landed: the UDP engine installed in worker and single-process mode over the TCP engine's selector and resolver cache, a caps region per UDP stream sent ahead of every `attach` and replaced on a size change, a dead worker's sessions released before its respawn is replayed, the 1 s caps tick, draining UDP bindings holding their ports until the drain ends, the node's source-port backstop. | Romain G. |
 | 2026-11-15 | 0.9 | Lot G landed: the `udp` settings on the stream view and both bodies, the listen-address rule called by `Stream::validate`, the usable source ports in the heartbeat and in the API's budget check and view, one "refuse raises, allow lowers" rule (`FdBudget::check_change`) for the API's write check and the node's bind, `openapi.yaml` with the UDP schemas, the refusal and drop words and `source_ports` pinned to their enums. | Romain G. |
+| 2026-11-18 | 0.10 | Lot J landed: the System page's budget panel shows each node's UDP session ceiling, what bound it, the usable source ports, the committed sessions, the source pools and `over_ceiling`, and each UDP stream's share; `source_ports` in the bind failure kinds. Frontend gates green (check, lint, Vitest 911). | Romain G. |
