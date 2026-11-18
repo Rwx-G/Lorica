@@ -116,4 +116,4 @@ pub use read::{
     AUTOMATION_READ_DEFAULT_ROWS, AUTOMATION_READ_MAX_ANSWER_BYTES, AUTOMATION_READ_MAX_ROWS,
 };
 pub use router::{build_automation_router, route_table, AutomationRoute, AUTOMATION_BODY_CAP};
-pub use scope::{path_template, required_scope, ScopeRequirement};
+pub use scope::{companion_scope, path_template, required_scope, ScopeRequirement};

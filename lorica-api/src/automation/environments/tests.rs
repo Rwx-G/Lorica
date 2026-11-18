@@ -879,6 +879,67 @@ async fn a_hostname_outside_the_token_allowlist_is_refused() {
     assert_no_rows(&row_counts(&state).await);
 }
 
+// ---- Story 12.10 D-f: the environment resource stays HTTP-only ----
+
+#[tokio::test]
+async fn an_environment_body_naming_streams_is_refused_and_writes_nothing() {
+    // The request type denies unknown fields, so a stream cannot ride in
+    // on an environment however the body spells it; 12.1's attachment
+    // rule 3 already keeps an environment's backend off every stream.
+    let state = crate::tests::test_state().await.0;
+    seed_wildcard(&state).await;
+    let token = writer(&state, "acme-ci").await;
+    for (key, value) in [
+        ("streams", serde_json::json!([{ "port_first": 5432 }])),
+        ("protocol", serde_json::json!("tcp")),
+        ("port_first", serde_json::json!(5432)),
+    ] {
+        let mut body = env_body();
+        body[key] = value;
+        let response = put(&state, &token, "pr-42", body).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{key}");
+        assert_no_rows(&row_counts(&state).await);
+    }
+}
+
+#[test]
+fn the_documented_environment_request_names_no_stream_property() {
+    // The contract half of the same pin: the two schemas a pipeline
+    // writes an environment with, read off the automation document,
+    // carry nothing a stream is made of, and admit nothing undeclared.
+    let document = include_str!("../../../openapi-automation.yaml");
+    for schema in ["EnvironmentRequest", "EnvironmentBackendRequest"] {
+        let body: Vec<&str> = document
+            .lines()
+            .skip_while(|line| line.trim_end() != format!("    {schema}:"))
+            .skip(1)
+            .take_while(|line| line.trim().is_empty() || line.starts_with("     "))
+            .collect();
+        assert!(!body.is_empty(), "{schema} is not in the document");
+        assert!(
+            body.iter()
+                .any(|line| line.trim() == "additionalProperties: false"),
+            "{schema} admits undeclared properties"
+        );
+        let properties: Vec<&str> = body
+            .iter()
+            .filter(|line| line.starts_with("        ") && !line.starts_with("         "))
+            .filter_map(|line| line.trim().strip_suffix(':'))
+            .collect();
+        assert!(!properties.is_empty(), "{schema}: the parse went blind");
+        // Whole words of the property, so `tls_upstream` is not read as
+        // naming a stream.
+        for property in properties {
+            for stream_word in ["stream", "streams", "port", "protocol", "listen"] {
+                assert!(
+                    !property.split('_').any(|word| word == stream_word),
+                    "{schema} documents `{property}`"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_wildcard_hostname_is_refused() {
     let state = crate::tests::test_state().await.0;

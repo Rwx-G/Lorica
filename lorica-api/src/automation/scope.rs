@@ -112,6 +112,38 @@ pub fn required_scope(method: &http::Method, path: &str) -> Option<ScopeRequirem
     declaration(method, path).map(|(_, requirement)| requirement)
 }
 
+/// The second scope a request needs beside [`required_scope`]'s, or
+/// `None` for every path but the one that reads two kinds of thing.
+///
+/// That path is the stream log (Story 12.9 D-j). Its rows are access-log
+/// rows, which `logs:read` documents, and each one names a stream, which
+/// only `streams:read` may reveal, so a token needs both. The stream
+/// scope is the one [`required_scope`] names, because it is the one a
+/// token minted before streams existed lacks: the MCP registry keys a
+/// tool on that scope, so such a token does not see the stream log tool
+/// at all rather than seeing one that refuses it.
+///
+/// A function beside the matrix and not a fourth state of
+/// [`ScopeRequirement`]: every reader of that type (the OpenAPI
+/// contract's `x-required-scope`, the MCP catalogue's one scope per
+/// tool) names one scope per path, and this is the one path where a
+/// second applies. [`authorize_scope`] and the audit layer's refusal
+/// reason both read it, so the 403 and the row name the scope missing.
+///
+/// ```
+/// use lorica_api::automation::companion_scope;
+/// use lorica_config::models::AutomationScope;
+///
+/// assert_eq!(
+///     companion_scope(&http::Method::GET, "/automation/v1/stream-logs"),
+///     Some(AutomationScope::LogsRead)
+/// );
+/// assert_eq!(companion_scope(&http::Method::GET, "/automation/v1/streams"), None);
+/// ```
+pub fn companion_scope(method: &http::Method, path: &str) -> Option<AutomationScope> {
+    (*method == http::Method::GET && path == STREAM_LOGS_PATH).then_some(AutomationScope::LogsRead)
+}
+
 /// The path template this request matched, or `None` for a path the
 /// plane declares nothing for.
 ///
@@ -283,6 +315,10 @@ fn read_declaration(path: &str) -> Option<(&'static str, AutomationScope)> {
         BACKENDS_PATH => Some((BACKENDS_PATH, AutomationScope::BackendsRead)),
         ROUTES_PATH => Some((ROUTES_PATH, AutomationScope::RoutesRead)),
         CERTIFICATES_PATH => Some((CERTIFICATES_PATH, AutomationScope::CertificatesRead)),
+        STREAMS_PATH => Some((STREAMS_PATH, AutomationScope::StreamsRead)),
+        STREAMS_STATUS_PATH => Some((STREAMS_STATUS_PATH, AutomationScope::StreamsRead)),
+        // `logs:read` as well, demanded by `companion_scope`: see there.
+        STREAM_LOGS_PATH => Some((STREAM_LOGS_PATH, AutomationScope::StreamsRead)),
         // One resource under a collection, and exactly one: a deeper
         // path stays undeclared and is refused for every token.
         _ if one_segment_under(path, SLA_ROUTES_PATH) => {
@@ -384,6 +420,23 @@ pub(super) const CERTIFICATES_PATH: &str = "/automation/v1/certificates";
 /// how the metric labels it.
 pub(super) const CERTIFICATE_RENEW_TEMPLATE: &str = "/automation/v1/certificates/{id}/renew";
 
+/// The stream listing (Story 12.10 D-f). Read only: no verb but `GET`
+/// is declared on it or under it, because there is no stream write
+/// scope.
+pub(super) const STREAMS_PATH: &str = "/automation/v1/streams";
+
+/// Every stream's bind state, per node on a control plane, and this
+/// node's live counters (Story 12.10 D-f).
+///
+/// The one read on this plane that names nodes without `cluster:read`:
+/// a bind state per node means nothing without the node, so
+/// `streams:read` reveals the names of the nodes that bind streams.
+pub(super) const STREAMS_STATUS_PATH: &str = "/automation/v1/streams/status";
+
+/// The stream log (Story 12.9 D-j), behind `streams:read` and, through
+/// [`companion_scope`], `logs:read`.
+pub(super) const STREAM_LOGS_PATH: &str = "/automation/v1/stream-logs";
+
 /// The global settings document, the admin tier's one path (Story
 /// 11.3). Written, never read: the answer to a write is the allowlisted
 /// part of the document and nothing more.
@@ -419,17 +472,23 @@ pub async fn authorize_scope(req: Request, next: Next) -> Result<Response, ApiEr
             "this path declares no automation scope and is reachable by no token".into(),
         ));
     };
-    if let ScopeRequirement::Scope(needed) = requirement {
-        if !principal.has_scope(needed) {
-            // The message names the missing scope. That is not a
-            // disclosure: the caller already holds the token and can
-            // read its own scopes from `whoami`; what they cannot do is
-            // guess which one this path wanted.
-            return Err(ApiError::Forbidden(format!(
-                "this token does not carry the {} scope",
-                scope_str(needed)
-            )));
-        }
+    let needed = match requirement {
+        ScopeRequirement::Scope(scope) => Some(scope),
+        ScopeRequirement::AnyLiveToken => None,
+    };
+    let missing = needed
+        .into_iter()
+        .chain(companion_scope(req.method(), &path))
+        .find(|scope| !principal.has_scope(*scope));
+    if let Some(missing) = missing {
+        // The message names the missing scope. That is not a
+        // disclosure: the caller already holds the token and can read
+        // its own scopes from `whoami`; what they cannot do is guess
+        // which one this path wanted.
+        return Err(ApiError::Forbidden(format!(
+            "this token does not carry the {} scope",
+            scope_str(missing)
+        )));
     }
 
     Ok(next.run(req).await)
@@ -480,6 +539,12 @@ pub(crate) const READ_SURFACE: &[(&str, AutomationScope)] = &[
         "/automation/v1/certificates",
         AutomationScope::CertificatesRead,
     ),
+    ("/automation/v1/streams", AutomationScope::StreamsRead),
+    (
+        "/automation/v1/streams/status",
+        AutomationScope::StreamsRead,
+    ),
+    ("/automation/v1/stream-logs", AutomationScope::StreamsRead),
 ];
 
 /// Every `(verb, path)` of the write surface beside the scope it sits
@@ -900,8 +965,80 @@ mod tests {
             "/automation/v1/certificates/c-1",
             "/automation/v1/routes/r-1",
             "/automation/v1/backends/b-1",
+            "/automation/v1/streams/s-1",
+            "/automation/v1/streams/",
+            "/automation/v1/streams/status/s-1",
+            "/automation/v1/stream-logs/export",
         ] {
             assert_eq!(required_scope(&Method::GET, path), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn no_verb_but_get_is_declared_on_a_stream_path_or_under_one() {
+        // Story 12.10 D-f, PRD D9: there is no stream write scope, so a
+        // mutation of a stream on this plane is not refused for want of
+        // a grant, it does not exist for any token.
+        for path in [
+            STREAMS_PATH,
+            STREAMS_STATUS_PATH,
+            STREAM_LOGS_PATH,
+            "/automation/v1/streams/s-1",
+            "/automation/v1/streams/{}",
+            "/automation/v1/streams/s-1/enabled",
+        ] {
+            for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+                assert_eq!(required_scope(&method, path), None, "{method} {path}");
+                assert_eq!(companion_scope(&method, path), None, "{method} {path}");
+            }
+        }
+        for path in [STREAMS_PATH, STREAMS_STATUS_PATH, STREAM_LOGS_PATH] {
+            assert_eq!(
+                required_scope(&Method::GET, path),
+                Some(ScopeRequirement::Scope(AutomationScope::StreamsRead)),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_stream_log_asks_for_a_second_scope() {
+        assert_eq!(
+            companion_scope(&Method::GET, STREAM_LOGS_PATH),
+            Some(AutomationScope::LogsRead)
+        );
+        for (path, _scope) in READ_SURFACE
+            .iter()
+            .filter(|(path, _)| *path != STREAM_LOGS_PATH)
+        {
+            assert_eq!(companion_scope(&Method::GET, path), None, "{path}");
+        }
+        for (spelled, path, _scope) in WRITE_SURFACE {
+            assert_eq!(companion_scope(&verb(spelled), path), None, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_layer_refuses_the_stream_log_to_a_token_missing_either_scope_naming_it() {
+        // Story 12.9 D-j: a stream log row is an access-log row that
+        // names a stream, so each scope alone is refused, the 403 naming
+        // the one missing.
+        let both = vec![AutomationScope::StreamsRead, AutomationScope::LogsRead];
+        assert_eq!(
+            through_the_layer(principal_carrying(both.clone()), STREAM_LOGS_PATH).await,
+            http::StatusCode::OK
+        );
+        for held in both {
+            let everything_but: Vec<AutomationScope> = AutomationScope::ALL
+                .iter()
+                .copied()
+                .filter(|scope| *scope != held)
+                .collect();
+            assert_eq!(
+                through_the_layer(principal_carrying(everything_but), STREAM_LOGS_PATH).await,
+                http::StatusCode::FORBIDDEN,
+                "a token without {held}"
+            );
         }
     }
 

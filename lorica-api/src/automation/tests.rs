@@ -386,10 +386,8 @@ async fn every_automation_request_lands_in_the_audit_log() {
 
 /// No write path of the automation plane names a stream, so no token and
 /// no MCP tool (each a request to one of these paths) writes a stream
-/// field, `allow_local_backend` included. The one read that names a
-/// stream is its SLA (Story 12.9), which answers figures and no field.
-/// Story 12.10 brings streams to this plane and must keep the flag out
-/// of it.
+/// field, `allow_local_backend` included. Story 12.10 brings streams to
+/// this plane as reads only: they show the flag, and nothing writes it.
 #[test]
 fn no_automation_write_path_reaches_a_stream() {
     let table = crate::automation::route_table();
@@ -518,4 +516,115 @@ async fn a_token_cannot_move_a_backend_a_stream_allowing_local_backends_forwards
     let response = automation_call(&f.state, "PUT", &path, &f.bearer, Some(moved)).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(stored_address().await, "10.0.0.11:8080");
+}
+
+// ---- Story 12.10 D-f and Story 12.9 D-j: streams are read, never written ----
+
+#[tokio::test]
+async fn no_verb_but_get_reaches_a_stream_for_a_token_holding_every_scope() {
+    // There is no stream write scope, so a mutation of a stream on this
+    // plane is not missing a grant: no token reaches one, and the row
+    // says the path declares no scope, which is a published reason and
+    // not a new one.
+    use crate::automation::test_support::{a_node_with_something_to_write, automation_call};
+
+    let f = a_node_with_something_to_write().await;
+    let mut refused = 0usize;
+    for path in [
+        "/automation/v1/streams",
+        "/automation/v1/streams/status",
+        "/automation/v1/streams/anything",
+        "/automation/v1/stream-logs",
+    ] {
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let response = automation_call(
+                &f.state,
+                method,
+                path,
+                &f.bearer,
+                Some(serde_json::json!({ "name": "pg", "port_first": 5432 })),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+            refused += 1;
+        }
+    }
+    let forbidden: Vec<String> = automation_audit_actions(&f.state)
+        .await
+        .into_iter()
+        .filter(|action| action.starts_with("automation.request.forbidden"))
+        .collect();
+    assert_eq!(forbidden.len(), refused, "{forbidden:?}");
+    for action in &forbidden {
+        assert_eq!(
+            action, "automation.request.forbidden:no_declared_scope",
+            "{forbidden:?}"
+        );
+        let reason = action
+            .strip_prefix("automation.request.forbidden:")
+            .expect("the reason rides in the verb");
+        assert!(crate::automation::audit::is_published_reason(reason));
+    }
+}
+
+#[tokio::test]
+async fn the_stream_log_names_the_scope_a_token_lacks_in_the_refusal_and_the_audit_row() {
+    // Story 12.9 D-j: `logs:read` and `streams:read`, each refused alone,
+    // the 403 and the row naming the one missing, as for any other path.
+    use crate::automation::test_support::assert_forbidden_naming;
+    use lorica_config::models::AutomationScope;
+
+    let data_dir = tempfile::tempdir().expect("test tempdir");
+    let (mut state, _session_store, _rate_limiter) = test_state().await;
+    state.log_store = Some(Arc::new(
+        crate::log_store::LogStore::open(data_dir.path()).expect("test setup: log store"),
+    ));
+    let pairs = [
+        (AutomationScope::LogsRead, AutomationScope::StreamsRead),
+        (AutomationScope::StreamsRead, AutomationScope::LogsRead),
+    ];
+    let mut expected: Vec<String> = Vec::new();
+    for (held, missing) in pairs {
+        let token = mint_automation(
+            &state,
+            held.as_str(),
+            vec![held],
+            &[],
+            chrono::Utc::now() + chrono::Duration::days(30),
+            None,
+        )
+        .await;
+        let response = automation_send(
+            &state,
+            "/automation/v1/stream-logs",
+            Some(&format!("Bearer {token}")),
+            None,
+        )
+        .await;
+        assert_forbidden_naming(response, missing.as_str(), held.as_str()).await;
+        expected.push(format!("automation.request.forbidden:{missing}"));
+    }
+    expected.sort();
+    assert_eq!(automation_audit_actions(&state).await, expected);
+}
+
+#[test]
+fn every_tool_on_a_path_that_needs_a_second_scope_names_it() {
+    // The MCP registry keys a tool on one scope; the plane demands a
+    // second on the stream log. The tool's own words are where a model
+    // learns that before the refusal does, so they are held to the
+    // matrix rather than to a copy of it.
+    let mut checked = 0usize;
+    for spec in lorica_mcp::tools::catalogue() {
+        let verb: http::Method = spec.verb().as_str().parse().expect("a verb");
+        if let Some(companion) = crate::automation::companion_scope(&verb, spec.path) {
+            checked += 1;
+            assert!(
+                spec.summary.contains(&format!("`{companion}`")),
+                "{} does not say it needs {companion}",
+                spec.name
+            );
+        }
+    }
+    assert!(checked > 0, "no tool reads the stream log");
 }

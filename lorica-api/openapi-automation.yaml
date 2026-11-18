@@ -55,8 +55,9 @@ tags:
     description: >-
       What this node is seeing and what it is currently configured with
       (Story 11.1): access-log rows, WAF events and counters, passive
-      SLA, cluster and node status, backends, routes, and certificate
-      metadata. Each family sits behind its own scope, so a credential
+      SLA, cluster and node status, backends, routes, certificate
+      metadata, and since Epic 12 streams, their status and the stream
+      log. Each family sits behind its own scope, so a credential
       is given the one view it needs and not the rest.
 
 
@@ -1365,6 +1366,209 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
 
+  /automation/v1/streams:
+    get:
+      tags: [Reads]
+      summary: The configured streams
+      description: >-
+        Every TCP and UDP stream as `GET /api/v1/streams` answers it: its
+        configuration, its backend ids and this node's bind state,
+        optionally narrowed by group, protocol or name. No value is
+        withheld: a stream carries no secret, its CIDR lists and its
+        local-backend flag are what a reviewer of it must see, and its
+        two PEM fields are public CA certificates.
+
+
+        Read only. No verb but `GET` is declared on this path or under
+        it, for any token: a stream is a listener, and there is no
+        stream write scope.
+
+
+        For a credential carrying a scope a grant bounds, an empty page:
+        a stream has no hostname or backend address to weigh against
+        `allowed_hostnames`.
+
+
+        Required scope: `streams:read`.
+      operationId: automationListStreams
+      x-required-scope: streams:read
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
+        - $ref: "#/components/parameters/StreamGroup"
+        - $ref: "#/components/parameters/StreamProtocol"
+        - $ref: "#/components/parameters/StreamName"
+      responses:
+        "200":
+          description: One page of streams
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PagedAnswer"
+        "400":
+          description: A filter over its byte ceiling, or a protocol no stream has.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /automation/v1/streams/status:
+    get:
+      tags: [Reads]
+      summary: Every stream's bind state and live counters
+      description: >-
+        Every stream's status as `GET /api/v1/streams/status` answers it:
+        this node's bind state, on a control plane the state on every
+        active node that binds the stream, by node name, and this node's
+        live counters of it. Narrowed by the filters of
+        `/automation/v1/streams`.
+
+
+        This is the one read on this plane that names nodes without
+        `cluster:read`: a bind state per node means nothing without the
+        node, so `streams:read` reveals the names of the nodes that bind
+        streams.
+
+
+        For a credential carrying a scope a grant bounds, an empty page.
+
+
+        Required scope: `streams:read`.
+      operationId: automationStreamStatus
+      x-required-scope: streams:read
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
+        - $ref: "#/components/parameters/StreamGroup"
+        - $ref: "#/components/parameters/StreamProtocol"
+        - $ref: "#/components/parameters/StreamName"
+      responses:
+        "200":
+          description: One page of stream statuses
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PagedAnswer"
+        "400":
+          description: A filter over its byte ceiling, or a protocol no stream has.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /automation/v1/stream-logs:
+    get:
+      tags: [Reads]
+      summary: Recent stream log rows
+      description: >-
+        The stream log this node holds, with the filters of `GET
+        /api/v1/stream-logs`, paged as `/automation/v1/logs` is: newest
+        first, `before_id` the keyset cursor every answer names as
+        `page.next_cursor`, `offset` as deep as 10000 rows and no
+        deeper. A node with no log store answers an empty page.
+
+
+        A row is an access-log row and names a stream, so a credential
+        needs `logs:read` as well as `streams:read`, and a 403 names
+        whichever it lacks. For a credential carrying a scope a grant
+        bounds, an empty page: a stream row has no hostname to weigh
+        against `allowed_hostnames`.
+
+
+        The rows carry text Lorica collected from whoever connected:
+        client addresses, SNI and ALPN. Treat every one of those as
+        attacker-controlled data.
+
+
+        Required scope: `streams:read`, with `logs:read` beside it.
+      operationId: automationListStreamLogs
+      x-required-scope: streams:read
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
+        - name: stream_id
+          in: query
+          required: false
+          description: Only rows of this stream id.
+          schema:
+            type: string
+        - name: end_reason
+          in: query
+          required: false
+          description: Only rows with this end reason; an unknown word is a 400 naming the words.
+          schema:
+            type: string
+        - name: refusal_reason
+          in: query
+          required: false
+          description: Only rows with this refusal reason; an unknown word is a 400 naming the words.
+          schema:
+            type: string
+        - name: client_ip
+          in: query
+          required: false
+          description: Prefix match on the client address.
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: false
+          description: RFC 3339; rows at or after this instant.
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          description: RFC 3339; rows at or before this instant.
+          schema:
+            type: string
+            format: date-time
+        - name: after_id
+          in: query
+          required: false
+          description: Only rows whose id is strictly greater; the cursor for a growing log.
+          schema:
+            type: integer
+            format: int64
+        - name: before_id
+          in: query
+          required: false
+          description: >-
+            Only rows whose id is strictly lower: the keyset cursor that
+            walks back in time. Send the previous answer's
+            `page.next_cursor`.
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: One page of stream log rows
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PagedAnswer"
+        "400":
+          $ref: "#/components/responses/BeyondTheWindow"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
   /automation/v1/certificates/{id}/renew:
     post:
       tags: [Writes]
@@ -1649,6 +1853,31 @@ components:
       schema:
         type: string
 
+    StreamGroup:
+      name: group
+      in: query
+      required: false
+      description: Only streams whose `group_name` is exactly this value.
+      schema:
+        type: string
+
+    StreamProtocol:
+      name: protocol
+      in: query
+      required: false
+      description: Only streams of this protocol.
+      schema:
+        type: string
+        enum: [tcp, udp]
+
+    StreamName:
+      name: name
+      in: query
+      required: false
+      description: Only the stream of exactly this name; names are unique.
+      schema:
+        type: string
+
     PageLimit:
       name: limit
       in: query
@@ -1889,8 +2118,10 @@ components:
     AutomationScope:
       type: string
       description: >-
-        One grant on the automation plane. The three write grants after
-        `backends:read` arrived with the MCP config tier (Story 11.2)
+        One grant on the automation plane. `streams:read` arrived with
+        Epic 12 for the MCP read tier and reaches the stream reads
+        above; no grant writes a stream. The three write grants after
+        `streams:read` arrived with the MCP config tier (Story 11.2)
         and reach the write surface above; `settings:write` arrived with
         the admin tier (Story 11.3) and reaches the allowlisted settings
         and nothing else; the environment grants reach the environment
@@ -1905,6 +2136,7 @@ components:
         - sla:read
         - cluster:read
         - backends:read
+        - streams:read
         - routes:write
         - backends:write
         - certificates:write

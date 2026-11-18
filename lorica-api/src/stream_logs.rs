@@ -563,6 +563,27 @@ fn select_rows(
         .map_err(|e| format!("failed to read stream log row: {e}"))
 }
 
+/// The newest `filter.limit` rows `filter` selects, at most
+/// [`crate::logs::LOGS_QUERY_MAX_ROWS`], oldest first.
+fn newest_rows(conn: &Connection, filter: &StreamLogFilter) -> Result<Vec<StreamLogEntry>, String> {
+    let (clause, mut binds) = filter.where_clause();
+    let limit = filter
+        .limit
+        .unwrap_or(200)
+        .min(crate::logs::LOGS_QUERY_MAX_ROWS);
+    binds.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
+    let refs: Vec<&dyn rusqlite::types::ToSql> = binds.iter().map(AsRef::as_ref).collect();
+    let mut rows = select_rows(
+        conn,
+        &format!(
+            "SELECT {SELECT_COLUMNS} FROM stream_access_logs {clause} ORDER BY id DESC LIMIT ?"
+        ),
+        &refs,
+    )?;
+    rows.reverse();
+    Ok(rows)
+}
+
 impl LogStore {
     fn stream_conn(&self) -> parking_lot::MutexGuard<'_, Connection> {
         self.conn().lock()
@@ -598,7 +619,7 @@ impl LogStore {
         filter: &StreamLogFilter,
     ) -> Result<(Vec<StreamLogEntry>, usize), String> {
         let conn = self.stream_conn();
-        let (clause, mut binds) = filter.where_clause();
+        let (clause, binds) = filter.where_clause();
         let refs: Vec<&dyn rusqlite::types::ToSql> = binds.iter().map(AsRef::as_ref).collect();
         let total: i64 = conn
             .query_row(
@@ -607,21 +628,16 @@ impl LogStore {
                 |row| row.get(0),
             )
             .map_err(|e| format!("failed to count stream logs: {e}"))?;
-        let limit = filter
-            .limit
-            .unwrap_or(200)
-            .min(crate::logs::LOGS_QUERY_MAX_ROWS);
-        binds.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
-        let refs: Vec<&dyn rusqlite::types::ToSql> = binds.iter().map(AsRef::as_ref).collect();
-        let mut rows = select_rows(
-            &conn,
-            &format!(
-                "SELECT {SELECT_COLUMNS} FROM stream_access_logs {clause} ORDER BY id DESC LIMIT ?"
-            ),
-            &refs,
-        )?;
-        rows.reverse();
+        let rows = newest_rows(&conn, filter)?;
         Ok((rows, usize::try_from(total).unwrap_or(0)))
+    }
+
+    /// [`LogStore::query_stream_logs`]'s rows without the match count,
+    /// for a reader that answers no total: the count is a pass over
+    /// every matching row, which the automation plane's window has no
+    /// use for.
+    pub fn stream_log_rows(&self, filter: &StreamLogFilter) -> Result<Vec<StreamLogEntry>, String> {
+        newest_rows(&self.stream_conn(), filter)
     }
 
     /// Up to `max` rows `filter` selects, oldest first, for an export.

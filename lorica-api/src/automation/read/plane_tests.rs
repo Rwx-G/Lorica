@@ -49,19 +49,34 @@ const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
     "active_connections",
     "add_path_prefix",
     "address",
+    "allow_local_backend",
+    "allowed_organizations",
+    "alpn",
     "applied_config_generation",
     "applied_config_hash",
+    "attempts",
     "auto_ban_duration_s",
     "auto_ban_threshold",
     "avg_connect_latency_ms",
     "avg_latency_ms",
     "backend",
+    "backend_address",
+    "backend_id",
+    "backend_ids",
+    "backend_keepalive",
+    "backend_keepalive_idle_s",
+    "backend_max_active",
     "backends",
+    "backup_backend_ids",
     "basic_auth_username",
+    "bind",
     "break_glass_until",
     "build_version",
     "by_category",
     "by_category_1h",
+    "bytes_download",
+    "bytes_upload",
+    "ca_cert_pem",
     "cache_enabled",
     "cache_max_bytes",
     "cache_ttl_s",
@@ -69,8 +84,17 @@ const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
     "case_insensitive_paths",
     "category",
     "certificate_id",
+    "certificate_ids",
+    "client_auth",
+    "client_cert",
+    "client_certificate_id",
     "client_ip",
+    "client_port",
+    "clienthello_timeout_ms",
+    "close_on_backend_down",
     "compression_enabled",
+    "connect_ms",
+    "connect_timeout_ms",
     "connect_timeout_s",
     "connected",
     "connection_state",
@@ -79,17 +103,28 @@ const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
     "cors_allowed_origins",
     "cors_max_age_s",
     "count",
+    "counters",
+    "countries",
     "created_at",
     "data",
+    "datagrams_download",
+    "datagrams_upload",
     "description",
+    "detected_protocol",
     "domain",
+    "download_rate_bps",
+    "drains_on_upgrade",
+    "duration_ms",
     "enabled",
+    "end_reason",
+    "entry",
     "error",
     "ewma_score_us",
     "failure_count",
     "fingerprint",
     "fleet",
     "force_https",
+    "geoip",
     "group_name",
     "h2_upstream",
     "has_more",
@@ -103,6 +138,7 @@ const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
     "hostname",
     "hostname_aliases",
     "id",
+    "idle_timeout_s",
     "ip_allowlist",
     "ip_denylist",
     "is_acme",
@@ -115,21 +151,34 @@ const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
     "latency_ms",
     "lifecycle_state",
     "limit",
+    "listen_address",
+    "listen_port",
     "load_balancing",
     "maintenance_mode",
+    "match_rules",
     "matched_field",
     "matched_value",
+    "matcher",
+    "max_connect_attempts",
     "max_connections",
+    "max_datagram_bytes",
+    "max_pending_connections",
     "max_request_body_bytes",
+    "max_sessions",
     "meets_target",
     "method",
+    "mode",
     "name",
     "next_cursor",
+    "no_sni_acknowledged",
     "node_id",
     "node_name",
+    "node_selector",
+    "nodes",
     "not_after",
     "not_before",
     "offset",
+    "open_rate",
     "p50_connect_latency_ms",
     "p50_latency_ms",
     "p95_connect_latency_ms",
@@ -142,16 +191,28 @@ const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
     "path_rewrite_pattern",
     "path_rewrite_replacement",
     "path_rules",
+    "port_first",
+    "port_last",
+    "protocol",
+    "proxied_from",
     "proxy_headers",
     "proxy_headers_remove",
+    "proxy_protocol_accept",
+    "proxy_protocol_send",
+    "proxy_protocol_trusted_cidrs",
     "rate_limit_burst",
     "rate_limit_rps",
     "read_timeout_s",
     "redirect_hostname",
     "redirect_to",
+    "refusal_reason",
     "request_id",
+    "requests_per_session",
+    "required",
+    "response_bytes_ratio",
     "response_headers",
     "response_headers_remove",
+    "responses_per_request",
     "retry_attempts",
     "retry_on_methods",
     "returned",
@@ -164,32 +225,54 @@ const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
     "security_headers",
     "send_timeout_s",
     "serve_robots_txt",
+    "server_name",
+    "server_names",
     "session_generation",
     "severity",
+    "skip_verify",
     "sla_pct",
     "slowloris_threshold_ms",
+    "sni",
     "source",
+    "source_addresses",
+    "source_allow_cidrs",
+    "source_byte_rate",
+    "source_datagram_rate",
+    "source_deny_cidrs",
+    "source_max_connections",
+    "source_open_rate",
+    "source_session_cap",
     "stale_if_error_s",
     "stale_while_revalidate_s",
+    "state",
     "status",
     "sticky_session",
     "stored_in",
     "stream_id",
+    "stream_name",
     "strip_path_prefix",
     "subject",
     "success_count",
     "successful_requests",
+    "suppressed",
     "target_pct",
     "timestamp",
+    "tls_mode",
     "tls_skip_verify",
     "tls_sni",
+    "tls_terminate",
     "tls_upstream",
     "total_1h",
     "total_24h",
     "total_events",
     "total_requests",
+    "total_timeout_s",
     "traffic_splits",
+    "udp",
+    "unbounded_responses",
     "updated_at",
+    "upload_rate_bps",
+    "upstream_tls",
     "version",
     "waf_body_scan_max_bytes",
     "waf_enabled",
@@ -237,6 +320,103 @@ impl Seeded {
     }
 }
 
+/// `value`, read as the model type a stream field holds.
+fn model<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
+    serde_json::from_value(value).expect("test setup: a model value")
+}
+
+/// The stream shapes the read fixture's one plain TCP stream does not
+/// reach, and a log store holding a connection row and a refusal row, so the
+/// sweeps walk every key a stream answer can carry: a UDP stream with
+/// its settings and a GeoIP filter, and a terminating TLS stream with
+/// both rule kinds, client verification and an upstream TLS. Each is
+/// built by `Stream::new` and given the fields under test, never spelled
+/// out whole. The returned directory holds the log store.
+async fn with_every_stream_shape(state: &mut AppState) -> tempfile::TempDir {
+    use lorica_config::models::{Stream, StreamProtocol, StreamTlsMode};
+
+    let now = chrono::Utc::now();
+    let mut udp = Stream::new(
+        uuid::Uuid::new_v4().to_string(),
+        "read-udp".to_string(),
+        StreamProtocol::Udp,
+        "127.0.0.1".parse().expect("an address"),
+        15353,
+        15353,
+        now,
+    );
+    udp.geoip = Some(model(
+        serde_json::json!({ "mode": "allowlist", "countries": ["FR"] }),
+    ));
+    let mut tls = Stream::new(
+        uuid::Uuid::new_v4().to_string(),
+        "read-tls".to_string(),
+        StreamProtocol::Tcp,
+        "0.0.0.0".parse().expect("an address"),
+        15443,
+        15443,
+        now,
+    );
+    {
+        let store = state.store.lock().await;
+        let certificate_id = store.list_certificates().expect("the certificates")[0]
+            .id
+            .clone();
+        tls.tls_mode = StreamTlsMode::Terminate;
+        tls.no_sni_acknowledged = true;
+        tls.match_rules = model(serde_json::json!([
+            { "name": "web", "matcher": {
+                "kind": "tls", "server_names": ["read.example.com"], "alpn": ["h2"] } },
+            { "name": "bare", "matcher": { "kind": "no_sni" } },
+        ]));
+        tls.tls_terminate = Some(model(serde_json::json!({
+            "certificate_ids": [certificate_id],
+            "client_auth": {
+                "ca_cert_pem": crate::tests::TEST_CERT_RSA_PEM,
+                "required": true,
+                "allowed_organizations": ["Example"],
+            },
+        })));
+        tls.upstream_tls = Some(model(serde_json::json!({
+            "server_name": { "mode": "fixed", "name": "backend.read.example.com" },
+            "alpn": ["h2"],
+        })));
+        store.create_stream(&udp).expect("test setup: UDP stream");
+        store.create_stream(&tls).expect("test setup: TLS stream");
+    }
+
+    use crate::stream_logs::test_support::{refusal, tcp_connection, tls as tls_record};
+    use crate::stream_logs::StreamLogEntry;
+    // Stream rows live in the log store alone, and with a store in place
+    // the access log and the WAF reads answer from it too, so the rows
+    // the fixture buffered move there with them and every read keeps
+    // answering what it did.
+    let dir = tempfile::tempdir().expect("test tempdir");
+    let store = crate::log_store::LogStore::open(dir.path()).expect("a log store");
+    store
+        .insert_batch(&state.log_buffer.snapshot())
+        .expect("access rows land");
+    if let Some(buffer) = &state.waf_event_buffer {
+        let events: Vec<lorica_waf::WafEvent> = buffer.lock().iter().cloned().collect();
+        store
+            .insert_waf_events_batch(&events)
+            .expect("WAF events land");
+    }
+    let mut ended = tcp_connection(lorica_config::models::StreamEndReason::ClientClose);
+    ended.tls = Some(tls_record(StreamTlsMode::Terminate));
+    store
+        .insert_stream_batch(&[
+            StreamLogEntry::from_connection(&ended),
+            StreamLogEntry::from_refusal(&refusal(
+                StreamProtocol::Tcp,
+                lorica_config::models::StreamRefusal::NoMatch,
+            )),
+        ])
+        .expect("stream rows land");
+    state.log_store = Some(Arc::new(store));
+    dir
+}
+
 #[tokio::test]
 async fn an_automation_read_path_needs_its_own_scope_and_no_other() {
     let (state, _all_scopes, route_id) = a_node_with_something_to_read().await;
@@ -244,10 +424,15 @@ async fn an_automation_read_path_needs_its_own_scope_and_no_other() {
 
     for (path, scope) in crate::automation::scope::READ_SURFACE {
         let request = as_seeded_request(path, &seeded);
+        // The path's scope, and the second one the stream log asks for
+        // beside it: nothing more.
+        let companion = crate::automation::companion_scope(&http::Method::GET, path);
+        let needed: Vec<lorica_config::models::AutomationScope> =
+            std::iter::once(*scope).chain(companion).collect();
         let only_this = mint_automation(
             &state,
             "narrow",
-            vec![*scope],
+            needed.clone(),
             &["*.read.example.com"],
             chrono::Utc::now() + chrono::Duration::days(30),
             None,
@@ -257,25 +442,32 @@ async fn an_automation_read_path_needs_its_own_scope_and_no_other() {
             automation_send(&state, &request, Some(&format!("Bearer {only_this}")), None).await;
         assert_eq!(response.status(), StatusCode::OK, "{request}");
 
-        // The same path, a token holding every OTHER grant there is.
-        let everything_else: Vec<lorica_config::models::AutomationScope> =
-            lorica_config::models::AutomationScope::ALL
-                .iter()
-                .copied()
-                .filter(|held| held != scope)
-                .collect();
-        let wide = mint_automation(
-            &state,
-            "wide",
-            everything_else,
-            &["*.read.example.com"],
-            chrono::Utc::now() + chrono::Duration::days(30),
-            None,
-        )
-        .await;
-        let response =
-            automation_send(&state, &request, Some(&format!("Bearer {wide}")), None).await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{request}");
+        // The same path, a token holding every OTHER grant there is, for
+        // each grant it needs.
+        for lacking in &needed {
+            let everything_else: Vec<lorica_config::models::AutomationScope> =
+                lorica_config::models::AutomationScope::ALL
+                    .iter()
+                    .copied()
+                    .filter(|held| held != lacking)
+                    .collect();
+            let wide = mint_automation(
+                &state,
+                "wide",
+                everything_else,
+                &["*.read.example.com"],
+                chrono::Utc::now() + chrono::Duration::days(30),
+                None,
+            )
+            .await;
+            let response =
+                automation_send(&state, &request, Some(&format!("Bearer {wide}")), None).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{request} without {lacking}"
+            );
+        }
     }
 }
 
@@ -347,8 +539,9 @@ async fn no_automation_read_answer_carries_a_secret_field_name() {
     // the filtering is inherited rather than written here; this walks
     // every answer to turn that inheritance into something a change
     // can break.
-    let (state, token, route_id) = a_node_with_something_to_read().await;
+    let (mut state, token, route_id) = a_node_with_something_to_read().await;
     let seeded = Seeded::on(&state, route_id).await;
+    let _log_dir = with_every_stream_shape(&mut state).await;
     let bearer = format!("Bearer {token}");
 
     let mut walked = 0usize;
@@ -400,8 +593,9 @@ async fn every_automation_read_answers_only_the_field_names_this_surface_committ
     // other gate green. Same idiom as `tests/openapi_contract.rs`:
     // extraction sanity first, both directions diffed, a panic naming
     // what to do, nothing auto-written.
-    let (state, token, route_id) = a_node_with_something_to_read().await;
+    let (mut state, token, route_id) = a_node_with_something_to_read().await;
     let seeded = Seeded::on(&state, route_id).await;
+    let _log_dir = with_every_stream_shape(&mut state).await;
     let bearer = format!("Bearer {token}");
 
     let mut answered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -1664,4 +1858,275 @@ async fn a_custom_payload_reads_masked_on_every_token_read_and_its_answers_and_t
     for answer in [&listing, &preview, &answered] {
         assert!(!answer.to_string().contains("s3cr3t"), "{answer}");
     }
+}
+
+// ---- Story 12.10 D-f and Story 12.9 D-j: the stream reads ----
+
+/// A token carrying exactly `scopes` and the read fixture's hostname
+/// grant, as `Bearer <token>`.
+async fn bearer_carrying(
+    state: &AppState,
+    name: &str,
+    scopes: Vec<lorica_config::models::AutomationScope>,
+) -> String {
+    let token = mint_automation(
+        state,
+        name,
+        scopes,
+        &["*.read.example.com"],
+        chrono::Utc::now() + chrono::Duration::days(30),
+        None,
+    )
+    .await;
+    format!("Bearer {token}")
+}
+
+/// `GET path` with `bearer`, its status and its JSON body.
+async fn read_with(state: &AppState, path: &str, bearer: &str) -> (StatusCode, serde_json::Value) {
+    let response = automation_send(state, path, Some(bearer), None).await;
+    let status = response.status();
+    (status, body_json(response).await)
+}
+
+/// The `name` of every item of a page, in order.
+fn item_names(page: &serde_json::Value) -> Vec<String> {
+    page["data"]["items"]
+        .as_array()
+        .expect("a page of items")
+        .iter()
+        .map(|item| item["name"].as_str().expect("a name").to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_streams_read_token_reads_every_stream_and_its_status_narrowed_by_the_filters() {
+    use lorica_config::models::AutomationScope;
+
+    let (mut state, _token, _route_id) = a_node_with_something_to_read().await;
+    let _log_dir = with_every_stream_shape(&mut state).await;
+    let bearer = bearer_carrying(&state, "streams", vec![AutomationScope::StreamsRead]).await;
+
+    for path in ["/automation/v1/streams", "/automation/v1/streams/status"] {
+        let (status, page) = read_with(&state, path, &bearer).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {page}");
+        let mut names = item_names(&page);
+        names.sort();
+        assert_eq!(names, ["read-stream", "read-tls", "read-udp"], "{path}");
+
+        for (query, expected) in [
+            ("?protocol=udp", vec!["read-udp"]),
+            ("?name=read-tls", vec!["read-tls"]),
+            ("?group=nobody&protocol=tcp", Vec::new()),
+            ("?name=read-udp&protocol=tcp", Vec::new()),
+        ] {
+            let (status, page) = read_with(&state, &format!("{path}{query}"), &bearer).await;
+            assert_eq!(status, StatusCode::OK, "{path}{query}");
+            assert_eq!(item_names(&page), expected, "{path}{query}");
+        }
+
+        // A refusal names the parameter and the words it takes, never
+        // what the caller sent.
+        let (status, refusal) =
+            read_with(&state, &format!("{path}?protocol=ignore-previous"), &bearer).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        let message = refusal["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("?protocol="), "{message}");
+        assert!(!message.contains("ignore-previous"), "{message}");
+        let long = "g".repeat(1024);
+        let (status, _) = read_with(&state, &format!("{path}?group={long}"), &bearer).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+    }
+
+    // Nothing is masked: the view's own values come back as stored.
+    let (_, page) = read_with(&state, "/automation/v1/streams?name=read-tls", &bearer).await;
+    let tls = &page["data"]["items"][0];
+    assert_eq!(
+        tls["tls_terminate"]["client_auth"]["ca_cert_pem"],
+        crate::tests::TEST_CERT_RSA_PEM
+    );
+    assert_eq!(tls["match_rules"][1]["matcher"]["kind"], "no_sni");
+
+    // The status names the nodes that bind a stream: the fixture's one
+    // active member, which has never reported.
+    let (_, page) = read_with(
+        &state,
+        "/automation/v1/streams/status?name=read-stream",
+        &bearer,
+    )
+    .await;
+    let nodes = page["data"]["items"][0]["nodes"]
+        .as_array()
+        .expect("a control plane lists the nodes");
+    assert_eq!(nodes.len(), 1, "{page}");
+    assert_eq!(nodes[0]["node_name"], "edge-1");
+    assert_eq!(nodes[0]["state"], "unknown");
+}
+
+#[tokio::test]
+async fn a_principal_carrying_grants_reads_an_empty_page_on_every_stream_read() {
+    // Story 12.10 D-f, Story 12.9 D-j: a stream has no hostname and no
+    // backend address of its own, so nothing of it, nor any row naming
+    // it, is inside a hostname or backend grant.
+    use lorica_config::models::AutomationScope;
+
+    let (mut state, _token, _route_id) = a_node_with_something_to_read().await;
+    let _log_dir = with_every_stream_shape(&mut state).await;
+    let unbounded = bearer_carrying(
+        &state,
+        "reader",
+        vec![AutomationScope::StreamsRead, AutomationScope::LogsRead],
+    )
+    .await;
+    let granted = bearer_carrying(
+        &state,
+        "granted",
+        vec![
+            AutomationScope::RoutesWrite,
+            AutomationScope::StreamsRead,
+            AutomationScope::LogsRead,
+        ],
+    )
+    .await;
+    for path in [
+        "/automation/v1/streams",
+        "/automation/v1/streams/status",
+        "/automation/v1/stream-logs",
+    ] {
+        let (status, page) = read_with(&state, path, &unbounded).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert!(
+            !page["data"]["items"].as_array().expect("items").is_empty(),
+            "{path}: the unbounded reader sees rows, so the empty page below is the grant"
+        );
+        let (status, page) = read_with(&state, path, &granted).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(page["data"]["items"], serde_json::json!([]), "{path}");
+        assert_eq!(page["data"]["page"]["has_more"], false, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn the_stream_reads_hold_the_row_ceiling_and_the_byte_ceiling() {
+    use crate::automation::{AUTOMATION_READ_MAX_ANSWER_BYTES, AUTOMATION_READ_MAX_ROWS};
+    use lorica_config::models::{AutomationScope, Stream, StreamProtocol};
+
+    let (state, _token, _route_id) = a_node_with_something_to_read().await;
+    {
+        // Past the row ceiling, each stream carrying a deny list long
+        // enough that the rows weigh past the byte ceiling well before
+        // the row ceiling is reached.
+        let store = state.store.lock().await;
+        for n in 0..=AUTOMATION_READ_MAX_ROWS {
+            let port = u16::try_from(20_000 + n).expect("a port");
+            let mut stream = Stream::new(
+                uuid::Uuid::new_v4().to_string(),
+                format!("bulk-{n}"),
+                StreamProtocol::Tcp,
+                "0.0.0.0".parse().expect("an address"),
+                port,
+                port,
+                chrono::Utc::now(),
+            );
+            stream.source_deny_cidrs = (0..64).map(|m| format!("10.{n}.{m}.0/24")).collect();
+            store.create_stream(&stream).expect("test setup: stream");
+        }
+    }
+    let bearer = bearer_carrying(&state, "bulk", vec![AutomationScope::StreamsRead]).await;
+
+    // Asked for more than the ceiling, the status answers the ceiling's
+    // worth of rows and says more exist: its rows are light.
+    let (status, page) =
+        read_with(&state, "/automation/v1/streams/status?limit=10000", &bearer).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["data"]["page"]["limit"], AUTOMATION_READ_MAX_ROWS);
+    assert_eq!(page["data"]["page"]["returned"], AUTOMATION_READ_MAX_ROWS);
+    assert_eq!(page["data"]["page"]["has_more"], true);
+
+    // The listing's rows are heavy: the byte ceiling ends the window
+    // first, and says so the way a pager reads it.
+    let (status, page) = read_with(&state, "/automation/v1/streams?limit=10000", &bearer).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["data"]["page"]["limit"], AUTOMATION_READ_MAX_ROWS);
+    let items = page["data"]["items"].as_array().expect("items");
+    assert!(
+        !items.is_empty() && items.len() < AUTOMATION_READ_MAX_ROWS,
+        "{} rows",
+        items.len()
+    );
+    assert_eq!(page["data"]["page"]["returned"], items.len());
+    assert_eq!(page["data"]["page"]["has_more"], true);
+    let weight = serde_json::to_string(items).expect("items serialise").len();
+    assert!(weight <= AUTOMATION_READ_MAX_ANSWER_BYTES, "{weight} bytes");
+}
+
+#[tokio::test]
+async fn the_stream_log_pages_newest_first_by_the_cursor_and_validates_its_filters() {
+    use lorica_config::models::AutomationScope;
+
+    let (mut state, _token, _route_id) = a_node_with_something_to_read().await;
+    let bearer = bearer_carrying(
+        &state,
+        "stream-logs",
+        vec![AutomationScope::StreamsRead, AutomationScope::LogsRead],
+    )
+    .await;
+
+    // No log store: an empty page, as the management read answers.
+    let (status, page) = read_with(&state, "/automation/v1/stream-logs", &bearer).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["data"]["items"], serde_json::json!([]));
+    assert_eq!(page["data"]["page"]["next_cursor"], serde_json::Value::Null);
+
+    let _log_dir = with_every_stream_shape(&mut state).await;
+    let ids = |page: &serde_json::Value| -> Vec<u64> {
+        page["data"]["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|row| row["id"].as_u64().expect("an id"))
+            .collect()
+    };
+    let (_, whole) = read_with(&state, "/automation/v1/stream-logs", &bearer).await;
+    let every = ids(&whole);
+    assert_eq!(every.len(), 2, "{whole}");
+    assert!(every[0] > every[1], "newest first: {every:?}");
+
+    let (_, first) = read_with(&state, "/automation/v1/stream-logs?limit=1", &bearer).await;
+    assert_eq!(ids(&first), [every[0]]);
+    assert_eq!(first["data"]["page"]["next_cursor"], every[0]);
+    let (_, second) = read_with(
+        &state,
+        &format!("/automation/v1/stream-logs?limit=1&before_id={}", every[0]),
+        &bearer,
+    )
+    .await;
+    assert_eq!(ids(&second), [every[1]]);
+    assert_eq!(second["data"]["page"]["has_more"], false);
+    assert_eq!(
+        second["data"]["page"]["next_cursor"],
+        serde_json::Value::Null
+    );
+
+    // The management read's own validation, and this plane's ceilings.
+    for query in [
+        "?end_reason=ignore-previous",
+        "?from=yesterday",
+        "?limit=50&offset=10000",
+    ] {
+        let (status, refusal) = read_with(
+            &state,
+            &format!("/automation/v1/stream-logs{query}"),
+            &bearer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {refusal}");
+    }
+    let long = "s".repeat(1024);
+    let (status, _) = read_with(
+        &state,
+        &format!("/automation/v1/stream-logs?stream_id={long}"),
+        &bearer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

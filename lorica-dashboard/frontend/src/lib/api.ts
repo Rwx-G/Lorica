@@ -2449,6 +2449,7 @@ export type AutomationScope =
   | 'sla:read'
   | 'cluster:read'
   | 'backends:read'
+  | 'streams:read'
   | 'routes:write'
   | 'backends:write'
   | 'certificates:write'

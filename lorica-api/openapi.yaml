@@ -7565,13 +7565,16 @@ components:
         so a token written against a newer Lorica fails loudly instead of
         silently losing a grant. The five read grants after `certificates:read`
         arrived with the management MCP server and are what its read tier is
-        built on; the three write grants after `backends:read` arrived with its
-        config tier and reach the automation plane's write surface
-        (`openapi-automation.yaml`), bounded by the token's hostname and
-        backend grants. `settings:write` arrived with its admin tier and
-        reaches the operational global settings that tier's allowlist
-        names, and nothing else. None of them uploads key material, and
-        none reaches a user, a token or a cluster member.
+        built on; `streams:read` arrived with Epic 12 for that read tier,
+        and no grant writes a stream, which is a listener and enters
+        through this API alone. The three write grants after
+        `streams:read` arrived with its config tier and reach the
+        automation plane's write surface (`openapi-automation.yaml`),
+        bounded by the token's hostname and backend grants.
+        `settings:write` arrived with its admin tier and reaches the
+        operational global settings that tier's allowlist names, and
+        nothing else. None of them uploads key material, and none
+        reaches a user, a token or a cluster member.
       enum:
         - environments:write
         - environments:read
@@ -7582,6 +7585,7 @@ components:
         - sla:read
         - cluster:read
         - backends:read
+        - streams:read
         - routes:write
         - backends:write
         - certificates:write

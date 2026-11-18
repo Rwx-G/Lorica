@@ -67,7 +67,7 @@ use crate::scope::AutomationScope;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Tier {
     /// Reads the node: logs, WAF events, SLA windows, the cluster
-    /// status, routes, backends and certificate metadata.
+    /// status, routes, backends, streams and certificate metadata.
     Read,
     /// Changes routes, backends and certificate bindings, bounded by
     /// the token's hostname and backend grants.
@@ -107,6 +107,7 @@ const READ: TierDefinition = TierDefinition {
         AutomationScope::SlaRead,
         AutomationScope::ClusterRead,
         AutomationScope::BackendsRead,
+        AutomationScope::StreamsRead,
         AutomationScope::RoutesRead,
         AutomationScope::CertificatesRead,
         AutomationScope::EnvironmentsRead,
@@ -659,6 +660,22 @@ mod tests {
         let refused = resolve(&[]).expect_err("no scope at all");
         assert_eq!(refused.tier, None);
         assert!(refused.offending.is_empty());
+    }
+
+    #[test]
+    fn streams_read_is_a_read_tier_scope_and_no_write_tier_tolerates_it() {
+        // Story 12.10 D-f: no config or admin tool needs a stream id, so
+        // neither tier tolerates the stream read, and a token carrying
+        // it beside a write is two tiers.
+        let streams = AutomationScope::StreamsRead;
+        assert_eq!(resolve(&spelled(&[streams])), Ok(Tier::Read));
+        let refused = resolve(&owned(&["streams:read", "routes:write"]))
+            .expect_err("a stream read beside a route write spans two tiers");
+        assert_eq!(refused.tier, Some(Tier::Config));
+        assert_eq!(refused.offending, owned(&["streams:read"]));
+        for tier in [Tier::Config, Tier::Admin] {
+            assert!(!tier.allows(streams), "{tier} allows {streams}");
+        }
     }
 
     #[test]

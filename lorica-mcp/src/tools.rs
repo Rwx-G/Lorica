@@ -1165,6 +1165,137 @@ pub const READS: &[ToolSpec] = &[
         kind: Kind::Read,
         tier: Tier::Read,
     },
+    ToolSpec {
+        name: "lorica_streams",
+        title: "Streams",
+        summary: "Read every TCP and UDP stream: its listen address and ports, the backends \
+                  it forwards to, every setting, and this node's bind state of it. Nothing is \
+                  withheld. Four fields widen what a stream accepts and are flags to read as \
+                  such: `udp.unbounded_responses` lifts the response bounds that keep a UDP \
+                  stream from amplifying, a match rule of kind `no_sni` admits clients that \
+                  name no server, `allow_local_backend` lets the stream forward to this \
+                  node's own addresses, and `drains_on_upgrade` says a hot upgrade drains \
+                  its connections. Streams are created and changed on the management API \
+                  only; no tool changes one.",
+        scope: AutomationScope::StreamsRead,
+        path: "/automation/v1/streams",
+        resource: None,
+        filters: STREAM_FILTERS,
+        paginated: true,
+        kind: Kind::Read,
+        tier: Tier::Read,
+    },
+    ToolSpec {
+        name: "lorica_stream_status",
+        title: "Stream status",
+        summary: "Read every stream's bind state: on this node, and on a control plane on \
+                  every active node that binds it, by node name, with the failure kind, port \
+                  and OS error of a node that failed to bind. Also this node's live counters \
+                  of each stream: active and pending connections or sessions, totals, and \
+                  counts per refusal, end and drop reason. The counters are this node's \
+                  traffic only; `lorica_sla_stream` is the fleet-wide view.",
+        scope: AutomationScope::StreamsRead,
+        path: "/automation/v1/streams/status",
+        resource: None,
+        filters: STREAM_FILTERS,
+        paginated: true,
+        kind: Kind::Read,
+        tier: Tier::Read,
+    },
+    ToolSpec {
+        name: "lorica_stream_logs",
+        title: "Stream log",
+        summary: "Read rows of the stream log, newest first: one row per TCP connection or \
+                  UDP session that ended, with its stream, client, backend, byte counts, \
+                  duration, TLS details and end reason, and one per refused connection. The \
+                  token needs `logs:read` beside `streams:read`. To walk back in time, send \
+                  the answer's `page.next_cursor` as `before_id` with the same filters.",
+        scope: AutomationScope::StreamsRead,
+        path: "/automation/v1/stream-logs",
+        resource: None,
+        filters: &[
+            Param {
+                name: "stream_id",
+                doc: "Only rows of this stream id, as `lorica_streams` reports it.",
+                kind: ParamKind::Text {
+                    max_bytes: FREE_TEXT_MAX_BYTES,
+                },
+            },
+            Param {
+                name: "end_reason",
+                doc: "Only rows with this end reason, spelled as the rows spell it; a word \
+                      the node does not know is refused with the words it takes.",
+                kind: ParamKind::Text { max_bytes: 64 },
+            },
+            Param {
+                name: "refusal_reason",
+                doc: "Only rows with this refusal reason, spelled as the rows spell it; a \
+                      word the node does not know is refused with the words it takes.",
+                kind: ParamKind::Text { max_bytes: 64 },
+            },
+            Param {
+                name: "client_ip",
+                doc: "Only rows whose client address starts with this.",
+                kind: ParamKind::Text {
+                    max_bytes: FREE_TEXT_MAX_BYTES,
+                },
+            },
+            Param {
+                name: "from",
+                doc: "Only rows at or after this RFC 3339 timestamp.",
+                kind: ParamKind::Text { max_bytes: 64 },
+            },
+            Param {
+                name: "to",
+                doc: "Only rows at or before this RFC 3339 timestamp.",
+                kind: ParamKind::Text { max_bytes: 64 },
+            },
+            Param {
+                name: "after_id",
+                doc: "Only rows recorded after this row id.",
+                kind: ParamKind::Count {
+                    min: 0,
+                    max: u64::MAX,
+                },
+            },
+            Param {
+                name: "before_id",
+                doc: "Only rows recorded before this row id: the cursor that walks back in \
+                      time. Send the previous answer's `page.next_cursor`.",
+                kind: ParamKind::Count {
+                    min: 0,
+                    max: u64::MAX,
+                },
+            },
+        ],
+        paginated: true,
+        kind: Kind::Read,
+        tier: Tier::Read,
+    },
+];
+
+/// The filters both stream listings take, each an exact match.
+const STREAM_FILTERS: &[Param] = &[
+    Param {
+        name: "group",
+        doc: "Only streams in this group.",
+        kind: ParamKind::Text {
+            max_bytes: FREE_TEXT_MAX_BYTES,
+        },
+    },
+    Param {
+        name: "protocol",
+        doc: "Only streams of this protocol, spelled as a stream's `protocol` field spells \
+              it.",
+        kind: ParamKind::Text { max_bytes: 16 },
+    },
+    Param {
+        name: "name",
+        doc: "Only the stream of exactly this name.",
+        kind: ParamKind::Text {
+            max_bytes: FREE_TEXT_MAX_BYTES,
+        },
+    },
 ];
 
 /// The one argument naming a route.
@@ -1179,7 +1310,7 @@ const ROUTE_ID: Param = Param {
 /// The one argument naming a stream.
 const STREAM_ID: Param = Param {
     name: "id",
-    doc: "The stream id, as the management API reports it.",
+    doc: "The stream id, as `lorica_streams` reports it.",
     kind: ParamKind::Text {
         max_bytes: FREE_TEXT_MAX_BYTES,
     },
@@ -2188,6 +2319,61 @@ mod tests {
             ]),
             "a scope moved: either give it a tool or add it to the complement here, \
              deliberately"
+        );
+    }
+
+    #[test]
+    fn the_stream_tools_are_reads_of_the_read_tier_and_no_tool_changes_a_stream() {
+        // Story 12.10 D-g, PRD D9. A stream is a listener, so every tool
+        // that touches one reads it, and the read tier owns them all.
+        let streams = AutomationScope::StreamsRead;
+        let behind: Vec<&ToolSpec> = catalogue()
+            .iter()
+            .filter(|spec| spec.scope == streams)
+            .collect();
+        assert!(!behind.is_empty(), "no tool sits behind {streams}");
+        for spec in &behind {
+            assert!(matches!(spec.kind, Kind::Read), "{}", spec.name);
+            assert_eq!(spec.tier, Tier::Read, "{}", spec.name);
+            assert!(spec.paginated, "{} is not paginated", spec.name);
+        }
+        for name in [
+            "lorica_streams",
+            "lorica_stream_status",
+            "lorica_stream_logs",
+        ] {
+            assert!(
+                behind.iter().any(|spec| spec.name == name),
+                "{name} is not a read behind {streams}"
+            );
+        }
+        // No tool of any kind but a read has a path on a stream, the
+        // collection, anything under it or the stream log.
+        for spec in catalogue() {
+            let on_a_stream = spec.path.starts_with("/automation/v1/streams")
+                || spec.path.starts_with("/automation/v1/stream-logs");
+            if on_a_stream {
+                assert!(
+                    matches!(spec.kind, Kind::Read),
+                    "{} changes a stream",
+                    spec.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_stream_log_tool_says_which_second_scope_it_needs() {
+        // The plane demands `logs:read` beside the tool's own scope on
+        // the stream log; a model reading the tool learns it before the
+        // first refusal does. `lorica-api` holds the plane's side.
+        let logs = spec("lorica_stream_logs");
+        assert_eq!(logs.scope, AutomationScope::StreamsRead);
+        assert!(
+            logs.summary
+                .contains(&format!("`{}`", AutomationScope::LogsRead.as_str())),
+            "{}",
+            logs.summary
         );
     }
 

@@ -375,7 +375,9 @@ fn outcome(status: StatusCode) -> &'static str {
 /// outside the grant) names no scope on purpose: naming the path's
 /// scope there would send an operator off to re-mint a token that was
 /// never the problem. A path any live token reaches has no scope to
-/// name at all, so a 403 on one is always a handler's.
+/// name at all, so a 403 on one is always a handler's. The one path that
+/// needs a second scope ([`super::scope::companion_scope`]) names it
+/// the same way, in the order the gate checks the two.
 fn refusal_reason(
     status: StatusCode,
     decision: Option<&AuthOutcome>,
@@ -387,10 +389,12 @@ fn refusal_reason(
         (StatusCode::FORBIDDEN, Some(AuthOutcome::Accepted { scopes, .. })) => {
             match super::scope::required_scope(method, path) {
                 None => Some(NO_DECLARED_SCOPE.to_string()),
-                Some(ScopeRequirement::Scope(needed)) if !scopes.contains(&needed) => {
-                    Some(scope_str(needed).to_string())
-                }
-                Some(_) => None,
+                Some(ScopeRequirement::Scope(needed)) => Some(needed)
+                    .into_iter()
+                    .chain(super::scope::companion_scope(method, path))
+                    .find(|scope| !scopes.contains(scope))
+                    .map(|missing| scope_str(missing).to_string()),
+                Some(ScopeRequirement::AnyLiveToken) => None,
             }
         }
         _ => None,

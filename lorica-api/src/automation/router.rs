@@ -66,8 +66,8 @@ use super::scope::{
     required_scope, ScopeRequirement, BACKENDS_PATH, BACKEND_TEMPLATE, CERTIFICATES_PATH,
     CERTIFICATE_RENEW_TEMPLATE, CLUSTER_STATUS_PATH, ENVIRONMENTS_PATH, ENVIRONMENT_TEMPLATE,
     LOGS_PATH, ROUTES_PATH, ROUTE_CERTIFICATE_TEMPLATE, ROUTE_TEMPLATE, SETTINGS_PATH,
-    SLA_OVERVIEW_PATH, SLA_ROUTE_TEMPLATE, SLA_STREAM_TEMPLATE, WAF_EVENTS_PATH, WAF_STATS_PATH,
-    WHOAMI_PATH,
+    SLA_OVERVIEW_PATH, SLA_ROUTE_TEMPLATE, SLA_STREAM_TEMPLATE, STREAMS_PATH, STREAMS_STATUS_PATH,
+    STREAM_LOGS_PATH, WAF_EVENTS_PATH, WAF_STATS_PATH, WHOAMI_PATH,
 };
 use crate::error::json_data;
 use crate::server::{AppState, LogStoreSlot};
@@ -331,6 +331,11 @@ pub fn route_table() -> Vec<AutomationRoute> {
         AutomationRoute::get(BACKENDS_PATH, super::read::list_backends),
         AutomationRoute::get(ROUTES_PATH, super::read::list_routes),
         AutomationRoute::get(CERTIFICATES_PATH, super::read::list_certificates),
+        // The stream reads (Story 12.10 D-f, Story 12.9 D-j). No verb
+        // but `GET` exists for a stream on this plane.
+        AutomationRoute::get(STREAMS_PATH, super::read::list_streams),
+        AutomationRoute::get(STREAMS_STATUS_PATH, super::read::stream_status),
+        AutomationRoute::get(STREAM_LOGS_PATH, super::read::list_stream_logs),
         // The write surface (Story 11.2). Every one of these runs the
         // management handler's own body with the token as the actor.
         // There is no route that takes a PEM body: the certificate

@@ -14,7 +14,8 @@
 
 //! The automation plane's read surface (Story 11.1): logs, WAF events
 //! and stats, SLA, cluster status, backends, routes and certificate
-//! metadata, each behind its own scope.
+//! metadata, each behind its own scope, and since Epic 12 the streams,
+//! their status and the stream log.
 //!
 //! # Why this exists at all
 //!
@@ -768,6 +769,205 @@ pub async fn list_certificates(
             && certificate_names_granted(&principal, text(row, "domain"), texts(row, "san_domains"))
     });
     page.of(masked(rows, redact::certificate_row))
+}
+
+/// The filters of the two stream reads (Story 12.10 D-f), each an
+/// exact match.
+///
+/// This surface's own and not a management struct: the management
+/// stream list takes no filter, and the page there is the dashboard's.
+#[derive(Debug, Default, Deserialize)]
+pub struct StreamsQuery {
+    /// Only streams whose `group_name` is exactly this.
+    pub group: Option<String>,
+    /// Only streams of this protocol, as `StreamProtocol` spells it.
+    pub protocol: Option<String>,
+    /// Only the stream of exactly this name; names are unique.
+    pub name: Option<String>,
+}
+
+impl StreamsQuery {
+    /// Refuse a filter over the ceiling, or a protocol no stream has.
+    ///
+    /// # Errors
+    ///
+    /// `BadRequest` naming the parameter, and for the protocol the words
+    /// it takes, never the caller's value.
+    fn checked(&self) -> Result<(), ApiError> {
+        within_the_filter_ceiling("group", self.group.as_deref())?;
+        within_the_filter_ceiling("name", self.name.as_deref())?;
+        let protocols: Vec<&'static str> =
+            <lorica_config::models::StreamProtocol as strum::VariantArray>::VARIANTS
+                .iter()
+                .map(lorica_config::models::StreamProtocol::as_str)
+                .collect();
+        match self.protocol.as_deref() {
+            Some(protocol) if !protocols.contains(&protocol) => Err(ApiError::BadRequest(format!(
+                "?protocol= is one of: {}",
+                protocols.join(", ")
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether a stream of this group, protocol and name passes.
+    fn admits(&self, group: &str, protocol: &str, name: &str) -> bool {
+        let matches = |wanted: &Option<String>, value: &str| {
+            wanted.as_deref().is_none_or(|wanted| wanted == value)
+        };
+        matches(&self.group, group)
+            && matches(&self.protocol, protocol)
+            && matches(&self.name, name)
+    }
+}
+
+/// `GET /automation/v1/streams` (scope `streams:read`).
+///
+/// Every stream as the management list answers it, its configuration
+/// and this node's bind state, narrowed by [`StreamsQuery`]. No value is
+/// withheld: the view withholds nothing (`STREAM_WITHHELD_FIELDS` is
+/// empty, for reasons Stories 12.1, 12.3 and 12.6 wrote down), the CIDR
+/// lists and the local-backend flag are what a reviewer of a stream must
+/// see, and its two PEM fields are public CA certificates, as a route's
+/// `mtls.ca_cert_pem` is.
+///
+/// A principal carrying grants gets an empty page: a stream has no
+/// hostname and no backend address of its own to weigh against
+/// `allowed_hostnames`, so nothing of it is inside such a grant.
+///
+/// # Errors
+///
+/// `BadRequest` for an oversized filter or an unknown protocol, then
+/// whatever [`crate::streams::list_streams`] answers.
+pub async fn list_streams(
+    principal: AutomationPrincipal,
+    Extension(state): Extension<AppState>,
+    Query(page): Query<PageQuery>,
+    Query(filters): Query<StreamsQuery>,
+) -> Result<Response, ApiError> {
+    let page = page.page();
+    filters.checked()?;
+    if principal.carries_grants() {
+        return page.of(Vec::new());
+    }
+    let answer = crate::streams::list_streams(Extension(state)).await?;
+    let rows: Vec<Value> = rows(answer, Some("streams"))?
+        .into_iter()
+        .filter(|row| {
+            filters.admits(
+                text(row, "group_name"),
+                text(row, "protocol"),
+                text(row, "name"),
+            )
+        })
+        .collect();
+    page.of(rows)
+}
+
+/// `GET /automation/v1/streams/status` (scope `streams:read`).
+///
+/// The management status of every stream ([`crate::streams::status`]):
+/// this node's bind state, on a control plane the state on every active
+/// node that binds it, named, and this node's live counters. The node
+/// names are why this read is behind `streams:read` and not
+/// `cluster:read` as well: a bind state per node is meaningless without
+/// the node. Filtered by [`StreamsQuery`], and empty for a principal
+/// carrying grants, as [`list_streams`] is.
+///
+/// # Errors
+///
+/// `BadRequest` for an oversized filter or an unknown protocol, then
+/// the store's error.
+pub async fn stream_status(
+    principal: AutomationPrincipal,
+    Extension(state): Extension<AppState>,
+    Query(page): Query<PageQuery>,
+    Query(filters): Query<StreamsQuery>,
+) -> Result<Response, ApiError> {
+    let page = page.page();
+    filters.checked()?;
+    if principal.carries_grants() {
+        return page.of(Vec::new());
+    }
+    // The status entry carries no group, so the group is read from the
+    // streams it names.
+    let groups: std::collections::BTreeMap<String, String> =
+        crate::db::db_blocking(&state.store, |store| {
+            Ok::<_, ApiError>(
+                store
+                    .list_streams()?
+                    .into_iter()
+                    .map(|stream| (stream.id, stream.group_name))
+                    .collect(),
+            )
+        })
+        .await?;
+    let statuses =
+        crate::streams::status::stream_statuses(&state, crate::stream_metrics::stream_metrics())
+            .await?;
+    let rows = statuses
+        .iter()
+        .filter(|status| {
+            let group = groups.get(&status.id).map_or("", String::as_str);
+            filters.admits(group, status.protocol.as_str(), &status.name)
+        })
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::Internal(format!("automation read: a stream status: {e}")))?;
+    page.of(rows)
+}
+
+/// `GET /automation/v1/stream-logs` (scopes `streams:read` and
+/// `logs:read`, Story 12.9 D-j).
+///
+/// The stream log with the management plane's filters, taken verbatim
+/// as [`crate::stream_logs::StreamLogsQuery`] and validated by it, and
+/// paged as `/logs` is: newest first, `before_id` the keyset cursor the
+/// answer names as `page.next_cursor`, `offset` as deep as
+/// [`crate::logs::LOGS_QUERY_MAX_ROWS`] and no deeper. The match count
+/// the dashboard's answer carries is never computed.
+///
+/// Both scopes, because a row is an access-log row and names a stream
+/// ([`super::scope::companion_scope`]). A principal carrying grants gets
+/// an empty page, the store unread: a stream row has no hostname to
+/// weigh against `allowed_hostnames`. A node without a log store answers
+/// an empty page, as the management read does: stream rows have no
+/// in-memory fallback.
+///
+/// # Errors
+///
+/// `BadRequest` for an unreachable offset, an oversized filter or a
+/// filter the management read refuses, then the store's error.
+pub async fn list_stream_logs(
+    principal: AutomationPrincipal,
+    Extension(state): Extension<AppState>,
+    Query(page): Query<PageQuery>,
+    Query(filters): Query<crate::stream_logs::StreamLogsQuery>,
+) -> Result<Response, ApiError> {
+    let page = page.page_within(crate::logs::LOGS_QUERY_MAX_ROWS)?;
+    within_the_filter_ceiling("stream_id", filters.stream_id.as_deref())?;
+    within_the_filter_ceiling("client_ip", filters.client_ip.as_deref())?;
+    let filter = crate::stream_logs::StreamLogsQuery {
+        limit: Some(page.scan()),
+        ..filters
+    }
+    .filter()?;
+    let cursor: fn(&Value) -> Option<u64> = |row| row.get("id").and_then(Value::as_u64);
+    let store = match state.log_store.as_ref() {
+        Some(store) if !principal.carries_grants() => store,
+        _ => return Ok(json_text_response(page.envelope(Vec::new(), Some(cursor))?)),
+    };
+    let mut rows = crate::db::log_db_blocking(store, move |s| s.stream_log_rows(&filter))
+        .await?
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::Internal(format!("automation read: a stream log row: {e}")))?;
+    // The store hands the newest rows back oldest first, as the access
+    // log's does; `/logs` explains why the window walks the other way.
+    rows.reverse();
+    let window = page.window_of(rows);
+    Ok(json_text_response(page.envelope(window, Some(cursor))?))
 }
 
 #[cfg(test)]

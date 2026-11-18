@@ -63,6 +63,16 @@ pub const AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS: i64 = 7;
 /// the reason it is there. Every other setting, and every identity and
 /// cluster operation, stays out of reach of any token.
 ///
+/// `streams:read` arrived with Epic 12 for the read tier: a stream's
+/// configuration, its bind state on every node that binds it and this
+/// node's live counters. There is no stream write scope, and its
+/// absence is the decision rather than an omission (PRD D9). A stream
+/// is a listener, which the `settings:write` definition already keeps
+/// off the automation plane, and a token has no axis that could confine
+/// a listen address or a port the way its hostname and backend grants
+/// confine a route. What that gives up is creating streams from CI:
+/// they enter through the management API, by a human.
+///
 /// An unknown scope string fails to deserialise rather than being
 /// dropped, so a token minted against a newer Lorica is refused here
 /// instead of silently losing the grant an operator wrote down.
@@ -87,7 +97,14 @@ pub const AUTOMATION_SETTINGS_WRITE_MAX_LIFETIME_DAYS: i64 = 7;
 // what the mint form offers, is diffed against `ALL` by
 // `lorica-api/tests/automation_scope_fixture.rs`. Add a variant here
 // alone and each of those turns red, and so does the tier partition in
-// `tier.rs`, which must place it.
+// `tier.rs`, which must place it. Three more follow without being
+// listed by anyone: `is_grant_bounded` below is an exhaustive match
+// and does not compile until the variant is placed; the
+// `AutomationScope` union in the dashboard's `lib/api.ts` is the type
+// the generated fixture is declared with, so `npm run check` refuses a
+// fixture entry the union lacks; and `lorica-mcp`'s
+// `every_scope_but_the_environment_pair_has_a_tool` fails until a tool
+// sits behind the new scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AutomationScope {
     /// Create, update and tear down environments.
@@ -117,6 +134,10 @@ pub enum AutomationScope {
     /// Read the backends a route resolves to.
     #[serde(rename = "backends:read")]
     BackendsRead,
+    /// Read streams, their bind state per node and this node's live
+    /// counters.
+    #[serde(rename = "streams:read")]
+    StreamsRead,
     /// Create, update and delete routes, one by id, and bind a
     /// certificate to one.
     #[serde(rename = "routes:write")]
@@ -156,6 +177,7 @@ impl AutomationScope {
         AutomationScope::SlaRead,
         AutomationScope::ClusterRead,
         AutomationScope::BackendsRead,
+        AutomationScope::StreamsRead,
         AutomationScope::RoutesWrite,
         AutomationScope::BackendsWrite,
         AutomationScope::CertificatesWrite,
@@ -197,6 +219,7 @@ impl AutomationScope {
             | AutomationScope::SlaRead
             | AutomationScope::ClusterRead
             | AutomationScope::BackendsRead
+            | AutomationScope::StreamsRead
             | AutomationScope::SettingsWrite => false,
         }
     }
@@ -219,6 +242,7 @@ impl AutomationScope {
             AutomationScope::SlaRead => "sla:read",
             AutomationScope::ClusterRead => "cluster:read",
             AutomationScope::BackendsRead => "backends:read",
+            AutomationScope::StreamsRead => "streams:read",
             AutomationScope::RoutesWrite => "routes:write",
             AutomationScope::BackendsWrite => "backends:write",
             AutomationScope::CertificatesWrite => "certificates:write",
