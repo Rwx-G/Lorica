@@ -27,6 +27,7 @@
   const routeLoaders: Record<string, () => Promise<{ default: Component }>> = {
     '/':            () => import('./Overview.svelte'),
     '/routes':      () => import('./Routes.svelte'),
+    '/streams':     () => import('./Streams.svelte'),
     '/backends':    () => import('./Backends.svelte'),
     '/certificates':() => import('./Certificates.svelte'),
     '/security':    () => import('./Security.svelte'),

@@ -1956,6 +1956,22 @@ export const api = {
   getStreamStatus: () =>
     request<{ streams: StreamStatus[] }>('GET', '/streams/status'),
 
+  // Streams (Story 12.1): Viewer reads, Operator writes.
+  listStreams: () =>
+    request<{ streams: StreamReadResponse[] }>('GET', '/streams'),
+
+  getStream: (id: string) =>
+    request<StreamReadResponse>('GET', `/streams/${id}`),
+
+  createStream: (body: CreateStreamRequest) =>
+    request<StreamWriteResponse>('POST', '/streams', body),
+
+  updateStream: (id: string, body: UpdateStreamRequest) =>
+    request<StreamWriteResponse>('PUT', `/streams/${id}`, body),
+
+  deleteStream: (id: string) =>
+    request<{ message: string }>('DELETE', `/streams/${id}`),
+
   // Audit log (Story 8.9)
   listAudit: (params: AuditQuery) => {
     const query = new URLSearchParams();
@@ -3029,6 +3045,166 @@ export interface UpdateStreamSlaConfigRequest {
   target_pct?: number;
   max_connect_latency_ms?: number;
 }
+
+// --- Streams (Stories 12.1 to 12.6, 12.10) ---
+
+/** The PROXY protocol header a stream sends its backends after connect. */
+export type StreamProxyProtocol = 'off' | 'v1' | 'v2';
+
+export type StreamLoadBalancing = 'round_robin' | 'consistent_hash' | 'random' | 'peak_ewma' | 'least_conn';
+
+/** How a TCP stream treats TLS (Story 12.4). */
+export type StreamTlsMode = 'none' | 'passthrough' | 'terminate';
+
+/** A country allow or deny list, as on a route. */
+export interface StreamGeoIp {
+  mode: GeoIpMode;
+  countries: string[];
+}
+
+/** A ClientHello naming one of `server_names`. */
+export interface StreamTlsMatcher {
+  kind: 'tls';
+  server_names: string[];
+  alpn?: string[];
+}
+
+/** A ClientHello naming no server, which `no_sni_acknowledged` or a source allowlist admits. */
+export interface StreamNoSniMatcher {
+  kind: 'no_sni';
+  alpn?: string[];
+}
+
+export type StreamMatcher = StreamTlsMatcher | StreamNoSniMatcher;
+
+/** One rule of a TLS stream and the backends serving it. */
+export interface StreamMatchRule {
+  name: string;
+  matcher: StreamMatcher;
+  backend_ids?: string[];
+  backup_backend_ids?: string[];
+  backend_max_active?: Record<string, number>;
+}
+
+export interface StreamClientAuth {
+  ca_cert_pem: string;
+  required?: boolean;
+  allowed_organizations?: string[];
+}
+
+/** What a terminating stream presents and verifies. */
+export interface StreamTlsTerminate {
+  certificate_ids: string[];
+  client_auth?: StreamClientAuth | null;
+}
+
+export type StreamUpstreamServerName =
+  | { mode: 'backend_address' }
+  | { mode: 'client' }
+  | { mode: 'fixed'; name: string };
+
+/** TLS from Lorica to the stream's backends. */
+export interface StreamUpstreamTls {
+  server_name?: StreamUpstreamServerName;
+  ca_cert_pem?: string | null;
+  skip_verify?: boolean;
+  client_certificate_id?: string | null;
+  alpn?: string[];
+}
+
+/** The settings of a UDP stream (Story 12.5), every cap per node. */
+export interface StreamUdpSettings {
+  max_sessions: number;
+  source_session_cap: number | null;
+  requests_per_session: number | null;
+  responses_per_request: number;
+  response_bytes_ratio: number;
+  unbounded_responses: boolean;
+  source_datagram_rate: number;
+  source_byte_rate: number;
+  max_datagram_bytes: number;
+}
+
+/** The `udp` object of a write: an absent setting keeps the value it is written over. */
+export type StreamUdpSettingsInput = Partial<StreamUdpSettings>;
+
+/** A stream as the API stores it (`StreamResponse`). */
+export interface StreamResponse {
+  id: string;
+  name: string;
+  group_name: string;
+  protocol: StreamProtocol;
+  enabled: boolean;
+  listen_address: string;
+  port_first: number;
+  port_last: number;
+  node_selector: string[];
+  load_balancing: StreamLoadBalancing;
+  connect_timeout_ms: number;
+  idle_timeout_s: number;
+  total_timeout_s: number | null;
+  max_connect_attempts: number;
+  backend_keepalive: boolean;
+  backend_keepalive_idle_s: number;
+  close_on_backend_down: boolean;
+  proxy_protocol_send: StreamProxyProtocol;
+  proxy_protocol_accept: boolean;
+  proxy_protocol_trusted_cidrs: string[];
+  source_addresses: string[];
+  allow_local_backend: boolean;
+  upload_rate_bps: number | null;
+  download_rate_bps: number | null;
+  max_connections: number;
+  source_max_connections: number | null;
+  max_pending_connections: number;
+  source_allow_cidrs: string[];
+  source_deny_cidrs: string[];
+  geoip: StreamGeoIp | null;
+  source_open_rate: number | null;
+  open_rate: number | null;
+  /** `null` on a TCP stream. */
+  udp: StreamUdpSettings | null;
+  tls_mode: StreamTlsMode;
+  match_rules: StreamMatchRule[];
+  no_sni_acknowledged: boolean;
+  clienthello_timeout_ms: number | null;
+  tls_terminate: StreamTlsTerminate | null;
+  upstream_tls: StreamUpstreamTls | null;
+  /** Read-only: the stream terminates or originates TLS, so a hot upgrade drains it for good. */
+  drains_on_upgrade: boolean;
+  /** Empty on a TLS stream, whose backends are listed per rule. */
+  backend_ids: string[];
+  backup_backend_ids: string[];
+  backend_max_active: Record<string, number>;
+  created_at: string;
+  updated_at: string;
+}
+
+/** A stream as the reads answer it, with this node's bind state of it. */
+export interface StreamReadResponse extends StreamResponse {
+  bind: StreamBindState | null;
+}
+
+/** A stream as a create or an update answers it. */
+export interface StreamWriteResponse extends StreamResponse {
+  warnings?: string[];
+}
+
+/**
+ * The settable fields of a stream: every one optional in an update,
+ * and `name`, `protocol`, `listen_address` and `port_first` required in
+ * a create. A field left out keeps its stored value, or the server
+ * default on a create.
+ */
+export type StreamWritableFields = Omit<
+  StreamResponse,
+  'id' | 'drains_on_upgrade' | 'created_at' | 'updated_at' | 'udp'
+> & { udp: StreamUdpSettingsInput | null };
+
+export type UpdateStreamRequest = Partial<StreamWritableFields>;
+
+export type CreateStreamRequest = UpdateStreamRequest &
+  Pick<StreamWritableFields, 'name' | 'protocol' | 'listen_address' | 'port_first'>;
 
 // --- Stream status (Story 12.10) ---
 

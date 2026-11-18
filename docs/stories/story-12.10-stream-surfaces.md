@@ -618,14 +618,14 @@ and an icon arm if one is added), `lorica-dashboard/frontend/src/lib/api.ts`
 (stream types and calls), `lorica-dashboard/frontend/src/lib/streams.ts`,
 `lorica-dashboard/frontend/src/lib/streams.test.ts`.
 
-- [ ] Types for the stream view with every field of 12.1, 12.3, 12.4,
+- [x] Types for the stream view with every field of 12.1, 12.3, 12.4,
       12.5 and 12.6 as `openapi.yaml` documents them, the requests, the
       status; `listStreams`, `getStream`, `createStream`, `updateStream`,
       `deleteStream`, `getStreamStatus`.
-- [ ] The list of D-a, the badges of D-c, the per-node states of D-d,
+- [x] The list of D-a, the badges of D-c, the per-node states of D-d,
       counters and rates of D-e, refreshed every 5 s while the page is
       visible.
-- [ ] Vitest: every badge kind derived and not derived; the "allowlisted"
+- [x] Vitest: every badge kind derived and not derived; the "allowlisted"
       and "acknowledged" suffixes; `ratesBetween` across a reset; a
       Viewer sees no create or save; the failed-bind tooltip; enable and
       disable send `enabled` only; delete says connections drain.
@@ -1036,6 +1036,43 @@ each one as "Resolved N".
   version lets a token unlink a stream's backend, so it is a fix to
   unreleased code, not a security fix to a release.
 
+- **Lot D1, 2026-11-18 (dashboard).** `lib/api.ts`: `StreamResponse`
+  and its parts (`StreamUdpSettings`, `StreamMatchRule` with the two
+  matcher kinds, `StreamTlsTerminate`, `StreamClientAuth`,
+  `StreamUpstreamTls`, `StreamGeoIp`), `StreamReadResponse` (`bind`),
+  `StreamWriteResponse` (`warnings`), `CreateStreamRequest` and
+  `UpdateStreamRequest` derived from the view's writable fields, and
+  the five calls. `StreamStatus` and `getStreamStatus` came with Story
+  12.9 Lot H, which needed the stream names first.
+- **Badges.** `lib/streams.ts`: `StreamBadgeKind`, `STREAM_BADGES`
+  (label, tone, help) and `streamBadges(stream, status)` over an
+  exhaustive `switch` with a `never` arm, every kind derived from an API
+  field; the failed-bind tooltip lists every failed node (this node
+  under its follower name, or "this node") with kind, port, OS error and
+  since. The test builds its per-kind fixture through a `switch` with no
+  default, so a new kind is a `tsc` error there too.
+- **Bind state, counters, rates.** `bindSummary` reads "bound on N of M
+  nodes" on a control plane (the worst node state picks the badge) and
+  this node's state elsewhere, naming workers that have not
+  acknowledged; each failed node is listed under it. `ratesBetween`
+  gives `null` (rendered `-`) for a total that went down or no time
+  elapsed. The status is re-read every 5 s while the document is
+  visible; the stream list on load and after a write.
+- **Page.** `routes/Streams.svelte`, `/streams` in the loader map, a
+  `Streams` entry after `Routes` with a new `stream` glyph (two opposed
+  arrows). Search over name, group and endpoint, a group filter and
+  group pills as on Routes (the same hue function), sortable columns,
+  Logs and SLA links built by `lib/stream-links.ts` (12.9 Lot H's
+  shapes), Enable / Disable sending `{ enabled }` alone, and Delete
+  whose confirmation reads `worker_drain_timeout_s` from
+  `GET /api/v1/settings` ("the drain timeout" when the read fails) and
+  names `config_removed`. On a control plane a line says the counters
+  are this node's and links the SLA page (Resolved 2). Create and edit
+  arrive with Lot D2's drawer.
+- **Test fixtures.** `src/test-stream-fixtures.ts` (new, outside the
+  allowlist): a stream view, a status and the UDP settings at their
+  documented defaults, shared with Lots D2 and E.
+
 ## File List
 
 - `lorica-api/src/streams/status.rs` (new, Lot A)
@@ -1065,6 +1102,11 @@ each one as "Resolved N".
   `lorica-api/openapi-automation.yaml` (the backend delete's 409),
   `lorica-mcp/src/tools.rs` (the `lorica_backend_delete` summary) (Lot C2)
 
+- `lorica-dashboard/frontend/src/lib/api.ts`, `lib/streams.ts`,
+  `lib/streams.test.ts`, `routes/Streams.svelte` (new),
+  `routes/Streams.test.ts` (new), `routes/Dashboard.svelte`,
+  `components/Nav.svelte`, `src/test-stream-fixtures.ts` (new) (Lot D1)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1076,3 +1118,4 @@ each one as "Resolved N".
 | 2026-11-18 | 0.5 | Lot C1: a TOML import writes one `stream.create`, `stream.update` or `stream.delete` row per stream whose view it moved, links included, beside its `config.import` row; a backend delete writes one `stream.backend_unlinked` per stream that linked it, beside `backend.delete`; the D-h walk with the chain verified. D-h's changed set amended against the code (views before and after, pinned equal to the preview's stream and link diffs). Gates on the final tree: the CI chain green (3,682 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean. | Romain G. |
 | 2026-11-18 | 0.6 | Lot C2: a token's backend delete (REST, both MCP transports, apply and preview) answers 409 naming every stream that links the backend, through a delete-only guard after the grant's check; address updates unchanged; the `lorica_backend_delete` summary and `openapi-automation.yaml` say so. Gates on the final tree: the CI chain green (3,684 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean. | Romain G. |
 | 2026-11-18 | 0.7 | D-i amended: the backend delete refusal names the streams only to a token holding `streams:read` and lists their ids, with the scope it lacks, to any other, on every door; tests for both cases. Gates on the final tree: the CI chain green (3,687 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean. | Romain G. |
+| 2026-11-18 | 0.8 | Lot D1: the Streams page (list, search, groups, sortable columns, bind state per node, this node's counters and browser-side rates, enable, disable, delete with the drain named, Logs and SLA links), the stream view and write types with the five calls, the derived badge map. Frontend gates green (check, lint, Vitest 937). | Romain G. |
