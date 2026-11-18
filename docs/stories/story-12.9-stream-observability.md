@@ -815,6 +815,8 @@ any), `CHANGELOG.md`, `README.md` (feature list).
 
 ### Lot J: end-to-end, IV1 - Docker e2e
 
+Delivered by Story 12.12 Lot I.
+
 Allowlist: `tests-e2e-docker/docker-compose.yml`,
 `tests-e2e-docker/entrypoint-stream-observability.sh` (new, LF),
 `tests-e2e-docker/test-runner/run-stream-observability-smoke.sh` (new,

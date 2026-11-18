@@ -1,7 +1,7 @@
 # Story 12.12: Parity Verification
 
 **Epic:** [Epic 12 - TCP and UDP Stream Proxying (v1.11.0 and v1.12.0)](../prd/epic-12-v1.11.0.md)
-**Status:** Draft
+**Status:** InProgress
 **Priority:** P0
 **Author:** Romain G.
 **Verified on:** `feat/v1.11.0` at `6e460a61` (2026-11-18). No stream
@@ -654,23 +654,23 @@ e2e Lot plus one line "Delivered by Story 12.12 Lot X" (nothing else in
 those files).
 Depends on: nothing (artefacts approved, Resolved 1 to 3).
 
-- [ ] Pin every approved image by digest; record the digests in
+- [x] Pin every approved image by digest; record the digests in
       "Resolved".
-- [ ] `baseline/Dockerfile` per D-g; `lorica --version` in the built
+- [x] `baseline/Dockerfile` per D-g; `lorica --version` in the built
       image prints 1.10.7.
-- [ ] `perf-tools/Dockerfile`: `iperf3`, `dnsperf`, `oha` (checksum),
+- [x] `perf-tools/Dockerfile`: `iperf3`, `dnsperf`, `oha` (checksum),
       `python3`.
-- [ ] Driver, scenario API (`scenario <name>`, `pass`, `fail`,
+- [x] Driver, scenario API (`scenario <name>`, `pass`, `fail`,
       `partial <note>`, each printing the D-c line), report with the
       registry check and the Markdown output.
-- [ ] `run.sh` flags; the L4 phase guarded like every phase; a
+- [x] `run.sh` flags; the L4 phase guarded like every phase; a
       `dump_node_log` equivalent for the L4 project.
-- [ ] `stop_grace_period` on `lorica-streams` and
+- [x] `stop_grace_period` on `lorica-streams` and
       `lorica-streams-single` in `docker-compose.l4.yml`, above the
       drain under test, which Story 12.2 D-f claims the e2e compose sets
       and none does (12.2's note of 2026-11-18). Without it `docker
       stop` SIGKILLs a drain after 10 s.
-- [ ] Self-test: the self-test scenario passes; a registry row with no
+- [x] Self-test: the self-test scenario passes; a registry row with no
       line fails the phase; a row printed twice fails it.
 - [ ] The full pre-existing suite passes with the toolchain pin (AC #7
       for this Lot).
@@ -1007,15 +1007,146 @@ this file points at the decision it took.
 15. **`strm/dnsmasq` is pinned by digest** in Lot A.
 16. **nginx logs per connection** in the perf phase, as Lorica does.
 
+### Digests and checksums pinned by Lot A (2026-11-18)
+
+Resolved with `docker buildx imagetools inspect` (the index digest, so
+every platform resolves through it) and pulled; versions read from the
+pulled images.
+
+| Artefact | Pinned as | Checked |
+|---|---|---|
+| nginx | `nginx:1.30.7@sha256:8a7280c664b1a205092ffea6443299e6d307fe65b6f946b02028fa311c29fd01` | Newest stable (`stable` tag on the day). `nginx -V` lists `--with-stream`, `--with-stream_ssl_module`, `--with-stream_ssl_preread_module`, `--with-stream_realip_module`. Debian 13 (trixie): the official stable line publishes no bookworm variant of 1.30.7, and `stable-bookworm` is frozen on 1.28.0 (built 2025-12-08), so the Debian variant is trixie. |
+| PostgreSQL | `postgres:17.12-bookworm@sha256:40865bc877a289da75963d97d72b59633f639fc5af7a4e856bfa3714cae5b536` | `postgres --version`: 17.12 (Debian 17.12-1.pgdg12+1). |
+| CoreDNS | `coredns/coredns:1.15.0@sha256:0a9d8c8ddf34347eb59aad9a8784f0710de88d6d112726d11d271f9bc6daca26` | `-version`: CoreDNS-1.15.0 (the `latest` tag on the day). |
+| Redis | `redis:7.4.12-bookworm@sha256:2e3eb11462c4e3759e6972678dd051d150ff54b1e60714b3c33b701260172a90` | `redis-server --version`: 7.4.12; same digest as `redis:7.4`. |
+| Debian base | `debian:bookworm-20261104-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc` | Same digest as `debian:12.15-slim` and `bookworm-slim` on the day. Used by `perf-tools` and `baseline`; `ssh-backend` (Lot K) uses the same line. |
+| `strm/dnsmasq` | `strm/dnsmasq:latest@sha256:dcf4c0aeb69ea6b9bca81314449d732ecd2ea021588d8a34d4be7c2304f89a39` | Resolved 15. A single-platform manifest; the image publishes no versioned tag. |
+| iperf3 | Debian bookworm `3.12-1+deb12u2` | `iperf3 --version`: 3.12. From the distribution, signed by its archive; not pinned to the package version, which a point release would remove from the mirror. |
+| dnsperf | Debian bookworm `2.10.0-2` | `apt-cache policy dnsperf` in the pinned base: in bookworm main, so the DNS-OARC tarball fallback is not needed. |
+| python3 (perf-tools) | Debian bookworm `3.11.2-1+b1` | |
+| oha | `v1.16.0`, `oha-linux-amd64`, SHA-256 `620bb9e16fb53eabc9a3fc45f88bdb41fefa3fee5c05e75892011ce320391716` | Checked by `sha256sum -c` in `perf-tools/Dockerfile`; equal to the digest GitHub publishes for the asset. `--latency-correction`, `-q`, `-z` and `--output-format` present. v1.17.0 (2026-11-14) was four days old and is not taken. |
+| Lorica 1.10.7 | `lorica_1.10.7_amd64.deb` SHA-256 `8f33d920aac1f6777cb1658b1bf47f4b7c74c5dbbe5adb7c617e4fa25a1e4cf7`, `.asc` SHA-256 `681911643828577c9d01fd24649039adf81aec05d9f723c978d8520ff7d77398` (GitHub asset digests) | `gpgv` in the baseline build: good signature from `B6E37EA916841674`; the built image's `lorica --version` prints `lorica 1.10.7`. |
+| Rust toolchain (e2e builder) | `rust-toolchain.toml`, 1.99.1 | The e2e build log shows rustup syncing `1.99.1-x86_64-unknown-linux-gnu` before cargo. |
+
 ## Dev Agent Record
 
 ### Debug Log
 
+- Lot A, 2026-11-18: the first self-test run failed on the probe's
+  process count: busybox `pgrep -x lorica` matches the workers' full
+  executable path, not their name, and found the supervisor alone. The
+  self-test now counts `ps -o comm`. Kept as the first proof that a
+  `FAIL` reaches the report.
+
 ### Completion Notes
+
+- **Lot A, 2026-11-18.** The harness, the images and the flags.
+  - **Layout.** `docker-compose.l4.yml` (project `lorica-e2e-l4`):
+    `lorica-streams` (`--workers 2`) and `lorica-streams-single`, one
+    image `lorica-e2e-l4/lorica:local`, both aliased `l4-node` on `l4`
+    (IPv6 on, `fd00:4c34::/64`), `stop_grace_period: 60s` (default drain
+    30 s plus the supervisor's 10 s), `net.ipv4.ip_unprivileged_port_start=1024`
+    so the 12.2 AC #3 check needs the capability; `streams-probe` in the
+    worker node's network and pid namespaces; `streams-client` on `l4`;
+    `streams-geo` (`214.78.120.0/24`) defined, attached by Lot F; and a
+    non-test `l4-report` service. The entrypoints start as root, run
+    Lorica and the socat forwarder through `setpriv` with
+    `CAP_NET_BIND_SERVICE` ambient (checked in `/proc/<pid>/status` on
+    the supervisor and both workers), and forward SIGTERM so `docker
+    stop` drains instead of waiting for SIGKILL.
+  - **Driver** `l4/run-l4.sh`, **library** `l4/lib.sh` (`scenario`,
+    `pass`, `fail`, `partial`, `l4_client`, `l4_probe`, `l4_node`,
+    `l4_api`, `l4_api_status`, `l4_dump_node_log`), **registry**
+    `l4/scenarios.tsv` (every row of D-d and D-e, plus the self-test and
+    the not-e2e rows), **report** `test-runner/l4/report.py`.
+  - **How a Lot adds a scenario.** Set its row's `state` to `live` in
+    `l4/scenarios.tsv` (correct the row if it is wrong, nothing else), and
+    in `l4/scenarios/<story>.sh` define `scenario_<name>` with every `.`
+    and `-` of the name turned into `_`. The driver calls it once per
+    profile the row names, after `scenario <name>`, in a subshell under
+    `set -euo pipefail` with stdin closed; it drives traffic with
+    `l4_client` (timed assertions inside one in-container command, the
+    Python tools under `test-runner/l4/`), the node's namespaces with
+    `l4_probe`, the API with `l4_api`, Docker itself directly
+    (`l4_compose kill|pause|...`), and ends with exactly one `pass`,
+    `fail` or `partial <note>`. A scenario in a pre-existing profile's
+    smoke echoes `L4-SCENARIO <name> <PASS|FAIL|PARTIAL> <detail>` at the
+    start of a line itself. The report fails a live row of a profile that
+    ran with no line, two lines, `FAIL`, `PARTIAL` from a `full` row, a
+    line under another profile, and a pending row that reports (mark it
+    live).
+  - **Deviations from the text.** (1) The registry has `lot` and `state`
+    columns: without `pending`, every row of the `streams` profile would
+    fail Lot A's own run. A run with no `--skip-*` or `--only-*` flag
+    (the release run) is strict: every row must report, pending ones
+    included, so the full suite fails at the report until Lot L lands;
+    iterate with `--skip-perf` or `--skip-l4`. (2) The report attributes
+    a line to a profile through `L4-PROFILE <name>` markers: run.sh
+    prints one at the start of every phase, the driver one per profile.
+    (3) The report derives the P1 rows from the PRD coverage matrix
+    (mounted read-only) and fails on a P1 row without a registry row or
+    a registry label that is not a P1 Feature cell, so the matrix is not
+    transcribed. (4) The report runs after every run except
+    `--only-perf`, not only in the L4 phase, so the stream sections of
+    pre-existing profiles are checked when the L4 phase is skipped (the
+    CI `e2e-docker` job of D-m). (5) `--only-perf` and `--perf-advisory`
+    exit 2 until Lot M; `--skip-perf` is accepted and skips nothing yet.
+    (6) `12.12-fd-reserve-http-unaffected` keeps D-f's name although it
+    has no kind segment; the report enforces the story prefix only.
+  - **For later Lots.** The `geoip` profile is not run by `run.sh`
+    today, so Lot H must add its phase (with `announce_profile geoip`)
+    or 12.8's rows stay `NOT-RUN` outside a strict run. Nothing prints
+    `L4-PROFILE suite` yet (12.8 IV3, Lot H). No D-d scenario asserts an
+    IP-literal allow/deny entry: the "IP allow/deny" matrix row is mapped
+    to `12.6-iv2-geo-deny-tcp-and-udp`, so Lot F adds one to that
+    scenario. A budget node of Lot B must not take the `l4-node` alias.
+    `--keep` leaves only the `streams-single` containers up.
+  - **Proof.** `./run.sh --only-l4`: both profiles, self-test `PASS`
+    (client `HTTP/1.1 404` in 3.7 ms timed in the container, API login
+    and zero streams, the probe sees 3 `lorica` processes and the :8080
+    listener), report `PASSED`, 19.7 s for the phase with the report.
+    With four temporary rows (removed): `fail` gave `FAIL`, two `pass`
+    gave `DUPLICATE`, a live row with no function gave `MISSING`, a
+    failing command before any verdict gave `FAIL ended without a
+    verdict (exit 1)`, and the report failed the run. Synthetic logs
+    also cover `DOWNGRADED`, `UNMARKED`, an unknown name, a wrong
+    profile, strict mode and ANSI/CRLF lines.
+  - **Toolchain pin.** Phase 1 alone (every other phase skipped) on the
+    pinned-toolchain image: 372 passed, 0 failed, 4 min 29 s. The full
+    pre-existing suite was **not** run: another Docker workload shared
+    the machine (the suite needs it alone), so that task stays open.
+  - **Runner additions**: Alpine 3.20 `iproute2` 6.9.0-r0 and
+    `openssh-client` 9.7_p1-r6. Still pinned by tag only and outside Lot
+    A's allowlist: `alpine:3.20`, `node:22-slim`, `rust:1-bookworm`,
+    `debian:bookworm-slim` in the e2e image, Jaeger, the OTel collector
+    and Pebble.
 
 - **Lot A gains a task, 2026-11-18:** `stop_grace_period` on the two Lorica services of `docker-compose.l4.yml`, above the drain under test. Story 12.2 D-f says the e2e compose sets it and no compose file does; 12.2 carries a dated note pointing here. The file is already on Lot A's allowlist.
 
 ## File List
+
+Lot A:
+
+- `tests-e2e-docker/docker-compose.l4.yml` (new)
+- `tests-e2e-docker/l4/run-l4.sh` (new)
+- `tests-e2e-docker/l4/lib.sh` (new)
+- `tests-e2e-docker/l4/scenarios.tsv` (new)
+- `tests-e2e-docker/l4/scenarios/12.12.sh` (new)
+- `tests-e2e-docker/test-runner/l4/report.py` (new)
+- `tests-e2e-docker/entrypoint-streams.sh` (new)
+- `tests-e2e-docker/entrypoint-streams-single.sh` (new)
+- `tests-e2e-docker/baseline/Dockerfile` (new)
+- `tests-e2e-docker/perf-tools/Dockerfile` (new)
+- `tests-e2e-docker/Dockerfile`
+- `tests-e2e-docker/test-runner/Dockerfile`
+- `tests-e2e-docker/run.sh`
+- `tests-e2e-docker/docker-compose.yml`
+- `.gitignore`
+- `docs/stories/story-12.2-stream-listeners.md`, `story-12.3-tcp-engine.md`,
+  `story-12.4-tls-l4.md`, `story-12.5-udp-engine.md`,
+  `story-12.6-stream-protection.md`, `story-12.8-proxy-protocol-http.md`,
+  `story-12.9-stream-observability.md`, `story-12.10-stream-surfaces.md`,
+  `story-12.11-upgrade-drain.md` (the "Delivered by" line)
 
 ## Change Log
 
@@ -1024,3 +1155,4 @@ this file points at the decision it took.
 | 2026-11-18 | 0.1 | Draft: one L4 phase absorbing the nine story e2e Lots, IV-to-scenario map with automation levels, parity-matrix scenarios, fd-reserve scenario, 1.10.7 from the signed package with toolchain parity, cold and hot rollback scenarios, perf topology, measurements, statistics and verdicts, NFR1 arms, three CI jobs, local release procedure, runtime estimates, artefacts for approval, 16 open questions. | Romain G. |
 | 2026-11-18 | 0.2 | Maintainer decisions folded in as Resolved 1 to 16: artefacts approved (digests and checksums recorded by Lot A), three CI jobs, every recommendation accepted except SMTP, now verified against a standard-library banner server (new scenario `12.7-x-smtp-banner-template`); release machine has 24 CPUs, larger cpuset layout. Status Draft. | Romain G. |
 | 2026-11-18 | 0.3 | Lot A gains the `stop_grace_period` task Story 12.2 D-f assumed was done. | Romain G. |
+| 2026-11-18 | 0.4 | Lot A implemented: L4 compose project, driver, scenario registry with pending rows, report gated on the registry and the PRD matrix, `perf-tools` and `baseline` images, toolchain pin, `run.sh` flags; digests and checksums recorded. The full pre-existing suite with the pin is still to run. Status InProgress. | Romain G. |

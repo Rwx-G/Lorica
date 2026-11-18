@@ -782,6 +782,8 @@ Depends on: D.
 
 ### Lot G: end-to-end, IV1 to IV3 - Docker e2e
 
+Delivered by Story 12.12 Lot H.
+
 Allowlist: `tests-e2e-docker/test-runner/run-proxy-protocol-smoke.sh`
 (new), `tests-e2e-docker/test-runner/proxy_protocol_client.py` (new),
 `tests-e2e-docker/test-runner/Dockerfile` (the `COPY` and `chmod`

@@ -693,6 +693,8 @@ added it).
 
 ### Lot H: end-to-end, IV1 - Docker e2e
 
+Delivered by Story 12.12 Lot J.
+
 Allowlist: `tests-e2e-docker/test-runner/run-mcp-smoke.sh`,
 `tests-e2e-docker/test-runner/mcp-helpers.sh`. LF line endings checked
 before the run (a tool-written `.sh` keeps CRLF).

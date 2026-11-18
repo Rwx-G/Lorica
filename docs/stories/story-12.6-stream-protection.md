@@ -713,6 +713,8 @@ Depends on: C, D, E, F; after 12.4 Lot G and 12.5 Lot H.
 
 ### Lot I: end-to-end, IV1 to IV3 - Docker e2e
 
+Delivered by Story 12.12 Lot F.
+
 Allowlist: `tests-e2e-docker/test-runner/run-streams-protect.sh` (new,
 LF), `tests-e2e-docker/test-runner/protect_tools.py` (new, LF, standard
 library only: a silent-connection holder, a TLS client, a UDP query

@@ -945,6 +945,8 @@ Depends on: B for the crate lists; its final pass after H.
 
 ### Lot H: end-to-end, IV1, IV2 and the stop path - Docker e2e
 
+Delivered by Story 12.12 Lot B.
+
 Allowlist: `tests-e2e-docker/entrypoint-streams.sh` (new, LF),
 `tests-e2e-docker/test-runner/run-streams-smoke.sh` (new, LF),
 `tests-e2e-docker/docker-compose.yml`, `tests-e2e-docker/Dockerfile`

@@ -1218,6 +1218,8 @@ Depends on: C, D2, E.
 
 ### Lot G: end-to-end, IV1 to IV4 - Docker e2e
 
+Delivered by Story 12.12 Lot C.
+
 Allowlist: `tests-e2e-docker/test-runner/run-streams-tcp.sh` (new, LF),
 `tests-e2e-docker/test-runner/tcp_backend.py` (new),
 `tests-e2e-docker/test-runner/dns_responder.py` (new),

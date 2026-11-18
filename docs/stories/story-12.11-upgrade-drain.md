@@ -661,6 +661,8 @@ Depends on: C, D, E.
 
 ### Lot G: end-to-end, IV1 and the handover scenarios - Docker e2e
 
+Delivered by Story 12.12 Lot K.
+
 Allowlist: `tests-e2e-docker/docker-compose.yml` (the `hot-upgrade`
 profile's services only), `tests-e2e-docker/ssh-backend/` (new),
 `tests-e2e-docker/test-runner/run-hot-upgrade-smoke.sh` (a new section

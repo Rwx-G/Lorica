@@ -1114,6 +1114,8 @@ Depends on: F and G (documents what was built).
 
 ### Lot I: end-to-end, IV1 and IV2 - Docker e2e
 
+Delivered by Story 12.12 Lot E.
+
 Allowlist: `tests-e2e-docker/test-runner/run-streams-udp-smoke.sh` (new,
 LF), `tests-e2e-docker/test-runner/udp_tools.py` (new, LF, Python
 standard library only: a spoofing sender over a raw socket, an amplifying

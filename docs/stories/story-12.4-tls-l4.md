@@ -1157,6 +1157,8 @@ Depends on: D, E, F.
 
 ### Lot H: end-to-end, IV1, IV2, the two-CA proof and key replication - Docker e2e
 
+Delivered by Story 12.12 Lot D.
+
 Allowlist: `tests-e2e-docker/test-runner/run-streams-tls.sh` (new, LF),
 `tests-e2e-docker/test-runner/tls_backend.py` (new, LF, standard
 library only: a TCP backend that reports the first bytes it received,
