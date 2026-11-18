@@ -13,6 +13,8 @@ Author: Rwx-G
 
 ### Changed
 
+- Dependencies refreshed: brotli 9.1.3, bytes 1.12.2, regex 1.13.2, clap 4.6.8, uuid 1.29.3, the AWS Route 53 client; dashboard tooling svelte 5.58, eslint 10.15, vitest 5.1.1.
+
 ### Fixed
 
 ### Removed
