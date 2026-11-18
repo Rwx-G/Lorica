@@ -75,6 +75,8 @@ use crate::routes::crud::{selector_roster, validate_group_name, validate_node_se
 use crate::server::AppState;
 use crate::stream_budget::{check_write, reported_fds, BudgetNode, NodeFds, StreamPlaneState};
 
+#[cfg(test)]
+mod audit_tests;
 pub mod status;
 #[cfg(test)]
 mod tests;
@@ -1517,6 +1519,24 @@ fn linked_backends(store: &ConfigStore, links: &StreamLinks) -> Result<Vec<Backe
 
 fn validated(stream: &Stream) -> Result<(), ApiError> {
     stream.validate().map_err(ApiError::Unprocessable)
+}
+
+/// The view of every stored stream, by id: what a write that moves
+/// streams without a stream handler (a TOML import, Story 12.10 D-h)
+/// reads before and after, so its audit rows carry the views the stream
+/// handlers' rows carry.
+pub(crate) fn stream_views(
+    store: &ConfigStore,
+) -> Result<BTreeMap<String, StreamResponse>, ApiError> {
+    let mut links = StreamLinks::by_stream(store.list_stream_backends()?);
+    Ok(store
+        .list_streams()?
+        .into_iter()
+        .map(|stream| {
+            let linked = links.remove(&stream.id).unwrap_or_default();
+            (stream.id.clone(), stream_to_response(&stream, linked))
+        })
+        .collect())
 }
 
 /// GET /api/v1/streams - every stream, by name, with its backend ids.

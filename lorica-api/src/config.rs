@@ -1,6 +1,8 @@
 //! Endpoints to export the running configuration as TOML and import a new
 //! one (with optional dry-run diff preview).
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use axum::extract::Extension;
 use axum::http::StatusCode;
 use axum::Json;
@@ -149,6 +151,66 @@ fn check_imported_streams(
     Ok(warnings)
 }
 
+/// One stream an import created, changed or removed, as the audit row
+/// a stream handler writes for the same change.
+struct ImportedStreamChange {
+    /// `stream.create`, `stream.update` or `stream.delete`.
+    action: &'static str,
+    stream_id: String,
+    before: Option<serde_json::Value>,
+    after: Option<serde_json::Value>,
+}
+
+/// The streams whose view an import moved, by id: present only after
+/// (created), only before (removed), or on both sides with a view that
+/// differs in anything but its timestamps (changed).
+///
+/// The timestamps are left out for the reason the import preview's
+/// stream diff leaves them out: an export round trip carries them and a
+/// hand edit of a file moves them, and neither changes the stream. The
+/// view covers the stream's backend links too, so a change of links
+/// alone is a changed stream, which is what the stream handlers'
+/// `stream.update` row says of the same change.
+fn imported_stream_changes(
+    before: &BTreeMap<String, crate::streams::StreamResponse>,
+    after: &BTreeMap<String, crate::streams::StreamResponse>,
+) -> Vec<ImportedStreamChange> {
+    let view = |stream: Option<&crate::streams::StreamResponse>| {
+        stream.and_then(|stream| serde_json::to_value(stream).ok())
+    };
+    let ids: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    ids.into_iter()
+        .filter_map(|id| {
+            let (before, after) = (view(before.get(id)), view(after.get(id)));
+            let action = match (&before, &after) {
+                (None, Some(_)) => "stream.create",
+                (Some(_), None) => "stream.delete",
+                (Some(old), Some(new)) if !same_but_timestamps(old, new) => "stream.update",
+                _ => return None,
+            };
+            Some(ImportedStreamChange {
+                action,
+                stream_id: id.clone(),
+                before,
+                after,
+            })
+        })
+        .collect()
+}
+
+/// Whether two stream views are equal once both timestamps are left out.
+fn same_but_timestamps(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    let without = |view: &serde_json::Value| {
+        let mut view = view.clone();
+        if let Some(fields) = view.as_object_mut() {
+            fields.remove("created_at");
+            fields.remove("updated_at");
+        }
+        view
+    };
+    without(a) == without(b)
+}
+
 /// POST /api/v1/config/import - replace the entire configuration from a TOML payload (max 1 MB).
 pub async fn import_config(
     connect_info: crate::audit::ClientConnectInfo,
@@ -193,16 +255,18 @@ pub async fn import_config(
     // certificate made manual because its authority is not on this
     // node (Epic 13 D14), and the nodes whose fd budget it could not
     // check. The caller learns it here or not at all.
-    let warnings: Vec<String> = db_blocking(&state.store, move |store| {
+    let (warnings, stream_changes) = db_blocking(&state.store, move |store| {
         // Before `import_to_store`, which clears the store first, and in
         // the same closure, so no stream write lands between the check
-        // and the import.
+        // and the import, nor between either view and the import.
         let mut warnings = check_imported_streams(store, &role, &budget, &import_data)?;
+        let before = crate::streams::stream_views(store)?;
         warnings.extend(
             lorica_config::import::import_to_store(&*store, &import_data)
                 .map_err(|e| ApiError::Internal(e.to_string()))?,
         );
-        Ok::<_, ApiError>(warnings)
+        let after = crate::streams::stream_views(store)?;
+        Ok::<_, ApiError>((warnings, imported_stream_changes(&before, &after)))
     })
     .await?;
     state.notify_config_changed();
@@ -219,6 +283,21 @@ pub async fn import_config(
         None,
     )
     .await;
+    // A stream view carries no secret (`STREAM_WITHHELD_FIELDS` is
+    // empty), so each stream the import moved gets the row a stream
+    // handler would have written, payloads included (Story 12.10 D-h).
+    // Routes keep the single row above (Resolved 5).
+    for change in &stream_changes {
+        crate::audit::record(
+            &state,
+            &audit_ctx,
+            change.action,
+            ("stream", &change.stream_id),
+            change.before.as_ref(),
+            change.after.as_ref(),
+        )
+        .await;
+    }
 
     Ok(json_data(serde_json::json!({
         "message": "configuration imported successfully",

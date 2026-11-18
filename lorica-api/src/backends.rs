@@ -707,7 +707,7 @@ pub(crate) async fn delete_backend_as(
     guard: crate::target::BackendGuard,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id_db = id.clone();
-    let (backend, force_deleted) = db_blocking(&state.store, move |store| {
+    let (backend, force_deleted, stream_links) = db_blocking(&state.store, move |store| {
         let mut backend = store
             .get_backend(&id_db)?
             .ok_or_else(|| ApiError::NotFound(format!("backend {id_db}")))?;
@@ -735,18 +735,25 @@ pub(crate) async fn delete_backend_as(
         let force_deleted =
             backend.lifecycle_state != lorica_config::models::LifecycleState::Normal;
         if mode.previews() {
-            return Ok((backend, force_deleted));
+            return Ok((backend, force_deleted, Vec::new()));
         }
+        // Read under the same lock as the delete or the mark, so the
+        // rows name exactly the links the store's cascade removes.
+        let stream_links: Vec<lorica_config::models::StreamBackend> = store
+            .list_stream_backends()?
+            .into_iter()
+            .filter(|link| link.backend_id == id_db)
+            .collect();
         if force_deleted {
             store.delete_backend(&id_db)?;
-            return Ok((backend, true));
+            return Ok((backend, true, stream_links));
         }
 
         // Transition to Closing - proxy stops routing new requests to this backend
         backend.lifecycle_state = lorica_config::models::LifecycleState::Closing;
         backend.updated_at = Utc::now();
         store.update_backend(&backend)?;
-        Ok::<_, ApiError>((backend, false))
+        Ok::<_, ApiError>((backend, false, stream_links))
     })
     .await?;
     if mode.previews() {
@@ -773,6 +780,28 @@ pub(crate) async fn delete_backend_as(
         None,
     )
     .await;
+    // The delete cascades out of every stream that links the backend,
+    // which changes that stream's backend set with no stream handler
+    // involved: each such stream gets its own row, beside the backend's
+    // and under the same actor (Story 12.10 D-h). Written when the
+    // delete is decided, as the backend's row is, though a draining
+    // backend's links go with the row when the drain ends.
+    for link in &stream_links {
+        let unlinked = serde_json::json!({
+            "backend_id": link.backend_id,
+            "was_backup": link.backup,
+            "rule": link.rule,
+        });
+        crate::audit::record(
+            state,
+            actor,
+            "stream.backend_unlinked",
+            ("stream", &link.stream_id),
+            None,
+            Some(&unlinked),
+        )
+        .await;
+    }
 
     if force_deleted {
         return Ok(json_data(serde_json::json!({"message": "backend deleted"})));

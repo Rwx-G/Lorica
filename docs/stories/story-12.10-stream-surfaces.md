@@ -578,11 +578,12 @@ Allowlist: `lorica-api/src/config.rs`, `lorica-api/src/backends.rs`,
 `lorica-api/src/streams/tests.rs`, `lorica-api/src/streams/audit_tests.rs`
 (new, if `tests.rs` would pass 1,500 lines).
 
-- [ ] Import: the streams diff before the import, one row per changed
-      stream (D-h).
-- [ ] `delete_backend_as`: `stream.backend_unlinked` per stream holding
+- [x] Import: the streams diff before the import, one row per changed
+      stream (D-h; built as the views before and after, see the Lot C1
+      notes).
+- [x] `delete_backend_as`: `stream.backend_unlinked` per stream holding
       the backend, written with the backend's row (D-h).
-- [ ] Test: the walk of D-h over every path, chain verified.
+- [x] Test: the walk of D-h over every path, chain verified.
 
 ### Lot C2: a token cannot unlink a backend from a stream (`lorica-api`, `lorica-mcp`) - cargo
 
@@ -854,6 +855,8 @@ each one as "Resolved N".
   `the_dashboard_fixture_carries_the_tier_table_and_vectors_rendered_from_the_policy`
   printed, by a script cutting it out of the failure message; the
   scope list was edited by hand, as the fixture's header says.
+- Lot C1, 2026-11-18, on `0adaa713`. Gates on the final tree: see the
+  Change Log row.
 
 ### Completion Notes
 
@@ -937,6 +940,44 @@ each one as "Resolved N".
   (the environment pins live there, not in `environments.rs`). The
   last three are in 12.9 Lot C3's allowlist or its record. No change
   to `lorica/src/cli_mcp.rs`: its blast-radius test names no tool.
+- **Lot C1, the import rows, amended against the code.** D-h names
+  `compute_diff`'s streams entity diff as the changed set. That diff
+  answers labels (`name (id)`), not ids, and compares the stream row
+  alone: a file that only moves a stream's backend links shows in the
+  separate `stream_backends` diff, and a stream row compare would give
+  it no row although its backend set, a stream field (D-i), changed.
+  So `import_config` reads `streams::stream_views` (every stored
+  stream's view, by id) before and after `import_to_store`, in the
+  store closure that runs both, and `imported_stream_changes` writes
+  `stream.create` (only after), `stream.delete` (only before) or
+  `stream.update` (both, views differing in anything but `created_at`
+  and `updated_at`, the fields the preview's `stream_eq` ignores too).
+  The rows follow the `config.import` row, with the importer as actor
+  and the views as payloads. The test pins the result against the
+  preview: the ids the rows name are exactly the ids of the preview's
+  `streams` and `stream_backends` diffs together.
+- **Lot C1, the cascade rows.** `delete_backend_as` reads the stream
+  links of the backend under the lock that deletes it or marks it
+  closing, and after the `backend.delete` row writes one
+  `stream.backend_unlinked` per link, target `("stream", id)`, after
+  `{ backend_id, was_backup, rule }`. A backend serves a stream through
+  one link at most (the store refuses a second rule and a primary that
+  is also a backup), so one link is one stream. A backend in normal
+  service drains first and its links go with the row when the drain
+  ends; the rows are written when the delete is decided, as the
+  backend's own row is. A preview writes none.
+- **Lot C1, the walk.** `streams/audit_tests.rs` (new, `tests.rs` is
+  past 4,000 lines): the import rows and their payloads, the preview
+  agreement and a no-op re-import; the cascade rows with a primary and
+  a backup link; and D-h's table walked (create, two updates, import,
+  cascade, delete), each row's action, target and the admin's role,
+  then `verify_audit_chain` holding. The follower row is unchanged and
+  not walked; the token's backend delete is Lot C2's.
+- **Outside the allowlist (Lot C1):** `lorica-api/src/streams.rs`, the
+  `audit_tests` module line and `stream_views`, which reuses the
+  private `StreamLinks::by_stream` rather than copying it into
+  `config.rs`. `streams/tests.rs` made its `Node` fixture, `tcp` and
+  `without_bind` `pub(super)` for the new module.
 
 ## File List
 
@@ -958,6 +999,10 @@ each one as "Resolved N".
   `lorica-api/openapi-automation.yaml` (Lot B)
 - `lorica-dashboard/frontend/src/components/settings-tabs/automation-scopes.generated.ts`,
   `lorica-dashboard/frontend/src/lib/api.ts` (Lot B)
+- `lorica-api/src/config.rs`, `lorica-api/src/backends.rs`,
+  `lorica-api/src/streams/audit_tests.rs` (new),
+  `lorica-api/src/streams/tests.rs` (the fixture's visibility),
+  `lorica-api/src/streams.rs` (`stream_views`, the module line) (Lot C1)
 
 ## Change Log
 
@@ -967,3 +1012,4 @@ each one as "Resolved N".
 | 2026-11-15 | 0.2 | Maintainer answers folded in as Resolved 1 to 5 (token delete of a stream's backend refused, address updates allowed; this node's counters only; no automatic `streams:read`, re-minting stated in the CHANGELOG as an operator action; node names revealed and documented; per-stream import rows for streams only), plus Resolved 6 (the corrected artefact list) and 7 (12.9 Lot C3 after Lot B) recorded in Dev Notes. Status Draft. | Romain G. |
 | 2026-11-18 | 0.3 | Lot A: `GET /api/v1/streams/status` (this node's bind state, per-node states on a control plane, this node's live counters with per-reason arrays), `StreamMetricsCollector::live_counters`, `node_bind_state` shared by the fleet view and the status, `NodeStreamBinding.stream_name`, `openapi.yaml`. D-d and D-e amended against the code (active nodes only, `unknown` before a report, no `nodes_truncated`, one-pass accessor, `node_name` null on a control plane). Status InProgress. | Romain G. |
 | 2026-11-18 | 0.4 | Lot B: `streams:read` in the closed scope enum with every restatement in one commit (both OpenAPI documents, the `api.ts` union, the generated fixture and its tier vectors), the read tier carrying it; `GET /automation/v1/streams` and `/automation/v1/streams/status`, filtered, unmasked, empty for a grant-carrying principal; `lorica_streams` and `lorica_stream_status`; with 12.9 Lot C3's `/automation/v1/stream-logs` and `lorica_stream_logs` behind `streams:read` plus `logs:read` through `companion_scope`. Gates on the final tree: the CI chain green (3,678 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean, frontend check, lint and Vitest (878) green. | Romain G. |
+| 2026-11-18 | 0.5 | Lot C1: a TOML import writes one `stream.create`, `stream.update` or `stream.delete` row per stream whose view it moved, links included, beside its `config.import` row; a backend delete writes one `stream.backend_unlinked` per stream that linked it, beside `backend.delete`; the D-h walk with the chain verified. D-h's changed set amended against the code (views before and after, pinned equal to the preview's stream and link diffs). Gates on the final tree: the CI chain green (3,682 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean. | Romain G. |

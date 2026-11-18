@@ -65,8 +65,8 @@ const EDGE_1: ReservedPorts = ReservedPorts {
 };
 
 /// A logged-in admin on an in-memory node with a real audit log.
-struct Node {
-    state: AppState,
+pub(super) struct Node {
+    pub(super) state: AppState,
     sessions: crate::middleware::auth::SessionStore,
     limiter: crate::middleware::rate_limit::RateLimiter,
     cookie: String,
@@ -75,7 +75,7 @@ struct Node {
 }
 
 impl Node {
-    async fn standalone() -> Self {
+    pub(super) async fn standalone() -> Self {
         Self::with_cluster(|_| None).await
     }
 
@@ -138,7 +138,12 @@ impl Node {
         (status, body_json(response).await)
     }
 
-    async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+    pub(super) async fn call(
+        &self,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
         self.call_as(&self.cookie, method, uri, body).await
     }
 
@@ -146,19 +151,19 @@ impl Node {
         self.call("POST", "/api/v1/streams", Some(body)).await
     }
 
-    async fn update(&self, id: &str, body: Value) -> (StatusCode, Value) {
+    pub(super) async fn update(&self, id: &str, body: Value) -> (StatusCode, Value) {
         self.call("PUT", &format!("/api/v1/streams/{id}"), Some(body))
             .await
     }
 
     /// Create, asserting the 201, and answer the view.
-    async fn created(&self, body: Value) -> Value {
+    pub(super) async fn created(&self, body: Value) -> Value {
         let (status, answer) = self.create(body).await;
         assert_eq!(status, StatusCode::CREATED, "{answer}");
         answer["data"].clone()
     }
 
-    async fn backend(&self, address: &str) -> String {
+    pub(super) async fn backend(&self, address: &str) -> String {
         let (status, answer) = self
             .call(
                 "POST",
@@ -199,7 +204,7 @@ impl Node {
             .expect("test setup: node");
     }
 
-    async fn audit_rows(&self) -> Vec<crate::audit::AuditRecord> {
+    pub(super) async fn audit_rows(&self) -> Vec<crate::audit::AuditRecord> {
         let log_store = self.state.log_store.clone().expect("log store");
         log_store.flush_audit().await.expect("the audit drains");
         let (mut rows, _) = log_store
@@ -219,7 +224,7 @@ impl Node {
 }
 
 /// A body the API accepts on a standalone node with [`THIS_NODE`].
-fn tcp(name: &str, port: u16) -> Value {
+pub(super) fn tcp(name: &str, port: u16) -> Value {
     json!({
         "name": name,
         "protocol": "tcp",
@@ -245,7 +250,7 @@ fn udp(name: &str, port: u16) -> Value {
 
 /// A stream as a read answers it, less its `bind`, which only the reads
 /// carry: what a write answered for the same row.
-fn without_bind(read: &Value) -> Value {
+pub(super) fn without_bind(read: &Value) -> Value {
     let mut view = read.clone();
     let object = view.as_object_mut().expect("an object");
     assert!(object.contains_key("bind"), "a read carries bind: {read}");
