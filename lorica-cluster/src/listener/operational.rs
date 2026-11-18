@@ -1011,6 +1011,7 @@ async fn serve_request(
                     access_cursor: batch.access_cursor,
                     waf_cursor: batch.waf_cursor,
                     audit_cursor: batch.audit_cursor,
+                    stream_cursor: batch.stream_cursor,
                     ..TelemetryPushAck::default()
                 };
                 return request

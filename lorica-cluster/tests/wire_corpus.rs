@@ -205,6 +205,8 @@ fn telemetry_push() -> TelemetryPush {
         dropped_since_last: 3,
         audit: vec![audit_row()],
         audit_cursor: 41,
+        stream: Vec::new(),
+        stream_cursor: 0,
     }
 }
 
@@ -404,6 +406,8 @@ fn corpus() -> Vec<Entry> {
                 waf_cursor: 77,
                 accepted_audit: 1,
                 audit_cursor: 41,
+                accepted_stream: 0,
+                stream_cursor: 0,
             },
         ),
         entry(

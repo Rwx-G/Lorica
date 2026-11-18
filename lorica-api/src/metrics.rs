@@ -320,7 +320,8 @@ static CLUSTER_TELEMETRY_LOST_TO_RETENTION_TOTAL: Lazy<IntCounterVec> = Lazy::ne
     )
 });
 
-/// Count `rows` of `kind` (`access` or `waf`) lost to local retention.
+/// Count `rows` of `kind` (`access`, `waf` or `stream`) lost to local
+/// retention.
 pub fn inc_cluster_telemetry_lost_to_retention(kind: &str, rows: u64) {
     if rows == 0 {
         return;

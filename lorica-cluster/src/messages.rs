@@ -698,7 +698,8 @@ pub struct CertMaterial {
     pub key_digest: ::prost::alloc::string::String,
 }
 
-/// Longest a telemetry batch may be in either row list.
+/// Longest a telemetry batch may be in any row list: access rows, WAF
+/// events, and stream rows (Story 12.9).
 ///
 /// A follower drains its shared store on a timer, so a batch is one
 /// interval of traffic, not a backlog. The cap bounds the frame well
@@ -944,6 +945,99 @@ pub struct TelemetryAuditRow {
     pub chain_hash: ::prost::alloc::string::String,
 }
 
+/// One stream access-log row on its way to the control plane (Story
+/// 12.9 D-i).
+///
+/// Mirrors the local `stream_access_logs` columns minus the rowid and,
+/// like every fanned-in row, minus any node identity: the control plane
+/// stamps that from the session. The words (`entry`, `protocol`,
+/// `tls_mode`, `end_reason`, `refusal_reason`) are strings, as they are
+/// in the local table, so a row a newer follower wrote with a word this
+/// build does not know is stored rather than refused.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct TelemetryStreamRow {
+    /// RFC 3339 timestamp of the end, as the origin node recorded it.
+    #[prost(string, tag = "1")]
+    pub timestamp: ::prost::alloc::string::String,
+    /// `ended` or `refusals_suppressed`.
+    #[prost(string, tag = "2")]
+    pub entry: ::prost::alloc::string::String,
+    /// The stream's id.
+    #[prost(string, tag = "3")]
+    pub stream_id: ::prost::alloc::string::String,
+    /// The stream's name when the row was written.
+    #[prost(string, tag = "4")]
+    pub stream_name: ::prost::alloc::string::String,
+    /// `tcp` or `udp`.
+    #[prost(string, tag = "5")]
+    pub protocol: ::prost::alloc::string::String,
+    /// The local port the client reached.
+    #[prost(uint32, tag = "6")]
+    pub listen_port: u32,
+    /// The client's address after PROXY protocol where accepted.
+    #[prost(string, tag = "7")]
+    pub client_ip: ::prost::alloc::string::String,
+    /// The client's port.
+    #[prost(uint32, tag = "8")]
+    pub client_port: u32,
+    /// The socket peer when a PROXY header replaced it, else empty.
+    #[prost(string, tag = "9")]
+    pub proxied_from: ::prost::alloc::string::String,
+    /// The backend connected, empty when none was.
+    #[prost(string, tag = "10")]
+    pub backend_id: ::prost::alloc::string::String,
+    /// The address actually connected, empty when none was.
+    #[prost(string, tag = "11")]
+    pub backend_address: ::prost::alloc::string::String,
+    /// Connect attempts made.
+    #[prost(uint32, tag = "12")]
+    pub attempts: u32,
+    /// Client-to-backend bytes forwarded.
+    #[prost(uint64, tag = "13")]
+    pub bytes_upload: u64,
+    /// Backend-to-client bytes forwarded.
+    #[prost(uint64, tag = "14")]
+    pub bytes_download: u64,
+    /// Client datagrams forwarded; absent on TCP.
+    #[prost(uint64, optional, tag = "15")]
+    pub datagrams_upload: ::core::option::Option<u64>,
+    /// Backend datagrams forwarded; absent on TCP.
+    #[prost(uint64, optional, tag = "16")]
+    pub datagrams_download: ::core::option::Option<u64>,
+    /// Accepted to end, in milliseconds.
+    #[prost(uint64, tag = "17")]
+    pub duration_ms: u64,
+    /// Accepted to connected; absent when nothing connected.
+    #[prost(uint64, optional, tag = "18")]
+    pub connect_ms: ::core::option::Option<u64>,
+    /// `none`, `passthrough` or `terminate`; empty on the rows whose
+    /// record carries no TLS mode.
+    #[prost(string, tag = "19")]
+    pub tls_mode: ::prost::alloc::string::String,
+    /// The server name the ClientHello carried.
+    #[prost(string, tag = "20")]
+    pub sni: ::prost::alloc::string::String,
+    /// The ALPN the row shows.
+    #[prost(string, tag = "21")]
+    pub alpn: ::prost::alloc::string::String,
+    /// The client certificate outcome; absent when the stream does not
+    /// verify client certificates.
+    #[prost(string, optional, tag = "22")]
+    pub client_cert: ::core::option::Option<::prost::alloc::string::String>,
+    /// The protocol Phase 2 detection found; absent until Story 12.15.
+    #[prost(string, optional, tag = "23")]
+    pub detected_protocol: ::core::option::Option<::prost::alloc::string::String>,
+    /// The end reason word.
+    #[prost(string, tag = "24")]
+    pub end_reason: ::prost::alloc::string::String,
+    /// The refusal reason word when `end_reason` is `refused`.
+    #[prost(string, tag = "25")]
+    pub refusal_reason: ::prost::alloc::string::String,
+    /// The count on a `refusals_suppressed` row, else 0.
+    #[prost(uint64, tag = "26")]
+    pub suppressed: u64,
+}
+
 /// A batch of telemetry (Story 9.6 AC #5), follower to control plane.
 ///
 /// Upwards only: a control plane sending one is inverting the fan-in
@@ -982,6 +1076,19 @@ pub struct TelemetryPush {
     /// The sender's own rowid for the last audit row in this batch.
     #[prost(uint64, tag = "8")]
     pub audit_cursor: u64,
+    /// Stream access-log rows, at most [`MAX_TELEMETRY_ROWS`] (Story
+    /// 12.9 D-i). Admitted as access rows are: charged against the
+    /// quota, shed by its verdict and by the storage watermark.
+    ///
+    /// A control plane of a release before 1.11.0 skips this field and
+    /// answers `accepted_stream = 0`, so the follower's stream cursor
+    /// stays put and the rows wait in its own store until the control
+    /// plane is upgraded or local retention takes them.
+    #[prost(message, repeated, tag = "9")]
+    pub stream: ::prost::alloc::vec::Vec<TelemetryStreamRow>,
+    /// The sender's own rowid for the last stream row in this batch.
+    #[prost(uint64, tag = "10")]
+    pub stream_cursor: u64,
 }
 
 /// What the control plane stored (Story 9.6).
@@ -1016,6 +1123,12 @@ pub struct TelemetryPushAck {
     /// The audit cursor from the request, echoed unmodified.
     #[prost(uint64, tag = "8")]
     pub audit_cursor: u64,
+    /// Stream rows written (Story 12.9).
+    #[prost(uint64, tag = "9")]
+    pub accepted_stream: u64,
+    /// The stream cursor from the request, echoed unmodified.
+    #[prost(uint64, tag = "10")]
+    pub stream_cursor: u64,
 }
 
 /// A fleet-wide ban (Story 9.6 AC #10), control plane to follower.
@@ -3355,5 +3468,278 @@ mod tests {
                 assert!(report.checked().is_some(), "{name} = {edge} is a port");
             }
         }
+    }
+
+    /// A stream row with every field set, optional ones included, so
+    /// prost emits every tag.
+    fn stream_row() -> TelemetryStreamRow {
+        TelemetryStreamRow {
+            timestamp: "2026-11-18T10:00:01.500Z".to_string(),
+            entry: "ended".to_string(),
+            stream_id: "0b6f2a4e-6a43-4bd4-9b8e-3c1f8a2d5e70".to_string(),
+            stream_name: "postgres".to_string(),
+            protocol: "udp".to_string(),
+            listen_port: 5432,
+            client_ip: "192.0.2.10".to_string(),
+            client_port: 40_000,
+            proxied_from: "192.0.2.1:51000".to_string(),
+            backend_id: "backend-1".to_string(),
+            backend_address: "10.0.0.10:5432".to_string(),
+            attempts: 2,
+            bytes_upload: 100,
+            bytes_download: 2_000,
+            datagrams_upload: Some(3),
+            datagrams_download: Some(2),
+            duration_ms: 1_500,
+            connect_ms: Some(7),
+            tls_mode: "passthrough".to_string(),
+            sni: "db.example.com".to_string(),
+            alpn: "h2".to_string(),
+            client_cert: Some("verified".to_string()),
+            detected_protocol: Some("postgres".to_string()),
+            end_reason: "refused".to_string(),
+            refusal_reason: "source_denied".to_string(),
+            suppressed: 4,
+        }
+    }
+
+    #[test]
+    fn the_stream_telemetry_tags_match_the_published_proto() {
+        let tags = proto_tags();
+        let tag = |block: &str, field: &str| -> u32 {
+            *tags
+                .get(&(block.to_string(), field.to_string()))
+                .unwrap_or_else(|| panic!("{block}.{field} missing from cluster.proto"))
+        };
+        let row = stream_row();
+        let fields = [
+            "timestamp",
+            "entry",
+            "stream_id",
+            "stream_name",
+            "protocol",
+            "listen_port",
+            "client_ip",
+            "client_port",
+            "proxied_from",
+            "backend_id",
+            "backend_address",
+            "attempts",
+            "bytes_upload",
+            "bytes_download",
+            "datagrams_upload",
+            "datagrams_download",
+            "duration_ms",
+            "connect_ms",
+            "tls_mode",
+            "sni",
+            "alpn",
+            "client_cert",
+            "detected_protocol",
+            "end_reason",
+            "refusal_reason",
+            "suppressed",
+        ];
+        // Pinned against the encoded field count, so a field added to the
+        // row without a name here turns this test red.
+        assert_eq!(
+            field_numbers(&row.encode_to_vec()),
+            fields
+                .iter()
+                .map(|field| tag("TelemetryStreamRow", field))
+                .collect::<Vec<_>>()
+        );
+        let push = TelemetryPush {
+            stream: vec![row],
+            stream_cursor: 7,
+            ..TelemetryPush::default()
+        };
+        assert_eq!(
+            field_numbers(&push.encode_to_vec()),
+            vec![
+                tag("TelemetryPush", "stream"),
+                tag("TelemetryPush", "stream_cursor")
+            ]
+        );
+        let ack = TelemetryPushAck {
+            accepted_stream: 1,
+            stream_cursor: 7,
+            ..TelemetryPushAck::default()
+        };
+        assert_eq!(
+            field_numbers(&ack.encode_to_vec()),
+            vec![
+                tag("TelemetryPushAck", "accepted_stream"),
+                tag("TelemetryPushAck", "stream_cursor")
+            ]
+        );
+    }
+
+    /// The telemetry push and its ack exactly as the v1.10.7 tag
+    /// declares them (`lorica-cluster/src/messages.rs` at that tag),
+    /// frozen here as released artefacts: the control plane a 1.11.0
+    /// follower pushes to during a rolling upgrade, followers first
+    /// (Story 12.1 D-3, Story 12.9 D-i).
+    mod v1_10_7 {
+        use super::{TelemetryAccessRow, TelemetryAuditRow, TelemetryBan, TelemetryWafRow};
+
+        #[derive(Clone, PartialEq, Eq, prost::Message)]
+        pub struct TelemetryPush {
+            #[prost(message, repeated, tag = "1")]
+            pub access: ::prost::alloc::vec::Vec<TelemetryAccessRow>,
+            #[prost(message, repeated, tag = "2")]
+            pub waf: ::prost::alloc::vec::Vec<TelemetryWafRow>,
+            #[prost(message, repeated, tag = "3")]
+            pub bans: ::prost::alloc::vec::Vec<TelemetryBan>,
+            #[prost(uint64, tag = "4")]
+            pub access_cursor: u64,
+            #[prost(uint64, tag = "5")]
+            pub waf_cursor: u64,
+            #[prost(uint64, tag = "6")]
+            pub dropped_since_last: u64,
+            #[prost(message, repeated, tag = "7")]
+            pub audit: ::prost::alloc::vec::Vec<TelemetryAuditRow>,
+            #[prost(uint64, tag = "8")]
+            pub audit_cursor: u64,
+        }
+
+        #[derive(Clone, PartialEq, Eq, prost::Message)]
+        pub struct TelemetryPushAck {
+            #[prost(uint64, tag = "1")]
+            pub accepted_access: u64,
+            #[prost(uint64, tag = "2")]
+            pub accepted_waf: u64,
+            #[prost(uint64, tag = "3")]
+            pub accepted_bans: u64,
+            #[prost(uint32, tag = "4")]
+            pub retry_after_s: u32,
+            #[prost(uint64, tag = "5")]
+            pub access_cursor: u64,
+            #[prost(uint64, tag = "6")]
+            pub waf_cursor: u64,
+            #[prost(uint64, tag = "7")]
+            pub accepted_audit: u64,
+            #[prost(uint64, tag = "8")]
+            pub audit_cursor: u64,
+        }
+    }
+
+    /// A push of every class but stream rows, every cursor set.
+    fn push_without_stream_rows() -> TelemetryPush {
+        TelemetryPush {
+            access: vec![TelemetryAccessRow {
+                path: "/".to_string(),
+                ..TelemetryAccessRow::default()
+            }],
+            waf: vec![TelemetryWafRow {
+                category: "sqli".to_string(),
+                ..TelemetryWafRow::default()
+            }],
+            bans: vec![TelemetryBan {
+                client_ip: "192.0.2.10".to_string(),
+                ..TelemetryBan::default()
+            }],
+            access_cursor: 11,
+            waf_cursor: 12,
+            dropped_since_last: 1,
+            audit: vec![TelemetryAuditRow {
+                origin_id: 3,
+                ..TelemetryAuditRow::default()
+            }],
+            audit_cursor: 13,
+            ..TelemetryPush::default()
+        }
+    }
+
+    /// The same push as the v1.10.7 type spells it.
+    fn released_push() -> v1_10_7::TelemetryPush {
+        let new = push_without_stream_rows();
+        v1_10_7::TelemetryPush {
+            access: new.access,
+            waf: new.waf,
+            bans: new.bans,
+            access_cursor: new.access_cursor,
+            waf_cursor: new.waf_cursor,
+            dropped_since_last: new.dropped_since_last,
+            audit: new.audit,
+            audit_cursor: new.audit_cursor,
+        }
+    }
+
+    #[test]
+    fn a_1_10_7_control_plane_decodes_a_push_carrying_stream_rows_and_acks_none_of_them() {
+        let new = TelemetryPush {
+            stream: vec![stream_row(); 3],
+            stream_cursor: 99,
+            ..push_without_stream_rows()
+        };
+        let old = v1_10_7::TelemetryPush::decode(new.encode_to_vec().as_slice())
+            .expect("an unknown tag is skipped, never refused");
+        assert_eq!(
+            old,
+            released_push(),
+            "every class the old control plane knows survives the stream rows"
+        );
+        // What that control plane answers, read by a 1.11.0 follower:
+        // nothing accepted of a class it never saw, so the follower's
+        // stream cursor stays where it was.
+        let answer = v1_10_7::TelemetryPushAck {
+            accepted_access: 1,
+            accepted_waf: 1,
+            accepted_bans: 1,
+            retry_after_s: 0,
+            access_cursor: 11,
+            waf_cursor: 12,
+            accepted_audit: 1,
+            audit_cursor: 13,
+        };
+        let read = TelemetryPushAck::decode(answer.encode_to_vec().as_slice()).expect("decodes");
+        assert_eq!((read.accepted_stream, read.stream_cursor), (0, 0));
+        assert_eq!(
+            (read.accepted_access, read.access_cursor, read.audit_cursor),
+            (1, 11, 13)
+        );
+    }
+
+    #[test]
+    fn a_1_11_0_control_plane_reads_a_1_10_7_push_as_carrying_no_stream_rows() {
+        let old = released_push();
+        let read = TelemetryPush::decode(old.encode_to_vec().as_slice()).expect("decodes");
+        assert_eq!(read, push_without_stream_rows());
+        assert!(read.stream.is_empty() && read.stream_cursor == 0);
+        // And a push with no stream row is byte-identical to the 1.10.7
+        // one: the new fields cost an old peer nothing.
+        assert_eq!(read.encode_to_vec(), old.encode_to_vec());
+        // Its ack, read by the old follower, keeps every field it knows.
+        let ack = TelemetryPushAck {
+            accepted_access: 1,
+            access_cursor: 11,
+            ..TelemetryPushAck::default()
+        };
+        let old_ack =
+            v1_10_7::TelemetryPushAck::decode(ack.encode_to_vec().as_slice()).expect("decodes");
+        assert_eq!((old_ack.accepted_access, old_ack.access_cursor), (1, 11));
+    }
+
+    #[test]
+    fn a_stream_row_without_its_optional_fields_reads_them_as_absent() {
+        let tcp = TelemetryStreamRow {
+            datagrams_upload: None,
+            datagrams_download: None,
+            connect_ms: None,
+            client_cert: None,
+            detected_protocol: None,
+            ..stream_row()
+        };
+        let read = TelemetryStreamRow::decode(tcp.encode_to_vec().as_slice()).expect("decodes");
+        assert_eq!(read, tcp, "absent stays absent across the wire");
+        // And zero is a figure, not an absence.
+        let zero = TelemetryStreamRow {
+            datagrams_upload: Some(0),
+            connect_ms: Some(0),
+            ..stream_row()
+        };
+        let read = TelemetryStreamRow::decode(zero.encode_to_vec().as_slice()).expect("decodes");
+        assert_eq!((read.datagrams_upload, read.connect_ms), (Some(0), Some(0)));
     }
 }

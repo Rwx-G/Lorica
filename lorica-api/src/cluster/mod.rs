@@ -71,6 +71,19 @@ pub(crate) fn control_plane_for_reads(state: &AppState) -> Result<Arc<ControlPla
     control_plane(state)
 }
 
+/// The fan-in database, for a fleet read elsewhere in the crate (the
+/// stream log takes `?node=`, Story 12.9 D-i): 409 off a control plane,
+/// 500 when the database could not be opened, as the fan-in endpoints
+/// here answer.
+pub(crate) fn fleet_telemetry_for_reads(
+    state: &AppState,
+) -> Result<Arc<lorica_fleet::telemetry_store::ClusterTelemetryStore>, ApiError> {
+    control_plane_runtime(state)?
+        .telemetry
+        .clone()
+        .ok_or_else(|| ApiError::Internal("the cluster telemetry database is not open".into()))
+}
+
 fn control_plane(state: &AppState) -> Result<Arc<ControlPlane>, ApiError> {
     Ok(Arc::clone(&control_plane_runtime(state)?.control))
 }

@@ -919,6 +919,7 @@ impl SessionHandler for FleetHandlers {
                         // never the audit trail.
                         accepted_audit,
                         audit_cursor: batch.audit_cursor,
+                        stream_cursor: batch.stream_cursor,
                         ..Default::default()
                     });
                 }
@@ -928,7 +929,7 @@ impl SessionHandler for FleetHandlers {
                 warn!(
                     node_id,
                     shed = admission.quota_dropped,
-                    offered = batch.access.len() + batch.waf.len(),
+                    offered = batch.access.len() + batch.waf.len() + batch.stream.len(),
                     "the node is over its telemetry ingest quota; the excess is dropped and counted"
                 );
             }
@@ -957,17 +958,22 @@ impl SessionHandler for FleetHandlers {
                 .take(admission.take_access)
                 .collect();
             let waf: Vec<_> = batch.waf.into_iter().take(admission.take_waf).collect();
+            let stream: Vec<_> = batch
+                .stream
+                .into_iter()
+                .take(admission.take_stream)
+                .collect();
             let outcome = tokio::task::spawn_blocking(move || {
                 // `stamped` is the id the SESSION proved. Nothing in
                 // the batch names a node (decision D2).
-                store.ingest(&stamped, &access, &waf, &[])
+                store.ingest(&stamped, &access, &waf, &stream)
             })
             .await
             .map_err(|e| format!("the telemetry ingest task failed: {e}"))??;
 
             lorica_api::metrics::inc_cluster_telemetry_ingested(
                 &node_id,
-                outcome.access + outcome.waf,
+                outcome.access + outcome.waf + outcome.stream,
             );
             Ok(lorica_cluster::TelemetryPushAck {
                 accepted_access: outcome.access,
@@ -978,6 +984,8 @@ impl SessionHandler for FleetHandlers {
                 waf_cursor: batch.waf_cursor,
                 accepted_audit,
                 audit_cursor: batch.audit_cursor,
+                accepted_stream: outcome.stream,
+                stream_cursor: batch.stream_cursor,
             })
         })
     }

@@ -32,9 +32,11 @@ use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, SecondsFormat, Utc};
 use http::header;
+use lorica_cluster::TelemetryStreamRow;
 use lorica_config::models::{
-    StreamEndKind, StreamEndReason, StreamProtocol, StreamRefusal, StreamTlsMode,
+    Role, StreamEndKind, StreamEndReason, StreamProtocol, StreamRefusal, StreamTlsMode,
 };
+use lorica_fleet::telemetry_store::FleetStreamQuery;
 use lorica_stream::{
     ClientCertificateOutcome, ConnectionRecord, RefusalRecord, SuppressedRecord, TlsRecord,
 };
@@ -302,6 +304,131 @@ impl StreamLogEntry {
         row.listen_port = record.listen_port;
         row.refusal_reason = refusal_word(record.refusal).to_string();
         row
+    }
+
+    /// The row on the wire to the control plane (D-i): every field but
+    /// the id, which is this node's.
+    pub fn to_wire(&self) -> TelemetryStreamRow {
+        let Self {
+            id: _,
+            timestamp,
+            entry,
+            stream_id,
+            stream_name,
+            protocol,
+            listen_port,
+            client_ip,
+            client_port,
+            proxied_from,
+            backend_id,
+            backend_address,
+            attempts,
+            bytes_upload,
+            bytes_download,
+            datagrams_upload,
+            datagrams_download,
+            duration_ms,
+            connect_ms,
+            tls_mode,
+            sni,
+            alpn,
+            client_cert,
+            detected_protocol,
+            end_reason,
+            refusal_reason,
+            suppressed,
+        } = self.clone();
+        TelemetryStreamRow {
+            timestamp,
+            entry,
+            stream_id,
+            stream_name,
+            protocol,
+            listen_port: u32::from(listen_port),
+            client_ip,
+            client_port: u32::from(client_port),
+            proxied_from,
+            backend_id,
+            backend_address,
+            attempts,
+            bytes_upload,
+            bytes_download,
+            datagrams_upload,
+            datagrams_download,
+            duration_ms,
+            connect_ms,
+            tls_mode,
+            sni,
+            alpn,
+            client_cert,
+            detected_protocol,
+            end_reason,
+            refusal_reason,
+            suppressed,
+        }
+    }
+
+    /// A fanned-in row read back on the control plane, `id` being the
+    /// fan-in store's. A port the wire carries past `u16` reads as 0,
+    /// as a stored one does.
+    pub fn from_wire(id: u64, row: TelemetryStreamRow) -> Self {
+        let TelemetryStreamRow {
+            timestamp,
+            entry,
+            stream_id,
+            stream_name,
+            protocol,
+            listen_port,
+            client_ip,
+            client_port,
+            proxied_from,
+            backend_id,
+            backend_address,
+            attempts,
+            bytes_upload,
+            bytes_download,
+            datagrams_upload,
+            datagrams_download,
+            duration_ms,
+            connect_ms,
+            tls_mode,
+            sni,
+            alpn,
+            client_cert,
+            detected_protocol,
+            end_reason,
+            refusal_reason,
+            suppressed,
+        } = row;
+        Self {
+            id,
+            timestamp,
+            entry,
+            stream_id,
+            stream_name,
+            protocol,
+            listen_port: u16::try_from(listen_port).unwrap_or(0),
+            client_ip,
+            client_port: u16::try_from(client_port).unwrap_or(0),
+            proxied_from,
+            backend_id,
+            backend_address,
+            attempts,
+            bytes_upload,
+            bytes_download,
+            datagrams_upload,
+            datagrams_download,
+            duration_ms,
+            connect_ms,
+            tls_mode,
+            sni,
+            alpn,
+            client_cert,
+            detected_protocol,
+            end_reason,
+            refusal_reason,
+            suppressed,
+        }
     }
 
     /// The row counting the rows one window held back (D-c): its
@@ -674,6 +801,41 @@ impl LogStore {
             .map_err(|e| format!("failed to clear stream logs: {e}"))
     }
 
+    /// Up to `limit` rows with an id strictly above `after_id`, oldest
+    /// first, each with its id: the fleet drain's read (Story 12.9 D-i),
+    /// the stream sibling of [`LogStore::access_rows_after`].
+    pub fn stream_rows_after(
+        &self,
+        after_id: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, StreamLogEntry)>, String> {
+        let rows = select_rows(
+            &self.stream_conn(),
+            &format!(
+                "SELECT {SELECT_COLUMNS} FROM stream_access_logs WHERE id > ?1 \
+                 ORDER BY id ASC LIMIT ?2"
+            ),
+            &[
+                &sql_int(after_id),
+                &i64::try_from(limit).unwrap_or(i64::MAX),
+            ],
+        )?;
+        Ok(rows.into_iter().map(|row| (row.id, row)).collect())
+    }
+
+    /// The highest stream row id stored, 0 when none: where a node that
+    /// has never drained starts, as [`LogStore::newest_access_id`] does
+    /// for access rows.
+    pub fn newest_stream_id(&self) -> Result<u64, String> {
+        let id: Option<i64> = self
+            .stream_conn()
+            .query_row("SELECT MAX(id) FROM stream_access_logs", [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| format!("failed to read the newest stream log id: {e}"))?;
+        Ok(id.map_or(0, |id| u64::try_from(id).unwrap_or(0)))
+    }
+
     /// Rows in `stream_access_logs`.
     pub fn stream_log_count(&self) -> Result<u64, String> {
         self.stream_conn()
@@ -861,14 +1023,87 @@ struct StreamLogsPage {
     total: usize,
 }
 
+/// One page of a follower's fanned-in stream rows (Story 12.9 D-i):
+/// the node named and the rows, with no count, for the reason the
+/// fan-in pages give (a count per page on the aggregated table is a scan
+/// under the lock every node's ingest waits on).
+#[derive(Serialize)]
+struct NodeStreamLogsPage {
+    node: String,
+    entries: Vec<StreamLogEntry>,
+}
+
+/// The rows `node` fanned in that `filter` selects, the newest page
+/// oldest first as the local read answers, ids being the fan-in store's.
+///
+/// A fleet read: the Operator floor every fleet read has (the authorize
+/// layer sees the path, not the query, so it is held here), and 409 off
+/// a control plane. A page holds at most the fan-in store's
+/// [`lorica_fleet::telemetry_store::MAX_PAGE`] rows.
+async fn node_stream_logs(
+    state: &AppState,
+    session: &Session,
+    node: String,
+    filter: StreamLogFilter,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if session.role < Role::Operator {
+        return Err(ApiError::Forbidden(
+            "another node's stream log is a fleet read: Operator or above".into(),
+        ));
+    }
+    let telemetry = crate::cluster::fleet_telemetry_for_reads(state)?;
+    let StreamLogFilter {
+        stream_id,
+        end_reason,
+        refusal_reason,
+        client_ip,
+        from,
+        to,
+        after_id,
+        before_id,
+        limit,
+    } = filter;
+    let query = FleetStreamQuery {
+        node_id: node.clone(),
+        stream_id,
+        end_reason,
+        refusal_reason,
+        client_ip,
+        from,
+        to,
+        after_id: after_id.map(sql_int),
+        before_id: before_id.map(sql_int),
+        limit: u32::try_from(limit.unwrap_or(200)).unwrap_or(u32::MAX),
+    };
+    let rows = tokio::task::spawn_blocking(move || telemetry.query_stream(&query))
+        .await
+        .map_err(|e| ApiError::Internal(format!("fleet stream log query task failed: {e}")))?
+        .map_err(ApiError::Internal)?;
+    let entries = rows
+        .into_iter()
+        .rev()
+        .map(|stored| StreamLogEntry::from_wire(u64::try_from(stored.id).unwrap_or(0), stored.row))
+        .collect();
+    Ok(json_data(NodeStreamLogsPage { node, entries }))
+}
+
 /// GET /api/v1/stream-logs - stream log rows matching the filters, the
 /// newest page oldest first, and the match count. A process with no log
 /// store answers an empty page: stream rows have no in-memory fallback.
+///
+/// With `?node=<node_id>` on a control plane, the rows that follower
+/// fanned in instead, under the same filters and without a count (Story
+/// 12.9 D-i); see `node_stream_logs`.
 pub async fn get_stream_logs(
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
+    Query(node): Query<crate::sla::NodeQuery>,
     Query(params): Query<StreamLogsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let filter = params.filter()?;
+    if let Some(node) = node.node.filter(|node| !node.is_empty()) {
+        return node_stream_logs(&state, &session, node, filter).await;
+    }
     let Some(store) = state.log_store.as_ref() else {
         return Ok(json_data(StreamLogsPage {
             entries: Vec::new(),
@@ -1576,5 +1811,159 @@ mod tests {
             };
             assert_eq!(row.entry, kind.as_str());
         }
+    }
+
+    #[test]
+    fn a_row_crosses_the_wire_and_reads_back_whole() {
+        let mut record = udp_session(StreamEndReason::Refused(StreamRefusal::SourceDenied));
+        record.tls = Some(tls(StreamTlsMode::Terminate));
+        record.proxied_from = Some("192.0.2.1:51000".parse().expect("fixture address"));
+        let mut row = StreamLogEntry::from_connection(&record);
+        row.id = 41;
+        let back = StreamLogEntry::from_wire(7, row.to_wire());
+        assert_eq!(
+            back,
+            StreamLogEntry { id: 7, ..row },
+            "only the id is the reader's"
+        );
+
+        let tcp = StreamLogEntry::from_connection(&tcp_connection(StreamEndReason::ClientClose));
+        let back = StreamLogEntry::from_wire(0, tcp.to_wire());
+        assert_eq!(back.datagrams_upload, None, "absent on TCP stays absent");
+        assert_eq!(back, tcp);
+    }
+
+    #[test]
+    fn the_drain_reads_after_its_cursor_oldest_first() {
+        let (store, _dir) = store();
+        assert_eq!(store.newest_stream_id().expect("newest"), 0);
+        let rows: Vec<StreamLogEntry> = StreamEndKind::VARIANTS
+            .iter()
+            .map(|kind| StreamLogEntry::from_connection(&tcp_connection(reason_of(*kind))))
+            .collect();
+        store.insert_stream_batch(&rows).expect("insert");
+        let newest = store.newest_stream_id().expect("newest");
+        assert_eq!(newest, rows.len() as u64);
+        let first = store.stream_rows_after(0, 2).expect("drain");
+        assert_eq!(
+            first.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(first[1].1.end_reason, rows[1].end_reason);
+        let rest = store.stream_rows_after(2, usize::MAX).expect("drain");
+        assert_eq!(rest.len(), rows.len() - 2);
+        assert!(store
+            .stream_rows_after(newest, 10)
+            .expect("drain")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_node_read_serves_that_follower_s_fanned_in_rows_to_an_operator() {
+        use axum::http::StatusCode;
+        use lorica_config::models::Role;
+
+        use crate::cluster::{ClusterRuntime, ControlPlaneRuntime};
+        use crate::tests::{
+            create_user_and_login, parse_data, send, setup_admin_and_login, test_control_plane,
+            test_state,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut state, sessions, limiter) = test_state().await;
+        let admin = setup_admin_and_login(&state, &sessions, &limiter).await;
+        let viewer =
+            create_user_and_login(&state, &sessions, &limiter, "viewer01", Role::Viewer).await;
+        let get = |uri: &'static str, state: AppState, cookie: String| {
+            let (sessions, limiter) = (sessions.clone(), limiter.clone());
+            async move { send(&state, &sessions, &limiter, "GET", uri, &cookie, None).await }
+        };
+
+        // Off a control plane a node read is a conflict, not an empty page.
+        let standalone = get(
+            "/api/v1/stream-logs?node=node-b",
+            state.clone(),
+            admin.clone(),
+        )
+        .await;
+        assert_eq!(standalone.status(), StatusCode::CONFLICT);
+
+        let telemetry = Arc::new(
+            lorica_fleet::telemetry_store::ClusterTelemetryStore::open(dir.path())
+                .expect("open the fan-in store"),
+        );
+        let (runtime, _liveness) = test_control_plane();
+        state.cluster =
+            ClusterRuntime::ControlPlane(Arc::new(ControlPlaneRuntime::with_telemetry(
+                Arc::clone(&runtime.control),
+                Some(Arc::clone(&telemetry)),
+            )));
+        let idle = StreamLogEntry::from_connection(&tcp_connection(StreamEndReason::IdleTimeout));
+        let refused = StreamLogEntry::from_refusal(&refusal(
+            StreamProtocol::Tcp,
+            StreamRefusal::SourceDenied,
+        ));
+        telemetry
+            .ingest("node-b", &[], &[], &[idle.to_wire(), refused.to_wire()])
+            .expect("fan in");
+        telemetry
+            .ingest("node-c", &[], &[], &[idle.to_wire()])
+            .expect("fan in");
+
+        let page = parse_data(
+            get(
+                "/api/v1/stream-logs?node=node-b",
+                state.clone(),
+                admin.clone(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(page["node"], "node-b");
+        assert!(
+            page.get("total").is_none(),
+            "a fan-in page carries no count"
+        );
+        let entries = page["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 2, "node-c's row is not node-b's");
+        assert_eq!(entries[0]["end_reason"], idle.end_reason, "oldest first");
+        assert_eq!(entries[1]["refusal_reason"], refused.refusal_reason);
+
+        let filtered = parse_data(
+            get(
+                "/api/v1/stream-logs?node=node-b&refusal_reason=source_denied",
+                state.clone(),
+                admin.clone(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(filtered["entries"].as_array().expect("entries").len(), 1);
+
+        let unknown_word = get(
+            "/api/v1/stream-logs?node=node-b&end_reason=exploded",
+            state.clone(),
+            admin.clone(),
+        )
+        .await;
+        assert_eq!(unknown_word.status(), StatusCode::BAD_REQUEST);
+
+        let forbidden = get(
+            "/api/v1/stream-logs?node=node-b",
+            state.clone(),
+            viewer.clone(),
+        )
+        .await;
+        assert_eq!(
+            forbidden.status(),
+            StatusCode::FORBIDDEN,
+            "a fleet read sits at the Operator floor"
+        );
+        let own = get("/api/v1/stream-logs", state.clone(), viewer).await;
+        assert_eq!(
+            own.status(),
+            StatusCode::OK,
+            "this node's own rows stay a Viewer read"
+        );
     }
 }

@@ -155,6 +155,110 @@ pub struct FleetBanRow {
     pub observed_at: String,
 }
 
+/// One fanned-in stream access-log row, as stored (Story 12.9 D-i).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetStreamRow {
+    /// Cursor for pagination: this store's own rowid.
+    pub id: i64,
+    /// The node the row came from, stamped from the session.
+    pub node_id: String,
+    /// The row as the origin node pushed it.
+    pub row: lorica_cluster::TelemetryStreamRow,
+}
+
+/// Filters for a node's fanned-in stream rows: the filters of the local
+/// stream log read, validated by its caller, plus the node.
+///
+/// Rows come back newest first and without a total, for the reason
+/// [`FleetQuery`] gives.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FleetStreamQuery {
+    /// The node whose rows to read.
+    pub node_id: String,
+    /// Exact stream id.
+    pub stream_id: Option<String>,
+    /// Exact end reason word.
+    pub end_reason: Option<String>,
+    /// Exact refusal reason word.
+    pub refusal_reason: Option<String>,
+    /// Client address prefix, matched literally.
+    pub client_ip: Option<String>,
+    /// Inclusive lower bound on `timestamp`, RFC 3339.
+    pub from: Option<String>,
+    /// Inclusive upper bound on `timestamp`, RFC 3339.
+    pub to: Option<String>,
+    /// Rows with an id strictly above this one.
+    pub after_id: Option<i64>,
+    /// Rows with an id strictly below this one.
+    pub before_id: Option<i64>,
+    /// Rows per page, clamped to [`MAX_PAGE`].
+    pub limit: u32,
+}
+
+/// The escape character of the stream query's `LIKE`.
+const LIKE_ESCAPE_CHAR: char = '\\';
+
+/// `value` with the `LIKE` wildcards and the escape character escaped,
+/// so a client address prefix matches literally.
+fn like_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if matches!(c, '%' | '_' | LIKE_ESCAPE_CHAR) {
+            out.push(LIKE_ESCAPE_CHAR);
+        }
+        out.push(c);
+    }
+    out
+}
+
+impl FleetStreamQuery {
+    /// The `WHERE` clause and its binds. Every value is bound; the
+    /// column names are this module's own.
+    fn build_where(&self) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+        let mut conditions: Vec<String> = vec!["node_id = ?".to_string()];
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(self.node_id.clone())];
+        for (column, value) in [
+            ("stream_id", &self.stream_id),
+            ("end_reason", &self.end_reason),
+            ("refusal_reason", &self.refusal_reason),
+        ] {
+            if let Some(value) = value {
+                conditions.push(format!("{column} = ?"));
+                binds.push(Box::new(value.clone()));
+            }
+        }
+        if let Some(prefix) = &self.client_ip {
+            conditions.push(format!("client_ip LIKE ? ESCAPE '{LIKE_ESCAPE_CHAR}'"));
+            binds.push(Box::new(format!("{}%", like_literal(prefix))));
+        }
+        if let Some(from) = &self.from {
+            conditions.push("timestamp >= ?".to_string());
+            binds.push(Box::new(from.clone()));
+        }
+        if let Some(to) = &self.to {
+            conditions.push("timestamp <= ?".to_string());
+            binds.push(Box::new(to.clone()));
+        }
+        if let Some(after) = self.after_id {
+            conditions.push("id > ?".to_string());
+            binds.push(Box::new(after));
+        }
+        if let Some(before) = self.before_id {
+            conditions.push("id < ?".to_string());
+            binds.push(Box::new(before));
+        }
+        (format!("WHERE {}", conditions.join(" AND ")), binds)
+    }
+
+    /// The page size to actually use.
+    fn page(&self) -> u32 {
+        match self.limit {
+            0 => DEFAULT_PAGE,
+            n => n.min(MAX_PAGE),
+        }
+    }
+}
+
 /// Filters for a fan-in query (AC #9).
 ///
 /// Deliberately cursor-paginated rather than offset-paginated, and
@@ -200,8 +304,8 @@ pub struct IngestOutcome {
     pub access: u64,
     /// WAF events written.
     pub waf: u64,
-    /// Bans recorded.
-    pub bans: u64,
+    /// Stream rows written (Story 12.9).
+    pub stream: u64,
 }
 
 /// The control plane's fan-in database.
@@ -311,7 +415,49 @@ impl ClusterTelemetryStore {
                 reason TEXT NOT NULL,
                 observed_at TEXT NOT NULL,
                 PRIMARY KEY (node_id, client_ip)
-            );",
+            );
+
+            -- Stream access-log rows (Story 12.9 D-i): the local
+            -- `stream_access_logs` columns plus the node the session
+            -- proved. (node_id, id) serves the retention cut and the
+            -- node page, as on the access table; the stream index
+            -- serves the per-stream filter of the stream log view.
+            CREATE TABLE IF NOT EXISTS fleet_stream_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                entry TEXT NOT NULL,
+                stream_id TEXT NOT NULL,
+                stream_name TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                listen_port INTEGER NOT NULL DEFAULT 0,
+                client_ip TEXT NOT NULL DEFAULT '',
+                client_port INTEGER NOT NULL DEFAULT 0,
+                proxied_from TEXT NOT NULL DEFAULT '',
+                backend_id TEXT NOT NULL DEFAULT '',
+                backend_address TEXT NOT NULL DEFAULT '',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                bytes_upload INTEGER NOT NULL DEFAULT 0,
+                bytes_download INTEGER NOT NULL DEFAULT 0,
+                datagrams_upload INTEGER,
+                datagrams_download INTEGER,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                connect_ms INTEGER,
+                tls_mode TEXT NOT NULL DEFAULT '',
+                sni TEXT NOT NULL DEFAULT '',
+                alpn TEXT NOT NULL DEFAULT '',
+                client_cert TEXT,
+                detected_protocol TEXT,
+                end_reason TEXT NOT NULL,
+                refusal_reason TEXT NOT NULL DEFAULT '',
+                suppressed INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_fleet_stream_node_id
+                ON fleet_stream_logs(node_id, id);
+            CREATE INDEX IF NOT EXISTS idx_fleet_stream_node_ts
+                ON fleet_stream_logs(node_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_fleet_stream_node_stream
+                ON fleet_stream_logs(node_id, stream_id, id);",
         )
         .map_err(|e| format!("failed to initialise the cluster telemetry schema: {e}"))?;
 
@@ -323,11 +469,12 @@ impl ClusterTelemetryStore {
     /// Store one node's batch, stamping every row with `node_id`.
     ///
     /// `node_id` is the caller's, taken from the authenticated
-    /// session; nothing in `access`, `waf` or `bans` is trusted to
-    /// name a node.
+    /// session; nothing in `access`, `waf` or `stream` is trusted to
+    /// name a node. Bans are not rows: a snapshot replaces the node's
+    /// last one through [`ClusterTelemetryStore::replace_ban_snapshot`].
     ///
     /// The whole batch is one transaction: a partial batch would
-    /// leave the follower's cursor ambiguous.
+    /// leave the follower's cursors ambiguous.
     ///
     /// # Errors
     ///
@@ -337,13 +484,12 @@ impl ClusterTelemetryStore {
         node_id: &str,
         access: &[lorica_cluster::TelemetryAccessRow],
         waf: &[lorica_cluster::TelemetryWafRow],
-        bans: &[lorica_cluster::TelemetryBan],
+        stream: &[lorica_cluster::TelemetryStreamRow],
     ) -> Result<IngestOutcome, String> {
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction()
             .map_err(|e| format!("failed to open a telemetry transaction: {e}"))?;
-        let observed_at = chrono::Utc::now().to_rfc3339();
 
         {
             // One prepared statement reused across the batch rather
@@ -406,23 +552,70 @@ impl ClusterTelemetryStore {
             }
         }
 
-        // A snapshot replaces what that node last reported for that
-        // address; a node that no longer reports an address has let
-        // the ban lapse, which `prune_stale_bans` reclaims.
-        for ban in bans {
-            tx.execute(
-                "INSERT OR REPLACE INTO fleet_bans
-                    (node_id, client_ip, remaining_s, reason, observed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
+        {
+            let mut stmt = tx
+                .prepare_cached(STREAM_INSERT_SQL)
+                .map_err(|e| format!("failed to prepare the stream row insert: {e}"))?;
+            for row in stream {
+                let lorica_cluster::TelemetryStreamRow {
+                    timestamp,
+                    entry,
+                    stream_id,
+                    stream_name,
+                    protocol,
+                    listen_port,
+                    client_ip,
+                    client_port,
+                    proxied_from,
+                    backend_id,
+                    backend_address,
+                    attempts,
+                    bytes_upload,
+                    bytes_download,
+                    datagrams_upload,
+                    datagrams_download,
+                    duration_ms,
+                    connect_ms,
+                    tls_mode,
+                    sni,
+                    alpn,
+                    client_cert,
+                    detected_protocol,
+                    end_reason,
+                    refusal_reason,
+                    suppressed,
+                } = row;
+                stmt.execute(rusqlite::params![
                     node_id,
-                    ban.client_ip,
-                    i64::try_from(ban.remaining_s).unwrap_or(i64::MAX),
-                    ban.reason,
-                    observed_at,
-                ],
-            )
-            .map_err(|e| format!("failed to store a fanned-in ban: {e}"))?;
+                    timestamp,
+                    entry,
+                    stream_id,
+                    stream_name,
+                    protocol,
+                    i64::from(*listen_port),
+                    client_ip,
+                    i64::from(*client_port),
+                    proxied_from,
+                    backend_id,
+                    backend_address,
+                    i64::from(*attempts),
+                    sql_int(*bytes_upload),
+                    sql_int(*bytes_download),
+                    datagrams_upload.map(sql_int),
+                    datagrams_download.map(sql_int),
+                    sql_int(*duration_ms),
+                    connect_ms.map(sql_int),
+                    tls_mode,
+                    sni,
+                    alpn,
+                    client_cert,
+                    detected_protocol,
+                    end_reason,
+                    refusal_reason,
+                    sql_int(*suppressed),
+                ])
+                .map_err(|e| format!("failed to store a fanned-in stream row: {e}"))?;
+            }
         }
 
         tx.commit()
@@ -431,7 +624,7 @@ impl ClusterTelemetryStore {
         Ok(IngestOutcome {
             access: access.len() as u64,
             waf: waf.len() as u64,
-            bans: bans.len() as u64,
+            stream: stream.len() as u64,
         })
     }
 
@@ -480,20 +673,20 @@ impl ClusterTelemetryStore {
         Ok(bans.len() as u64)
     }
 
-    /// Every node that has rows in either table.
+    /// Every node that has rows in any table of [`TelemetryTable::ALL`].
     ///
     /// # Errors
     ///
     /// Returns the SQLite error text on a read failure.
     pub fn nodes_with_rows(&self) -> Result<Vec<String>, String> {
+        let union = TelemetryTable::ALL
+            .iter()
+            .map(|table| format!("SELECT node_id FROM {}", table.as_str()))
+            .collect::<Vec<_>>()
+            .join(" UNION ");
         let conn = self.conn.lock();
         let mut stmt = conn
-            .prepare(
-                "SELECT node_id FROM fleet_access_logs
-                 UNION
-                 SELECT node_id FROM fleet_waf_events
-                 ORDER BY node_id",
-            )
+            .prepare(&format!("{union} ORDER BY node_id"))
             .map_err(|e| format!("failed to list telemetry nodes: {e}"))?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))
@@ -615,7 +808,7 @@ impl ClusterTelemetryStore {
         )
     }
 
-    /// Drop everything one node ever fanned in: both series and its
+    /// Drop everything one node ever fanned in: every series and its
     /// ban snapshot. For a node that is no longer in the roster, or
     /// was revoked long enough ago that its last hours are no longer
     /// an incident to review (Epic 9 close, architecture review).
@@ -633,7 +826,7 @@ impl ClusterTelemetryStore {
     /// Returns the SQLite error text on a delete failure.
     pub fn forget_node(&self, node_id: &str) -> Result<u64, String> {
         let mut removed = 0u64;
-        for table in [TelemetryTable::Access, TelemetryTable::Waf] {
+        for table in TelemetryTable::ALL {
             loop {
                 let chunk = {
                     let conn = self.conn.lock();
@@ -818,6 +1011,39 @@ impl ClusterTelemetryStore {
         (sql, binds)
     }
 
+    /// One page of a node's fanned-in stream rows, newest first
+    /// (Story 12.9 D-i).
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQLite error text on a read failure.
+    pub fn query_stream(&self, params: &FleetStreamQuery) -> Result<Vec<FleetStreamRow>, String> {
+        let (sql, binds) = Self::stream_query_sql(params);
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("failed to prepare the fleet stream query: {e}"))?;
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt
+            .query_map(refs.as_slice(), read_stream_row)
+            .map_err(|e| format!("failed to run the fleet stream query: {e}"))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| format!("failed to read a fleet stream row: {e}"))
+    }
+
+    /// The statement [`ClusterTelemetryStore::query_stream`] runs, and
+    /// its binds, separate so the plan test inspects the SQL the read
+    /// path issues.
+    fn stream_query_sql(params: &FleetStreamQuery) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+        let (where_clause, binds) = params.build_where();
+        let sql = format!(
+            "SELECT {STREAM_SELECT_COLUMNS} FROM fleet_stream_logs {where_clause}
+             ORDER BY id DESC LIMIT {}",
+            params.page()
+        );
+        (sql, binds)
+    }
+
     /// How many rows one node holds in one table. Test and diagnostic
     /// use: it is the `COUNT(*)` the retention path deliberately
     /// avoids, so it must not be called on a request path.
@@ -838,6 +1064,75 @@ impl ClusterTelemetryStore {
     }
 }
 
+/// The insert of one fanned-in stream row, the node first and then the
+/// wire row's fields in their tag order.
+const STREAM_INSERT_SQL: &str = "INSERT INTO fleet_stream_logs (node_id, timestamp, entry, \
+    stream_id, stream_name, protocol, listen_port, client_ip, client_port, proxied_from, \
+    backend_id, backend_address, attempts, bytes_upload, bytes_download, datagrams_upload, \
+    datagrams_download, duration_ms, connect_ms, tls_mode, sni, alpn, client_cert, \
+    detected_protocol, end_reason, refusal_reason, suppressed) \
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
+    ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)";
+
+/// The columns a stream row is read with, in [`read_stream_row`]'s order.
+const STREAM_SELECT_COLUMNS: &str = "id, node_id, timestamp, entry, stream_id, stream_name, \
+    protocol, listen_port, client_ip, client_port, proxied_from, backend_id, backend_address, \
+    attempts, bytes_upload, bytes_download, datagrams_upload, datagrams_download, duration_ms, \
+    connect_ms, tls_mode, sni, alpn, client_cert, detected_protocol, end_reason, \
+    refusal_reason, suppressed";
+
+/// SQLite holds signed 64-bit integers; a counter past `i64::MAX` is
+/// stored as the maximum rather than wrapping negative.
+fn sql_int(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn read_stream_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FleetStreamRow> {
+    let unsigned = |index: usize| -> rusqlite::Result<u64> {
+        Ok(u64::try_from(row.get::<_, i64>(index)?).unwrap_or(0))
+    };
+    let optional = |index: usize| -> rusqlite::Result<Option<u64>> {
+        Ok(row
+            .get::<_, Option<i64>>(index)?
+            .map(|value| u64::try_from(value).unwrap_or(0)))
+    };
+    let narrow = |index: usize| -> rusqlite::Result<u32> {
+        Ok(u32::try_from(row.get::<_, i64>(index)?).unwrap_or(0))
+    };
+    Ok(FleetStreamRow {
+        id: row.get(0)?,
+        node_id: row.get(1)?,
+        row: lorica_cluster::TelemetryStreamRow {
+            timestamp: row.get(2)?,
+            entry: row.get(3)?,
+            stream_id: row.get(4)?,
+            stream_name: row.get(5)?,
+            protocol: row.get(6)?,
+            listen_port: narrow(7)?,
+            client_ip: row.get(8)?,
+            client_port: narrow(9)?,
+            proxied_from: row.get(10)?,
+            backend_id: row.get(11)?,
+            backend_address: row.get(12)?,
+            attempts: narrow(13)?,
+            bytes_upload: unsigned(14)?,
+            bytes_download: unsigned(15)?,
+            datagrams_upload: optional(16)?,
+            datagrams_download: optional(17)?,
+            duration_ms: unsigned(18)?,
+            connect_ms: optional(19)?,
+            tls_mode: row.get(20)?,
+            sni: row.get(21)?,
+            alpn: row.get(22)?,
+            client_cert: row.get(23)?,
+            detected_protocol: row.get(24)?,
+            end_reason: row.get(25)?,
+            refusal_reason: row.get(26)?,
+            suppressed: unsigned(27)?,
+        },
+    })
+}
+
 /// Which fan-in table a retention pass or a count addresses.
 ///
 /// An enum rather than a string because both callers interpolate the
@@ -849,14 +1144,21 @@ pub enum TelemetryTable {
     Access,
     /// `fleet_waf_events`.
     Waf,
+    /// `fleet_stream_logs` (Story 12.9).
+    Stream,
 }
 
 impl TelemetryTable {
+    /// Every row table, for the passes that walk each one: the node
+    /// list, the per-node quota and the reclaim of a retired node.
+    pub const ALL: [TelemetryTable; 3] = [Self::Access, Self::Waf, Self::Stream];
+
     /// The table name, a compile-time constant of this module.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Access => "fleet_access_logs",
             Self::Waf => "fleet_waf_events",
+            Self::Stream => "fleet_stream_logs",
         }
     }
 }
@@ -1633,5 +1935,237 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A stream row of `stream_id` that ended at `ts`.
+    fn stream_row(stream_id: &str, ts: &str) -> lorica_cluster::TelemetryStreamRow {
+        lorica_cluster::TelemetryStreamRow {
+            timestamp: ts.to_string(),
+            entry: "ended".to_string(),
+            stream_id: stream_id.to_string(),
+            stream_name: "postgres".to_string(),
+            protocol: "tcp".to_string(),
+            client_ip: "192.0.2.10".to_string(),
+            end_reason: "client_close".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_stream_row_reads_back_as_it_was_pushed_under_the_session_s_node() {
+        let (store, _dir) = store();
+        let pushed = lorica_cluster::TelemetryStreamRow {
+            protocol: "udp".to_string(),
+            listen_port: 5353,
+            client_port: 40_000,
+            proxied_from: "192.0.2.1:51000".to_string(),
+            backend_id: "backend-1".to_string(),
+            backend_address: "10.0.0.10:53".to_string(),
+            attempts: 2,
+            bytes_upload: u64::MAX,
+            bytes_download: 2_000,
+            datagrams_upload: Some(3),
+            datagrams_download: Some(0),
+            duration_ms: 1_500,
+            connect_ms: None,
+            tls_mode: "none".to_string(),
+            sni: "db.example.com".to_string(),
+            alpn: "h2".to_string(),
+            client_cert: Some("verified".to_string()),
+            detected_protocol: None,
+            end_reason: "refused".to_string(),
+            refusal_reason: "source_denied".to_string(),
+            suppressed: 7,
+            ..stream_row("stream-1", "2026-11-18T10:00:00.000Z")
+        };
+        let outcome = store
+            .ingest("node-a", &[], &[], std::slice::from_ref(&pushed))
+            .expect("ingest");
+        assert_eq!(outcome.stream, 1);
+        let rows = store
+            .query_stream(&FleetStreamQuery {
+                node_id: "node-a".to_string(),
+                ..Default::default()
+            })
+            .expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].node_id, "node-a");
+        let expected = lorica_cluster::TelemetryStreamRow {
+            // SQLite holds signed integers: the counter saturates.
+            bytes_upload: i64::MAX as u64,
+            ..pushed
+        };
+        assert_eq!(rows[0].row, expected, "every column round-trips");
+    }
+
+    #[test]
+    fn a_node_s_stream_page_is_its_own_newest_first_and_filtered() {
+        let (store, _dir) = store();
+        let mut refused = stream_row("stream-2", "2026-11-18T10:00:03.000Z");
+        refused.end_reason = "refused".to_string();
+        refused.refusal_reason = "rate_limited".to_string();
+        refused.client_ip = "198.51.100.7".to_string();
+        store
+            .ingest(
+                "node-a",
+                &[],
+                &[],
+                &[
+                    stream_row("stream-1", "2026-11-18T10:00:01.000Z"),
+                    stream_row("stream-1", "2026-11-18T10:00:02.000Z"),
+                    refused,
+                ],
+            )
+            .expect("ingest");
+        store
+            .ingest(
+                "node-b",
+                &[],
+                &[],
+                &[stream_row("stream-1", "2026-11-18T10:00:04.000Z")],
+            )
+            .expect("ingest");
+        let page = |query: FleetStreamQuery| {
+            store
+                .query_stream(&FleetStreamQuery {
+                    node_id: "node-a".to_string(),
+                    ..query
+                })
+                .expect("query")
+                .into_iter()
+                .map(|r| r.row.timestamp)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            page(FleetStreamQuery::default()),
+            vec![
+                "2026-11-18T10:00:03.000Z",
+                "2026-11-18T10:00:02.000Z",
+                "2026-11-18T10:00:01.000Z"
+            ],
+            "newest first, and node-b's row is not node-a's"
+        );
+        assert_eq!(
+            page(FleetStreamQuery {
+                stream_id: Some("stream-1".to_string()),
+                from: Some("2026-11-18T10:00:02.000Z".to_string()),
+                ..Default::default()
+            }),
+            vec!["2026-11-18T10:00:02.000Z"]
+        );
+        assert_eq!(
+            page(FleetStreamQuery {
+                end_reason: Some("refused".to_string()),
+                refusal_reason: Some("rate_limited".to_string()),
+                client_ip: Some("198.51.".to_string()),
+                ..Default::default()
+            }),
+            vec!["2026-11-18T10:00:03.000Z"]
+        );
+        // The prefix is literal: `_` is no wildcard and a quote is a value.
+        for hostile in ["192_0", "' OR 1=1 --", "%"] {
+            assert!(
+                page(FleetStreamQuery {
+                    client_ip: Some(hostile.to_string()),
+                    ..Default::default()
+                })
+                .is_empty(),
+                "{hostile}"
+            );
+        }
+        let first = store
+            .query_stream(&FleetStreamQuery {
+                node_id: "node-a".to_string(),
+                limit: 2,
+                ..Default::default()
+            })
+            .expect("query");
+        assert_eq!(first.len(), 2);
+        let rest = page(FleetStreamQuery {
+            before_id: Some(first[1].id),
+            ..Default::default()
+        });
+        assert_eq!(
+            rest,
+            vec!["2026-11-18T10:00:01.000Z"],
+            "the cursor walks back"
+        );
+        let newer = page(FleetStreamQuery {
+            after_id: Some(first[1].id),
+            ..Default::default()
+        });
+        assert_eq!(newer, vec!["2026-11-18T10:00:03.000Z"]);
+    }
+
+    #[test]
+    fn stream_rows_follow_the_per_node_quota_and_the_reclaim_of_a_retired_node() {
+        let (store, _dir) = store();
+        let rows: Vec<_> = (0..30)
+            .map(|i| stream_row("stream-1", &format!("2026-11-18T10:00:{i:02}.000Z")))
+            .collect();
+        store.ingest("node-a", &[], &[], &rows).expect("ingest");
+        store
+            .ingest("node-b", &[], &[], &rows[..2])
+            .expect("ingest");
+        assert_eq!(
+            store.nodes_with_rows().expect("list"),
+            vec!["node-a".to_string(), "node-b".to_string()],
+            "a node with stream rows only is a node with rows"
+        );
+        assert_eq!(
+            store
+                .enforce_node_quota(TelemetryTable::Stream, "node-a", 10)
+                .expect("prune"),
+            20
+        );
+        assert_eq!(
+            store
+                .count_for_node(TelemetryTable::Stream, "node-a")
+                .expect("count"),
+            10
+        );
+        assert_eq!(
+            store
+                .count_for_node(TelemetryTable::Stream, "node-b")
+                .expect("count"),
+            2,
+            "a neighbour's retention does not touch this node"
+        );
+        assert_eq!(store.forget_node("node-b").expect("forget"), 2);
+        assert_eq!(
+            store.nodes_with_rows().expect("list"),
+            vec!["node-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_stream_page_and_its_retention_ride_the_node_index() {
+        let (store, _dir) = store();
+        let rows: Vec<_> = (0..200)
+            .map(|i| stream_row(&format!("stream-{}", i % 4), "2026-11-18T10:00:00.000Z"))
+            .collect();
+        for node in ["node-0", "node-1", "node-2"] {
+            store.ingest(node, &[], &[], &rows).expect("ingest");
+        }
+        let (sql, binds) = ClusterTelemetryStore::stream_query_sql(&FleetStreamQuery {
+            node_id: "node-1".to_string(),
+            ..Default::default()
+        });
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let page = plan_of(&store, &sql, refs.as_slice());
+        assert!(
+            page.contains("idx_fleet_stream_node_id (") && !page.contains("TEMP B-TREE"),
+            "a node's page walks (node_id, id) backwards: {page}"
+        );
+        let node: &dyn rusqlite::ToSql = &"node-1";
+        let cut = plan_of(
+            &store,
+            &ClusterTelemetryStore::quota_cut_sql(TelemetryTable::Stream),
+            &[node, &100i64],
+        );
+        assert!(
+            cut.contains("idx_fleet_stream_node_id (") && !cut.contains("TEMP B-TREE"),
+            "the quota cut walks (node_id, id): {cut}"
+        );
     }
 }

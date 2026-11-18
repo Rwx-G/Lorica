@@ -168,14 +168,12 @@ impl ConfigStore {
             "DELETE FROM cluster_identity WHERE id = ?1",
             params![IDENTITY_ROW_ID],
         )?;
-        tx.execute(
-            "DELETE FROM cluster_state WHERE key IN (?1, ?2, ?3)",
-            params![
-                crate::TelemetryCursor::Access.as_key(),
-                crate::TelemetryCursor::Waf.as_key(),
-                crate::TelemetryCursor::Audit.as_key(),
-            ],
-        )?;
+        for cursor in crate::TelemetryCursor::ALL {
+            tx.execute(
+                "DELETE FROM cluster_state WHERE key = ?1",
+                params![cursor.as_key()],
+            )?;
+        }
         tx.commit()?;
         Ok(changed == 1)
     }

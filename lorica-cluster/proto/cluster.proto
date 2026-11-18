@@ -384,8 +384,41 @@ message TelemetryAuditRow {
   string chain_hash = 13;
 }
 
-// A batch of telemetry. At most 512 access rows and 512 WAF events
-// per push; a longer batch is a PROTOCOL_VIOLATION.
+// One stream access-log row (Story 12.9 D-i). Mirrors the local
+// `stream_access_logs` columns minus the rowid; the words stay strings,
+// so a row a newer follower wrote with a word this build does not know
+// is stored rather than refused.
+message TelemetryStreamRow {
+  string timestamp = 1;              // RFC 3339, the end
+  string entry = 2;                  // "ended" or "refusals_suppressed"
+  string stream_id = 3;
+  string stream_name = 4;
+  string protocol = 5;               // "tcp" or "udp"
+  uint32 listen_port = 6;
+  string client_ip = 7;
+  uint32 client_port = 8;
+  string proxied_from = 9;
+  string backend_id = 10;
+  string backend_address = 11;
+  uint32 attempts = 12;
+  uint64 bytes_upload = 13;
+  uint64 bytes_download = 14;
+  optional uint64 datagrams_upload = 15;    // Absent on TCP
+  optional uint64 datagrams_download = 16;  // Absent on TCP
+  uint64 duration_ms = 17;
+  optional uint64 connect_ms = 18;          // Absent when nothing connected
+  string tls_mode = 19;
+  string sni = 20;
+  string alpn = 21;
+  optional string client_cert = 22;         // Absent when the stream does not verify
+  optional string detected_protocol = 23;
+  string end_reason = 24;
+  string refusal_reason = 25;
+  uint64 suppressed = 26;
+}
+
+// A batch of telemetry. At most 512 access rows, 512 WAF events and
+// 512 stream rows per push; a longer batch is a PROTOCOL_VIOLATION.
 //
 // The cursors are the sender's local rowids for the last row in each
 // list. The control plane echoes them back so the follower knows what
@@ -404,6 +437,12 @@ message TelemetryPush {
   // entire purpose is that the record exists.
   repeated TelemetryAuditRow audit = 7;
   uint64 audit_cursor = 8;
+  // Story 12.9. Admitted as access rows are: charged against the quota
+  // and shed by it and by the storage watermark. A control plane before
+  // 1.11.0 skips the field and answers accepted_stream = 0, so the
+  // follower's stream cursor stays put.
+  repeated TelemetryStreamRow stream = 9;
+  uint64 stream_cursor = 10;
 }
 
 // What the control plane stored. `accepted_*` may be lower than what
@@ -418,6 +457,8 @@ message TelemetryPushAck {
   uint64 waf_cursor = 6;
   uint64 accepted_audit = 7;  // Story 9.9: equals what was sent, or the push failed
   uint64 audit_cursor = 8;
+  uint64 accepted_stream = 9; // Story 12.9
+  uint64 stream_cursor = 10;
 }
 
 // A fleet-wide ban issued by an operator on the control plane

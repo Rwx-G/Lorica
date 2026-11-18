@@ -1,13 +1,17 @@
 //! Upgrade of a `cluster-telemetry.db` written by a released version.
 //!
 //! The file first shipped in v1.7.0 and its schema was the same through
-//! v1.9.1; since then only indexes on existing columns were added, which
+//! v1.10.7; until then only indexes on existing columns were added, which
 //! `CREATE INDEX IF NOT EXISTS` applies to an old file on its next open.
+//! v1.11.0 adds a table, `fleet_stream_logs` (Story 12.9), which
+//! `CREATE TABLE IF NOT EXISTS` adds the same way.
 //! The DDL below is copied from `ClusterTelemetryStore::open` at v1.7.0
 //! and is a frozen historical artefact: never edit it to follow the live
 //! schema, which is what it exists to be compared with.
 
-use lorica_fleet::telemetry_store::{ClusterTelemetryStore, FleetQuery, TelemetryTable};
+use lorica_fleet::telemetry_store::{
+    ClusterTelemetryStore, FleetQuery, FleetStreamQuery, TelemetryTable,
+};
 use rusqlite::Connection;
 
 const CLUSTER_TELEMETRY_V1_7_0: &str = "
@@ -128,4 +132,53 @@ fn cluster_telemetry_db_from_v1_7_0_upgrades_with_its_rows() {
 
     drop(store);
     ClusterTelemetryStore::open(dir.path()).expect("an upgraded file reopens");
+}
+
+#[test]
+fn a_released_file_gains_the_stream_table_and_a_released_reader_still_opens_it() {
+    let dir = tempfile::tempdir().expect("test setup: tempdir");
+    {
+        let conn =
+            Connection::open(dir.path().join("cluster-telemetry.db")).expect("test setup: open");
+        conn.execute_batch(CLUSTER_TELEMETRY_V1_7_0)
+            .expect("test setup: released schema");
+    }
+
+    let store = ClusterTelemetryStore::open(dir.path()).expect("a released file must open");
+    let row = lorica_cluster::TelemetryStreamRow {
+        timestamp: "2026-11-18T10:00:00.000Z".into(),
+        entry: "ended".into(),
+        stream_id: "stream-1".into(),
+        end_reason: "idle_timeout".into(),
+        ..Default::default()
+    };
+    store
+        .ingest("node-b", &[], &[], std::slice::from_ref(&row))
+        .expect("the upgraded file stores stream rows");
+    let read = store
+        .query_stream(&FleetStreamQuery {
+            node_id: "node-b".into(),
+            ..FleetStreamQuery::default()
+        })
+        .expect("stream read");
+    assert_eq!(read.len(), 1);
+    assert_eq!(read[0].row, row);
+    assert_eq!(
+        store
+            .count_for_node(TelemetryTable::Stream, "node-b")
+            .expect("count"),
+        1
+    );
+    drop(store);
+
+    // A rollback to a release that does not know the table: its own
+    // schema statements are all IF NOT EXISTS over tables the file
+    // already has, and an extra table is invisible to its reads.
+    let conn = Connection::open(dir.path().join("cluster-telemetry.db")).expect("reopen");
+    conn.execute_batch(CLUSTER_TELEMETRY_V1_7_0)
+        .expect("the released schema applies over the upgraded file");
+    let access: i64 = conn
+        .query_row("SELECT COUNT(*) FROM fleet_access_logs", [], |r| r.get(0))
+        .expect("a released read");
+    assert_eq!(access, 0);
 }

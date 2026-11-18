@@ -356,6 +356,7 @@ pub fn translate_cluster_request(request: &ClusterRequest) -> BridgeOutcome {
             // gets a chance to shed it.
             if push.access.len() > MAX_TELEMETRY_ROWS
                 || push.waf.len() > MAX_TELEMETRY_ROWS
+                || push.stream.len() > MAX_TELEMETRY_ROWS
                 || push.bans.len() > MAX_TELEMETRY_BANS
                 || push.audit.len() > MAX_TELEMETRY_AUDIT
             {
@@ -1202,5 +1203,26 @@ Injected: 1"
                 panic!("worker bytes must never materialise as a cluster response")
             }
         }
+    }
+
+    #[test]
+    fn stream_rows_are_bounded_like_access_rows_at_the_decode_boundary() {
+        let push = |rows: usize| {
+            ClusterRequest::telemetry_push(TelemetryPush {
+                stream: vec![crate::messages::TelemetryStreamRow::default(); rows],
+                stream_cursor: 9,
+                ..TelemetryPush::default()
+            })
+        };
+        assert!(matches!(
+            translate_cluster_request(&push(MAX_TELEMETRY_ROWS)),
+            BridgeOutcome::InPlane(InPlaneAction::TelemetryPush { batch })
+                if batch.stream.len() == MAX_TELEMETRY_ROWS && batch.stream_cursor == 9
+        ));
+        assert_eq!(
+            translate_cluster_request(&push(MAX_TELEMETRY_ROWS + 1)),
+            BridgeOutcome::ProtocolViolation,
+            "one row over the cap is refused before the quota allocates for it"
+        );
     }
 }

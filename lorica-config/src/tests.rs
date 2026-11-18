@@ -5070,6 +5070,33 @@ cert_critical_days = 3
         let store = ConfigStore::open_in_memory().expect("store");
         assert!(!store.delete_cluster_identity().expect("delete absent"));
     }
+
+    #[test]
+    fn leaving_the_fleet_resets_every_telemetry_cursor() {
+        let store = ConfigStore::open_in_memory().expect("store");
+        for (position, cursor) in crate::TelemetryCursor::ALL.into_iter().enumerate() {
+            store
+                .advance_telemetry_cursor(cursor, position as u64 + 10)
+                .expect("advance");
+        }
+        let keys: std::collections::BTreeSet<&str> = crate::TelemetryCursor::ALL
+            .iter()
+            .map(|cursor| cursor.as_key())
+            .collect();
+        assert_eq!(
+            keys.len(),
+            crate::TelemetryCursor::ALL.len(),
+            "one key per cursor"
+        );
+        store.delete_cluster_identity().expect("leave");
+        for cursor in crate::TelemetryCursor::ALL {
+            assert_eq!(
+                store.telemetry_cursor(cursor).expect("read"),
+                0,
+                "{cursor:?}"
+            );
+        }
+    }
     /// One writer's slice of a minute, for `merge_sla_bucket` tests.
     fn sla_slice(
         route_id: &str,

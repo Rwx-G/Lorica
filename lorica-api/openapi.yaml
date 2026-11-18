@@ -2674,9 +2674,24 @@ paths:
         (Story 12.9). The newest page matching the filters, oldest first,
         and the match count. Viewer and above, as `GET /api/v1/logs`. A
         process with no log store answers an empty page.
+        With `?node=<node_id>` on a control plane, the rows that follower
+        pushed over the cluster plane instead (Story 12.9 D-i), under the
+        same filters, ids being the fan-in store's: the answer names the
+        `node` and carries no `total` (a count per page on the fan-in
+        table is a scan under the lock every node's ingest waits on), and
+        a page holds at most 1000 rows. Operator floor when a node is
+        named, as every fleet read; 409 off a control plane.
       security:
         - sessionCookie: []
       parameters:
+        - name: node
+          in: query
+          required: false
+          schema:
+            type: string
+          description: >-
+            A follower's node id, on a control plane: that node's
+            fanned-in rows. Absent or empty: this node's own rows.
         - name: stream_id
           in: query
           schema:
@@ -2746,10 +2761,18 @@ paths:
                           $ref: "#/components/schemas/StreamLogEntry"
                       total:
                         type: integer
+                        description: Absent on a `node` read.
+                      node:
+                        type: string
+                        description: The node read, on a `node` read only.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: A `node` read off a cluster control plane.
     delete:
       tags: [Logs]
       summary: Clear the stream access log

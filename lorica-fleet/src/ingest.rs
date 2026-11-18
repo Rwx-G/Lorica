@@ -37,6 +37,11 @@
 //! - **The storage watermark overrides every per-node budget.** When the
 //!   fan-in database is at its cap, a node well inside its quota is shed
 //!   too, ban snapshot included, and its quota is not charged.
+//! - **Stream rows are traffic** (Story 12.9 D-i). They are charged,
+//!   shed and counted exactly as access rows are: they share the access
+//!   rows' side of the quota's split, divided between the two kinds in
+//!   proportion to what was offered, and the watermark sheds them with
+//!   everything else.
 //! - **Drop reasons** are the metric labels the handler counts under,
 //!   [`DropReason::label`].
 
@@ -129,7 +134,9 @@ pub struct Admission {
     pub take_access: usize,
     /// WAF events to store, from the front of the batch.
     pub take_waf: usize,
-    /// Access rows and WAF events the quota dropped.
+    /// Stream rows to store, from the front of the batch.
+    pub take_stream: usize,
+    /// Access rows, WAF events and stream rows the quota dropped.
     pub quota_dropped: u64,
     /// Whether the ban snapshot is applied. A node whose quota is
     /// exhausted does not get its snapshot applied, so ban spam cannot
@@ -146,7 +153,7 @@ pub enum IngestOutcome {
     /// included. The quota was not consulted. The audit rows were
     /// already stored: the watermark sheds telemetry, never the trail.
     StorageShed {
-        /// Access rows, WAF events and bans dropped.
+        /// Access rows, WAF events, stream rows and bans dropped.
         dropped: u64,
         /// What the ack tells the node to wait.
         retry_after_s: u32,
@@ -183,7 +190,8 @@ pub fn admit(
         lorica_cluster::storage_verdict(stats.storage_used_bytes, stats.storage_cap_bytes);
     if matches!(storage, IngestVerdict::Shed { .. }) {
         return IngestOutcome::StorageShed {
-            dropped: (push.access.len() + push.waf.len() + push.bans.len()) as u64,
+            dropped: (push.access.len() + push.waf.len() + push.stream.len() + push.bans.len())
+                as u64,
             retry_after_s: storage.retry_after_s(),
         };
     }
@@ -191,21 +199,43 @@ pub fn admit(
     let bytes = estimated_bytes(push) + batch.audit.bytes;
     // Bans are part of what the node offered, so they are part of what
     // it is charged for, and so are the audit rows already stored.
+    // Stream rows ride the access rows' side of the split: both are a
+    // line per unit of traffic.
+    let traffic = push.access.len() + push.stream.len();
     let verdict = quota.admit(
         node_id,
-        push.access.len(),
+        traffic,
         push.waf.len() + push.bans.len() + batch.audit.rows,
         bytes,
     );
-    let take_access = verdict.access_allowance(push.access.len());
+    let (take_access, take_stream) = split_traffic(
+        verdict.access_allowance(traffic),
+        push.access.len(),
+        push.stream.len(),
+    );
     let take_waf = verdict.waf_allowance(push.waf.len());
     IngestOutcome::Admitted(Admission {
         take_access,
         take_waf,
-        quota_dropped: ((push.access.len() - take_access) + (push.waf.len() - take_waf)) as u64,
+        take_stream,
+        quota_dropped: ((traffic - take_access - take_stream) + (push.waf.len() - take_waf)) as u64,
         apply_bans: !matches!(verdict, IngestVerdict::Shed { .. }),
         retry_after_s: verdict.retry_after_s(),
     })
+}
+
+/// Divide the traffic allowance between access rows and stream rows in
+/// proportion to what was offered of each, so neither kind starves the
+/// other, the remainder going to stream rows. Takes exactly `allowed`
+/// rows, or the whole offer when `allowed` covers it.
+fn split_traffic(allowed: usize, access: usize, stream: usize) -> (usize, usize) {
+    let offered = access + stream;
+    if allowed >= offered {
+        return (access, stream);
+    }
+    // `offered > allowed`, so it is not zero here.
+    let take_access = (allowed as u128 * access as u128 / offered as u128) as usize;
+    (take_access, (allowed - take_access).min(stream))
 }
 
 /// What a batch's audit rows will cost on disk (Story 9.9).
@@ -286,14 +316,39 @@ pub fn estimated_bytes(batch: &TelemetryPush) -> u64 {
                     + r.action.len()) as u64
         })
         .sum();
-    access + waf + bans
+    let stream: u64 = batch
+        .stream
+        .iter()
+        .map(|r| {
+            ROW_OVERHEAD
+                + (r.timestamp.len()
+                    + r.entry.len()
+                    + r.stream_id.len()
+                    + r.stream_name.len()
+                    + r.protocol.len()
+                    + r.client_ip.len()
+                    + r.proxied_from.len()
+                    + r.backend_id.len()
+                    + r.backend_address.len()
+                    + r.tls_mode.len()
+                    + r.sni.len()
+                    + r.alpn.len()
+                    + r.client_cert.as_ref().map_or(0, String::len)
+                    + r.detected_protocol.as_ref().map_or(0, String::len)
+                    + r.end_reason.len()
+                    + r.refusal_reason.len()) as u64
+        })
+        .sum();
+    access + waf + stream + bans
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use lorica_cluster::{TelemetryAccessRow, TelemetryBan, TelemetryWafRow, QUOTA_RETRY_AFTER_S};
+    use lorica_cluster::{
+        TelemetryAccessRow, TelemetryBan, TelemetryStreamRow, TelemetryWafRow, QUOTA_RETRY_AFTER_S,
+    };
 
     use super::*;
 
@@ -339,6 +394,20 @@ mod tests {
                 })
                 .collect(),
             ..Default::default()
+        }
+    }
+
+    /// `push` with `rows` stream rows added.
+    fn with_stream(push: TelemetryPush, rows: usize) -> TelemetryPush {
+        TelemetryPush {
+            stream: (0..rows)
+                .map(|i| TelemetryStreamRow {
+                    stream_id: format!("stream-{i}"),
+                    end_reason: "client_close".into(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..push
         }
     }
 
@@ -446,6 +515,7 @@ mod tests {
             Admission {
                 take_access: 3,
                 take_waf: 2,
+                take_stream: 0,
                 quota_dropped: 0,
                 apply_bans: true,
                 retry_after_s: 0,
@@ -487,5 +557,107 @@ mod tests {
     fn the_drop_reasons_are_the_metric_labels() {
         assert_eq!(DropReason::StorageWatermark.label(), "storage_watermark");
         assert_eq!(DropReason::NodeQuota.label(), "node_quota");
+    }
+
+    #[test]
+    fn stream_rows_inside_the_quota_are_stored_whole() {
+        let (batch, _) = ChargedBatch::take_audit(with_stream(push(2, 1, 0, 0), 4));
+        let outcome = admit(&batch, NODE, &ROOMY, &quota(100));
+        let admission = admitted(outcome);
+        assert_eq!(
+            (
+                admission.take_access,
+                admission.take_waf,
+                admission.take_stream
+            ),
+            (2, 1, 4)
+        );
+        assert_eq!(outcome.dropped(), None);
+    }
+
+    #[test]
+    fn stream_rows_are_charged_against_the_quota_like_access_rows() {
+        let quota = quota(3);
+        let (streams_only, _) = ChargedBatch::take_audit(with_stream(push(0, 0, 0, 0), 3));
+        assert_eq!(
+            admitted(admit(&streams_only, NODE, &ROOMY, &quota)).take_stream,
+            3
+        );
+        let (next, _) = ChargedBatch::take_audit(push(1, 0, 0, 0));
+        let after = admitted(admit(&next, NODE, &ROOMY, &quota));
+        assert_eq!(
+            (after.take_access, after.retry_after_s),
+            (0, QUOTA_RETRY_AFTER_S),
+            "the stream rows spent the budget the access row needed"
+        );
+    }
+
+    #[test]
+    fn a_node_over_its_quota_sheds_stream_and_access_rows_in_proportion() {
+        let (batch, _) = ChargedBatch::take_audit(with_stream(push(6, 0, 0, 0), 6));
+        let outcome = admit(&batch, NODE, &ROOMY, &quota(6));
+        let admission = admitted(outcome);
+        assert_eq!(
+            (admission.take_access, admission.take_stream),
+            (3, 3),
+            "neither kind starves the other"
+        );
+        assert_eq!(outcome.dropped(), Some((DropReason::NodeQuota, 6)));
+        assert_eq!(admission.retry_after_s, QUOTA_RETRY_AFTER_S);
+    }
+
+    #[test]
+    fn the_watermark_sheds_stream_rows_and_keeps_the_audit_rows() {
+        let (batch, rows) = ChargedBatch::take_audit(with_stream(push(1, 1, 1, 2), 5));
+        let outcome = admit(&batch, NODE, &FULL, &quota(100));
+        assert_eq!(
+            outcome,
+            IngestOutcome::StorageShed {
+                dropped: 8,
+                retry_after_s: QUOTA_RETRY_AFTER_S,
+            }
+        );
+        assert_eq!(outcome.dropped(), Some((DropReason::StorageWatermark, 8)));
+        assert_eq!(rows.len(), 2, "the trail is never shed");
+    }
+
+    #[test]
+    fn audit_rows_stay_exempt_when_stream_rows_are_shed() {
+        let quota = quota(1);
+        let (spend, _) = ChargedBatch::take_audit(push(1, 0, 0, 0));
+        admitted(admit(&spend, NODE, &ROOMY, &quota));
+        let (over, rows) = ChargedBatch::take_audit(with_stream(push(0, 0, 0, 3), 4));
+        let outcome = admit(&over, NODE, &ROOMY, &quota);
+        assert_eq!(rows.len(), 3, "every audit row is stored");
+        assert_eq!(admitted(outcome).take_stream, 0);
+        assert_eq!(outcome.dropped(), Some((DropReason::NodeQuota, 4)));
+    }
+
+    #[test]
+    fn stream_rows_cost_bytes() {
+        let plain = push(0, 0, 0, 0);
+        let streams = with_stream(push(0, 0, 0, 0), 2);
+        assert!(estimated_bytes(&streams) > estimated_bytes(&plain));
+    }
+
+    #[test]
+    fn the_traffic_split_takes_exactly_the_allowance() {
+        for (allowed, access, stream) in [
+            (0, 3, 4),
+            (5, 3, 4),
+            (7, 3, 4),
+            (9, 3, 4),
+            (2, 0, 5),
+            (2, 5, 0),
+            (1, 1, 1),
+        ] {
+            let (a, s) = split_traffic(allowed, access, stream);
+            assert!(a <= access && s <= stream, "{allowed} of {access}+{stream}");
+            assert_eq!(
+                a + s,
+                allowed.min(access + stream),
+                "{allowed} of {access}+{stream}"
+            );
+        }
     }
 }

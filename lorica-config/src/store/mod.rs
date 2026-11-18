@@ -230,15 +230,22 @@ pub enum TelemetryCursor {
     /// Progress through this node's OWN `audit_log` rows
     /// (Story 9.9 AC #2).
     Audit,
+    /// Progress through the local `stream_access_logs` table
+    /// (Story 12.9 D-i).
+    Stream,
 }
 
 impl TelemetryCursor {
+    /// Every cursor, for the passes that reset or seed them all.
+    pub const ALL: [TelemetryCursor; 4] = [Self::Access, Self::Waf, Self::Audit, Self::Stream];
+
     /// The `cluster_state` key, a compile-time constant of this module.
     pub fn as_key(self) -> &'static str {
         match self {
             Self::Access => "telemetry_access_cursor",
             Self::Waf => "telemetry_waf_cursor",
             Self::Audit => "telemetry_audit_cursor",
+            Self::Stream => "telemetry_stream_cursor",
         }
     }
 }

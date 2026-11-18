@@ -147,21 +147,23 @@ pub(crate) fn spawn_telemetry_drain(
     })
 }
 
-/// Point both cursors at the newest local row, once, when this node
+/// Point every cursor at the newest local row, once, when this node
 /// has never pushed.
 async fn seed_cursors(
     config_store: &Arc<Mutex<ConfigStore>>,
     logs: Arc<LogStore>,
 ) -> Result<(), String> {
-    let (newest_access, newest_waf, newest_audit) = tokio::task::spawn_blocking(move || {
-        Ok::<_, String>((
-            logs.newest_access_id()?,
-            logs.newest_waf_id()?,
-            logs.newest_local_audit_id()?,
-        ))
-    })
-    .await
-    .map_err(|e| format!("the cursor seed task failed: {e}"))??;
+    let (newest_access, newest_waf, newest_audit, newest_stream) =
+        tokio::task::spawn_blocking(move || {
+            Ok::<_, String>((
+                logs.newest_access_id()?,
+                logs.newest_waf_id()?,
+                logs.newest_local_audit_id()?,
+                logs.newest_stream_id()?,
+            ))
+        })
+        .await
+        .map_err(|e| format!("the cursor seed task failed: {e}"))??;
     cursor_write(config_store, move |store| {
         for (kind, newest) in [
             (TelemetryCursor::Access, newest_access),
@@ -172,6 +174,12 @@ async fn seed_cursors(
             // still verifiable there; chaining them into the aggregate
             // would say they were fanned in when they were not.
             (TelemetryCursor::Audit, newest_audit),
+            // Stream rows (Story 12.9 D-i) start at the present too, for
+            // the reason access rows do. A cursor a control plane before
+            // 1.11.0 never let advance still reads 0, so a restart in that
+            // window starts it at the present as well: what the old
+            // control plane refused stays in this node's own log only.
+            (TelemetryCursor::Stream, newest_stream),
         ] {
             let current = store
                 .telemetry_cursor(kind)
@@ -228,7 +236,7 @@ async fn drain_once(
         return Ok(DrainOutcome::CaughtUp);
     };
 
-    let (access_cursor, waf_cursor, audit_cursor) = {
+    let (access_cursor, waf_cursor, audit_cursor, stream_cursor) = {
         let guard = Arc::clone(config_store).lock_owned().await;
         tokio::task::spawn_blocking(move || {
             Ok::<_, String>((
@@ -240,6 +248,9 @@ async fn drain_once(
                     .map_err(|e| e.to_string())?,
                 guard
                     .telemetry_cursor(TelemetryCursor::Audit)
+                    .map_err(|e| e.to_string())?,
+                guard
+                    .telemetry_cursor(TelemetryCursor::Stream)
                     .map_err(|e| e.to_string())?,
             ))
         })
@@ -254,7 +265,7 @@ async fn drain_once(
     // of these stores in this codebase offloads the same way; the one
     // module written to honour that discipline should not be the one
     // that breaks it.
-    let (access, waf, audit) = match logs {
+    let (access, waf, audit, stream) = match logs {
         Some(logs) => {
             let logs = Arc::clone(logs);
             tokio::task::spawn_blocking(move || {
@@ -262,24 +273,31 @@ async fn drain_once(
                     logs.access_rows_after(access_cursor, MAX_TELEMETRY_ROWS)?,
                     logs.waf_rows_after(waf_cursor, MAX_TELEMETRY_ROWS)?,
                     logs.audit_rows_after(audit_cursor, MAX_TELEMETRY_AUDIT)?,
+                    logs.stream_rows_after(stream_cursor, MAX_TELEMETRY_ROWS)?,
                 ))
             })
             .await
             .map_err(|e| format!("the telemetry read task failed: {e}"))??
         }
-        None => (Vec::new(), Vec::new(), Vec::new()),
+        None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
     };
     let ban_snapshot = bans.snapshot().await;
 
     // Nothing new and nothing banned: do not spend a round trip.
-    if access.is_empty() && waf.is_empty() && audit.is_empty() && ban_snapshot.is_empty() {
+    if access.is_empty()
+        && waf.is_empty()
+        && audit.is_empty()
+        && stream.is_empty()
+        && ban_snapshot.is_empty()
+    {
         return Ok(DrainOutcome::CaughtUp);
     }
-    // A full batch on either kind means there is very likely more
-    // behind it, which is what lets one tick ship more than one.
+    // A full batch on any kind means there is very likely more behind
+    // it, which is what lets one tick ship more than one.
     let batch_was_full = access.len() >= MAX_TELEMETRY_ROWS
         || waf.len() >= MAX_TELEMETRY_ROWS
-        || audit.len() >= MAX_TELEMETRY_AUDIT;
+        || audit.len() >= MAX_TELEMETRY_AUDIT
+        || stream.len() >= MAX_TELEMETRY_ROWS;
 
     let next_access = access
         .last()
@@ -290,6 +308,7 @@ async fn drain_once(
         .last()
         .map(|(id, _)| *id as u64)
         .unwrap_or(audit_cursor);
+    let next_stream = stream.last().map_or(stream_cursor, |(id, _)| *id);
 
     let batch = TelemetryPush {
         access: access
@@ -358,6 +377,8 @@ async fn drain_once(
         audit_cursor: next_audit,
         access_cursor: next_access,
         waf_cursor: next_waf,
+        stream: stream.iter().map(|(_, row)| row.to_wire()).collect(),
+        stream_cursor: next_stream,
         // The local writer already counts what it dropped; this field
         // carries it so the control plane can show the gap beside the
         // rows that did arrive.
@@ -366,6 +387,7 @@ async fn drain_once(
     let sent_access = batch.access.len();
     let sent_waf = batch.waf.len();
     let sent_audit = batch.audit.len();
+    let sent_stream = batch.stream.len();
 
     let response = tokio::time::timeout(
         PUSH_DEADLINE,
@@ -402,13 +424,20 @@ async fn drain_once(
     // never a quota decision: it means the control plane could not
     // store them. That cursor stays put and the rows are offered again,
     // which is what the fan-in insert's idempotency is for.
+    //
+    // Stream rows are the case that paragraph foresaw (Story 12.9 D-i):
+    // a control plane before 1.11.0 skips them and answers zero, so
+    // their cursor stays put, the rows wait here, and the other classes
+    // carry on.
     let access_ok = ack.accepted_access as usize == sent_access;
     let waf_ok = ack.accepted_waf as usize == sent_waf;
     let audit_ok = ack.accepted_audit as usize == sent_audit;
+    let stream_ok = ack.accepted_stream as usize == sent_stream;
     let advances: Vec<(TelemetryCursor, u64)> = [
         (TelemetryCursor::Access, access_ok, ack.access_cursor),
         (TelemetryCursor::Waf, waf_ok, ack.waf_cursor),
         (TelemetryCursor::Audit, audit_ok, ack.audit_cursor),
+        (TelemetryCursor::Stream, stream_ok, ack.stream_cursor),
     ]
     .into_iter()
     .filter(|(_, ok, _)| *ok)
@@ -425,12 +454,13 @@ async fn drain_once(
         })
         .await?;
     }
-    let accepted_all = access_ok && waf_ok && audit_ok;
+    let accepted_all = access_ok && waf_ok && audit_ok && stream_ok;
     if accepted_all {
         debug!(
             access = sent_access,
             waf = sent_waf,
             audit = sent_audit,
+            stream = sent_stream,
             "telemetry delivered to the control plane"
         );
     } else {
@@ -438,9 +468,11 @@ async fn drain_once(
             sent_access,
             sent_waf,
             sent_audit,
+            sent_stream,
             accepted_access = ack.accepted_access,
             accepted_waf = ack.accepted_waf,
             accepted_audit = ack.accepted_audit,
+            accepted_stream = ack.accepted_stream,
             retry_after_s = ack.retry_after_s,
             "the control plane accepted part of the telemetry batch; the cursor of each short \
              class stays put so nothing is lost, and the rest is offered again"

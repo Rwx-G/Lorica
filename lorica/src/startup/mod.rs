@@ -388,11 +388,12 @@ pub(crate) fn spawn_retention_loop(
             // from its control plane for longer than local retention, the
             // difference is rows the fleet view will never hold, and a
             // quiet edge and a truncated one look the same without a count.
-            let (access_cursor, waf_cursor) = {
+            let (access_cursor, waf_cursor, stream_cursor) = {
                 let s = retention_config_store.lock().await;
                 (
                     s.telemetry_cursor(TelemetryCursor::Access).ok(),
                     s.telemetry_cursor(TelemetryCursor::Waf).ok(),
+                    s.telemetry_cursor(TelemetryCursor::Stream).ok(),
                 )
             };
             if let Some(logs) = &retention_log_store {
@@ -420,11 +421,28 @@ pub(crate) fn spawn_retention_loop(
                 }
                 // Its own row count (Story 12.9 D-b), so a chatty UDP
                 // stream never evicts HTTP rows nor the reverse; `0` is
-                // unlimited. The fleet drain ships no stream row yet, so
-                // there is no cursor to count against.
+                // unlimited. Counted against the fleet drain's stream
+                // cursor as the access rows are against theirs (D-i).
                 if let Ok(max @ 1..) = u64::try_from(stream_retention) {
-                    if let Err(e) = logs.enforce_stream_retention(max, None) {
-                        tracing::warn!(error = %e, "stream log retention cleanup failed");
+                    match logs.enforce_stream_retention(max, stream_cursor) {
+                        Ok(outcome) => {
+                            if outcome.undrained > 0 {
+                                tracing::warn!(
+                                    rows = outcome.undrained,
+                                    deleted = outcome.deleted,
+                                    "stream log retention removed rows the cluster \
+                                     drain had not sent; the fleet view is short by \
+                                     that many"
+                                );
+                                lorica_api::metrics::inc_cluster_telemetry_lost_to_retention(
+                                    "stream",
+                                    outcome.undrained,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "stream log retention cleanup failed");
+                        }
                     }
                 }
             }
@@ -474,10 +492,7 @@ pub(crate) fn spawn_retention_loop(
                             total += reclaimed;
                             continue;
                         }
-                        for table in [
-                            lorica_fleet::telemetry_store::TelemetryTable::Access,
-                            lorica_fleet::telemetry_store::TelemetryTable::Waf,
-                        ] {
+                        for table in lorica_fleet::telemetry_store::TelemetryTable::ALL {
                             total += telemetry.enforce_node_quota(
                                 table,
                                 node_id,
