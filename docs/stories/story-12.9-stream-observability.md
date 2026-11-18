@@ -742,21 +742,21 @@ Allowlist: `lorica/src/stream_log.rs` (new), `lorica/src/stream_engine.rs`,
 `lorica/src/otel.rs`, `lorica/src/reload.rs`, `lorica/src/health.rs`,
 `lorica/src/proxy_wiring/lb.rs`, `lorica/tests/*` (new files only).
 
-- [ ] `StreamLogObserver`: record to row, store, sinks, SLA collector
+- [x] `StreamLogObserver`: record to row, store, sinks, SLA collector
       (D-a, D-c, D-g); installed at both `stream_engine.rs` sites.
-- [ ] Worker: `stream_counters` and the sink gauges in each metrics report;
+- [x] Worker: `stream_counters` and the sink gauges in each metrics report;
       supervisor: apply to `StreamMetricsCollector`, prune on table change,
       `stream_listener_up` and `stream_info` from the stream plane, UDP
       `active` and `pending` from the region.
-- [ ] `record_failure` returns the open transition; `stream_backend_down`
+- [x] `record_failure` returns the open transition; `stream_backend_down`
       from the supervisor registry and the single-process adapter, with
       the hold; `stream_udp_ceiling_reached` from the aggregate (D-h).
-- [ ] `backend_down` details gain `streams` (D-h).
-- [ ] OTLP: `SinkPayload::Stream` in `emit_sink_event`, the export-outcome
+- [x] `backend_down` details gain `streams` (D-h).
+- [x] OTLP: `SinkPayload::Stream` in `emit_sink_event`, the export-outcome
       wrapper, the stream toggle in `init_logs` / `register_lane` (D-d,
       D-f); reload carries the new toggles.
-- [ ] Shutdown order (D-k).
-- [ ] Tests: a TCP connection through a single process writes one row with
+- [x] Shutdown order (D-k).
+- [x] Tests: a TCP connection through a single process writes one row with
       every D-a field right; `node_shutdown` row on stop; a refused flood
       writes the bounded rows; the supervisor aggregate of two simulated
       workers; the breaker alert once per incident and held; the ceiling
@@ -1439,6 +1439,108 @@ edited here.
 - Lot E gates, `rust:1-bookworm` with `CARGO_BUILD_WARNINGS=deny`: the
   CI chain green (3,665 product, 957 `lorica`, 915 forked, 592
   TLS-featured tests) and `cargo audit` clean.
+- Lot F, 2026-11-18, on Lot E (`6062c8e8`). What each hand-off became:
+  - **Observer (A, C1, D).** `lorica::stream_log::StreamLogObserver`
+    replaces `LogObserver` (both `stream_engine.rs` construction sites
+    are one function, `stream_engines`, which now takes it). Every
+    record, admitted refusal and suppressed count becomes a row through
+    `StreamLogEntry::from_*`, offered to `publish_stream` and to the
+    process writer's `enqueue_stream` (the `LogStoreSlot`'s, so a store
+    that opens late is written from then on). `connect_outcome` maps
+    onto `StreamSlaOutcome` as Lot A proposed; a UDP stream owing no
+    response is judged in `observe` from its end reason. The observer
+    learns which streams owe none from the UDP engine's table: the
+    engine is wrapped (`ObservedUdp`) so the observer is told every
+    table the engine is. Lot A's gap, decided here: such a session that
+    ends `no_healthy_backend` is a failure (`TcpNotConnected`, which
+    Lot D documents as "connect_failed or no_healthy_backend").
+  - **Report (E, C2).** `lorica::stream_report` converts
+    `CountersSnapshot` to the wire type and back; a worker installs its
+    engines' counters at start and `WorkerMetricsCtx::build_report`
+    (both report paths) carries them, with
+    `snapshot_per_worker_gauges()` chained beside the counters. The
+    supervisor applies them with `apply_worker_report` at both report
+    sites; `forget_worker_generic_counters` already forgets a dead
+    worker's stream counters.
+  - **Plane (C2).** `PlaneWatch` on `StreamPlaneHandle`: after every
+    pass (before and after a commit, the retry tick, a health refresh)
+    the table, read as the plane reads it, goes to
+    `StreamMetricsCollector::retain` and the stream alerts, and the SLA
+    breach series of a stream that left are dropped
+    (`forget_stream_sla_breaches`); every caps tick (1 s) sets the
+    node gauges (`NodeStreamGauges::udp`/`::tcp`) from the regions and
+    checks each UDP stream's ceiling. `set_bind_states` once at start.
+    Both modes: single-process also gets `set_local_counters`.
+  - **SLA (D, C3).** `start_alerting_stack` builds the stream
+    collector beside the route one, loads its targets, starts its flush
+    task with the dispatcher (supervisor and single process) and puts
+    it in `AppState.stream_sla_collector`. A worker builds its own,
+    flushes with `None`. Every process registers its collector with
+    `reload::register_stream_sla_collector`, and
+    `apply_per_process_reload_state`, which every reload path of the
+    three modes already runs, reloads its targets.
+  - **Retention (C1).** `enforce_stream_retention` in the hourly loop
+    beside the access-log pass, skipped at `0`, no drain cursor (Lot G).
+  - **OTLP (C1, C2).** `ObservedLogExporter` wraps the SDK exporter:
+    each export call's outcome sets `lorica_log_sink_up{sink="otlp"}`;
+    a successful `init_logs` sets 1, a failed one 0, an unconfigured
+    OTLP lane clears it. A generation counter keeps a replaced
+    exporter's last batch from overwriting its successor's state.
+  - **Alerts (A, B).** `lorica::stream_alerts::StreamAlerts`, one per
+    node. `CircuitBreaker::record_failure` and the supervisor registry's
+    `report` return whether they opened a closed circuit (a failed
+    half-open probe is the same incident); the registry's
+    `report_outcome` and, in single-process mode,
+    `StreamBreakerGate::with_alerts` pass a stream's opening on. Held
+    5 minutes per (stream, backend). `stream_udp_ceiling_reached`: the
+    node's aggregated `counter_total(CeilingReached)` (supervisor) or
+    the process's own counter (single process) growing while the
+    stream is not at its ceiling; re-armed below
+    `CEILING_REARM_PERCENT` of the region's session count; the detail
+    `ceiling_bound_by` is the budget's `CeilingBound` at the last pass.
+    `backend_down` gains `streams` (sorted names, 20 then `and N more`),
+    only for a backend some stream links.
+  - **Shutdown (D-k).** Single process: the drain, `stream_runtime.stop()`
+    (joins the stream thread, so every drained record has been
+    observed), then `flush_rows_at_exit` (the writer's barrier, 3 s at
+    most), then `otel::shutdown` (sinks). Worker: the drain watcher's
+    exit, then the same flush, then the sinks, in both exit paths.
+- **Residual, outside this Lot's files:** the engines finish a
+  connection's tracker entry before they hand its record to the
+  observer (`tcp/engine.rs`, `udp/engine.rs`: `finish`, then
+  `admission.ended`), so a worker's drain watcher polling the tracker
+  can see it empty a few instructions before the last `observe` runs.
+  The process test finds its `node_shutdown` row in both modes, but the
+  window is not closed by construction; closing it means reporting the
+  end before the entry leaves the tracker, a `lorica-stream` change.
+- **Deviations.** Three new modules rather than one (`stream_log.rs`,
+  `stream_report.rs`, `stream_alerts.rs`): the wire conversion and the
+  alert state are not the observer's. `UdpSettings::expects_responses`
+  (`lorica-config`) now holds the rule `Bounds::expects_responses`
+  (`lorica-stream/src/udp/session.rs`) held privately, so the observer
+  reads the same predicate the engine applies; `NodeCapsRegions::pending`
+  (`lorica-stream/src/caps.rs`) sums the regions' pending counts as
+  `sessions` sums their totals. `worker_rpc.rs` (the report builder) and
+  `lorica/tests/stream_tls_wiring.rs` (the new `stream_engines`
+  argument) are outside the allowlist and needed.
+- **Tests.** `lorica/tests/stream_observability_process_test.rs`, both
+  modes: a refused connection's row (`source_denied`, client, port), a
+  burst of 20 more bounded to one `ended` row per refusing process plus
+  `refusals_suppressed` counts adding up to 21, an idle-timeout row
+  with every D-a field checked, a `config_removed` row after a stream
+  `DELETE` through the API, `lorica_stream_ended_total`,
+  `lorica_stream_refused_total` and `lorica_stream_bytes_total` above
+  zero on `/api/v1/metrics` (worker mode: from the workers' reports),
+  and a `node_shutdown` row in the store after `SIGTERM`. Unit tests:
+  the report round trip with every enum word, two workers summing,
+  the observer's verdicts, the breaker edge (`lb.rs`), the registry's
+  alert once per incident and held (`supervisor.rs`), the backend hold
+  and the ceiling alert once for two workers' edges
+  (`stream_alerts.rs`), the OTLP wrapper's generations (`otel.rs`), the
+  `streams` detail (`health.rs`), `NodeCapsRegions::pending`.
+- Lot F gates, `rust:1-bookworm` with `CARGO_BUILD_WARNINGS=deny`: the
+  CI chain green (3,665 product, 976 `lorica`, 915 forked, 592
+  TLS-featured tests) and `cargo audit` clean.
 
 ## File List
 
@@ -1502,6 +1604,17 @@ edited here.
   `lorica-api/src/stream_logs.rs`, `lorica-mcp/src/tools.rs`, both
   OpenAPI documents (Lot C3, the stream log, with Story 12.10 Lot B)
 - `lorica-command/src/messages.rs`, `lorica-command/src/lib.rs` (Lot E)
+- `lorica/src/stream_log.rs`, `stream_report.rs`, `stream_alerts.rs`
+  (new), `lorica/src/lib.rs`, `stream_engine.rs`, `otel.rs`,
+  `reload.rs`, `health.rs`, `proxy_wiring/lb.rs`,
+  `proxy_wiring/worker_rpc.rs` (Lot F)
+- `lorica/src/startup/mod.rs`, `single.rs`, `supervisor.rs`,
+  `worker.rs`, `stream_plane.rs` (Lot F)
+- `lorica/tests/stream_observability_process_test.rs` (new),
+  `lorica/tests/stream_tls_wiring.rs` (Lot F)
+- `lorica-config/src/models/stream.rs` (`UdpSettings::expects_responses`),
+  `lorica-stream/src/udp/session.rs`, `lorica-stream/src/caps.rs`
+  (`NodeCapsRegions::pending`) (Lot F)
 
 ## Change Log
 
@@ -1518,4 +1631,5 @@ edited here.
 | 2026-11-18 | 0.10 | Lot C3, in part: the stream SLA management routes, `GET /automation/v1/sla/streams/{id}` under `sla:read` and the MCP tool `lorica_sla_stream`, both OpenAPI documents. The overview `streams` field is not buildable as D-g words it (maintainer to decide); the stream-log reads wait for 12.10 Lot B. Gates on the final tree: the CI chain green (3,653 product, 957 `lorica`, 910 forked, 592 TLS-featured tests) and `cargo audit` clean after lettre 0.11.24. | Romain G. |
 | 2026-11-18 | 0.11 | Lot C3, the stream log: `GET /automation/v1/stream-logs` behind `streams:read` and `logs:read`, empty for a hostname-confined token, the 403 and the audit row naming the scope missing, and the MCP tool `lorica_stream_logs`, both OpenAPI documents; shipped with Story 12.10 Lot B. The overview `streams` field stays open. | Romain G. |
 | 2026-11-18 | 0.12 | Lot E: the worker metrics report carries the stream counters, typed, every keyed family by its enum's word. | Romain G. |
+| 2026-11-18 | 0.13 | Lot F: the stream observer writes rows and judges the SLA, workers report their stream counters and gauges, the plane prunes and sets the node gauges, `stream_backend_down` and `stream_udp_ceiling_reached` raised, `backend_down` names its streams, OTLP export outcome in `lorica_log_sink_up`, stream retention, rows flushed before the sinks at a stop; process tests in both modes. | Romain G. |
 | 2026-11-18 | 0.9 | Lot C1: `stream_access_logs` with its own retention and writer queue, `StreamLogEntry` built from the stream records, `/api/v1/stream-logs` with export and clear, the three settings in the settings API, the `stream` sink kind, and a syslog up state that follows the collector without traffic. | Romain G. |

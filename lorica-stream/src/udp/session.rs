@@ -66,6 +66,7 @@ pub(crate) struct Bounds {
     responses_per_request: u64,
     bytes_ratio: u64,
     unbounded: bool,
+    expects_responses: bool,
     max_datagram: usize,
 }
 
@@ -76,14 +77,16 @@ impl Bounds {
             responses_per_request: u64::from(udp.responses_per_request),
             bytes_ratio: u64::from(udp.response_bytes_ratio),
             unbounded: udp.unbounded_responses,
+            expects_responses: udp.expects_responses(),
             max_datagram: udp.max_datagram_bytes as usize,
         }
     }
 
     /// Whether a session must hear back: a silent backend is then a
-    /// failure at the idle timeout (D-i).
+    /// failure at the idle timeout (D-i). The settings' own
+    /// [`UdpSettings::expects_responses`], which the stream SLA reads too.
     pub(crate) fn expects_responses(&self) -> bool {
-        !self.unbounded && self.responses_per_request >= 1
+        self.expects_responses
     }
 
     /// Whether the session ends right after its last request, there being

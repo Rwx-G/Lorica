@@ -340,24 +340,32 @@ impl CircuitBreaker {
         }
     }
 
-    /// Record a failure. Increments the counter and opens the circuit if threshold is reached.
-    pub fn record_failure(&self, route_id: &str, addr: &str) {
+    /// The consecutive failures that open a circuit.
+    pub fn threshold(&self) -> u32 {
+        self.threshold
+    }
+
+    /// Record a failure. Increments the counter and opens the circuit if
+    /// threshold is reached. Returns whether this failure opened a closed
+    /// circuit: the start of an incident, which a stream reports as
+    /// `stream_backend_down` (Story 12.9 D-h). A failed half-open probe
+    /// re-opens the circuit within the same incident and returns `false`;
+    /// HTTP callers ignore the value.
+    pub fn record_failure(&self, route_id: &str, addr: &str) -> bool {
         // Fast path: known (route, backend) pair, `&str` lookups only.
         // The `get_mut` guard must not outlive the early return: an
         // `entry()` insert on the same inner map while its shard ref
         // is alive would deadlock, hence the staged shape below.
         if let Some(route_states) = self.states.get(route_id) {
             if let Some(mut entry) = route_states.get_mut(addr) {
-                self.bump_failure(&mut entry, route_id, addr);
-                return;
+                return self.bump_failure(&mut entry, route_id, addr);
             }
             // Known route, first-seen backend: the inner guard from the
             // miss above is dropped, only the outer shard ref is held.
             let mut entry = route_states
                 .entry(addr.to_string())
                 .or_insert_with(CircuitBreakerState::closed);
-            self.bump_failure(&mut entry, route_id, addr);
-            return;
+            return self.bump_failure(&mut entry, route_id, addr);
         }
         // First-seen route: the outer `get` miss guard is dropped at the
         // end of the `if let` above, so the upsert cannot self-deadlock.
@@ -365,14 +373,16 @@ impl CircuitBreaker {
         let mut entry = route_states
             .entry(addr.to_string())
             .or_insert_with(CircuitBreakerState::closed);
-        self.bump_failure(&mut entry, route_id, addr);
+        self.bump_failure(&mut entry, route_id, addr)
     }
 
     /// Shared tail of [`Self::record_failure`]: bump the consecutive
-    /// counter and open the circuit at the threshold.
-    fn bump_failure(&self, entry: &mut CircuitBreakerState, route_id: &str, addr: &str) {
+    /// counter and open the circuit at the threshold. Returns whether it
+    /// opened a closed circuit.
+    fn bump_failure(&self, entry: &mut CircuitBreakerState, route_id: &str, addr: &str) -> bool {
         entry.failures += 1;
         if entry.failures >= self.threshold && entry.state != CircuitStatus::Open {
+            let was_closed = entry.state == CircuitStatus::Closed;
             entry.state = CircuitStatus::Open;
             entry.changed_at = Instant::now();
             tracing::warn!(
@@ -382,6 +392,35 @@ impl CircuitBreaker {
                 cooldown_s = self.cooldown_s,
                 "circuit breaker opened - backend removed from rotation for this route"
             );
+            return was_closed;
         }
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_failure_reports_only_the_closed_to_open_edge() {
+        let breaker = CircuitBreaker::new(2, 0);
+        let (route, backend) = ("stream:s1", "192.0.2.10:53");
+        assert!(!breaker.record_failure(route, backend));
+        assert!(
+            breaker.record_failure(route, backend),
+            "the threshold opens it"
+        );
+        assert!(!breaker.record_failure(route, backend), "already open");
+        // A zero cooldown lets the next check probe: half-open.
+        assert!(breaker.is_available(route, backend));
+        assert!(
+            !breaker.record_failure(route, backend),
+            "a failed probe is the same incident"
+        );
+        breaker.record_success(route, backend);
+        assert!(!breaker.record_failure(route, backend));
+        assert!(breaker.record_failure(route, backend), "a new incident");
+        assert_eq!(breaker.threshold(), 2);
     }
 }

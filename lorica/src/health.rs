@@ -491,17 +491,22 @@ async fn persist_health_flips(health: &HealthLoop, commits: &[HealthFlip]) -> bo
         // a payload, never a byte the backend sent.
         if let ProbeResult::Down(reason) = outcome.result {
             if let Some(ref sender) = health.alert_sender {
-                sender.send(
-                    lorica_notify::AlertEvent::new(
-                        lorica_notify::events::AlertType::BackendDown,
-                        format!("Backend {} is down", backend.address),
-                    )
-                    .with_detail("backend_id", backend.id.clone())
-                    .with_detail("address", backend.address.clone())
-                    .with_detail("name", backend.name.clone())
-                    .with_detail("check", check_label(&backend.health_check))
-                    .with_detail("reason", reason.as_str()),
-                );
+                let alert = lorica_notify::AlertEvent::new(
+                    lorica_notify::events::AlertType::BackendDown,
+                    format!("Backend {} is down", backend.address),
+                )
+                .with_detail("backend_id", backend.id.clone())
+                .with_detail("address", backend.address.clone())
+                .with_detail("name", backend.name.clone())
+                .with_detail("check", check_label(&backend.health_check))
+                .with_detail("reason", reason.as_str());
+                // A stream operator learns the flip is theirs from the
+                // same alert (Story 12.9 D-h).
+                let alert = match linked_stream_names(&store, &backend.id) {
+                    Some(streams) => alert.with_detail("streams", streams),
+                    None => alert,
+                };
+                sender.send(alert);
             }
         }
 
@@ -519,6 +524,50 @@ async fn persist_health_flips(health: &HealthLoop, commits: &[HealthFlip]) -> bo
         }
     }
     changed
+}
+
+/// The most stream names a `backend_down` alert lists before it counts
+/// the rest.
+const BACKEND_DOWN_STREAMS_LISTED: usize = 20;
+
+/// The `streams` detail of a `backend_down` alert: the names of the
+/// streams linked to `backend_id`, sorted, `None` for a backend no
+/// stream uses. A store that cannot be read leaves the detail out
+/// rather than the alert.
+fn linked_stream_names(store: &ConfigStore, backend_id: &str) -> Option<String> {
+    let links = store.list_stream_backends().ok()?;
+    let streams = store.list_streams().ok()?;
+    let mut names: Vec<String> = streams
+        .into_iter()
+        .filter(|stream| {
+            links
+                .iter()
+                .any(|link| link.stream_id == stream.id && link.backend_id == backend_id)
+        })
+        .map(|stream| stream.name)
+        .collect();
+    names.sort_unstable();
+    stream_names_detail(&names)
+}
+
+/// `names` as one detail: at most [`BACKEND_DOWN_STREAMS_LISTED`],
+/// then `and N more`.
+fn stream_names_detail(names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let listed = names
+        .iter()
+        .take(BACKEND_DOWN_STREAMS_LISTED)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = names.len().saturating_sub(BACKEND_DOWN_STREAMS_LISTED);
+    Some(if more > 0 {
+        format!("{listed} and {more} more")
+    } else {
+        listed
+    })
 }
 
 /// What a notification names a check by: its template, or its kind.
@@ -2143,5 +2192,55 @@ mod tests {
             &HealthStatus::Down,
             1
         ));
+    }
+
+    #[test]
+    fn the_streams_detail_lists_twenty_names_then_counts_the_rest() {
+        assert_eq!(stream_names_detail(&[]), None);
+        let few: Vec<String> = vec!["dns".into(), "pg".into()];
+        assert_eq!(stream_names_detail(&few).as_deref(), Some("dns, pg"));
+        let many: Vec<String> = (0..BACKEND_DOWN_STREAMS_LISTED + 3)
+            .map(|i| format!("s{i:02}"))
+            .collect();
+        let detail = stream_names_detail(&many).expect("a detail");
+        assert!(detail.ends_with(" and 3 more"), "{detail}");
+        assert_eq!(
+            detail.matches(", ").count(),
+            BACKEND_DOWN_STREAMS_LISTED - 1,
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_streams_detail_names_the_streams_linked_to_the_backend() {
+        let backend = backend_checked_by(None, false);
+        let store = store_holding(&backend).await;
+        let store = store.lock().await;
+        assert_eq!(linked_stream_names(&store, &backend.id), None);
+        const PG: &str = "6f1c1a52-5b0e-4f7e-9a51-1a7c5a1b2c02";
+        const DNS: &str = "6f1c1a52-5b0e-4f7e-9a51-1a7c5a1b2c01";
+        const OTHER: &str = "6f1c1a52-5b0e-4f7e-9a51-1a7c5a1b2c03";
+        for (id, name, port) in [(PG, "pg", 5432), (DNS, "dns", 53), (OTHER, "other", 6000)] {
+            store
+                .create_stream(&lorica_config::models::Stream::new(
+                    id.into(),
+                    name.into(),
+                    lorica_config::models::StreamProtocol::Tcp,
+                    "127.0.0.1".parse().expect("an address"),
+                    port,
+                    port,
+                    chrono::Utc::now(),
+                ))
+                .expect("test setup: stream");
+        }
+        for id in [DNS, PG] {
+            store
+                .set_stream_backends(id, std::slice::from_ref(&backend.id))
+                .expect("test setup: link");
+        }
+        assert_eq!(
+            linked_stream_names(&store, &backend.id).as_deref(),
+            Some("dns, pg")
+        );
     }
 }

@@ -31,7 +31,7 @@ use crate::cli::Cli;
 use crate::startup;
 use crate::startup::log_store_health::LogStoreRole;
 use crate::startup::stream_plane::{
-    InProcessLink, PlaneRole, StoreStreamTable, StreamPlane, StreamPlaneHandle,
+    InProcessLink, PlaneRole, PlaneWatch, StoreStreamTable, StreamPlane, StreamPlaneHandle,
     STREAM_CTL_ACK_TIMEOUT,
 };
 
@@ -201,6 +201,7 @@ pub(crate) fn run_single_process(cli: Cli) {
             notification_history,
             probe_scheduler,
             sla_collector,
+            stream_sla_collector,
         } = startup::start_alerting_stack(&store, &alert_sender, log_store.clone()).await;
         let _log_store_retry = startup::log_store_health::spawn_log_store_retry(
             log_store.clone(),
@@ -554,30 +555,55 @@ pub(crate) fn run_single_process(cli: Cli) {
         };
         let (stream_peer, stream_transport) =
             lorica_stream::ControlTransport::in_process_pair(STREAM_CHANNEL_CAPACITY);
+        // Stream observability (Story 12.9): this process is the whole
+        // node, so it writes the rows, judges the SLA, renders its own
+        // counters at scrape and raises the stream alerts itself.
+        let stream_role = PlaneRole::of(&cluster_runtime);
+        let stream_breaker_threshold = match &stream_breaker_engine {
+            lorica::proxy_wiring::BreakerEngine::Local(breaker) => breaker.threshold(),
+            // Single-process mode builds only its local breaker.
+            lorica::proxy_wiring::BreakerEngine::Rpc { .. } => 0,
+        };
+        let stream_alerts = Arc::new(lorica::stream_alerts::StreamAlerts::new(
+            alert_sender.clone(),
+            stream_role.label(),
+            stream_breaker_threshold,
+        ));
+        let stream_observer = Arc::new(lorica::stream_log::StreamLogObserver::new(
+            log_store.clone(),
+            Arc::clone(&stream_sla_collector),
+        ));
+        // The TCP engine (Story 12.3) and the UDP engine (Story 12.5),
+        // over one selector and one resolver cache. TLS streams terminate
+        // on the resolver the HTTPS listener answers from, which the
+        // reload loop below swaps on every certificate change (Story
+        // 12.4). Sources are judged by the HTTP listeners' connection
+        // filter, IP blocklist, WAF whitelist and GeoIP resolver, every
+        // one loaded above and reloaded in place by the same paths
+        // (Story 12.6).
+        let stream_engines = lorica::stream_engine::stream_engines(
+            Arc::new(
+                lorica::stream_engine::StreamBreakerGate::with_engine(stream_breaker_engine)
+                    .with_alerts(Arc::clone(&stream_alerts)),
+            ),
+            Arc::new(lorica::stream_engine::HickoryResolve::from_system_conf()),
+            Some(process_reserved_ports),
+            lorica::stream_engine::stream_tls_parts(Arc::clone(&cert_resolver)),
+            Arc::new(lorica::stream_engine::StreamSourceGate::new(
+                Arc::clone(&connection_filter),
+                Arc::clone(&waf_engine),
+                Arc::clone(&proxy_config),
+                stream_geoip_resolver,
+            )),
+            stream_observer,
+        );
+        let stream_counters = Arc::clone(&stream_engines.counters);
+        lorica_api::stream_metrics::stream_metrics()
+            .set_local_counters(Arc::clone(&stream_counters));
+        lorica_api::stream_metrics::stream_metrics().set_bind_states(stream_states.clone());
         let stream_runtime = match lorica_stream::StreamRuntime::spawn(
             stream_transport,
-            // The TCP engine (Story 12.3) and the UDP engine (Story
-            // 12.5), over one selector and one resolver cache. TLS
-            // streams terminate on the resolver the HTTPS listener
-            // answers from, which the reload loop below swaps on every
-            // certificate change (Story 12.4). Sources are judged by the
-            // HTTP listeners' connection filter, IP blocklist, WAF
-            // whitelist and GeoIP resolver, every one loaded above and
-            // reloaded in place by the same paths (Story 12.6).
-            lorica::stream_engine::stream_engines(
-                Arc::new(lorica::stream_engine::StreamBreakerGate::with_engine(
-                    stream_breaker_engine,
-                )),
-                Arc::new(lorica::stream_engine::HickoryResolve::from_system_conf()),
-                Some(process_reserved_ports),
-                lorica::stream_engine::stream_tls_parts(Arc::clone(&cert_resolver)),
-                Arc::new(lorica::stream_engine::StreamSourceGate::new(
-                    Arc::clone(&connection_filter),
-                    Arc::clone(&waf_engine),
-                    Arc::clone(&proxy_config),
-                    stream_geoip_resolver,
-                )),
-            ),
+            stream_engines,
             stream_source as Arc<dyn lorica_stream::StreamTableSource>,
         ) {
             Ok(handle) => handle,
@@ -596,10 +622,23 @@ pub(crate) fn run_single_process(cli: Cli) {
                 STREAM_CTL_ACK_TIMEOUT,
             ),
             Arc::clone(&store),
-            PlaneRole::of(&cluster_runtime),
+            stream_role,
             Some(log_store.clone()),
             alert_sender.clone(),
-        );
+        )
+        // The process's counters are the node's: a stream's ceiling
+        // edges are its own.
+        .with_watch(PlaneWatch::new(
+            stream_alerts,
+            lorica_api::stream_metrics::stream_metrics().clone(),
+            move |stream_id| {
+                stream_counters
+                    .snapshot()
+                    .streams
+                    .get(stream_id)
+                    .map_or(0, |s| s.ceiling_reached)
+            },
+        ));
 
         let api_handle = tokio::spawn(async move {
             let state = AppState {
@@ -631,7 +670,7 @@ pub(crate) fn run_single_process(cli: Cli) {
                 acme_challenge_store: Some(acme_challenge_store),
                 pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
-                stream_sla_collector: None,
+                stream_sla_collector: Some(Arc::clone(&stream_sla_collector)),
                 load_test_engine: Some(Arc::clone(&load_test_engine)),
                 notification_history: Some(notification_history),
                 log_store: api_log_store,
@@ -810,7 +849,12 @@ pub(crate) fn run_single_process(cli: Cli) {
             Ok(end) => info!(?end, "drain finished"),
             Err(e) => warn!(error = %e, "drain watcher failed; stopping without it"),
         }
+        // Joins the stream thread: every record of the drain, the
+        // `node_shutdown` ones included, has been observed once it returns.
         stream_runtime.stop();
+        // Then the rows reach the store, before the sinks drain in
+        // `otel::shutdown` below (Story 12.9 D-k).
+        lorica::stream_log::flush_rows_at_exit(&log_store).await;
 
         // Drain tracked background tasks and cluster units in flight
         // before tearing down the API server, each bounded so a hung

@@ -214,6 +214,28 @@ pub async fn apply_per_process_reload_state(store: &Arc<Mutex<ConfigStore>>) {
     rebuild_merged_crawlers(store).await;
     apply_log_sinks_from_store(store).await;
     apply_automation_allowlist_from_store(store).await;
+    apply_stream_sla_configs_from_store(store).await;
+}
+
+/// The stream SLA collector of this process, registered by its startup
+/// ([`register_stream_sla_collector`]).
+static STREAM_SLA_COLLECTOR: std::sync::OnceLock<Arc<lorica_bench::StreamSlaCollector>> =
+    std::sync::OnceLock::new();
+
+/// Register the process's stream SLA collector, whose targets every
+/// reload re-reads (Story 12.9 D-g): a worker judges its streams'
+/// connections against them, so a target edited on the dashboard must
+/// reach it without a restart. A second call keeps the first.
+pub fn register_stream_sla_collector(collector: Arc<lorica_bench::StreamSlaCollector>) {
+    let _ = STREAM_SLA_COLLECTOR.set(collector);
+}
+
+/// Reload the registered stream SLA collector's targets; a no-op in a
+/// process that registered none.
+async fn apply_stream_sla_configs_from_store(store: &Arc<Mutex<ConfigStore>>) {
+    if let Some(collector) = STREAM_SLA_COLLECTOR.get() {
+        collector.load_configs(&*store.lock().await);
+    }
 }
 
 /// Re-apply `automation_allowed_cidrs` to the automation listener this
@@ -1006,11 +1028,16 @@ fn install_log_sinks(next: &LogSinksSnapshot) {
                 "OTLP logs sink (re)installed from settings"
             ),
             Err(e) => {
+                // Configured and not running: down, never absent, so a
+                // lane that never came up does not read as "not
+                // configured" (Story 12.9 D-f).
+                lorica_api::metrics::set_log_sink_up("otlp", false);
                 warn!(error = %e, "OTLP logs sink init failed; no otlp lane is registered")
             }
         }
     } else {
         crate::otel::shutdown_logs();
+        lorica_api::metrics::clear_log_sink_up("otlp");
     }
     if let Some(syslog) = &next.sinks.syslog {
         info!(

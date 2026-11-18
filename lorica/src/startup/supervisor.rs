@@ -785,6 +785,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
             notification_history: _,
             probe_scheduler,
             sla_collector,
+            stream_sla_collector,
         } = startup::start_alerting_stack(&store, &alert_sender, log_store.clone()).await;
         let _log_store_retry = startup::log_store_health::spawn_log_store_retry(
             log_store.clone(),
@@ -1051,13 +1052,39 @@ pub(crate) fn run_supervisor(cli: Cli) {
                         .collect(),
                 );
             }
+            // Stream observability (Story 12.9): the workers count and
+            // log; this process sees the node, so it renders the
+            // aggregate, reads the regions and raises the stream alerts.
+            let role = stream_plane::PlaneRole::of(&cluster_runtime);
+            let stream_alerts = Arc::new(lorica::stream_alerts::StreamAlerts::new(
+                alert_sender.clone(),
+                role.label(),
+                breaker_registry.failure_threshold,
+            ));
+            breaker_registry.set_stream_alerts(Arc::clone(&stream_alerts));
+            let metrics = lorica_api::stream_metrics::stream_metrics();
+            metrics.set_bind_states(stream_states.clone());
             stream_plane::StreamPlaneHandle::new(
                 plane,
                 Arc::clone(&store),
-                stream_plane::PlaneRole::of(&cluster_runtime),
+                role,
                 Some(log_store.clone()),
                 alert_sender.clone(),
             )
+            .with_watch(stream_plane::PlaneWatch::new(
+                stream_alerts,
+                metrics.clone(),
+                // Each worker sees its own edge: the node's count is the
+                // aggregate of every worker's reports.
+                |stream_id| {
+                    lorica_api::stream_metrics::stream_metrics()
+                        .counter_total(
+                            lorica_api::stream_metrics::StreamFamily::CeilingReached,
+                            &[stream_id],
+                        )
+                        .unwrap_or(0)
+                },
+            ))
         };
 
         // Start health check background task (runs in supervisor, not
@@ -1137,7 +1164,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 acme_challenge_store: Some(lorica_api::acme::AcmeChallengeStore::with_db_path(api_db_path)),
                 pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
-                stream_sla_collector: None,
+                stream_sla_collector: Some(Arc::clone(&stream_sla_collector)),
                 load_test_engine: Some(load_test_engine),
                 notification_history: {
                     let d = notify_dispatcher.lock().await;
@@ -2014,6 +2041,11 @@ fn spawn_worker_channel_task(
                                     worker_id,
                                     &gc,
                                 );
+                                lorica::stream_report::apply_worker_report(
+                                    lorica_api::stream_metrics::stream_metrics(),
+                                    worker_id,
+                                    &report,
+                                );
                             }
                         }
                         Err(e) => {
@@ -2336,6 +2368,10 @@ struct SupervisorBreakerRegistry {
     entries: dashmap::DashMap<String, parking_lot::Mutex<SupervisorBreakerEntry>>,
     failure_threshold: u32,
     cooldown: Duration,
+    /// Where a stream's opened circuit is reported (Story 12.9 D-h),
+    /// set once the alert channel and the stream plane exist, after the
+    /// first RPC handlers already hold the registry.
+    stream_alerts: std::sync::OnceLock<Arc<lorica::stream_alerts::StreamAlerts>>,
 }
 
 impl SupervisorBreakerRegistry {
@@ -2344,6 +2380,25 @@ impl SupervisorBreakerRegistry {
             entries: dashmap::DashMap::new(),
             failure_threshold,
             cooldown,
+            stream_alerts: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Report the circuits of streams (`stream:<id>` keys) that open
+    /// from now on to `alerts`.
+    fn set_stream_alerts(&self, alerts: Arc<lorica::stream_alerts::StreamAlerts>) {
+        let _ = self.stream_alerts.set(alerts);
+    }
+
+    /// The outcome a worker reported: [`Self::report`], then a circuit
+    /// it opened for a stream raises `stream_backend_down`.
+    fn report_outcome(&self, route_id: &str, backend: &str, success: bool, was_probe: bool) {
+        if !self.report(route_id, backend, success, was_probe) {
+            return;
+        }
+        let stream_id = route_id.strip_prefix(lorica::stream_engine::STREAM_BREAKER_PREFIX);
+        if let (Some(stream_id), Some(alerts)) = (stream_id, self.stream_alerts.get()) {
+            alerts.breaker_opened(stream_id, backend);
         }
     }
 
@@ -2420,8 +2475,10 @@ impl SupervisorBreakerRegistry {
         }
     }
 
-    /// Update breaker state after a worker reports the outcome.
-    fn report(&self, route_id: &str, backend: &str, success: bool, was_probe: bool) {
+    /// Update breaker state after a worker reports the outcome. Returns
+    /// whether the report opened a closed circuit: the start of an
+    /// incident. A failed probe re-opens within the same incident.
+    fn report(&self, route_id: &str, backend: &str, success: bool, was_probe: bool) -> bool {
         let key = Self::key(route_id, backend);
         let entry = self.entries.entry(key).or_insert_with(|| {
             parking_lot::Mutex::new(SupervisorBreakerEntry {
@@ -2430,6 +2487,7 @@ impl SupervisorBreakerRegistry {
             })
         });
         let mut guard = entry.value().lock();
+        let was_closed = matches!(guard.state, SupervisorBreakerState::Closed);
         if success {
             guard.consecutive_failures = 0;
             if was_probe
@@ -2453,6 +2511,7 @@ impl SupervisorBreakerRegistry {
                 };
             }
         }
+        was_closed && matches!(guard.state, SupervisorBreakerState::Open { .. })
     }
 }
 
@@ -2493,7 +2552,7 @@ async fn handle_breaker_report(
             return;
         }
     };
-    registry.report(&r.route_id, &r.backend, r.success, r.was_probe);
+    registry.report_outcome(&r.route_id, &r.backend, r.success, r.was_probe);
     let _ = inc.reply(lorica_command::Response::ok(0)).await;
 }
 
@@ -2941,6 +3000,12 @@ async fn pull_all_metrics_via_rpc(
                         })
                         .collect();
                     lorica_api::metrics::apply_worker_generic_counters(wid, &gc);
+                    // The workers' stream counters (Story 12.9 D-e).
+                    lorica::stream_report::apply_worker_report(
+                        lorica_api::stream_metrics::stream_metrics(),
+                        wid,
+                        &report,
+                    );
                 }
                 _ => {
                     lorica_api::metrics::inc_supervisor_rpc_outcome("metrics_pull", "error");
@@ -3184,6 +3249,57 @@ mod supervisor_tests {
             lorica_command::BreakerDecision::AllowProbe,
             "backend admits a fresh probe; if this fails the breaker has stuck (audit H-1)"
         );
+    }
+
+    #[test]
+    fn a_stream_circuit_the_registry_opens_alerts_once_per_incident_and_holds() {
+        const BACKEND: &str = "192.0.2.10:5432";
+        let sender = lorica_notify::AlertSender::new(16);
+        let mut alerts = sender.subscribe();
+        let r = SupervisorBreakerRegistry::new(2, Duration::from_millis(0));
+        r.set_stream_alerts(Arc::new(lorica::stream_alerts::StreamAlerts::new(
+            sender,
+            "standalone",
+            2,
+        )));
+        let key = lorica::stream_engine::stream_breaker_key("s1");
+
+        r.report_outcome(&key, BACKEND, false, false);
+        r.report_outcome(&key, BACKEND, false, false);
+        r.report_outcome(&key, BACKEND, false, false);
+        // The probe fails: the same incident.
+        assert_eq!(
+            r.query(&key, BACKEND),
+            lorica_command::BreakerDecision::AllowProbe
+        );
+        r.report_outcome(&key, BACKEND, false, true);
+        // An HTTP route's circuit is not a stream's.
+        r.report_outcome("route-1", BACKEND, false, false);
+        r.report_outcome("route-1", BACKEND, false, false);
+
+        let alert = alerts.try_recv().expect("one stream_backend_down");
+        assert_eq!(
+            alert.alert_type,
+            lorica_notify::events::AlertType::StreamBackendDown
+        );
+        assert_eq!(alert.details["stream_id"], "s1");
+        assert_eq!(alert.details["address"], BACKEND);
+        assert_eq!(alert.details["threshold"], "2");
+        assert!(alerts.try_recv().is_err(), "one alert per incident");
+
+        // Closed, then open again within the hold: a new incident, held.
+        assert_eq!(
+            r.query(&key, BACKEND),
+            lorica_command::BreakerDecision::AllowProbe
+        );
+        r.report_outcome(&key, BACKEND, true, true);
+        r.report_outcome(&key, BACKEND, false, false);
+        r.report_outcome(&key, BACKEND, false, false);
+        assert_eq!(
+            r.query(&key, BACKEND),
+            lorica_command::BreakerDecision::AllowProbe
+        );
+        assert!(alerts.try_recv().is_err(), "held for the incident's pair");
     }
 
     #[test]

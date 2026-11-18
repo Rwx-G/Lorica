@@ -59,9 +59,9 @@ use lorica_geoip::GeoIpResolver;
 use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
     Admission, BackendSelector, BreakerGate, Candidate, ClientIdentity, ConnectionObserver,
-    Engines, LogObserver, Resolve, ResolveError, Resolved, ResolverCache, SelectionRequest,
-    SourceGate, StreamCounters, StreamTable, TcpEngine, TcpEngineParts, TlsParts, UdpEngine,
-    UdpEngineParts,
+    Datagram, DatagramHandler, Engines, Resolve, ResolveError, Resolved, ResolverCache,
+    SelectionRequest, SourceGate, StreamCounters, StreamTable, TcpEngine, TcpEngineParts, TlsParts,
+    UdpEngine, UdpEngineParts,
 };
 use lorica_tls::cert_resolver::{CertResolver, ResolvesServerCertByLocalIp};
 use lorica_waf::WafEngine;
@@ -72,6 +72,8 @@ use crate::proxy_wiring::lb::{random_seed, select_index, SelectionState};
 use crate::proxy_wiring::{
     BackendConnections, BreakerAdmission, BreakerEngine, EwmaTracker, ProxyConfig, SmoothWrrState,
 };
+use crate::stream_alerts::StreamAlerts;
+use crate::stream_log::StreamLogObserver;
 
 /// The prefix of a stream's circuit-breaker key. A route is keyed by its
 /// bare id, so the prefix keeps the two namespaces apart by construction
@@ -265,9 +267,15 @@ impl BackendSelector for StreamSelector {
 
 /// The circuit breaker of the stream engines (D-g): the process's
 /// [`BreakerEngine`], once installed.
+///
+/// With [`StreamBreakerGate::with_alerts`] (single-process mode, whose
+/// breaker is this process's own) a circuit a stream's failure opens
+/// raises `stream_backend_down` (Story 12.9 D-h). In worker mode the
+/// registry, and so the alert, is the supervisor's.
 #[derive(Default)]
 pub struct StreamBreakerGate {
     engine: ArcSwapOption<BreakerEngine>,
+    alerts: Option<Arc<StreamAlerts>>,
 }
 
 impl std::fmt::Debug for StreamBreakerGate {
@@ -296,6 +304,13 @@ impl StreamBreakerGate {
     pub fn install(&self, engine: BreakerEngine) {
         self.engine.store(Some(Arc::new(engine)));
     }
+
+    /// Raise `stream_backend_down` through `alerts` when a failure opens
+    /// a circuit of the process's local breaker.
+    pub fn with_alerts(mut self, alerts: Arc<StreamAlerts>) -> Self {
+        self.alerts = Some(alerts);
+        self
+    }
 }
 
 impl BreakerGate for StreamBreakerGate {
@@ -323,17 +338,45 @@ impl BreakerGate for StreamBreakerGate {
         was_probe: bool,
     ) -> SeamFuture<'a, ()> {
         Box::pin(async move {
-            if let Some(engine) = self.engine.load_full() {
-                engine
-                    .record(
-                        &stream_breaker_key(stream_id),
-                        &backend.address,
-                        success,
-                        was_probe,
-                    )
-                    .await;
+            let Some(engine) = self.engine.load_full() else {
+                return;
+            };
+            let key = stream_breaker_key(stream_id);
+            match (&*engine, &self.alerts) {
+                // The local breaker says when a failure opens a circuit,
+                // which `BreakerEngine::record` does not pass on.
+                (BreakerEngine::Local(breaker), Some(alerts)) => {
+                    if success {
+                        breaker.record_success(&key, &backend.address);
+                    } else if breaker.record_failure(&key, &backend.address) {
+                        alerts.breaker_opened(stream_id, &backend.address);
+                    }
+                }
+                _ => {
+                    engine
+                        .record(&key, &backend.address, success, was_probe)
+                        .await
+                }
             }
         })
+    }
+}
+
+/// The UDP engine with the observer told every table it is told, so the
+/// observer knows which UDP streams owe no response (Story 12.9 D-g).
+struct ObservedUdp {
+    engine: Arc<UdpEngine>,
+    observer: Arc<StreamLogObserver>,
+}
+
+impl DatagramHandler for ObservedUdp {
+    fn handle(&self, datagram: Datagram<'_>) {
+        self.engine.handle(datagram);
+    }
+
+    fn table_changed(&self, table: &StreamTable) {
+        self.engine.table_changed(table);
+        self.observer.table_changed(table);
     }
 }
 
@@ -500,7 +543,9 @@ impl SourceGate for StreamSourceGate {
 /// connections counts a backend's TCP connections and UDP sessions
 /// together and round-robin state is per stream whatever its protocol;
 /// `breaker`; one [`ResolverCache`] over `resolver`, so a host named by
-/// a TCP and a UDP stream is resolved once; a debug-logging observer;
+/// a TCP and a UDP stream is resolved once; `observer`, which writes
+/// every end and refusal as a stream access-log row and judges the
+/// stream SLA (Story 12.9), told every table the UDP engine is told;
 /// and the node's `reserved_ports` for the local check (`None` when the
 /// process was not told them: the stream listen ports are still
 /// refused). Both engines and the runtime share one counters `Arc`.
@@ -519,11 +564,11 @@ pub fn stream_engines(
     reserved_ports: Option<ReservedPorts>,
     tls: TlsParts,
     source_gate: Arc<dyn SourceGate>,
+    observer: Arc<StreamLogObserver>,
 ) -> Engines {
     let counters = Arc::new(StreamCounters::new());
     let selector = Arc::new(StreamSelector::new(std::process::id() as usize));
     let resolver = ResolverCache::new(resolver, Arc::clone(&counters));
-    let observer = Arc::new(LogObserver);
     let tcp = TcpEngine::with_tls(
         TcpEngineParts {
             selector: Arc::clone(&selector) as Arc<dyn BackendSelector>,
@@ -541,13 +586,16 @@ pub fn stream_engines(
         breaker,
         resolver,
         counters: Arc::clone(&counters),
-        observer,
+        observer: Arc::clone(&observer) as Arc<dyn ConnectionObserver>,
         reserved_ports,
         source_gate,
     });
     Engines {
         tcp: Some(Arc::new(tcp)),
-        udp: Some(Arc::new(udp)),
+        udp: Some(Arc::new(ObservedUdp {
+            engine: Arc::new(udp),
+            observer,
+        })),
         counters,
     }
 }

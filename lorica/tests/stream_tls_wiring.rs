@@ -268,6 +268,11 @@ impl Harness {
                 public_roots: None,
             },
             Arc::new(Ungated),
+            // No log store: rows go nowhere, which these tests do not read.
+            Arc::new(lorica::stream_log::StreamLogObserver::new(
+                lorica_api::server::LogStoreSlot::default(),
+                Arc::new(lorica_bench::StreamSlaCollector::new()),
+            )),
         );
         let (peer, transport) = ControlTransport::in_process_pair(8);
         let runtime = StreamRuntime::spawn(

@@ -68,6 +68,10 @@ pub(crate) struct AlertingStack {
     pub(crate) probe_scheduler: Arc<lorica_bench::ProbeScheduler>,
     /// SLA collector with its flush task already started.
     pub(crate) sla_collector: Arc<lorica_bench::SlaCollector>,
+    /// Stream SLA collector (Story 12.9 D-g), its flush task started
+    /// with the dispatcher, so this process evaluates the stream targets
+    /// and raises their breaches; registered for the reload path.
+    pub(crate) stream_sla_collector: Arc<lorica_bench::StreamSlaCollector>,
 }
 
 /// Start the alerting + probing + SLA cluster shared by supervisor and
@@ -126,11 +130,19 @@ pub(crate) async fn start_alerting_stack(
     }
     sla_collector.start_flush_task(Arc::clone(store), Some(Arc::clone(&notify_dispatcher)));
 
+    // The stream one beside it: in worker mode the workers record and
+    // flush, and this one, which records nothing, evaluates.
+    let stream_sla_collector = Arc::new(lorica_bench::StreamSlaCollector::new());
+    stream_sla_collector.load_configs(&*store.lock().await);
+    stream_sla_collector.start_flush_task(Arc::clone(store), Some(Arc::clone(&notify_dispatcher)));
+    lorica::reload::register_stream_sla_collector(Arc::clone(&stream_sla_collector));
+
     AlertingStack {
         notify_dispatcher,
         notification_history,
         probe_scheduler,
         sla_collector,
+        stream_sla_collector,
     }
 }
 
@@ -353,7 +365,7 @@ pub(crate) fn spawn_retention_loop(
         loop {
             interval.tick().await;
             let retention_log_store = log_store.store();
-            let (retention, waf_retention, audit_retention_days) = {
+            let (retention, waf_retention, audit_retention_days, stream_retention) = {
                 let s = retention_config_store.lock().await;
                 s.get_global_settings()
                     .map(|gs| {
@@ -361,9 +373,15 @@ pub(crate) fn spawn_retention_loop(
                             gs.access_log_retention,
                             gs.waf_event_retention,
                             gs.audit_log_retention_days,
+                            gs.stream_access_log_retention,
                         )
                     })
-                    .unwrap_or((100_000, 100_000, 90))
+                    .unwrap_or((
+                        100_000,
+                        100_000,
+                        90,
+                        lorica_config::models::GlobalSettings::DEFAULT_STREAM_ACCESS_LOG_RETENTION,
+                    ))
             };
             // Backlog #76: retention trims the local log whether or not
             // the fan-in drain has sent those rows. On a follower cut off
@@ -398,6 +416,15 @@ pub(crate) fn spawn_retention_loop(
                         Err(e) => {
                             tracing::warn!(error = %e, "access log retention cleanup failed");
                         }
+                    }
+                }
+                // Its own row count (Story 12.9 D-b), so a chatty UDP
+                // stream never evicts HTTP rows nor the reverse; `0` is
+                // unlimited. The fleet drain ships no stream row yet, so
+                // there is no cursor to count against.
+                if let Ok(max @ 1..) = u64::try_from(stream_retention) {
+                    if let Err(e) = logs.enforce_stream_retention(max, None) {
+                        tracing::warn!(error = %e, "stream log retention cleanup failed");
                     }
                 }
             }

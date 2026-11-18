@@ -73,14 +73,17 @@ use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
+use lorica::stream_alerts::StreamAlerts;
+use lorica_api::stream_metrics::{NodeStreamGauges, StreamMetricsCollector};
 use lorica_config::listen_ports::ReservedPorts;
 use lorica_config::models::{GlobalSettings, NodeRole, Stream, StreamBackend, StreamProtocol};
 use lorica_config::ConfigStore;
+use lorica_stream::budget::CeilingBound;
 use lorica_stream::caps::admitted_cap;
 use lorica_stream::reconcile::desired_bindings;
 use lorica_stream::{
     diff, BindFailureKind, BindKey, BindState, BoundBinding, BudgetViolation, Detach, FdBudget,
-    InProcessPeer, NodeCapsRegions, ReleaseCause, StreamBindStates, StreamDemand,
+    InProcessPeer, NodeCapsRegions, ReleaseCause, StreamBindStates, StreamDemand, StreamTable,
 };
 use lorica_worker::fd_passing::StreamProto;
 use lorica_worker::stream_ctl::{
@@ -158,8 +161,8 @@ impl PlaneRole {
         }
     }
 
-    /// How audit rows name the node.
-    fn label(&self) -> &str {
+    /// How audit rows and stream alerts name the node.
+    pub(crate) fn label(&self) -> &str {
         match self {
             PlaneRole::Standalone => "standalone",
             PlaneRole::ControlPlane => "control_plane",
@@ -1072,6 +1075,21 @@ impl<L: WorkerLink> StreamPlane<L> {
         }
     }
 
+    /// What bounds the node's UDP session ceiling for the streams of
+    /// `streams` this plane holds, with the source ports read at the last
+    /// pass: the `stream_udp_ceiling_reached` alert names it (Story 12.9
+    /// D-h).
+    pub(crate) fn ceiling_bound(&self, streams: &[Stream]) -> CeilingBound {
+        let demands: Vec<StreamDemand> = streams
+            .iter()
+            .filter(|s| self.held.contains_key(&s.id))
+            .map(StreamDemand::of)
+            .collect();
+        self.budget
+            .session_ceiling(&demands, self.usable_source_ports)
+            .bound_by
+    }
+
     /// The stop path (D-f): quiesce every worker for `drain` and release
     /// every binding with cause `shutdown`.
     pub(crate) async fn quiesce(&mut self, drain: Duration) -> Vec<PlaneEvent> {
@@ -1547,10 +1565,93 @@ impl<L: WorkerLink> StreamPlane<L> {
     }
 }
 
+/// What the stream plane feeds the node's stream observability (Story
+/// 12.9), from the one process that sees the whole node:
+///
+/// - every table it loads goes to the metrics collector (series of a
+///   removed stream, link or backend pruned, `lorica_stream_info`
+///   rendered), to the stream alerts, and drops the SLA breach series of
+///   a stream that left;
+/// - every caps tick reads the regions for the node-exact gauges (UDP
+///   sessions, pending connections) and checks each UDP stream's ceiling
+///   against the node's count of ceiling edges, `ceiling_total`.
+pub(crate) struct PlaneWatch {
+    alerts: Arc<StreamAlerts>,
+    metrics: StreamMetricsCollector,
+    ceiling_total: Box<dyn Fn(&str) -> u64 + Send + Sync>,
+    table: StdMutex<Arc<StreamTable>>,
+    known: StdMutex<BTreeSet<String>>,
+}
+
+impl PlaneWatch {
+    /// A watch publishing to `metrics` and `alerts`, reading a stream's
+    /// count of ceiling edges on the node with `ceiling_total`.
+    pub(crate) fn new(
+        alerts: Arc<StreamAlerts>,
+        metrics: StreamMetricsCollector,
+        ceiling_total: impl Fn(&str) -> u64 + Send + Sync + 'static,
+    ) -> Self {
+        PlaneWatch {
+            alerts,
+            metrics,
+            ceiling_total: Box::new(ceiling_total),
+            table: StdMutex::new(Arc::new(StreamTable::default())),
+            known: StdMutex::new(BTreeSet::new()),
+        }
+    }
+
+    fn table_changed(&self, table: StreamTable, bound: Option<CeilingBound>) {
+        let ids: BTreeSet<String> = table.streams().map(|s| s.id.clone()).collect();
+        {
+            let mut known = self.known.lock().unwrap_or_else(PoisonError::into_inner);
+            for gone in known.difference(&ids) {
+                lorica_bench::metrics::forget_stream_sla_breaches(gone);
+            }
+            *known = ids;
+        }
+        self.metrics.retain(&table);
+        let table = Arc::new(table);
+        self.alerts.table_changed(Arc::clone(&table), bound);
+        *self.table.lock().unwrap_or_else(PoisonError::into_inner) = table;
+    }
+
+    fn tick(&self, caps: &SharedCaps) {
+        let table = Arc::clone(&self.table.lock().unwrap_or_else(PoisonError::into_inner));
+        let read: Vec<(String, StreamProtocol, u64, u64)> = {
+            let caps = lock_caps(caps);
+            table
+                .streams()
+                .filter(|s| caps.holds(&s.id))
+                .map(|s| {
+                    (
+                        s.id.clone(),
+                        s.protocol,
+                        caps.sessions(&s.id),
+                        caps.pending(&s.id),
+                    )
+                })
+                .collect()
+        };
+        let mut gauges = Vec::with_capacity(read.len());
+        for (id, protocol, sessions, pending) in read {
+            match protocol {
+                StreamProtocol::Udp => {
+                    self.alerts
+                        .ceiling(&id, (self.ceiling_total)(&id), sessions);
+                    gauges.push((id, NodeStreamGauges::udp(sessions, pending)));
+                }
+                StreamProtocol::Tcp => gauges.push((id, NodeStreamGauges::tcp(pending))),
+            }
+        }
+        self.metrics.set_node_gauges(gauges);
+    }
+}
+
 /// A [`StreamPlane`] shared by the reload path, the retry tick, the
 /// worker monitor and the stop path, with what each pass reads (the
-/// store, the node's role) and where its events go (the audit chain and
-/// the alert channel).
+/// store, the node's role) and where its events go (the audit chain, the
+/// alert channel and, with [`StreamPlaneHandle::with_watch`], the
+/// node's stream observability).
 pub(crate) struct StreamPlaneHandle<L> {
     plane: Arc<Mutex<StreamPlane<L>>>,
     /// The plane's caps regions, reached without waiting for a pass that
@@ -1560,6 +1661,7 @@ pub(crate) struct StreamPlaneHandle<L> {
     role: Arc<PlaneRole>,
     audit: Option<lorica_api::server::LogStoreSlot>,
     alerts: lorica_notify::AlertSender,
+    watch: Option<Arc<PlaneWatch>>,
 }
 
 impl<L> Clone for StreamPlaneHandle<L> {
@@ -1571,6 +1673,7 @@ impl<L> Clone for StreamPlaneHandle<L> {
             role: Arc::clone(&self.role),
             audit: self.audit.clone(),
             alerts: self.alerts.clone(),
+            watch: self.watch.clone(),
         }
     }
 }
@@ -1593,7 +1696,43 @@ impl<L: WorkerLink + 'static> StreamPlaneHandle<L> {
             role: Arc::new(role),
             audit,
             alerts,
+            watch: None,
         }
+    }
+
+    /// Feed `watch` from every pass and caps tick from now on.
+    pub(crate) fn with_watch(mut self, watch: PlaneWatch) -> Self {
+        self.watch = Some(Arc::new(watch));
+        self
+    }
+
+    /// Hand the table as the store holds it now to the watch, if any:
+    /// after every pass, so the series and the alert state of a removed
+    /// stream go with the change that removed it.
+    async fn publish_table(&self) {
+        let Some(watch) = &self.watch else {
+            return;
+        };
+        let loaded = {
+            let store = self.store.lock().await;
+            (
+                store.list_streams(),
+                store.list_stream_backends(),
+                store.list_backends(),
+            )
+        };
+        let (streams, links, backends) = match loaded {
+            (Ok(streams), Ok(links), Ok(backends)) => (streams, links, backends),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                warn!(error = %e, "stream plane: configuration unreadable; stream metrics keep the last table");
+                return;
+            }
+        };
+        let bound = self.plane.lock().await.ceiling_bound(&streams);
+        watch.table_changed(
+            lorica_stream::StreamTable::with_backends(streams, &links, backends),
+            Some(bound),
+        );
     }
 
     async fn inputs(&self) -> Option<(Vec<Stream>, Vec<StreamBackend>, PassSettings)> {
@@ -1624,6 +1763,7 @@ impl<L: WorkerLink + 'static> StreamPlaneHandle<L> {
             .release_stale(&streams, self.role.as_node_role(), pass)
             .await;
         self.record(events).await;
+        self.publish_table().await;
     }
 
     /// D-d step 3: after the workers commit a change, and the first
@@ -1643,6 +1783,7 @@ impl<L: WorkerLink + 'static> StreamPlaneHandle<L> {
             .bind_desired(&streams, &links, self.role.as_node_role(), pass, trigger)
             .await;
         self.record(events).await;
+        self.publish_table().await;
     }
 
     /// A backend's health or lifecycle changed (Story 12.3 D-i): every
@@ -1662,6 +1803,7 @@ impl<L: WorkerLink + 'static> StreamPlaneHandle<L> {
             }
         };
         self.plane.lock().await.refresh_all(pass).await;
+        self.publish_table().await;
     }
 
     /// The health loop's `on_change` hook: [`Self::refresh_tables`] on a
@@ -1693,15 +1835,20 @@ impl<L: WorkerLink + 'static> StreamPlaneHandle<L> {
 
     /// Every [`STREAM_CAPS_TICK_INTERVAL`], for the life of the process:
     /// evict the settled rate cells of every caps region and drop the
-    /// retired regions that count no session (D-d).
+    /// retired regions that count no session (D-d), then read the regions
+    /// for the watch, if any (Story 12.9).
     pub(crate) fn spawn_caps_tick(&self) -> tokio::task::JoinHandle<()> {
         let caps = Arc::clone(&self.caps);
+        let watch = self.watch.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(STREAM_CAPS_TICK_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
                 lock_caps(&caps).tick(lorica_shmem::now_ns());
+                if let Some(watch) = &watch {
+                    watch.tick(&caps);
+                }
             }
         })
     }

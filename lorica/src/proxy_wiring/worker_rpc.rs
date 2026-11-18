@@ -299,9 +299,12 @@ impl WorkerMetricsCtx {
         // keeps lorica-api free of the lorica-command dep. The worker's
         // log-store state rides the same list, so the supervisor can
         // report and alert on a worker that persists nothing.
+        // The aggregated gauges (`lorica_log_sink_up`, Story 12.9 D-f)
+        // ride the same list, zeros included: for a state, 0 is the news.
         report.generic_counters = lorica_api::metrics::snapshot_per_worker_counters()
             .into_iter()
             .chain(lorica_api::metrics::snapshot_log_store_up())
+            .chain(lorica_api::metrics::snapshot_per_worker_gauges())
             .map(|(name, label_pairs, value)| {
                 // Flatten name=value pairs into alternating strings on
                 // the wire (`["route_id", "uuid", "mode", "cookie", ...]`).
@@ -320,6 +323,9 @@ impl WorkerMetricsCtx {
                 }
             })
             .collect();
+        // This worker's stream counters, typed (Story 12.9 D-e): the
+        // generic list carries neither gauges per stream nor histograms.
+        report.stream_counters = crate::stream_report::worker_report().map(Box::new);
 
         report
     }

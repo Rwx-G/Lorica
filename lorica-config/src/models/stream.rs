@@ -815,6 +815,14 @@ impl UdpSettings {
             .unwrap_or(Self::DEFAULT_SOURCE_SESSION_CAP)
     }
 
+    /// Whether a session owes its client a response: bounded responses,
+    /// at least one per request. A silent backend is then a failure at
+    /// the idle timeout (Story 12.5 D-i), and the stream SLA judges the
+    /// session on that outcome rather than at its end (Story 12.9 D-g).
+    pub fn expects_responses(&self) -> bool {
+        !self.unbounded_responses && self.responses_per_request >= 1
+    }
+
     /// Response bytes per second Lorica forwards at most towards one
     /// source key on one node, burst excluded; `None` with
     /// `unbounded_responses`, which lifts the bound.

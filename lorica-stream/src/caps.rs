@@ -343,6 +343,17 @@ impl NodeCapsRegions {
         })
     }
 
+    /// Connections `stream_id` holds in their pre-forwarding reads on the
+    /// node, exact, over its live regions: what `lorica_stream_pending`
+    /// reports (Story 12.9 D-e).
+    pub fn pending(&self, stream_id: &str) -> u64 {
+        self.streams.get(stream_id).map_or(0, |held| {
+            held.retired.iter().fold(held.current.pending(), |acc, r| {
+                acc.saturating_add(r.pending())
+            })
+        })
+    }
+
     /// Memfds the supervisor holds, one per stream with a region.
     pub fn memfds(&self) -> usize {
         self.streams.len()
@@ -539,7 +550,17 @@ mod tests {
         let caps = registry.get("pg").unwrap();
         assert_eq!(caps.retired_pending(), 1);
         assert_eq!(caps.pending_cap_left(8), 7);
+        assert_eq!(
+            node.pending("pg"),
+            1,
+            "the node counts the retired region's"
+        );
+        let current = caps.current().admit_stream(4_096, true, 8).unwrap();
+        assert_eq!(node.pending("pg"), 2);
         drop(pending);
+        drop(current);
         assert_eq!(caps.pending_cap_left(8), 8);
+        assert_eq!(node.pending("pg"), 0);
+        assert_eq!(node.pending("absent"), 0);
     }
 }

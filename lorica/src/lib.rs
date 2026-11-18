@@ -47,7 +47,10 @@ pub mod mtls;
 pub mod otel;
 pub mod proxy_wiring;
 pub mod reload;
+pub mod stream_alerts;
 pub mod stream_engine;
+pub mod stream_log;
+pub mod stream_report;
 
 pub use lorica_core::*;
 

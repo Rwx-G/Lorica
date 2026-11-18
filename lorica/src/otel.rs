@@ -488,6 +488,69 @@ mod imp {
     static LOGS_CONSUMER: Lazy<Mutex<Option<std::thread::JoinHandle<()>>>> =
         Lazy::new(|| Mutex::new(None));
 
+    /// The generation of the installed logs exporter: an exporter being
+    /// replaced still exports its last batch, and its outcome must not
+    /// overwrite the state its successor publishes.
+    static LOGS_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// The SDK's logs exporter with its export outcome observed (Story
+    /// 12.9 D-f): `lorica_log_sink_up{sink="otlp"}` is 1 when the last
+    /// export call returned `Ok`, 0 when it failed. The batch processor
+    /// calls [`ObservedLogExporter::export`]; everything else delegates.
+    #[derive(Debug)]
+    pub(super) struct ObservedLogExporter<E> {
+        inner: E,
+        generation: u64,
+    }
+
+    impl<E> ObservedLogExporter<E> {
+        /// Wrap `inner` as the current generation, which publishes from
+        /// now on.
+        pub(super) fn current(inner: E) -> Self {
+            let generation = LOGS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+            ObservedLogExporter { inner, generation }
+        }
+
+        fn publish(&self, up: bool) {
+            if LOGS_GENERATION.load(std::sync::atomic::Ordering::Acquire) == self.generation {
+                lorica_api::metrics::set_log_sink_up("otlp", up);
+            }
+        }
+    }
+
+    impl<E: opentelemetry_sdk::logs::LogExporter> opentelemetry_sdk::logs::LogExporter
+        for ObservedLogExporter<E>
+    {
+        async fn export(
+            &self,
+            batch: opentelemetry_sdk::logs::LogBatch<'_>,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            let outcome = self.inner.export(batch).await;
+            if let Err(e) = &outcome {
+                // The SDK reports the error itself; this line names the
+                // sink the gauge now reads down.
+                tracing::debug!(error = %e, "OTLP logs export failed; the otlp sink reads down");
+            }
+            self.publish(outcome.is_ok());
+            outcome
+        }
+
+        fn shutdown_with_timeout(
+            &self,
+            timeout: std::time::Duration,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.inner.shutdown_with_timeout(timeout)
+        }
+
+        fn event_enabled(&self, level: Severity, target: &str, name: Option<&str>) -> bool {
+            self.inner.event_enabled(level, target, name)
+        }
+
+        fn set_resource(&mut self, resource: &Resource) {
+            self.inner.set_resource(resource);
+        }
+    }
+
     /// Install the OTLP logs exporter and spawn the consumer that
     /// drains the sink hub's otlp lane (Story 9.8). The consumer is a
     /// plain OS thread using `blocking_recv` - it never needs a tokio
@@ -565,7 +628,7 @@ mod imp {
             .build();
 
         let provider = SdkLoggerProvider::builder()
-            .with_batch_exporter(exporter)
+            .with_batch_exporter(ObservedLogExporter::current(exporter))
             .with_resource(resource)
             .build();
 
@@ -602,6 +665,9 @@ mod imp {
             let _ = old.shutdown();
         }
         *slot = Some(provider);
+        // Up from a working install until the first export says
+        // otherwise (D-f).
+        lorica_api::metrics::set_log_sink_up("otlp", true);
         Ok(())
     }
 
@@ -775,6 +841,62 @@ mod imp {
                 ),
                 OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT
             );
+        }
+
+        /// An exporter whose every export answers `ok`.
+        #[derive(Debug)]
+        struct Answers(bool);
+
+        impl opentelemetry_sdk::logs::LogExporter for Answers {
+            async fn export(
+                &self,
+                _batch: opentelemetry_sdk::logs::LogBatch<'_>,
+            ) -> opentelemetry_sdk::error::OTelSdkResult {
+                if self.0 {
+                    Ok(())
+                } else {
+                    Err(opentelemetry_sdk::error::OTelSdkError::InternalFailure(
+                        "collector unreachable".into(),
+                    ))
+                }
+            }
+        }
+
+        fn otlp_up() -> Option<u64> {
+            lorica_api::metrics::snapshot_per_worker_gauges()
+                .into_iter()
+                .find(|(name, labels, _)| {
+                    name.ends_with("log_sink_up")
+                        && labels.iter().any(|(k, v)| k == "sink" && v == "otlp")
+                })
+                .map(|(_, _, value)| value)
+        }
+
+        /// `lorica_log_sink_up{sink="otlp"}` follows the last export of
+        /// the current exporter, and a replaced exporter's last batch
+        /// does not overwrite it (Story 12.9 D-f).
+        #[test]
+        fn the_otlp_sink_reads_up_from_the_last_export_of_the_current_exporter() {
+            use opentelemetry_sdk::logs::{LogBatch, LogExporter as _};
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("test setup: runtime");
+            let export = |exporter: &super::ObservedLogExporter<Answers>| -> bool {
+                runtime
+                    .block_on(exporter.export(LogBatch::new(&[])))
+                    .is_ok()
+            };
+            let replaced = super::ObservedLogExporter::current(Answers(true));
+            let failing = super::ObservedLogExporter::current(Answers(false));
+            assert!(!export(&failing));
+            assert_eq!(otlp_up(), Some(0));
+            assert!(export(&replaced));
+            assert_eq!(otlp_up(), Some(0), "a replaced exporter publishes nothing");
+            let recovered = super::ObservedLogExporter::current(Answers(true));
+            assert!(export(&recovered));
+            assert_eq!(otlp_up(), Some(1));
+            lorica_api::metrics::clear_log_sink_up("otlp");
         }
     }
 }

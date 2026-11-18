@@ -239,20 +239,45 @@ pub(crate) fn run_worker(
         );
     }
     let stream_breaker = Arc::new(lorica::stream_engine::StreamBreakerGate::new());
+    // Open a LogStore so the worker can persist access logs, WAF events
+    // and stream rows directly (with route_hostname and action stamped).
+    // SQLite WAL mode allows concurrent writes from multiple worker
+    // processes. Writes go through the per-worker background log writer
+    // (backlog #24). A store that will not open is retried below and
+    // reported to the supervisor, which alerts: see
+    // `startup::log_store_health`. Opened before the stream runtime, whose
+    // observer writes through the same writer (Story 12.9).
+    let worker_log_store = crate::startup::log_store_health::open_log_store(
+        &data_dir,
+        crate::startup::log_store_health::LogStoreRole::Worker,
+    );
+    // The stream SLA of this worker's connections (Story 12.9 D-g),
+    // flushed by the background runtime below and reloaded with every
+    // configuration change; the supervisor evaluates the targets.
+    let stream_sla_collector = Arc::new(lorica_bench::StreamSlaCollector::new());
+    stream_sla_collector.load_configs(&store.blocking_lock());
+    lorica::reload::register_stream_sla_collector(Arc::clone(&stream_sla_collector));
+    let stream_engines = lorica::stream_engine::stream_engines(
+        Arc::clone(&stream_breaker),
+        Arc::new(lorica::stream_engine::HickoryResolve::from_system_conf()),
+        reserved_ports,
+        lorica::stream_engine::stream_tls_parts(Arc::clone(&cert_resolver)),
+        Arc::new(lorica::stream_engine::StreamSourceGate::new(
+            Arc::clone(&connection_filter),
+            Arc::clone(&waf_engine),
+            Arc::clone(&proxy_config),
+            Arc::clone(&geoip_resolver),
+        )),
+        Arc::new(lorica::stream_log::StreamLogObserver::new(
+            worker_log_store.clone(),
+            Arc::clone(&stream_sla_collector),
+        )),
+    );
+    // Every metrics report carries these counters to the supervisor.
+    lorica::stream_report::install_worker_counters(Arc::clone(&stream_engines.counters));
     let stream_runtime = match lorica_stream::StreamRuntime::spawn(
         lorica_stream::ControlTransport::Seqpacket(stream_ctl_fd),
-        lorica::stream_engine::stream_engines(
-            Arc::clone(&stream_breaker),
-            Arc::new(lorica::stream_engine::HickoryResolve::from_system_conf()),
-            reserved_ports,
-            lorica::stream_engine::stream_tls_parts(Arc::clone(&cert_resolver)),
-            Arc::new(lorica::stream_engine::StreamSourceGate::new(
-                Arc::clone(&connection_filter),
-                Arc::clone(&waf_engine),
-                Arc::clone(&proxy_config),
-                Arc::clone(&geoip_resolver),
-            )),
-        ),
+        stream_engines,
         Arc::clone(&stream_source) as Arc<dyn lorica_stream::StreamTableSource>,
     ) {
         Ok(handle) => Arc::new(handle),
@@ -535,6 +560,7 @@ pub(crate) fn run_worker(
     // Worker background tasks: log forwarding + WAF event forwarding via UDS + SLA flush to DB
     let log_fwd_buffer = Arc::clone(&log_buffer);
     let sla_flush_collector = Arc::clone(&sla_collector);
+    let stream_sla_flush_collector = Arc::clone(&stream_sla_collector);
     let sla_flush_store = Arc::clone(&store);
     let log_sock_path = PathBuf::from(&data_dir).join("log.sock");
     let waf_fwd_engine = Arc::clone(&waf_engine);
@@ -545,6 +571,7 @@ pub(crate) fn run_worker(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("worker background runtime");
         rt.block_on(async move {
+            stream_sla_flush_collector.start_flush_task(Arc::clone(&sla_flush_store), None);
             sla_flush_collector.start_flush_task(sla_flush_store, None);
 
             // IP blocklist: initial load + periodic refresh (every 6h)
@@ -822,17 +849,9 @@ pub(crate) fn run_worker(
         stream_breaker.install(lorica_proxy.circuit_breaker_engine.clone());
     }
     drop(_rt_guard);
-    // Open a LogStore so the worker can persist access logs and WAF
-    // events directly (with route_hostname and action stamped). SQLite
-    // WAL mode allows concurrent writes from multiple worker processes.
-    // Writes go through the per-worker background log writer (backlog
-    // #24). A store that will not open is retried here and reported to
-    // the supervisor, which alerts: see `startup::log_store_health`.
-    let worker_log_store = crate::startup::log_store_health::open_log_store(
-        &data_dir,
-        crate::startup::log_store_health::LogStoreRole::Worker,
-    );
     lorica_proxy.log_store = worker_log_store.clone();
+    let exit_log_store = worker_log_store.clone();
+    let served_log_store = worker_log_store.clone();
     // The capture self-disable writer. Capture admission happens in
     // this process, so the queue it drains is this process's; without
     // the task a rule that spent its total keeps its stored `enabled`
@@ -970,8 +989,11 @@ pub(crate) fn run_worker(
             info!(
                 worker_id = id,
                 ?end,
-                "drain finished; flushing OTel spans and exiting"
+                "drain finished; flushing logs and OTel spans and exiting"
             );
+            // The drain's rows, `node_shutdown` included, reach the store
+            // and then the sinks before the process goes (Story 12.9 D-k).
+            lorica::stream_log::flush_rows_at_exit_blocking(&exit_log_store);
             lorica::otel::shutdown();
             std::process::exit(0);
         },
@@ -979,7 +1001,11 @@ pub(crate) fn run_worker(
         warn!(worker_id = id, error = %e, "drain watcher not started; Pingora's grace bounds the stop");
     }
     server.run(lorica_core::server::RunArgs::default());
-    info!(worker_id = id, "proxy engine drained; flushing OTel spans");
+    info!(
+        worker_id = id,
+        "proxy engine drained; flushing logs and OTel spans"
+    );
+    lorica::stream_log::flush_rows_at_exit_blocking(&served_log_store);
     lorica::otel::shutdown();
     std::process::exit(0);
 }
