@@ -911,11 +911,13 @@ acknowledge blocks only itself, which is what lets a follower one
 release ahead keep shipping the classes an older control plane
 understands.
 
-One loss is silent today and is stated here rather than hidden: a
-partition that outlasts the local retention window loses the rows
-retention evicted below the cursor, to the fleet view only (the node
-never had them for longer on its own), and nothing counts them yet.
-Backlog #76 names the signal to add.
+One loss remains and is stated here rather than hidden: a partition
+that outlasts the local retention window loses the rows retention
+evicted before the drain sent them, to the fleet view only (the node
+never had them for longer on its own). The follower counts them on
+`lorica_cluster_telemetry_lost_to_retention_total{kind}` and logs each
+retention pass that took some at WARN; see "What protects the control
+plane" below.
 
 ### The ceiling, stated rather than discovered
 
@@ -1008,7 +1010,9 @@ dropped at the control plane, so neither counter above moves, and a
 quiet edge reads exactly like a truncated one.
 `lorica_cluster_telemetry_lost_to_retention_total{kind}` (`access`,
 `waf` or `stream`) is counted on the follower, where the delete happens, over
-exactly the rows retention took from above the drain cursor. A
+exactly the rows retention took from above the drain cursor. Only a
+follower counts it: a standalone node or a control plane has no drain
+cursor, so its retention never moves the counter. A
 non-zero value means the fleet view has a hole for that node and the
 node's own log is the only place that period still exists. The
 retention pass also logs it at WARN.
@@ -1493,7 +1497,7 @@ for the five things that go wrong:
 | Control plane restarts | converge by themselves: the generation is persisted, followers reconnect with backoff and pull | resumes from each follower's persisted cursors | no | the replicator's quarantine set and its last report (process memory, backlog #58) |
 | Follower restarts | converge at the handshake: the opener carries the applied generation and the control plane answers with the current one | resumes from the persisted cursors | no | the in-memory ban map (see "Bans") |
 | Partition shorter than local retention | as above, on reconnect | nothing: the rows waited locally | no | nothing |
-| Partition longer than local retention | as above | rows retention evicted below the cursor never reach the fleet view | no | those rows, uncounted today (backlog #76) |
+| Partition longer than local retention | as above | rows retention evicted before the drain sent them never reach the fleet view | no | those rows, counted on the follower by `lorica_cluster_telemetry_lost_to_retention_total{kind}` |
 | Control plane machine lost | nothing converges: no changes, no renewals, no fleet actions until it is back; traffic keeps flowing | stops | **yes**, see below | see below |
 | Node re-enrolled under a new id | the new id is a new node; the old row must be revoked first because names are unique | the old id's rows are reclaimed by the hourly pass; the new id starts at the present | yes: revoke the dead row before re-enrolling under the same name | nothing that was not already on the dead node |
 
