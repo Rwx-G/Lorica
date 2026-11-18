@@ -504,10 +504,17 @@ pub async fn start_automation_server(
             };
             let io = TokioIo::new(tls_stream);
             let hyper_service = TowerToHyperService::new(tower_service);
-            if let Err(e) = HyperAutoBuilder::new(TokioExecutor::new())
-                .serve_connection_with_upgrades(io, hyper_service)
-                .await
-            {
+            // Ends with the process's shutdown, as the management
+            // server's connections do.
+            let builder = HyperAutoBuilder::new(TokioExecutor::new());
+            let connection = builder.serve_connection_with_upgrades(io, hyper_service);
+            tokio::pin!(connection);
+            let served =
+                crate::shutdown::serve_until(connection, &crate::shutdown::token(), |connection| {
+                    connection.graceful_shutdown()
+                })
+                .await;
+            if let Err(e) = served {
                 tracing::debug!(peer = %peer, error = %e, "automation connection ended with error");
             }
         });

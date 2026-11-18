@@ -1824,10 +1824,18 @@ pub async fn start_server(
             };
             let io = TokioIo::new(tls_stream);
             let hyper_service = TowerToHyperService::new(tower_service);
-            if let Err(e) = HyperAutoBuilder::new(TokioExecutor::new())
-                .serve_connection_with_upgrades(io, hyper_service)
-                .await
-            {
+            // Ends with the process's shutdown, a hot upgrade's handoff
+            // included, so no client keeps a keep-alive connection to
+            // an outgoing binary.
+            let builder = HyperAutoBuilder::new(TokioExecutor::new());
+            let connection = builder.serve_connection_with_upgrades(io, hyper_service);
+            tokio::pin!(connection);
+            let served =
+                crate::shutdown::serve_until(connection, &crate::shutdown::token(), |connection| {
+                    connection.graceful_shutdown()
+                })
+                .await;
+            if let Err(e) = served {
                 tracing::debug!(peer = %remote_addr, error = %e, "management connection ended with error");
             }
         });

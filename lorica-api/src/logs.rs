@@ -571,7 +571,7 @@ pub async fn logs_ws(
     Extension(state): Extension<AppState>,
 ) -> impl IntoResponse {
     let rx = state.log_buffer.subscribe();
-    ws.on_upgrade(move |socket| handle_log_stream(socket, rx))
+    ws.on_upgrade(move |socket| handle_log_stream(socket, rx, crate::shutdown::token()))
 }
 
 /// Hard ceiling on cumulative per-connection log drops before we
@@ -580,7 +580,13 @@ pub async fn logs_ws(
 /// that never reads cannot hold on to a broadcast slot forever.
 const LOG_WS_CLOSE_ON_DROPS: u64 = 1000;
 
-async fn handle_log_stream(socket: WebSocket, mut rx: broadcast::Receiver<LogEntry>) {
+/// Stream `rx` to `socket` until the client goes, or until `shutdown`
+/// is cancelled, when the client is sent a going-away close frame.
+pub(crate) async fn handle_log_stream(
+    socket: WebSocket,
+    mut rx: broadcast::Receiver<LogEntry>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
     use axum::extract::ws::CloseCode;
     use axum::extract::ws::CloseFrame;
     let (mut sender, mut receiver) = socket.split();
@@ -597,7 +603,15 @@ async fn handle_log_stream(socket: WebSocket, mut rx: broadcast::Receiver<LogEnt
     let send_task = tokio::spawn(async move {
         let mut drops: u64 = 0;
         loop {
-            match rx.recv().await {
+            let received = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    let _ = sender.send(crate::shutdown::going_away()).await;
+                    break;
+                }
+                received = rx.recv() => received,
+            };
+            match received {
                 Ok(entry) => {
                     if let Ok(json) = serde_json::to_string(&entry) {
                         if sender.send(Message::Text(json.into())).await.is_err() {

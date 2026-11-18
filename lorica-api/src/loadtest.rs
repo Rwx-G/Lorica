@@ -578,19 +578,30 @@ pub async fn loadtest_ws(
     Extension(state): Extension<AppState>,
 ) -> impl IntoResponse {
     let engine = state.load_test_engine.clone();
-    ws.on_upgrade(move |socket| handle_loadtest_stream(socket, engine))
+    ws.on_upgrade(move |socket| handle_loadtest_stream(socket, engine, crate::shutdown::token()))
 }
 
+/// Send `engine`'s progress every second until the client goes, or
+/// until `shutdown` is cancelled, when it is sent a going-away close
+/// frame.
 async fn handle_loadtest_stream(
     socket: WebSocket,
     engine: Option<Arc<lorica_bench::LoadTestEngine>>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
     // Send progress updates every second
     let send_task = tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    let _ = sender.send(crate::shutdown::going_away()).await;
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
 
             let json = match &engine {
                 Some(e) => match e.progress().await {
