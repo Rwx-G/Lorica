@@ -228,6 +228,7 @@ describe('nodeStreamRows', () => {
         bindings: [
           {
             stream_id: 's2',
+            stream_name: 'dns',
             state: 'failed',
             kind: 'address_in_use',
             os_error: 'Address already in use (os error 98)',
@@ -256,13 +257,19 @@ describe('nodeStreamRows', () => {
     expect(rows[0].state).toBeNull();
   });
 
-  it('keeps a binding the control plane does not target there, by id', () => {
-    const rows = nodeStreamRows(
-      [],
-      plane({ bindings: [{ stream_id: 'orphan', state: 'pending' }] }),
-    );
+  it('keeps a binding the control plane does not target there, under its name', () => {
+    const binding = { stream_id: 's-9', stream_name: 'smtp', state: 'pending' as const };
+    const rows = nodeStreamRows([], plane({ bindings: [binding] }));
     expect(rows).toEqual([
-      { id: 'orphan', name: 'orphan', port: null, state: 'pending', binding: { stream_id: 'orphan', state: 'pending' } },
+      { id: 's-9', name: 'smtp', notInConfiguration: false, port: null, state: 'pending', binding },
+    ]);
+  });
+
+  it('keeps a binding of a stream no longer in the configuration, by id', () => {
+    const binding = { stream_id: 'orphan', stream_name: null, state: 'pending' as const };
+    const rows = nodeStreamRows([], plane({ bindings: [binding] }));
+    expect(rows).toEqual([
+      { id: 'orphan', name: 'orphan', notInConfiguration: true, port: null, state: 'pending', binding },
     ]);
   });
 });
@@ -272,10 +279,10 @@ describe('unboundCounts', () => {
     const counts = unboundCounts(
       plane({
         bindings: [
-          { stream_id: 'a', state: 'failed' },
-          { stream_id: 'b', state: 'failed' },
-          { stream_id: 'c', state: 'pending' },
-          { stream_id: 'd', state: 'unknown' },
+          { stream_id: 'a', stream_name: 'a', state: 'failed' },
+          { stream_id: 'b', stream_name: 'b', state: 'failed' },
+          { stream_id: 'c', stream_name: 'c', state: 'pending' },
+          { stream_id: 'd', stream_name: null, state: 'unknown' },
         ],
       }),
     );

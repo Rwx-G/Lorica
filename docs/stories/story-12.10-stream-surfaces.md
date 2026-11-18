@@ -670,9 +670,9 @@ Allowlist: `lorica-dashboard/frontend/src/routes/Cluster.svelte`,
 `lorica-dashboard/frontend/src/lib/streams.ts`,
 `lorica-dashboard/frontend/src/lib/streams.test.ts`.
 
-- [ ] `NodeStreamBinding.stream_name` in the type and the join; a
+- [x] `NodeStreamBinding.stream_name` in the type and the join; a
       `null` name reads "not in this configuration" beside the id.
-- [ ] Vitest: a binding outside `stream_ports` shows its name.
+- [x] Vitest: a binding outside `stream_ports` shows its name.
 
 ### Lot G: documentation - no cargo
 
@@ -1153,6 +1153,17 @@ each one as "Resolved N".
   Deviation: the old form refused port 0 and the new rule accepts it as
   the server's parse does; the server's other checks stay the authority.
 
+- **Lot F, 2026-11-18 (dashboard).** `NodeStreamBinding.stream_name`
+  (`string | null`, always present as Lot A answers it) is in
+  `lib/api.ts`, where the type lives (not `lib/cluster.ts`).
+  `nodeStreamRows` names a binding outside the node's `stream_ports` by
+  that name, or by its id with `notInConfiguration` set when the name is
+  `null`; the Cluster drawer prints "not in this configuration" beside
+  such an id. Tests: `streams.test.ts` for both cases, and a Cluster
+  drawer test with a named binding outside `stream_ports` (a
+  `source_ports` failure, which also shows 12.5's new kind rendered as
+  its word) and an unnamed one. The existing fixtures gained the field.
+
 ## File List
 
 - `lorica-api/src/streams/status.rs` (new, Lot A)
@@ -1200,6 +1211,10 @@ each one as "Resolved N".
   `lib/backend-address.test.ts` (new), `lib/backend-usage.ts` (new),
   `lib/backend-usage.test.ts` (new) (Lot E)
 
+- `lorica-dashboard/frontend/src/lib/api.ts` (`NodeStreamBinding`),
+  `lib/streams.ts`, `lib/streams.test.ts`, `routes/Cluster.svelte`,
+  `routes/Cluster.test.ts` (Lot F)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1214,3 +1229,4 @@ each one as "Resolved N".
 | 2026-11-18 | 0.8 | Lot D1: the Streams page (list, search, groups, sortable columns, bind state per node, this node's counters and browser-side rates, enable, disable, delete with the drain named, Logs and SLA links), the stream view and write types with the five calls, the derived badge map. Frontend gates green (check, lint, Vitest 937). | Romain G. |
 | 2026-11-18 | 0.9 | Lot D2: the stream drawer with its six tabs, `fieldsFor` deciding what is shown and sent, no range in the frontend, server refusals routed by `fieldTab` to the tab holding the field, every cap labelled per node, the IV1 create body pinned as `stream-iv1-create.json`. Frontend gates green (check, lint, Vitest 976). | Romain G. |
 | 2026-11-18 | 0.10 | Lot E: the Backends page's "Used by" column joined in the browser from the route and stream lists, the delete confirmation naming the streams and their drain, active checks forced off with the reason for a backend serving a UDP stream and for a portless address, the address rule read as the server reads it. Frontend gates green (check, lint, Vitest 1000). | Romain G. |
+| 2026-11-18 | 0.11 | Lot F: the Cluster drawer names every binding, a binding outside the node's stream ports by the name the control plane resolved, and one of a stream no longer held by its id with "not in this configuration". Frontend gates green (check, lint, Vitest 1002). | Romain G. |

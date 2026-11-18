@@ -615,7 +615,12 @@
           <tbody>
             {#each nodeStreamRows(node.stream_ports, plane) as row (row.id)}
               <tr>
-                <td>{row.name}</td>
+                <td>
+                  {row.name}
+                  {#if row.notInConfiguration}
+                    <span class="muted-inline">not in this configuration</span>
+                  {/if}
+                </td>
                 <td class="mono">
                   {#if row.port}
                     {row.port.protocol.toUpperCase()}

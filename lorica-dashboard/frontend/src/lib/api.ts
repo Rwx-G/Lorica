@@ -2913,6 +2913,11 @@ export interface StreamPortsEntry {
 /** One binding a node holds that is not bound. The `failed` fields are absent otherwise. */
 export interface NodeStreamBinding {
   stream_id: string;
+  /**
+   * The stream's name in this control plane's configuration; `null` for
+   * a stream it no longer holds, which a node may still report.
+   */
+  stream_name: string | null;
   state: Exclude<StreamBindStateKind, 'bound'>;
   kind?: StreamBindFailureKind;
   os_error?: string;

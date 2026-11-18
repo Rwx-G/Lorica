@@ -232,6 +232,7 @@ describe('Cluster page, stream bindings', () => {
             bindings: [
               {
                 stream_id: 's-smtp',
+                stream_name: 'smtp',
                 state: 'failed',
                 kind: 'address_in_use',
                 os_error: 'Address already in use (os error 98)',
@@ -271,7 +272,7 @@ describe('Cluster page, stream bindings', () => {
           stream_plane: {
             bound_count: 0,
             listen_sockets_used: 0,
-            bindings: [{ stream_id: 's-pg', state: 'unknown' }],
+            bindings: [{ stream_id: 's-pg', stream_name: 'pg', state: 'unknown' }],
             truncated: false,
           },
         },
@@ -316,6 +317,34 @@ describe('Cluster page, stream bindings', () => {
     expect(within(ports).getByText(/TCP\s+0\.0\.0\.0:5432/)).toBeInTheDocument();
     expect(within(ports).getByText(/UDP\s+\[::\]:53/)).toBeInTheDocument();
     expect(within(ports).getByText(/dns-fleetwide/)).toBeInTheDocument();
+  });
+
+  it('names a binding outside the stream ports, and marks one no longer configured', async () => {
+    vi.spyOn(api, 'listClusterNodes').mockResolvedValue({
+      data: [
+        {
+          ...node('id-a', 'edge-a'),
+          stream_ports: [streamPort('s-pg', 'pg', 5432)],
+          stream_plane: {
+            bound_count: 1,
+            listen_sockets_used: 1,
+            bindings: [
+              { stream_id: 's-old', stream_name: 'legacy-smtp', state: 'failed', kind: 'source_ports', os_error: 'no source port left', port: 25 },
+              { stream_id: '5f0c0000-0000-4000-8000-000000000000', stream_name: null, state: 'pending' },
+            ],
+            truncated: false,
+          },
+        },
+      ],
+    });
+
+    const drawer = await openDrawer('edge-a');
+    const named = within(drawer).getByText('legacy-smtp').closest('tr') as HTMLElement;
+    expect(within(named).getByText('failed')).toHaveClass('badge-red');
+    expect(within(named).queryByText('not in this configuration')).toBeNull();
+    expect(within(drawer).getByText('source_ports')).toBeInTheDocument();
+    const gone = within(drawer).getByText(/5f0c0000-0000-4000-8000-000000000000/).closest('tr') as HTMLElement;
+    expect(within(gone).getByText('not in this configuration')).toBeInTheDocument();
   });
 
   it('says a pending node no stream targets opens no stream port', async () => {

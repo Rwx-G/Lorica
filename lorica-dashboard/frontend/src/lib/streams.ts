@@ -36,8 +36,10 @@ export function streamEndpoint(listenAddress: string, portFirst: number, portLas
 /** One stream of a node, with its bind state there. */
 export interface NodeStreamRow {
   id: string;
-  /** The stream's name, or its id for a binding the control plane does not target here. */
+  /** The stream's name, or its id for a binding of a stream this configuration no longer holds. */
   name: string;
+  /** The binding names a stream the control plane no longer holds: `name` is then its id. */
+  notInConfiguration: boolean;
   /** `null` for a binding the control plane does not target here. */
   port: StreamPortsEntry | null;
   /** `null` while the node has sent no stream plane report. */
@@ -53,8 +55,9 @@ export interface NodeStreamRow {
  * while the node drifts), unless the report was cut, which leaves an
  * unlisted stream `unknown` as the budget view reads it. A binding the
  * node reports for a stream the control plane does not target there is
- * kept, by id, rather than dropped: a failure an operator cannot see is
- * the one they need.
+ * kept rather than dropped, under the name the control plane resolved
+ * for it, or its id for a stream no longer in the configuration: a
+ * failure an operator cannot see is the one they need.
  */
 export function nodeStreamRows(
   ports: readonly StreamPortsEntry[],
@@ -67,6 +70,7 @@ export function nodeStreamRows(
     return {
       id: port.id,
       name: port.name,
+      notInConfiguration: false,
       port,
       state: plane === null ? null : (binding?.state ?? unlisted),
       binding,
@@ -75,7 +79,14 @@ export function nodeStreamRows(
   const targeted = new Set(ports.map((p) => p.id));
   for (const binding of plane?.bindings ?? []) {
     if (targeted.has(binding.stream_id)) continue;
-    rows.push({ id: binding.stream_id, name: binding.stream_id, port: null, state: binding.state, binding });
+    rows.push({
+      id: binding.stream_id,
+      name: binding.stream_name ?? binding.stream_id,
+      notInConfiguration: binding.stream_name === null,
+      port: null,
+      state: binding.state,
+      binding,
+    });
   }
   return rows;
 }
