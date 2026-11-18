@@ -1182,6 +1182,20 @@ pub struct SlaPull {
     /// Raw minute buckets rather than summaries.
     #[prost(bool, tag = "5")]
     pub buckets: bool,
+    /// The pull is about streams rather than routes (Story 12.9 D-g):
+    /// `stream_id` names one, empty asks for the stream overview (every
+    /// stream the node holds with a target or data, 1h and 24h), and
+    /// `route_id` must be empty.
+    ///
+    /// A follower of a release before 1.11.0 skips this field and reads
+    /// the pull as the route overview; its answer then lacks
+    /// [`SlaPullAck::streams`], which is how the control plane tells it
+    /// apart from a stream answer.
+    #[prost(bool, tag = "6")]
+    pub streams: bool,
+    /// The stream, on a stream pull; empty for the stream overview.
+    #[prost(string, tag = "7")]
+    pub stream_id: ::prost::alloc::string::String,
 }
 
 /// One SLA summary as the follower computed it; mirrors the API's
@@ -1276,20 +1290,129 @@ pub struct SlaBucketRow {
     pub cfg_target_pct: f64,
 }
 
-/// The follower's answer to a [`SlaPull`]: exactly one of the two
-/// lists is populated, by `SlaPull.buckets`.
+/// One stream SLA summary as the follower computed it (Story 12.9
+/// D-g); mirrors the API's `StreamSlaSummary` field for field. The
+/// latency fields are absent where nothing connected, which is every
+/// UDP stream.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct StreamSlaSummaryRow {
+    /// The stream the summary is for.
+    #[prost(string, tag = "1")]
+    pub stream_id: ::prost::alloc::string::String,
+    /// The window label (`1h`, `24h`, `7d`, `30d`).
+    #[prost(string, tag = "2")]
+    pub window: ::prost::alloc::string::String,
+    /// Connections or sessions judged in the window.
+    #[prost(int64, tag = "3")]
+    pub judged_count: i64,
+    /// Judged ones that met the target.
+    #[prost(int64, tag = "4")]
+    pub success_count: i64,
+    /// Judged ones that did not.
+    #[prost(int64, tag = "5")]
+    pub failure_count: i64,
+    /// Availability over the window, as a percentage.
+    #[prost(double, tag = "6")]
+    pub sla_pct: f64,
+    /// Mean connect latency of the connections that connected.
+    #[prost(double, optional, tag = "7")]
+    pub avg_connect_latency_ms: ::core::option::Option<f64>,
+    /// Highest p50 connect latency of the window's buckets.
+    #[prost(int64, optional, tag = "8")]
+    pub p50_connect_latency_ms: ::core::option::Option<i64>,
+    /// Highest p95 connect latency of the window's buckets.
+    #[prost(int64, optional, tag = "9")]
+    pub p95_connect_latency_ms: ::core::option::Option<i64>,
+    /// Highest p99 connect latency of the window's buckets.
+    #[prost(int64, optional, tag = "10")]
+    pub p99_connect_latency_ms: ::core::option::Option<i64>,
+    /// The stream's SLA target.
+    #[prost(double, tag = "11")]
+    pub target_pct: f64,
+    /// Whether `sla_pct` reaches `target_pct`.
+    #[prost(bool, tag = "12")]
+    pub meets_target: bool,
+}
+
+/// One raw stream minute bucket (Story 12.9 D-g); mirrors the API's
+/// `StreamSlaBucket`, minus the row id, which is the follower's.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct StreamSlaBucketRow {
+    /// The stream the bucket is for.
+    #[prost(string, tag = "1")]
+    pub stream_id: ::prost::alloc::string::String,
+    /// RFC 3339.
+    #[prost(string, tag = "2")]
+    pub bucket_start: ::prost::alloc::string::String,
+    /// `passive`, the one source a stream records.
+    #[prost(string, tag = "3")]
+    pub source: ::prost::alloc::string::String,
+    /// Connections or sessions judged in the minute.
+    #[prost(int64, tag = "4")]
+    pub judged_count: i64,
+    /// Judged ones that met the target.
+    #[prost(int64, tag = "5")]
+    pub success_count: i64,
+    /// Judged ones that did not.
+    #[prost(int64, tag = "6")]
+    pub failure_count: i64,
+    /// Judged ones that connected, the latency sample count.
+    #[prost(int64, tag = "7")]
+    pub connected_count: i64,
+    /// Sum of the connect latencies.
+    #[prost(int64, optional, tag = "8")]
+    pub connect_latency_sum_ms: ::core::option::Option<i64>,
+    /// Fastest connect.
+    #[prost(int64, optional, tag = "9")]
+    pub connect_latency_min_ms: ::core::option::Option<i64>,
+    /// Slowest connect.
+    #[prost(int64, optional, tag = "10")]
+    pub connect_latency_max_ms: ::core::option::Option<i64>,
+    /// p50 connect latency.
+    #[prost(int64, optional, tag = "11")]
+    pub connect_latency_p50_ms: ::core::option::Option<i64>,
+    /// p95 connect latency.
+    #[prost(int64, optional, tag = "12")]
+    pub connect_latency_p95_ms: ::core::option::Option<i64>,
+    /// p99 connect latency.
+    #[prost(int64, optional, tag = "13")]
+    pub connect_latency_p99_ms: ::core::option::Option<i64>,
+    /// The SLA target the stream was configured with at the time.
+    #[prost(double, tag = "14")]
+    pub cfg_target_pct: f64,
+    /// The connect latency bound the stream was configured with.
+    #[prost(int64, tag = "15")]
+    pub cfg_max_connect_latency_ms: i64,
+}
+
+/// The follower's answer to a [`SlaPull`]: exactly one of the lists is
+/// populated, by `SlaPull.streams` and `SlaPull.buckets`.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct SlaPullAck {
-    /// Summaries, when `buckets` was false on the pull.
+    /// Summaries, when `buckets` was false on a route pull.
     #[prost(message, repeated, tag = "1")]
     pub summaries: ::prost::alloc::vec::Vec<SlaSummaryRow>,
     /// Raw minute buckets, when it was true.
     #[prost(message, repeated, tag = "2")]
     pub buckets: ::prost::alloc::vec::Vec<SlaBucketRow>,
+    /// Stream summaries, when `buckets` was false on a stream pull
+    /// (Story 12.9).
+    #[prost(message, repeated, tag = "3")]
+    pub stream_summaries: ::prost::alloc::vec::Vec<StreamSlaSummaryRow>,
+    /// Raw stream minute buckets, when it was true.
+    #[prost(message, repeated, tag = "4")]
+    pub stream_buckets: ::prost::alloc::vec::Vec<StreamSlaBucketRow>,
+    /// Set by a follower that answered a stream pull as one. A follower
+    /// before 1.11.0 never sets it: it read the pull as the route
+    /// overview, and the control plane refuses that answer rather than
+    /// serve an empty stream chart.
+    #[prost(bool, tag = "5")]
+    pub streams: bool,
 }
 
-/// Longest `route_id` a [`SlaPull`] may name: the store's ids are
-/// UUIDs, and the follower looks the value up rather than trusting it.
+/// Longest `route_id` or `stream_id` a [`SlaPull`] may name: the
+/// store's ids are UUIDs, and the follower looks the value up rather
+/// than trusting it.
 pub const MAX_SLA_ROUTE_ID_BYTES: usize = 64;
 
 /// Longest `from` / `to` a [`SlaPull`] may carry; an RFC 3339 stamp
@@ -1302,6 +1425,18 @@ pub const MAX_SLA_TIME_BYTES: usize = 40;
 /// falls back to its defaults on a value that does not parse.
 pub fn sla_pull_defect(pull: &SlaPull) -> Option<&'static str> {
     if pull.route_id.len() > MAX_SLA_ROUTE_ID_BYTES || pull.route_id.chars().any(char::is_control) {
+        return Some("route_id");
+    }
+    // A stream id is a store id too, bounded like a route's. A pull
+    // names a route or a stream, never both, and a stream id outside a
+    // stream pull would be silently ignored, so it is refused instead.
+    if pull.stream_id.len() > MAX_SLA_ROUTE_ID_BYTES
+        || pull.stream_id.chars().any(char::is_control)
+        || (!pull.streams && !pull.stream_id.is_empty())
+    {
+        return Some("stream_id");
+    }
+    if pull.streams && !pull.route_id.is_empty() {
         return Some("route_id");
     }
     if pull.source != "passive" && pull.source != "active" {
@@ -3741,5 +3876,251 @@ mod tests {
         };
         let read = TelemetryStreamRow::decode(zero.encode_to_vec().as_slice()).expect("decodes");
         assert_eq!((read.datagrams_upload, read.connect_ms), (Some(0), Some(0)));
+    }
+
+    #[test]
+    fn the_stream_sla_tags_match_the_published_proto() {
+        let tags = proto_tags();
+        let tag = |block: &str, field: &str| -> u32 {
+            *tags
+                .get(&(block.to_string(), field.to_string()))
+                .unwrap_or_else(|| panic!("{block}.{field} missing from cluster.proto"))
+        };
+        let pull = SlaPull {
+            streams: true,
+            stream_id: "s".to_string(),
+            ..SlaPull::default()
+        };
+        assert_eq!(
+            field_numbers(&pull.encode_to_vec()),
+            vec![tag("SlaPull", "streams"), tag("SlaPull", "stream_id")]
+        );
+        let summary = stream_sla_summary();
+        let summary_fields = [
+            "stream_id",
+            "window",
+            "judged_count",
+            "success_count",
+            "failure_count",
+            "sla_pct",
+            "avg_connect_latency_ms",
+            "p50_connect_latency_ms",
+            "p95_connect_latency_ms",
+            "p99_connect_latency_ms",
+            "target_pct",
+            "meets_target",
+        ];
+        assert_eq!(
+            field_numbers(&summary.encode_to_vec()),
+            summary_fields
+                .iter()
+                .map(|field| tag("StreamSlaSummaryRow", field))
+                .collect::<Vec<_>>()
+        );
+        let bucket = stream_sla_bucket();
+        let bucket_fields = [
+            "stream_id",
+            "bucket_start",
+            "source",
+            "judged_count",
+            "success_count",
+            "failure_count",
+            "connected_count",
+            "connect_latency_sum_ms",
+            "connect_latency_min_ms",
+            "connect_latency_max_ms",
+            "connect_latency_p50_ms",
+            "connect_latency_p95_ms",
+            "connect_latency_p99_ms",
+            "cfg_target_pct",
+            "cfg_max_connect_latency_ms",
+        ];
+        assert_eq!(
+            field_numbers(&bucket.encode_to_vec()),
+            bucket_fields
+                .iter()
+                .map(|field| tag("StreamSlaBucketRow", field))
+                .collect::<Vec<_>>()
+        );
+        let ack = SlaPullAck {
+            stream_summaries: vec![summary],
+            stream_buckets: vec![bucket],
+            streams: true,
+            ..SlaPullAck::default()
+        };
+        assert_eq!(
+            field_numbers(&ack.encode_to_vec()),
+            vec![
+                tag("SlaPullAck", "stream_summaries"),
+                tag("SlaPullAck", "stream_buckets"),
+                tag("SlaPullAck", "streams")
+            ]
+        );
+    }
+
+    /// A stream summary with every field set, so prost emits every tag.
+    fn stream_sla_summary() -> StreamSlaSummaryRow {
+        StreamSlaSummaryRow {
+            stream_id: "s".to_string(),
+            window: "1h".to_string(),
+            judged_count: 10,
+            success_count: 9,
+            failure_count: 1,
+            sla_pct: 90.0,
+            avg_connect_latency_ms: Some(12.5),
+            p50_connect_latency_ms: Some(10),
+            p95_connect_latency_ms: Some(20),
+            p99_connect_latency_ms: Some(30),
+            target_pct: 99.9,
+            meets_target: true,
+        }
+    }
+
+    /// A stream bucket with every field set.
+    fn stream_sla_bucket() -> StreamSlaBucketRow {
+        StreamSlaBucketRow {
+            stream_id: "s".to_string(),
+            bucket_start: "2026-11-18T10:00:00+00:00".to_string(),
+            source: "passive".to_string(),
+            judged_count: 10,
+            success_count: 9,
+            failure_count: 1,
+            connected_count: 9,
+            connect_latency_sum_ms: Some(900),
+            connect_latency_min_ms: Some(20),
+            connect_latency_max_ms: Some(300),
+            connect_latency_p50_ms: Some(80),
+            connect_latency_p95_ms: Some(250),
+            connect_latency_p99_ms: Some(300),
+            cfg_target_pct: 99.9,
+            cfg_max_connect_latency_ms: 500,
+        }
+    }
+
+    /// The SLA pull and its answer exactly as the v1.10.7 tag declares
+    /// them: the follower a 1.11.0 control plane may still ask during a
+    /// rolling upgrade if the fleet's order was not followed.
+    mod v1_10_7_sla {
+        use super::{SlaBucketRow, SlaSummaryRow};
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        pub struct SlaPull {
+            #[prost(string, tag = "1")]
+            pub route_id: ::prost::alloc::string::String,
+            #[prost(string, tag = "2")]
+            pub source: ::prost::alloc::string::String,
+            #[prost(string, tag = "3")]
+            pub from: ::prost::alloc::string::String,
+            #[prost(string, tag = "4")]
+            pub to: ::prost::alloc::string::String,
+            #[prost(bool, tag = "5")]
+            pub buckets: bool,
+        }
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        pub struct SlaPullAck {
+            #[prost(message, repeated, tag = "1")]
+            pub summaries: ::prost::alloc::vec::Vec<SlaSummaryRow>,
+            #[prost(message, repeated, tag = "2")]
+            pub buckets: ::prost::alloc::vec::Vec<SlaBucketRow>,
+        }
+    }
+
+    #[test]
+    fn a_1_10_7_follower_reads_a_stream_pull_as_the_route_overview_and_says_so_by_omission() {
+        let pull = SlaPull {
+            source: "passive".to_string(),
+            streams: true,
+            stream_id: "0b6f2a4e-6a43-4bd4-9b8e-3c1f8a2d5e70".to_string(),
+            ..SlaPull::default()
+        };
+        assert_eq!(sla_pull_defect(&pull), None);
+        let old = v1_10_7_sla::SlaPull::decode(pull.encode_to_vec().as_slice())
+            .expect("an unknown tag is skipped, never refused");
+        assert_eq!(
+            old,
+            v1_10_7_sla::SlaPull {
+                source: "passive".to_string(),
+                ..v1_10_7_sla::SlaPull::default()
+            },
+            "no route named: the old follower answers its route overview"
+        );
+        // That answer, read by the 1.11.0 control plane, carries no
+        // stream marker, which is what the control plane refuses on.
+        let answer = v1_10_7_sla::SlaPullAck {
+            summaries: vec![SlaSummaryRow {
+                route_id: "r".to_string(),
+                ..SlaSummaryRow::default()
+            }],
+            buckets: Vec::new(),
+        };
+        let read = SlaPullAck::decode(answer.encode_to_vec().as_slice()).expect("decodes");
+        assert!(!read.streams);
+        assert!(read.stream_summaries.is_empty() && read.stream_buckets.is_empty());
+    }
+
+    #[test]
+    fn a_1_10_7_control_plane_s_pull_reads_as_a_route_pull_and_its_answer_is_unchanged() {
+        let old = v1_10_7_sla::SlaPull {
+            route_id: "r".to_string(),
+            source: "passive".to_string(),
+            from: String::new(),
+            to: String::new(),
+            buckets: true,
+        };
+        let read = SlaPull::decode(old.encode_to_vec().as_slice()).expect("decodes");
+        assert!(!read.streams && read.stream_id.is_empty());
+        assert_eq!(sla_pull_defect(&read), None);
+        assert_eq!(read.encode_to_vec(), old.encode_to_vec());
+        // A route answer of this build is byte-identical to the old one.
+        let ack = SlaPullAck {
+            buckets: vec![SlaBucketRow {
+                route_id: "r".to_string(),
+                ..SlaBucketRow::default()
+            }],
+            ..SlaPullAck::default()
+        };
+        let old_ack =
+            v1_10_7_sla::SlaPullAck::decode(ack.encode_to_vec().as_slice()).expect("decodes");
+        assert_eq!(old_ack.encode_to_vec(), ack.encode_to_vec());
+    }
+
+    #[test]
+    fn a_pull_names_a_route_or_a_stream_never_both() {
+        let stream_pull = |stream_id: &str| SlaPull {
+            source: "passive".to_string(),
+            streams: true,
+            stream_id: stream_id.to_string(),
+            ..SlaPull::default()
+        };
+        assert_eq!(sla_pull_defect(&stream_pull("")), None, "the overview");
+        assert_eq!(
+            sla_pull_defect(&stream_pull(&"s".repeat(MAX_SLA_ROUTE_ID_BYTES))),
+            None
+        );
+        assert_eq!(
+            sla_pull_defect(&stream_pull(&"s".repeat(MAX_SLA_ROUTE_ID_BYTES + 1))),
+            Some("stream_id")
+        );
+        assert_eq!(
+            sla_pull_defect(&stream_pull("s\nforged")),
+            Some("stream_id")
+        );
+        assert_eq!(
+            sla_pull_defect(&SlaPull {
+                route_id: "r".to_string(),
+                ..stream_pull("s")
+            }),
+            Some("route_id"),
+            "a stream pull names no route"
+        );
+        assert_eq!(
+            sla_pull_defect(&SlaPull {
+                streams: false,
+                ..stream_pull("s")
+            }),
+            Some("stream_id"),
+            "a stream id outside a stream pull would be ignored, so it is refused"
+        );
     }
 }

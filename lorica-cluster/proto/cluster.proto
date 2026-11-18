@@ -486,6 +486,50 @@ message SlaPull {
   string from = 3;           // RFC 3339, buckets only; empty = now - 24h
   string to = 4;             // RFC 3339, buckets only; empty = now
   bool buckets = 5;          // Raw minute buckets instead of summaries
+  // Story 12.9: the pull is about streams; route_id must be empty and
+  // stream_id names one stream, empty for the stream overview. A
+  // follower before 1.11.0 skips both and reads the route overview;
+  // its answer then lacks SlaPullAck.streams.
+  bool streams = 6;
+  string stream_id = 7;
+}
+
+// One stream SLA summary (Story 12.9, mirrors the API's
+// `StreamSlaSummary`). The latencies are absent where nothing
+// connected, which is every UDP stream.
+message StreamSlaSummaryRow {
+  string stream_id = 1;
+  string window = 2;
+  int64 judged_count = 3;
+  int64 success_count = 4;
+  int64 failure_count = 5;
+  double sla_pct = 6;
+  optional double avg_connect_latency_ms = 7;
+  optional int64 p50_connect_latency_ms = 8;
+  optional int64 p95_connect_latency_ms = 9;
+  optional int64 p99_connect_latency_ms = 10;
+  double target_pct = 11;
+  bool meets_target = 12;
+}
+
+// One raw stream minute bucket (Story 12.9, mirrors the API's
+// `StreamSlaBucket` minus the follower's row id).
+message StreamSlaBucketRow {
+  string stream_id = 1;
+  string bucket_start = 2;   // RFC 3339
+  string source = 3;
+  int64 judged_count = 4;
+  int64 success_count = 5;
+  int64 failure_count = 6;
+  int64 connected_count = 7;
+  optional int64 connect_latency_sum_ms = 8;
+  optional int64 connect_latency_min_ms = 9;
+  optional int64 connect_latency_max_ms = 10;
+  optional int64 connect_latency_p50_ms = 11;
+  optional int64 connect_latency_p95_ms = 12;
+  optional int64 connect_latency_p99_ms = 13;
+  double cfg_target_pct = 14;
+  int64 cfg_max_connect_latency_ms = 15;
 }
 
 // One SLA summary as the follower computed it (mirrors the API's
@@ -524,10 +568,14 @@ message SlaBucketRow {
   double cfg_target_pct = 16;
 }
 
-// Exactly one of the two lists is populated, by `SlaPull.buckets`.
+// Exactly one of the lists is populated, by `SlaPull.streams` and
+// `SlaPull.buckets`.
 message SlaPullAck {
   repeated SlaSummaryRow summaries = 1;
   repeated SlaBucketRow buckets = 2;
+  repeated StreamSlaSummaryRow stream_summaries = 3;   // Story 12.9
+  repeated StreamSlaBucketRow stream_buckets = 4;
+  bool streams = 5;          // Set by a follower that answered a stream pull
 }
 
 message BanPushAck {

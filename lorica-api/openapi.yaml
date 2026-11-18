@@ -3482,7 +3482,12 @@ paths:
         `/api/v1/sla/overview`, kept apart because that answer is a bare
         array of route rows. For TCP the connect latency to a backend;
         a UDP stream has no connect and its latency fields are null.
-        This node's figures only; no `?node=`.
+        With `?node=<node_id>` on a control plane, one follower's
+        overview, computed on that follower (Story 12.9 Lot G); a 409
+        when the node holds no session or runs a release that reports no
+        stream SLA.
+      parameters:
+        - $ref: "#/components/parameters/SlaNode"
       security:
         - sessionCookie: []
       responses:
@@ -3512,8 +3517,11 @@ paths:
         failures, availability, and for TCP the connect latency to a
         backend (mean of the connections that connected, highest
         percentiles of the window's buckets). A UDP stream has no
-        connect: its latency fields are null. This node's figures only;
-        no `?node=`.
+        connect: its latency fields are null. With `?node=<node_id>` on
+        a control plane, one follower's windows, as for a route (Story
+        12.9 Lot G).
+      parameters:
+        - $ref: "#/components/parameters/SlaNode"
       security:
         - sessionCookie: []
       responses:
@@ -3542,6 +3550,10 @@ paths:
       description: >-
         `?from=` and `?to=` (RFC 3339, default the last 24 hours) and
         `?source=` (default `passive`, the only source a stream records).
+        With `?node=<node_id>` on a control plane, one follower's buckets
+        (Story 12.9 Lot G).
+      parameters:
+        - $ref: "#/components/parameters/SlaNode"
       security:
         - sessionCookie: []
       responses:

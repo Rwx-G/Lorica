@@ -21,14 +21,19 @@
 //! then ONE follower's own, computed on that follower over its cluster
 //! session and served here unchanged. Nothing fans in for SLA, and
 //! nothing is aggregated: a fleet percentile is not a function of
-//! per-node percentiles, so the page shows one node at a time.
+//! per-node percentiles, so the page shows one node at a time. The
+//! three stream reads (overview, per-stream windows, raw buckets) take
+//! it the same way since Story 12.9 Lot G, the pull marked as a stream
+//! pull.
 
 use axum::extract::{Path, Query};
 use axum::response::IntoResponse;
 use axum::Extension;
 use axum::Json;
 use chrono::{DateTime, Duration, Utc};
-use lorica_cluster::messages::{SlaBucketRow, SlaPull, SlaPullAck, SlaSummaryRow};
+use lorica_cluster::messages::{
+    SlaBucketRow, SlaPull, SlaPullAck, SlaSummaryRow, StreamSlaBucketRow, StreamSlaSummaryRow,
+};
 use lorica_config::models::{Role, SlaBucket, SlaSummary, StreamSlaBucket, StreamSlaSummary};
 use serde::Deserialize;
 
@@ -87,6 +92,9 @@ pub fn answer_sla_pull(
     store: &lorica_config::ConfigStore,
     pull: &SlaPull,
 ) -> Result<SlaPullAck, String> {
+    if pull.streams {
+        return answer_stream_sla_pull(store, pull);
+    }
     let now = Utc::now();
     if pull.route_id.is_empty() {
         let routes = store.list_routes().map_err(|e| e.to_string())?;
@@ -103,7 +111,7 @@ pub fn answer_sla_pull(
         }
         return Ok(SlaPullAck {
             summaries,
-            buckets: Vec::new(),
+            ..SlaPullAck::default()
         });
     }
     store
@@ -117,15 +125,240 @@ pub fn answer_sla_pull(
             .query_sla_buckets(&pull.route_id, &from, &to, &pull.source)
             .map_err(|e| e.to_string())?;
         return Ok(SlaPullAck {
-            summaries: Vec::new(),
             buckets: buckets.iter().map(bucket_to_wire).collect(),
+            ..SlaPullAck::default()
         });
     }
     let summaries = lorica_bench::results::compute_all_windows(store, &pull.route_id, &pull.source)
         .map_err(|e| e.to_string())?;
     Ok(SlaPullAck {
         summaries: summaries.iter().map(summary_to_wire).collect(),
-        buckets: Vec::new(),
+        ..SlaPullAck::default()
+    })
+}
+
+/// The stream half of [`answer_sla_pull`] (Story 12.9 D-g): the same
+/// reads the local stream handlers make, the answer marked as a stream
+/// answer so the control plane can tell it from an old follower's.
+fn answer_stream_sla_pull(
+    store: &lorica_config::ConfigStore,
+    pull: &SlaPull,
+) -> Result<SlaPullAck, String> {
+    let answer = |stream_summaries: Vec<StreamSlaSummaryRow>,
+                  stream_buckets: Vec<StreamSlaBucketRow>| SlaPullAck {
+        stream_summaries,
+        stream_buckets,
+        streams: true,
+        ..SlaPullAck::default()
+    };
+    if pull.stream_id.is_empty() {
+        let overview = stream_sla_overview_rows(store, 0, usize::MAX).map_err(|e| e.to_string())?;
+        return Ok(answer(
+            overview.iter().map(stream_summary_to_wire).collect(),
+            Vec::new(),
+        ));
+    }
+    store
+        .get_stream(&pull.stream_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("stream {} not found on this node", pull.stream_id))?;
+    if pull.buckets {
+        let now = Utc::now();
+        let from = parse_rfc3339(&pull.from).unwrap_or_else(|| now - Duration::hours(24));
+        let to = parse_rfc3339(&pull.to).unwrap_or(now);
+        let buckets = store
+            .query_stream_sla_buckets(&pull.stream_id, &from, &to, &pull.source)
+            .map_err(|e| e.to_string())?;
+        return Ok(answer(
+            Vec::new(),
+            buckets.iter().map(stream_bucket_to_wire).collect(),
+        ));
+    }
+    let summaries =
+        lorica_bench::results::compute_all_stream_windows(store, &pull.stream_id, &pull.source)
+            .map_err(|e| e.to_string())?;
+    Ok(answer(
+        summaries.iter().map(stream_summary_to_wire).collect(),
+        Vec::new(),
+    ))
+}
+
+/// Read one follower's stream SLA over the cluster plane (Story 12.9
+/// D-g): [`pull_from_node`] with the pull marked as a stream pull, and
+/// the answer refused unless the follower answered it as one. A
+/// follower before 1.11.0 reads the pull as its route overview and
+/// answers that; serving it would show an empty stream chart for a node
+/// that was never asked, so the answer is a 409 naming the cause.
+async fn pull_streams_from_node(
+    state: &AppState,
+    session: &Session,
+    node: &str,
+    pull: SlaPull,
+) -> Result<SlaPullAck, ApiError> {
+    let pull = SlaPull {
+        streams: true,
+        ..pull
+    };
+    stream_answer_of(node, pull_from_node(state, session, node, pull).await?)
+}
+
+/// `ack` when the follower answered a stream pull as one.
+fn stream_answer_of(node: &str, ack: SlaPullAck) -> Result<SlaPullAck, ApiError> {
+    if ack.streams {
+        Ok(ack)
+    } else {
+        Err(ApiError::Conflict(format!(
+            "node {node} runs a release that reports no stream SLA"
+        )))
+    }
+}
+
+/// The API stream summary, field for field, onto the wire.
+pub fn stream_summary_to_wire(s: &StreamSlaSummary) -> StreamSlaSummaryRow {
+    let StreamSlaSummary {
+        stream_id,
+        window,
+        judged_count,
+        success_count,
+        failure_count,
+        sla_pct,
+        avg_connect_latency_ms,
+        p50_connect_latency_ms,
+        p95_connect_latency_ms,
+        p99_connect_latency_ms,
+        target_pct,
+        meets_target,
+    } = s.clone();
+    StreamSlaSummaryRow {
+        stream_id,
+        window,
+        judged_count,
+        success_count,
+        failure_count,
+        sla_pct,
+        avg_connect_latency_ms,
+        p50_connect_latency_ms,
+        p95_connect_latency_ms,
+        p99_connect_latency_ms,
+        target_pct,
+        meets_target,
+    }
+}
+
+/// The wire stream summary back into the API struct.
+pub fn stream_summary_from_wire(r: StreamSlaSummaryRow) -> StreamSlaSummary {
+    let StreamSlaSummaryRow {
+        stream_id,
+        window,
+        judged_count,
+        success_count,
+        failure_count,
+        sla_pct,
+        avg_connect_latency_ms,
+        p50_connect_latency_ms,
+        p95_connect_latency_ms,
+        p99_connect_latency_ms,
+        target_pct,
+        meets_target,
+    } = r;
+    StreamSlaSummary {
+        stream_id,
+        window,
+        judged_count,
+        success_count,
+        failure_count,
+        sla_pct,
+        avg_connect_latency_ms,
+        p50_connect_latency_ms,
+        p95_connect_latency_ms,
+        p99_connect_latency_ms,
+        target_pct,
+        meets_target,
+    }
+}
+
+/// The API stream bucket, field for field, onto the wire. The row id
+/// is this node's and travels nowhere.
+pub fn stream_bucket_to_wire(b: &StreamSlaBucket) -> StreamSlaBucketRow {
+    let StreamSlaBucket {
+        id: _,
+        stream_id,
+        bucket_start,
+        source,
+        judged_count,
+        success_count,
+        failure_count,
+        connected_count,
+        connect_latency_sum_ms,
+        connect_latency_min_ms,
+        connect_latency_max_ms,
+        connect_latency_p50_ms,
+        connect_latency_p95_ms,
+        connect_latency_p99_ms,
+        cfg_target_pct,
+        cfg_max_connect_latency_ms,
+    } = b.clone();
+    StreamSlaBucketRow {
+        stream_id,
+        bucket_start: bucket_start.to_rfc3339(),
+        source,
+        judged_count,
+        success_count,
+        failure_count,
+        connected_count,
+        connect_latency_sum_ms,
+        connect_latency_min_ms,
+        connect_latency_max_ms,
+        connect_latency_p50_ms,
+        connect_latency_p95_ms,
+        connect_latency_p99_ms,
+        cfg_target_pct,
+        cfg_max_connect_latency_ms,
+    }
+}
+
+/// The wire stream bucket back into the API struct.
+///
+/// # Errors
+///
+/// A `bucket_start` that is not RFC 3339, as [`bucket_from_wire`].
+pub fn stream_bucket_from_wire(r: StreamSlaBucketRow) -> Result<StreamSlaBucket, String> {
+    let StreamSlaBucketRow {
+        stream_id,
+        bucket_start,
+        source,
+        judged_count,
+        success_count,
+        failure_count,
+        connected_count,
+        connect_latency_sum_ms,
+        connect_latency_min_ms,
+        connect_latency_max_ms,
+        connect_latency_p50_ms,
+        connect_latency_p95_ms,
+        connect_latency_p99_ms,
+        cfg_target_pct,
+        cfg_max_connect_latency_ms,
+    } = r;
+    let bucket_start = parse_rfc3339(&bucket_start)
+        .ok_or_else(|| format!("bucket_start {bucket_start:?} is not RFC 3339"))?;
+    Ok(StreamSlaBucket {
+        id: None,
+        stream_id,
+        bucket_start,
+        source,
+        judged_count,
+        success_count,
+        failure_count,
+        connected_count,
+        connect_latency_sum_ms,
+        connect_latency_min_ms,
+        connect_latency_max_ms,
+        connect_latency_p50_ms,
+        connect_latency_p95_ms,
+        connect_latency_p99_ms,
+        cfg_target_pct,
+        cfg_max_connect_latency_ms,
     })
 }
 
@@ -301,6 +534,7 @@ pub async fn get_route_sla_buckets(
             from: query.from.clone().unwrap_or_default(),
             to: query.to.clone().unwrap_or_default(),
             buckets: true,
+            ..SlaPull::default()
         };
         let ack = pull_from_node(&state, &session, node, pull).await?;
         let buckets = ack
@@ -693,9 +927,9 @@ pub async fn get_sla_overview(
 
 // ---- Stream SLA (Story 12.9) ----
 //
-// The stream routes mirror the route ones and their role floors. They
-// take no `?node=`: a follower's stream figures cross the cluster plane
-// once `SlaPull` can name a stream.
+// The stream routes mirror the route ones and their role floors, and
+// the three reads take `?node=` as the route reads do (Lot G), through
+// `pull_streams_from_node`.
 
 /// `NotFound` unless this node holds the stream `stream_id`.
 fn ensure_stream_held(store: &lorica_config::ConfigStore, stream_id: &str) -> Result<(), ApiError> {
@@ -727,10 +961,27 @@ pub(crate) async fn local_stream_sla(
 }
 
 /// GET /api/v1/sla/streams/:id - return passive SLA summaries for all standard windows.
+/// With `?node=`, the same for one follower (Lot G).
 pub async fn get_stream_sla(
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(stream_id): Path<String>,
+    Query(node): Query<NodeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Some(node) = foreign_node(&node.node) {
+        let pull = SlaPull {
+            stream_id,
+            source: "passive".to_string(),
+            ..SlaPull::default()
+        };
+        let ack = pull_streams_from_node(&state, &session, node, pull).await?;
+        let summaries: Vec<StreamSlaSummary> = ack
+            .stream_summaries
+            .into_iter()
+            .map(stream_summary_from_wire)
+            .collect();
+        return Ok(json_data(summaries));
+    }
     Ok(json_data(local_stream_sla(&state, stream_id).await?))
 }
 
@@ -768,50 +1019,76 @@ pub(crate) async fn local_stream_sla_overview(
         take: usize::MAX,
     });
     db_blocking(&state.store, move |store| {
-        let targeted: std::collections::BTreeSet<String> = store
-            .list_stream_sla_configs()?
-            .into_iter()
-            .map(|config| config.stream_id)
-            .collect();
-        let recorded = store.list_stream_ids_with_sla_buckets("passive")?;
-        let streams = store.list_streams()?;
-        let now = Utc::now();
-        streams
-            .iter()
-            .filter(|stream| targeted.contains(&stream.id) || recorded.contains(&stream.id))
-            .flat_map(|stream| {
-                STREAM_OVERVIEW_WINDOWS
-                    .iter()
-                    .map(move |period| (stream, period))
-            })
-            .skip(skip)
-            .take(take)
-            .map(|(stream, period)| {
-                store
-                    .compute_stream_sla_summary(
-                        &stream.id,
-                        &(now - period.duration()),
-                        &now,
-                        period.label(),
-                        "passive",
-                    )
-                    .map_err(|e| ApiError::Internal(e.to_string()))
-            })
-            .collect()
+        stream_sla_overview_rows(store, skip, take)
     })
     .await
 }
 
+/// The rows `skip..skip + take` of this node's stream overview, the
+/// computation [`local_stream_sla_overview`] runs and a follower runs
+/// for the control plane's stream overview pull.
+fn stream_sla_overview_rows(
+    store: &lorica_config::ConfigStore,
+    skip: usize,
+    take: usize,
+) -> Result<Vec<StreamSlaSummary>, ApiError> {
+    let targeted: std::collections::BTreeSet<String> = store
+        .list_stream_sla_configs()?
+        .into_iter()
+        .map(|config| config.stream_id)
+        .collect();
+    let recorded = store.list_stream_ids_with_sla_buckets("passive")?;
+    let streams = store.list_streams()?;
+    let now = Utc::now();
+    streams
+        .iter()
+        .filter(|stream| targeted.contains(&stream.id) || recorded.contains(&stream.id))
+        .flat_map(|stream| {
+            STREAM_OVERVIEW_WINDOWS
+                .iter()
+                .map(move |period| (stream, period))
+        })
+        .skip(skip)
+        .take(take)
+        .map(|(stream, period)| {
+            store
+                .compute_stream_sla_summary(
+                    &stream.id,
+                    &(now - period.duration()),
+                    &now,
+                    period.label(),
+                    "passive",
+                )
+                .map_err(|e| ApiError::Internal(e.to_string()))
+        })
+        .collect()
+}
+
 /// GET /api/v1/sla/streams - the passive 1h and 24h summaries of every
 /// stream this node holds with a target or data, two rows per stream.
-/// No `?node=`, as for every stream SLA read.
+/// With `?node=`, one follower's (Lot G).
 pub async fn get_stream_sla_overview(
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
+    Query(node): Query<NodeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Some(node) = foreign_node(&node.node) {
+        let pull = SlaPull {
+            source: "passive".to_string(),
+            ..SlaPull::default()
+        };
+        let ack = pull_streams_from_node(&state, &session, node, pull).await?;
+        let summaries: Vec<StreamSlaSummary> = ack
+            .stream_summaries
+            .into_iter()
+            .map(stream_summary_from_wire)
+            .collect();
+        return Ok(json_data(summaries));
+    }
     Ok(json_data(local_stream_sla_overview(&state, None).await?))
 }
 
-/// Query parameters for stream bucket queries: `?from=&to=&source=`.
+/// Query parameters for stream bucket queries: `?from=&to=&source=&node=`.
 #[derive(Deserialize)]
 pub struct StreamBucketQuery {
     /// Start of the window (RFC 3339); default now - 24 h.
@@ -820,14 +1097,39 @@ pub struct StreamBucketQuery {
     pub to: Option<String>,
     /// Bucket source; default `"passive"`, the only one a stream records.
     pub source: Option<String>,
+    /// A follower's node id, on a control plane (Lot G).
+    pub node: Option<String>,
 }
 
 /// GET /api/v1/sla/streams/:id/buckets - return raw stream SLA buckets within the requested time range.
+/// With `?node=`, one follower's (Lot G).
 pub async fn get_stream_sla_buckets(
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(stream_id): Path<String>,
     Query(query): Query<StreamBucketQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Some(node) = foreign_node(&query.node) {
+        let pull = SlaPull {
+            stream_id,
+            source: query
+                .source
+                .clone()
+                .unwrap_or_else(|| "passive".to_string()),
+            from: query.from.clone().unwrap_or_default(),
+            to: query.to.clone().unwrap_or_default(),
+            buckets: true,
+            ..SlaPull::default()
+        };
+        let ack = pull_streams_from_node(&state, &session, node, pull).await?;
+        let buckets = ack
+            .stream_buckets
+            .into_iter()
+            .map(stream_bucket_from_wire)
+            .collect::<Result<Vec<StreamSlaBucket>, String>>()
+            .map_err(ApiError::Internal)?;
+        return Ok(json_data(buckets));
+    }
     let now = Utc::now();
     let from = query
         .from

@@ -496,3 +496,149 @@ async fn the_stream_overview_lists_every_held_stream_with_a_target_or_data_and_n
         "a row names its stream by id only: {json}"
     );
 }
+
+#[tokio::test]
+async fn a_follower_answers_a_stream_pull_with_what_its_local_reads_serve() {
+    use lorica_cluster::messages::SlaPull;
+
+    use crate::sla::{answer_sla_pull, stream_bucket_from_wire, stream_summary_from_wire};
+
+    let node = Node::with_a_stream().await;
+    node.seed_bucket(5).await;
+    let id = node.stream_id.clone();
+    let (_, local_windows) = node
+        .call("GET", &format!("/api/v1/sla/streams/{id}"), None)
+        .await;
+    let (_, local_buckets) = node
+        .call("GET", &format!("/api/v1/sla/streams/{id}/buckets"), None)
+        .await;
+    let (_, local_overview) = node.call("GET", "/api/v1/sla/streams", None).await;
+    let stream_pull = |stream_id: &str, buckets: bool| SlaPull {
+        source: "passive".to_string(),
+        streams: true,
+        stream_id: stream_id.to_string(),
+        buckets,
+        ..SlaPull::default()
+    };
+    let store = node.state.store.lock().await;
+
+    let windows = answer_sla_pull(&store, &stream_pull(&id, false)).expect("windows");
+    assert!(windows.streams, "the answer says it is a stream answer");
+    assert!(windows.summaries.is_empty() && windows.buckets.is_empty());
+    let windows: Vec<StreamSlaSummary> = windows
+        .stream_summaries
+        .into_iter()
+        .map(stream_summary_from_wire)
+        .collect();
+    assert_eq!(
+        serde_json::to_value(&windows).expect("json"),
+        local_windows["data"],
+        "the proxied windows are the follower's own read"
+    );
+
+    let buckets = answer_sla_pull(&store, &stream_pull(&id, true)).expect("buckets");
+    let buckets: Vec<StreamSlaBucket> = buckets
+        .stream_buckets
+        .into_iter()
+        .map(|row| stream_bucket_from_wire(row).expect("an RFC 3339 start"))
+        .collect();
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0].judged_count, 10);
+    assert_eq!(buckets[0].connect_latency_p95_ms, Some(250));
+    assert_eq!(
+        local_buckets["data"].as_array().map(Vec::len),
+        Some(1),
+        "the local read holds the same minute"
+    );
+
+    let overview = answer_sla_pull(&store, &stream_pull("", false)).expect("overview");
+    let overview: Vec<StreamSlaSummary> = overview
+        .stream_summaries
+        .into_iter()
+        .map(stream_summary_from_wire)
+        .collect();
+    assert_eq!(
+        serde_json::to_value(&overview).expect("json"),
+        local_overview["data"]
+    );
+
+    let unknown = answer_sla_pull(&store, &stream_pull("no-such-stream", false));
+    assert!(
+        unknown.is_err(),
+        "a stream this node does not hold is refused"
+    );
+}
+
+#[test]
+fn a_stream_bucket_crosses_the_wire_whole() {
+    use crate::sla::{stream_bucket_from_wire, stream_bucket_to_wire};
+
+    let config = StreamSlaConfig::default_for_stream("stream-1");
+    let mut bucket = StreamSlaBucket::empty(&config, Utc::now(), "passive");
+    bucket.judged_count = 3;
+    bucket.connected_count = 3;
+    bucket.connect_latency_p99_ms = Some(42);
+    let back = stream_bucket_from_wire(stream_bucket_to_wire(&bucket)).expect("decodes");
+    assert_eq!(back, bucket);
+
+    let udp = StreamSlaBucket::empty(&config, Utc::now(), "passive");
+    let back = stream_bucket_from_wire(stream_bucket_to_wire(&udp)).expect("decodes");
+    assert_eq!(back, udp, "no latency stays no latency");
+}
+
+#[tokio::test]
+async fn the_stream_reads_take_node_as_fleet_reads_do() {
+    let node = Node::with_a_stream().await;
+    let id = node.stream_id.clone();
+    let viewer = create_user_and_login(
+        &node.state,
+        &node.sessions,
+        &node.limiter,
+        "viewer01",
+        Role::Viewer,
+    )
+    .await;
+    for uri in [
+        "/api/v1/sla/streams?node=node-b".to_string(),
+        format!("/api/v1/sla/streams/{id}?node=node-b"),
+        format!("/api/v1/sla/streams/{id}/buckets?node=node-b"),
+    ] {
+        let (status, _) = node.call_as(&viewer, "GET", &uri, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "a fleet read: {uri}");
+        let (status, _) = node.call("GET", &uri, None).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "off a control plane a node read is a conflict: {uri}"
+        );
+    }
+    // An empty node is this node, as on the route reads.
+    let (status, _) = node
+        .call_as(
+            &viewer,
+            "GET",
+            &format!("/api/v1/sla/streams/{id}?node="),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[test]
+fn an_answer_without_the_stream_marker_is_refused_not_served_empty() {
+    use lorica_cluster::messages::{SlaPullAck, SlaSummaryRow};
+
+    let old_follower = SlaPullAck {
+        summaries: vec![SlaSummaryRow::default()],
+        ..SlaPullAck::default()
+    };
+    assert!(matches!(
+        crate::sla::stream_answer_of("node-b", old_follower),
+        Err(crate::error::ApiError::Conflict(reason)) if reason.contains("node-b")
+    ));
+    let answered = SlaPullAck {
+        streams: true,
+        ..SlaPullAck::default()
+    };
+    assert!(crate::sla::stream_answer_of("node-b", answered).is_ok());
+}

@@ -776,11 +776,11 @@ stream drain cursor only; sequential after C1), `lorica-api/src/sla.rs`
 (`answer_sla_pull` only; sequential after C3), `lorica-api/src/stream_logs.rs`
 (the fleet read only; sequential after C1).
 
-- [ ] `TelemetryStreamRow`, the stream drain with its cursor,
+- [x] `TelemetryStreamRow`, the stream drain with its cursor,
       `fleet_stream_logs`, retention and quota; the control plane's stream
       log read merges local and fleet rows (D-i).
-- [ ] `SlaPull.stream_id` and its answer (D-g).
-- [ ] Tests: a follower's rows reach the control plane store; an old
+- [x] `SlaPull.stream_id` and its answer (D-g).
+- [x] Tests: a follower's rows reach the control plane store; an old
       control plane decoding a new push ignores the field; the 1.10.6
       telemetry DB opens.
 
@@ -1641,6 +1641,102 @@ edited here.
   --frozen-lockfile`: `pnpm run check` 0 errors and 0 warnings, `pnpm
   run lint` clean, Vitest green (see the Change Log row).
 
+- Lot G, 2026-11-18, on `38e4bfad`. Two commits: the stream row fan-in,
+  then the stream SLA pull.
+  - **Wire.** `TelemetryPush.stream` (tag 9) and `stream_cursor` (10),
+    `TelemetryPushAck.accepted_stream` (9) and `stream_cursor` (10), and
+    `TelemetryStreamRow`, the local row minus its id, words as strings
+    (a newer follower's word is stored, not refused), the null columns
+    as proto3 `optional`. `SlaPull.streams` (6) and `stream_id` (7),
+    `SlaPullAck.stream_summaries` (3), `stream_buckets` (4) and
+    `streams` (5), with `StreamSlaSummaryRow` and `StreamSlaBucketRow`.
+    `cluster.proto` carries every tag and the tag tests read it. The
+    frozen corpus fixture is byte-for-byte unchanged: its instances
+    gained the new fields empty, which encode to nothing.
+  - **Compatibility, tested against the v1.10.7 declarations frozen in
+    `messages.rs`.** A 1.10.7 control plane decodes a push carrying
+    stream rows with every known class intact and acks none of them; a
+    push without stream rows is byte-identical to a 1.10.7 one; the old
+    ack reads `accepted_stream = 0`. The follower's per-class cursors
+    (the Epic 9 close rule) then keep the stream cursor put while access,
+    WAF and audit advance. So the rows of the mixed window wait in the
+    follower's store and reach the control plane once it is upgraded,
+    rather than being lost as D-i says, unless local retention takes
+    them first (counted as
+    `lorica_cluster_telemetry_lost_to_retention_total{kind="stream"}`) or
+    the follower restarts in the window: a stream cursor the old control
+    plane never let advance still reads 0, the "never drained" mark, and
+    the first tick seeds it at the present, as D-i's loss. The cost is up
+    to one batch of stream rows re-sent per drain tick to an old control
+    plane. A 1.10.7 follower reads a stream `SlaPull` as
+    its route overview (no `route_id`, a valid pull); its answer lacks
+    `SlaPullAck.streams`, so the control plane answers 409 ("runs a
+    release that reports no stream SLA") instead of an empty chart. An
+    old control plane's pull reads as a route pull here, unchanged.
+  - **Admission (`lorica-fleet/src/ingest.rs`).** Stream rows are
+    traffic: bounded at the bridge by `MAX_TELEMETRY_ROWS`, charged on
+    the access rows' side of the quota's split and divided with them in
+    proportion to what was offered (`split_traffic`, exact), shed by the
+    quota verdict and by the storage watermark, counted under the same
+    drop reasons, priced by `estimated_bytes`; audit rows stay charged
+    and exempt. A `stream` drop is a `node_quota` or
+    `storage_watermark` drop like any other row's.
+  - **Store.** `fleet_stream_logs` (`CREATE TABLE IF NOT EXISTS`, indexes
+    `(node_id, id)`, `(node_id, timestamp)`, `(node_id, stream_id, id)`),
+    `TelemetryTable::Stream` and `TelemetryTable::ALL`, which the node
+    list, the per-node quota and the retired-node reclaim now walk, so
+    the per-node quota (`DEFAULT_ROWS_PER_NODE`) covers stream rows.
+    `ClusterTelemetryStore::ingest` takes the stream rows in the slot of
+    its `bans` slice, which no caller filled (bans go through
+    `replace_ban_snapshot`); the batch stays one transaction.
+  - **Follower.** `TelemetryCursor::Stream` (`lorica-config`), seeded at
+    the present on the first tick like the others, reset on leave
+    (`delete_cluster_identity` now walks `TelemetryCursor::ALL`);
+    `LogStore::stream_rows_after` and `newest_stream_id`;
+    `StreamLogEntry::to_wire` / `from_wire`; stream retention now gets the
+    stream cursor.
+  - **The node filter.** `GET /api/v1/stream-logs?node=<id>` on a control
+    plane reads that follower's fanned-in rows with the local read's
+    validated filters, oldest first, ids the fan-in store's, at most
+    `MAX_PAGE` rows, no `total` (the fan-in rule: no count per page under
+    the ingest lock), the answer naming `node`. The Operator floor of
+    every fleet read is held in the handler (the authorize layer sees the
+    path, not the query); 409 off a control plane. A separate `node`
+    extractor, so the automation read, which shares `StreamLogsQuery`,
+    takes no `?node=`. The local read and its `total` are unchanged.
+  - **`?node=` on the stream SLA reads.** `GET /api/v1/sla/streams`,
+    `/sla/streams/{id}` and `/buckets` pull from the follower as the
+    route reads do (Operator floor, 409 without a session), the pull
+    marked `streams`, answered by `answer_sla_pull` with the same
+    computations as the local reads (`stream_sla_overview_rows` is the
+    overview's, shared).
+  - **Outside the allowlist, needed:** `lorica-fleet/src/ingest.rs` (the
+    admission), `lorica/src/startup/cluster_plane.rs` (the ingest
+    handler), `lorica/src/startup/mod.rs` (stream retention cursor, the
+    fleet quota over `TelemetryTable::ALL`), `lorica-config/src/store/mod.rs`,
+    `store/cluster_identity.rs` and `tests.rs` (the cursor),
+    `lorica-cluster/src/bridge.rs` and `listener/operational.rs` (the row
+    bound, the rate-limited ack's cursor), `lorica-cluster/src/lib.rs`,
+    `lorica-cluster/tests/wire_corpus.rs` and `replication.rs` (struct
+    literals), `lorica-api/src/cluster/mod.rs`
+    (`fleet_telemetry_for_reads`), `lorica-api/src/metrics.rs` (one doc
+    line), `lorica-api/openapi.yaml` (`node` on the four reads),
+    `lorica-api/src/sla/stream_tests.rs`. The telemetry drain is
+    `lorica/src/startup/telemetry_drain.rs`. Nothing of
+    `lorica-api/src/log_store.rs`: the drain read sits with the other
+    stream store functions in `stream_logs.rs`.
+  - **Observed, not changed:** on a node that never joined a fleet the
+    telemetry cursors read 0, so the hourly access (and now stream)
+    retention counts every row it deletes as undrained and warns that the
+    fleet view is short. Pre-existing on the access path since backlog
+    #76; the stream path mirrors it.
+  - **Left for Lot I:** `docs/cluster.md` on the mixed window (rows wait,
+    not lost) and on `?node=`; `docs/streams.md`.
+- Lot G gates, `rust:1-bookworm` with `CARGO_BUILD_WARNINGS=deny`, on
+  each committed tree (the fan-in `3a3b755e`, then the SLA pull): the CI
+  chain green and `cargo audit` clean. Last tree: 3,721 product, 976
+  `lorica`, 915 forked and 592 TLS-featured tests.
+
 ## File List
 
 - `lorica-config/src/models/settings.rs`
@@ -1719,6 +1815,17 @@ edited here.
   both OpenAPI documents, `lorica-mcp/src/tools.rs`,
   `lorica-config/src/store/sla.rs`, `lorica-config/src/tests.rs`,
   `docs/automation.md` (Lot C3, the stream SLA overview, Resolved 9)
+- `lorica-cluster/src/messages.rs`, `proto/cluster.proto`, `lib.rs`,
+  `bridge.rs`, `listener/operational.rs`, `tests/wire_corpus.rs`,
+  `tests/replication.rs` (Lot G)
+- `lorica-fleet/src/telemetry_store.rs`, `ingest.rs`,
+  `tests/cluster_telemetry_upgrade.rs` (Lot G)
+- `lorica-config/src/store/mod.rs`, `store/cluster_identity.rs`,
+  `tests.rs` (Lot G, `TelemetryCursor::Stream`)
+- `lorica-api/src/stream_logs.rs`, `sla.rs`, `sla/stream_tests.rs`,
+  `cluster/mod.rs`, `metrics.rs`, `openapi.yaml` (Lot G)
+- `lorica/src/startup/telemetry_drain.rs` (the drain), `cluster_plane.rs`,
+  `mod.rs` (Lot G)
 
 - `lorica-dashboard/frontend/src/lib/api.ts`, `lib/router.ts`,
   `lib/stream-links.ts` (new), `lib/stream-links.test.ts` (new),
@@ -1749,3 +1856,4 @@ edited here.
 | 2026-11-18 | 0.14 | Lot C3 closed: the overview `streams` field built as a read of its own (Resolved 9), `GET /api/v1/sla/streams` (Viewer), `GET /automation/v1/sla/streams` under `sla:read` and the MCP read tool `lorica_sla_streams`, the 1h and 24h windows of every held stream with a target or data, rows naming the stream by id, paged with the window pushed into the computation; both OpenAPI documents. Gates on the final tree: the CI chain green (3,687 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean. | Romain G. |
 | 2026-11-18 | 0.9 | Lot C1: `stream_access_logs` with its own retention and writer queue, `StreamLogEntry` built from the stream records, `/api/v1/stream-logs` with export and clear, the three settings in the settings API, the `stream` sink kind, and a syslog up state that follows the collector without traffic. | Romain G. |
 | 2026-11-18 | 0.15 | Lot H: the Logs page's HTTP / Streams switch with the stream table, its filters, export and clear; the SLA page's Streams section with windows, buckets, target editor, export and delete; the stream retention and the two stream sink toggles in the settings forms; `#/logs?view=streams&stream=<id>` and `#/sla?stream=<id>` links. Frontend gates green (check, lint, Vitest 904). | Romain G. |
+| 2026-11-18 | 0.16 | Lot G: stream rows fan in to the control plane on the telemetry push (new tags, admitted as access rows are: quota charged, watermark shed, drop reasons counted, audit still exempt), stored in `fleet_stream_logs` under the per-node quota and read with `GET /api/v1/stream-logs?node=`; `SlaPull` names a stream and the three stream SLA reads take `?node=`. A 1.10.7 peer is tested both ways against its frozen push, ack, pull and answer; the frozen wire corpus is unchanged. Gates on both trees: the CI chain green (3,721 product, 976 `lorica`, 915 forked, 592 TLS-featured tests on the last), `cargo audit` clean. | Romain G. |

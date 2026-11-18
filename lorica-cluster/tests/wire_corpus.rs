@@ -427,6 +427,8 @@ fn corpus() -> Vec<Entry> {
                 from: "2026-09-09T09:00:00Z".to_string(),
                 to: "2026-09-09T10:00:00Z".to_string(),
                 buckets: true,
+                streams: false,
+                stream_id: String::new(),
             },
         ),
         entry("SlaSummaryRow", sla_summary()),
@@ -436,6 +438,9 @@ fn corpus() -> Vec<Entry> {
             SlaPullAck {
                 summaries: vec![sla_summary()],
                 buckets: vec![sla_bucket()],
+                stream_summaries: Vec::new(),
+                stream_buckets: Vec::new(),
+                streams: false,
             },
         ),
         entry(
