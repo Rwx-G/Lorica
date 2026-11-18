@@ -656,9 +656,9 @@ Allowlist: `lorica-dashboard/frontend/src/routes/Backends.svelte`,
 `lorica-dashboard/frontend/src/lib/backend-address.test.ts` (new).
 `lib/api.ts` is read, not edited.
 
-- [ ] Usage column and popover, delete confirmation naming streams, the
+- [x] Usage column and popover, delete confirmation naming streams, the
       UDP-attached hint, the portless address (D-j).
-- [ ] Vitest: the join over a route, a TCP stream with a backup, a TLS
+- [x] Vitest: the join over a route, a TCP stream with a backup, a TLS
       stream's per-rule links; the address cases; checks forced off for a
       portless address.
 
@@ -1126,6 +1126,33 @@ each one as "Resolved N".
   the UDP tab, the suspended bounds, the hole help text, the header
   badges, a Viewer's read-only drawer.
 
+- **Lot E, 2026-11-18 (dashboard).** `lib/backend-usage.ts` (new,
+  outside the allowlist, tested on its own): `backendUsage(routes,
+  streams)` joins `GET /api/v1/routes` (`backends`) and
+  `GET /api/v1/streams` (`backend_ids`, `backup_backend_ids` and each
+  TLS rule's lists) into each backend's routes and stream links (backup
+  or primary, rule name); `udpStreamsOf` picks the UDP streams. The
+  Backends page reads both lists beside the backends and shows a "Used
+  by" column: "N routes, M streams" as a disclosure listing route
+  hostnames and stream names with how each links, linking to their
+  pages. Nothing is added to `BackendResponse`, as D-j says.
+- **Delete.** The confirmation names the routes and the streams that
+  lose the backend and says the streams' connections to it drain for
+  the drain timeout, then close; "No route or stream uses it." otherwise.
+- **Checks forced off, with the reason.** `lib/backend-address.ts`:
+  `validateBackendAddress` reads an address as `backend_address_port`
+  does (`lorica-config/src/models/backend.rs`): `host:port`,
+  `[v6]:port`, the portless host, IPv4 and bracketed IPv6 forms (the
+  IPv6 literal checked by the browser's URL parser, not a regex), an
+  unbracketed IPv6 literal read with its last group as the port; its
+  test replays the cases of `address_tests` there. A portless address,
+  or an edited backend serving a UDP stream, disables the "Health check
+  enabled" toggle, forces it off and says why ("No port to probe..." or
+  "Serves UDP stream X: active checks are not available until
+  1.12.0."). The `pattern` attribute and `ADDRESS_PATTERN` are gone.
+  Deviation: the old form refused port 0 and the new rule accepts it as
+  the server's parse does; the server's other checks stay the authority.
+
 ## File List
 
 - `lorica-api/src/streams/status.rs` (new, Lot A)
@@ -1168,6 +1195,11 @@ each one as "Resolved N".
   `ScalarFields`, `LinkSet`), `routes/Streams.svelte`,
   `routes/Streams.test.ts` (Lot D2)
 
+- `lorica-dashboard/frontend/src/routes/Backends.svelte`,
+  `routes/Backends.test.ts`, `lib/backend-address.ts` (new),
+  `lib/backend-address.test.ts` (new), `lib/backend-usage.ts` (new),
+  `lib/backend-usage.test.ts` (new) (Lot E)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1181,3 +1213,4 @@ each one as "Resolved N".
 | 2026-11-18 | 0.7 | D-i amended: the backend delete refusal names the streams only to a token holding `streams:read` and lists their ids, with the scope it lacks, to any other, on every door; tests for both cases. Gates on the final tree: the CI chain green (3,687 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean. | Romain G. |
 | 2026-11-18 | 0.8 | Lot D1: the Streams page (list, search, groups, sortable columns, bind state per node, this node's counters and browser-side rates, enable, disable, delete with the drain named, Logs and SLA links), the stream view and write types with the five calls, the derived badge map. Frontend gates green (check, lint, Vitest 937). | Romain G. |
 | 2026-11-18 | 0.9 | Lot D2: the stream drawer with its six tabs, `fieldsFor` deciding what is shown and sent, no range in the frontend, server refusals routed by `fieldTab` to the tab holding the field, every cap labelled per node, the IV1 create body pinned as `stream-iv1-create.json`. Frontend gates green (check, lint, Vitest 976). | Romain G. |
+| 2026-11-18 | 0.10 | Lot E: the Backends page's "Used by" column joined in the browser from the route and stream lists, the delete confirmation naming the streams and their drain, active checks forced off with the reason for a backend serving a UDP stream and for a portless address, the address rule read as the server reads it. Frontend gates green (check, lint, Vitest 1000). | Romain G. |

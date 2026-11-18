@@ -1,8 +1,8 @@
-import { render, screen, fireEvent } from '@testing-library/svelte';
+import { render, screen, fireEvent, within } from '@testing-library/svelte';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import { auth } from '../lib/auth';
-import { api, type BackendResponse } from '../lib/api';
+import { api, type BackendResponse, type RouteResponse } from '../lib/api';
 import { clusterStatus } from '../lib/cluster';
 import {
   EXPECT_MAX_ALTERNATIVES,
@@ -11,6 +11,7 @@ import {
   SEND_MAX_BYTES,
   TCP_CHECK_TEMPLATES,
 } from '../lib/health-check-templates.generated';
+import { stream, udpSettings } from '../test-stream-fixtures';
 import Backends from './Backends.svelte';
 
 function backend(overrides: Partial<BackendResponse> = {}): BackendResponse {
@@ -48,6 +49,8 @@ const managedBackend = backend({
 beforeEach(() => {
   vi.restoreAllMocks();
   vi.spyOn(api, 'listBackends').mockResolvedValue({ data: { backends: [backend(), managedBackend] } });
+  vi.spyOn(api, 'listRoutes').mockResolvedValue({ data: { routes: [] } });
+  vi.spyOn(api, 'listStreams').mockResolvedValue({ data: { streams: [] } });
   auth.set({ status: 'authenticated', username: 'someone', role: 'operator' });
 });
 
@@ -368,4 +371,75 @@ describe('Backends page: templates and send/expect checks (Story 12.7)', () => {
       expect(update.mock.calls[0][1].health_check).toEqual(stored);
     });
   }
+});
+
+describe('Backends page: usage and portless addresses (Story 12.10 Lot E)', () => {
+  const pg = stream({ id: 's1', name: 'pg', backend_ids: ['backend-1'] });
+  const dns = stream({ id: 's2', name: 'dns', protocol: 'udp', udp: udpSettings(), backend_ids: [], backup_backend_ids: ['backend-1'] });
+
+  beforeEach(() => {
+    vi.mocked(api.listRoutes).mockResolvedValue({
+      data: { routes: [{ id: 'r1', hostname: 'app.example.com', backends: ['backend-1'] } as RouteResponse] },
+    });
+    vi.mocked(api.listStreams).mockResolvedValue({ data: { streams: [{ ...pg, bind: null }, { ...dns, bind: null }] } });
+  });
+
+  it('counts the routes and streams each backend serves, and lists them', async () => {
+    render(Backends);
+    const summary = await screen.findByLabelText('Used by web-01: 1 route, 2 streams');
+    const list = summary.closest('details') as HTMLElement;
+    expect(within(list).getByRole('link', { name: 'app.example.com' })).toHaveAttribute('href', '#/routes');
+    expect(within(list).getByRole('link', { name: 'pg' })).toHaveAttribute('href', '#/streams');
+    expect(list.textContent).toContain('stream, backup, UDP');
+    const managed = screen.getByText('pr-42-app').closest('tr') as HTMLElement;
+    expect(within(managed).queryByRole('group')).toBeNull();
+    expect(managed.querySelector('details')).toBeNull();
+  });
+
+  it('names the streams that lose the backend in the delete confirmation, and their drain', async () => {
+    render(Backends);
+    await fireEvent.click(await screen.findByRole('button', { name: 'Delete web-01' }));
+    const dialog = screen.getByRole('dialog');
+    expect(dialog.textContent).toContain('Streams pg, dns lose it');
+    expect(dialog.textContent).toContain('drain');
+    expect(dialog.textContent).toContain('Routes app.example.com');
+  });
+
+  it('keeps checks off on a backend serving a UDP stream, and says why', async () => {
+    render(Backends);
+    await fireEvent.click(await screen.findByRole('button', { name: 'Edit web-01' }));
+    const toggle = screen.getByLabelText('Health check enabled') as HTMLInputElement;
+    expect(toggle).toBeDisabled();
+    expect(toggle.checked).toBe(false);
+    expect(screen.getByRole('note')).toHaveTextContent('Serves UDP stream dns: active checks are not available until 1.12.0.');
+  });
+
+  it('accepts a portless address and forces checks off for it', async () => {
+    const create = vi.spyOn(api, 'createBackend').mockResolvedValue({ data: backend() });
+    render(Backends);
+    await screen.findByText('web-01');
+    await fireEvent.click(screen.getByRole('button', { name: 'Add Backend' }));
+    await fireEvent.input(screen.getByLabelText(/^Address/), { target: { value: '192.0.2.10' } });
+    const toggle = screen.getByLabelText('Health check enabled') as HTMLInputElement;
+    expect(toggle).toBeDisabled();
+    expect(screen.getByRole('note')).toHaveTextContent('No port to probe');
+    await fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(create.mock.calls[0][0]).toMatchObject({ address: '192.0.2.10', health_check_enabled: false });
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Add Backend' }));
+    await fireEvent.input(screen.getByLabelText(/^Address/), { target: { value: '192.0.2.10:8080' } });
+    expect(screen.getByLabelText('Health check enabled')).toBeEnabled();
+  });
+
+  it('refuses an address the server refuses', async () => {
+    const create = vi.spyOn(api, 'createBackend').mockResolvedValue({ data: backend() });
+    render(Backends);
+    await screen.findByText('web-01');
+    await fireEvent.click(screen.getByRole('button', { name: 'Add Backend' }));
+    await fireEvent.input(screen.getByLabelText(/^Address/), { target: { value: '[192.0.2.10]' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+    expect(create).not.toHaveBeenCalled();
+    expect(screen.getAllByText(/Invalid bracketed IPv6 literal/).length).toBeGreaterThan(0);
+  });
 });

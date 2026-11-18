@@ -7,9 +7,13 @@
     type HealthCheck,
     type HealthCheckPayload,
     type MatchAnchor,
+    type RouteResponse,
+    type StreamResponse,
     type TcpCheckTemplateName,
     type UpdateBackendRequest,
   } from '../lib/api';
+  import { validateBackendAddress } from '../lib/backend-address';
+  import { backendUsage, udpStreamsOf, type BackendUsage } from '../lib/backend-usage';
   import {
     EXPECT_MAX_ALTERNATIVES,
     EXPECT_MAX_BYTES,
@@ -28,6 +32,11 @@
   import { canWrite } from '../lib/auth';
 
   let backends: BackendResponse[] = $state([]);
+  // The routes and streams each backend serves (Story 12.10 D-j), joined
+  // here rather than carried by the backend view.
+  let routes: RouteResponse[] = $state([]);
+  let streams: StreamResponse[] = $state([]);
+  const usage: Record<string, BackendUsage> = $derived(backendUsage(routes, streams));
   let error = $state('');
   let loading = $state(true);
 
@@ -119,14 +128,46 @@
     return result;
   });
 
-  const ADDRESS_PATTERN = /^[a-zA-Z0-9._-]+:\d{1,5}$/;
-
   function validateAddress(value: string): string {
-    if (!value.trim()) return 'Address is required (e.g. 10.0.0.1:8080)';
-    if (!ADDRESS_PATTERN.test(value.trim())) return 'Address must be in host:port format';
-    const port = parseInt(value.split(':').pop()!, 10);
-    if (port < 1 || port > 65535) return 'Port must be between 1 and 65535';
+    const check = validateBackendAddress(value);
+    return 'error' in check ? check.error : '';
+  }
+
+  /**
+   * Why the form keeps active checks off, `''` when nothing does: a
+   * portless address has no port to probe, and a backend serving a UDP
+   * stream may have no active check until 1.12.0 (12.1 D-6). The server
+   * refuses both; the form says so before the save.
+   */
+  const checksBlockedBy: string = $derived.by(() => {
+    const check = validateBackendAddress(formAddress);
+    if ('portless' in check && check.portless) return 'No port to probe: a portless backend serves port-range streams only.';
+    const udp = editingBackend ? udpStreamsOf(usage[editingBackend.id]) : [];
+    if (udp.length > 0) {
+      const names = udp.map((s) => s.name).join(', ');
+      return `Serves UDP stream ${names}: active checks are not available until 1.12.0.`;
+    }
     return '';
+  });
+
+  $effect(() => {
+    if (checksBlockedBy !== '') formHealthCheckEnabled = false;
+  });
+
+  function usageTitle(u: BackendUsage | undefined): string {
+    const routeCount = u?.routes.length ?? 0;
+    const streamCount = new Set((u?.streams ?? []).map((l) => l.stream.id)).size;
+    return `${routeCount} route${routeCount === 1 ? '' : 's'}, ${streamCount} stream${streamCount === 1 ? '' : 's'}`;
+  }
+
+  /** Each stream once, with how it links the backend. */
+  function streamLinks(u: BackendUsage): { name: string; how: string }[] {
+    return u.streams.map((l) => ({
+      name: l.stream.name,
+      how: [l.backup ? 'backup' : 'primary', l.rule ? `rule ${l.rule}` : '', l.stream.protocol.toUpperCase()]
+        .filter((x) => x)
+        .join(', '),
+    }));
   }
 
   function validate(): string {
@@ -320,12 +361,18 @@
   async function loadData() {
     loading = true;
     error = '';
-    const res = await api.listBackends();
+    const [res, routesRes, streamsRes] = await Promise.all([
+      api.listBackends(),
+      api.listRoutes(),
+      api.listStreams(),
+    ]);
     if (res.error) {
       error = res.error.message;
     } else if (res.data) {
       backends = res.data.backends;
     }
+    routes = routesRes.data?.routes ?? [];
+    streams = streamsRes.data?.streams ?? [];
     loading = false;
   }
 
@@ -439,7 +486,19 @@
   }
 
   function deleteBackendMessage(b: BackendResponse): string {
-    return `Delete backend ${b.address}? Routes using this backend will lose it from their pool.`;
+    const u = usage[b.id];
+    const parts = [`Delete backend ${b.address}?`];
+    if (u && u.routes.length > 0) {
+      parts.push(`Routes ${u.routes.map((r) => r.hostname).join(', ')} lose it from their pool.`);
+    }
+    const streamNames = [...new Set((u?.streams ?? []).map((l) => l.stream.name))];
+    if (streamNames.length > 0) {
+      parts.push(
+        `Streams ${streamNames.join(', ')} lose it: their connections to it drain for the drain timeout (Settings), then close.`,
+      );
+    }
+    if (parts.length === 1) parts.push('No route or stream uses it.');
+    return parts.join(' ');
   }
 
   async function handleDelete() {
@@ -506,6 +565,7 @@
             <th>Weight</th>
             <th>Health Check</th>
             <th>TLS</th>
+            <th>Used by</th>
             <th>Connections</th>
             <th>EWMA</th>
             <th></th>
@@ -540,6 +600,24 @@
                 {/if}
                 {#if b.h2_upstream}
                   <span class="badge-on">H2</span>
+                {/if}
+              </td>
+              <td class="used-by">
+                {#if usage[b.id]}
+                  {@const u = usage[b.id]}
+                  <details>
+                    <summary aria-label="Used by {b.name || b.address}: {usageTitle(u)}">{usageTitle(u)}</summary>
+                    <ul class="usage-list">
+                      {#each u.routes as r (r.id)}
+                        <li><a href="#/routes">{r.hostname}</a> <span class="text-muted">route</span></li>
+                      {/each}
+                      {#each streamLinks(u) as link, i (i)}
+                        <li><a href="#/streams">{link.name}</a> <span class="text-muted">stream, {link.how}</span></li>
+                      {/each}
+                    </ul>
+                  </details>
+                {:else}
+                  <span class="text-muted">-</span>
                 {/if}
               </td>
               <td class="mono">{b.active_connections}</td>
@@ -607,7 +685,8 @@
 
         <div class="form-group">
           <label for="backend-address">Address <span class="required">*</span></label>
-          <input id="backend-address" type="text" bind:value={formAddress} placeholder="10.0.0.1:8080" pattern={'^[a-zA-Z0-9._-]+:\\d{1,5}$'} onblur={handleAddressBlur} oninput={handleAddressBlur} />
+          <input id="backend-address" type="text" bind:value={formAddress} placeholder="10.0.0.1:8080" onblur={handleAddressBlur} oninput={handleAddressBlur} />
+          <span class="hint">host:port, or a host with no port for a port-range stream, which forwards each listen port to the same port of its backends.</span>
           {#if addressError}
             <span class="field-error">{addressError}</span>
           {/if}
@@ -714,8 +793,8 @@
         {/if}
 
         <div class="checkbox-row">
-          <label class="checkbox-item">
-            <input type="checkbox" bind:checked={formHealthCheckEnabled} />
+          <label class="checkbox-item" title={checksBlockedBy || undefined}>
+            <input type="checkbox" bind:checked={formHealthCheckEnabled} disabled={checksBlockedBy !== ''} />
             Health check enabled
           </label>
           <label class="checkbox-item">
@@ -727,6 +806,10 @@
             HTTP/2 upstream (h2c for plaintext, ALPN h2 for TLS; HTTP routes only; streams ignore it)
           </label>
         </div>
+
+        {#if checksBlockedBy}
+          <p class="hint checks-blocked" role="note">{checksBlockedBy}</p>
+        {/if}
 
         {#if formTlsUpstream}
           <div class="form-group">
@@ -781,4 +864,7 @@
   .exchange-label { margin: var(--space-3) 0 var(--space-2); font-size: var(--text-sm); }
   .answer-row { display: flex; gap: var(--space-2); align-items: center; margin-bottom: var(--space-2); }
   .answer-row input { flex: 1; min-width: 0; }
+  .used-by summary { cursor: pointer; white-space: nowrap; }
+  .usage-list { margin: var(--space-1) 0 0; padding-left: var(--space-4); font-size: var(--text-sm); }
+  .checks-blocked { margin-top: 0; }
 </style>
