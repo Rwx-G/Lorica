@@ -1,7 +1,14 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type StreamReadResponse, type StreamStatus } from '../lib/api';
+  import {
+    api,
+    type BackendResponse,
+    type CertificateResponse,
+    type StreamReadResponse,
+    type StreamStatus,
+  } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
+  import StreamDrawer from '../components/StreamDrawer.svelte';
   import { canWrite } from '../lib/auth';
   import { nodeRole } from '../lib/cluster';
   import { formatBytes } from '../lib/format';
@@ -38,6 +45,20 @@
   let sortDirection: 'asc' | 'desc' = $state('asc');
 
   let deleting: StreamReadResponse | null = $state(null);
+
+  // The drawer: the backends and certificates it links are read when it opens.
+  let showDrawer = $state(false);
+  let editing: StreamReadResponse | null = $state(null);
+  let backends: BackendResponse[] = $state([]);
+  let certificates: CertificateResponse[] = $state([]);
+
+  async function openDrawer(stream: StreamReadResponse | null) {
+    editing = stream;
+    const [backendsRes, certsRes] = await Promise.all([api.listBackends(), api.listCertificates()]);
+    backends = backendsRes.data?.backends ?? [];
+    certificates = certsRes.data?.certificates ?? [];
+    showDrawer = true;
+  }
   let togglingId: string | null = $state(null);
 
   async function loadStreams() {
@@ -216,6 +237,9 @@
 <div class="streams-page">
   <div class="page-header">
     <h1>Streams</h1>
+    {#if $canWrite}
+      <button class="btn btn-primary" onclick={() => void openDrawer(null)}>+ New Stream</button>
+    {/if}
   </div>
 
   {#if $nodeRole === 'control_plane'}
@@ -325,6 +349,7 @@
                 <span class="enabled-indicator" class:on={stream.enabled}>{stream.enabled ? 'Yes' : 'No'}</span>
               </td>
               <td class="actions">
+                <button class="btn btn-secondary btn-sm" aria-label="{$canWrite ? 'Edit' : 'View'} {stream.name}" onclick={() => void openDrawer(stream)}>{$canWrite ? 'Edit' : 'View'}</button>
                 <a class="btn btn-secondary btn-sm" href={streamLogsHref(stream.id)} title="Access log of {stream.name}">Logs</a>
                 <a class="btn btn-secondary btn-sm" href={streamSlaHref(stream.id)} title="SLA of {stream.name}">SLA</a>
                 {#if $canWrite}
@@ -345,6 +370,16 @@
     </div>
   {/if}
 </div>
+
+<StreamDrawer
+  open={showDrawer}
+  {editing}
+  status={editing ? (statuses[editing.id] ?? null) : null}
+  {backends}
+  {certificates}
+  onsave={reload}
+  onclose={() => { showDrawer = false; editing = null; }}
+/>
 
 {#if deleting}
   <ConfirmDialog

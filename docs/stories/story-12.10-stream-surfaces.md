@@ -640,8 +640,8 @@ Allowlist: `lorica-dashboard/frontend/src/components/StreamDrawer.svelte`
 `lorica-dashboard/frontend/src/routes/Streams.svelte` (opening the
 drawer only).
 
-- [ ] Tabs and `fieldsFor` of D-b; `fieldTab` routing of server errors.
-- [ ] Vitest: for each (protocol, TLS mode) pair, the shown set equals
+- [x] Tabs and `fieldsFor` of D-b; `fieldTab` routing of server errors.
+- [x] Vitest: for each (protocol, TLS mode) pair, the shown set equals
       the sent set and excludes every field the server refuses for that
       pair; a create with only name, port and one backend sends exactly
       those (the IV1 request, pinned as a fixture the e2e reuses); every
@@ -1073,6 +1073,59 @@ each one as "Resolved N".
   allowlist): a stream view, a status and the UDP settings at their
   documented defaults, shared with Lots D2 and E.
 
+- **Lot D2, 2026-11-18 (dashboard).** `lib/stream-form.ts`:
+  `FIELD_TAB` (every writable field to its tab, a `Record` over the
+  view's writable keys so a new field is a `tsc` error until placed),
+  `fieldsFor(protocol, tlsMode)` and `tabsFor`, `fieldTab(message)`
+  (a field named whole, longest first, so `max_connections` is not
+  read inside `source_max_connections`; a rule's links route to
+  Backends, the rest of a rule to TLS; `general` when nothing is
+  named), the scalar and UDP field specs (label, kind, "per node",
+  the one-line help of the fields that open a hole, what empty means),
+  the draft (`newDraft`, `draftOf`) and `buildBody`.
+- **What a save sends.** Only fields `fieldsFor` the draft's shape
+  takes. An edit sends every one of them with its value (an empty
+  nullable number as `null`, an empty required one left out so it keeps
+  its stored value, an empty last port left out for a single port); a
+  create sends only what was set, so the server fills its defaults. A
+  boolean on a create is a select whose first choice is the server
+  default, never a copy of it. `requests_per_session` has a "no bound"
+  box, since an empty input means the default (64), not `null`. The
+  two response bounds are disabled, still sent, while
+  `unbounded_responses` is set. Load balancing and PROXY send offer on
+  UDP only what 12.5 D-l lifts (no `peak_ewma`, no `v1`).
+- **No range in the frontend.** Inputs carry no `min` or `max`; the
+  placeholder says "server default", "no limit" or what empty means.
+  A 400, 409 or 422 is shown on the tab `fieldTab` picks, which opens.
+- **The IV1 request** is `src/lib/stream-iv1-create.json` (name, TCP,
+  `0.0.0.0`, port 40100, one backend as `<BACKEND_ID>`): the drawer test
+  types the name and port, ticks the backend and asserts the create
+  body equals the file, and Lot H's MCP smoke posts it after
+  substituting the backend id.
+- **Components.** `components/StreamDrawer.svelte` with the drawer
+  structure of `RouteDrawer` (overlay, header with the endpoint and the
+  stream's badges from `streamBadges`, tab bar, body, footer), the six
+  tabs under `components/stream-tabs/` plus `FieldControl.svelte` (one
+  control per spec), `ScalarFields.svelte` (a tab's spec list filtered
+  by `fieldsFor`) and `LinkSet.svelte` (primaries, backups and a
+  "Max active to X (per node)" input per link, a backend never both).
+  A TLS stream's links are edited per rule on the Backends tab, the
+  rule's matcher on the TLS tab. Certificates come from
+  `GET /api/v1/certificates`. A Viewer opens the drawer read-only (the
+  body is a disabled fieldset, no save). Write `warnings` are shown as
+  toasts. `Streams.svelte` gains "+ New Stream" and Edit / View.
+- **Vitest.** `stream-form.test.ts`: for each pair the edit body's keys
+  equal `fieldsFor`, and exclude a per-pair list of fields
+  `openapi.yaml` says the server refuses; the IV1 create; empty
+  optional, required and last-port semantics; both protocol switches;
+  `requests_per_session` both ways; `fieldTab` on every field in two
+  message shapes, whole-name reading, UDP and rule routing, fallback;
+  every cap D-b lists labelled per node. `StreamDrawer.test.ts`: the
+  IV1 create through the form, the tabs per protocol, the per-node
+  labels on the rendered tabs (the link cap included), a 422 landing on
+  the UDP tab, the suspended bounds, the hole help text, the header
+  badges, a Viewer's read-only drawer.
+
 ## File List
 
 - `lorica-api/src/streams/status.rs` (new, Lot A)
@@ -1107,6 +1160,14 @@ each one as "Resolved N".
   `routes/Streams.test.ts` (new), `routes/Dashboard.svelte`,
   `components/Nav.svelte`, `src/test-stream-fixtures.ts` (new) (Lot D1)
 
+- `lorica-dashboard/frontend/src/lib/stream-form.ts` (new),
+  `lib/stream-form.test.ts` (new), `lib/stream-iv1-create.json` (new),
+  `components/StreamDrawer.svelte` (new), `components/StreamDrawer.test.ts`
+  (new), `components/stream-tabs/` (new: `GeneralTab`, `BackendsTab`,
+  `TlsTab`, `ConnectionTab`, `UdpTab`, `ProtectionTab`, `FieldControl`,
+  `ScalarFields`, `LinkSet`), `routes/Streams.svelte`,
+  `routes/Streams.test.ts` (Lot D2)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1119,3 +1180,4 @@ each one as "Resolved N".
 | 2026-11-18 | 0.6 | Lot C2: a token's backend delete (REST, both MCP transports, apply and preview) answers 409 naming every stream that links the backend, through a delete-only guard after the grant's check; address updates unchanged; the `lorica_backend_delete` summary and `openapi-automation.yaml` say so. Gates on the final tree: the CI chain green (3,684 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean. | Romain G. |
 | 2026-11-18 | 0.7 | D-i amended: the backend delete refusal names the streams only to a token holding `streams:read` and lists their ids, with the scope it lacks, to any other, on every door; tests for both cases. Gates on the final tree: the CI chain green (3,687 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean. | Romain G. |
 | 2026-11-18 | 0.8 | Lot D1: the Streams page (list, search, groups, sortable columns, bind state per node, this node's counters and browser-side rates, enable, disable, delete with the drain named, Logs and SLA links), the stream view and write types with the five calls, the derived badge map. Frontend gates green (check, lint, Vitest 937). | Romain G. |
+| 2026-11-18 | 0.9 | Lot D2: the stream drawer with its six tabs, `fieldsFor` deciding what is shown and sent, no range in the frontend, server refusals routed by `fieldTab` to the tab holding the field, every cap labelled per node, the IV1 create body pinned as `stream-iv1-create.json`. Frontend gates green (check, lint, Vitest 976). | Romain G. |

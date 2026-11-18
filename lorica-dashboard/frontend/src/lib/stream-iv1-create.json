@@ -1,0 +1,7 @@
+{
+  "name": "iv1-tcp",
+  "protocol": "tcp",
+  "listen_address": "0.0.0.0",
+  "port_first": 40100,
+  "backend_ids": ["<BACKEND_ID>"]
+}

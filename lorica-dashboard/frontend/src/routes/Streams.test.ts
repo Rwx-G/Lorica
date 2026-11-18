@@ -144,7 +144,18 @@ describe('Streams page (Story 12.10 Lot D1)', () => {
     signIn('viewer');
     render(Streams);
     await screen.findByText('[::]:53');
-    expect(screen.queryByRole('button', { name: /^(Enable|Disable|Delete) / })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^(Enable|Disable|Delete|Edit) / })).toBeNull();
+    expect(screen.queryByRole('button', { name: '+ New Stream' })).toBeNull();
+    expect(within(rowOf('pg')).getByRole('button', { name: 'View pg' })).toBeInTheDocument();
     expect(within(rowOf('pg')).getByRole('link', { name: 'Logs' })).toBeInTheDocument();
+  });
+
+  it('opens the drawer on a new stream for an Operator, with the backends to link', async () => {
+    vi.spyOn(api, 'listBackends').mockResolvedValue({ data: { backends: [] } });
+    vi.spyOn(api, 'listCertificates').mockResolvedValue({ data: { certificates: [] } });
+    render(Streams);
+    await fireEvent.click(await screen.findByRole('button', { name: '+ New Stream' }));
+    expect(await screen.findByRole('heading', { name: 'New Stream' })).toBeInTheDocument();
+    expect(api.listBackends).toHaveBeenCalled();
   });
 });
