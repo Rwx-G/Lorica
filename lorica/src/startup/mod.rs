@@ -333,6 +333,55 @@ async fn purge_superseded_acme_orphans(store: &Arc<Mutex<ConfigStore>>) {
     );
 }
 
+/// How far the fan-in drain has sent each local log, as retention
+/// counts its losses against (backlog #76). `None` means "no drain":
+/// retention then reports deletions only.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FanInDrainCursors {
+    access: Option<u64>,
+    waf: Option<u64>,
+    stream: Option<u64>,
+}
+
+impl FanInDrainCursors {
+    /// The cursors on a follower, and none anywhere else.
+    ///
+    /// A standalone node or a control plane drains to nobody, and its
+    /// cursors read 0 because nothing ever advanced them. Counting
+    /// against 0 took every row retention deleted for a row the fleet
+    /// view would miss, and warned hourly on nodes that have no fleet
+    /// view. Read per tick, from the stored identity, so a node that
+    /// joins or leaves a fleet after boot is counted for what it is now.
+    fn read(store: &ConfigStore) -> Self {
+        if !store.is_follower() {
+            return Self::default();
+        }
+        Self {
+            access: store.telemetry_cursor(TelemetryCursor::Access).ok(),
+            waf: store.telemetry_cursor(TelemetryCursor::Waf).ok(),
+            stream: store.telemetry_cursor(TelemetryCursor::Stream).ok(),
+        }
+    }
+}
+
+/// A follower's fleet identity, for the tests that need a store to read
+/// as one. Only its presence matters to [`ConfigStore::is_follower`].
+#[cfg(test)]
+fn follower_identity() -> lorica_config::models::ClusterIdentity {
+    let now = chrono::Utc::now();
+    lorica_config::models::ClusterIdentity {
+        node_id: "00000000-0000-4000-8000-000000000001".to_string(),
+        node_name: "follower01".to_string(),
+        cert_pem: String::new(),
+        key_pem: String::new(),
+        ca_pem: String::new(),
+        control_plane: "cp.internal:9444".to_string(),
+        server_name: "cp.internal".to_string(),
+        enrolled_at: now,
+        cert_not_after: now + chrono::Duration::days(90),
+    }
+}
+
 /// Spawn the hourly retention loop shared by supervisor and
 /// single-process modes (audit H-9 dedup): access-log retention, probe
 /// result purge (keep 1000), WAF event retention (keep 100 000),
@@ -388,13 +437,13 @@ pub(crate) fn spawn_retention_loop(
             // from its control plane for longer than local retention, the
             // difference is rows the fleet view will never hold, and a
             // quiet edge and a truncated one look the same without a count.
-            let (access_cursor, waf_cursor, stream_cursor) = {
+            let FanInDrainCursors {
+                access: access_cursor,
+                waf: waf_cursor,
+                stream: stream_cursor,
+            } = {
                 let s = retention_config_store.lock().await;
-                (
-                    s.telemetry_cursor(TelemetryCursor::Access).ok(),
-                    s.telemetry_cursor(TelemetryCursor::Waf).ok(),
-                    s.telemetry_cursor(TelemetryCursor::Stream).ok(),
-                )
+                FanInDrainCursors::read(&s)
             };
             if let Some(logs) = &retention_log_store {
                 if retention > 0 {
@@ -1381,6 +1430,65 @@ pub(crate) async fn drain_for_exit(tracker: &tokio_util::task::TaskTracker) -> E
 
 #[cfg(test)]
 mod tests {
+    use super::{follower_identity, FanInDrainCursors};
+    use lorica_config::store::TelemetryCursor;
+    use lorica_config::ConfigStore;
+
+    /// Every cursor kind advanced to a distinct value, so a mix-up
+    /// between kinds would show.
+    fn advance_every_cursor(store: &ConfigStore) {
+        for (n, kind) in (1u64..).zip(TelemetryCursor::ALL) {
+            store
+                .advance_telemetry_cursor(kind, 10 * n)
+                .expect("cursor write");
+        }
+    }
+
+    #[test]
+    fn a_standalone_node_counts_no_retention_loss() {
+        // No control plane to drain to: whatever the cursors read,
+        // retention must not count its deletions as rows the fleet view
+        // misses, or a standalone node warns every hour.
+        let store = ConfigStore::open_in_memory().expect("test store opens");
+        assert_eq!(
+            FanInDrainCursors::read(&store),
+            FanInDrainCursors::default()
+        );
+        advance_every_cursor(&store);
+        assert_eq!(
+            FanInDrainCursors::read(&store),
+            FanInDrainCursors::default()
+        );
+    }
+
+    #[test]
+    fn a_follower_counts_retention_loss_against_each_drain_cursor() {
+        let store = ConfigStore::open_in_memory().expect("test store opens");
+        store
+            .set_cluster_identity(&follower_identity())
+            .expect("identity write");
+        // A follower that has never pushed counts from the oldest row.
+        assert_eq!(
+            FanInDrainCursors::read(&store),
+            FanInDrainCursors {
+                access: Some(0),
+                waf: Some(0),
+                stream: Some(0),
+            }
+        );
+        advance_every_cursor(&store);
+        let cursors = FanInDrainCursors::read(&store);
+        for (kind, cursor) in [
+            (TelemetryCursor::Access, cursors.access),
+            (TelemetryCursor::Waf, cursors.waf),
+            (TelemetryCursor::Stream, cursors.stream),
+        ] {
+            let stored = store.telemetry_cursor(kind).expect("cursor read");
+            assert_ne!(stored, 0, "test setup: the cursor moved");
+            assert_eq!(cursor, Some(stored));
+        }
+    }
+
     /// An ACME certificate of `domain` expiring in `days`, as the store
     /// holds one.
     fn acme_certificate(id: &str, domain: &str, days: i64) -> lorica_config::models::Certificate {

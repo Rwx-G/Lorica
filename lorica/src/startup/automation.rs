@@ -263,8 +263,8 @@ fn adopt_inherited(
 
 #[cfg(test)]
 mod tests {
+    use super::super::follower_identity;
     use super::*;
-    use lorica_config::models::ClusterIdentity;
 
     const RESERVED: ReservedPorts = ReservedPorts {
         management: 9443,
@@ -274,21 +274,6 @@ mod tests {
         enrollment: None,
         automation: None,
     };
-
-    fn follower_identity() -> ClusterIdentity {
-        let now = chrono::Utc::now();
-        ClusterIdentity {
-            node_id: "00000000-0000-4000-8000-000000000001".to_string(),
-            node_name: "follower01".to_string(),
-            cert_pem: String::new(),
-            key_pem: String::new(),
-            ca_pem: String::new(),
-            control_plane: "cp.internal:9444".to_string(),
-            server_name: "cp.internal".to_string(),
-            enrolled_at: now,
-            cert_not_after: now + chrono::Duration::days(90),
-        }
-    }
 
     #[test]
     fn a_follower_refuses_to_open_the_automation_listener() {
