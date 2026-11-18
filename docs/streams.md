@@ -121,7 +121,7 @@ in `log-forward` sections only).
 | [`random`][n-random] | [`balance random`][h-balance] | `random` |
 | [`least_time connect`][n-least-time] | no equivalent | `peak_ewma` (connect latency) |
 | [`random two`][n-random] | [`balance random(2)`][h-balance] | not in 1.11.0 (weighted P2C is 1.12.0) |
-| [`health_check`][n-hc] (commercial subscription) | [`option tcp-check`][h-tcp-check], [`tcp-check send`][h-tcp-check-send], [`tcp-check expect`][h-tcp-check-expect] | the backend's `health_check`, `tcp_template` or `tcp_send_expect` (`docs/health-checks.md`) |
+| [`health_check`][n-hc] (commercial subscription) | [`option tcp-check`][h-tcp-check], [`tcp-check send`][h-tcp-check-send], [`tcp-check expect`][h-tcp-check-expect] | the backend's `health_check`, `tcp_template` or `tcp_send_expect` ([health checks](health-checks.md)) |
 | [`proxy_connect_timeout`][n-connect] | [`timeout connect`][h-t-connect] | `connect_timeout_ms` |
 | [`proxy_timeout`][n-timeout] | [`timeout client`][h-t-client] and [`timeout server`][h-t-server] (or [`timeout tunnel`][h-t-tunnel]) | `idle_timeout_s` |
 | none | none | `total_timeout_s` |
@@ -545,16 +545,16 @@ write that raises the demand is refused until it fits again.
 
 ### Raising capacity
 
-For high session or connection counts, in this order:
+For high session or connection counts there are three levers. The
+drop-in and the sysctl file are in the hardening guide,
+[Stream capacity: descriptors and source ports](security/hardening-guide.md#stream-capacity-descriptors-and-source-ports).
 
-1. **Raise `LimitNOFILE`** with a systemd drop-in
-   (`systemctl edit lorica`, `[Service]` then `LimitNOFILE=262144`). It
-   grows `S` and the HTTP reserve together, since `H` is half the limit.
-   The hardening guide (`docs/security/hardening-guide.md`) has the
-   drop-in.
-2. **Widen `net.ipv4.ip_local_port_range`** (for example `1024 65535`,
-   minus any port a local service listens on, listed in
-   `ip_local_reserved_ports`). It grows `U` for every pool.
+1. **Raise `LimitNOFILE`.** It grows `S` and the HTTP reserve together,
+   since `H` is half the limit. The limit is read at start, so it takes
+   a restart; a hot upgrade inherits the old process's limit.
+2. **Widen `net.ipv4.ip_local_port_range`**, or reserve fewer ports in
+   `ip_local_reserved_ports`. It grows `U` for every pool and applies
+   without a restart.
 3. **Add `source_addresses`** to the UDP streams that need more than one
    address's ports: each address is a pool of its own, and a stream's
    sessions spread evenly over its addresses. The addresses must be
@@ -625,7 +625,7 @@ Lorica makes itself (a local address, a name that does not resolve, a
 source address that cannot be bound) does not. While the breaker is
 open the backend is skipped (`lorica_stream_breaker_denied_total`).
 Active health checks feed the same backend state as for routes
-(`docs/health-checks.md`); a confirmed health change reaches every
+([health checks](health-checks.md)); a confirmed health change reaches every
 worker's table at once.
 
 A failed connect moves to another backend at once, up to
@@ -715,7 +715,8 @@ address is spoofable, so "a trusted peer" means nothing there.
 
 The HTTP and HTTPS listeners accept PROXY headers too, with their own
 settings (`proxy_protocol_http`, `proxy_protocol_https`,
-`proxy_protocol_trusted_cidrs`); see `docs/security.md`.
+`proxy_protocol_trusted_cidrs`); see
+[Client address from a PROXY header](security.md#client-address-from-a-proxy-header-v1110).
 
 ### Source addresses
 
@@ -1108,7 +1109,7 @@ The bound is per source key and **per node that binds the stream**,
 never per victim network: a spoofing attacker spreading across many
 source keys, or a stream placed on many nodes, multiplies it. That is
 why the listen-address rule below exists, and why the threat model
-(`docs/security/threat-model.md`) treats per-source controls as a
+([T12](security/threat-model.md#t12-stream-listeners-and-proxy-protocol-v1110)) treats per-source controls as a
 courtesy.
 
 ### The listen-address rule
@@ -1361,12 +1362,12 @@ axis that could confine a listen address or a port. So:
   /automation/v1/streams`, `GET /automation/v1/streams/status`), and the
   MCP server has stream tools in the read tier only (`lorica_streams`,
   `lorica_stream_status`, `lorica_stream_logs`). No scope and no tier
-  writes a stream (`docs/automation.md`, `docs/mcp.md`);
+  writes a stream ([automation API](automation.md), [MCP](mcp.md));
 - the settings that open a hole are refused on every automation and MCP
   surface: lifting the UDP response bounds, PROXY accept and its trusted
   CIDRs, local backends, and custom health-check payloads (a token with
   `backends:write` may pick a named template, never write a payload; see
-  `docs/health-checks.md`);
+  [health checks](health-checks.md));
 - a token may not change the address of a backend that a stream with
   `allow_local_backend` forwards to, and may not delete a backend a
   stream links (`409`, naming the streams only to a token that holds
@@ -1532,7 +1533,8 @@ with the rest of their telemetry. While the control plane runs a release
 older than its followers' (the mixed-version window of an upgrade), the
 rows **wait** on the follower and are sent once the control plane is
 upgraded; they are lost only if the follower's own retention removes
-them first or it restarts in the window. See `docs/cluster.md`.
+them first or it restarts in the window. See
+[Running a Mixed-Version Fleet](cluster.md#running-a-mixed-version-fleet).
 
 ---
 
@@ -1626,7 +1628,8 @@ the unit's `TimeoutStopSec` never cuts a drain short and no drop-in is
 needed for a long drain (systemd 236 or later). Without systemd (a
 container), nothing extends the runtime's own stop grace: set Docker's
 `stop_grace_period` above the drain. `docs/installation.md` and the
-hardening guide cover both.
+hardening guide's [The drain on a stop](security/hardening-guide.md#the-drain-on-a-stop)
+cover both.
 
 ### A hot upgrade
 
@@ -1675,7 +1678,7 @@ confirmation shows it.
 connections the old one closed at the deadline and how many finished on
 their own, in `lorica_hot_upgrade_stream_connections_total{stream_id,
 outcome}` (`drained`, `finished`), beside the unchanged
-`lorica_hot_upgrade_total`. `docs/hot-upgrade.md` describes the whole
+`lorica_hot_upgrade_total`. [Hot binary upgrade](hot-upgrade.md#what-the-drain-does) describes the whole
 sequence, the report and chained upgrades.
 
 `drains_on_upgrade` and its badge name the streams that will keep
