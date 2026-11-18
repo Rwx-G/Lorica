@@ -110,6 +110,13 @@ pub struct ServerConf {
     ///
     /// When not set, the tokio default (10 seconds) is used.
     pub blocking_threads_ttl_seconds: Option<u64>,
+    /// Timeout durations greater than this threshold use Tokio's native timeout instead of
+    /// Lorica's fast timeout.
+    ///
+    /// This avoids retaining long-duration cancelled timers in the fast timeout's shared timer
+    /// map until their original deadline. Defaults to 900 seconds (15 minutes). Set to `None`
+    /// to disable the Tokio fallback.
+    pub fast_timeout_to_tokio_threshold_seconds: Option<u64>,
     /// Path to a CRL (Certificate Revocation List) file in PEM or DER format.
     /// When set, upstream server certificates are checked against this CRL.
     pub upstream_crl_file: Option<String>,
@@ -141,6 +148,9 @@ impl Default for ServerConf {
             upgrade_sock_connect_accept_max_retries: None,
             max_blocking_threads: None,
             blocking_threads_ttl_seconds: None,
+            fast_timeout_to_tokio_threshold_seconds: Some(
+                lorica_timeout::fast_timeout::DEFAULT_FAST_TIMEOUT_TO_TOKIO_THRESHOLD.as_secs(),
+            ),
             upstream_crl_file: None,
         }
     }
@@ -266,6 +276,7 @@ mod tests {
             upgrade_sock_connect_accept_max_retries: None,
             max_blocking_threads: None,
             blocking_threads_ttl_seconds: None,
+            fast_timeout_to_tokio_threshold_seconds: Some(900),
             upstream_crl_file: None,
         };
         assert_eq!(expected, ServerConf::new());

@@ -546,6 +546,13 @@ impl Server {
             fast_timeout::unpause();
         }
 
+        // This global timeout threshold is intended to be configured once during server startup,
+        // before service runtimes begin creating timeout futures.
+        fast_timeout::set_fast_timeout_to_tokio_threshold(
+            conf.fast_timeout_to_tokio_threshold_seconds
+                .map(Duration::from_secs),
+        );
+
         let blocking_opts = BlockingPoolOpts {
             max_threads: conf.max_blocking_threads,
             thread_keep_alive: conf.blocking_threads_ttl_seconds.map(Duration::from_secs),
