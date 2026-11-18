@@ -6647,6 +6647,121 @@ fn hot_upgrade_counter(outcome: &str) -> u64 {
     0
 }
 
+/// Read `lorica_hot_upgrade_stream_connections_total{stream_id,outcome}`
+/// as the registry renders it, or `None` when the series does not exist.
+fn hot_upgrade_stream_connections_counter(stream_id: &str, outcome: &str) -> Option<u64> {
+    lorica_metrics::gather()
+        .iter()
+        .filter(|mf| mf.name() == "lorica_hot_upgrade_stream_connections_total")
+        .flat_map(|mf| mf.get_metric())
+        .find(|m| {
+            let has = |name: &str, value: &str| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.name() == name && l.value() == value)
+            };
+            has("stream_id", stream_id) && has("outcome", outcome)
+        })
+        .map(|m| m.get_counter().value() as u64)
+}
+
+#[test]
+fn hot_upgrade_stream_connections_count_each_outcome_per_stream() {
+    use crate::metrics::{record_hot_upgrade_stream_connections, HotUpgradeStreamOutcome};
+    let stream_id = "s1211c-counts";
+    for (i, outcome) in HotUpgradeStreamOutcome::ALL.into_iter().enumerate() {
+        let first = 3 + i as u64;
+        record_hot_upgrade_stream_connections(stream_id, outcome, first);
+        record_hot_upgrade_stream_connections(stream_id, outcome, 10);
+        assert_eq!(
+            hot_upgrade_stream_connections_counter(stream_id, outcome.as_str()),
+            Some(first + 10),
+            "{outcome:?} adds what each report says"
+        );
+        assert_eq!(
+            crate::metrics::hot_upgrade_stream_connections_value(stream_id, outcome),
+            Some(first + 10)
+        );
+    }
+    // A zero still renders the series: both outcomes of a drained stream
+    // exist even when nothing finished on its own.
+    record_hot_upgrade_stream_connections("s1211c-zero", HotUpgradeStreamOutcome::Finished, 0);
+    assert_eq!(
+        hot_upgrade_stream_connections_counter("s1211c-zero", "finished"),
+        Some(0)
+    );
+}
+
+#[test]
+fn hot_upgrade_stream_connections_series_go_with_their_stream() {
+    use crate::metrics::{
+        record_hot_upgrade_stream_connections, retain_hot_upgrade_stream_connections,
+        HotUpgradeStreamOutcome,
+    };
+    for outcome in HotUpgradeStreamOutcome::ALL {
+        record_hot_upgrade_stream_connections("s1211c-kept", outcome, 1);
+        record_hot_upgrade_stream_connections("s1211c-deleted", outcome, 1);
+    }
+
+    // Other tests record in the same registry: keep every stream but the
+    // deleted one, as a table holding them would.
+    retain_hot_upgrade_stream_connections(|id| id != "s1211c-deleted");
+
+    for outcome in HotUpgradeStreamOutcome::ALL {
+        assert_eq!(
+            hot_upgrade_stream_connections_counter("s1211c-deleted", outcome.as_str()),
+            None
+        );
+        assert_eq!(
+            hot_upgrade_stream_connections_counter("s1211c-kept", outcome.as_str()),
+            Some(1)
+        );
+    }
+}
+
+#[test]
+fn hot_upgrade_total_keeps_its_one_outcome_label_and_its_declared_outcomes() {
+    // The outcomes `lorica_hot_upgrade_total` declares are the ones its
+    // help names; the per-stream connection counts live on their own
+    // family and never add a label here (Story 12.11 Resolved 1).
+    crate::metrics::record_hot_upgrade_stream_connections(
+        "s1211c-total",
+        crate::metrics::HotUpgradeStreamOutcome::Drained,
+        1,
+    );
+    let family = |name: &str| {
+        lorica_metrics::gather()
+            .into_iter()
+            .find(|mf| mf.name() == name)
+    };
+    let declared: Vec<String> = {
+        crate::metrics::record_hot_upgrade("completed");
+        let help = family("lorica_hot_upgrade_total")
+            .expect("the family renders once recorded")
+            .help()
+            .to_string();
+        let list = help
+            .split_once("outcome=")
+            .and_then(|(_, rest)| rest.split(')').next())
+            .expect("the help declares the outcomes");
+        list.split('|').map(str::to_string).collect()
+    };
+    for outcome in &declared {
+        crate::metrics::record_hot_upgrade(outcome);
+    }
+    let rendered = family("lorica_hot_upgrade_total").expect("the family renders");
+    let mut seen: Vec<String> = Vec::new();
+    for m in rendered.get_metric() {
+        let names: Vec<&str> = m.get_label().iter().map(|l| l.name()).collect();
+        assert_eq!(names, vec!["outcome"]);
+        seen.push(m.get_label()[0].value().to_string());
+    }
+    seen.sort();
+    let mut expected = declared.clone();
+    expected.sort();
+    assert_eq!(seen, expected);
+}
+
 /// Build a `multipart/form-data` body with a `binary` part (raw bytes)
 /// and a `signature` part (hex). Returns `(content_type, body)`.
 fn build_upgrade_multipart(binary: &[u8], signature_hex: &str) -> (String, Vec<u8>) {

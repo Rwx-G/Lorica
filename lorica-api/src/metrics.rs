@@ -2312,12 +2312,14 @@ pub fn inc_config_reload_split_fleet() {
 /// - `"exec_failed"`: the new supervisor never came up (fork/exec failed,
 ///   staged-binary re-verify failed, or it never signalled readiness);
 ///   the old rolled back and kept serving.
-/// - `"drain_timeout"`: the old supervisor's post-handoff connection
-///   drain exceeded its window and stragglers were force-killed. This is
-///   informational, not an error, and CAN co-occur with a `completed`
-///   upgrade: pingora keeps idle upstream-keepalive connections that do
-///   not self-exit, so the drain routinely reaches the window even on a
-///   zero-drop swap. Do not alert on it alone.
+/// - `"drain_timeout"`: the outgoing generation's drain reached
+///   `worker_drain_timeout_s` with traffic still open (its drain report
+///   says `deadline` or `killed`), so what was left was closed at the
+///   deadline. Since Story 12.11 a worker ends its drain as soon as no
+///   request and no stream connection is in flight, so this counts
+///   upgrades that cut live traffic, not idle keepalives. Recorded by the
+///   NEW supervisor from the drain report it reads, beside `completed`,
+///   so it survives the old process.
 ///
 /// Bounded cardinality: five operator-controlled outcome strings, no
 /// user-derived label.
@@ -2336,25 +2338,165 @@ pub fn record_hot_upgrade(outcome: &str) {
     HOT_UPGRADE_TOTAL.with_label_values(&[outcome]).inc();
 }
 
+/// This process's `lorica_hot_upgrade_total{outcome}`, 0 when never
+/// recorded. Reading never creates a series.
+pub fn hot_upgrade_value(outcome: &str) -> u64 {
+    use lorica_metrics::prometheus::core::Collector;
+    HOT_UPGRADE_TOTAL
+        .collect()
+        .iter()
+        .flat_map(|family| family.get_metric())
+        .find(|m| m.get_label().iter().any(|l| l.value() == outcome))
+        .map(|m| m.get_counter().value() as u64)
+        .unwrap_or(0)
+}
+
 /// Worker connection-drain duration during a successful hot upgrade.
 ///
-/// Observed once per successful handoff: the seconds spent in
-/// `WorkerManager::shutdown_all` (SIGTERM the old workers, wait for
-/// in-flight connections to finish) on the outgoing supervisor, just
-/// before it exits. Buckets span the configurable drain window (default
-/// 30 s) so an operator can alert on drains creeping toward the timeout.
+/// Observed once per successful handoff: the seconds the outgoing
+/// generation's workers took to drain and exit, as its drain report
+/// says. The NEW supervisor observes it when the report arrives, so the
+/// figure outlives the process that measured it (Story 12.11 D-g).
+/// Buckets span the whole range of `worker_drain_timeout_s` (up to an
+/// hour) so an operator can alert on drains creeping toward the setting.
 static HOT_UPGRADE_DRAIN_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     lorica_metrics::register_histogram(
         "hot_upgrade_drain_seconds",
         "Worker connection-drain duration on a successful hot upgrade, in seconds",
-        vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0],
+        vec![
+            0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 120.0, 300.0, 600.0,
+            1_200.0, 1_800.0, 3_600.0,
+        ],
     )
 });
 
 /// Observe one successful-upgrade drain duration in seconds. Called by
-/// the supervisor's handoff success path after `shutdown_all` returns.
+/// the new supervisor once the outgoing generation's drain report has
+/// arrived.
 pub fn observe_hot_upgrade_drain(seconds: f64) {
     HOT_UPGRADE_DRAIN_SECONDS.observe(seconds);
+}
+
+/// What became of a stream connection or session an upgrade marked
+/// draining: the `outcome` of
+/// `lorica_hot_upgrade_stream_connections_total` (Story 12.11 D-g).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotUpgradeStreamOutcome {
+    /// The upgrade ended it, with `drained_by_upgrade`.
+    Drained,
+    /// It ended on its own during the drain.
+    Finished,
+}
+
+impl HotUpgradeStreamOutcome {
+    /// Every outcome, the family's closed label set.
+    pub const ALL: [HotUpgradeStreamOutcome; 2] = [
+        HotUpgradeStreamOutcome::Drained,
+        HotUpgradeStreamOutcome::Finished,
+    ];
+
+    /// The `outcome` label value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HotUpgradeStreamOutcome::Drained => "drained",
+            HotUpgradeStreamOutcome::Finished => "finished",
+        }
+    }
+}
+
+/// Counter: per stream, the connections and sessions a hot upgrade
+/// drained, by [`HotUpgradeStreamOutcome`] (Story 12.11 Resolved 1). It
+/// counts connections, never upgrades: `lorica_hot_upgrade_total` does.
+///
+/// Recorded by the NEW supervisor from the outgoing generation's drain
+/// report, so it is read from the process that survives. Cardinality:
+/// two series per stream on the node, the label being the stream id
+/// (never its name, never client-chosen); a deleted stream's series are
+/// removed by [`retain_hot_upgrade_stream_connections`] on the table
+/// change that removes it.
+static HOT_UPGRADE_STREAM_CONNECTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let outcomes: Vec<&str> = HotUpgradeStreamOutcome::ALL
+        .iter()
+        .map(|o| o.as_str())
+        .collect();
+    lorica_metrics::register_int_counter_vec(
+        "hot_upgrade_stream_connections_total",
+        &format!(
+            "Stream connections and sessions a hot upgrade drained, per stream (outcome={})",
+            outcomes.join("|")
+        ),
+        &["stream_id", "outcome"],
+    )
+});
+
+/// Add `connections` to `stream_id`'s series of `outcome`. A count of 0
+/// still creates the series, so both outcomes of a drained stream render.
+pub fn record_hot_upgrade_stream_connections(
+    stream_id: &str,
+    outcome: HotUpgradeStreamOutcome,
+    connections: u64,
+) {
+    HOT_UPGRADE_STREAM_CONNECTIONS_TOTAL
+        .with_label_values(&[stream_id, outcome.as_str()])
+        .inc_by(connections);
+}
+
+/// The stream ids `lorica_hot_upgrade_stream_connections_total` holds a
+/// series of, read without creating one.
+fn hot_upgrade_stream_connection_series() -> Vec<(String, String, u64)> {
+    use lorica_metrics::prometheus::core::Collector;
+    HOT_UPGRADE_STREAM_CONNECTIONS_TOTAL
+        .collect()
+        .iter()
+        .flat_map(|family| family.get_metric())
+        .map(|metric| {
+            let label = |name: &str| {
+                metric
+                    .get_label()
+                    .iter()
+                    .find(|l| l.name() == name)
+                    .map(|l| l.value().to_string())
+                    .unwrap_or_default()
+            };
+            (
+                label("stream_id"),
+                label("outcome"),
+                metric.get_counter().value() as u64,
+            )
+        })
+        .collect()
+}
+
+/// This process's `lorica_hot_upgrade_stream_connections_total` for
+/// `stream_id` and `outcome`, or `None` when no such series exists.
+/// Reading never creates a series.
+pub fn hot_upgrade_stream_connections_value(
+    stream_id: &str,
+    outcome: HotUpgradeStreamOutcome,
+) -> Option<u64> {
+    hot_upgrade_stream_connection_series()
+        .into_iter()
+        .find(|(id, o, _)| id == stream_id && o == outcome.as_str())
+        .map(|(_, _, value)| value)
+}
+
+/// Remove the `lorica_hot_upgrade_stream_connections_total` series of
+/// every stream `keep` refuses: called with the node's stream table on
+/// every table change, beside the stream metrics collector's own prune.
+pub fn retain_hot_upgrade_stream_connections(keep: impl Fn(&str) -> bool) {
+    let gone: std::collections::BTreeSet<String> = hot_upgrade_stream_connection_series()
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .filter(|id| !keep(id))
+        .collect();
+    for stream_id in gone {
+        for outcome in HotUpgradeStreamOutcome::ALL {
+            // `Err` means that outcome was never recorded for the
+            // stream, which is the state wanted.
+            let _ = HOT_UPGRADE_STREAM_CONNECTIONS_TOTAL
+                .remove_label_values(&[&stream_id, outcome.as_str()]);
+        }
+    }
 }
 
 // ---- Traffic capture (Story 10.1 AC #9) ----

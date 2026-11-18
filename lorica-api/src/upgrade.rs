@@ -103,6 +103,28 @@ pub struct StagedBinary {
     pub sha256: String,
 }
 
+/// The pid of this node's previous generation while it still drains
+/// after the hot upgrade that started this process (Story 12.11 D-h).
+static PREVIOUS_GENERATION: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+
+/// Record that the generation `pid` is still draining, or with `None`
+/// that it is done: its drain report arrived, or it is no longer this
+/// process's parent. Set by the supervisor only.
+pub fn set_previous_generation(pid: Option<u32>) {
+    *PREVIOUS_GENERATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = pid;
+}
+
+/// The pid of a previous generation of this node still draining, the
+/// upgrade preview's `previous_generation`. A further upgrade is allowed
+/// meanwhile; the preview only warns.
+pub fn previous_generation() -> Option<u32> {
+    *PREVIOUS_GENERATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Whether the successful verify+stage actually kicked off a live
 /// zero-downtime handoff, so the CLI / dashboard can report honestly
 /// instead of always claiming a swap happened (audit H1).
