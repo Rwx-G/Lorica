@@ -59,6 +59,7 @@ its live shape is `lorica-api/openapi-automation.yaml`:
 - `PUT /automation/v1/environments/{name}` (`environments:write`) - one idempotent create-or-replace covering a route, its backends, a certificate binding and a lifetime, applied in a single transaction.
 - `DELETE /automation/v1/environments/{name}` (`environments:write`) - also done by the reaper once `expires_at` has passed.
 - The read surface (`logs:read`, `waf:read`, `sla:read`, `cluster:read`, `backends:read`, `routes:read`, `certificates:read`), the write surface (`routes:write`, `backends:write`, `certificates:write`), `PUT /automation/v1/settings` (`settings:write`) and `POST /automation/v1/mcp` (any live token) - v1.9.0, listed with their scopes in `openapi-automation.yaml`.
+- `GET /automation/v1/streams` and `GET /automation/v1/streams/status` (`streams:read`), and `GET /automation/v1/stream-logs` (`streams:read` and `logs:read`) - v1.11.0, in the read tier and behind the MCP read tools `lorica_streams`, `lorica_stream_status` and `lorica_stream_logs`. Streams are read on this plane and never written: there is no stream write scope, and only `GET` is declared on these paths (`docs/automation.md`).
 
 ### Authentication
 

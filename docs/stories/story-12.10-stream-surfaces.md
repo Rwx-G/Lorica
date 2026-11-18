@@ -688,7 +688,7 @@ delete refusal and the import and cascade audit rows; under Changed, re-minting 
 streams line of the feature list, only if no earlier Lot of this epic
 added it).
 
-- [ ] Each document above; every example uses `example.com`, `host01`,
+- [x] Each document above; every example uses `example.com`, `host01`,
       `192.0.2.10` and `<UUID>` placeholders.
 
 ### Lot H: end-to-end, IV1 - Docker e2e
@@ -1169,6 +1169,8 @@ each one as "Resolved N".
 - **Lot G, the parts in `docs/streams.md`, `README.md` and `CHANGELOG.md` (2026-11-18); the box stays open.** `docs/streams.md` (new): "Managing streams in the dashboard" (the page, the form's tabs pointing at `STREAM_TABS`, the badges pointing at `STREAM_BADGES` and what each marks, counters being this node's) and "Management plane only" (no write scope, the read scope's paths and tools, the backend-delete refusal, re-minting). `CHANGELOG.md` `[Unreleased]`: Added (the Streams page and status endpoint, `streams:read` and the MCP tools), Changed (re-mint read-tier tokens), Security (the backend-delete refusal and the import and cascade audit rows; listed under Security as a property of the new feature, "new in this release", since the bypass the C2 commit closed never shipped). `README.md`: the streams feature entry. `docs/automation.md` and `docs/mcp.md` were covered by the other documentation pass. Still open, so the box stays open: the scope list line of `docs/architecture/api-design-and-integration.md`, which does not name `streams:read` yet.
 - The existing 12.1 CHANGELOG entry ends "Streams are not on the automation plane or the MCP server", which `streams:read` now contradicts; left as written (this pass adds entries and rewrites none), flagged for the release edit.
 
+- **Lot G closed, 2026-11-18.** `docs/architecture/api-design-and-integration.md` names `streams:read` beside the v1.9.0 scope list line: the two stream paths, the stream log path with its two scopes, the MCP read tools that sit on them, and that streams are never written on the automation plane, pointing at `docs/automation.md`. It carries no example, so no placeholder applies. The other documents of the Lot had landed (`docs/automation.md`, `docs/mcp.md`, `docs/streams.md`, `README.md`, `CHANGELOG.md`, whose Story 12.1 entry no longer says streams are absent from the automation plane and MCP), so the Lot's box is ticked.
+
 ## File List
 
 - `lorica-api/src/streams/status.rs` (new, Lot A)
@@ -1239,3 +1241,4 @@ each one as "Resolved N".
 | 2026-11-18 | 0.11 | Lot F: the Cluster drawer names every binding, a binding outside the node's stream ports by the name the control plane resolved, and one of a stream no longer held by its id with "not in this configuration". Frontend gates green (check, lint, Vitest 1002). | Romain G. |
 | 2026-11-18 | 0.12 | Lot G, automation and MCP part: `streams:read`, its paths and the two backend refusals in `docs/automation.md`; the stream read tools and re-minting in `docs/mcp.md`. The rest of the Lot stays open. | Romain G. |
 | 2026-11-18 | 0.13 | Lot G, the `docs/streams.md`, README and CHANGELOG parts: managing streams and the management-plane-only rule documented; automation, MCP and architecture docs stay open, so the box does. Status InProgress. | Romain G. |
+| 2026-11-18 | 0.14 | Lot G closed: `streams:read` in `docs/architecture/api-design-and-integration.md`. | Romain G. |
