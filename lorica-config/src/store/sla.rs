@@ -394,6 +394,24 @@ impl ConfigStore {
 
     // ---- Stream SLA Buckets (Story 12.9) ----
 
+    /// The ids of the streams holding at least one SLA bucket of
+    /// `source`. The bucket table has no foreign key, so an id here may
+    /// name a stream the store no longer holds.
+    pub fn list_stream_ids_with_sla_buckets(
+        &self,
+        source: &str,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT stream_id FROM stream_sla_buckets WHERE source = ?1")?;
+        let rows = stmt.query_map(params![source], |row| row.get::<_, String>(0))?;
+        let mut ids = std::collections::BTreeSet::new();
+        for row in rows {
+            ids.insert(row?);
+        }
+        Ok(ids)
+    }
+
     /// Merge one slice of a minute into its stream SLA bucket, keyed by
     /// `(stream_id, bucket_start, source)`, on the rules
     /// [`Self::merge_sla_bucket`] gives for routes: the counters and the

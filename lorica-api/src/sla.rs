@@ -734,6 +734,83 @@ pub async fn get_stream_sla(
     Ok(json_data(local_stream_sla(&state, stream_id).await?))
 }
 
+/// The windows of the stream SLA overview, shortest first: the two the
+/// route overview answers per route.
+const STREAM_OVERVIEW_WINDOWS: [lorica_bench::results::SlaWindow; 2] = [
+    lorica_bench::results::SlaWindow::OneHour,
+    lorica_bench::results::SlaWindow::TwentyFourHours,
+];
+
+/// This node's passive summaries over [`STREAM_OVERVIEW_WINDOWS`] for
+/// every stream it holds that has a stored target or recorded buckets,
+/// one row per window, streams in the store's order; or only the rows
+/// of `window`.
+///
+/// The stream sibling of [`local_sla_overview`], and a read of its own
+/// rather than a `streams` key in that one: the route overview answers
+/// a bare array of route rows (and the automation one a page of them),
+/// which has no object to put such a key in (Story 12.9 Lot C3, the
+/// maintainer's decision). A stream with neither a target nor a bucket
+/// is left out, since its rows would read 0 % judged on nothing; a
+/// bucket of a stream this node no longer holds is left out too, as
+/// [`local_stream_sla`] answers 404 for it. `window` skips the rows
+/// before it uncomputed, for the reason [`local_sla_overview`] gives.
+///
+/// # Errors
+///
+/// The store's error text.
+pub(crate) async fn local_stream_sla_overview(
+    state: &AppState,
+    window: Option<SlaWindow>,
+) -> Result<Vec<StreamSlaSummary>, ApiError> {
+    let SlaWindow { skip, take } = window.unwrap_or(SlaWindow {
+        skip: 0,
+        take: usize::MAX,
+    });
+    db_blocking(&state.store, move |store| {
+        let targeted: std::collections::BTreeSet<String> = store
+            .list_stream_sla_configs()?
+            .into_iter()
+            .map(|config| config.stream_id)
+            .collect();
+        let recorded = store.list_stream_ids_with_sla_buckets("passive")?;
+        let streams = store.list_streams()?;
+        let now = Utc::now();
+        streams
+            .iter()
+            .filter(|stream| targeted.contains(&stream.id) || recorded.contains(&stream.id))
+            .flat_map(|stream| {
+                STREAM_OVERVIEW_WINDOWS
+                    .iter()
+                    .map(move |period| (stream, period))
+            })
+            .skip(skip)
+            .take(take)
+            .map(|(stream, period)| {
+                store
+                    .compute_stream_sla_summary(
+                        &stream.id,
+                        &(now - period.duration()),
+                        &now,
+                        period.label(),
+                        "passive",
+                    )
+                    .map_err(|e| ApiError::Internal(e.to_string()))
+            })
+            .collect()
+    })
+    .await
+}
+
+/// GET /api/v1/sla/streams - the passive 1h and 24h summaries of every
+/// stream this node holds with a target or data, two rows per stream.
+/// No `?node=`, as for every stream SLA read.
+pub async fn get_stream_sla_overview(
+    Extension(state): Extension<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(json_data(local_stream_sla_overview(&state, None).await?))
+}
+
 /// Query parameters for stream bucket queries: `?from=&to=&source=`.
 #[derive(Deserialize)]
 pub struct StreamBucketQuery {

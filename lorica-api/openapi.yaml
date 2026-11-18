@@ -3447,6 +3447,36 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /api/v1/sla/streams:
+    get:
+      tags: [SLA]
+      summary: Get SLA overview across all streams
+      description: >-
+        The 1h and 24h passive summaries of every stream this node holds
+        that has a stored SLA target or recorded data, two rows per
+        stream, each naming its stream by `stream_id` (Story 12.9). A
+        stream with neither is left out. The stream sibling of
+        `/api/v1/sla/overview`, kept apart because that answer is a bare
+        array of route rows. For TCP the connect latency to a backend;
+        a UDP stream has no connect and its latency fields are null.
+        This node's figures only; no `?node=`.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Stream SLA overview
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /api/v1/sla/streams/{id}:
     parameters:
       - $ref: "#/components/parameters/ResourceId"

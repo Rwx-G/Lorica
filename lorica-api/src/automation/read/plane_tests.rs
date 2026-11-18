@@ -1056,6 +1056,102 @@ async fn an_automation_read_of_one_stream_sla_answers_the_windows_or_404() {
     assert!(message.contains("stream"), "{message}");
 }
 
+#[tokio::test]
+async fn sla_read_alone_pages_the_stream_overview_by_id_and_the_window_is_its_slice() {
+    // Story 12.9 Lot C3: the stream overview is its own read under
+    // `sla:read`, paged like the route overview, its window pushed down
+    // into the computation.
+    let (state, _token, _route_id) = a_node_with_something_to_read().await;
+    let mut ids = vec![the_seeded_stream_id(&state).await];
+    for (name, port) in [("sla-b", 15433), ("sla-c", 15434)] {
+        let stream = lorica_config::models::Stream::new(
+            uuid::Uuid::new_v4().to_string(),
+            name.to_string(),
+            lorica_config::models::StreamProtocol::Tcp,
+            "0.0.0.0".parse().expect("an address"),
+            port,
+            port,
+            chrono::Utc::now(),
+        );
+        state
+            .store
+            .lock()
+            .await
+            .create_stream(&stream)
+            .expect("test setup: stream");
+        ids.push(stream.id);
+    }
+    {
+        let store = state.store.lock().await;
+        for id in &ids {
+            store
+                .upsert_stream_sla_config(
+                    &lorica_config::models::StreamSlaConfig::default_for_stream(id),
+                )
+                .expect("test setup: a target");
+        }
+    }
+
+    let key = |summary: &lorica_config::models::StreamSlaSummary| {
+        (summary.stream_id.clone(), summary.window.clone())
+    };
+    let whole: Vec<_> = crate::sla::local_stream_sla_overview(&state, None)
+        .await
+        .expect("the whole overview")
+        .iter()
+        .map(key)
+        .collect();
+    assert_eq!(whole.len(), ids.len() * 2, "two windows per stream");
+    for skip in 0..=whole.len() + 1 {
+        for take in 1..=4 {
+            let window: Vec<_> = crate::sla::local_stream_sla_overview(
+                &state,
+                Some(crate::sla::SlaWindow { skip, take }),
+            )
+            .await
+            .expect("a window")
+            .iter()
+            .map(key)
+            .collect();
+            let slice: Vec<_> = whole.iter().skip(skip).take(take).cloned().collect();
+            assert_eq!(window, slice, "skip {skip} take {take}");
+        }
+    }
+
+    let sla_only = mint_automation(
+        &state,
+        "sla-only",
+        vec![lorica_config::models::AutomationScope::SlaRead],
+        &[],
+        chrono::Utc::now() + chrono::Duration::days(30),
+        None,
+    )
+    .await;
+    let response = automation_send(
+        &state,
+        "/automation/v1/sla/streams?limit=3&offset=1",
+        Some(&format!("Bearer {sla_only}")),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let answered: Vec<(String, String)> = body["data"]["items"]
+        .as_array()
+        .expect("a page")
+        .iter()
+        .map(|row| {
+            assert!(row.get("stream_name").is_none(), "{row}");
+            (
+                row["stream_id"].as_str().expect("an id").to_string(),
+                row["window"].as_str().expect("a window").to_string(),
+            )
+        })
+        .collect();
+    let expected: Vec<(String, String)> = whole.iter().skip(1).take(3).cloned().collect();
+    assert_eq!(answered, expected, "{body}");
+}
+
 // ---- Pre-merge audit: the reads page before they compute ----
 
 #[tokio::test]

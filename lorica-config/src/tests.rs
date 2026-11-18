@@ -5384,6 +5384,39 @@ cert_critical_days = 3
     }
 
     #[test]
+    fn the_streams_with_sla_buckets_are_listed_per_source_held_or_not() {
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let recorded = stored_stream(&store, "sla-recorded");
+        let gone = stored_stream(&store, "sla-gone");
+        let quiet = stored_stream(&store, "sla-quiet");
+        store
+            .upsert_stream_sla_config(&StreamSlaConfig::default_for_stream(&quiet))
+            .expect("a target and no data");
+        let minute = this_minute();
+        for (stream_id, earlier) in [(&recorded, 0), (&recorded, 1), (&gone, 0)] {
+            store
+                .merge_stream_sla_bucket(&stream_sla_slice(
+                    stream_id,
+                    minute - chrono::Duration::minutes(earlier),
+                    1,
+                    0,
+                    None,
+                ))
+                .expect("bucket");
+        }
+        store.delete_stream(&gone).expect("delete stream");
+
+        let listed = store
+            .list_stream_ids_with_sla_buckets("passive")
+            .expect("list");
+        assert_eq!(listed, [recorded, gone].into_iter().collect());
+        assert!(store
+            .list_stream_ids_with_sla_buckets("active")
+            .expect("list")
+            .is_empty());
+    }
+
+    #[test]
     fn stream_sla_slices_of_one_minute_add_up() {
         let store = ConfigStore::open_in_memory().expect("test setup");
         let id = stored_stream(&store, "sla-merge");

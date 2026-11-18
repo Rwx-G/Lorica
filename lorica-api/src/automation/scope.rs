@@ -311,6 +311,7 @@ fn read_declaration(path: &str) -> Option<(&'static str, AutomationScope)> {
         WAF_EVENTS_PATH => Some((WAF_EVENTS_PATH, AutomationScope::WafRead)),
         WAF_STATS_PATH => Some((WAF_STATS_PATH, AutomationScope::WafRead)),
         SLA_OVERVIEW_PATH => Some((SLA_OVERVIEW_PATH, AutomationScope::SlaRead)),
+        SLA_STREAMS_PATH => Some((SLA_STREAMS_PATH, AutomationScope::SlaRead)),
         CLUSTER_STATUS_PATH => Some((CLUSTER_STATUS_PATH, AutomationScope::ClusterRead)),
         BACKENDS_PATH => Some((BACKENDS_PATH, AutomationScope::BackendsRead)),
         ROUTES_PATH => Some((ROUTES_PATH, AutomationScope::RoutesRead)),
@@ -372,10 +373,11 @@ pub(super) const SLA_ROUTES_PATH: &str = "/automation/v1/sla/routes";
 /// metric labels it.
 pub(super) const SLA_ROUTE_TEMPLATE: &str = "/automation/v1/sla/routes/{id}";
 
-/// Passive SLA per stream (Story 12.9); one stream id hangs under it.
+/// Passive SLA of every stream with a target or data (Story 12.9 Lot
+/// C3); one stream id hangs under it for that stream's windows.
 ///
-/// `sla:read` alone, not `streams:read`: the answer carries the id the
-/// caller sent and the stream's figures, never its name or its
+/// `sla:read` alone, not `streams:read`, on both: each row carries a
+/// stream id and the stream's figures, never its name or its
 /// configuration.
 pub(super) const SLA_STREAMS_PATH: &str = "/automation/v1/sla/streams";
 
@@ -528,6 +530,7 @@ pub(crate) const READ_SURFACE: &[(&str, AutomationScope)] = &[
     ("/automation/v1/waf/stats", AutomationScope::WafRead),
     ("/automation/v1/sla/overview", AutomationScope::SlaRead),
     ("/automation/v1/sla/routes/r-1", AutomationScope::SlaRead),
+    ("/automation/v1/sla/streams", AutomationScope::SlaRead),
     ("/automation/v1/sla/streams/s-1", AutomationScope::SlaRead),
     (
         "/automation/v1/cluster/status",
@@ -952,12 +955,13 @@ mod tests {
     fn a_deeper_read_path_stays_undeclared() {
         // The collections that take one id take exactly one. Anything
         // beyond it has no entry, and no entry is a 403 for every
-        // token, including one carrying every scope.
+        // token, including one carrying every scope. The stream SLA
+        // collection is itself a read (Story 12.9 Resolved 9), on
+        // `READ_SURFACE`; only its trailing-slash twin stays undeclared.
         for path in [
             "/automation/v1/sla/routes",
             "/automation/v1/sla/routes/",
             "/automation/v1/sla/routes/r-1/buckets",
-            "/automation/v1/sla/streams",
             "/automation/v1/sla/streams/",
             "/automation/v1/sla/streams/s-1/buckets",
             "/automation/v1/waf/rules",

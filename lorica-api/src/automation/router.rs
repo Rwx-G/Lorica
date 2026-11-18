@@ -66,8 +66,8 @@ use super::scope::{
     required_scope, ScopeRequirement, BACKENDS_PATH, BACKEND_TEMPLATE, CERTIFICATES_PATH,
     CERTIFICATE_RENEW_TEMPLATE, CLUSTER_STATUS_PATH, ENVIRONMENTS_PATH, ENVIRONMENT_TEMPLATE,
     LOGS_PATH, ROUTES_PATH, ROUTE_CERTIFICATE_TEMPLATE, ROUTE_TEMPLATE, SETTINGS_PATH,
-    SLA_OVERVIEW_PATH, SLA_ROUTE_TEMPLATE, SLA_STREAM_TEMPLATE, STREAMS_PATH, STREAMS_STATUS_PATH,
-    STREAM_LOGS_PATH, WAF_EVENTS_PATH, WAF_STATS_PATH, WHOAMI_PATH,
+    SLA_OVERVIEW_PATH, SLA_ROUTE_TEMPLATE, SLA_STREAMS_PATH, SLA_STREAM_TEMPLATE, STREAMS_PATH,
+    STREAMS_STATUS_PATH, STREAM_LOGS_PATH, WAF_EVENTS_PATH, WAF_STATS_PATH, WHOAMI_PATH,
 };
 use crate::error::json_data;
 use crate::server::{AppState, LogStoreSlot};
@@ -326,6 +326,7 @@ pub fn route_table() -> Vec<AutomationRoute> {
         AutomationRoute::get(WAF_STATS_PATH, super::read::waf_stats),
         AutomationRoute::get(SLA_OVERVIEW_PATH, super::read::sla_overview),
         AutomationRoute::get(SLA_ROUTE_TEMPLATE, super::read::route_sla),
+        AutomationRoute::get(SLA_STREAMS_PATH, super::read::stream_sla_overview),
         AutomationRoute::get(SLA_STREAM_TEMPLATE, super::read::stream_sla),
         AutomationRoute::get(CLUSTER_STATUS_PATH, super::read::cluster_status),
         AutomationRoute::get(BACKENDS_PATH, super::read::list_backends),

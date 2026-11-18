@@ -379,6 +379,7 @@ async fn a_viewer_reads_a_stream_sla_and_changes_nothing() {
     .await;
     let id = &node.stream_id;
     for path in [
+        "/api/v1/sla/streams".to_string(),
         format!("/api/v1/sla/streams/{id}"),
         format!("/api/v1/sla/streams/{id}/buckets"),
         format!("/api/v1/sla/streams/{id}/config"),
@@ -398,4 +399,100 @@ async fn a_viewer_reads_a_stream_sla_and_changes_nothing() {
         let (status, json) = node.call_as(&viewer, method, &path, body).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {json}");
     }
+}
+
+/// A stored TCP stream named `name` on `port`; its id.
+async fn another_stream(node: &Node, name: &str, port: u16) -> String {
+    let stream = Stream::new(
+        uuid::Uuid::new_v4().to_string(),
+        name.to_string(),
+        StreamProtocol::Tcp,
+        "0.0.0.0".parse().expect("an address"),
+        port,
+        port,
+        Utc::now(),
+    );
+    node.state
+        .store
+        .lock()
+        .await
+        .create_stream(&stream)
+        .expect("test setup: stream");
+    stream.id
+}
+
+#[tokio::test]
+async fn the_stream_overview_lists_every_held_stream_with_a_target_or_data_and_no_other() {
+    // Story 12.9 Lot C3, the maintainer's decision: a read of its own
+    // beside the route overview, the overview's windows per stream.
+    let node = Node::with_a_stream().await;
+    let (status, json) = node.call("GET", "/api/v1/sla/streams", None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"], json!([]), "no target and no data: no row");
+
+    node.seed_bucket(10).await;
+    let targeted = another_stream(&node, "targeted", 15433).await;
+    let quiet = another_stream(&node, "quiet", 15434).await;
+    let gone = another_stream(&node, "gone", 15435).await;
+    {
+        let store = node.state.store.lock().await;
+        store
+            .upsert_stream_sla_config(&StreamSlaConfig::default_for_stream(&targeted))
+            .expect("test setup: a target and no data");
+        let mut bucket = StreamSlaBucket::empty(
+            &StreamSlaConfig::default_for_stream(&gone),
+            Utc::now() - Duration::minutes(5),
+            "passive",
+        );
+        bucket.judged_count = 1;
+        bucket.success_count = 1;
+        store
+            .merge_stream_sla_bucket(&bucket)
+            .expect("test setup: bucket");
+        store
+            .delete_stream(&gone)
+            .expect("test setup: the stream goes, its bucket stays");
+    }
+
+    let (status, json) = node.call("GET", "/api/v1/sla/streams", None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let rows: Vec<StreamSlaSummary> =
+        serde_json::from_value(json["data"].clone()).expect("stream summaries");
+    let listed: Vec<String> = node
+        .state
+        .store
+        .lock()
+        .await
+        .list_streams()
+        .expect("streams")
+        .into_iter()
+        .map(|stream| stream.id)
+        .filter(|id| *id == node.stream_id || *id == targeted)
+        .collect();
+    let windows: Vec<&str> = super::STREAM_OVERVIEW_WINDOWS
+        .iter()
+        .map(lorica_bench::results::SlaWindow::label)
+        .collect();
+    let expected: Vec<(String, &str)> = listed
+        .iter()
+        .flat_map(|id| windows.iter().map(move |window| (id.clone(), *window)))
+        .collect();
+    let answered: Vec<(String, &str)> = rows
+        .iter()
+        .map(|row| (row.stream_id.clone(), row.window.as_str()))
+        .collect();
+    assert_eq!(answered, expected);
+    assert!(!answered.iter().any(|(id, _)| *id == quiet || *id == gone));
+    for row in &rows {
+        let judged = if row.stream_id == node.stream_id {
+            10
+        } else {
+            0
+        };
+        assert_eq!(row.judged_count, judged, "{} {}", row.stream_id, row.window);
+    }
+    assert!(
+        json["data"][0].get("stream_name").is_none(),
+        "a row names its stream by id only: {json}"
+    );
 }

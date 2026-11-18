@@ -712,13 +712,16 @@ Allowlist: `lorica-api/src/sla.rs`, `lorica-api/src/vocabulary.rs`,
 `lorica-mcp/src/tools.rs`. Sequential after C1 (`server.rs`,
 `openapi.yaml`).
 
-- [ ] Stream SLA management routes and overview field (D-g). The
+- [x] Stream SLA management routes and overview field (D-g; the field
+      built as `GET /api/v1/sla/streams`, Resolved 9). The
       cluster pull for `stream_id` is Lot G's, which edits
       `answer_sla_pull` after this Lot.
 - [x] Labels for the two new alert types.
-- [ ] Automation `sla/streams/{id}`, the overview field, `stream-logs`
+- [x] Automation `sla/streams/{id}`, the overview field, `stream-logs`
       with the D-j scope and confinement rule; MCP `lorica_sla_stream`,
-      `lorica_stream_logs`; audit reasons; both OpenAPI documents.
+      `lorica_stream_logs`; audit reasons; both OpenAPI documents (the
+      overview field as `GET /automation/v1/sla/streams` and
+      `lorica_sla_streams`, Resolved 9).
 - [x] Tests: contract tests green; a `logs:read` token without
       `streams:read` gets 403 on stream logs; a hostname-confined token gets
       an empty page; `sla:read` reads a stream SLA.
@@ -962,6 +965,15 @@ edited here.
    `CanonicalConfig.stream_sla_configs` (serde default, format stays 3,
    shape digest moved) is cut per recipient with its stream, and the
    replica apply writes the targets of the streams the follower keeps.
+9. **The stream SLA overview is a read of its own** (raised by Lot C3,
+   2026-11-18), not a `streams` field: `GET /api/v1/sla/overview`
+   answers a bare array of route rows and `/automation/v1/sla/overview`
+   a page of them, so neither has an object to carry the field. `GET
+   /api/v1/sla/streams` answers every stream this node holds with a
+   stored target or recorded data, its windows, at the route overview's
+   role (Viewer); `GET /automation/v1/sla/streams` under `sla:read` and
+   the MCP read tool `lorica_sla_streams`, paged and capped like the
+   route overview's; both OpenAPI documents.
 
 ## Dev Agent Record
 
@@ -1422,6 +1434,47 @@ edited here.
   `the_stream_log_pages_newest_first_by_the_cursor_and_validates_its_filters`.
   Story 12.10's record has the design note. Still open in C3: the
   overview `streams` field (maintainer to decide, above).
+- Lot C3 (the stream SLA overview, Resolved 9), 2026-11-18, with Story
+  12.10 Lots C1 and C2, on `18c4cd64`. Built:
+  `sla::local_stream_sla_overview(state, window)`, the sibling of
+  `local_sla_overview`: every stream this node holds (store order) with
+  a stored target (`list_stream_sla_configs`) or a passive bucket
+  (`ConfigStore::list_stream_ids_with_sla_buckets`, new, one `SELECT
+  DISTINCT` on `stream_sla_buckets`), one row per window of
+  `STREAM_OVERVIEW_WINDOWS` (`SlaWindow::OneHour` and
+  `TwentyFourHours` of `lorica-bench`, the route overview's pair), the
+  rows before the window skipped uncomputed. `GET /api/v1/sla/streams`
+  (`get_stream_sla_overview`, Viewer as the GET default, no `?node=`
+  as for every stream SLA read), `GET /automation/v1/sla/streams`
+  (`read::stream_sla_overview`, `sla:read`, `PageQuery` with one row
+  past the window as the route overview), the MCP read tool
+  `lorica_sla_streams`, both OpenAPI documents, one line of
+  `docs/automation.md`. Decisions:
+  - **Windows: 1h and 24h**, the two the route overview answers and the
+    ones the C3 record recommended; `lorica_sla_stream` and
+    `/sla/streams/{id}` keep every window for one stream.
+  - **"With a target or data"**: a stream with neither is left out (its
+    rows would read 0 % judged on nothing), and a bucket of a stream
+    this node no longer holds is left out too, as the per-stream read
+    answers 404 for it.
+  - **Rows name the stream by id only**, as the per-stream read does,
+    which is why `sla:read` alone reaches the list; listing ids it does
+    reveal which streams carry SLA figures, the same disclosure the
+    route overview makes of route ids.
+  Tests: `the_stream_overview_lists_every_held_stream_with_a_target_or_data_and_no_other`
+  (`sla/stream_tests.rs`, the expected rows derived from the store's
+  order and `STREAM_OVERVIEW_WINDOWS`), the Viewer read added to
+  `a_viewer_reads_a_stream_sla_and_changes_nothing`,
+  `sla_read_alone_pages_the_stream_overview_by_id_and_the_window_is_its_slice`
+  (`read/plane_tests.rs`), and
+  `the_streams_with_sla_buckets_are_listed_per_source_held_or_not`
+  (`lorica-config`). The read sweep and the MCP catalogue tests reach
+  the new path and tool through `READ_SURFACE` and the catalogue.
+  **Outside the 12.9 C3 allowlist:** `lorica-config/src/store/sla.rs`
+  and `lorica-config/src/tests.rs` (the bucket id query),
+  `automation/scope.rs` and `router.rs` (the path, its scope, its
+  mount, `READ_SURFACE`), `sla/stream_tests.rs`,
+  `read/plane_tests.rs`, `docs/automation.md`.
 
 - Lot E, 2026-11-18, on `91c045d1`. `MetricsReport.stream_counters`
   (tag 16, `Option<Box<StreamCountersReport>>`) and its entries
@@ -1615,6 +1668,11 @@ edited here.
 - `lorica-config/src/models/stream.rs` (`UdpSettings::expects_responses`),
   `lorica-stream/src/udp/session.rs`, `lorica-stream/src/caps.rs`
   (`NodeCapsRegions::pending`) (Lot F)
+- `lorica-api/src/sla.rs`, `sla/stream_tests.rs`, `server.rs`,
+  `automation/read.rs`, `scope.rs`, `router.rs`, `read/plane_tests.rs`,
+  both OpenAPI documents, `lorica-mcp/src/tools.rs`,
+  `lorica-config/src/store/sla.rs`, `lorica-config/src/tests.rs`,
+  `docs/automation.md` (Lot C3, the stream SLA overview, Resolved 9)
 
 ## Change Log
 
@@ -1632,4 +1690,5 @@ edited here.
 | 2026-11-18 | 0.11 | Lot C3, the stream log: `GET /automation/v1/stream-logs` behind `streams:read` and `logs:read`, empty for a hostname-confined token, the 403 and the audit row naming the scope missing, and the MCP tool `lorica_stream_logs`, both OpenAPI documents; shipped with Story 12.10 Lot B. The overview `streams` field stays open. | Romain G. |
 | 2026-11-18 | 0.12 | Lot E: the worker metrics report carries the stream counters, typed, every keyed family by its enum's word. | Romain G. |
 | 2026-11-18 | 0.13 | Lot F: the stream observer writes rows and judges the SLA, workers report their stream counters and gauges, the plane prunes and sets the node gauges, `stream_backend_down` and `stream_udp_ceiling_reached` raised, `backend_down` names its streams, OTLP export outcome in `lorica_log_sink_up`, stream retention, rows flushed before the sinks at a stop; process tests in both modes. | Romain G. |
+| 2026-11-18 | 0.14 | Lot C3 closed: the overview `streams` field built as a read of its own (Resolved 9), `GET /api/v1/sla/streams` (Viewer), `GET /automation/v1/sla/streams` under `sla:read` and the MCP read tool `lorica_sla_streams`, the 1h and 24h windows of every held stream with a target or data, rows naming the stream by id, paged with the window pushed into the computation; both OpenAPI documents. Gates on the final tree: the CI chain green (3,687 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean. | Romain G. |
 | 2026-11-18 | 0.9 | Lot C1: `stream_access_logs` with its own retention and writer queue, `StreamLogEntry` built from the stream records, `/api/v1/stream-logs` with export and clear, the three settings in the settings API, the `stream` sink kind, and a syslog up state that follows the collector without traffic. | Romain G. |

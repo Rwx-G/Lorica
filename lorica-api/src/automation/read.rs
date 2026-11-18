@@ -623,6 +623,30 @@ pub async fn route_sla(
     page.of(rows(json_data(summaries), None)?)
 }
 
+/// `GET /automation/v1/sla/streams` (scope `sla:read`).
+///
+/// The stream sibling of [`sla_overview`]: the 1h and 24h passive
+/// summaries of every stream this node holds with a stored target or
+/// recorded data, two rows per stream, the window travelling down into
+/// the computation as there. Each row names its stream by id only, as
+/// [`stream_sla`] does, which is why `sla:read` alone reaches it.
+///
+/// # Errors
+///
+/// Whatever [`crate::sla::local_stream_sla_overview`] answers.
+pub async fn stream_sla_overview(
+    Extension(state): Extension<AppState>,
+    Query(page): Query<PageQuery>,
+) -> Result<Response, ApiError> {
+    let page = page.page();
+    let window = crate::sla::SlaWindow {
+        skip: page.offset,
+        take: page.limit.saturating_add(1),
+    };
+    let summaries = crate::sla::local_stream_sla_overview(&state, Some(window)).await?;
+    page.of_window(rows(json_data(summaries), None)?)
+}
+
 /// `GET /automation/v1/sla/streams/{id}` (scope `sla:read`).
 ///
 /// One stream's passive summaries over every standard window

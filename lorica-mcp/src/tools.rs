@@ -1097,6 +1097,22 @@ pub const READS: &[ToolSpec] = &[
         tier: Tier::Read,
     },
     ToolSpec {
+        name: "lorica_sla_streams",
+        title: "SLA overview of streams",
+        summary: "Read the passive 1 hour and 24 hour availability windows of every TCP or UDP \
+                  stream this node holds that has an SLA target or recorded data: the \
+                  connections judged, how many met the target, and for TCP the time to \
+                  connect to a backend. Each row names its stream by id only; \
+                  `lorica_sla_stream` reads one stream over every window.",
+        scope: AutomationScope::SlaRead,
+        path: "/automation/v1/sla/streams",
+        resource: None,
+        filters: &[],
+        paginated: true,
+        kind: Kind::Read,
+        tier: Tier::Read,
+    },
+    ToolSpec {
         name: "lorica_cluster_status",
         title: "Cluster status",
         summary: "Read this node's cluster role, build, applied configuration generation and \

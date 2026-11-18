@@ -1539,6 +1539,10 @@ pub fn build_router(
             "/api/v1/sla/routes/{id}/active",
             get(crate::probes::get_active_sla),
         )
+        .route(
+            "/api/v1/sla/streams",
+            get(crate::sla::get_stream_sla_overview),
+        )
         .route("/api/v1/sla/streams/{id}", get(crate::sla::get_stream_sla))
         .route(
             "/api/v1/sla/streams/{id}/buckets",
