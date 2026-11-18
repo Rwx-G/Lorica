@@ -17,6 +17,8 @@ Author: Rwx-G
 
 ### Fixed
 
+- **Leaving the Logs page stops its refresh** ([#60](https://github.com/Rwx-G/Lorica/issues/60)). Closing the page's live-tail WebSocket on the way out fired its close handler after the page was gone, and that handler started the 5-second fallback polling, which nothing stopped: the dashboard went on fetching up to 500 log entries every 5 seconds from any page, one more poller for each visit to Logs. On a control plane in a cluster, the page also opened the live tail it is meant to replace with polling of the fleet's logs, which mixed this node's own requests into the fleet view under an unknown node.
+
 ### Removed
 
 ### Security
