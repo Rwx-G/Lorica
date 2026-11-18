@@ -550,18 +550,18 @@ Allowlist: `lorica-automation-policy/src/scope.rs`,
 only), `lorica/src/cli_mcp.rs` (only if its blast-radius test names
 tools by hand).
 
-- [ ] The variant, its doc comment, the enum comment's paragraph,
+- [x] The variant, its doc comment, the enum comment's paragraph,
       `ALL`, `as_str`, `is_grant_bounded` (D-f).
-- [ ] `READ.requires` gains it; the tier tests and the module comment's
+- [x] `READ.requires` gains it; the tier tests and the module comment's
       list of read things.
-- [ ] `required_scope`: GET on the two paths; the two wrappers in
+- [x] `required_scope`: GET on the two paths; the two wrappers in
       `read.rs`; the router lines.
-- [ ] `AUTOMATION_READ_FIELD_NAMES` gains every key of both answers.
-- [ ] `lorica_streams`, `lorica_stream_status` (D-g).
-- [ ] Both OpenAPI documents; the generated fixture rewritten from the
+- [x] `AUTOMATION_READ_FIELD_NAMES` gains every key of both answers.
+- [x] `lorica_streams`, `lorica_stream_status` (D-g).
+- [x] Both OpenAPI documents; the generated fixture rewritten from the
       fixture test's own rendering (tier vectors included), never by
       hand-editing the vectors.
-- [ ] Tests: a `streams:read` token reads both paths; a token without it
+- [x] Tests: a `streams:read` token reads both paths; a token without it
       gets 403 naming `streams:read`; a grant-carrying principal gets an
       empty page; POST, PUT, PATCH, DELETE on `/automation/v1/streams`
       and `/automation/v1/streams/{anything}` answer 403
@@ -848,6 +848,12 @@ each one as "Resolved N".
   machine. Not touched by this Lot; five isolated reruns and the full
   rerun passed. Recorded because a pending-cap overshoot under load is
   worth a look by whoever owns 12.6's admission.
+- Lot B, 2026-11-18, on `7e66b6be`, with 12.9 Lot C3's stream-log read
+  (12.10 Resolved 7). Gates on the final tree: see the Change Log row.
+  The generated fixture's tier section was replaced with what
+  `the_dashboard_fixture_carries_the_tier_table_and_vectors_rendered_from_the_policy`
+  printed, by a script cutting it out of the failure message; the
+  scope list was edited by hand, as the fixture's header says.
 
 ### Completion Notes
 
@@ -883,6 +889,54 @@ each one as "Resolved N".
   `null` for a stream the control plane no longer holds.
 - **Outside the allowlist:** none. `openapi_contract.rs` derives the
   paths from `server.rs` and was not touched.
+- **Lot B, the scope.** `AutomationScope::StreamsRead` after
+  `BackendsRead`, with the no-write-scope paragraph above the enum; the
+  enum comment now also names the three restatements it did not
+  (`is_grant_bounded`, the `api.ts` union, the MCP catalogue test).
+  `READ.requires` carries it; neither other tier tolerates it, which
+  `streams_read_is_a_read_tier_scope_and_no_write_tier_tolerates_it`
+  pins with `resolve`. `AUTOMATION_AUDIT_REASONS` is untouched, as
+  Resolved 6 says.
+- **Lot B, the reads.** `list_streams` wraps the management
+  `streams::list_streams` (there is no `list_streams_as`; the handler
+  takes no actor) and filters its rows by `?group=`, `?protocol=`,
+  `?name=` (`StreamsQuery`, exact, each under
+  `AUTOMATION_READ_MAX_FILTER_BYTES`, a protocol refused naming the
+  `StreamProtocol` words, never the caller's). `stream_status` wraps
+  Lot A's `stream_statuses` with the process collector, reading the
+  groups from the store since a status entry carries none. Both answer
+  an empty page, the store unread, to a principal that
+  `carries_grants()`. No value is masked.
+- **Lot B, the field pin** gained 83 names, walked on two more streams
+  seeded in the plane tests (`with_every_stream_shape`: a UDP stream
+  with GeoIP, a terminating TLS stream with both rule kinds, client
+  verification and upstream TLS) and on stream log rows. The status's
+  `counters` object and a failed bind's fields are not reached by the
+  fixture (no collector series, no stream plane in a unit test), so
+  their inner keys are pinned by Lot A's
+  `the_published_status_schemas_name_exactly_the_fields_the_status_answers`
+  against `openapi.yaml`, not by this pin.
+- **12.9 Lot C3's stream log, done here.** `GET /automation/v1/stream-logs`
+  needs `streams:read` and `logs:read`. The matrix keeps one scope per
+  path, `streams:read` (the one an older read token lacks, so it never
+  sees the tool), and `scope::companion_scope` names the second;
+  `authorize_scope` and the audit layer's `refusal_reason` both read
+  it, so the 403 and the row (`automation.request.forbidden:logs:read`)
+  name whichever scope is missing. Rejected: a fourth
+  `ScopeRequirement` state, which every reader of that type (the
+  OpenAPI `x-required-scope`, the MCP one-scope-per-tool pin) would
+  have had to learn for one path. `lorica_stream_logs` sits behind
+  `streams:read` and its summary names `logs:read`, which
+  `every_tool_on_a_path_that_needs_a_second_scope_names_it` derives
+  from `companion_scope`. `LogStore::stream_log_rows` reads the rows
+  without the match count, which the window never uses.
+- **Outside the allowlist:** `lorica-api/src/automation/mod.rs` (the
+  `companion_scope` re-export), `automation/audit.rs` (the companion in
+  `refusal_reason`), `lorica-api/src/stream_logs.rs` (`stream_log_rows`
+  and the shared `newest_rows`), `automation/environments/tests.rs`
+  (the environment pins live there, not in `environments.rs`). The
+  last three are in 12.9 Lot C3's allowlist or its record. No change
+  to `lorica/src/cli_mcp.rs`: its blast-radius test names no tool.
 
 ## File List
 
@@ -894,6 +948,16 @@ each one as "Resolved N".
 - `lorica-api/src/stream_metrics.rs` (Lot A, the accessor)
 - `lorica-api/src/server.rs` (Lot A, one route line)
 - `lorica-api/openapi.yaml` (Lot A)
+- `lorica-automation-policy/src/scope.rs`, `tier.rs` (Lot B)
+- `lorica-api/src/automation/scope.rs`, `read.rs`, `router.rs`,
+  `audit.rs`, `mod.rs`, `tests.rs`, `read/plane_tests.rs`,
+  `environments/tests.rs` (Lot B)
+- `lorica-api/src/stream_logs.rs` (Lot B, `stream_log_rows`)
+- `lorica-mcp/src/tools.rs` (Lot B)
+- `lorica-api/openapi.yaml` (Lot B, the scope enum),
+  `lorica-api/openapi-automation.yaml` (Lot B)
+- `lorica-dashboard/frontend/src/components/settings-tabs/automation-scopes.generated.ts`,
+  `lorica-dashboard/frontend/src/lib/api.ts` (Lot B)
 
 ## Change Log
 
@@ -902,3 +966,4 @@ each one as "Resolved N".
 | 2026-11-15 | 0.1 | Draft: the Streams page with a drawer covering every stored field and a derived badge map that reserves 12.13's and 12.15's kinds by type rather than by dead code, `GET /api/v1/streams/status` with per-node bind state and this node's live counters, stream names on the fleet view's bindings, the `streams:read` scope with its two automation paths and two MCP read tools in one commit after the field-adding API Lots, per-stream audit rows for imports and backend cascades, the refusal of a token's delete of a stream's backend, the backend page's usage column and portless addresses, IV1 in the MCP smoke, Lots A to H. | Romain G. |
 | 2026-11-15 | 0.2 | Maintainer answers folded in as Resolved 1 to 5 (token delete of a stream's backend refused, address updates allowed; this node's counters only; no automatic `streams:read`, re-minting stated in the CHANGELOG as an operator action; node names revealed and documented; per-stream import rows for streams only), plus Resolved 6 (the corrected artefact list) and 7 (12.9 Lot C3 after Lot B) recorded in Dev Notes. Status Draft. | Romain G. |
 | 2026-11-18 | 0.3 | Lot A: `GET /api/v1/streams/status` (this node's bind state, per-node states on a control plane, this node's live counters with per-reason arrays), `StreamMetricsCollector::live_counters`, `node_bind_state` shared by the fleet view and the status, `NodeStreamBinding.stream_name`, `openapi.yaml`. D-d and D-e amended against the code (active nodes only, `unknown` before a report, no `nodes_truncated`, one-pass accessor, `node_name` null on a control plane). Status InProgress. | Romain G. |
+| 2026-11-18 | 0.4 | Lot B: `streams:read` in the closed scope enum with every restatement in one commit (both OpenAPI documents, the `api.ts` union, the generated fixture and its tier vectors), the read tier carrying it; `GET /automation/v1/streams` and `/automation/v1/streams/status`, filtered, unmasked, empty for a grant-carrying principal; `lorica_streams` and `lorica_stream_status`; with 12.9 Lot C3's `/automation/v1/stream-logs` and `lorica_stream_logs` behind `streams:read` plus `logs:read` through `companion_scope`. Gates on the final tree: the CI chain green (3,678 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean, frontend check, lint and Vitest (878) green. | Romain G. |

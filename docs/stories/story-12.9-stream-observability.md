@@ -719,7 +719,7 @@ Allowlist: `lorica-api/src/sla.rs`, `lorica-api/src/vocabulary.rs`,
 - [ ] Automation `sla/streams/{id}`, the overview field, `stream-logs`
       with the D-j scope and confinement rule; MCP `lorica_sla_stream`,
       `lorica_stream_logs`; audit reasons; both OpenAPI documents.
-- [ ] Tests: contract tests green; a `logs:read` token without
+- [x] Tests: contract tests green; a `logs:read` token without
       `streams:read` gets 403 on stream logs; a hostname-confined token gets
       an empty page; `sla:read` reads a stream SLA.
 
@@ -1403,6 +1403,25 @@ edited here.
   stream and writes nothing), every `AppState` literal (the new field),
   `lorica-automation-policy/src/scope.rs` (the `sla:read` doc),
   `docs/automation.md` and `docs/mcp.md` (one line each).
+- Lot C3 (the stream log), 2026-11-18, with Story 12.10 Lot B, which
+  added `streams:read`. Built: `GET /automation/v1/stream-logs`, paged
+  as `/automation/v1/logs` is (newest first, `before_id` the cursor the
+  answer names, `offset` to `LOGS_QUERY_MAX_ROWS`), the filters and
+  their validation `StreamLogsQuery`'s own, no match count
+  (`LogStore::stream_log_rows`); the MCP tool `lorica_stream_logs`;
+  both OpenAPI documents. Scopes: `streams:read` is the path's scope in
+  the matrix and `scope::companion_scope` adds `logs:read`, read by the
+  gate and by the audit refusal reason, so a token lacking either gets
+  a 403 naming it and a row `automation.request.forbidden:<scope>`. No
+  word enters `AUTOMATION_AUDIT_REASONS`: the reason is a scope
+  spelling, published by derivation. A principal that
+  `carries_grants()` (hostname-confined) gets an empty page, the store
+  unread. Tests: `the_stream_log_names_the_scope_a_token_lacks_in_the_refusal_and_the_audit_row`,
+  `the_layer_refuses_the_stream_log_to_a_token_missing_either_scope_naming_it`,
+  `a_principal_carrying_grants_reads_an_empty_page_on_every_stream_read`,
+  `the_stream_log_pages_newest_first_by_the_cursor_and_validates_its_filters`.
+  Story 12.10's record has the design note. Still open in C3: the
+  overview `streams` field (maintainer to decide, above).
 
 ## File List
 
@@ -1461,6 +1480,10 @@ edited here.
   `lorica/src/startup/single.rs`, `supervisor.rs` (Lot C3, the
   `AppState` field)
 - `docs/automation.md`, `docs/mcp.md` (Lot C3)
+- `lorica-api/src/automation/read.rs`, `scope.rs`, `router.rs`,
+  `audit.rs`, `mod.rs`, `tests.rs`, `read/plane_tests.rs`,
+  `lorica-api/src/stream_logs.rs`, `lorica-mcp/src/tools.rs`, both
+  OpenAPI documents (Lot C3, the stream log, with Story 12.10 Lot B)
 
 ## Change Log
 
@@ -1475,4 +1498,5 @@ edited here.
 | 2026-11-16 | 0.7 | Lot A: `protocol` and `detected_protocol` on the record, `client_certificate` null on a stream that does not verify, `connect_outcome` and `ConnectOutcome`, `StreamLogKey` widening the limiter key with pre-forwarding ends passed through it, per-backend bytes and `lorica_stream_backend_bytes_total`. | Romain G. |
 | 2026-11-16 | 0.8 | The `tcp_engine` timeouts traced to the tests (a released port answered by strangers, a burst assumed to fit one second, wall-clock upper bounds); fixed in the tests, 0 failures in 800 contended runs. | Romain G. |
 | 2026-11-18 | 0.10 | Lot C3, in part: the stream SLA management routes, `GET /automation/v1/sla/streams/{id}` under `sla:read` and the MCP tool `lorica_sla_stream`, both OpenAPI documents. The overview `streams` field is not buildable as D-g words it (maintainer to decide); the stream-log reads wait for 12.10 Lot B. Gates on the final tree: the CI chain green (3,653 product, 957 `lorica`, 910 forked, 592 TLS-featured tests) and `cargo audit` clean after lettre 0.11.24. | Romain G. |
+| 2026-11-18 | 0.11 | Lot C3, the stream log: `GET /automation/v1/stream-logs` behind `streams:read` and `logs:read`, empty for a hostname-confined token, the 403 and the audit row naming the scope missing, and the MCP tool `lorica_stream_logs`, both OpenAPI documents; shipped with Story 12.10 Lot B. The overview `streams` field stays open. | Romain G. |
 | 2026-11-18 | 0.9 | Lot C1: `stream_access_logs` with its own retention and writer queue, `StreamLogEntry` built from the stream records, `/api/v1/stream-logs` with export and clear, the three settings in the settings API, the `stream` sink kind, and a syslog up state that follows the collector without traffic. | Romain G. |
