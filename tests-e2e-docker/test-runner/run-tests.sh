@@ -4334,6 +4334,20 @@ JSON
         ok "Response rewrite: original string removed"
     fi
 
+    # With compression also on, a client accepting gzip still gets the
+    # rewritten body: the rewrite refuses an encoded body, so the
+    # response it edits is left uncompressed (#59).
+    api_put "/api/v1/routes/$RW_ROUTE_ID" '{"compression_enabled": true}' >/dev/null
+    sleep 2
+    RW_GZ_HEADERS=$(curl -s --max-time 5 -o /tmp/rw-gz-body -D - -H "Accept-Encoding: gzip" \
+        -H "Host: rewrite.test" "$PROXY/hello" 2>/dev/null | tr -d '\r' || echo "")
+    if ! echo "$RW_GZ_HEADERS" | grep -qi "^Content-Encoding:" \
+        && grep -q "Bonjour depuis backend1" /tmp/rw-gz-body; then
+        ok "Response rewrite with compression on: rewritten and left uncompressed"
+    else
+        fail "Response rewrite with compression on: $(echo "$RW_GZ_HEADERS" | grep -i '^Content-Encoding:' || echo 'body not rewritten')"
+    fi
+
     api_del "/api/v1/routes/$RW_ROUTE_ID" >/dev/null 2>&1
     api_del "/api/v1/backends/$RW_B_ID" >/dev/null 2>&1
 
