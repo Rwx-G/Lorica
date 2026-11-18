@@ -37,6 +37,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **Custom error pages** - configurable HTML for upstream errors (502/504) with `{{status}}` and `{{message}}` placeholders
 - Configurable proxy headers, per-route timeouts, WebSocket passthrough, X-Forwarded-Proto via TLS session detection
 - Connection pooling with health-aware backend filtering
+- **Layer-4 streams** (v1.11.0) - TCP and UDP proxying at parity with nginx `stream {}` and HAProxy `mode tcp`, on the backends routes already use. A stream's port opens when the stream is created and closes when it is deleted, on the running process, privileged ports included; a bind failure is a reported state, never a crash. TCP: the route balancing algorithms with backups and the circuit breaker, bounded retries, connect / idle / total timeouts, backend keepalive, PROXY protocol v1/v2 sent and accepted from trusted CIDRs only, chosen source addresses, per-connection bandwidth limits, DNS re-resolution. TLS: passthrough routed by SNI and ALPN with no default backend (clients without SNI only through an explicit, badged matcher), termination with Lorica's own ACME or AD CS certificates, upstream TLS and mTLS verified by default. UDP: sessions bounded by default in datagrams and bytes against reflection, a listen-address rule for exposed addresses, PROXY v2 per datagram. Per stream allow / deny CIDRs and GeoIP, per-node connection, session and pending caps, new-connection rate limits, backends on local addresses refused. Every node keeps an fd budget streams cannot take from HTTP, shown per stream. Replicated with per-node targeting, audited, logged per connection with a closed set of end reasons, measured in Prometheus and the SLA view, drained on configuration change, stop and upgrade for `worker_drain_timeout_s`; read-only on the automation API and the MCP read tier. See `docs/streams.md`
 
 ### :lock: Security
 
@@ -913,6 +914,7 @@ trail, failure modes and how to replace a control plane.
 - [docs/automation.md](docs/automation.md) - the CI automation API: the listener, tokens and scopes, the environment resource, GitLab pipelines and OIDC
 - [docs/mcp.md](docs/mcp.md) - the management MCP server: the three tiers, minting a token, configuring a client over stdio or Streamable HTTP, what each tier cannot see or change, the audit
 - [docs/security.md](docs/security.md), [docs/security/hardening-guide.md](docs/security/hardening-guide.md), [docs/security/threat-model.md](docs/security/threat-model.md) - what is protected, how, and what is not
+- [docs/streams.md](docs/streams.md) - layer-4 TCP and UDP streams: the nginx and HAProxy equivalence table, every field, the fd budget and UDP capacity, TLS passthrough and termination, protections, end reasons, observability, drains
 - [docs/worker-mode.md](docs/worker-mode.md), [docs/tuning.md](docs/tuning.md) - `--workers`, kernel and file-descriptor tuning
 - [docs/hot-upgrade.md](docs/hot-upgrade.md), [docs/ai-crawlers.md](docs/ai-crawlers.md), [docs/self-proxy-dashboard.md](docs/self-proxy-dashboard.md)
 - [CHANGELOG.md](CHANGELOG.md), [COMPARISON.md](COMPARISON.md), [FORK.md](FORK.md)
