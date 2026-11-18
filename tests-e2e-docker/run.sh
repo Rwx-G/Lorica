@@ -4,7 +4,8 @@
 #                 [--skip-ai-bot] [--skip-rbac] [--skip-audit] [--skip-hot-upgrade]
 #                 [--skip-log-sinks] [--skip-log-sinks-workers] [--skip-acme]
 #                 [--skip-cluster] [--skip-capture] [--skip-capture-workers]
-#                 [--skip-mcp] [--skip-adcs]
+#                 [--skip-mcp] [--skip-adcs] [--skip-l4] [--skip-perf]
+#                 [--only-l4] [--only-perf] [--perf-advisory]
 #   --build             Force rebuild all images
 #   --keep              Don't tear down containers after tests
 #   --skip-workers      Skip worker isolation tests (faster)
@@ -21,6 +22,23 @@
 #   --skip-capture-workers  Skip the worker-mode variant of the capture profile
 #   --skip-mcp          Skip the v1.9.0 Story 11.4 MCP profile (faster)
 #   --skip-adcs         Skip the v1.10.0 Story 13.6 AD CS profile (faster)
+#   --skip-l4           Skip the v1.11.0 Story 12.12 L4 phase (streams and
+#                       streams-single profiles, docker-compose.l4.yml)
+#   --skip-perf         Skip the Story 12.12 performance phase
+#   --only-l4           Run the L4 phase alone: every pre-existing phase,
+#                       Phase 1 included, is skipped
+#   --only-perf         Run the performance phase alone
+#   --perf-advisory     Report the performance verdicts without gating (CI)
+#
+# Every run is teed to results/e2e-<UTC timestamp>.log. After the last
+# phase, test-runner/l4/report.py checks the log against the L4 scenario
+# registry (l4/scenarios.tsv) and writes results/l4-summary.md. A run with
+# no --skip-* and no --only-* flag is the release run: there, every row of
+# the registry must report, pending rows included (Story 12.12 D-m).
+#
+# The performance phase is Story 12.12 Lot M and is not built yet:
+# --only-perf and --perf-advisory are refused until it lands, and
+# --skip-perf skips nothing.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -41,6 +59,10 @@ SKIP_CAPTURE=false
 SKIP_CAPTURE_WORKERS=false
 SKIP_MCP=false
 SKIP_ADCS=false
+SKIP_L4=false
+ONLY_L4=false
+ONLY_PERF=false
+STRICT_REPORT=true
 
 for arg in "$@"; do
     case "$arg" in
@@ -60,10 +82,64 @@ for arg in "$@"; do
         --skip-capture-workers) SKIP_CAPTURE_WORKERS=true ;;
         --skip-mcp)          SKIP_MCP=true ;;
         --skip-adcs)         SKIP_ADCS=true ;;
+        --skip-l4)           SKIP_L4=true ;;
+        --skip-perf)         ;;
+        --only-l4)           ONLY_L4=true ;;
+        --only-perf)         ONLY_PERF=true ;;
+        --perf-advisory)
+            echo "run.sh: --perf-advisory needs the performance phase (Story 12.12 Lot M), not built yet" >&2
+            exit 2 ;;
+    esac
+    case "$arg" in
+        --skip-*|--only-*) STRICT_REPORT=false ;;
     esac
 done
 
+if [ "$ONLY_PERF" = true ]; then
+    echo "run.sh: --only-perf needs the performance phase (Story 12.12 Lot M), not built yet" >&2
+    exit 2
+fi
+
+# --only-l4 skips every pre-existing phase. A new phase gets its SKIP_
+# variable set here too.
+RUN_PHASE_1=true
+if [ "$ONLY_L4" = true ]; then
+    RUN_PHASE_1=false
+    SKIP_WORKERS=true
+    SKIP_CERT_EXPORT=true
+    SKIP_AI_BOT=true
+    SKIP_RBAC=true
+    SKIP_AUDIT=true
+    SKIP_HOT_UPGRADE=true
+    SKIP_LOG_SINKS=true
+    SKIP_LOG_SINKS_WORKERS=true
+    SKIP_ACME=true
+    SKIP_CLUSTER=true
+    SKIP_CAPTURE=true
+    SKIP_CAPTURE_WORKERS=true
+    SKIP_MCP=true
+    SKIP_ADCS=true
+fi
+
+# Tee the whole run, so the L4 report can read every phase's scenario
+# lines and CI can upload the log.
+mkdir -p results
+RESULTS_LOG="results/e2e-$(date -u +%Y%m%dT%H%M%SZ).log"
+exec > >(tee -a "$RESULTS_LOG") 2>&1
+echo "Logging this run to tests-e2e-docker/${RESULTS_LOG}"
+
 EXIT_CODE=0
+
+# Mark the start of a phase for the L4 report: a scenario line belongs to
+# the profile of the last marker before it (Story 12.12 D-c).
+announce_profile() {
+    echo "L4-PROFILE $1"
+}
+
+# The L4 project's compose file and every profile in it, for build and
+# teardown.
+L4_COMPOSE="docker compose -f docker-compose.l4.yml"
+L4_ALL_PROFILES="--profile streams --profile streams-single --profile l4-report"
 
 # Dump a node's log when a smoke fails.
 #
@@ -98,38 +174,52 @@ ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profil
 # gated images, which once left a pre-HTTPS `ai-bot-smoke` image (built
 # before the management API went TLS) failing every curl with a TLS
 # verification error against the now-self-signed endpoint.
+# The L4 report runs after every run (except --only-perf), so its image
+# is rebuilt whatever is skipped: a stale one would check the log with an
+# old report.
 if [ -n "$BUILD_FLAG" ]; then
-    docker compose $ALL_PROFILES build
+    if [ "$ONLY_L4" = false ]; then
+        docker compose $ALL_PROFILES build
+    fi
+    if [ "$SKIP_L4" = false ]; then
+        $L4_COMPOSE $L4_ALL_PROFILES build
+    else
+        $L4_COMPOSE --profile l4-report build
+    fi
 fi
 
 # ---- Phase 1: Single-process tests ----
-echo "=== Lorica E2E Tests (single-process) ==="
-echo ""
+if [ "$RUN_PHASE_1" = true ]; then
+    echo "=== Lorica E2E Tests (single-process) ==="
+    echo ""
+    announce_profile default
 
-docker compose up $BUILD_FLAG -d backend1 backend2 lorica
+    docker compose up $BUILD_FLAG -d backend1 backend2 lorica
 
-echo "Waiting for Lorica to initialize..."
-for i in $(seq 1 60); do
-    if docker compose exec -T lorica curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
-        echo "Lorica is ready."
-        break
-    fi
-    if [ "$i" = "60" ]; then
-        echo "ERROR: Lorica did not start within 120s"
-        docker compose logs lorica | tail -20
-        docker compose $ALL_PROFILES down -v
-        exit 1
-    fi
-    sleep 2
-done
+    echo "Waiting for Lorica to initialize..."
+    for i in $(seq 1 60); do
+        if docker compose exec -T lorica curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
+            echo "Lorica is ready."
+            break
+        fi
+        if [ "$i" = "60" ]; then
+            echo "ERROR: Lorica did not start within 120s"
+            docker compose logs lorica | tail -20
+            docker compose $ALL_PROFILES down -v
+            exit 1
+        fi
+        sleep 2
+    done
 
-docker compose run --rm test-runner || EXIT_CODE=$?
+    docker compose run --rm test-runner || EXIT_CODE=$?
+fi
 
 # ---- Phase 2: Worker isolation tests ----
 if [ "$SKIP_WORKERS" = false ] && [ "$EXIT_CODE" = "0" ]; then
     echo ""
     echo "=== Lorica E2E Tests (worker isolation) ==="
     echo ""
+    announce_profile workers
 
     docker compose up $BUILD_FLAG -d lorica-workers
 
@@ -157,6 +247,7 @@ if [ "$SKIP_CERT_EXPORT" = false ] && [ "$EXIT_CODE" = "0" ]; then
     echo ""
     echo "=== Lorica E2E Tests (cert export profile) ==="
     echo ""
+    announce_profile cert-export
 
     docker compose --profile cert-export up $BUILD_FLAG -d lorica-cert-export
 
@@ -185,6 +276,7 @@ if [ "$SKIP_AI_BOT" = false ] && [ "$EXIT_CODE" = "0" ]; then
     echo ""
     echo "=== Lorica E2E Tests (AI-bot deny-list profile) ==="
     echo ""
+    announce_profile ai-bot
 
     docker compose --profile ai-bot up $BUILD_FLAG -d lorica-ai-bot
 
@@ -208,6 +300,7 @@ if [ "$SKIP_AI_BOT" = false ] && [ "$EXIT_CODE" = "0" ]; then
         echo ""
         echo "=== Lorica E2E Tests (AI-bot deny-list, worker mode) ==="
         echo ""
+        announce_profile ai-bot-workers
 
         docker compose --profile ai-bot-workers up $BUILD_FLAG -d lorica-ai-bot-workers
 
@@ -236,6 +329,7 @@ if [ "$SKIP_RBAC" = false ] && [ "$EXIT_CODE" = "0" ]; then
     echo ""
     echo "=== Lorica E2E Tests (RBAC profile) ==="
     echo ""
+    announce_profile rbac
 
     docker compose --profile rbac up $BUILD_FLAG -d lorica-rbac
 
@@ -259,6 +353,7 @@ if [ "$SKIP_RBAC" = false ] && [ "$EXIT_CODE" = "0" ]; then
         echo ""
         echo "=== Lorica E2E Tests (RBAC, worker mode) ==="
         echo ""
+        announce_profile rbac-workers
 
         docker compose --profile rbac-workers up $BUILD_FLAG -d lorica-rbac-workers
 
@@ -288,6 +383,7 @@ if [ "$SKIP_AUDIT" = false ] && [ "$EXIT_CODE" = "0" ]; then
     echo ""
     echo "=== Lorica E2E Tests (audit-log profile) ==="
     echo ""
+    announce_profile audit
 
     docker compose --profile audit up $BUILD_FLAG -d lorica-audit
 
@@ -316,6 +412,7 @@ if [ "$SKIP_HOT_UPGRADE" = false ] && [ "$EXIT_CODE" = "0" ]; then
     echo ""
     echo "=== Lorica E2E Tests (hot binary-upgrade profile) ==="
     echo ""
+    announce_profile hot-upgrade
 
     docker compose --profile hot-upgrade up $BUILD_FLAG -d lorica-hot-upgrade
 
@@ -345,6 +442,7 @@ if [ "$SKIP_LOG_SINKS" = false ] && [ "$EXIT_CODE" = "0" ]; then
     echo ""
     echo "=== Lorica E2E Tests (log-sinks profile) ==="
     echo ""
+    announce_profile log-sinks
 
     docker compose --profile log-sinks up $BUILD_FLAG -d backend1 syslog-collector otelcol-logs lorica-log-sinks
 
@@ -378,6 +476,7 @@ if [ "$SKIP_LOG_SINKS_WORKERS" = false ] && [ "$SKIP_LOG_SINKS" = false ] \
     echo ""
     echo "=== Lorica E2E Tests (log-sinks profile, worker mode) ==="
     echo ""
+    announce_profile log-sinks-workers
 
     docker compose --profile log-sinks-workers up $BUILD_FLAG -d \
         backend1 syslog-collector-log-sinks-workers otelcol-logs-log-sinks-workers \
@@ -412,6 +511,7 @@ if [ "$SKIP_ACME" = false ] && [ "$EXIT_CODE" = "0" ]; then
     echo ""
     echo "=== Lorica E2E Tests (acme profile) ==="
     echo ""
+    announce_profile acme
 
     docker compose --profile acme up $BUILD_FLAG -d backend1 challtestsrv pebble lorica-acme
 
@@ -446,6 +546,7 @@ if [ "$SKIP_CAPTURE" = false ] && [ "$EXIT_CODE" = "0" ]; then
     echo ""
     echo "=== Lorica E2E Tests (capture profile) ==="
     echo ""
+    announce_profile capture
 
     docker compose --profile capture up $BUILD_FLAG -d \
         backend1 syslog-collector-capture otelcol-logs-capture lorica-capture
@@ -486,6 +587,7 @@ if [ "$SKIP_CAPTURE_WORKERS" = false ] && [ "$SKIP_CAPTURE" = false ] \
     echo ""
     echo "=== Lorica E2E Tests (capture profile, worker mode) ==="
     echo ""
+    announce_profile capture-workers
 
     docker compose --profile capture-workers up $BUILD_FLAG -d \
         backend1 syslog-collector-capture-workers otelcol-logs-capture-workers \
@@ -523,6 +625,7 @@ if [ "$SKIP_MCP" = false ] && [ "$EXIT_CODE" = "0" ]; then
     echo ""
     echo "=== Lorica E2E Tests (mcp profile) ==="
     echo ""
+    announce_profile mcp
 
     docker compose --profile mcp up $BUILD_FLAG -d lorica-mcp
 
@@ -558,6 +661,7 @@ if [ "$SKIP_ADCS" = false ] && [ "$EXIT_CODE" = "0" ]; then
     echo ""
     echo "=== Lorica E2E Tests (adcs profile) ==="
     echo ""
+    announce_profile adcs
 
     docker compose --profile adcs up $BUILD_FLAG -d lorica-adcs
 
@@ -602,6 +706,7 @@ if [ "$SKIP_CLUSTER" = false ] && [ "$EXIT_CODE" = "0" ]; then
     echo ""
     echo "=== Lorica E2E Tests (cluster profile) ==="
     echo ""
+    announce_profile cluster
 
     # backend2 and oidc-issuer serve the automation phase below: the
     # backend an environment moves its traffic to, and the ID-token
@@ -702,9 +807,37 @@ if [ "$SKIP_CLUSTER" = false ] && [ "$EXIT_CODE" = "0" ]; then
     fi
 fi
 
+# ---- Phase: L4 (Story 12.12 D-b, D-c) ---------------------------------
+# Its own compose project (lorica-e2e-l4): the `streams` profile (worker
+# mode) then `streams-single`, each scenario of l4/scenarios/*.sh run by
+# the host-side driver. Opt-out via --skip-l4 (default ON).
+if [ "$SKIP_L4" = false ] && [ "$EXIT_CODE" = "0" ]; then
+    L4_ARGS=""
+    if [ "$KEEP" = true ]; then
+        L4_ARGS="--keep"
+    fi
+    bash l4/run-l4.sh $L4_ARGS || EXIT_CODE=$?
+fi
+
+# ---- L4 report: every scenario line of the run against the registry --
+# Runs whatever failed before it, so a failing run still shows which
+# scenarios reported. The host user's uid makes results/ files the
+# user's own; MSYS_NO_PATHCONV keeps Git Bash from rewriting /results.
+REPORT_ARGS="--log /results/$(basename "$RESULTS_LOG") --markdown /results/l4-summary.md"
+if [ "$STRICT_REPORT" = true ]; then
+    REPORT_ARGS="$REPORT_ARGS --strict"
+fi
+echo ""
+echo "=== L4 scenario report ==="
+if ! MSYS_NO_PATHCONV=1 $L4_COMPOSE --profile l4-report run --rm -T \
+        --user "$(id -u):$(id -g)" l4-report $REPORT_ARGS; then
+    EXIT_CODE=1
+fi
+
 # Cleanup unless --keep
 if [ "$KEEP" = false ]; then
     docker compose $ALL_PROFILES down -v
+    $L4_COMPOSE $L4_ALL_PROFILES down -v --remove-orphans
 fi
 
 if [ "$EXIT_CODE" = "0" ]; then

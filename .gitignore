@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# e2e run logs, L4 report and perf summaries (Story 12.12)
+tests-e2e-docker/results/
+
 # Working docs
 FIXLIST.md
 /tmp/

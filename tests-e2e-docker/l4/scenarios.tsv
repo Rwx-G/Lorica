@@ -1,0 +1,79 @@
+# The L4 scenario registry (Story 12.12 D-c): one row per scenario of
+# D-d and D-e. test-runner/l4/report.py fails the run when a row of a
+# profile that ran has no L4-SCENARIO line, more than one, or FAIL.
+#
+# Columns, tab-separated:
+#   name      <story>-<kind>-<slug>, kind iv<n>, ac<n>, x or matrix
+#   source    the IV or AC the scenario proves; for a not-e2e row, the
+#             test that proves its matrix rows instead
+#   story     the story whose IV or AC it is
+#   profiles  comma-separated profiles it runs in (one line expected per
+#             profile that ran); `-` for a not-e2e row
+#   level     full (PASS expected), partial (PASS or PARTIAL), not-e2e
+#   lot       the Story 12.12 Lot that delivers it
+#   state     pending until that Lot lands, then live; a pending row that
+#             prints a line fails the report until it is marked live
+#   matrix    `;`-separated Feature cells of the PRD coverage matrix it
+#             proves, verbatim; `-` for none
+#
+# Profiles: streams and streams-single run in l4/run-l4.sh; the others
+# are run.sh phases, each announced by an `L4-PROFILE <name>` line. suite
+# is the whole run (12.8 IV3), announced by nobody yet; geoip is a compose
+# profile run.sh does not run yet. Both are Lot H's.
+name	source	story	profiles	level	lot	state	matrix
+12.12-x-harness-self-test	12.12 Lot A	12.12	streams,streams-single	full	A	live	-
+12.1-iv1-targeted-stream-binds-on-one-node	12.1 IV1	12.1	cluster	full	L	pending	Dynamic reconfiguration
+12.1-iv2-follower-https-port-refused	12.1 IV2	12.1	cluster	full	L	pending	-
+12.1-ac3-rollback-cold-1.10.7	12.1 AC #3	12.1	streams-single	full	L	pending	-
+12.1-ac3-rollback-hot-1.10.7	12.1 AC #3	12.1	hot-upgrade	full	L	pending	-
+12.2-iv1-bind-and-release-within-5s	12.2 IV1	12.2	streams,streams-single	full	B	pending	TCP proxying;Dynamic reconfiguration
+12.2-iv2-port-in-use-fails-cleanly	12.2 IV2	12.2	streams,streams-single	full	B	pending	-
+12.2-ac3-privileged-port-853	12.2 AC #3	12.2	streams	partial	B	pending	-
+12.2-ac1-udp-group-survives-worker-respawn	12.2 AC #1	12.2	streams	full	B	pending	-
+12.2-ac1-dual-stack-conflict	12.2 AC #1	12.2	streams	full	B	pending	IPv6
+12.2-ac7-stop-drains-then-exits	12.2 AC #7	12.2	streams,streams-single	full	B	pending	Connection draining
+12.2-ac5-budget-refuses-range	12.2 AC #5	12.2	streams	full	B	pending	Port ranges
+12.12-fd-reserve-http-unaffected	12.12 AC #1	12.12	streams	full	B	pending	-
+12.3-iv1-pg-balance-and-failover	12.3 IV1	12.3	streams	full	C	pending	TCP proxying;Round robin, least conn;Hash / consistent hash on source;Random / power of two;Passive failure detection;Session persistence
+12.3-iv2-shared-backend-down-both-planes	12.3 IV2	12.3	streams	full	C	pending	Active health: TCP connect
+12.3-iv3-proxy-v2-send-and-accept	12.3 IV3	12.3	streams	full	C	pending	PROXY protocol v1/v2 send;PROXY protocol v1/v2 accept on streams
+12.3-iv4-local-backend-refused-and-rebind-excluded	12.3 IV4	12.3	streams	partial	C	pending	Upstream DNS re-resolution
+12.3-matrix-backup-backends	12.12 D-e	12.3	streams	full	C	pending	Backup backends
+12.3-matrix-bandwidth	12.12 D-e	12.3	streams	full	C	pending	Bandwidth limit
+12.3-matrix-timeouts	12.12 D-e	12.3	streams	full	C	pending	Timeouts connect / idle / total
+12.3-matrix-proxy-bind	12.12 D-e	12.3	streams	full	C	pending	Chosen source address (`proxy_bind`)
+12.3-matrix-port-range	12.12 D-e	12.3	streams	full	C	pending	Port ranges
+12.3-matrix-latency-aware-selection	not e2e: Story 12.3 Lot D1 selection tests	12.3	-	not-e2e	-	-	Latency-aware selection
+12.3-matrix-backend-keepalive	not e2e: Story 12.3 Lot C socket-option test	12.3	-	not-e2e	-	-	Backend TCP keepalive
+12.4-iv1-sni-passthrough-two-names	12.4 IV1	12.4	streams	full	D	pending	TLS passthrough, SNI routing;ALPN routing
+12.4-iv2-acme-renewal-on-terminating-stream	12.4 IV2	12.4	acme	partial	D	pending	TLS termination at L4
+12.4-ac5-two-cas-two-streams	12.4 AC #5	12.4	streams	full	D	pending	TLS termination at L4
+12.4-ac4-upstream-mtls	12.4 AC #4	12.4	streams	full	D	pending	Upstream TLS / mTLS
+12.4-x-key-replication-targeted	12.4 Lot H	12.4	cluster	full	D	pending	-
+12.5-iv1-reflection-bounded	12.5 IV1	12.5	streams	full	E	pending	UDP request/response bounds
+12.5-ac2-byte-bound	12.5 AC #2	12.5	streams	full	E	pending	UDP request/response bounds
+12.5-ac5-table-isolation	12.5 AC #5	12.5	streams	full	E	pending	-
+12.5-iv2-dns-above-capacity-all-answered	12.5 IV2	12.5	streams	full	E	pending	UDP proxying with idle timeout
+12.5-x-reply-source-address	12.5 Lot I	12.5	streams	full	E	pending	-
+12.5-x-worker-death-no-leaked-count	12.5 Lot I	12.5	streams	full	E	pending	-
+12.5-ac6-budget-refuses-second-stream	12.5 AC #6	12.5	streams	full	E	pending	-
+12.5-matrix-udp-idle-timeout	12.12 D-e	12.5	streams	full	E	pending	UDP proxying with idle timeout;Timeouts connect / idle / total
+12.6-iv1-source-rate-refused-other-served	12.6 IV1	12.6	streams	full	F	pending	New-connection rate limit
+12.6-iv2-geo-deny-tcp-and-udp	12.6 IV2	12.6	streams	full	F	pending	GeoIP;IP allow/deny
+12.6-iv3-10k-silent-pending-cap	12.6 IV3	12.6	streams	full	F	pending	-
+12.6-matrix-concurrency-caps	12.12 D-e	12.6	streams	full	F	pending	Connection limit per source IP;Connection limit per listener / backend
+12.7-iv1-redis-paused-marked-down	12.7 IV1	12.7	streams	full	G	pending	Active health: send/expect
+12.7-x-smtp-banner-template	12.7 AC #3	12.7	streams	full	G	pending	Active health: send/expect
+12.7-iv2-template-yes-payload-no	12.7 IV2	12.7	mcp	full	J	pending	-
+12.8-iv1-proxy-v2-https-real-client	12.8 IV1	12.8	geoip	full	H	pending	PROXY protocol accept on the HTTP listeners
+12.8-iv2-untrusted-and-forged-xff	12.8 IV2	12.8	geoip,workers	full	H	pending	PROXY protocol accept on the HTTP listeners
+12.8-iv3-proxy-off-suite-unchanged	12.8 IV3	12.8	suite	partial	H	pending	-
+12.9-iv1-end-reasons-in-api-and-syslog	12.9 IV1	12.9	streams	partial	I	pending	L4 access log
+12.9-x-metrics-and-sink-up	12.9 Lot J	12.9	streams	full	I	pending	L4 metrics
+12.9-x-stream-sla	12.9 Lot J	12.9	streams	full	I	pending	-
+12.10-iv1-dashboard-stream-visible-read-only	12.10 IV1	12.10	mcp	partial	J	pending	-
+12.11-iv1-stream-ssh-drained-by-upgrade	12.11 IV1	12.11	hot-upgrade	full	K	pending	Connection draining;Hot binary upgrade
+12.11-x-stream-new-connection-after-upgrade	12.11 Lot G	12.11	hot-upgrade	full	K	pending	Hot binary upgrade
+12.11-x-udp-across-upgrade	12.11 Lot G	12.11	hot-upgrade	full	K	pending	Hot binary upgrade
+12.11-x-fd-transfer-past-32	12.11 Lot G	12.11	hot-upgrade	full	K	pending	-
+12.0-matrix-nginx-import-fix	not e2e: Story 12.0 Vitest suite	12.0	-	not-e2e	-	-	Import from an nginx config

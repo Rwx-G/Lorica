@@ -98,8 +98,10 @@ COPY tests-e2e-docker/entrypoint-cluster-follower.sh /entrypoint-cluster-followe
 COPY tests-e2e-docker/entrypoint-capture.sh /entrypoint-capture.sh
 COPY tests-e2e-docker/entrypoint-capture-workers.sh /entrypoint-capture-workers.sh
 COPY tests-e2e-docker/entrypoint-mcp.sh /entrypoint-mcp.sh
+COPY tests-e2e-docker/entrypoint-streams.sh /entrypoint-streams.sh
+COPY tests-e2e-docker/entrypoint-streams-single.sh /entrypoint-streams-single.sh
 COPY tests-e2e-docker/seed-automation-allowlist.sh /seed-automation-allowlist.sh
-RUN chmod +x /entrypoint.sh /entrypoint-workers.sh /entrypoint-geoip.sh /entrypoint-otel.sh /entrypoint-otel-workers.sh /entrypoint-rdns.sh /entrypoint-hot-upgrade.sh /entrypoint-log-sinks.sh /entrypoint-log-sinks-workers.sh /entrypoint-acme.sh /entrypoint-cluster-cp.sh /entrypoint-cluster-follower.sh /entrypoint-capture.sh /entrypoint-capture-workers.sh /entrypoint-mcp.sh
+RUN chmod +x /entrypoint.sh /entrypoint-workers.sh /entrypoint-geoip.sh /entrypoint-otel.sh /entrypoint-otel-workers.sh /entrypoint-rdns.sh /entrypoint-hot-upgrade.sh /entrypoint-log-sinks.sh /entrypoint-log-sinks-workers.sh /entrypoint-acme.sh /entrypoint-cluster-cp.sh /entrypoint-cluster-follower.sh /entrypoint-capture.sh /entrypoint-capture-workers.sh /entrypoint-mcp.sh /entrypoint-streams.sh /entrypoint-streams-single.sh
 
 # Pre-create the `/shared` mount point owned by the non-root lorica
 # user so the entrypoint can write `/shared/admin_password` after the

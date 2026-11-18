@@ -1,0 +1,120 @@
+# The L4 phase of the e2e suite (Story 12.12 D-b). A compose project of
+# its own, so its Lots never serialise against edits of
+# docker-compose.yml and its teardown is independent. Driven by
+# l4/run-l4.sh, which run.sh calls; see that file for how a scenario is
+# added.
+#
+# One profile runs at a time: `streams` (worker mode) then
+# `streams-single` (single process), torn down with `down -v` in
+# between. Both nodes carry the alias `l4-node` on the `l4` network, so
+# the client and the tools target one name whichever profile runs.
+#
+# Backends, clients and extra nodes are added by the scenario Lots.
+name: lorica-e2e-l4
+
+x-lorica-node: &lorica-node
+  build:
+    context: ..
+    dockerfile: tests-e2e-docker/Dockerfile
+  # One image name for both nodes: a run builds the Lorica image once.
+  image: lorica-e2e-l4/lorica:local
+  # The entrypoint starts as root and drops to `lorica` with
+  # CAP_NET_BIND_SERVICE ambient (see entrypoint-streams.sh).
+  user: "0:0"
+  sysctls:
+    # Docker defaults this to 0 in a container's network namespace,
+    # which would let any user bind a privileged port and make the
+    # Story 12.2 AC #3 check pass without the capability.
+    net.ipv4.ip_unprivileged_port_start: "1024"
+  # Above the drain under test: the default worker_drain_timeout_s is
+  # 30 s and the supervisor allows a worker the drain plus 10 s before
+  # SIGKILL (Story 12.2 D-f). Docker's default of 10 s would SIGKILL a
+  # drain in the middle.
+  stop_grace_period: 60s
+
+x-l4-runner: &l4-runner
+  build:
+    context: ./test-runner
+  image: lorica-e2e-l4/runner:local
+  entrypoint: ["sleep", "infinity"]
+
+services:
+  lorica-streams:
+    <<: *lorica-node
+    profiles: ["streams"]
+    entrypoint: ["/entrypoint-streams.sh"]
+    volumes:
+      - l4-shared:/shared
+      - streams-data:/var/lib/lorica
+    networks:
+      l4:
+        aliases: ["l4-node"]
+
+  lorica-streams-single:
+    <<: *lorica-node
+    profiles: ["streams-single"]
+    entrypoint: ["/entrypoint-streams-single.sh"]
+    volumes:
+      - l4-shared:/shared
+      - streams-single-data:/var/lib/lorica
+    networks:
+      l4:
+        aliases: ["l4-node"]
+
+  # Shares the worker-mode node's network and pid namespaces: `ss` sees
+  # its sockets, a squatter binds in its namespace, a worker can be
+  # killed. Root, to signal processes owned by `lorica`.
+  streams-probe:
+    <<: *l4-runner
+    profiles: ["streams"]
+    network_mode: "service:lorica-streams"
+    pid: "service:lorica-streams"
+    user: root
+    depends_on:
+      - lorica-streams
+    volumes:
+      - l4-shared:/shared:ro
+
+  # Has its own addresses: every source-address scenario needs a client
+  # that is not the node's loopback.
+  streams-client:
+    <<: *l4-runner
+    profiles: ["streams", "streams-single"]
+    volumes:
+      - l4-shared:/shared:ro
+    networks:
+      - l4
+
+  # Not a test service: runs test-runner/l4/report.py over the run's log
+  # (Story 12.12 D-c). run.sh invokes it with the host user's uid so the
+  # Markdown it writes into results/ belongs to that user.
+  l4-report:
+    build:
+      context: ./test-runner
+    image: lorica-e2e-l4/runner:local
+    profiles: ["l4-report"]
+    entrypoint: ["python3", "/tests/l4/report.py"]
+    network_mode: none
+    volumes:
+      - ./l4/scenarios.tsv:/l4/scenarios.tsv:ro
+      - ../docs/prd/epic-12-v1.11.0.md:/l4/prd.md:ro
+      - ./results:/results
+
+volumes:
+  l4-shared:
+  streams-data:
+  streams-single-data:
+
+networks:
+  l4:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: fd00:4c34::/64
+  # The GeoIP and source-address network of Story 12.6 Lot I, which
+  # attaches the node and the client to it: addresses in the GeoIP test
+  # database (214.78.120.5 is US).
+  streams-geo:
+    ipam:
+      config:
+        - subnet: 214.78.120.0/24

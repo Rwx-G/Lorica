@@ -6,7 +6,9 @@ FROM alpine:3.20
 # socat is used by the log-sinks profile: the syslog-collector service
 # reuses this image with an entrypoint override that runs a plain socat
 # TCP listener appending received frames to /shared/syslog.log.
-RUN apk add --no-cache bash curl jq openssl python3 socat sqlite
+# iproute2 gives the L4 phase `ss` (Story 12.2), openssh-client the SSH
+# stream client (Story 12.11); both approved in Story 12.12 D-p.
+RUN apk add --no-cache bash curl iproute2 jq openssh-client openssl python3 socat sqlite
 RUN adduser -D -s /sbin/nologin testuser
 # The management API now serves TLS with an auto-generated self-signed
 # cert (Story 8.8). Every test curl targets an internal, trusted
@@ -20,5 +22,7 @@ RUN mkdir -p /etc/curl && printf 'insecure\n' > /etc/curl/.curlrc && chmod 0644 
 WORKDIR /tests
 COPY helpers.sh run-tests.sh run-tests-workers.sh run-otel-smoke.sh run-geoip-smoke.sh run-bot-smoke.sh run-rdns-smoke.sh run-cert-export-smoke.sh run-ai-bot-smoke.sh run-rbac-smoke.sh run-audit-smoke.sh run-hot-upgrade-smoke.sh run-log-sinks-smoke.sh run-log-sinks-workers-smoke.sh run-acme-smoke.sh run-cluster-smoke.sh run-cluster-restart-smoke.sh run-cluster-revocation-smoke.sh run-automation-smoke.sh run-capture-smoke.sh run-capture-workers-smoke.sh run-adcs-smoke.sh capture-helpers.sh ./
 RUN chmod +x run-tests.sh run-tests-workers.sh run-otel-smoke.sh run-geoip-smoke.sh run-bot-smoke.sh run-rdns-smoke.sh run-cert-export-smoke.sh run-ai-bot-smoke.sh run-rbac-smoke.sh run-audit-smoke.sh run-hot-upgrade-smoke.sh run-log-sinks-smoke.sh run-log-sinks-workers-smoke.sh run-acme-smoke.sh run-cluster-smoke.sh run-cluster-restart-smoke.sh run-cluster-revocation-smoke.sh run-automation-smoke.sh run-capture-smoke.sh run-capture-workers-smoke.sh run-adcs-smoke.sh helpers.sh capture-helpers.sh
+# The L4 phase's in-container tools and its report (Story 12.12 D-c).
+COPY l4/ l4/
 USER testuser
 ENTRYPOINT ["bash", "run-tests.sh"]
