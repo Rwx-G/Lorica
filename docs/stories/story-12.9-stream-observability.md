@@ -715,7 +715,7 @@ Allowlist: `lorica-api/src/sla.rs`, `lorica-api/src/vocabulary.rs`,
 - [ ] Stream SLA management routes and overview field (D-g). The
       cluster pull for `stream_id` is Lot G's, which edits
       `answer_sla_pull` after this Lot.
-- [ ] Labels for the two new alert types.
+- [x] Labels for the two new alert types.
 - [ ] Automation `sla/streams/{id}`, the overview field, `stream-logs`
       with the D-j scope and confinement rule; MCP `lorica_sla_stream`,
       `lorica_stream_logs`; audit reasons; both OpenAPI documents.
@@ -1343,6 +1343,66 @@ edited here.
 - **Not done here:** `stream_access_log_retention` is not in the
   automation plane's admin settings allowlist
   (`lorica-automation-policy`), which `access_log_retention` is in.
+- Lot C3 (part), 2026-11-18, on `0e93f5ca`. Built: the stream SLA
+  management routes (`GET /api/v1/sla/streams/{id}`, `/buckets`, `GET`
+  and `PUT /config`, `/export`, `DELETE /data`, at the route floors,
+  audited `sla.config_update` and `sla.data_clear` with target type
+  `stream`), the automation read `GET /automation/v1/sla/streams/{id}`
+  (`sla:read`) and the MCP read tool `lorica_sla_stream`, in both
+  OpenAPI documents. The alert labels were Lot B's (`vocabulary.rs`),
+  checked here. Not built, and why:
+  - **The overview `streams` array (D-g) is not buildable as written.**
+    `GET /api/v1/sla/overview` answers `data` as a bare array of route
+    summaries (the dashboard reads it as `SlaSummary[]`, the `?node=`
+    pull fills it from `SlaPull`), and `/automation/v1/sla/overview`
+    answers the paginated `{items, page}` envelope over the route rows.
+    Neither has an object to put a `streams` key beside. Recommended
+    instead (maintainer to decide): a sibling read, `GET
+    /api/v1/sla/streams` (1h and 24h per stream) and its automation
+    and MCP counterparts, which keeps each answer one shape.
+  - **`/automation/v1/stream-logs` and `lorica_stream_logs` (D-j)** need
+    `streams:read`, which Story 12.10 Lot B adds (12.10 Resolved 7 puts
+    this Lot after it). Not started; the audit reason and the 403 and
+    confinement tests go with them.
+  - **No `?node=` on the stream SLA routes**: `SlaPull` cannot name a
+    stream until Lot G, so a follower's figures cannot be read yet. Lot
+    G's allowlist names `answer_sla_pull` only; the requesting side
+    (the stream handlers here) needs it too.
+- **`stream_access_log_retention` is still not in the admin settings
+  allowlist** (the Lot C1 note above). Story 11.3 AC #3 requires every
+  allowlisted key to be undoable on the dashboard's settings form, and
+  `every_allowlisted_setting_is_a_field_the_dashboard_form_edits_and_the_document_carries`
+  fails for a key no settings tab binds; the dashboard gains the stream
+  retention field in Lot H. The entry (raise-only, `1..=RETENTION_TIER_CEILING_ROWS`,
+  fleet, live), its `SettingsPatch` property, the `docs/mcp.md` row,
+  the retention ceiling test and the "three retentions" wording of
+  `openapi-automation.yaml` and `docs/mcp.md` belong with that field.
+- `AppState.stream_sla_collector` (`Option<Arc<StreamSlaCollector>>`)
+  is what the PUT and DELETE call `set_sla_config` and `clear_stream`
+  on. It is `None` in `single.rs` and `supervisor.rs` until Lot F
+  builds the collector and puts it there, as it does the route one.
+- The route `update_sla_config` does not call `notify_config_changed`;
+  the stream one mirrors it. Whether a replicated target change should
+  wake the replication round was not examined here.
+- `lorica_bench::results::SlaWindow::ALL` is the window list, read by
+  `compute_all_windows` and the new `compute_all_stream_windows`, so
+  the stream reads and their tests derive the windows rather than
+  restating them.
+- Lot C3 gates: see the Change Log row; `rust:1-bookworm` with
+  `CARGO_BUILD_WARNINGS=deny`, the CI chain and `cargo audit`.
+- **Outside the allowlist:** `lorica-bench/src/results.rs`
+  (`SlaWindow::ALL`, `compute_all_stream_windows`),
+  `lorica-api/src/automation/scope.rs` and `router.rs` (the path, its
+  scope and its mount), `lorica-api/src/sla/stream_tests.rs` (new),
+  `lorica-api/src/automation/test_support.rs` (the read fixture seeds a
+  stream), `read/plane_tests.rs` and `mcp/plane_tests.rs` (the sweeps
+  reach the stream read; the committed field names gain the stream
+  summary's), `lorica-api/src/automation/tests.rs`
+  (`no_automation_path_reaches_a_stream` becomes
+  `no_automation_write_path_reaches_a_stream`: the SLA read names a
+  stream and writes nothing), every `AppState` literal (the new field),
+  `lorica-automation-policy/src/scope.rs` (the `sla:read` doc),
+  `docs/automation.md` and `docs/mcp.md` (one line each).
 
 ## File List
 
@@ -1388,6 +1448,19 @@ edited here.
 - `lorica-api/tests/log_store_upgrade.rs` (Lot C1)
 - `lorica/src/otel.rs`, `lorica/src/capture/sink.rs` (Lot C1,
   `register_lane`)
+- `lorica-api/src/sla.rs`, `lorica-api/src/sla/stream_tests.rs` (new),
+  `server.rs`, `openapi.yaml`, `openapi-automation.yaml` (Lot C3)
+- `lorica-api/src/automation/read.rs`, `scope.rs`, `router.rs`,
+  `tests.rs`, `test_support.rs`, `read/plane_tests.rs`,
+  `mcp/plane_tests.rs` (Lot C3)
+- `lorica-mcp/src/tools.rs` (Lot C3, `lorica_sla_stream`)
+- `lorica-bench/src/results.rs` (Lot C3, `SlaWindow::ALL`)
+- `lorica-automation-policy/src/scope.rs` (Lot C3, the `sla:read` doc)
+- `lorica-api/src/acme/tests.rs`, `automation/audit.rs`,
+  `automation_tokens/tests.rs`, `oidc_issuers/tests.rs`, `tests.rs`,
+  `lorica/src/startup/single.rs`, `supervisor.rs` (Lot C3, the
+  `AppState` field)
+- `docs/automation.md`, `docs/mcp.md` (Lot C3)
 
 ## Change Log
 
@@ -1401,4 +1474,5 @@ edited here.
 | 2026-11-16 | 0.6 | Lot C2: `AggregatedGauge` and `GaugeAggregation` in `lorica-metrics`, `PER_WORKER_GAUGES` and `lorica_log_sink_up{sink}` with `Min`; `StreamMetricsCollector` rendering the D-e families from `CountersSnapshot` with monotone retired totals, node gauges and table pruning. The per-link bytes family waits for Lot A. | Romain G. |
 | 2026-11-16 | 0.7 | Lot A: `protocol` and `detected_protocol` on the record, `client_certificate` null on a stream that does not verify, `connect_outcome` and `ConnectOutcome`, `StreamLogKey` widening the limiter key with pre-forwarding ends passed through it, per-backend bytes and `lorica_stream_backend_bytes_total`. | Romain G. |
 | 2026-11-16 | 0.8 | The `tcp_engine` timeouts traced to the tests (a released port answered by strangers, a burst assumed to fit one second, wall-clock upper bounds); fixed in the tests, 0 failures in 800 contended runs. | Romain G. |
+| 2026-11-18 | 0.10 | Lot C3, in part: the stream SLA management routes, `GET /automation/v1/sla/streams/{id}` under `sla:read` and the MCP tool `lorica_sla_stream`, both OpenAPI documents. The overview `streams` field is not buildable as D-g words it (maintainer to decide); the stream-log reads wait for 12.10 Lot B. Gates on the final tree: the CI chain green (3,653 product, 957 `lorica`, 910 forked, 592 TLS-featured tests) and `cargo audit` clean after lettre 0.11.24. | Romain G. |
 | 2026-11-18 | 0.9 | Lot C1: `stream_access_logs` with its own retention and writer queue, `StreamLogEntry` built from the stream records, `/api/v1/stream-logs` with export and clear, the three settings in the settings API, the `stream` sink kind, and a syslog up state that follows the collector without traffic. | Romain G. |
