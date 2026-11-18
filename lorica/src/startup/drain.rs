@@ -203,7 +203,7 @@ pub(crate) fn arm_worker_drain(
                 loop {
                     tokio::select! {
                         changed = quiesced.wait_for(Option::is_some) => {
-                            return changed.ok().and_then(|drain| *drain);
+                            return changed.ok().and_then(|q| q.map(|q| q.drain));
                         }
                         phase = phases.recv(), if phases_open => match phase {
                             Ok(ExecutionPhase::GracefulTerminate)
@@ -455,7 +455,13 @@ mod tests {
             exit_rx.recv_timeout(Duration::from_secs(5)),
             Ok(DrainEnd::Idle)
         );
-        assert_eq!(*runtime.quiesced().borrow(), Some(Duration::from_secs(7)));
+        assert_eq!(
+            *runtime.quiesced().borrow(),
+            Some(lorica_stream::Quiesced {
+                drain: Duration::from_secs(7),
+                reason: lorica_worker::stream_ctl::QuiesceReason::Shutdown
+            })
+        );
         watcher.join().unwrap();
     }
 

@@ -84,7 +84,10 @@ pub use local::BoundPorts;
 pub use reconcile::{diff, Actions, BindKey, BoundBinding, Detach, ReleaseCause, UdpOverlap};
 pub use refusal_log::{RefusalLogDecision, RefusalLogLimiter, REFUSAL_LOG_WINDOW};
 pub use resolver::ResolverCache;
-pub use runtime::{StreamRuntime, StreamRuntimeError, StreamRuntimeHandle};
+pub use runtime::{
+    quiesce_end_reason, DrainReportError, Quiesced, StreamRuntime, StreamRuntimeError,
+    StreamRuntimeHandle,
+};
 pub use seams::{
     Admission, BackendSelector, BreakerGate, Candidate, Resolve, ResolveError, Resolved,
     SelectionRequest, SourceGate,
@@ -93,6 +96,6 @@ pub use state::{BindFailure, BindFailureKind, BindState, BindStateKind, StreamBi
 pub use table::{ClientIdentity, StreamTable, StreamTableSource};
 pub use tcp::{TcpEngine, TcpEngineParts};
 pub use tls::TlsParts;
-pub use tracker::{ConnectionTracker, TrackedConnection};
+pub use tracker::{ConnectionTracker, TrackedConnection, UpgradeDrainCounts};
 pub use transport::{ControlTransport, InProcessPeer};
 pub use udp::{UdpEngine, UdpEngineParts};

@@ -469,9 +469,9 @@ impl Harness {
             .unwrap_or_default()
     }
 
-    fn drain_now(&self) {
+    fn drain_now(&self, reason: StreamEndReason) {
         let now = Instant::now();
-        self.tracker.drain_all(now, StreamEndReason::ConfigRemoved);
+        self.tracker.drain_all(now, reason);
         self.tracker.close_expired(now);
     }
 }
@@ -1357,45 +1357,51 @@ async fn connection_1025_of_a_1024_cap_is_refused_and_counted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_drain_ends_a_connection_in_each_phase_with_the_drain_reason() {
-    let mut h = Harness::new().await;
-    let (addr, _) = echo().await;
+    // A configuration change, and a hot upgrade (Story 12.11 D-c).
+    for reason in [
+        StreamEndReason::ConfigRemoved,
+        StreamEndReason::DrainedByUpgrade,
+    ] {
+        let mut h = Harness::new().await;
+        let (addr, _) = echo().await;
 
-    // Phase 2: a trusted peer that has not sent its header yet.
-    h.set(
-        accepting(&["127.0.0.1"], StreamProxyProtocol::Off),
-        vec![(backend("b1", addr), false)],
-    );
-    let mut client = h.connect().await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    h.drain_now();
-    let record = h.record().await;
-    assert_eq!(record.end_reason, StreamEndReason::ConfigRemoved);
-    assert_eq!(record.attempts, 0);
-    assert!(read_to_end(&mut client).await.is_empty());
+        // Phase 2: a trusted peer that has not sent its header yet.
+        h.set(
+            accepting(&["127.0.0.1"], StreamProxyProtocol::Off),
+            vec![(backend("b1", addr), false)],
+        );
+        let mut client = h.connect().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.drain_now(reason);
+        let record = h.record().await;
+        assert_eq!(record.end_reason, reason);
+        assert_eq!(record.attempts, 0);
+        assert!(read_to_end(&mut client).await.is_empty());
 
-    // Phase 3: a name whose resolution never answers.
-    h.set(
-        stream(),
-        vec![(backend("b1", "never.example.com:5432"), false)],
-    );
-    let mut client = h.connect().await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    h.drain_now();
-    let record = h.record().await;
-    assert_eq!(record.end_reason, StreamEndReason::ConfigRemoved);
-    assert_eq!(record.backend_id, None);
-    assert!(read_to_end(&mut client).await.is_empty());
+        // Phase 3: a name whose resolution never answers.
+        h.set(
+            stream(),
+            vec![(backend("b1", "never.example.com:5432"), false)],
+        );
+        let mut client = h.connect().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.drain_now(reason);
+        let record = h.record().await;
+        assert_eq!(record.end_reason, reason);
+        assert_eq!(record.backend_id, None);
+        assert!(read_to_end(&mut client).await.is_empty());
 
-    // Phase 4: an established echo.
-    h.set(stream(), vec![(backend("b1", addr), false)]);
-    let mut client = h.connect().await;
-    echo_once(&mut client, b"live").await;
-    h.drain_now();
-    let record = h.record().await;
-    assert_eq!(record.end_reason, StreamEndReason::ConfigRemoved);
-    assert_eq!(record.backend_id.as_deref(), Some("b1"));
-    assert!(read_to_end(&mut client).await.is_empty());
-    assert_eq!(ended(&h.stats(), StreamEndKind::ConfigRemoved), 3);
+        // Phase 4: an established echo.
+        h.set(stream(), vec![(backend("b1", addr), false)]);
+        let mut client = h.connect().await;
+        echo_once(&mut client, b"live").await;
+        h.drain_now(reason);
+        let record = h.record().await;
+        assert_eq!(record.end_reason, reason);
+        assert_eq!(record.backend_id.as_deref(), Some("b1"));
+        assert!(read_to_end(&mut client).await.is_empty());
+        assert_eq!(ended(&h.stats(), reason.kind()), 3);
+    }
 }
 
 // ---- admission (Story 12.6) ---------------------------------------------

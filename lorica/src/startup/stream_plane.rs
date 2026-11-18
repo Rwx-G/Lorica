@@ -3448,7 +3448,10 @@ mod tests {
             })
         );
         plane.quiesce(Duration::from_secs(1)).await;
-        assert_eq!(*runtime.quiesced().borrow(), Some(Duration::from_secs(1)));
+        assert_eq!(
+            runtime.quiesced().borrow().map(|q| (q.drain, q.reason)),
+            Some((Duration::from_secs(1), QuiesceReason::Shutdown))
+        );
         runtime.stop();
     }
 

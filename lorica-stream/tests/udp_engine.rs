@@ -47,9 +47,10 @@ use lorica_stream::{
     ConnectionTracker, ControlTransport, Engines, InProcessPeer, NodeCapsRegions, RefusalRecord,
     Resolve, ResolveError, Resolved, ResolverCache, SelectionRequest, SourceGate, StreamCounters,
     StreamRuntime, StreamRuntimeHandle, StreamTable, StreamTableSource, UdpEngine, UdpEngineParts,
+    UpgradeDrainCounts,
 };
 use lorica_worker::fd_passing::StreamProto;
-use lorica_worker::stream_ctl::{StreamCtlMsg, StreamSocket};
+use lorica_worker::stream_ctl::{QuiesceReason, StreamCtlMsg, StreamSocket};
 use lorica_worker::stream_sockets::bind_udp_group;
 use socket2::SockRef;
 use tokio::net::UdpSocket;
@@ -1527,5 +1528,150 @@ async fn no_healthy_backend_is_not_connected_and_a_silent_stream_reports_only_it
     assert!(h.records.try_recv().is_err(), "one record per session");
     let link = h.link("syslog", "b2");
     assert_eq!((link.bytes_upload, link.bytes_download), (11, 0));
+    h.stop();
+}
+
+// ---- the upgrade drain (Story 12.11 D-e) -------------------------------
+
+impl Harness {
+    /// Quiesce the runtime for a hot upgrade draining `drain_ms`.
+    async fn upgrade(&mut self, drain_ms: u64) {
+        let seq = self.next_seq();
+        self.exchange(StreamCtlMsg::Quiesce {
+            seq,
+            reason: QuiesceReason::Upgrade,
+            drain_ms,
+        })
+        .await;
+    }
+
+    /// Wait until the upgrade counts of `stream_id` are `expected`: an
+    /// entry is counted as it leaves the tracker, right after its record.
+    async fn upgrade_counts_reach(&self, stream_id: &str, expected: UpgradeDrainCounts) {
+        wait_until("the upgrade counts", || {
+            self.handle
+                .tracker()
+                .upgrade_drain_counts()
+                .get(stream_id)
+                .copied()
+                == Some(expected)
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn an_upgrade_ends_an_unbounded_session_at_once() {
+    let b1 = UdpBackend::echo().await;
+    let mut stream = udp_stream("game", "127.0.0.1");
+    udp(&mut stream).unbounded_responses = true;
+    let mut h = Harness::one(stream, vec![backend("b1", b1.addr)]).await;
+    let c = client().await;
+    c.send_to(b"move", h.listen()).await.unwrap();
+    assert_eq!(reply(&c).await, b"move");
+
+    // A drain far longer than the test: the end is the policy's.
+    h.upgrade(600_000).await;
+    let record = h.record().await;
+    assert_eq!(record.end_reason, StreamEndReason::DrainedByUpgrade);
+    h.upgrade_counts_reach(
+        "game",
+        UpgradeDrainCounts {
+            closed: 1,
+            finished: 0,
+        },
+    )
+    .await;
+    h.stop();
+}
+
+/// A backend that answers only when the test says so, to the upstream
+/// port it last heard from.
+struct HeldBackend {
+    socket: UdpSocket,
+    peer: Option<SocketAddr>,
+}
+
+impl HeldBackend {
+    async fn new() -> Self {
+        HeldBackend {
+            socket: reserved_socket(loopback(1)).await,
+            peer: None,
+        }
+    }
+
+    fn addr(&self) -> SocketAddr {
+        self.socket.local_addr().unwrap()
+    }
+
+    async fn receive(&mut self) -> Vec<u8> {
+        let mut buf = [0u8; 2048];
+        let (n, peer) = tokio::time::timeout(WAIT, self.socket.recv_from(&mut buf))
+            .await
+            .expect("the query in time")
+            .unwrap();
+        self.peer = Some(peer);
+        buf[..n].to_vec()
+    }
+
+    async fn answer(&self, payload: &[u8]) {
+        self.socket
+            .send_to(payload, self.peer.expect("a query first"))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn an_upgrade_relays_the_response_a_bounded_session_is_owed_then_ends_it_on_its_bound() {
+    let mut b1 = HeldBackend::new().await;
+    let mut h = Harness::one(
+        udp_stream("dns", "127.0.0.1"),
+        vec![backend("b1", b1.addr())],
+    )
+    .await;
+    let c = client().await;
+    c.send_to(b"query", h.listen()).await.unwrap();
+    assert_eq!(b1.receive().await, b"query");
+
+    h.upgrade(600_000).await;
+    b1.answer(b"answer").await;
+    assert_eq!(reply(&c).await, b"answer", "relayed from the slot socket");
+    let record = h.record().await;
+    assert_eq!(record.end_reason, StreamEndReason::ResponseBoundReached);
+    assert_eq!(record.datagrams_download, Some(1));
+    h.upgrade_counts_reach(
+        "dns",
+        UpgradeDrainCounts {
+            closed: 0,
+            finished: 1,
+        },
+    )
+    .await;
+    h.stop();
+}
+
+#[tokio::test]
+async fn an_upgrade_drained_session_that_idles_ends_with_drained_by_upgrade() {
+    let mut b1 = HeldBackend::new().await;
+    let mut stream = udp_stream("dns", "127.0.0.1");
+    stream.idle_timeout_s = 3;
+    let mut h = Harness::one(stream, vec![backend("b1", b1.addr())]).await;
+    let c = client().await;
+    c.send_to(b"query", h.listen()).await.unwrap();
+    assert_eq!(b1.receive().await, b"query");
+
+    h.upgrade(600_000).await;
+    let record = h.record().await;
+    assert_eq!(record.end_reason, StreamEndReason::DrainedByUpgrade);
+    assert_eq!(record.datagrams_download, Some(0));
+    h.upgrade_counts_reach(
+        "dns",
+        UpgradeDrainCounts {
+            closed: 1,
+            finished: 0,
+        },
+    )
+    .await;
     h.stop();
 }

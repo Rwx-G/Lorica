@@ -35,7 +35,21 @@
 //!   otherwise know.
 //!
 //! Worker to supervisor: `ack <seq> <count>` or `nack <seq> <reason>`,
-//! where `reason` is a [`NackReason`] token, never free text.
+//! where `reason` is a [`NackReason`] token, never free text. At the end
+//! of an upgrade drain (Story 12.11 D-g), the worker's drain report,
+//! under the seq of the `quiesce reason=upgrade` it answers:
+//!
+//! - `drained <seq> <closed>:<finished>:<stream_id>...`, as many as the
+//!   entries need, each packed to the payload buffer ([`pack_drained`]);
+//!   the stream id goes last because it is the one unvalidated string;
+//! - then `drained_end <seq> <end> http_cut=<n> entries=<n>
+//!   report=<complete|truncated>`, `end` a [`DrainEnd`] token and
+//!   `entries` the number of entries the `drained` messages before it
+//!   carried.
+//!
+//! The report is sent without waiting ([`send_drain_report`]): a send
+//! that would block stops the entries and the end marker says
+//! `truncated`. A worker never blocks its exit on its report.
 //!
 //! Flow control is stop-and-wait per worker, owned by the sender: the
 //! next message goes out only after the previous one's answer or its
@@ -91,6 +105,37 @@ const _: () = assert!(
     "a caps message must fit the payload buffer"
 );
 
+/// Longest `drained <seq>` header.
+const DRAINED_HEADER_MAX_LEN: usize = "drained".len() + 1 + U64_MAX_DIGITS;
+
+/// Longest `<closed>:<finished>:<stream_id>` entry.
+const DRAINED_ENTRY_MAX_LEN: usize = U64_MAX_DIGITS + 1 + U64_MAX_DIGITS + 1 + MAX_STREAM_ID_LEN;
+
+/// Longest `drained_end` message.
+const DRAINED_END_MAX_LEN: usize = "drained_end".len()
+    + 1
+    + U64_MAX_DIGITS
+    + 1
+    + DRAIN_END_MAX_LEN
+    + " http_cut=".len()
+    + U64_MAX_DIGITS
+    + " entries=".len()
+    + U64_MAX_DIGITS
+    + " report=truncated".len();
+
+/// Longest [`DrainEnd`] token.
+const DRAIN_END_MAX_LEN: usize = "deadline".len();
+
+const _: () = assert!(
+    DRAINED_HEADER_MAX_LEN + 1 + DRAINED_ENTRY_MAX_LEN <= PAYLOAD_BUF_SIZE,
+    "a drained message must carry at least one entry"
+);
+
+const _: () = assert!(
+    DRAINED_END_MAX_LEN <= PAYLOAD_BUF_SIZE,
+    "a drained_end message must fit the payload buffer"
+);
+
 /// Errors of the stream control channel.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamCtlError {
@@ -119,27 +164,115 @@ pub enum StreamCtlError {
     Invalid(&'static str),
 }
 
-/// Why a stream is quiesced.
+/// Why a stream is quiesced. The worker closes what the drain leaves
+/// with the end reason this maps to: `node_shutdown` for a stop,
+/// `drained_by_upgrade` for a hot upgrade (Story 12.11 D-a).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuiesceReason {
     /// The process is stopping.
     Shutdown,
+    /// A new generation took over the node's listening sockets; this one
+    /// drains and exits.
+    Upgrade,
 }
 
 impl QuiesceReason {
+    /// Every reason, in wire order.
+    pub const ALL: [QuiesceReason; 2] = [QuiesceReason::Shutdown, QuiesceReason::Upgrade];
+
     /// The wire token, the value of `reason=`.
     pub fn as_str(self) -> &'static str {
         match self {
             QuiesceReason::Shutdown => "shutdown",
+            QuiesceReason::Upgrade => "upgrade",
         }
     }
 
     fn from_wire(s: &str) -> Option<Self> {
-        match s {
-            "shutdown" => Some(QuiesceReason::Shutdown),
-            _ => None,
+        Self::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+}
+
+/// How a worker's drain ended, the `end` of a `drained_end`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainEnd {
+    /// No traffic was left before the deadline.
+    Idle,
+    /// The deadline passed with traffic still in flight.
+    Deadline,
+}
+
+impl DrainEnd {
+    /// Every end, in wire order.
+    pub const ALL: [DrainEnd; 2] = [DrainEnd::Idle, DrainEnd::Deadline];
+
+    /// The wire token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DrainEnd::Idle => "idle",
+            DrainEnd::Deadline => "deadline",
         }
     }
+
+    fn from_wire(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|e| e.as_str() == s)
+    }
+}
+
+/// One stream's line of a worker's drain report (Story 12.11 D-g).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainedEntry {
+    /// The stream.
+    pub stream_id: String,
+    /// Its connections and sessions that ended with `drained_by_upgrade`.
+    pub closed: u64,
+    /// Those marked draining for the upgrade that ended on their own.
+    pub finished: u64,
+}
+
+impl DrainedEntry {
+    fn to_token(&self) -> String {
+        format!("{}:{}:{}", self.closed, self.finished, self.stream_id)
+    }
+
+    fn from_token(tok: &str) -> Result<Self, StreamCtlError> {
+        let mut parts = tok.splitn(3, ':');
+        let (Some(closed), Some(finished), Some(stream_id)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(StreamCtlError::Malformed(
+                "a drained entry is closed:finished:stream_id",
+            ));
+        };
+        Ok(DrainedEntry {
+            closed: parse_u64(closed)?,
+            finished: parse_u64(finished)?,
+            stream_id: parse_stream_id(stream_id)?,
+        })
+    }
+}
+
+/// What a worker reports at the end of its upgrade drain, before the
+/// wire splits it into messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainReport {
+    /// How the drain ended.
+    pub end: DrainEnd,
+    /// HTTP requests still in flight at the deadline, which the exit
+    /// cuts; 0 when the drain ended idle.
+    pub http_cut: u64,
+    /// One entry per stream the upgrade drained something of.
+    pub entries: Vec<DrainedEntry>,
+}
+
+/// What [`send_drain_report`] delivered: the end marker always, and the
+/// entries before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportSent {
+    /// Entries sent before the end marker.
+    pub entries: u64,
+    /// Whether a send would have blocked and the rest was left out.
+    pub truncated: bool,
 }
 
 /// Why a worker refused a message. A closed set, so a `nack` never
@@ -237,6 +370,21 @@ pub enum StreamCtlMsg {
     Ack { seq: u64, count: u32 },
     /// The worker refused message `seq`.
     Nack { seq: u64, reason: NackReason },
+    /// Part of the drain report answering upgrade quiesce `seq`: one or
+    /// more entries.
+    Drained {
+        seq: u64,
+        entries: Vec<DrainedEntry>,
+    },
+    /// The end of the drain report answering upgrade quiesce `seq`.
+    DrainedEnd {
+        seq: u64,
+        end: DrainEnd,
+        http_cut: u64,
+        /// Entries the `drained` messages before it carried.
+        entries: u64,
+        truncated: bool,
+    },
 }
 
 impl StreamCtlMsg {
@@ -249,7 +397,9 @@ impl StreamCtlMsg {
             | StreamCtlMsg::Quiesce { seq, .. }
             | StreamCtlMsg::Caps { seq, .. }
             | StreamCtlMsg::Ack { seq, .. }
-            | StreamCtlMsg::Nack { seq, .. } => *seq,
+            | StreamCtlMsg::Nack { seq, .. }
+            | StreamCtlMsg::Drained { seq, .. }
+            | StreamCtlMsg::DrainedEnd { seq, .. } => *seq,
         }
     }
 
@@ -329,6 +479,39 @@ impl StreamCtlMsg {
             StreamCtlMsg::Nack { seq, reason } => {
                 Ok((format!("nack {seq} {}", reason.as_str()), Vec::new()))
             }
+            StreamCtlMsg::Drained { seq, entries } => {
+                if entries.is_empty() {
+                    return Err(StreamCtlError::Invalid(
+                        "a drained message carries at least one entry",
+                    ));
+                }
+                let mut payload = format!("drained {seq}");
+                for entry in entries {
+                    check_stream_id(&entry.stream_id).map_err(StreamCtlError::Invalid)?;
+                    payload.push(' ');
+                    payload.push_str(&entry.to_token());
+                }
+                if payload.len() > PAYLOAD_BUF_SIZE {
+                    return Err(StreamCtlError::Invalid(
+                        "a drained message must fit the payload buffer",
+                    ));
+                }
+                Ok((payload, Vec::new()))
+            }
+            StreamCtlMsg::DrainedEnd {
+                seq,
+                end,
+                http_cut,
+                entries,
+                truncated,
+            } => Ok((
+                format!(
+                    "drained_end {seq} {} http_cut={http_cut} entries={entries} report={}",
+                    end.as_str(),
+                    if *truncated { "truncated" } else { "complete" }
+                ),
+                Vec::new(),
+            )),
         }
     }
 
@@ -438,6 +621,27 @@ impl StreamCtlMsg {
                 reason: NackReason::from_wire(reason)
                     .ok_or(StreamCtlError::Malformed("unknown nack reason"))?,
             }),
+            ("drained", [seq, entries @ ..]) if !entries.is_empty() => Ok(StreamCtlMsg::Drained {
+                seq: parse_u64(seq)?,
+                entries: entries
+                    .iter()
+                    .map(|tok| DrainedEntry::from_token(tok))
+                    .collect::<Result<_, _>>()?,
+            }),
+            ("drained_end", [seq, end, http_cut, entries, report]) => {
+                Ok(StreamCtlMsg::DrainedEnd {
+                    seq: parse_u64(seq)?,
+                    end: DrainEnd::from_wire(end)
+                        .ok_or(StreamCtlError::Malformed("unknown drain end"))?,
+                    http_cut: parse_u64(keyed(http_cut, "http_cut")?)?,
+                    entries: parse_u64(keyed(entries, "entries")?)?,
+                    truncated: match keyed(report, "report")? {
+                        "complete" => false,
+                        "truncated" => true,
+                        _ => return Err(StreamCtlError::Malformed("unknown report state")),
+                    },
+                })
+            }
             _ => Err(StreamCtlError::Malformed("unknown verb or token count")),
         }
     }
@@ -515,6 +719,98 @@ pub fn chunk_sockets(sockets: Vec<StreamSocket>) -> Vec<Vec<StreamSocket>> {
     chunks
 }
 
+/// Split drain report `entries` into `drained` messages under `seq`, in
+/// order, each as full as the payload buffer allows.
+pub fn pack_drained(seq: u64, entries: Vec<DrainedEntry>) -> Vec<StreamCtlMsg> {
+    let header = format!("drained {seq}").len();
+    let mut messages = Vec::new();
+    let mut current: Vec<DrainedEntry> = Vec::new();
+    let mut len = header;
+    for entry in entries {
+        let entry_len = 1 + entry.to_token().len();
+        if !current.is_empty() && len + entry_len > PAYLOAD_BUF_SIZE {
+            messages.push(StreamCtlMsg::Drained {
+                seq,
+                entries: std::mem::take(&mut current),
+            });
+            len = header;
+        }
+        len += entry_len;
+        current.push(entry);
+    }
+    if !current.is_empty() {
+        messages.push(StreamCtlMsg::Drained {
+            seq,
+            entries: current,
+        });
+    }
+    messages
+}
+
+/// Whether a send failed only because it would have blocked.
+pub fn would_block(e: &StreamCtlError) -> bool {
+    matches!(e, StreamCtlError::Send(Errno::EAGAIN))
+}
+
+/// Hand drain report `report` under `seq` to `try_send`, which never
+/// waits and answers a send that would block with
+/// [`StreamCtlError::Send`] of `EAGAIN`: the `drained` messages in order
+/// until one would block, then the `drained_end` marker saying how many
+/// entries went and whether the rest was left out.
+///
+/// # Errors
+///
+/// The error of the end marker's send, or of an entry's send that was
+/// not a would-block: the supervisor then holds no complete report and
+/// counts the worker as unreported.
+pub fn deliver_drain_report(
+    seq: u64,
+    report: DrainReport,
+    mut try_send: impl FnMut(StreamCtlMsg) -> Result<(), StreamCtlError>,
+) -> Result<ReportSent, StreamCtlError> {
+    let mut sent = ReportSent {
+        entries: 0,
+        truncated: false,
+    };
+    for msg in pack_drained(seq, report.entries) {
+        let carried = match &msg {
+            StreamCtlMsg::Drained { entries, .. } => entries.len() as u64,
+            _ => 0,
+        };
+        match try_send(msg) {
+            Ok(()) => sent.entries += carried,
+            Err(e) if would_block(&e) => {
+                sent.truncated = true;
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    try_send(StreamCtlMsg::DrainedEnd {
+        seq,
+        end: report.end,
+        http_cut: report.http_cut,
+        entries: sent.entries,
+        truncated: sent.truncated,
+    })?;
+    Ok(sent)
+}
+
+/// Send drain report `report` under `seq` on `sock` with
+/// [`try_send_msg`]: never waits, whatever the socket's mode
+/// ([`deliver_drain_report`]).
+///
+/// # Errors
+///
+/// As [`deliver_drain_report`].
+pub fn send_drain_report(
+    sock: impl AsFd,
+    seq: u64,
+    report: DrainReport,
+) -> Result<ReportSent, StreamCtlError> {
+    deliver_drain_report(seq, report, |msg| try_send_msg(&sock, &msg))
+}
+
 /// Send one message on the stream control channel. An `attach` passes its
 /// sockets with `SCM_RIGHTS`; the caller keeps its own copies, the
 /// receiver gets fresh descriptors of the same sockets.
@@ -522,13 +818,24 @@ pub fn chunk_sockets(sockets: Vec<StreamSocket>) -> Vec<Vec<StreamSocket>> {
 /// Blocking or not follows the socket's mode; `EINTR` is retried and
 /// `SIGPIPE` is never raised (`MSG_NOSIGNAL`).
 pub fn send_msg(sock: impl AsFd, msg: &StreamCtlMsg) -> Result<(), StreamCtlError> {
+    send_with(sock, msg, MsgFlags::MSG_NOSIGNAL)
+}
+
+/// [`send_msg`] that never waits, whatever the socket's mode
+/// (`MSG_DONTWAIT`): a full socket buffer is [`StreamCtlError::Send`] of
+/// `EAGAIN` ([`would_block`]).
+pub fn try_send_msg(sock: impl AsFd, msg: &StreamCtlMsg) -> Result<(), StreamCtlError> {
+    send_with(sock, msg, MsgFlags::MSG_NOSIGNAL | MsgFlags::MSG_DONTWAIT)
+}
+
+fn send_with(sock: impl AsFd, msg: &StreamCtlMsg, flags: MsgFlags) -> Result<(), StreamCtlError> {
     let (payload, fds) = msg.encode()?;
     let iov = [IoSlice::new(payload.as_bytes())];
     let rights = [ControlMessage::ScmRights(&fds)];
     let cmsgs: &[ControlMessage<'_>] = if fds.is_empty() { &[] } else { &rights };
     let raw = sock.as_fd().as_raw_fd();
     loop {
-        match socket::sendmsg::<UnixAddr>(raw, &iov, cmsgs, MsgFlags::MSG_NOSIGNAL, None) {
+        match socket::sendmsg::<UnixAddr>(raw, &iov, cmsgs, flags, None) {
             Ok(_) => return Ok(()),
             Err(Errno::EINTR) => continue,
             Err(e) => return Err(StreamCtlError::Send(e)),
@@ -608,18 +915,20 @@ mod tests {
                 drain_ms: 0
             }
         ));
-        assert!(matches!(
-            roundtrip(StreamCtlMsg::Quiesce {
+        for reason in QuiesceReason::ALL {
+            match roundtrip(StreamCtlMsg::Quiesce {
                 seq: 3,
-                reason: QuiesceReason::Shutdown,
-                drain_ms: 3_600_000
-            }),
-            StreamCtlMsg::Quiesce {
-                seq: 3,
-                reason: QuiesceReason::Shutdown,
-                drain_ms: 3_600_000
+                reason,
+                drain_ms: 3_600_000,
+            }) {
+                StreamCtlMsg::Quiesce {
+                    seq: 3,
+                    reason: r,
+                    drain_ms: 3_600_000,
+                } => assert_eq!(r, reason),
+                other => panic!("unexpected {other:?}"),
             }
-        ));
+        }
         assert!(matches!(
             roundtrip(StreamCtlMsg::Ack { seq: 4, count: 32 }),
             StreamCtlMsg::Ack { seq: 4, count: 32 }
@@ -665,6 +974,41 @@ mod tests {
                 },
                 "quiesce 9 reason=shutdown drain_ms=250",
             ),
+            (
+                StreamCtlMsg::Quiesce {
+                    seq: 9,
+                    reason: QuiesceReason::Upgrade,
+                    drain_ms: 250,
+                },
+                "quiesce 9 reason=upgrade drain_ms=250",
+            ),
+            (
+                StreamCtlMsg::Drained {
+                    seq: 9,
+                    entries: vec![entry("s1", 3, 1), entry("s:2", 0, 7)],
+                },
+                "drained 9 3:1:s1 0:7:s:2",
+            ),
+            (
+                StreamCtlMsg::DrainedEnd {
+                    seq: 9,
+                    end: DrainEnd::Deadline,
+                    http_cut: 4,
+                    entries: 2,
+                    truncated: false,
+                },
+                "drained_end 9 deadline http_cut=4 entries=2 report=complete",
+            ),
+            (
+                StreamCtlMsg::DrainedEnd {
+                    seq: 9,
+                    end: DrainEnd::Idle,
+                    http_cut: 0,
+                    entries: 0,
+                    truncated: true,
+                },
+                "drained_end 9 idle http_cut=0 entries=0 report=truncated",
+            ),
             (StreamCtlMsg::Ack { seq: 9, count: 3 }, "ack 9 3"),
             (
                 StreamCtlMsg::Nack {
@@ -691,8 +1035,16 @@ mod tests {
             "refresh +1 drain_ms=5",
             "refresh 1 drain_ms=5 extra",
             "detach 1 s1 2",
-            "quiesce 1 reason=upgrade drain_ms=5",
+            "quiesce 1 reason=reload drain_ms=5",
             "quiesce 1 shutdown drain_ms=5",
+            "drained 1",
+            "drained 1 5:0",
+            "drained 1 x:0:s1",
+            "drained 1 1:2:",
+            "drained_end 1 idle http_cut=0 entries=0",
+            "drained_end 1 stopped http_cut=0 entries=0 report=complete",
+            "drained_end 1 idle http_cut=0 entries=0 report=partial",
+            "drained_end 1 idle cut=0 entries=0 report=complete",
             "ack 1",
             "ack 1 -1",
             "nack 1 because",
@@ -813,5 +1165,234 @@ mod tests {
             u64::MAX
         );
         assert_eq!(header.len(), ATTACH_HEADER_MAX_LEN);
+    }
+
+    fn entry(stream_id: &str, closed: u64, finished: u64) -> DrainedEntry {
+        DrainedEntry {
+            stream_id: stream_id.into(),
+            closed,
+            finished,
+        }
+    }
+
+    /// A canonical stream id numbered `n`, as the tracker holds them.
+    fn uuid(n: usize) -> String {
+        format!("00000000-0000-4000-8000-{n:012}")
+    }
+
+    #[test]
+    fn every_wire_list_holds_every_variant() {
+        // Adding a variant breaks these matches until it is in `ALL`.
+        for (i, reason) in QuiesceReason::ALL.into_iter().enumerate() {
+            let position = match reason {
+                QuiesceReason::Shutdown => 0,
+                QuiesceReason::Upgrade => 1,
+            };
+            assert_eq!(i, position);
+            assert_eq!(QuiesceReason::from_wire(reason.as_str()), Some(reason));
+        }
+        for (i, end) in DrainEnd::ALL.into_iter().enumerate() {
+            let position = match end {
+                DrainEnd::Idle => 0,
+                DrainEnd::Deadline => 1,
+            };
+            assert_eq!(i, position);
+            assert_eq!(DrainEnd::from_wire(end.as_str()), Some(end));
+        }
+    }
+
+    #[test]
+    fn drain_report_messages_round_trip() {
+        let drained = StreamCtlMsg::Drained {
+            seq: 4,
+            entries: vec![entry(&uuid(1), u64::MAX, 0), entry("a:b:c", 0, 2)],
+        };
+        let StreamCtlMsg::Drained { seq, entries } = roundtrip(drained) else {
+            panic!("expected drained");
+        };
+        assert_eq!(seq, 4);
+        assert_eq!(
+            entries,
+            vec![entry(&uuid(1), u64::MAX, 0), entry("a:b:c", 0, 2)],
+            "the stream id is last, so it may hold colons"
+        );
+        for end in DrainEnd::ALL {
+            for truncated in [false, true] {
+                let StreamCtlMsg::DrainedEnd {
+                    seq,
+                    end: e,
+                    http_cut,
+                    entries,
+                    truncated: t,
+                } = roundtrip(StreamCtlMsg::DrainedEnd {
+                    seq: 4,
+                    end,
+                    http_cut: 12,
+                    entries: 99,
+                    truncated,
+                })
+                else {
+                    panic!("expected drained_end");
+                };
+                assert_eq!((seq, e, http_cut, entries, t), (4, end, 12, 99, truncated));
+            }
+        }
+    }
+
+    #[test]
+    fn longest_drained_end_matches_its_bound() {
+        let msg = StreamCtlMsg::DrainedEnd {
+            seq: u64::MAX,
+            end: DrainEnd::Deadline,
+            http_cut: u64::MAX,
+            entries: u64::MAX,
+            truncated: true,
+        };
+        assert_eq!(msg.encode().unwrap().0.len(), DRAINED_END_MAX_LEN);
+        let longest_entry = entry(&"a".repeat(MAX_STREAM_ID_LEN), u64::MAX, u64::MAX);
+        assert_eq!(longest_entry.to_token().len(), DRAINED_ENTRY_MAX_LEN);
+        assert!(
+            DrainEnd::ALL
+                .iter()
+                .all(|e| e.as_str().len() <= DRAIN_END_MAX_LEN),
+            "DRAIN_END_MAX_LEN bounds every end token"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_oversized_drained_message_is_refused() {
+        assert!(matches!(
+            StreamCtlMsg::Drained {
+                seq: 1,
+                entries: Vec::new()
+            }
+            .encode(),
+            Err(StreamCtlError::Invalid(_))
+        ));
+        let too_many = (0..200)
+            .map(|n| entry(&uuid(n), u64::MAX, u64::MAX))
+            .collect();
+        assert!(matches!(
+            StreamCtlMsg::Drained {
+                seq: 1,
+                entries: too_many
+            }
+            .encode(),
+            Err(StreamCtlError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn packed_drained_messages_fill_the_buffer_and_keep_every_entry_in_order() {
+        let entries: Vec<DrainedEntry> = (0..1_000)
+            .map(|n| entry(&uuid(n), u64::MAX, n as u64))
+            .collect();
+        let messages = pack_drained(u64::MAX, entries.clone());
+        assert!(messages.len() > 1, "a thousand entries need several");
+        let mut unpacked = Vec::new();
+        for (i, msg) in messages.iter().enumerate() {
+            let (payload, _) = msg.encode().expect("every packed message encodes");
+            assert!(payload.len() <= PAYLOAD_BUF_SIZE);
+            if i + 1 < messages.len() {
+                assert!(
+                    payload.len() + 1 + DRAINED_ENTRY_MAX_LEN > PAYLOAD_BUF_SIZE,
+                    "message {i} had room for another entry"
+                );
+            }
+            let StreamCtlMsg::Drained { seq, entries } = msg else {
+                panic!("expected drained");
+            };
+            assert_eq!(*seq, u64::MAX);
+            unpacked.extend(entries.iter().cloned());
+        }
+        assert_eq!(unpacked, entries);
+        assert!(pack_drained(1, Vec::new()).is_empty());
+    }
+
+    fn report(entries: usize) -> DrainReport {
+        DrainReport {
+            end: DrainEnd::Deadline,
+            http_cut: 3,
+            entries: (0..entries).map(|n| entry(&uuid(n), 1, 2)).collect(),
+        }
+    }
+
+    #[test]
+    fn a_drain_report_arrives_whole_over_a_seqpacket_pair() {
+        let (supervisor, worker) = create_seqpacket_pair().unwrap();
+        let sent = send_drain_report(&worker, 7, report(300)).expect("sent");
+        assert_eq!(
+            sent,
+            ReportSent {
+                entries: 300,
+                truncated: false
+            }
+        );
+        // The worker exits; what it queued is still read.
+        drop(worker);
+        let mut entries = Vec::new();
+        loop {
+            match recv_msg(&supervisor).expect("a queued message") {
+                StreamCtlMsg::Drained { seq: 7, entries: e } => entries.extend(e),
+                StreamCtlMsg::DrainedEnd {
+                    seq: 7,
+                    end,
+                    http_cut,
+                    entries: count,
+                    truncated,
+                } => {
+                    assert_eq!((end, http_cut, truncated), (DrainEnd::Deadline, 3, false));
+                    assert_eq!(count, entries.len() as u64);
+                    break;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(entries, report(300).entries);
+        assert!(matches!(recv_msg(&supervisor), Err(StreamCtlError::Closed)));
+    }
+
+    #[test]
+    fn a_send_that_would_block_truncates_the_report_and_never_waits() {
+        let mut queue: Vec<StreamCtlMsg> = Vec::new();
+        let sent = deliver_drain_report(7, report(300), |msg| {
+            if matches!(msg, StreamCtlMsg::Drained { .. }) && !queue.is_empty() {
+                return Err(StreamCtlError::Send(Errno::EAGAIN));
+            }
+            queue.push(msg);
+            Ok(())
+        })
+        .expect("the end marker went");
+        let first = match &queue[0] {
+            StreamCtlMsg::Drained { entries, .. } => entries.len() as u64,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(
+            sent,
+            ReportSent {
+                entries: first,
+                truncated: true
+            }
+        );
+        assert!(matches!(
+            queue.last(),
+            Some(StreamCtlMsg::DrainedEnd { entries, truncated: true, .. }) if *entries == first
+        ));
+    }
+
+    #[test]
+    fn a_full_socket_buffer_fails_the_report_at_once() {
+        let (_supervisor, worker) = create_seqpacket_pair().unwrap();
+        // Nobody reads the supervisor's end: fill the worker's send
+        // buffer, in blocking mode, until a send would block.
+        let filler = StreamCtlMsg::Refresh {
+            seq: 1,
+            drain_ms: 0,
+        };
+        while try_send_msg(&worker, &filler).is_ok() {}
+        let started = std::time::Instant::now();
+        let result = send_drain_report(&worker, 7, report(3));
+        assert!(matches!(&result, Err(e) if would_block(e)), "{result:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }

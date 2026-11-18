@@ -118,7 +118,7 @@ pub use stream::{
     AttachmentConflict, AttachmentRule, AttachmentSnapshot, DatagramDropReason, NodeRole, OnUdp,
     Stream, StreamBackend, StreamEndKind, StreamEndReason, StreamMatchRule, StreamMatcher,
     StreamProtocol, StreamProxyProtocol, StreamRefusal, StreamTlsMode, StreamTlsTerminate,
-    StreamUpstreamTls, TcpEngineField, UdpSettings, UpstreamServerName, STREAM_ID_LEN,
-    STREAM_NAME_MAX_LEN, STREAM_PORT_RANGE_MAX, TCP_ENGINE_FIELDS,
+    StreamUpstreamTls, TcpEngineField, UdpSettings, UpgradePolicy, UpstreamServerName,
+    STREAM_ID_LEN, STREAM_NAME_MAX_LEN, STREAM_PORT_RANGE_MAX, TCP_ENGINE_FIELDS,
     UDP_EXPOSED_SOURCE_SESSION_CAP_MAX,
 };

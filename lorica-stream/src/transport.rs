@@ -20,7 +20,8 @@
 use std::io;
 use std::os::fd::OwnedFd;
 
-use lorica_worker::stream_ctl::{self, StreamCtlError, StreamCtlMsg};
+use lorica_worker::stream_ctl::{self, DrainReport, ReportSent, StreamCtlError, StreamCtlMsg};
+use nix::errno::Errno;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 
@@ -147,6 +148,28 @@ impl ActiveTransport {
                 .recv()
                 .await
                 .ok_or_else(|| TransportError::Lost("driver gone".into())),
+        }
+    }
+
+    /// Send drain report `report` under `seq` without ever waiting
+    /// (Story 12.11 D-g): a full socket buffer or channel truncates it.
+    pub(crate) fn try_send_report(
+        &self,
+        seq: u64,
+        report: DrainReport,
+    ) -> Result<ReportSent, StreamCtlError> {
+        match self {
+            ActiveTransport::Seqpacket(fd) => {
+                stream_ctl::send_drain_report(fd.get_ref(), seq, report)
+            }
+            ActiveTransport::InProcess { to_driver, .. } => {
+                stream_ctl::deliver_drain_report(seq, report, |msg| {
+                    to_driver.try_send(msg).map_err(|e| match e {
+                        mpsc::error::TrySendError::Full(_) => StreamCtlError::Send(Errno::EAGAIN),
+                        mpsc::error::TrySendError::Closed(_) => StreamCtlError::Closed,
+                    })
+                })
+            }
         }
     }
 

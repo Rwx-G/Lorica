@@ -40,6 +40,14 @@
 //! idle and total timers, ICMP errors, the tracker's close; and at the
 //! end the breaker report, the record, and the session's counts given
 //! back.
+//!
+//! On a hot upgrade (Story 12.11 D-e) the runtime stops the receive
+//! loops, so a session takes no more requests, and its tracker entry
+//! drains with `drained_by_upgrade`: at once when its stream's
+//! [`Stream::upgrade_policy`] is `close`, otherwise at the drain
+//! deadline. Meanwhile it relays the responses it is still owed from its
+//! own handle on the slot socket, ends on its bound with its natural
+//! reason, or idles out with `drained_by_upgrade`.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -833,7 +841,7 @@ impl Inner {
                             s.link.connect_failed(ConnectFailureKind::NoResponse);
                             self.report(s, ConnectOutcome::NoResponse).await;
                         }
-                        return StreamEndReason::IdleTimeout;
+                        return idle_end(tracked);
                     }
                 },
                 // An ICMP error raises only `EPOLLERR` on a UDP socket,
@@ -914,6 +922,17 @@ impl Inner {
             .await;
         self.observer
             .connect_outcome(s.stream_id, StreamProtocol::Udp, outcome);
+    }
+}
+
+/// How a session that went idle ends: `drained_by_upgrade` once an
+/// upgrade drains it (Story 12.11 D-e), since the old generation reads no
+/// more of its client's requests and an `idle_timeout` would hide that
+/// the upgrade starved it; `idle_timeout` otherwise.
+fn idle_end(tracked: &TrackedConnection) -> StreamEndReason {
+    match tracked.drain_reason() {
+        Some(StreamEndReason::DrainedByUpgrade) => StreamEndReason::DrainedByUpgrade,
+        _ => StreamEndReason::IdleTimeout,
     }
 }
 

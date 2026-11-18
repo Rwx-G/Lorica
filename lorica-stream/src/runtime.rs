@@ -27,7 +27,7 @@
 //! | `attach` | adopt the sockets, start one loop per socket | sockets adopted |
 //! | `detach` | TCP: stop the binding's loops, close its sockets; UDP: put its loops in drain mode; then drain its connections or sessions with `config_removed` | TCP: sockets closed; UDP: sockets put in drain |
 //! | `refresh` | reload the table, drain what it no longer holds with `config_removed` | connections newly draining |
-//! | `quiesce` | stop every TCP loop, put every UDP loop in drain mode, drain everything with `node_shutdown` | bindings stopped or draining |
+//! | `quiesce` | stop every loop and drain everything with the reason's end reason (below) | bindings stopped or draining |
 //! | `caps` | map the stream's caps region and make it the stream's current one in the [`CapsRegistry`] the engines read | 1 |
 //!
 //! A refused message is answered with a `nack`: `unknown_binding` for a
@@ -47,6 +47,27 @@
 //! its loops keep serving existing sessions, open none, and close their
 //! sockets when the binding's last session ends or at the drain
 //! deadline, whichever comes first.
+//!
+//! A `quiesce` carries its reason (Story 12.11 D-a), which
+//! [`quiesce_end_reason`] maps to the end reason of what it closes:
+//!
+//! - `shutdown`, the node stopping: every TCP loop stops and closes its
+//!   listener, every UDP binding drains open as on a `detach`, everything
+//!   drains with `node_shutdown`;
+//! - `upgrade`, a new generation holding the same sockets: every loop
+//!   stops and closes this worker's own descriptor, never `shutdown(2)`,
+//!   which would stop the new generation's accepts too (D-c). A UDP
+//!   session keeps its slot socket to answer from the address its client
+//!   wrote to, and reads nothing more from it: the new generation does
+//!   (D-e). Each connection or session then follows its stream's
+//!   [`Stream::upgrade_policy`]: `close` ends at once, `drain` and
+//!   `relay_in_flight` at their deadline at the latest, with
+//!   `drained_by_upgrade`. The worker's drain report, sent by
+//!   [`StreamRuntimeHandle::send_drain_report`], answers this quiesce.
+//!
+//! Only the first quiesce counts: a later one, or a
+//! [`StreamRuntimeHandle::terminate`], changes neither the reason nor the
+//! deadline.
 //!
 //! After every table load (start, `refresh`, the `attach` of an unknown
 //! stream) both engines are told
@@ -68,10 +89,15 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use lorica_config::models::{GlobalSettings, HealthStatus, StreamEndReason};
+#[cfg(doc)]
+use lorica_config::models::Stream;
+use lorica_config::models::{GlobalSettings, HealthStatus, StreamEndReason, UpgradePolicy};
 use lorica_shmem::StreamCapsRegion;
 use lorica_worker::fd_passing::StreamProto;
-use lorica_worker::stream_ctl::{NackReason, StreamCtlMsg, StreamSocket};
+use lorica_worker::stream_ctl::{
+    DrainEnd, DrainReport, DrainedEntry, NackReason, QuiesceReason, ReportSent, StreamCtlError,
+    StreamCtlMsg, StreamSocket,
+};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -103,8 +129,53 @@ pub enum StreamRuntimeError {
     Thread(io::Error),
 }
 
+/// How long [`StreamRuntimeHandle::send_drain_report`] waits for the
+/// runtime thread to hand the report to the channel. The sends never
+/// wait; this bounds a runtime thread busy elsewhere.
+pub const DRAIN_REPORT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The end reason of what a quiesce for `reason` closes (Story 12.11
+/// D-a).
+pub fn quiesce_end_reason(reason: QuiesceReason) -> StreamEndReason {
+    match reason {
+        QuiesceReason::Shutdown => StreamEndReason::NodeShutdown,
+        QuiesceReason::Upgrade => StreamEndReason::DrainedByUpgrade,
+    }
+}
+
+/// How the runtime was quiesced: the drain it applied and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quiesced {
+    /// The drain, capped at the setting's hard maximum.
+    pub drain: Duration,
+    /// Why; what the drain watcher closes the leftovers with.
+    pub reason: QuiesceReason,
+}
+
+/// Why a drain report did not reach the channel.
+#[derive(Debug, thiserror::Error)]
+pub enum DrainReportError {
+    /// No `quiesce reason=upgrade` reached the runtime: there is no
+    /// upgrade to report on.
+    #[error("the stream runtime was not quiesced for an upgrade")]
+    NotUpgrading,
+    /// The runtime thread is gone.
+    #[error("the stream runtime is gone")]
+    RuntimeGone,
+    /// The runtime thread did not take the report in time.
+    #[error("the stream runtime did not send the report in time")]
+    Timeout,
+    /// The channel refused the end marker.
+    #[error(transparent)]
+    Channel(StreamCtlError),
+}
+
 enum Command {
     Terminate(Duration),
+    Report {
+        report: DrainReport,
+        reply: std::sync::mpsc::SyncSender<Result<ReportSent, DrainReportError>>,
+    },
 }
 
 /// The handle the worker keeps on its running stream runtime. Dropping
@@ -113,7 +184,7 @@ enum Command {
 pub struct StreamRuntimeHandle {
     tracker: ConnectionTracker,
     counters: Arc<StreamCounters>,
-    quiesced: watch::Receiver<Option<Duration>>,
+    quiesced: watch::Receiver<Option<Quiesced>>,
     commands: mpsc::UnboundedSender<Command>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -130,21 +201,67 @@ impl StreamRuntimeHandle {
         self.counters.snapshot()
     }
 
-    /// Turns `Some(drain)` once the runtime is quiesced, by a `quiesce`
-    /// message or by [`Self::terminate`]: the signal that arms the drain
-    /// watcher, with the drain the runtime applied.
-    pub fn quiesced(&self) -> watch::Receiver<Option<Duration>> {
+    /// Turns `Some` once the runtime is quiesced, by a `quiesce` message
+    /// or by [`Self::terminate`]: the signal that arms the drain watcher,
+    /// with the drain the runtime applied and its reason.
+    pub fn quiesced(&self) -> watch::Receiver<Option<Quiesced>> {
         self.quiesced.clone()
     }
 
     /// Quiesce without a `quiesce` message: stop every loop and drain
     /// everything for `drain` with `node_shutdown`. The path of a SIGTERM
-    /// that arrives without one (Pingora's `GracefulTerminate`, the
-    /// upgrade path until Story 12.11).
+    /// that arrives without one (Pingora's `GracefulTerminate`), which a
+    /// worker cannot tell from a stop: an upgrade always quiesces first,
+    /// and a runtime already quiesced ignores it.
     pub fn terminate(&self, drain: Duration) {
         // A send error means the runtime is already gone, which leaves
         // nothing to quiesce.
         let _ = self.commands.send(Command::Terminate(drain));
+    }
+
+    /// Send this worker's upgrade drain report (Story 12.11 D-g) to the
+    /// supervisor, answering the `quiesce reason=upgrade` it got: the
+    /// tracker's per-stream counts, how the drain ended and the HTTP
+    /// requests it cut. Never waits on the channel, and waits at most
+    /// [`DRAIN_REPORT_TIMEOUT`] for the runtime thread.
+    ///
+    /// # Errors
+    ///
+    /// [`DrainReportError`]: no upgrade quiesce, the runtime gone or
+    /// late, or the end marker refused (a full socket buffer).
+    pub fn send_drain_report(
+        &self,
+        end: DrainEnd,
+        http_cut: u64,
+    ) -> Result<ReportSent, DrainReportError> {
+        let entries = self
+            .tracker
+            .upgrade_drain_counts()
+            .into_iter()
+            .map(|(stream_id, counts)| DrainedEntry {
+                stream_id,
+                closed: counts.closed,
+                finished: counts.finished,
+            })
+            .collect();
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        self.commands
+            .send(Command::Report {
+                report: DrainReport {
+                    end,
+                    http_cut,
+                    entries,
+                },
+                reply,
+            })
+            .map_err(|_| DrainReportError::RuntimeGone)?;
+        match answer.recv_timeout(DRAIN_REPORT_TIMEOUT) {
+            Ok(sent) => sent,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(DrainReportError::Timeout),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(DrainReportError::RuntimeGone)
+            }
+        }
     }
 
     /// Stop the runtime and wait for its thread. Live connections are
@@ -186,7 +303,10 @@ pub struct StreamRuntime {
     /// Turns true when the runtime ends, closing every draining binding
     /// at once.
     ending: watch::Sender<bool>,
-    quiesced: watch::Sender<Option<Duration>>,
+    quiesced: watch::Sender<Option<Quiesced>>,
+    /// The seq of the `quiesce reason=upgrade` this runtime applied: the
+    /// drain report answers it.
+    upgrade_seq: Option<u64>,
 }
 
 struct Binding {
@@ -243,6 +363,7 @@ impl StreamRuntime {
             draining: Vec::new(),
             ending: watch::channel(false).0,
             quiesced: quiesced_tx,
+            upgrade_seq: None,
         };
         let thread = thread::Builder::new()
             .name(STREAM_THREAD_NAME.into())
@@ -265,9 +386,23 @@ impl StreamRuntime {
             tokio::select! {
                 command = commands.recv() => match command {
                     Some(Command::Terminate(drain)) => {
-                        info!(drain_ms = drain.as_millis() as u64,
-                              "stream runtime terminated without a quiesce message");
-                        self.quiesce(drain).await;
+                        if self.quiesced.borrow().is_none() {
+                            info!(drain_ms = drain.as_millis() as u64,
+                                  "stream runtime terminated without a quiesce message");
+                        }
+                        self.quiesce(drain, QuiesceReason::Shutdown, None).await;
+                    }
+                    Some(Command::Report { report, reply }) => {
+                        let sent = match self.upgrade_seq {
+                            Some(seq) => self
+                                .transport
+                                .try_send_report(seq, report)
+                                .map_err(DrainReportError::Channel),
+                            None => Err(DrainReportError::NotUpgrading),
+                        };
+                        // The watcher may have given up waiting; nothing
+                        // is left to tell it then.
+                        let _ = reply.send(sent);
                     }
                     None => break,
                 },
@@ -368,8 +503,14 @@ impl StreamRuntime {
                 drain_ms,
             } => Some(self.detach(seq, stream_id, bind_gen, drain_ms).await),
             StreamCtlMsg::Refresh { seq, drain_ms } => Some(self.refresh(seq, drain_ms)),
-            StreamCtlMsg::Quiesce { seq, drain_ms, .. } => {
-                let stopped = self.quiesce(drain_duration(drain_ms)).await;
+            StreamCtlMsg::Quiesce {
+                seq,
+                reason,
+                drain_ms,
+            } => {
+                let stopped = self
+                    .quiesce(drain_duration(drain_ms), reason, Some(seq))
+                    .await;
                 Some(StreamCtlMsg::Ack {
                     seq,
                     count: count(stopped),
@@ -382,10 +523,13 @@ impl StreamRuntime {
                 slot,
                 region,
             } => Some(self.adopt_caps(seq, &stream_id, caps_gen, slot, region)),
-            StreamCtlMsg::Ack { seq, .. } | StreamCtlMsg::Nack { seq, .. } => {
+            StreamCtlMsg::Ack { seq, .. }
+            | StreamCtlMsg::Nack { seq, .. }
+            | StreamCtlMsg::Drained { seq, .. }
+            | StreamCtlMsg::DrainedEnd { seq, .. } => {
                 warn!(
                     seq,
-                    "unexpected answer on the stream control channel ignored"
+                    "unexpected worker-to-supervisor message on the stream control channel ignored"
                 );
                 None
             }
@@ -565,30 +709,50 @@ impl StreamRuntime {
         }
     }
 
-    /// Stop every TCP binding, put every UDP binding in drain mode, and
-    /// drain everything for `drain` with `node_shutdown`. Returns the
-    /// bindings stopped or draining.
-    async fn quiesce(&mut self, drain: Duration) -> usize {
-        let deadline = Instant::now() + drain;
+    /// Stop every binding and drain everything for `drain` with the end
+    /// reason of `reason`, as the module doc describes; `seq` is the
+    /// message's, which the drain report answers. Returns the bindings
+    /// stopped or draining: 0 when already quiesced, which changes
+    /// nothing.
+    async fn quiesce(&mut self, drain: Duration, reason: QuiesceReason, seq: Option<u64>) -> usize {
+        let already = *self.quiesced.borrow();
+        if let Some(first) = already {
+            if seq.is_some() {
+                info!(
+                    first = first.reason.as_str(),
+                    again = reason.as_str(),
+                    "stream runtime already quiesced; the first quiesce stands"
+                );
+            }
+            return 0;
+        }
+        let now = Instant::now();
+        let deadline = now + drain;
+        let end = quiesce_end_reason(reason);
         let bindings: Vec<((String, u64), Binding)> = self.bindings.drain().collect();
         let stopped = bindings.len();
         for ((stream_id, bind_gen), binding) in bindings {
-            if binding.udp {
-                self.drain_open(
-                    stream_id,
-                    bind_gen,
-                    binding,
-                    deadline,
-                    StreamEndReason::NodeShutdown,
-                );
+            if binding.udp && reason == QuiesceReason::Shutdown {
+                self.drain_open(stream_id, bind_gen, binding, deadline, end);
             } else {
+                // TCP: the loops drop their listeners, a `close` of this
+                // worker's descriptors. UDP on an upgrade: the loops stop
+                // reading; each session keeps its own handle on its slot
+                // socket to answer from.
                 stop_binding(binding, &self.bound_ports).await;
             }
         }
-        self.tracker
-            .drain_all(deadline, StreamEndReason::NodeShutdown);
+        if reason == QuiesceReason::Upgrade {
+            self.upgrade_seq = seq;
+            self.tracker.drain_where(
+                |e| e.snapshot.upgrade_policy() == UpgradePolicy::Close,
+                now,
+                end,
+            );
+        }
+        self.tracker.drain_all(deadline, end);
         self.tracker.close_expired(Instant::now());
-        self.quiesced.send_replace(Some(drain));
+        self.quiesced.send_replace(Some(Quiesced { drain, reason }));
         stopped
     }
 

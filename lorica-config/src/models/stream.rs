@@ -425,6 +425,46 @@ impl StreamTlsMode {
     }
 }
 
+/// What a hot upgrade does to a stream's established connections or
+/// sessions (Story 12.11 D-c, D-e), as [`Stream::upgrade_policy`] derives
+/// it. The words are the upgrade preview's `on_upgrade`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    EnumString,
+    IntoStaticStr,
+    VariantArray,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum UpgradePolicy {
+    /// The old generation keeps serving each connection until it ends or
+    /// the drain deadline closes it with `drained_by_upgrade`.
+    Drain,
+    /// The old generation reads no more requests and relays the
+    /// responses its sessions are still owed, then each session ends on
+    /// its bound, or at the earlier of its idle timeout and the drain
+    /// deadline with `drained_by_upgrade`.
+    RelayInFlight,
+    /// Every session ends at once with `drained_by_upgrade`: none is owed
+    /// a response, and its client's next datagram reaches the new
+    /// generation.
+    Close,
+}
+
+impl UpgradePolicy {
+    /// Snake_case wire representation.
+    pub fn as_str(&self) -> &'static str {
+        self.into()
+    }
+}
+
 /// One rule of a TLS stream (D-d): a name its links refer to, and what
 /// a ClientHello must carry to match it.
 ///
@@ -1274,6 +1314,25 @@ impl Stream {
     /// badge, the upgrade preview and the transfer exclusion read.
     pub fn drains_on_upgrade(&self) -> bool {
         self.tls_mode == StreamTlsMode::Terminate || self.upstream_tls.is_some()
+    }
+
+    /// What a hot upgrade does to the stream's connections or sessions
+    /// (Story 12.11 D-c, D-e): the one rule the worker's upgrade drain,
+    /// the upgrade preview and the docs read.
+    ///
+    /// Every TCP stream drains, TLS or not: no connection is transferred
+    /// before Story 12.16, so [`Stream::drains_on_upgrade`] does not
+    /// change it here. A UDP stream whose sessions are owed responses
+    /// ([`UdpSettings::expects_responses`]) relays them; one whose
+    /// sessions are owed none (unbounded or one-way) closes.
+    pub fn upgrade_policy(&self) -> UpgradePolicy {
+        match self.protocol {
+            StreamProtocol::Tcp => UpgradePolicy::Drain,
+            StreamProtocol::Udp => match &self.udp {
+                Some(udp) if udp.expects_responses() => UpgradePolicy::RelayInFlight,
+                _ => UpgradePolicy::Close,
+            },
+        }
     }
 
     /// Whether any rule admits a client naming no server.
@@ -4071,6 +4130,35 @@ pub(crate) mod tests {
 
     fn tls_refusal(s: &Stream) -> String {
         s.validate().expect_err("refused")
+    }
+
+    #[test]
+    fn the_upgrade_policy_follows_the_protocol_and_the_responses_owed() {
+        let tcp = stream("t", "pg", StreamProtocol::Tcp, 5432);
+        assert_eq!(tcp.upgrade_policy(), UpgradePolicy::Drain);
+        let mut terminating = tcp.clone();
+        terminating.tls_mode = StreamTlsMode::Terminate;
+        assert!(terminating.drains_on_upgrade());
+        assert_eq!(terminating.upgrade_policy(), UpgradePolicy::Drain);
+
+        let bounded = stream("u", "dns", StreamProtocol::Udp, 53);
+        assert!(bounded.udp.as_ref().unwrap().expects_responses());
+        assert_eq!(bounded.upgrade_policy(), UpgradePolicy::RelayInFlight);
+        let mut unbounded = bounded.clone();
+        unbounded.udp.as_mut().unwrap().unbounded_responses = true;
+        assert_eq!(unbounded.upgrade_policy(), UpgradePolicy::Close);
+        let mut one_way = bounded.clone();
+        one_way.udp.as_mut().unwrap().responses_per_request = 0;
+        assert_eq!(one_way.upgrade_policy(), UpgradePolicy::Close);
+
+        for policy in UpgradePolicy::VARIANTS {
+            assert_eq!(
+                serde_json::to_value(policy).expect("serialize"),
+                serde_json::Value::String(policy.as_str().to_string())
+            );
+            assert_eq!(policy.as_str().parse::<UpgradePolicy>(), Ok(*policy));
+        }
+        assert_eq!(UpgradePolicy::RelayInFlight.as_str(), "relay_in_flight");
     }
 
     #[test]

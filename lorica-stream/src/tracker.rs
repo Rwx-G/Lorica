@@ -18,21 +18,28 @@
 //! id, `bind_gen`, the backend its engine chose, and the `Arc<Stream>`
 //! it was accepted with. A drain marks entries with a deadline and a
 //! pending end reason (`config_removed` for a configuration change,
-//! `node_shutdown` for a stop). At the deadline the tracker signals the
-//! connection to close with that reason, so the end reason is written
-//! by the worker and never left to a SIGKILL; a connection that ends on
-//! its own first keeps its natural reason.
+//! `node_shutdown` for a stop, `drained_by_upgrade` for a hot upgrade).
+//! At the deadline the tracker signals the connection to close with that
+//! reason, so the end reason is written by the worker and never left to
+//! a SIGKILL; a connection that ends on its own first keeps its natural
+//! reason.
 //!
 //! An entry already draining keeps its reason and the earlier of its two
 //! deadlines when drained again: a connection the configuration already
-//! removed stays `config_removed` if the node then stops.
+//! removed stays `config_removed` if the node then stops or upgrades.
+//!
+//! Entries marked `drained_by_upgrade` are counted per stream as they
+//! leave (Story 12.11 D-g), [`ConnectionTracker::upgrade_drain_counts`]:
+//! `closed` when they end with that reason, `finished` when they end on
+//! their own first. That reason is only ever set by an upgrade quiesce,
+//! so the counts start with it.
 //!
 //! The tracker only signals. Closing the socket is the engine's job, on
 //! [`TrackedConnection::closed`]; the entry leaves the tracker when the
 //! engine drops its [`TrackedConnection`], which is what
 //! [`ConnectionTracker::is_empty`] (the drain watcher's test) waits for.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use lorica_config::models::{Stream, StreamEndReason};
@@ -60,6 +67,17 @@ struct Entry {
 struct State {
     next_id: u64,
     entries: HashMap<u64, Entry>,
+    upgrade_counts: BTreeMap<String, UpgradeDrainCounts>,
+}
+
+/// What an upgrade drain did to one stream's connections and sessions
+/// in this worker (Story 12.11 D-g).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpgradeDrainCounts {
+    /// Ended with `drained_by_upgrade`.
+    pub closed: u64,
+    /// Marked draining for the upgrade, ended on their own first.
+    pub finished: u64,
 }
 
 #[derive(Debug, Default)]
@@ -131,6 +149,7 @@ impl ConnectionTracker {
             tracker: self.clone(),
             snapshot,
             close_rx,
+            ended: None,
         }
     }
 
@@ -270,6 +289,13 @@ impl ConnectionTracker {
         }
     }
 
+    /// Per stream, what the upgrade drain closed and what finished on
+    /// its own, among the entries that have left. Read by the drain
+    /// watcher once the tracker is empty or the deadline has passed.
+    pub fn upgrade_drain_counts(&self) -> BTreeMap<String, UpgradeDrainCounts> {
+        self.with_state(|s| s.upgrade_counts.clone())
+    }
+
     fn set_backend(&self, id: u64, backend_id: &str) {
         self.with_state(|s| {
             if let Some(e) = s.entries.get_mut(&id) {
@@ -278,8 +304,32 @@ impl ConnectionTracker {
         });
     }
 
-    fn deregister(&self, id: u64) {
-        self.with_state(|s| s.entries.remove(&id));
+    fn drain_reason(&self, id: u64) -> Option<StreamEndReason> {
+        self.with_state(|s| s.entries.get(&id).and_then(|e| e.drain).map(|d| d.reason))
+    }
+
+    /// Remove entry `id`, which ended with `ended` when its engine said
+    /// so ([`TrackedConnection::finish`]), and count it if the upgrade
+    /// marked it.
+    fn deregister(&self, id: u64, ended: Option<StreamEndReason>) {
+        self.with_state(|s| {
+            let Some(entry) = s.entries.remove(&id) else {
+                return;
+            };
+            let Some(drain) = entry
+                .drain
+                .filter(|d| d.reason == StreamEndReason::DrainedByUpgrade)
+            else {
+                return;
+            };
+            let ended = ended.or(drain.signalled.then_some(drain.reason));
+            let counts = s.upgrade_counts.entry(entry.stream_id).or_default();
+            if ended == Some(StreamEndReason::DrainedByUpgrade) {
+                counts.closed += 1;
+            } else {
+                counts.finished += 1;
+            }
+        });
         self.inner.deregistered.notify_waiters();
     }
 }
@@ -292,6 +342,8 @@ pub struct TrackedConnection {
     tracker: ConnectionTracker,
     snapshot: Arc<Stream>,
     close_rx: watch::Receiver<Option<StreamEndReason>>,
+    /// The reason [`TrackedConnection::finish`] reported, for the count.
+    ended: Option<StreamEndReason>,
 }
 
 impl TrackedConnection {
@@ -310,6 +362,12 @@ impl TrackedConnection {
     /// The reason the tracker closed this connection with, if it did.
     pub fn close_reason(&self) -> Option<StreamEndReason> {
         *self.close_rx.borrow()
+    }
+
+    /// The reason a drain marked this connection with, before or after
+    /// its deadline; `None` while no drain selected it.
+    pub fn drain_reason(&self) -> Option<StreamEndReason> {
+        self.tracker.drain_reason(self.id)
     }
 
     /// Resolve when the tracker closes this connection, with the reason.
@@ -335,11 +393,13 @@ impl TrackedConnection {
     /// stops while the connection's row or refusal is still on its way
     /// to the observer (Story 12.9 D-k). Returns what `report` returns.
     pub fn finish<R>(
-        self,
+        mut self,
         natural: StreamEndReason,
         report: impl FnOnce(StreamEndReason) -> R,
     ) -> R {
-        let reported = report(self.close_reason().unwrap_or(natural));
+        let reason = self.close_reason().unwrap_or(natural);
+        let reported = report(reason);
+        self.ended = Some(reason);
         drop(self);
         reported
     }
@@ -347,7 +407,7 @@ impl TrackedConnection {
 
 impl Drop for TrackedConnection {
     fn drop(&mut self) {
-        self.tracker.deregister(self.id);
+        self.tracker.deregister(self.id, self.ended);
     }
 }
 
@@ -539,6 +599,76 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), tracker.binding_ended("s", 9))
             .await
             .expect("a binding without entries has ended");
+    }
+
+    #[tokio::test]
+    async fn the_upgrade_counts_closed_and_finished_per_stream_and_nothing_else() {
+        let tracker = ConnectionTracker::new();
+        let mut closed = tracker.register(1, stream("a"));
+        let finished = tracker.register(1, stream("a"));
+        let removed = tracker.register(1, stream("b"));
+        let idled = tracker.register(1, stream("a"));
+        let before = tracker.register(1, stream("c"));
+        let now = Instant::now();
+        let later = now + Duration::from_secs(30);
+
+        // Ends before the upgrade: never counted.
+        assert_eq!(
+            before.finish(StreamEndReason::ClientClose, |r| r),
+            StreamEndReason::ClientClose
+        );
+        tracker.drain_where(
+            |e| e.stream_id == "b" && e.bind_gen == 1,
+            later,
+            StreamEndReason::ConfigRemoved,
+        );
+        assert_eq!(
+            tracker.drain_all(later, StreamEndReason::DrainedByUpgrade),
+            3
+        );
+        assert_eq!(
+            closed.drain_reason(),
+            Some(StreamEndReason::DrainedByUpgrade)
+        );
+        assert_eq!(
+            tracker.register(1, stream("d")).drain_reason(),
+            None,
+            "a connection no drain selected"
+        );
+
+        // Ends on its own during the drain: finished.
+        finished.finish(StreamEndReason::BackendClose, |_| ());
+        // Already draining for the configuration: keeps it, not counted.
+        tracker.drain_where(
+            |e| e.stream_id == "b",
+            now,
+            StreamEndReason::DrainedByUpgrade,
+        );
+        tracker.close_expired(now);
+        assert_eq!(removed.close_reason(), Some(StreamEndReason::ConfigRemoved));
+        drop(removed);
+        // An engine that ends a drained session idle says so itself.
+        assert_eq!(
+            idled.finish(StreamEndReason::DrainedByUpgrade, |r| r),
+            StreamEndReason::DrainedByUpgrade
+        );
+        // Closed at the deadline.
+        tracker.close_expired(later);
+        assert_eq!(closed.closed().await, StreamEndReason::DrainedByUpgrade);
+        closed.finish(StreamEndReason::ClientClose, |_| ());
+
+        let counts = tracker.upgrade_drain_counts();
+        assert_eq!(
+            counts.into_iter().collect::<Vec<_>>(),
+            vec![(
+                "a".to_string(),
+                UpgradeDrainCounts {
+                    closed: 2,
+                    finished: 1
+                }
+            )]
+        );
+        assert!(tracker.is_empty());
     }
 
     #[tokio::test]

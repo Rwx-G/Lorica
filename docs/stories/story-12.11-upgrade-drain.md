@@ -151,11 +151,16 @@ tell an upgrade from a stop without the message.
 The reason travels with the message: `QuiesceReason` gains `Upgrade`
 (`reason=upgrade`); the runtime's `quiesce` takes the reason and maps it
 (`Shutdown` to `node_shutdown`, `Upgrade` to `drained_by_upgrade`); the
-`quiesced()` watch carries `(Duration, QuiesceReason)`, and the watcher's
+`quiesced()` watch carries `(Duration, QuiesceReason)` (as built: a
+`Quiesced { drain, reason }` struct, and `lorica_stream::quiesce_end_reason`
+is the one mapping), and the watcher's
 deadline close uses that reason instead of the hard-coded one. A
 connection already draining for another reason (`config_removed`) keeps
 it, as 12.2 D-g already does. A connection that ends on its own during
-the drain keeps its natural reason.
+the drain keeps its natural reason. Only the first quiesce counts: a
+later `quiesce` is acknowledged with a count of 0 and `terminate` is
+ignored, so the SIGTERM that follows an upgrade quiesce changes neither
+the reason nor the deadline (amended in Lot B1).
 
 ### D-b. The drain delay, and the old supervisor's sequence
 
@@ -213,8 +218,13 @@ it (Resolved 2).
   `drained_by_upgrade` and `deadline = now + D`, in any phase (12.3 D-b):
   forwarding, connecting, or a pending PROXY header, ClientHello or
   detection read. TLS-terminating and TLS-originating streams drain the
-  same way (D8); `drains_on_upgrade()` is true for every stream in 1.11.0
-  and only the preview reads it.
+  same way (D8). *Amended in Lot B1:* `drains_on_upgrade()` is not true
+  for every stream: since Story 12.4 it is true only for a stream that
+  terminates or originates TLS, the streams live transfer (12.16) will
+  never move. In 1.11.0 every stream drains whatever it says, so the
+  engine reads `Stream::upgrade_policy()` (`drain` for every TCP stream),
+  and the preview shows `drains_on_upgrade` beside it as the 12.16
+  exclusion.
 
 ### D-d. The fd transfer becomes chunked, and stays compatible
 
@@ -286,6 +296,16 @@ On `quiesce reason=upgrade` an old worker's UDP binding:
   what measures "nothing more is owed"; ending it as `idle_timeout` would
   hide that the upgrade starved it of requests.
 
+*Amended in Lot B1:* the split is on `UdpSettings::expects_responses()`
+rather than `unbounded_responses` alone. A one-way stream
+(`responses_per_request = 0`, syslog) is owed nothing either, so it
+closes at once like an unbounded one; `Stream::upgrade_policy()` is
+`relay_in_flight` only when responses are bounded and at least one per
+request. "Stops reading but keeps them open" is built as: the receive
+loops stop and drop their handle, and each live session keeps its own
+handle on its slot socket until it ends, so the old worker's last
+descriptor closes with its last session.
+
 The invariant for UDP is per exchange: each client datagram is read by
 exactly one generation and its responses come back through that
 generation. In the attach-to-`quiesce` window both generations read the
@@ -307,7 +327,7 @@ own caps region, as 12.5 D-d already documents.
   - `streams`: one entry per stream bound on this node, `{ stream_id,
     name, protocol, established, on_upgrade, drains_on_upgrade }`, where
     `on_upgrade` is `drain` (TCP), `relay_in_flight` (UDP, bounded) or
-    `close` (UDP, unbounded), derived by one function
+    `close` (UDP, unbounded or one-way, D-e as amended), derived by one function
     `Stream::upgrade_policy()` beside `drains_on_upgrade()` so the
     preview, the engine and the docs cannot disagree;
   - `as_of`: when the figures were read.
@@ -346,6 +366,22 @@ reads these messages from each worker's control socket after the worker
 has exited (data queued in the supervisor's end survives the peer's
 close); a worker with no `drained_end` (SIGKILLed, crashed) is counted
 as unreported.
+
+*Amended in Lot B1, the wire as built* (`lorica-worker/src/stream_ctl.rs`):
+both messages carry the seq of the `quiesce reason=upgrade` they
+answer, so they decode as `StreamCtlMsg::Drained` and
+`StreamCtlMsg::DrainedEnd` beside `ack` and `nack` and keep `seq()`
+total: `drained <seq> <closed>:<finished>:<stream_id>...` and
+`drained_end <seq> <idle|deadline> http_cut=<n> entries=<n>
+report=<complete|truncated>`. `end` keeps idle and deadline apart from
+truncation, which is its own token; `entries` counts the entries sent
+before the marker. A `drained` send that would block stops the entries
+and the marker says `truncated` (a short marker can still fit where an
+8 KiB message did not); a marker that cannot be sent either leaves the
+worker unreported. `StreamRuntimeHandle::send_drain_report(end,
+http_cut)` builds the report from the tracker and sends it through the
+runtime thread, waiting at most `DRAIN_REPORT_TIMEOUT` (1 s) for that
+thread; it refuses (`NotUpgrading`) when no upgrade quiesce arrived.
 
 **Old generation to new generation.** The old supervisor writes
 `<data_dir>/upgrade/drain-report.<new_pid>.json` (0600, temp file then
@@ -474,21 +510,21 @@ only).
 Depends on: nothing in this story; sequential with any open 12.6 or 12.9
 Lot editing `lorica-stream/src/udp/` or `tracker.rs`.
 
-- [ ] `QuiesceReason::Upgrade` (`reason=upgrade`), wire round-trip.
-- [ ] `drained` and `drained_end` worker-to-supervisor messages (D-g),
+- [x] `QuiesceReason::Upgrade` (`reason=upgrade`), wire round-trip.
+- [x] `drained` and `drained_end` worker-to-supervisor messages (D-g),
       encode and decode, packing to `PAYLOAD_BUF_SIZE`, `truncated`.
-- [ ] Runtime `quiesce(drain, reason)`; `quiesced()` carries
+- [x] Runtime `quiesce(drain, reason)`; `quiesced()` carries
       `(Duration, QuiesceReason)`; `terminate` stays `Shutdown` and is a
       no-op once quiesced.
-- [ ] TCP: stop accept loops, `close` (never `shutdown`) the worker's
+- [x] TCP: stop accept loops, `close` (never `shutdown`) the worker's
       listener descriptors, drain with the mapped reason (D-c).
-- [ ] UDP: on `Upgrade`, stop reading, keep sockets for sends, the two
+- [x] UDP: on `Upgrade`, stop reading, keep sockets for sends, the two
       policies of D-e. On `Shutdown`, unchanged (drain mode, 12.5 D-m).
-- [ ] Tracker: per-stream `closed` and `finished` counts from the
+- [x] Tracker: per-stream `closed` and `finished` counts from the
       upgrade quiesce on, read by the watcher.
-- [ ] `Stream::upgrade_policy()` returning `Drain`, `RelayInFlight` or
+- [x] `Stream::upgrade_policy()` returning `Drain`, `RelayInFlight` or
       `Close`, serialised as the preview's words.
-- [ ] Tests: a TCP connection in each phase ends with
+- [x] Tests: a TCP connection in each phase ends with
       `drained_by_upgrade` at the deadline and one that closes earlier
       keeps its reason; a `config_removed` connection keeps it across an
       upgrade quiesce; a listener closed by an old worker still accepts
@@ -839,6 +875,73 @@ predates Lot A and that its diff cannot reach:
 `client_certificate`) the enum now carries. Every other test of that
 line passes (`--no-fail-fast`).
 
+**Lot B1, what the code had become.** Read on `feat/v1.11.0` at
+`3a2663e0`. Three shapes of the story no longer matched and are amended
+in place (D-a, D-c, D-e, D-g, each marked "amended in Lot B1"):
+`drains_on_upgrade()` is the 12.16 transfer exclusion (TLS terminate or
+origin only), not "true for every stream", so the engine reads the new
+`upgrade_policy()` instead; a one-way UDP stream is owed nothing and
+closes like an unbounded one; the report messages carry the quiesce's
+seq and a `report=` token. Nothing in the decisions was wrong against
+the code; no stop was needed.
+
+**Lot B1, how it is built.**
+
+- `QuiesceReason::Upgrade`; `lorica_stream::quiesce_end_reason` maps
+  `Shutdown` to `node_shutdown` and `Upgrade` to `drained_by_upgrade`.
+  `quiesced()` is a `watch` of `Option<Quiesced { drain, reason }>`.
+- Runtime `quiesce(drain, reason, seq)`: a no-op once quiesced (a later
+  message is acked 0, `terminate` ignored). On `Upgrade` every binding,
+  TCP and UDP, goes through `stop_binding`: a TCP loop drops its
+  listener (`close`, the accept loop's doc says why never `shutdown`),
+  a UDP loop stops reading and drops its handle while each session keeps
+  its own `Arc` on the slot socket to answer from. Entries whose
+  snapshot's policy is `close` are drained with a deadline of now, then
+  everything with `now + D`, both with the mapped reason; `drain_all`
+  keeps an earlier reason, so `config_removed` stays. On `Shutdown`
+  nothing changed (UDP drain mode of 12.5 D-m).
+- UDP engine: a session whose tracker entry the upgrade marked and that
+  idles out ends `drained_by_upgrade` (`idle_end`); ends on its bound
+  keep their natural reason. The bounded/unbounded split lives in
+  `upgrade_policy()` only.
+- Tracker: `TrackedConnection::finish` records the reason it reported,
+  and the entry's removal counts it per stream when its drain reason is
+  `drained_by_upgrade` (only the upgrade sets it): `closed` if it ended
+  with that reason, `finished` otherwise. `drain_reason()` exposes the
+  mark to the engines. `upgrade_drain_counts()` is what the report reads.
+- `send_drain_report` runs on the runtime thread through a `Command`,
+  over `ActiveTransport::try_send_report` (seqpacket: `MSG_DONTWAIT`;
+  in-process: `try_send`, `Full` read as `EAGAIN`).
+
+**Lot B1, files outside the allowlist**, each the smallest edit the
+Lot needed: `lorica-config/src/models/mod.rs` (re-export
+`UpgradePolicy`), `lorica-stream/src/lib.rs` (re-exports),
+`lorica-stream/src/transport.rs` (`try_send_report`),
+`lorica-stream/tests/udp_engine.rs` (the three UDP upgrade tests, which
+need the real engine and that file's fake seams),
+`lorica-stream/tests/tcp_engine.rs` (the each-phase drain test runs for
+`drained_by_upgrade` as well as `config_removed`),
+`lorica/src/startup/drain.rs` (the watcher reads `Quiesced.drain`, its
+test the new type; Lot B2 then reworks it) and
+`lorica/src/startup/stream_plane.rs` (one test assertion on the
+`quiesced()` type).
+
+**Lot B1, for Lot C.** A `quiesce reason=upgrade` must not go out
+before the UDP slot sockets ride the handoff: an old worker's slot
+socket now stays open while its sessions live and is read by nobody, so
+in a merged group (no handover) the datagrams hashed to it would be
+lost until its last session ends. Send both in the same Lot. The
+supervisor reads `Drained` and `DrainedEnd` with the ordinary
+`recv_msg`; today `StreamPlane::late_answer` would log them as
+unexpected, so the collection after exit must read them before (or
+instead of) that path.
+
+**Lot B1 gates** (Docker `rust:1-bookworm`, `CARGO_BUILD_WARNINGS=deny`,
+the `ci.yml` cargo lines in order): fmt, workspace clippy with
+`lorica/otel`, the product crates, `lorica --features otel`, the forked
+crates, the rustls line and `cargo audit`, all clean. The `lorica-api`
+openapi failure Lot A recorded no longer occurs on this base.
+
 ### Completion Notes
 
 ## File List
@@ -847,6 +950,20 @@ line passes (`--no-fail-fast`).
 - `lorica/src/startup/mod.rs` (module line, Lot A)
 - `lorica/src/startup/hot_upgrade.rs` (transfer, `stream-udp:` family, Lot A)
 - `lorica-worker/src/fd_passing.rs` (`send_with_rights`, `recv_with_rights_cloexec`, Lot A)
+- `lorica-worker/src/stream_ctl.rs` (`QuiesceReason::Upgrade`, `DrainEnd`, the drain report messages, Lot B1)
+- `lorica-config/src/models/stream.rs` (`UpgradePolicy`, `Stream::upgrade_policy`, Lot B1)
+- `lorica-config/src/models/mod.rs` (re-export, Lot B1)
+- `lorica-stream/src/runtime.rs` (quiesce reason, `Quiesced`, `send_drain_report`, Lot B1)
+- `lorica-stream/src/tracker.rs` (upgrade counts, `drain_reason`, Lot B1)
+- `lorica-stream/src/listener.rs` (TCP stop path doc, Lot B1)
+- `lorica-stream/src/transport.rs` (`try_send_report`, Lot B1)
+- `lorica-stream/src/lib.rs` (re-exports, Lot B1)
+- `lorica-stream/src/udp/engine.rs` (idle end under an upgrade, Lot B1)
+- `lorica-stream/tests/runtime.rs` (Lot B1)
+- `lorica-stream/tests/tcp_engine.rs` (Lot B1)
+- `lorica-stream/tests/udp_engine.rs` (Lot B1)
+- `lorica/src/startup/stream_plane.rs` (one test assertion, Lot B1)
+- `lorica/src/startup/drain.rs` (the `Quiesced` type, Lot B1)
 - `docs/stories/story-12.11-upgrade-drain.md`
 
 ## Change Log
@@ -856,3 +973,4 @@ line passes (`--no-fail-fast`).
 | 2026-11-15 | 0.1 | Draft: decisions D-a to D-i, Lots A to G, five open questions. | Romain G. |
 | 2026-11-15 | 0.2 | Maintainer answers folded in as Resolved 1 to 5: a dedicated `lorica_hot_upgrade_stream_connections_total{stream_id,outcome}` with `lorica_hot_upgrade_total` unchanged (AC #2 copy updated to the amended PRD text, D-g and Lots C, F, G rewritten); HTTP cuts in the report and log only; chained upgrades allowed with a warning; SSH packages approved for the e2e images; the UDP handover of D-e accepted. Lot A opens with the failing 32-fd / 2,048-byte test on the current tree. Status Draft. | Romain G. |
 | 2026-11-15 | 0.3 | Lot A: chunked `lorica-fds/2` transfer with a one-byte acknowledgement per header and chunk, legacy single message kept whenever the table fits, receiver reading both and closing everything on error; `stream-udp:` key family parsed into `StreamUdpFd`. Red run recorded. Status InProgress. | Romain G. |
+| 2026-11-18 | 0.4 | Lot B1: `quiesce reason=upgrade` mapped to `drained_by_upgrade`, `Quiesced { drain, reason }`, first quiesce stands; old workers close their own listener and slot descriptors, UDP sessions relay what they are owed or close by `Stream::upgrade_policy()`; tracker counts `closed` and `finished` per stream; `drained` / `drained_end` report messages sent without waiting. D-a, D-c, D-e, D-f and D-g amended where the code had moved (`drains_on_upgrade` is the 12.16 exclusion, one-way UDP closes, the report wire carries the quiesce seq). | Romain G. |

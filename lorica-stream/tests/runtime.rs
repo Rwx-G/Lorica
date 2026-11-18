@@ -33,14 +33,14 @@ use chrono::Utc;
 use lorica_config::models::{Stream, StreamBackend, StreamEndReason, StreamProtocol};
 use lorica_stream::handler::HandlerFuture;
 use lorica_stream::{
-    AcceptedConnection, ControlTransport, Datagram, DatagramHandler, Engines, InProcessPeer,
-    NodeCapsRegions, StreamHandler, StreamRuntime, StreamRuntimeHandle, StreamTable,
-    StreamTableSource,
+    AcceptedConnection, ControlTransport, Datagram, DatagramHandler, DrainReportError, Engines,
+    InProcessPeer, NodeCapsRegions, Quiesced, StreamHandler, StreamRuntime, StreamRuntimeHandle,
+    StreamTable, StreamTableSource, UpgradeDrainCounts,
 };
 use lorica_worker::fd_passing::StreamProto;
 use lorica_worker::stream_ctl::{
-    create_seqpacket_pair, recv_msg, send_msg, NackReason, QuiesceReason, StreamCtlMsg,
-    StreamSocket,
+    create_seqpacket_pair, recv_msg, send_msg, DrainEnd, DrainedEntry, NackReason, QuiesceReason,
+    ReportSent, StreamCtlMsg, StreamSocket,
 };
 use lorica_worker::stream_sockets::{bind_tcp_stream_listener, bind_udp_group};
 use socket2::SockRef;
@@ -471,7 +471,13 @@ fn the_seqpacket_channel_attaches_refuses_and_quiesces() {
         }),
         StreamCtlMsg::Ack { seq: 4, count: 1 }
     ));
-    assert_eq!(*quiesced.borrow(), Some(Duration::ZERO));
+    assert_eq!(
+        *quiesced.borrow(),
+        Some(Quiesced {
+            drain: Duration::ZERO,
+            reason: QuiesceReason::Shutdown
+        })
+    );
     let mut rest = [0u8; 4];
     assert!(matches!(client.read(&mut rest), Ok(0) | Err(_)));
     let deadline = std::time::Instant::now() + ANSWER_TIMEOUT;
@@ -520,7 +526,58 @@ fn terminate_quiesces_without_a_message() {
             .map(|d| *d)
             .unwrap()
     });
-    assert_eq!(drain, Some(Duration::from_secs(7)));
+    assert_eq!(
+        drain,
+        Some(Quiesced {
+            drain: Duration::from_secs(7),
+            reason: QuiesceReason::Shutdown
+        })
+    );
+    assert!(matches!(
+        handle.send_drain_report(DrainEnd::Idle, 0),
+        Err(DrainReportError::NotUpgrading)
+    ));
+    handle.stop();
+}
+
+/// A runtime that got `quiesce reason=upgrade` ignores the SIGTERM path
+/// that follows it: the reason and the deadline stay the upgrade's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminate_after_an_upgrade_quiesce_changes_nothing() {
+    let (mut peer, transport) = ControlTransport::in_process_pair(8);
+    let handle =
+        StreamRuntime::spawn(transport, Engines::default(), Source::with(Vec::new(), &[])).unwrap();
+    peer.to_runtime
+        .send(StreamCtlMsg::Quiesce {
+            seq: 1,
+            reason: QuiesceReason::Upgrade,
+            drain_ms: 120_000,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        answer(&mut peer).await,
+        StreamCtlMsg::Ack { seq: 1, count: 0 }
+    ));
+    let upgrade = Quiesced {
+        drain: Duration::from_secs(120),
+        reason: QuiesceReason::Upgrade,
+    };
+    assert_eq!(*handle.quiesced().borrow(), Some(upgrade));
+    handle.terminate(Duration::from_secs(1));
+    peer.to_runtime
+        .send(StreamCtlMsg::Quiesce {
+            seq: 2,
+            reason: QuiesceReason::Shutdown,
+            drain_ms: 0,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        answer(&mut peer).await,
+        StreamCtlMsg::Ack { seq: 2, count: 0 }
+    ));
+    assert_eq!(*handle.quiesced().borrow(), Some(upgrade));
     handle.stop();
 }
 
@@ -987,5 +1044,265 @@ async fn a_quiesced_udp_binding_drains_open_until_its_deadline() {
         *probe.ends.lock().unwrap(),
         vec![StreamEndReason::NodeShutdown]
     );
+    handle.stop();
+}
+
+// ---- the upgrade quiesce (Story 12.11) ----------------------------------
+
+/// Story 12.11 D-c: the old worker closes its own descriptor of the
+/// listening socket, so the port keeps accepting through the new
+/// generation's; its connections drain with `drained_by_upgrade`, one
+/// that ends first keeps its reason, and the drain report answers the
+/// quiesce with the counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upgrade_quiesce_closes_only_this_workers_listener_and_drains_with_drained_by_upgrade() {
+    let echo = Echo::default();
+    let ends = Arc::clone(&echo.ends);
+    let (mut peer, transport) = ControlTransport::in_process_pair(8);
+    let handle = StreamRuntime::spawn(
+        transport,
+        tcp_engines(echo),
+        Source::with(vec![stream("s1", StreamProtocol::Tcp)], &[]),
+    )
+    .unwrap();
+
+    // The new generation's descriptor of the same listening socket.
+    let new_generation = bind_tcp_stream_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = local_addr(&new_generation);
+    peer.to_runtime
+        .send(StreamCtlMsg::Attach {
+            seq: 1,
+            stream_id: "s1".into(),
+            bind_gen: 1,
+            sockets: vec![tcp_socket(&new_generation)],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(answer(&mut peer).await, StreamCtlMsg::Ack { .. }));
+    let mut stays = tokio::net::TcpStream::connect(addr).await.unwrap();
+    echo_once(&mut stays, b"stays").await;
+    let mut leaves = tokio::net::TcpStream::connect(addr).await.unwrap();
+    echo_once(&mut leaves, b"leaves").await;
+    assert_eq!(handle.tracker().len(), 2);
+
+    peer.to_runtime
+        .send(StreamCtlMsg::Quiesce {
+            seq: 2,
+            reason: QuiesceReason::Upgrade,
+            // Long enough for the steps below to run before it ends.
+            drain_ms: 3_000,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        answer(&mut peer).await,
+        StreamCtlMsg::Ack { seq: 2, count: 1 }
+    ));
+
+    // A `shutdown(2)` would have stopped the socket for every holder: a
+    // new client still connects, and the other descriptor accepts it.
+    let late = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("the port still listens");
+    let new_generation = {
+        let listener = std::net::TcpListener::from(new_generation);
+        listener.set_nonblocking(true).unwrap();
+        tokio::net::TcpListener::from_std(listener).unwrap()
+    };
+    let (_, from) = tokio::time::timeout(ANSWER_TIMEOUT, new_generation.accept())
+        .await
+        .expect("the new generation accepts")
+        .unwrap();
+    assert_eq!(from, late.local_addr().unwrap());
+    assert_eq!(handle.tracker().len(), 2, "the old worker accepted nothing");
+
+    // Established connections keep working; one that ends first keeps
+    // its own reason...
+    echo_once(&mut stays, b"still").await;
+    drop(leaves);
+    wait_until("the client close", || ends.lock().unwrap().len() == 1).await;
+    // ...the other ends at the deadline, with a FIN.
+    let mut buf = [0u8; 8];
+    let eof = tokio::time::timeout(ANSWER_TIMEOUT, stays.read(&mut buf))
+        .await
+        .expect("closed at the deadline");
+    assert!(matches!(eof, Ok(0)), "{eof:?}");
+    wait_until("both ends", || ends.lock().unwrap().len() == 2).await;
+    assert_eq!(
+        *ends.lock().unwrap(),
+        vec![
+            StreamEndReason::ClientClose,
+            StreamEndReason::DrainedByUpgrade
+        ]
+    );
+    assert_eq!(
+        handle
+            .tracker()
+            .upgrade_drain_counts()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![(
+            "s1".to_string(),
+            UpgradeDrainCounts {
+                closed: 1,
+                finished: 1
+            }
+        )]
+    );
+
+    let sent = handle
+        .send_drain_report(DrainEnd::Deadline, 2)
+        .expect("the report is sent");
+    assert_eq!(
+        sent,
+        ReportSent {
+            entries: 1,
+            truncated: false
+        }
+    );
+    match answer(&mut peer).await {
+        StreamCtlMsg::Drained { seq: 2, entries } => assert_eq!(
+            entries,
+            vec![DrainedEntry {
+                stream_id: "s1".into(),
+                closed: 1,
+                finished: 1
+            }]
+        ),
+        other => panic!("expected the report's entries, got {other:?}"),
+    }
+    assert!(matches!(
+        answer(&mut peer).await,
+        StreamCtlMsg::DrainedEnd {
+            seq: 2,
+            end: DrainEnd::Deadline,
+            http_cut: 2,
+            entries: 1,
+            truncated: false
+        }
+    ));
+    handle.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_config_removed_connection_keeps_its_reason_across_an_upgrade_quiesce() {
+    let echo = Echo {
+        backend: Some("b1".into()),
+        ..Echo::default()
+    };
+    let ends = Arc::clone(&echo.ends);
+    let link = StreamBackend::primary("s1", "b1");
+    let source = Source::with(
+        vec![stream("s1", StreamProtocol::Tcp)],
+        std::slice::from_ref(&link),
+    );
+    let (mut peer, transport) = ControlTransport::in_process_pair(8);
+    let handle = StreamRuntime::spawn(
+        transport,
+        tcp_engines(echo),
+        Arc::clone(&source) as Arc<dyn StreamTableSource>,
+    )
+    .unwrap();
+    let listener = bind_tcp_stream_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = local_addr(&listener);
+    peer.to_runtime
+        .send(StreamCtlMsg::Attach {
+            seq: 1,
+            stream_id: "s1".into(),
+            bind_gen: 1,
+            sockets: vec![tcp_socket(&listener)],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(answer(&mut peer).await, StreamCtlMsg::Ack { .. }));
+    let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+    echo_once(&mut client, b"hi").await;
+
+    source.set(vec![stream("s1", StreamProtocol::Tcp)], &[]);
+    peer.to_runtime
+        .send(StreamCtlMsg::Refresh {
+            seq: 2,
+            drain_ms: 60_000,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        answer(&mut peer).await,
+        StreamCtlMsg::Ack { seq: 2, count: 1 }
+    ));
+    peer.to_runtime
+        .send(StreamCtlMsg::Quiesce {
+            seq: 3,
+            reason: QuiesceReason::Upgrade,
+            drain_ms: 200,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        answer(&mut peer).await,
+        StreamCtlMsg::Ack { seq: 3, .. }
+    ));
+    wait_until("the end reason", || !ends.lock().unwrap().is_empty()).await;
+    assert_eq!(*ends.lock().unwrap(), vec![StreamEndReason::ConfigRemoved]);
+    assert!(
+        handle.tracker().upgrade_drain_counts().is_empty(),
+        "the upgrade drained nothing of it"
+    );
+    handle.stop();
+}
+
+/// Story 12.11 D-e: after an upgrade quiesce the old worker reads none of
+/// its slot socket's datagrams; the new generation's descriptor of the
+/// same socket does. Its session keeps serving until the drain ends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn after_an_upgrade_quiesce_the_worker_reads_no_datagram_from_its_slot_socket() {
+    let (mut peer, handle, probe) = udp_runtime();
+    let (addr, fd) = udp_slot("127.0.0.1");
+    let new_generation = std::net::UdpSocket::from(fd.try_clone().unwrap());
+    assert_eq!(attach_udp(&mut peer, 1, 1, vec![fd]).await, 1);
+    let client = udp_client().await;
+    assert_eq!(echoed(&client, addr, b"q").await, b"q");
+    assert_eq!(probe.seen.lock().unwrap().len(), 1);
+
+    peer.to_runtime
+        .send(StreamCtlMsg::Quiesce {
+            seq: 2,
+            reason: QuiesceReason::Upgrade,
+            drain_ms: 500,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        answer(&mut peer).await,
+        StreamCtlMsg::Ack { seq: 2, count: 1 }
+    ));
+    client.send_to(b"after", addr).await.unwrap();
+    new_generation
+        .set_read_timeout(Some(ANSWER_TIMEOUT))
+        .unwrap();
+    let mut buf = [0u8; 16];
+    let (n, from) = new_generation
+        .recv_from(&mut buf)
+        .expect("the new generation reads it");
+    assert_eq!(
+        (&buf[..n], from),
+        (&b"after"[..], client.local_addr().unwrap())
+    );
+    assert_eq!(
+        probe.seen.lock().unwrap().len(),
+        1,
+        "the old worker read nothing"
+    );
+    assert_eq!(probe.dropped_draining.load(Ordering::Relaxed), 0);
+
+    wait_until("the session ended", || {
+        !probe.ends.lock().unwrap().is_empty()
+    })
+    .await;
+    assert_eq!(
+        *probe.ends.lock().unwrap(),
+        vec![StreamEndReason::DrainedByUpgrade]
+    );
+    assert!(!udp_port_free(addr), "the new generation still holds it");
     handle.stop();
 }

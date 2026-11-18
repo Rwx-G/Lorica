@@ -83,7 +83,8 @@ pub(crate) enum LoopMode {
     /// UDP only: keep the socket and serve existing sessions, open none
     /// (Story 12.5 D-m). A TCP loop stops.
     Draining,
-    /// Close the socket.
+    /// Stop and drop the loop's handle on the socket. A UDP session keeps
+    /// its own until it ends.
     Stopped,
 }
 
@@ -162,6 +163,11 @@ async fn reached(mode: &mut watch::Receiver<LoopMode>, until: impl FnMut(&LoopMo
     let _ = mode.wait_for(until).await;
 }
 
+/// Accept until `mode` leaves `Serving`, then drop the listener: a
+/// `close` of this worker's descriptor only. Never `shutdown(2)`: the
+/// listening socket is one kernel object shared with the supervisor and,
+/// across a hot upgrade, with the new generation's workers, and a
+/// `shutdown` would stop their accepts too (Story 12.11 D-c).
 async fn accept_loop(listener: TcpListener, ctx: LoopContext, mut mode: watch::Receiver<LoopMode>) {
     loop {
         let accepted = tokio::select! {
