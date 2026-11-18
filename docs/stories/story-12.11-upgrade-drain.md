@@ -603,10 +603,10 @@ edits the same file), `lorica/src/main.rs` and `lorica/src/cli.rs` (the
 Depends on: B1 (`upgrade_policy`), C (`previous_generation`, and the
 shared `tests.rs`), 12.9's collector Lot.
 
-- [ ] Handler, role check identical to the upload's, `MetricsRefresher`
+- [x] Handler, role check identical to the upload's, `MetricsRefresher`
       before reading, `handoff_available` (D-f).
-- [ ] CLI: preview to stderr before upload; `--preview` exits after it.
-- [ ] Tests: a role below the upload's gets 403; single-process mode
+- [x] CLI: preview to stderr before upload; `--preview` exits after it.
+- [x] Tests: a role below the upload's gets 403; single-process mode
       returns `handoff_available: false`; a TCP and a bounded and an
       unbounded UDP stream report `drain`, `relay_in_flight`, `close`;
       `established` follows the aggregate; the response matches
@@ -1113,6 +1113,48 @@ and the 64-port TCP plus UDP table past 32 descriptors.
 - Gates on the two fixes: the same chain, product crates 3,747,
   `lorica` 992, forked 915, rustls 592, `cargo audit`, all clean.
 
+**Lot D, how it is built.** Read on `feat/v1.11.0` at `6e4ec592`.
+
+- `lorica_api::upgrade::UpgradePreview` (`drain_timeout_s`,
+  `handoff_available`, `previous_generation: { pid }`, `streams`,
+  `as_of`) and `UpgradePreviewStream` (`stream_id`, `name`,
+  `protocol`, `established`, `on_upgrade`, `drains_on_upgrade`), both
+  `Serialize` and `Deserialize`: the CLI parses the API's own type.
+- Sources: the stored `worker_drain_timeout_s` (capped at
+  `WORKER_DRAIN_TIMEOUT_MAX_S`, as the supervisor's `drain_timeout`
+  caps it); `handoff_available` is `AppState::upgrade_trigger()`
+  present (supervisor mode); `previous_generation()` from Lot C;
+  `established` is `StreamMetricsCollector::live_counters().active`,
+  the source of 12.10's `GET /api/v1/streams/status` and of `/metrics`
+  (TCP: the sum over workers; UDP: the node gauge when the plane has set
+  it). The handler awaits the `MetricsRefresher` with the 1 s budget
+  `/metrics` uses first. Reusing `stream_statuses` would still have
+  needed a second `list_streams` for `upgrade_policy()`, so the handler
+  reads the same three sources (store, bind registry, collector)
+  directly rather than joining a status answer to the store.
+- A stream is listed when this node's bind state is `bound`; a pending
+  or failed one holds no connection an upgrade could drain.
+- Role: `GET /api/v1/system/upgrade/preview` would have fallen to the
+  Viewer GET default, so `required_role` names it at `SuperAdmin`
+  ahead of that default, and a unit test pins it equal to the upload's
+  floor.
+- CLI: `lorica upgrade` reads the binary and signature first (fail
+  fast), logs in, prints the preview to stderr, then uploads; a node
+  that cannot answer the preview (older than the endpoint, the node a
+  new binary's CLI usually meets) gets a one-line note and the upload
+  anyway. `--preview` makes `--binary` optional, prints, exits 0, and
+  fails if the preview cannot be read.
+
+**Lot D, files outside the allowlist.**
+`lorica-api/src/middleware/authorize.rs` (the preview's role rule and
+its test): without it the endpoint is Viewer-readable.
+
+**Lot D gates** (Docker `rust:1-bookworm`, `CARGO_BUILD_WARNINGS=deny`,
+the `ci.yml` cargo lines in order): fmt, workspace clippy with
+`lorica/otel`, the product crates (`lorica-api` unit tests 1,400),
+`lorica --features otel` (library 547, binary 252), the forked crates,
+the rustls line and `cargo audit`, all clean.
+
 **Lot C gates** (Docker `rust:1-bookworm`, `CARGO_BUILD_WARNINGS=deny`,
 the `ci.yml` cargo lines in order): fmt, workspace clippy with
 `lorica/otel`, the product crates (3,712 tests), `lorica --features
@@ -1130,7 +1172,12 @@ otel` (989), the forked crates (915), the rustls line (592) and
 - `lorica-worker/src/manager.rs` (`drain_for_handoff(drain)`, Lot C)
 - `lorica-api/src/metrics.rs` (`lorica_hot_upgrade_stream_connections_total`, `drain_timeout` doc, drain histogram buckets, Lot C)
 - `lorica-api/src/tests.rs` (the new family's reader and tests, Lot C)
-- `lorica-api/src/upgrade.rs` (`previous_generation` state, Lot C)
+- `lorica-api/src/upgrade.rs` (`previous_generation` state, Lot C; the preview handler and its types, Lot D)
+- `lorica-api/src/server.rs` (the preview route, Lot D)
+- `lorica-api/src/middleware/authorize.rs` (the preview's role, Lot D)
+- `lorica-api/openapi.yaml` (the preview path, `UpgradePreview`, `UpgradePreviewStream`, Lot D)
+- `lorica-api/src/tests.rs` (preview tests, Lot D)
+- `lorica/src/cli.rs`, `lorica/src/main.rs` (`lorica upgrade` prints the preview, `--preview`, Lot D)
 - `lorica-api/src/shutdown.rs`, `server.rs`, `automation/listener.rs`, `logs.rs`, `loadtest.rs` (API connections and WebSockets end on the shutdown, Lot C)
 - `lorica-bench/src/active_probes.rs`, `scheduler.rs`, `passive_sla/{collector,persistence,stream,tests}.rs` (loops stop on the shutdown, SLA `flush_all`, Lot C)
 - `lorica/src/startup/mod.rs`, `single.rs`, `worker.rs`, `lorica/src/reload.rs` (loops stop on the shutdown, SLA flushed at exit, Lot C)
@@ -1163,3 +1210,4 @@ otel` (989), the forked crates (915), the rustls line (592) and
 | 2026-11-18 | 0.4 | Lot B1: `quiesce reason=upgrade` mapped to `drained_by_upgrade`, `Quiesced { drain, reason }`, first quiesce stands; old workers close their own listener and slot descriptors, UDP sessions relay what they are owed or close by `Stream::upgrade_policy()`; tracker counts `closed` and `finished` per stream; `drained` / `drained_end` report messages sent without waiting. D-a, D-c, D-e, D-f and D-g amended where the code had moved (`drains_on_upgrade` is the 12.16 exclusion, one-way UDP closes, the report wire carries the quiesce seq). | Romain G. |
 | 2026-11-18 | 0.5 | Lot B2: the drain watcher closes leftovers with the quiesce's end reason, returns `DrainOutcome { end, http_cut }`, and on an upgrade logs the per-stream closes at the deadline and sends the worker's drain report before `exit`, never blocking on it; `DrainEnd` is the wire's. | Romain G. |
 | 2026-11-18 | 0.6 | Lot C: the old supervisor stops its APIs and health loop at the handoff, reads `worker_drain_timeout_s` once, quiesces its workers for the upgrade, waits the drain plus the kill margin off the runtime threads, collects the workers' drain reports and writes the generation's report; UDP slot sockets ride the handoff and are adopted slot by slot or closed and rebound; the new supervisor reads the report, records `lorica_hot_upgrade_stream_connections_total`, the drain histogram (buckets to 3,600 s) and `drain_timeout`, and keeps `previous_generation` for the preview; a quiesced plane binds nothing more. | Romain G. |
+| 2026-11-18 | 0.7 | Lot D: `GET /api/v1/system/upgrade/preview` at the upload's SuperAdmin floor, pulling the workers' counters first: the stored drain delay, `handoff_available`, a draining previous generation, and per bound stream its open connections from the 12.9 aggregate and `upgrade_policy()`; published in `openapi.yaml`; `lorica upgrade` prints it to stderr before uploading and `--preview` prints it alone. | Romain G. |

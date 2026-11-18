@@ -6935,6 +6935,345 @@ async fn upgrade_endpoint_missing_signing_key_400s() {
     );
 }
 
+// ---- Upgrade preview (Story 12.11 D-f) ----
+
+const UPGRADE_PREVIEW: &str = "/api/v1/system/upgrade/preview";
+
+/// A stream named `name` of `protocol` on `port`, listening on a private
+/// address so a UDP one needs no source allowlist.
+fn preview_model(
+    name: &str,
+    protocol: lorica_config::models::StreamProtocol,
+    port: u16,
+) -> lorica_config::models::Stream {
+    lorica_config::models::Stream::new(
+        uuid::Uuid::new_v4().to_string(),
+        name.to_string(),
+        protocol,
+        "10.0.0.10".parse().expect("test setup: an address"),
+        port,
+        port,
+        chrono::Utc::now(),
+    )
+}
+
+/// [`preview_model`], stored, and bound on this node when `states` is
+/// given.
+async fn preview_stream(
+    state: &AppState,
+    states: Option<&lorica_stream::StreamBindStates>,
+    name: &str,
+    protocol: lorica_config::models::StreamProtocol,
+    port: u16,
+) -> lorica_config::models::Stream {
+    let stream = preview_model(name, protocol, port);
+    store_preview_stream(state, states, &stream).await;
+    stream
+}
+
+async fn store_preview_stream(
+    state: &AppState,
+    states: Option<&lorica_stream::StreamBindStates>,
+    stream: &lorica_config::models::Stream,
+) {
+    state
+        .store
+        .lock()
+        .await
+        .create_stream(stream)
+        .expect("test setup: stream");
+    if let Some(states) = states {
+        states.set_bound(&stream.id, 2, 2);
+    }
+}
+
+/// A node whose stream plane reads `states`.
+async fn preview_node(
+    states: &lorica_stream::StreamBindStates,
+) -> (AppState, SessionStore, RateLimiter) {
+    let (mut state, sessions, limiter) = test_state().await;
+    state.stream_plane = crate::stream_budget::StreamPlaneState::new(states.clone(), 65_536, 2);
+    (state, sessions, limiter)
+}
+
+async fn set_drain_timeout(state: &AppState, seconds: u32) {
+    let store = state.store.lock().await;
+    let mut settings = store.get_global_settings().expect("test setup: settings");
+    settings.worker_drain_timeout_s = seconds;
+    store
+        .update_global_settings(&settings)
+        .expect("test setup: settings");
+}
+
+async fn preview_as(
+    state: &AppState,
+    sessions: &SessionStore,
+    limiter: &RateLimiter,
+    cookie: &str,
+) -> (StatusCode, serde_json::Value) {
+    let response = send(
+        state,
+        sessions,
+        limiter,
+        "GET",
+        UPGRADE_PREVIEW,
+        cookie,
+        None,
+    )
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (status, serde_json::from_slice(&body).expect("json"))
+}
+
+#[tokio::test]
+async fn the_upgrade_preview_is_refused_below_the_uploads_role() {
+    let (state, sessions, limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &sessions, &limiter).await;
+    let operator = create_user_and_login(
+        &state,
+        &sessions,
+        &limiter,
+        "operator01",
+        lorica_config::models::Role::Operator,
+    )
+    .await;
+
+    let (status, answer) = preview_as(&state, &sessions, &limiter, &operator).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
+    let (status, answer) = preview_as(&state, &sessions, &limiter, &admin).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+}
+
+#[tokio::test]
+async fn a_single_process_node_previews_no_handoff_and_the_stored_drain() {
+    let states = lorica_stream::StreamBindStates::new();
+    let (mut state, sessions, limiter) = preview_node(&states).await;
+    state.mode = Mode::SingleProcess {
+        cache_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        cache_misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ban_list: Arc::new(crate::ban::BanMap::new()),
+        ewma_scores: Arc::new(dashmap::DashMap::new()),
+        backend_connections: Arc::new(crate::connections::BackendConnections::new()),
+        cache_backend: Box::leak(Box::new(lorica_cache::MemCache::new())),
+    };
+    set_drain_timeout(&state, 120).await;
+    let admin = setup_admin_and_login(&state, &sessions, &limiter).await;
+
+    let (status, answer) = preview_as(&state, &sessions, &limiter, &admin).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["data"]["handoff_available"], false);
+    assert_eq!(answer["data"]["drain_timeout_s"], 120);
+    assert_eq!(answer["data"]["streams"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn a_supervisor_previews_a_handoff_with_the_workers_counters_pulled_first() {
+    use crate::stream_metrics::stream_metrics;
+
+    // A worker id no other test reports under, since the collector the
+    // handler reads is the process's.
+    const WORKER: u32 = 12_011;
+    let states = lorica_stream::StreamBindStates::new();
+    let (mut state, sessions, limiter) = preview_node(&states).await;
+    let pg = preview_stream(
+        &state,
+        Some(&states),
+        "pg",
+        lorica_config::models::StreamProtocol::Tcp,
+        5432,
+    )
+    .await;
+    let counters = Arc::new(lorica_stream::StreamCounters::new());
+    let _open = counters.stream(&pg.id).accept();
+    let pulled = Arc::clone(&counters);
+    let refresher: crate::server::MetricsRefresher =
+        Arc::new(move || -> futures_util::future::BoxFuture<'static, ()> {
+            let counters = Arc::clone(&pulled);
+            Box::pin(async move {
+                stream_metrics().apply_worker(WORKER, &counters.snapshot());
+            })
+        });
+    let (upgrade_trigger, _staged) = tokio::sync::mpsc::channel(1);
+    state.mode = Mode::Supervisor {
+        worker_metrics: Arc::new(WorkerMetrics::new()),
+        aggregated_metrics: Arc::new(crate::workers::AggregatedMetrics::new()),
+        metrics_refresher: Some(refresher),
+        upgrade_trigger,
+    };
+    let admin = setup_admin_and_login(&state, &sessions, &limiter).await;
+
+    let (status, answer) = preview_as(&state, &sessions, &limiter, &admin).await;
+    stream_metrics().forget_worker(WORKER);
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["data"]["handoff_available"], true);
+    let streams = answer["data"]["streams"].as_array().expect("streams");
+    assert_eq!(streams.len(), 1, "{answer}");
+    assert_eq!(streams[0]["stream_id"], pg.id.as_str());
+    assert_eq!(
+        streams[0]["established"], 1,
+        "the connection the refresher pulled: {answer}"
+    );
+}
+
+#[tokio::test]
+async fn each_bound_stream_previews_what_the_upgrade_does_to_it_and_its_open_count() {
+    use lorica_config::models::{StreamProtocol, UpgradePolicy};
+
+    let states = lorica_stream::StreamBindStates::new();
+    let (state, _, _) = preview_node(&states).await;
+    let tcp = preview_stream(&state, Some(&states), "a-tcp", StreamProtocol::Tcp, 5432).await;
+    let bounded = preview_stream(&state, Some(&states), "b-dns", StreamProtocol::Udp, 53).await;
+    let mut unbounded = preview_model("c-media", StreamProtocol::Udp, 5004);
+    unbounded
+        .udp
+        .as_mut()
+        .expect("a UDP stream has UDP settings")
+        .unbounded_responses = true;
+    store_preview_stream(&state, Some(&states), &unbounded).await;
+    preview_stream(&state, None, "d-unbound", StreamProtocol::Tcp, 2525).await;
+
+    // Two workers: the aggregate is their sum.
+    let first = lorica_stream::StreamCounters::new();
+    let second = lorica_stream::StreamCounters::new();
+    let _open = [
+        first.stream(&tcp.id).accept(),
+        first.stream(&tcp.id).accept(),
+        second.stream(&tcp.id).accept(),
+        second.stream(&bounded.id).accept(),
+    ];
+    let collector = crate::stream_metrics::StreamMetricsCollector::new();
+    collector.apply_worker(1, &first.snapshot());
+    collector.apply_worker(2, &second.snapshot());
+
+    let preview = crate::upgrade::upgrade_preview(&state, &collector)
+        .await
+        .expect("a preview");
+    let seen: Vec<(&str, u64, UpgradePolicy)> = preview
+        .streams
+        .iter()
+        .map(|s| (s.stream_id.as_str(), s.established, s.on_upgrade))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (tcp.id.as_str(), 3, UpgradePolicy::Drain),
+            (bounded.id.as_str(), 1, UpgradePolicy::RelayInFlight),
+            (unbounded.id.as_str(), 0, UpgradePolicy::Close),
+        ],
+        "every bound stream, its policy and its open count; the unbound one is absent"
+    );
+    assert!(preview.streams.iter().all(|s| !s.drains_on_upgrade));
+}
+
+#[tokio::test]
+async fn the_preview_names_a_previous_generation_still_draining() {
+    let states = lorica_stream::StreamBindStates::new();
+    let (state, _, _) = preview_node(&states).await;
+    let collector = crate::stream_metrics::StreamMetricsCollector::new();
+
+    crate::upgrade::set_previous_generation(Some(4242));
+    let draining = crate::upgrade::upgrade_preview(&state, &collector).await;
+    crate::upgrade::set_previous_generation(None);
+    let done = crate::upgrade::upgrade_preview(&state, &collector).await;
+
+    assert_eq!(
+        draining.expect("a preview").previous_generation,
+        Some(crate::upgrade::PreviousGeneration { pid: 4242 })
+    );
+    assert_eq!(done.expect("a preview").previous_generation, None);
+}
+
+/// The lines of the component schema `name` in `openapi.yaml`, its
+/// header excluded.
+fn openapi_schema(name: &str) -> Vec<&'static str> {
+    const OPENAPI: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.yaml"));
+    let header = format!("    {name}:");
+    let mut lines = OPENAPI.lines().skip_while(|l| l.trim_end() != header);
+    assert!(lines.next().is_some(), "openapi.yaml has no schema {name}");
+    lines
+        .take_while(|l| l.trim().is_empty() || l.starts_with("     "))
+        .collect()
+}
+
+/// The `[a, b]` list of the first `key:` line of `lines` at `indent`.
+fn openapi_list(lines: &[&str], indent: &str, key: &str) -> std::collections::BTreeSet<String> {
+    let prefix = format!("{indent}{key}: [");
+    let list = lines
+        .iter()
+        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("no {key} list at that depth"));
+    list.trim_end_matches(']')
+        .split(',')
+        .map(|word| word.trim().to_string())
+        .collect()
+}
+
+/// The property names of a schema's lines, at the top level.
+fn openapi_properties(lines: &[&str]) -> std::collections::BTreeSet<String> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let key = line.strip_prefix("        ")?.strip_suffix(':')?;
+            key.chars()
+                .all(|c| c.is_ascii_lowercase() || c == '_')
+                .then(|| key.to_string())
+        })
+        .collect()
+}
+
+fn json_keys(value: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    value
+        .as_object()
+        .expect("an object")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn the_published_upgrade_preview_names_exactly_the_fields_it_answers() {
+    use lorica_config::models::UpgradePolicy;
+    use strum::VariantArray;
+
+    let states = lorica_stream::StreamBindStates::new();
+    let (state, _, _) = preview_node(&states).await;
+    preview_stream(
+        &state,
+        Some(&states),
+        "pg",
+        lorica_config::models::StreamProtocol::Tcp,
+        5432,
+    )
+    .await;
+    let collector = crate::stream_metrics::StreamMetricsCollector::new();
+    let preview = crate::upgrade::upgrade_preview(&state, &collector)
+        .await
+        .expect("a preview");
+    let answer = serde_json::to_value(&preview).expect("serialises");
+
+    let top = openapi_schema("UpgradePreview");
+    assert_eq!(openapi_properties(&top), json_keys(&answer));
+    assert_eq!(openapi_list(&top, "      ", "required"), json_keys(&answer));
+    let entry = openapi_schema("UpgradePreviewStream");
+    let fields = json_keys(&answer["streams"][0]);
+    assert_eq!(openapi_properties(&entry), fields);
+    assert_eq!(openapi_list(&entry, "      ", "required"), fields);
+    let words: std::collections::BTreeSet<String> = UpgradePolicy::VARIANTS
+        .iter()
+        .map(|p| p.as_str().to_string())
+        .collect();
+    assert_eq!(openapi_list(&entry, "          ", "enum"), words);
+    let pid =
+        serde_json::to_value(crate::upgrade::PreviousGeneration { pid: 1 }).expect("serialises");
+    assert_eq!(
+        openapi_list(&top, "          ", "required"),
+        json_keys(&pid)
+    );
+}
+
 // ---- Settings schema endpoint (Story 8.10 AC #7) ----
 
 pub(crate) async fn parse_data(response: axum::response::Response) -> serde_json::Value {

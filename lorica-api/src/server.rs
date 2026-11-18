@@ -1188,6 +1188,11 @@ pub fn build_router(
                 .layer(bl(BODY_CAP_UPGRADE))
                 .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
         )
+        // Story 12.11 D-f: what an upgrade started now would do here.
+        .route(
+            "/api/v1/system/upgrade/preview",
+            get(crate::upgrade::get_upgrade_preview),
+        )
         .route("/api/v1/workers", get(crate::workers::get_workers))
         .route("/api/v1/config/export", post(crate::config::export_config))
         .route(

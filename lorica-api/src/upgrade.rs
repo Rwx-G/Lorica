@@ -27,9 +27,15 @@ use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use std::time::Duration;
+
 use axum::extract::{Extension, Multipart};
 use axum::Json;
+use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
+use lorica_config::models::{GlobalSettings, StreamProtocol, UpgradePolicy};
+use lorica_stream::BindState;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::db::db_blocking;
@@ -37,6 +43,7 @@ use crate::error::{json_data, ApiError};
 use crate::metrics::record_hot_upgrade;
 use crate::middleware::auth::Session;
 use crate::server::AppState;
+use crate::stream_metrics::{stream_metrics, StreamMetricsCollector};
 
 /// Length in bytes of an Ed25519 verifying key.
 const PUBLIC_KEY_LEN: usize = 32;
@@ -123,6 +130,128 @@ pub fn previous_generation() -> Option<u32> {
     *PREVIOUS_GENERATION
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// What a hot upgrade started now would do on this node (Story 12.11
+/// D-f), the answer of `GET /api/v1/system/upgrade/preview`.
+///
+/// An upgrade is node-local, so is its preview: the figures are those
+/// of the node whose API answers. The CLI deserialises the same type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpgradePreview {
+    /// `worker_drain_timeout_s` as stored, the drain the old generation
+    /// will apply. The supervisor reads it again at the handoff, so a
+    /// setting changed after this answer is the one that applies.
+    pub drain_timeout_s: u32,
+    /// Whether an upload starts a live handoff: false in single-process
+    /// mode, where it only stages the binary for the next restart.
+    pub handoff_available: bool,
+    /// An earlier generation of this node still draining from the
+    /// upgrade that started this process (D-h). A further upgrade is
+    /// allowed; that generation keeps its connections until its own
+    /// deadline.
+    pub previous_generation: Option<PreviousGeneration>,
+    /// One entry per stream this node binds, in the store's order.
+    pub streams: Vec<UpgradePreviewStream>,
+    /// When the figures were read.
+    pub as_of: DateTime<Utc>,
+}
+
+/// A previous generation of this node still draining.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviousGeneration {
+    /// Its supervisor's pid.
+    pub pid: u32,
+}
+
+/// One bound stream in an [`UpgradePreview`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpgradePreviewStream {
+    /// The stream's id.
+    pub stream_id: String,
+    /// The stream's name.
+    pub name: String,
+    /// `tcp` or `udp`.
+    pub protocol: StreamProtocol,
+    /// Connections (TCP) or sessions (UDP) open on this node now: the
+    /// `lorica_stream_active` aggregate.
+    pub established: u64,
+    /// What the upgrade does to them, [`lorica_config::models::Stream::upgrade_policy`].
+    pub on_upgrade: UpgradePolicy,
+    /// Whether the stream would still drain once live transfer exists
+    /// (TLS terminated or originated, [`lorica_config::models::Stream::drains_on_upgrade`]).
+    pub drains_on_upgrade: bool,
+}
+
+/// How long the preview waits for the workers' counters, the budget the
+/// `/metrics` scrape gives the same refresher. On timeout the last
+/// pulled figures answer.
+const PREVIEW_REFRESH_BUDGET: Duration = Duration::from_millis(1_000);
+
+/// The upgrade preview of this node, its counters read from `collector`.
+///
+/// A stream is listed when this node holds its sockets
+/// ([`BindState::Bound`]); a pending or failed one has no connection an
+/// upgrade could drain.
+///
+/// # Errors
+///
+/// The store's error.
+pub(crate) async fn upgrade_preview(
+    state: &AppState,
+    collector: &StreamMetricsCollector,
+) -> Result<UpgradePreview, ApiError> {
+    let (settings, streams) = db_blocking(&state.store, |store| {
+        Ok::<_, ApiError>((store.get_global_settings()?, store.list_streams()?))
+    })
+    .await?;
+    let counters = collector.live_counters();
+    let streams: Vec<UpgradePreviewStream> = streams
+        .into_iter()
+        .filter(|stream| {
+            matches!(
+                state.stream_plane.bind_state(&stream.id),
+                Some(BindState::Bound { .. })
+            )
+        })
+        .map(|stream| UpgradePreviewStream {
+            established: counters.get(&stream.id).map_or(0, |live| live.active),
+            on_upgrade: stream.upgrade_policy(),
+            drains_on_upgrade: stream.drains_on_upgrade(),
+            stream_id: stream.id,
+            name: stream.name,
+            protocol: stream.protocol,
+        })
+        .collect();
+    Ok(UpgradePreview {
+        // The cap the supervisor's `drain_timeout` applies at the handoff.
+        drain_timeout_s: settings
+            .worker_drain_timeout_s
+            .min(GlobalSettings::WORKER_DRAIN_TIMEOUT_MAX_S),
+        handoff_available: state.upgrade_trigger().is_some(),
+        previous_generation: previous_generation().map(|pid| PreviousGeneration { pid }),
+        streams,
+        as_of: Utc::now(),
+    })
+}
+
+/// GET /api/v1/system/upgrade/preview - what an upgrade started now would
+/// do on this node (Story 12.11 D-f).
+///
+/// Pulls the workers' counters first, as a `/metrics` scrape does, so
+/// `established` is as of the request rather than of the last pull.
+///
+/// Authorization: `SuperAdmin`, the floor of the upload it previews
+/// (`required_role`). Management plane only, never the automation API
+/// or MCP.
+pub async fn get_upgrade_preview(
+    Extension(state): Extension<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Some(refresher) = state.metrics_refresher() {
+        let _ = tokio::time::timeout(PREVIEW_REFRESH_BUDGET, refresher()).await;
+    }
+    let preview = upgrade_preview(&state, stream_metrics()).await?;
+    Ok(json_data(preview))
 }
 
 /// Whether the successful verify+stage actually kicked off a live

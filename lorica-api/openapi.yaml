@@ -2967,6 +2967,38 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /api/v1/system/upgrade/preview:
+    get:
+      tags: [System]
+      summary: What a hot upgrade started now would do on this node (Story 12.11)
+      description: >-
+        The node whose API answers, since an upgrade is node-local: the
+        drain delay the old generation will apply, whether an upload
+        starts a live handoff, an earlier generation still draining, and
+        per stream this node binds the connections or sessions open now
+        and what the upgrade does to them. The workers' counters are
+        pulled first, as a `/metrics` scrape pulls them. SuperAdmin, the
+        floor of the upload it previews. A further upgrade while
+        `previous_generation` is set is allowed, not refused. The drain
+        delay is read again at the handoff, so a setting changed after
+        this answer is the one that applies.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: This node's upgrade preview
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/UpgradePreview"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
   # ---------------------------------------------------------------------------
   # WAF
   # ---------------------------------------------------------------------------
@@ -9495,6 +9527,78 @@ components:
             has counted it on this node.
           allOf:
             - $ref: "#/components/schemas/StreamLiveCounters"
+
+    UpgradePreview:
+      type: object
+      description: >-
+        What a hot upgrade started now would do on the answering node
+        (`GET /api/v1/system/upgrade/preview`).
+      required: [drain_timeout_s, handoff_available, previous_generation, streams, as_of]
+      properties:
+        drain_timeout_s:
+          type: integer
+          description: >-
+            `worker_drain_timeout_s` as stored: how long the old
+            generation keeps serving the connections it holds before it
+            closes them with `drained_by_upgrade`.
+        handoff_available:
+          type: boolean
+          description: >-
+            False in single-process mode, where an upload only stages the
+            binary for the next restart.
+        previous_generation:
+          type: object
+          nullable: true
+          description: >-
+            An earlier generation of this node still draining from the
+            upgrade that started this process; `null` otherwise. It keeps
+            its connections until its own deadline.
+          required: [pid]
+          properties:
+            pid:
+              type: integer
+        streams:
+          type: array
+          description: One entry per stream this node binds, ordered by name.
+          items:
+            $ref: "#/components/schemas/UpgradePreviewStream"
+        as_of:
+          type: string
+          format: date-time
+          description: When the figures were read.
+
+    UpgradePreviewStream:
+      type: object
+      description: One stream this node binds, in an upgrade preview.
+      required: [stream_id, name, protocol, established, on_upgrade, drains_on_upgrade]
+      properties:
+        stream_id:
+          type: string
+        name:
+          type: string
+        protocol:
+          $ref: "#/components/schemas/StreamProtocol"
+        established:
+          type: integer
+          description: >-
+            Connections (TCP) or sessions (UDP) open on this node now, the
+            `lorica_stream_active` aggregate.
+        on_upgrade:
+          type: string
+          enum: [drain, relay_in_flight, close]
+          description: >-
+            `drain`: the old generation serves each connection until it
+            ends or the drain deadline closes it. `relay_in_flight`: the
+            old generation reads no more requests, relays the responses
+            its sessions are owed, and each session ends on its bound or
+            at the earlier of its idle timeout and the deadline. `close`:
+            every session ends at once, none being owed a response.
+        drains_on_upgrade:
+          type: boolean
+          description: >-
+            The stream's `drains_on_upgrade`: true when it terminates or
+            originates TLS, so it will keep draining once a later release
+            transfers connections instead.
 
     StreamNodeState:
       type: object

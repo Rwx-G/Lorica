@@ -176,6 +176,13 @@ pub fn required_role(method: &http::Method, path: &str) -> Role {
         return Role::Operator;
     }
 
+    // The upgrade preview (Story 12.11 D-f) sits at the upload's floor:
+    // it is the first step of the upgrade, and it names the node's
+    // drain delay and the streams holding connections.
+    if path == "/api/v1/system/upgrade/preview" {
+        return Role::SuperAdmin;
+    }
+
     if method == http::Method::GET || method == http::Method::HEAD {
         // `format=key` / `format=full` return the private key; the
         // whole download endpoint is treated as secret material
@@ -753,6 +760,14 @@ mod tests {
         assert_eq!(
             required_role(&Method::POST, "/api/v1/system/upgrade"),
             Role::SuperAdmin
+        );
+    }
+
+    #[test]
+    fn the_upgrade_preview_sits_at_the_uploads_floor() {
+        assert_eq!(
+            required_role(&Method::GET, "/api/v1/system/upgrade/preview"),
+            required_role(&Method::POST, "/api/v1/system/upgrade")
         );
     }
 

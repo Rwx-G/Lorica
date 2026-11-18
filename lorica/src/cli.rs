@@ -251,11 +251,18 @@ pub(crate) enum Commands {
         password: Option<String>,
     },
     /// Upload a new signed `lorica` binary to the running instance and
-    /// trigger a zero-downtime hot upgrade (Story 8.4).
+    /// trigger a zero-downtime hot upgrade (Story 8.4). The node's
+    /// upgrade preview is printed to stderr first (Story 12.11).
     Upgrade {
         /// Path to the new `lorica` executable to install.
+        #[arg(long, required_unless_present = "preview")]
+        binary: Option<String>,
+
+        /// Print what an upgrade would do on this node (drain delay,
+        /// streams and their open connections) and exit without
+        /// uploading.
         #[arg(long)]
-        binary: String,
+        preview: bool,
 
         /// Path to the detached Ed25519 signature (128 hex chars).
         /// Defaults to `<binary>.sig`.
@@ -1184,37 +1191,50 @@ pub(crate) fn run_unban(data_dir: &str, port: u16, ip: String, user: String, pas
 /// deps) is pulled in just for one upload. The client and the login
 /// are the shared `cli_client` ones (one loopback trust decision, one
 /// login contract for every CLI command).
+///
+/// The node's upgrade preview (Story 12.11 D-f) goes to stderr first,
+/// without a prompt, so a script's behaviour is unchanged. `binary` is
+/// `None` for `--preview`, which prints the preview and uploads
+/// nothing. A node that cannot answer the preview (one older than the
+/// endpoint, which is the node a new binary's CLI usually meets) still
+/// gets the upload; `--preview` then fails.
 pub(crate) fn run_upgrade(
     data_dir: &str,
     port: u16,
-    binary: String,
+    binary: Option<String>,
     signature: Option<String>,
     user: String,
     password: String,
 ) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
-        let signature_path: String = signature.unwrap_or_else(|| format!("{binary}.sig"));
+        let upload: Option<(String, Vec<u8>, String)> = binary.map(|binary| {
+            let signature_path: String = signature.unwrap_or_else(|| format!("{binary}.sig"));
+            let binary_bytes: Vec<u8> = std::fs::read(&binary)
+                .unwrap_or_else(|e| crate::cli_client::fail(format!("Cannot read binary {binary}: {e}")));
+            let signature_hex: String = std::fs::read_to_string(&signature_path)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|e| {
+                    crate::cli_client::fail(format!("Cannot read signature {signature_path}: {e}"))
+                });
+            (binary, binary_bytes, signature_hex)
+        });
 
-        let binary_bytes: Vec<u8> = match std::fs::read(&binary) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("Cannot read binary {binary}: {e}");
-                std::process::exit(1);
-            }
-        };
-        let signature_hex: String = match std::fs::read_to_string(&signature_path) {
-            Ok(s) => s.trim().to_string(),
-            Err(e) => {
-                eprintln!("Cannot read signature {signature_path}: {e}");
-                std::process::exit(1);
-            }
-        };
-
-        // Login (the upgrade endpoint is behind require_auth).
+        // Login (the upgrade endpoints are behind require_auth).
         let client =
             crate::cli_client::management_session(Path::new(data_dir), port, &user, &password)
                 .await;
+
+        match fetch_upgrade_preview(&client, port).await {
+            Ok(preview) => eprint!("{}", render_upgrade_preview(&preview)),
+            Err(e) if upload.is_none() => {
+                crate::cli_client::fail(format!("Upgrade preview failed: {e}"))
+            }
+            Err(e) => eprintln!("Upgrade preview unavailable ({e}); uploading anyway."),
+        }
+        let Some((binary, binary_bytes, signature_hex)) = upload else {
+            return;
+        };
 
         // Hand-rolled multipart/form-data body: `binary` (raw bytes) +
         // `signature` (hex text), matching the axum Multipart extractor.
@@ -1298,6 +1318,86 @@ pub(crate) fn run_upgrade(
             }
         }
     });
+}
+
+/// `GET /api/v1/system/upgrade/preview` on the node at `port`, or why it
+/// could not be read.
+async fn fetch_upgrade_preview(
+    client: &reqwest::Client,
+    port: u16,
+) -> Result<lorica_api::upgrade::UpgradePreview, String> {
+    let url = crate::cli_client::management_url(port, "/api/v1/system/upgrade/preview");
+    let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    let status = response.status();
+    let body = response.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("{status}: {body}"));
+    }
+    serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("data").cloned())
+        .and_then(|data| serde_json::from_value(data).ok())
+        .ok_or_else(|| format!("unexpected answer: {body}"))
+}
+
+/// The upgrade preview as `lorica upgrade` prints it.
+fn render_upgrade_preview(preview: &lorica_api::upgrade::UpgradePreview) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Upgrade preview for this node (as of {}):",
+        preview.as_of.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    let _ = writeln!(
+        out,
+        "  Drain delay: {} s (worker_drain_timeout_s); the old binary closes what is \
+         still open then.",
+        preview.drain_timeout_s
+    );
+    if let Some(previous) = preview.previous_generation {
+        let _ = writeln!(
+            out,
+            "  WARNING: an earlier generation (pid {}) is still draining; it keeps its \
+             connections until its own deadline.",
+            previous.pid
+        );
+    }
+    if !preview.handoff_available {
+        let _ = writeln!(
+            out,
+            "  NOTE: single-process mode: the binary is staged for the next restart, \
+             no live handoff."
+        );
+    }
+    if preview.streams.is_empty() {
+        let _ = writeln!(out, "  No stream is bound on this node.");
+        return out;
+    }
+    let name_width = preview
+        .streams
+        .iter()
+        .map(|s| s.name.chars().count())
+        .chain(std::iter::once("STREAM".len()))
+        .max()
+        .unwrap_or_default();
+    let _ = writeln!(
+        out,
+        "  {:<name_width$}  PROTOCOL  ESTABLISHED  ON UPGRADE",
+        "STREAM"
+    );
+    for stream in &preview.streams {
+        let _ = writeln!(
+            out,
+            "  {:<name_width$}  {:<8}  {:<11}  {}",
+            stream.name,
+            stream.protocol.as_str(),
+            stream.established,
+            stream.on_upgrade.as_str()
+        );
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1807,5 +1907,91 @@ mod tests {
         )
         .expect("an IPv6 literal is an address, not a host:port");
         assert_eq!(binds.advertise_host, "2001:db8::10");
+    }
+
+    #[test]
+    fn upgrade_takes_a_binary_or_preview_alone() {
+        let preview = Cli::try_parse_from(["lorica", "upgrade", "--preview"])
+            .expect("--preview needs no binary");
+        assert!(matches!(
+            preview.command,
+            Some(Commands::Upgrade {
+                preview: true,
+                binary: None,
+                ..
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(["lorica", "upgrade"]).is_err(),
+            "an upload needs its binary"
+        );
+        let upload = Cli::try_parse_from(["lorica", "upgrade", "--binary", "/tmp/lorica.new"])
+            .expect("an upload");
+        assert!(matches!(
+            upload.command,
+            Some(Commands::Upgrade {
+                preview: false,
+                binary: Some(_),
+                ..
+            })
+        ));
+    }
+
+    fn preview_from(answer: serde_json::Value) -> lorica_api::upgrade::UpgradePreview {
+        serde_json::from_value(answer).expect("the API's preview")
+    }
+
+    #[test]
+    fn the_upgrade_preview_prints_the_delay_and_every_stream() {
+        let preview = preview_from(serde_json::json!({
+            "drain_timeout_s": 120,
+            "handoff_available": true,
+            "previous_generation": null,
+            "streams": [
+                { "stream_id": "s-1", "name": "postgres-primary", "protocol": "tcp",
+                  "established": 3, "on_upgrade": "drain", "drains_on_upgrade": false },
+                { "stream_id": "s-2", "name": "dns", "protocol": "udp",
+                  "established": 0, "on_upgrade": "relay_in_flight", "drains_on_upgrade": false },
+            ],
+            "as_of": "2026-11-18T10:00:00Z",
+        }));
+        let printed = render_upgrade_preview(&preview);
+        assert!(
+            printed.contains("as of 2026-11-18 10:00:00 UTC"),
+            "{printed}"
+        );
+        assert!(printed.contains("Drain delay: 120 s"), "{printed}");
+        assert!(!printed.contains("WARNING"), "{printed}");
+        assert!(!printed.contains("single-process"), "{printed}");
+        let rows: Vec<Vec<&str>> = printed
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with("STREAM"))
+            .skip(1)
+            .map(|line| line.split_whitespace().collect())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                vec!["postgres-primary", "tcp", "3", "drain"],
+                vec!["dns", "udp", "0", "relay_in_flight"],
+            ]
+        );
+    }
+
+    #[test]
+    fn the_upgrade_preview_warns_of_a_draining_generation_and_a_staged_only_upload() {
+        let preview = preview_from(serde_json::json!({
+            "drain_timeout_s": 30,
+            "handoff_available": false,
+            "previous_generation": { "pid": 4242 },
+            "streams": [],
+            "as_of": "2026-11-18T10:00:00Z",
+        }));
+        let printed = render_upgrade_preview(&preview);
+        assert!(printed.contains("WARNING"), "{printed}");
+        assert!(printed.contains("pid 4242"), "{printed}");
+        assert!(printed.contains("single-process"), "{printed}");
+        assert!(printed.contains("No stream is bound"), "{printed}");
+        assert!(!printed.contains("STREAM"), "{printed}");
     }
 }

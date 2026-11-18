@@ -93,6 +93,7 @@ fn main() {
         }
         Some(Commands::Upgrade {
             binary,
+            preview,
             signature,
             user,
             password_file,
@@ -105,7 +106,7 @@ fn main() {
             run_upgrade(
                 &cli.data_dir,
                 cli.management_port,
-                binary,
+                binary.filter(|_| !preview),
                 signature,
                 user,
                 password,
