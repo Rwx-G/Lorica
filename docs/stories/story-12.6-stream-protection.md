@@ -1201,6 +1201,8 @@ lint` and `vitest run` clean.
 - `CHANGELOG.md` `[Unreleased]`: Added (stream protection) and Security (the WAF auto-ban does not apply, filter changes judge new connections only).
 - The threat model and `worker-shared-state.md` the other documentation pass of this cycle covered (commit `11b46697` and those it names); the bump checklists' region line is outside this pass.
 
+- **The region version line, 2026-11-18** (commit `ba176913`): `docs/BUMP-CHECKLIST.md` gains a "Shared-memory layout versions" section naming `LAYOUT_VERSION` and `STREAM_CAPS_LAYOUT_VERSION`, where each lives and when each moves, without their current values. `.claude/skills/bump-version/bump-checklist.md` is not tracked by git on this branch or on `main`, so its copy of the line is for the maintainer to add in the main checkout.
+
 ## File List
 
 Lot A:
@@ -1292,3 +1294,4 @@ Lot G:
 | 2026-11-18 | 0.9 | The stream and pending totals admit by compare-and-swap instead of an add taken back past the cap: a refused admission no longer shows in the totals for an instant, which IV3's engine test read as 257 pending against a cap of 256 under load and which could refuse an admission while a release had freed a slot. No slot was ever held past the cap. | Romain G. |
 | 2026-11-18 | 0.10 | Lot H, threat model and architecture part: slow reads, log amplification, table fill and handshake CPU in T12; region version 2 in `worker-shared-state.md`. The bump-checklist line, `docs/streams.md` and `CHANGELOG.md` stay open. | Romain G. |
 | 2026-11-18 | 0.11 | Lot H, the `docs/streams.md` and CHANGELOG parts: "Protecting a stream" documented with the two plain statements; with the other documentation pass's boxes, every box of the Lot is ticked. Status InProgress. | Romain G. |
+| 2026-11-18 | 0.12 | Lot H, the region version line in `docs/BUMP-CHECKLIST.md`; the skill's untracked copy left to the maintainer. | Romain G. |

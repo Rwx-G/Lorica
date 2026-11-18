@@ -2027,6 +2027,8 @@ decision.
 
 - **Correction, 2026-11-18: HAProxy Enterprise's 10 s UDP idle is documented**, on the module's reference page rather than the overview the PRD links: it is the default of `timeout client` in a `udp-lb` section, the client side's inactivity; the page states no default for `timeout server`. The bullet above calling it "not documented" read the overview only. `docs/streams.md` (the Idle, UDP row), the doc comment of `Stream::DEFAULT_UDP_IDLE_TIMEOUT_S` and a dated amendment of the PRD now cite the reference page with that scope.
 
+- **The region version line, 2026-11-18** (commit `ba176913`): `docs/BUMP-CHECKLIST.md` gains a "Shared-memory layout versions" section naming `LAYOUT_VERSION` and `STREAM_CAPS_LAYOUT_VERSION`, where each lives and when each moves, without their current values. `.claude/skills/bump-version/bump-checklist.md` is not tracked by git on this branch or on `main`, so its copy of the line is for the maintainer to add in the main checkout.
+
 ## File List
 
 Lot J:
@@ -2137,3 +2139,4 @@ Lot A:
 | 2026-11-18 | 0.11 | Lot H, threat model, hardening and architecture part: UDP reflection and amplification in T12, raising UDP session capacity in the hardening guide, the stream-caps region in `worker-shared-state.md`. The bump-checklist line, `docs/streams.md` and `CHANGELOG.md` stay open. | Romain G. |
 | 2026-11-18 | 0.12 | Lot H, the `docs/streams.md` and CHANGELOG parts: UDP streams documented, survey values and PROXY v2 receivers verified from their documentation (HAProxy Enterprise's 10 s not documented); with the other documentation pass's boxes, every box of the Lot is ticked. Status InProgress. | Romain G. |
 | 2026-11-18 | 0.13 | HAProxy Enterprise's 10 s UDP idle traced to the module's reference page (`timeout client` of a `udp-lb` section); `docs/streams.md`, the `DEFAULT_UDP_IDLE_TIMEOUT_S` doc comment and the PRD cite it. | Romain G. |
+| 2026-11-18 | 0.14 | Lot H, the region version line in `docs/BUMP-CHECKLIST.md`; the skill's untracked copy left to the maintainer. | Romain G. |
