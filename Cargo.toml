@@ -39,7 +39,7 @@ members = [
     "lorica-stream",
 ]
 
-exclude = ["fuzz"]
+exclude = ["fuzz", "spikes"]
 
 [workspace.dependencies]
 bstr = "1.12.0"

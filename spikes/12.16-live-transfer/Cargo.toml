@@ -1,0 +1,17 @@
+[package]
+name = "spike-12-16-live-transfer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+authors = ["Romain G."]
+description = "Feasibility spike for Story 12.16: live transfer of TCP passthrough connections and UDP sessions between two processes. Not a workspace member, not shipped."
+
+# Only crates already in the workspace Cargo.lock, at the versions it pins.
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+nix = { version = "0.31", features = ["socket", "uio", "net", "poll"] }
+libc = "0.2"
+
+[profile.release]
+debug = 1
