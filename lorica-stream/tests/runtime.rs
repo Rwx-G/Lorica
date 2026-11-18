@@ -138,7 +138,7 @@ impl StreamHandler for Echo {
                     },
                 }
             };
-            let reason = tracked.finish(natural);
+            let reason = tracked.finish(natural, |reason| reason);
             ends.lock().unwrap().push(reason);
         })
     }
@@ -698,7 +698,9 @@ impl DatagramHandler for SessionEcho {
                     reason = tracked.closed() => reason,
                     _ = end_rx => StreamEndReason::ClientClose,
                 };
-                ends.lock().unwrap().push(tracked.finish(natural));
+                ends.lock()
+                    .unwrap()
+                    .push(tracked.finish(natural, |reason| reason));
             });
             sessions.insert(d.source, end_tx);
         }

@@ -174,10 +174,24 @@ struct Records {
     refused: mpsc::UnboundedSender<RefusalRecord>,
     suppressed: mpsc::UnboundedSender<SuppressedRecord>,
     outcomes: mpsc::UnboundedSender<Outcome>,
+    /// The harness's tracker, read at each record and refusal.
+    tracker: ConnectionTracker,
+    /// The entries the tracker held when each record or refusal arrived.
+    tracked_at_report: Arc<Mutex<Vec<usize>>>,
+}
+
+impl Records {
+    fn note_tracked(&self) {
+        self.tracked_at_report
+            .lock()
+            .unwrap()
+            .push(self.tracker.len());
+    }
 }
 
 impl ConnectionObserver for Records {
     fn observe(&self, record: ConnectionRecord) {
+        self.note_tracked();
         let _ = self.ended.send(record);
     }
 
@@ -188,6 +202,7 @@ impl ConnectionObserver for Records {
     }
 
     fn refused(&self, record: RefusalRecord) {
+        self.note_tracked();
         let _ = self.refused.send(record);
     }
 
@@ -258,6 +273,9 @@ struct Harness {
     node: Mutex<NodeCapsRegions>,
     caps: CapsRegistry,
     listen: SocketAddr,
+    /// The tracker's entry count at each record and refusal the
+    /// observer took.
+    tracked_at_report: Arc<Mutex<Vec<usize>>>,
 }
 
 impl Harness {
@@ -275,6 +293,8 @@ impl Harness {
         let (refused, refusals) = mpsc::unbounded_channel();
         let (held_back, suppressed) = mpsc::unbounded_channel();
         let (outcome, outcomes) = mpsc::unbounded_channel();
+        let tracker = ConnectionTracker::new();
+        let tracked_at_report = Arc::default();
         let engine = TcpEngine::new(TcpEngineParts {
             selector: Arc::clone(&selector) as Arc<dyn BackendSelector>,
             breaker: Arc::clone(&breaker) as Arc<dyn BreakerGate>,
@@ -288,11 +308,12 @@ impl Harness {
                 refused,
                 suppressed: held_back,
                 outcomes: outcome,
+                tracker: tracker.clone(),
+                tracked_at_report: Arc::clone(&tracked_at_report),
             }),
             reserved_ports,
             source_gate: Arc::clone(&gate) as Arc<dyn SourceGate>,
         });
-        let tracker = ConnectionTracker::new();
         let bound = BoundPorts::new();
         let table: Arc<Mutex<Arc<StreamTable>>> = Arc::default();
         let caps = CapsRegistry::new();
@@ -341,6 +362,7 @@ impl Harness {
             node: Mutex::new(NodeCapsRegions::new(1)),
             caps,
             listen,
+            tracked_at_report,
         }
     }
 
@@ -1876,4 +1898,34 @@ async fn per_backend_bytes_add_up_to_the_streams() {
         (upload, download),
         (stream.bytes_upload, stream.bytes_download)
     );
+}
+
+/// Story 12.9 D-k: the observer takes a connection's record, and a
+/// refused one's row, while the connection is still in the tracker, so
+/// a drain that waits for an empty tracker cannot stop with either in
+/// flight. Read at the moment of the report, not after, so the check
+/// depends on no timing: with the entry gone first it reads 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_and_a_refusal_reach_the_observer_before_their_entry_leaves_the_tracker() {
+    let mut h = Harness::new().await;
+    let (addr, _) = echo().await;
+    let mut s = stream();
+    s.source_deny_cidrs = vec!["127.0.0.4".into()];
+    h.set(s, vec![(backend("b1", addr), false)]);
+
+    let mut client = h.connect().await;
+    echo_once(&mut client, b"ping").await;
+    client.shutdown().await.unwrap();
+    assert!(read_to_end(&mut client).await.is_empty());
+    h.record().await;
+    let client = h.connect_from(4).await;
+    refused_at_accept(&mut h, client, StreamRefusal::SourceDenied).await;
+
+    let tracked = h.tracked_at_report.lock().unwrap().clone();
+    assert_eq!(tracked.len(), 2, "one record and one refusal: {tracked:?}");
+    assert!(
+        tracked.iter().all(|&entries| entries >= 1),
+        "a report found its connection already out of the tracker: {tracked:?}"
+    );
+    wait_until("the entries left", || h.tracker.is_empty()).await;
 }

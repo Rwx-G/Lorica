@@ -44,8 +44,8 @@ use lorica_stream::counters::{ConnectFailureKind, LinkCountersSnapshot, StreamCo
 use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
     Admission, BackendSelector, BreakerGate, ConnectOutcome, ConnectionObserver, ConnectionRecord,
-    ControlTransport, Engines, InProcessPeer, NodeCapsRegions, RefusalRecord, Resolve,
-    ResolveError, Resolved, ResolverCache, SelectionRequest, SourceGate, StreamCounters,
+    ConnectionTracker, ControlTransport, Engines, InProcessPeer, NodeCapsRegions, RefusalRecord,
+    Resolve, ResolveError, Resolved, ResolverCache, SelectionRequest, SourceGate, StreamCounters,
     StreamRuntime, StreamRuntimeHandle, StreamTable, StreamTableSource, UdpEngine, UdpEngineParts,
 };
 use lorica_worker::fd_passing::StreamProto;
@@ -206,10 +206,17 @@ struct Records {
     ended: mpsc::UnboundedSender<ConnectionRecord>,
     refused: mpsc::UnboundedSender<RefusalRecord>,
     outcomes: Arc<Mutex<Vec<(String, StreamProtocol, ConnectOutcome)>>>,
+    /// The runtime's tracker, known once the runtime is spawned.
+    tracker: Arc<std::sync::OnceLock<ConnectionTracker>>,
+    /// The entries the tracker held when each record arrived.
+    tracked_at_report: Arc<Mutex<Vec<usize>>>,
 }
 
 impl ConnectionObserver for Records {
     fn observe(&self, record: ConnectionRecord) {
+        if let Some(tracker) = self.tracker.get() {
+            self.tracked_at_report.lock().unwrap().push(tracker.len());
+        }
         let _ = self.ended.send(record);
     }
 
@@ -385,6 +392,8 @@ struct Harness {
     node: NodeCapsRegions,
     listens: Vec<SocketAddr>,
     seq: u64,
+    /// The tracker's entry count at each record the observer took.
+    tracked_at_report: Arc<Mutex<Vec<usize>>>,
 }
 
 impl Harness {
@@ -415,6 +424,8 @@ impl Harness {
         let (ended, records) = mpsc::unbounded_channel();
         let (refused, refusals) = mpsc::unbounded_channel();
         let outcomes = Arc::default();
+        let tracker: Arc<std::sync::OnceLock<ConnectionTracker>> = Arc::default();
+        let tracked_at_report = Arc::default();
         let engine = UdpEngine::new(UdpEngineParts {
             selector: Arc::clone(&selector) as Arc<dyn BackendSelector>,
             breaker: Arc::clone(&breaker) as Arc<dyn BreakerGate>,
@@ -424,6 +435,8 @@ impl Harness {
                 ended,
                 refused,
                 outcomes: Arc::clone(&outcomes),
+                tracker: Arc::clone(&tracker),
+                tracked_at_report: Arc::clone(&tracked_at_report),
             }),
             reserved_ports: None,
             source_gate: Arc::clone(&gate) as Arc<dyn SourceGate>,
@@ -457,6 +470,7 @@ impl Harness {
             Arc::new(FixedTable(table)),
         )
         .unwrap();
+        let _ = tracker.set(handle.tracker().clone());
         let mut harness = Harness {
             peer,
             handle,
@@ -469,6 +483,7 @@ impl Harness {
             node: NodeCapsRegions::new(1),
             listens: Vec::new(),
             seq: 0,
+            tracked_at_report,
         };
         for (n, (stream, _)) in streams.iter().enumerate() {
             if !without_region.contains(&stream.id.as_str()) {
@@ -672,6 +687,21 @@ async fn a_query_closes_on_its_answer_and_its_record_counts_datagrams() {
     h.record().await;
     assert_eq!(h.stats("dns").accepted, 2);
     h.stop();
+}
+
+/// Story 12.9 D-k: a session's record reaches the observer while the
+/// session is still in the tracker, so a drain waiting for an empty
+/// tracker cannot stop with the row in flight. Read at the moment of the
+/// report: with the entry gone first it reads 0, whatever the timing.
+#[tokio::test]
+async fn a_session_record_reaches_the_observer_before_its_entry_leaves_the_tracker() {
+    let b1 = UdpBackend::echo().await;
+    let mut h = Harness::one(udp_stream("dns", "127.0.0.1"), vec![backend("b1", b1.addr)]).await;
+    let c = client().await;
+    c.send_to(b"query", h.listen()).await.unwrap();
+    assert_eq!(reply(&c).await, b"query");
+    h.record().await;
+    assert_eq!(*h.tracked_at_report.lock().unwrap(), vec![1]);
 }
 
 #[tokio::test]

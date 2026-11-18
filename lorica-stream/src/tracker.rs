@@ -329,8 +329,19 @@ impl TrackedConnection {
 
     /// End the connection: the tracker's reason if it closed it,
     /// otherwise `natural`, the way the connection ended by itself.
-    pub fn finish(self, natural: StreamEndReason) -> StreamEndReason {
-        self.close_reason().unwrap_or(natural)
+    /// `report` is handed that reason while the entry is still
+    /// registered, and the entry leaves the tracker only once it
+    /// returns: a drain that waits for an empty tracker therefore never
+    /// stops while the connection's row or refusal is still on its way
+    /// to the observer (Story 12.9 D-k). Returns what `report` returns.
+    pub fn finish<R>(
+        self,
+        natural: StreamEndReason,
+        report: impl FnOnce(StreamEndReason) -> R,
+    ) -> R {
+        let reported = report(self.close_reason().unwrap_or(natural));
+        drop(self);
+        reported
     }
 }
 
@@ -400,7 +411,7 @@ mod tests {
         assert_eq!(other.close_reason(), None);
         assert_eq!(tracker.next_deadline(), None);
         assert_eq!(
-            conn.finish(StreamEndReason::ClientClose),
+            conn.finish(StreamEndReason::ClientClose, |reason| reason),
             StreamEndReason::ConfigRemoved
         );
         assert_eq!(tracker.len(), 1);
@@ -418,6 +429,39 @@ mod tests {
         assert_eq!(conn.closed().await, StreamEndReason::NodeShutdown);
     }
 
+    /// A drain watcher on another thread waits for the tracker to read
+    /// empty, then checks the end was reported. The report yields the
+    /// thread for a while before it completes: were the entry to leave
+    /// the tracker before the report ran, the watcher would see an empty
+    /// tracker during that yield and find nothing reported.
+    #[test]
+    fn the_end_is_reported_before_the_entry_leaves_the_tracker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tracker = ConnectionTracker::new();
+        let conn = tracker.register(1, stream("s"));
+        let reported = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (tracker, reported) = (tracker.clone(), Arc::clone(&reported));
+            std::thread::spawn(move || {
+                while !tracker.is_empty() {
+                    std::thread::yield_now();
+                }
+                reported.load(Ordering::SeqCst)
+            })
+        };
+        let reason = conn.finish(StreamEndReason::ClientClose, |reason| {
+            std::thread::sleep(Duration::from_millis(50));
+            reported.store(true, Ordering::SeqCst);
+            reason
+        });
+        assert_eq!(reason, StreamEndReason::ClientClose);
+        assert!(
+            watcher.join().expect("the watcher ends"),
+            "the tracker read empty before the end was reported"
+        );
+    }
+
     #[test]
     fn an_entry_ending_before_its_deadline_keeps_its_own_reason() {
         let tracker = ConnectionTracker::new();
@@ -428,7 +472,7 @@ mod tests {
             StreamEndReason::ConfigRemoved,
         );
         assert_eq!(
-            conn.finish(StreamEndReason::BackendClose),
+            conn.finish(StreamEndReason::BackendClose, |reason| reason),
             StreamEndReason::BackendClose
         );
         assert!(tracker.is_empty());

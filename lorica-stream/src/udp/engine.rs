@@ -544,18 +544,22 @@ impl Inner {
         let region = Arc::clone(session.region());
         drop(permit);
         stats.sessions_held(region.total(), max_sessions);
-        let reason = tracked.finish(natural);
-        stats.ended(reason.kind());
-        drop(active);
-        record.bytes_upload = forwarded.bytes_upload;
-        record.bytes_download = forwarded.bytes_download;
-        record.datagrams_upload = Some(forwarded.datagrams_upload);
-        record.datagrams_download = Some(forwarded.datagrams_download);
-        record.ended_at = Utc::now();
-        record.end_reason = reason;
-        // A refused session is a row through the refusal log, not a
-        // record (Story 12.6 D-j).
-        self.admission.ended(record);
+        // The record is handed over before the entry leaves the tracker
+        // (Story 12.9 D-k): a drain waiting for an empty tracker then
+        // never stops with a row still in flight.
+        tracked.finish(natural, |reason| {
+            stats.ended(reason.kind());
+            drop(active);
+            record.bytes_upload = forwarded.bytes_upload;
+            record.bytes_download = forwarded.bytes_download;
+            record.datagrams_upload = Some(forwarded.datagrams_upload);
+            record.datagrams_download = Some(forwarded.datagrams_download);
+            record.ended_at = Utc::now();
+            record.end_reason = reason;
+            // A refused session is a row through the refusal log, not a
+            // record (Story 12.6 D-j).
+            self.admission.ended(record);
+        });
     }
 
     /// Select a backend, admit it through the breaker, check it is not a

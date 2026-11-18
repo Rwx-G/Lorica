@@ -298,18 +298,22 @@ impl Inner {
             Err(refusal) => {
                 stats.refused(refusal);
                 close(&conn.stream);
-                let reason = conn.tracked.finish(StreamEndReason::Refused(refusal));
-                stats.ended(reason.kind());
-                self.admission.report(RefusalRecord {
-                    stream_id: snapshot.id.clone(),
-                    stream_name: snapshot.name.clone(),
-                    protocol: StreamProtocol::Tcp,
-                    listen_port: local.port(),
-                    client: peer,
-                    proxied_from: None,
-                    refusal,
-                    at: Utc::now(),
-                });
+                // Reported before the entry leaves the tracker, so a
+                // drain never ends with the refusal still in flight.
+                conn.tracked
+                    .finish(StreamEndReason::Refused(refusal), |reason| {
+                        stats.ended(reason.kind());
+                        self.admission.report(RefusalRecord {
+                            stream_id: snapshot.id.clone(),
+                            stream_name: snapshot.name.clone(),
+                            protocol: StreamProtocol::Tcp,
+                            listen_port: local.port(),
+                            client: peer,
+                            proxied_from: None,
+                            refusal,
+                            at: Utc::now(),
+                        });
+                    });
                 return;
             }
         };
@@ -370,15 +374,19 @@ impl Inner {
             ..
         } = live.conn;
         drop(admitted);
-        let reason = tracked.finish(natural);
-        stats.ended(reason.kind());
-        record.ended_at = Utc::now();
-        record.end_reason = reason;
-        // A refused connection is a row through the refusal log, not a
-        // record (D-j), and one that ended before forwarding passes the
-        // same log (Story 12.9 D-c): whoever connects chooses how often
-        // either happens.
-        self.admission.ended(record);
+        // The record is handed over before the entry leaves the tracker
+        // (Story 12.9 D-k): a drain waiting for an empty tracker then
+        // never stops with a row still in flight.
+        tracked.finish(natural, |reason| {
+            stats.ended(reason.kind());
+            record.ended_at = Utc::now();
+            record.end_reason = reason;
+            // A refused connection is a row through the refusal log, not
+            // a record (D-j), and one that ended before forwarding passes
+            // the same log (Story 12.9 D-c): whoever connects chooses how
+            // often either happens.
+            self.admission.ended(record);
+        });
     }
 
     /// Phases 2 to 4; returns the natural end reason. `trusted`: the
