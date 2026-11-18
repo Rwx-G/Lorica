@@ -13,6 +13,18 @@ Author: Rwx-G
 
 ### Changed
 
+### Fixed
+
+### Removed
+
+### Security
+
+## [1.10.8] - 2026-11-18
+
+Route compression works for the first time, the Logs page stops polling once it is left, the Cluster page, fleet bar and wide settings tables follow the theme and lay out, and `lettre` closes six SMTP advisories. No schema migration.
+
+### Changed
+
 - Dependencies refreshed: brotli 9.1.3, bytes 1.12.2, regex 1.13.2, clap 4.6.8, uuid 1.29.3, the AWS Route 53 client; dashboard tooling svelte 5.58, eslint 10.15, vitest 5.1.1.
 
 ### Fixed
@@ -23,8 +35,6 @@ Author: Rwx-G
 - **The Cluster page's buttons, status pills and break-glass banner look like the rest of the dashboard.** "Add node", the buttons of the add-node dialog and of the node panel, and the break-glass and leave controls carried a colour class without the shared button base, so they rendered as bare browser buttons. The add-node dialog now uses the dashboard's modal and form layout, and the node panel and dialog take their colours from the theme, so they no longer stay light in dark mode. The node status and connection pills are the dashboard's badges, and the break-glass banner, white text on a fixed amber that the dark theme left unreadable, is a tinted panel in the theme's colours.
 - **The fleet bar of a clustered node follows the theme and stands apart from the page.** The bar above every page of a control plane or follower drew its bottom rule and its read-only text in light-theme fallback colours, because it read theme variables that do not exist, and its node-count badge and break-glass notice in fixed light colours; the page content started right under it. It now uses the theme tokens and the shared badges, with space below it.
 - **The automation token, custom crawler and protection record tables no longer draw their last columns over each other.** Settings tables share fixed widths sized for four columns, so in these tables of five to seven columns the last ones had no width: on the automation tokens tab, "Last used" and the Revoke button sat on top of each other. Wider tables now size their columns from their content and scroll sideways when the window is narrow.
-
-### Removed
 
 ### Security
 
