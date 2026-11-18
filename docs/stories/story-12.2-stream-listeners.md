@@ -923,7 +923,9 @@ Allowlist: `docs/hot-upgrade.md`, `docs/installation.md`,
 bind-state and listen-address sections).
 Depends on: B for the crate lists; its final pass after H.
 
-- [ ] Every crate list of D-b, the README product-crate test count.
+- [x] Every crate list of D-b, the README product-crate test count.
+      (The test count moves at the 1.11.0 bump, with every other count
+      of the cycle, by the maintainer's call.)
 - [x] `worker_drain_timeout_s` and `stream_listen_socket_cap` as they now
       exist: `installation.md` (`TimeoutStopSec=90` is no longer "must
       exceed the drain": the stop keepalive extends it; systemd 236+),
@@ -936,7 +938,7 @@ Depends on: B for the crate lists; its final pass after H.
       its port).
 - [x] `worker-shared-state.md`: a section for the stream control channel
       (D-a), its flow control and its crash behaviour.
-- [ ] `FORK.md` and backlog #81 per D-l; `CHANGELOG.md` `[Unreleased]`
+- [x] `FORK.md` and backlog #81 per D-l; `CHANGELOG.md` `[Unreleased]`
       (Added: stream listeners, the two settings, the alert; Fixed:
       stops waited on a hard-coded delay and single-process mode did not
       drain HTTP).
@@ -1655,6 +1657,8 @@ the budget view stays Operator and SuperAdmin.
 
 - **Lot G, the parts in `docs/streams.md`, `README.md` and `CHANGELOG.md` (2026-11-18).** `docs/streams.md` (new) carries "Listeners and binding" (bind states, failure kinds and their retry, audit rows, the alert) and "The fd budget" (`B`, `H`, `S`, the four constraints, the budget view, the refusal, raising capacity), with the listen-address rule (`::` dual-stack and exclusive on its port, any other IPv6 literal IPv6-only) under "Concepts", and the stop path under "Configuration changes, stops and upgrades". Figures quoted are the constants' and the tests' (`packaged_limit_gives_the_documented_figures`). `CHANGELOG.md` `[Unreleased]`: Added (stream listeners and bind states, the fd budget and `stream_listen_socket_cap`, `worker_drain_timeout_s` and the stop drain) and Fixed (single-process mode drains HTTP on a stop); "a stop waited on a hard-coded delay" was already there. Still open in Lot G: the crate lists and the README product-crate test count, `FORK.md` and backlog #81, which still lists `5104a3e0` and `4a9d66d8` as deferred, so the last box (FORK.md, backlog, CHANGELOG) stays open though its CHANGELOG part is done. The `installation.md`, `hot-upgrade.md`, hardening-guide and `worker-shared-state.md` items the other documentation pass of this cycle covered (commit `11b46697` and those it names).
 
+- **Lot G closed, 2026-11-18.** Crate lists: `README.md` and `FORK.md` gain a `lorica-stream` row, the workspace counts in `README.md` and `CONTRIBUTING.md` move to 36 crates (20 product, 16 forked, from the members' versions), and the cross-dependency lines of `docs/BUMP-CHECKLIST.md` gain the pins the manifests carry (`lorica-adcs` and `lorica-stream` in `lorica` and `lorica-api`, `lorica-shmem` in `lorica-stream`); `docs/architecture/source-tree.md`, `docs/architecture/component-architecture.md` and `.claude/rules/lorica-project.md` already named both new crates, and the `run-tests` and `build-deb` skills read their lists from `ci.yml`. The README product-crate test count is left for the 1.11.0 bump, by the maintainer's call. `.claude/skills/bump-version/bump-checklist.md` still lacks `lorica-stream` and its pins: that file is not tracked by git, so it is for the maintainer to edit in the main checkout. D-l: the 1.10.5 sync row of `FORK.md` records `5104a3e0` and `4a9d66d8` as ruled out with D-l's reasons, and backlog #81 drops them. `CHANGELOG.md` already carried the Added and Fixed entries of the last box. Commits `61424e62`, `561f7be6`. D-f's claim about the e2e compose has a dated note and a task in Story 12.12 Lot A (`58493cb8`).
+
 ## File List
 
 - `lorica-worker/Cargo.toml` (nix `resource` feature)
@@ -1719,3 +1723,4 @@ the budget view stays Operator and SuperAdmin.
 | 2026-11-14 | 0.11 | Lot F implemented: the stream fd budget on the System page for Operators and above, stream bind states in the Cluster roster and node drawer, the pending node's stream ports, `worker_drain_timeout_s` and `stream_listen_socket_cap` in the global config tab. Status InProgress. | Romain G. |
 | 2026-11-18 | 0.12 | Lot G, security, operations and architecture part: the drain setting and the stop path in the installation, hot-upgrade and hardening documents, the stream control channel in `worker-shared-state.md`, `lorica-stream` in the source tree and the component architecture. The crate lists, `FORK.md`, backlog #81, `docs/streams.md` and `CHANGELOG.md` stay open. | Romain G. |
 | 2026-11-18 | 0.13 | Lot G, the `docs/streams.md`, README and CHANGELOG parts: bind states, the fd budget, the listen-address rule and the stop drain documented; the other Lot G items stay open. Status InProgress. | Romain G. |
+| 2026-11-18 | 0.14 | Lot G closed: `lorica-stream` in the crate lists, `5104a3e0` and `4a9d66d8` ruled out in `FORK.md` and dropped from backlog #81; a dated note under D-f on `stop_grace_period`. | Romain G. |
