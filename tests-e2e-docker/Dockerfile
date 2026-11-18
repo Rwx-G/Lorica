@@ -15,7 +15,10 @@ RUN pnpm run build
 FROM rust:1-bookworm AS builder
 RUN apt-get update && apt-get install -y cmake pkg-config libssl-dev libkrb5-dev libclang-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+# The toolchain the release builds with (Story 12.12 D-g), not whatever
+# stable rust:1-bookworm carries: rustup reads this file at the first
+# cargo call and installs the pinned version.
+COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY lorica/ lorica/
 COPY lorica-acme/ lorica-acme/
 COPY lorica-api/ lorica-api/
