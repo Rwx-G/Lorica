@@ -1,8 +1,10 @@
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/svelte';
+import { get } from 'svelte/store';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import { api, type BackendResponse } from '../lib/api';
 import { auth, type Role } from '../lib/auth';
+import { toasts } from '../lib/toast';
 import iv1Create from '../lib/stream-iv1-create.json';
 import { status, stream, udpSettings } from '../test-stream-fixtures';
 import StreamDrawer from './StreamDrawer.svelte';
@@ -139,6 +141,18 @@ describe('StreamDrawer (Story 12.10 Lot D2)', () => {
     const header = screen.getByLabelText('Stream badges');
     expect(within(header).getByText('local backend')).toBeInTheDocument();
     expect(within(header).getByText('failed bind')).toBeInTheDocument();
+  });
+
+  it('shows each warning of a save as a warning toast, apart from the saved one', async () => {
+    toasts.set([]);
+    const warning = 'port 5432 is not bound on node web01 yet';
+    vi.spyOn(api, 'updateStream').mockResolvedValue({ data: { ...stream(), warnings: [warning] } });
+    render(StreamDrawer, { props: props({ editing: stream() }) });
+    await fireEvent.click(screen.getByRole('button', { name: 'Update' }));
+    await waitFor(() => expect(get(toasts)).toHaveLength(2));
+    const [warned, saved] = get(toasts);
+    expect(warned).toMatchObject({ type: 'warning', message: expect.stringContaining(warning) });
+    expect(saved.type).toBe('success');
   });
 
   it('lets a Viewer read a stream but not save it', () => {

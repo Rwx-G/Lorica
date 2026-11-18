@@ -1,6 +1,10 @@
 import { writable } from 'svelte/store';
 
-export type ToastType = 'success' | 'error';
+/**
+ * `warning` is for a write that succeeded with something to read: the
+ * `warnings` an answer carries. It is not a softer `error`.
+ */
+export type ToastType = 'success' | 'warning' | 'error';
 
 export interface Toast {
   id: number;

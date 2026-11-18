@@ -51,6 +51,16 @@
     color: #fff;
   }
 
+  /* The badge pair, the -text colour on its -subtle tint, laid over an
+     opaque surface since a toast floats over whatever is under it.
+     app-contrast.test.ts reads this rule and holds it at WCAG AA. */
+  .toast-warning {
+    background-color: var(--color-bg-elevated);
+    background-image: linear-gradient(var(--color-orange-subtle), var(--color-orange-subtle));
+    color: var(--color-orange-text);
+    border: 1px solid var(--color-orange);
+  }
+
   .toast-error {
     background: var(--color-red, #ef4444);
     color: #fff;

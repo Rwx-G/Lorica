@@ -70,6 +70,25 @@ function token(theme: Map<string, Rgba>, name: string): Rgba {
   return value;
 }
 
+const toastCss = readFileSync(new URL('./components/Toast.svelte', import.meta.url), 'utf8');
+
+/** The declarations of `selector`'s rule in `css`. */
+function cssRule(css: string, selector: string): string {
+  const escaped = selector.replace(/[.]/g, '\\$&');
+  const block = new RegExp(`${escaped}\\s*\\{([^}]*)\\}`).exec(css);
+  if (!block) throw new Error(`no ${selector} rule`);
+  return block[1];
+}
+
+/** The colour tokens one property of a rule names, in order, at least one. */
+function declaredTokens(rule: string, property: string): string[] {
+  const declaration = new RegExp(`(?:^|[;\\s])${property}:\\s*([^;]+);`).exec(rule);
+  if (!declaration) throw new Error(`no ${property} in the rule`);
+  const names = [...new Set([...declaration[1].matchAll(/var\((--color-[\w-]+)\)/g)].map((m) => m[1]))];
+  if (names.length === 0) throw new Error(`${property} names no colour token`);
+  return names;
+}
+
 /** Every opaque surface a badge sits on, with and without row hover. */
 function surfaces(theme: Map<string, Rgba>): Rgba[] {
   const hover = token(theme, '--color-bg-hover');
@@ -100,5 +119,19 @@ describe.each(Object.entries(THEMES))('badge text contrast, %s theme', (_, theme
     for (const surface of surfaces(theme)) {
       expect(contrast(text, surface)).toBeGreaterThanOrEqual(AA);
     }
+  });
+
+  it('the warning toast holds AA on its own background', () => {
+    const rule = cssRule(toastCss, '.toast-warning');
+    const [base] = declaredTokens(rule, 'background-color');
+    const surface = token(theme, base);
+    // A toast floats over the page: a translucent base would let
+    // whatever is under it decide the contrast.
+    expect(surface[3]).toBe(1);
+    const background = declaredTokens(rule, 'background-image')
+      .map((name) => token(theme, name))
+      .reduce((under, layer) => over(layer, under), surface);
+    const [text] = declaredTokens(rule, 'color');
+    expect(contrast(token(theme, text), background)).toBeGreaterThanOrEqual(AA);
   });
 });

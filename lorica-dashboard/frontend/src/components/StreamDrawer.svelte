@@ -77,7 +77,7 @@
       activeTab = tab;
       return;
     }
-    for (const warning of res.data?.warnings ?? []) showToast(`Saved, with a warning: ${warning}`, 'success', 10_000);
+    for (const warning of res.data?.warnings ?? []) showToast(`Saved, with a warning: ${warning}`, 'warning', 10_000);
     showToast(editing ? `Stream ${editing.name} updated` : 'Stream created', 'success');
     await onsave();
     onclose();
