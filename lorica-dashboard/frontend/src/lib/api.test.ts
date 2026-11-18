@@ -353,6 +353,35 @@ describe('api.uploadUpgradeBinary', () => {
   });
 });
 
+describe('api.getUpgradePreview', () => {
+  it('calls GET /api/v1/system/upgrade/preview and returns the preview', async () => {
+    mockFetch({
+      drain_timeout_s: 120,
+      handoff_available: true,
+      previous_generation: { pid: 4242 },
+      streams: [
+        {
+          stream_id: 's-1',
+          name: 'postgres',
+          protocol: 'tcp',
+          established: 3,
+          on_upgrade: 'drain',
+          drains_on_upgrade: false,
+        },
+      ],
+      as_of: '2026-11-18T10:00:00Z',
+    });
+    const res = await api.getUpgradePreview();
+    expect(res.data?.drain_timeout_s).toBe(120);
+    expect(res.data?.previous_generation?.pid).toBe(4242);
+    expect(res.data?.streams[0].on_upgrade).toBe('drain');
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/system/upgrade/preview',
+      expect.objectContaining({ method: 'GET' }),
+    );
+  });
+});
+
 // ---- Settings API Tests ----
 
 const mockSettings = {

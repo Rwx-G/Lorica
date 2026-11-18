@@ -5,10 +5,12 @@
     api,
     isValidUpgradeSignatureHex,
     type ProxyInfo,
+    type UpgradePolicy,
+    type UpgradePreview,
     type UpgradeStageResult,
   } from '../../lib/api';
   import { formatBytes } from '../../lib/format';
-  import ConfirmDialog from '../ConfirmDialog.svelte';
+  import { modalFocus } from '../../lib/modal-focus';
 
   interface Props {
     expanded: boolean;
@@ -62,13 +64,58 @@
 
   let canSubmit = $derived(binaryFile !== null && signatureReady && !uploading);
 
+  // The node's upgrade preview, read each time the confirm dialog opens
+  // (Story 12.11 D-f).
+  let preview = $state<UpgradePreview | null>(null);
+  let previewLoading = $state(false);
+  let previewError = $state('');
+  // A preview answered after its dialog closed, or after a newer one
+  // opened, is dropped.
+  let previewRequest = 0;
+
+  let openStreams = $derived(preview ? preview.streams.filter((s) => s.established > 0) : []);
+
+  function onUpgradeLabel(policy: UpgradePolicy, drainS: number): string {
+    switch (policy) {
+      case 'drain':
+        return `Served for up to ${drainS} s, then closed`;
+      case 'relay_in_flight':
+        return 'Owed responses relayed, then closed';
+      case 'close':
+        return 'Closed at once';
+    }
+  }
+
+  async function loadPreview() {
+    const request = ++previewRequest;
+    preview = null;
+    previewError = '';
+    previewLoading = true;
+    const res = await api.getUpgradePreview();
+    if (request !== previewRequest) return;
+    if (res.error) {
+      previewError = res.error.message;
+    } else if (res.data) {
+      preview = res.data;
+    }
+    previewLoading = false;
+  }
+
   function requestUpgrade() {
     if (!canSubmit) return;
     confirming = true;
+    void loadPreview();
+  }
+
+  function onConfirmKeydown(e: KeyboardEvent) {
+    // Enter deliberately does not confirm: the upgrade replaces this
+    // process and cannot be undone from the dashboard.
+    if (e.key === 'Escape') cancelUpgrade();
   }
 
   async function confirmUpgrade() {
     confirming = false;
+    previewRequest++;
     if (binaryFile === null) return;
     uploading = true;
     result = null;
@@ -95,6 +142,7 @@
 
   function cancelUpgrade() {
     confirming = false;
+    previewRequest++;
   }
 </script>
 
@@ -109,9 +157,10 @@
         Upload a new, signed <code>lorica</code> executable to upgrade in
         place with no downtime. The server verifies the detached Ed25519
         signature against the configured signing key before staging the
-        binary, then hands off to the supervisor: in-flight connections
-        drain over up to 30 seconds while the replacement process takes
-        over the listening sockets.
+        binary, then hands off to the supervisor: the replacement process
+        takes over the listening sockets while the old one drains its open
+        connections for up to the drain timeout (Settings). The confirmation
+        shows this node's delay and the streams holding connections.
       </p>
 
       <h3>Running version</h3>
@@ -225,14 +274,86 @@
 </section>
 
 {#if confirming}
-  <ConfirmDialog
-    title="Start binary upgrade?"
-    message="The server will verify the signature, stage the new binary, then replace this process. In-flight traffic drains over up to 30 seconds while the new process takes over. This cannot be undone from the dashboard."
-    confirmLabel="Start upgrade"
-    confirmStyle="warning"
-    onconfirm={confirmUpgrade}
-    oncancel={cancelUpgrade}
-  />
+  <div
+    class="overlay"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="upgrade-confirm-title"
+    tabindex="-1"
+    onclick={(e) => { if (e.target === e.currentTarget) cancelUpgrade(); }}
+    onkeydown={onConfirmKeydown}
+    {@attach modalFocus}
+  >
+    <div class="modal upgrade-confirm" role="document" data-testid="upgrade-confirm">
+      <h2 id="upgrade-confirm-title">Start binary upgrade?</h2>
+      <p class="confirm-text">
+        The server will verify the signature, stage the new binary, then
+        replace this process. This cannot be undone from the dashboard.
+      </p>
+
+      {#if previewLoading}
+        <p class="hint" role="status">Reading this node's open connections...</p>
+      {:else if previewError}
+        <p class="hint" data-testid="upgrade-preview-error">
+          The upgrade preview could not be read ({previewError}). The upgrade
+          can still start.
+        </p>
+      {:else if preview}
+        {#if preview.previous_generation}
+          <p class="upgrade-warning" role="note" data-testid="upgrade-previous-generation">
+            An earlier generation (PID {preview.previous_generation.pid}) is
+            still draining from the previous upgrade. Upgrading again is
+            allowed: it keeps its connections until its own deadline, beside
+            this process and the new one.
+          </p>
+        {/if}
+        {#if preview.handoff_available}
+          <p class="confirm-text" data-testid="upgrade-drain">
+            Open connections drain for up to
+            <strong>{preview.drain_timeout_s} seconds</strong> (the drain
+            timeout in Settings) while the new process takes over, then the
+            old process closes what is still open.
+          </p>
+        {:else}
+          <p class="confirm-text" data-testid="upgrade-staged-only">
+            This node runs in single-process mode: the binary is staged and
+            takes effect on the next restart, with no live handoff.
+          </p>
+        {/if}
+        {#if openStreams.length > 0}
+          <div class="table-wrapper">
+            <table data-testid="upgrade-streams">
+              <thead>
+                <tr>
+                  <th>Stream</th>
+                  <th>Open</th>
+                  <th>On upgrade</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each openStreams as stream (stream.stream_id)}
+                  <tr>
+                    <td>{stream.name} <span class="protocol">{stream.protocol.toUpperCase()}</span></td>
+                    <td>{stream.established}</td>
+                    <td>{onUpgradeLabel(stream.on_upgrade, preview.drain_timeout_s)}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {:else if preview.streams.length > 0}
+          <p class="hint">No stream holds an open connection on this node.</p>
+        {/if}
+      {/if}
+
+      <div class="form-actions">
+        <button class="btn btn-cancel" onclick={cancelUpgrade} data-autofocus>Cancel</button>
+        <button class="btn btn-warning" onclick={confirmUpgrade} disabled={previewLoading}>
+          Start upgrade
+        </button>
+      </div>
+    </div>
+  </div>
 {/if}
 
 <style>
@@ -308,5 +429,44 @@
   .key-hint {
     margin: 0.5rem 0 0;
     font-size: 0.8125rem;
+  }
+  .confirm-text {
+    color: var(--color-text-muted);
+    font-size: 0.875rem;
+    line-height: 1.5;
+    margin: 0 0 0.75rem;
+  }
+  /* The warning toast's pair (Toast.svelte, held at WCAG AA by
+     app-contrast.test.ts): the -text colour on the -subtle tint over the
+     elevated surface, which is the modal's own background. */
+  .upgrade-warning {
+    background-color: var(--color-bg-elevated);
+    background-image: linear-gradient(var(--color-orange-subtle), var(--color-orange-subtle));
+    color: var(--color-orange-text);
+    border: 1px solid var(--color-orange);
+    border-radius: var(--radius-md);
+    padding: 0.5rem 0.75rem;
+    font-size: 0.8125rem;
+    line-height: 1.45;
+    margin: 0 0 0.75rem;
+  }
+  .upgrade-confirm td {
+    font-size: var(--text-sm);
+  }
+  .protocol {
+    font-size: var(--text-xs);
+    color: var(--color-text-muted);
+    margin-left: 0.25rem;
+  }
+  .upgrade-confirm .btn-warning {
+    background: var(--color-orange, #f59e0b);
+    color: white;
+  }
+  .upgrade-confirm .btn-warning:hover:not(:disabled) {
+    background: #d97706;
+  }
+  .upgrade-confirm .btn-warning:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 </style>

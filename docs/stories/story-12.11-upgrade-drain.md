@@ -621,10 +621,10 @@ Allowlist:
 one exists or a new one beside it.
 Depends on: D.
 
-- [ ] Preview loaded on dialog open; drain delay from the response; the
+- [x] Preview loaded on dialog open; drain delay from the response; the
       streams table; the previous-generation warning; the stale
       "30 seconds" text gone from both places.
-- [ ] Vitest: the dialog text uses the response's delay; an empty
+- [x] Vitest: the dialog text uses the response's delay; an empty
       stream list shows no table; the warning appears with
       `previous_generation`.
 - [ ] Gates of `lorica-frontend.md`; light and dark checked by eye before
@@ -1155,6 +1155,36 @@ the `ci.yml` cargo lines in order): fmt, workspace clippy with
 `lorica --features otel` (library 547, binary 252), the forked crates,
 the rustls line and `cargo audit`, all clean.
 
+**Lot E, how it is built.**
+
+- `api.ts`: `UpgradePolicy`, `UpgradePreviewStream`, `UpgradePreview`
+  and `api.getUpgradePreview()`.
+- `BinaryUpgradeTab.svelte`: the shared `ConfirmDialog` takes a message
+  string only and is outside the allowlist, so the tab renders its own
+  modal on the `AdcsIssueConfirm` pattern (`.overlay`, `.modal`,
+  `modalFocus`, Escape cancels, Enter does not confirm: the upgrade
+  cannot be undone from the dashboard). Opening it loads the preview;
+  an answer that arrives after the dialog closed or reopened is
+  dropped. It shows the drain delay from the response (or, on a
+  single-process node, that the binary is only staged), a table of the
+  streams with `established > 0` (name and protocol, open count, what
+  the upgrade does in words derived from `on_upgrade` and the delay), a
+  line when bound streams hold nothing open, and the previous-generation
+  warning. A preview that cannot be read is said in one line and does
+  not block "Start upgrade", which is disabled only while it loads.
+- The warning uses the warning toast's pair (`--color-orange-text` on
+  `--color-orange-subtle` over `--color-bg-elevated`, with the
+  `--color-orange` border), the one `app-contrast.test.ts` holds at AA;
+  `.modal`'s own background is `--color-bg-elevated`, so the pair is
+  rendered exactly as tested.
+- The section hint no longer says "up to 30 seconds"; it names the
+  drain timeout in Settings and says the confirmation shows the delay.
+
+**Lot E gates** (Docker `node:22`, `pnpm install --frozen-lockfile` on a
+copy of the frontend): `npm run check` 0 errors 0 warnings, `npm run
+lint` clean, Vitest 60 files, 1,016 tests, all passing. Light and dark
+themes not checked by eye: no browser in the agent environment.
+
 **Lot C gates** (Docker `rust:1-bookworm`, `CARGO_BUILD_WARNINGS=deny`,
 the `ci.yml` cargo lines in order): fmt, workspace clippy with
 `lorica/otel`, the product crates (3,712 tests), `lorica --features
@@ -1178,6 +1208,9 @@ otel` (989), the forked crates (915), the rustls line (592) and
 - `lorica-api/openapi.yaml` (the preview path, `UpgradePreview`, `UpgradePreviewStream`, Lot D)
 - `lorica-api/src/tests.rs` (preview tests, Lot D)
 - `lorica/src/cli.rs`, `lorica/src/main.rs` (`lorica upgrade` prints the preview, `--preview`, Lot D)
+- `lorica-dashboard/frontend/src/components/settings-tabs/BinaryUpgradeTab.svelte` (the confirm dialog shows the preview, Lot E)
+- `lorica-dashboard/frontend/src/components/settings-tabs/BinaryUpgradeTab.test.ts` (new, Lot E)
+- `lorica-dashboard/frontend/src/lib/api.ts`, `api.test.ts` (`getUpgradePreview` and its types, Lot E)
 - `lorica-api/src/shutdown.rs`, `server.rs`, `automation/listener.rs`, `logs.rs`, `loadtest.rs` (API connections and WebSockets end on the shutdown, Lot C)
 - `lorica-bench/src/active_probes.rs`, `scheduler.rs`, `passive_sla/{collector,persistence,stream,tests}.rs` (loops stop on the shutdown, SLA `flush_all`, Lot C)
 - `lorica/src/startup/mod.rs`, `single.rs`, `worker.rs`, `lorica/src/reload.rs` (loops stop on the shutdown, SLA flushed at exit, Lot C)
@@ -1211,3 +1244,4 @@ otel` (989), the forked crates (915), the rustls line (592) and
 | 2026-11-18 | 0.5 | Lot B2: the drain watcher closes leftovers with the quiesce's end reason, returns `DrainOutcome { end, http_cut }`, and on an upgrade logs the per-stream closes at the deadline and sends the worker's drain report before `exit`, never blocking on it; `DrainEnd` is the wire's. | Romain G. |
 | 2026-11-18 | 0.6 | Lot C: the old supervisor stops its APIs and health loop at the handoff, reads `worker_drain_timeout_s` once, quiesces its workers for the upgrade, waits the drain plus the kill margin off the runtime threads, collects the workers' drain reports and writes the generation's report; UDP slot sockets ride the handoff and are adopted slot by slot or closed and rebound; the new supervisor reads the report, records `lorica_hot_upgrade_stream_connections_total`, the drain histogram (buckets to 3,600 s) and `drain_timeout`, and keeps `previous_generation` for the preview; a quiesced plane binds nothing more. | Romain G. |
 | 2026-11-18 | 0.7 | Lot D: `GET /api/v1/system/upgrade/preview` at the upload's SuperAdmin floor, pulling the workers' counters first: the stored drain delay, `handoff_available`, a draining previous generation, and per bound stream its open connections from the 12.9 aggregate and `upgrade_policy()`; published in `openapi.yaml`; `lorica upgrade` prints it to stderr before uploading and `--preview` prints it alone. | Romain G. |
+| 2026-11-18 | 0.8 | Lot E: the Binary Upgrade confirmation loads the preview when it opens, states the drain delay from the setting instead of "up to 30 seconds", lists the streams holding connections and what the upgrade does to them, says a single-process node only stages, and warns of a previous generation still draining in the warning toast's colours; Enter no longer confirms. | Romain G. |

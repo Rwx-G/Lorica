@@ -1107,6 +1107,37 @@ export interface UpgradeStageResult {
   handoff: UpgradeHandoff;
 }
 
+/// What a hot upgrade does to a stream's open connections or sessions
+/// (Story 12.11 D-c, D-e): `drain` serves them until they end or the
+/// drain delay runs out, `relay_in_flight` relays the UDP responses
+/// already owed then ends each session, `close` ends every session at
+/// once.
+export type UpgradePolicy = 'drain' | 'relay_in_flight' | 'close';
+
+/// One stream this node binds, in an upgrade preview.
+export interface UpgradePreviewStream {
+  stream_id: string;
+  name: string;
+  protocol: StreamProtocol;
+  /// Connections (TCP) or sessions (UDP) open on this node now.
+  established: number;
+  on_upgrade: UpgradePolicy;
+  drains_on_upgrade: boolean;
+}
+
+/// `GET /api/v1/system/upgrade/preview` (Story 12.11 D-f): what an
+/// upgrade started now would do on the node that answers.
+export interface UpgradePreview {
+  /// The stored `worker_drain_timeout_s`, the drain the old binary applies.
+  drain_timeout_s: number;
+  /// False in single-process mode: the upload only stages the binary.
+  handoff_available: boolean;
+  /// An earlier generation still draining from the previous upgrade.
+  previous_generation: { pid: number } | null;
+  streams: UpgradePreviewStream[];
+  as_of: string;
+}
+
 /// A detached Ed25519 signature is the 64-byte sig hex-encoded, i.e.
 /// exactly 128 lower/upper-case hex characters. Validate client-side so
 /// the operator gets immediate feedback before the multipart upload.
@@ -2052,6 +2083,10 @@ export const api = {
     }
     return { data: json.data as UpgradeStageResult };
   },
+
+  // Story 12.11 D-f, SuperAdmin like the upload it previews.
+  getUpgradePreview: () =>
+    request<UpgradePreview>('GET', '/system/upgrade/preview'),
 
   // Settings
   getSettings: () =>
