@@ -40,21 +40,27 @@
 //!    to `ready.sock` until it receives an "ack" back (or its deadline
 //!    elapses, in which case it exits so the old rolls back cleanly).
 //! 4. Old: wait up to 10 s for the readiness datagram while watching the
-//!    child for an early exit. On ready -> ack the new side, drain
-//!    workers, record the metrics, exit(0). On early exit / timeout ->
-//!    roll back (kill the child, quarantine the staged binary, resume).
+//!    child for an early exit. On ready -> ack the new side, stop
+//!    serving the APIs, quiesce the workers for the upgrade and drain
+//!    them for `worker_drain_timeout_s`, write the drain report, exit(0)
+//!    (Story 12.11 D-b). On early exit / timeout -> roll back (kill the
+//!    child, quarantine the staged binary, resume).
 //! 5. New: only AFTER the ack does it `sd_notify` `READY=1` +
 //!    `MAINPID=<newpid>` (systemd main-PID handover) and record the
 //!    terminal `completed` outcome. Deferring the MAINPID reassignment
 //!    until the old has committed to draining is what prevents a lost
 //!    readiness datagram from stranding systemd on a killed PID (H3).
+//!    It then waits for the old generation's [`DrainReport`] and records
+//!    the drain's metrics, which the old process's registry would lose.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::os::fd::{IntoRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use lorica_config::models::GlobalSettings;
 use lorica_core::server::Fds;
 
 use super::fd_transfer;
@@ -194,9 +200,6 @@ fn parse_stream_tcp_key(rest: &str) -> Option<(String, u64, SocketAddr)> {
 }
 
 /// `Fds` table key of one UDP stream slot socket.
-// Produced by the stream plane's UDP handoff (Story 12.11 Lot C); until
-// it lands nothing sends this family.
-#[allow(dead_code)]
 pub fn stream_udp_fds_key(stream_id: &str, bind_gen: u64, slot: u32, addr: SocketAddr) -> String {
     format!("{STREAM_UDP_KEY_PREFIX}{stream_id}:{bind_gen}:{slot}:{addr}")
 }
@@ -224,8 +227,6 @@ fn parse_stream_udp_key(rest: &str) -> Option<(String, u64, u32, SocketAddr)> {
 }
 
 /// One UDP stream slot socket crossing a hot upgrade.
-// Read by the stream plane's UDP adoption (Story 12.11 Lot C).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamUdpFd {
     /// The stream it serves.
@@ -251,6 +252,15 @@ pub struct StreamTcpFd {
     pub addr: SocketAddr,
     /// The listening socket.
     pub fd: RawFd,
+}
+
+/// The stream sockets an outgoing supervisor hands over.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamHandoffFds {
+    /// One per TCP stream listener.
+    pub tcp: Vec<StreamTcpFd>,
+    /// One per UDP slot socket: every slot of every port of each group.
+    pub udp: Vec<StreamUdpFd>,
 }
 
 /// `Fds` table key for the automation listener bound at `bind_addr`:
@@ -301,8 +311,9 @@ pub enum RollbackReason {
     /// The new process exited before signalling ready, or never signalled
     /// ready within [`READY_DEADLINE`].
     ExecFailed,
-    /// The connection drain on the (otherwise successful) handoff exceeded
-    /// its window and stragglers were force-killed.
+    /// Not a rollback: the (otherwise successful) handoff's drain reached
+    /// `worker_drain_timeout_s` with traffic still open, as the outgoing
+    /// generation's [`DrainReport`] says. Shares this enum for its label.
     DrainTimeout,
 }
 
@@ -385,10 +396,8 @@ pub struct InheritedListeners {
     /// TCP stream listeners (Story 12.2 D-j), adopted by the stream
     /// plane before its first reconcile.
     pub stream_tcp: Vec<StreamTcpFd>,
-    /// UDP stream slot sockets (Story 12.11 D-e).
-    // Adopted slot by slot by the stream plane (Story 12.11 Lot C); no
-    // outgoing supervisor sends them before that lands.
-    #[allow(dead_code)]
+    /// UDP stream slot sockets (Story 12.11 D-e), adopted slot by slot
+    /// by the stream plane before its first reconcile.
     pub stream_udp: Vec<StreamUdpFd>,
 }
 
@@ -396,15 +405,16 @@ pub struct InheritedListeners {
 /// keyed by its bind address, the management listener under the
 /// [`MANAGEMENT_KEY_PREFIX`] key, each cluster listener (when present)
 /// under its role-qualified [`CLUSTER_KEY_PREFIX`] key, and the
-/// automation listener under its [`AUTOMATION_KEY_PREFIX`] key, and each
-/// TCP stream listener under its [`STREAM_TCP_KEY_PREFIX`] key.
+/// automation listener under its [`AUTOMATION_KEY_PREFIX`] key, each
+/// TCP stream listener under its [`STREAM_TCP_KEY_PREFIX`] key and each
+/// UDP stream slot socket under its [`STREAM_UDP_KEY_PREFIX`] key.
 fn build_fds_table(
     proxy: &[(String, RawFd)],
     management_fd: RawFd,
     management_port: u16,
     cluster: &[(ClusterListenerRole, String, RawFd)],
     automation: &[(String, RawFd)],
-    stream_tcp: &[StreamTcpFd],
+    streams: &StreamHandoffFds,
 ) -> Fds {
     let mut fds = Fds::new();
     for (addr, fd) in proxy {
@@ -417,8 +427,14 @@ fn build_fds_table(
     for (bind, fd) in automation {
         fds.add(automation_fds_key(bind), *fd);
     }
-    for s in stream_tcp {
+    for s in &streams.tcp {
         fds.add(stream_tcp_fds_key(&s.stream_id, s.bind_gen, s.addr), s.fd);
+    }
+    for s in &streams.udp {
+        fds.add(
+            stream_udp_fds_key(&s.stream_id, s.bind_gen, s.slot, s.addr),
+            s.fd,
+        );
     }
     fds
 }
@@ -437,7 +453,7 @@ pub fn serve_listener_fds_blocking(
     management_port: u16,
     cluster: &[(ClusterListenerRole, String, RawFd)],
     automation: &[(String, RawFd)],
-    stream_tcp: &[StreamTcpFd],
+    streams: &StreamHandoffFds,
 ) -> Result<(), String> {
     let table = build_fds_table(
         proxy,
@@ -445,7 +461,7 @@ pub fn serve_listener_fds_blocking(
         management_port,
         cluster,
         automation,
-        stream_tcp,
+        streams,
     );
     let sock = transfer_sock_path(data_dir);
     fd_transfer::send_table(&table, &sock)
@@ -763,8 +779,9 @@ pub struct HandoffArgs {
     /// Automation-API listeners (bind address, FD) to hand over, when
     /// the node runs with `--automation-listen` (Story 10.3).
     pub automation_fds: Vec<(String, RawFd)>,
-    /// TCP stream listeners to hand over (Story 12.2 D-j).
-    pub stream_tcp_fds: Vec<StreamTcpFd>,
+    /// Stream sockets to hand over: the TCP listeners (Story 12.2 D-j)
+    /// and the UDP slot sockets (Story 12.11 D-e).
+    pub stream_fds: StreamHandoffFds,
     /// Full argv for the new binary, `argv[0]` first.
     pub child_argv: Vec<String>,
 }
@@ -821,7 +838,7 @@ pub async fn run_old_side_handoff(args: HandoffArgs) -> HandoffRun {
     let serve_port = args.management_port;
     let serve_cluster = args.cluster_fds.clone();
     let serve_automation = args.automation_fds.clone();
-    let serve_stream_tcp = args.stream_tcp_fds.clone();
+    let serve_streams = args.stream_fds.clone();
     let serve_task = tokio::task::spawn_blocking(move || {
         serve_listener_fds_blocking(
             &serve_data_dir,
@@ -830,7 +847,7 @@ pub async fn run_old_side_handoff(args: HandoffArgs) -> HandoffRun {
             serve_port,
             &serve_cluster,
             &serve_automation,
-            &serve_stream_tcp,
+            &serve_streams,
         )
     });
 
@@ -863,6 +880,226 @@ pub async fn run_old_side_handoff(args: HandoffArgs) -> HandoffRun {
         child: Some(child),
         serve_task,
     }
+}
+
+// ---- The generation drain report (Story 12.11 D-g) ----
+//
+// The outgoing supervisor's registry dies with it, so what its drain did
+// travels to the new generation as a file: written once its workers are
+// gone, read by the new supervisor, which records the metrics and
+// deletes it.
+
+/// How long a new supervisor waits for its predecessor's drain report,
+/// and how old a report addressed to another process must be before a
+/// starting supervisor deletes it: the longest drain, the kill margin,
+/// and a minute for the old side to collect and write.
+pub const DRAIN_REPORT_WAIT: Duration = Duration::from_secs(
+    GlobalSettings::WORKER_DRAIN_TIMEOUT_MAX_S as u64
+        + crate::startup::drain::WORKER_KILL_MARGIN.as_secs()
+        + 60,
+);
+
+/// How often the new supervisor looks for its predecessor's report.
+pub const DRAIN_REPORT_POLL: Duration = Duration::from_secs(1);
+
+const DRAIN_REPORT_PREFIX: &str = "drain-report.";
+const DRAIN_REPORT_SUFFIX: &str = ".json";
+const DRAIN_REPORT_TMP_SUFFIX: &str = ".json.tmp";
+
+/// `<data_dir>/upgrade/drain-report.<new_pid>.json`: the report the
+/// generation that handed over to `new_pid` writes for it.
+pub fn drain_report_path(data_dir: &Path, new_pid: u32) -> PathBuf {
+    upgrade_dir(data_dir).join(format!(
+        "{DRAIN_REPORT_PREFIX}{new_pid}{DRAIN_REPORT_SUFFIX}"
+    ))
+}
+
+/// How a generation's drain ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationDrainEnd {
+    /// Every worker ran out of traffic before the deadline.
+    Idle,
+    /// A worker reached the deadline and closed what was left.
+    Deadline,
+    /// A worker outlived the deadline and its margin and was SIGKILLed.
+    Killed,
+}
+
+impl GenerationDrainEnd {
+    /// Whether the drain reached `worker_drain_timeout_s` with traffic
+    /// still open, which `lorica_hot_upgrade_total{outcome="drain_timeout"}`
+    /// counts.
+    pub fn reached_the_deadline(self) -> bool {
+        matches!(
+            self,
+            GenerationDrainEnd::Deadline | GenerationDrainEnd::Killed
+        )
+    }
+
+    /// The token the summary log line uses, the serialized form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GenerationDrainEnd::Idle => "idle",
+            GenerationDrainEnd::Deadline => "deadline",
+            GenerationDrainEnd::Killed => "killed",
+        }
+    }
+}
+
+/// One stream's counts in a drain report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StreamDrainCounts {
+    /// Connections and sessions the upgrade ended, `drained_by_upgrade`.
+    pub closed: u64,
+    /// Those the upgrade marked draining that ended on their own.
+    pub finished: u64,
+}
+
+/// What an outgoing generation's drain did, as its supervisor writes it
+/// for the new one.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DrainReport {
+    /// The outgoing supervisor.
+    pub old_pid: u32,
+    /// The supervisor it handed over to, which the file is addressed to.
+    pub new_pid: u32,
+    /// `worker_drain_timeout_s` as read at the handoff.
+    pub drain_timeout_s: u64,
+    /// From the SIGTERM to the last worker's exit.
+    pub drain_secs: f64,
+    /// How the drain ended.
+    pub end: GenerationDrainEnd,
+    /// Workers that sent no `drained_end`: killed, crashed, or whose
+    /// channel was full. Their streams are counted from what they sent.
+    pub workers_unreported: u32,
+    /// HTTP requests in flight at the deadline, cut by the exits.
+    pub http_cut: u64,
+    /// Per stream id, summed over the workers.
+    pub streams: BTreeMap<String, StreamDrainCounts>,
+}
+
+/// Write `report` where its new supervisor reads it, 0600, through a
+/// temp file and a rename so the reader never sees half of it.
+pub fn write_drain_report(data_dir: &Path, report: &DrainReport) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let path = drain_report_path(data_dir, report.new_pid);
+    let tmp = path.with_extension("json.tmp");
+    let body = serde_json::to_vec(report).map_err(std::io::Error::other)?;
+    let _ = std::fs::remove_file(&tmp);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(&body)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+/// The report addressed to `new_pid`, or `None` while there is none.
+pub fn read_drain_report(data_dir: &Path, new_pid: u32) -> std::io::Result<Option<DrainReport>> {
+    let body = match std::fs::read(drain_report_path(data_dir, new_pid)) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// The pid a report file name is addressed to, the finished file or its
+/// temp file alike.
+fn drain_report_addressee(file_name: &str) -> Option<u32> {
+    let rest = file_name.strip_prefix(DRAIN_REPORT_PREFIX)?;
+    let pid = rest
+        .strip_suffix(DRAIN_REPORT_TMP_SUFFIX)
+        .or_else(|| rest.strip_suffix(DRAIN_REPORT_SUFFIX))?;
+    pid.parse().ok()
+}
+
+/// Delete the report files left by a crash: those addressed to another
+/// process than `self_pid` and last written more than `max_age` ago. A
+/// younger one is never touched, since a chained upgrade's new
+/// supervisor may still be waiting for it. Returns what was deleted.
+pub fn remove_stale_drain_reports(
+    data_dir: &Path,
+    self_pid: u32,
+    max_age: Duration,
+) -> std::io::Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(upgrade_dir(data_dir)) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut removed = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(addressee) = name.to_str().and_then(drain_report_addressee) else {
+            continue;
+        };
+        if addressee == self_pid {
+            continue;
+        }
+        let age = entry
+            .metadata()?
+            .modified()?
+            .elapsed()
+            .unwrap_or(Duration::ZERO);
+        if age > max_age {
+            std::fs::remove_file(entry.path())?;
+            removed.push(entry.path());
+        }
+    }
+    Ok(removed)
+}
+
+/// What [`record_drain_report`] did with a report's streams.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordedDrain {
+    /// Streams whose counts were recorded.
+    pub recorded: Vec<String>,
+    /// Streams the node's table no longer holds: logged, not recorded,
+    /// so no series outlives its stream.
+    pub skipped: Vec<String>,
+}
+
+/// Record `report` in this process's registry, the new generation's:
+/// `lorica_hot_upgrade_stream_connections_total` for every stream `held`
+/// accepts, `lorica_hot_upgrade_drain_seconds`, and
+/// `lorica_hot_upgrade_total{outcome="drain_timeout"}` when the drain
+/// reached the deadline.
+pub fn record_drain_report(report: &DrainReport, held: impl Fn(&str) -> bool) -> RecordedDrain {
+    use lorica_api::metrics::{
+        observe_hot_upgrade_drain, record_hot_upgrade, record_hot_upgrade_stream_connections,
+        HotUpgradeStreamOutcome,
+    };
+
+    let mut out = RecordedDrain::default();
+    for (stream_id, counts) in &report.streams {
+        if !held(stream_id) {
+            out.skipped.push(stream_id.clone());
+            continue;
+        }
+        for outcome in HotUpgradeStreamOutcome::ALL {
+            let connections = match outcome {
+                HotUpgradeStreamOutcome::Drained => counts.closed,
+                HotUpgradeStreamOutcome::Finished => counts.finished,
+            };
+            record_hot_upgrade_stream_connections(stream_id, outcome, connections);
+        }
+        out.recorded.push(stream_id.clone());
+    }
+    observe_hot_upgrade_drain(report.drain_secs);
+    if report.end.reached_the_deadline() {
+        record_hot_upgrade(RollbackReason::DrainTimeout.metric_outcome());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -974,7 +1211,7 @@ mod tests {
             9443,
             &[],
             &automation,
-            &[],
+            &no_streams(),
         );
         let (keys, fds) = table.serialize();
         let mut inherited = partition_inherited_fds(keys, fds, 9443).expect("partition succeeds");
@@ -1003,7 +1240,7 @@ mod tests {
         assert_eq!(produced.len(), 1);
         assert_eq!(produced[0].0, bind.to_string());
 
-        let table = build_fds_table(&[], 12, 9443, &[], &produced, &[]);
+        let table = build_fds_table(&[], 12, 9443, &[], &produced, &no_streams());
         let (keys, fds) = table.serialize();
         let inherited = partition_inherited_fds(keys, fds, 9443).expect("partition succeeds");
         assert_eq!(inherited.automation, produced);
@@ -1036,7 +1273,7 @@ mod tests {
             9443,
             &cluster,
             &[],
-            &[],
+            &no_streams(),
         );
         let (keys, fds) = table.serialize();
         let mut inherited = partition_inherited_fds(keys, fds, 9443).expect("partition succeeds");
@@ -1119,13 +1356,26 @@ mod tests {
             9443,
             &[],
             &[],
-            &streams,
+            &tcp_streams(&streams),
         );
         let (keys, fds) = table.serialize();
         let mut inherited = partition_inherited_fds(keys, fds, 9443).expect("partition succeeds");
         assert_eq!(inherited.proxy, vec![("0.0.0.0:8080".to_string(), 10)]);
         inherited.stream_tcp.sort_by_key(|s| s.fd);
         assert_eq!(inherited.stream_tcp, streams);
+    }
+
+    /// The stream part of a table that holds no stream.
+    fn no_streams() -> StreamHandoffFds {
+        StreamHandoffFds::default()
+    }
+
+    /// The stream part of a table that holds the TCP listeners `tcp`.
+    fn tcp_streams(tcp: &[StreamTcpFd]) -> StreamHandoffFds {
+        StreamHandoffFds {
+            tcp: tcp.to_vec(),
+            udp: Vec::new(),
+        }
     }
 
     #[test]
@@ -1166,7 +1416,7 @@ mod tests {
             9443,
             &[],
             &[],
-            stream_tcp,
+            &tcp_streams(stream_tcp),
         )
         .expect("the old side serves the table");
         receiver
@@ -1284,18 +1534,192 @@ mod tests {
                 fd: 82,
             },
         ];
-        let mut keys = vec!["0.0.0.0:8080".to_string()];
-        keys.extend(
-            slots
-                .iter()
-                .map(|s| stream_udp_fds_key(&s.stream_id, s.bind_gen, s.slot, s.addr)),
+        // Through the producer, as `HandoffArgs::stream_fds` carries them.
+        let streams = StreamHandoffFds {
+            tcp: Vec::new(),
+            udp: slots.clone(),
+        };
+        let table = build_fds_table(
+            &[("0.0.0.0:8080".to_string(), 10)],
+            12,
+            9443,
+            &[],
+            &[],
+            &streams,
         );
-        let mut fds = vec![10];
-        fds.extend(slots.iter().map(|s| s.fd));
-        let inherited = partition_inherited_fds(keys, fds, 9443).expect("partition succeeds");
+        let (keys, fds) = table.serialize();
+        let mut inherited = partition_inherited_fds(keys, fds, 9443).expect("partition succeeds");
         assert_eq!(inherited.proxy, vec![("0.0.0.0:8080".to_string(), 10)]);
         assert!(inherited.stream_tcp.is_empty());
+        inherited.stream_udp.sort_by_key(|s| s.fd);
         assert_eq!(inherited.stream_udp, slots);
+    }
+
+    fn report(new_pid: u32, end: GenerationDrainEnd) -> DrainReport {
+        DrainReport {
+            old_pid: 100,
+            new_pid,
+            drain_timeout_s: 120,
+            drain_secs: 42.5,
+            end,
+            workers_unreported: 1,
+            http_cut: 3,
+            streams: BTreeMap::from([
+                (
+                    "s1211c-db".to_string(),
+                    StreamDrainCounts {
+                        closed: 2,
+                        finished: 5,
+                    },
+                ),
+                (
+                    "s1211c-gone".to_string(),
+                    StreamDrainCounts {
+                        closed: 1,
+                        finished: 0,
+                    },
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn a_drain_report_round_trips_through_its_file_owner_only() {
+        let data_dir = tempfile::tempdir().expect("test data dir");
+        std::fs::create_dir(upgrade_dir(data_dir.path())).expect("test upgrade dir");
+        assert_eq!(read_drain_report(data_dir.path(), 4242).unwrap(), None);
+
+        let sent = report(4242, GenerationDrainEnd::Deadline);
+        let path = write_drain_report(data_dir.path(), &sent).expect("the report is written");
+
+        assert_eq!(path, drain_report_path(data_dir.path(), 4242));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(
+            read_drain_report(data_dir.path(), 4242).unwrap(),
+            Some(sent)
+        );
+        assert_eq!(
+            read_drain_report(data_dir.path(), 4243).unwrap(),
+            None,
+            "a report is read by the process it is addressed to only"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(upgrade_dir(data_dir.path()))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "no temp file left: {leftovers:?}");
+    }
+
+    #[test]
+    fn a_drain_report_end_serializes_as_its_token() {
+        for end in [
+            GenerationDrainEnd::Idle,
+            GenerationDrainEnd::Deadline,
+            GenerationDrainEnd::Killed,
+        ] {
+            assert_eq!(
+                serde_json::to_value(end).unwrap(),
+                serde_json::Value::from(end.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn stale_report_deletion_spares_a_young_file_and_our_own() {
+        let data_dir = tempfile::tempdir().expect("test data dir");
+        std::fs::create_dir(upgrade_dir(data_dir.path())).expect("test upgrade dir");
+        let age = |path: &Path, ago: Duration| {
+            let file = std::fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(std::time::SystemTime::now() - ago)
+                .unwrap();
+        };
+        let old_other =
+            write_drain_report(data_dir.path(), &report(11, GenerationDrainEnd::Idle)).unwrap();
+        let young_other =
+            write_drain_report(data_dir.path(), &report(12, GenerationDrainEnd::Idle)).unwrap();
+        let old_own =
+            write_drain_report(data_dir.path(), &report(13, GenerationDrainEnd::Idle)).unwrap();
+        let old_tmp = upgrade_dir(data_dir.path()).join("drain-report.14.json.tmp");
+        std::fs::write(&old_tmp, b"{").unwrap();
+        let unrelated = upgrade_dir(data_dir.path()).join("lorica.failed.1");
+        std::fs::write(&unrelated, b"x").unwrap();
+        for path in [&old_other, &old_own, &old_tmp, &unrelated] {
+            age(path, DRAIN_REPORT_WAIT + Duration::from_secs(60));
+        }
+        age(&young_other, DRAIN_REPORT_WAIT - Duration::from_secs(60));
+
+        let mut removed =
+            remove_stale_drain_reports(data_dir.path(), 13, DRAIN_REPORT_WAIT).unwrap();
+
+        removed.sort();
+        let mut expected = vec![old_other, old_tmp];
+        expected.sort();
+        assert_eq!(removed, expected);
+        assert!(
+            young_other.exists(),
+            "a chained upgrade may still wait for it"
+        );
+        assert!(old_own.exists(), "this process's own report is never stale");
+        assert!(unrelated.exists());
+        assert_eq!(
+            remove_stale_drain_reports(Path::new("/nonexistent/s1211c"), 1, DRAIN_REPORT_WAIT)
+                .unwrap(),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    fn drain_timeout_count() -> u64 {
+        lorica_api::metrics::hot_upgrade_value(RollbackReason::DrainTimeout.metric_outcome())
+    }
+
+    #[test]
+    fn a_report_records_its_streams_and_drain_timeout_follows_its_end() {
+        use lorica_api::metrics::{hot_upgrade_stream_connections_value, HotUpgradeStreamOutcome};
+        // The only test of this binary that records `drain_timeout`: the
+        // deltas below are this test's own.
+        for (end, ticks) in [
+            (GenerationDrainEnd::Idle, 0),
+            (GenerationDrainEnd::Deadline, 1),
+            (GenerationDrainEnd::Killed, 1),
+        ] {
+            let before = drain_timeout_count();
+            let drained_before =
+                hot_upgrade_stream_connections_value("s1211c-db", HotUpgradeStreamOutcome::Drained)
+                    .unwrap_or(0);
+            let finished_before = hot_upgrade_stream_connections_value(
+                "s1211c-db",
+                HotUpgradeStreamOutcome::Finished,
+            )
+            .unwrap_or(0);
+
+            let recorded = record_drain_report(&report(7, end), |id| id == "s1211c-db");
+
+            assert_eq!(recorded.recorded, vec!["s1211c-db".to_string()]);
+            assert_eq!(recorded.skipped, vec!["s1211c-gone".to_string()]);
+            assert_eq!(drain_timeout_count() - before, ticks, "{end:?}");
+            assert_eq!(
+                hot_upgrade_stream_connections_value("s1211c-db", HotUpgradeStreamOutcome::Drained),
+                Some(drained_before + 2),
+                "drained counts the report's closed"
+            );
+            assert_eq!(
+                hot_upgrade_stream_connections_value(
+                    "s1211c-db",
+                    HotUpgradeStreamOutcome::Finished
+                ),
+                Some(finished_before + 5),
+                "finished counts the report's finished"
+            );
+            assert_eq!(
+                hot_upgrade_stream_connections_value(
+                    "s1211c-gone",
+                    HotUpgradeStreamOutcome::Drained
+                ),
+                None,
+                "a stream the table no longer holds is not recorded"
+            );
+        }
     }
 
     #[test]

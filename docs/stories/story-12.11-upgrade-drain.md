@@ -571,16 +571,16 @@ the existing family; `lorica_hot_upgrade_total` itself untouched),
 the existing one).
 Depends on: A (shares `hot_upgrade.rs`), B2.
 
-- [ ] Before editing: list the supervisor tasks draining workers depend
+- [x] Before editing: list the supervisor tasks draining workers depend
       on (metrics pull, log or telemetry fan-in) and record the finding
       in the Debug Log; step 2 of D-b keeps exactly those.
-- [ ] The `Drain` arm in the order of D-b; `drain_for_handoff(D +
+- [x] The `Drain` arm in the order of D-b; `drain_for_handoff(D +
       WORKER_KILL_MARGIN)`; no audit release rows on upgrade.
-- [ ] UDP groups in the handoff and their adoption by slot (D-e).
-- [ ] Worker reports collected after exit, generation report written;
+- [x] UDP groups in the handoff and their adoption by slot (D-e).
+- [x] Worker reports collected after exit, generation report written;
       the new side's polling reader, metrics recorded there only (D-g).
-- [ ] `previous_generation` state for the preview (D-h).
-- [ ] Tests: the `Drain` arm sends `quiesce reason=upgrade` before
+- [x] `previous_generation` state for the preview (D-h).
+- [x] Tests: the `Drain` arm sends `quiesce reason=upgrade` before
       SIGTERM and waits `D + margin` (driver test with a fake manager or
       the existing plane test harness); an adopted UDP group is attached
       slot by slot, a mismatched one is closed and rebound; the report
@@ -976,13 +976,136 @@ grace + `DRAIN_REPORT_TIMEOUT`.
 **Lot B2 gates**: the same chain as B1, all clean, `cargo audit`
 included.
 
+**Lot C, what the draining workers need from their supervisor.** Read
+on `feat/v1.11.0` at `25daf15f`, before any edit:
+
+- Kept up through the drain, because an old worker calls it while
+  traffic is in flight: its command channel task (bans, reloads; the
+  heartbeat stops on `shutting_down`), its RPC handler (rate-limit
+  deltas, forward-auth verdict lookups and pushes, circuit-breaker
+  queries and reports: in-flight HTTP requests and stream connects
+  use them), the `log.sock` and `waf.sock` fan-in (access-log lines,
+  WAF events and the auto-ban fan-out back to the old workers), the
+  stream plane (the quiesce, then the reports) and its caps tick (the
+  old regions' rate cells), and the shared-memory eviction task.
+- The metrics pull is not one of them: `pull_all_metrics_via_rpc`
+  runs only when the old API's `/metrics` is scraped, so it stops with
+  that API and no worker waits on it.
+- Stopped at step 2: the management API (`api_handle`), the automation
+  API (now held by the API task through an `AbortOnDropHandle`, so the
+  same abort stops it; before, its `JoinHandle` was dropped and the
+  server outlived the abort), the health-check loop, and every loop
+  that waits on `lorica_api::shutdown` (blocklist refresh, ACME renewal
+  and expiry checks, session GC, log-store retry and watch,
+  environment reaper).
+- Still running in the old process for the drain, with no stop hook in
+  this Lot's files: the probe scheduler, the SLA flush tasks, the
+  retention loop, the load-test cron scheduler, the GeoIP and ASN
+  updater and the config-reload bridge (its stream-plane calls are
+  no-ops once quiesced). They ran for 30 s before; with a drain of up
+  to an hour they duplicate the new generation's work. Handed back to
+  the orchestrator.
+- Also handed back: aborting the management and automation servers
+  stops their accept loops, but each accepted connection runs on a
+  detached task (`lorica-api/src/server.rs` `start_server`, and the
+  automation listener's equivalent), so a dashboard's keep-alive or
+  WebSocket connection to the old binary lives on until it closes or
+  the old process exits. Ending those tasks on
+  `lorica_api::shutdown::token()`, which step 2 already cancels, is a
+  small change in `lorica-api` outside this Lot.
+
+**Lot C, how it is built.**
+
+- `StreamPlaneHandle::drain_for_upgrade(D, terminate)` is steps 4 to
+  6: `quiesce_for_upgrade(D)` (each worker's seq kept, the plane marked
+  quiesced, no `stream.release` row), then `terminate(D +
+  WORKER_KILL_MARGIN)` on a blocking thread (the supervisor's `Drain`
+  arm passes `WorkerManager::drain_for_handoff`, which now takes its
+  bound), then `collect_drain_reports()`. Running the wait off the
+  runtime's worker threads keeps the RPC handlers served on a one-core
+  host for a drain of up to an hour.
+- A quiesced plane (stop or upgrade) binds, detaches, refreshes and
+  replays nothing more: the retry tick and the reload bridge would
+  otherwise rebind ports a quiesced worker no longer serves.
+- Reports: each worker's channel is read until its `DrainedEnd`
+  matching the quiesce's seq, its close (the worker exited), or the ack
+  timeout. `ack` and `nack` met there are skipped; `Drained` and
+  `DrainedEnd` read by an earlier exchange (a quiesce ack that came
+  late) are kept aside by `late_answer` instead of logged as
+  unexpected, and read first. A worker with no `DrainedEnd` is
+  unreported; the entries it did send are still summed. The
+  generation's end is `killed` when the wait had to SIGKILL, else
+  `deadline` when a worker said so, else `idle`.
+- `hot_upgrade.rs`: `StreamHandoffFds` (TCP listeners and UDP slots)
+  rides `HandoffArgs`, `serve_listener_fds_blocking` and
+  `build_fds_table`; Lot A's `#[allow(dead_code)]` items are gone. The
+  drain report section: `drain_report_path`, `DrainReport`
+  (`GenerationDrainEnd`, `StreamDrainCounts`), `write_drain_report`
+  (0600, temp file then rename), `read_drain_report`,
+  `remove_stale_drain_reports` (another pid's file older than
+  `DRAIN_REPORT_WAIT`, its temp file included) and
+  `record_drain_report`, which records only streams the table holds.
+- New side: the parent pid at start is the predecessor; after
+  `completed`, `receive_drain_report` sets
+  `lorica_api::upgrade::previous_generation`, polls every second, and
+  on the report records the metrics, logs one summary line (with
+  `http_cut` and `workers_unreported`) and deletes the file. It gives
+  up with a warning when the predecessor is no longer its parent (read
+  before the file, so a report written just before the exit is not
+  missed) or after `DRAIN_REPORT_WAIT`, clearing
+  `previous_generation` either way. Every supervisor deletes stale
+  reports at start.
+- UDP adoption: `adopt_inherited_udp`, then the first pass takes a
+  binding's inherited group only when every port has exactly the slots
+  `0..W`; otherwise the inherited sockets are closed, a warning names
+  the stream, and a fresh group is bound (D-e's fallback).
+- Metrics: `HotUpgradeStreamOutcome` (its `ALL` drives the help text,
+  the recording and the pruning), `record_hot_upgrade_stream_connections`,
+  `hot_upgrade_stream_connections_value` and
+  `retain_hot_upgrade_stream_connections`, called from
+  `PlaneWatch::table_changed` beside the 12.9 collector's prune;
+  `hot_upgrade_value` reads `lorica_hot_upgrade_total` without creating
+  a series. The old process records no drain metric any more.
+
+**Lot C, files outside the allowlist.** `lorica-api/src/upgrade.rs`
+(`set_previous_generation` and `previous_generation`, the state Lot D's
+preview reads: `lorica-api` cannot see a `lorica` type, and a global
+avoids a new `AppState` field in every test fixture).
+
+**Lot C, deviations.** None from the decisions. The `Drain` arm's
+step-2 list is the one above; `health_handle` is aborted at step 2
+rather than at the exit.
+
+**Lot C, what Lot G must cover.** The `lorica` crate has no
+process-level upgrade driver (an upgrade needs a signed binary, the
+signing key in the settings and an authenticated upload), so nothing
+here runs two generations. Lot G owns: IV1 end to end; that the old
+generation's report reaches the new one and
+`lorica_hot_upgrade_stream_connections_total` and
+`lorica_hot_upgrade_drain_seconds` show on the new `/metrics`; that a
+request to the management API during the drain is answered by the new
+binary (the pid in `GET /api/v1/system`); the UDP scenario with a group
+adopted slot by slot (no `binding_draining` drop, every answer back);
+and the 64-port TCP plus UDP table past 32 descriptors.
+
+**Lot C gates** (Docker `rust:1-bookworm`, `CARGO_BUILD_WARNINGS=deny`,
+the `ci.yml` cargo lines in order): fmt, workspace clippy with
+`lorica/otel`, the product crates (3,712 tests), `lorica --features
+otel` (989), the forked crates (915), the rustls line (592) and
+`cargo audit`, all clean.
+
 ### Completion Notes
 
 ## File List
 
 - `lorica/src/startup/fd_transfer.rs` (new, Lot A)
 - `lorica/src/startup/mod.rs` (module line, Lot A)
-- `lorica/src/startup/hot_upgrade.rs` (transfer, `stream-udp:` family, Lot A)
+- `lorica/src/startup/hot_upgrade.rs` (transfer, `stream-udp:` family, Lot A; UDP slots in the handoff, the drain report section, Lot C)
+- `lorica/src/startup/supervisor.rs` (the `Drain` arm, UDP adoption, the drain report reader, Lot C)
+- `lorica-worker/src/manager.rs` (`drain_for_handoff(drain)`, Lot C)
+- `lorica-api/src/metrics.rs` (`lorica_hot_upgrade_stream_connections_total`, `drain_timeout` doc, drain histogram buckets, Lot C)
+- `lorica-api/src/tests.rs` (the new family's reader and tests, Lot C)
+- `lorica-api/src/upgrade.rs` (`previous_generation` state, Lot C)
 - `lorica-worker/src/fd_passing.rs` (`send_with_rights`, `recv_with_rights_cloexec`, Lot A)
 - `lorica-worker/src/stream_ctl.rs` (`QuiesceReason::Upgrade`, `DrainEnd`, the drain report messages, Lot B1)
 - `lorica-config/src/models/stream.rs` (`UpgradePolicy`, `Stream::upgrade_policy`, Lot B1)
@@ -996,7 +1119,7 @@ included.
 - `lorica-stream/tests/runtime.rs` (Lot B1)
 - `lorica-stream/tests/tcp_engine.rs` (Lot B1)
 - `lorica-stream/tests/udp_engine.rs` (Lot B1)
-- `lorica/src/startup/stream_plane.rs` (one test assertion, Lot B1)
+- `lorica/src/startup/stream_plane.rs` (one test assertion, Lot B1; upgrade quiesce, report collection, UDP handoff and adoption, Lot C)
 - `lorica/src/startup/drain.rs` (the `Quiesced` type, Lot B1; the watcher's reason and the drain report, Lot B2)
 - `lorica/src/startup/worker.rs` (comments of the drain arming and the exit closure, Lot B2)
 - `lorica/src/startup/single.rs` (`DrainProbe::new`, Lot B2)
@@ -1011,3 +1134,4 @@ included.
 | 2026-11-15 | 0.3 | Lot A: chunked `lorica-fds/2` transfer with a one-byte acknowledgement per header and chunk, legacy single message kept whenever the table fits, receiver reading both and closing everything on error; `stream-udp:` key family parsed into `StreamUdpFd`. Red run recorded. Status InProgress. | Romain G. |
 | 2026-11-18 | 0.4 | Lot B1: `quiesce reason=upgrade` mapped to `drained_by_upgrade`, `Quiesced { drain, reason }`, first quiesce stands; old workers close their own listener and slot descriptors, UDP sessions relay what they are owed or close by `Stream::upgrade_policy()`; tracker counts `closed` and `finished` per stream; `drained` / `drained_end` report messages sent without waiting. D-a, D-c, D-e, D-f and D-g amended where the code had moved (`drains_on_upgrade` is the 12.16 exclusion, one-way UDP closes, the report wire carries the quiesce seq). | Romain G. |
 | 2026-11-18 | 0.5 | Lot B2: the drain watcher closes leftovers with the quiesce's end reason, returns `DrainOutcome { end, http_cut }`, and on an upgrade logs the per-stream closes at the deadline and sends the worker's drain report before `exit`, never blocking on it; `DrainEnd` is the wire's. | Romain G. |
+| 2026-11-18 | 0.6 | Lot C: the old supervisor stops its APIs and health loop at the handoff, reads `worker_drain_timeout_s` once, quiesces its workers for the upgrade, waits the drain plus the kill margin off the runtime threads, collects the workers' drain reports and writes the generation's report; UDP slot sockets ride the handoff and are adopted slot by slot or closed and rebound; the new supervisor reads the report, records `lorica_hot_upgrade_stream_connections_total`, the drain histogram (buckets to 3,600 s) and `drain_timeout`, and keeps `previous_generation` for the preview; a quiesced plane binds nothing more. | Romain G. |

@@ -63,6 +63,16 @@
 //!   what the node counted for the stream passes, so a node already past
 //!   its ceiling (a narrowed port range) can still move a stream.
 //!
+//! **Hot upgrades** (Story 12.11): the outgoing plane hands its TCP
+//! listeners and its UDP slot sockets to the next generation
+//! ([`StreamPlaneHandle::handoff_fds`]), which adopts them in its first
+//! pass, a UDP group whole or not at all, slot `k` to worker `k`, so the
+//! group never changes size. Once the new generation is up the outgoing
+//! plane quiesces its workers for the upgrade, waits for them to exit
+//! and reads the drain reports they left on their channels
+//! ([`StreamPlaneHandle::drain_for_upgrade`]). A quiesced plane binds,
+//! detaches and refreshes nothing more.
+//!
 //! [`WORKER_RELEASE`]: StreamPlane::release_worker
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -87,15 +97,18 @@ use lorica_stream::{
 };
 use lorica_worker::fd_passing::StreamProto;
 use lorica_worker::stream_ctl::{
-    self, check_stream_id, chunk_sockets, NackReason, QuiesceReason, StreamCtlError, StreamCtlMsg,
-    StreamSocket,
+    self, check_stream_id, chunk_sockets, DrainEnd, DrainedEntry, NackReason, QuiesceReason,
+    StreamCtlError, StreamCtlMsg, StreamSocket,
 };
 use lorica_worker::stream_sockets::{bind_range, usable_udp_source_ports, BoundPort};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::startup::hot_upgrade::StreamTcpFd;
+use crate::startup::drain::WORKER_KILL_MARGIN;
+use crate::startup::hot_upgrade::{
+    DrainReport, GenerationDrainEnd, StreamDrainCounts, StreamHandoffFds, StreamTcpFd, StreamUdpFd,
+};
 
 /// How long the driver waits for a worker's answer before it moves on,
 /// the two-phase reload's Prepare timeout.
@@ -484,6 +497,65 @@ struct WorkerSlot<L> {
     /// Attaches that timed out, by sequence number, credited if their
     /// answer arrives later.
     outstanding: HashMap<u64, Pending>,
+    /// Drain report messages read while waiting for another answer, kept
+    /// for [`StreamPlane::collect_drain_reports`].
+    reports: Vec<StreamCtlMsg>,
+}
+
+/// What one worker's drain report said (Story 12.11 D-g).
+#[derive(Debug, Default)]
+struct WorkerReport {
+    entries: Vec<DrainedEntry>,
+    /// The `drained_end`, absent for an unreported worker.
+    end: Option<ReportEnd>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReportEnd {
+    end: DrainEnd,
+    http_cut: u64,
+    entries: u64,
+    truncated: bool,
+}
+
+impl WorkerReport {
+    /// Take `msg` into the report answering quiesce `seq`; `true` once
+    /// its end marker is in.
+    fn take(&mut self, worker: u32, seq: u64, msg: StreamCtlMsg) -> bool {
+        match msg {
+            StreamCtlMsg::Drained { seq: s, entries } if s == seq => {
+                self.entries.extend(entries);
+                false
+            }
+            StreamCtlMsg::DrainedEnd {
+                seq: s,
+                end,
+                http_cut,
+                entries,
+                truncated,
+            } if s == seq => {
+                self.end = Some(ReportEnd {
+                    end,
+                    http_cut,
+                    entries,
+                    truncated,
+                });
+                true
+            }
+            // Answers to earlier messages, the quiesce's own ack among
+            // them when it came after its timeout.
+            StreamCtlMsg::Ack { .. } | StreamCtlMsg::Nack { .. } => false,
+            other => {
+                warn!(
+                    worker_id = worker,
+                    seq = other.seq(),
+                    quiesce_seq = seq,
+                    "stream control message that answers no upgrade quiesce ignored"
+                );
+                false
+            }
+        }
+    }
 }
 
 impl<L: WorkerLink> WorkerSlot<L> {
@@ -491,6 +563,46 @@ impl<L: WorkerLink> WorkerSlot<L> {
         WorkerSlot {
             link: Some(link),
             outstanding: HashMap::new(),
+            reports: Vec::new(),
+        }
+    }
+
+    /// Read the drain report answering quiesce `seq`: what was kept
+    /// aside, then the channel until the end marker, the channel's close
+    /// (the worker exited), or `timeout`.
+    async fn read_report(&mut self, worker: u32, seq: u64, timeout: Duration) -> WorkerReport {
+        let mut report = WorkerReport::default();
+        for msg in std::mem::take(&mut self.reports) {
+            if report.take(worker, seq, msg) {
+                return report;
+            }
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let Some(link) = self.link.as_mut() else {
+                return report;
+            };
+            match tokio::time::timeout_at(deadline, link.recv()).await {
+                Err(_) => {
+                    warn!(
+                        worker_id = worker,
+                        "no drain report end from the worker in time"
+                    );
+                    return report;
+                }
+                Ok(Ok(msg)) => {
+                    if report.take(worker, seq, msg) {
+                        return report;
+                    }
+                }
+                Ok(Err(LinkError::Lost(_))) => {
+                    self.link = None;
+                    return report;
+                }
+                Ok(Err(e @ LinkError::Refused(_))) => {
+                    warn!(worker_id = worker, error = %e, "garbled drain report message dropped");
+                }
+            }
         }
     }
 
@@ -678,6 +790,99 @@ struct DrainingBinding {
     until: Instant,
 }
 
+/// The workers' drain reports answering an upgrade quiesce, summed over
+/// the workers (Story 12.11 D-g).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct UpgradeDrainReports {
+    /// Workers whose `drained_end` arrived.
+    pub(crate) reported: u32,
+    /// Workers with no `drained_end`: killed, crashed, never quiesced,
+    /// or whose end marker did not fit their channel. What they sent
+    /// before is counted.
+    pub(crate) unreported: u32,
+    /// Reported workers whose report lost entries to a full channel.
+    pub(crate) truncated: u32,
+    /// Whether a worker reached its deadline with traffic left.
+    pub(crate) deadline: bool,
+    /// HTTP requests the workers' exits cut.
+    pub(crate) http_cut: u64,
+    /// Per stream id.
+    pub(crate) streams: BTreeMap<String, StreamDrainCounts>,
+}
+
+impl UpgradeDrainReports {
+    fn add(&mut self, worker: u32, report: WorkerReport) {
+        let received = u64::try_from(report.entries.len()).unwrap_or(u64::MAX);
+        for entry in report.entries {
+            let counts = self.streams.entry(entry.stream_id).or_default();
+            counts.closed = counts.closed.saturating_add(entry.closed);
+            counts.finished = counts.finished.saturating_add(entry.finished);
+        }
+        let Some(end) = report.end else {
+            warn!(
+                worker_id = worker,
+                entries = received,
+                "no upgrade drain report end from the worker; counted as unreported"
+            );
+            self.unreported += 1;
+            return;
+        };
+        if end.entries != received {
+            warn!(
+                worker_id = worker,
+                declared = end.entries,
+                received,
+                "upgrade drain report entries lost on the way"
+            );
+        }
+        self.reported += 1;
+        self.truncated += u32::from(end.truncated);
+        self.deadline |= end.end == DrainEnd::Deadline;
+        self.http_cut = self.http_cut.saturating_add(end.http_cut);
+    }
+}
+
+/// What an old generation's upgrade drain did, as its supervisor saw it
+/// (Story 12.11 D-b steps 4 to 6).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct UpgradeDrain {
+    /// Every worker exited by itself within the bound.
+    pub(crate) clean: bool,
+    /// From the SIGTERM to the last worker's exit.
+    pub(crate) drain_secs: f64,
+    /// The workers' reports.
+    pub(crate) reports: UpgradeDrainReports,
+}
+
+impl UpgradeDrain {
+    /// How the generation's drain ended: `killed` when a worker had to
+    /// be, `deadline` when one reached it, `idle` otherwise.
+    pub(crate) fn end(&self) -> GenerationDrainEnd {
+        if !self.clean {
+            GenerationDrainEnd::Killed
+        } else if self.reports.deadline {
+            GenerationDrainEnd::Deadline
+        } else {
+            GenerationDrainEnd::Idle
+        }
+    }
+
+    /// The report the generation writes for `new_pid`, its drain having
+    /// been `drain`.
+    pub(crate) fn report(&self, old_pid: u32, new_pid: u32, drain: Duration) -> DrainReport {
+        DrainReport {
+            old_pid,
+            new_pid,
+            drain_timeout_s: drain.as_secs(),
+            drain_secs: self.drain_secs,
+            end: self.end(),
+            workers_unreported: self.reports.unreported,
+            http_cut: self.reports.http_cut,
+            streams: self.reports.streams.clone(),
+        }
+    }
+}
+
 /// The caps regions a plane and its handle share. Never held across an
 /// await.
 type SharedCaps = Arc<StdMutex<NodeCapsRegions>>;
@@ -710,6 +915,16 @@ pub(crate) struct StreamPlane<L> {
     /// TCP listeners inherited from the outgoing supervisor, adopted by
     /// the first pass that wants them and closed by it otherwise.
     inherited: Vec<(String, SocketAddr, OwnedFd)>,
+    /// UDP slot sockets inherited from the outgoing supervisor, adopted
+    /// group by group by the first pass that wants them (Story 12.11
+    /// D-e) and closed by it otherwise.
+    inherited_udp: Vec<(StreamUdpFd, OwnedFd)>,
+    /// Set by a quiesce: the plane binds, detaches and refreshes nothing
+    /// from then on, the process being on its way out.
+    quiesced: bool,
+    /// The seq of the `quiesce reason=upgrade` each worker was sent, which
+    /// its drain report answers.
+    upgrade_quiesce: BTreeMap<u32, u64>,
     states: StreamBindStates,
     failures: BTreeMap<String, BindFailureKind>,
     next_gen: u64,
@@ -747,6 +962,9 @@ impl<L: WorkerLink> StreamPlane<L> {
             source_ports: Box::new(read_usable_source_ports),
             usable_source_ports: None,
             inherited: Vec::new(),
+            inherited_udp: Vec::new(),
+            quiesced: false,
+            upgrade_quiesce: BTreeMap::new(),
             states,
             failures: BTreeMap::new(),
             next_gen: 1,
@@ -766,6 +984,17 @@ impl<L: WorkerLink> StreamPlane<L> {
             // supervisor never reuses one.
             self.next_gen = self.next_gen.max(entry.bind_gen.saturating_add(1));
             self.inherited.push((entry.stream_id, entry.addr, fd));
+        }
+    }
+
+    /// Adopt the UDP slot sockets a hot upgrade handed over (Story 12.11
+    /// D-e). The next pass takes a binding's whole group, slot `k` going
+    /// to worker `k`, when it has exactly one slot per worker on every
+    /// port; otherwise it closes them and binds a fresh group.
+    pub(crate) fn adopt_inherited_udp(&mut self, sockets: Vec<(StreamUdpFd, OwnedFd)>) {
+        for (entry, fd) in sockets {
+            self.next_gen = self.next_gen.max(entry.bind_gen.saturating_add(1));
+            self.inherited_udp.push((entry, fd));
         }
     }
 
@@ -821,6 +1050,30 @@ impl<L: WorkerLink> StreamPlane<L> {
             .collect()
     }
 
+    /// The UDP slot sockets a hot upgrade hands to the next supervisor
+    /// (Story 12.11 D-e): every slot of every port of each held group,
+    /// slot `k` being worker `k`'s. The descriptors stay owned here.
+    pub(crate) fn udp_handoff_fds(&self) -> Vec<StreamUdpFd> {
+        self.held
+            .values()
+            .filter(|b| b.key.protocol == StreamProtocol::Udp)
+            .flat_map(|b| {
+                b.ports.iter().flat_map(move |port| {
+                    port.sockets
+                        .iter()
+                        .enumerate()
+                        .map(move |(slot, fd)| StreamUdpFd {
+                            stream_id: b.key.stream_id.clone(),
+                            bind_gen: b.bind_gen,
+                            slot: u32::try_from(slot).unwrap_or(u32::MAX),
+                            addr: port.addr,
+                            fd: fd.as_raw_fd(),
+                        })
+                })
+            })
+            .collect()
+    }
+
     /// D-d step 1, before the workers commit: detach every binding no
     /// longer desired or whose bind key changed.
     pub(crate) async fn release_stale(
@@ -829,6 +1082,9 @@ impl<L: WorkerLink> StreamPlane<L> {
         role: NodeRole<'_>,
         pass: PassSettings,
     ) -> Vec<PlaneEvent> {
+        if self.quiesced {
+            return Vec::new();
+        }
         let actions = diff(streams, role, &self.bound_list());
         self.detach(actions.detach, pass).await
     }
@@ -845,6 +1101,9 @@ impl<L: WorkerLink> StreamPlane<L> {
         pass: PassSettings,
         trigger: Trigger,
     ) -> Vec<PlaneEvent> {
+        if self.quiesced {
+            return Vec::new();
+        }
         let actions = diff(streams, role, &self.bound_list());
         let mut events = self.detach(actions.detach, pass).await;
         self.usable_source_ports = (self.source_ports)();
@@ -901,6 +1160,10 @@ impl<L: WorkerLink> StreamPlane<L> {
         for (stream_id, addr, _fd) in self.inherited.drain(..) {
             info!(%stream_id, %addr, "inherited stream listener not adopted; closed");
         }
+        for (entry, _fd) in self.inherited_udp.drain(..) {
+            info!(stream_id = %entry.stream_id, addr = %entry.addr, slot = entry.slot,
+                  "inherited UDP slot socket not adopted; closed");
+        }
 
         if trigger == Trigger::Change {
             self.refresh_all(pass).await;
@@ -912,6 +1175,9 @@ impl<L: WorkerLink> StreamPlane<L> {
     /// drains what the new one no longer holds. Binds and detaches
     /// nothing.
     pub(crate) async fn refresh_all(&mut self, pass: PassSettings) {
+        if self.quiesced {
+            return;
+        }
         let mut per_worker: BTreeMap<u32, Vec<StreamCtlMsg>> = BTreeMap::new();
         for id in self.workers.keys().copied().collect::<Vec<_>>() {
             let seq = self.seq();
@@ -1052,6 +1318,9 @@ impl<L: WorkerLink> StreamPlane<L> {
     /// `refresh` (D-a, Story 12.5 D-d).
     pub(crate) async fn replay_worker(&mut self, worker: u32, link: L, pass: PassSettings) {
         self.release_worker(worker);
+        if self.quiesced {
+            return;
+        }
         self.workers.insert(worker, WorkerSlot::new(link));
         let mut msgs = Vec::new();
         let ids: Vec<String> = self.held.keys().cloned().collect();
@@ -1090,23 +1359,74 @@ impl<L: WorkerLink> StreamPlane<L> {
             .bound_by
     }
 
-    /// The stop path (D-f): quiesce every worker for `drain` and release
-    /// every binding with cause `shutdown`.
-    pub(crate) async fn quiesce(&mut self, drain: Duration) -> Vec<PlaneEvent> {
+    /// Send every worker `quiesce reason=<reason>` for `drain`, and take
+    /// no binding afterwards. Returns the seq each worker was sent.
+    async fn quiesce_workers(
+        &mut self,
+        reason: QuiesceReason,
+        drain: Duration,
+    ) -> BTreeMap<u32, u64> {
         let drain_ms = u64::try_from(drain.as_millis()).unwrap_or(u64::MAX);
         let mut per_worker: BTreeMap<u32, Vec<StreamCtlMsg>> = BTreeMap::new();
+        let mut seqs = BTreeMap::new();
         for id in self.workers.keys().copied().collect::<Vec<_>>() {
             let seq = self.seq();
+            seqs.insert(id, seq);
             per_worker.insert(
                 id,
                 vec![StreamCtlMsg::Quiesce {
                     seq,
-                    reason: QuiesceReason::Shutdown,
+                    reason,
                     drain_ms,
                 }],
             );
         }
+        self.quiesced = true;
         self.send_all(per_worker).await;
+        seqs
+    }
+
+    /// D-b step 4 of a hot upgrade (Story 12.11): quiesce every worker
+    /// for `drain` with reason `upgrade`. Nothing is released and no
+    /// `stream.release` row is written: the ports stay open through the
+    /// new generation, which holds them. Each worker answers with its
+    /// drain report once its drain ends, read by
+    /// [`Self::collect_drain_reports`].
+    pub(crate) async fn quiesce_for_upgrade(&mut self, drain: Duration) {
+        self.upgrade_quiesce = self.quiesce_workers(QuiesceReason::Upgrade, drain).await;
+    }
+
+    /// Read every worker's drain report answering the upgrade quiesce,
+    /// once the workers have exited (Story 12.11 D-g): their messages
+    /// wait in this end of each channel. A worker is read until its end
+    /// marker, its channel's close, or the ack timeout; one with no end
+    /// marker is unreported.
+    pub(crate) async fn collect_drain_reports(&mut self) -> UpgradeDrainReports {
+        let timeout = self.ack_timeout;
+        let quiesce = std::mem::take(&mut self.upgrade_quiesce);
+        let reads: Vec<(u32, WorkerReport)> =
+            join_all(self.workers.iter_mut().map(|(id, slot)| {
+                let seq = quiesce.get(id).copied();
+                async move {
+                    let report = match seq {
+                        Some(seq) => slot.read_report(*id, seq, timeout).await,
+                        None => WorkerReport::default(),
+                    };
+                    (*id, report)
+                }
+            }))
+            .await;
+        let mut reports = UpgradeDrainReports::default();
+        for (worker, report) in reads {
+            reports.add(worker, report);
+        }
+        reports
+    }
+
+    /// The stop path (D-f): quiesce every worker for `drain` and release
+    /// every binding with cause `shutdown`.
+    pub(crate) async fn quiesce(&mut self, drain: Duration) -> Vec<PlaneEvent> {
+        self.quiesce_workers(QuiesceReason::Shutdown, drain).await;
         let mut events = Vec::new();
         for (id, b) in std::mem::take(&mut self.held) {
             self.states.remove(&id);
@@ -1210,12 +1530,67 @@ impl<L: WorkerLink> StreamPlane<L> {
         }
     }
 
-    /// The inherited listeners that cover exactly the ports of `key`, if
-    /// every port has one.
+    /// The inherited sockets of `key`, if they cover it: see
+    /// [`Self::take_inherited_tcp`] and [`Self::take_inherited_udp`].
     fn take_inherited(&mut self, key: &BindKey) -> Option<Vec<BoundPort>> {
-        if key.protocol != StreamProtocol::Tcp {
+        match key.protocol {
+            StreamProtocol::Tcp => self.take_inherited_tcp(key),
+            StreamProtocol::Udp => self.take_inherited_udp(key),
+        }
+    }
+
+    /// The inherited UDP group of `key`, slot `k` of each port being
+    /// worker `k`'s socket, if it has exactly one slot per worker on
+    /// every port (Story 12.11 D-e). The sockets inherited for `key` are
+    /// taken either way: a group that does not match is closed and the
+    /// caller binds a fresh one, which then shares the port with the old
+    /// generation's group until that one is gone.
+    fn take_inherited_udp(&mut self, key: &BindKey) -> Option<Vec<BoundPort>> {
+        let matches = |(entry, _): &(StreamUdpFd, OwnedFd)| {
+            entry.stream_id == key.stream_id
+                && entry.addr.ip() == key.listen_address
+                && key.ports().contains(&entry.addr.port())
+        };
+        if !self.inherited_udp.iter().any(matches) {
             return None;
         }
+        let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.inherited_udp)
+            .into_iter()
+            .partition(matches);
+        self.inherited_udp = kept;
+        let received = taken.len();
+        let mut groups: BTreeMap<SocketAddr, BTreeMap<u32, OwnedFd>> = BTreeMap::new();
+        for (entry, fd) in taken {
+            groups.entry(entry.addr).or_default().insert(entry.slot, fd);
+        }
+        let slots = || 0..self.worker_count;
+        let whole = groups.len() == key.ports().len()
+            && groups.values().all(|g| g.keys().copied().eq(slots()))
+            && received == groups.values().map(BTreeMap::len).sum::<usize>();
+        if !whole {
+            warn!(
+                stream_id = %key.stream_id,
+                received,
+                ports = groups.len(),
+                workers = self.worker_count,
+                "inherited UDP group does not match this node's workers; closed, a fresh group is bound"
+            );
+            return None;
+        }
+        Some(
+            groups
+                .into_iter()
+                .map(|(addr, group)| BoundPort {
+                    addr,
+                    sockets: group.into_values().collect(),
+                })
+                .collect(),
+        )
+    }
+
+    /// The inherited listeners that cover exactly the ports of `key`, if
+    /// every port has one.
+    fn take_inherited_tcp(&mut self, key: &BindKey) -> Option<Vec<BoundPort>> {
         let matches = |(stream_id, addr, _): &(String, SocketAddr, OwnedFd)| {
             *stream_id == key.stream_id
                 && addr.ip() == key.listen_address
@@ -1534,6 +1909,14 @@ impl<L: WorkerLink> StreamPlane<L> {
         let (seq, acked) = match msg {
             StreamCtlMsg::Ack { seq, .. } => (seq, true),
             StreamCtlMsg::Nack { seq, .. } => (seq, false),
+            // A drain report read while another answer was awaited: kept
+            // for the collection that follows the workers' exit.
+            report @ (StreamCtlMsg::Drained { .. } | StreamCtlMsg::DrainedEnd { .. }) => {
+                if let Some(slot) = self.workers.get_mut(&worker) {
+                    slot.reports.push(report);
+                }
+                return;
+            }
             other => {
                 warn!(
                     worker_id = worker,
@@ -1607,6 +1990,7 @@ impl PlaneWatch {
             for gone in known.difference(&ids) {
                 lorica_bench::metrics::forget_stream_sla_breaches(gone);
             }
+            lorica_api::metrics::retain_hot_upgrade_stream_connections(|id| ids.contains(id));
             *known = ids;
         }
         self.metrics.retain(&table);
@@ -1879,9 +2263,45 @@ impl<L: WorkerLink + 'static> StreamPlaneHandle<L> {
         self.record(events).await;
     }
 
-    /// The TCP listeners to hand over on a hot upgrade.
-    pub(crate) async fn tcp_handoff_fds(&self) -> Vec<StreamTcpFd> {
-        self.plane.lock().await.tcp_handoff_fds()
+    /// The stream sockets to hand over on a hot upgrade: the TCP
+    /// listeners (D-j) and the UDP slot sockets (Story 12.11 D-e).
+    pub(crate) async fn handoff_fds(&self) -> StreamHandoffFds {
+        let plane = self.plane.lock().await;
+        StreamHandoffFds {
+            tcp: plane.tcp_handoff_fds(),
+            udp: plane.udp_handoff_fds(),
+        }
+    }
+
+    /// D-b steps 4 to 6 of a hot upgrade's old side (Story 12.11): quiesce
+    /// every worker for `drain` with reason `upgrade`, then `terminate`
+    /// them, which SIGTERMs, waits and SIGKILLs past the bound it is
+    /// given, `drain` plus [`WORKER_KILL_MARGIN`], and says whether every
+    /// worker exited by itself; then read the reports the workers left.
+    /// `terminate` blocks, so it runs off the runtime's worker threads:
+    /// the supervisor tasks the draining workers call keep being served.
+    pub(crate) async fn drain_for_upgrade(
+        &self,
+        drain: Duration,
+        terminate: impl FnOnce(Duration) -> bool + Send + 'static,
+    ) -> UpgradeDrain {
+        self.plane.lock().await.quiesce_for_upgrade(drain).await;
+        let started = Instant::now();
+        let bound = drain + WORKER_KILL_MARGIN;
+        let clean = match tokio::task::spawn_blocking(move || terminate(bound)).await {
+            Ok(clean) => clean,
+            Err(e) => {
+                warn!(error = %e, "upgrade drain: the worker wait failed; counted as killed");
+                false
+            }
+        };
+        let drain_secs = started.elapsed().as_secs_f64();
+        let reports = self.plane.lock().await.collect_drain_reports().await;
+        UpgradeDrain {
+            clean,
+            drain_secs,
+            reports,
+        }
     }
 
     async fn record(&self, events: Vec<PlaneEvent>) {
@@ -2035,6 +2455,7 @@ mod tests {
         },
         Quiesce {
             drain_ms: u64,
+            reason: QuiesceReason,
         },
         /// `total` is the region's session total when the message
         /// arrived.
@@ -2059,7 +2480,8 @@ mod tests {
 
     /// A worker that answers from a script (acks once it runs out), and
     /// holds the sockets it was attached until they are detached, as a
-    /// worker does.
+    /// worker does. Quiesced for an upgrade, it leaves its drain report,
+    /// if it has one, and exits: its channel then reads as closed.
     #[derive(Default)]
     struct FakeLink {
         script: VecDeque<Reply>,
@@ -2067,6 +2489,8 @@ mod tests {
         outbox: VecDeque<StreamCtlMsg>,
         late: Vec<StreamCtlMsg>,
         holding: HashMap<(String, u64), Vec<OwnedFd>>,
+        report: Option<(Vec<DrainedEntry>, DrainEnd, u64)>,
+        exited: bool,
     }
 
     impl FakeLink {
@@ -2077,6 +2501,34 @@ mod tests {
             };
             let seen = Arc::clone(&link.seen);
             (link, seen)
+        }
+
+        /// A worker whose upgrade drain ends with `end` and reports
+        /// `entries` and `http_cut`.
+        fn reporting(
+            script: &[Reply],
+            entries: Vec<DrainedEntry>,
+            end: DrainEnd,
+            http_cut: u64,
+        ) -> (Self, Arc<StdMutex<Vec<Seen>>>) {
+            let (mut link, seen) = FakeLink::new(script);
+            link.report = Some((entries, end, http_cut));
+            (link, seen)
+        }
+
+        /// The fds it holds for binding `bind_gen` of `stream_id`.
+        fn held(&self, stream_id: &str, bind_gen: u64) -> &[OwnedFd] {
+            self.holding
+                .get(&(stream_id.to_string(), bind_gen))
+                .map_or(&[], Vec::as_slice)
+        }
+    }
+
+    fn entry(stream_id: &str, closed: u64, finished: u64) -> DrainedEntry {
+        DrainedEntry {
+            stream_id: stream_id.to_string(),
+            closed,
+            finished,
         }
     }
 
@@ -2115,9 +2567,14 @@ mod tests {
                     }
                 }
                 StreamCtlMsg::Refresh { drain_ms, .. } => Seen::Refresh { drain_ms },
-                StreamCtlMsg::Quiesce { drain_ms, .. } => {
+                StreamCtlMsg::Quiesce {
+                    drain_ms, reason, ..
+                } => {
                     self.holding.clear();
-                    Seen::Quiesce { drain_ms }
+                    if reason == QuiesceReason::Upgrade {
+                        self.exited = true;
+                    }
+                    Seen::Quiesce { drain_ms, reason }
                 }
                 StreamCtlMsg::Caps {
                     stream_id,
@@ -2148,12 +2605,29 @@ mod tests {
                     reason: NackReason::AdoptFailed,
                 }),
             }
+            if self.exited {
+                if let Some((entries, end, http_cut)) = self.report.take() {
+                    let sent = u64::try_from(entries.len()).unwrap();
+                    if !entries.is_empty() {
+                        self.outbox
+                            .push_back(StreamCtlMsg::Drained { seq, entries });
+                    }
+                    self.outbox.push_back(StreamCtlMsg::DrainedEnd {
+                        seq,
+                        end,
+                        http_cut,
+                        entries: sent,
+                        truncated: false,
+                    });
+                }
+            }
             Ok(())
         }
 
         async fn recv(&mut self) -> Result<StreamCtlMsg, LinkError> {
             match self.outbox.pop_front() {
                 Some(msg) => Ok(msg),
+                None if self.exited => Err(LinkError::Lost("the worker exited".into())),
                 None => std::future::pending().await,
             }
         }
@@ -2794,7 +3268,8 @@ mod tests {
             })
         ));
         assert_eq!(lock_caps(&plane.caps).memfds(), 1);
-        assert!(plane.tcp_handoff_fds().is_empty(), "UDP is not handed over");
+        assert!(plane.tcp_handoff_fds().is_empty());
+        assert_eq!(plane.udp_handoff_fds().len(), 2, "one per slot");
     }
 
     #[tokio::test]
@@ -3347,7 +3822,13 @@ mod tests {
         let events = plane.quiesce(Duration::from_secs(20)).await;
 
         for log in [&seen0, &seen1] {
-            assert_eq!(seen(log).last(), Some(&Seen::Quiesce { drain_ms: 20_000 }));
+            assert_eq!(
+                seen(log).last(),
+                Some(&Seen::Quiesce {
+                    drain_ms: 20_000,
+                    reason: QuiesceReason::Shutdown
+                })
+            );
         }
         assert!(matches!(
             events.as_slice(),
@@ -3357,6 +3838,347 @@ mod tests {
             }]
         ));
         assert!(states.snapshot().is_empty());
+    }
+
+    fn plane_handle(plane: StreamPlane<FakeLink>) -> StreamPlaneHandle<FakeLink> {
+        StreamPlaneHandle::new(
+            plane,
+            Arc::new(Mutex::new(
+                ConfigStore::open_in_memory().expect("test setup: store"),
+            )),
+            PlaneRole::Standalone,
+            None,
+            lorica_notify::AlertSender::new(16),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upgrade_drain_quiesces_before_the_sigterm_waits_drain_plus_margin_and_sums_the_reports(
+    ) {
+        let (w0, seen0) = FakeLink::reporting(
+            &[],
+            vec![entry("db", 2, 3), entry("dns", 1, 0)],
+            DrainEnd::Deadline,
+            4,
+        );
+        // Its quiesce ack never comes: the report still counts, read
+        // from where the quiesce exchange set it aside.
+        let (w1, seen1) = FakeLink::reporting(
+            &[Reply::Ack, Reply::Ack, Reply::Ack, Reply::Silent],
+            vec![entry("db", 5, 1)],
+            DrainEnd::Idle,
+            0,
+        );
+        let (mut plane, states) = plane(vec![w0, w1]);
+        let s = tcp("s1", free_ports(1));
+        plane
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
+            .await;
+        let handle = plane_handle(plane);
+        let drain = Duration::from_secs(120);
+
+        /// The bound `terminate` was given, and what each worker had
+        /// seen by then.
+        type AtTerminate = Option<(Duration, Vec<Seen>, Vec<Seen>)>;
+        let at_terminate: Arc<StdMutex<AtTerminate>> = Arc::default();
+        let terminate_saw = Arc::clone(&at_terminate);
+        let (log0, log1) = (Arc::clone(&seen0), Arc::clone(&seen1));
+        let drained = handle
+            .drain_for_upgrade(drain, move |bound| {
+                *terminate_saw.lock().unwrap() = Some((bound, seen(&log0), seen(&log1)));
+                true
+            })
+            .await;
+
+        let (bound, before0, before1) = at_terminate.lock().unwrap().take().expect("terminated");
+        assert_eq!(bound, drain + WORKER_KILL_MARGIN);
+        for before in [before0, before1] {
+            assert_eq!(
+                before.last(),
+                Some(&Seen::Quiesce {
+                    drain_ms: 120_000,
+                    reason: QuiesceReason::Upgrade
+                }),
+                "every worker is quiesced for the upgrade before the SIGTERM"
+            );
+        }
+        assert_eq!(
+            drained.reports,
+            UpgradeDrainReports {
+                reported: 2,
+                unreported: 0,
+                truncated: 0,
+                deadline: true,
+                http_cut: 4,
+                streams: BTreeMap::from([
+                    (
+                        "db".to_string(),
+                        StreamDrainCounts {
+                            closed: 7,
+                            finished: 4
+                        }
+                    ),
+                    (
+                        "dns".to_string(),
+                        StreamDrainCounts {
+                            closed: 1,
+                            finished: 0
+                        }
+                    ),
+                ]),
+            }
+        );
+        assert!(drained.clean);
+        assert_eq!(drained.end(), GenerationDrainEnd::Deadline);
+        let report = drained.report(10, 20, drain);
+        assert_eq!(
+            (report.old_pid, report.new_pid, report.drain_timeout_s),
+            (10, 20, 120)
+        );
+        assert_eq!(report.streams, drained.reports.streams);
+        assert!(
+            matches!(states.get("s1"), Some(BindState::Bound { .. })),
+            "an upgrade releases nothing: the new generation holds the ports"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_worker_without_its_report_end_is_unreported_and_a_kill_says_killed() {
+        let (w0, _) = FakeLink::reporting(&[], vec![entry("db", 1, 0)], DrainEnd::Idle, 0);
+        let (w1, _) = FakeLink::new(&[]);
+        let (plane, _) = plane(vec![w0, w1]);
+        let handle = plane_handle(plane);
+
+        let drained = handle
+            .drain_for_upgrade(Duration::from_secs(1), |_| false)
+            .await;
+
+        assert_eq!(
+            (drained.reports.reported, drained.reports.unreported),
+            (1, 1)
+        );
+        assert!(!drained.reports.deadline);
+        assert_eq!(drained.end(), GenerationDrainEnd::Killed);
+        assert_eq!(
+            drained
+                .report(1, 2, Duration::from_secs(1))
+                .workers_unreported,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plane_quiesced_for_an_upgrade_binds_nothing_more() {
+        let (w0, seen0) = FakeLink::new(&[]);
+        let (mut plane, states) = plane(vec![w0]);
+        plane.quiesce_for_upgrade(Duration::from_secs(5)).await;
+        let port = free_ports(1);
+
+        let events = plane
+            .bind_desired(&[tcp("late", port)], &[], STANDALONE, PASS, Trigger::Change)
+            .await;
+        plane.refresh_all(PASS).await;
+
+        assert!(events.is_empty());
+        assert!(states.snapshot().is_empty());
+        assert!(bindable(port));
+        assert_eq!(
+            seen(&seen0),
+            vec![Seen::Quiesce {
+                drain_ms: 5_000,
+                reason: QuiesceReason::Upgrade
+            }]
+        );
+    }
+
+    /// The device and inode of socket `fd`: one kernel socket whatever
+    /// descriptor names it.
+    fn socket_identity(fd: &OwnedFd) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let file = std::fs::File::from(fd.try_clone().unwrap());
+        let meta = file.metadata().unwrap();
+        (meta.dev(), meta.ino())
+    }
+
+    #[tokio::test]
+    async fn a_udp_group_is_handed_over_and_adopted_slot_by_slot() {
+        let port = free_udp_port();
+        let s = udp("u1", port);
+        let (mut old, _) = plane(vec![FakeLink::new(&[]).0, FakeLink::new(&[]).0]);
+        old.bind_desired(
+            std::slice::from_ref(&s),
+            &[],
+            STANDALONE,
+            PASS,
+            Trigger::Change,
+        )
+        .await;
+
+        let mut handed = old.udp_handoff_fds();
+        handed.sort_by_key(|h| h.slot);
+        assert_eq!(
+            handed.iter().map(|h| h.slot).collect::<Vec<_>>(),
+            vec![0, 1],
+            "every slot of the group"
+        );
+        assert!(handed
+            .iter()
+            .all(|h| h.stream_id == "u1" && h.addr.port() == port));
+        // What the new supervisor receives: its own descriptors of the
+        // same sockets.
+        let received: Vec<(StreamUdpFd, OwnedFd)> = handed
+            .iter()
+            .map(|h| {
+                // SAFETY: the old plane owns `h.fd` and outlives this
+                // borrow; the clone is a new descriptor of its own.
+                let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(h.fd) };
+                (h.clone(), borrowed.try_clone_to_owned().unwrap())
+            })
+            .collect();
+        let identities: Vec<(u64, u64)> =
+            received.iter().map(|(_, fd)| socket_identity(fd)).collect();
+
+        let (mut new, states) = plane(vec![FakeLink::new(&[]).0, FakeLink::new(&[]).0]);
+        new.adopt_inherited_udp(received);
+        let events = new
+            .bind_desired(
+                std::slice::from_ref(&s),
+                &[],
+                STANDALONE,
+                PASS,
+                Trigger::Change,
+            )
+            .await;
+
+        let bind_gen = handed[0].bind_gen + 1;
+        assert!(
+            matches!(events.as_slice(), [PlaneEvent::Bound { bind_gen: g, .. }] if *g == bind_gen),
+            "{events:?}"
+        );
+        assert!(matches!(
+            states.get("u1"),
+            Some(BindState::Bound {
+                workers_serving: 2,
+                ..
+            })
+        ));
+        for (worker, identity) in identities.iter().enumerate() {
+            let link = new.workers[&u32::try_from(worker).unwrap()]
+                .link
+                .as_ref()
+                .unwrap();
+            let held = link.held("u1", bind_gen);
+            assert_eq!(held.len(), 1);
+            assert_eq!(
+                socket_identity(&held[0]),
+                *identity,
+                "worker {worker} serves the old generation's slot {worker}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_udp_group_that_does_not_match_the_workers_is_closed_and_rebound() {
+        let port = free_udp_port();
+        let s = udp("u1", port);
+        let (mut old, _) = plane(vec![FakeLink::new(&[]).0]);
+        old.bind_desired(
+            std::slice::from_ref(&s),
+            &[],
+            STANDALONE,
+            PASS,
+            Trigger::Change,
+        )
+        .await;
+        let handed = old.udp_handoff_fds();
+        assert_eq!(handed.len(), 1, "a one-worker group");
+        let received: Vec<(StreamUdpFd, OwnedFd)> = handed
+            .iter()
+            .map(|h| {
+                // SAFETY: as in the adoption test above.
+                let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(h.fd) };
+                (h.clone(), borrowed.try_clone_to_owned().unwrap())
+            })
+            .collect();
+        let inherited = socket_identity(&received[0].1);
+
+        // Two workers on the new side: the group cannot be kept whole.
+        let (mut new, states) = plane(vec![FakeLink::new(&[]).0, FakeLink::new(&[]).0]);
+        new.adopt_inherited_udp(received);
+        new.bind_desired(
+            std::slice::from_ref(&s),
+            &[],
+            STANDALONE,
+            PASS,
+            Trigger::Change,
+        )
+        .await;
+
+        assert!(matches!(
+            states.get("u1"),
+            Some(BindState::Bound {
+                workers_serving: 2,
+                ..
+            })
+        ));
+        assert!(
+            new.inherited_udp.is_empty(),
+            "nothing inherited is left open"
+        );
+        let bind_gen = handed[0].bind_gen + 1;
+        for worker in 0..2u32 {
+            let held = new.workers[&worker]
+                .link
+                .as_ref()
+                .unwrap()
+                .held("u1", bind_gen);
+            assert_eq!(held.len(), 1);
+            assert_ne!(socket_identity(&held[0]), inherited, "a fresh group");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_real_worker_runtime_reports_its_upgrade_drain_through_the_seqpacket_link() {
+        let (supervisor_end, worker_end) = stream_ctl::create_seqpacket_pair().unwrap();
+        let runtime = lorica_stream::StreamRuntime::spawn(
+            lorica_stream::ControlTransport::Seqpacket(worker_end),
+            lorica_stream::Engines::default(),
+            Arc::new(FixedTable(Vec::new())),
+        )
+        .unwrap();
+        let mut plane = StreamPlane::new(
+            vec![(0, SeqpacketLink::new(supervisor_end).unwrap())],
+            1,
+            FdBudget::from_limit(65536),
+            reserved(),
+            StreamBindStates::new(),
+            STREAM_CTL_ACK_TIMEOUT,
+        );
+
+        plane.quiesce_for_upgrade(Duration::from_secs(1)).await;
+        let mut quiesced = runtime.quiesced();
+        let q = *quiesced.wait_for(Option::is_some).await.unwrap();
+        assert_eq!(q.map(|q| q.reason), Some(QuiesceReason::Upgrade));
+        // What a worker's drain watcher does before its exit, then the
+        // exit closing its end of the channel.
+        let worker_exit = tokio::task::spawn_blocking(move || {
+            let sent = runtime.send_drain_report(DrainEnd::Deadline, 2).unwrap();
+            assert!(!sent.truncated);
+            runtime.stop();
+        });
+        worker_exit.await.unwrap();
+
+        let reports = plane.collect_drain_reports().await;
+
+        assert_eq!((reports.reported, reports.unreported), (1, 0));
+        assert!(reports.deadline);
+        assert_eq!(reports.http_cut, 2);
     }
 
     #[tokio::test]

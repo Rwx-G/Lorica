@@ -94,6 +94,11 @@ pub(crate) fn run_supervisor(cli: Cli) {
 
     let data_dir_path = PathBuf::from(&cli.data_dir);
 
+    // The generation this process takes over from, by the parent pid it
+    // has at start: it drains until its report arrives or it is no
+    // longer this process's parent (Story 12.11 D-h).
+    let predecessor: Option<u32> = cli.hot_upgrade.then(std::os::unix::process::parent_id);
+
     // Hot upgrade (Story 8.4), NEW supervisor side: pull the inherited
     // listening sockets from the outgoing supervisor's transfer socket
     // BEFORE any other startup work, so we bind/adopt the transfer socket
@@ -112,6 +117,8 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     // live, and it rebinds on the next liveness edge).
                     cluster_listeners = i.cluster.len(),
                     automation_listeners = i.automation.len(),
+                    stream_tcp_listeners = i.stream_tcp.len(),
+                    stream_udp_slots = i.stream_udp.len(),
                     "hot upgrade: pulled inherited listeners from outgoing supervisor"
                 );
                 Some(i)
@@ -343,6 +350,20 @@ pub(crate) fn run_supervisor(cli: Cli) {
         if let Err(e) = std::fs::create_dir_all(&data_dir) {
             error!(error = %e, path = %data_dir.display(), "failed to create data directory");
             std::process::exit(1);
+        }
+        // Drain reports a crash left behind (Story 12.11 D-g); a young
+        // one may still be awaited by a chained upgrade and is kept.
+        match hot_upgrade::remove_stale_drain_reports(
+            &data_dir,
+            std::process::id(),
+            hot_upgrade::DRAIN_REPORT_WAIT,
+        ) {
+            Ok(removed) => {
+                for path in removed {
+                    info!(path = %path.display(), "hot upgrade: stale drain report deleted");
+                }
+            }
+            Err(e) => warn!(error = %e, "hot upgrade: stale drain reports not cleaned up"),
         }
 
         // Load or create encryption key for certificate private keys at rest
@@ -1051,6 +1072,19 @@ pub(crate) fn run_supervisor(cli: Cli) {
                         })
                         .collect(),
                 );
+                // Story 12.11 D-e: the UDP slot sockets, adopted group by
+                // group, slot `k` to worker `k`.
+                plane.adopt_inherited_udp(
+                    inherited
+                        .stream_udp
+                        .iter()
+                        .map(|entry| {
+                            // SAFETY: as above, received via SCM_RIGHTS
+                            // and owned by nothing else.
+                            (entry.clone(), unsafe { OwnedFd::from_raw_fd(entry.fd) })
+                        })
+                        .collect(),
+                );
             }
             // Stream observability (Story 12.9): the workers count and
             // log; this process sees the node, so it renders the
@@ -1197,10 +1231,16 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 state.clone(),
             )
             .await;
-            if let Err(e) = automation {
-                error!(error = %e, "automation listener failed to start");
-                std::process::exit(1);
-            }
+            // Held by this task, so that aborting it at a hot upgrade's
+            // handoff stops the automation server with the management one
+            // (Story 12.11 D-b).
+            let _automation_server = match automation {
+                Ok(server) => server.map(tokio_util::task::AbortOnDropHandle::new),
+                Err(e) => {
+                    error!(error = %e, "automation listener failed to start");
+                    std::process::exit(1);
+                }
+            };
 
             // Session store + ACME auto-renewal + cert-expiry notifier
             // + server loop, shared with single-process mode (audit
@@ -1493,6 +1533,17 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     // operator can see the completed upgrade on /metrics
                     // (audit M4).
                     lorica_api::metrics::record_hot_upgrade("completed");
+                    // The outgoing generation now drains for up to
+                    // `worker_drain_timeout_s`; its drain metrics arrive
+                    // with its report (Story 12.11 D-g, D-h).
+                    if let Some(predecessor) = predecessor {
+                        tokio::spawn(receive_drain_report(
+                            data_dir_path.clone(),
+                            std::process::id(),
+                            predecessor,
+                            Arc::clone(&store),
+                        ));
+                    }
                 }
                 Ok(false) => {
                     // No ack within the deadline: the old never saw us (or
@@ -1638,15 +1689,20 @@ pub(crate) fn run_supervisor(cli: Cli) {
                         // TCP stream listeners hold their ports without
                         // SO_REUSEPORT: the new generation inherits them
                         // or meets EADDRINUSE until this one exits (D-j).
-                        stream_tcp_fds: stream_plane.tcp_handoff_fds().await,
+                        // UDP groups are handed over whole, so their size
+                        // never changes and no client is remapped
+                        // (Story 12.11 D-e).
+                        stream_fds: stream_plane.handoff_fds().await,
                         child_argv,
                     })
                     .await;
 
                     match run.decision {
                         hot_upgrade::HandoffDecision::Drain => {
-                            info!("hot upgrade: new supervisor is up; draining old workers");
-                            // The new supervisor owns its own dup of
+                            info!("hot upgrade: new supervisor is up; draining the old generation");
+                            // Story 12.11 D-b, in its order.
+                            //
+                            // 1. The new supervisor owns its own dup of
                             // the cluster socket and serves the new
                             // takeover epoch: stop accepting and end
                             // every session here NOW, so no follower
@@ -1663,37 +1719,67 @@ pub(crate) fn run_supervisor(cli: Cli) {
                             // seen as a crash and respawned.
                             shutting_down.store(true, std::sync::atomic::Ordering::Release);
                             monitor_handle.abort();
-                            // Drain in-flight connections, timing it for
-                            // the histogram. Only after this completes do
-                            // the old listening sockets close (the manager
-                            // drops at process exit); until then both old
-                            // and new accept from the shared queue, so no
-                            // connection is dropped.
-                            let drain_start = Instant::now();
-                            let clean = manager
-                                .lock()
-                                .unwrap_or_else(|e| {
-                                    warn!("worker manager mutex poisoned during handoff, recovering");
-                                    e.into_inner()
+                            // 2. Stop serving the management and
+                            // automation APIs: the new supervisor accepts
+                            // on its own copies of both sockets, so no
+                            // request is refused and every new one reaches
+                            // the new binary. The health loop and every
+                            // periodic control-plane loop stop with them.
+                            // What the draining workers still call stays
+                            // up: their command channels, the RPC handlers
+                            // (rate limits, forward-auth verdicts,
+                            // breakers), the log and WAF fan-in, and the
+                            // stream plane.
+                            api_handle.abort();
+                            health_handle.abort();
+                            lorica_api::shutdown::begin();
+                            // 3. Read once: the drain an operator previewed
+                            // is the one applied.
+                            let drain = startup::drain::stored_drain_timeout(&*store.lock().await);
+                            // 4 and 5. Quiesce for the upgrade, then
+                            // SIGTERM and wait up to the drain plus the
+                            // kill margin. Until each old worker exits,
+                            // both generations accept HTTP from the
+                            // shared queues, so no connection is dropped.
+                            let terminate_manager = Arc::clone(&manager);
+                            let drained = stream_plane
+                                .drain_for_upgrade(drain, move |bound| {
+                                    terminate_manager
+                                        .lock()
+                                        .unwrap_or_else(|e| {
+                                            warn!("worker manager mutex poisoned during handoff, recovering");
+                                            e.into_inner()
+                                        })
+                                        .drain_for_handoff(bound)
                                 })
-                                .drain_for_handoff();
-                            let drain_secs = drain_start.elapsed().as_secs_f64();
-                            lorica_api::metrics::observe_hot_upgrade_drain(drain_secs);
-                            if !clean {
-                                lorica_api::metrics::record_hot_upgrade(
-                                    hot_upgrade::RollbackReason::DrainTimeout.metric_outcome(),
-                                );
+                                .await;
+                            // 6. The new generation records the drain's
+                            // metrics from this report: this process's
+                            // registry dies with it.
+                            let end = drained.end();
+                            match run.child.and_then(|child| u32::try_from(child.as_raw()).ok()) {
+                                Some(new_pid) => {
+                                    let report = drained.report(std::process::id(), new_pid, drain);
+                                    match hot_upgrade::write_drain_report(&data_dir_path, &report) {
+                                        Ok(path) => info!(path = %path.display(), "hot upgrade: drain report written"),
+                                        Err(e) => warn!(error = %e,
+                                            "hot upgrade: drain report not written; the new generation records no drain metrics"),
+                                    }
+                                }
+                                None => warn!("hot upgrade: the new supervisor's pid is unknown; no drain report written"),
+                            }
+                            if end.reached_the_deadline() {
                                 warn!(
-                                    drain_secs,
-                                    "hot upgrade: drain exceeded the window, stragglers were force-killed"
+                                    end = end.as_str(),
+                                    drain_s = drain.as_secs(),
+                                    "hot upgrade: the drain reached worker_drain_timeout_s with traffic still open"
                                 );
                             }
                             startup::drain_for_exit(&shutdown_task_tracker).await;
-                            api_handle.abort();
-                            health_handle.abort();
                             lorica::otel::shutdown();
                             info!(
-                                drain_secs,
+                                drain_secs = drained.drain_secs,
+                                end = end.as_str(),
                                 "hot upgrade complete; exiting so the new supervisor takes over"
                             );
                             std::process::exit(0);
@@ -1774,6 +1860,103 @@ pub(crate) fn run_supervisor(cli: Cli) {
             }
         }
     });
+}
+
+/// The new generation's half of the drain report (Story 12.11 D-g, D-h):
+/// while `predecessor` drains, the preview says so; every
+/// [`hot_upgrade::DRAIN_REPORT_POLL`] look for the report it writes for
+/// `self_pid`, and once it is there record its metrics in this process,
+/// log one summary line and delete it. The wait ends without a report
+/// when `predecessor` is no longer this process's parent or after
+/// [`hot_upgrade::DRAIN_REPORT_WAIT`], with a warning.
+async fn receive_drain_report(
+    data_dir: PathBuf,
+    self_pid: u32,
+    predecessor: u32,
+    store: Arc<Mutex<ConfigStore>>,
+) {
+    use crate::startup::hot_upgrade;
+
+    lorica_api::upgrade::set_previous_generation(Some(predecessor));
+    let started = Instant::now();
+    let mut tick = tokio::time::interval(hot_upgrade::DRAIN_REPORT_POLL);
+    loop {
+        tick.tick().await;
+        // The parent is read before the file: the old generation writes
+        // its report before it exits, so once it is gone the report is
+        // there or never will be.
+        let gone = std::os::unix::process::parent_id() != predecessor;
+        match hot_upgrade::read_drain_report(&data_dir, self_pid) {
+            Ok(Some(report)) => {
+                record_received_drain_report(&report, &store).await;
+                break;
+            }
+            Ok(None) if gone => {
+                warn!(
+                    previous_pid = predecessor,
+                    "hot upgrade: the previous generation exited without a drain report"
+                );
+                break;
+            }
+            Ok(None) if started.elapsed() > hot_upgrade::DRAIN_REPORT_WAIT => {
+                warn!(
+                    previous_pid = predecessor,
+                    waited_s = started.elapsed().as_secs(),
+                    "hot upgrade: no drain report from the previous generation"
+                );
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, "hot upgrade: the drain report is unreadable; deleted");
+                break;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(hot_upgrade::drain_report_path(&data_dir, self_pid));
+    lorica_api::upgrade::set_previous_generation(None);
+}
+
+/// Record `report` against the streams this node holds now and log its
+/// summary line.
+async fn record_received_drain_report(
+    report: &crate::startup::hot_upgrade::DrainReport,
+    store: &Arc<Mutex<ConfigStore>>,
+) {
+    let held: Option<std::collections::BTreeSet<String>> = match store.lock().await.list_streams() {
+        Ok(streams) => Some(streams.into_iter().map(|s| s.id).collect()),
+        Err(e) => {
+            warn!(error = %e, "hot upgrade: streams unreadable; every stream of the drain report is recorded");
+            None
+        }
+    };
+    let recorded = crate::startup::hot_upgrade::record_drain_report(report, |id| {
+        held.as_ref().is_none_or(|held| held.contains(id))
+    });
+    for stream_id in &recorded.skipped {
+        info!(%stream_id, "hot upgrade: the drain report names a stream this node no longer holds; not recorded");
+    }
+    let (closed, finished) = report
+        .streams
+        .values()
+        .fold((0u64, 0u64), |(c, f), counts| {
+            (
+                c.saturating_add(counts.closed),
+                f.saturating_add(counts.finished),
+            )
+        });
+    info!(
+        previous_pid = report.old_pid,
+        drain_timeout_s = report.drain_timeout_s,
+        drain_secs = report.drain_secs,
+        end = report.end.as_str(),
+        workers_unreported = report.workers_unreported,
+        http_cut = report.http_cut,
+        streams = report.streams.len(),
+        closed,
+        finished,
+        "hot upgrade: the previous generation drained"
+    );
 }
 
 /// Restore WAF runtime state for the supervisor from persisted settings:

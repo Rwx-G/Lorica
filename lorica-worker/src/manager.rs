@@ -583,18 +583,19 @@ impl WorkerManager {
         self.shutdown_all_with_timeout(drain);
     }
 
-    /// Drain workers for a hot upgrade and report whether the drain
-    /// finished cleanly within the timeout.
+    /// Drain workers for a hot upgrade and report whether every worker
+    /// exited by itself within `drain`.
     ///
-    /// Same SIGTERM-then-wait-then-SIGKILL sequence as [`Self::shutdown_all`]
-    /// but returns `true` when every worker exited on its own (all
-    /// in-flight connections completed) and `false` when the drain window
-    /// elapsed and stragglers were force-killed. The supervisor's
-    /// handoff success path records `lorica_hot_upgrade_total{outcome=
-    /// "drain_timeout"}` on `false` and observes the elapsed time into
-    /// `lorica_hot_upgrade_drain_seconds` regardless.
-    pub fn drain_for_handoff(&self) -> bool {
-        self.shutdown_all_with_timeout(Duration::from_secs(30))
+    /// Same SIGTERM-then-wait-then-SIGKILL sequence as [`Self::shutdown_all`].
+    /// `drain` is the upgrade's bound: `worker_drain_timeout_s`, read once
+    /// at the handoff, plus the kill margin (Story 12.11 D-b). The workers
+    /// were quiesced for the upgrade before the SIGTERM, so each one's
+    /// drain watcher ends it as soon as its traffic is gone, or at the
+    /// setting with what is left closed; the SIGKILL past `drain` only
+    /// meets a worker whose watcher failed. Returns `false` when one had
+    /// to be killed, which the generation's drain report says as `killed`.
+    pub fn drain_for_handoff(&self, drain: Duration) -> bool {
+        self.shutdown_all_with_timeout(drain)
     }
 
     fn shutdown_all_with_timeout(&self, drain_timeout: Duration) -> bool {
