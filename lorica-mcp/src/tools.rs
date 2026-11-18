@@ -1873,7 +1873,9 @@ pub const MUTATIONS: &[Mutation] = &[
                   runs: no new request is routed to it, and the row leaves once its \
                   connections are gone or after a minute. The backend named must be inside \
                   the token's allowed_backend_cidrs on its stored address. A backend an \
-                  environment owns is refused.",
+                  environment owns is refused, and so is a backend any TCP or UDP stream \
+                  uses: the refusal names those streams, and an operator unlinks the \
+                  backend from them in the dashboard first.",
         scope: AutomationScope::BackendsWrite,
         verb: Verb::Delete,
         path: "/automation/v1/backends",

@@ -592,9 +592,9 @@ Allowlist: `lorica-api/src/automation/write.rs`,
 `lorica-api/openapi-automation.yaml` (the 409 on backend delete),
 `lorica-mcp/src/tools.rs` (the `lorica_backend_delete` summary only).
 
-- [ ] The refusal of D-i, preview and apply alike, the 409 naming every
+- [x] The refusal of D-i, preview and apply alike, the 409 naming every
       stream.
-- [ ] Tests: refused with one and with two streams named; allowed once
+- [x] Tests: refused with one and with two streams named; allowed once
       the management plane unlinked it; a backend on a route only still
       deletes; the dry run is refused the same way.
 
@@ -857,6 +857,8 @@ each one as "Resolved N".
   scope list was edited by hand, as the fixture's header says.
 - Lot C1, 2026-11-18, on `0adaa713`. Gates on the final tree: see the
   Change Log row.
+- Lot C2, 2026-11-18, on `c334ea2d`. Gates on the final tree: see the
+  Change Log row.
 
 ### Completion Notes
 
@@ -978,6 +980,44 @@ each one as "Resolved N".
   private `StreamLinks::by_stream` rather than copying it into
   `config.rs`. `streams/tests.rs` made its `Node` fixture, `tcp` and
   `without_bind` `pub(super)` for the new module.
+- **Lot C2, where the refusal runs.** D-i says "before
+  `delete_backend_as` is called". It runs inside it instead, in a
+  delete-only guard, `backend_delete_guard` (`backend_guard`'s checks,
+  shared through `check_backend_target`, then
+  `ensure_not_unlinked_from_a_stream`). Its own guard, because a
+  target cannot say which write it is: an update's first look at the
+  row also arrives with a `before` and no `after`, and a first cut
+  keyed on that shape refused the address move of 12.3's test. The
+  guard runs under the lock on the row the delete removes, so no
+  stream link can land between the check and the cascade, and after
+  the grant's own check on that row, so a token reads stream names only
+  for a backend its `allowed_backend_cidrs` reaches. The preview runs
+  the same guard, so it is refused alike. A plain `409 conflict`, as
+  the certificate delete's refusal it is modelled on; the names are
+  sorted and quoted.
+- **Lot C2, what the names reveal.** A `backends:write` token without
+  `streams:read` (every config-tier token) reads, in the refusal, the
+  names of the streams that use a backend inside its grant. D-j keeps
+  stream names off `BackendResponse` for that reason, and Lot H's IV1
+  expects the refusal to name the stream, as 12.3's address refusal
+  already does. Kept as D-i decides; flagged here for the release
+  review.
+- **Lot C2, the tests** (`write/plane_tests.rs`):
+  `a_token_cannot_delete_a_backend_a_stream_uses_on_any_door` drives
+  apply and `?dry_run=true` over REST, the same request carrying the
+  stdio server's asserted transport and tool, and both MCP Streamable
+  HTTP tools (`lorica_backend_delete` and its preview), with one stream
+  then two named, the canonical configuration unchanged and no
+  `backend.delete` row, then the token's delete accepted once the
+  management plane emptied both streams' `backend_ids`.
+  `a_token_still_deletes_a_backend_only_a_route_uses` covers the route
+  case, preview and apply. The stdio server itself relays a plane
+  answer it does not judge, so its own tests (`lorica-mcp/src/stdio.rs`)
+  were not extended.
+- **Scope of the C2 commit: `api`.** The bypass existed since 12.1 gave
+  streams backends, on a branch that has not shipped: no released
+  version lets a token unlink a stream's backend, so it is a fix to
+  unreleased code, not a security fix to a release.
 
 ## File List
 
@@ -1003,6 +1043,10 @@ each one as "Resolved N".
   `lorica-api/src/streams/audit_tests.rs` (new),
   `lorica-api/src/streams/tests.rs` (the fixture's visibility),
   `lorica-api/src/streams.rs` (`stream_views`, the module line) (Lot C1)
+- `lorica-api/src/automation/write.rs`,
+  `lorica-api/src/automation/write/plane_tests.rs`,
+  `lorica-api/openapi-automation.yaml` (the backend delete's 409),
+  `lorica-mcp/src/tools.rs` (the `lorica_backend_delete` summary) (Lot C2)
 
 ## Change Log
 
@@ -1013,3 +1057,4 @@ each one as "Resolved N".
 | 2026-11-18 | 0.3 | Lot A: `GET /api/v1/streams/status` (this node's bind state, per-node states on a control plane, this node's live counters with per-reason arrays), `StreamMetricsCollector::live_counters`, `node_bind_state` shared by the fleet view and the status, `NodeStreamBinding.stream_name`, `openapi.yaml`. D-d and D-e amended against the code (active nodes only, `unknown` before a report, no `nodes_truncated`, one-pass accessor, `node_name` null on a control plane). Status InProgress. | Romain G. |
 | 2026-11-18 | 0.4 | Lot B: `streams:read` in the closed scope enum with every restatement in one commit (both OpenAPI documents, the `api.ts` union, the generated fixture and its tier vectors), the read tier carrying it; `GET /automation/v1/streams` and `/automation/v1/streams/status`, filtered, unmasked, empty for a grant-carrying principal; `lorica_streams` and `lorica_stream_status`; with 12.9 Lot C3's `/automation/v1/stream-logs` and `lorica_stream_logs` behind `streams:read` plus `logs:read` through `companion_scope`. Gates on the final tree: the CI chain green (3,678 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean, frontend check, lint and Vitest (878) green. | Romain G. |
 | 2026-11-18 | 0.5 | Lot C1: a TOML import writes one `stream.create`, `stream.update` or `stream.delete` row per stream whose view it moved, links included, beside its `config.import` row; a backend delete writes one `stream.backend_unlinked` per stream that linked it, beside `backend.delete`; the D-h walk with the chain verified. D-h's changed set amended against the code (views before and after, pinned equal to the preview's stream and link diffs). Gates on the final tree: the CI chain green (3,682 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean. | Romain G. |
+| 2026-11-18 | 0.6 | Lot C2: a token's backend delete (REST, both MCP transports, apply and preview) answers 409 naming every stream that links the backend, through a delete-only guard after the grant's check; address updates unchanged; the `lorica_backend_delete` summary and `openapi-automation.yaml` say so. Gates on the final tree: the CI chain green (3,684 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean. | Romain G. |

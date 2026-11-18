@@ -3883,3 +3883,200 @@ async fn iv2_a_token_sets_a_template_and_never_authors_a_custom_payload() {
         "a refused create stored a backend"
     );
 }
+
+// ---- Story 12.10 D-i: a token never unlinks a backend from a stream ----
+
+/// A TCP stream named `name` on `port` linking `backends` as primaries,
+/// created by the fixture's admin through the management API; its id.
+async fn a_stream_using(f: &WriteFixture, name: &str, port: u16, backends: &[&str]) -> String {
+    let created = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "POST",
+        "/api/v1/streams",
+        &f.admin,
+        Some(serde_json::json!({
+            "name": name,
+            "protocol": "tcp",
+            "listen_address": "0.0.0.0",
+            "port_first": port,
+            "backend_ids": backends,
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED, "test setup: {name}");
+    parse_data(created).await["id"]
+        .as_str()
+        .expect("stream id")
+        .to_string()
+}
+
+/// A token's `DELETE` of `backend_id` with `suffix`, sent as the REST
+/// caller sends it and as `lorica-mcp` over stdio sends it (the same
+/// request, carrying the transport and tool it asserts): both answers.
+async fn token_deletes(
+    f: &WriteFixture,
+    backend_id: &str,
+    suffix: &str,
+) -> Vec<(&'static str, axum::response::Response)> {
+    let uri = format!("/automation/v1/backends/{backend_id}{suffix}");
+    let rest = automation_call(&f.state, "DELETE", &uri, &f.bearer, None).await;
+    let stdio = crate::automation::build_automation_router(f.state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(&uri)
+                .header(http::header::AUTHORIZATION, &f.mcp_bearer)
+                .header(
+                    crate::automation::audit::ASSERTED_TRANSPORT_HEADER,
+                    "mcp-stdio",
+                )
+                .header(
+                    crate::automation::audit::ASSERTED_TOOL_HEADER,
+                    "lorica_backend_delete",
+                )
+                .body(Body::empty())
+                .expect("test setup"),
+        )
+        .await
+        .expect("test setup");
+    vec![("rest", rest), ("stdio", stdio)]
+}
+
+/// The refusal text of a 409, after asserting the status.
+async fn conflict_message(response: axum::response::Response, what: &str) -> String {
+    assert_eq!(response.status(), StatusCode::CONFLICT, "{what}");
+    body_json(response).await["error"]["message"]
+        .as_str()
+        .expect("a message")
+        .to_string()
+}
+
+/// Every door a token reaches the backend delete through, apply and
+/// preview: each refusal's text.
+async fn refusals_on_every_door(f: &WriteFixture, backend_id: &str) -> Vec<String> {
+    let mut refusals = Vec::new();
+    for suffix in ["", "?dry_run=true"] {
+        for (door, response) in token_deletes(f, backend_id, suffix).await {
+            refusals.push(conflict_message(response, &format!("{door}{suffix}")).await);
+        }
+    }
+    for tool in ["lorica_backend_delete", "lorica_backend_delete_preview"] {
+        let refused = mcp_call(
+            &f.state,
+            &f.mcp_bearer,
+            tool,
+            serde_json::json!({ "id": backend_id }),
+        )
+        .await;
+        assert_eq!(
+            refused["result"]["isError"],
+            serde_json::json!(true),
+            "{tool}: {refused}"
+        );
+        let text = refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(text.contains("HTTP 409"), "{tool}: {text}");
+        refusals.push(text);
+    }
+    refusals
+}
+
+#[tokio::test]
+async fn a_token_cannot_delete_a_backend_a_stream_uses_on_any_door() {
+    // Story 12.10 D-i, Resolved 1: a stream's backend set is a stream
+    // field, and the delete's cascade was a stream write reachable with
+    // `backends:write`. Refused 409 naming every stream, the preview
+    // like the apply, over REST, MCP Streamable HTTP and the request
+    // the stdio server sends; nothing moves.
+    let f = a_node_with_something_to_write().await;
+    let smtp = a_stream_using(&f, "smtp", 2525, &[&f.backend_id]).await;
+    let before = canonical_now(&f.state).await;
+    let before_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
+
+    for refusal in refusals_on_every_door(&f, &f.backend_id).await {
+        assert!(refusal.contains("`smtp`"), "{refusal}");
+    }
+    let imap = a_stream_using(&f, "imap", 2526, &[&f.backend_id]).await;
+    let before = canonical_now(&f.state).await;
+    let two_streams_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
+    for refusal in refusals_on_every_door(&f, &f.backend_id).await {
+        assert!(
+            refusal.contains("`imap`") && refusal.contains("`smtp`"),
+            "{refusal}"
+        );
+    }
+    assert_ne!(
+        before_bytes, two_streams_bytes,
+        "test setup: a second stream"
+    );
+    assert_eq!(
+        two_streams_bytes,
+        lorica_config::canonical::encode_canonical(&canonical_now(&f.state).await)
+            .expect("encodes"),
+        "a refused delete changed the store"
+    );
+    let deletes = audit_rows_under(&f.state, "backend.delete").await;
+    assert!(deletes.is_empty(), "{deletes:?}");
+
+    // Once the management plane unlinked it, the token deletes it.
+    for stream in [&smtp, &imap] {
+        let unlinked = send(
+            &f.state,
+            &f.session_store,
+            &f.rate_limiter,
+            "PUT",
+            &format!("/api/v1/streams/{stream}"),
+            &f.admin,
+            Some(serde_json::json!({ "backend_ids": [] })),
+        )
+        .await;
+        assert_eq!(unlinked.status(), StatusCode::OK);
+    }
+    let response = automation_call(
+        &f.state,
+        "DELETE",
+        &format!("/automation/v1/backends/{}", f.backend_id),
+        &f.bearer,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        parse_data(response).await["lifecycle_state"],
+        serde_json::json!("closing")
+    );
+}
+
+#[tokio::test]
+async fn a_token_still_deletes_a_backend_only_a_route_uses() {
+    let f = a_node_with_something_to_write().await;
+    let created = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &f.admin,
+        Some(serde_json::json!({
+            "hostname": "route-only.write.example.com",
+            "backend_ids": [f.backend_id],
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    for suffix in ["?dry_run=true", ""] {
+        let response = automation_call(
+            &f.state,
+            "DELETE",
+            &format!("/automation/v1/backends/{}{suffix}", f.backend_id),
+            &f.bearer,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{suffix}");
+    }
+}

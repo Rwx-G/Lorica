@@ -226,7 +226,7 @@ use crate::preview::{previewed, DryRunQuery, WriteMode};
 use crate::routes::{CreateRouteRequest, UpdateRouteRequest};
 use crate::server::AppState;
 use crate::settings::{SettingsAuditTarget, UpdateSettingsRequest};
-use crate::target::{BackendGuard, CertificateGuard, RouteGuard, RouteTarget};
+use crate::target::{BackendGuard, BackendTarget, CertificateGuard, RouteGuard, RouteTarget};
 
 // The admin tier's surface is the automation policy's, declared in
 // `lorica-automation-policy` so `lorica-mcp` builds its tool from the
@@ -699,29 +699,88 @@ fn ensure_new_certificate_granted(
 /// ([`redact::restore_health_check_payload`]).
 fn backend_guard(principal: &AutomationPrincipal) -> BackendGuard {
     let principal = principal.clone();
+    BackendGuard::bounded(move |store, target| check_backend_target(store, &principal, target))
+        .restoring_withheld(redact::restore_health_check_path)
+}
+
+/// [`backend_guard`] for a delete: the same checks, then the refusal of
+/// a backend a stream links ([`ensure_not_unlinked_from_a_stream`]).
+///
+/// A guard of its own because the target cannot say which write it is:
+/// a delete and the first look of an update both arrive as a stored row
+/// with no row after it.
+fn backend_delete_guard(principal: &AutomationPrincipal) -> BackendGuard {
+    let principal = principal.clone();
     BackendGuard::bounded(move |store, target| {
-        if let Some(before) = target.before {
-            ensure_backend_row_granted(store, &principal, before)?;
+        check_backend_target(store, &principal, target)?;
+        match target.before {
+            Some(deleted) => ensure_not_unlinked_from_a_stream(store, deleted),
+            None => Ok(()),
         }
-        if let Some(after) = target.after {
-            ensure_backend_row_granted(store, &principal, after)?;
-            ensure_no_new_raw_payload(target.before, after)?;
-            let created;
-            let before = match target.before {
-                Some(before) => before,
-                None => {
-                    created = as_created_by_default(after);
-                    &created
-                }
-            };
-            ensure_not_weakened(BACKEND_PROTECTIONS, "backend", &after.id, before, after)?;
-        }
-        if let (Some(before), Some(after)) = (target.before, target.after) {
-            ensure_not_moved_under_a_local_stream(store, before, after)?;
-        }
-        Ok(())
     })
-    .restoring_withheld(redact::restore_health_check_path)
+}
+
+/// What [`backend_guard`] weighs on one target.
+fn check_backend_target(
+    store: &ConfigStore,
+    principal: &AutomationPrincipal,
+    target: BackendTarget<'_>,
+) -> Result<(), ApiError> {
+    if let Some(before) = target.before {
+        ensure_backend_row_granted(store, principal, before)?;
+    }
+    if let Some(after) = target.after {
+        ensure_backend_row_granted(store, principal, after)?;
+        ensure_no_new_raw_payload(target.before, after)?;
+        let created;
+        let before = match target.before {
+            Some(before) => before,
+            None => {
+                created = as_created_by_default(after);
+                &created
+            }
+        };
+        ensure_not_weakened(BACKEND_PROTECTIONS, "backend", &after.id, before, after)?;
+    }
+    if let (Some(before), Some(after)) = (target.before, target.after) {
+        ensure_not_moved_under_a_local_stream(store, before, after)?;
+    }
+    Ok(())
+}
+
+/// A token may not delete a backend any stream links (Story 12.10 D-i,
+/// Resolved 1, D9 of the PRD).
+///
+/// A stream's backend set is a stream field, and no automation or MCP
+/// path writes a stream; the delete cascades the backend out of every
+/// stream that links it, which made exactly that write reachable with
+/// `backends:write`. Refused 409, the preview like the apply, naming
+/// every such stream, as the certificate delete names the streams that
+/// reference a certificate. Run in the guard, so under the lock on the
+/// row the delete would remove and after the grant's own check on it: a
+/// token learns these names only for a backend its grant reaches. An
+/// operator unlinks the backend in the dashboard first; a backend no
+/// stream links is the token's to delete as before.
+fn ensure_not_unlinked_from_a_stream(
+    store: &ConfigStore,
+    backend: &Backend,
+) -> Result<(), ApiError> {
+    let mut streams: Vec<String> = Vec::new();
+    for stream_id in store.list_streams_for_backend(&backend.id)? {
+        if let Some(stream) = store.get_stream(&stream_id)? {
+            streams.push(format!("`{}`", stream.name));
+        }
+    }
+    if streams.is_empty() {
+        return Ok(());
+    }
+    streams.sort_unstable();
+    Err(ApiError::Conflict(format!(
+        "backend `{}` serves streams {}: a stream's backends are changed in the dashboard, \
+         not with an automation token; unlink it from them there first",
+        backend.id,
+        streams.join(", ")
+    )))
 }
 
 /// D9 of the Epic 12 PRD (Story 12.7, D-7): a token never creates or
@@ -1082,7 +1141,9 @@ pub async fn update_backend(
 /// and the refusal of a backend an environment owns (409). The backend
 /// named must sit inside the token's `allowed_backend_cidrs` on its
 /// stored address and belong to no other principal's environment
-/// (403). With `?dry_run=true`, which needs `backends:read` (403), the
+/// (403), and no stream may link it (409 naming the streams,
+/// [`ensure_not_unlinked_from_a_stream`]). With `?dry_run=true`, which
+/// needs `backends:read` (403), the
 /// backend marked closing as the drain would leave it, or the row that
 /// would go at once when it is already closing, and no drain started.
 ///
@@ -1105,7 +1166,7 @@ pub async fn delete_backend(
         &actor,
         id,
         WriteMode::from(dry_run),
-        backend_guard(&principal),
+        backend_delete_guard(&principal),
     )
     .await?;
     Ok(redact::write_answer(answer, redact::backend_row))
