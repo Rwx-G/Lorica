@@ -658,14 +658,14 @@ Allowlist: `lorica-api/src/stream_logs.rs` (new), `lorica-api/src/log_store.rs`,
 `lorica-api/src/settings.rs`, `lorica-api/openapi.yaml`,
 `lorica-api/tests/log_store_upgrade.rs`.
 
-- [ ] `StreamLogEntry`, `stream_access_logs`, insert, query, export,
+- [x] `StreamLogEntry`, `stream_access_logs`, insert, query, export,
       clear, retention (D-a, D-b).
-- [ ] `enqueue_stream` on its own queue (D-b).
-- [ ] `SinkKind::Stream`, payload, toggles, `publish_stream`; syslog
+- [x] `enqueue_stream` on its own queue (D-b).
+- [x] `SinkKind::Stream`, payload, toggles, `publish_stream`; syslog
       eager connect, timer-driven reconnect, per-sink up state published
       through C2's `set_log_sink_up` (D-d, D-f).
-- [ ] Settings API validation of the three new settings.
-- [ ] Tests: one row per `StreamEndKind` and `StreamRefusal` word
+- [x] Settings API validation of the three new settings.
+- [x] Tests: one row per `StreamEndKind` and `StreamRefusal` word
       round-trips store and `body_json`; retention trims stream rows only;
       the queues do not starve each other; the sink's MSGID and toggle; the
       syslog up state follows a collector that goes away and comes back
@@ -1253,6 +1253,78 @@ edited here.
   `udp_engine.rs`, `tls_engine.rs` (Lot A's tests, and the `Absent`
   assertion above), and `lorica-api/src/stream_metrics.rs` (the bytes
   family, as Lot C2 planned).
+- Lot C1, 2026-11-16 to 2026-11-18, started on `13e35fe0`, paused once
+  (PC shutdown), rebased onto Lot A (`be1800cf`) after its first commit.
+  `lorica-api` already depends on `lorica-stream` (Lot C2's finding), so
+  the record-to-row conversion is in `lorica-api/src/stream_logs.rs`, not
+  in the binary as D-a planned: Lot F's `StreamLogObserver` calls
+  `StreamLogEntry::from_connection`, `from_refusal` and
+  `from_suppressed` and hands the row to `enqueue_stream` and
+  `publish_stream`. The record types are spelled out once each, in
+  `stream_logs::test_support`, so a field the records gain changes one
+  constructor and no test.
+- The writer waits on both queues from a current-thread runtime of its
+  own thread (a blocking `recv` waits on one queue only); each round
+  takes up to `BATCH_MAX` writes from each queue and `flush` barriers
+  both. `StreamWrite::Row` and `SinkPayload::Stream` are boxed: clippy's
+  `large_enum_variant` refused them unboxed.
+- Lot C1 gates, `rust:1-bookworm` with `CARGO_BUILD_WARNINGS=deny`, on
+  each committed tree: the CI chain green and `cargo audit` clean. Last
+  tree: 3,645 product, 957 lorica, 910 forked and 592 TLS-featured tests.
+- **Lot C1, the row.** Fields as D-a, words as strings so a row a later
+  release wrote reads back after a rollback. Mapped from
+  `ConnectionRecord`: `ended_at` (timestamp, RFC 3339 UTC with
+  milliseconds, fixed width so the time filters compare as text),
+  `stream_id`, `stream_name`, `protocol`, `local.port()` (listen_port),
+  `client` (ip, port), `proxied_from`, `backend_id`, `backend_address`,
+  `attempts`, both byte and datagram counts, `accepted_at` to `ended_at`
+  (duration_ms) and to `connected_at` (connect_ms), `tls.mode` (`none`
+  without TLS), `tls.server_name`, the ALPN (negotiated when terminating,
+  first offered in passthrough), `tls.client_certificate` (outcome word,
+  null when the stream does not verify), `detected_protocol`, the end
+  kind and, for `refused`, the refusal. Not mapped: `bind_gen`, `peer`
+  (beyond `proxied_from`), `tls.rule`, `tls.ech_offered`,
+  `tls.upstream_tls`. `RefusalRecord`: `at`, stream, `protocol`,
+  `listen_port`, `client`, `proxied_from`, `refusal`; `tls_mode` is empty
+  (the record carries none). `SuppressedRecord`: `reported_at`, stream,
+  `protocol`, `key.end_kind()` and `key.refusal()`, `suppressed`; no
+  client, port 0.
+- **Store and API.** `stream_access_logs` created whole in
+  `LogStore::open`; `insert_stream_batch`, `query_stream_logs`,
+  `export_stream_logs`, `clear_stream_logs`, `stream_log_count`,
+  `enforce_stream_retention(max, drain_cursor)` (the HTTP span
+  estimate; `undrained` for Lot G's cursor). `GET /api/v1/stream-logs`
+  (`stream_id`, `end_reason`, `refusal_reason`, `client_ip`, `from`,
+  `to`, `limit`, `after_id`, `before_id`; an unknown word or time is a
+  400), `/export` (CSV with the HTTP formula guard, or JSON) and
+  `DELETE` (audited `stream_logs.clear`, its own rate bucket), at the
+  roles of their `/api/v1/logs` counterparts with no change to the
+  authorize middleware (a test compares them). No log store: an empty
+  page.
+- **Sinks.** `SinkKind::Stream`, `SinkPayload::Stream`, `publish_stream`
+  (no trace context), syslog at `syslog_severity_access`, MSGID
+  `stream`. `register_lane` takes a `SinkKindToggles` (`ALL`, `only`).
+  The syslog consumer connects at start, retries on its backoff timer
+  without events and reads a TCP or TLS connection to see the collector
+  close it; `lorica_log_sink_up{sink="syslog"}` is 0 from a lane's
+  install until it connects, 0 for a configured sink whose consumer
+  cannot start, cleared when no syslog is configured, and only the
+  installed lane's consumer publishes it.
+- **What Lot F wires:** the observer (rows to `enqueue_stream` and
+  `publish_stream`), `enforce_stream_retention` in the retention loop
+  beside `enforce_retention` (skipping `0`), the OTLP export-outcome
+  wrapper and `set_log_sink_up("otlp", ..)`, and the reload carrying the
+  two stream toggles (it already compares `LogSinksConfig`, which now
+  holds them).
+- **Outside the allowlist:** `lorica-api/src/logs.rs` (`csv_escape` and
+  `EXPORT_MAX_ENTRIES` made `pub(crate)` for the stream export),
+  `lorica/src/otel.rs` (the `register_lane` call, and the
+  `SinkPayload::Stream` arm its exhaustive match needs: severity INFO,
+  the row's timestamp, as D-d says) and `lorica/src/capture/sink.rs`
+  (four `register_lane` calls in its tests).
+- **Not done here:** `stream_access_log_retention` is not in the
+  automation plane's admin settings allowlist
+  (`lorica-automation-policy`), which `access_log_retention` is in.
 
 ## File List
 
@@ -1291,6 +1363,13 @@ edited here.
 - `lorica-api/src/stream_metrics.rs` (Lot A, `lorica_stream_backend_bytes_total`)
 - `lorica-stream/tests/tcp_engine.rs`, `lorica-stream/src/tcp/forward.rs`
   (the load-proof tests)
+- `lorica-api/src/stream_logs.rs` (new, Lot C1)
+- `lorica-api/src/log_store.rs`, `log_writer.rs`, `logs.rs`, `lib.rs`,
+  `server.rs`, `settings.rs`, `openapi.yaml` (Lot C1)
+- `lorica-api/src/log_sinks/mod.rs`, `log_sinks/syslog.rs` (Lot C1)
+- `lorica-api/tests/log_store_upgrade.rs` (Lot C1)
+- `lorica/src/otel.rs`, `lorica/src/capture/sink.rs` (Lot C1,
+  `register_lane`)
 
 ## Change Log
 
@@ -1304,3 +1383,4 @@ edited here.
 | 2026-11-16 | 0.6 | Lot C2: `AggregatedGauge` and `GaugeAggregation` in `lorica-metrics`, `PER_WORKER_GAUGES` and `lorica_log_sink_up{sink}` with `Min`; `StreamMetricsCollector` rendering the D-e families from `CountersSnapshot` with monotone retired totals, node gauges and table pruning. The per-link bytes family waits for Lot A. | Romain G. |
 | 2026-11-16 | 0.7 | Lot A: `protocol` and `detected_protocol` on the record, `client_certificate` null on a stream that does not verify, `connect_outcome` and `ConnectOutcome`, `StreamLogKey` widening the limiter key with pre-forwarding ends passed through it, per-backend bytes and `lorica_stream_backend_bytes_total`. | Romain G. |
 | 2026-11-16 | 0.8 | The `tcp_engine` timeouts traced to the tests (a released port answered by strangers, a burst assumed to fit one second, wall-clock upper bounds); fixed in the tests, 0 failures in 800 contended runs. | Romain G. |
+| 2026-11-18 | 0.9 | Lot C1: `stream_access_logs` with its own retention and writer queue, `StreamLogEntry` built from the stream records, `/api/v1/stream-logs` with export and clear, the three settings in the settings API, the `stream` sink kind, and a syslog up state that follows the collector without traffic. | Romain G. |
