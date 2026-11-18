@@ -714,7 +714,7 @@ fn backend_delete_guard(principal: &AutomationPrincipal) -> BackendGuard {
     BackendGuard::bounded(move |store, target| {
         check_backend_target(store, &principal, target)?;
         match target.before {
-            Some(deleted) => ensure_not_unlinked_from_a_stream(store, deleted),
+            Some(deleted) => ensure_not_unlinked_from_a_stream(store, &principal, deleted),
             None => Ok(()),
         }
     })
@@ -754,30 +754,51 @@ fn check_backend_target(
 /// A stream's backend set is a stream field, and no automation or MCP
 /// path writes a stream; the delete cascades the backend out of every
 /// stream that links it, which made exactly that write reachable with
-/// `backends:write`. Refused 409, the preview like the apply, naming
-/// every such stream, as the certificate delete names the streams that
-/// reference a certificate. Run in the guard, so under the lock on the
-/// row the delete would remove and after the grant's own check on it: a
-/// token learns these names only for a backend its grant reaches. An
-/// operator unlinks the backend in the dashboard first; a backend no
+/// `backends:write`. Refused 409, the preview like the apply, listing
+/// every such stream. Run in the guard, so under the lock on the row
+/// the delete would remove and after the grant's own check on it: a
+/// token learns of these streams only for a backend its grant reaches.
+/// An operator unlinks the backend in the dashboard first; a backend no
 /// stream links is the token's to delete as before.
+///
+/// The streams are named only to a token holding `streams:read`; any
+/// other is given their ids and told which scope reads the names. A
+/// stream's name is what `streams:read` exists to reveal, and the
+/// backend reads keep it from a token without that scope (Story 12.10
+/// D-j); a refusal answered to every config-tier token must not hand it
+/// out instead.
 fn ensure_not_unlinked_from_a_stream(
     store: &ConfigStore,
+    principal: &AutomationPrincipal,
     backend: &Backend,
 ) -> Result<(), ApiError> {
+    let names_visible = principal.has_scope(AutomationScope::StreamsRead);
     let mut streams: Vec<String> = Vec::new();
     for stream_id in store.list_streams_for_backend(&backend.id)? {
         if let Some(stream) = store.get_stream(&stream_id)? {
-            streams.push(format!("`{}`", stream.name));
+            let shown = if names_visible {
+                stream.name
+            } else {
+                stream.id
+            };
+            streams.push(format!("`{shown}`"));
         }
     }
     if streams.is_empty() {
         return Ok(());
     }
     streams.sort_unstable();
+    let named = if names_visible {
+        String::new()
+    } else {
+        format!(
+            " (by id: this token lacks `{}` to read their names)",
+            AutomationScope::StreamsRead.as_str()
+        )
+    };
     Err(ApiError::Conflict(format!(
-        "backend `{}` serves streams {}: a stream's backends are changed in the dashboard, \
-         not with an automation token; unlink it from them there first",
+        "backend `{}` serves streams {}{named}: a stream's backends are changed in the \
+         dashboard, not with an automation token; unlink it from them there first",
         backend.id,
         streams.join(", ")
     )))

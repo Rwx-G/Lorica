@@ -442,6 +442,16 @@ which mutations get a `stream.*` row:
 - The `lorica_backend_delete` summary and the 409 in
   `openapi-automation.yaml` say so. Accepted as Resolved 1, since
   it narrows what an existing scope can do.
+- **Amended after Lot C2** (2026-11-18, maintainer): the 409 names the
+  streams **only to a token holding `streams:read`**; any other token
+  reads their ids (opaque UUIDs) and that it lacks `streams:read` to
+  read the names. Same on REST, both MCP transports, apply and dry
+  run. Reason: D-j keeps stream names out of the reads for a token
+  without `streams:read`, which is every config-tier token, and the
+  refusal must not undo that. Since the tier rule refuses
+  `streams:read` beside a write scope, an MCP token always reads ids
+  here: Lot H's "refused naming the stream" reads "refused listing the
+  stream's id".
 
 ### D-j. The backend page: usage, and portless creation
 
@@ -995,13 +1005,20 @@ each one as "Resolved N".
   the same guard, so it is refused alike. A plain `409 conflict`, as
   the certificate delete's refusal it is modelled on; the names are
   sorted and quoted.
-- **Lot C2, what the names reveal.** A `backends:write` token without
-  `streams:read` (every config-tier token) reads, in the refusal, the
-  names of the streams that use a backend inside its grant. D-j keeps
-  stream names off `BackendResponse` for that reason, and Lot H's IV1
-  expects the refusal to name the stream, as 12.3's address refusal
-  already does. Kept as D-i decides; flagged here for the release
-  review.
+- **Lot C2, what the names reveal**, resolved by D-i's amendment. The
+  first cut named the streams to every token, so a config-tier token
+  read names D-j keeps from it. `ensure_not_unlinked_from_a_stream`
+  now takes the principal and spells each stream by name when it
+  `has_scope(StreamsRead)`, by id otherwise, with the clause "by id:
+  this token lacks `streams:read` to read their names" (the scope
+  spelled from `AutomationScope::as_str`). The tests split every door's
+  refusals by token: the REST and stdio-shaped requests with the
+  fixture's every-scope token (names, no id) and its config-tier token
+  (ids and the clause, no name), both MCP Streamable HTTP tools with
+  the config-tier token, with one and two streams. 12.3's address
+  refusal (`ensure_not_moved_under_a_local_stream`) still names its
+  stream to any token; it is outside this amendment and left as 12.3
+  decided.
 - **Lot C2, the tests** (`write/plane_tests.rs`):
   `a_token_cannot_delete_a_backend_a_stream_uses_on_any_door` drives
   apply and `?dry_run=true` over REST, the same request carrying the
@@ -1058,3 +1075,4 @@ each one as "Resolved N".
 | 2026-11-18 | 0.4 | Lot B: `streams:read` in the closed scope enum with every restatement in one commit (both OpenAPI documents, the `api.ts` union, the generated fixture and its tier vectors), the read tier carrying it; `GET /automation/v1/streams` and `/automation/v1/streams/status`, filtered, unmasked, empty for a grant-carrying principal; `lorica_streams` and `lorica_stream_status`; with 12.9 Lot C3's `/automation/v1/stream-logs` and `lorica_stream_logs` behind `streams:read` plus `logs:read` through `companion_scope`. Gates on the final tree: the CI chain green (3,678 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean, frontend check, lint and Vitest (878) green. | Romain G. |
 | 2026-11-18 | 0.5 | Lot C1: a TOML import writes one `stream.create`, `stream.update` or `stream.delete` row per stream whose view it moved, links included, beside its `config.import` row; a backend delete writes one `stream.backend_unlinked` per stream that linked it, beside `backend.delete`; the D-h walk with the chain verified. D-h's changed set amended against the code (views before and after, pinned equal to the preview's stream and link diffs). Gates on the final tree: the CI chain green (3,682 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean. | Romain G. |
 | 2026-11-18 | 0.6 | Lot C2: a token's backend delete (REST, both MCP transports, apply and preview) answers 409 naming every stream that links the backend, through a delete-only guard after the grant's check; address updates unchanged; the `lorica_backend_delete` summary and `openapi-automation.yaml` say so. Gates on the final tree: the CI chain green (3,684 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean. | Romain G. |
+| 2026-11-18 | 0.7 | D-i amended: the backend delete refusal names the streams only to a token holding `streams:read` and lists their ids, with the scope it lacks, to any other, on every door; tests for both cases. Gates on the final tree: the CI chain green (3,687 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean. | Romain G. |

@@ -3912,22 +3912,23 @@ async fn a_stream_using(f: &WriteFixture, name: &str, port: u16, backends: &[&st
         .to_string()
 }
 
-/// A token's `DELETE` of `backend_id` with `suffix`, sent as the REST
+/// `bearer`'s `DELETE` of `backend_id` with `suffix`, sent as the REST
 /// caller sends it and as `lorica-mcp` over stdio sends it (the same
 /// request, carrying the transport and tool it asserts): both answers.
 async fn token_deletes(
     f: &WriteFixture,
+    bearer: &str,
     backend_id: &str,
     suffix: &str,
 ) -> Vec<(&'static str, axum::response::Response)> {
     let uri = format!("/automation/v1/backends/{backend_id}{suffix}");
-    let rest = automation_call(&f.state, "DELETE", &uri, &f.bearer, None).await;
+    let rest = automation_call(&f.state, "DELETE", &uri, bearer, None).await;
     let stdio = crate::automation::build_automation_router(f.state.clone())
         .oneshot(
             Request::builder()
                 .method("DELETE")
                 .uri(&uri)
-                .header(http::header::AUTHORIZATION, &f.mcp_bearer)
+                .header(http::header::AUTHORIZATION, bearer)
                 .header(
                     crate::automation::audit::ASSERTED_TRANSPORT_HEADER,
                     "mcp-stdio",
@@ -3953,15 +3954,34 @@ async fn conflict_message(response: axum::response::Response, what: &str) -> Str
         .to_string()
 }
 
-/// Every door a token reaches the backend delete through, apply and
-/// preview: each refusal's text.
-async fn refusals_on_every_door(f: &WriteFixture, backend_id: &str) -> Vec<String> {
-    let mut refusals = Vec::new();
+/// The refusals of every door a token reaches the backend delete
+/// through, apply and preview, split by whether the token holds
+/// `streams:read`: `(named, by_id)`.
+///
+/// The fixture's REST token holds every scope; its config-tier token
+/// holds what `--tier config` mints, which is not `streams:read` (the
+/// tier rule refuses that scope beside a write scope), and is the only
+/// kind of token either MCP transport accepts for a delete. So over MCP
+/// the refusal always lists ids; the REST and stdio-shaped requests are
+/// driven with both tokens.
+async fn refusals_on_every_door(f: &WriteFixture, backend_id: &str) -> (Vec<String>, Vec<String>) {
+    use lorica_config::models::AutomationScope;
+    use lorica_mcp::TierTools as _;
+    assert!(
+        !lorica_mcp::Tier::Config
+            .minted_scopes()
+            .contains(&AutomationScope::StreamsRead),
+        "test setup: a config-tier token does not read streams"
+    );
+    let (mut named, mut by_id) = (Vec::new(), Vec::new());
     for suffix in ["", "?dry_run=true"] {
-        for (door, response) in token_deletes(f, backend_id, suffix).await {
-            refusals.push(conflict_message(response, &format!("{door}{suffix}")).await);
+        for (bearer, refusals) in [(&f.bearer, &mut named), (&f.mcp_bearer, &mut by_id)] {
+            for (door, response) in token_deletes(f, bearer, backend_id, suffix).await {
+                refusals.push(conflict_message(response, &format!("{door}{suffix}")).await);
+            }
         }
     }
+    let refusals = &mut by_id;
     for tool in ["lorica_backend_delete", "lorica_backend_delete_preview"] {
         let refused = mcp_call(
             &f.state,
@@ -3982,33 +4002,64 @@ async fn refusals_on_every_door(f: &WriteFixture, backend_id: &str) -> Vec<Strin
         assert!(text.contains("HTTP 409"), "{tool}: {text}");
         refusals.push(text);
     }
-    refusals
+    (named, by_id)
+}
+
+/// A refusal naming exactly `names` to a token that reads streams, and
+/// one listing exactly `ids` and the missing scope to a token that does
+/// not: neither carries the other's spelling.
+fn assert_streams_listed(
+    (named, by_id): &(Vec<String>, Vec<String>),
+    names: &[&str],
+    ids: &[&str],
+) {
+    assert!(!named.is_empty() && !by_id.is_empty());
+    for refusal in named {
+        for name in names {
+            assert!(refusal.contains(&format!("`{name}`")), "{refusal}");
+        }
+        for id in ids {
+            assert!(!refusal.contains(id), "{refusal}");
+        }
+    }
+    for refusal in by_id {
+        for id in ids {
+            assert!(refusal.contains(&format!("`{id}`")), "{refusal}");
+        }
+        for name in names {
+            assert!(!refusal.contains(&format!("`{name}`")), "{refusal}");
+        }
+        assert!(refusal.contains("lacks `streams:read`"), "{refusal}");
+    }
 }
 
 #[tokio::test]
 async fn a_token_cannot_delete_a_backend_a_stream_uses_on_any_door() {
     // Story 12.10 D-i, Resolved 1: a stream's backend set is a stream
     // field, and the delete's cascade was a stream write reachable with
-    // `backends:write`. Refused 409 naming every stream, the preview
+    // `backends:write`. Refused 409 listing every stream, the preview
     // like the apply, over REST, MCP Streamable HTTP and the request
-    // the stdio server sends; nothing moves.
+    // the stdio server sends; nothing moves. The streams are named only
+    // to a token holding `streams:read`, and listed by id to any other
+    // (the D-i amendment: D-j keeps stream names from such a token).
     let f = a_node_with_something_to_write().await;
     let smtp = a_stream_using(&f, "smtp", 2525, &[&f.backend_id]).await;
     let before = canonical_now(&f.state).await;
     let before_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
 
-    for refusal in refusals_on_every_door(&f, &f.backend_id).await {
-        assert!(refusal.contains("`smtp`"), "{refusal}");
-    }
+    assert_streams_listed(
+        &refusals_on_every_door(&f, &f.backend_id).await,
+        &["smtp"],
+        &[&smtp],
+    );
     let imap = a_stream_using(&f, "imap", 2526, &[&f.backend_id]).await;
     let before = canonical_now(&f.state).await;
     let two_streams_bytes = lorica_config::canonical::encode_canonical(&before).expect("encodes");
-    for refusal in refusals_on_every_door(&f, &f.backend_id).await {
-        assert!(
-            refusal.contains("`imap`") && refusal.contains("`smtp`"),
-            "{refusal}"
-        );
-    }
+    assert_streams_listed(
+        &refusals_on_every_door(&f, &f.backend_id).await,
+        &["imap", "smtp"],
+        &[&imap, &smtp],
+    );
     assert_ne!(
         before_bytes, two_streams_bytes,
         "test setup: a second stream"

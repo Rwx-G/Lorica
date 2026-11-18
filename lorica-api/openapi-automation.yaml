@@ -1012,12 +1012,15 @@ paths:
         which only the pipeline owns.
 
 
-        A backend any stream links answers 409 too, naming every such
+        A backend any stream links answers 409 too, listing every such
         stream: the delete would remove it from each stream's backend
         set, a stream field no automation path writes. An operator
-        unlinks it from those streams in the dashboard first. The check
-        runs after the grant's, so the names are answered only for a
-        backend the token's `allowed_backend_cidrs` reaches.
+        unlinks it from those streams in the dashboard first. The
+        streams are named only to a token holding `streams:read`; any
+        other token reads their ids and the scope it lacks, since a
+        stream's name is what that scope reveals. The check runs after
+        the grant's, so the streams are listed only for a backend the
+        token's `allowed_backend_cidrs` reaches.
 
 
         With `?dry_run=true`, the backend that would drain, and no
@@ -1050,8 +1053,9 @@ paths:
           description: >-
             The backend belongs to an automation environment (the
             `ManagedRow` refusal), or one or more streams link it: the
-            message then names every such stream and says to unlink it
-            in the dashboard first.
+            message then lists every such stream, by name to a token
+            holding `streams:read` and by id to any other, and says to
+            unlink it in the dashboard first.
           content:
             application/json:
               schema:
@@ -1059,7 +1063,7 @@ paths:
               example:
                 error:
                   code: conflict
-                  message: "conflict: backend `<UUID>` serves streams `imap`, `smtp`: a stream's backends are changed in the dashboard, not with an automation token; unlink it from them there first"
+                  message: "conflict: backend `<UUID>` serves streams `<UUID>` (by id: this token lacks `streams:read` to read their names): a stream's backends are changed in the dashboard, not with an automation token; unlink it from them there first"
         "429":
           $ref: "#/components/responses/WriteBudget"
 
