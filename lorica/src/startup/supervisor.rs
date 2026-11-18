@@ -562,6 +562,9 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // coordinator below, which makes the freshly-downloaded
         // .mmdb visible to the data plane without a manual save.
         lorica::reload::register_supervisor_reload_trigger(config_reload_tx.clone());
+        tokio::spawn(lorica::reload::stop_auto_updaters_on(
+            lorica_api::shutdown::token(),
+        ));
 
         // Fire the hot-reload path once at boot so the updater
         // tasks spawn if `*_auto_update_enabled` is persisted true.
@@ -1160,8 +1163,11 @@ pub(crate) fn run_supervisor(cli: Cli) {
             Some(stream_plane.clone()),
         );
         let supervisor_reload_store = Arc::clone(&store);
+        // Ends with the process's shutdown: a hot upgrade's outgoing
+        // generation applies no change any more, the new one does.
+        let reload_shutdown = lorica_api::shutdown::token();
         tokio::spawn(async move {
-            while config_reload_rx.changed().await.is_ok() {
+            while startup::next_config_change(&mut config_reload_rx, &reload_shutdown).await {
                 // Per-process hot-reload hooks (GeoIP / ASN updater
                 // lifecycle, OTel exporter, log sinks, bot HMAC secret)
                 // on the SUPERVISOR side; without this they would only
@@ -1261,6 +1267,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
             // Only a control plane holds a fan-in store; every other
             // role passes `None` and the per-node quota is skipped.
             fleet_telemetry,
+            lorica_api::shutdown::token(),
         );
 
 

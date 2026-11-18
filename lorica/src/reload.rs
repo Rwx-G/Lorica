@@ -784,6 +784,26 @@ static ASN_UPDATER_HANDLE: once_cell::sync::Lazy<
     parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
 
+/// Once `shutdown` is cancelled, stop the GeoIP and ASN auto-update
+/// tasks for good: the process is going away, and during a hot
+/// upgrade's drain the new generation updates in its place (Story 12.11
+/// D-b). The supervisor spawns this once with the process's shutdown
+/// token; no updater starts after it.
+pub async fn stop_auto_updaters_on(shutdown: tokio_util::sync::CancellationToken) {
+    shutdown.cancelled().await;
+    stop_updater(&GEOIP_UPDATER_HANDLE, "geoip");
+    stop_updater(&ASN_UPDATER_HANDLE, "asn");
+}
+
+/// Abort the updater `slot` holds, if any. The download writes a temp
+/// file and renames it, so an abort never leaves a half-written DB.
+fn stop_updater(slot: &parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>, log_tag: &str) {
+    if let Some(handle) = slot.lock().take() {
+        handle.abort();
+        info!(tag = log_tag, "auto-update task stopped by the shutdown");
+    }
+}
+
 /// Generic auto-update flip handler: aborts any running task, then
 /// spawns a new one when `enabled && path.is_some()`. The
 /// `spawn_fn` closure is the only piece that varies between GeoIP
@@ -809,8 +829,11 @@ fn apply_auto_update_flip<R: Send + Sync + 'static>(
     // supervisor by the presence of the registered reload trigger:
     // only `run_supervisor` calls `register_supervisor_reload_trigger`.
     let is_supervisor = SUPERVISOR_RELOAD_TRIGGER.get().is_some();
+    // A process whose shutdown has begun starts no updater: see
+    // `stop_auto_updaters_on`.
+    let stopping = lorica_api::shutdown::token().is_cancelled();
 
-    if should_run && !is_running && is_supervisor {
+    if should_run && !is_running && is_supervisor && !stopping {
         if let Some(p) = path {
             let mut cfg = lorica_geoip::updater::UpdaterConfig::new(p.clone());
             cfg.url_template = url_template.to_string();
@@ -1487,6 +1510,32 @@ pub async fn reload_cert_resolver(
             lorica_api::metrics::inc_cert_resolver_reload("fail");
             warn!(error = %e, "failed to reload TLS certificate resolver");
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_updater_stop_tests {
+    use super::stop_updater;
+
+    #[tokio::test]
+    async fn a_stopped_updater_slot_is_emptied_and_its_task_aborted() {
+        let slot = parking_lot::Mutex::new(Some(tokio::spawn(std::future::pending::<()>())));
+        let probe = slot
+            .lock()
+            .as_ref()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .expect("a running updater");
+
+        stop_updater(&slot, "geoip");
+
+        assert!(slot.lock().is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !probe.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the updater task is aborted");
     }
 }
 

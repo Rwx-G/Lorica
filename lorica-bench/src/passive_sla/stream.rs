@@ -273,6 +273,14 @@ impl StreamSlaCollector {
         self.flush_before(store, current_bucket_start())
     }
 
+    /// Merge every minute into the store, the open one included: what a
+    /// process does last, so the minute it was recording is not lost
+    /// with it. The merge is additive, so another process's slice of
+    /// the same minute adds up.
+    pub fn flush_all(&self, store: &ConfigStore) -> usize {
+        self.flush_before(store, DateTime::<Utc>::MAX_UTC)
+    }
+
     fn flush_before(&self, store: &ConfigStore, now_bucket: DateTime<Utc>) -> usize {
         let completed: Vec<((String, DateTime<Utc>), StreamMinute)> = match self.minutes.lock() {
             Ok(mut minutes) => {
@@ -387,16 +395,28 @@ impl StreamSlaCollector {
     /// evaluates the targets and dispatches the alerts. It evaluates
     /// even when this process flushed nothing: in worker mode the
     /// workers write the buckets and the supervisor raises the alerts.
+    /// Once `stop` resolves it merges every minute, the open one
+    /// included ([`Self::flush_all`]), and ends.
     pub fn start_flush_task(
         self: &Arc<Self>,
         store: Arc<TokioMutex<ConfigStore>>,
         dispatcher: Option<Arc<TokioMutex<NotifyDispatcher>>>,
+        stop: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> tokio::task::JoinHandle<()> {
         let collector = Arc::clone(self);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            tokio::pin!(stop);
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    biased;
+                    _ = &mut stop => {
+                        let flushed = collector.flush_all(&*store.lock().await);
+                        info!(count = flushed, "stream SLA flush stopped; last buckets flushed");
+                        return;
+                    }
+                    _ = interval.tick() => {}
+                }
                 let (flushed, alerts) = {
                     let store = store.lock().await;
                     let flushed = collector.flush(&store);
@@ -475,6 +495,26 @@ mod tests {
             .expect("query");
         assert_eq!(buckets.len(), 1, "one bucket for the minute");
         buckets.remove(0)
+    }
+
+    #[tokio::test]
+    async fn a_stopped_flush_task_ends_and_merges_the_open_minute() {
+        let store = Arc::new(TokioMutex::new(store_with_stream(STREAM_ID, "pg")));
+        let collector = Arc::new(StreamSlaCollector::new());
+        let minute = current_bucket_start();
+        collector.record_at(STREAM_ID, connected(10), minute);
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+
+        let task = collector.start_flush_task(Arc::clone(&store), None, async move {
+            let _ = stopped.await;
+        });
+        stop.send(()).expect("the task listens");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the task ends on its stop")
+            .expect("the task does not panic");
+        assert_eq!(stored_bucket(&*store.lock().await, minute).judged_count, 1);
     }
 
     #[test]

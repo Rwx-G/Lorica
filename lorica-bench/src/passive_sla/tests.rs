@@ -119,6 +119,39 @@ fn a_finished_minute_reaches_the_store_when_the_next_one_starts_before_the_flush
     );
 }
 
+#[tokio::test]
+async fn a_stopped_flush_task_ends_and_flushes_the_open_minute() {
+    let collector = std::sync::Arc::new(SlaCollector::new());
+    let store = std::sync::Arc::new(tokio::sync::Mutex::new(
+        ConfigStore::open_in_memory().expect("test setup: open in-memory store"),
+    ));
+    let now = current_bucket_start();
+    collector.record_at("route-open", 200, 10, now);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+
+    let task = collector.start_flush_task(std::sync::Arc::clone(&store), None, async move {
+        let _ = stopped.await;
+    });
+    stop.send(()).expect("the task listens");
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("the task ends on its stop")
+        .expect("the task does not panic");
+    let stored = store
+        .lock()
+        .await
+        .query_sla_buckets(
+            "route-open",
+            &now,
+            &(now + chrono::Duration::minutes(1)),
+            "passive",
+        )
+        .expect("query");
+    assert_eq!(stored.len(), 1, "the open minute is stored");
+    assert_eq!(stored[0].request_count, 1);
+}
+
 #[test]
 fn test_collector_default_success_criteria() {
     let collector = SlaCollector::new();

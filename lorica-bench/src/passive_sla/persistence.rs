@@ -89,17 +89,35 @@ pub(super) fn flush_before(
     flushed
 }
 
-/// Start the background flush task that runs every 60 seconds.
+/// Flush every bucket, the open minute included. The merge is additive,
+/// so a minute another process flushes too adds up rather than clashes.
+pub(super) fn flush_all(collector: &SlaCollector, store: &ConfigStore) -> usize {
+    flush_before(collector, store, DateTime::<Utc>::MAX_UTC)
+}
+
+/// Start the background flush task that runs every 60 seconds, until
+/// `stop` resolves: then it flushes every bucket, the open minute
+/// included, and ends.
 pub(super) fn start_flush_task(
     collector: &Arc<SlaCollector>,
     store: Arc<TokioMutex<ConfigStore>>,
     dispatcher: Option<Arc<TokioMutex<NotifyDispatcher>>>,
+    stop: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> tokio::task::JoinHandle<()> {
     let collector = Arc::clone(collector);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        tokio::pin!(stop);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                biased;
+                _ = &mut stop => {
+                    let flushed = flush_all(&collector, &*store.lock().await);
+                    info!(count = flushed, "SLA flush stopped; last buckets flushed");
+                    return;
+                }
+                _ = interval.tick() => {}
+            }
 
             // Flush buckets while holding the store lock, then release it.
             // Always check thresholds even if this process flushed nothing:

@@ -45,6 +45,8 @@ pub struct ProbeScheduler {
     dispatcher: Option<Arc<TokioMutex<NotifyDispatcher>>>,
     http_client: reqwest::Client,
     tasks: TokioMutex<HashMap<String, JoinHandle<()>>>,
+    /// Set by [`Self::stop`]: no probe runs or starts again.
+    stopped: std::sync::atomic::AtomicBool,
 }
 
 impl ProbeScheduler {
@@ -64,12 +66,27 @@ impl ProbeScheduler {
             dispatcher,
             http_client,
             tasks: TokioMutex::new(HashMap::new()),
+            stopped: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Stop every probe for good: the process is going away, and a hot
+    /// upgrade's new generation probes in its place. A later
+    /// [`Self::reload`] starts nothing.
+    pub async fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        for (_, handle) in self.tasks.lock().await.drain() {
+            handle.abort();
         }
     }
 
     /// Reload probe configurations from the database and restart probe tasks.
     /// Enforces the system-wide max_active_probes limit from global settings.
     pub async fn reload(&self) {
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let (probes, max_probes) = {
             let store = self.store.lock().await;
             let probes = match store.list_enabled_probes() {
@@ -224,14 +241,6 @@ impl ProbeScheduler {
         })
     }
 
-    /// Stop all running probe tasks.
-    pub async fn stop(&self) {
-        let mut tasks = self.tasks.lock().await;
-        for (_, handle) in tasks.drain() {
-            handle.abort();
-        }
-    }
-
     /// Get number of active probe tasks.
     pub async fn active_count(&self) -> usize {
         self.tasks.lock().await.len()
@@ -376,21 +385,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_probe_config_creation() {
-        let probe = make_probe_config("p1", "r1");
-        assert_eq!(probe.method, "GET");
-        assert_eq!(probe.interval_s, 30);
-        assert_eq!(probe.expected_status, 200);
-    }
-
-    #[test]
-    fn test_store_probe_crud() {
-        let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
-
-        // Create a route (FK constraint)
-        let route = lorica_config::models::Route {
-            id: "r1".to_string(),
+    /// A stored route `id` with every field at its usual value, for the
+    /// probes' foreign key.
+    fn route(id: &str) -> lorica_config::models::Route {
+        lorica_config::models::Route {
+            id: id.to_string(),
             hostname: "example.com".to_string(),
             path_prefix: "/".to_string(),
             certificate_id: None,
@@ -464,7 +463,23 @@ mod tests {
             node_selector: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
-        };
+        }
+    }
+
+    #[test]
+    fn test_probe_config_creation() {
+        let probe = make_probe_config("p1", "r1");
+        assert_eq!(probe.method, "GET");
+        assert_eq!(probe.interval_s, 30);
+        assert_eq!(probe.expected_status, 200);
+    }
+
+    #[test]
+    fn test_store_probe_crud() {
+        let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
+
+        // Create a route (FK constraint)
+        let route = route("r1");
         store
             .create_route(&route)
             .expect("test setup: create route");
@@ -529,82 +544,7 @@ mod tests {
     fn test_store_probe_cascade_delete() {
         let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
 
-        let route = lorica_config::models::Route {
-            id: "r1".to_string(),
-            hostname: "example.com".to_string(),
-            path_prefix: "/".to_string(),
-            certificate_id: None,
-            load_balancing: lorica_config::models::LoadBalancing::RoundRobin,
-            waf_enabled: false,
-            waf_mode: lorica_config::models::WafMode::Detection,
-
-            enabled: true,
-            force_https: false,
-            redirect_hostname: None,
-            redirect_to: None,
-            hostname_aliases: Vec::new(),
-            proxy_headers: std::collections::HashMap::new(),
-            response_headers: std::collections::HashMap::new(),
-            security_headers: "moderate".to_string(),
-            connect_timeout_s: 5,
-            read_timeout_s: 60,
-            send_timeout_s: 60,
-            strip_path_prefix: None,
-            add_path_prefix: None,
-            path_rewrite_pattern: None,
-            path_rewrite_replacement: None,
-            access_log_enabled: true,
-            proxy_headers_remove: Vec::new(),
-            response_headers_remove: Vec::new(),
-            max_request_body_bytes: None,
-            waf_body_scan_max_bytes: None,
-            websocket_enabled: true,
-            rate_limit_rps: None,
-            rate_limit_burst: None,
-            ip_allowlist: Vec::new(),
-            ip_denylist: Vec::new(),
-            cors_allowed_origins: Vec::new(),
-            cors_allowed_methods: Vec::new(),
-            cors_max_age_s: None,
-            compression_enabled: false,
-            retry_attempts: None,
-            cache_enabled: false,
-            cache_ttl_s: 300,
-            cache_max_bytes: 52428800,
-            max_connections: None,
-            slowloris_threshold_ms: 5000,
-            auto_ban_threshold: None,
-            auto_ban_duration_s: 3600,
-            path_rules: vec![],
-            return_status: None,
-            sticky_session: false,
-            basic_auth_username: None,
-            basic_auth_password_hash: None,
-            stale_while_revalidate_s: 10,
-            stale_if_error_s: 60,
-            retry_on_methods: vec![],
-            maintenance_mode: false,
-            error_page_html: None,
-            cache_vary_headers: vec![],
-            header_rules: vec![],
-            traffic_splits: vec![],
-            forward_auth: None,
-            mirror: None,
-            response_rewrite: None,
-            mtls: None,
-            rate_limit: None,
-            geoip: None,
-            bot_protection: None,
-            ai_bot_policy: None,
-            ai_bot_spoofed_fallback: None,
-            serve_robots_txt: false,
-            case_insensitive_paths: false,
-            managed_by: None,
-            group_name: String::new(),
-            node_selector: Vec::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
+        let route = route("r1");
         store
             .create_route(&route)
             .expect("test setup: create route");
@@ -620,6 +560,29 @@ mod tests {
             .get_probe_config("p1")
             .expect("test setup: get probe config after cascade")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_stopped_scheduler_ends_its_probes_and_starts_none_again() {
+        let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
+        store
+            .create_route(&route("r1"))
+            .expect("test setup: create route");
+        store
+            .create_probe_config(&make_probe_config("p1", "r1"))
+            .expect("test setup: create probe config");
+        let scheduler = ProbeScheduler::new(Arc::new(TokioMutex::new(store)), None);
+        scheduler.reload().await;
+        assert_eq!(scheduler.active_count().await, 1);
+
+        scheduler.stop().await;
+        assert_eq!(scheduler.active_count().await, 0);
+        scheduler.reload().await;
+        assert_eq!(
+            scheduler.active_count().await,
+            0,
+            "a reload after the stop starts nothing"
+        );
     }
 
     #[tokio::test]

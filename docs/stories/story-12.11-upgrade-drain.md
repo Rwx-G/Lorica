@@ -1003,16 +1003,15 @@ on `feat/v1.11.0` at `25daf15f`, before any edit:
   retention loop, the load-test cron scheduler, the GeoIP and ASN
   updater and the config-reload bridge (its stream-plane calls are
   no-ops once quiesced). They ran for 30 s before; with a drain of up
-  to an hour they duplicate the new generation's work. Handed back to
-  the orchestrator.
+  to an hour they duplicate the new generation's work. Closed below.
 - Also handed back: aborting the management and automation servers
   stops their accept loops, but each accepted connection runs on a
   detached task (`lorica-api/src/server.rs` `start_server`, and the
   automation listener's equivalent), so a dashboard's keep-alive or
   WebSocket connection to the old binary lives on until it closes or
   the old process exits. Ending those tasks on
-  `lorica_api::shutdown::token()`, which step 2 already cancels, is a
-  small change in `lorica-api` outside this Lot.
+  `lorica_api::shutdown::token()`, which step 2 already cancels, was
+  the fix; closed below.
 
 **Lot C, how it is built.**
 
@@ -1088,6 +1087,32 @@ binary (the pid in `GET /api/v1/system`); the UDP scenario with a group
 adopted slot by slot (no `binding_draining` drop, every answer back);
 and the 64-port TCP plus UDP table past 32 descriptors.
 
+**Lot C, the two handed-back gaps, closed in the same cycle.**
+
+- Connections: each accepted connection of the management server and
+  of the automation listener runs through
+  `lorica_api::shutdown::serve_until`, which on the shutdown token asks
+  hyper for a graceful shutdown (the response in flight completes, an
+  idle keep-alive closes, HTTP/2 sends `GOAWAY`); the log and load-test
+  WebSockets send a 1001 close frame (`shutdown::going_away`) on the
+  same token. Since a stop also begins the shutdown at its start, the
+  management API stops answering when a stop begins, not when it ends.
+- Loops: the probe scheduler (`ProbeScheduler::stop`, after which a
+  reload starts nothing), both SLA flush tasks, the load-test cron and
+  the retention loop (`shutdown::tick_on`) end on the token; the
+  supervisor's reload bridge waits on `next_config_change`; the GeoIP
+  and ASN updaters are aborted by `stop_auto_updaters_on` and none
+  starts after. The SLA flush tasks merge every minute, the open one
+  included (`flush_all`), as they stop; a worker does the same at its
+  exit and single-process mode after its drain, since in both the
+  recording outlives the signal. Kept running, because draining workers
+  use them: the alert dispatcher, the WAF ban-policy reload, the
+  rate-limit prune, the shared-memory eviction and the stream plane's
+  ticks. The retention loop's body, the cluster telemetry retention
+  included, is unchanged: only its tick is.
+- Gates on the two fixes: the same chain, product crates 3,747,
+  `lorica` 992, forked 915, rustls 592, `cargo audit`, all clean.
+
 **Lot C gates** (Docker `rust:1-bookworm`, `CARGO_BUILD_WARNINGS=deny`,
 the `ci.yml` cargo lines in order): fmt, workspace clippy with
 `lorica/otel`, the product crates (3,712 tests), `lorica --features
@@ -1106,6 +1131,9 @@ otel` (989), the forked crates (915), the rustls line (592) and
 - `lorica-api/src/metrics.rs` (`lorica_hot_upgrade_stream_connections_total`, `drain_timeout` doc, drain histogram buckets, Lot C)
 - `lorica-api/src/tests.rs` (the new family's reader and tests, Lot C)
 - `lorica-api/src/upgrade.rs` (`previous_generation` state, Lot C)
+- `lorica-api/src/shutdown.rs`, `server.rs`, `automation/listener.rs`, `logs.rs`, `loadtest.rs` (API connections and WebSockets end on the shutdown, Lot C)
+- `lorica-bench/src/active_probes.rs`, `scheduler.rs`, `passive_sla/{collector,persistence,stream,tests}.rs` (loops stop on the shutdown, SLA `flush_all`, Lot C)
+- `lorica/src/startup/mod.rs`, `single.rs`, `worker.rs`, `lorica/src/reload.rs` (loops stop on the shutdown, SLA flushed at exit, Lot C)
 - `lorica-worker/src/fd_passing.rs` (`send_with_rights`, `recv_with_rights_cloexec`, Lot A)
 - `lorica-worker/src/stream_ctl.rs` (`QuiesceReason::Upgrade`, `DrainEnd`, the drain report messages, Lot B1)
 - `lorica-config/src/models/stream.rs` (`UpgradePolicy`, `Stream::upgrade_policy`, Lot B1)

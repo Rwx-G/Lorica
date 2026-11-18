@@ -571,8 +571,14 @@ pub(crate) fn run_worker(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("worker background runtime");
         rt.block_on(async move {
-            stream_sla_flush_collector.start_flush_task(Arc::clone(&sla_flush_store), None);
-            sla_flush_collector.start_flush_task(sla_flush_store, None);
+            // A worker's last minute is flushed by its exit
+            // (`flush_sla_at_exit`), not by a stop of these loops.
+            stream_sla_flush_collector.start_flush_task(
+                Arc::clone(&sla_flush_store),
+                None,
+                std::future::pending(),
+            );
+            sla_flush_collector.start_flush_task(sla_flush_store, None, std::future::pending());
 
             // IP blocklist: initial load + periodic refresh (every 6h)
             if waf_fwd_engine.ip_blocklist().is_enabled() {
@@ -852,6 +858,12 @@ pub(crate) fn run_worker(
     lorica_proxy.log_store = worker_log_store.clone();
     let exit_log_store = worker_log_store.clone();
     let served_log_store = worker_log_store.clone();
+    let exit_sla = (
+        Arc::clone(&store),
+        Arc::clone(&sla_collector),
+        Arc::clone(&stream_sla_collector),
+    );
+    let served_sla = exit_sla.clone();
     // The capture self-disable writer. Capture admission happens in
     // this process, so the queue it drains is this process's; without
     // the task a rule that spent its total keeps its stored `enabled`
@@ -997,6 +1009,7 @@ pub(crate) fn run_worker(
             // `drained_by_upgrade` included, reach the store and then the
             // sinks before the process goes (Story 12.9 D-k).
             lorica::stream_log::flush_rows_at_exit_blocking(&exit_log_store);
+            flush_sla_at_exit(&exit_sla.0, &exit_sla.1, &exit_sla.2);
             lorica::otel::shutdown();
             std::process::exit(0);
         },
@@ -1009,8 +1022,25 @@ pub(crate) fn run_worker(
         "proxy engine drained; flushing logs and OTel spans"
     );
     lorica::stream_log::flush_rows_at_exit_blocking(&served_log_store);
+    flush_sla_at_exit(&served_sla.0, &served_sla.1, &served_sla.2);
     lorica::otel::shutdown();
     std::process::exit(0);
+}
+
+/// Merge every SLA minute this worker holds, the open one included,
+/// before it exits: its flush loops run every minute, so without this a
+/// stop or a hot upgrade loses up to a minute of the worker's SLA, which
+/// the new generation's reports then lack. Blocking: called off the
+/// runtime, on the exit path.
+fn flush_sla_at_exit(
+    store: &Arc<Mutex<ConfigStore>>,
+    sla: &lorica_bench::SlaCollector,
+    stream_sla: &lorica_bench::StreamSlaCollector,
+) {
+    let store = store.blocking_lock();
+    let routes = sla.flush_all(&store);
+    let streams = stream_sla.flush_all(&store);
+    info!(routes, streams, "SLA buckets flushed at exit");
 }
 
 /// Load persisted certificates into the worker's SNI resolver at boot.

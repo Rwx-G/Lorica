@@ -54,9 +54,16 @@ pub fn token() -> CancellationToken {
 /// Wait for the next tick of `ticker`. Returns `false` instead once the
 /// shutdown has begun, so a loop reads `while shutdown::tick(&mut t).await`.
 pub async fn tick(ticker: &mut tokio::time::Interval) -> bool {
+    tick_on(ticker, &SHUTDOWN).await
+}
+
+/// [`tick`] on `shutdown` instead of the process's signal, for a loop
+/// its caller hands the token to: the process passes [`token`], a test
+/// its own.
+pub async fn tick_on(ticker: &mut tokio::time::Interval, shutdown: &CancellationToken) -> bool {
     tokio::select! {
         biased;
-        _ = SHUTDOWN.cancelled() => false,
+        _ = shutdown.cancelled() => false,
         _ = ticker.tick() => true,
     }
 }

@@ -121,20 +121,40 @@ pub(crate) async fn start_alerting_stack(
         Some(Arc::clone(&notify_dispatcher)),
     ));
     probe_scheduler.reload().await;
+    // The probes, the SLA flushes below and the load-test cron end with
+    // the process's shutdown (`lorica_api::shutdown`): during a hot
+    // upgrade's drain the new generation does their work, and the old
+    // one must not do it twice (Story 12.11 D-b).
+    {
+        let probe_scheduler = Arc::clone(&probe_scheduler);
+        tokio::spawn(async move {
+            lorica_api::shutdown::token().cancelled().await;
+            probe_scheduler.stop().await;
+        });
+    }
 
-    // Create SLA collector and start background flush task
+    // Create SLA collector and start background flush task. Stopped, it
+    // flushes the minute it holds, open or not.
     let sla_collector = Arc::new(lorica_bench::SlaCollector::new());
     {
         let s = store.lock().await;
         sla_collector.load_configs(&s);
     }
-    sla_collector.start_flush_task(Arc::clone(store), Some(Arc::clone(&notify_dispatcher)));
+    sla_collector.start_flush_task(
+        Arc::clone(store),
+        Some(Arc::clone(&notify_dispatcher)),
+        lorica_api::shutdown::token().cancelled_owned(),
+    );
 
     // The stream one beside it: in worker mode the workers record and
     // flush, and this one, which records nothing, evaluates.
     let stream_sla_collector = Arc::new(lorica_bench::StreamSlaCollector::new());
     stream_sla_collector.load_configs(&*store.lock().await);
-    stream_sla_collector.start_flush_task(Arc::clone(store), Some(Arc::clone(&notify_dispatcher)));
+    stream_sla_collector.start_flush_task(
+        Arc::clone(store),
+        Some(Arc::clone(&notify_dispatcher)),
+        lorica_api::shutdown::token().cancelled_owned(),
+    );
     lorica::reload::register_stream_sla_collector(Arc::clone(&stream_sla_collector));
 
     AlertingStack {
@@ -158,7 +178,11 @@ pub(crate) fn start_load_test_engine(
     store: &Arc<Mutex<ConfigStore>>,
 ) -> Arc<lorica_bench::LoadTestEngine> {
     let engine = Arc::new(lorica_bench::LoadTestEngine::new());
-    lorica_bench::scheduler::start_scheduler(Arc::clone(store), Arc::clone(&engine));
+    lorica_bench::scheduler::start_scheduler(
+        Arc::clone(store),
+        Arc::clone(&engine),
+        lorica_api::shutdown::token().cancelled_owned(),
+    );
     engine
 }
 
@@ -395,14 +419,16 @@ fn follower_identity() -> lorica_config::models::ClusterIdentity {
 /// on any node whose log store was missing, which is exactly the
 /// degraded node where stale rows accumulate unnoticed.
 ///
-/// The `JoinHandle` was discarded at both original call sites, so it
-/// is not returned. Must be called from within a tokio runtime
+/// The loop ends with `shutdown`, the process's shutdown signal: a hot
+/// upgrade's outgoing generation leaves retention to the new one
+/// (Story 12.11 D-b). Must be called from within a tokio runtime
 /// context.
 pub(crate) fn spawn_retention_loop(
     log_store: lorica_api::server::LogStoreSlot,
     config_store: Arc<Mutex<ConfigStore>>,
     telemetry: Option<Arc<lorica_fleet::telemetry_store::ClusterTelemetryStore>>,
-) {
+    shutdown: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     // The loop runs even with no log store: several of its jobs
     // (expired ACME challenges, probe results, SLA windows) live in
     // the configuration store and must not be hostage to whether this
@@ -411,8 +437,7 @@ pub(crate) fn spawn_retention_loop(
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(3600));
         let mut last_sla_purge_day: u32 = 0;
-        loop {
-            interval.tick().await;
+        while lorica_api::shutdown::tick_on(&mut interval, &shutdown).await {
             let retention_log_store = log_store.store();
             let (retention, waf_retention, audit_retention_days, stream_retention) = {
                 let s = retention_config_store.lock().await;
@@ -697,7 +722,21 @@ pub(crate) fn spawn_retention_loop(
             }
             last_sla_purge_day = run_sla_purge(&retention_config_store, last_sla_purge_day).await;
         }
-    });
+    })
+}
+
+/// Wait for the next configuration change on `changes`: `true` when
+/// one arrived, `false` once the channel is closed or `shutdown` is
+/// cancelled, which ends the reload bridge that loops on it.
+pub(crate) async fn next_config_change(
+    changes: &mut tokio::sync::watch::Receiver<u64>,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => false,
+        changed = changes.changed() => changed.is_ok(),
+    }
 }
 
 /// Spawn the background OCSP-staple refresh loop (Story 8.5).
@@ -1487,6 +1526,42 @@ mod tests {
             assert_ne!(stored, 0, "test setup: the cursor moved");
             assert_eq!(cursor, Some(stored));
         }
+    }
+
+    #[tokio::test]
+    async fn the_retention_loop_ends_on_the_shutdown() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task = super::spawn_retention_loop(
+            lorica_api::server::LogStoreSlot::failed("no log store in this test".to_string()),
+            std::sync::Arc::new(tokio::sync::Mutex::new(
+                lorica_config::ConfigStore::open_in_memory().expect("test setup: store"),
+            )),
+            None,
+            shutdown.clone(),
+        );
+
+        shutdown.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("the loop ends on the shutdown")
+            .expect("the loop does not panic");
+    }
+
+    #[tokio::test]
+    async fn the_reload_bridge_waits_for_a_change_and_ends_on_the_shutdown() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (changes, mut rx) = tokio::sync::watch::channel(0u64);
+
+        changes.send(1).expect("a receiver");
+        assert!(super::next_config_change(&mut rx, &shutdown).await);
+
+        shutdown.cancel();
+        changes.send(2).expect("a receiver");
+        assert!(
+            !super::next_config_change(&mut rx, &shutdown).await,
+            "a change pending at the shutdown is not applied"
+        );
     }
 
     /// An ACME certificate of `domain` expiring in `days`, as the store

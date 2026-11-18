@@ -134,13 +134,23 @@ impl SlaCollector {
         persistence::flush(self, store)
     }
 
-    /// Start the background flush task that runs every 60 seconds.
+    /// Flush every bucket, the open minute included: what a process
+    /// does last, so the minute it was recording is not lost with it.
+    /// Returns the number of buckets flushed.
+    pub fn flush_all(&self, store: &ConfigStore) -> usize {
+        persistence::flush_all(self, store)
+    }
+
+    /// Start the background flush task that runs every 60 seconds until
+    /// `stop` resolves, when it flushes every bucket, the open minute
+    /// included ([`Self::flush_all`]), and ends.
     pub fn start_flush_task(
         self: &Arc<Self>,
         store: Arc<TokioMutex<ConfigStore>>,
         dispatcher: Option<Arc<TokioMutex<NotifyDispatcher>>>,
+        stop: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> tokio::task::JoinHandle<()> {
-        persistence::start_flush_task(self, store, dispatcher)
+        persistence::start_flush_task(self, store, dispatcher, stop)
     }
 }
 

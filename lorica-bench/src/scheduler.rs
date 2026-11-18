@@ -73,15 +73,22 @@ fn field_matches(field: &str, value: u32) -> bool {
 }
 
 /// Start the load test scheduler background task.
-/// Checks every 60 seconds if any scheduled tests need to run.
+/// Checks every 60 seconds if any scheduled tests need to run, until
+/// `stop` resolves; a test it already started runs on.
 pub fn start_scheduler(
     store: Arc<TokioMutex<ConfigStore>>,
     engine: Arc<LoadTestEngine>,
+    stop: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        tokio::pin!(stop);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                biased;
+                _ = &mut stop => return,
+                _ = interval.tick() => {}
+            }
 
             let configs = {
                 let s = store.lock().await;
@@ -136,6 +143,24 @@ pub fn start_scheduler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_scheduler_ends_on_its_stop() {
+        let store = Arc::new(TokioMutex::new(
+            ConfigStore::open_in_memory().expect("test setup: open in-memory store"),
+        ));
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let task = start_scheduler(store, Arc::new(LoadTestEngine::new()), async move {
+            let _ = stopped.await;
+        });
+
+        stop.send(()).expect("the scheduler listens");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the scheduler ends on its stop")
+            .expect("the scheduler does not panic");
+    }
 
     #[test]
     fn test_field_matches_wildcard() {

@@ -640,6 +640,9 @@ pub(crate) fn run_single_process(cli: Cli) {
             },
         ));
 
+        // Flushed at exit, after the drain (see the stop path below).
+        let exit_sla_collector = Arc::clone(&sla_collector);
+        let exit_stream_sla_collector = Arc::clone(&stream_sla_collector);
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store.clone(),
@@ -726,6 +729,7 @@ pub(crate) fn run_single_process(cli: Cli) {
             // Only a control plane holds a fan-in store; every other
             // role passes `None` and the per-node quota is skipped.
             fleet_telemetry,
+            lorica_api::shutdown::token(),
         );
 
 
@@ -856,6 +860,14 @@ pub(crate) fn run_single_process(cli: Cli) {
         // Then the rows reach the store, before the sinks drain in
         // `otel::shutdown` below (Story 12.9 D-k).
         lorica::stream_log::flush_rows_at_exit(&log_store).await;
+        // The SLA flush loops stopped when the stop began; what the drain
+        // recorded since, the open minute included, is merged here.
+        {
+            let store = store.lock().await;
+            let routes = exit_sla_collector.flush_all(&store);
+            let streams = exit_stream_sla_collector.flush_all(&store);
+            info!(routes, streams, "SLA buckets flushed at exit");
+        }
 
         // Drain tracked background tasks and cluster units in flight
         // before tearing down the API server, each bounded so a hung
