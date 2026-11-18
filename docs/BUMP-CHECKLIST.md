@@ -60,6 +60,24 @@ When bumping the version, update ALL of these files:
   lorica-lb, lorica-cache, lorica-memory-cache, lorica-lru, lorica-limits,
   lorica-tls, tinyufo
 
+## Shared-memory layout versions (NOT bumped with the product)
+
+`lorica-shmem` carries one layout version per region, each checked by
+every process that maps that region. Neither follows the product version,
+and neither moves because the other did:
+
+- `LAYOUT_VERSION` (`lorica-shmem/src/region.rs`): the WAF region. Bumped
+  on any change to `WAF_SLOTS`, to the layout of `SharedRegion` or of its
+  tables, or to the ABI of `Slot`.
+- `STREAM_CAPS_LAYOUT_VERSION` (`lorica-shmem/src/stream_caps.rs`, since
+  v1.11.0): the stream-caps region. Bumped on any change to its header,
+  its parts, their order or the ABI of its cells.
+
+At release time, check whether the cycle changed either layout and, if it
+did, that the matching constant moved in the same commit. Bumping one
+without a layout change only makes its check lie. The current values live
+in the constants; this file does not repeat them.
+
 ## Release tag (signed)
 
 Once the release commit is on `main`, the tag is **annotated and GPG-signed**.
