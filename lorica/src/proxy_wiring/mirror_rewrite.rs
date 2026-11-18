@@ -300,46 +300,6 @@ pub(crate) fn should_rewrite_response(
         .any(|p| starts_with_ignore_ascii_case(content_type, p))
 }
 
-/// Whether the route's response rewrite fires for `upstream_response`.
-///
-/// Two callers must agree on it: `response_filter`, which arms the
-/// rewrite, and `response_compression_level`, which runs first and must
-/// leave alone a body the rewrite is about to edit, since
-/// [`should_rewrite_response`] refuses an encoded one.
-///
-/// A HEAD response must keep the Content-Length a GET would produce
-/// (RFC 9110 9.3.2) and carries no body; 1xx, 204 and 304 have none
-/// either, and stripping a 304's Content-Length would break
-/// revalidation. A cached route never rewrites: the cache replays the
-/// stored upstream bytes through the body filter, so it would either
-/// rewrite twice or lose the framing the stored Content-Length gives.
-pub(crate) fn response_rewrite_applies(
-    session: &lorica_proxy::Session,
-    route: &lorica_config::models::Route,
-    upstream_response: &lorica_http::ResponseHeader,
-) -> bool {
-    let Some(cfg) = route.response_rewrite.as_ref() else {
-        return false;
-    };
-    let is_head = session
-        .req_header()
-        .method
-        .as_str()
-        .eq_ignore_ascii_case("HEAD");
-    let body_forbidden = matches!(upstream_response.status.as_u16(), 100..=199 | 204 | 304);
-    if is_head || body_forbidden || session.cache.enabled() {
-        return false;
-    }
-    let header = |name: &str| {
-        upstream_response
-            .headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-    };
-    should_rewrite_response(cfg, header("content-type"), header("content-encoding"))
-}
-
 /// Build the fixed forward-header set for a mirror sub-request: the
 /// whole request header bag minus hop-by-hop headers, plus the mirror
 /// tag and the propagated request id. Pure function so the filtering

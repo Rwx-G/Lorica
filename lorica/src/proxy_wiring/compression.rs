@@ -12,10 +12,12 @@
 //! `application/` type once given a level. That is too wide for a proxy
 //! in front of arbitrary backends: a `206` would keep a `Content-Range`
 //! that no longer describes its body, a binary download would lose its
-//! `Content-Length` and with it resuming, and an event stream would
-//! stall, because an encoder emits nothing until it has filled a block
-//! or the stream ends. The policy here is applied before the level is
-//! handed to the context.
+//! `Content-Length` and with it resuming, and a stream would stall: the
+//! encoders emit nothing until they have filled a block or the body
+//! ends, so an event stream, a long poll or a log tail would hold its
+//! data. Only a body of declared length is compressed for that reason; an
+//! open-ended one is sent chunked. The policy here is applied before the
+//! level is handed to the context.
 
 use lorica_http::ResponseHeader;
 
@@ -53,7 +55,11 @@ const COMPRESSED_SUFFIXES: &[&str] = &["+json", "+xml"];
 /// accept an encoding, the backend must not have encoded the body, and a
 /// declared `Content-Length` must be at least 20 bytes.
 pub(crate) fn compresses_response(upstream_response: &ResponseHeader) -> bool {
-    if !COMPRESSED_STATUSES.contains(&upstream_response.status.as_u16()) {
+    if !COMPRESSED_STATUSES.contains(&upstream_response.status.as_u16())
+        || !upstream_response
+            .headers
+            .contains_key(http::header::CONTENT_LENGTH)
+    {
         return false;
     }
     upstream_response
@@ -86,12 +92,22 @@ fn is_compressible_content_type(content_type: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A response of declared length, the only shape that is compressed.
     fn response(status: u16, content_type: Option<&str>) -> ResponseHeader {
         let mut resp = ResponseHeader::build(status, None).unwrap();
+        resp.insert_header(http::header::CONTENT_LENGTH, "4096")
+            .unwrap();
         if let Some(ct) = content_type {
             resp.insert_header(http::header::CONTENT_TYPE, ct).unwrap();
         }
         resp
+    }
+
+    #[test]
+    fn a_body_without_declared_length_is_not_compressed() {
+        let mut chunked = response(200, Some("application/json"));
+        chunked.remove_header(&http::header::CONTENT_LENGTH);
+        assert!(!compresses_response(&chunked));
     }
 
     #[test]

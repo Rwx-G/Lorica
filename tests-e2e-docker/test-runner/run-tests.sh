@@ -4335,8 +4335,8 @@ JSON
     fi
 
     # With compression also on, a client accepting gzip still gets the
-    # rewritten body: the rewrite refuses an encoded body, so the
-    # response it edits is left uncompressed (#59).
+    # rewritten body: the rewrite refuses an encoded body, so a route
+    # with a rewrite is never compressed (#59).
     api_put "/api/v1/routes/$RW_ROUTE_ID" '{"compression_enabled": true}' >/dev/null
     sleep 2
     RW_GZ_HEADERS=$(curl -s --max-time 5 -o /tmp/rw-gz-body -D - -H "Accept-Encoding: gzip" \

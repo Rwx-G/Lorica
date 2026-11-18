@@ -430,9 +430,12 @@
       streams and gRPC, and any body the backend already encoded.
     </p>
     <p>
-      A response the <code>Response body rewrite</code> edits is left
-      uncompressed, so the rewrite always sees plain bytes. With the cache
-      on, the compressed and plain variants of a URL are cached apart.
+      Only a body of declared length is compressed: a response streamed
+      without <code>Content-Length</code> goes out as sent, so a long poll
+      or a log tail is never held in the encoder. A route with a
+      <code>Response body rewrite</code> is not compressed, so the rewrite
+      always sees plain bytes. With the cache on, the compressed and plain
+      variants of a URL are cached apart.
     </p>
   </HelpModal>
 {:else if activeHelp === 'compression_enabled'}

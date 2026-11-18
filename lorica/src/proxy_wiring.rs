@@ -274,13 +274,13 @@ mod compression;
 use compression::{compresses_response, RESPONSE_COMPRESSION_LEVEL};
 
 pub mod mirror_rewrite;
+#[cfg(test)]
+pub(crate) use mirror_rewrite::build_mirror_url;
 pub(crate) use mirror_rewrite::{
     apply_response_rewrites, build_mirror_forward_headers, compile_rewrite_rule,
-    is_stream_content_type, mirror_sample_hit, request_has_body, response_rewrite_applies,
+    is_stream_content_type, mirror_sample_hit, request_has_body, should_rewrite_response,
     spawn_mirrors, CompiledRewriteRule, MirrorBodyState, MirrorPending, ResponseRewriteState,
 };
-#[cfg(test)]
-pub(crate) use mirror_rewrite::{build_mirror_url, should_rewrite_response};
 
 pub mod helpers;
 // `pub` (not `pub(crate)`) for `canary_bucket` and the mTLS helpers
@@ -2631,30 +2631,66 @@ impl ProxyHttp for LoricaProxy {
         // rewritten body will have a different length) before the
         // response line is sent.
         //
+        // Skip HEAD requests: the response MUST report the Content-Length
+        // a GET would produce (RFC 7231 s4.3.2), and HEAD carries no
+        // body for us to rewrite. Stripping Content-Length here would
+        // break clients that size their follow-up GET based on HEAD.
+        //
+        // Also skip 1xx / 204 / 304 responses: they are defined as
+        // having no body, and stripping Content-Length on a 304 would
+        // corrupt the revalidation contract.
+        let is_head = session
+            .req_header()
+            .method
+            .as_str()
+            .eq_ignore_ascii_case("HEAD");
+        let status = upstream_response.status.as_u16();
+        let body_forbidden = matches!(status, 100..=199 | 204 | 304);
         // v1 scope: response rewriting is mutually exclusive with
-        // caching (see `response_rewrite_applies`). Rewriting wins over
-        // caching with a loud warning, because rewriting is typically
-        // the stricter security / integrity requirement.
-        if session.cache.enabled() && route.response_rewrite.is_some() {
+        // caching. Pingora's cache captures raw upstream bytes and
+        // replays them through response_body_filter on cache hits,
+        // so naively combining the two would either double-rewrite
+        // (if the cache stored rewritten bytes) or silently break
+        // the stream framing (the cache relies on the
+        // upstream-reported Content-Length we would strip). Pick
+        // one per route; rewriting wins over caching with a loud
+        // warning, because rewriting is typically the stricter
+        // security / integrity requirement.
+        let cache_active = session.cache.enabled();
+        if cache_active && route.response_rewrite.is_some() {
             tracing::warn!(
                 route_id = %route.id,
                 "response_rewrite disabled for this response because the route also has cache_enabled; caching + rewriting are mutually exclusive in v1"
             );
         }
-        if response_rewrite_applies(session, route, upstream_response) {
-            // Strip Content-Length; the framework will emit the
-            // rewritten body as chunked. Transfer-Encoding is
-            // likewise re-derived by the server.
-            upstream_response.remove_header("content-length");
-            ctx.response_rewrite_state = Some(ResponseRewriteState::Active(Vec::new()));
-            // Resolve compiled rules ONCE from the cached
-            // route entry and hand them to response_body_filter
-            // via ctx. Prior code re-scanned routes on every
-            // chunk (O(routes) per chunk under load); now the
-            // per-chunk path is a pointer clone.
-            if let Some(entry) = ctx.matched_route_entry.as_ref() {
-                ctx.response_rewrite_rules =
-                    Some(Arc::new(entry.response_rewrite_compiled.clone()));
+        if let Some(ref rr_cfg) = route.response_rewrite {
+            if !is_head && !body_forbidden && !cache_active {
+                let ct = upstream_response
+                    .headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let ce = upstream_response
+                    .headers
+                    .get("content-encoding")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if should_rewrite_response(rr_cfg, ct, ce) {
+                    // Strip Content-Length; the framework will emit the
+                    // rewritten body as chunked. Transfer-Encoding is
+                    // likewise re-derived by the server.
+                    upstream_response.remove_header("content-length");
+                    ctx.response_rewrite_state = Some(ResponseRewriteState::Active(Vec::new()));
+                    // Resolve compiled rules ONCE from the cached
+                    // route entry and hand them to response_body_filter
+                    // via ctx. Prior code re-scanned routes on every
+                    // chunk (O(routes) per chunk under load); now the
+                    // per-chunk path is a pointer clone.
+                    if let Some(entry) = ctx.matched_route_entry.as_ref() {
+                        ctx.response_rewrite_rules =
+                            Some(Arc::new(entry.response_rewrite_compiled.clone()));
+                    }
+                }
             }
         }
 
@@ -2770,20 +2806,22 @@ impl ProxyHttp for LoricaProxy {
         Ok(None)
     }
 
-    /// A response the route's body rewrite will edit is left uncompressed:
-    /// compression runs before `response_filter`, and the rewrite refuses
-    /// an encoded body, so compressing it would switch the rewrite off.
+    /// A route with a body rewrite is never compressed. Compression runs
+    /// before `response_filter`, and the rewrite refuses an encoded body;
+    /// whether it fires is only settled there, after the cache has judged
+    /// the response and the route's header overrides have applied, so the
+    /// only answer this hook can give without racing it is "not here".
     fn response_compression_level(
         &self,
-        session: &mut Session,
+        _session: &mut Session,
         upstream_response: &ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> u32 {
         match ctx.route_snapshot.as_deref() {
             Some(route)
                 if route.compression_enabled
-                    && compresses_response(upstream_response)
-                    && !response_rewrite_applies(session, route, upstream_response) =>
+                    && route.response_rewrite.is_none()
+                    && compresses_response(upstream_response) =>
             {
                 RESPONSE_COMPRESSION_LEVEL
             }
