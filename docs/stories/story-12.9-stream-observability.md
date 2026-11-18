@@ -806,7 +806,7 @@ describes log export (Story 9.8's), the docs page that lists metrics,
 `docs/backlog.md` (#53 (a) row removed, #53 kept for its other items if
 any), `CHANGELOG.md`, `README.md` (feature list).
 
-- [ ] Row fields, end reasons (rendered from the enum list the API
+- [x] Row fields, end reasons (rendered from the enum list the API
       publishes, not retyped), the limiter, retention, the sink kind and
       toggles, every metric family, the SLA definitions, the three
       notifications and why DNS has none, `lorica_log_sink_up` and its
@@ -1741,6 +1741,8 @@ edited here.
 
 - **Lot I, the parts in `docs/streams.md`, `README.md` and `CHANGELOG.md` (2026-11-18); the box stays open.** `docs/streams.md` (new), "Observability": the row's fields (pointing at `StreamLogEntry`), storage and retention, the reads, the sink kind and its toggles, token reads, the metric families (pointing at `StreamFamily` rather than retyping them), `lorica_log_sink_up` and its lowest-worker rule, UDP syslog "up" proving no delivery, the SLA definitions as built (UDP availability only), the three notifications and why DNS has none, and the fleet's mixed-version window (rows wait, as built, not lost as D-i said). End reasons and refusal words point at `StreamEndKind`, `StreamRefusal` and `DatagramDropReason` and where `openapi.yaml` publishes them, never a typed list. `CHANGELOG.md` `[Unreleased]`: Added (stream logs, metrics, SLA, alerts, `lorica_log_sink_up`); `README.md`: the streams feature entry. `docs/cluster.md` and the threat model were covered by the other documentation pass. Still open, so the box stays open: `docs/cluster.md` ("rows wait", `?node=`) and the threat model, which the other documentation pass owns; the log-export page, the metrics page and the `docs/backlog.md` row for #53 (a), which no documentation pass of this cycle was given.
 
+- **Lot I closed, 2026-11-18.** Lorica has no page of its own for log export or for metrics: log export is described by the "Syslog export" and "OTLP logs export" entries of the `README.md` feature list, and the metrics by its "Prometheus metrics" entry and the "Prometheus" section of `docs/tuning.md`. The syslog entry now names the `stream` kind (since v1.11.0, pointing at `docs/streams.md`) and `lorica_log_sink_up{sink}` with its lowest-worker rule; the Prometheus entry names the `lorica_stream_*` families; `docs/tuning.md` lists `lorica_log_sink_up{sink}` (UDP "up" proving no delivery) and the stream families, pointing at `docs/streams.md`, "Metrics", for their names and labels rather than retyping them. Backlog #53 is removed whole: (a) shipped here as `lorica_log_sink_up{sink}` and (b) and (c) shipped in 1.9.2, so nothing is left open. With the cluster and threat-model parts and the `docs/streams.md`, `README.md` and `CHANGELOG.md` parts already landed, the Lot's one box is ticked.
+
 ## File List
 
 - `lorica-config/src/models/settings.rs`
@@ -1865,3 +1867,4 @@ edited here.
 | 2026-11-18 | 0.16 | Lot G: stream rows fan in to the control plane on the telemetry push (new tags, admitted as access rows are: quota charged, watermark shed, drop reasons counted, audit still exempt), stored in `fleet_stream_logs` under the per-node quota and read with `GET /api/v1/stream-logs?node=`; `SlaPull` names a stream and the three stream SLA reads take `?node=`. A 1.10.7 peer is tested both ways against its frozen push, ack, pull and answer; the frozen wire corpus is unchanged. Gates on both trees: the CI chain green (3,721 product, 976 `lorica`, 915 forked, 592 TLS-featured tests on the last), `cargo audit` clean. | Romain G. |
 | 2026-11-18 | 0.17 | Lot I, cluster and threat-model part: stream row fan-in, `?node=` on stream logs and stream SLA, replicated SLA targets and the mixed-version window in `docs/cluster.md`; log amplification in the threat model. The rest of the Lot stays open. | Romain G. |
 | 2026-11-18 | 0.18 | Lot I, the `docs/streams.md`, README and CHANGELOG parts: stream observability documented; the cluster, threat-model, log-export, metrics and backlog parts stay open, so the box does. Status InProgress. | Romain G. |
+| 2026-11-18 | 0.19 | Lot I closed: stream logs and `lorica_log_sink_up` on the log-export entries of the README, stream families and the sink gauge on the metrics docs (README, `docs/tuning.md`), backlog #53 removed. | Romain G. |

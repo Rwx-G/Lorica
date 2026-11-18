@@ -144,6 +144,13 @@ rather than stored in the settings:
 - `lorica_log_store_up{role, worker_id}` - 0 while a process cannot
   open `access-log.db` and persists no audit trail, access logs or WAF
   events (see `docs/installation.md`); alert on `min(...) == 0`
+- `lorica_log_sink_up{sink}` - 0 when any worker's syslog sink is not
+  connected or its last OTLP export failed; over UDP, syslog "up" only
+  means the socket is open
+- `lorica_stream_*` - per stream and per (stream, backend): active and
+  pending connections or sessions, ends by reason, refusals by word,
+  bytes, connect attempts and latency; the families and their labels
+  are in `docs/streams.md`, "Metrics"
 
 ### Dashboard
 
