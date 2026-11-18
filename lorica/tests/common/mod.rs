@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! Helpers shared by the end-to-end proxy tests and the tests that start
-//! the real binary.
+//! the real binary, and, through `#[path]`, by the `lorica-stream` UDP
+//! tests, whose `SO_REUSEPORT` slots need the same cross-process ports.
 //!
 //! Cargo compiles every top-level file under `tests/` as its own crate,
 //! so code cannot be shared by `use`. A subdirectory is not a test

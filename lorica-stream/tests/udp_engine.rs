@@ -56,7 +56,27 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-const WAIT: Duration = Duration::from_secs(10);
+// A UDP socket with `SO_REUSEPORT` bound to port 0 may be handed a port
+// another `SO_REUSEPORT` socket of the same user already holds: the
+// kernel then joins the two in one group and splits the datagrams
+// between them, so a test's slot shares its traffic with another test's,
+// in this binary or in another process. And a port released goes back
+// to the ephemeral pool while datagrams may still be on their way to it
+// (the ICMP tests send to a closed port on purpose; a late answer
+// reaches an ended session's port): whatever autobinds it next receives
+// them. Every socket a test reads from here (slot, backend, client)
+// binds a port of the shared reservation scheme instead, below the
+// ephemeral range and locked across processes, which no autobind ever
+// reaches and nobody else is handed.
+#[path = "../../lorica/tests/common/mod.rs"]
+mod common;
+
+use common::reserve_port;
+
+/// How long an expected event may take before the test calls it lost. It
+/// bounds a hang, never a duration: a loaded host delays every event,
+/// and no assertion here may depend on how much.
+const WAIT: Duration = Duration::from_secs(60);
 const QUIET: Duration = Duration::from_millis(300);
 
 // ---- fake seams ------------------------------------------------------
@@ -295,9 +315,16 @@ struct UdpBackend {
     seen: Seen,
 }
 
+/// A UDP socket on `ip`, on a reserved port.
+async fn reserved_socket(ip: IpAddr) -> UdpSocket {
+    UdpSocket::bind(SocketAddr::new(ip, reserve_port()))
+        .await
+        .unwrap()
+}
+
 impl UdpBackend {
     async fn spawn(answer: impl Fn(&[u8]) -> Vec<Vec<u8>> + Send + 'static) -> Self {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = reserved_socket(loopback(1)).await;
         let addr = socket.local_addr().unwrap();
         let seen: Seen = Arc::default();
         let log = Arc::clone(&seen);
@@ -339,10 +366,11 @@ impl UdpBackend {
 }
 
 /// A loopback UDP port nothing listens on: a datagram to it draws an
-/// ICMP port unreachable.
+/// ICMP port unreachable. Reserved, so nothing binds it later either: a
+/// port bound and released at once goes back to the ephemeral pool, and
+/// a socket another test bound there would take the datagram instead.
 fn closed_port() -> SocketAddr {
-    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket.local_addr().unwrap()
+    SocketAddr::new("127.0.0.1".parse().unwrap(), reserve_port())
 }
 
 struct Harness {
@@ -454,7 +482,7 @@ impl Harness {
                     .expect("a region");
                 harness.exchange(caps).await;
             }
-            let fd = bind_udp_group(SocketAddr::new(stream.listen_address, 0), 1)
+            let fd = bind_udp_group(SocketAddr::new(stream.listen_address, reserve_port()), 1)
                 .unwrap()
                 .remove(0);
             let addr = SockRef::from(&fd)
@@ -564,7 +592,7 @@ fn dropped(stats: &StreamCountersSnapshot, reason: DatagramDropReason) -> u64 {
 }
 
 async fn client() -> UdpSocket {
-    UdpSocket::bind("127.0.0.1:0").await.unwrap()
+    reserved_socket(loopback(1)).await
 }
 
 async fn reply(client: &UdpSocket) -> Vec<u8> {
@@ -690,7 +718,9 @@ async fn without_expected_responses_a_session_ends_at_its_request_bound() {
     assert_eq!(record.end_reason, StreamEndReason::RequestBoundReached);
     assert_eq!(record.datagrams_upload, Some(3));
     assert_eq!(record.datagrams_download, Some(0));
-    assert_eq!(b1.received().len(), 3);
+    // The record follows the third send; the backend's own task logs
+    // the datagram when it gets to it.
+    wait_until("the backend got all three", || b1.received().len() == 3).await;
     assert_silent(&c).await;
     assert!(
         dropped(&h.stats("syslog"), DatagramDropReason::ResponseCountBound) >= 1,
@@ -806,9 +836,9 @@ async fn an_icmp_refusal_before_any_answer_fails_the_session() {
 #[tokio::test]
 async fn an_icmp_refusal_after_an_answer_is_the_backends_close() {
     // Answers the first datagram, then closes its socket.
-    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let socket = reserved_socket(loopback(1)).await;
     let addr = socket.local_addr().unwrap();
-    tokio::spawn(async move {
+    let answering = tokio::spawn(async move {
         let mut buf = [0u8; 64];
         let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
         socket.send_to(&buf[..n], peer).await.unwrap();
@@ -819,8 +849,9 @@ async fn an_icmp_refusal_after_an_answer_is_the_backends_close() {
     let c = client().await;
     c.send_to(b"q1", h.listen()).await.unwrap();
     assert_eq!(reply(&c).await, b"q1");
-    // Let the backend task end and its port close.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The backend's task has ended once joined, its socket dropped with
+    // it; the port is reserved, so nothing binds it again.
+    answering.await.unwrap();
     c.send_to(b"q2", h.listen()).await.unwrap();
     let record = h.record().await;
     assert_eq!(record.end_reason, StreamEndReason::BackendClose);
@@ -1049,15 +1080,19 @@ fn loopback(n: u8) -> IpAddr {
 
 /// A client sending from `127.0.0.<n>`.
 async fn client_from(n: u8) -> UdpSocket {
-    UdpSocket::bind(SocketAddr::new(loopback(n), 0))
-        .await
-        .unwrap()
+    reserved_socket(loopback(n)).await
 }
 
 /// `c`'s first datagram is refused `refusal`: no session, no answer, one
 /// row naming the client, the refusal counted once and as nothing else.
 async fn refused_session(h: &mut Harness, c: &UdpSocket, refusal: StreamRefusal) {
     c.send_to(b"q", h.listen()).await.unwrap();
+    refused_as(h, c, refusal).await;
+}
+
+/// `c`'s datagram, already sent, was refused `refusal`: no answer, one
+/// row naming the client, the refusal counted once and as nothing else.
+async fn refused_as(h: &mut Harness, c: &UdpSocket, refusal: StreamRefusal) {
     let row = h.refusal().await;
     assert_eq!(row.refusal, refusal);
     assert_eq!(row.client, c.local_addr().unwrap());
@@ -1122,20 +1157,58 @@ async fn a_datagram_before_the_region_is_refused_caps_unavailable_and_counted() 
     h.stop();
 }
 
+/// Open sessions from `addresses` in turn, each a new client, until the
+/// open rate refuses one; returns how many were served first, how long
+/// it took, and the refused client.
+///
+/// The rate holds one second of burst and refills as it goes, so how many
+/// sessions it serves before a refusal depends on how long they took to
+/// arrive, which a loaded host stretches: the caller bounds the count by
+/// the time it measured, never by an assumed one.
+async fn open_until_refused(
+    h: &Harness,
+    mut addresses: impl Iterator<Item = u8>,
+    refusal: StreamRefusal,
+) -> (u64, Duration, UdpSocket) {
+    let refused = || h.stats("dns").refused.get(&refusal).copied().unwrap_or(0);
+    let started = Instant::now();
+    let mut served = 0;
+    loop {
+        let c = client_from(addresses.next().expect("test setup: an address")).await;
+        c.send_to(b"q", h.listen()).await.unwrap();
+        tokio::select! {
+            answer = reply(&c) => {
+                assert_eq!(answer, b"q");
+                served += 1;
+            }
+            () = wait_until("the refusal", || refused() == 1) => {
+                return (served, started.elapsed(), c);
+            }
+        }
+        assert!(started.elapsed() < WAIT, "no session outran the rate");
+    }
+}
+
+/// At most the burst, plus what the rate refilled over `took`.
+fn within_the_rate(served: u64, took: Duration, per_second: u32) {
+    let refill = (took.as_secs_f64() * f64::from(per_second)).ceil() as u64;
+    assert!(
+        served >= u64::from(per_second) && served <= u64::from(per_second) + refill,
+        "{served} served in {took:?} at {per_second} per second with one second of burst"
+    );
+}
+
 #[tokio::test]
 async fn the_source_open_rate_refuses_one_address_and_serves_another() {
     let b1 = UdpBackend::echo().await;
     let mut stream = udp_stream("dns", "127.0.0.1");
     stream.source_open_rate = Some(2);
     let mut h = Harness::one(stream, vec![backend("b1", b1.addr)]).await;
-    // Two sessions in one second of burst, from two ports of one address.
-    for _ in 0..2 {
-        let c = client_from(2).await;
-        c.send_to(b"q", h.listen()).await.unwrap();
-        assert_eq!(reply(&c).await, b"q");
-    }
-    let third = client_from(2).await;
-    refused_session(&mut h, &third, StreamRefusal::SourceOpenRate).await;
+    // Sessions from new ports of one address.
+    let (served, took, refused) =
+        open_until_refused(&h, std::iter::repeat(2), StreamRefusal::SourceOpenRate).await;
+    within_the_rate(served, took, 2);
+    refused_as(&mut h, &refused, StreamRefusal::SourceOpenRate).await;
     let other = client_from(3).await;
     other.send_to(b"q", h.listen()).await.unwrap();
     assert_eq!(reply(&other).await, b"q", "another source is served");
@@ -1148,11 +1221,10 @@ async fn the_stream_open_rate_refuses_every_source_past_it() {
     let mut stream = udp_stream("dns", "127.0.0.1");
     stream.open_rate = Some(1);
     let mut h = Harness::one(stream, vec![backend("b1", b1.addr)]).await;
-    let first = client_from(2).await;
-    first.send_to(b"q", h.listen()).await.unwrap();
-    assert_eq!(reply(&first).await, b"q");
-    let second = client_from(3).await;
-    refused_session(&mut h, &second, StreamRefusal::OpenRate).await;
+    // Each session from another address: the stream's rate is everyone's.
+    let (served, took, refused) = open_until_refused(&h, 2..=250, StreamRefusal::OpenRate).await;
+    within_the_rate(served, took, 1);
+    refused_as(&mut h, &refused, StreamRefusal::OpenRate).await;
     h.stop();
 }
 
@@ -1231,8 +1303,11 @@ async fn consistent_hash_keeps_one_client_address_on_one_backend() {
 async fn least_sessions_counts_each_session_once() {
     let b1 = UdpBackend::sink().await;
     let b2 = UdpBackend::sink().await;
+    // The first session must still be open when the second picks its
+    // backend: no idle timeout ends it on its own, however long the
+    // host takes; a detach ends both once the second has opened.
     let mut stream = udp_stream("dns", "127.0.0.1");
-    stream.idle_timeout_s = 1;
+    stream.idle_timeout_s = 3_600;
     let mut h = Harness::start(
         vec![(stream, vec![backend("b1", b1.addr), backend("b2", b2.addr)])],
         Pick::FewestSessions,
@@ -1246,6 +1321,14 @@ async fn least_sessions_counts_each_session_once() {
     let second = client().await;
     second.send_to(b"q", h.listen()).await.unwrap();
     wait_until("the second session", || b2.received().len() == 1).await;
+    let seq = h.next_seq();
+    h.exchange(StreamCtlMsg::Detach {
+        seq,
+        stream_id: "dns".into(),
+        bind_gen: 1,
+        drain_ms: 0,
+    })
+    .await;
     h.record().await;
     h.record().await;
     let mut connected = h.selector.connected.lock().unwrap().clone();

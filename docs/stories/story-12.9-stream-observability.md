@@ -1064,7 +1064,25 @@ edited here.
   4 of 80 runs (late replies, a session counted twice);
   `tls_engine.rs` 0 of 80. Gate runs share the host's loopback with
   other agents' test binaries, so these can fail a gate the same way.
-
+- Those two, fixed 2026-11-18 in the tests, separate commit. The cause
+  of the foreign datagrams, proven by a probe: a UDP socket with
+  `SO_REUSEPORT` bound to port 0 may be handed a port another
+  `SO_REUSEPORT` socket of the same user holds (37 of 20,000 autobinds
+  landed on one of 64 held ports; TCP, 0 of 20,000), and the kernel then
+  splits the datagrams between the two. The tests bound their slots so.
+  Production cannot: a stream's port is validated non-zero. Second cause:
+  ports released while datagrams were still on their way (the ICMP
+  tests send to a closed port on purpose, late answers reach an ended
+  session's port) were autobound by another test's client or backend.
+  Every UDP slot, backend and client of `runtime.rs` and `udp_engine.rs`
+  now binds a port of `lorica/tests/common/mod.rs`'s reservation scheme
+  (included by `#[path]`), the ICMP-after-answer test joins its backend
+  task instead of sleeping 100 ms, the two open-rate tests bound the
+  sessions served by the time measured, the least-sessions test keeps
+  its first session open until a detach (a 1 s idle timeout ended it
+  before the second picked its backend), and the hang bounds are 60 s.
+  After: 0 failures in 400 runs at 16 copies on two cores and in 800 at
+  32 on one core, for each of `runtime` and `udp_engine`.
 - **Lot B.** Settings: `stream_access_log_retention` (default
   `GlobalSettings::DEFAULT_STREAM_ACCESS_LOG_RETENTION`, 100,000, `0`
   unlimited) replicated through `CanonicalGlobalSettings` with a serde

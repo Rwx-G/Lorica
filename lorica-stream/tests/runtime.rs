@@ -47,7 +47,27 @@ use socket2::SockRef;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 
-const ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
+// A UDP socket with `SO_REUSEPORT` bound to port 0 may be handed a port
+// another `SO_REUSEPORT` socket of the same user already holds: the
+// kernel then joins the two in one group and splits the datagrams
+// between them, so a test's slot shares its traffic with another test's,
+// in this binary or in another process. Every slot here binds a port of
+// the shared reservation scheme instead, below the ephemeral range and
+// locked across processes, which no autobind ever reaches.
+#[path = "../../lorica/tests/common/mod.rs"]
+mod common;
+
+use common::reserve_port;
+
+/// How long an expected answer or event may take before the test calls
+/// it lost. It bounds a hang, never a duration: a loaded host delays
+/// every event, and no assertion here may depend on how much.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A loopback UDP address on a reserved port.
+fn reserved_udp(ip: &str) -> SocketAddr {
+    SocketAddr::new(ip.parse().unwrap(), reserve_port())
+}
 
 fn stream(id: &str, protocol: StreamProtocol) -> Stream {
     Stream::new(
@@ -403,7 +423,7 @@ fn the_seqpacket_channel_attaches_refuses_and_quiesces() {
     ));
 
     // A UDP socket under a TCP token is not adopted.
-    let udp = bind_udp_group("127.0.0.1:0".parse().unwrap(), 1)
+    let udp = bind_udp_group(reserved_udp("127.0.0.1"), 1)
         .unwrap()
         .remove(0);
     assert!(matches!(
@@ -521,12 +541,7 @@ impl DatagramHandler for Recorder {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_runtimes_sharing_a_udp_group_each_receive_only_their_slot() {
-    let port = std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let addr: SocketAddr = SocketAddr::new("127.0.0.1".parse().unwrap(), port);
+    let addr = reserved_udp("127.0.0.1");
     let group = bind_udp_group(addr, 2).unwrap();
 
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -719,11 +734,9 @@ fn udp_runtime() -> (InProcessPeer, StreamRuntimeHandle, EchoProbe) {
     (peer, handle, probe)
 }
 
-/// A one-slot UDP group on `ip`, port chosen by the kernel.
+/// A one-slot UDP group on `ip`, on a reserved port.
 fn udp_slot(ip: &str) -> (SocketAddr, OwnedFd) {
-    let fd = bind_udp_group(SocketAddr::new(ip.parse().unwrap(), 0), 1)
-        .unwrap()
-        .remove(0);
+    let fd = bind_udp_group(reserved_udp(ip), 1).unwrap().remove(0);
     (local_addr(&fd), fd)
 }
 
@@ -751,8 +764,12 @@ async fn attach_udp(peer: &mut InProcessPeer, seq: u64, bind_gen: u64, fds: Vec<
     }
 }
 
+/// A client on a reserved port: a datagram another test sent to a port
+/// it released can never reach it.
 async fn udp_client() -> tokio::net::UdpSocket {
-    tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()
+    tokio::net::UdpSocket::bind(reserved_udp("127.0.0.1"))
+        .await
+        .unwrap()
 }
 
 /// Send `payload` to `to` and read the echo.
