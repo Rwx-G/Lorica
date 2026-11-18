@@ -474,6 +474,7 @@ To raise it:
   Keep the range clear of every port a service on the host listens on, Lorica's stream ports included.
 - **More source addresses: set the stream's `source_addresses`** (nginx's `proxy_bind`, at most 16), each an address configured on the node. A UDP stream spreads its sessions evenly over them, and each address is a pool of its own.
 - A sysctl narrowed under bound streams does not unbind them; the budget view flags the node `over_ceiling` and refuses any change that raises the demand until it fits again.
+- `stream_listen_socket_cap` (global setting, default 2,048, 1 to 16,384) bounds the stream listening sockets one node holds, one per port of every stream bound on it. It is a sanity bound on configuration, not a capacity figure: the descriptor budget above refuses what the process cannot hold whatever the cap says.
 
 ## 6. Monitoring
 
