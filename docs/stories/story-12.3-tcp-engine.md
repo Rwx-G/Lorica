@@ -1192,7 +1192,7 @@ Depends on: C, D2, E.
       `max_connections` as "per worker process until Story 12.6, per
       node from then on" with its budget arithmetic; buffers and why no
       splice.
-- [ ] Threat model: a stream exposing local services; forwarding loops
+- [x] Threat model: a stream exposing local services; forwarding loops
       (same node refused; across nodes not detected, bounded by caps);
       DNS rebinding of stream backends; PROXY-header spoofing on
       streams.
@@ -1785,6 +1785,8 @@ performance phase.
   out the names of `TCP_ENGINE_FIELDS` (derived, not listed), with a
   comment saying Lot E drops the filter. Lot E must remove it.
 
+- Lot F, security, operations and architecture documentation, 2026-11-18: Threat model T12: a stream exposing local services (rules A and B, the three checks), forwarding loops (same node refused by rule B, across nodes bounded and not detected), DNS rebinding of stream backends (connect-time check after every resolution, the per-stream exclusion that is not written to the shared health), PROXY-header spoofing on streams. The hardening guide's capacity section covers source addresses. The survey check and the `docs/streams.md` sections are the other agent's and stay open. The other documentation agent of this cycle owns `docs/streams.md`, `README.md` and `CHANGELOG.md`; the items of this Lot in those files are theirs and stay unticked here until they land. Commits `9473b7d6` (security), `c17ff277` (worker), `df122844` (cluster), `619b55bb` (mcp), `5e4d0d69` (security, `stream_listen_socket_cap`).
+
 ## File List
 
 Lot E:
@@ -1866,6 +1868,7 @@ Lot B:
   `lorica-api/src/streams.rs`, `lorica-api/src/streams/tests.rs`
   (literal sites)
 - `docs/stories/story-12.3-tcp-engine.md`
+- `docs/security/threat-model.md`, `docs/security/hardening-guide.md` (Lot F, threat model and hardening part)
 
 ## Change Log
 
@@ -1880,3 +1883,4 @@ Lot B:
 | 2026-11-15 | 0.8 | Lot E landed: the engine settings and `backup_backend_ids` on the stream API and in `openapi.yaml`, rule B (`stream_local_backend`, 409) on stream writes both ways, backend updates and imports, the D9 automation guard reached by the MCP backend tool, and one budget demand function for the API and the node. | Romain G. |
 | 2026-11-15 | 0.6 | Lot C landed: the TCP engine in `lorica_stream::tcp`, the protocol-neutral seams, local check, resolver cache and counters at the crate root (Story 12.5 E2, E3), `StreamTable::with_backends`, `table_changed` and the `backend_down` drain, the connection record and its observer. | Romain G. |
 | 2026-11-18 | 0.9 | D9 amended: the local-backend refusal of a token's address change names the stream only to a token holding `streams:read` and its id otherwise, through `streams_as_seen_by`, the helper Story 12.10's backend delete refusal uses; reason: 12.10 D-j keeps stream names from a config-tier token and the refusal must not undo it. Tests both ways on REST, the stdio-shaped request and both MCP tools, apply and preview. Gates: the CI chain green, `cargo audit` clean. | Romain G. |
+| 2026-11-18 | 0.10 | Lot F, threat-model part: local services, forwarding loops, DNS rebinding and PROXY-header spoofing on streams in T12; source addresses in the hardening guide. The survey check, `docs/streams.md` and `CHANGELOG.md` stay open. | Romain G. |

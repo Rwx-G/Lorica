@@ -1106,7 +1106,7 @@ Depends on: F and G (documents what was built).
       PROXY v2 convention and the verified receivers, reply source on
       wildcard addresses, drain mode and the rebind gap, the upgrade
       overlap.
-- [ ] Threat model: reflection and amplification (what is bounded, by
+- [x] Threat model: reflection and amplification (what is bounded, by
       which field, per node; the random-source table fill and its
       mitigations; per-source controls are courtesy, D6).
 - [ ] `CHANGELOG.md` `[Unreleased]`: Added (UDP streams), Security (the
@@ -2017,6 +2017,8 @@ decision.
 - Commit scope `proxy`: the region serves the stream proxy's caps, not
   the WAF, whose region is untouched.
 
+- Lot H, security, operations and architecture documentation, 2026-11-18: Threat model T12: reflection and amplification with the per-session bounds, the per-source rates and the reflection bound computed from the defaults (8,192,000 bytes a second per source key and node, arithmetic from the constants of `UdpSettings`, not a measurement: IV1 of Lot I is still open), the exposed-address rule, the random-source table fill and its mitigations, per-source controls as a courtesy (residual risk 17). The hardening guide covers raising UDP session capacity (`LimitNOFILE`, `ip_local_port_range`, `source_addresses`); `worker-shared-state.md` section 7a.2 covers the stream-caps region, at its current layout version 2. Not done, outside this agent's files: the region version line in `docs/BUMP-CHECKLIST.md` and `.claude/skills/bump-version/bump-checklist.md` (neither lists `STREAM_CAPS_LAYOUT_VERSION` today). The other documentation agent of this cycle owns `docs/streams.md`, `README.md` and `CHANGELOG.md`; the items of this Lot in those files are theirs and stay unticked here until they land. Commits `9473b7d6` (security), `c17ff277` (worker), `df122844` (cluster), `619b55bb` (mcp), `5e4d0d69` (security, `stream_listen_socket_cap`).
+
 ## File List
 
 Lot J:
@@ -2107,6 +2109,7 @@ Lot A:
 - `lorica/src/startup/worker.rs` (the `FdKind` arm)
 - `lorica-stream/src/runtime.rs` (the `caps` arm, outside the allowlist)
 - `docs/stories/story-12.5-udp-engine.md`
+- `docs/security/threat-model.md`, `docs/security/hardening-guide.md`, `docs/architecture/worker-shared-state.md` (Lot H, threat model, hardening and architecture part)
 
 ## Change Log
 
@@ -2122,3 +2125,4 @@ Lot A:
 | 2026-11-15 | 0.8 | Lot F landed: the UDP engine installed in worker and single-process mode over the TCP engine's selector and resolver cache, a caps region per UDP stream sent ahead of every `attach` and replaced on a size change, a dead worker's sessions released before its respawn is replayed, the 1 s caps tick, draining UDP bindings holding their ports until the drain ends, the node's source-port backstop. | Romain G. |
 | 2026-11-15 | 0.9 | Lot G landed: the `udp` settings on the stream view and both bodies, the listen-address rule called by `Stream::validate`, the usable source ports in the heartbeat and in the API's budget check and view, one "refuse raises, allow lowers" rule (`FdBudget::check_change`) for the API's write check and the node's bind, `openapi.yaml` with the UDP schemas, the refusal and drop words and `source_ports` pinned to their enums. | Romain G. |
 | 2026-11-18 | 0.10 | Lot J landed: the System page's budget panel shows each node's UDP session ceiling, what bound it, the usable source ports, the committed sessions, the source pools and `over_ceiling`, and each UDP stream's share; `source_ports` in the bind failure kinds. Frontend gates green (check, lint, Vitest 911). | Romain G. |
+| 2026-11-18 | 0.11 | Lot H, threat model, hardening and architecture part: UDP reflection and amplification in T12, raising UDP session capacity in the hardening guide, the stream-caps region in `worker-shared-state.md`. The bump-checklist line, `docs/streams.md` and `CHANGELOG.md` stay open. | Romain G. |

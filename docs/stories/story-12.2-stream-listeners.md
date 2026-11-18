@@ -917,7 +917,7 @@ bind-state and listen-address sections).
 Depends on: B for the crate lists; its final pass after H.
 
 - [ ] Every crate list of D-b, the README product-crate test count.
-- [ ] `worker_drain_timeout_s` and `stream_listen_socket_cap` as they now
+- [x] `worker_drain_timeout_s` and `stream_listen_socket_cap` as they now
       exist: `installation.md` (`TimeoutStopSec=90` is no longer "must
       exceed the drain": the stop keepalive extends it; systemd 236+),
       `hot-upgrade.md` (the upgrade drain stays 30 s until 12.11), the
@@ -927,7 +927,7 @@ Depends on: B for the crate lists; its final pass after H.
 - [ ] `docs/streams.md`: the budget formula, bind states, and the
       listen-address rule of D-c (`[::]` is dual-stack and exclusive on
       its port).
-- [ ] `worker-shared-state.md`: a section for the stream control channel
+- [x] `worker-shared-state.md`: a section for the stream control channel
       (D-a), its flow control and its crash behaviour.
 - [ ] `FORK.md` and backlog #81 per D-l; `CHANGELOG.md` `[Unreleased]`
       (Added: stream listeners, the two settings, the alert; Fixed:
@@ -1644,6 +1644,8 @@ the budget view stays Operator and SuperAdmin.
   the Cluster roster column, the drawer's Streams section and the
   pending-node review need a look in both themes.
 
+- Lot G, security, operations and architecture documentation, 2026-11-18: `docs/installation.md` (`TimeoutStopSec` bounds a stop without progress, the `EXTEND_TIMEOUT_USEC` keepalive, systemd 236+, `LimitNOFILE`), `docs/hot-upgrade.md` (the drain as 12.11 built it, which supersedes "stays 30 s until 12.11"), the hardening guide (no drop-in for longer drains, why `TimeoutStopSec` stays, `LimitNOFILE` as the way to grow stream capacity, `stream_listen_socket_cap`, Docker `stop_grace_period`), and `worker-shared-state.md` section 7a.1 (the stream control channel, its flow control and its crash behaviour). The crate lists, `FORK.md`, backlog #81 and the `docs/streams.md` budget and bind-state sections are not in this agent's files and stay open. Not verified: no compose file in the repository sets `stop_grace_period`, although D-f says the e2e compose does (Lot H is still open). The other documentation agent of this cycle owns `docs/streams.md`, `README.md` and `CHANGELOG.md`; the items of this Lot in those files are theirs and stay unticked here until they land. Commits `9473b7d6` (security), `c17ff277` (worker), `df122844` (cluster), `619b55bb` (mcp), `5e4d0d69` (security, `stream_listen_socket_cap`).
+
 ## File List
 
 - `lorica-worker/Cargo.toml` (nix `resource` feature)
@@ -1688,6 +1690,7 @@ the budget view stays Operator and SuperAdmin.
 - `lorica-dashboard/frontend/src/routes/Cluster.svelte`, `lorica-dashboard/frontend/src/routes/Cluster.test.ts` (Lot F: the roster column, the drawer's Streams section, the pending-node stream ports)
 - `lorica-dashboard/frontend/src/components/settings-tabs/GlobalConfigTab.svelte`, `lorica-dashboard/frontend/src/components/settings-tabs/GlobalConfigTab.test.ts`, `lorica-dashboard/frontend/src/routes/Settings.svelte` (Lot F: the two settings)
 - `lorica-dashboard/frontend/src/components/NodeFilter.test.ts`, `lorica-dashboard/frontend/src/routes/Security.test.ts` (Lot F: the node fixtures' two new fields)
+- `docs/installation.md`, `docs/hot-upgrade.md`, `docs/security/hardening-guide.md`, `docs/architecture/worker-shared-state.md`, `docs/architecture/source-tree.md`, `docs/architecture/component-architecture.md` (Lot G, security, operations and architecture part)
 
 ## Change Log
 
@@ -1704,3 +1707,4 @@ the budget view stays Operator and SuperAdmin.
 | 2026-11-14 | 0.9 | Lot E3 implemented: `bind` on the stream reads, the fd budget check of stream writes, `GET /api/v1/streams/budget`, the stream plane on `AppState`, the OpenAPI document; the `stream_bind_failed` alert is raised once per failed bind. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.10 | Lot E2 implemented: the heartbeat's stream plane report (tag 7, compatible with 1.10.6 both ways), each stream's bind state per node and `stream_ports` on the cluster node view, the activation row's stream ports, control-plane budget checks and budget view from reported figures, and the fd budget check on the config import and its preview. D-i amended: `stream_ports` carries `port_first`/`port_last`. Status InProgress. | Romain G. |
 | 2026-11-14 | 0.11 | Lot F implemented: the stream fd budget on the System page for Operators and above, stream bind states in the Cluster roster and node drawer, the pending node's stream ports, `worker_drain_timeout_s` and `stream_listen_socket_cap` in the global config tab. Status InProgress. | Romain G. |
+| 2026-11-18 | 0.12 | Lot G, security, operations and architecture part: the drain setting and the stop path in the installation, hot-upgrade and hardening documents, the stream control channel in `worker-shared-state.md`, `lorica-stream` in the source tree and the component architecture. The crate lists, `FORK.md`, backlog #81, `docs/streams.md` and `CHANGELOG.md` stay open. | Romain G. |

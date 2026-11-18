@@ -1164,6 +1164,8 @@ each one as "Resolved N".
   `source_ports` failure, which also shows 12.5's new kind rendered as
   its word) and an unnamed one. The existing fixtures gained the field.
 
+- Lot G, security, operations and architecture documentation, 2026-11-18: Lot G, the parts in this agent's files: `docs/automation.md` (`streams:read`, the three paths, filters, confinement, no value withheld, node names revealed, no write scope and why, the backend delete `409` and the local-stream address `403`, both naming streams only to a `streams:read` token; the scope lists gain it) and `docs/mcp.md` (the three read tools, the read tier only, re-minting read tokens minted before 1.11.0, the config-tier refusals listing ids). Both documents said until now that streams were on neither surface. The Lot's checkbox spans `docs/streams.md`, `docs/architecture/api-design-and-integration.md`, `CHANGELOG.md` and `README.md`, which are not in this agent's files, so it stays unticked. The other documentation agent of this cycle owns `docs/streams.md`, `README.md` and `CHANGELOG.md`; the items of this Lot in those files are theirs and stay unticked here until they land. Commits `9473b7d6` (security), `c17ff277` (worker), `df122844` (cluster), `619b55bb` (mcp), `5e4d0d69` (security, `stream_listen_socket_cap`).
+
 ## File List
 
 - `lorica-api/src/streams/status.rs` (new, Lot A)
@@ -1214,6 +1216,7 @@ each one as "Resolved N".
 - `lorica-dashboard/frontend/src/lib/api.ts` (`NodeStreamBinding`),
   `lib/streams.ts`, `lib/streams.test.ts`, `routes/Cluster.svelte`,
   `routes/Cluster.test.ts` (Lot F)
+- `docs/automation.md`, `docs/mcp.md` (Lot G, automation and MCP part)
 
 ## Change Log
 
@@ -1230,3 +1233,4 @@ each one as "Resolved N".
 | 2026-11-18 | 0.9 | Lot D2: the stream drawer with its six tabs, `fieldsFor` deciding what is shown and sent, no range in the frontend, server refusals routed by `fieldTab` to the tab holding the field, every cap labelled per node, the IV1 create body pinned as `stream-iv1-create.json`. Frontend gates green (check, lint, Vitest 976). | Romain G. |
 | 2026-11-18 | 0.10 | Lot E: the Backends page's "Used by" column joined in the browser from the route and stream lists, the delete confirmation naming the streams and their drain, active checks forced off with the reason for a backend serving a UDP stream and for a portless address, the address rule read as the server reads it. Frontend gates green (check, lint, Vitest 1000). | Romain G. |
 | 2026-11-18 | 0.11 | Lot F: the Cluster drawer names every binding, a binding outside the node's stream ports by the name the control plane resolved, and one of a stream no longer held by its id with "not in this configuration". Frontend gates green (check, lint, Vitest 1002). | Romain G. |
+| 2026-11-18 | 0.12 | Lot G, automation and MCP part: `streams:read`, its paths and the two backend refusals in `docs/automation.md`; the stream read tools and re-minting in `docs/mcp.md`. The rest of the Lot stays open. | Romain G. |

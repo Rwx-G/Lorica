@@ -1737,6 +1737,8 @@ edited here.
   chain green and `cargo audit` clean. Last tree: 3,721 product, 976
   `lorica`, 915 forked and 592 TLS-featured tests.
 
+- Lot I, security, operations and architecture documentation, 2026-11-18: Lot I, the parts in this agent's files: `docs/cluster.md` (stream rows fan in to `fleet_stream_logs`, `?node=` on `GET /api/v1/stream-logs` and on the three stream SLA reads, stream SLA targets replicated with the stream, `lost_to_retention_total{kind="stream"}`, and the mixed-version window: stream rows wait in the follower's store, as Lot G built it, rather than being lost as D-i first said); the threat model's log-amplification row. The Lot's one checkbox spans `docs/streams.md`, the log-export and metrics pages, `docs/backlog.md`, `CHANGELOG.md` and `README.md`, which are the other agent's or nobody's here, so it stays unticked. The other documentation agent of this cycle owns `docs/streams.md`, `README.md` and `CHANGELOG.md`; the items of this Lot in those files are theirs and stay unticked here until they land. Commits `9473b7d6` (security), `c17ff277` (worker), `df122844` (cluster), `619b55bb` (mcp), `5e4d0d69` (security, `stream_listen_socket_cap`).
+
 ## File List
 
 - `lorica-config/src/models/settings.rs`
@@ -1836,6 +1838,7 @@ edited here.
   `components/StreamSlaSection.test.ts` (new),
   `components/settings-tabs/GlobalConfigTab.svelte`, `GlobalConfigTab.test.ts`,
   `LogExportTab.svelte`, `LogExportTab.test.ts` (Lot H)
+- `docs/cluster.md`, `docs/security/threat-model.md` (Lot I, cluster and threat model part)
 
 ## Change Log
 
@@ -1857,3 +1860,4 @@ edited here.
 | 2026-11-18 | 0.9 | Lot C1: `stream_access_logs` with its own retention and writer queue, `StreamLogEntry` built from the stream records, `/api/v1/stream-logs` with export and clear, the three settings in the settings API, the `stream` sink kind, and a syslog up state that follows the collector without traffic. | Romain G. |
 | 2026-11-18 | 0.15 | Lot H: the Logs page's HTTP / Streams switch with the stream table, its filters, export and clear; the SLA page's Streams section with windows, buckets, target editor, export and delete; the stream retention and the two stream sink toggles in the settings forms; `#/logs?view=streams&stream=<id>` and `#/sla?stream=<id>` links. Frontend gates green (check, lint, Vitest 904). | Romain G. |
 | 2026-11-18 | 0.16 | Lot G: stream rows fan in to the control plane on the telemetry push (new tags, admitted as access rows are: quota charged, watermark shed, drop reasons counted, audit still exempt), stored in `fleet_stream_logs` under the per-node quota and read with `GET /api/v1/stream-logs?node=`; `SlaPull` names a stream and the three stream SLA reads take `?node=`. A 1.10.7 peer is tested both ways against its frozen push, ack, pull and answer; the frozen wire corpus is unchanged. Gates on both trees: the CI chain green (3,721 product, 976 `lorica`, 915 forked, 592 TLS-featured tests on the last), `cargo audit` clean. | Romain G. |
+| 2026-11-18 | 0.17 | Lot I, cluster and threat-model part: stream row fan-in, `?node=` on stream logs and stream SLA, replicated SLA targets and the mixed-version window in `docs/cluster.md`; log amplification in the threat model. The rest of the Lot stays open. | Romain G. |
