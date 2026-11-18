@@ -83,7 +83,7 @@
       {/if}
 
       <div class="settings-table-wrap">
-        <table class="settings-table">
+        <table class="settings-table settings-table-wide">
           <thead>
             <tr>
               <th>Names</th>

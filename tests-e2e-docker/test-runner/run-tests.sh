@@ -1783,17 +1783,74 @@ PY
 # =============================================================================
     log "=== 31. Compression ==="
 
-    api_put "/api/v1/routes/$R1_ID" '{"compression_enabled": true}' >/dev/null
+    # A route of its own, with the cache on: the compressed and the plain
+    # variant of one URL must not be served to each other's clients (#59).
+    # The backend answers uncompressed application/json.
+    CMP_B=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\",\"health_check_enabled\":false}")
+    CMP_B_ID=$(echo "$CMP_B" | jq -r '.data.id')
+    CMP_ROUTE=$(api_post "/api/v1/routes" "{
+        \"hostname\":\"compress.test\",
+        \"path_prefix\":\"/\",
+        \"backend_ids\":[\"$CMP_B_ID\"],
+        \"compression_enabled\":true,
+        \"cache_enabled\":true,
+        \"cache_ttl_s\":60,
+        \"waf_enabled\":false
+    }")
+    CMP_ROUTE_ID=$(echo "$CMP_ROUTE" | jq -r '.data.id')
+    assert_json "$CMP_ROUTE" ".data.compression_enabled" "true" "Compression enabled on route"
     sleep 2
 
-    COMP_HEADERS=$(curl -sI --max-time 5 -H "Host: app1.local" -H "Accept-Encoding: gzip, deflate" "$PROXY/" 2>/dev/null || echo "")
-    if echo "$COMP_HEADERS" | grep -qi "Content-Encoding"; then
-        ok "Compression: Content-Encoding header present"
+    # Fetches /compress?$1 with the Accept-Encoding $2 (none when empty).
+    # Leaves the response headers in CMP_H and the raw body in /tmp/cmp-body.
+    cmp_get() {
+        local ae_header=()
+        [ -n "$2" ] && ae_header=(-H "Accept-Encoding: $2")
+        CMP_H=$(curl -s --max-time 5 -o /tmp/cmp-body -D - "${ae_header[@]}" \
+            -H "Host: compress.test" "$PROXY/compress?$1" 2>/dev/null | tr -d '\r' || echo "")
+    }
+    cmp_header() { echo "$CMP_H" | grep -i "^$1:" | head -1 | sed 's/^[^:]*: *//'; }
+
+    cmp_get "v=1" "gzip, deflate, br"
+    if [ "$(cmp_header Content-Encoding)" = "gzip" ] \
+        && gzip -dc /tmp/cmp-body 2>/dev/null | jq -e '.backend' >/dev/null; then
+        ok "Compression: gzip response that decodes to the backend's JSON"
     else
-        ok "Compression: configured (backend may not return compressible content)"
+        fail "Compression: expected a gzip body (Content-Encoding='$(cmp_header Content-Encoding)')"
+    fi
+    if cmp_header Vary | grep -qi "accept-encoding"; then
+        ok "Compression: Vary names Accept-Encoding"
+    else
+        fail "Compression: Vary is '$(cmp_header Vary)', expected Accept-Encoding"
     fi
 
-    api_put "/api/v1/routes/$R1_ID" '{"compression_enabled": false}' >/dev/null
+    cmp_get "v=1" "gzip, deflate, br"
+    if [ "$(cmp_header X-Cache-Status)" = "HIT" ] && [ "$(cmp_header Content-Encoding)" = "gzip" ]; then
+        ok "Compression: the gzip variant is served from cache"
+    else
+        fail "Compression: second gzip request X-Cache-Status='$(cmp_header X-Cache-Status)' Content-Encoding='$(cmp_header Content-Encoding)'"
+    fi
+
+    # Same URL, cached gzip variant in place: a client that sent no
+    # Accept-Encoding must still get the plain body.
+    cmp_get "v=1" ""
+    if [ -z "$(cmp_header Content-Encoding)" ] && jq -e '.backend' /tmp/cmp-body >/dev/null 2>&1; then
+        ok "Compression: plain body for a client without Accept-Encoding, beside a cached gzip variant"
+    else
+        fail "Compression: client without Accept-Encoding got Content-Encoding='$(cmp_header Content-Encoding)'"
+    fi
+
+    api_put "/api/v1/routes/$CMP_ROUTE_ID" '{"compression_enabled": false}' >/dev/null
+    sleep 2
+    cmp_get "v=2" "gzip"
+    if [ -z "$(cmp_header Content-Encoding)" ]; then
+        ok "Compression: off on the route, response left uncompressed"
+    else
+        fail "Compression: disabled route answered Content-Encoding='$(cmp_header Content-Encoding)'"
+    fi
+
+    api_del "/api/v1/routes/$CMP_ROUTE_ID" >/dev/null
+    api_del "/api/v1/backends/$CMP_B_ID" >/dev/null
 
 # =============================================================================
 # 32. WEBSOCKET BLOCK
@@ -4275,6 +4332,20 @@ JSON
         fail "Response rewrite: original string still present"
     else
         ok "Response rewrite: original string removed"
+    fi
+
+    # With compression also on, a client accepting gzip still gets the
+    # rewritten body: the rewrite refuses an encoded body, so a route
+    # with a rewrite is never compressed (#59).
+    api_put "/api/v1/routes/$RW_ROUTE_ID" '{"compression_enabled": true}' >/dev/null
+    sleep 2
+    RW_GZ_HEADERS=$(curl -s --max-time 5 -o /tmp/rw-gz-body -D - -H "Accept-Encoding: gzip" \
+        -H "Host: rewrite.test" "$PROXY/hello" 2>/dev/null | tr -d '\r' || echo "")
+    if ! echo "$RW_GZ_HEADERS" | grep -qi "^Content-Encoding:" \
+        && grep -q "Bonjour depuis backend1" /tmp/rw-gz-body; then
+        ok "Response rewrite with compression on: rewritten and left uncompressed"
+    else
+        fail "Response rewrite with compression on: $(echo "$RW_GZ_HEADERS" | grep -i '^Content-Encoding:' || echo 'body not rewritten')"
     fi
 
     api_del "/api/v1/routes/$RW_ROUTE_ID" >/dev/null 2>&1

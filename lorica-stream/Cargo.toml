@@ -1,6 +1,6 @@
 [package]
 name = "lorica-stream"
-version = "1.10.7"
+version = "1.10.8"
 authors = ["Romain G."]
 license = "Apache-2.0"
 edition = "2021"
@@ -14,8 +14,8 @@ description = "Stream data plane for Lorica: the worker-side stream runtime, its
 # stream model and its end reasons. `lorica-api` reads the bind-state and
 # budget types from here without depending on the binary.
 [dependencies]
-lorica-config = { version = "1.10.7", path = "../lorica-config" }
-lorica-worker = { version = "1.10.7", path = "../lorica-worker" }
+lorica-config = { version = "1.10.8", path = "../lorica-config" }
+lorica-worker = { version = "1.10.8", path = "../lorica-worker" }
 # The PROXY protocol parser and encoder (Story 12.3 D-j, D-k), shared
 # with the HTTP listeners. Its `rustls` feature carries
 # `get_organizations_serial_bytes`, so a terminating stream reads a
@@ -28,7 +28,7 @@ lorica-core = { version = "0.1.0", path = "../lorica-core", default-features = f
 lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
 # The stream-caps regions of UDP streams (Story 12.5 D-d): a worker maps
 # the memfd a `caps` message carries, the supervisor creates them.
-lorica-shmem = { version = "1.10.7", path = "../lorica-shmem" }
+lorica-shmem = { version = "1.10.8", path = "../lorica-shmem" }
 # `recvmsg` with `IP_PKTINFO` / `IPV6_PKTINFO` on wildcard UDP listen
 # addresses (Story 12.5 D-g): tokio's `UdpSocket` has no ancillary API.
 nix = { version = "0.31", features = ["socket", "net", "uio"] }

@@ -460,7 +460,7 @@ where
     }
 
     /// Apply per-request compression level before the compression context
-    /// processes the first header task. This must be called while the
+    /// processes the final response header. This must be called while the
     /// compression context is still in HeaderPhase.
     fn apply_response_compression_level(
         &self,
@@ -471,9 +471,19 @@ where
         SV: ProxyHttp,
     {
         if let HttpTask::Header(header, _) = task {
+            // Lorica: a 1xx leaves the context in its header phase and is
+            // followed by the final header, which would feed the client's
+            // Accept-Encoding a second time.
+            if header.status.is_informational() {
+                return;
+            }
             let level = self.inner.response_compression_level(session, header, ctx);
             if level > 0 {
-                session.upstream_compression.adjust_level(level);
+                enable_response_compression(
+                    &mut session.upstream_compression,
+                    level,
+                    session.downstream_session.req_header(),
+                );
             }
         }
     }
@@ -558,6 +568,23 @@ where
 
 use lorica_cache::HttpCache;
 use lorica_core::protocols::http::compression::ResponseCompressionCtx;
+
+/// Lorica: turn on the compression of the response to `client_request`.
+///
+/// The session's context starts disabled, and a disabled context skips the
+/// request's `Accept-Encoding` when the request goes upstream. Raising the
+/// level at response time therefore left it with no encoding to choose,
+/// and every response went out uncompressed (#59). The client's header is
+/// fed once the level is set, while the context is still in its header
+/// phase.
+fn enable_response_compression(
+    compression: &mut ResponseCompressionCtx,
+    level: u32,
+    client_request: &RequestHeader,
+) {
+    compression.adjust_level(level);
+    compression.request_filter(client_request);
+}
 
 /// The established HTTP session
 ///
@@ -1654,5 +1681,97 @@ mod tests {
         .await
         .expect("read_request parked after shutdown");
         assert!(session.is_none());
+    }
+
+    const COMPRESSIBLE_BODY: &[u8] =
+        b"<html><body>lorica lorica lorica lorica lorica</body></html>";
+
+    fn client_request(accept_encoding: Option<&str>) -> RequestHeader {
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        if let Some(value) = accept_encoding {
+            req.insert_header(header::ACCEPT_ENCODING, value).unwrap();
+        }
+        req
+    }
+
+    /// The compression context as a session holds it once the request went
+    /// upstream: created disabled, then handed the upstream request.
+    fn context_after_upstream_request(req: &RequestHeader) -> ResponseCompressionCtx {
+        let mut compression = ResponseCompressionCtx::new(0, false, false);
+        compression.request_filter(req);
+        compression
+    }
+
+    /// Runs an uncompressed HTML response through `compression` and returns
+    /// its header and body as the client receives them.
+    fn respond_with_html(compression: &mut ResponseCompressionCtx) -> (ResponseHeader, Bytes) {
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header(header::CONTENT_TYPE, "text/html")
+            .unwrap();
+        let mut head = HttpTask::Header(Box::new(resp), false);
+        compression.response_filter(&mut head);
+        let mut body = HttpTask::Body(Some(Bytes::from_static(COMPRESSIBLE_BODY)), true);
+        compression.response_filter(&mut body);
+        match (head, body) {
+            (HttpTask::Header(resp, _), HttpTask::Body(Some(body), _)) => (*resp, body),
+            _ => unreachable!("the filter keeps the task kinds"),
+        }
+    }
+
+    #[test]
+    fn enabled_compression_compresses_for_a_client_that_accepts_it() {
+        let req = client_request(Some("gzip, deflate, br"));
+        let mut compression = context_after_upstream_request(&req);
+
+        enable_response_compression(&mut compression, 6, &req);
+        let (resp, body) = respond_with_html(&mut compression);
+
+        assert_eq!(resp.headers[header::CONTENT_ENCODING], "gzip");
+        assert!(resp.headers[header::VARY]
+            .as_bytes()
+            .eq_ignore_ascii_case(b"accept-encoding"));
+        assert_eq!(&body[..2], &[0x1f, 0x8b], "gzip magic bytes");
+    }
+
+    #[test]
+    fn enabled_compression_uses_the_encoding_the_client_lists_first() {
+        for (accept_encoding, expected) in [("br, gzip", "br"), ("zstd, gzip", "zstd")] {
+            let req = client_request(Some(accept_encoding));
+            let mut compression = context_after_upstream_request(&req);
+
+            enable_response_compression(&mut compression, 6, &req);
+            let (resp, _) = respond_with_html(&mut compression);
+
+            assert_eq!(resp.headers[header::CONTENT_ENCODING], expected);
+        }
+    }
+
+    #[test]
+    fn enabled_compression_leaves_the_response_alone_without_accept_encoding() {
+        let req = client_request(None);
+        let mut compression = context_after_upstream_request(&req);
+
+        enable_response_compression(&mut compression, 6, &req);
+        let (resp, body) = respond_with_html(&mut compression);
+
+        assert!(resp.headers.get(header::CONTENT_ENCODING).is_none());
+        assert_eq!(&body[..], COMPRESSIBLE_BODY);
+    }
+
+    /// Pins the behaviour of the forked context that
+    /// `enable_response_compression` works around: a level raised after the
+    /// request went upstream compresses nothing. If an upstream sync makes
+    /// this fail, the context records Accept-Encoding while disabled and the
+    /// second `request_filter` call can go.
+    #[test]
+    fn raising_the_level_alone_compresses_nothing() {
+        let req = client_request(Some("gzip"));
+        let mut compression = context_after_upstream_request(&req);
+
+        compression.adjust_level(6);
+        let (resp, body) = respond_with_html(&mut compression);
+
+        assert!(resp.headers.get(header::CONTENT_ENCODING).is_none());
+        assert_eq!(&body[..], COMPRESSIBLE_BODY);
     }
 }

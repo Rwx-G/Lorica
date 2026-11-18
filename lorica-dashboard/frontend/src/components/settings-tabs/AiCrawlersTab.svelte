@@ -223,7 +223,7 @@
 
       <h3>Custom crawlers</h3>
       <div class="settings-table-wrap">
-        <table class="settings-table">
+        <table class="settings-table settings-table-wide">
           <thead>
             <tr>
               <th>Name</th>
