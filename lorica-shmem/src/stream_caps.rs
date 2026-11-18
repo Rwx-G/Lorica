@@ -44,7 +44,8 @@
 //! What each part counts:
 //!
 //! - **The stream total and the pending total** are exact: an admission
-//!   adds 1 and backs off when the result passes the cap.
+//!   adds 1 by compare-and-swap only while the total is below the cap,
+//!   so neither total ever reads above it.
 //!   `per_worker[i]` and `pending_per_worker[i]` attribute them, so the
 //!   supervisor can subtract a dead worker's share.
 //! - **Per-source and per-backend counts** live in per-worker shards. A
@@ -1498,14 +1499,16 @@ impl Drop for BackendSlot {
 }
 
 /// Add 1 to `counter` unless that passes `cap`; exact under any number
-/// of writers, since an add that passes is taken back before it is seen
-/// as admitted.
+/// of writers. A compare-and-swap, not an add taken back past the cap:
+/// that add would sit in the counter for an instant, where a reader sees
+/// the stream past its cap and a concurrent admission is refused although
+/// a release left a slot free.
 fn add_within(counter: &AtomicU64, cap: u64) -> bool {
-    if counter.fetch_add(1, Ordering::AcqRel) >= cap {
-        saturating_sub(counter, 1);
-        return false;
-    }
-    true
+    counter
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            (held < cap).then(|| held + 1)
+        })
+        .is_ok()
 }
 
 /// Subtract without wrapping: a counter a dead worker's release already
@@ -1864,6 +1867,62 @@ mod tests {
         assert_eq!((r.total(), r.pending()), (0, 0));
         assert!((0..WORKERS)
             .all(|slot| r.worker_sessions(slot) == Some(0) && r.worker_pending(slot) == Some(0)));
+    }
+
+    /// The totals are what the dashboard, the budget and a retired
+    /// region's `stream_cap_left` read: a refused admission must never
+    /// show in them, even for the instant between its count and its
+    /// refusal, or a reader sees the stream past its cap and a concurrent
+    /// admission is refused while a slot is free.
+    #[test]
+    fn the_totals_never_read_above_their_caps_while_admissions_race() {
+        const WORKERS: u32 = 8;
+        const CAP: u64 = 4;
+        const PENDING_CAP: u64 = 2;
+        const READS: u32 = 2_000_000;
+        let r = region(CAP, WORKERS);
+        let stop = Arc::new(AtomicBool::new(false));
+        // Permits alive at once, counted inside each permit's life, so
+        // never above what the region really holds.
+        let held = Arc::new(AtomicU64::new(0));
+        let most_held = Arc::new(AtomicU64::new(0));
+        let admitters: Vec<_> = (0..WORKERS)
+            .map(|slot| {
+                let caps = r.worker(slot).unwrap();
+                let (stop, held, most_held) =
+                    (Arc::clone(&stop), Arc::clone(&held), Arc::clone(&most_held));
+                thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        // Admitted and given back at once: most attempts
+                        // meet a full cap and are refused.
+                        if let Ok(permit) = caps.admit_stream(CAP, true, PENDING_CAP) {
+                            let now = held.fetch_add(1, Ordering::AcqRel) + 1;
+                            most_held.fetch_max(now, Ordering::AcqRel);
+                            held.fetch_sub(1, Ordering::AcqRel);
+                            drop(permit);
+                        }
+                    }
+                })
+            })
+            .collect();
+        let (mut total, mut pending) = (0, 0);
+        for _ in 0..READS {
+            total = r.total().max(total);
+            pending = r.pending().max(pending);
+        }
+        stop.store(true, Ordering::Relaxed);
+        for admitter in admitters {
+            admitter.join().unwrap();
+        }
+        let most_held = most_held.load(Ordering::Acquire);
+        assert!(most_held > 0, "some admission went through");
+        assert!(most_held <= PENDING_CAP, "{most_held} pending permits held");
+        assert!(total <= CAP, "the stream total read {total} past {CAP}");
+        assert!(
+            pending <= PENDING_CAP,
+            "the pending total read {pending} past {PENDING_CAP}"
+        );
+        assert_eq!((r.total(), r.pending()), (0, 0));
     }
 
     /// W threads, one per worker slot, admit one key until refused; the

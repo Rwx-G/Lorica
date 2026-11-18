@@ -305,7 +305,7 @@ one region per stream, TCP included.
   has. At the TCP default (1,024 connections) and 8 workers: 256 KiB of
   rate cells and 512 KiB of shards; `docs/streams.md` gives the formula.
 - **Exactness.** The stream total and the pending total are exact
-  (`fetch_add`, back off past the cap), attributed per worker so
+  (compare-and-swap below the cap), attributed per worker so
   `release_worker` subtracts a dead worker's share of both. Per-source
   active and pending counts and per-backend counts live in per-worker
   shards, summed over W at each check, with 12.5's bound: at most
@@ -1281,3 +1281,4 @@ Lot G:
 | 2026-11-16 | 0.6 | Lot D: `StreamSourceGate` over the process's connection filter, IP blocklist with the WAF whitelist exemption, and GeoIP resolver in both modes, the interim pass-through gate deleted; the worker loads its source controls before its stream runtime starts; regions sized for their capped links; the HTTP PROXY refusal log on the shared limiter; the stream protection process test. | Romain G. |
 | 2026-11-16 | 0.7 | Lot E: the source controls on the stream API and in `openapi.yaml`, `backend_max_active` per link at the stream level and per rule, `max_connections` documented per node, the interim view filter removed. | Romain G. |
 | 2026-11-16 | 0.8 | Lot G: the Network tab says the per-IP connection limit is per worker process and does not apply to streams. | Romain G. |
+| 2026-11-18 | 0.9 | The stream and pending totals admit by compare-and-swap instead of an add taken back past the cap: a refused admission no longer shows in the totals for an instant, which IV3's engine test read as 257 pending against a cap of 256 under load and which could refuse an admission while a release had freed a slot. No slot was ever held past the cap. | Romain G. |
