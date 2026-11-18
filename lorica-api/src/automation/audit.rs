@@ -1589,6 +1589,7 @@ mod tests {
             acme_challenge_store: None,
             pending_dns_challenges: Arc::new(dashmap::DashMap::new()),
             sla_collector: None,
+            stream_sla_collector: None,
             load_test_engine: None,
             notification_history: None,
             log_store: Some(log_store),

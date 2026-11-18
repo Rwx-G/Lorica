@@ -284,6 +284,7 @@ async fn test_check_cert_expiry_dispatches_alerts() {
         acme_challenge_store: None,
         pending_dns_challenges: Arc::new(DashMap::new()),
         sla_collector: None,
+        stream_sla_collector: None,
         load_test_engine: None,
         notification_history: None,
         log_store: None,

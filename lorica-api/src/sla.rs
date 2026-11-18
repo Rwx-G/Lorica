@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Read and configure SLA windows, raw buckets, and CSV/JSON exports per route.
+//! Read and configure SLA windows, raw buckets, and CSV/JSON exports per
+//! route and per stream.
 //!
 //! On a control plane the three reads (overview, per-route windows,
 //! raw buckets) and the active-probe windows in `probes.rs` accept
@@ -28,7 +29,7 @@ use axum::Extension;
 use axum::Json;
 use chrono::{DateTime, Duration, Utc};
 use lorica_cluster::messages::{SlaBucketRow, SlaPull, SlaPullAck, SlaSummaryRow};
-use lorica_config::models::{Role, SlaBucket, SlaSummary};
+use lorica_config::models::{Role, SlaBucket, SlaSummary, StreamSlaBucket, StreamSlaSummary};
 use serde::Deserialize;
 
 use crate::db::db_blocking;
@@ -689,3 +690,296 @@ pub async fn get_sla_overview(
     }
     Ok(json_data(local_sla_overview(&state, None).await?))
 }
+
+// ---- Stream SLA (Story 12.9) ----
+//
+// The stream routes mirror the route ones and their role floors. They
+// take no `?node=`: a follower's stream figures cross the cluster plane
+// once `SlaPull` can name a stream.
+
+/// `NotFound` unless this node holds the stream `stream_id`.
+fn ensure_stream_held(store: &lorica_config::ConfigStore, stream_id: &str) -> Result<(), ApiError> {
+    store
+        .get_stream(stream_id)?
+        .ok_or_else(|| ApiError::NotFound(format!("stream {stream_id}")))?;
+    Ok(())
+}
+
+/// This node's own passive SLA summaries for one stream, every standard
+/// window (1h, 24h, 7d, 30d).
+///
+/// Shared by [`get_stream_sla`] and the automation plane's read, for the
+/// reason [`local_route_sla`] gives.
+///
+/// # Errors
+///
+/// `NotFound` when this node holds no such stream, or the store's error.
+pub(crate) async fn local_stream_sla(
+    state: &AppState,
+    stream_id: String,
+) -> Result<Vec<StreamSlaSummary>, ApiError> {
+    db_blocking(&state.store, move |store| {
+        ensure_stream_held(store, &stream_id)?;
+        lorica_bench::results::compute_all_stream_windows(store, &stream_id, "passive")
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await
+}
+
+/// GET /api/v1/sla/streams/:id - return passive SLA summaries for all standard windows.
+pub async fn get_stream_sla(
+    Extension(state): Extension<AppState>,
+    Path(stream_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(json_data(local_stream_sla(&state, stream_id).await?))
+}
+
+/// Query parameters for stream bucket queries: `?from=&to=&source=`.
+#[derive(Deserialize)]
+pub struct StreamBucketQuery {
+    /// Start of the window (RFC 3339); default now - 24 h.
+    pub from: Option<String>,
+    /// End of the window (RFC 3339); default now.
+    pub to: Option<String>,
+    /// Bucket source; default `"passive"`, the only one a stream records.
+    pub source: Option<String>,
+}
+
+/// GET /api/v1/sla/streams/:id/buckets - return raw stream SLA buckets within the requested time range.
+pub async fn get_stream_sla_buckets(
+    Extension(state): Extension<AppState>,
+    Path(stream_id): Path<String>,
+    Query(query): Query<StreamBucketQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let now = Utc::now();
+    let from = query
+        .from
+        .as_deref()
+        .and_then(parse_rfc3339)
+        .unwrap_or_else(|| now - Duration::hours(24));
+    let to = query.to.as_deref().and_then(parse_rfc3339).unwrap_or(now);
+    let source = query.source.unwrap_or_else(|| "passive".to_string());
+    let buckets = db_blocking(&state.store, move |store| {
+        ensure_stream_held(store, &stream_id)?;
+        store
+            .query_stream_sla_buckets(&stream_id, &from, &to, &source)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await?;
+    Ok(json_data(buckets))
+}
+
+/// GET /api/v1/sla/streams/:id/config - return the stream's SLA target and connect latency bound.
+pub async fn get_stream_sla_config(
+    Extension(state): Extension<AppState>,
+    Path(stream_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let config = db_blocking(&state.store, move |store| {
+        ensure_stream_held(store, &stream_id)?;
+        store
+            .get_stream_sla_config(&stream_id)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await?;
+    Ok(json_data(config))
+}
+
+/// JSON body for `PUT /api/v1/sla/streams/:id/config`. Only supplied
+/// fields are mutated. Unknown fields are refused: a route's status
+/// range sent to a stream would otherwise read as accepted.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateStreamSlaConfig {
+    /// New SLA target percentage (0..=100).
+    pub target_pct: Option<f64>,
+    /// New connect latency bound (ms), positive. A UDP stream never
+    /// reads it.
+    pub max_connect_latency_ms: Option<i64>,
+}
+
+/// PUT /api/v1/sla/streams/:id/config - patch the stream's SLA target and refresh the live collector cache.
+pub async fn update_stream_sla_config(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
+    Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
+    Path(stream_id): Path<String>,
+    Json(body): Json<UpdateStreamSlaConfig>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let db_stream_id = stream_id.clone();
+    let (before_config, config) = db_blocking(&state.store, move |store| {
+        ensure_stream_held(store, &db_stream_id)?;
+        let mut config = store
+            .get_stream_sla_config(&db_stream_id)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let before_config = config.clone();
+        if let Some(target) = body.target_pct {
+            if !(0.0..=100.0).contains(&target) {
+                return Err(ApiError::BadRequest(
+                    "target_pct must be between 0 and 100".into(),
+                ));
+            }
+            config.target_pct = target;
+        }
+        if let Some(latency) = body.max_connect_latency_ms {
+            if latency <= 0 {
+                return Err(ApiError::BadRequest(
+                    "max_connect_latency_ms must be positive".into(),
+                ));
+            }
+            config.max_connect_latency_ms = latency;
+        }
+        config.updated_at = Utc::now();
+        store
+            .upsert_stream_sla_config(&config)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        Ok((before_config, config))
+    })
+    .await?;
+
+    if let Some(ref collector) = state.stream_sla_collector {
+        collector.set_sla_config(config.clone());
+    }
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let before = serde_json::to_value(&before_config).ok();
+    let after = serde_json::to_value(&config).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "sla.config_update",
+        ("stream", &stream_id),
+        before.as_ref(),
+        after.as_ref(),
+    )
+    .await;
+
+    Ok(json_data(config))
+}
+
+/// GET /api/v1/sla/streams/:id/export - download passive stream SLA buckets as JSON or CSV.
+pub async fn export_stream_sla_data(
+    Extension(state): Extension<AppState>,
+    Path(stream_id): Path<String>,
+    Query(query): Query<ExportQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let (from, to) = parse_export_range(&query);
+    let is_csv = query
+        .format
+        .as_deref()
+        .is_some_and(|f| f.eq_ignore_ascii_case("csv"));
+
+    let db_stream_id = stream_id.clone();
+    let export = db_blocking(&state.store, move |store| {
+        ensure_stream_held(store, &db_stream_id)?;
+        let export = if is_csv {
+            StreamExport::Csv(
+                store
+                    .query_stream_sla_buckets(&db_stream_id, &from, &to, "passive")
+                    .map_err(|e| ApiError::Internal(e.to_string()))?,
+            )
+        } else {
+            StreamExport::Json(
+                store
+                    .export_stream_sla_data(&db_stream_id, &from, &to)
+                    .map_err(|e| ApiError::Internal(e.to_string()))?,
+            )
+        };
+        Ok::<_, ApiError>(export)
+    })
+    .await?;
+
+    match export {
+        StreamExport::Json(export) => {
+            Ok(Json(serde_json::json!({ "data": export })).into_response())
+        }
+        StreamExport::Csv(buckets) => Ok(axum::response::Response::builder()
+            .header("Content-Type", "text/csv")
+            .header(
+                "Content-Disposition",
+                format!("attachment; filename=\"sla-stream-{stream_id}.csv\""),
+            )
+            .body(axum::body::Body::from(stream_buckets_csv(&buckets)))
+            .expect("CSV response builder")),
+    }
+}
+
+/// What one stream export read from the store.
+enum StreamExport {
+    /// The JSON document, config embedded.
+    Json(serde_json::Value),
+    /// The buckets the CSV is written from.
+    Csv(Vec<StreamSlaBucket>),
+}
+
+/// The CSV of a stream export: one line per bucket. A latency column
+/// with no sample (nothing connected, every UDP bucket) is empty, never
+/// 0, which would read as an instant connect.
+fn stream_buckets_csv(buckets: &[StreamSlaBucket]) -> String {
+    fn cell(value: Option<i64>) -> String {
+        value.map(|v| v.to_string()).unwrap_or_default()
+    }
+    let mut csv = String::from(
+        "bucket_start,judged_count,success_count,failure_count,connected_count,\
+         connect_latency_sum_ms,connect_latency_min_ms,connect_latency_max_ms,\
+         connect_latency_p50_ms,connect_latency_p95_ms,connect_latency_p99_ms\n",
+    );
+    for b in buckets {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            b.bucket_start.to_rfc3339(),
+            b.judged_count,
+            b.success_count,
+            b.failure_count,
+            b.connected_count,
+            cell(b.connect_latency_sum_ms),
+            cell(b.connect_latency_min_ms),
+            cell(b.connect_latency_max_ms),
+            cell(b.connect_latency_p50_ms),
+            cell(b.connect_latency_p95_ms),
+            cell(b.connect_latency_p99_ms),
+        ));
+    }
+    csv
+}
+
+/// DELETE /api/v1/sla/streams/:id/data - delete every persisted stream SLA bucket and the collector's unflushed minutes.
+pub async fn clear_stream_sla(
+    connect_info: crate::audit::ClientConnectInfo,
+    headers: http::HeaderMap,
+    Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
+    Path(stream_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let db_stream_id = stream_id.clone();
+    let deleted = db_blocking(&state.store, move |store| {
+        ensure_stream_held(store, &db_stream_id)?;
+        store
+            .delete_stream_sla_buckets(&db_stream_id)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await?;
+
+    if let Some(ref collector) = state.stream_sla_collector {
+        collector.clear_stream(&stream_id);
+    }
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "sla.data_clear",
+        ("stream", &stream_id),
+        None,
+        None,
+    )
+    .await;
+
+    Ok(json_data(serde_json::json!({
+        "stream_id": stream_id,
+        "deleted_buckets": deleted,
+    })))
+}
+
+#[cfg(test)]
+mod stream_tests;

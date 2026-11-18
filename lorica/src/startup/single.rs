@@ -631,6 +631,7 @@ pub(crate) fn run_single_process(cli: Cli) {
                 acme_challenge_store: Some(acme_challenge_store),
                 pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
+                stream_sla_collector: None,
                 load_test_engine: Some(Arc::clone(&load_test_engine)),
                 notification_history: Some(notification_history),
                 log_store: api_log_store,

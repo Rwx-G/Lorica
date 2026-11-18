@@ -384,15 +384,20 @@ async fn every_automation_request_lands_in_the_audit_log() {
 
 // ---- Story 12.3 D-m: `allow_local_backend` is never a token's ----
 
-/// No path of the automation plane names a stream, so no token and no
-/// MCP tool (each a request to one of these paths) writes a stream
-/// field, `allow_local_backend` included. Story 12.10 brings streams to
-/// this plane and must keep the flag out of it.
+/// No write path of the automation plane names a stream, so no token and
+/// no MCP tool (each a request to one of these paths) writes a stream
+/// field, `allow_local_backend` included. The one read that names a
+/// stream is its SLA (Story 12.9), which answers figures and no field.
+/// Story 12.10 brings streams to this plane and must keep the flag out
+/// of it.
 #[test]
-fn no_automation_path_reaches_a_stream() {
+fn no_automation_write_path_reaches_a_stream() {
     let table = crate::automation::route_table();
     assert!(!table.is_empty());
     for route in table {
+        if route.method == http::Method::GET {
+            continue;
+        }
         assert!(
             !route.path.contains("stream"),
             "{} {} reaches a stream",

@@ -723,6 +723,46 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /automation/v1/sla/streams/{id}:
+    get:
+      tags: [Reads]
+      summary: Passive SLA for one stream
+      description: >-
+        One TCP or UDP stream's passive summaries over every standard
+        window (1h, 24h, 7d, 30d): the connections judged, the ones
+        that met the target, and for TCP the connect latency to a
+        backend. A UDP stream has no connect, so its latency fields are
+        null. The answer names the stream by its id and carries nothing
+        else of it, which is why `sla:read` alone reaches it.
+
+
+        Required scope: `sla:read`.
+      operationId: automationStreamSla
+      x-required-scope: sla:read
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
+      responses:
+        "200":
+          description: One page of SLA summaries for the stream
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PagedAnswer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: This node holds no stream with that id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /automation/v1/cluster/status:
     get:
       tags: [Reads]

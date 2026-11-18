@@ -275,6 +275,7 @@ struct SweptIds {
     route: String,
     backend: String,
     certificate: String,
+    stream: String,
 }
 
 /// The arguments a sweep gives `spec`: the seeded resource it names,
@@ -290,6 +291,7 @@ fn sweep_arguments(spec: &lorica_mcp::tools::ToolSpec, ids: &SweptIds) -> serde_
         let id = match spec.path {
             "/automation/v1/backends" => &ids.backend,
             "/automation/v1/certificates" => &ids.certificate,
+            "/automation/v1/sla/streams" => &ids.stream,
             _ => &ids.route,
         };
         map.insert(param.name.to_string(), serde_json::json!(id));
@@ -355,6 +357,7 @@ async fn every_registered_tool_answers_through_the_endpoint_without_leaving_the_
             )
             .await,
         ),
+        stream: crate::automation::test_support::the_seeded_stream_id(&state).await,
     };
     // The renewal preview refuses a certificate that was uploaded, as
     // the apply would; the seeded one is marked as issued so the

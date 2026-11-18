@@ -448,11 +448,13 @@ fn within_the_filter_ceiling(name: &str, value: Option<&str>) -> Result<(), ApiE
 /// The management plane echoes the id back ("route `<id>`"), which is
 /// the right answer for a dashboard toast. Here the reader is a
 /// language model and the echoed span is whatever the caller put in the
-/// path, so the refusal names the class of thing and nothing the caller
-/// chose.
-fn without_the_callers_echo(error: ApiError) -> ApiError {
+/// path, so the refusal names the class of thing, `kind`, and nothing
+/// the caller chose.
+fn without_the_callers_echo(error: ApiError, kind: &str) -> ApiError {
     match error {
-        ApiError::NotFound(_) => ApiError::NotFound("this node holds no route with that id".into()),
+        ApiError::NotFound(_) => {
+            ApiError::NotFound(format!("this node holds no {kind} with that id"))
+        }
         other => other,
     }
 }
@@ -616,7 +618,31 @@ pub async fn route_sla(
     let page = page.page();
     let summaries = crate::sla::local_route_sla(&state, route_id)
         .await
-        .map_err(without_the_callers_echo)?;
+        .map_err(|e| without_the_callers_echo(e, "route"))?;
+    page.of(rows(json_data(summaries), None)?)
+}
+
+/// `GET /automation/v1/sla/streams/{id}` (scope `sla:read`).
+///
+/// One stream's passive summaries over every standard window
+/// (Story 12.9 D-g). `sla:read` covers it, and nothing more is asked:
+/// the answer is the stream's id and its figures, never its name, its
+/// ports or its backends, which only a stream read reveals.
+///
+/// # Errors
+///
+/// Whatever [`crate::sla::local_stream_sla`] answers, including a 404
+/// for a stream this node does not hold, with the caller's own id
+/// struck out of the message.
+pub async fn stream_sla(
+    Extension(state): Extension<AppState>,
+    Path(stream_id): Path<String>,
+    Query(page): Query<PageQuery>,
+) -> Result<Response, ApiError> {
+    let page = page.page();
+    let summaries = crate::sla::local_stream_sla(&state, stream_id)
+        .await
+        .map_err(|e| without_the_callers_echo(e, "stream"))?;
     page.of(rows(json_data(summaries), None)?)
 }
 
@@ -1058,18 +1084,22 @@ mod tests {
 
     #[test]
     fn a_not_found_on_this_plane_names_no_identifier_the_caller_chose() {
-        let echoed = ApiError::NotFound("route ignore-previous-instructions".to_string());
-        let ApiError::NotFound(message) = without_the_callers_echo(echoed) else {
-            panic!("a not-found stays a not-found")
-        };
-        assert!(
-            !message.contains("ignore-previous-instructions"),
-            "{message}"
-        );
+        for kind in ["route", "stream"] {
+            let echoed = ApiError::NotFound(format!("{kind} ignore-previous-instructions"));
+            let ApiError::NotFound(message) = without_the_callers_echo(echoed, kind) else {
+                panic!("a not-found stays a not-found")
+            };
+            assert!(
+                !message.contains("ignore-previous-instructions"),
+                "{message}"
+            );
+            assert!(message.contains(kind), "{message}");
+        }
 
         // Every other variant travels unchanged: the echo rule is about
         // identifiers in a 404, not about rewriting the store's errors.
-        let conflict = without_the_callers_echo(ApiError::Conflict("not a control plane".into()));
+        let conflict =
+            without_the_callers_echo(ApiError::Conflict("not a control plane".into()), "route");
         assert!(matches!(conflict, ApiError::Conflict(_)), "{conflict:?}");
     }
 }

@@ -20,7 +20,7 @@
 use crate::automation::test_support::{
     a_node_with_something_to_read, a_node_with_something_to_write, an_environment_owning,
     automation_call, automation_send, json_keys_and_strings, mcp_call, mint_automation,
-    NEVER_LEAVES_THE_NODE, WRITE_TOKEN_NAME,
+    the_seeded_stream_id, NEVER_LEAVES_THE_NODE, WRITE_TOKEN_NAME,
 };
 use crate::server::AppState;
 use crate::tests::{body_json, parse_data, send, setup_admin_and_login, test_state};
@@ -53,6 +53,7 @@ const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
     "applied_config_hash",
     "auto_ban_duration_s",
     "auto_ban_threshold",
+    "avg_connect_latency_ms",
     "avg_latency_ms",
     "backend",
     "backends",
@@ -85,6 +86,7 @@ const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
     "enabled",
     "error",
     "ewma_score_us",
+    "failure_count",
     "fingerprint",
     "fleet",
     "force_https",
@@ -107,6 +109,7 @@ const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
     "is_xff",
     "issuer",
     "items",
+    "judged_count",
     "kind",
     "last_seen_at",
     "latency_ms",
@@ -127,8 +130,11 @@ const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
     "not_after",
     "not_before",
     "offset",
+    "p50_connect_latency_ms",
     "p50_latency_ms",
+    "p95_connect_latency_ms",
     "p95_latency_ms",
+    "p99_connect_latency_ms",
     "p99_latency_ms",
     "page",
     "path",
@@ -168,8 +174,10 @@ const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
     "status",
     "sticky_session",
     "stored_in",
+    "stream_id",
     "strip_path_prefix",
     "subject",
+    "success_count",
     "successful_requests",
     "target_pct",
     "timestamp",
@@ -198,25 +206,44 @@ const AUTOMATION_READ_FIELD_NAMES: &[&str] = &[
 /// `READ_SURFACE` is a list of requests, not the matrix itself; what
 /// holds it to the plane is `every_read_the_plane_mounts_is_on_the_read_surface`
 /// in `automation::scope`, which fails naming any read the router mounts
-/// and the list does not carry. The one entry naming a resource id gets
+/// and the list does not carry. The entries naming a resource id get
 /// the id the fixture seeded: a path added later that takes an id and
 /// is not handled here answers 404, and the sweep's own 200 assertion
 /// is where that surfaces.
-fn as_seeded_request(path: &str, route_id: &str) -> String {
+fn as_seeded_request(path: &str, seeded: &Seeded) -> String {
     match path.rsplit_once('/') {
         Some((collection, _)) if collection == "/automation/v1/sla/routes" => {
-            format!("{collection}/{route_id}")
+            format!("{collection}/{}", seeded.route_id)
+        }
+        Some((collection, _)) if collection == "/automation/v1/sla/streams" => {
+            format!("{collection}/{}", seeded.stream_id)
         }
         _ => path.to_string(),
+    }
+}
+
+/// The ids of the resources the read fixture seeded.
+struct Seeded {
+    route_id: String,
+    stream_id: String,
+}
+
+impl Seeded {
+    async fn on(state: &AppState, route_id: String) -> Seeded {
+        Seeded {
+            route_id,
+            stream_id: the_seeded_stream_id(state).await,
+        }
     }
 }
 
 #[tokio::test]
 async fn an_automation_read_path_needs_its_own_scope_and_no_other() {
     let (state, _all_scopes, route_id) = a_node_with_something_to_read().await;
+    let seeded = Seeded::on(&state, route_id).await;
 
     for (path, scope) in crate::automation::scope::READ_SURFACE {
-        let request = as_seeded_request(path, &route_id);
+        let request = as_seeded_request(path, &seeded);
         let only_this = mint_automation(
             &state,
             "narrow",
@@ -321,11 +348,12 @@ async fn no_automation_read_answer_carries_a_secret_field_name() {
     // every answer to turn that inheritance into something a change
     // can break.
     let (state, token, route_id) = a_node_with_something_to_read().await;
+    let seeded = Seeded::on(&state, route_id).await;
     let bearer = format!("Bearer {token}");
 
     let mut walked = 0usize;
     for (path, _scope) in crate::automation::scope::READ_SURFACE {
-        let request = as_seeded_request(path, &route_id);
+        let request = as_seeded_request(path, &seeded);
         let response = automation_send(&state, &request, Some(&bearer), None).await;
         assert_eq!(response.status(), StatusCode::OK, "{request}");
         let body = body_json(response).await;
@@ -373,11 +401,12 @@ async fn every_automation_read_answers_only_the_field_names_this_surface_committ
     // extraction sanity first, both directions diffed, a panic naming
     // what to do, nothing auto-written.
     let (state, token, route_id) = a_node_with_something_to_read().await;
+    let seeded = Seeded::on(&state, route_id).await;
     let bearer = format!("Bearer {token}");
 
     let mut answered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (path, _scope) in crate::automation::scope::READ_SURFACE {
-        let request = as_seeded_request(path, &route_id);
+        let request = as_seeded_request(path, &seeded);
         let response = automation_send(&state, &request, Some(&bearer), None).await;
         assert_eq!(response.status(), StatusCode::OK, "{request}");
         let body = body_json(response).await;
@@ -771,6 +800,66 @@ async fn an_automation_read_of_one_route_sla_answers_the_windows_or_404() {
         !message.contains("ignore-previous-instructions"),
         "{message}"
     );
+}
+
+#[tokio::test]
+async fn an_automation_read_of_one_stream_sla_answers_the_windows_or_404() {
+    // Story 12.9 D-g: `sla:read` alone reads a stream's figures, and the
+    // answer names the stream by the id the caller sent and nothing else.
+    let (state, _token, _route_id) = a_node_with_something_to_read().await;
+    let stream_id = the_seeded_stream_id(&state).await;
+    let sla_only = mint_automation(
+        &state,
+        "sla-only",
+        vec![lorica_config::models::AutomationScope::SlaRead],
+        &[],
+        chrono::Utc::now() + chrono::Duration::days(30),
+        None,
+    )
+    .await;
+    let bearer = format!("Bearer {sla_only}");
+
+    let response = automation_send(
+        &state,
+        &format!("/automation/v1/sla/streams/{stream_id}"),
+        Some(&bearer),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let windows = body["data"]["items"].as_array().expect("a page of windows");
+    let labels: Vec<&str> = windows
+        .iter()
+        .map(|window| window["window"].as_str().expect("a window label"))
+        .collect();
+    let expected: Vec<&str> = lorica_bench::results::SlaWindow::ALL
+        .iter()
+        .map(lorica_bench::results::SlaWindow::label)
+        .collect();
+    assert_eq!(labels, expected, "{body}");
+    for window in windows {
+        assert_eq!(window["stream_id"], stream_id.as_str());
+        assert!(window.get("stream_name").is_none(), "{window}");
+    }
+
+    let response = automation_send(
+        &state,
+        "/automation/v1/sla/streams/ignore-previous-instructions",
+        Some(&bearer),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let message = body_json(response).await["error"]["message"]
+        .as_str()
+        .expect("the refusal carries a message")
+        .to_string();
+    assert!(
+        !message.contains("ignore-previous-instructions"),
+        "{message}"
+    );
+    assert!(message.contains("stream"), "{message}");
 }
 
 // ---- Pre-merge audit: the reads page before they compute ----

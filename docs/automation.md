@@ -815,6 +815,7 @@ nothing else:
 | `/automation/v1/waf/stats` | `waf:read` | Totals, the 24 h and 1 h counts, the loaded rule count, the count per category over all events held and over the last hour, with `stored_in` saying where the events held are (the retained table, or without a log store the in-memory ring), up to `WAF_STATS_MAX_AGE` old. |
 | `/automation/v1/sla/overview` | `sla:read` | The 1 h and 24 h passive windows for every route. |
 | `/automation/v1/sla/routes/{id}` | `sla:read` | One route's passive windows (1 h, 24 h, 7 d, 30 d). |
+| `/automation/v1/sla/streams/{id}` | `sla:read` | One stream's passive windows (1 h, 24 h, 7 d, 30 d): connections judged, successes, and for TCP the connect latency. It names the stream by its id only. |
 | `/automation/v1/cluster/status` | `cluster:read` | This node's role, build, applied generation and hash. |
 | `/automation/v1/backends` | `backends:read` | Every backend with its health, connections and EWMA score. |
 | `/automation/v1/routes` | `routes:read` | Every route with its linked backend ids, optionally one group. |

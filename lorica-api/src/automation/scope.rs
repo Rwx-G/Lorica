@@ -288,6 +288,9 @@ fn read_declaration(path: &str) -> Option<(&'static str, AutomationScope)> {
         _ if one_segment_under(path, SLA_ROUTES_PATH) => {
             Some((SLA_ROUTE_TEMPLATE, AutomationScope::SlaRead))
         }
+        _ if one_segment_under(path, SLA_STREAMS_PATH) => {
+            Some((SLA_STREAM_TEMPLATE, AutomationScope::SlaRead))
+        }
         _ => None,
     }
 }
@@ -332,6 +335,17 @@ pub(super) const SLA_ROUTES_PATH: &str = "/automation/v1/sla/routes";
 /// How `openapi-automation.yaml` spells one route's SLA, and how the
 /// metric labels it.
 pub(super) const SLA_ROUTE_TEMPLATE: &str = "/automation/v1/sla/routes/{id}";
+
+/// Passive SLA per stream (Story 12.9); one stream id hangs under it.
+///
+/// `sla:read` alone, not `streams:read`: the answer carries the id the
+/// caller sent and the stream's figures, never its name or its
+/// configuration.
+pub(super) const SLA_STREAMS_PATH: &str = "/automation/v1/sla/streams";
+
+/// How `openapi-automation.yaml` spells one stream's SLA, and how the
+/// metric labels it.
+pub(super) const SLA_STREAM_TEMPLATE: &str = "/automation/v1/sla/streams/{id}";
 
 /// This node's cluster role and applied configuration.
 ///
@@ -455,6 +469,7 @@ pub(crate) const READ_SURFACE: &[(&str, AutomationScope)] = &[
     ("/automation/v1/waf/stats", AutomationScope::WafRead),
     ("/automation/v1/sla/overview", AutomationScope::SlaRead),
     ("/automation/v1/sla/routes/r-1", AutomationScope::SlaRead),
+    ("/automation/v1/sla/streams/s-1", AutomationScope::SlaRead),
     (
         "/automation/v1/cluster/status",
         AutomationScope::ClusterRead,
@@ -877,6 +892,9 @@ mod tests {
             "/automation/v1/sla/routes",
             "/automation/v1/sla/routes/",
             "/automation/v1/sla/routes/r-1/buckets",
+            "/automation/v1/sla/streams",
+            "/automation/v1/sla/streams/",
+            "/automation/v1/sla/streams/s-1/buckets",
             "/automation/v1/waf/rules",
             "/automation/v1/logs/export",
             "/automation/v1/certificates/c-1",
@@ -1060,6 +1078,10 @@ mod tests {
         assert_eq!(
             path_template(&Method::GET, "/automation/v1/sla/routes/r-1"),
             Some("/automation/v1/sla/routes/{id}")
+        );
+        assert_eq!(
+            path_template(&Method::GET, "/automation/v1/sla/streams/s-1"),
+            Some("/automation/v1/sla/streams/{id}")
         );
         assert_eq!(
             path_template(&Method::PUT, "/automation/v1/environments/pr-42"),

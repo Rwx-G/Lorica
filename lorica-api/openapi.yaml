@@ -3408,6 +3408,198 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /api/v1/sla/streams/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      tags: [SLA]
+      summary: Get passive SLA windows for a stream
+      description: >-
+        One TCP or UDP stream's passive summaries over the 1h, 24h, 7d
+        and 30d windows (Story 12.9): connections judged, successes,
+        failures, availability, and for TCP the connect latency to a
+        backend (mean of the connections that connected, highest
+        percentiles of the window's buckets). A UDP stream has no
+        connect: its latency fields are null. This node's figures only;
+        no `?node=`.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Stream SLA windows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/sla/streams/{id}/buckets:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      tags: [SLA]
+      summary: Get raw SLA minute buckets for a stream
+      description: >-
+        `?from=` and `?to=` (RFC 3339, default the last 24 hours) and
+        `?source=` (default `passive`, the only source a stream records).
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Stream SLA bucket data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/sla/streams/{id}/config:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      tags: [SLA]
+      summary: Get the SLA target of a stream
+      description: >-
+        The stored target, or the shipped default when none was written.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Stream SLA config
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [SLA]
+      summary: Update the SLA target of a stream
+      description: >-
+        Only the fields sent change; a field the route target has and a
+        stream's does not is refused (422). Audited as
+        `sla.config_update`. Operator or above.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                target_pct:
+                  type: number
+                  minimum: 0
+                  maximum: 100
+                max_connect_latency_ms:
+                  type: integer
+                  format: int64
+                  minimum: 1
+                  description: >-
+                    A TCP connection that connects slower than this is a
+                    failure. A UDP stream never reads it.
+      responses:
+        "200":
+          description: Stream SLA config updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/sla/streams/{id}/export:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      tags: [SLA]
+      summary: Export SLA data for a stream
+      description: >-
+        `?from=` and `?to=` (RFC 3339, default the last 30 days) and
+        `?format=json|csv` (default `json`). In the CSV a latency with no
+        sample is an empty cell, never 0.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Exported stream SLA data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+            text/csv:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/sla/streams/{id}/data:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    delete:
+      tags: [SLA]
+      summary: Delete the SLA history of a stream
+      description: >-
+        Deletes every stored bucket of the stream and the minutes this
+        process has not flushed yet. Audited as `sla.data_clear`.
+        Operator or above.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Stream SLA history deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      stream_id:
+                        type: string
+                      deleted_buckets:
+                        type: integer
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   # ---------------------------------------------------------------------------
   # Probes
   # ---------------------------------------------------------------------------

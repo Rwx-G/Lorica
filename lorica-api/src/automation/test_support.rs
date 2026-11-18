@@ -260,6 +260,23 @@ pub(crate) async fn a_node_with_something_to_read() -> (AppState, String, String
         .expect("route id")
         .to_string();
 
+    // One stream, so the stream SLA read answers a real stream's windows
+    // (`the_seeded_stream_id`).
+    state
+        .store
+        .lock()
+        .await
+        .create_stream(&lorica_config::models::Stream::new(
+            uuid::Uuid::new_v4().to_string(),
+            "read-stream".to_string(),
+            lorica_config::models::StreamProtocol::Tcp,
+            "0.0.0.0".parse().expect("an address"),
+            15432,
+            15432,
+            chrono::Utc::now(),
+        ))
+        .expect("test setup: stream");
+
     for n in 0..5u64 {
         state.log_buffer.push(crate::logs::LogEntry {
             id: 0,
@@ -315,6 +332,18 @@ pub(crate) async fn a_node_with_something_to_read() -> (AppState, String, String
     )
     .await;
     (state, token, route_id)
+}
+
+/// The id of the one stream [`a_node_with_something_to_read`] seeded.
+pub(crate) async fn the_seeded_stream_id(state: &AppState) -> String {
+    let streams = state
+        .store
+        .lock()
+        .await
+        .list_streams()
+        .expect("the streams");
+    assert_eq!(streams.len(), 1, "the fixture seeds exactly one stream");
+    streams[0].id.clone()
 }
 
 // ---- Story 11.2: the automation plane's write surface ----

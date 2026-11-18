@@ -1137,6 +1137,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 acme_challenge_store: Some(lorica_api::acme::AcmeChallengeStore::with_db_path(api_db_path)),
                 pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
+                stream_sla_collector: None,
                 load_test_engine: Some(load_test_engine),
                 notification_history: {
                     let d = notify_dispatcher.lock().await;

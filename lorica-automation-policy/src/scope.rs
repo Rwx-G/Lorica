@@ -108,7 +108,7 @@ pub enum AutomationScope {
     /// Read WAF events and their aggregate counts.
     #[serde(rename = "waf:read")]
     WafRead,
-    /// Read SLA windows per route.
+    /// Read SLA windows per route and per stream.
     #[serde(rename = "sla:read")]
     SlaRead,
     /// Read cluster and node status.

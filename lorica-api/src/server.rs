@@ -245,6 +245,11 @@ pub struct AppState {
     pub pending_dns_challenges: crate::acme::PendingDnsChallenges,
     /// Passive SLA metrics collector.
     pub sla_collector: Option<Arc<lorica_bench::SlaCollector>>,
+    /// Passive stream SLA collector (Story 12.9): the stream SLA API
+    /// refreshes its cached target on a config write and drops its
+    /// unflushed minutes when the stream's history is cleared. `None`
+    /// where no collector runs in this process.
+    pub stream_sla_collector: Option<Arc<lorica_bench::StreamSlaCollector>>,
     /// Load test engine.
     pub load_test_engine: Option<Arc<lorica_bench::LoadTestEngine>>,
     /// Notification event history ring buffer (shared with NotifyDispatcher).
@@ -1529,6 +1534,35 @@ pub fn build_router(
         .route(
             "/api/v1/sla/routes/{id}/active",
             get(crate::probes::get_active_sla),
+        )
+        .route("/api/v1/sla/streams/{id}", get(crate::sla::get_stream_sla))
+        .route(
+            "/api/v1/sla/streams/{id}/buckets",
+            get(crate::sla::get_stream_sla_buckets),
+        )
+        .route(
+            "/api/v1/sla/streams/{id}/config",
+            get(crate::sla::get_stream_sla_config),
+        )
+        .route(
+            "/api/v1/sla/streams/{id}/config",
+            put(crate::sla::update_stream_sla_config).layer(rl(
+                "destructive_cud",
+                RL_DESTRUCTIVE_CUD,
+                RL_WINDOW_S,
+            )),
+        )
+        .route(
+            "/api/v1/sla/streams/{id}/export",
+            get(crate::sla::export_stream_sla_data),
+        )
+        .route(
+            "/api/v1/sla/streams/{id}/data",
+            delete(crate::sla::clear_stream_sla).layer(rl(
+                "destructive_cud",
+                RL_DESTRUCTIVE_CUD,
+                RL_WINDOW_S,
+            )),
         )
         .route("/api/v1/probes", get(crate::probes::list_probes))
         .route(

@@ -284,7 +284,7 @@ pipeline calls the automation paths themselves.
 
 The read tier is one tool per read the automation plane serves: the
 access log with the filters the dashboard offers, WAF events and their
-aggregate counts, the SLA summary and one route's SLA windows, this
+aggregate counts, the SLA summary, one route's and one stream's SLA windows, this
 node's cluster status, and the route, backend and certificate listings.
 Each tool sits behind the read scope of its family. The catalogue is
 `READS` in `lorica-mcp/src/tools.rs`; `lorica mcp token create --tier

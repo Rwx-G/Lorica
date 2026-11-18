@@ -1081,6 +1081,22 @@ pub const READS: &[ToolSpec] = &[
         tier: Tier::Read,
     },
     ToolSpec {
+        name: "lorica_sla_stream",
+        title: "SLA for one stream",
+        summary: "Read one TCP or UDP stream's passive availability windows over 1 hour, 24 \
+                  hours, 7 days and 30 days: the connections judged, how many met the \
+                  target, and for TCP the time to connect to a backend. A UDP stream has no \
+                  connect, so its latency fields are null. The answer names the stream by \
+                  its id only.",
+        scope: AutomationScope::SlaRead,
+        path: "/automation/v1/sla/streams",
+        resource: Some(STREAM_ID),
+        filters: &[],
+        paginated: true,
+        kind: Kind::Read,
+        tier: Tier::Read,
+    },
+    ToolSpec {
         name: "lorica_cluster_status",
         title: "Cluster status",
         summary: "Read this node's cluster role, build, applied configuration generation and \
@@ -1155,6 +1171,15 @@ pub const READS: &[ToolSpec] = &[
 const ROUTE_ID: Param = Param {
     name: "id",
     doc: "The route id, as `lorica_routes` reports it.",
+    kind: ParamKind::Text {
+        max_bytes: FREE_TEXT_MAX_BYTES,
+    },
+};
+
+/// The one argument naming a stream.
+const STREAM_ID: Param = Param {
+    name: "id",
+    doc: "The stream id, as the management API reports it.",
     kind: ParamKind::Text {
         max_bytes: FREE_TEXT_MAX_BYTES,
     },
@@ -2841,18 +2866,20 @@ mod tests {
     }
 
     #[test]
-    fn no_tool_reaches_a_stream_or_offers_the_local_backend_flag() {
+    fn no_tool_writes_a_stream_or_offers_the_local_backend_flag() {
         // Story 12.3 D-m: `allow_local_backend` is never settable from
-        // MCP. No tool calls a stream path, none declares the field at
-        // any depth of its input schema, and a body naming it is refused
-        // here, before a request leaves. `lorica-api` proves the plane
-        // mounts no stream path either, and refuses a token moving a
-        // backend that a stream with the flag forwards to; the backend
-        // tool below is the request that reaches that refusal.
+        // MCP. No tool that changes something calls a stream path (the
+        // one read that names a stream is its SLA, Story 12.9, figures
+        // and no field), none declares the field at any depth of its
+        // input schema, and a body naming it is refused here, before a
+        // request leaves. `lorica-api` proves the plane mounts no stream
+        // write path either, and refuses a token moving a backend that a
+        // stream with the flag forwards to; the backend tool below is
+        // the request that reaches that refusal.
         const FLAG: &str = "allow_local_backend";
         for spec in catalogue() {
             assert!(
-                !spec.path.contains("stream"),
+                spec.write().is_none() || !spec.path.contains("stream"),
                 "{} calls {}",
                 spec.name,
                 spec.path
