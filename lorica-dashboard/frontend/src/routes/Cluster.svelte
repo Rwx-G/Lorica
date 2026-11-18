@@ -288,6 +288,12 @@
     }
   }
 
+  const STATUS_BADGE: Record<ClusterNodeResponse['status'], string> = {
+    active: 'badge-green',
+    pending: 'badge-orange',
+    revoked: 'badge-gray',
+  };
+
   // The server forms this verdict; the page shows it. Recomputing it
   // here is what made the pill disagree with `/cluster/drift`
   // (backlog #71).
@@ -325,7 +331,7 @@
       </p>
     </div>
     {#if status?.role === 'control_plane' && superAdmin}
-      <button class="btn-primary" onclick={() => (showMint = true)}>Add node</button>
+      <button class="btn btn-primary" onclick={() => (showMint = true)}>Add node</button>
     {/if}
   </header>
 
@@ -348,7 +354,7 @@
           </li>
         {/each}
       </ul>
-      <button class="btn-secondary" onclick={() => (reissue = null)}>Dismiss</button>
+      <button class="btn btn-secondary" onclick={() => (reissue = null)}>Dismiss</button>
     </div>
   {/if}
 
@@ -387,12 +393,12 @@
                 {n.name}
               </button>
             </td>
-            <td><span class="pill pill-{n.status}">{n.status}</span></td>
+            <td><span class="badge {STATUS_BADGE[n.status]}">{n.status}</span></td>
             <td>
               {#if n.connected}
-                <span class="pill pill-ok">connected</span>
+                <span class="badge badge-green">connected</span>
               {:else}
-                <span class="pill pill-off">offline</span>
+                <span class="badge badge-gray">offline</span>
               {/if}
             </td>
             <td>{n.version || '-'}</td>
@@ -400,7 +406,7 @@
             <td>
               {n.applied_config_generation}
               {#if driftedFrom(n)}
-                <span class="pill pill-warn" title="Behind the control plane's generation">
+                <span class="badge badge-orange" title="Behind the control plane's generation">
                   drift
                 </span>
               {/if}
@@ -418,14 +424,16 @@
   <aside class="drawer" aria-label="Node detail">
     <header class="drawer-header">
       <h2>{node.name}</h2>
-      <button class="icon-btn" aria-label="Close" onclick={() => (selected = null)}>x</button>
+      <button class="btn-icon" title="Close" aria-label="Close" onclick={() => (selected = null)}>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
     </header>
 
     <dl class="detail">
       <dt>Node id</dt>
       <dd class="mono">{node.node_id}</dd>
       <dt>Status</dt>
-      <dd><span class="pill pill-{node.status}">{node.status}</span></dd>
+      <dd><span class="badge {STATUS_BADGE[node.status]}">{node.status}</span></dd>
       <dt>Session</dt>
       <dd>{node.connected ? (node.session_peer ?? 'connected') : 'not connected'}</dd>
       <dt>Version</dt>
@@ -460,7 +468,7 @@
           </p>
         {/if}
         {#if superAdmin}
-          <button class="btn-primary" onclick={() => void activate(node)}>
+          <button class="btn btn-primary" onclick={() => void activate(node)}>
             Activate {node.name}
           </button>
         {/if}
@@ -614,7 +622,7 @@
 
     {#if superAdmin && node.status !== 'revoked'}
       <footer class="drawer-footer">
-        <button class="btn-danger" onclick={() => (revoking = node)}>Revoke node</button>
+        <button class="btn btn-danger" onclick={() => (revoking = node)}>Revoke node</button>
       </footer>
     {/if}
   </aside>
@@ -632,30 +640,43 @@
 
 {#if showMint}
   <div class="overlay" role="dialog" aria-modal="true">
-    <div class="dialog wide">
+    <div class="modal" role="document">
       {#if !minted}
         <h2>Add a node</h2>
-        <p class="muted">
+        <p class="text-muted">
           The token names the node it may enrol. That name is what route
           selectors resolve against, so it decides which certificate keys the
           node receives; binding it here is what makes the choice yours rather
           than the joining machine's.
         </p>
-        <label for="mint-name">Node name</label>
-        <input
-          id="mint-name"
-          bind:value={mintName}
-          placeholder="edge-01"
-          autocomplete="off"
-        />
-        <label for="mint-ttl">Valid for (seconds)</label>
-        <input id="mint-ttl" type="number" bind:value={mintTtl} min="60" max="86400" />
-        <label for="mint-cidr">Source CIDR (optional)</label>
-        <input id="mint-cidr" bind:value={mintCidr} placeholder="192.0.2.0/24" autocomplete="off" />
-        <div class="dialog-actions">
-          <button class="btn-secondary" onclick={closeMint}>Cancel</button>
+        <div class="form-group">
+          <label for="mint-name">Node name</label>
+          <input
+            id="mint-name"
+            type="text"
+            bind:value={mintName}
+            placeholder="edge-01"
+            autocomplete="off"
+          />
+        </div>
+        <div class="form-group">
+          <label for="mint-ttl">Valid for (seconds)</label>
+          <input id="mint-ttl" type="number" bind:value={mintTtl} min="60" max="86400" />
+        </div>
+        <div class="form-group">
+          <label for="mint-cidr">Source CIDR (optional)</label>
+          <input
+            id="mint-cidr"
+            type="text"
+            bind:value={mintCidr}
+            placeholder="192.0.2.0/24"
+            autocomplete="off"
+          />
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-cancel" onclick={closeMint}>Cancel</button>
           <button
-            class="btn-primary"
+            class="btn btn-primary"
             disabled={minting || mintName.trim() === ''}
             onclick={() => void mint()}
           >
@@ -675,32 +696,36 @@
           {secondsUntil(token.expires_at)} seconds.
         </p>
 
-        <label for="join-cmd">1. Run this on the new node</label>
-        <div class="copy-row">
-          <code id="join-cmd" class="mono block">{joinCommand(controlPlaneAddress)}</code>
-          <button
-            class="btn-secondary"
-            onclick={() => void copy(joinCommand(controlPlaneAddress), 'Command')}
-          >
-            Copy
-          </button>
+        <div class="form-group">
+          <label for="join-cmd">1. Run this on the new node</label>
+          <div class="copy-row">
+            <code id="join-cmd" class="mono block">{joinCommand(controlPlaneAddress)}</code>
+            <button
+              class="btn btn-cancel"
+              onclick={() => void copy(joinCommand(controlPlaneAddress), 'Command')}
+            >
+              Copy
+            </button>
+          </div>
         </div>
 
-        <label for="join-token">2. Paste the token into its stdin</label>
-        <div class="copy-row">
-          <code id="join-token" class="mono block secret">{token.token}</code>
-          <button class="btn-secondary" onclick={() => void copy(token.token, 'Token')}>
-            Copy
-          </button>
+        <div class="form-group">
+          <label for="join-token">2. Paste the token into its stdin</label>
+          <div class="copy-row">
+            <code id="join-token" class="mono block secret">{token.token}</code>
+            <button class="btn btn-cancel" onclick={() => void copy(token.token, 'Token')}>
+              Copy
+            </button>
+          </div>
         </div>
-        <p class="muted">
+        <p class="text-muted">
           The token is deliberately kept off the command line: argv is readable
           through <code>/proc</code>, lands in shell history, and is logged
           verbatim by CI and configuration-management tools.
         </p>
 
-        <div class="dialog-actions">
-          <button class="btn-primary" onclick={closeMint}>Done</button>
+        <div class="form-actions">
+          <button class="btn btn-primary" onclick={closeMint}>Done</button>
         </div>
       {/if}
     </div>
@@ -729,7 +754,7 @@
         A break-glass window is open. Closing it now makes this node pull the
         control plane's current configuration and discard local edits.
       </p>
-      <button class="btn-secondary" disabled={glassBusy} onclick={() => void closeGlass()}>
+      <button class="btn btn-secondary" disabled={glassBusy} onclick={() => void closeGlass()}>
         Close break-glass
       </button>
     {:else}
@@ -747,7 +772,7 @@
         min="1"
         max="86400"
       />
-      <button class="btn-secondary" disabled={glassBusy} onclick={() => void openGlass()}>
+      <button class="btn btn-secondary" disabled={glassBusy} onclick={() => void openGlass()}>
         Open break-glass
       </button>
     {/if}
@@ -757,7 +782,7 @@
       node's fleet identity. If the control plane cannot be reached the node
       still leaves and must be revoked there by hand.
     </p>
-    <button class="btn-danger" disabled={leaving} onclick={() => (confirmLeave = true)}>
+    <button class="btn btn-danger" disabled={leaving} onclick={() => (confirmLeave = true)}>
       Leave the fleet
     </button>
   </section>
@@ -863,14 +888,14 @@
   }
   .subtitle,
   .muted {
-    color: var(--text-muted, #6b7280);
+    color: var(--color-text-muted);
     margin: 0;
   }
   .error-text {
-    color: var(--danger, #dc2626);
+    color: var(--color-red);
   }
   .reissue {
-    border: 1px solid var(--danger, #dc2626);
+    border: 1px solid var(--color-red);
     border-radius: 6px;
     padding: 0.75rem 1rem;
     margin-bottom: 1rem;
@@ -879,7 +904,7 @@
     margin: 0.5rem 0;
   }
   .warn-text {
-    color: var(--warning, #b45309);
+    color: var(--color-orange);
   }
   .data-table {
     width: 100%;
@@ -889,43 +914,13 @@
   .data-table td {
     text-align: left;
     padding: 0.55rem 0.65rem;
-    border-bottom: 1px solid var(--border, #e5e7eb);
+    border-bottom: 1px solid var(--color-border);
   }
   .row {
     cursor: pointer;
   }
   .row:hover {
-    background: var(--surface-hover, #f9fafb);
-  }
-  .link-btn {
-    background: none;
-    border: none;
-    padding: 0;
-    color: var(--accent, #2563eb);
-    cursor: pointer;
-    font: inherit;
-  }
-  .pill {
-    display: inline-block;
-    padding: 0.1rem 0.45rem;
-    border-radius: 999px;
-    font-size: 0.75rem;
-    border: 1px solid var(--border, #e5e7eb);
-  }
-  .pill-active,
-  .pill-ok {
-    background: #dcfce7;
-    color: #166534;
-  }
-  .pill-pending,
-  .pill-warn {
-    background: #fef3c7;
-    color: #92400e;
-  }
-  .pill-revoked,
-  .pill-off {
-    background: #f3f4f6;
-    color: #4b5563;
+    background: var(--color-bg-hover);
   }
   .mono {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -934,12 +929,12 @@
   .block {
     display: block;
     padding: 0.5rem;
-    background: var(--surface-alt, #f3f4f6);
+    background: var(--color-bg-input);
     border-radius: 4px;
     overflow-wrap: anywhere;
   }
   .secret {
-    border: 1px dashed var(--warning, #b45309);
+    border: 1px dashed var(--color-orange);
   }
   .drawer {
     position: fixed;
@@ -947,8 +942,8 @@
     right: 0;
     width: min(30rem, 100%);
     height: 100%;
-    background: var(--surface, #fff);
-    border-left: 1px solid var(--border, #e5e7eb);
+    background: var(--color-bg-elevated);
+    border-left: 1px solid var(--color-border);
     padding: 1.25rem;
     overflow-y: auto;
     box-shadow: -4px 0 16px rgb(0 0 0 / 8%);
@@ -962,12 +957,6 @@
     margin: 0;
     font-size: 1.15rem;
   }
-  .icon-btn {
-    background: none;
-    border: none;
-    font-size: 1.1rem;
-    cursor: pointer;
-  }
   .detail {
     display: grid;
     grid-template-columns: max-content 1fr;
@@ -975,7 +964,7 @@
     margin: 1rem 0;
   }
   .detail dt {
-    color: var(--text-muted, #6b7280);
+    color: var(--color-text-muted);
     font-size: 0.85rem;
   }
   .detail dd {
@@ -983,7 +972,7 @@
     overflow-wrap: anywhere;
   }
   .approve {
-    border-top: 1px solid var(--border, #e5e7eb);
+    border-top: 1px solid var(--color-border);
     padding-top: 1rem;
   }
   .approve h3 {
@@ -995,41 +984,9 @@
     padding-left: 1.1rem;
   }
   .drawer-footer {
-    border-top: 1px solid var(--border, #e5e7eb);
+    border-top: 1px solid var(--color-border);
     margin-top: 1.25rem;
     padding-top: 1rem;
-  }
-  .overlay {
-    position: fixed;
-    inset: 0;
-    background: rgb(0 0 0 / 45%);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 50;
-  }
-  .dialog {
-    background: var(--surface, #fff);
-    border-radius: 8px;
-    padding: 1.25rem;
-    width: min(34rem, 92vw);
-  }
-  .dialog h2 {
-    margin: 0 0 0.5rem;
-    font-size: 1.15rem;
-  }
-  .dialog label {
-    display: block;
-    margin: 0.85rem 0 0.25rem;
-    font-size: 0.85rem;
-    color: var(--text-muted, #6b7280);
-  }
-  .dialog input {
-    width: 100%;
-    padding: 0.45rem 0.55rem;
-    border: 1px solid var(--border, #e5e7eb);
-    border-radius: 4px;
-    font: inherit;
   }
   .copy-row {
     display: flex;
@@ -1039,20 +996,20 @@
   .copy-row code {
     flex: 1;
   }
-  .dialog-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 0.5rem;
-    margin-top: 1.25rem;
-  }
   .glass-banner {
     position: fixed;
     bottom: 0;
     left: 0;
     right: 0;
     padding: 0.6rem 1rem;
-    background: var(--warning, #b45309);
-    color: #fff;
+    /* Fixed over the page, so the tint is laid on an opaque surface:
+       the subtle token alone is translucent and the content under it
+       would show through the text. */
+    background:
+      linear-gradient(var(--color-orange-subtle), var(--color-orange-subtle)),
+      var(--color-bg-elevated);
+    border-top: 2px solid var(--color-orange);
+    color: var(--color-text-heading);
     text-align: center;
   }
 </style>

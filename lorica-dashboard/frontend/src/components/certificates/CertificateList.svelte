@@ -211,20 +211,6 @@
     color: var(--color-text-heading);
   }
 
-  .link-btn {
-    background: none;
-    border: none;
-    color: var(--color-primary);
-    font-weight: 600;
-    font-size: 0.875rem;
-    padding: 0;
-    text-decoration: none;
-  }
-
-  .link-btn:hover {
-    text-decoration: underline;
-  }
-
   .cert-source-badge {
     display: inline-block;
     padding: 0.0625rem 0.375rem;

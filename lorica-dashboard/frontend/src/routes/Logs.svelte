@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount } from 'svelte';
   import { SvelteURLSearchParams } from 'svelte/reactivity';
   import { api, type LogEntry, type LogsQuery } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
@@ -67,48 +67,8 @@
     window.open(`/api/v1/logs/export?${params}`, '_blank');
   }
 
-  let refreshInterval: ReturnType<typeof setInterval> | null = null;
-  let ws: WebSocket | null = null;
+  const POLL_INTERVAL_MS = 5000;
   let wsConnected = $state(false);
-
-  function connectWebSocket() {
-    if (ws) return;
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${proto}//${location.host}/api/v1/logs/ws`);
-
-    ws.onopen = () => {
-      wsConnected = true;
-      stopAutoRefresh(); // No need to poll when WS is active
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const entry: LogEntry = JSON.parse(event.data);
-        // Apply client-side filters before adding
-        if (matchesFilters(entry)) {
-          entries = [...entries.slice(-(filterLimit - 1)), entry];
-          total += 1;
-        }
-      } catch { /* ignore malformed messages */ }
-    };
-
-    ws.onclose = () => {
-      wsConnected = false;
-      ws = null;
-      // Fall back to polling if WS disconnects
-      if (autoRefresh) startAutoRefresh();
-    };
-
-    ws.onerror = () => {
-      ws?.close();
-    };
-  }
-
-  function disconnectWebSocket() {
-    ws?.close();
-    ws = null;
-    wsConnected = false;
-  }
 
   function matchesFilters(e: LogEntry): boolean {
     if (filterStatusCategory === '2xx' && (e.status < 200 || e.status > 299)) return false;
@@ -210,20 +170,6 @@
     }
   }
 
-  function startAutoRefresh() {
-    stopAutoRefresh();
-    if (autoRefresh) {
-      refreshInterval = setInterval(loadLogs, 5000);
-    }
-  }
-
-  function stopAutoRefresh() {
-    if (refreshInterval) {
-      clearInterval(refreshInterval);
-      refreshInterval = null;
-    }
-  }
-
   function statusColor(status: number): string {
     if (status >= 500) return 'var(--color-red)';
     if (status >= 400) return 'var(--color-orange)';
@@ -243,29 +189,67 @@
 
   onMount(() => {
     loadLogs();
-    // The live tail carries only THIS node's rows and the fan-in view
-    // has no node id for them, so they would render under "-" beside
-    // genuinely fanned-in rows: the control plane's own traffic,
-    // labelled as if its origin were unknown. The fleet view polls
-    // instead.
-    if (autoRefresh && !fleetView) connectWebSocket();
   });
 
-  onDestroy(() => {
-    stopAutoRefresh();
-    disconnectWebSocket();
-  });
-
-  // React to auto-refresh toggle: connect/disconnect WS + polling
+  // The live tail and its polling fallback belong to this effect alone:
+  // its cleanup runs when the page unmounts and before every re-run.
+  // The cleanup detaches the socket's handlers before closing it,
+  // because the close event arrives after `close()` returns, and a
+  // handler still attached would restart polling on a page that no
+  // longer exists (#60).
+  //
+  // The live tail carries only THIS node's rows and the fan-in view
+  // has no node id for them, so they would render under "-" beside
+  // genuinely fanned-in rows: the control plane's own traffic,
+  // labelled as if its origin were unknown. The fleet view polls
+  // instead. Reading `fleetView` here also moves the page from the
+  // tail to polling when the cluster status arrives after mount.
   $effect(() => {
     localStorage.setItem('lorica-logs-autorefresh', String(autoRefresh));
-    if (autoRefresh) {
-      connectWebSocket();
-      startAutoRefresh();
-    } else {
-      disconnectWebSocket();
-      stopAutoRefresh();
-    }
+    if (!autoRefresh) return;
+
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    const startPolling = () => {
+      pollTimer ??= setInterval(loadLogs, POLL_INTERVAL_MS);
+    };
+    const stopPolling = () => {
+      if (pollTimer !== null) clearInterval(pollTimer);
+      pollTimer = null;
+    };
+
+    startPolling();
+    if (fleetView) return stopPolling;
+
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const socket = new WebSocket(`${proto}//${location.host}/api/v1/logs/ws`);
+    socket.onopen = () => {
+      wsConnected = true;
+      stopPolling();
+    };
+    socket.onmessage = (event) => {
+      try {
+        const entry: LogEntry = JSON.parse(event.data);
+        if (matchesFilters(entry)) {
+          entries = [...entries.slice(-(filterLimit - 1)), entry];
+          total += 1;
+        }
+      } catch { /* ignore malformed messages */ }
+    };
+    socket.onclose = () => {
+      wsConnected = false;
+      startPolling();
+    };
+    socket.onerror = () => socket.close();
+
+    return () => {
+      socket.onopen = null;
+      socket.onmessage = null;
+      socket.onclose = null;
+      socket.onerror = null;
+      socket.close();
+      wsConnected = false;
+      stopPolling();
+    };
   });
 
   const statusCategories = [

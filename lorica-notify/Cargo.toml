@@ -1,22 +1,22 @@
 [package]
 name = "lorica-notify"
-version = "1.10.7"
+version = "1.10.8"
 edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-lorica-metrics = { version = "1.10.7", path = "../lorica-metrics" }
+lorica-metrics = { version = "1.10.8", path = "../lorica-metrics" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
 tracing = "0.1"
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
-# Floor pinned to 0.11.22: RUSTSEC-2026-0141 (CVSS 9.1, inverted
-# boolean silently disabling TLS hostname verification) affected
-# 0.10.1 through 0.11.21. Lorica uses `tokio1-rustls-tls`, not the
-# vulnerable `boring-tls` backend, so the path is inactive here, but
-# the floor blocks any resolve below the fix as defense in depth.
-lettre = { version = "0.11.22", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
+# Floor pinned to 0.11.24, the fix for RUSTSEC-2026-0560 to 0565:
+# STARTTLS reply injection, SMTP smuggling through bare line endings,
+# quoted local parts rewritten in the envelope, and panics or
+# unbounded buffering on hostile SMTP replies and display names. It
+# also keeps RUSTSEC-2026-0141 (fixed in 0.11.22) out of any resolve.
+lettre = { version = "0.11.24", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
 reqwest = { workspace = true, features = ["json"] }
 # The TLS policy of the webhook and Slack clients (`lorica_tls::http_client`).
 lorica-tls = { version = "0.1.0", path = "../lorica-tls" }

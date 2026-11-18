@@ -416,20 +416,26 @@
 {:else if activeHelp === 'section:compression'}
   <HelpModal title="Compression" onclose={() => { activeHelp = null; }}>
     <p>
-      Lorica applies on-the-fly gzip (and brotli when the client supports
-      it) to responses whose <code>Content-Type</code> matches text-like
-      MIME types. Only fires when the client advertises a supported
-      <code>Accept-Encoding</code> header.
+      Lorica compresses at a fixed level with the first of gzip, Brotli
+      or zstd that the client lists in its <code>Accept-Encoding</code>
+      header, and adds <code>Vary: Accept-Encoding</code>. Applies to
+      <code>200</code>, <code>403</code> and <code>404</code> responses
+      of a textual type: <code>text/*</code>, JSON, JavaScript, XML, SVG
+      and other <code>+json</code> / <code>+xml</code> types,
+      WebAssembly and uncompressed fonts.
     </p>
     <p>
-      Already-compressed bodies (images, video, <code>.gz</code>
-      downloads) are passed through unchanged. The backend's own
-      <code>Content-Encoding</code> header wins if it is already set.
+      Images, video, archives, binary downloads and partial
+      (<code>206</code>) responses pass through unchanged, as do event
+      streams and gRPC, and any body the backend already encoded.
     </p>
     <p>
-      Runs after <code>Response body rewrite</code> so rewrites operate
-      on the uncompressed bytes, and after the final response has been
-      buffered or streamed.
+      Only a body of declared length is compressed: a response streamed
+      without <code>Content-Length</code> goes out as sent, so a long poll
+      or a log tail is never held in the encoder. A route with a
+      <code>Response body rewrite</code> is not compressed, so the rewrite
+      always sees plain bytes. With the cache on, the compressed and plain
+      variants of a URL are cached apart.
     </p>
   </HelpModal>
 {:else if activeHelp === 'compression_enabled'}

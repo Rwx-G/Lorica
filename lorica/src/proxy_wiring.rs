@@ -270,6 +270,9 @@ pub(crate) use forward_auth::{
 };
 pub(crate) use forward_auth::{run_forward_auth_keyed, ForwardAuthOutcome};
 
+mod compression;
+use compression::{compresses_response, RESPONSE_COMPRESSION_LEVEL};
+
 pub mod mirror_rewrite;
 #[cfg(test)]
 pub(crate) use mirror_rewrite::build_mirror_url;
@@ -2707,8 +2710,10 @@ impl ProxyHttp for LoricaProxy {
         // Traffic capture, response side (Story 10.1). Ahead of the
         // rewrite fast path for two reasons: a route with no rewrite
         // rule still captures, and the bytes recorded are the ones the
-        // upstream sent, before any rewrite rule edits them. The chunk
-        // is read, never replaced.
+        // upstream sent, before any rewrite rule edits them. Route
+        // compression has already run by this point, so on a route with
+        // `compression_enabled` the recorded body is the encoded one the
+        // client receives. The chunk is read, never replaced.
         if let Some(ref mut capture) = ctx.capture {
             if let Some(ref chunk) = *body {
                 capture.push_response(chunk);
@@ -2801,14 +2806,25 @@ impl ProxyHttp for LoricaProxy {
         Ok(None)
     }
 
+    /// A route with a body rewrite is never compressed. Compression runs
+    /// before `response_filter`, and the rewrite refuses an encoded body;
+    /// whether it fires is only settled there, after the cache has judged
+    /// the response and the route's header overrides have applied, so the
+    /// only answer this hook can give without racing it is "not here".
     fn response_compression_level(
         &self,
         _session: &mut Session,
-        _upstream_response: &ResponseHeader,
+        upstream_response: &ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> u32 {
-        match &ctx.route_snapshot {
-            Some(route) if route.compression_enabled => 6, // standard gzip level
+        match ctx.route_snapshot.as_deref() {
+            Some(route)
+                if route.compression_enabled
+                    && route.response_rewrite.is_none()
+                    && compresses_response(upstream_response) =>
+            {
+                RESPONSE_COMPRESSION_LEVEL
+            }
             _ => 0,
         }
     }

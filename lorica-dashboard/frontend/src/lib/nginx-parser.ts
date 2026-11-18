@@ -945,19 +945,21 @@ export const LORICA_HANDLED_DIRECTIVES: Record<string, string> = {
   open_log_file_cache: 'ignored: not applicable',
   // Compression
   gzip: 'Lorica: compression_enabled',
-  gzip_types: 'Lorica: compression auto',
+  gzip_types: 'ignored: fixed type list',
   gzip_vary: 'Lorica: compression auto',
   gzip_proxied: 'Lorica: compression auto',
-  gzip_comp_level: 'Lorica: compression auto',
-  gzip_min_length: 'Lorica: compression auto',
+  gzip_comp_level: 'ignored: fixed compression level',
+  gzip_min_length: 'ignored: fixed minimum length',
   gzip_disable: 'Lorica: compression auto',
   gzip_buffers: 'Lorica: compression auto',
   gzip_http_version: 'Lorica: compression auto',
   gzip_static: 'ignored: static files',
-  brotli: 'ignored: not supported',
-  brotli_types: 'ignored: not supported',
-  brotli_comp_level: 'ignored: not supported',
-  brotli_min_length: 'ignored: not supported',
+  // compression_enabled also compresses with Brotli, for a client that
+  // lists br first.
+  brotli: 'Lorica: compression_enabled',
+  brotli_types: 'ignored: fixed type list',
+  brotli_comp_level: 'ignored: fixed compression level',
+  brotli_min_length: 'ignored: fixed minimum length',
   brotli_static: 'ignored: static files',
   // Server/networking
   sendfile: 'ignored: kernel optimization',

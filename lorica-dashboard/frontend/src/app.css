@@ -367,6 +367,23 @@ tbody tr:hover td {
   color: var(--color-red);
 }
 
+/* A table cell's name that opens its detail view */
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--color-primary);
+  font-weight: 600;
+  font-size: var(--text-md);
+  text-align: left;
+  cursor: pointer;
+  transition: color var(--transition-fast);
+}
+
+.link-btn:hover {
+  text-decoration: underline;
+}
+
 /* Modals */
 .overlay {
   position: fixed;
@@ -540,6 +557,13 @@ tbody tr:hover td {
   color: var(--color-primary);
 }
 
+/* Text, not text-muted: muted on the input surface falls to about 3:1
+   in the dark theme. */
+.badge-gray {
+  background: var(--color-bg-input);
+  color: var(--color-text);
+}
+
 /* Hint text */
 .hint {
   display: block;
@@ -686,6 +710,12 @@ tbody tr:hover td {
 .settings-table th:nth-child(2) { width: 45%; }
 .settings-table th:nth-child(3) { width: 15%; }
 .settings-table th:nth-child(4) { width: 20%; }
+/* The widths above fill 100% with four columns, so under the fixed
+   layout every column past the fourth got no width and the last ones
+   were drawn over each other. A table with more columns sizes them
+   from its content and scrolls inside .settings-table-wrap. */
+.settings-table-wide { table-layout: auto; }
+.settings-table-wide th:nth-child(n) { width: auto; }
 .settings-table td {
   padding: var(--space-2) var(--space-3);
   border-bottom: 1px solid var(--color-border);

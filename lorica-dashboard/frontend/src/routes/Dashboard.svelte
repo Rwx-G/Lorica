@@ -7,7 +7,14 @@
     breakGlassActive,
     fleetBadge,
     isClustered,
+    type BadgeTone,
   } from '../lib/cluster';
+
+  /** The shared app.css badge for each fleet tone, themed in both modes. */
+  const BADGE_CLASS: Record<BadgeTone, string> = {
+    ok: 'badge-green',
+    warning: 'badge-orange',
+  };
 
   /** How often the fleet state is refreshed while a tab is open. */
   const CLUSTER_POLL_MS = 10_000;
@@ -130,7 +137,7 @@
     {@const badge = fleetBadge($clusterStatus)}
     <div class="fleet-bar">
       {#if badge}
-        <span class="badge badge-{badge.tone}" title={badge.reason ?? ''}>
+        <span class="badge {BADGE_CLASS[badge.tone]}" title={badge.reason ?? ''}>
           {badge.label}
         </span>
       {/if}
@@ -161,30 +168,18 @@
   .fleet-bar {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: var(--space-3);
     flex-wrap: wrap;
-    padding: 0.5rem 1.5rem;
-    border-bottom: 1px solid var(--border, #e5e7eb);
+    padding: var(--space-2) 0 var(--space-3);
+    margin-bottom: var(--space-6);
+    border-bottom: 1px solid var(--color-border);
     font-size: 0.85rem;
   }
-  .badge {
-    padding: 0.15rem 0.5rem;
-    border-radius: 999px;
-    font-weight: 600;
-  }
-  .badge-ok {
-    background: #dcfce7;
-    color: #166534;
-  }
-  .badge-warning {
-    background: #fef3c7;
-    color: #92400e;
-  }
   .readonly {
-    color: var(--text-muted, #6b7280);
+    color: var(--color-text-muted);
   }
   .glass {
-    color: #92400e;
+    color: var(--color-orange);
     font-weight: 600;
   }
   .content {

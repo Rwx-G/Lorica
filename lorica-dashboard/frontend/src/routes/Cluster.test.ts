@@ -240,6 +240,65 @@ describe('Cluster page, revocation', () => {
   });
 });
 
+/**
+ * A variant class (`btn-primary`, `btn-cancel`, ...) only sets colours;
+ * padding, radius and font come from the `btn` base class in `app.css`.
+ * This page shipped with bare variants, which rendered as unstyled
+ * browser buttons.
+ */
+function expectVariantButtonsHaveBase() {
+  const variants = Array.from(document.querySelectorAll('button')).filter((b) =>
+    /\bbtn-(primary|secondary|danger|cancel)\b/.test(b.className),
+  );
+  expect(variants.length).toBeGreaterThan(0);
+  for (const button of variants) expect(button).toHaveClass('btn');
+}
+
+describe('Cluster page, button styles', () => {
+  it('gives the page, drawer and add-node dialog buttons the shared base class', async () => {
+    clusterStatus.set(status('control_plane'));
+    vi.spyOn(api, 'listClusterNodes').mockResolvedValue({ data: [node('id-a', 'edge-a')] });
+    vi.spyOn(api, 'getFleetWafEvents').mockResolvedValue({
+      data: { rows: [], next_cursor: null },
+    });
+
+    render(Cluster);
+    await waitFor(() => expect(screen.getByText('edge-a')).toBeInTheDocument());
+    (screen.getAllByText('edge-a')[0] as HTMLElement).click();
+    await waitFor(() => expect(screen.getByText('Revoke node')).toBeInTheDocument());
+    screen.getByRole('button', { name: 'Add node' }).click();
+    await waitFor(() => expect(screen.getByText('Mint token')).toBeInTheDocument());
+
+    expect(screen.getByRole('button', { name: 'Cancel' })).toHaveClass('btn', 'btn-cancel');
+    expect(screen.getByRole('button', { name: 'Mint token' })).toHaveClass('btn', 'btn-primary');
+    expectVariantButtonsHaveBase();
+  });
+
+  it('gives the follower controls the shared base class', async () => {
+    clusterStatus.set(status('follower'));
+    vi.spyOn(api, 'listClusterNodes').mockResolvedValue({ data: [] });
+
+    render(Cluster);
+    await waitFor(() => expect(screen.getByText('Open break-glass')).toBeInTheDocument());
+
+    expect(screen.getByRole('button', { name: 'Leave the fleet' })).toHaveClass('btn', 'btn-danger');
+    expectVariantButtonsHaveBase();
+  });
+
+  it('renders the node status and connection as the shared badges', async () => {
+    clusterStatus.set(status('control_plane'));
+    vi.spyOn(api, 'listClusterNodes').mockResolvedValue({
+      data: [{ ...node('id-a', 'edge-a'), status: 'pending', connected: false }],
+    });
+
+    render(Cluster);
+    await waitFor(() => expect(screen.getByText('edge-a')).toBeInTheDocument());
+
+    expect(screen.getByText('pending')).toHaveClass('badge', 'badge-orange');
+    expect(screen.getByText('offline')).toHaveClass('badge', 'badge-gray');
+  });
+});
+
 describe('Cluster page, follower controls', () => {
   it('offers break-glass and leave on a follower', async () => {
     // Story 9.7 AC #7 banners the read-only state; these two are the
