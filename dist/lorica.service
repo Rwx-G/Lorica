@@ -52,8 +52,12 @@ RestartSec=5
 # stop timeout. Required for both ordinary shutdown and the hot-upgrade
 # drain.
 KillMode=mixed
-# Must exceed the worker drain window (worker_drain_timeout_s, default 30s)
-# with headroom so a legitimate drain is never cut short by systemd.
+# Does not need to cover the drain window (worker_drain_timeout_s): since
+# Story 12.2, a stop that is draining renews its own deadline with
+# sd_notify EXTEND_TIMEOUT_USEC (systemd 236 and later) for as long as the
+# process lives, so a legitimate drain is never cut short. A process that
+# hangs stops renewing and is SIGKILLed once its last extension runs out.
+# This value is the bound when no renewal arrives at all.
 TimeoutStopSec=90
 LimitNOFILE=65536
 
