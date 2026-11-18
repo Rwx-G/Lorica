@@ -10,6 +10,13 @@
   import { canWrite, canWriteRole } from '../lib/auth';
   import { clusterStatus, isFleetView } from '../lib/cluster';
   import NodeFilter from '../components/NodeFilter.svelte';
+  import StreamSlaSection from '../components/StreamSlaSection.svelte';
+  import { get } from 'svelte/store';
+  import { currentQuery } from '../lib/router';
+  import { streamOf } from '../lib/stream-links';
+
+  /** The stream a link from the Streams page opened the page on. */
+  const linkedStream = streamOf(get(currentQuery));
 
   // Story 9.7 AC #5: on a control plane the page shows ONE node at a
   // time. `''` is this node; a follower's id asks the control plane to
@@ -338,6 +345,18 @@
         {/if}
       </div>
     {/if}
+
+    <!--
+      Stream SLA (Story 12.9) has no ?node= read: a follower's stream
+      figures cannot be asked of it through this control plane, so the
+      section shows this node's own and steps aside while a follower is
+      picked rather than labelling this node's figures as that node's.
+    -->
+    {#if selectedNode}
+      <p class="text-muted stream-sla-elsewhere">Stream SLA shows this node's figures only; pick this node to see it.</p>
+    {:else}
+      <StreamSlaSection initialStreamId={linkedStream} />
+    {/if}
   {/if}
 
   <!-- Config modal -->
@@ -424,4 +443,5 @@
 
   .btn-small { padding: var(--space-1) var(--space-3); border-radius: var(--radius-md); font-size: var(--text-base); font-weight: 500; border: 1px solid var(--color-border); background: transparent; color: var(--color-text); cursor: pointer; transition: background-color var(--transition-fast); }
   .btn-small:hover { background: var(--color-bg-hover); }
+  .stream-sla-elsewhere { margin-top: var(--space-8); }
 </style>

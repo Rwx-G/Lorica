@@ -30,6 +30,7 @@ function form(overrides: Partial<FormShape> = {}): FormShape {
     waf_body_scan_max_inflight_bytes: 268435456,
     access_log_retention: 100000,
     waf_event_retention: 100000,
+    stream_access_log_retention: 100000,
     sla_purge_enabled: false,
     sla_purge_retention_days: 90,
     sla_purge_schedule: 'first_of_month',
@@ -204,5 +205,27 @@ describe('GlobalConfigTab, the settings backlog #89 added', () => {
     render(GlobalConfigTab, { props: props({ schema }) });
     const row = screen.getByLabelText('WAF Ban Duration (seconds)').parentElement as HTMLElement;
     expect(row.textContent).toContain('max 30 days');
+  });
+});
+
+describe('GlobalConfigTab, the stream access log retention (Story 12.9)', () => {
+  it('edits its own setting, apart from the HTTP access log retention', async () => {
+    const settingsForm = form({ access_log_retention: 100000, stream_access_log_retention: 5000 });
+    render(GlobalConfigTab, { props: props({ settingsForm }) });
+    const field = screen.getByLabelText('Stream Access Log Retention (entries)') as HTMLInputElement;
+    expect(field.disabled).toBe(false);
+    expect(field.value).toBe('5000');
+    await fireEvent.input(field, { target: { value: '0' } });
+    expect(settingsForm.stream_access_log_retention).toBe(0);
+    expect(settingsForm.access_log_retention).toBe(100000);
+  });
+
+  it('takes its floor from the server schema', async () => {
+    const schema = { stream_access_log_retention: { type: 'integer' as const, min: 0 } };
+    render(GlobalConfigTab, { props: props({ schema }) });
+    const field = screen.getByLabelText('Stream Access Log Retention (entries)') as HTMLInputElement;
+    expect(field.min).toBe('0');
+    await fireEvent.input(field, { target: { value: '-1' } });
+    expect(field.parentElement?.querySelector('[role="alert"]')).not.toBeNull();
   });
 });

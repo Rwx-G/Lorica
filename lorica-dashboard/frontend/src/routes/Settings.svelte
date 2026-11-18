@@ -57,6 +57,7 @@
     waf_body_scan_max_inflight_bytes: 268435456,
     access_log_retention: 100000,
     waf_event_retention: 100000,
+    stream_access_log_retention: 100000,
     sla_purge_enabled: false,
     sla_purge_retention_days: 90,
     sla_purge_schedule: 'first_of_month',
@@ -94,6 +95,7 @@
     syslog_waf_enabled: true,
     syslog_audit_enabled: true,
     syslog_capture_enabled: true,
+    syslog_stream_enabled: true,
     syslog_tls_ca_pem: '',
     syslog_tls_client_cert_pem: '',
     syslog_tls_client_key_pem: '',
@@ -104,6 +106,7 @@
     otlp_logs_waf_enabled: true,
     otlp_logs_audit_enabled: true,
     otlp_logs_capture_enabled: true,
+    otlp_logs_stream_enabled: true,
     // Defense-in-depth data-plane bounds (Story 8.9).
     // connection_limits_per_ip is held as a string so an empty
     // input maps to "no cap" (sent as 0), the way the cert export
@@ -239,6 +242,7 @@
         syslog_waf_enabled: settingsRes.data.syslog_waf_enabled ?? true,
         syslog_audit_enabled: settingsRes.data.syslog_audit_enabled ?? true,
         syslog_capture_enabled: settingsRes.data.syslog_capture_enabled ?? true,
+        syslog_stream_enabled: settingsRes.data.syslog_stream_enabled ?? true,
         syslog_tls_ca_pem: settingsRes.data.syslog_tls_ca_pem ?? '',
         syslog_tls_client_cert_pem:
           settingsRes.data.syslog_tls_client_cert_pem ?? '',
@@ -251,6 +255,7 @@
         otlp_logs_waf_enabled: settingsRes.data.otlp_logs_waf_enabled ?? true,
         otlp_logs_audit_enabled: settingsRes.data.otlp_logs_audit_enabled ?? true,
         otlp_logs_capture_enabled: settingsRes.data.otlp_logs_capture_enabled ?? true,
+        otlp_logs_stream_enabled: settingsRes.data.otlp_logs_stream_enabled ?? true,
         connection_limits_per_ip:
           settingsRes.data.connection_limits_per_ip != null
             ? String(settingsRes.data.connection_limits_per_ip)
@@ -428,6 +433,7 @@
         syslog_waf_enabled: res.data.syslog_waf_enabled ?? true,
         syslog_audit_enabled: res.data.syslog_audit_enabled ?? true,
         syslog_capture_enabled: res.data.syslog_capture_enabled ?? true,
+        syslog_stream_enabled: res.data.syslog_stream_enabled ?? true,
         syslog_tls_ca_pem: res.data.syslog_tls_ca_pem ?? '',
         syslog_tls_client_cert_pem: res.data.syslog_tls_client_cert_pem ?? '',
         syslog_tls_client_key_pem: res.data.syslog_tls_client_key_pem ?? '',
@@ -438,6 +444,7 @@
         otlp_logs_waf_enabled: res.data.otlp_logs_waf_enabled ?? true,
         otlp_logs_audit_enabled: res.data.otlp_logs_audit_enabled ?? true,
         otlp_logs_capture_enabled: res.data.otlp_logs_capture_enabled ?? true,
+        otlp_logs_stream_enabled: res.data.otlp_logs_stream_enabled ?? true,
         connection_limits_per_ip:
           res.data.connection_limits_per_ip != null
             ? String(res.data.connection_limits_per_ip)

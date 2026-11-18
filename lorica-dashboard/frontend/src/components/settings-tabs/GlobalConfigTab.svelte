@@ -22,6 +22,7 @@
     waf_body_scan_max_inflight_bytes: number;
     access_log_retention: number;
     waf_event_retention: number;
+    stream_access_log_retention: number;
     sla_purge_enabled: boolean;
     sla_purge_retention_days: number;
     sla_purge_schedule: string;
@@ -81,6 +82,7 @@
     wafScanBudget: bound('waf_body_scan_max_inflight_bytes', 1_048_576, 17_179_869_184),
     logRet: bound('access_log_retention', 0, 100_000_000),
     wafRet: bound('waf_event_retention', 0, 100_000_000),
+    streamLogRet: bound('stream_access_log_retention', 0, 100_000_000),
     slaPurge: bound('sla_purge_retention_days', 1, 3650),
     activeProbes: bound('max_active_probes', 1, 10_000),
     loadConcurrency: bound('loadtest_max_concurrency', 1, 10_000),
@@ -104,6 +106,7 @@
   let wafScanBudgetErr = $state<string | null>(null);
   let logRetErr = $state<string | null>(null);
   let wafRetErr = $state<string | null>(null);
+  let streamLogRetErr = $state<string | null>(null);
   let slaPurgeErr = $state<string | null>(null);
   let activeProbesErr = $state<string | null>(null);
   let loadConcurrencyErr = $state<string | null>(null);
@@ -140,6 +143,7 @@
   function checkWafScanBudget() { wafScanBudgetErr = integerInRange(settingsForm.waf_body_scan_max_inflight_bytes, c.wafScanBudget); }
   function checkLogRet() { logRetErr = integerInRange(settingsForm.access_log_retention, c.logRet); }
   function checkWafRet() { wafRetErr = integerInRange(settingsForm.waf_event_retention, c.wafRet); }
+  function checkStreamLogRet() { streamLogRetErr = integerInRange(settingsForm.stream_access_log_retention, c.streamLogRet); }
   function checkSlaPurge() { slaPurgeErr = integerInRange(settingsForm.sla_purge_retention_days, c.slaPurge); }
   function checkActiveProbes() { activeProbesErr = integerInRange(settingsForm.max_active_probes, c.activeProbes); }
   function checkLoadConcurrency() { loadConcurrencyErr = integerInRange(settingsForm.loadtest_max_concurrency, c.loadConcurrency); }
@@ -253,6 +257,12 @@
         <input id="s-waf-retention" type="number" min={c.wafRet.min} max={c.wafRet.max} bind:value={settingsForm.waf_event_retention} onblur={checkWafRet} oninput={checkWafRet} />
         {#if wafRetErr}<span class="field-error" role="alert">{wafRetErr}</span>{/if}
         <span class="hint">Maximum WAF events in persistent store (0 = unlimited).</span>
+      </div>
+      <div class="settings-form-row">
+        <label for="s-stream-log-retention">Stream Access Log Retention (entries)</label>
+        <input id="s-stream-log-retention" type="number" min={c.streamLogRet.min} max={c.streamLogRet.max} bind:value={settingsForm.stream_access_log_retention} onblur={checkStreamLogRet} oninput={checkStreamLogRet} />
+        {#if streamLogRetErr}<span class="field-error" role="alert">{streamLogRetErr}</span>{/if}
+        <span class="hint">Maximum stream connection and session rows in the persistent store (0 = unlimited). Kept apart from the HTTP access log, so a busy UDP stream cannot evict HTTP rows nor the reverse. Replicated to every node.</span>
       </div>
 
       <h3 class="subsection-title">Draining and Streams</h3>

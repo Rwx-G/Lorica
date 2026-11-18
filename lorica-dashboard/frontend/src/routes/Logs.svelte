@@ -1,11 +1,22 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { get } from 'svelte/store';
   import { SvelteURLSearchParams } from 'svelte/reactivity';
   import { api, type LogEntry, type LogsQuery } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import NodeFilter from '../components/NodeFilter.svelte';
+  import StreamLogView from '../components/StreamLogView.svelte';
   import { canWrite, canWriteRole } from '../lib/auth';
   import { clusterStatus, isFleetView } from '../lib/cluster';
+  import { currentQuery } from '../lib/router';
+  import { logsViewOf, streamOf, type LogsView } from '../lib/stream-links';
+
+  // HTTP access log or stream access log (Story 12.9), as the link that
+  // opened the page asks; the stream table may arrive filtered on one
+  // stream.
+  const openedWith = get(currentQuery);
+  let view = $state<LogsView>(logsViewOf(openedWith));
+  const linkedStream = streamOf(openedWith);
 
   let entries: LogEntry[] = $state([]);
   let total = $state(0);
@@ -248,7 +259,7 @@
     // genuinely fanned-in rows: the control plane's own traffic,
     // labelled as if its origin were unknown. The fleet view polls
     // instead.
-    if (autoRefresh && !fleetView) connectWebSocket();
+    if (autoRefresh && !fleetView && view === 'http') connectWebSocket();
   });
 
   onDestroy(() => {
@@ -259,7 +270,9 @@
   // React to auto-refresh toggle: connect/disconnect WS + polling
   $effect(() => {
     localStorage.setItem('lorica-logs-autorefresh', String(autoRefresh));
-    if (autoRefresh) {
+    // The live tail and the poll feed the HTTP table only; the stream
+    // table polls on its own.
+    if (autoRefresh && view === 'http') {
       connectWebSocket();
       startAutoRefresh();
     } else {
@@ -290,21 +303,31 @@
   <div class="page-header">
     <h1>Access Logs</h1>
     <div class="header-actions">
+      <div class="view-switch" role="group" aria-label="Log table">
+        <button class="btn btn-secondary" class:active={view === 'http'} aria-pressed={view === 'http'} onclick={() => (view = 'http')}>HTTP</button>
+        <button class="btn btn-secondary" class:active={view === 'streams'} aria-pressed={view === 'streams'} onclick={() => (view = 'streams')}>Streams</button>
+      </div>
       <label class="auto-refresh">
         <input type="checkbox" bind:checked={autoRefresh} />
         <span>{wsConnected ? 'Live (WebSocket)' : 'Auto-refresh (5s)'}</span>
         {#if wsConnected}<span class="ws-dot" title="WebSocket connected"></span>{/if}
       </label>
-      <button class="btn btn-secondary" onclick={loadLogs}>Refresh</button>
-      <button
-        class="btn btn-secondary"
-        onclick={() => { if (!showExport) initExportDefaults(); showExport = !showExport; }}
-      >Export</button>
-      {#if $canWrite}
-        <button class="btn btn-danger" onclick={() => (showClearConfirm = true)}>Clear</button>
+      {#if view === 'http'}
+        <button class="btn btn-secondary" onclick={loadLogs}>Refresh</button>
+        <button
+          class="btn btn-secondary"
+          onclick={() => { if (!showExport) initExportDefaults(); showExport = !showExport; }}
+        >Export</button>
+        {#if $canWrite}
+          <button class="btn btn-danger" onclick={() => (showClearConfirm = true)}>Clear</button>
+        {/if}
       {/if}
     </div>
   </div>
+
+  {#if view === 'streams'}
+    <StreamLogView initialStreamId={linkedStream} {autoRefresh} />
+  {:else}
 
   {#if showExport}
     <div class="export-panel">
@@ -451,6 +474,7 @@
       </table>
     </div>
   {/if}
+  {/if}
 
   {#if showClearConfirm}
     <ConfirmDialog
@@ -470,6 +494,28 @@
     display: flex;
     align-items: center;
     gap: var(--space-3);
+  }
+
+  .view-switch {
+    display: flex;
+  }
+
+  .view-switch .btn {
+    border-radius: 0;
+  }
+
+  .view-switch .btn:first-child {
+    border-radius: var(--radius-md) 0 0 var(--radius-md);
+  }
+
+  .view-switch .btn:last-child {
+    border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  }
+
+  .view-switch .btn.active {
+    background: var(--color-primary-subtle);
+    color: var(--color-primary-text);
+    border-color: var(--color-primary);
   }
 
   .auto-refresh {

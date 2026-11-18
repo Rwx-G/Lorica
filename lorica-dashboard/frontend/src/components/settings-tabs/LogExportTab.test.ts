@@ -23,6 +23,7 @@ function form(overrides: Partial<FormShape> = {}): FormShape {
     syslog_waf_enabled: true,
     syslog_audit_enabled: true,
     syslog_capture_enabled: true,
+    syslog_stream_enabled: true,
     syslog_tls_ca_pem: '',
     syslog_tls_client_cert_pem: '',
     syslog_tls_client_key_pem: '',
@@ -33,6 +34,7 @@ function form(overrides: Partial<FormShape> = {}): FormShape {
     otlp_logs_waf_enabled: true,
     otlp_logs_audit_enabled: true,
     otlp_logs_capture_enabled: true,
+    otlp_logs_stream_enabled: true,
     ...overrides,
   });
 }
@@ -51,16 +53,18 @@ function props(overrides: Partial<TabProps> = {}): TabProps {
 }
 
 /// Label text of every per-kind toggle, paired with the form field it
-/// binds. The four kinds are symmetric on both sinks (backlog #50).
+/// binds. The kinds are symmetric on both sinks (backlog #50, Story 12.9).
 const KIND_TOGGLES: ReadonlyArray<[string, keyof FormShape]> = [
   ['Export access logs', 'syslog_access_enabled'],
   ['Export WAF events', 'syslog_waf_enabled'],
   ['Export audit logs', 'syslog_audit_enabled'],
   ['Export capture records', 'syslog_capture_enabled'],
+  ['Export stream access logs', 'syslog_stream_enabled'],
   ['Export access logs via OTLP', 'otlp_logs_access_enabled'],
   ['Export WAF events via OTLP', 'otlp_logs_waf_enabled'],
   ['Export audit logs via OTLP', 'otlp_logs_audit_enabled'],
   ['Export capture records via OTLP', 'otlp_logs_capture_enabled'],
+  ['Export stream access logs via OTLP', 'otlp_logs_stream_enabled'],
 ];
 
 function checkbox(label: string): HTMLInputElement {

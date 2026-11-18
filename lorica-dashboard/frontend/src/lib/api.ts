@@ -867,6 +867,103 @@ export interface LogsQuery {
   after_id?: number;
 }
 
+/**
+ * One stream access-log row (`StreamLogEntry`, Story 12.9): a TCP
+ * connection or UDP session at its end, an admitted refusal, or a count
+ * of refusals held back. Word fields carry their enums' words as the
+ * server wrote them; a word a later release wrote reads back as it is.
+ */
+export interface StreamLogEntry {
+  id: number;
+  timestamp: string;
+  /** `ended`, or `refusals_suppressed` for a count of held-back refusals. */
+  entry: string;
+  stream_id: string;
+  stream_name: string;
+  protocol: string;
+  /** 0 on a `refusals_suppressed` row. */
+  listen_port: number;
+  client_ip: string;
+  client_port: number;
+  /** The socket peer when a PROXY header replaced it, else empty. */
+  proxied_from: string;
+  backend_id: string;
+  /** The address connected, else empty. */
+  backend_address: string;
+  attempts: number;
+  bytes_upload: number;
+  bytes_download: number;
+  /** Null on TCP. */
+  datagrams_upload: number | null;
+  datagrams_download: number | null;
+  duration_ms: number;
+  /** Null when nothing connected. */
+  connect_ms: number | null;
+  /** Empty on refusal and suppressed rows. */
+  tls_mode: string;
+  sni: string;
+  alpn: string;
+  /** Null when the stream does not verify client certificates. */
+  client_cert: string | null;
+  detected_protocol: string | null;
+  end_reason: string;
+  /** The refusal word when `end_reason` is `refused`, else empty. */
+  refusal_reason: string;
+  /** The count on a `refusals_suppressed` row, else 0. */
+  suppressed: number;
+}
+
+/** `GET /api/v1/stream-logs`: the newest page matching the filters, oldest first. */
+export interface StreamLogsResponse {
+  entries: StreamLogEntry[];
+  total: number;
+}
+
+/** The filters of `GET /api/v1/stream-logs`, which its export shares. */
+export interface StreamLogsFilter {
+  stream_id?: string;
+  /** An end reason word; an unknown one is a 400 naming the words accepted. */
+  end_reason?: string;
+  /** A refusal reason word; an unknown one is a 400 naming the words accepted. */
+  refusal_reason?: string;
+  /** Client address prefix. */
+  client_ip?: string;
+  /** RFC 3339, inclusive. */
+  from?: string;
+  to?: string;
+}
+
+export interface StreamLogsQuery extends StreamLogsFilter {
+  limit?: number;
+  after_id?: number;
+  before_id?: number;
+}
+
+/** The query string of a stream log read or export, every unset filter omitted. */
+export function streamLogsQuery(
+  params: StreamLogsQuery & { format?: 'csv' | 'json' },
+): string {
+  const query = new URLSearchParams();
+  for (const key of [
+    'stream_id',
+    'end_reason',
+    'refusal_reason',
+    'client_ip',
+    'from',
+    'to',
+    'format',
+  ] as const) {
+    const value = params[key];
+    if (value) query.set(key, value);
+  }
+  for (const key of ['limit', 'after_id', 'before_id'] as const) {
+    const value = params[key];
+    if (value !== undefined) query.set(key, String(value));
+  }
+  const qs = query.toString();
+  return qs ? `?${qs}` : '';
+}
+
 // --- Audit log (Story 8.9) ---
 
 /// One hash-chained operator-action record. `chain_hash` is the
@@ -1056,6 +1153,8 @@ export interface GlobalSettingsResponse {
   waf_body_scan_max_inflight_bytes: number;
   access_log_retention: number;
   waf_event_retention: number;
+  // Stream access-log rows kept, 0 unlimited (Story 12.9). Replicated.
+  stream_access_log_retention: number;
   sla_purge_enabled: boolean;
   sla_purge_retention_days: number;
   sla_purge_schedule: string;
@@ -1127,6 +1226,10 @@ export interface GlobalSettingsResponse {
   otlp_logs_waf_enabled?: boolean;
   otlp_logs_audit_enabled?: boolean;
   otlp_logs_capture_enabled?: boolean;
+  // Stream access-log rows on each sink (Story 12.9); node-local,
+  // default true server-side.
+  syslog_stream_enabled?: boolean;
+  otlp_logs_stream_enabled?: boolean;
 }
 
 export interface UpdateSettingsRequest {
@@ -1148,6 +1251,7 @@ export interface UpdateSettingsRequest {
   waf_body_scan_max_inflight_bytes?: number;
   access_log_retention?: number;
   waf_event_retention?: number;
+  stream_access_log_retention?: number;
   sla_purge_enabled?: boolean;
   sla_purge_retention_days?: number;
   sla_purge_schedule?: string;
@@ -1210,6 +1314,8 @@ export interface UpdateSettingsRequest {
   otlp_logs_waf_enabled?: boolean;
   otlp_logs_audit_enabled?: boolean;
   otlp_logs_capture_enabled?: boolean;
+  syslog_stream_enabled?: boolean;
+  otlp_logs_stream_enabled?: boolean;
 }
 
 /**
@@ -1835,6 +1941,21 @@ export const api = {
   clearLogs: () =>
     request<{ message: string }>('DELETE', '/logs'),
 
+  // Stream access log (Story 12.9): Viewer reads, Operator clears.
+  getStreamLogs: (params: StreamLogsQuery = {}) =>
+    request<StreamLogsResponse>('GET', `/stream-logs${streamLogsQuery(params)}`),
+
+  clearStreamLogs: () =>
+    request<{ message: string }>('DELETE', '/stream-logs'),
+
+  /** The download URL of the rows matching `filter`. */
+  streamLogsExportUrl: (filter: StreamLogsFilter, format: 'csv' | 'json') =>
+    `${BASE}/stream-logs/export${streamLogsQuery({ ...filter, format })}`,
+
+  /** Every stream's bind state per node and this node's live counters (Story 12.10). */
+  getStreamStatus: () =>
+    request<{ streams: StreamStatus[] }>('GET', '/streams/status'),
+
   // Audit log (Story 8.9)
   listAudit: (params: AuditQuery) => {
     const query = new URLSearchParams();
@@ -2189,6 +2310,36 @@ export const api = {
     const url = `${BASE}/sla/routes/${routeId}/export?format=${format}`;
     return fetch(url, { credentials: 'same-origin' });
   },
+
+  // Stream SLA (Story 12.9): this node's figures only, no `?node=`.
+  /** The 1h and 24h summaries of every stream with a target or data. */
+  getStreamSlaOverview: () =>
+    request<StreamSlaSummary[]>('GET', '/sla/streams'),
+
+  /** One stream's summaries over every standard window. */
+  getStreamSla: (streamId: string) =>
+    request<StreamSlaSummary[]>('GET', `/sla/streams/${streamId}`),
+
+  /** Raw minute buckets, the last 24 hours unless `from` and `to` say otherwise. */
+  getStreamSlaBuckets: (streamId: string, params?: { from?: string; to?: string }) => {
+    const query = new URLSearchParams();
+    if (params?.from) query.set('from', params.from);
+    if (params?.to) query.set('to', params.to);
+    const qs = query.toString();
+    return request<StreamSlaBucket[]>('GET', `/sla/streams/${streamId}/buckets${qs ? `?${qs}` : ''}`);
+  },
+
+  getStreamSlaConfig: (streamId: string) =>
+    request<StreamSlaConfig>('GET', `/sla/streams/${streamId}/config`),
+
+  updateStreamSlaConfig: (streamId: string, body: UpdateStreamSlaConfigRequest) =>
+    request<StreamSlaConfig>('PUT', `/sla/streams/${streamId}/config`, body),
+
+  clearStreamSla: (streamId: string) =>
+    request<{ stream_id: string; deleted_buckets: number }>('DELETE', `/sla/streams/${streamId}/data`),
+
+  exportStreamSla: (streamId: string, format: 'json' | 'csv') =>
+    fetch(`${BASE}/sla/streams/${streamId}/export?format=${format}`, { credentials: 'same-origin' }),
 
   // Probes
   listProbes: () =>
@@ -2795,6 +2946,124 @@ export interface UpdateSlaConfigRequest {
   max_latency_ms?: number;
   success_status_min?: number;
   success_status_max?: number;
+}
+
+/**
+ * One stream's passive SLA over one window (Story 12.9). A stream judges
+ * connections, not bytes; a UDP stream has no connect, so its latency
+ * fields are `null`, as are a TCP stream's while nothing connected.
+ */
+export interface StreamSlaSummary {
+  stream_id: string;
+  window: string;
+  judged_count: number;
+  success_count: number;
+  failure_count: number;
+  /** Percent of the judged connections that succeeded; 0 when none was judged. */
+  sla_pct: number;
+  avg_connect_latency_ms: number | null;
+  p50_connect_latency_ms: number | null;
+  p95_connect_latency_ms: number | null;
+  p99_connect_latency_ms: number | null;
+  target_pct: number;
+  meets_target: boolean;
+}
+
+/** One stream's judged connections over one minute. */
+export interface StreamSlaBucket {
+  id: number | null;
+  stream_id: string;
+  bucket_start: string;
+  source: string;
+  judged_count: number;
+  success_count: number;
+  failure_count: number;
+  /** The judged connections that connected: the sample count behind the latencies. */
+  connected_count: number;
+  connect_latency_sum_ms: number | null;
+  connect_latency_min_ms: number | null;
+  connect_latency_max_ms: number | null;
+  connect_latency_p50_ms: number | null;
+  connect_latency_p95_ms: number | null;
+  connect_latency_p99_ms: number | null;
+  cfg_target_pct: number;
+  cfg_max_connect_latency_ms: number;
+}
+
+/** A stream's SLA target, the shipped default until one is written. */
+export interface StreamSlaConfig {
+  stream_id: string;
+  target_pct: number;
+  /** A TCP connection connecting slower than this is a failure; UDP never reads it. */
+  max_connect_latency_ms: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** `PUT /api/v1/sla/streams/{id}/config`: only the fields sent change. */
+export interface UpdateStreamSlaConfigRequest {
+  target_pct?: number;
+  max_connect_latency_ms?: number;
+}
+
+// --- Stream status (Story 12.10) ---
+
+/** A stream's bind state on the answering node (`StreamBindState`). */
+export interface StreamBindState {
+  state: Exclude<StreamBindStateKind, 'unknown'>;
+  /** `bound` only. */
+  workers_serving?: number;
+  workers?: number;
+  /** `failed` only, as the four below. */
+  kind?: StreamBindFailureKind;
+  os_error?: string;
+  port?: number;
+  since?: string;
+}
+
+/** One node's bind state of a stream, on a control plane. */
+export interface StreamNodeState {
+  node_id: string;
+  node_name: string;
+  state: StreamBindStateKind;
+  kind?: StreamBindFailureKind;
+  os_error?: string;
+  port?: number;
+  since?: string;
+}
+
+/** A count under one reason word of the metric family its field names. */
+export interface StreamReasonCount {
+  reason: string;
+  count: number;
+}
+
+/** One stream's counters on the answering node, as its `/metrics` renders them. */
+export interface StreamLiveCounters {
+  /** The answering node's name on a follower; `null` standalone and on a control plane. */
+  node_name: string | null;
+  active: number;
+  pending: number;
+  accepted_total: number;
+  bytes_upload_total: number;
+  bytes_download_total: number;
+  /** Non-zero reasons only. */
+  refused: StreamReasonCount[];
+  ended: StreamReasonCount[];
+  datagrams_dropped: StreamReasonCount[];
+}
+
+/** One entry of `GET /api/v1/streams/status`. */
+export interface StreamStatus {
+  id: string;
+  name: string;
+  protocol: StreamProtocol;
+  /** This node's state; `null` when this node does not bind the stream. */
+  bind: StreamBindState | null;
+  /** On a control plane, every active node binding the stream; `null` elsewhere. */
+  nodes: StreamNodeState[] | null;
+  /** `null` while nothing has counted the stream on this node. */
+  counters: StreamLiveCounters | null;
 }
 
 // --- Probes ---

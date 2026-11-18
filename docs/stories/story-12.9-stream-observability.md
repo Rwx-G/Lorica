@@ -791,10 +791,10 @@ Allowlist: `lorica-dashboard/frontend/src/routes/Logs.svelte`,
 `lorica-dashboard/frontend/src/lib/api.ts`, the settings component that
 holds the syslog and OTLP kind toggles, their `*.test.ts`, new test files.
 
-- [ ] Logs: HTTP / Streams switch, the stream table and filters (D-b).
-- [ ] SLA: Streams section with config editor (D-g).
-- [ ] Settings: the two stream toggles and the retention field.
-- [ ] Gates: `tsc`, `svelte-check`, ESLint, Vitest (per
+- [x] Logs: HTTP / Streams switch, the stream table and filters (D-b).
+- [x] SLA: Streams section with config editor (D-g).
+- [x] Settings: the two stream toggles and the retention field.
+- [x] Gates: `tsc`, `svelte-check`, ESLint, Vitest (per
       `.claude/rules/lorica-frontend.md`); `pnpm-lock.yaml` untouched (no
       dependency).
 
@@ -1594,6 +1594,52 @@ edited here.
 - Lot F gates, `rust:1-bookworm` with `CARGO_BUILD_WARNINGS=deny`: the
   CI chain green (3,665 product, 976 `lorica`, 915 forked, 592
   TLS-featured tests) and `cargo audit` clean.
+- **Lot H (dashboard), 2026-11-18.** Logs page: an HTTP / Streams
+  switch in the header; the stream table is `StreamLogView.svelte`
+  (new), polling `GET /api/v1/stream-logs` every 5 s while the page's
+  auto-refresh is on (no live tail exists for stream rows), with the
+  filters of `StreamLogsQuery` (stream, end reason, refusal reason,
+  client prefix, a time range sent as `from`, the page size), export
+  through `/api/v1/stream-logs/export` with the same filters, and Clear
+  for `canWrite` behind a confirmation. The HTTP live tail and poll
+  stop while the stream table shows.
+- **No reason vocabulary in the dashboard.** The two reason filters
+  are text inputs whose suggestions are the words the rows on screen
+  carry; a word not offered can be typed, and the server's 400, which
+  names the words it accepts, is shown as it is. No end-reason or
+  refusal list is copied into the frontend. Badge tone is structural:
+  a row with a `refusal_reason` reads red, a `refusals_suppressed` row
+  orange, every other end neutral.
+- **SLA page:** a Streams section (`StreamSlaSection.svelte`, new)
+  below the routes: one card per stream from the 24h row of
+  `GET /api/v1/sla/streams`, names and protocols from
+  `GET /api/v1/streams/status` (the overview rows carry only the id);
+  the detail reads the four windows, the minute buckets and the target;
+  latency columns and the latency bound are hidden on UDP and never
+  sent there; Configure (target, and the bound on TCP), export CSV and
+  JSON, and Clear for `canWrite`. No range is copied: the server's 400
+  is shown in the dialog. On a control plane with a follower picked in
+  the node filter the section is replaced by a sentence, since the
+  stream reads have no `?node=` (Lot G).
+- **Settings:** `stream_access_log_retention` in Global Configuration
+  beside the two other retentions (its floor from `/settings/schema`),
+  `syslog_stream_enabled` and `otlp_logs_stream_enabled` in Log Export.
+  The retention field is now an editable binding of the settings tabs,
+  which is what `every_allowlisted_setting_is_a_field_the_dashboard_form_edits_and_the_document_carries`
+  reads: the automation allowlist entry (Lot C1's note) can be added.
+- **Links (for Story 12.10 Lot D1):** `lib/stream-links.ts` builds and
+  reads them: `#/logs?view=streams&stream=<id>` and
+  `#/sla?stream=<id>`. `lib/router.ts` now splits the hash into a path
+  and a query (`splitHash`, `currentQuery`), so the loader map and the
+  sidebar key on the path alone. Outside the allowlist: `router.ts`,
+  the two new components and their tests, `Logs.test.ts`,
+  `Settings.svelte` (the form defaults), `GlobalConfigTab.svelte`
+  (the retention field lives there, not in the sink tab), and the
+  `StreamStatus` types and `getStreamStatus` in `api.ts`, which Story
+  12.10 Lot D1 reuses.
+- Lot H gates, `node:22` with `CI=true` and `pnpm install
+  --frozen-lockfile`: `pnpm run check` 0 errors and 0 warnings, `pnpm
+  run lint` clean, Vitest green (see the Change Log row).
 
 ## File List
 
@@ -1674,6 +1720,16 @@ edited here.
   `lorica-config/src/store/sla.rs`, `lorica-config/src/tests.rs`,
   `docs/automation.md` (Lot C3, the stream SLA overview, Resolved 9)
 
+- `lorica-dashboard/frontend/src/lib/api.ts`, `lib/router.ts`,
+  `lib/stream-links.ts` (new), `lib/stream-links.test.ts` (new),
+  `routes/Logs.svelte`, `routes/Logs.test.ts` (new), `routes/Sla.svelte`,
+  `routes/Settings.svelte`, `components/StreamLogView.svelte` (new),
+  `components/StreamLogView.test.ts` (new),
+  `components/StreamSlaSection.svelte` (new),
+  `components/StreamSlaSection.test.ts` (new),
+  `components/settings-tabs/GlobalConfigTab.svelte`, `GlobalConfigTab.test.ts`,
+  `LogExportTab.svelte`, `LogExportTab.test.ts` (Lot H)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1692,3 +1748,4 @@ edited here.
 | 2026-11-18 | 0.13 | Lot F: the stream observer writes rows and judges the SLA, workers report their stream counters and gauges, the plane prunes and sets the node gauges, `stream_backend_down` and `stream_udp_ceiling_reached` raised, `backend_down` names its streams, OTLP export outcome in `lorica_log_sink_up`, stream retention, rows flushed before the sinks at a stop; process tests in both modes. | Romain G. |
 | 2026-11-18 | 0.14 | Lot C3 closed: the overview `streams` field built as a read of its own (Resolved 9), `GET /api/v1/sla/streams` (Viewer), `GET /automation/v1/sla/streams` under `sla:read` and the MCP read tool `lorica_sla_streams`, the 1h and 24h windows of every held stream with a target or data, rows naming the stream by id, paged with the window pushed into the computation; both OpenAPI documents. Gates on the final tree: the CI chain green (3,687 product, 957 `lorica`, 915 forked, 592 TLS-featured tests), `cargo audit` clean. | Romain G. |
 | 2026-11-18 | 0.9 | Lot C1: `stream_access_logs` with its own retention and writer queue, `StreamLogEntry` built from the stream records, `/api/v1/stream-logs` with export and clear, the three settings in the settings API, the `stream` sink kind, and a syslog up state that follows the collector without traffic. | Romain G. |
+| 2026-11-18 | 0.15 | Lot H: the Logs page's HTTP / Streams switch with the stream table, its filters, export and clear; the SLA page's Streams section with windows, buckets, target editor, export and delete; the stream retention and the two stream sink toggles in the settings forms; `#/logs?view=streams&stream=<id>` and `#/sla?stream=<id>` links. Frontend gates green (check, lint, Vitest 904). | Romain G. |

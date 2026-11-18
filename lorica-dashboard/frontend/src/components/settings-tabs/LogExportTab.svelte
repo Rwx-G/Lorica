@@ -14,6 +14,7 @@
     syslog_waf_enabled: boolean;
     syslog_audit_enabled: boolean;
     syslog_capture_enabled: boolean;
+    syslog_stream_enabled: boolean;
     syslog_tls_ca_pem: string;
     syslog_tls_client_cert_pem: string;
     syslog_tls_client_key_pem: string;
@@ -24,6 +25,7 @@
     otlp_logs_waf_enabled: boolean;
     otlp_logs_audit_enabled: boolean;
     otlp_logs_capture_enabled: boolean;
+    otlp_logs_stream_enabled: boolean;
   }
 
   interface Props {
@@ -237,6 +239,14 @@
         </label>
       </div>
 
+      <div class="settings-form-row">
+        <label class="toggle-row">
+          <input type="checkbox" bind:checked={settingsForm.syslog_stream_enabled} />
+          Export stream access logs
+        </label>
+        <span class="hint">One message per stream connection, UDP session or refusal, MSGID <code>stream</code>, at the access log severity. This node only.</span>
+      </div>
+
       {#if settingsForm.syslog_transport === 'tcp-tls'}
         <div class="settings-form-row">
           <label for="syslog-tls-ca">TLS CA bundle (PEM)</label>
@@ -345,6 +355,14 @@
           <input type="checkbox" bind:checked={settingsForm.otlp_logs_capture_enabled} />
           Export capture records via OTLP
         </label>
+      </div>
+
+      <div class="settings-form-row">
+        <label class="toggle-row">
+          <input type="checkbox" bind:checked={settingsForm.otlp_logs_stream_enabled} />
+          Export stream access logs via OTLP
+        </label>
+        <span class="hint">This node only.</span>
       </div>
 
       <div class="settings-form-row">
