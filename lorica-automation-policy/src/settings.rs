@@ -147,8 +147,8 @@ impl AdminSetting {
     }
 }
 
-/// The highest row retention the admin tier may raise either persistent
-/// buffer to: ten times the shipped default of 100000 rows.
+/// The highest row retention the admin tier may raise any persistent
+/// log buffer to: ten times the shipped default of 100000 rows.
 ///
 /// A raise-only retention is safe only up to a size a human chose the
 /// disk for. An access-log row weighs about 500 bytes once its four
@@ -221,6 +221,19 @@ pub const SETTINGS_ALLOWLIST: &[AdminSetting] = &[
               and 0 (unlimited) is refused because the table then grows until the disk fills; \
               no higher than RETENTION_TIER_CEILING_ROWS, about half a gigabyte of rows, for \
               the same reason",
+        min: 1,
+        max: RETENTION_TIER_CEILING_ROWS,
+        direction: Direction::RaiseOnly,
+        reach: Reach::Fleet,
+        takes_effect: TakesEffect::Live,
+        validator_also: None,
+    },
+    AdminSetting {
+        name: "stream_access_log_retention",
+        why: "retention of the persistent stream access-log buffer, kept apart from the HTTP \
+              one so neither evicts the other; raised, it keeps more history, and 0 \
+              (unlimited) is refused; no higher than RETENTION_TIER_CEILING_ROWS, for the \
+              disk's sake",
         min: 1,
         max: RETENTION_TIER_CEILING_ROWS,
         direction: Direction::RaiseOnly,

@@ -2422,8 +2422,7 @@ components:
       description: >-
         The global settings the admin tier may change, and no other,
         each within the bound its `minimum` and `maximum` publish; the
-        three retentions may also only be raised from their stored
-        value. Each field means what it means on `PUT /api/v1/settings`
+        retentions may also only be raised from their stored value. Each field means what it means on `PUT /api/v1/settings`
         in `openapi.yaml`, is optional, and is validated by the same
         function after the tier's bound; a field absent leaves the
         stored value alone. A key not listed here is refused (403) with
@@ -2435,6 +2434,12 @@ components:
       additionalProperties: false
       properties:
         access_log_retention:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 1000000
+          description: Raise-only. 0 (unlimited) is refused, and so is anything above ten times the shipped default.
+        stream_access_log_retention:
           type: integer
           format: int64
           minimum: 1

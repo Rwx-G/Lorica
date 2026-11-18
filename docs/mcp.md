@@ -861,6 +861,7 @@ accepts, and how far it lets each one move:
 | Setting | Tier bound | Management API | Reach | Takes effect |
 |---|---|---|---|---|
 | `access_log_retention` | raise-only, 1..=1000000 | 0.. | fleet | live |
+| `stream_access_log_retention` | raise-only, 1..=1000000 | 0.. | fleet | live |
 | `waf_event_retention` | raise-only, 1..=1000000 | 0.. | fleet | live |
 | `sla_purge_retention_days` | raise-only, 1..=3650 | 1..=3650 | fleet | live |
 | `cert_warning_days` | 14..=365 | 1.. | fleet | live |
@@ -891,7 +892,7 @@ there.
 
 **Every key has a safe direction and a bound.** A key is on the list
 only when a model reading attacker-authored text can move it in a
-direction that harms nothing. The three retentions only go up: a
+direction that harms nothing. The retentions only go up: a
 retention lowered deletes rows that setting it back does not bring
 back, and 0, which means unlimited, is refused because the table then
 grows until the disk fills. The certificate alert thresholds cannot go

@@ -2111,12 +2111,22 @@ mod tests {
 
     #[test]
     fn the_retention_ceiling_is_ten_times_the_shipped_default() {
-        let defaults = lorica_config::models::GlobalSettings::default();
-        for shipped in [defaults.access_log_retention, defaults.waf_event_retention] {
-            assert_eq!(RETENTION_TIER_CEILING_ROWS, shipped * 10);
-        }
-        for name in ["access_log_retention", "waf_event_retention"] {
-            let setting = admin_setting(name).expect("allowlisted");
+        // The row-count retentions are the keys named `*_retention`; the
+        // day-count ones end in `_days` and have bounds of their own.
+        let defaults = serde_json::to_value(lorica_config::models::GlobalSettings::default())
+            .expect("the settings document serialises");
+        let row_retentions: Vec<&AdminSetting> = SETTINGS_ALLOWLIST
+            .iter()
+            .filter(|setting| setting.name.ends_with("_retention"))
+            .collect();
+        assert!(
+            !row_retentions.is_empty(),
+            "no row retention is allowlisted; the filter went blind"
+        );
+        for setting in row_retentions {
+            let name = setting.name;
+            let shipped = defaults[name].as_i64().expect("a shipped row count");
+            assert_eq!(RETENTION_TIER_CEILING_ROWS, shipped * 10, "{name}");
             assert_eq!(setting.max, RETENTION_TIER_CEILING_ROWS, "{name}");
             assert!(
                 setting
