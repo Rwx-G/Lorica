@@ -505,6 +505,23 @@ lives in.
   with worker CPU per GiB never more than 4.7 % worse. On an upstream
   sync, keep both constants at 64 KiB; taking `L4BufferSettings` makes
   the read-ahead a setting whose Lorica default is 64 KiB.
+- **`lorica-proxy`, a compression level chosen per response (v0.1.2,
+  repaired in v1.10.8).** Sites: `lorica-proxy/src/proxy_trait.rs`
+  (`ProxyHttp::response_compression_level`, defaulted to `0`) and
+  `lorica-proxy/src/lib.rs` (`apply_response_compression_level`, called
+  before `upstream_compression.response_filter` in `proxy_h1.rs`,
+  `proxy_h2.rs` and `proxy_custom.rs`, and `enable_response_compression`).
+  Upstream's own response-time hook, `adjust_upstream_modules` (feature
+  `upstream_modules`, `21fa5929` and `6ac51b38`), is not ported, so this
+  is the only place the level is set. Lorica asks for it on the final
+  response header, so the route's `compression_enabled` decides.
+  The context is created disabled and a disabled context does not record
+  the request's `Accept-Encoding`, so `enable_response_compression` feeds
+  the client's request header again after raising the level; until
+  1.10.8 it did not, and no response was ever compressed (#59).
+  `raising_the_level_alone_compresses_nothing` pins the context
+  behaviour this works around: if an upstream sync makes it fail, the
+  second `request_filter` call can go.
 
 ## Upstream sync record
 
