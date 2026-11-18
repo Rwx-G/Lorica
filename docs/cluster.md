@@ -308,6 +308,21 @@ replication into an arbitrary-path file write on every edge. Users,
 sessions and preferences are never touched either: operator accounts
 stay node-local.
 
+The client-address trust lists are node-local by the same decision:
+`trusted_proxies` and, since 1.11.0, the PROXY protocol settings of the
+HTTP and HTTPS listeners (`proxy_protocol_http`,
+`proxy_protocol_https`, `proxy_protocol_trusted_cidrs`). A replicated
+trust list would let one control-plane compromise make every edge
+accept forged client addresses from a network of the attacker's
+choosing, which would defeat every IP allowlist in the fleet at once.
+The cost is that each node is configured on its own; on a follower that
+means before enrollment, or inside a break-glass window (see
+"Follower read-only, and break-glass"). A stream's own PROXY trust list
+(`proxy_protocol_trusted_cidrs` on the stream) is the exception and
+replicates with the stream: a stream is already a replicated perimeter
+object, and a control plane that can write its trust list can as well
+open its port.
+
 Secret material is never in the blob. Certificate private keys,
 notification-channel payloads and DNS-provider credentials are carried
 as a `sha256:` digest, which moves when the secret changes (so drift
@@ -688,6 +703,16 @@ Node names are unique from this version on, and enrollment refuses a
 name already taken. That is for the operator writing a route selector,
 not for the security model, which does not rest on names.
 
+**A stream that terminates TLS entitles its nodes too (1.11.0).** It
+names its certificates explicitly, `tls_terminate.certificate_ids`,
+and each one entitles the stream's `node_selector` exactly as a route's
+`certificate_id` does: the push, the pull and the node drawer read the
+same rule (`cert_key_recipients` and `certificates_entitling_node` in
+`lorica-config/src/store/cluster_nodes.rs`), and a disabled stream still
+entitles, as a disabled route does. Entitlement is not inferred from
+the names a stream's rules match: that would hand a key to every node
+of any stream whose rule happens to cover the name.
+
 ### What distribution actually means
 
 Stated plainly, because it is a real trust decision and not an
@@ -798,9 +823,20 @@ fleet at 03:14" without three SSH sessions.
 
 ### What travels, and what stamps it
 
-Access-log rows and WAF events travel; so does a snapshot of the live
-bans. Nothing else. Audit entries are Story 9.9's, and they need a
-different mechanism because the audit chain cannot simply be copied.
+Access-log rows and WAF events travel; so do stream log rows (since
+1.11.0, one per stream connection or UDP session, and the refusal rows
+the stream limiter writes) and a snapshot of the live bans. Nothing
+else. Audit entries are Story 9.9's, and they need a different
+mechanism because the audit chain cannot simply be copied.
+
+Stream rows matter on a fleet in particular: a stream targeted at
+followers by its `node_selector` carries its traffic there, so a stream
+log the control plane could not show would be blind exactly where
+streams run. They ride the same telemetry push under their own cursor,
+are admitted as access rows are (charged to the per-node quota on the
+traffic side, shed by the storage watermark, counted under the same
+drop reasons), and land in `fleet_stream_logs` in
+`cluster-telemetry.db`, under the same per-node retention.
 
 **No message carries a node identity.** The control plane stamps every
 row it stores with the `node_id` that node's mutual-TLS session
@@ -970,8 +1006,8 @@ OWN retention keeps trimming: rows the drain had not sent yet are
 deleted locally and will never reach the fleet view. Nothing is
 dropped at the control plane, so neither counter above moves, and a
 quiet edge reads exactly like a truncated one.
-`lorica_cluster_telemetry_lost_to_retention_total{kind}` (`access` or
-`waf`) is counted on the follower, where the delete happens, over
+`lorica_cluster_telemetry_lost_to_retention_total{kind}` (`access`,
+`waf` or `stream`) is counted on the follower, where the delete happens, over
 exactly the rows retention took from above the drain cursor. A
 non-zero value means the fleet view has a hole for that node and the
 node's own log is the only place that period still exists. The
@@ -982,13 +1018,21 @@ retention pass also logs it at WARN.
 ```
 GET /api/v1/cluster/logs?node=<node_id>&route=shop.example.com&from=...&to=...
 GET /api/v1/cluster/waf-events?node=<node_id>
+GET /api/v1/stream-logs?node=<node_id>&stream_id=<UUID>
 ```
 
-Both are cursor-paginated and return no total. Pass the previous
+All three are cursor-paginated and return no total. Pass the previous
 page's `next_cursor` as `before_id`; a null `next_cursor` is the last
 page. The absent total is deliberate: a `COUNT(*)` per page on an
 aggregated table is a full scan under the store lock, so a dashboard
 polling it would stall the ingest writer.
+
+The stream log read is the local one with a node filter: without
+`?node=` it answers this node's own rows, with their total; with it, on
+a control plane, the rows that follower fanned in, with the local
+read's filters, oldest first, the answer naming the node. Off a control
+plane `?node=` is a `409`. The automation plane's stream log read takes
+no `?node=`.
 
 Every fleet read (the roster, the replication and drift reports, the
 fan-in queries, the ban snapshot) sits at the **Operator** floor, and
@@ -1013,6 +1057,19 @@ plane already holds (`SlaPull`, tag 42), and serves them unchanged.
 Operator floor, like every fleet read; a node with no session answers
 409 rather than an empty chart. Export and clear stay local to the
 node you are on.
+
+Streams have an SLA of their own since 1.11.0 (availability, and on
+TCP the backend connect latency), and it follows the same rule.
+`GET /api/v1/sla/streams`, `/api/v1/sla/streams/{id}` and its
+`/buckets` take `?node=` and pull from that follower over the same
+session, the pull naming the stream; the follower answers with the
+same computation as its local read. A follower whose release reports no
+stream SLA answers the pull without it, and the control plane says so
+with a `409` rather than an empty chart. The **targets** are a
+different matter: a stream's SLA target and connect-latency bound
+replicate with the stream, cut per recipient like it, as route SLA
+targets do, so every node that binds a stream judges it against the
+same target.
 
 ### Log sinks in a fleet
 
@@ -1355,12 +1412,14 @@ see this: the sessions stay up, and only the rounds fail.
 
 ### From 1.10.x to 1.11.0
 
-1.11.0 carries schema migrations 71 to 73 (streams and their backend
-links, the typed health check, the reserved ports on `cluster_nodes`)
+1.11.0 carries schema migrations 71 to 80 (streams and their backend
+links and settings, the typed health check, the reserved ports on
+`cluster_nodes`, the stream SLA tables, and the subscription of
+explicitly-listed notification channels to the new stream alert types)
 and moves the canonical format from version 2 to 3, once for the whole
-release: the blob gains `streams` and `stream_backends`, and every
-backend gains `health_check`, all of them unknown fields to a 1.10.x
-decoder. The order is the usual one, **followers first, the control
+release: the blob gains `streams`, `stream_backends` and
+`stream_sla_configs`, and every backend gains `health_check`, all of
+them unknown fields to a 1.10.x decoder. The order is the usual one, **followers first, the control
 plane last**, because the schema gate refuses a follower behind the
 control plane.
 
@@ -1388,6 +1447,26 @@ control plane and reaches the fleet once the control plane runs 1.11.0.
 It is the freeze that keeps the fleet from silently serving something
 other than what the dashboard shows for the length of the rollout. The 1.8.0 upgrade (version 1 to 2)
 had the same window.
+
+**Telemetry in the window.** An upgraded follower keeps pushing its
+access rows, WAF events and audit rows to the 1.10.x control plane as
+before. On a first upgrade it has no stream rows to send, since a
+1.10.x control plane holds no stream; it has some when the control
+plane was rolled back to 1.10.7 after streams existed (below). Those
+rows ride a field the old control plane ignores and never acknowledges,
+and the per-class cursors keep the stream cursor where it is while the
+others advance. **The rows wait in
+the follower's own store** and reach the fleet view once the control
+plane runs 1.11.0. Two things can still lose them for the fleet view,
+never for the follower: local retention taking them first (counted on
+`lorica_cluster_telemetry_lost_to_retention_total{kind="stream"}`), and
+a follower restart inside the window, after which a stream cursor the
+old control plane never let advance reads as "never drained" and is
+seeded at the present. The cost while the window lasts is up to one
+batch of stream rows re-sent per drain tick. Stream SLA reads with
+`?node=` are not answered by a node that does not report stream SLA
+(`409`); with followers upgraded first, a 1.11.0 control plane never
+meets one.
 
 Why the 1.11.0 decoder does not also accept version 2 as "no streams",
 which would remove the window: a control plane rolled back to 1.10.x
