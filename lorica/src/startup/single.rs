@@ -837,10 +837,11 @@ pub(crate) fn run_single_process(cli: Cli) {
         // to be idle, for the setting as it is now at most.
         let drain = startup::drain::stored_drain_timeout(&*store.lock().await);
         stream_plane.quiesce(drain).await;
-        let probe = startup::drain::DrainProbe {
-            http_in_flight: Arc::clone(&active_connections),
-            streams: stream_runtime.tracker().clone(),
-        };
+        let probe = startup::drain::DrainProbe::new(
+            Arc::clone(&active_connections),
+            stream_runtime.tracker().clone(),
+            lorica_worker::stream_ctl::QuiesceReason::Shutdown,
+        );
         match tokio::task::spawn_blocking(move || {
             startup::drain::wait_for_drain(&probe, drain, startup::drain::DRAIN_POLL_INTERVAL)
         })

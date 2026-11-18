@@ -12,16 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! How a stop drains (Story 12.2 D-f).
+//! How a stop or a hot upgrade drains (Story 12.2 D-f, Story 12.11).
 //!
 //! - [`pingora_server_conf`]: Pingora's own shutdown waits, from the
 //!   drain setting's hard maximum instead of its 300 s `EXIT_TIMEOUT`.
 //! - The drain watcher ([`wait_for_drain`], [`arm_worker_drain`]): once
-//!   a stop starts, it ends the process as soon as no HTTP request and
-//!   no stream connection is in flight, or at the drain deadline, having
-//!   first let the stream tracker close what is left with
-//!   `node_shutdown`. This is what makes a stop take as long as the
-//!   traffic needs and no longer.
+//!   a stop or an upgrade starts, it ends the process as soon as no HTTP
+//!   request and no stream connection is in flight, or at the drain
+//!   deadline, having first let the stream tracker close what is left
+//!   with the quiesce's end reason: `node_shutdown` for a stop,
+//!   `drained_by_upgrade` for an upgrade. This is what makes a drain take
+//!   as long as the traffic needs and no longer. At the end of an upgrade
+//!   drain a worker sends its drain report to its supervisor first.
 //! - The stop keepalive ([`start_stop_keepalive`]): while a stop drains
 //!   under systemd, `EXTEND_TIMEOUT_USEC` keeps the unit's
 //!   `TimeoutStopSec` from cutting it short.
@@ -36,7 +38,9 @@ use lorica_config::models::{GlobalSettings, StreamEndReason};
 use lorica_config::ConfigStore;
 use lorica_core::server::configuration::ServerConf;
 use lorica_core::server::ExecutionPhase;
-use lorica_stream::{ConnectionTracker, StreamRuntimeHandle};
+use lorica_stream::{quiesce_end_reason, ConnectionTracker, Quiesced, StreamRuntimeHandle};
+pub(crate) use lorica_worker::stream_ctl::DrainEnd;
+use lorica_worker::stream_ctl::QuiesceReason;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -110,70 +114,133 @@ pub(crate) fn stored_drain_timeout(store: &ConfigStore) -> Duration {
 }
 
 /// What the drain watcher looks at: the HTTP requests in flight and the
-/// stream connections and sessions the tracker holds.
+/// stream connections and sessions the tracker holds, and the end reason
+/// it closes the leftovers with.
 #[derive(Debug, Clone)]
 pub(crate) struct DrainProbe {
     /// `LoricaProxy::active_connections`, which counts in-flight
     /// requests, not idle keepalive connections.
-    pub(crate) http_in_flight: Arc<AtomicU64>,
+    http_in_flight: Arc<AtomicU64>,
     /// The stream runtime's tracker.
-    pub(crate) streams: ConnectionTracker,
+    streams: ConnectionTracker,
+    /// What a connection still open at the deadline closes with.
+    end_reason: StreamEndReason,
 }
 
 impl DrainProbe {
+    /// A probe for a drain quiesced for `reason`.
+    pub(crate) fn new(
+        http_in_flight: Arc<AtomicU64>,
+        streams: ConnectionTracker,
+        reason: QuiesceReason,
+    ) -> Self {
+        DrainProbe {
+            http_in_flight,
+            streams,
+            end_reason: quiesce_end_reason(reason),
+        }
+    }
+
     fn idle(&self) -> bool {
         self.http_in_flight.load(Ordering::Acquire) == 0 && self.streams.is_empty()
     }
 
-    /// Close every stream connection still open, with `node_shutdown`
-    /// unless it was already draining for another reason.
+    /// Close every stream connection still open with the drain's end
+    /// reason, unless it was already draining for another one.
     fn close_remaining(&self) {
         let now = tokio::time::Instant::now();
-        self.streams.drain_all(now, StreamEndReason::NodeShutdown);
+        self.streams.drain_all(now, self.end_reason);
         self.streams.close_expired(now);
     }
 }
 
-/// How a drain ended.
+/// How a drain ended, and what the exit cuts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DrainEnd {
-    /// No traffic was left before the deadline.
-    Idle,
-    /// The deadline passed with traffic still in flight.
-    Deadline,
+pub(crate) struct DrainOutcome {
+    /// Idle before the deadline, or not.
+    pub(crate) end: DrainEnd,
+    /// HTTP requests still in flight at the deadline, which the exit
+    /// cuts; 0 when the drain ended idle.
+    pub(crate) http_cut: u64,
 }
 
 /// Wait, blocking, until `probe` is idle or `drain` has elapsed,
 /// checking every `poll`. At the deadline the stream connections left
-/// are closed with `node_shutdown` and given [`DEADLINE_CLOSE_GRACE`] to
-/// end, so their end reason is written here and never left to the exit.
-pub(crate) fn wait_for_drain(probe: &DrainProbe, drain: Duration, poll: Duration) -> DrainEnd {
+/// are closed with the probe's end reason and given
+/// [`DEADLINE_CLOSE_GRACE`] to end, so their end reason is written here
+/// and never left to the exit.
+pub(crate) fn wait_for_drain(probe: &DrainProbe, drain: Duration, poll: Duration) -> DrainOutcome {
     let deadline = Instant::now() + drain;
     loop {
         if probe.idle() {
-            return DrainEnd::Idle;
+            return DrainOutcome {
+                end: DrainEnd::Idle,
+                http_cut: 0,
+            };
         }
         if Instant::now() >= deadline {
             break;
         }
         thread::sleep(poll.min(deadline.saturating_duration_since(Instant::now())));
     }
+    let http_cut = probe.http_in_flight.load(Ordering::Acquire);
     probe.close_remaining();
     let grace_end = Instant::now() + DEADLINE_CLOSE_GRACE;
     while !probe.streams.is_empty() && Instant::now() < grace_end {
         thread::sleep(poll.min(DEADLINE_CLOSE_GRACE));
     }
-    DrainEnd::Deadline
+    DrainOutcome {
+        end: DrainEnd::Deadline,
+        http_cut,
+    }
+}
+
+/// End an upgrade drain's bookkeeping before the exit (Story 12.11 D-g):
+/// at the deadline, one `warn` per stream the upgrade closed connections
+/// of and one for the HTTP requests cut; then the drain report to the
+/// supervisor, which never waits on the channel.
+fn report_upgrade_drain(runtime: &StreamRuntimeHandle, outcome: DrainOutcome) {
+    if outcome.end == DrainEnd::Deadline {
+        for (stream_id, counts) in runtime.tracker().upgrade_drain_counts() {
+            if counts.closed > 0 {
+                warn!(%stream_id, closed = counts.closed,
+                      "upgrade drain deadline reached; stream connections closed with drained_by_upgrade");
+            }
+        }
+        if outcome.http_cut > 0 {
+            warn!(
+                http_cut = outcome.http_cut,
+                "upgrade drain deadline reached; HTTP requests in flight are cut by the exit"
+            );
+        }
+    }
+    match runtime.send_drain_report(outcome.end, outcome.http_cut) {
+        Ok(sent) if sent.truncated => {
+            warn!(
+                entries = sent.entries,
+                "upgrade drain report truncated: the control channel was full"
+            )
+        }
+        Ok(sent) => info!(entries = sent.entries, "upgrade drain report sent"),
+        Err(e) => {
+            warn!(error = %e,
+                  "upgrade drain report not sent; the supervisor counts this worker as unreported")
+        }
+    }
 }
 
 /// Arm a worker's drain watcher on its own thread.
 ///
 /// The watcher waits for the stream runtime to be quiesced, either by a
-/// `quiesce` message (a stop driven by the supervisor) or because
-/// Pingora reached its graceful-terminate phase (a SIGTERM without one,
-/// the upgrade path until Story 12.11), in which case the runtime is
-/// terminated with `fallback_drain()`, the stored setting. It then waits
-/// for the drain and calls `exit` with how it ended.
+/// `quiesce` message (a stop or a hot upgrade driven by the supervisor,
+/// which says which) or because Pingora reached its graceful-terminate
+/// phase (a SIGTERM without one, a degraded stop path), in which case
+/// the runtime is terminated with `fallback_drain()`, the stored setting,
+/// and drains as for a stop. A SIGTERM after a `quiesce` changes nothing:
+/// the first quiesce stands. The watcher then waits for the drain,
+/// closing the leftovers with the quiesce's end reason, sends the drain
+/// report when the quiesce was an upgrade, and calls `exit` with how the
+/// drain ended.
 ///
 /// The worker keeps `runtime` alive for its whole life: dropping the
 /// last handle stops the runtime.
@@ -198,12 +265,12 @@ pub(crate) fn arm_worker_drain(
                 }
             };
             let mut quiesced = runtime.quiesced();
-            let armed: Option<Duration> = rt.block_on(async {
+            let armed: Option<Quiesced> = rt.block_on(async {
                 let mut phases_open = true;
                 loop {
                     tokio::select! {
                         changed = quiesced.wait_for(Option::is_some) => {
-                            return changed.ok().and_then(|q| q.map(|q| q.drain));
+                            return changed.ok().and_then(|q| *q);
                         }
                         phase = phases.recv(), if phases_open => match phase {
                             Ok(ExecutionPhase::GracefulTerminate)
@@ -217,16 +284,20 @@ pub(crate) fn arm_worker_drain(
                     }
                 }
             });
-            let Some(drain) = armed else {
+            let Some(Quiesced { drain, reason }) = armed else {
                 return;
             };
-            info!(drain_s = drain.as_secs(), "stop started; draining");
-            let probe = DrainProbe {
-                http_in_flight,
-                streams: runtime.tracker().clone(),
-            };
-            let end = wait_for_drain(&probe, drain, DRAIN_POLL_INTERVAL);
-            exit(end);
+            info!(
+                drain_s = drain.as_secs(),
+                reason = reason.as_str(),
+                "drain started"
+            );
+            let probe = DrainProbe::new(http_in_flight, runtime.tracker().clone(), reason);
+            let outcome = wait_for_drain(&probe, drain, DRAIN_POLL_INTERVAL);
+            if reason == QuiesceReason::Upgrade {
+                report_upgrade_drain(&runtime, outcome);
+            }
+            exit(outcome.end);
         })
 }
 
@@ -276,13 +347,20 @@ pub(crate) fn start_stop_keepalive(target: Option<PathBuf>) -> Option<thread::Jo
 mod tests {
     use super::*;
     use lorica_config::models::{Stream, StreamProtocol};
+    use lorica_worker::stream_ctl::{self, DrainedEntry, StreamCtlMsg};
+    use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixDatagram;
 
     fn probe() -> DrainProbe {
-        DrainProbe {
-            http_in_flight: Arc::new(AtomicU64::new(0)),
-            streams: ConnectionTracker::new(),
-        }
+        probe_for(QuiesceReason::Shutdown)
+    }
+
+    fn probe_for(reason: QuiesceReason) -> DrainProbe {
+        DrainProbe::new(
+            Arc::new(AtomicU64::new(0)),
+            ConnectionTracker::new(),
+            reason,
+        )
     }
 
     fn stream() -> Arc<Stream> {
@@ -358,8 +436,14 @@ mod tests {
     #[test]
     fn the_watcher_ends_at_once_when_nothing_is_in_flight() {
         let start = Instant::now();
-        let end = wait_for_drain(&probe(), Duration::from_secs(30), DRAIN_POLL_INTERVAL);
-        assert_eq!(end, DrainEnd::Idle);
+        let outcome = wait_for_drain(&probe(), Duration::from_secs(30), DRAIN_POLL_INTERVAL);
+        assert_eq!(
+            outcome,
+            DrainOutcome {
+                end: DrainEnd::Idle,
+                http_cut: 0
+            }
+        );
         assert!(start.elapsed() < Duration::from_secs(1));
     }
 
@@ -373,9 +457,9 @@ mod tests {
             counter.store(0, Ordering::Release);
         });
         let start = Instant::now();
-        let end = wait_for_drain(&probe, Duration::from_secs(30), Duration::from_millis(20));
+        let outcome = wait_for_drain(&probe, Duration::from_secs(30), Duration::from_millis(20));
         finisher.join().unwrap();
-        assert_eq!(end, DrainEnd::Idle);
+        assert_eq!(outcome.end, DrainEnd::Idle);
         assert!(start.elapsed() >= Duration::from_millis(400));
         assert!(start.elapsed() < Duration::from_secs(5));
     }
@@ -389,31 +473,42 @@ mod tests {
             drop(tracked);
         });
         let start = Instant::now();
-        let end = wait_for_drain(&probe, Duration::from_secs(30), Duration::from_millis(20));
+        let outcome = wait_for_drain(&probe, Duration::from_secs(30), Duration::from_millis(20));
         finisher.join().unwrap();
-        assert_eq!(end, DrainEnd::Idle);
+        assert_eq!(outcome.end, DrainEnd::Idle);
         assert!(start.elapsed() >= Duration::from_millis(400));
     }
 
     #[test]
-    fn at_the_deadline_the_watcher_closes_what_is_left_with_node_shutdown() {
-        let probe = probe();
-        probe.http_in_flight.store(1, Ordering::Release);
-        let tracked = probe.streams.register(1, stream());
-        let start = Instant::now();
-        let end = wait_for_drain(
-            &probe,
-            Duration::from_millis(300),
-            Duration::from_millis(20),
-        );
-        assert_eq!(end, DrainEnd::Deadline);
-        assert!(start.elapsed() >= Duration::from_millis(300));
-        assert_eq!(tracked.close_reason(), Some(StreamEndReason::NodeShutdown));
+    fn at_the_deadline_the_watcher_closes_what_is_left_with_the_quiesce_end_reason() {
+        for (reason, expected) in [
+            (QuiesceReason::Shutdown, StreamEndReason::NodeShutdown),
+            (QuiesceReason::Upgrade, StreamEndReason::DrainedByUpgrade),
+        ] {
+            let probe = probe_for(reason);
+            probe.http_in_flight.store(2, Ordering::Release);
+            let tracked = probe.streams.register(1, stream());
+            let start = Instant::now();
+            let outcome = wait_for_drain(
+                &probe,
+                Duration::from_millis(300),
+                Duration::from_millis(20),
+            );
+            assert_eq!(
+                outcome,
+                DrainOutcome {
+                    end: DrainEnd::Deadline,
+                    http_cut: 2
+                }
+            );
+            assert!(start.elapsed() >= Duration::from_millis(300));
+            assert_eq!(tracked.close_reason(), Some(expected), "{reason:?}");
+        }
     }
 
     #[test]
     fn a_connection_already_draining_keeps_its_reason_at_the_deadline() {
-        let probe = probe();
+        let probe = probe_for(QuiesceReason::Upgrade);
         let tracked = probe.streams.register(1, stream());
         probe.streams.drain_all(
             tokio::time::Instant::now() + Duration::from_secs(60),
@@ -457,12 +552,168 @@ mod tests {
         );
         assert_eq!(
             *runtime.quiesced().borrow(),
-            Some(lorica_stream::Quiesced {
+            Some(Quiesced {
                 drain: Duration::from_secs(7),
-                reason: lorica_worker::stream_ctl::QuiesceReason::Shutdown
+                reason: QuiesceReason::Shutdown
             })
         );
         watcher.join().unwrap();
+    }
+
+    /// A worker runtime on a real stream control socketpair, and the
+    /// supervisor's end, reading with a timeout.
+    fn seqpacket_runtime() -> (OwnedFd, Arc<StreamRuntimeHandle>) {
+        let (supervisor, worker) = stream_ctl::create_seqpacket_pair().unwrap();
+        // `SO_RCVTIMEO` through std's setter, which applies to any socket
+        // type: a lost message fails the test instead of hanging it.
+        let supervisor = {
+            let socket = std::os::unix::net::UnixStream::from(supervisor);
+            socket
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            OwnedFd::from(socket)
+        };
+        let runtime = lorica_stream::StreamRuntime::spawn(
+            lorica_stream::ControlTransport::Seqpacket(worker),
+            lorica_stream::Engines::default(),
+            Arc::new(EmptyTable),
+        )
+        .expect("test setup: stream runtime");
+        (supervisor, Arc::new(runtime))
+    }
+
+    fn quiesce_for_upgrade(supervisor: &OwnedFd, seq: u64, drain_ms: u64) {
+        stream_ctl::send_msg(
+            supervisor,
+            &StreamCtlMsg::Quiesce {
+                seq,
+                reason: QuiesceReason::Upgrade,
+                drain_ms,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            stream_ctl::recv_msg(supervisor),
+            Ok(StreamCtlMsg::Ack { seq: s, .. }) if s == seq
+        ));
+    }
+
+    /// Arm the watcher on `runtime` with no SIGTERM path; `exit` sends
+    /// how the drain ended.
+    fn arm(
+        runtime: &Arc<StreamRuntimeHandle>,
+        http_in_flight: Arc<AtomicU64>,
+    ) -> (thread::JoinHandle<()>, std::sync::mpsc::Receiver<DrainEnd>) {
+        let (_phase_tx, phases) = broadcast::channel(1);
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let watcher = arm_worker_drain(
+            Arc::clone(runtime),
+            phases,
+            http_in_flight,
+            || Duration::from_secs(1),
+            move |end| exit_tx.send(end).unwrap(),
+        )
+        .unwrap();
+        (watcher, exit_rx)
+    }
+
+    #[test]
+    fn an_upgrade_drain_that_ends_idle_reports_before_the_exit() {
+        let (supervisor, runtime) = seqpacket_runtime();
+        let (watcher, exit_rx) = arm(&runtime, Arc::new(AtomicU64::new(0)));
+        quiesce_for_upgrade(&supervisor, 5, 60_000);
+        assert_eq!(
+            exit_rx.recv_timeout(Duration::from_secs(30)),
+            Ok(DrainEnd::Idle)
+        );
+        assert!(matches!(
+            stream_ctl::recv_msg(&supervisor),
+            Ok(StreamCtlMsg::DrainedEnd {
+                seq: 5,
+                end: DrainEnd::Idle,
+                http_cut: 0,
+                entries: 0,
+                truncated: false
+            })
+        ));
+        watcher.join().unwrap();
+    }
+
+    #[test]
+    fn an_upgrade_drain_that_reaches_its_deadline_reports_what_it_closed_and_cut() {
+        let (supervisor, runtime) = seqpacket_runtime();
+        let http_in_flight = Arc::new(AtomicU64::new(1));
+        // A stream connection whose engine ends it when told to.
+        let mut tracked = runtime.tracker().register(1, stream());
+        let engine = thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let reason = rt.block_on(tracked.closed());
+            tracked.finish(reason, |r| r)
+        });
+        let (watcher, exit_rx) = arm(&runtime, Arc::clone(&http_in_flight));
+        quiesce_for_upgrade(&supervisor, 9, 300);
+        assert_eq!(
+            exit_rx.recv_timeout(Duration::from_secs(30)),
+            Ok(DrainEnd::Deadline)
+        );
+        assert_eq!(engine.join().unwrap(), StreamEndReason::DrainedByUpgrade);
+        match stream_ctl::recv_msg(&supervisor) {
+            Ok(StreamCtlMsg::Drained { seq: 9, entries }) => assert_eq!(
+                entries,
+                vec![DrainedEntry {
+                    stream_id: "s1".into(),
+                    closed: 1,
+                    finished: 0
+                }]
+            ),
+            other => panic!("expected the report's entries, got {other:?}"),
+        }
+        assert!(matches!(
+            stream_ctl::recv_msg(&supervisor),
+            Ok(StreamCtlMsg::DrainedEnd {
+                seq: 9,
+                end: DrainEnd::Deadline,
+                http_cut: 1,
+                entries: 1,
+                truncated: false
+            })
+        ));
+        watcher.join().unwrap();
+    }
+
+    /// Nobody reads the supervisor's end: the runtime blocks on its acks
+    /// once the channel is full, so the report can be neither handed over
+    /// nor sent. The exit still comes, bounded by the report timeout.
+    #[test]
+    fn a_full_control_channel_does_not_hold_the_exit() {
+        let (supervisor, runtime) = seqpacket_runtime();
+        let (watcher, exit_rx) = arm(&runtime, Arc::new(AtomicU64::new(1)));
+        let drain = Duration::from_secs(2);
+        quiesce_for_upgrade(&supervisor, 1, drain.as_millis() as u64);
+        let filler = StreamCtlMsg::Refresh {
+            seq: 2,
+            drain_ms: 0,
+        };
+        let flood_until = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < flood_until {
+            match stream_ctl::try_send_msg(&supervisor, &filler) {
+                Ok(()) => {}
+                Err(e) if stream_ctl::would_block(&e) => break,
+                Err(e) => panic!("flood: {e}"),
+            }
+        }
+        let bound = drain + DEADLINE_CLOSE_GRACE + lorica_stream::runtime::DRAIN_REPORT_TIMEOUT;
+        assert_eq!(
+            exit_rx.recv_timeout(bound + Duration::from_secs(20)),
+            Ok(DrainEnd::Deadline)
+        );
+        watcher.join().unwrap();
+        // The runtime's pending ack fails once the peer is gone, which
+        // lets it stop.
+        drop(supervisor);
     }
 
     struct EmptyTable;

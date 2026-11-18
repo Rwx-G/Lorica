@@ -542,14 +542,14 @@ Allowlist: `lorica/src/startup/drain.rs`, `lorica/src/startup/worker.rs`
 reaches it).
 Depends on: B1.
 
-- [ ] The watcher reads the reason from `quiesced()`; the deadline close
+- [x] The watcher reads the reason from `quiesced()`; the deadline close
       uses it; `DrainProbe` takes it.
-- [ ] On an upgrade drain, the report of D-g sent with `MSG_DONTWAIT`
+- [x] On an upgrade drain, the report of D-g sent with `MSG_DONTWAIT`
       before `exit`, with `http_cut` from `http_in_flight` at the
       deadline.
-- [ ] Doc comments that say "the upgrade path until Story 12.11" are
+- [x] Doc comments that say "the upgrade path until Story 12.11" are
       rewritten to say what is true now.
-- [ ] Tests: an upgrade-armed watcher closes leftovers with
+- [x] Tests: an upgrade-armed watcher closes leftovers with
       `drained_by_upgrade` and a shutdown-armed one with `node_shutdown`;
       the report is sent on both `idle` and `deadline` ends; a full
       socket buffer does not block the exit.
@@ -942,6 +942,40 @@ the `ci.yml` cargo lines in order): fmt, workspace clippy with
 crates, the rustls line and `cargo audit`, all clean. The `lorica-api`
 openapi failure Lot A recorded no longer occurs on this base.
 
+**Lot B2, how it is built.** `arm_worker_drain` waits for `Quiesced`
+and builds `DrainProbe::new(http_in_flight, tracker, reason)`, whose
+deadline close uses `quiesce_end_reason(reason)`. `wait_for_drain` now
+returns `DrainOutcome { end, http_cut }`, `http_cut` read from
+`http_in_flight` at the deadline (0 on an idle end). On an upgrade
+drain the watcher, before `exit`: at a deadline end logs one `warn`
+per stream with the count the upgrade closed and one for the HTTP
+requests cut, then calls `StreamRuntimeHandle::send_drain_report(end,
+http_cut)` and logs what went (`truncated` or an error at `warn`: the
+supervisor then counts the worker unreported). A stop sends no report.
+`DrainEnd` is now `lorica_worker::stream_ctl::DrainEnd`, the wire's,
+re-exported from `drain.rs`, so the watcher and the report cannot
+disagree. `exit` still takes the `DrainEnd`; `worker.rs` changed only
+in its two comments, `single.rs` only in building the probe.
+
+**Lot B2, the shape Lot C consumes.** After a worker exits, its
+supervisor end of the stream control socketpair holds, in order, the
+`ack` of the upgrade quiesce, zero or more `StreamCtlMsg::Drained { seq,
+entries }` and one `StreamCtlMsg::DrainedEnd { seq, end, http_cut,
+entries, truncated }`, `seq` being the quiesce's. Read them with
+`recv_msg` until `DrainedEnd` or `Closed`; no `DrainedEnd` is an
+unreported worker. Sum `closed` and `finished` per `stream_id` across
+workers, `http_cut` across workers, and take the generation's `end` as
+`deadline` when any worker says so.
+
+**Lot B2, the full-buffer test.** Nobody reads the supervisor's end and
+the test floods `refresh` messages until its own send would block: the
+runtime thread is then stuck sending acks, so the report cannot even be
+handed to it. The exit still comes, bounded by drain + the 1 s close
+grace + `DRAIN_REPORT_TIMEOUT`.
+
+**Lot B2 gates**: the same chain as B1, all clean, `cargo audit`
+included.
+
 ### Completion Notes
 
 ## File List
@@ -963,7 +997,9 @@ openapi failure Lot A recorded no longer occurs on this base.
 - `lorica-stream/tests/tcp_engine.rs` (Lot B1)
 - `lorica-stream/tests/udp_engine.rs` (Lot B1)
 - `lorica/src/startup/stream_plane.rs` (one test assertion, Lot B1)
-- `lorica/src/startup/drain.rs` (the `Quiesced` type, Lot B1)
+- `lorica/src/startup/drain.rs` (the `Quiesced` type, Lot B1; the watcher's reason and the drain report, Lot B2)
+- `lorica/src/startup/worker.rs` (comments of the drain arming and the exit closure, Lot B2)
+- `lorica/src/startup/single.rs` (`DrainProbe::new`, Lot B2)
 - `docs/stories/story-12.11-upgrade-drain.md`
 
 ## Change Log
@@ -974,3 +1010,4 @@ openapi failure Lot A recorded no longer occurs on this base.
 | 2026-11-15 | 0.2 | Maintainer answers folded in as Resolved 1 to 5: a dedicated `lorica_hot_upgrade_stream_connections_total{stream_id,outcome}` with `lorica_hot_upgrade_total` unchanged (AC #2 copy updated to the amended PRD text, D-g and Lots C, F, G rewritten); HTTP cuts in the report and log only; chained upgrades allowed with a warning; SSH packages approved for the e2e images; the UDP handover of D-e accepted. Lot A opens with the failing 32-fd / 2,048-byte test on the current tree. Status Draft. | Romain G. |
 | 2026-11-15 | 0.3 | Lot A: chunked `lorica-fds/2` transfer with a one-byte acknowledgement per header and chunk, legacy single message kept whenever the table fits, receiver reading both and closing everything on error; `stream-udp:` key family parsed into `StreamUdpFd`. Red run recorded. Status InProgress. | Romain G. |
 | 2026-11-18 | 0.4 | Lot B1: `quiesce reason=upgrade` mapped to `drained_by_upgrade`, `Quiesced { drain, reason }`, first quiesce stands; old workers close their own listener and slot descriptors, UDP sessions relay what they are owed or close by `Stream::upgrade_policy()`; tracker counts `closed` and `finished` per stream; `drained` / `drained_end` report messages sent without waiting. D-a, D-c, D-e, D-f and D-g amended where the code had moved (`drains_on_upgrade` is the 12.16 exclusion, one-way UDP closes, the report wire carries the quiesce seq). | Romain G. |
+| 2026-11-18 | 0.5 | Lot B2: the drain watcher closes leftovers with the quiesce's end reason, returns `DrainOutcome { end, http_cut }`, and on an upgrade logs the per-stream closes at the deadline and sends the worker's drain report before `exit`, never blocking on it; `DrainEnd` is the wire's. | Romain G. |

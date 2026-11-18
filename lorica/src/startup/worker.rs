@@ -974,11 +974,13 @@ pub(crate) fn run_worker(
     let mut server = lorica_core::server::Server::new_with_opt_and_conf(None, lorica_server_conf());
     server.set_listen_fds(fds);
     server.add_service(proxy_service);
-    // The drain watcher ends this worker as soon as a stop has no
-    // traffic left, long before Pingora's grace (the setting's hard
-    // maximum) would: armed by the supervisor's `quiesce`, or by
-    // Pingora's graceful-terminate phase with the stored setting when a
-    // SIGTERM arrives without one.
+    // The drain watcher ends this worker as soon as a stop or a hot
+    // upgrade has no traffic left, long before Pingora's grace (the
+    // setting's hard maximum) would: armed by the supervisor's
+    // `quiesce`, which says which of the two it is, or by Pingora's
+    // graceful-terminate phase with the stored setting when a SIGTERM
+    // arrives without one. On an upgrade it has sent this worker's drain
+    // report to the supervisor before `exit` runs.
     let drain_source = Arc::clone(&stream_source);
     if let Err(e) = startup::drain::arm_worker_drain(
         Arc::clone(&stream_runtime),
@@ -991,8 +993,9 @@ pub(crate) fn run_worker(
                 ?end,
                 "drain finished; flushing logs and OTel spans and exiting"
             );
-            // The drain's rows, `node_shutdown` included, reach the store
-            // and then the sinks before the process goes (Story 12.9 D-k).
+            // The drain's rows, those it ended with `node_shutdown` or
+            // `drained_by_upgrade` included, reach the store and then the
+            // sinks before the process goes (Story 12.9 D-k).
             lorica::stream_log::flush_rows_at_exit_blocking(&exit_log_store);
             lorica::otel::shutdown();
             std::process::exit(0);
