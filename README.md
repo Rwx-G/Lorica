@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.10.8-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.10.9-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
   <img src="https://img.shields.io/badge/Lorica%20Tests-3711-brightgreen.svg" alt="Lorica Tests">
@@ -768,11 +768,11 @@ cargo test -p lorica-cluster --tests
 cd lorica-dashboard/frontend && pnpm install --frozen-lockfile && pnpm run check && pnpm run lint && pnpm exec vitest run
 ```
 
-At 1.10.8 the two product-crate steps run 3711 Rust tests and the
+At 1.10.9 the two product-crate steps run 3711 Rust tests and the
 forked-crate step 880; the rustls build runs 539 more, most of them the
 default-feature tests of `lorica-core` and `lorica-lb` again with TLS on,
-so they are left out of the forked figure. The frontend suite is 804
-Vitest cases across 47 files.
+so they are left out of the forked figure. The frontend suite is 825
+Vitest cases across 48 files.
 
 The `lorica` binary crate carries 26 end-to-end binaries under
 `lorica/tests/` that drive a real Pingora `Server` against mock backends
