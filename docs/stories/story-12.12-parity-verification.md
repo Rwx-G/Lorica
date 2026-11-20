@@ -699,8 +699,8 @@ CoreDNS, the Python backends), `docs/stories/story-12.3-tcp-engine.md`
 (Lot G checkboxes only).
 Depends on: B; 12.3 Lots D2 and E.
 
-- [ ] 12.3 IV1 to IV4 per D-d, IV1 with PostgreSQL and `psql`.
-- [ ] The five `12.3-matrix-*` scenarios of D-e.
+- [x] 12.3 IV1 to IV4 per D-d, IV1 with PostgreSQL and `psql`.
+- [x] The five `12.3-matrix-*` scenarios of D-e.
 
 ### Lot D: Story 12.4 scenarios - Docker e2e
 
@@ -1006,6 +1006,10 @@ this file points at the decision it took.
 14. **Alpine's `openssh-client`** in the runner is accepted.
 15. **`strm/dnsmasq` is pinned by digest** in Lot A.
 16. **nginx logs per connection** in the perf phase, as Lorica does.
+17. **`NET_ADMIN` on `streams-probe`** (approved 2026-11-20, test
+    environment only): the probe gives the worker node a second address
+    on `l4` for `12.3-matrix-proxy-bind` (D-e's "second address on the
+    node"). D-p's privileges row gave it to `streams-client` only.
 
 ### Digests and checksums pinned by Lot A (2026-11-18)
 
@@ -1046,6 +1050,9 @@ pulled images.
   `./run.sh --only-l4 --build` (runner image rebuild; the Lorica image
   is cached), starting with `12.3-iv1-pg-balance-and-failover`. Lot D
   not started.
+- Resumed 2026-11-20 on `feat/v1.11.0` at `4ace5482` (Lot B integrated
+  as `7813bbcf`); the Lot C files were carried over unchanged, and
+  `docker-compose.l4.yml` had not moved since Lot B.
 
 ### Completion Notes
 
@@ -1207,6 +1214,58 @@ pulled images.
     nodes are `lorica-budget-4k` and `lorica-budget-8k`, worker mode,
     their own `/shared`, no `l4-node` alias.
 
+- **Lot C, 2026-11-20.** Story 12.3's IVs and the TCP rows of the parity
+  matrix, on `4ace5482` (the e2e images rebuilt for it).
+  - **Verdicts** (`./run.sh --only-l4`, Lots A to C, 416 s for the phase
+    with the report), all PASS:
+    `12.3-iv1-pg-balance-and-failover` (three `postgres:17.12` servers,
+    `psql` from `pg-client`: round robin 100/99/101 over 300
+    connections, consistent hash 300 on one server, random
+    119/102/79, least connections 9/10/11 over 30 overlapping
+    sessions, peak EWMA 7/45/48 reported; one server killed, marked down
+    in about 16 s, then 100 new connections all on the two survivors; a
+    session held on a survivor across the kill finished its queries);
+    `12.3-iv2-shared-backend-down-both-planes` (route and stream 20 of
+    20 on the other backend once the shared one was marked down, about
+    13 s after its listener closed; the stream connection established
+    before answered 35 pings, 0 failures);
+    `12.3-iv3-proxy-v2-send-and-accept` (v2 carries the client address;
+    an untrusted v1 and v2 header are closed and counted
+    `proxy_header_invalid`; a trusted header's 203.0.113.7 reaches the
+    backend through a v2 send and the access-log row);
+    `12.3-iv4-local-backend-refused-and-rebind-excluded` PASS in full,
+    not partial: the management port is refused 409
+    `stream_local_backend` with the flag and without, and a CoreDNS name
+    moved to 127.0.0.1 was excluded within 5 s, ten connections closed
+    with nothing forwarded, two exclusions counted in
+    `lorica_stream_backend_dns_local_excluded_total` (Docker's embedded
+    DNS forwarded the 5 s TTL as is);
+    `12.3-matrix-backup-backends`, `-bandwidth` (64 KiB at 16 KiB/s
+    each way in about 3.05 s, one second of burst; unlimited 1 ms),
+    `-timeouts` (0.501, 2.001 and 3.002 s, with their three end reasons),
+    `-proxy-bind`, `-port-range` (16 ports, N to N).
+  - **No product defect found.** Corrected in the scenarios: IV4's
+    first half expected 422 without `allow_local_backend`; rule B
+    answers 409 for a node's own port whatever the flag, as
+    docs/streams.md states, and is checked first. A killed backend's
+    health flip takes three probes at the loop's 5 s floor, each up to
+    the 5 s connect timeout, so the waits allow 45 s (16 s measured).
+    Counters are read with a short poll: a connection's end is counted
+    when its task finishes, a moment after the client sees the close.
+    Observed, not a defect: an untrusted PROXY header on a stream with
+    no backend linked ends `no_healthy_backend`, since the backend is
+    chosen before the first bytes are inspected; with a backend it ends
+    `proxy_header_invalid`, and either way nothing is forwarded.
+  - **Deviations.** `NET_ADMIN` on `streams-probe` (Resolved 17) to give
+    the node its second address. The client tools are one Python string
+    in `l4/scenarios/12.3.sh` (`L4C_TCP_CLIENT`), since the Lot's
+    allowlist names no client file. The CoreDNS zone is a hosts file the
+    scenario copies into the container (`docker compose cp`, the image
+    has no shell); `l4/coredns/` holds the Corefile only. The worker node
+    joins a network `l4-dns` (10.89.53.0/24) where CoreDNS has a fixed
+    address, which `dns:` needs. `tcp_backend.py` also reports the TCP
+    peer (`peer=`), which the proxy-bind row reads.
+
 ## File List
 
 Lot A:
@@ -1243,6 +1302,17 @@ Lot B:
   `lorica-budget-8k`, `streams-single-probe`)
 - `docs/stories/story-12.2-stream-listeners.md` (Lot H checkboxes)
 
+Lot C:
+
+- `tests-e2e-docker/l4/scenarios/12.3.sh` (new)
+- `tests-e2e-docker/l4/scenarios.tsv` (Lot C rows `live`)
+- `tests-e2e-docker/test-runner/l4/tcp_backend.py` (new)
+- `tests-e2e-docker/l4/coredns/Corefile` (new)
+- `tests-e2e-docker/docker-compose.l4.yml` (PostgreSQL x3, `pg-client`,
+  five `tcp_backend.py` services, CoreDNS and `l4-dns`, the worker
+  node's `dns:`, `NET_ADMIN` on `streams-probe`)
+- `docs/stories/story-12.3-tcp-engine.md` (Lot G checkboxes)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1252,3 +1322,4 @@ Lot B:
 | 2026-11-18 | 0.3 | Lot A gains the `stop_grace_period` task Story 12.2 D-f assumed was done. | Romain G. |
 | 2026-11-18 | 0.4 | Lot A implemented: L4 compose project, driver, scenario registry with pending rows, report gated on the registry and the PRD matrix, `perf-tools` and `baseline` images, toolchain pin, `run.sh` flags; digests and checksums recorded. The full pre-existing suite with the pin is still to run. Status InProgress. | Romain G. |
 | 2026-11-19 | 0.5 | Lot B implemented: Story 12.2's scenarios in both profiles and the fd-reserve scenario, all passing (AC #3 partial as D-d says); budget nodes, a single-process probe, `udp_hold.py` and `http_loop.py`. No product defect. The budget item asserts `worker_fds` for 1,024 ports and `supervisor_fds` for 600, since a UDP session now holds an fd. | Romain G. |
+| 2026-11-20 | 0.6 | Lot C implemented: Story 12.3 IV1 to IV4 (IV1 on three PostgreSQL servers, IV4 in full through CoreDNS) and the five TCP matrix rows, all passing; `NET_ADMIN` on the probe recorded as Resolved 17. No product defect. | Romain G. |

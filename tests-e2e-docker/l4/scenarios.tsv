@@ -34,15 +34,15 @@ name	source	story	profiles	level	lot	state	matrix
 12.2-ac7-stop-drains-then-exits	12.2 AC #7	12.2	streams,streams-single	full	B	live	Connection draining
 12.2-ac5-budget-refuses-range	12.2 AC #5	12.2	streams	full	B	live	Port ranges
 12.12-fd-reserve-http-unaffected	12.12 AC #1	12.12	streams	full	B	live	-
-12.3-iv1-pg-balance-and-failover	12.3 IV1	12.3	streams	full	C	pending	TCP proxying;Round robin, least conn;Hash / consistent hash on source;Random / power of two;Passive failure detection;Session persistence
-12.3-iv2-shared-backend-down-both-planes	12.3 IV2	12.3	streams	full	C	pending	Active health: TCP connect
-12.3-iv3-proxy-v2-send-and-accept	12.3 IV3	12.3	streams	full	C	pending	PROXY protocol v1/v2 send;PROXY protocol v1/v2 accept on streams
-12.3-iv4-local-backend-refused-and-rebind-excluded	12.3 IV4	12.3	streams	partial	C	pending	Upstream DNS re-resolution
-12.3-matrix-backup-backends	12.12 D-e	12.3	streams	full	C	pending	Backup backends
-12.3-matrix-bandwidth	12.12 D-e	12.3	streams	full	C	pending	Bandwidth limit
-12.3-matrix-timeouts	12.12 D-e	12.3	streams	full	C	pending	Timeouts connect / idle / total
-12.3-matrix-proxy-bind	12.12 D-e	12.3	streams	full	C	pending	Chosen source address (`proxy_bind`)
-12.3-matrix-port-range	12.12 D-e	12.3	streams	full	C	pending	Port ranges
+12.3-iv1-pg-balance-and-failover	12.3 IV1	12.3	streams	full	C	live	TCP proxying;Round robin, least conn;Hash / consistent hash on source;Random / power of two;Passive failure detection;Session persistence
+12.3-iv2-shared-backend-down-both-planes	12.3 IV2	12.3	streams	full	C	live	Active health: TCP connect
+12.3-iv3-proxy-v2-send-and-accept	12.3 IV3	12.3	streams	full	C	live	PROXY protocol v1/v2 send;PROXY protocol v1/v2 accept on streams
+12.3-iv4-local-backend-refused-and-rebind-excluded	12.3 IV4	12.3	streams	partial	C	live	Upstream DNS re-resolution
+12.3-matrix-backup-backends	12.12 D-e	12.3	streams	full	C	live	Backup backends
+12.3-matrix-bandwidth	12.12 D-e	12.3	streams	full	C	live	Bandwidth limit
+12.3-matrix-timeouts	12.12 D-e	12.3	streams	full	C	live	Timeouts connect / idle / total
+12.3-matrix-proxy-bind	12.12 D-e	12.3	streams	full	C	live	Chosen source address (`proxy_bind`)
+12.3-matrix-port-range	12.12 D-e	12.3	streams	full	C	live	Port ranges
 12.3-matrix-latency-aware-selection	not e2e: Story 12.3 Lot D1 selection tests	12.3	-	not-e2e	-	-	Latency-aware selection
 12.3-matrix-backend-keepalive	not e2e: Story 12.3 Lot C socket-option test	12.3	-	not-e2e	-	-	Backend TCP keepalive
 12.4-iv1-sni-passthrough-two-names	12.4 IV1	12.4	streams	full	D	pending	TLS passthrough, SNI routing;ALPN routing

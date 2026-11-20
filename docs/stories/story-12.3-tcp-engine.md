@@ -1229,23 +1229,23 @@ Allowlist: `tests-e2e-docker/test-runner/run-streams-tcp.sh` (new, LF),
 Depends on: D2, E, 12.2 Lot H. The machine to itself, orphan containers
 torn down first.
 
-- [ ] `tcp_backend.py` (stdlib): echo with an identity prefix, a mode
+- [x] `tcp_backend.py` (stdlib): echo with an identity prefix, a mode
       that parses a PROXY v2 header and echoes the carried source, a
       mode that closes its listening socket while keeping established
       connections.
-- [ ] IV1 with three Python backends (the `psql` form is Story 12.12's,
+- [x] IV1 with three Python backends (the `psql` form is Story 12.12's,
       Resolved 6): balancing per algorithm over 300 connections;
       kill one backend; every new connection after the breaker trips
       succeeds; a connection opened before the kill on a survivor keeps
       echoing.
-- [ ] IV2: one backend linked to a route and a stream; its listener
+- [x] IV2: one backend linked to a route and a stream; its listener
       closes; after the health thresholds both the route and the stream
       stop selecting it; the stream connection established before is
       still echoing.
-- [ ] IV3: v2 send seen by the backend with the runner's address; with
+- [x] IV3: v2 send seen by the backend with the runner's address; with
       the runner outside the trusted list, a v1 and a v2 header are
       disconnected and counted.
-- [ ] IV4 second half: `dns_responder.py` answers a test name with a
+- [x] IV4 second half: `dns_responder.py` answers a test name with a
       runner-reachable address, then `127.0.0.1`, with a 5 s TTL; the
       Lorica service's `dns:` points at the runner; after the switch no
       connection reaches the backend and the exclusion is logged. If the

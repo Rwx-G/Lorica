@@ -1,0 +1,17 @@
+# CoreDNS of the L4 phase (Story 12.12 D-p): authoritative only, no
+# forwarding, so every answer is deterministic.
+#
+# l4.test: the 12.3 IV4 test names, from a hosts file the scenario
+# copies into the container (`docker compose cp`) and rewrites to move a
+# name onto 127.0.0.1. The file is absent until then, which the hosts
+# plugin tolerates; it is read again every second, and every answer
+# carries a 5 s TTL, so a resolver following the TTL sees a change
+# within seconds.
+l4.test:53 {
+    hosts /l4-hosts {
+        ttl 5
+        reload 1s
+        no_reverse
+    }
+    errors
+}

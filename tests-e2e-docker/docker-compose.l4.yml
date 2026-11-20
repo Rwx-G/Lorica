@@ -46,9 +46,15 @@ services:
     volumes:
       - l4-shared:/shared
       - streams-data:/var/lib/lorica
+    # Names Docker's embedded DNS does not own (the 12.3 IV4 test name)
+    # are forwarded to the CoreDNS service, which the node reaches on
+    # l4-dns.
+    dns:
+      - 10.89.53.53
     networks:
       l4:
         aliases: ["l4-node"]
+      l4-dns: {}
 
   lorica-streams-single:
     <<: *lorica-node
@@ -70,6 +76,10 @@ services:
     network_mode: "service:lorica-streams"
     pid: "service:lorica-streams"
     user: root
+    # Gives the node a second address on `l4` for the chosen-source-
+    # address scenario (12.3 `proxy_bind`, Story 12.12 D-e).
+    cap_add:
+      - NET_ADMIN
     depends_on:
       - lorica-streams
     volumes:
@@ -119,6 +129,71 @@ services:
     networks:
       - l4
 
+  # ---- Story 12.3 backends (Story 12.12 Lot C) ----------------------
+
+  # Three PostgreSQL backends for 12.3 IV1 and a client of the same image
+  # for `psql`. Trust authentication: test containers on a private
+  # network.
+  pg-1: &postgres
+    image: postgres:17.12-bookworm@sha256:40865bc877a289da75963d97d72b59633f639fc5af7a4e856bfa3714cae5b536
+    profiles: ["streams"]
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    networks:
+      - l4
+
+  pg-2: *postgres
+
+  pg-3: *postgres
+
+  pg-client:
+    <<: *postgres
+    entrypoint: ["sleep", "infinity"]
+    environment:
+      PGCONNECT_TIMEOUT: "5"
+      PGUSER: postgres
+
+  # test-runner/l4/tcp_backend.py: identity line then echo, HTTP 200 on a
+  # GET, SIGUSR1 closes the listener and SIGUSR2 reopens it.
+  tcp-backend-1: &tcp-backend
+    <<: *l4-runner
+    profiles: ["streams"]
+    entrypoint: ["python3", "/tests/l4/tcp_backend.py", "--name", "tcp-backend-1", "--ports", "9000"]
+    networks:
+      - l4
+
+  tcp-backend-2:
+    <<: *tcp-backend
+    entrypoint: ["python3", "/tests/l4/tcp_backend.py", "--name", "tcp-backend-2", "--ports", "9000"]
+
+  tcp-backend-3:
+    <<: *tcp-backend
+    entrypoint: ["python3", "/tests/l4/tcp_backend.py", "--name", "tcp-backend-3", "--ports", "9000"]
+
+  # Reads a PROXY v1/v2 header first and reports the address it carried.
+  tcp-backend-proxy:
+    <<: *tcp-backend
+    entrypoint: ["python3", "/tests/l4/tcp_backend.py", "--name", "tcp-backend-proxy", "--ports", "9000", "--proxy"]
+
+  # One listener per port of the 12.3 port-range stream, each reporting
+  # its port.
+  tcp-backend-range:
+    <<: *tcp-backend
+    entrypoint: ["python3", "/tests/l4/tcp_backend.py", "--name", "tcp-backend-range", "--ports", "7300-7315"]
+
+  # Authoritative only, no forwarding (D-p): l4/coredns/Corefile serves
+  # `l4.test` from a hosts file the 12.3 IV4 scenario copies in and
+  # rewrites, with a 5 s TTL.
+  coredns:
+    image: coredns/coredns:1.15.0@sha256:0a9d8c8ddf34347eb59aad9a8784f0710de88d6d112726d11d271f9bc6daca26
+    profiles: ["streams"]
+    command: ["-conf", "/etc/coredns/Corefile"]
+    volumes:
+      - ./l4/coredns:/etc/coredns:ro
+    networks:
+      l4-dns:
+        ipv4_address: 10.89.53.53
+
   # Has its own addresses: every source-address scenario needs a client
   # that is not the node's loopback.
   streams-client:
@@ -159,6 +234,12 @@ networks:
     ipam:
       config:
         - subnet: fd00:4c34::/64
+  # The worker node and CoreDNS only: `dns:` needs a fixed address, and
+  # a fixed address needs a subnet of its own.
+  l4-dns:
+    ipam:
+      config:
+        - subnet: 10.89.53.0/24
   # The GeoIP and source-address network of Story 12.6 Lot I, which
   # attaches the node and the client to it: addresses in the GeoIP test
   # database (214.78.120.5 is US).
