@@ -4,8 +4,8 @@
   import { api, type LogEntry, type LogsQuery } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import NodeFilter from '../components/NodeFilter.svelte';
-  import { canWrite, canWriteRole } from '../lib/auth';
-  import { clusterStatus, isFleetView } from '../lib/cluster';
+  import { canReadFleet, canWrite } from '../lib/auth';
+  import { nodeScope, type NodeScope } from '../lib/cluster';
 
   let entries: LogEntry[] = $state([]);
   let total = $state(0);
@@ -20,17 +20,25 @@
   let filterStatusCategory = $state('');
   let filterTimeRange = $state('');
   let filterLimit = $state(500);
-  /** Selected node id, or `''` for every node (Story 9.7 AC #5). */
-  let filterNode = $state('');
   /**
-   * Whether this page is showing the FAN-IN store rather than this
-   * node's own log. Only a control plane holds fanned-in rows.
+   * Node filter choice (Story 9.7 AC #5): `''` for this node, a
+   * follower's id, or every follower. This node is the default because
+   * the control plane's own traffic is never fanned in, so no fan-in
+   * read can show it.
    */
-  // The fleet view reads Operator-floor endpoints; a Viewer on the
-  // control plane sees this node's own data, as on a standalone.
-  const fleetView = $derived(isFleetView($clusterStatus) && $canWriteRole);
+  let filterNode = $state('');
+  /** Where the next read goes. Without `canReadFleet` there is no filter, so always here. */
+  const scope = $derived<NodeScope>($canReadFleet ? nodeScope(filterNode) : { store: 'local' });
+  /** Whether the next read goes to the FAN-IN store; the live tail follows it. */
+  const readsFanIn = $derived(scope.store === 'fan-in');
   /**
-   * Row id to the node that produced it, for the fleet view's Node
+   * Which store the rows on screen came from. The Node column and the
+   * actions on this node's own log follow it rather than the filter, so
+   * the table never carries one store's rows under the other's controls.
+   */
+  let entriesSource = $state<NodeScope['store']>('local');
+  /**
+   * Row id to the node that produced it, for the fan-in table's Node
    * column.
    *
    * Keyed by id rather than held parallel to `entries`, because the
@@ -87,7 +95,17 @@
     return true;
   }
 
+  /**
+   * Bumped by every read. Polls, Refresh, filter changes and node
+   * switches overlap, and responses land in any order: one that is no
+   * longer the latest is dropped, or a late fan-in page would land
+   * under this node's live tail, or the reverse.
+   */
+  let latestLoad = 0;
+
   async function loadLogs() {
+    const load = ++latestLoad;
+    const requested = scope;
     const params: LogsQuery = { limit: filterLimit };
     if (searchText.trim()) params.search = searchText.trim();
     if (filterRoute.trim()) params.route = filterRoute.trim();
@@ -108,18 +126,19 @@
       params.time_from = from.toISOString();
     }
 
-    // On a control plane with a node picked (or with "all nodes" while
-    // clustered), read the FAN-IN store rather than this node's own
-    // log: the point of the filter is to see other nodes' traffic.
+    // On a control plane with a follower picked, or all of them, read
+    // the FAN-IN store rather than this node's own log. It filters on
+    // host and time only, so the page hides the other filters there.
     // The fan-in view has no total, by design, so the count is the
     // page itself rather than a number the server had to scan for.
-    if (fleetView) {
+    if (requested.store === 'fan-in') {
       const res = await api.getFleetLogs({
-        ...(filterNode ? { node: filterNode } : {}),
+        ...(requested.node ? { node: requested.node } : {}),
         ...(filterRoute.trim() ? { route: filterRoute.trim() } : {}),
         ...(typeof params.time_from === 'string' ? { from: params.time_from } : {}),
         limit: filterLimit,
       });
+      if (load !== latestLoad) return;
       if (res.error) {
         error = res.error.message;
       } else if (res.data) {
@@ -142,6 +161,7 @@
           request_id: r.request_id,
         }));
         fleetNodeById = Object.fromEntries(res.data.rows.map((r) => [r.id, r.node_id]));
+        entriesSource = 'fan-in';
         total = res.data.rows.length;
         error = '';
       }
@@ -150,14 +170,32 @@
     }
 
     const res = await api.getLogs(params);
+    if (load !== latestLoad) return;
     if (res.error) {
       error = res.error.message;
     } else if (res.data) {
       entries = res.data.entries;
+      entriesSource = 'local';
       total = res.data.total;
       error = '';
     }
     loading = false;
+  }
+
+  /**
+   * A new node filter choice. The rows on screen belong to the previous
+   * one, possibly in the other store, so they go before the read rather
+   * than sitting under the new choice's controls until it lands.
+   */
+  function selectNode(choice: string) {
+    filterNode = choice;
+    entries = [];
+    fleetNodeById = {};
+    total = 0;
+    entriesSource = scope.store;
+    error = '';
+    loading = true;
+    void loadLogs();
   }
 
   async function handleClearLogs() {
@@ -201,9 +239,9 @@
   // The live tail carries only THIS node's rows and the fan-in view
   // has no node id for them, so they would render under "-" beside
   // genuinely fanned-in rows: the control plane's own traffic,
-  // labelled as if its origin were unknown. The fleet view polls
-  // instead. Reading `fleetView` here also moves the page from the
-  // tail to polling when the cluster status arrives after mount.
+  // labelled as if its origin were unknown. A fan-in read polls
+  // instead. Reading `readsFanIn` here moves the page between the tail
+  // and polling as the operator picks this node or a follower.
   $effect(() => {
     localStorage.setItem('lorica-logs-autorefresh', String(autoRefresh));
     if (!autoRefresh) return;
@@ -218,7 +256,7 @@
     };
 
     startPolling();
-    if (fleetView) return stopPolling;
+    if (readsFanIn) return stopPolling;
 
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const socket = new WebSocket(`${proto}//${location.host}/api/v1/logs/ws`);
@@ -280,17 +318,22 @@
         {#if wsConnected}<span class="ws-dot" title="WebSocket connected"></span>{/if}
       </label>
       <button class="btn btn-secondary" onclick={loadLogs}>Refresh</button>
-      <button
-        class="btn btn-secondary"
-        onclick={() => { if (!showExport) initExportDefaults(); showExport = !showExport; }}
-      >Export</button>
-      {#if $canWrite}
-        <button class="btn btn-danger" onclick={() => (showClearConfirm = true)}>Clear</button>
+      <!-- Export and Clear act on this node's own log, so they are
+           absent while the table shows followers' rows rather than
+           wired to a target other than the one displayed. -->
+      {#if entriesSource === 'local'}
+        <button
+          class="btn btn-secondary"
+          onclick={() => { if (!showExport) initExportDefaults(); showExport = !showExport; }}
+        >Export</button>
+        {#if $canWrite}
+          <button class="btn btn-danger" onclick={() => (showClearConfirm = true)}>Clear</button>
+        {/if}
       {/if}
     </div>
   </div>
 
-  {#if showExport}
+  {#if showExport && entriesSource === 'local'}
     <div class="export-panel">
       <div class="export-row">
         <label class="export-label">
@@ -316,25 +359,28 @@
   <div class="filters">
     <NodeFilter
       value={filterNode}
-      onchange={(id) => {
-        filterNode = id;
-        void loadLogs();
-      }}
+      offerAllFollowers
+      onchange={selectNode}
     />
-    <input
-      type="text"
-      class="filter-input search-input"
-      placeholder="Search logs..."
-      bind:value={searchText}
-      onkeydown={(e) => { if (e.key === 'Enter') loadLogs(); }}
-    />
-    <input
-      type="text"
-      class="filter-input ip-input"
-      placeholder="Filter by Client IP..."
-      bind:value={filterClientIp}
-      onkeydown={(e) => { if (e.key === 'Enter') loadLogs(); }}
-    />
+    <!-- The fan-in read filters on host and time only. A search, client
+         IP or status filter left on screen there would filter nothing,
+         so they are hidden rather than shown and ignored. -->
+    {#if !readsFanIn}
+      <input
+        type="text"
+        class="filter-input search-input"
+        placeholder="Search logs..."
+        bind:value={searchText}
+        onkeydown={(e) => { if (e.key === 'Enter') loadLogs(); }}
+      />
+      <input
+        type="text"
+        class="filter-input ip-input"
+        placeholder="Filter by Client IP..."
+        bind:value={filterClientIp}
+        onkeydown={(e) => { if (e.key === 'Enter') loadLogs(); }}
+      />
+    {/if}
     <input
       type="text"
       class="filter-input route-input"
@@ -342,11 +388,13 @@
       bind:value={filterRoute}
       onkeydown={(e) => { if (e.key === 'Enter') loadLogs(); }}
     />
-    <select class="filter-select" bind:value={filterStatusCategory} onchange={loadLogs}>
-      {#each statusCategories as cat (cat.value)}
-        <option value={cat.value}>{cat.label}</option>
-      {/each}
-    </select>
+    {#if !readsFanIn}
+      <select class="filter-select" bind:value={filterStatusCategory} onchange={loadLogs}>
+        {#each statusCategories as cat (cat.value)}
+          <option value={cat.value}>{cat.label}</option>
+        {/each}
+      </select>
+    {/if}
     <select class="filter-select" bind:value={filterTimeRange} onchange={loadLogs}>
       {#each timeRanges as tr (tr.value)}
         <option value={tr.value}>{tr.label}</option>
@@ -377,7 +425,7 @@
       <table>
         <thead>
           <tr>
-            {#if fleetView}
+            {#if entriesSource === 'fan-in'}
               <th>Node</th>
             {/if}
             <th>Time</th>
@@ -394,7 +442,7 @@
         <tbody>
           {#each [...entries].reverse() as entry (entry.id)}
             <tr>
-              {#if fleetView}
+              {#if entriesSource === 'fan-in'}
                 <td class="mono">{fleetNodeById[entry.id] ?? '-'}</td>
               {/if}
               <td class="mono time-col">{formatTimestamp(entry.timestamp)}</td>

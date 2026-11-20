@@ -19,6 +19,17 @@ Author: Rwx-G
 
 ### Security
 
+## [1.10.9] - 2026-11-20
+
+A cluster's control plane shows its own access logs, WAF events and bans again, and no page offers an action on the control plane's data while it shows a follower's. Dashboard only, no schema migration.
+
+### Fixed
+
+- **A control plane's Access Logs and Security pages show its own traffic again.** A node's own requests, WAF events and bans are never copied into the store that collects the followers', yet on a control plane both pages read only that store, so the requests the control plane proxied itself appeared nowhere. Up to 1.10.7 the Logs page's live tail filled the gap by accident; once 1.10.8 stopped it, the page stayed empty on a control plane however much traffic it served. The node filter now opens on "This node", which reads this node's own log, WAF events and bans as on a standalone install, live tail included; "All followers" and each follower's name read the collected rows. There is no single view of the whole fleet, this node included. On a follower, which has no node list to offer, the filter is no longer shown. Affected: the WAF events and bans since 1.7.0, the access logs in 1.10.8.
+- **The Access Logs and Security pages no longer show one node's rows under another's columns and actions.** A slow response could land after the operator had switched between this node and a follower and replace the rows on screen, so a follower's requests could appear as the control plane's own, with the live tail appending to them, or the reverse, labelled with an unrelated node. On the Security page, picking a node on the Bans tab left the Events tab on the previous choice, so "Clear Events", which deletes this node's events, could sit above a follower's. Each page now keeps only the answer to its latest read, empties the table as soon as the node changes, and reloads both tabs on a switch. Export, Clear and Clear Events show only above this node's own rows.
+- **The Access Logs search, client IP and status filters are hidden while followers' logs are shown.** The collected rows are filtered by host and time only, so those three stayed on screen and filtered nothing, and a 5xx filter over "All followers" listed every status.
+- **The SLA page no longer offers to export or clear a route's SLA data while a follower is picked.** On a control plane, with a follower picked in the node filter, the route detail kept its Export and Clear SLA buttons although the page said they were hidden. The export and the clear take no node and act on the control plane's own store, so the operator downloaded, or deleted, the control plane's figures for that route while looking at the follower's. They are now hidden while a follower is picked, as Configure already was. A late answer for the previously picked node also no longer replaces the figures shown. Affected releases: 1.7.0 to 1.10.8.
+
 ## [1.10.8] - 2026-11-18
 
 Route compression works for the first time, the Logs page stops polling once it is left, the Cluster page, fleet bar and wide settings tables follow the theme and lay out, and `lettre` closes six SMTP advisories. No schema migration.

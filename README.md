@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.10.8-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.10.9-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
   <img src="https://img.shields.io/badge/Lorica%20Tests-3711-brightgreen.svg" alt="Lorica Tests">
@@ -367,11 +367,11 @@ The dashboard ships inside the binary and is served on the management port (defa
 - **Routes** - create/edit routes with host matching, path prefixes, load balancing, WAF mode, rate limits, caching, timeouts, security headers, CORS, and 25 other per-route settings; a route the automation API owns carries an `automation` badge naming its environment and opens read-only, with a hint to update it through the pipeline
 - **Backends** - manage backend addresses, weights, health check type (TCP/HTTP), TLS upstream, active connections; automation-owned backends carry the same badge
 - **Certificates** - upload PEM certificates, view expiry dates, provision via ACME/Let's Encrypt (HTTP-01, DNS-01)
-- **Security** - WAF counters for the last hour, the last 24 hours and the events held (the retained table, bounded by `waf_event_retention`, or without a log store the in-memory events since start, labelled as such), refreshed periodically; WAF event table with category filtering, 49 rule toggles, IP ban list with unban button, admin audit log with chain verification; on a control plane every tab carries a node filter over the fleet's events, bans and audit chains
+- **Security** - WAF counters for the last hour, the last 24 hours and the events held (the retained table, bounded by `waf_event_retention`, or without a log store the in-memory events since start, labelled as such), refreshed periodically; WAF event table with category filtering, 49 rule toggles, IP ban list with unban button, admin audit log with chain verification; on a control plane the events and bans open on this node's own and a node filter switches them to every follower or one, and the audit tab filters the chains by node
 - **SLA** - per-route passive/active SLA side-by-side, latency percentile tables, config editor, CSV/JSON export; on a control plane a node picker shows one follower's own figures (never a fleet aggregate: a fleet percentile is not a function of per-node percentiles)
 - **Load Tests** - test config management with clone, one-click execution, real-time WebSocket progress panel, historical results
 - **Active Probes** - CRUD for synthetic health probes with route selection, HTTP method/path/status/interval/timeout
-- **Access Logs** - scrollable real-time log stream via WebSocket with green pulsing indicator; on a control plane, the fleet's access logs with a node column and filter
+- **Access Logs** - scrollable real-time log stream via WebSocket with green pulsing indicator; on a control plane it opens on this node's own log, live, and a node filter switches it to every follower's or one follower's logs, with a node column
 - **Capture** (v1.8.0) - the rule list with live counters, remaining budget and time to expiry, Disable for Operators, Create / Edit / Delete for SuperAdmins (the form refuses a rule that would record every request on a route unless the operator says so, and shows the expiry the TTL produces as they type), and a "Recent captures" panel over the last 50 records this process emitted, with a whole-record download
 - **Cluster** (v1.7.0) - the fleet roster with live sessions, applied configuration generation, resource gauges, per-node certificate entitlement and recent WAF events, join-token dialog with the ready-to-paste `cluster join` command, activation and revocation (which names the keys to re-issue); on a follower, the read-only banner with break-glass and leave
 - **System** - worker table with PID, health, heartbeat latency; CPU/memory/disk gauges
@@ -768,11 +768,11 @@ cargo test -p lorica-cluster --tests
 cd lorica-dashboard/frontend && pnpm install --frozen-lockfile && pnpm run check && pnpm run lint && pnpm exec vitest run
 ```
 
-At 1.10.8 the two product-crate steps run 3711 Rust tests and the
+At 1.10.9 the two product-crate steps run 3711 Rust tests and the
 forked-crate step 880; the rustls build runs 539 more, most of them the
 default-feature tests of `lorica-core` and `lorica-lb` again with TLS on,
-so they are left out of the forked figure. The frontend suite is 804
-Vitest cases across 47 files.
+so they are left out of the forked figure. The frontend suite is 825
+Vitest cases across 48 files.
 
 The `lorica` binary crate carries 26 end-to-end binaries under
 `lorica/tests/` that drive a real Pingora `Server` against mock backends

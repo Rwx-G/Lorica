@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import { api } from '../lib/api';
 import { auth } from '../lib/auth';
-import { clusterStatus, type ClusterStatus } from '../lib/cluster';
+import { ALL_FOLLOWERS, clusterStatus, type ClusterStatus } from '../lib/cluster';
 import NodeFilter from './NodeFilter.svelte';
 
 function status(role: ClusterStatus['role']): ClusterStatus {
@@ -60,17 +60,43 @@ afterEach(() => {
 });
 
 describe('NodeFilter', () => {
-  it('labels the empty choice as this node when there is no aggregate', async () => {
+  it('offers this node and each follower, and no aggregate unless asked', async () => {
     // The SLA page shows one node at a time (Story 9.7 AC #5): there
-    // is no "all nodes" figure to offer.
+    // is no fleet figure to offer.
     vi.spyOn(api, 'listClusterNodes').mockResolvedValue({
       data: [node('node-b', 'edge-02', 'active')],
     });
     clusterStatus.set(status('control_plane'));
-    render(NodeFilter, { props: { value: '', onchange: () => {}, allowAll: false } });
+    render(NodeFilter, { props: { value: '', onchange: () => {} } });
     await waitFor(() => expect(screen.getByText('edge-02')).toBeInTheDocument());
-    expect(screen.getByText('This node')).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'This node' })).toHaveValue('');
+    expect(screen.queryByText('All followers')).toBeNull();
+  });
+
+  it('offers every follower at once under a value no node id takes', async () => {
+    // `''` stays this node even where the fan-in aggregate is offered:
+    // the control plane's own rows are never fanned in, so the
+    // aggregate cannot stand for "all nodes" (the 1.10.8 regression).
+    vi.spyOn(api, 'listClusterNodes').mockResolvedValue({
+      data: [node('node-b', 'edge-02', 'active')],
+    });
+    clusterStatus.set(status('control_plane'));
+    render(NodeFilter, { props: { value: '', onchange: () => {}, offerAllFollowers: true } });
+    await waitFor(() => expect(screen.getByText('edge-02')).toBeInTheDocument());
+    expect(screen.getByRole('option', { name: 'This node' })).toHaveValue('');
+    expect(screen.getByRole('option', { name: 'All followers' })).toHaveValue(ALL_FOLLOWERS);
     expect(screen.queryByText('All nodes')).toBeNull();
+  });
+
+  it('renders nothing on a follower, which has no roster to list', async () => {
+    const list = vi.spyOn(api, 'listClusterNodes');
+    clusterStatus.set(status('follower'));
+    const { container } = render(NodeFilter, {
+      props: { value: '', onchange: () => {}, offerAllFollowers: true },
+    });
+    await Promise.resolve();
+    expect(container.querySelector('select')).toBeNull();
+    expect(list).not.toHaveBeenCalled();
   });
 
   it('renders nothing for a viewer, whose roster read is 403', async () => {
@@ -113,9 +139,8 @@ describe('NodeFilter', () => {
     // The regression this pins: the roster load used to run once at
     // mount, and `clusterStatus` is filled by an async read. A
     // component that mounted first returned early and never loaded, so
-    // on a real cluster the select appeared a moment later with "All
-    // nodes" as its only option until the page was navigated away from
-    // and back.
+    // on a real cluster the select appeared a moment later with one
+    // option until the page was navigated away from and back.
     vi.spyOn(api, 'listClusterNodes').mockResolvedValue({
       data: [node('id-a', 'edge-01', 'active')],
     });
@@ -141,18 +166,35 @@ describe('NodeFilter', () => {
     // belongs in the filter; a revoked one never will again.
     expect(screen.getByText('edge-02')).toBeInTheDocument();
     expect(screen.queryByText('edge-gone')).toBeNull();
-    expect(screen.getByText('All nodes')).toBeInTheDocument();
   });
 
-  it('keeps the "all nodes" option when the roster read fails', async () => {
+  it('retries a failed roster read on the next status poll', async () => {
+    // The status store emits on every poll while the visibility gate
+    // stays true, so the retry has to follow the store itself.
+    const list = vi
+      .spyOn(api, 'listClusterNodes')
+      .mockResolvedValueOnce({ error: { code: 'internal', message: 'nope' } })
+      .mockResolvedValue({ data: [node('id-a', 'edge-01', 'active')] });
+    clusterStatus.set(status('control_plane'));
+    render(NodeFilter, { props: { value: '', onchange: () => {} } });
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText('edge-01')).toBeNull();
+
+    clusterStatus.set(status('control_plane'));
+    await waitFor(() => expect(screen.getByText('edge-01')).toBeInTheDocument());
+    expect(list).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps this node and every follower when the roster read fails', async () => {
     // The filter is an aid, not a gate. A failed roster read must
     // leave the page usable rather than trap it on one node.
     vi.spyOn(api, 'listClusterNodes').mockResolvedValue({
       error: { code: 'internal', message: 'nope' },
     });
     clusterStatus.set(status('control_plane'));
-    render(NodeFilter, { props: { value: '', onchange: () => {} } });
+    render(NodeFilter, { props: { value: '', onchange: () => {}, offerAllFollowers: true } });
 
-    await waitFor(() => expect(screen.getByText('All nodes')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('All followers')).toBeInTheDocument());
+    expect(screen.getByText('This node')).toBeInTheDocument();
   });
 });

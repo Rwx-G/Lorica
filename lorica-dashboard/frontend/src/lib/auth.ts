@@ -1,6 +1,6 @@
 import { writable, derived } from 'svelte/store';
 
-import { clusterStatus, isReadOnlyNode } from './cluster';
+import { clusterStatus, isControlPlane, isReadOnlyNode } from './cluster';
 
 /** RBAC role of the logged-in account (Story 8.3). */
 export type Role = 'super_admin' | 'operator' | 'viewer';
@@ -76,4 +76,18 @@ export const isSuperAdminRole = derived(
 export const canWriteRole = derived(
   auth,
   (a) => a.status === 'authenticated' && (a.role === 'operator' || a.role === 'super_admin'),
+);
+
+/**
+ * Whether this session can read other nodes' data: a control plane,
+ * and a role at the Operator floor the server puts every fleet read
+ * behind (the cluster block of `authorize.rs`). A Viewer on a control
+ * plane sees this node's own data, as on a standalone install.
+ *
+ * The node filter and every page's choice of store read this one
+ * store, so the two cannot disagree on who sees a follower's rows.
+ */
+export const canReadFleet = derived(
+  [clusterStatus, canWriteRole],
+  ([cluster, writeRole]) => isControlPlane(cluster) && writeRole,
 );
