@@ -1126,7 +1126,7 @@ Depends on: F, G; 12.2 Lot H's `streams` profile and 12.3 Lot G (which
 extends it too; sequential on `docker-compose.yml`). The machine to
 itself, orphan containers torn down first.
 
-- [ ] **IV1.** Services on one compose network (RFC 1918, so the default
+- [x] **IV1.** Services on one compose network (RFC 1918, so the default
       stream passes D-k): Lorica in worker mode (2 workers) with a UDP
       stream at default settings in front of an amplifying backend that
       answers every request with 10 datagrams of 1,800 bytes (within the
@@ -1146,14 +1146,14 @@ itself, orphan containers torn down first.
       accepted request (read from the counters); `source_datagram_rate`
       and `response_count_bound` drops are non-zero; the legitimate client
       gets every answer.
-- [ ] **Byte bound.** The same flood against a backend answering one
+- [x] **Byte bound.** The same flood against a backend answering one
       datagram of 4,000 bytes: every response exceeds the 1,920-byte
       allowance, the victim receives nothing, and the drops are
       `response_byte_bound`.
-- [ ] **Table isolation (AC #5).** The spoofer switches to random source
+- [x] **Table isolation (AC #5).** The spoofer switches to random source
       addresses on stream A; a second UDP stream B keeps serving a
       client, and A's refusals are `session_table_full` only.
-- [ ] **IV2.** Two DNS responders behind a UDP stream at default settings;
+- [x] **IV2.** Two DNS responders behind a UDP stream at default settings;
       the load generator sends at twice the capacity formula
       (`2 x 4,096 / 10` = 820 queries per second, under the default
       per-source rate) for 60 s across 64 source ports from one address.
@@ -1161,12 +1161,12 @@ itself, orphan containers torn down first.
       zero `idle_timeout` ends, every end `response_bound_reached` or
       `request_bound_reached`, and the session gauge far below
       `max_sessions`.
-- [ ] **Reply source.** A stream on `0.0.0.0`; a client sends to a second
+- [x] **Reply source.** A stream on `0.0.0.0`; a client sends to a second
       address of Lorica's container and receives the reply from it.
-- [ ] **Worker death.** `kill -9` one worker under IV2's load: the region
+- [x] **Worker death.** `kill -9` one worker under IV2's load: the region
       `total` returns to the live sessions (no leaked count), and the
       respawned worker serves its slot's clients.
-- [ ] **Budget.** `ulimits: nofile` set so that two default UDP streams
+- [x] **Budget.** `ulimits: nofile` set so that two default UDP streams
       exceed the fd constraint: the second is refused naming `worker_fds`
       and the numbers.
 

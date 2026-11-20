@@ -269,6 +269,68 @@ services:
     networks:
       - l4
 
+  # ---- Story 12.5 services (Story 12.12 Lot E) ----------------------
+
+  # test-runner/l4/udp_tools.py amplify: 9200 answers every datagram with
+  # 10 of 1,800 bytes (12.5 IV1), 9201 with one of 4,000 bytes, past the
+  # 1,920 bytes a 60-byte request earns at the default ratio.
+  udp-amplifier:
+    <<: *tcp-backend
+    entrypoint: ["python3", "/tests/l4/udp_tools.py", "amplify", "--listen", "9200:10:1800", "--listen", "9201:1:4000"]
+
+  # Forges the victim's address, or random ones, over a raw socket
+  # (Story 12.12 D-p: NET_RAW on the spoofer only).
+  udp-spoofer:
+    <<: *l4-runner
+    profiles: ["streams"]
+    user: root
+    cap_add:
+      - NET_RAW
+    networks:
+      - l4
+
+  # The address the spoofer forges: records what the proxy reflects to it.
+  udp-victim:
+    <<: *l4-runner
+    profiles: ["streams"]
+    networks:
+      - l4
+
+  # The second resolver of 12.5 IV2 (the first is `coredns`), same
+  # Corefile, on `l4`.
+  coredns-2:
+    image: coredns/coredns:1.15.0@sha256:0a9d8c8ddf34347eb59aad9a8784f0710de88d6d112726d11d271f9bc6daca26
+    profiles: ["streams"]
+    command: ["-conf", "/etc/coredns/Corefile"]
+    volumes:
+      - ./l4/coredns:/etc/coredns:ro
+    networks:
+      - l4
+
+  # dnsperf, from the perf-tools image (Story 12.12 D-p), for 12.5 IV2.
+  dns-loadgen:
+    build:
+      context: ./perf-tools
+    image: lorica-e2e-l4/perf-tools:${L4_IMAGE_TAG:-local}
+    profiles: ["streams"]
+    networks:
+      - l4
+
+  # Story 12.5 AC #6: one default UDP stream fits its fd budget (7,168
+  # at this limit), two do not, so the second is refused on worker_fds.
+  # A budget node as Lot B's: no `l4-node` alias, its own /shared.
+  lorica-budget-16k:
+    <<: *lorica-node
+    profiles: ["streams"]
+    entrypoint: ["/entrypoint-streams.sh"]
+    ulimits:
+      nofile: 16384
+    volumes:
+      - budget-16k-shared:/shared
+      - budget-16k-data:/var/lib/lorica
+    networks:
+      - l4
+
   # Has its own addresses: every source-address scenario needs a client
   # that is not the node's loopback.
   streams-client:
@@ -311,6 +373,8 @@ volumes:
   budget-4k-data:
   budget-8k-shared:
   budget-8k-data:
+  budget-16k-shared:
+  budget-16k-data:
 
 networks:
   l4:

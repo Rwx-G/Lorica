@@ -18,16 +18,17 @@ export MSYS_NO_PATHCONV=1
 # shellcheck source=lib.sh
 . l4/lib.sh
 
-services="lorica-streams streams-client"
+services="lorica-streams streams-client dns-loadgen"
 case "${1:-}" in
     --runner-only) services="streams-client" ;;
     "") ;;
     *) echo "build-images.sh: unknown argument $1" >&2; exit 2 ;;
 esac
 
-# Every profile, so profile-gated services resolve; the Lorica image
-# and the runner image are each named by one service of the `streams`
-# profile and shared by every other service that uses them.
+# Every profile, so profile-gated services resolve; the Lorica image,
+# the runner image and the perf-tools image (dns-loadgen, Story 12.5
+# IV2) are each named by one service of the `streams` profile and
+# shared by every other service that uses them.
 # shellcheck disable=SC2086 # the service list is word-split on purpose
 l4_compose --profile streams --profile streams-single --profile l4-report build $services
 echo "Built lorica-e2e-l4 images with tag ${L4_IMAGE_TAG}"

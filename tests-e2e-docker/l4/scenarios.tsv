@@ -50,14 +50,14 @@ name	source	story	profiles	level	lot	state	matrix
 12.4-ac5-two-cas-two-streams	12.4 AC #5	12.4	streams	full	D	live	TLS termination at L4
 12.4-ac4-upstream-mtls	12.4 AC #4	12.4	streams	full	D	live	Upstream TLS / mTLS
 12.4-x-key-replication-targeted	12.4 Lot H	12.4	cluster	full	D	live	-
-12.5-iv1-reflection-bounded	12.5 IV1	12.5	streams	full	E	pending	UDP request/response bounds
-12.5-ac2-byte-bound	12.5 AC #2	12.5	streams	full	E	pending	UDP request/response bounds
-12.5-ac5-table-isolation	12.5 AC #5	12.5	streams	full	E	pending	-
-12.5-iv2-dns-above-capacity-all-answered	12.5 IV2	12.5	streams	full	E	pending	UDP proxying with idle timeout
-12.5-x-reply-source-address	12.5 Lot I	12.5	streams	full	E	pending	-
-12.5-x-worker-death-no-leaked-count	12.5 Lot I	12.5	streams	full	E	pending	-
-12.5-ac6-budget-refuses-second-stream	12.5 AC #6	12.5	streams	full	E	pending	-
-12.5-matrix-udp-idle-timeout	12.12 D-e	12.5	streams	full	E	pending	UDP proxying with idle timeout;Timeouts connect / idle / total
+12.5-iv1-reflection-bounded	12.5 IV1	12.5	streams	full	E	live	UDP request/response bounds
+12.5-ac2-byte-bound	12.5 AC #2	12.5	streams	full	E	live	UDP request/response bounds
+12.5-ac5-table-isolation	12.5 AC #5	12.5	streams	full	E	live	-
+12.5-iv2-dns-above-capacity-all-answered	12.5 IV2	12.5	streams	full	E	live	UDP proxying with idle timeout
+12.5-x-reply-source-address	12.5 Lot I	12.5	streams	full	E	live	-
+12.5-x-worker-death-no-leaked-count	12.5 Lot I	12.5	streams	full	E	live	-
+12.5-ac6-budget-refuses-second-stream	12.5 AC #6	12.5	streams	full	E	live	-
+12.5-matrix-udp-idle-timeout	12.12 D-e	12.5	streams	full	E	live	UDP proxying with idle timeout;Timeouts connect / idle / total
 12.6-iv1-source-rate-refused-other-served	12.6 IV1	12.6	streams	full	F	live	New-connection rate limit
 12.6-iv2-geo-deny-tcp-and-udp	12.6 IV2	12.6	streams	full	F	live	GeoIP;IP allow/deny
 12.6-iv3-10k-silent-pending-cap	12.6 IV3	12.6	streams	full	F	live	-

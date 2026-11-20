@@ -726,10 +726,10 @@ amplifying backend, victim recorder), `tests-e2e-docker/docker-compose.l4.yml`
 `docs/stories/story-12.5-udp-engine.md` (Lot I checkboxes only).
 Depends on: C (CoreDNS service); 12.5 Lots F, G, H.
 
-- [ ] Every item of 12.5 Lot I; IV2 with CoreDNS and `dnsperf` instead
+- [x] Every item of 12.5 Lot I; IV2 with CoreDNS and `dnsperf` instead
       of the stand-ins (the stand-in DNS responder and load generator of
       12.5 Lot I are not written).
-- [ ] `12.5-matrix-udp-idle-timeout`.
+- [x] `12.5-matrix-udp-idle-timeout`.
 
 ### Lot F: Story 12.6 scenarios - Docker e2e
 
@@ -1646,6 +1646,70 @@ pulled images.
     `tls-backend` through `${L4_RESULTS}-l4d-*` files on the host, one
     file at a time.
 
+- **Lot E, 2026-11-20.** Story 12.5's IVs, the Lot I items and the UDP
+  idle-timeout row, on `3857b24e` (lane 1).
+  - **Verdicts** (`L4_LANE=1 L4_LOTS=E ./run.sh --only-l4`, 316 s for
+    the phase with the report), all PASS:
+    `12.5-iv1-reflection-bounded` (600,000 spoofed datagrams at 20,000/s
+    for 30 s; the victim received 30,950 datagrams, a mean of 1,857,000
+    B/s against the bound 8,192,000, worst second 3,405,600 B against
+    2 B; exactly one 1,800-byte response per request accepted from its
+    key, 568,938 `source_datagram_rate` drops; the legitimate client got
+    300 of 300 answers); `12.5-ac2-byte-bound` (the victim received
+    nothing, 0 response bytes forwarded, 30,993 `response_byte_bound`
+    drops, each session ending `response_bound_reached`);
+    `12.5-ac5-table-isolation` (300,000 datagrams from random sources:
+    145,473 refusals on stream A, all `session_table_full`; stream B's
+    client answered 150 of 150, no refusal on B);
+    `12.5-iv2-dns-above-capacity-all-answered` (dnsperf, 49,200 queries
+    at 820/s for 60 s over 64 source ports, every one answered within
+    2 s and NOERROR; no refusal, no drop; 49,200 sessions, every one
+    ended `response_bound_reached`; the session gauge peaked at 1);
+    `12.5-x-reply-source-address`; `12.5-x-worker-death-no-leaked-count`
+    (a stream holding 200 sessions went to 111 after the kill, equal to
+    the upstream sockets still open; the DNS stream's total back to 0;
+    8,200 of 8,200 queries answered after the respawn);
+    `12.5-ac6-budget-refuses-second-stream` ("worker fds: 8194 committed
+    exceed the stream budget of 7168 (fd limit 16384, ...)");
+    `12.5-matrix-udp-idle-timeout` (closed 2.005 s after the last
+    datagram, one session across a datagram at 1.5 s).
+  - **No product defect found.** First-run failures were the
+    scenarios': the host has no `jq` (every host-side read now runs `jq`
+    in the client), and the stream counters are no clock in worker mode,
+    since the workers' counters reach the API with the supervisor's
+    heartbeat round every 5 s: the idle timeout first measured 4.7 s from
+    the counter. It is now timed in the probe on the session's upstream
+    socket, and every counter read after a load waits until the counters
+    have not moved for 7 s.
+  - **Deviations.** (1) 12.5 Lot I's IV1 expects `response_count_bound`
+    drops to be non-zero. With `responses_per_request` 1 a session ends
+    under the lock of its first forwarded response (D-b), so the other 9
+    datagrams of the amplifier reach a closed upstream socket and no
+    session counts them; the counter stays 0 and the scenario reports
+    it. The count bound is asserted by its effect instead: at most one
+    datagram at the victim per request accepted from its key. The
+    reflection bound holds either way; `docs/streams.md` ("How a session
+    ends") does not say that responses past the count arriving after the
+    end go uncounted. (2) The victim binds the spoofer's 2,000 source
+    ports rather than reading a raw socket, so it needs no privilege;
+    the spoofer alone has `NET_RAW` (D-p). (3) Table isolation spoofs
+    sources in 198.18.0.0/15 (RFC 2544) against a backend answering past
+    the byte bound, so nothing is ever sent to those addresses and the
+    node's neighbour table is not flooded; the table that fills is the
+    rate table (4 cells per session of `max_sessions`, evicted every
+    second), whose full window refuses `session_table_full`. (4) The
+    AC #6 node is a new budget node, `lorica-budget-16k` (fd limit
+    16,384, `S` 7,168), the limit at which one default UDP stream fits
+    and two do not; Lot B's nodes are too small for one. (5) The second
+    resolver is `coredns-2`; both serve `iv2.test` from
+    `l4/coredns/iv2.test.db`, a block added to Lot C's Corefile.
+    `dns-loadgen` runs the `perf-tools` image, which
+    `l4/build-images.sh` now builds for the lanes. (6) Worker death
+    asserts the "no leaked count" on a stream holding 200 sessions
+    (`responses_per_request` 0, a 300 s idle timeout) beside IV2's load:
+    the DNS load alone holds about one session at a time, too few for a
+    leak to show.
+
 ## File List
 
 Lot A:
@@ -1777,6 +1841,19 @@ Lot D:
   replication section appended)
 - `docs/stories/story-12.4-tls-l4.md` (Lot H checkboxes)
 
+Lot E:
+
+- `tests-e2e-docker/l4/scenarios/12.5.sh` (new)
+- `tests-e2e-docker/l4/scenarios.tsv` (Lot E rows `live`)
+- `tests-e2e-docker/test-runner/l4/udp_tools.py` (new)
+- `tests-e2e-docker/l4/coredns/iv2.test.db` (new),
+  `tests-e2e-docker/l4/coredns/Corefile` (the `iv2.test` block)
+- `tests-e2e-docker/docker-compose.l4.yml` (`udp-amplifier`,
+  `udp-spoofer`, `udp-victim`, `coredns-2`, `dns-loadgen`,
+  `lorica-budget-16k`)
+- `tests-e2e-docker/l4/build-images.sh` (builds `dns-loadgen`)
+- `docs/stories/story-12.5-udp-engine.md` (Lot I checkboxes)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1796,3 +1873,4 @@ Lot D:
 | 2026-11-21 | 0.7 | Lot K implemented: Story 12.11 IV1 and its three handover scenarios in the `hot-upgrade` profile, all passing (SSH session drained at the 120 s deadline with its report on the new `/metrics`, UDP across the upgrade with no loss, 64 range ports handed over); `ssh-backend` image. No product defect. | Romain G. |
 | 2026-11-21 | 0.8 | Lot J implemented: Story 12.10 IV1 (partial as D-d says: the form's body, not a click) and Story 12.7 IV2 in the `mcp` profile, both reporting as expected; the section's mints wait out the login limit. No product defect. | Romain G. |
 | 2026-11-20 | 0.7 | Lot D implemented: Story 12.4 IV1 with the ALPN name, IV2 across a forced ACME renewal (full, not partial), the two-CA proof, upstream mTLS and key replication in the `cluster` profile, all passing; the key-replication defect it found is fixed in `44d6248b`. | Romain G. |
+| 2026-11-20 | 0.8 | Lot E implemented: Story 12.5 IV1 (spoofed flood, the reflection bound at the victim), the byte bound, table isolation, IV2 on two CoreDNS servers with dnsperf, reply source, worker death, the AC #6 budget and the UDP idle-timeout row, all passing. No product defect; `response_count_bound` stays 0 under IV1 by D-b's end rule, recorded. | Romain G. |
