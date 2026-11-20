@@ -1170,21 +1170,21 @@ certificate it saw), `tests-e2e-docker/test-runner/Dockerfile` (the
 Depends on: E, F; 12.3 Lot G and 12.5 Lot I (same compose file). The
 machine to itself, orphan containers torn down first.
 
-- [ ] IV1: two names in passthrough to two backends, each reporting a
+- [x] IV1: two names in passthrough to two backends, each reporting a
       ClientHello identical to the one `openssl s_client` (or Python's
       `ssl`) sent, captured on the runner side; a third name is closed
       and counted `no_match`.
-- [ ] IV2 in the `acme` profile (Pebble): a terminating stream on a
+- [x] IV2 in the `acme` profile (Pebble): a terminating stream on a
       Pebble-issued certificate; a renewal triggered the way the ACME
       smoke triggers one; new connections present the new serial, an
       open connection keeps echoing. If a renewal cannot be forced in
       that profile, the certificate is replaced through the store write
       the renewal performs, and the Completion Notes say so.
-- [ ] AC #5 end to end: two terminating streams with two CAs, each
+- [x] AC #5 end to end: two terminating streams with two CAs, each
       client certificate accepted on its own stream only.
-- [ ] Upstream mTLS: a terminate-and-re-encrypt stream presents a
+- [x] Upstream mTLS: a terminate-and-re-encrypt stream presents a
       stored client certificate the TLS backend reports.
-- [ ] Key replication (Resolved 2), in the `cluster` profile: a
+- [x] Key replication (Resolved 2), in the `cluster` profile: a
       terminating stream targeted at one follower, naming a certificate
       no route names and a client identity no route names. After
       convergence the targeted follower holds both keys (non-empty

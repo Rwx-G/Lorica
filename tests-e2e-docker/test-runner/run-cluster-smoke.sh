@@ -802,4 +802,175 @@ OWN=$(api_get "/api/v1/sla/overview")
 assert_json "$OWN" '[.data[] | select(.route_id == "'"$ROUTE_ID"'" and .total_requests > 0)] | length' '0' \
     "the control plane's own SLA is not the follower's"
 
+# ---------------------------------------------------------------------
+# Story 12.4, key replication (Story 12.12 Lot D, 12.4 Resolved 2): a
+# terminating stream targeted at one follower, naming a certificate and
+# an upstream client identity no route names. Its keys reach the
+# targeted follower and no other; a handshake completes there, through to
+# a TLS backend that verifies the identity. Retargeted, the keys follow.
+# Prints exactly one `L4-SCENARIO` line (Story 12.12 D-c).
+# ---------------------------------------------------------------------
+log "=== 12.4: stream key replication follows the selector ==="
+l4_kr_line() {
+    echo "L4-SCENARIO 12.4-x-key-replication-targeted $1 $2"
+    if [ "$1" = PASS ]; then ok "12.4 key replication: $2"; else fail "12.4 key replication: $2"; fi
+}
+# The roster's entitlement of <node> to <certificate id>: 1 or 0.
+l4_kr_entitled() {
+    API="$CP_API" SESSION="$CP_SESSION" api_get /api/v1/cluster/nodes | jq --arg n "$1" --arg c "$2" \
+        '[(.data // [])[] | select(.name == $n) | (.certificate_ids // [])[] | select(. == $c)] | length'
+}
+# Whether <node>'s own API hands out a private key for <certificate id>,
+# on the follower sessions l4_kr opens once (the login limit is 5 a
+# minute per address).
+l4_kr_key() {
+    local api session
+    case "$1" in
+        edge-a) api="$EDGE_A_API" session="$L4_KR_SESSION_A" ;;
+        *) api="$EDGE_B_API" session="$L4_KR_SESSION_B" ;;
+    esac
+    if curl -sk -b "$session" "$api/api/v1/certificates/$2/download?part=key" | grep -q 'PRIVATE KEY'; then
+        echo key
+    else
+        echo none
+    fi
+}
+# Whether <node>'s own API lists the row of <certificate id>: 1 or 0.
+l4_kr_row() {
+    local api session
+    case "$1" in
+        edge-a) api="$EDGE_A_API" session="$L4_KR_SESSION_A" ;;
+        *) api="$EDGE_B_API" session="$L4_KR_SESSION_B" ;;
+    esac
+    curl -sk -b "$session" "$api/api/v1/certificates/$2" | jq -r --arg id "$2" 'if .data.id == $id then 1 else 0 end'
+}
+# A handshake on <node>'s stream port, through to the TLS backend.
+l4_kr_handshake() {
+    python3 /tests/l4/tls_backend.py term --host "lorica-$1" --port 7601 --sni kr.l4d.test
+}
+l4_kr() {
+    local pki=/tmp/kr-pki smoke_ip server client backend stream body i seen other a_srv a_cli b_srv b_cli
+    mkdir -p "$pki/backend"
+    (
+        cd "$pki"
+        for c in ca-up ca-client; do
+            openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 -subj "/CN=$c" \
+                -keyout "$c.key" -out "$c.crt" -addext basicConstraints=critical,CA:TRUE \
+                -addext keyUsage=critical,keyCertSign,cRLSign 2>/dev/null
+        done
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 -subj "/CN=kr.l4d.test" \
+            -keyout server.key -out server.crt -addext subjectAltName=DNS:kr.l4d.test 2>/dev/null
+        for leaf in "tls-backend.l4d.test ca-up serverAuth" "kr-client.l4d.test ca-client clientAuth"; do
+            set -- $leaf
+            openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=$1" \
+                -keyout "$1.key" -out "$1.csr" 2>/dev/null
+            printf 'subjectAltName=DNS:%s\nextendedKeyUsage=%s\nbasicConstraints=CA:FALSE\n' "$1" "$3" > "$1.ext"
+            openssl x509 -req -in "$1.csr" -CA "$2.crt" -CAkey "$2.key" -CAcreateserial -days 30 \
+                -extfile "$1.ext" -out "$1.crt" 2>/dev/null
+        done
+        cp tls-backend.l4d.test.crt backend/backend.crt
+        cp tls-backend.l4d.test.key backend/backend.key
+        cp ca-client.crt backend/client-ca.crt
+    )
+    python3 /tests/l4/tls_backend.py tls --name kr-backend --port 9701 --pki "$pki/backend" &
+    smoke_ip=$(python3 -c 'import socket; print(socket.gethostbyname(socket.gethostname()))')
+
+    API="$EDGE_A_API"; login "$(cat "$SHARED/edge-a_admin_password")"; L4_KR_SESSION_A="$SESSION"
+    API="$EDGE_B_API"; login "$(cat "$SHARED/edge-b_admin_password")"; L4_KR_SESSION_B="$SESSION"
+    API="$CP_API"
+    SESSION="$CP_SESSION"
+    upload() {
+        api_post /api/v1/certificates "$(jq -n --arg d "$1" --rawfile c "$pki/$2.crt" --rawfile k "$pki/$2.key" \
+            '{domain: $d, cert_pem: $c, key_pem: $k}')" | jq -r '.data.id // empty'
+    }
+    server=$(upload kr.l4d.test server)
+    client=$(upload kr-client.l4d.test kr-client.l4d.test)
+    [ -n "$server" ] && [ -n "$client" ] || { l4_kr_line FAIL "certificate upload refused on the control plane"; return; }
+    backend=$(api_post /api/v1/backends "{\"address\":\"${smoke_ip}:9701\",\"health_check_enabled\":false}" | jq -r '.data.id // empty')
+    [ -n "$backend" ] || { l4_kr_line FAIL "backend create refused"; return; }
+    body=$(jq -n --arg srv "$server" --arg cli "$client" --arg b "$backend" --rawfile ca "$pki/ca-up.crt" \
+        '{name: "l4d-key-replication", protocol: "tcp", listen_address: "0.0.0.0", port_first: 7601,
+          node_selector: ["edge-a"], tls_mode: "terminate",
+          match_rules: [{name: "kr", matcher: {kind: "tls", server_names: ["kr.l4d.test"]}, backend_ids: [$b]}],
+          tls_terminate: {certificate_ids: [$srv]},
+          upstream_tls: {server_name: {mode: "fixed", name: "tls-backend.l4d.test"}, ca_cert_pem: $ca, client_certificate_id: $cli}}')
+    # A follower's reserved ports arrive with its heartbeat; until then
+    # the control plane refuses a stream it cannot check there.
+    local answer=""
+    for i in $(seq 1 30); do
+        answer=$(api_post /api/v1/streams "$body")
+        stream=$(echo "$answer" | jq -r '.data.id // empty')
+        [ -n "$stream" ] && break
+        echo "$answer" | grep -q 'has not reported its reserved ports' || break
+        sleep 2
+    done
+    [ -n "$stream" ] || { l4_kr_line FAIL "stream create refused: $(echo "$answer" | head -c 300)"; return; }
+
+    for i in $(seq 1 60); do
+        seen=$(l4_kr_handshake edge-a)
+        case "$seen" in "name=kr-backend "*) break ;; esac
+        sleep 1
+    done
+    case "$seen" in
+        "name=kr-backend sni=tls-backend.l4d.test client=kr-client.l4d.test "*) ;;
+        *) l4_kr_line FAIL "no handshake through edge-a's stream: ${seen}"; return ;;
+    esac
+    other=$(l4_kr_handshake edge-b)
+    a_srv=$(l4_kr_key edge-a "$server"); a_cli=$(l4_kr_key edge-a "$client")
+    b_srv=$(l4_kr_key edge-b "$server"); b_cli=$(l4_kr_key edge-b "$client")
+    if [ "$a_srv $a_cli $b_srv $b_cli" != "key key none none" ] \
+        || [ "$(l4_kr_entitled edge-a "$server")$(l4_kr_entitled edge-a "$client")" != 11 ] \
+        || [ "$(l4_kr_entitled edge-b "$server")$(l4_kr_entitled edge-b "$client")" != 00 ]; then
+        l4_kr_line FAIL "targeted at edge-a: edge-a keys ${a_srv}/${a_cli}, edge-b keys ${b_srv}/${b_cli}, entitlements a=$(l4_kr_entitled edge-a "$server")$(l4_kr_entitled edge-a "$client") b=$(l4_kr_entitled edge-b "$server")$(l4_kr_entitled edge-b "$client")"
+        return
+    fi
+    case "$other" in name=*) l4_kr_line FAIL "edge-b, not targeted, served the stream: ${other}"; return ;; esac
+    # Not even the rows: since Story 10.0 a node receives only the
+    # certificates of what it serves (`restrict_for_recipient`), so the
+    # "rows without a key" Story 12.4 Lot H expected predates that cut.
+    [ "$(l4_kr_row edge-a "$server")$(l4_kr_row edge-a "$client")" = 11 ] \
+        || { l4_kr_line FAIL "edge-a does not hold both certificate rows"; return; }
+    [ "$(l4_kr_row edge-b "$server")$(l4_kr_row edge-b "$client")" = 00 ] \
+        || { l4_kr_line FAIL "edge-b, not targeted, holds a certificate row of the stream"; return; }
+
+    api_put "/api/v1/streams/$stream" '{"node_selector":["edge-b"]}' >/dev/null
+    for i in $(seq 1 60); do
+        seen=$(l4_kr_handshake edge-b)
+        case "$seen" in "name=kr-backend "*) break ;; esac
+        sleep 1
+    done
+    case "$seen" in
+        "name=kr-backend sni=tls-backend.l4d.test client=kr-client.l4d.test "*) ;;
+        *) l4_kr_line FAIL "no handshake through edge-b's stream after the retarget: ${seen}"; return ;;
+    esac
+    for i in $(seq 1 30); do
+        [ "$(l4_kr_entitled edge-a "$server")$(l4_kr_entitled edge-a "$client")" = 00 ] && break
+        sleep 2
+    done
+    other=$(l4_kr_handshake edge-a)
+    b_srv=$(l4_kr_key edge-b "$server"); b_cli=$(l4_kr_key edge-b "$client")
+    a_srv=$(l4_kr_key edge-a "$server"); a_cli=$(l4_kr_key edge-a "$client")
+    local a_ent b_ent
+    a_ent="$(l4_kr_entitled edge-a "$server")$(l4_kr_entitled edge-a "$client")"
+    b_ent="$(l4_kr_entitled edge-b "$server")$(l4_kr_entitled edge-b "$client")"
+    # What edge-a keeps, asserted as the cluster smoke asserts a node's
+    # entitlement (the roster) plus what its own API holds: the next
+    # generation's cut no longer carries the rows, and the apply deletes
+    # a row the blob dropped, key and all.
+    local a_rows
+    a_rows="$(l4_kr_row edge-a "$server")$(l4_kr_row edge-a "$client")"
+    if [ "$b_srv $b_cli" != "key key" ] || [ "$b_ent" != 11 ] || [ "$a_ent" != 00 ] \
+        || [ "$a_rows" != 00 ] || [ "$a_srv $a_cli" != "none none" ]; then
+        l4_kr_line FAIL "retargeted to edge-b: edge-b keys ${b_srv}/${b_cli} entitled ${b_ent}; edge-a entitled ${a_ent}, rows ${a_rows}, keys ${a_srv}/${a_cli}"
+        return
+    fi
+    case "$other" in name=*) l4_kr_line FAIL "edge-a still served the stream after the retarget: ${other}"; return ;; esac
+    api_del "/api/v1/streams/$stream" >/dev/null
+    l4_kr_line PASS "targeted at edge-a: its own API hands out both keys, edge-b holds neither row nor key, the roster entitles edge-a only, a handshake through edge-a reaches the TLS backend with the replicated client identity; retargeted to edge-b: the same there, and edge-a is no longer entitled, holds neither row nor key, and no longer serves the stream"
+}
+# Without errexit: every path of l4_kr ends on its one line.
+set +e
+l4_kr
+set -e
+
 print_results

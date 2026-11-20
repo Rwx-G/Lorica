@@ -714,7 +714,7 @@ profiles' stream additions only), the `acme` and `cluster` smoke scripts
 `docs/stories/story-12.4-tls-l4.md` (Lot H checkboxes only).
 Depends on: C; 12.4 Lots E and F.
 
-- [ ] Every item of 12.4 Lot H, plus the ALPN name in IV1.
+- [x] Every item of 12.4 Lot H, plus the ALPN name in IV1.
 
 ### Lot E: Story 12.5 scenarios - Docker e2e
 
@@ -1603,6 +1603,48 @@ pulled images.
     machine") stays open: this run held the main-compose lock while L4
     lanes ran their own projects. 12.7 has no handed-over e2e Lot (its
     IV2 is automated in its Lot 2), so nothing is ticked there.
+- **Lot D, 2026-11-20.** Story 12.4's IVs, the two-CA proof, upstream
+  mTLS and key replication, on `c01536bb` (lane 1).
+  - **Verdicts**, all PASS. In lane 1 (`L4_LANE=1 L4_LOTS=D
+    ./run.sh --only-l4`, 41 s for the phase with the report):
+    `12.4-iv1-sni-passthrough-two-names` (one.l4d.test and two.l4d.test
+    on one passthrough port to `tls-raw-1` and `tls-raw-2`, each
+    reporting the SHA-256 of the 517-byte ClientHello the client sent;
+    alpn.l4d.test offering `h2` to one backend, `http/1.1` alone to the
+    other; three.l4d.test closed, one `no_match` counted);
+    `12.4-ac5-two-cas-two-streams` (each client certificate served on its
+    own stream and refused on the other, no certificate refused on both);
+    `12.4-ac4-upstream-mtls` (the Python `ssl` backend verified the
+    stored client identity and saw the fixed name). In the `acme` and
+    `cluster` phases of the plain layout on `44d6248b` (the main compose
+    project, before lanes; the smoke sections are unchanged since):
+    `12.4-iv2-acme-renewal-on-terminating-stream` PASS, not partial: the
+    renewal is forced through `POST /api/v1/certificates/{id}/renew` on
+    Pebble, in place (same id), new connections present the renewed
+    certificate's fingerprint and the connection opened before kept
+    echoing (124 pings, 0 failures); `12.4-x-key-replication-targeted`.
+  - **Product defect found and fixed**: the per-recipient cut of the
+    replicated configuration dropped a stream's certificates (Debug Log,
+    `44d6248b`). The first key-replication run failed on it (TLS alert
+    49 through edge-a's stream).
+  - **Deviations.** (1) Key replication: 12.4 Lot H expected the
+    untargeted follower to hold both rows without a key. Since Story
+    10.0 a node receives only the certificates of what it serves
+    (`restrict_for_recipient`), so it holds neither row nor key, and the
+    scenario asserts that. After the retarget, what edge-a keeps is
+    asserted as the cluster smoke asserts a retargeted route: the
+    roster's entitlement (`certificate_ids` of
+    `GET /api/v1/cluster/nodes`) plus what the node's own API holds; it
+    is no longer entitled, holds neither row nor key (the apply deletes
+    a row the blob dropped), and no longer serves the stream. (2) Files:
+    `test-runner/l4/tls_backend.py` and `l4/scenarios/12.4.sh` replace
+    12.4 Lot H's `test-runner/tls_backend.py` and `run-streams-tls.sh`;
+    the runner Dockerfile's `COPY l4/` already ships the tool, so it is
+    unchanged. (3) The renewal waits out a 429: the two issuances of the
+    ACME smoke spend the same bucket (3 a minute per address); the first
+    run failed on it. (4) The TLS backend's PKI goes from the client to
+    `tls-backend` through `${L4_RESULTS}-l4d-*` files on the host, one
+    file at a time.
 
 ## File List
 
@@ -1722,6 +1764,18 @@ Lot J:
   appended)
 - `tests-e2e-docker/l4/scenarios.tsv` (Lot J rows `live`)
 - `docs/stories/story-12.10-stream-surfaces.md` (Lot H checkboxes)
+Lot D:
+
+- `tests-e2e-docker/l4/scenarios/12.4.sh` (new)
+- `tests-e2e-docker/l4/scenarios.tsv` (Lot D rows `live`)
+- `tests-e2e-docker/test-runner/l4/tls_backend.py` (new)
+- `tests-e2e-docker/docker-compose.l4.yml` (`tls-raw-1`, `tls-raw-2`,
+  `tls-backend`)
+- `tests-e2e-docker/test-runner/run-acme-smoke.sh` (12.4 IV2 section
+  appended)
+- `tests-e2e-docker/test-runner/run-cluster-smoke.sh` (12.4 key
+  replication section appended)
+- `docs/stories/story-12.4-tls-l4.md` (Lot H checkboxes)
 
 ## Change Log
 
@@ -1741,3 +1795,4 @@ Lot J:
 | 2026-11-21 | 0.7 (Lot I) | Lot I re-verified by a fresh run after the lane was interrupted: same verdicts, no file change. | Romain G. |
 | 2026-11-21 | 0.7 | Lot K implemented: Story 12.11 IV1 and its three handover scenarios in the `hot-upgrade` profile, all passing (SSH session drained at the 120 s deadline with its report on the new `/metrics`, UDP across the upgrade with no loss, 64 range ports handed over); `ssh-backend` image. No product defect. | Romain G. |
 | 2026-11-21 | 0.8 | Lot J implemented: Story 12.10 IV1 (partial as D-d says: the form's body, not a click) and Story 12.7 IV2 in the `mcp` profile, both reporting as expected; the section's mints wait out the login limit. No product defect. | Romain G. |
+| 2026-11-20 | 0.7 | Lot D implemented: Story 12.4 IV1 with the ALPN name, IV2 across a forced ACME renewal (full, not partial), the two-CA proof, upstream mTLS and key replication in the `cluster` profile, all passing; the key-replication defect it found is fixed in `44d6248b`. | Romain G. |

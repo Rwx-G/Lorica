@@ -45,11 +45,11 @@ name	source	story	profiles	level	lot	state	matrix
 12.3-matrix-port-range	12.12 D-e	12.3	streams	full	C	live	Port ranges
 12.3-matrix-latency-aware-selection	not e2e: Story 12.3 Lot D1 selection tests	12.3	-	not-e2e	-	-	Latency-aware selection
 12.3-matrix-backend-keepalive	not e2e: Story 12.3 Lot C socket-option test	12.3	-	not-e2e	-	-	Backend TCP keepalive
-12.4-iv1-sni-passthrough-two-names	12.4 IV1	12.4	streams	full	D	pending	TLS passthrough, SNI routing;ALPN routing
-12.4-iv2-acme-renewal-on-terminating-stream	12.4 IV2	12.4	acme	partial	D	pending	TLS termination at L4
-12.4-ac5-two-cas-two-streams	12.4 AC #5	12.4	streams	full	D	pending	TLS termination at L4
-12.4-ac4-upstream-mtls	12.4 AC #4	12.4	streams	full	D	pending	Upstream TLS / mTLS
-12.4-x-key-replication-targeted	12.4 Lot H	12.4	cluster	full	D	pending	-
+12.4-iv1-sni-passthrough-two-names	12.4 IV1	12.4	streams	full	D	live	TLS passthrough, SNI routing;ALPN routing
+12.4-iv2-acme-renewal-on-terminating-stream	12.4 IV2	12.4	acme	partial	D	live	TLS termination at L4
+12.4-ac5-two-cas-two-streams	12.4 AC #5	12.4	streams	full	D	live	TLS termination at L4
+12.4-ac4-upstream-mtls	12.4 AC #4	12.4	streams	full	D	live	Upstream TLS / mTLS
+12.4-x-key-replication-targeted	12.4 Lot H	12.4	cluster	full	D	live	-
 12.5-iv1-reflection-bounded	12.5 IV1	12.5	streams	full	E	pending	UDP request/response bounds
 12.5-ac2-byte-bound	12.5 AC #2	12.5	streams	full	E	pending	UDP request/response bounds
 12.5-ac5-table-isolation	12.5 AC #5	12.5	streams	full	E	pending	-

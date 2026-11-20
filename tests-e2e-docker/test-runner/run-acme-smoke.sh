@@ -259,6 +259,84 @@ else
     fail "no certificate for ${DNS01_DOMAIN} in: $(echo "$CERTS" | jq -c '.data.certificates | map(.domain)' 2>/dev/null)"
 fi
 
+# --- Story 12.4 IV2: a terminating stream across an ACME renewal ---
+# Story 12.12 Lot D. A stream terminating TLS with the HTTP-01
+# certificate above, in front of an echo served by this container; one
+# connection held open across a renewal forced through the API (the
+# renewal the background loop would perform, in place, same id); new
+# connections then present the renewed certificate, the held one keeps
+# echoing. Prints exactly one `L4-SCENARIO` line (Story 12.12 D-c).
+log "=== 12.4 IV2: a terminating stream across an ACME renewal ==="
+l4_iv2_line() {
+    echo "L4-SCENARIO 12.4-iv2-acme-renewal-on-terminating-stream $1 $2"
+    if [ "$1" = PASS ]; then ok "12.4 IV2: $2"; else fail "12.4 IV2: $2"; fi
+}
+l4_iv2() {
+    local tls=/tests/l4/tls_backend.py cert_id smoke_ip backend stream state fp_old fp_new fp_api held i
+    cert_id=$(api_get /api/v1/certificates | jq -r --arg d "$HTTP01_DOMAIN" \
+        '[.data.certificates[]? | select(.domain == $d)][0].id // empty')
+    [ -n "$cert_id" ] || { l4_iv2_line FAIL "no ${HTTP01_DOMAIN} certificate to terminate with"; return; }
+    socat TCP-LISTEN:9700,fork,reuseaddr EXEC:cat &
+    smoke_ip=$(python3 -c 'import socket; print(socket.gethostbyname(socket.gethostname()))')
+    backend=$(api_post /api/v1/backends "{\"address\":\"${smoke_ip}:9700\",\"health_check_enabled\":false}" \
+        | jq -r '.data.id // empty')
+    [ -n "$backend" ] || { l4_iv2_line FAIL "echo backend create refused"; return; }
+    stream=$(api_post /api/v1/streams "{\"name\":\"l4d-acme-tls\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":7600,\"tls_mode\":\"terminate\",\"match_rules\":[{\"name\":\"acme\",\"matcher\":{\"kind\":\"tls\",\"server_names\":[\"${HTTP01_DOMAIN}\"]},\"backend_ids\":[\"${backend}\"]}],\"tls_terminate\":{\"certificate_ids\":[\"${cert_id}\"]}}")
+    stream=$(echo "$stream" | jq -r '.data.id // empty')
+    [ -n "$stream" ] || { l4_iv2_line FAIL "terminating stream create refused"; return; }
+    for i in $(seq 1 50); do
+        state=$(api_get "/api/v1/streams/$stream" | jq -r '.data.bind.state // empty')
+        [ "$state" = bound ] && break
+        sleep 0.2
+    done
+    [ "$state" = bound ] || { l4_iv2_line FAIL "the stream did not bind (${state})"; return; }
+
+    rm -f /tmp/l4-iv2-held.json /tmp/l4-iv2-held.stop
+    python3 "$tls" held --host "$LORICA_HOST" --port 7600 --sni "$HTTP01_DOMAIN" \
+        --stop /tmp/l4-iv2-held.stop --out /tmp/l4-iv2-held.json &
+    for i in $(seq 1 50); do
+        [ -s /tmp/l4-iv2-held.json ] && break
+        sleep 0.2
+    done
+    fp_old=$(jq -r '.fp // empty' /tmp/l4-iv2-held.json 2>/dev/null)
+    [ -n "$fp_old" ] || { l4_iv2_line FAIL "no handshake on the stream: $(cat /tmp/l4-iv2-held.json 2>/dev/null)"; return; }
+
+    # A renewal spends the ACME bucket the two issuances above spent (3 a
+    # minute per address): wait out a 429 rather than fail on it.
+    for i in $(seq 1 8); do
+        RENEW_CODE=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 240 -b "$SESSION" -X POST \
+            "$API/api/v1/certificates/$cert_id/renew")
+        [ "$RENEW_CODE" = 429 ] || break
+        sleep 10
+    done
+    [ "$RENEW_CODE" = 200 ] || { l4_iv2_line FAIL "renewal answered HTTP ${RENEW_CODE}"; return; }
+    fp_api=$(curl -sk -b "$SESSION" "$API/api/v1/certificates/$cert_id/download?part=cert" \
+        | openssl x509 -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)
+    [ "$fp_api" != "$fp_old" ] || { l4_iv2_line FAIL "the stored certificate did not change on renewal"; return; }
+    fp_new=""
+    for i in $(seq 1 60); do
+        fp_new=$(python3 "$tls" term --host "$LORICA_HOST" --port 7600 --sni "$HTTP01_DOMAIN" | grep -o 'fp=[0-9a-f]*' | cut -d= -f2)
+        [ "$fp_new" = "$fp_api" ] && break
+        sleep 0.5
+    done
+    sleep 1
+    touch /tmp/l4-iv2-held.stop
+    sleep 1
+    held=$(cat /tmp/l4-iv2-held.json)
+    [ "$fp_new" = "$fp_api" ] \
+        || { l4_iv2_line FAIL "new connections still present ${fp_new:0:16}, not the renewed ${fp_api:0:16}"; return; }
+    if [ "$(echo "$held" | jq -r '.failures')" != 0 ] || [ "$(echo "$held" | jq -r '.pings')" -lt 2 ]; then
+        l4_iv2_line FAIL "the connection opened before the renewal did not keep echoing: ${held}"
+        return
+    fi
+    l4_iv2_line PASS "renewed in place: new connections present ${fp_new:0:16} (the stored renewal), not ${fp_old:0:16}; the connection opened before kept echoing ($(echo "$held" | jq -r '.pings') pings, 0 failures)"
+}
+# Without errexit: every path of l4_iv2 ends on its one line, and an
+# unexpected error must reach one rather than end the smoke silently.
+set +e
+l4_iv2
+set -e
+
 # --- Summary ---
 echo ""
 log "=== ACME smoke summary ==="

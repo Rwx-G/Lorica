@@ -195,6 +195,24 @@ services:
     <<: *tcp-backend
     entrypoint: ["python3", "/tests/l4/tcp_backend.py", "--name", "tcp-backend-range", "--ports", "7300-7315"]
 
+  # ---- Story 12.4 backends (Story 12.12 Lot D) ----------------------
+
+  # test-runner/l4/tls_backend.py. `raw`: behind a passthrough stream,
+  # answers the SHA-256 of the ClientHello records it read. `tls`: behind
+  # an upstream-TLS stream, verifies the client certificate and reports
+  # it and the SNI; its PKI is copied into /tmp/pki by the scenario.
+  tls-raw-1:
+    <<: *tcp-backend
+    entrypoint: ["python3", "/tests/l4/tls_backend.py", "raw", "--name", "tls-raw-1"]
+
+  tls-raw-2:
+    <<: *tcp-backend
+    entrypoint: ["python3", "/tests/l4/tls_backend.py", "raw", "--name", "tls-raw-2"]
+
+  tls-backend:
+    <<: *tcp-backend
+    entrypoint: ["python3", "/tests/l4/tls_backend.py", "tls", "--name", "tls-backend", "--pki", "/tmp/pki"]
+
   # Authoritative only, no forwarding (D-p): l4/coredns/Corefile serves
   # `l4.test` from a hosts file the 12.3 IV4 scenario copies in and
   # rewrites, with a 5 s TTL.
