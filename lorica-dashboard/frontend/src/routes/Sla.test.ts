@@ -139,4 +139,24 @@ describe('Sla page', () => {
     expect(screen.getByText('42.00%')).toBeInTheDocument();
     expect(screen.queryByText('11.00%')).toBeNull();
   });
+
+  it('reads the picked follower, and this node again once the session can no longer read fleet', async () => {
+    render(Sla);
+    const card = (await screen.findByText(ROUTE_ID)).closest('button') as HTMLElement;
+    await fireEvent.click(card);
+    await screen.findByRole('option', { name: 'edge-b' });
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Filter by node' }), {
+      target: { value: 'node-b' },
+    });
+    await waitFor(() => expect(api.getRouteSla).toHaveBeenLastCalledWith(ROUTE_ID, 'node-b'));
+    expect(api.getStreamSlaOverview).toHaveBeenLastCalledWith('node-b');
+
+    // The filter goes with `canReadFleet`; the follower choice must go
+    // too, and the figures on screen with it.
+    auth.set({ status: 'authenticated', username: 'user01', role: 'viewer' });
+    await waitFor(() => expect(api.getRouteSla).toHaveBeenLastCalledWith(ROUTE_ID, undefined));
+    expect(api.getSlaOverview).toHaveBeenLastCalledWith(undefined);
+    expect(api.getStreamSlaOverview).toHaveBeenLastCalledWith(undefined);
+    expect(screen.queryByRole('combobox', { name: 'Filter by node' })).toBeNull();
+  });
 });

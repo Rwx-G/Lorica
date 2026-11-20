@@ -939,9 +939,19 @@ export interface StreamLogsQuery extends StreamLogsFilter {
   before_id?: number;
 }
 
+/**
+ * `GET /api/v1/stream-logs?node=`: the rows one follower fanned in, the
+ * newest page oldest first, ids being the fan-in store's. No count, as
+ * every fan-in page.
+ */
+export interface NodeStreamLogsResponse {
+  node: string;
+  entries: StreamLogEntry[];
+}
+
 /** The query string of a stream log read or export, every unset filter omitted. */
 export function streamLogsQuery(
-  params: StreamLogsQuery & { format?: 'csv' | 'json' },
+  params: StreamLogsQuery & { format?: 'csv' | 'json'; node?: string },
 ): string {
   const query = new URLSearchParams();
   for (const key of [
@@ -952,6 +962,7 @@ export function streamLogsQuery(
     'from',
     'to',
     'format',
+    'node',
   ] as const) {
     const value = params[key];
     if (value) query.set(key, value);
@@ -1975,6 +1986,14 @@ export const api = {
   // Stream access log (Story 12.9): Viewer reads, Operator clears.
   getStreamLogs: (params: StreamLogsQuery = {}) =>
     request<StreamLogsResponse>('GET', `/stream-logs${streamLogsQuery(params)}`),
+
+  /**
+   * The stream rows one follower fanned in (Story 12.9 D-i), on a
+   * control plane, Operator and above. One follower per read: the server
+   * has no all-followers aggregate for stream rows.
+   */
+  getFleetStreamLogs: (node: string, params: StreamLogsQuery = {}) =>
+    request<NodeStreamLogsResponse>('GET', `/stream-logs${streamLogsQuery({ ...params, node })}`),
 
   clearStreamLogs: () =>
     request<{ message: string }>('DELETE', '/stream-logs'),

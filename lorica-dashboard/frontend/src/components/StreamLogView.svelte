@@ -6,9 +6,11 @@
     type StreamLogsFilter,
     type StreamStatus,
   } from '../lib/api';
-  import { canWrite } from '../lib/auth';
+  import { canReadFleet, canWrite } from '../lib/auth';
+  import { nodeScope, type NodeScope } from '../lib/cluster';
   import { formatBytes } from '../lib/format';
   import ConfirmDialog from './ConfirmDialog.svelte';
+  import NodeFilter from './NodeFilter.svelte';
 
   interface Props {
     /** The stream a link opened the table on, `''` for every stream. */
@@ -37,6 +39,23 @@
   let filterClientIp = $state('');
   let filterTimeRange = $state('');
   let filterLimit = $state(200);
+
+  /**
+   * Node filter choice (Story 9.7 D23): `''` for this node, or a
+   * follower's id. This node is the default because its own rows never
+   * fan in. No "All followers": the server reads one follower's stream
+   * rows at a time.
+   */
+  let filterNode = $state('');
+  /** Where the next read goes. Without `canReadFleet` there is no filter, so always here. */
+  const scope = $derived<NodeScope>($canReadFleet ? nodeScope(filterNode) : { store: 'local' });
+  /**
+   * Which store the rows on screen came from. The Node column and the
+   * actions on this node's own log follow it rather than the filter.
+   */
+  let entriesSource = $state<NodeScope['store']>('local');
+  /** The follower the fan-in rows on screen came from, for the Node column. */
+  let entriesNode = $state('');
 
   let showExport = $state(false);
   let exportFormat = $state<'csv' | 'json'>('csv');
@@ -73,16 +92,64 @@
     return filter;
   }
 
+  /**
+   * Bumped by every read. Polls, Refresh, filter changes and node
+   * switches overlap, and a response that is no longer the latest is
+   * dropped, or one store's rows would land under the other's controls.
+   */
+  let latestLoad = 0;
+
   async function loadRows() {
-    const res = await api.getStreamLogs({ ...currentFilter(), limit: filterLimit });
+    const load = ++latestLoad;
+    const requested = scope;
+    const query = { ...currentFilter(), limit: filterLimit };
+
+    // A follower's rows come from the fan-in store, under the same
+    // filters, with no count: the count is the page itself.
+    if (requested.store === 'fan-in' && requested.node) {
+      const res = await api.getFleetStreamLogs(requested.node, query);
+      if (load !== latestLoad) return;
+      if (res.error) {
+        error = res.error.message;
+      } else if (res.data) {
+        entries = res.data.entries;
+        entriesNode = res.data.node;
+        entriesSource = 'fan-in';
+        total = res.data.entries.length;
+        error = '';
+      }
+      loading = false;
+      return;
+    }
+
+    const res = await api.getStreamLogs(query);
+    if (load !== latestLoad) return;
     if (res.error) {
       error = res.error.message;
     } else if (res.data) {
       entries = res.data.entries;
+      entriesNode = '';
+      entriesSource = 'local';
       total = res.data.total;
       error = '';
     }
     loading = false;
+  }
+
+  /**
+   * A new node filter choice. The rows on screen belong to the previous
+   * one, possibly in the other store, so they go before the read rather
+   * than sitting under the new choice's controls until it lands.
+   */
+  function selectNode(choice: string) {
+    filterNode = choice;
+    entries = [];
+    entriesNode = '';
+    total = 0;
+    entriesSource = scope.store;
+    error = '';
+    loading = true;
+    void loadRows();
   }
 
   async function loadStreams() {
@@ -145,13 +212,17 @@
 
 <div class="stream-log-toolbar">
   <button class="btn btn-secondary" onclick={() => void loadRows()}>Refresh</button>
-  <button class="btn btn-secondary" onclick={() => (showExport = !showExport)}>Export</button>
-  {#if $canWrite}
-    <button class="btn btn-danger" onclick={() => (showClearConfirm = true)}>Clear</button>
+  <!-- Export and Clear act on this node's own stream log, so they are
+       absent while the table shows a follower's rows. -->
+  {#if entriesSource === 'local'}
+    <button class="btn btn-secondary" onclick={() => (showExport = !showExport)}>Export</button>
+    {#if $canWrite}
+      <button class="btn btn-danger" onclick={() => (showClearConfirm = true)}>Clear</button>
+    {/if}
   {/if}
 </div>
 
-{#if showExport}
+{#if showExport && entriesSource === 'local'}
   <div class="export-panel">
     <p class="hint">The rows matching the filters below, oldest first.</p>
     <label class="export-label">
@@ -166,6 +237,7 @@
 {/if}
 
 <div class="filters">
+  <NodeFilter value={filterNode} onchange={selectNode} />
   <select class="filter-select" aria-label="Stream" bind:value={filterStream} onchange={() => void loadRows()}>
     <option value="">All streams</option>
     {#each streams as s (s.id)}
@@ -239,6 +311,9 @@
     <table>
       <thead>
         <tr>
+          {#if entriesSource === 'fan-in'}
+            <th>Node</th>
+          {/if}
           <th>Time</th>
           <th>Stream</th>
           <th>Client</th>
@@ -255,6 +330,9 @@
       <tbody>
         {#each [...entries].reverse() as entry (entry.id)}
           <tr>
+            {#if entriesSource === 'fan-in'}
+              <td class="mono">{entriesNode}</td>
+            {/if}
             <td class="mono time-col">{formatTimestamp(entry.timestamp)}</td>
             <td>
               {entry.stream_name || entry.stream_id}

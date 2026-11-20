@@ -124,6 +124,57 @@ describe('StreamSlaSection', () => {
     expect(api.getStreamSlaOverview).toHaveBeenLastCalledWith('node-2');
   });
 
+  it("keeps the picked node's overview when the previous node's answer lands last", async () => {
+    let releaseFirst: (value: { data: StreamSlaSummary[] }) => void = () => {};
+    vi.mocked(api.getStreamSlaOverview)
+      .mockImplementationOnce(() => new Promise((resolve) => (releaseFirst = resolve)))
+      .mockResolvedValue({ data: [summary({ sla_pct: 42 })] });
+    const { rerender } = render(StreamSlaSection);
+
+    await rerender({ node: 'node-2' });
+    await screen.findByText('42.00%');
+
+    releaseFirst({ data: [summary({ sla_pct: 11 })] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.getByText('42.00%')).toBeInTheDocument();
+    expect(screen.queryByText('11.00%')).toBeNull();
+  });
+
+  it("keeps the picked node's stream figures when the previous node's answer lands last", async () => {
+    let releaseFirst: (value: { data: StreamSlaSummary[] }) => void = () => {};
+    vi.mocked(api.getStreamSla)
+      .mockImplementationOnce(() => new Promise((resolve) => (releaseFirst = resolve)))
+      .mockResolvedValue({ data: [summary({ window: '7d', sla_pct: 42 })] });
+    const { rerender } = render(StreamSlaSection, { props: { initialStreamId: 'pg-id' } });
+    await waitFor(() => expect(api.getStreamSla).toHaveBeenCalledWith('pg-id', undefined));
+
+    await rerender({ initialStreamId: 'pg-id', node: 'node-2' });
+    await screen.findByRole('cell', { name: '7d' });
+
+    releaseFirst({ data: [summary({ window: '30d', sla_pct: 11 })] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.getByRole('cell', { name: '7d' })).toBeInTheDocument();
+    expect(screen.queryByRole('cell', { name: '30d' })).toBeNull();
+    // The figures are the follower's: nothing on screen acts on this node.
+    expect(screen.queryByRole('button', { name: 'Clear SLA' })).toBeNull();
+  });
+
+  it("empties this node's figures and its actions as soon as a follower is picked", async () => {
+    vi.mocked(api.getStreamSla).mockImplementation(async (id: string, node?: string) =>
+      node ? new Promise(() => {}) : { data: [summary({ stream_id: id, window: '7d' })] },
+    );
+    const { rerender } = render(StreamSlaSection, { props: { initialStreamId: 'pg-id' } });
+    await screen.findByRole('cell', { name: '7d' });
+    expect(screen.getByRole('button', { name: 'Clear SLA' })).toBeInTheDocument();
+
+    await rerender({ initialStreamId: 'pg-id', node: 'node-2' });
+
+    expect(screen.queryByRole('cell', { name: '7d' })).toBeNull();
+    for (const name of ['Configure', 'Export CSV', 'Export JSON', 'Clear SLA']) {
+      expect(screen.queryByRole('button', { name })).toBeNull();
+    }
+  });
+
   it('saves a target and leaves the latency bound out on UDP', async () => {
     const update = vi.spyOn(api, 'updateStreamSlaConfig').mockResolvedValue({
       data: {

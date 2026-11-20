@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import {
     api,
     type SlaSummary,
@@ -7,7 +7,7 @@
     type SlaConfigResponse,
     type SlaBucket,
   } from '../lib/api';
-  import { canWrite } from '../lib/auth';
+  import { canReadFleet, canWrite } from '../lib/auth';
   import NodeFilter from '../components/NodeFilter.svelte';
   import StreamSlaSection from '../components/StreamSlaSection.svelte';
   import { get } from 'svelte/store';
@@ -21,10 +21,14 @@
   // time. `''` is this node; a follower's id asks the control plane to
   // read that follower's own figures over its session. There is no
   // "all nodes": a fleet percentile is not a function of per-node
-  // percentiles, and nothing SLA fans in. The filter shows itself only
-  // where `canReadFleet` holds, so `selectedNode` stays `''` elsewhere.
+  // percentiles, and nothing SLA fans in. These reads are pulls from the
+  // follower, not fan-in reads, so `nodeScope` does not apply; the gate
+  // is the same `canReadFleet`, read here as well as by the filter, so a
+  // session that loses it falls back to this node rather than keep
+  // asking for a follower it can no longer read.
   let selectedNode = $state('');
-  const nodeParam = $derived(selectedNode || undefined);
+  /** The follower the reads ask for, `undefined` for this node. */
+  const nodeParam = $derived($canReadFleet && selectedNode ? selectedNode : undefined);
 
   let routes: RouteResponse[] = $state([]);
   let overview: SlaSummary[] = $state([]);
@@ -78,8 +82,15 @@
     }
   }
 
+  // The first run is the first load; a later one is the node read
+  // moving, by the picker or by `canReadFleet` dropping, and re-reads
+  // every figure on screen for the node now read.
+  $effect(() => {
+    void nodeParam;
+    untrack(() => void refreshAll());
+  });
+
   onMount(() => {
-    refreshAll();
     refreshTimer = setInterval(refreshAll, 30000);
     return () => {
       if (refreshTimer) clearInterval(refreshTimer);
@@ -100,14 +111,14 @@
     // node switch re-reads the same route, and the previous node's
     // answer must not land last.
     const captured = routeId;
-    const capturedNode = selectedNode;
+    const capturedNode = nodeParam;
     const [passiveRes, activeRes, configRes, bucketsRes] = await Promise.all([
       api.getRouteSla(routeId, nodeParam),
       api.getRouteSlaActive(routeId, nodeParam),
       api.getSlaConfig(routeId),
       api.getRouteSlaBuckets(routeId, { source: 'passive', node: nodeParam }),
     ]);
-    if (selectedRouteId !== captured || selectedNode !== capturedNode) return;
+    if (selectedRouteId !== captured || nodeParam !== capturedNode) return;
     if (passiveRes.data) passiveSla = passiveRes.data;
     if (activeRes.data) activeSla = activeRes.data;
     if (configRes.data) slaConfig = configRes.data;
@@ -185,10 +196,7 @@
     <h1>SLA Monitoring</h1>
     <NodeFilter
       value={selectedNode}
-      onchange={(id) => {
-        selectedNode = id;
-        void refreshAll();
-      }}
+      onchange={(id) => (selectedNode = id)}
     />
     {#if lastRefresh}
       <span class="refresh-indicator" title="Auto-refresh every 30s">
@@ -201,7 +209,7 @@
   {#if error}
     <div class="error-banner">{error}</div>
   {/if}
-  {#if selectedNode}
+  {#if nodeParam}
     <p class="text-muted">
       Showing that node's own figures, computed on the node. Export and
       clear act on this node's store, so they are hidden here.
@@ -249,7 +257,7 @@
             <div class="detail-actions">
               <!-- The export and the clear take no ?node=: they act on
                    this node's store, never on a picked follower's. -->
-              {#if !selectedNode}
+              {#if !nodeParam}
                 {#if $canWrite}
                   <button class="btn btn-small" onclick={openConfigModal}>Configure</button>
                 {/if}

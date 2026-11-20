@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import { api, streamLogsQuery, type StreamLogEntry, type StreamStatus } from '../lib/api';
 import { auth, type Role } from '../lib/auth';
+import { clusterStatus, type ClusterNodeResponse, type ClusterStatus } from '../lib/cluster';
 import StreamLogView from './StreamLogView.svelte';
 
 function row(overrides: Partial<StreamLogEntry> = {}): StreamLogEntry {
@@ -159,10 +160,141 @@ describe('StreamLogView', () => {
   });
 });
 
+function controlPlane(): ClusterStatus {
+  return {
+    role: 'control_plane',
+    build_version: '1.11.0',
+    node_id: 'node-a',
+    node_name: 'edge-01',
+    control_plane: null,
+    connection_state: null,
+    applied_config_generation: 1,
+    applied_config_hash: 'abc',
+    break_glass_until: null,
+    fleet: [],
+  };
+}
+
+function follower(id: string, name: string): ClusterNodeResponse {
+  return {
+    node_id: id,
+    name,
+    status: 'active',
+    version: '1.11.0',
+    schema_version: 1,
+    applied_config_generation: 1,
+    applied_config_hash: 'abc',
+    last_seen_at: null,
+    enrolled_at: '2026-09-09T00:00:00Z',
+    connected: true,
+    session_peer: '192.0.2.10:9444',
+    session_last_seen_unix: null,
+    drifted: false,
+    applied_generation: 1,
+    applied_hash: 'abc',
+    from_live_session: true,
+    selected_for_hostnames: [],
+    certificate_ids: [],
+    resources: null,
+    stream_plane: null,
+    stream_ports: [],
+  };
+}
+
+describe('StreamLogView on a control plane', () => {
+  beforeEach(() => {
+    vi.spyOn(api, 'listClusterNodes').mockResolvedValue({ data: [follower('node-b', 'edge-02')] });
+    vi.spyOn(api, 'getFleetStreamLogs').mockResolvedValue({
+      data: { node: 'node-b', entries: [row({ id: 7, client_ip: '198.51.100.20' })] },
+    });
+    clusterStatus.set(controlPlane());
+  });
+
+  afterEach(() => {
+    clusterStatus.set(null);
+  });
+
+  async function pick(choice: string) {
+    await screen.findByRole('option', { name: 'edge-02' });
+    await fireEvent.change(screen.getByLabelText('Filter by node'), { target: { value: choice } });
+  }
+
+  it("opens on this node's own rows, with its actions and no Node column", async () => {
+    render(StreamLogView, { props: { autoRefresh: false } });
+    await screen.findByText('192.0.2.10:40000');
+    expect(api.getStreamLogs).toHaveBeenCalled();
+    expect(api.getFleetStreamLogs).not.toHaveBeenCalled();
+    expect((screen.getByLabelText('Filter by node') as HTMLSelectElement).value).toBe('');
+    expect(screen.queryByRole('option', { name: 'All followers' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Export' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Clear' })).toBeInTheDocument();
+    expect(screen.queryByRole('columnheader', { name: 'Node' })).toBeNull();
+  });
+
+  it("reads a picked follower's fanned-in rows under the filters, labelled, with no action on this node", async () => {
+    render(StreamLogView, { props: { autoRefresh: false, initialStreamId: 'pg-id' } });
+    await screen.findByText('192.0.2.10:40000');
+
+    await pick('node-b');
+    await screen.findByText('198.51.100.20:40000');
+
+    expect(api.getFleetStreamLogs).toHaveBeenLastCalledWith('node-b', expect.objectContaining({ stream_id: 'pg-id' }));
+    expect(screen.queryByText('192.0.2.10:40000')).toBeNull();
+    expect(screen.getByRole('columnheader', { name: 'Node' })).toBeInTheDocument();
+    expect(within(rowOf('198.51.100.20:40000')).getAllByRole('cell')[0]).toHaveTextContent('node-b');
+    expect(screen.getByText('1 entries')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Export' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Clear' })).toBeNull();
+  });
+
+  it("drops this node's read when it lands after a follower was picked", async () => {
+    let releaseLocal: (value: unknown) => void = () => {};
+    vi.mocked(api.getStreamLogs).mockImplementationOnce(
+      () => new Promise((resolve) => (releaseLocal = resolve)) as never,
+    );
+    render(StreamLogView, { props: { autoRefresh: false } });
+
+    await pick('node-b');
+    await screen.findByText('198.51.100.20:40000');
+    releaseLocal({ data: { entries: [row()], total: 1 } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(screen.queryByText('192.0.2.10:40000')).toBeNull();
+    expect(within(rowOf('198.51.100.20:40000')).getAllByRole('cell')[0]).toHaveTextContent('node-b');
+  });
+
+  it("empties a follower's rows at once when this node is picked again", async () => {
+    render(StreamLogView, { props: { autoRefresh: false } });
+    await pick('node-b');
+    await screen.findByText('198.51.100.20:40000');
+    vi.mocked(api.getStreamLogs).mockImplementation(() => new Promise(() => {}) as never);
+
+    await fireEvent.change(screen.getByLabelText('Filter by node'), { target: { value: '' } });
+
+    expect(screen.queryByText('198.51.100.20:40000')).toBeNull();
+    expect(screen.queryByRole('columnheader', { name: 'Node' })).toBeNull();
+  });
+
+  it('offers no node filter to a Viewer, who reads this node only', async () => {
+    signIn('viewer');
+    render(StreamLogView, { props: { autoRefresh: false } });
+    await screen.findByText('192.0.2.10:40000');
+    expect(screen.queryByLabelText('Filter by node')).toBeNull();
+    expect(api.getFleetStreamLogs).not.toHaveBeenCalled();
+  });
+});
+
 describe('streamLogsQuery', () => {
   it('omits every unset filter', () => {
     expect(streamLogsQuery({})).toBe('');
     expect(streamLogsQuery({ stream_id: '', client_ip: undefined })).toBe('');
+  });
+
+  it('carries the node of a fan-in read', () => {
+    expect(Object.fromEntries(new URLSearchParams(streamLogsQuery({ node: 'node-b', limit: 5 }).slice(1)))).toEqual({
+      node: 'node-b',
+      limit: '5',
+    });
   });
 
   it('carries each set filter and the page', () => {

@@ -64,11 +64,29 @@
     return streams.find((s) => s.id === id)?.protocol ?? '';
   }
 
+  /**
+   * The node the figures on screen were read from, `undefined` for this
+   * node. Configure, Export and Clear SLA act on this node's store, so
+   * they follow the figures shown rather than the picker.
+   */
+  let figuresNode = $state<string | undefined>(undefined);
+
+  /**
+   * Bumped by every overview read, and by every detail read. A node
+   * switch overlaps the 30 s refresh and a selection, and a response
+   * that is no longer the latest would put the previous node's figures
+   * under the new one's name.
+   */
+  let latestOverviewLoad = 0;
+  let latestDetailLoad = 0;
+
   async function loadOverview() {
+    const load = ++latestOverviewLoad;
     const [overviewRes, statusRes] = await Promise.all([
       api.getStreamSlaOverview(node),
       api.getStreamStatus(),
     ]);
+    if (load !== latestOverviewLoad) return;
     if (overviewRes.data) overview = overviewRes.data;
     if (statusRes.data) streams = statusRes.data.streams;
     error = overviewRes.error?.message ?? '';
@@ -76,21 +94,21 @@
   }
 
   async function select(id: string) {
+    const load = ++latestDetailLoad;
+    const requested = node;
     selectedId = id;
     detailError = '';
-    // A later selection or refresh must not be overwritten by this
-    // one's answers arriving last.
-    const captured = id;
     const [windowsRes, bucketsRes, configRes] = await Promise.all([
-      api.getStreamSla(id, node),
-      api.getStreamSlaBuckets(id, { node }),
+      api.getStreamSla(id, requested),
+      api.getStreamSlaBuckets(id, { node: requested }),
       // Replicated fleet policy: this node's copy is the follower's.
       api.getStreamSlaConfig(id),
     ]);
-    if (selectedId !== captured) return;
+    if (load !== latestDetailLoad) return;
     windows = windowsRes.data ?? [];
     buckets = bucketsRes.data ?? [];
     config = configRes.data ?? null;
+    figuresNode = requested;
     detailError = windowsRes.error?.message ?? '';
   }
 
@@ -100,10 +118,22 @@
   }
 
   // The first run is the first load; a later one is the node picker
-  // moving, which re-reads the open stream on the node picked.
+  // moving, which re-reads the open stream on the node picked. The
+  // figures on screen belong to the previous node, so they go before
+  // the read rather than sitting under the new node's name until it
+  // lands.
   $effect(() => {
-    void node;
-    untrack(() => void refresh());
+    const picked = node;
+    untrack(() => {
+      overview = [];
+      windows = [];
+      buckets = [];
+      figuresNode = picked;
+      error = '';
+      detailError = '';
+      loading = true;
+      void refresh();
+    });
   });
 
   onMount(() => {
@@ -239,7 +269,7 @@
         <div class="detail-header">
           <h3>{nameOf(selectedId)}</h3>
           <div class="detail-actions">
-            {#if !node}
+            {#if figuresNode === undefined}
               {#if $canWrite}
                 <button class="btn btn-secondary" onclick={openConfig} disabled={!config}>Configure</button>
               {/if}
