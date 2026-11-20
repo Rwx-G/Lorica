@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the Lorica E2E test suite with Docker Compose.
 # Usage: ./run.sh [--build] [--keep] [--skip-workers] [--skip-cert-export]
-#                 [--skip-ai-bot] [--skip-rbac] [--skip-audit] [--skip-hot-upgrade]
+#                 [--skip-geoip] [--skip-ai-bot] [--skip-rbac] [--skip-audit] [--skip-hot-upgrade]
 #                 [--skip-log-sinks] [--skip-log-sinks-workers] [--skip-acme]
 #                 [--skip-cluster] [--skip-capture] [--skip-capture-workers]
 #                 [--skip-mcp] [--skip-adcs] [--skip-l4] [--skip-perf]
@@ -9,6 +9,7 @@
 #   --build             Force rebuild all images
 #   --keep              Don't tear down containers after tests
 #   --skip-workers      Skip worker isolation tests (faster)
+#   --skip-geoip        Skip the v1.4.0 Story 2.7 GeoIP profile (faster)
 #   --skip-cert-export  Skip the v1.4.1 cert-export profile (faster)
 #   --skip-ai-bot       Skip the v1.6.0 Story 8.2 AI-bot profile (faster)
 #   --skip-rbac         Skip the v1.6.0 Story 8.3 RBAC profile (faster)
@@ -55,6 +56,7 @@ cd "$(dirname "$0")"
 BUILD_FLAG=""
 KEEP=false
 SKIP_WORKERS=false
+SKIP_GEOIP=false
 SKIP_CERT_EXPORT=false
 SKIP_AI_BOT=false
 SKIP_RBAC=false
@@ -78,6 +80,7 @@ for arg in "$@"; do
         --build)             BUILD_FLAG="--build" ;;
         --keep)              KEEP=true ;;
         --skip-workers)      SKIP_WORKERS=true ;;
+        --skip-geoip)        SKIP_GEOIP=true ;;
         --skip-cert-export)  SKIP_CERT_EXPORT=true ;;
         --skip-ai-bot)       SKIP_AI_BOT=true ;;
         --skip-rbac)         SKIP_RBAC=true ;;
@@ -115,6 +118,7 @@ RUN_PHASE_1=true
 if [ "$ONLY_L4" = true ]; then
     RUN_PHASE_1=false
     SKIP_WORKERS=true
+    SKIP_GEOIP=true
     SKIP_CERT_EXPORT=true
     SKIP_AI_BOT=true
     SKIP_RBAC=true
@@ -260,6 +264,40 @@ if [ "$SKIP_WORKERS" = false ] && [ "$EXIT_CODE" = "0" ]; then
     done
 
     docker compose run --rm test-runner-workers || EXIT_CODE=$?
+fi
+
+# ---- Phase 2b: GeoIP profile (Story 2.7; Story 12.8 IV1 and IV2) ----
+# The MaxMind test database mounted on a single-process node: route
+# GeoIP allow and deny lists, then the PROXY protocol scenarios of Story
+# 12.8, which need a carried address the database knows. The profile
+# existed before run.sh ran it (Story 12.12 Lot A). Opt-out via
+# --skip-geoip (default ON).
+if [ "$SKIP_GEOIP" = false ] && [ "$EXIT_CODE" = "0" ]; then
+    echo ""
+    echo "=== Lorica E2E Tests (geoip profile) ==="
+    echo ""
+    announce_profile geoip
+
+    docker compose --profile geoip up $BUILD_FLAG -d backend1 lorica-geoip
+
+    echo "Waiting for Lorica (geoip) to initialize..."
+    for i in $(seq 1 60); do
+        if docker compose exec -T lorica-geoip curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
+            echo "Lorica (geoip) is ready."
+            break
+        fi
+        if [ "$i" = "60" ]; then
+            echo "ERROR: Lorica (geoip) did not start within 120s"
+            docker compose logs lorica-geoip | tail -20
+            break
+        fi
+        sleep 2
+    done
+
+    if ! docker compose --profile geoip run --rm geoip-smoke; then
+        EXIT_CODE=1
+        dump_node_log lorica-geoip
+    fi
 fi
 
 # ---- Phase 3: Cert export profile ----
@@ -826,6 +864,29 @@ if [ "$SKIP_CLUSTER" = false ] && [ "$EXIT_CODE" = "0" ]; then
     # that needs a live follower has already run.
     if [ "$EXIT_CODE" = "0" ]; then
         docker compose --profile cluster run --rm cluster-revocation-smoke || EXIT_CODE=$?
+    fi
+fi
+
+# ---- 12.8 IV3: the pre-existing suite with PROXY accept off ----------
+# Announced only when every pre-existing phase was asked for: the `suite`
+# profile of the L4 registry is the whole pre-existing suite, and a run
+# that skipped part of it proves nothing about it. Each profile starts
+# with PROXY accept off (the default), and the two sections that turn it
+# on (geoip, workers) put it back. What "unchanged" means is a review of
+# the diff of tests-e2e-docker/ since v1.10.7 (Story 12.12 Lot O), which
+# no run can do, hence PARTIAL.
+SUITE_COMPLETE=$RUN_PHASE_1
+for skipped in "$SKIP_WORKERS" "$SKIP_GEOIP" "$SKIP_CERT_EXPORT" "$SKIP_AI_BOT" \
+    "$SKIP_RBAC" "$SKIP_AUDIT" "$SKIP_HOT_UPGRADE" "$SKIP_LOG_SINKS" "$SKIP_LOG_SINKS_WORKERS" \
+    "$SKIP_ACME" "$SKIP_CLUSTER" "$SKIP_CAPTURE" "$SKIP_CAPTURE_WORKERS" "$SKIP_MCP" "$SKIP_ADCS"; do
+    [ "$skipped" = false ] || SUITE_COMPLETE=false
+done
+if [ "$SUITE_COMPLETE" = true ]; then
+    announce_profile suite
+    if [ "$EXIT_CODE" = "0" ]; then
+        echo "L4-SCENARIO 12.8-iv3-proxy-off-suite-unchanged PARTIAL every pre-existing profile passed with PROXY accept off -- not automated: that no pre-existing assertion changed is the review of git diff v1.10.7 -- tests-e2e-docker/ (Story 12.12 Lot O)"
+    else
+        echo "L4-SCENARIO 12.8-iv3-proxy-off-suite-unchanged FAIL a pre-existing phase failed (exit ${EXIT_CODE}); the phases after it did not run"
     fi
 fi
 

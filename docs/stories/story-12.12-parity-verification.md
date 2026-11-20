@@ -774,7 +774,7 @@ profile's environment only), plus `docs/stories/story-12.8-proxy-protocol-http.m
 (Lot G checkboxes only).
 Depends on: A; 12.8 Lot D.
 
-- [ ] Every item of 12.8 Lot G, each printing its scenario line.
+- [x] Every item of 12.8 Lot G, each printing its scenario line.
 
 ### Lot I: Story 12.9 scenarios - Docker e2e
 
@@ -1392,6 +1392,73 @@ pulled images.
     nor the IV depends on it.
   - **Deviations.** None from the Lot's items. The runner Dockerfile
     needed no change: it already copies `test-runner/l4/` whole.
+- **Lot H, 2026-11-20.** Story 12.8's scenarios, in the `geoip` and
+  `workers` profiles (L4 lane 3, `feat/v1.11.0` at `c01536bb`).
+  - **Verdicts** (`L4_IMAGE_TAG=lane3 L4_LOTS=H ./run.sh --keep` with
+    every pre-existing phase but Phase 1, `workers` and `geoip` skipped,
+    and `--skip-l4`; 7 min 9 s, Phase 1 included):
+    `12.8-iv1-proxy-v2-https-real-client` PASS in `geoip` (v2 headers
+    from the runner, HTTPS `required`, the runner's /32 trusted: carried
+    US `214.78.120.5` 403 and KR `2001:220::1` 200 by the route's GeoIP
+    denylist; access-log rows with those client addresses and `is_xff`
+    false; the echo backend got `X-Real-IP 2001:220::1` and it as the
+    last `X-Forwarded-For` entry; on a per-IP bucket of 2, one carried
+    address answered 200 200 429 and another 200;
+    `lorica_proxy_protocol_accepted_total{listener="https",kind="v2"}`
+    grew); `12.8-iv2-untrusted-and-forged-xff` PASS in `geoip` and in
+    `workers` (a trusted v2 header carrying `198.51.100.20` with a
+    forged `X-Forwarded-For: 192.0.2.99`: logged as `198.51.100.20`,
+    `is_xff` false, no row with the forged address, the backend got
+    `X-Forwarded-For: 192.0.2.99, 198.51.100.20`; with the trust list
+    moved to a TEST-NET address, a v1 and a v2 header from the runner
+    were disconnected without a byte, `untrusted_peer` counted exactly 2,
+    and plain HTTPS requests from the same runner answered 200). The
+    `geoip` smoke trusts `0.0.0.0/0` in `trusted_proxies`, so only the
+    no-stacking rule kept the forged address out. Report: Lot H rows
+    PASS, the others `NOT-RUN`, `=== L4 REPORT PASSED ===`.
+  - **`12.8-iv3-proxy-off-suite-unchanged`** is printed by `run.sh`
+    after its last pre-existing phase, under `L4-PROFILE suite`, only
+    when no pre-existing phase was skipped: `PARTIAL` with D-d's note
+    when they all passed, `FAIL` otherwise. Not run here (the full
+    pre-existing suite is Lot O's); the block was run on its own with
+    the four flag combinations that matter and its line fed to the
+    report, which reads it `PARTIAL` from a `partial` row and passes.
+    Both sections that turn PROXY accept on put the three settings back
+    to off and delete what they created (checked in `geoip`'s store
+    after the run), so the profiles after them start as before.
+  - **No product defect found.** One first-run failure was the smoke's:
+    `helpers.sh` resets `SESSION` when sourced, so the caller's session
+    is read before it.
+  - **Lot A's note settled.** `run.sh` gains the `geoip` phase (Phase
+    2b, after `workers`, `--skip-geoip`, skipped by `--only-l4`): the
+    profile existed and no run ever ran it. Its existing smoke passed
+    unchanged.
+  - **Choices.** The scenarios live in `run-proxy-protocol-smoke.sh`,
+    called once at the end of each host smoke with its session, and print
+    their own `L4-SCENARIO` lines; a failure there also fails the host
+    smoke. IV1 runs in `geoip` only (the GeoIP test database is mounted
+    there); IV2 runs in both, as the registry row says. The HTTPS
+    listener is the node's `:8443` with a self-signed certificate per
+    route: the listener is registered at boot with or without
+    certificates (`startup/single.rs`, `startup/worker.rs`), so the
+    "no certificates at boot" caveat in `run-tests.sh` does not apply.
+    No `docker-compose.yml` change was needed.
+  - **Shared-project hygiene.** The run held the main-compose lock, built
+    only the services it ran, used `--keep` so `run.sh` would not tear
+    down the plain `lorica-e2e-l4` project (the report container is the
+    only thing it put there, with no network), then tore the main
+    project down itself.
+  - **Re-verified 2026-11-21** after the lane was interrupted before its
+    report: the main-compose images this run uses rebuilt from the lane
+    worktree under the lock, then the same `run.sh` invocation. Phase 1
+    passed, `workers` 91 of 91, `geoip` 16 of 16; `12.8-iv1-*` PASS in
+    `geoip` (accepted v2 0 to 7, per-IP bucket 200 200 429 then 200 for
+    the other address), `12.8-iv2-*` PASS in `geoip` and `workers`
+    (`untrusted_peer` 0 to 2 in each), `12.8-iv3-*` `NOT-RUN` as
+    expected on a partial run; `=== L4 REPORT PASSED ===`; 7 min 7 s.
+    The `suite` block of `run.sh` was exercised alone again: `PARTIAL`
+    after a complete passing run, `FAIL` after a failed phase, nothing
+    when Phase 1 or any phase is skipped. Nothing changed in the files.
 
 ## File List
 
@@ -1440,6 +1507,19 @@ Lot C:
   node's `dns:`, `NET_ADMIN` on `streams-probe`)
 - `docs/stories/story-12.3-tcp-engine.md` (Lot G checkboxes)
 
+Lot H:
+
+- `tests-e2e-docker/test-runner/run-proxy-protocol-smoke.sh` (new)
+- `tests-e2e-docker/test-runner/proxy_protocol_client.py` (new)
+- `tests-e2e-docker/test-runner/Dockerfile` (`COPY` and `chmod` lines)
+- `tests-e2e-docker/test-runner/run-geoip-smoke.sh`,
+  `tests-e2e-docker/test-runner/run-tests-workers.sh` (one call each)
+- `tests-e2e-docker/run.sh` (the `geoip` phase and `--skip-geoip`; the
+  `suite` profile and the 12.8 IV3 line)
+- `tests-e2e-docker/l4/scenarios.tsv` (Lot H rows `live`; the header
+  comment on `suite` and `geoip`)
+- `docs/stories/story-12.8-proxy-protocol-http.md` (Lot G checkboxes)
+
 Lanes (between Lots C and D):
 
 - `tests-e2e-docker/l4/lib.sh` (lane derivation, `l4_compose -p`)
@@ -1487,3 +1567,5 @@ Lot G:
 | 2026-11-20 | 0.6 | Lot C implemented: Story 12.3 IV1 to IV4 (IV1 on three PostgreSQL servers, IV4 in full through CoreDNS) and the five TCP matrix rows, all passing; `NET_ADMIN` on the probe recorded as Resolved 17. No product defect. | Romain G. |
 | 2026-11-21 | 0.7 | Lot F implemented: Story 12.6 IV1 to IV3 (IV3 at 10,000 silent connections, then nine sources filling the pending cap), an IP-literal allow and deny entry in IV2, and the concurrency-caps matrix row, all passing in lane 2; the client joins `streams-geo` per scenario. No product defect. | Romain G. |
 | 2026-11-21 | 0.8 | Lot G implemented: Story 12.7 IV1 against the pinned Redis frozen with `docker pause`, and the SMTP banner template against a standard-library banner server, both passing in lane 2; what Redis, PostgreSQL and the banner server see per probe recorded in `docs/health-checks.md`. No product defect. | Romain G. |
+| 2026-11-20 | 0.7 (Lot H) | Lot H implemented: Story 12.8 IV1 (`geoip`) and IV2 (`geoip`, `workers`) through a Python PROXY client, both passing; `run.sh` runs the `geoip` profile and prints 12.8 IV3 under a `suite` profile after a complete pre-existing run. No product defect. | Romain G. |
+| 2026-11-21 | 0.7 (Lot H) | Lot H re-verified by a fresh run after the lane was interrupted: same verdicts, no file change. | Romain G. |

@@ -18,8 +18,8 @@
 #
 # Profiles: streams and streams-single run in l4/run-l4.sh; the others
 # are run.sh phases, each announced by an `L4-PROFILE <name>` line. suite
-# is the whole run (12.8 IV3), announced by nobody yet; geoip is a compose
-# profile run.sh does not run yet. Both are Lot H's.
+# is the whole pre-existing suite (12.8 IV3), announced by run.sh after
+# its last pre-existing phase when none was skipped.
 name	source	story	profiles	level	lot	state	matrix
 12.12-x-harness-self-test	12.12 Lot A	12.12	streams,streams-single	full	A	live	-
 12.1-iv1-targeted-stream-binds-on-one-node	12.1 IV1	12.1	cluster	full	L	pending	Dynamic reconfiguration
@@ -65,9 +65,9 @@ name	source	story	profiles	level	lot	state	matrix
 12.7-iv1-redis-paused-marked-down	12.7 IV1	12.7	streams	full	G	live	Active health: send/expect
 12.7-x-smtp-banner-template	12.7 AC #3	12.7	streams	full	G	live	Active health: send/expect
 12.7-iv2-template-yes-payload-no	12.7 IV2	12.7	mcp	full	J	pending	-
-12.8-iv1-proxy-v2-https-real-client	12.8 IV1	12.8	geoip	full	H	pending	PROXY protocol accept on the HTTP listeners
-12.8-iv2-untrusted-and-forged-xff	12.8 IV2	12.8	geoip,workers	full	H	pending	PROXY protocol accept on the HTTP listeners
-12.8-iv3-proxy-off-suite-unchanged	12.8 IV3	12.8	suite	partial	H	pending	-
+12.8-iv1-proxy-v2-https-real-client	12.8 IV1	12.8	geoip	full	H	live	PROXY protocol accept on the HTTP listeners
+12.8-iv2-untrusted-and-forged-xff	12.8 IV2	12.8	geoip,workers	full	H	live	PROXY protocol accept on the HTTP listeners
+12.8-iv3-proxy-off-suite-unchanged	12.8 IV3	12.8	suite	partial	H	live	-
 12.9-iv1-end-reasons-in-api-and-syslog	12.9 IV1	12.9	streams	partial	I	pending	L4 access log
 12.9-x-metrics-and-sink-up	12.9 Lot J	12.9	streams	full	I	pending	L4 metrics
 12.9-x-stream-sla	12.9 Lot J	12.9	streams	full	I	pending	-

@@ -302,6 +302,9 @@ else
     fail "lorica_geoip_block_total{route_id,KR,allowlist} did not increment ($BASELINE_KR_ALLOW -> $AFTER_KR_ALLOW)"
 fi
 
+# --- PROXY protocol on the HTTP listeners (Story 12.8 IV1, IV2) ------------
+SESSION="$SESSION" bash "$SCRIPT_DIR/run-proxy-protocol-smoke.sh" geoip || fail "PROXY protocol scenarios (see their L4-SCENARIO lines)"
+
 # --- Summary ---------------------------------------------------------------
 log "=== GeoIP smoke: summary ==="
 echo "Tests: $TOTAL | Passed: $PASS | Failed: $FAIL"

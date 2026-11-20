@@ -793,11 +793,11 @@ lines), `tests-e2e-docker/test-runner/run-geoip-smoke.sh` and
 an environment variable).
 Depends on: D.
 
-- [ ] A Python client (the runner already ships `python3`; no new
+- [x] A Python client (the runner already ships `python3`; no new
       image, no HAProxy) that opens TCP, writes a v1 or v2 header with a
       chosen source, then speaks HTTP or TLS (`ssl` module) over the
       same socket.
-- [ ] In the geoip profile (it has the MaxMind test database): with the
+- [x] In the geoip profile (it has the MaxMind test database): with the
       runner's address trusted and HTTPS `required`, a v2 header
       carrying a test-database address of a denied country gets 403 and
       another gets 200; the access-log row shows the carried address;
@@ -806,11 +806,11 @@ Depends on: D.
       address does not limit another (IV1). A forged `X-Forwarded-For`
       behind the header is logged with the carried address (IV2, second
       half).
-- [ ] With the runner removed from the trust list, a v1 and a v2 header
+- [x] With the runner removed from the trust list, a v1 and a v2 header
       are disconnected and `lorica_proxy_protocol_refused_total{reason="untrusted_peer"}`
       counts both, while a plain request from the same runner is served
       (IV2, first half).
-- [ ] In the workers profile, the accepted and untrusted cases once
+- [x] In the workers profile, the accepted and untrusted cases once
       more, since settings reach workers through the reload RPC.
 - [ ] IV3: the full suite with PROXY off, untouched profiles.
 

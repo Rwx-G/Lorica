@@ -1543,6 +1543,11 @@ api_del "/api/v1/backends/$B1_ID" >/dev/null 2>&1 && ok "Backend 1 deleted" || f
 api_del "/api/v1/backends/$B2_ID" >/dev/null 2>&1 && ok "Backend 2 deleted" || fail "Backend 2 delete failed"
 
 # =============================================================================
+# 21. PROXY PROTOCOL (Story 12.8 IV2, the settings through the reload RPC)
+# =============================================================================
+SESSION="$SESSION" bash "$SCRIPT_DIR/run-proxy-protocol-smoke.sh" workers || fail "PROXY protocol scenario (see its L4-SCENARIO line)"
+
+# =============================================================================
 # REPORT
 # =============================================================================
 print_results "WORKER ISOLATION"
