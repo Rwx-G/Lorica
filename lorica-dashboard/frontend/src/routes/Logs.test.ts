@@ -1,12 +1,16 @@
-import { render } from '@testing-library/svelte';
+import { fireEvent, render, screen } from '@testing-library/svelte';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import { api } from '../lib/api';
 import { auth } from '../lib/auth';
-import { clusterStatus, type ClusterStatus } from '../lib/cluster';
+import { ALL_FOLLOWERS, clusterStatus, type ClusterStatus } from '../lib/cluster';
 import Logs from './Logs.svelte';
 
 const POLL_MS = 5000;
+
+function nodeFilter(): HTMLSelectElement {
+  return screen.getByLabelText('Filter by node') as HTMLSelectElement;
+}
 
 /**
  * A WebSocket whose close event is delivered on a later task, as a
@@ -62,7 +66,9 @@ beforeEach(() => {
   auth.set({ status: 'authenticated', username: 'admin', role: 'super_admin' });
   getLogs = vi.spyOn(api, 'getLogs').mockResolvedValue({ data: { entries: [], total: 0 } } as never);
   getFleetLogs = vi.spyOn(api, 'getFleetLogs').mockResolvedValue({ data: { rows: [] } } as never);
-  vi.spyOn(api, 'listClusterNodes').mockResolvedValue({ data: [] });
+  vi.spyOn(api, 'listClusterNodes').mockResolvedValue({
+    data: [{ node_id: 'node-b', name: 'edge-02', status: 'active' }],
+  } as never);
 });
 
 afterEach(() => {
@@ -99,24 +105,63 @@ describe('Logs page live tail', () => {
     expect(getLogs.mock.calls.length).toBe(afterMount + 1);
   });
 
-  it('opens no socket and polls the fan-in store on the fleet view', async () => {
+  it("shows a control plane its own log, live, by default", async () => {
+    // The 1.10.8 regression: the control plane opened on the fan-in
+    // store, which never holds its own traffic, so its Logs page stayed
+    // empty however much it proxied.
     clusterStatus.set(controlPlane());
     render(Logs);
     await vi.advanceTimersByTimeAsync(POLL_MS);
 
-    expect(FakeWebSocket.instances).toHaveLength(0);
-    expect(getFleetLogs).toHaveBeenCalledTimes(2);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(FakeWebSocket.instances[0].closed).toBe(false);
+    expect(getLogs).toHaveBeenCalled();
+    expect(getFleetLogs).not.toHaveBeenCalled();
   });
 
-  it('closes the socket when the cluster status turns the page into the fleet view', async () => {
+  it('keeps the live tail when the cluster status arrives after mount', async () => {
     render(Logs);
     const socket = FakeWebSocket.instances[0];
 
     clusterStatus.set(controlPlane());
     await vi.advanceTimersByTimeAsync(0);
 
-    expect(socket.closed).toBe(true);
+    expect(socket.closed).toBe(false);
     expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+
+  it('polls the fan-in store with the socket closed while followers are shown', async () => {
+    clusterStatus.set(controlPlane());
+    render(Logs);
+    const socket = FakeWebSocket.instances[0];
+    await vi.advanceTimersByTimeAsync(0);
+
+    await fireEvent.change(nodeFilter(), { target: { value: ALL_FOLLOWERS } });
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+
+    expect(socket.closed).toBe(true);
+    expect(getFleetLogs).toHaveBeenCalledTimes(2);
+    expect(getFleetLogs.mock.calls[0][0]).not.toHaveProperty('node');
+    // Export and Clear act on this node's own log, not on the rows shown.
+    expect(screen.queryByText('Export')).toBeNull();
+    expect(screen.queryByText('Clear')).toBeNull();
+  });
+
+  it('reads one follower by id, then goes back to the live tail for this node', async () => {
+    clusterStatus.set(controlPlane());
+    render(Logs);
+    await vi.advanceTimersByTimeAsync(0);
+
+    await fireEvent.change(nodeFilter(), { target: { value: 'node-b' } });
+    expect(getFleetLogs).toHaveBeenLastCalledWith(expect.objectContaining({ node: 'node-b' }));
+
+    const localReads = getLogs.mock.calls.length;
+    await fireEvent.change(nodeFilter(), { target: { value: '' } });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(getLogs.mock.calls.length).toBe(localReads + 1);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(FakeWebSocket.instances[1].closed).toBe(false);
   });
 
   it('neither polls nor opens a socket with auto-refresh off', async () => {

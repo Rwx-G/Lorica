@@ -1,9 +1,14 @@
-import { render, screen, waitFor } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import { auth } from '../lib/auth';
 import { api, type NodeVerifyResult } from '../lib/api';
-import { clusterStatus, type ClusterNodeResponse, type ClusterStatus } from '../lib/cluster';
+import {
+  ALL_FOLLOWERS,
+  clusterStatus,
+  type ClusterNodeResponse,
+  type ClusterStatus,
+} from '../lib/cluster';
 import Security, { STATS_REFRESH_MS } from './Security.svelte';
 
 function controlPlane(): ClusterStatus {
@@ -82,6 +87,8 @@ beforeEach(() => {
     data: { enabled: false, ip_count: 0, source: '' },
   });
   vi.spyOn(api, 'listCustomRules').mockResolvedValue({ data: { rules: [], total: 0 } });
+  vi.spyOn(api, 'getWafEvents').mockResolvedValue({ data: { events: [], total: 0 } } as never);
+  vi.spyOn(api, 'listBans').mockResolvedValue({ data: { bans: [], total: 0 } } as never);
   vi.spyOn(api, 'getFleetWafEvents').mockResolvedValue({ data: { rows: [], next_cursor: null } });
   vi.spyOn(api, 'getFleetBans').mockResolvedValue({ data: [] });
   vi.spyOn(api, 'listAudit').mockResolvedValue({ data: { entries: [], total: 0 } });
@@ -149,6 +156,51 @@ describe('Security page, WAF counters', () => {
     await vi.advanceTimersByTimeAsync(STATS_REFRESH_MS);
     await waitFor(() => expect(statValue('Events (1h)')).toBe('3'));
     expect(stats).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('Security page, node filter on a control plane', () => {
+  function nodeFilter(): HTMLSelectElement {
+    return screen.getByLabelText('Filter by node') as HTMLSelectElement;
+  }
+
+  it("shows the control plane's own events and bans by default", async () => {
+    // Its own events and bans are never fanned in, so opening on the
+    // fan-in store hid them.
+    render(Security);
+    await waitFor(() => expect(api.getWafEvents).toHaveBeenCalled());
+    expect(api.listBans).toHaveBeenCalled();
+    expect(api.getFleetWafEvents).not.toHaveBeenCalled();
+    expect(api.getFleetBans).not.toHaveBeenCalled();
+  });
+
+  it('reads the fan-in store for every follower, without a node parameter', async () => {
+    render(Security);
+    await waitFor(() => expect(nodeFilter()).toBeInTheDocument());
+
+    await fireEvent.change(nodeFilter(), { target: { value: ALL_FOLLOWERS } });
+    await waitFor(() => expect(api.getFleetWafEvents).toHaveBeenCalled());
+    expect(vi.mocked(api.getFleetWafEvents).mock.calls[0][0]).not.toHaveProperty('node');
+  });
+
+  it('reads one follower by id', async () => {
+    render(Security);
+    await waitFor(() => expect(screen.getByRole('option', { name: 'edge-a' })).toBeInTheDocument());
+
+    await fireEvent.change(nodeFilter(), { target: { value: 'id-a' } });
+    await waitFor(() =>
+      expect(api.getFleetWafEvents).toHaveBeenCalledWith(expect.objectContaining({ node: 'id-a' })),
+    );
+  });
+
+  it('keeps the audit node selector while the events show this node', async () => {
+    // The audit log fans into this node's own store, so its selector
+    // does not follow the events filter.
+    render(Security);
+    (screen.getByText('Audit log') as HTMLElement).click();
+    await waitFor(() =>
+      expect(screen.getByLabelText('Filter audit by node')).toBeInTheDocument(),
+    );
   });
 });
 

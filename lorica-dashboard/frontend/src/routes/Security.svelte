@@ -5,13 +5,13 @@
   import NodeFilter from '../components/NodeFilter.svelte';
   import { showToast } from '../lib/toast';
   import { canWrite, canWriteRole, isSuperAdmin, isSuperAdminRole } from '../lib/auth';
-  import { clusterStatus, isFleetView, type FleetBanRow } from '../lib/cluster';
+  import { clusterStatus, fanInNode, isFleetView, type FleetBanRow } from '../lib/cluster';
 
   /**
-   * The events table. On a control plane the rows come from the fan-in
-   * store and carry the node that produced them; `node_id` is absent
-   * on a standalone install rather than empty, so the Node column
-   * exists only where it means something.
+   * The events table. On a control plane showing followers the rows
+   * come from the fan-in store and carry the node that produced them;
+   * `node_id` is absent from this node's own events rather than empty,
+   * so the Node column exists only where it means something.
    */
   let events: (WafEvent & { node_id?: string })[] = $state([]);
   let stats: WafStatsResponse = $state({
@@ -52,15 +52,26 @@
   let loading = $state(true);
   let error = $state('');
   let filterCategory = $state('');
-  /** Selected node id, or `''` for every node (Story 9.7 AC #5). */
+  /**
+   * Node filter choice for events and bans (Story 9.7 AC #5): `''` for
+   * this node, a follower's id, or every follower. This node is the
+   * default because its own events and bans are never fanned in, so no
+   * fan-in read can show them.
+   */
   let filterNode = $state('');
   /**
-   * Whether this page is reading the FAN-IN store rather than this
-   * node's own tables. Only a control plane holds fanned-in rows.
+   * Whether this is a control plane, whose audit tab lists every
+   * node's chain. The audit log fans into this node's own store, so
+   * that tab has its own node selector and ignores `filterNode`.
    */
-  // The fleet view reads Operator-floor endpoints; a Viewer on the
-  // control plane sees this node's own data, as on a standalone.
-  const fleetView = $derived(isFleetView($clusterStatus) && $canWriteRole);
+  // Fleet reads are Operator-floor endpoints; a Viewer on the control
+  // plane sees this node's own data, as on a standalone.
+  const controlPlaneView = $derived(isFleetView($clusterStatus) && $canWriteRole);
+  /**
+   * Whether the events and bans tables are reading the FAN-IN store
+   * rather than this node's own tables.
+   */
+  const fleetView = $derived(controlPlaneView && filterNode !== '');
   let activeTab: 'events' | 'rules' | 'blocklist' | 'custom' | 'bans' | 'audit' = $state('events');
   let showClearConfirm = $state(false);
   let bans: BanEntry[] = $state([]);
@@ -120,8 +131,9 @@
     ]);
 
     if (fleetView) {
+      const node = fanInNode(filterNode);
       const res = await api.getFleetWafEvents({
-        ...(filterNode ? { node: filterNode } : {}),
+        ...(node ? { node } : {}),
         ...(filterCategory ? { category: filterCategory } : {}),
         limit: 100,
       });
@@ -182,7 +194,7 @@
   async function loadBans() {
     bansLoading = true;
     if (fleetView) {
-      const res = await api.getFleetBans(filterNode || undefined);
+      const res = await api.getFleetBans(fanInNode(filterNode));
       if (res.data) {
         fleetBans = res.data;
       }
@@ -412,7 +424,7 @@
   }
 
   async function loadAuditNodes() {
-    if (!fleetView) return;
+    if (!controlPlaneView) return;
     const res = await api.listClusterNodes();
     if (!res.data) return;
     auditNodeNames = Object.fromEntries(
@@ -449,8 +461,8 @@
   {/if}
 
   <!-- Stats cards. Local counters: the WAF statistics endpoint has no
-       fan-in counterpart, so on a control plane they describe this node
-       while the table below describes the fleet. -->
+       fan-in counterpart, so they describe this node even while the
+       table below shows followers. -->
   {#if fleetView}
     <p class="text-muted">Counters below are this node's own.</p>
   {/if}
@@ -511,6 +523,7 @@
     <div class="filter-bar">
       <NodeFilter
         value={filterNode}
+        offerAllFollowers
         onchange={(id) => {
           filterNode = id;
           void loadData();
@@ -791,6 +804,7 @@
       <div class="filter-bar">
         <NodeFilter
           value={filterNode}
+          offerAllFollowers
           onchange={(id) => {
             filterNode = id;
             void loadBans();
@@ -895,7 +909,7 @@
       <p class="text-muted">
         Tamper-evident record of every operator mutation. Hash-chained, newest first.
       </p>
-      {#if fleetView}
+      {#if controlPlaneView}
         <p class="text-muted">
           This node also holds the rows other nodes fanned in. Each chain is
           verified separately. The hash is unkeyed, so this proves what a node
@@ -934,7 +948,7 @@
           <option value={500}>500</option>
           <option value={1000}>1000</option>
         </select>
-        {#if fleetView}
+        {#if controlPlaneView}
           <select
             class="audit-select"
             aria-label="Filter audit by node"
@@ -1025,7 +1039,7 @@
           <table>
             <thead>
               <tr>
-                {#if fleetView}
+                {#if controlPlaneView}
                   <th>Node</th>
                 {/if}
                 <th>Timestamp</th>
@@ -1039,7 +1053,7 @@
             <tbody>
               {#each auditEntries as record (record.id)}
                 <tr>
-                  {#if fleetView}
+                  {#if controlPlaneView}
                     <td class="mono">
                       {#if isLocalChain(record.node_id)}
                         <span class="local-chain">this node</span>

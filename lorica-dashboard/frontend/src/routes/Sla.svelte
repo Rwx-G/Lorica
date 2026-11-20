@@ -168,7 +168,6 @@
     {#if fleetView}
       <NodeFilter
         value={selectedNode}
-        allowAll={false}
         onchange={(id) => {
           selectedNode = id;
           void refreshAll();

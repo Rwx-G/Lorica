@@ -15,6 +15,8 @@ Author: Rwx-G
 
 ### Fixed
 
+- **A control plane's Access Logs and Security pages show its own traffic again.** A node's own requests, WAF events and bans are never copied into the store that collects the followers', yet on a control plane both pages read only that store, so the requests the control plane proxied itself appeared nowhere. Until 1.10.8 the Logs page's live tail filled the gap by accident; once 1.10.8 stopped it, the page stayed empty on a control plane however much traffic it served. The node filter now opens on "This node", which reads this node's own log, WAF events and bans as on a standalone install, live tail included; "All followers" and each follower's name read the collected rows. Export and Clear are hidden while followers are shown, since they act on this node's own log. On a follower, which has no node list to offer, the filter is no longer shown. Affected: the WAF events and bans since 1.7.0, the access logs in 1.10.8.
+
 ### Removed
 
 ### Security

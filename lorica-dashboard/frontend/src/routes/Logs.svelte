@@ -5,7 +5,7 @@
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import NodeFilter from '../components/NodeFilter.svelte';
   import { canWrite, canWriteRole } from '../lib/auth';
-  import { clusterStatus, isFleetView } from '../lib/cluster';
+  import { clusterStatus, fanInNode, isFleetView } from '../lib/cluster';
 
   let entries: LogEntry[] = $state([]);
   let total = $state(0);
@@ -20,7 +20,12 @@
   let filterStatusCategory = $state('');
   let filterTimeRange = $state('');
   let filterLimit = $state(500);
-  /** Selected node id, or `''` for every node (Story 9.7 AC #5). */
+  /**
+   * Node filter choice (Story 9.7 AC #5): `''` for this node, a
+   * follower's id, or every follower. This node is the default because
+   * the control plane's own traffic is never fanned in, so no fan-in
+   * read can show it.
+   */
   let filterNode = $state('');
   /**
    * Whether this page is showing the FAN-IN store rather than this
@@ -28,7 +33,7 @@
    */
   // The fleet view reads Operator-floor endpoints; a Viewer on the
   // control plane sees this node's own data, as on a standalone.
-  const fleetView = $derived(isFleetView($clusterStatus) && $canWriteRole);
+  const fleetView = $derived(isFleetView($clusterStatus) && $canWriteRole && filterNode !== '');
   /**
    * Row id to the node that produced it, for the fleet view's Node
    * column.
@@ -108,14 +113,14 @@
       params.time_from = from.toISOString();
     }
 
-    // On a control plane with a node picked (or with "all nodes" while
-    // clustered), read the FAN-IN store rather than this node's own
-    // log: the point of the filter is to see other nodes' traffic.
+    // On a control plane with a follower picked, or all of them, read
+    // the FAN-IN store rather than this node's own log.
     // The fan-in view has no total, by design, so the count is the
     // page itself rather than a number the server had to scan for.
     if (fleetView) {
+      const node = fanInNode(filterNode);
       const res = await api.getFleetLogs({
-        ...(filterNode ? { node: filterNode } : {}),
+        ...(node ? { node } : {}),
         ...(filterRoute.trim() ? { route: filterRoute.trim() } : {}),
         ...(typeof params.time_from === 'string' ? { from: params.time_from } : {}),
         limit: filterLimit,
@@ -202,8 +207,8 @@
   // has no node id for them, so they would render under "-" beside
   // genuinely fanned-in rows: the control plane's own traffic,
   // labelled as if its origin were unknown. The fleet view polls
-  // instead. Reading `fleetView` here also moves the page from the
-  // tail to polling when the cluster status arrives after mount.
+  // instead. Reading `fleetView` here moves the page between the tail
+  // and polling as the operator picks this node or a follower.
   $effect(() => {
     localStorage.setItem('lorica-logs-autorefresh', String(autoRefresh));
     if (!autoRefresh) return;
@@ -280,17 +285,22 @@
         {#if wsConnected}<span class="ws-dot" title="WebSocket connected"></span>{/if}
       </label>
       <button class="btn btn-secondary" onclick={loadLogs}>Refresh</button>
-      <button
-        class="btn btn-secondary"
-        onclick={() => { if (!showExport) initExportDefaults(); showExport = !showExport; }}
-      >Export</button>
-      {#if $canWrite}
-        <button class="btn btn-danger" onclick={() => (showClearConfirm = true)}>Clear</button>
+      <!-- Export and Clear act on this node's own log, so they are
+           absent while the table shows followers' rows rather than
+           wired to a target other than the one displayed. -->
+      {#if !fleetView}
+        <button
+          class="btn btn-secondary"
+          onclick={() => { if (!showExport) initExportDefaults(); showExport = !showExport; }}
+        >Export</button>
+        {#if $canWrite}
+          <button class="btn btn-danger" onclick={() => (showClearConfirm = true)}>Clear</button>
+        {/if}
       {/if}
     </div>
   </div>
 
-  {#if showExport}
+  {#if showExport && !fleetView}
     <div class="export-panel">
       <div class="export-row">
         <label class="export-label">
@@ -316,6 +326,7 @@
   <div class="filters">
     <NodeFilter
       value={filterNode}
+      offerAllFollowers
       onchange={(id) => {
         filterNode = id;
         void loadLogs();
