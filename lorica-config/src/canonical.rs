@@ -856,8 +856,9 @@ impl SelectorResolution {
 /// filtering on the control plane instead (Story 10.0, backlog #56).
 ///
 /// Restricted: routes the node serves, the links of those routes, the
-/// backends those links reference, the certificates those routes bind,
-/// and the capture rules attached to those routes. Left fleet-wide:
+/// backends those links reference, the certificates those routes bind
+/// (and those its streams name, below), and the capture rules attached
+/// to those routes. Left fleet-wide:
 /// global policy, WAF rules and disabled ids, export ACL patterns, AI
 /// crawler entries, probe and SLA definitions, notification channels
 /// and DNS providers. Those are fleet policy or carry digests only, and
@@ -879,7 +880,12 @@ impl SelectorResolution {
 /// with them, and the backends are the
 /// union of what the kept routes and the kept streams reference. A
 /// node serving only a stream would otherwise receive the stream and
-/// none of its backends, and the apply would delete them.
+/// none of its backends, and the apply would delete them. The
+/// certificates are likewise the union of the kept routes' and the
+/// certificates the kept streams name (`Stream::certificate_references`,
+/// the same list that entitles a node to their keys, Story 12.4
+/// Resolved 2): without their rows a terminating stream binds and
+/// refuses every handshake.
 pub fn restrict_for_recipient(
     cfg: &CanonicalConfig,
     node_id: &str,
@@ -934,6 +940,7 @@ pub fn restrict_for_recipient(
     let cert_ids: std::collections::HashSet<&str> = routes
         .iter()
         .filter_map(|r| r.certificate_id.as_deref())
+        .chain(streams.iter().flat_map(Stream::certificate_references))
         .collect();
     let certificates: Vec<Certificate> = cfg
         .certificates
@@ -1490,6 +1497,47 @@ mod tests {
         assert!(
             !other.backends.iter().any(|b| b.id == "b-s"),
             "another node's stream upstream address"
+        );
+    }
+
+    /// Story 12.4 Resolved 2: the certificates a stream names (the ones
+    /// it terminates with, the client identity it presents upstream)
+    /// travel with the stream to the nodes it targets, as a route's
+    /// certificate does. The cut used to keep route certificates only,
+    /// so a follower bound a terminating stream with no certificate row
+    /// to serve and refused every handshake.
+    #[test]
+    fn a_streams_certificates_are_cut_with_the_stream() {
+        let mut cfg = fleet_config();
+        cfg.streams[0].tls_terminate = Some(
+            serde_json::from_value(serde_json::json!({ "certificate_ids": ["cert-s-served"] }))
+                .expect("test setup: a terminate block"),
+        );
+        cfg.streams[0].upstream_tls = Some(crate::models::StreamUpstreamTls {
+            client_certificate_id: Some("cert-s-client".to_string()),
+            ..crate::models::StreamUpstreamTls::default()
+        });
+        cfg.certificates
+            .push(make_certificate("cert-s-served", "ee:ff"));
+        cfg.certificates
+            .push(make_certificate("cert-s-client", "11:22"));
+
+        let cut = restrict_for_recipient(&cfg, "id-b", &resolution());
+        let ids: Vec<&str> = cut.certificates.iter().map(|c| c.id.as_str()).collect();
+        for id in ["cert-b", "cert-s-served", "cert-s-client"] {
+            assert!(
+                ids.contains(&id),
+                "{id} reaches the node the stream targets: {ids:?}"
+            );
+        }
+
+        let other = restrict_for_recipient(&cfg, "id-a", &resolution());
+        assert!(
+            !other
+                .certificates
+                .iter()
+                .any(|c| c.id == "cert-s-served" || c.id == "cert-s-client"),
+            "a node the stream does not target receives none of its certificates"
         );
     }
 
