@@ -5,7 +5,8 @@
 //! imports by name; the handlers here only call it and audit.
 //!
 //! Role floors live in the authorize middleware: token endpoints and
-//! every node mutation are SuperAdmin, reads are Viewer+.
+//! every node mutation are SuperAdmin, `status` is Viewer+, and every
+//! other read is Operator+ (fleet reads carry cross-node data).
 
 pub mod runtime;
 #[cfg(test)]
@@ -539,7 +540,7 @@ pub(crate) async fn one_node(
     Ok(responses.remove(0))
 }
 
-/// GET /api/v1/cluster/nodes - the fleet roster (Viewer+).
+/// GET /api/v1/cluster/nodes - the fleet roster (Operator+).
 pub async fn list_nodes(
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -547,7 +548,7 @@ pub async fn list_nodes(
     Ok(json_data(roster(&state, session.role).await?))
 }
 
-/// GET /api/v1/cluster/nodes/{id} - one node (Viewer+).
+/// GET /api/v1/cluster/nodes/{id} - one node (Operator+).
 pub async fn get_node(
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
@@ -1098,7 +1099,7 @@ impl From<lorica_cluster::ReplicationReport> for ReplicationRoundResponse {
 }
 
 /// GET /api/v1/cluster/replication - the last replication round and
-/// the generation in flight (Viewer+, control plane only).
+/// the generation in flight (Operator+, control plane only).
 pub async fn get_replication(
     Extension(state): Extension<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -1115,7 +1116,7 @@ pub async fn get_replication(
 
 /// GET /api/v1/cluster/drift - nodes whose applied configuration
 /// differs from the current one, with the age of the divergence
-/// (Viewer+, control plane only, AC #12).
+/// (Operator+, control plane only, AC #12).
 pub async fn get_drift(
     Extension(state): Extension<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -1175,7 +1176,7 @@ pub struct FleetPage<T> {
     pub next_cursor: Option<i64>,
 }
 
-/// GET /api/v1/cluster/logs - the fleet's access logs (Viewer+,
+/// GET /api/v1/cluster/logs - the fleet's access logs (Operator+,
 /// Story 9.6 AC #9).
 ///
 /// Control plane only: a follower holds its own rows and serves them
@@ -1198,7 +1199,7 @@ pub async fn fleet_logs(
     Ok(json_data(FleetPage { rows, next_cursor }))
 }
 
-/// GET /api/v1/cluster/waf-events - the fleet's WAF events (Viewer+,
+/// GET /api/v1/cluster/waf-events - the fleet's WAF events (Operator+,
 /// Story 9.6 AC #9).
 pub async fn fleet_waf_events(
     Extension(state): Extension<AppState>,
@@ -1230,7 +1231,7 @@ fn next_cursor(returned: usize, requested: Option<u32>, last_id: Option<i64>) ->
     (returned as u32 >= page).then_some(last_id).flatten()
 }
 
-/// GET /api/v1/cluster/bans - every node's live bans (Viewer+,
+/// GET /api/v1/cluster/bans - every node's live bans (Operator+,
 /// control plane, Story 9.6 AC #10).
 ///
 /// A snapshot of what each node last reported, not a history: bans
