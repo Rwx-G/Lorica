@@ -269,19 +269,17 @@ export function isClustered(status: ClusterStatus | null): boolean {
 }
 
 /**
- * Whether a page can show other nodes' data beside this node's own
- * (Story 9.7 AC #5).
+ * Whether this node is a control plane, the only node that can show
+ * other nodes' data (Story 9.7 AC #5).
  *
  * Only a control plane holds fanned-in rows: a follower ships its own
  * and keeps no copy of anyone else's, so on a follower the local
- * tables are the only truth there is. Which store a page then reads
- * is the node filter's choice, not this predicate's.
- *
- * Lifted out of the pages because it is pure boolean logic with no
- * dependency on row shape, and every fleet-aware page shares it.
+ * tables are the only truth there is. Which store a page reads is
+ * [`nodeScope`]'s answer, not this predicate's. Pages gate on
+ * `canReadFleet` in `auth.ts`, which adds the role floor.
  */
-export function isFleetView(status: ClusterStatus | null): boolean {
-  return isClustered(status) && status?.role === 'control_plane';
+export function isControlPlane(status: ClusterStatus | null): boolean {
+  return status?.role === 'control_plane';
 }
 
 /**
@@ -291,17 +289,34 @@ export function isFleetView(status: ClusterStatus | null): boolean {
  * `''` is this node, not the fleet: the control plane's own traffic
  * never reaches the fan-in store (Story 9.6 AC #2), so the fan-in
  * aggregate leaves out the very node the operator is logged into, and
- * defaulting to it is what hid that node's access logs in 1.10.8. Node
- * ids are UUIDs, so this value cannot name one.
+ * defaulting to it is what hid that node's access logs in 1.10.8
+ * (Story 9.7 D23). Node ids are UUIDs, so this value cannot name one.
  */
 export const ALL_FOLLOWERS = '*';
 
 /**
- * The `node` parameter of a fan-in read for a node filter choice other
- * than this node: `undefined` for every follower, the id otherwise.
+ * The audit tab's choice of every chain, this node's included.
+ *
+ * Deliberately not `ALL_FOLLOWERS`: audit rows fan into this node's
+ * own audit store (Story 9.9), so the audit aggregate does include the
+ * control plane and "All nodes" is its honest label. The telemetry
+ * aggregate cannot include it. Unifying the two would mislabel one.
  */
-export function fanInNode(choice: string): string | undefined {
-  return choice === ALL_FOLLOWERS ? undefined : choice;
+export const ALL_AUDIT_CHAINS = '__all__';
+
+/** Where a page reads its rows from, for one node filter choice. */
+export type NodeScope =
+  | { store: 'local' }
+  | { store: 'fan-in'; node: string | undefined };
+
+/**
+ * The one place a node filter choice becomes a store and a `node`
+ * parameter: `''` is this node's own tables, `ALL_FOLLOWERS` is the
+ * fan-in store unfiltered, anything else is one follower's fan-in rows.
+ */
+export function nodeScope(choice: string): NodeScope {
+  if (choice === '') return { store: 'local' };
+  return { store: 'fan-in', node: choice === ALL_FOLLOWERS ? undefined : choice };
 }
 
 /** How the header badge should present the fleet (AC #6). */

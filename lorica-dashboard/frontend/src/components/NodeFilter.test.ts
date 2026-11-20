@@ -168,6 +168,23 @@ describe('NodeFilter', () => {
     expect(screen.queryByText('edge-gone')).toBeNull();
   });
 
+  it('retries a failed roster read on the next status poll', async () => {
+    // The status store emits on every poll while the visibility gate
+    // stays true, so the retry has to follow the store itself.
+    const list = vi
+      .spyOn(api, 'listClusterNodes')
+      .mockResolvedValueOnce({ error: { code: 'internal', message: 'nope' } })
+      .mockResolvedValue({ data: [node('id-a', 'edge-01', 'active')] });
+    clusterStatus.set(status('control_plane'));
+    render(NodeFilter, { props: { value: '', onchange: () => {} } });
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText('edge-01')).toBeNull();
+
+    clusterStatus.set(status('control_plane'));
+    await waitFor(() => expect(screen.getByText('edge-01')).toBeInTheDocument());
+    expect(list).toHaveBeenCalledTimes(2);
+  });
+
   it('keeps this node and every follower when the roster read fails', async () => {
     // The filter is an aid, not a gate. A failed roster read must
     // leave the page usable rather than trap it on one node.

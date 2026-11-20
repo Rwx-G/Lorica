@@ -4,16 +4,16 @@
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import NodeFilter from '../components/NodeFilter.svelte';
   import { showToast } from '../lib/toast';
-  import { canWrite, canWriteRole, isSuperAdmin, isSuperAdminRole } from '../lib/auth';
-  import { clusterStatus, fanInNode, isFleetView, type FleetBanRow } from '../lib/cluster';
+  import { canReadFleet, canWrite, isSuperAdmin, isSuperAdminRole } from '../lib/auth';
+  import { ALL_AUDIT_CHAINS, nodeScope, type FleetBanRow, type NodeScope } from '../lib/cluster';
 
   /**
    * The events table. On a control plane showing followers the rows
-   * come from the fan-in store and carry the node that produced them;
-   * `node_id` is absent from this node's own events rather than empty,
-   * so the Node column exists only where it means something.
+   * come from the fan-in store and carry their row id and the node that
+   * produced them; both are absent from this node's own events rather
+   * than empty, so the Node column exists only where it means something.
    */
-  let events: (WafEvent & { node_id?: string })[] = $state([]);
+  let events: (WafEvent & { id?: number; node_id?: string })[] = $state([]);
   let stats: WafStatsResponse = $state({
     total_events: 0,
     total_24h: 0,
@@ -60,18 +60,23 @@
    */
   let filterNode = $state('');
   /**
-   * Whether this is a control plane, whose audit tab lists every
-   * node's chain. The audit log fans into this node's own store, so
-   * that tab has its own node selector and ignores `filterNode`.
+   * Where the next events and bans reads go. Without `canReadFleet`
+   * there is no filter, so always here. The audit tab ignores it: audit
+   * rows fan into this node's own store, so that tab has its own
+   * selector, shown wherever `canReadFleet` holds.
    */
-  // Fleet reads are Operator-floor endpoints; a Viewer on the control
-  // plane sees this node's own data, as on a standalone.
-  const controlPlaneView = $derived(isFleetView($clusterStatus) && $canWriteRole);
+  const scope = $derived<NodeScope>($canReadFleet ? nodeScope(filterNode) : { store: 'local' });
   /**
-   * Whether the events and bans tables are reading the FAN-IN store
-   * rather than this node's own tables.
+   * Which store the events and the bans on screen came from. Their
+   * Node columns, notes and actions follow these rather than the
+   * filter, so a table never carries one store's rows under the
+   * other's controls.
    */
-  const fleetView = $derived(controlPlaneView && filterNode !== '');
+  let eventsSource = $state<NodeScope['store']>('local');
+  let bansSource = $state<NodeScope['store']>('local');
+  /** Bumped by every read, so a response that lost a race is dropped. */
+  let latestEventsLoad = 0;
+  let latestBansLoad = 0;
   let activeTab: 'events' | 'rules' | 'blocklist' | 'custom' | 'bans' | 'audit' = $state('events');
   let showClearConfirm = $state(false);
   let bans: BanEntry[] = $state([]);
@@ -117,6 +122,8 @@
   let deletingCustomRule: CustomWafRule | null = $state(null);
 
   async function loadData() {
+    const load = ++latestEventsLoad;
+    const requested = scope;
     loading = true;
     error = '';
     // The rules, blocklist and custom-rule views describe THIS node's
@@ -129,28 +136,32 @@
       api.getBlocklistStatus(),
       api.listCustomRules(),
     ]);
+    if (load !== latestEventsLoad) return;
 
-    if (fleetView) {
-      const node = fanInNode(filterNode);
+    if (requested.store === 'fan-in') {
       const res = await api.getFleetWafEvents({
-        ...(node ? { node } : {}),
+        ...(requested.node ? { node: requested.node } : {}),
         ...(filterCategory ? { category: filterCategory } : {}),
         limit: 100,
       });
+      if (load !== latestEventsLoad) return;
       if (res.error) {
         error = res.error.message;
       } else if (res.data) {
         events = res.data.rows;
+        eventsSource = 'fan-in';
       }
     } else {
       const res = await api.getWafEvents({
         limit: 100,
         category: filterCategory || undefined,
       });
+      if (load !== latestEventsLoad) return;
       if (res.error) {
         error = res.error.message;
       } else if (res.data) {
         events = res.data.events;
+        eventsSource = 'local';
       }
     }
 
@@ -192,19 +203,40 @@
   });
 
   async function loadBans() {
+    const load = ++latestBansLoad;
+    const requested = scope;
     bansLoading = true;
-    if (fleetView) {
-      const res = await api.getFleetBans(fanInNode(filterNode));
+    if (requested.store === 'fan-in') {
+      const res = await api.getFleetBans(requested.node);
+      if (load !== latestBansLoad) return;
       if (res.data) {
         fleetBans = res.data;
       }
     } else {
       const res = await api.listBans();
+      if (load !== latestBansLoad) return;
       if (res.data) {
         bans = res.data.bans;
       }
     }
+    bansSource = requested.store;
     bansLoading = false;
+  }
+
+  /**
+   * A new node filter choice, from either tab. Events and bans share
+   * it, so both reload: a tab left on the previous choice would show
+   * its rows under the new choice's columns and actions when reopened.
+   * Rows from the other store go before the reads land.
+   */
+  function selectNode(choice: string) {
+    filterNode = choice;
+    events = [];
+    eventsSource = scope.store;
+    fleetBans = [];
+    bansSource = scope.store;
+    void loadData();
+    void loadBans();
   }
 
   function startBansRefresh() {
@@ -424,7 +456,7 @@
   }
 
   async function loadAuditNodes() {
-    if (!controlPlaneView) return;
+    if (!$canReadFleet) return;
     const res = await api.listClusterNodes();
     if (!res.data) return;
     auditNodeNames = Object.fromEntries(
@@ -450,7 +482,7 @@
     <h1>Security</h1>
     <div class="header-actions">
       <button class="btn btn-secondary" onclick={loadData}>Refresh</button>
-      {#if $canWrite && !fleetView && activeTab === 'events' && events.length > 0}
+      {#if $canWrite && eventsSource === 'local' && activeTab === 'events' && events.length > 0}
         <button class="btn btn-secondary" style="color: var(--color-red)" onclick={() => (showClearConfirm = true)}>Clear Events</button>
       {/if}
     </div>
@@ -463,7 +495,7 @@
   <!-- Stats cards. Local counters: the WAF statistics endpoint has no
        fan-in counterpart, so they describe this node even while the
        table below shows followers. -->
-  {#if fleetView}
+  {#if eventsSource === 'fan-in'}
     <p class="text-muted">Counters below are this node's own.</p>
   {/if}
   <div class="stats-grid">
@@ -521,14 +553,7 @@
   {#if activeTab === 'events'}
     <!-- Filter -->
     <div class="filter-bar">
-      <NodeFilter
-        value={filterNode}
-        offerAllFollowers
-        onchange={(id) => {
-          filterNode = id;
-          void loadData();
-        }}
-      />
+      <NodeFilter value={filterNode} offerAllFollowers onchange={selectNode} />
       <label for="cat-filter">Filter by category:</label>
       <select id="cat-filter" bind:value={filterCategory} onchange={handleFilterChange}>
         <option value="">All categories</option>
@@ -559,7 +584,7 @@
         <table>
           <thead>
             <tr>
-              {#if fleetView}
+              {#if eventsSource === 'fan-in'}
                 <th>Node</th>
               {/if}
               <th>Time</th>
@@ -581,9 +606,9 @@
               that list is replaced wholesale on every load, which is
               the case index keying is safe for.
             -->
-            {#each events as event, i (event.node_id ? `${event.node_id}:${i}` : i)}
+            {#each events as event, i (event.id ?? i)}
               <tr>
-                {#if fleetView}
+                {#if eventsSource === 'fan-in'}
                   <td class="mono">{event.node_id ?? '-'}</td>
                 {/if}
                 <td class="mono">{formatTime(event.timestamp)}</td>
@@ -794,7 +819,7 @@
         IPs automatically banned for repeated rate limit violations. Bans expire after 1 hour.
         Auto-refreshes every 10 seconds.
       </p>
-      {#if fleetView}
+      {#if bansSource === 'fan-in'}
         <p class="text-muted">
           Each node reports the bans it currently holds. Bans live in memory,
           so a node that restarted reports none until it bans again, and
@@ -802,17 +827,10 @@
         </p>
       {/if}
       <div class="filter-bar">
-        <NodeFilter
-          value={filterNode}
-          offerAllFollowers
-          onchange={(id) => {
-            filterNode = id;
-            void loadBans();
-          }}
-        />
+        <NodeFilter value={filterNode} offerAllFollowers onchange={selectNode} />
       </div>
 
-      {#if fleetView}
+      {#if bansSource === 'fan-in'}
         {#if bansLoading && fleetBans.length === 0}
           <p class="loading">Loading...</p>
         {:else if fleetBans.length === 0}
@@ -909,7 +927,7 @@
       <p class="text-muted">
         Tamper-evident record of every operator mutation. Hash-chained, newest first.
       </p>
-      {#if controlPlaneView}
+      {#if $canReadFleet}
         <p class="text-muted">
           This node also holds the rows other nodes fanned in. Each chain is
           verified separately. The hash is unkeyed, so this proves what a node
@@ -948,7 +966,7 @@
           <option value={500}>500</option>
           <option value={1000}>1000</option>
         </select>
-        {#if controlPlaneView}
+        {#if $canReadFleet}
           <select
             class="audit-select"
             aria-label="Filter audit by node"
@@ -958,11 +976,11 @@
               // `''` is a real filter (this node's own rows) and the
               // sentinel below is "no filter", so they cannot share a
               // value.
-              auditNode = picked === '__all__' ? undefined : picked;
+              auditNode = picked === ALL_AUDIT_CHAINS ? undefined : picked;
               void loadAudit();
             }}
           >
-            <option value="__all__">All nodes</option>
+            <option value={ALL_AUDIT_CHAINS}>All nodes</option>
             <option value="">This node (local chain)</option>
             {#each auditNodeIds.filter((n) => n !== '') as id (id)}
               <option value={id}>{fleetNodeName(id)}</option>
@@ -1039,7 +1057,7 @@
           <table>
             <thead>
               <tr>
-                {#if controlPlaneView}
+                {#if $canReadFleet}
                   <th>Node</th>
                 {/if}
                 <th>Timestamp</th>
@@ -1053,7 +1071,7 @@
             <tbody>
               {#each auditEntries as record (record.id)}
                 <tr>
-                  {#if controlPlaneView}
+                  {#if $canReadFleet}
                     <td class="mono">
                       {#if isLocalChain(record.node_id)}
                         <span class="local-chain">this node</span>

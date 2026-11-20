@@ -1,10 +1,10 @@
 <script lang="ts">
   import { api } from '../lib/api';
-  import { canWriteRole } from '../lib/auth';
-  import { ALL_FOLLOWERS, clusterStatus, isFleetView } from '../lib/cluster';
+  import { canReadFleet } from '../lib/auth';
+  import { ALL_FOLLOWERS, clusterStatus } from '../lib/cluster';
 
   interface Props {
-    /** Selected node id, `''` for this node, or `ALL_FOLLOWERS`. */
+    /** `''` for this node, `ALL_FOLLOWERS`, or a follower's node id. */
     value: string;
     /** Called with the new choice when the operator picks one. */
     onchange: (choice: string) => void;
@@ -20,29 +20,24 @@
 
   let names = $state<{ id: string; label: string }[]>([]);
 
-  // Rendered only on a control plane (AC #5): an operator who never
-  // clustered must not see a filter with one option in it, and a
-  // follower has no roster to list, since only the control plane
-  // serves it. Also hidden from a Viewer, for whom the roster is 403.
-  const visible = $derived(isFleetView($clusterStatus) && $canWriteRole);
-
   /** Whether the roster has been fetched, so it is fetched once. */
   let loaded = false;
 
-  // Driven by the store rather than by mount. `clusterStatus` starts
-  // null and is filled by an async read, so a component that mounts
-  // first would have returned early here and never populated: the
-  // select would appear a moment later with this node as its only
-  // option, on a real cluster, until the page was navigated away from
-  // and back.
+  // Rendered only where `canReadFleet` holds (AC #5): an operator who
+  // never clustered must not see a filter with one option in it, a
+  // follower has no roster to list, and a Viewer's roster read is 403.
+  //
+  // `$clusterStatus` is read for its own sake: `canReadFleet` only
+  // notifies when it flips, while the status store emits on every poll,
+  // and that re-run is what retries a failed roster read. A component
+  // that mounts before the first status read populates the same way.
   $effect(() => {
-    if (loaded || !visible) return;
+    void $clusterStatus;
+    if (loaded || !$canReadFleet) return;
     loaded = true;
     void (async () => {
       const res = await api.listClusterNodes();
       if (!res.data) {
-        // Retry on the next status change rather than leaving the
-        // filter permanently empty on one failed read.
         loaded = false;
         return;
       }
@@ -53,7 +48,7 @@
   });
 </script>
 
-{#if visible}
+{#if $canReadFleet}
   <select
     class="filter-select"
     aria-label="Filter by node"

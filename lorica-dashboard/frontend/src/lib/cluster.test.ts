@@ -1,10 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import {
+  ALL_AUDIT_CHAINS,
+  ALL_FOLLOWERS,
   breakGlassActive,
   fleetBadge,
   gaugePercent,
   isClustered,
+  isControlPlane,
   isReadOnlyNode,
+  nodeScope,
   joinCommand,
   secondsUntil,
   type ClusterStatus,
@@ -90,6 +94,37 @@ describe('isClustered', () => {
   it('is true on both sides of a fleet', () => {
     expect(isClustered(status({ role: 'control_plane' }))).toBe(true);
     expect(isClustered(status({ role: 'follower' }))).toBe(true);
+  });
+});
+
+describe('isControlPlane', () => {
+  it('is true on a control plane only', () => {
+    expect(isControlPlane(status({ role: 'control_plane' }))).toBe(true);
+    expect(isControlPlane(status({ role: 'follower' }))).toBe(false);
+    expect(isControlPlane(status({ role: 'standalone' }))).toBe(false);
+    expect(isControlPlane(null)).toBe(false);
+  });
+});
+
+describe('nodeScope', () => {
+  it("reads this node's own tables for the empty choice", () => {
+    // Not the fan-in aggregate: this node's rows never fan in (9.6
+    // AC #2), so reading it for '' is the 1.10.8 regression.
+    expect(nodeScope('')).toEqual({ store: 'local' });
+  });
+
+  it('reads the fan-in store without a node for every follower', () => {
+    expect(nodeScope(ALL_FOLLOWERS)).toEqual({ store: 'fan-in', node: undefined });
+  });
+
+  it("reads one follower's fan-in rows for its id", () => {
+    const id = '3f2b8c1e-7a4d-4e9b-8c2f-1d6e5a4b3c2d';
+    expect(nodeScope(id)).toEqual({ store: 'fan-in', node: id });
+  });
+
+  it('keeps the two aggregates apart', () => {
+    // Audit's aggregate includes this node, telemetry's cannot.
+    expect(ALL_AUDIT_CHAINS).not.toBe(ALL_FOLLOWERS);
   });
 });
 
