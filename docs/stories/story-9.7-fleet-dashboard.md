@@ -194,6 +194,33 @@ anything is worse than no check, because it is quoted as evidence.
 Every "gates green" line recorded in this story before 2026-09-09
 covered less than it claimed.
 
+**D23 (1.10.9, operator's decision): the node filter opens on this
+node, and "All followers" replaces "All nodes".** AC #5 asked for a
+default of all nodes. On Access Logs and Security that default read
+the fan-in store, which by 9.6 AC #2 never holds the control plane's
+own rows: "all nodes" was every node but the one the operator was
+logged into. Nothing showed the control plane's own requests, WAF
+events or bans. Up to 1.10.7 the Logs page hid the gap by accident,
+its live tail connecting regardless of the fleet view; 1.10.8 closed
+that leak (#60) and the page went empty on a control plane. The filter
+now offers "This node" (`''`, the local tables, live tail included,
+the SLA page's convention from D22), "All followers" (`ALL_FOLLOWERS`,
+the fan-in store unfiltered) and each follower. `nodeScope` in
+`lib/cluster.ts` is the one place a choice becomes a store, and
+`canReadFleet` in `lib/auth.ts` the one gate. The audit tab keeps its
+own selector and its "All nodes": audit rows fan into this node's own
+store (9.9), so that aggregate does include it.
+
+Not built: one view of the whole fleet, this node included. Merging
+the two stores server side means paging two SQLite files whose ids are
+independent, so it needs a composite keyset cursor such as
+`(timestamp, origin, id)` and a k-way merge, ordered by origin
+timestamps that clock skew makes approximate. Writing the control
+plane's own rows into `cluster-telemetry.db` instead would reverse
+9.6 AC #2 and double the busiest node's writes. The server-side merge
+is the route to take if the need appears. Do not restore "all nodes"
+as the default over the fan-in store: that is the 1.10.8 regression.
+
 **D22 (Epic close, operator's decision): AC #5's SLA leg is built as
 a per-node read, not a fleet aggregate.** D17 below stands on its
 mechanics (nothing SLA fans in, and a fleet percentile is not
@@ -576,6 +603,7 @@ Corrected in passing:
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
+| 2026-11-20 | 1.4 | AC #5's default revised (D23, the operator's decision in 1.10.9): the node filter opens on this node, because the fan-in store never holds the control plane's own rows and the "all nodes" default had hidden them since 1.7.0 on Security and in 1.10.8 on Access Logs. "All followers" and each follower read the fan-in store; the audit tab keeps "All nodes". | Romain G. |
 | 2026-09-09 | 1.3 | AC #5 SLA leg delivered as a per-node read (D22, the operator's decision at the epic close): `SlaPull`/`SlaPullAck` on tag 42, `?node=` on the four SLA reads, the node filter in single-node mode on the SLA page, corpus and e2e coverage. AC #5 is now met on all three pages. | Romain G. |
 | 2026-09-09 | 1.2 | Epic close. The one acceptance criterion knowingly short (AC #5 on SLA, D17) is carried to the epic report for the operator's decision rather than left as a Review blocker; the four epic-wide auditors raised nothing against this story's own surface beyond `STALE_AFTER_MS`'s comment ("three intervals" over a six-interval value; now derived from `HEARTBEAT_INTERVAL_MS` and the badge label reads the constant). Revocation now answers 200 with `certificates_to_reissue` and the page keeps that list on screen until dismissed, because a toast would scroll away before an operator re-issued anything. Status Done. | Romain G. |
 | 2026-09-09 | 1.1 | Audit and remediation complete (D20). Four auditors returned one Critical, four High and eight Medium; every finding was verified against the code before acting, two were downgraded on that reading. The Critical was another comment asserting a safety the code did not have: the drawer's certificate inventory omitted every fleet-wide entitlement while claiming to reproduce the push path's rule, so a node holding every fleet-wide certificate was shown as holding none. The most consequential finding is one this story caused: AC #4 hid every mutation control on a follower, including the break-glass and leave controls that `isSuperAdminRole`'s own doc claimed to exist for and which had never been written, so AC #7 shipped an alarm with no lever. Both now exist. Also fixed: the drawer race, swallowed drawer errors, the live-tail leak into the fleet table, `NodeFilter` populating only if the status arrived before it mounted, two writers on the cluster store, the blocking sampler on the heartbeat task, the unbounded CPU gauge, and the resource gauges sitting at the Viewer floor. Pinned: a test cross-checking the dashboard's follower paths against the server allow-list, and six cases on `Cluster.svelte`, which had none and is where both shipped defects were. Raised to the backlog rather than fixed here: #69, #70, #71, plus verification notes on #52 and #59. Gates: `npm run check`, `npm run lint`, 419 Vitest cases, three clippy gates, 599 + 286 + cluster Rust tests, all green. Status stays Review: one acceptance criterion is knowingly short and that is the user's call, not the author's. | Romain G. |

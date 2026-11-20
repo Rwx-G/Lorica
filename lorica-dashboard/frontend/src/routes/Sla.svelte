@@ -7,8 +7,7 @@
     type SlaConfigResponse,
     type SlaBucket,
   } from '../lib/api';
-  import { canWrite, canWriteRole } from '../lib/auth';
-  import { clusterStatus, isFleetView } from '../lib/cluster';
+  import { canWrite } from '../lib/auth';
   import NodeFilter from '../components/NodeFilter.svelte';
   import StreamSlaSection from '../components/StreamSlaSection.svelte';
   import { get } from 'svelte/store';
@@ -22,8 +21,8 @@
   // time. `''` is this node; a follower's id asks the control plane to
   // read that follower's own figures over its session. There is no
   // "all nodes": a fleet percentile is not a function of per-node
-  // percentiles, and nothing SLA fans in.
-  const fleetView = $derived(isFleetView($clusterStatus) && $canWriteRole);
+  // percentiles, and nothing SLA fans in. The filter shows itself only
+  // where `canReadFleet` holds, so `selectedNode` stays `''` elsewhere.
   let selectedNode = $state('');
   const nodeParam = $derived(selectedNode || undefined);
 
@@ -49,13 +48,22 @@
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
   let lastRefresh: Date | null = $state(null);
 
+  /**
+   * Bumped by every overview read. A node switch overlaps the 30 s
+   * refresh, and a response that is no longer the latest would put the
+   * previous node's figures under the new one's name.
+   */
+  let latestOverviewLoad = 0;
+
   async function loadData() {
+    const load = ++latestOverviewLoad;
     loading = true;
     error = '';
     const [routesRes, overviewRes] = await Promise.all([
       api.listRoutes(),
       api.getSlaOverview(nodeParam),
     ]);
+    if (load !== latestOverviewLoad) return;
     if (routesRes.data) routes = routesRes.data.routes;
     if (overviewRes.data) overview = overviewRes.data;
     if (routesRes.error) error = routesRes.error.message;
@@ -88,15 +96,18 @@
     // responses must NOT overwrite the freshly-selected route's
     // view. `selectedRouteId` is the source of truth for the
     // current selection ; we compare against our local `captured`
-    // and bail out if they differ.
+    // and bail out if they differ. The node is captured with it: a
+    // node switch re-reads the same route, and the previous node's
+    // answer must not land last.
     const captured = routeId;
+    const capturedNode = selectedNode;
     const [passiveRes, activeRes, configRes, bucketsRes] = await Promise.all([
       api.getRouteSla(routeId, nodeParam),
       api.getRouteSlaActive(routeId, nodeParam),
       api.getSlaConfig(routeId),
       api.getRouteSlaBuckets(routeId, { source: 'passive', node: nodeParam }),
     ]);
-    if (selectedRouteId !== captured) return;
+    if (selectedRouteId !== captured || selectedNode !== capturedNode) return;
     if (passiveRes.data) passiveSla = passiveRes.data;
     if (activeRes.data) activeSla = activeRes.data;
     if (configRes.data) slaConfig = configRes.data;
@@ -172,16 +183,13 @@
 <div class="sla-page">
   <div class="page-header">
     <h1>SLA Monitoring</h1>
-    {#if fleetView}
-      <NodeFilter
-        value={selectedNode}
-        allowAll={false}
-        onchange={(id) => {
-          selectedNode = id;
-          void refreshAll();
-        }}
-      />
-    {/if}
+    <NodeFilter
+      value={selectedNode}
+      onchange={(id) => {
+        selectedNode = id;
+        void refreshAll();
+      }}
+    />
     {#if lastRefresh}
       <span class="refresh-indicator" title="Auto-refresh every 30s">
         <span class="refresh-dot"></span>

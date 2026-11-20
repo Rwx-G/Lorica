@@ -2743,7 +2743,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "lorica"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "ammonia",
  "arc-swap",
@@ -2818,7 +2818,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-acme"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2843,7 +2843,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-adcs"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2867,7 +2867,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-api"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2929,7 +2929,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-automation-policy"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "serde",
  "serde_json",
@@ -2937,7 +2937,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-bench"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "chrono",
  "lorica-config",
@@ -2991,7 +2991,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-challenge"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "arc-swap",
  "base64 0.23.1",
@@ -3010,7 +3010,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-cluster"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -3028,7 +3028,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-command"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "nix",
  "prost",
@@ -3039,7 +3039,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-config"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -3114,7 +3114,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-dashboard"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "axum",
  "getrandom 0.4.3",
@@ -3132,7 +3132,7 @@ version = "0.1.0"
 
 [[package]]
 name = "lorica-fleet"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "chrono",
  "futures-util",
@@ -3150,7 +3150,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-geoip"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -3246,7 +3246,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-mcp"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "lorica-automation-policy",
  "lorica-tls",
@@ -3278,7 +3278,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-metrics"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "once_cell",
  "parking_lot",
@@ -3287,7 +3287,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-notify"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "chrono",
  "lettre",
@@ -3349,7 +3349,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-shmem"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "nix",
  "rand 0.10.4",
@@ -3360,7 +3360,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-stream"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "chrono",
  "lorica-config",
@@ -3411,7 +3411,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-waf"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "aho-corasick",
  "chrono",
@@ -3425,7 +3425,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-worker"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "nix",
  "socket2",

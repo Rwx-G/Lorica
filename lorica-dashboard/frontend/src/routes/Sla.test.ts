@@ -117,4 +117,26 @@ describe('Sla page', () => {
       expect(screen.queryByRole('button', { name })).toBeNull();
     }
   });
+
+  it("keeps this node's figures when the previous node's answer lands last", async () => {
+    // A node switch re-reads the overview while an earlier read may
+    // still be in flight; the late one must not overwrite the new
+    // node's figures.
+    let releaseFirst: (value: { data: SlaSummary[] }) => void = () => {};
+    vi.mocked(api.getSlaOverview)
+      .mockImplementationOnce(() => new Promise((resolve) => (releaseFirst = resolve)))
+      .mockResolvedValue({ data: [{ ...summary('24h'), sla_pct: 42 }] });
+    render(Sla);
+
+    await screen.findByRole('option', { name: 'edge-b' });
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Filter by node' }), {
+      target: { value: 'node-b' },
+    });
+    await screen.findByText('42.00%');
+
+    releaseFirst({ data: [{ ...summary('24h'), sla_pct: 11 }] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.getByText('42.00%')).toBeInTheDocument();
+    expect(screen.queryByText('11.00%')).toBeNull();
+  });
 });

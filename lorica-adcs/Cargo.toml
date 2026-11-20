@@ -1,6 +1,6 @@
 [package]
 name = "lorica-adcs"
-version = "1.10.8"
+version = "1.10.9"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
