@@ -786,7 +786,7 @@ images and `fixtures/otelcol-logs.yaml`),
 only).
 Depends on: C (Python backend); 12.9 Lots C1, C3, E, H.
 
-- [ ] Every item of 12.9 Lot J, in the `streams` profile instead of a
+- [x] Every item of 12.9 Lot J, in the `streams` profile instead of a
       `stream-observability` profile of its own (same shape: one node,
       two workers; one boot fewer).
 
@@ -1460,6 +1460,61 @@ pulled images.
     after a complete passing run, `FAIL` after a failed phase, nothing
     when Phase 1 or any phase is skipped. Nothing changed in the files.
 
+- **Lot I, 2026-11-20.** Story 12.9's scenarios in the `streams` profile
+  (L4 lane 3, `feat/v1.11.0` at `c01536bb` plus Lot H).
+  - **Verdicts** (`L4_LANE=3 L4_IMAGE_TAG=lane3 L4_LOTS=I ./run.sh
+    --only-l4`, 2 min 20 s for the phase with both boots and the report,
+    run twice with the same results):
+    `12.9-iv1-end-reasons-in-api-and-syslog` PARTIAL with D-d's note
+    (refused: a stream whose `source_deny_cidrs` holds the client; the
+    first row is `ended`, `refused`, `source_denied`, with the client's
+    address; one connect then a burst of 30 gave 2 refused rows and 2
+    `refusals_suppressed` rows counting 29, so every one of the 31
+    refusals is accounted for and each process wrote at most one row per
+    window; idle timeout: the silent connection closed after 2.00 s on a
+    2 s timeout, one `idle_timeout` row; `config_removed`: with
+    `worker_drain_timeout_s` 3, unlinking the backend under an open
+    connection gave the row 3.2 s after the update, the connection closed
+    3.1 s after; each row also a syslog frame with MSGID `stream` and the
+    same words in its body); `12.9-x-metrics-and-sink-up` PASS
+    (`lorica_stream_ended_total{reason="idle_timeout"}` 1 and
+    `lorica_stream_bytes_total` 56 for the stream on the supervisor's
+    `/metrics`, values only the workers hold;
+    `lorica_log_sink_up{sink="syslog"}` 1, then 0 about 1.1 to 1.2 s
+    after the collector's `FinishedAt`, then 1 about 1.7 to 2.2 s after
+    its `StartedAt`, with no traffic between); `12.9-x-stream-sla` PASS
+    (after 5 connections, the `1h` window judged 5, 5 successes, 0
+    failures, 100 %).
+  - **No product defect found**; every scenario passed on its first run.
+  - **Deviations.** (1) No logs-only OTel collector: the L4 image is
+    built without the `otel` feature (one image for every L4 node), so an
+    OTLP lane cannot run there, and none of 12.9 Lot J's assertions reads
+    it; a collector nobody sends to would prove nothing. (2) The burst
+    bound is per process: the limiter keeps one window per key in each
+    process (`lorica-stream/src/refusal_log.rs`), so with two workers a
+    burst gives up to two refused rows and two `refusals_suppressed`
+    rows, not "the limiter's rows plus one"; the scenario asserts that
+    bound and that the rows account for every refusal. (3) The syslog
+    collector writes one file per TCP connection, as the
+    `log-sinks-workers` one does, since each worker holds its own
+    connection. (4) The gauge's two delays are measured from Docker's
+    `FinishedAt` and `StartedAt` to the moment a poll in the client read
+    the new value, both on the VM clock; the poll runs every 0.5 s, so
+    the figures are upper bounds.
+  - **Ports** 7910 to 7914 and names `l4o-*` (streams and backends),
+    removed with the settings put back (`worker_drain_timeout_s` 30, no
+    syslog endpoint) by each scenario's cleanup.
+  - **Re-verified 2026-11-21** after the lane was interrupted before its
+    report: `l4/build-images.sh` (every layer cached, so the images are
+    the ones the first runs used), then the same lane run, 2 min 18 s.
+    Same verdicts: IV1 PARTIAL with D-d's note (2 refused rows and 2
+    `refusals_suppressed` rows counting 29 for 31 refusals; idle close
+    at 2.00 s; `config_removed` row 3.2 s after the update, connection
+    closed 3.1 s after), metrics and gauge PASS (0 at 1.2 s after the
+    stop, 1 at 1.8 s after the start), SLA PASS (5 judged, 5 successes);
+    `=== L4 REPORT PASSED ===`; the lane project left nothing behind.
+    Nothing changed in the files.
+
 ## File List
 
 Lot A:
@@ -1520,6 +1575,13 @@ Lot H:
   comment on `suite` and `geoip`)
 - `docs/stories/story-12.8-proxy-protocol-http.md` (Lot G checkboxes)
 
+Lot I:
+
+- `tests-e2e-docker/l4/scenarios/12.9.sh` (new)
+- `tests-e2e-docker/l4/scenarios.tsv` (Lot I rows `live`)
+- `tests-e2e-docker/docker-compose.l4.yml` (`syslog-collector`)
+- `docs/stories/story-12.9-stream-observability.md` (Lot J checkboxes)
+
 Lanes (between Lots C and D):
 
 - `tests-e2e-docker/l4/lib.sh` (lane derivation, `l4_compose -p`)
@@ -1568,4 +1630,6 @@ Lot G:
 | 2026-11-21 | 0.7 | Lot F implemented: Story 12.6 IV1 to IV3 (IV3 at 10,000 silent connections, then nine sources filling the pending cap), an IP-literal allow and deny entry in IV2, and the concurrency-caps matrix row, all passing in lane 2; the client joins `streams-geo` per scenario. No product defect. | Romain G. |
 | 2026-11-21 | 0.8 | Lot G implemented: Story 12.7 IV1 against the pinned Redis frozen with `docker pause`, and the SMTP banner template against a standard-library banner server, both passing in lane 2; what Redis, PostgreSQL and the banner server see per probe recorded in `docs/health-checks.md`. No product defect. | Romain G. |
 | 2026-11-20 | 0.7 (Lot H) | Lot H implemented: Story 12.8 IV1 (`geoip`) and IV2 (`geoip`, `workers`) through a Python PROXY client, both passing; `run.sh` runs the `geoip` profile and prints 12.8 IV3 under a `suite` profile after a complete pre-existing run. No product defect. | Romain G. |
+| 2026-11-20 | 0.7 (Lot I) | Lot I implemented: Story 12.9 IV1 (partial as D-d says), the metrics and sink gauge, and the stream SLA, in the `streams` profile with a syslog collector, all passing. No product defect. | Romain G. |
 | 2026-11-21 | 0.7 (Lot H) | Lot H re-verified by a fresh run after the lane was interrupted: same verdicts, no file change. | Romain G. |
+| 2026-11-21 | 0.7 (Lot I) | Lot I re-verified by a fresh run after the lane was interrupted: same verdicts, no file change. | Romain G. |

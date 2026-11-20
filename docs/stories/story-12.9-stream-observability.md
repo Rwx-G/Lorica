@@ -823,10 +823,10 @@ Allowlist: `tests-e2e-docker/docker-compose.yml`,
 LF), `tests-e2e-docker/run.sh`, a Python TCP backend fixture if 12.3 Lot
 G's is not reusable.
 
-- [ ] Profile `stream-observability`: one node with `--workers 2`, the
+- [x] Profile `stream-observability`: one node with `--workers 2`, the
       existing `syslog-collector` and logs-only OTel collector joined to
       the profile, a Python TCP backend.
-- [ ] IV1, each case asserted in `GET /api/v1/stream-logs` (what the
+- [x] IV1, each case asserted in `GET /api/v1/stream-logs` (what the
       dashboard reads) and as a syslog frame with MSGID `stream`:
       - refused: a stream whose deny CIDR holds the runner's address;
         one connect gives `end_reason = refused` with 12.6's reason word;
@@ -837,13 +837,13 @@ G's is not reusable.
       - `config_removed`: `worker_drain_timeout_s = 3`, an open connection,
         the backend removed from the stream, `end_reason = config_removed`
         within the drain plus 2 s.
-- [ ] Metrics: `lorica_stream_ended_total{reason="idle_timeout"}` on the
+- [x] Metrics: `lorica_stream_ended_total{reason="idle_timeout"}` on the
       supervisor's `/metrics` (a worker-only value, so aggregation is
       proven), `lorica_stream_bytes_total` above zero,
       `lorica_log_sink_up{sink="syslog"}` 1, then 0 within 10 s of the
       collector being stopped, then 1 within 40 s of its restart with no
       traffic in between.
-- [ ] Stream SLA: after the cases, `GET /api/v1/sla/streams/{id}` has
+- [x] Stream SLA: after the cases, `GET /api/v1/sla/streams/{id}` has
       judged connections.
 
 ## Dev Notes

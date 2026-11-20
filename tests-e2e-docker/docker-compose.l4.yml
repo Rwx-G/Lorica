@@ -234,6 +234,23 @@ services:
     networks:
       - l4
 
+  # ---- Story 12.9 (Story 12.12 Lot I) --------------------------------
+
+  # The log-sinks profiles' socat syslog collector on the runner image:
+  # RFC 6587 frames appended to one file per TCP connection, since each
+  # worker holds its own connection and two writers to one file could
+  # interleave a frame. The 12.9 scenarios stop and start it to move
+  # `lorica_log_sink_up{sink="syslog"}`.
+  syslog-collector:
+    <<: *l4-runner
+    profiles: ["streams"]
+    entrypoint:
+      - "sh"
+      - "-c"
+      - "mkdir -p /tmp/syslog && exec socat -u TCP-LISTEN:6601,fork,reuseaddr SYSTEM:'cat >> /tmp/syslog/conn-$${SOCAT_PEERPORT}.log'"
+    networks:
+      - l4
+
   # Has its own addresses: every source-address scenario needs a client
   # that is not the node's loopback.
   streams-client:
