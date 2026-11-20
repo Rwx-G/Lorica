@@ -7,10 +7,15 @@
 # phase, is the gate; this script's exit status only adds a node that
 # never became ready or a scenario that failed.
 #
-# Usage: l4/run-l4.sh [--build] [--keep]
+# Usage: [L4_LANE=1..4] [L4_IMAGE_TAG=<tag>] l4/run-l4.sh [--build] [--keep]
 #   --build  rebuild the L4 images when a profile starts
 #   --keep   leave the last profile's containers up (profiles are torn
 #            down between each other: both nodes answer as `l4-node`)
+# L4_LANE and L4_IMAGE_TAG: see the lanes paragraph of l4/lib.sh. A lane
+# runs on images l4/build-images.sh built and never builds them itself.
+# L4_LOTS=B,D runs only the rows of those Lots (the `lot` column); run.sh
+# hands the same list to the report, which then reads the other Lots'
+# rows as not run instead of missing.
 #
 # Adding a scenario: give its registry row (l4/scenarios.tsv, already
 # written for every scenario of D-d and D-e) state `live`, and define
@@ -93,7 +98,14 @@ run_profile() {
     echo ""
     echo "L4-PROFILE ${profile}"
 
-    l4_compose --profile "$profile" up $BUILD_FLAG -d
+    # A lane never builds: lanes share images built once by
+    # l4/build-images.sh, and several lanes building one tag at once
+    # would race. `--no-build` fails at once on a missing image instead.
+    local build="$BUILD_FLAG"
+    if [ -z "$build" ] && [ -n "${L4_LANE:-}" ]; then
+        build="--no-build"
+    fi
+    l4_compose --profile "$profile" up $build -d
     wait_for_node
     if [ $? -ne 0 ]; then
         l4_dump_node_log "$L4_NODE"
@@ -101,11 +113,17 @@ run_profile() {
     fi
 
     for row in "${REGISTRY_ROWS[@]}"; do
-        IFS=$'\t' read -r name _ _ profiles _ <<< "$row"
+        IFS=$'\t' read -r name _ _ profiles _ lot _ <<< "$row"
         case ",${profiles}," in
             *",${profile},"*) ;;
             *) continue ;;
         esac
+        if [ -n "${L4_LOTS:-}" ]; then
+            case ",${L4_LOTS}," in
+                *",${lot},"*) ;;
+                *) continue ;;
+            esac
+        fi
         fn=$(l4_function_name "$name")
         # A row with no function prints no line; the report fails it
         # unless the row is still pending.

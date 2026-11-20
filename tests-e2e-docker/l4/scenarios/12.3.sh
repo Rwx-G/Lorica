@@ -519,8 +519,8 @@ scenario_12_3_iv4_local_backend_refused_and_rebind_excluded() {
 
     backend_ip=$(l4c_ip tcp-backend-1)
     mkdir -p results
-    printf '%s rebind.l4.test\n' "$backend_ip" > results/l4c-coredns-hosts
-    l4_compose cp results/l4c-coredns-hosts coredns:/l4-hosts >/dev/null 2>&1 || fail "could not install the CoreDNS hosts file"
+    printf '%s rebind.l4.test\n' "$backend_ip" > "${L4_RESULTS}-coredns-hosts"
+    l4_compose cp "${L4_RESULTS}-coredns-hosts" coredns:/l4-hosts >/dev/null 2>&1 || fail "could not install the CoreDNS hosts file"
     hostname=$(l4c_backend rebind.l4.test:9000 nocheck) || fail "backend: ${hostname}"
     id=$(l4s_create_stream "{\"name\":\"l4c-iv4-rebind\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":7406,\"backend_ids\":[\"${hostname}\"]}") \
         || fail "stream create refused: ${id}"
@@ -536,8 +536,8 @@ scenario_12_3_iv4_local_backend_refused_and_rebind_excluded() {
         *) fail "rebind.l4.test never reached tcp-backend-1 (${served}): the node does not resolve through CoreDNS" ;;
     esac
 
-    printf '127.0.0.1 rebind.l4.test\n' > results/l4c-coredns-hosts
-    l4_compose cp results/l4c-coredns-hosts coredns:/l4-hosts >/dev/null 2>&1 || fail "could not rewrite the CoreDNS hosts file"
+    printf '127.0.0.1 rebind.l4.test\n' > "${L4_RESULTS}-coredns-hosts"
+    l4_compose cp "${L4_RESULTS}-coredns-hosts" coredns:/l4-hosts >/dev/null 2>&1 || fail "could not rewrite the CoreDNS hosts file"
     moved=""
     local t0=$SECONDS
     while [ $(( SECONDS - t0 )) -lt 70 ]; do

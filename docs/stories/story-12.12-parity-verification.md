@@ -1053,6 +1053,18 @@ pulled images.
 - Resumed 2026-11-20 on `feat/v1.11.0` at `4ace5482` (Lot B integrated
   as `7813bbcf`); the Lot C files were carried over unchanged, and
   `docker-compose.l4.yml` had not moved since Lot B.
+- 2026-11-20, Lot D in progress when the plan changed to lanes. Its
+  cluster key-replication scenario found a product defect, fixed in
+  `44d6248b` (`fix(cluster)`): the per-recipient cut of the replicated
+  configuration (`restrict_for_recipient`) kept the certificates of the
+  recipient's routes only, so a follower bound a terminating stream with
+  no certificate row and refused every handshake (TLS alert 49), while
+  the roster listed it as entitled. Unreleased (streams are 1.11.0's).
+  Regression test `a_streams_certificates_are_cut_with_the_stream`; full
+  cargo chain and `cargo audit` clean; the `acme` and `cluster` phases
+  then passed with Lot D's sections (12.4 IV2 renewal and key
+  replication, PASS). Lot D's files are not committed: they wait in the
+  Lot D agent's hands (see its report).
 
 ### Completion Notes
 
@@ -1091,6 +1103,29 @@ pulled images.
     ran with no line, two lines, `FAIL`, `PARTIAL` from a `full` row, a
     line under another profile, and a pending row that reports (mark it
     live).
+  - **Lanes and image reuse (added 2026-11-20).** Build the images once
+    per product or runner change, then iterate without `--build`:
+    `L4_IMAGE_TAG=<tag> l4/build-images.sh` (`--runner-only` after a
+    change under `test-runner/` alone; scenario files under `l4/` run on
+    the host and need no rebuild). To run several L4 phases at once on
+    one Docker host, give each `L4_LANE=1..4`:
+    `L4_LANE=2 L4_IMAGE_TAG=<tag> ./run.sh --only-l4`. A lane gets its
+    own compose project (`lorica-e2e-l4-N`, so its own containers,
+    networks and volumes), its own pinned subnets (IPv6 of `l4`,
+    `l4-dns`, `streams-geo`, all derived in `l4/lib.sh` and nowhere
+    else), its own `results/` files (`e2e-l4-lane-N-*.log`,
+    `l4-summary-lane-N.md`, `${L4_RESULTS}-*` for a scenario's own), no
+    host port, and it never builds: `run.sh` refuses `L4_LANE` with
+    `--build` or without `--only-l4`. `L4_LOTS=B,D` (any run) runs only
+    those Lots' rows, and the report reads the other Lots' rows as
+    `NOT-RUN` instead of `MISSING`; include `A` to keep the self-test.
+    Unset `L4_LANE` is the previous layout, which lane 1 shares a
+    `streams-geo` /24 with (the GeoIP test database's US block holds
+    four), so run lanes 1 to 4 or the plain layout, not both. A scenario
+    drives Docker only through `l4_compose` (never a bare `docker
+    compose -f`) and names any file it writes under `results/` with
+    `${L4_RESULTS}`. An `--only-l4` run no longer tears down the main
+    project, which it never started.
   - **Deviations from the text.** (1) The registry has `lot` and `state`
     columns: without `pending`, every row of the `streams` profile would
     fail Lot A's own run. A run with no `--skip-*` or `--only-*` flag
@@ -1312,6 +1347,19 @@ Lot C:
   five `tcp_backend.py` services, CoreDNS and `l4-dns`, the worker
   node's `dns:`, `NET_ADMIN` on `streams-probe`)
 - `docs/stories/story-12.3-tcp-engine.md` (Lot G checkboxes)
+
+Lanes (between Lots C and D):
+
+- `tests-e2e-docker/l4/lib.sh` (lane derivation, `l4_compose -p`)
+- `tests-e2e-docker/l4/run-l4.sh` (`--no-build` in a lane, `L4_LOTS`)
+- `tests-e2e-docker/l4/build-images.sh` (new)
+- `tests-e2e-docker/l4/scenarios/12.3.sh` (the CoreDNS hosts file under
+  `${L4_RESULTS}`)
+- `tests-e2e-docker/docker-compose.l4.yml` (image tag and subnets from
+  the environment)
+- `tests-e2e-docker/run.sh` (sources `l4/lib.sh`, lane guard, lane log
+  and summary names, `--lots`, no main-project teardown on `--only-l4`)
+- `tests-e2e-docker/test-runner/l4/report.py` (`--lots`)
 
 ## Change Log
 

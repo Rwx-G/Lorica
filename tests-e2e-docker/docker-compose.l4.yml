@@ -10,14 +10,22 @@
 # the client and the tools target one name whichever profile runs.
 #
 # Backends, clients and extra nodes are added by the scenario Lots.
+#
+# Lanes. The project name (`-p`), the pinned subnets and the image tag
+# come from l4/lib.sh, which derives them from `L4_LANE` and
+# `L4_IMAGE_TAG` and exports the `L4_*` variables below; the defaults
+# here are the values with neither set. Always drive this file through
+# l4/lib.sh's `l4_compose` (or run.sh, which sources it), never with a
+# bare `docker compose -f`. No service publishes a host port.
 name: lorica-e2e-l4
 
 x-lorica-node: &lorica-node
   build:
     context: ..
     dockerfile: tests-e2e-docker/Dockerfile
-  # One image name for both nodes: a run builds the Lorica image once.
-  image: lorica-e2e-l4/lorica:local
+  # One image name for both nodes: a run builds the Lorica image once,
+  # and l4/build-images.sh builds it for lanes that only reuse it.
+  image: lorica-e2e-l4/lorica:${L4_IMAGE_TAG:-local}
   # The entrypoint starts as root and drops to `lorica` with
   # CAP_NET_BIND_SERVICE ambient (see entrypoint-streams.sh).
   user: "0:0"
@@ -35,7 +43,7 @@ x-lorica-node: &lorica-node
 x-l4-runner: &l4-runner
   build:
     context: ./test-runner
-  image: lorica-e2e-l4/runner:local
+  image: lorica-e2e-l4/runner:${L4_IMAGE_TAG:-local}
   entrypoint: ["sleep", "infinity"]
 
 services:
@@ -50,7 +58,7 @@ services:
     # are forwarded to the CoreDNS service, which the node reaches on
     # l4-dns.
     dns:
-      - 10.89.53.53
+      - ${L4_DNS_IP:-10.89.53.53}
     networks:
       l4:
         aliases: ["l4-node"]
@@ -192,7 +200,7 @@ services:
       - ./l4/coredns:/etc/coredns:ro
     networks:
       l4-dns:
-        ipv4_address: 10.89.53.53
+        ipv4_address: ${L4_DNS_IP:-10.89.53.53}
 
   # Has its own addresses: every source-address scenario needs a client
   # that is not the node's loopback.
@@ -210,7 +218,7 @@ services:
   l4-report:
     build:
       context: ./test-runner
-    image: lorica-e2e-l4/runner:local
+    image: lorica-e2e-l4/runner:${L4_IMAGE_TAG:-local}
     profiles: ["l4-report"]
     entrypoint: ["python3", "/tests/l4/report.py"]
     network_mode: none
@@ -233,17 +241,17 @@ networks:
     enable_ipv6: true
     ipam:
       config:
-        - subnet: fd00:4c34::/64
+        - subnet: ${L4_V6_SUBNET:-fd00:4c34::/64}
   # The worker node and CoreDNS only: `dns:` needs a fixed address, and
   # a fixed address needs a subnet of its own.
   l4-dns:
     ipam:
       config:
-        - subnet: 10.89.53.0/24
+        - subnet: ${L4_DNS_SUBNET:-10.89.53.0/24}
   # The GeoIP and source-address network of Story 12.6 Lot I, which
   # attaches the node and the client to it: addresses in the GeoIP test
-  # database (214.78.120.5 is US).
+  # database, where 214.78.120.0/22 is US; each lane takes one /24 of it.
   streams-geo:
     ipam:
       config:
-        - subnet: 214.78.120.0/24
+        - subnet: ${L4_GEO_SUBNET:-214.78.120.0/24}

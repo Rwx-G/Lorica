@@ -36,6 +36,15 @@
 # no --skip-* and no --only-* flag is the release run: there, every row of
 # the registry must report, pending rows included (Story 12.12 D-m).
 #
+# L4 lanes: `L4_LANE=1..4 ./run.sh --only-l4` runs the L4 phase as an
+# isolated lane (its own compose project, subnets and results files; see
+# l4/lib.sh), so several lanes run at once on one Docker host. A lane is
+# --only-l4 only and never builds: build the images once with
+# `[L4_IMAGE_TAG=<tag>] l4/build-images.sh` and run every lane with the
+# same L4_IMAGE_TAG. Without L4_LANE, nothing changes. `L4_LOTS=B,D`
+# (any run) runs only those Lots' L4 rows; the report reads the others
+# as not run. The lane's report is results/l4-summary-lane-N.md.
+#
 # The performance phase is Story 12.12 Lot M and is not built yet:
 # --only-perf and --perf-advisory are refused until it lands, and
 # --skip-perf skips nothing.
@@ -121,10 +130,23 @@ if [ "$ONLY_L4" = true ]; then
     SKIP_ADCS=true
 fi
 
+# The L4 project's name, subnets and image tag, from L4_LANE and
+# L4_IMAGE_TAG (l4/lib.sh is their one derivation). A lane runs the L4
+# phase alone, on images built beforehand: the pre-existing phases share
+# one compose project, and several lanes building one tag would race.
+# shellcheck source=l4/lib.sh
+. l4/lib.sh
+if [ -n "${L4_LANE:-}" ]; then
+    if [ "$ONLY_L4" = false ] || [ -n "$BUILD_FLAG" ]; then
+        echo "run.sh: L4_LANE runs --only-l4 without --build; build first with l4/build-images.sh" >&2
+        exit 2
+    fi
+fi
+
 # Tee the whole run, so the L4 report can read every phase's scenario
 # lines and CI can upload the log.
 mkdir -p results
-RESULTS_LOG="results/e2e-$(date -u +%Y%m%dT%H%M%SZ).log"
+RESULTS_LOG="results/e2e${L4_LANE:+-l4-lane-$L4_LANE}-$(date -u +%Y%m%dT%H%M%SZ).log"
 exec > >(tee -a "$RESULTS_LOG") 2>&1
 echo "Logging this run to tests-e2e-docker/${RESULTS_LOG}"
 
@@ -138,7 +160,7 @@ announce_profile() {
 
 # The L4 project's compose file and every profile in it, for build and
 # teardown.
-L4_COMPOSE="docker compose -f docker-compose.l4.yml"
+L4_COMPOSE="docker compose -p ${L4_PROJECT} -f docker-compose.l4.yml"
 L4_ALL_PROFILES="--profile streams --profile streams-single --profile l4-report"
 
 # Dump a node's log when a smoke fails.
@@ -823,9 +845,14 @@ fi
 # Runs whatever failed before it, so a failing run still shows which
 # scenarios reported. The host user's uid makes results/ files the
 # user's own; MSYS_NO_PATHCONV keeps Git Bash from rewriting /results.
-REPORT_ARGS="--log /results/$(basename "$RESULTS_LOG") --markdown /results/l4-summary.md"
+REPORT_ARGS="--log /results/$(basename "$RESULTS_LOG") --markdown /results/l4-summary${L4_LANE:+-lane-$L4_LANE}.md"
 if [ "$STRICT_REPORT" = true ]; then
     REPORT_ARGS="$REPORT_ARGS --strict"
+fi
+# L4_LOTS (l4/run-l4.sh) selects part of the registry; never on a release
+# run, which the report refuses.
+if [ -n "${L4_LOTS:-}" ]; then
+    REPORT_ARGS="$REPORT_ARGS --lots ${L4_LOTS}"
 fi
 echo ""
 echo "=== L4 scenario report ==="
@@ -834,9 +861,13 @@ if ! MSYS_NO_PATHCONV=1 $L4_COMPOSE --profile l4-report run --rm -T \
     EXIT_CODE=1
 fi
 
-# Cleanup unless --keep
+# Cleanup unless --keep. An --only-l4 run started nothing in the main
+# project, and tearing it down would stop another run's containers: it
+# leaves it alone.
 if [ "$KEEP" = false ]; then
-    docker compose $ALL_PROFILES down -v
+    if [ "$ONLY_L4" = false ]; then
+        docker compose $ALL_PROFILES down -v
+    fi
     $L4_COMPOSE $L4_ALL_PROFILES down -v --remove-orphans
 fi
 

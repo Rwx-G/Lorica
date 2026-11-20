@@ -161,13 +161,17 @@ def p1_features(prd: Path) -> list[str]:
     return features
 
 
-def judge_row(row: Row, verdicts: list[Verdict], profiles_ran: list[str], strict: bool) -> list[Outcome]:
+def judge_row(
+    row: Row, verdicts: list[Verdict], profiles_ran: list[str], strict: bool, lots: set[str] | None
+) -> list[Outcome]:
     outcomes: list[Outcome] = []
     for profile in row.profiles:
         mine = [v for v in verdicts if v.name == row.name and v.profile == profile]
         ran = strict or profile in profiles_ran
         if not ran:
             outcomes.append(Outcome(row, profile, "NOT-RUN", "profile did not run"))
+        elif lots is not None and row.lot not in lots and not mine:
+            outcomes.append(Outcome(row, profile, "NOT-RUN", f"Lot {row.lot} not selected (L4_LOTS)"))
         elif not mine:
             if row.state == "pending" and not strict:
                 outcomes.append(Outcome(row, profile, "PENDING", f"Lot {row.lot} has not landed"))
@@ -187,7 +191,14 @@ def judge_row(row: Row, verdicts: list[Verdict], profiles_ran: list[str], strict
     return outcomes
 
 
-def build_report(rows: list[Row], verdicts: list[Verdict], profiles_ran: list[str], features: list[str], strict: bool) -> Report:
+def build_report(
+    rows: list[Row],
+    verdicts: list[Verdict],
+    profiles_ran: list[str],
+    features: list[str],
+    strict: bool,
+    lots: set[str] | None = None,
+) -> Report:
     report = Report()
     by_name: dict[str, Row] = {row.name: row for row in rows}
     for verdict in verdicts:
@@ -203,7 +214,7 @@ def build_report(rows: list[Row], verdicts: list[Verdict], profiles_ran: list[st
         if row.level == "not-e2e":
             report.outcomes.append(Outcome(row, "-", "NOT-E2E", row.source))
         else:
-            report.outcomes.extend(judge_row(row, verdicts, profiles_ran, strict))
+            report.outcomes.extend(judge_row(row, verdicts, profiles_ran, strict, lots))
     for outcome in report.outcomes:
         if outcome.result in FAILING:
             report.errors.append(f"{outcome.row.name} [{outcome.profile}]: {outcome.result} {outcome.detail}")
@@ -278,7 +289,15 @@ def main() -> int:
     parser.add_argument("--prd", type=Path, default=Path("/l4/prd.md"))
     parser.add_argument("--markdown", type=Path, help="write the tables as Markdown here")
     parser.add_argument("--strict", action="store_true", help="every row must report, whatever ran (the release run)")
+    parser.add_argument(
+        "--lots",
+        help="comma-separated Lots the run selected (L4_LOTS): a row of another Lot that did not "
+        "report is NOT-RUN rather than MISSING; refused with --strict",
+    )
     args = parser.parse_args()
+    if args.lots and args.strict:
+        parser.error("--lots selects part of the registry; the strict run checks all of it")
+    lots = {lot.strip() for lot in args.lots.split(",")} if args.lots else None
 
     registry_errors: list[str] = []
     rows = read_registry(args.registry, registry_errors)
@@ -286,7 +305,7 @@ def main() -> int:
     features = p1_features(args.prd)
     if not features:
         registry_errors.append(f"no P1 row found in the coverage matrix of {args.prd}")
-    report = build_report(rows, verdicts, profiles_ran, features, args.strict)
+    report = build_report(rows, verdicts, profiles_ran, features, args.strict, lots)
     report.errors = registry_errors + report.errors
 
     text, markdown = render(report, features, profiles_ran, args.strict)

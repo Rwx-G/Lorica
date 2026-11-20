@@ -16,8 +16,37 @@
 L4_COMPOSE_FILE=docker-compose.l4.yml
 L4_REGISTRY=l4/scenarios.tsv
 
+# ---- Lanes -----------------------------------------------------------
+# `L4_LANE=1..4` runs the L4 phase as an isolated lane, so several run at
+# once on one Docker host: its own compose project (containers,
+# networks and volumes are named after it), its own pinned subnets, and
+# results files of its own. Unset is the single-run layout. The subnets
+# are derived here and nowhere else; docker-compose.l4.yml reads them.
+#   - project       lorica-e2e-l4[-N]
+#   - l4 (IPv6)     fd00:4c34:N::/64      (N = 0 when unset)
+#   - l4-dns        10.89.(53+N).0/24, CoreDNS at .53
+#   - streams-geo   214.78.(119+N).0/24, lane 1 sharing the unset /24:
+#                   the GeoIP test database's US block is 214.78.120.0/22,
+#                   four /24s, so an unset run and lane 1 cannot overlap
+# `L4_IMAGE_TAG` (default `local`) names the Lorica and runner images;
+# l4/build-images.sh builds them once for every lane that reuses them.
+case "${L4_LANE:-}" in
+    ""|1|2|3|4) ;;
+    *) echo "l4/lib.sh: L4_LANE must be 1 to 4 or unset, not '${L4_LANE}'" >&2; exit 2 ;;
+esac
+L4_LANE_INDEX=${L4_LANE:-0}
+L4_GEO_INDEX=$(( L4_LANE_INDEX == 0 ? 1 : L4_LANE_INDEX ))
+export L4_PROJECT="lorica-e2e-l4${L4_LANE:+-$L4_LANE}"
+export L4_IMAGE_TAG="${L4_IMAGE_TAG:-local}"
+export L4_V6_SUBNET="fd00:4c34:${L4_LANE_INDEX}::/64"
+export L4_DNS_SUBNET="10.89.$(( 53 + L4_LANE_INDEX )).0/24"
+export L4_DNS_IP="10.89.$(( 53 + L4_LANE_INDEX )).53"
+export L4_GEO_SUBNET="214.78.$(( 119 + L4_GEO_INDEX )).0/24"
+# Prefix of the files a lane writes under results/.
+L4_RESULTS="results/${L4_PROJECT}"
+
 l4_compose() {
-    docker compose -f "$L4_COMPOSE_FILE" "$@"
+    docker compose -p "$L4_PROJECT" -f "$L4_COMPOSE_FILE" "$@"
 }
 
 # Run a command in the client, which has its own address on the `l4`
@@ -43,7 +72,7 @@ l4_node() {
 l4_dump_node_log() {
     local node="$1" lines="${2:-80}"
     echo ""
-    echo "--- last ${lines} log lines from ${node} (lorica-e2e-l4) ---"
+    echo "--- last ${lines} log lines from ${node} (${L4_PROJECT}) ---"
     l4_compose logs --no-color "$node" 2>&1 | tail -n "$lines"
     echo "--- end ${node} ---"
     echo ""
