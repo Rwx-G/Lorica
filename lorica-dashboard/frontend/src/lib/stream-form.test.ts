@@ -1,3 +1,8 @@
+// @vitest-environment node
+/// <reference types="node" />
+// The node environment gives `import.meta.url` the file: scheme the
+// contract read below needs; nothing here touches the DOM.
+import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 
 import type { StreamProtocol, StreamResponse, StreamTlsMode } from './api';
@@ -13,6 +18,7 @@ import {
   labelOf,
   newDraft,
   tabsFor,
+  type ScalarSpec,
   type StreamField,
 } from './stream-form';
 import iv1Create from './stream-iv1-create.json';
@@ -183,16 +189,53 @@ describe('fieldTab', () => {
   });
 });
 
-describe('every cap is labelled per node (12.6 D-k)', () => {
-  // The caps and rates D-b lists; the backend link cap is in LinkSet's label.
-  const CAPS = ['max_connections', 'source_max_connections', 'max_pending_connections', 'source_open_rate', 'open_rate'] as const;
-  const UDP_CAPS = ['max_sessions', 'source_session_cap', 'source_datagram_rate', 'source_byte_rate'] as const;
+const OPENAPI = readFileSync(new URL('../../../../lorica-api/openapi.yaml', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 
-  it.each(CAPS)('%s', (field) => {
+/**
+ * The properties of an `openapi.yaml` schema whose description says the
+ * value holds per node: the API contract's own statement of which
+ * fields are caps (12.6 D-k), read rather than retyped here.
+ */
+function perNodeInContract(schema: string): Set<string> {
+  const lines = OPENAPI.split('\n');
+  const start = lines.indexOf(`    ${schema}:`);
+  expect(start, `${schema} in openapi.yaml`).toBeGreaterThan(-1);
+  const end = lines.findIndex((line, i) => i > start && /^ {4}\S/.test(line));
+  const descriptions: Record<string, string> = {};
+  let property = '';
+  for (const line of lines.slice(start + 1, end)) {
+    const name = /^ {8}([a-z0-9_]+):\s*$/.exec(line);
+    if (name) {
+      property = name[1];
+      descriptions[property] = '';
+    } else if (property && line.startsWith(' '.repeat(10))) {
+      descriptions[property] += ` ${line.trim()}`;
+    }
+  }
+  return new Set(Object.keys(descriptions).filter((p) => /\bper\s+node\b/.test(descriptions[p])));
+}
+
+function perNodeSpecs<K extends string>(specs: Record<K, ScalarSpec>): K[] {
+  return (Object.keys(specs) as K[]).filter((field) => specs[field].perNode);
+}
+
+describe('every cap is labelled per node (12.6 D-k)', () => {
+  it.each(perNodeSpecs(SCALAR_SPECS))('%s', (field) => {
     expect(labelOf(SCALAR_SPECS[field])).toMatch(/\(per node\)$/);
   });
 
-  it.each(UDP_CAPS)('udp.%s', (field) => {
+  it.each(perNodeSpecs(UDP_SPECS))('udp.%s', (field) => {
     expect(labelOf(UDP_SPECS[field])).toMatch(/\(per node\)$/);
+  });
+
+  it('flags as perNode exactly the stream fields the API documents per node', () => {
+    const contract = [...perNodeInContract('StreamResponse')];
+    // The link cap is edited per backend, and LinkSet labels it.
+    expect(contract.filter((field) => !(field in SCALAR_SPECS))).toEqual(['backend_max_active']);
+    expect(new Set<string>(perNodeSpecs(SCALAR_SPECS))).toEqual(new Set(contract.filter((field) => field in SCALAR_SPECS)));
+  });
+
+  it('flags as perNode exactly the UDP settings the API documents per node', () => {
+    expect(new Set<string>(perNodeSpecs(UDP_SPECS))).toEqual(perNodeInContract('StreamUdpSettings'));
   });
 });
