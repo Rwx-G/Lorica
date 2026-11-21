@@ -702,6 +702,49 @@ async fn a_backend_fin_still_lets_the_client_send() {
     assert_eq!(h.record().await.end_reason, StreamEndReason::BackendClose);
 }
 
+/// An answer the backend writes in two segments, 2 ms apart, reaches the
+/// client whole without waiting on Nagle: the engine's second write to
+/// the client goes out before the client acknowledges the first. With
+/// Nagle on the client socket, the rounds where the client delays that
+/// acknowledgement (Linux holds it up to 40 ms) take about 40 ms each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_two_segment_answer_does_not_wait_on_nagle_toward_the_client() {
+    const ROUNDS: u32 = 20;
+    let mut h = Harness::new().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket.set_nodelay(true).unwrap();
+        let mut request = [0u8; 8];
+        while socket.read_exact(&mut request).await.is_ok() {
+            socket.write_all(&[1u8; 64]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            socket.write_all(&[2u8; 64]).await.unwrap();
+        }
+    });
+    h.set(stream(), vec![(backend("b1", addr), false)]);
+
+    let mut client = h.connect().await;
+    client.set_nodelay(true).unwrap();
+    let mut answer = [0u8; 128];
+    let started = Instant::now();
+    for _ in 0..ROUNDS {
+        client.write_all(b"request!").await.unwrap();
+        tokio::time::timeout(WAIT, client.read_exact(&mut answer))
+            .await
+            .expect("an answer in time")
+            .unwrap();
+    }
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_millis(15) * ROUNDS,
+        "{ROUNDS} rounds took {took:?}"
+    );
+    client.shutdown().await.unwrap();
+    assert_eq!(h.record().await.end_reason, StreamEndReason::ClientClose);
+}
+
 // ---- timers ----------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

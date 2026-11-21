@@ -317,6 +317,14 @@ impl Inner {
                 return;
             }
         };
+        // Both sockets of an admitted connection go without Nagle (D-c,
+        // nginx `stream`'s `tcp_nodelay on`): an answer the backend sends
+        // in two segments must not wait for the client's delayed ACK of
+        // the first. A refused connection is closed before it matters.
+        if let Err(e) = conn.stream.set_nodelay(true) {
+            debug!(stream_id = %snapshot.id, error = %e,
+                   "TCP_NODELAY not set on a stream client socket");
+        }
         let tls = (snapshot.tls_mode != StreamTlsMode::None || snapshot.upstream_tls.is_some())
             .then(|| TlsRecord {
                 mode: snapshot.tls_mode,
