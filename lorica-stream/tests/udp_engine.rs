@@ -158,14 +158,17 @@ impl BackendSelector for Selector {
 struct Breaker {
     deny: HashSet<String>,
     hang: HashSet<String>,
+    /// Backends whose breaker is half-open: each admission is a probe.
+    probe: HashSet<String>,
     records: Mutex<Vec<(String, bool, bool)>>,
 }
 
 impl BreakerGate for Breaker {
     fn admit<'a>(&'a self, _stream_id: &'a str, backend: &'a Backend) -> SeamFuture<'a, Admission> {
-        let (denied, hangs) = (
+        let (denied, hangs, probes) = (
             self.deny.contains(&backend.id),
             self.hang.contains(&backend.id),
+            self.probe.contains(&backend.id),
         );
         Box::pin(async move {
             if hangs {
@@ -173,6 +176,8 @@ impl BreakerGate for Breaker {
             }
             if denied {
                 Admission::Deny
+            } else if probes {
+                Admission::AllowProbe
             } else {
                 Admission::Allow
             }
@@ -797,24 +802,64 @@ async fn unbounded_responses_lift_both_bounds() {
     h.stop();
 }
 
+/// Phase 1 audit C1: whether a datagram is answered is chosen by whoever
+/// sends it (RADIUS, SNMP or WireGuard drop bad input silently), so six
+/// unanswered sessions from six source ports, more than the breaker's
+/// threshold, report nothing to it. Each still counts `no_response` on
+/// its link and reaches the SLA as `NoResponse`.
 #[tokio::test]
-async fn a_silent_backend_ends_the_session_idle_and_reports_one_failure() {
+async fn unanswered_sessions_count_no_response_and_never_reach_the_breaker() {
     let b1 = UdpBackend::sink().await;
     let mut stream = udp_stream("dns", "127.0.0.1");
     stream.idle_timeout_s = 1;
     let mut h = Harness::one(stream, vec![backend("b1", b1.addr)]).await;
-    let c = client().await;
     let started = Instant::now();
-    c.send_to(b"query", h.listen()).await.unwrap();
-    let record = h.record().await;
-    assert_eq!(record.end_reason, StreamEndReason::IdleTimeout);
+    let mut clients = Vec::new();
+    for _ in 0..6 {
+        let c = client().await;
+        c.send_to(b"dropped by the backend", h.listen())
+            .await
+            .unwrap();
+        clients.push(c);
+    }
+    for _ in 0..6 {
+        assert_eq!(h.record().await.end_reason, StreamEndReason::IdleTimeout);
+    }
     assert!(started.elapsed() >= Duration::from_secs(1));
-    assert_eq!(h.breaker_records(), vec![("b1".to_string(), false, false)]);
-    assert_eq!(h.outcomes("dns"), vec![ConnectOutcome::NoResponse]);
+    assert!(h.breaker_records().is_empty(), "{:?}", h.breaker_records());
+    assert_eq!(h.outcomes("dns"), vec![ConnectOutcome::NoResponse; 6]);
     assert_eq!(
         h.link("dns", "b1").connect_failures[&ConnectFailureKind::NoResponse],
-        1
+        6
     );
+    h.stop();
+}
+
+/// An unanswered half-open probe frees the probe slot as a success: it
+/// drew no ICMP error, the one signal the breaker judges a UDP backend
+/// by, and a probe never reported would hold the supervisor's slot until
+/// its stale-probe rule counts it as a failure.
+#[tokio::test]
+async fn an_unanswered_probe_is_answered_as_a_success() {
+    let b1 = UdpBackend::sink().await;
+    let mut stream = udp_stream("dns", "127.0.0.1");
+    stream.idle_timeout_s = 1;
+    let mut h = Harness::start(
+        vec![(stream, vec![backend("b1", b1.addr)])],
+        Pick::First,
+        Breaker {
+            probe: ["b1".to_string()].into(),
+            ..Breaker::default()
+        },
+    )
+    .await;
+    let c = client().await;
+    c.send_to(b"dropped by the backend", h.listen())
+        .await
+        .unwrap();
+    assert_eq!(h.record().await.end_reason, StreamEndReason::IdleTimeout);
+    assert_eq!(h.breaker_records(), vec![("b1".to_string(), true, true)]);
+    assert_eq!(h.outcomes("dns"), vec![ConnectOutcome::NoResponse]);
     h.stop();
 }
 

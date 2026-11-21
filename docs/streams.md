@@ -1042,10 +1042,20 @@ with no access-log row.
 The algorithms are those of TCP except `peak_ewma` (a session has no
 connect latency); `least_conn` counts sessions. Backups, the circuit
 breaker, `close_on_backend_down`, `total_timeout_s`, `source_addresses`
-and `allow_local_backend` apply per session, with the same meaning. A
-session that receives nothing before its idle timeout, while it was owed
-a response, counts as a failure of its backend; an ICMP error from the
-backend does too.
+and `allow_local_backend` apply per session, with the same meaning.
+**The breaker judges a UDP backend by ICMP errors only** (port, host or
+network unreachable before any response). A session that receives
+nothing before its idle timeout, while it was owed a response, counts as
+`no_response` on its link
+(`lorica_stream_backend_connect_failures_total{kind="no_response"}`) and
+as a failure in the stream SLA, but never against the breaker: whether a
+datagram is answered is chosen by whoever sends it, and many protocols
+drop bad input without a word by specification (RADIUS, SNMP, WireGuard,
+a DNS server rate-limiting its answers), so counting silence would let
+five spoofed datagrams open the circuit for every client. An unanswered
+half-open probe closes the circuit, since it drew no ICMP error. A
+backend that goes silent without sending ICMP is therefore not detected
+passively; the UDP active checks of Story 12.14 are what will detect it.
 
 ### How a session ends
 

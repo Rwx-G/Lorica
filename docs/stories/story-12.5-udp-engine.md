@@ -570,9 +570,18 @@ The UDP engine uses the seams 12.3 D-a defines and implements in
     What this gives up: passive detection of a UDP backend that goes
     silent without sending ICMP, which Story 12.14's UDP checks provide
     (recorded there). Ratios or distinct-source counts were weighed and
-    refused: each stays poisonable by spoofing. The change ships with
-    the audit's code lot for C1; until it lands, the Failure bullet
-    above is what the code does.
+    refused: each stays poisonable by spoofing.
+  - **Note 2026-11-22 (C1 landed):** the code now does what the
+    amendment says (`Inner::report`, `lorica-stream/src/udp/engine.rs`).
+    One case the amendment left open: an unanswered session that was the
+    half-open **probe** is reported as a success with
+    `was_probe = true`. It drew no ICMP error, the one failure signal
+    left, and a probe never reported holds the supervisor's probe slot
+    until its stale-probe rule (`SupervisorBreakerRegistry::query`)
+    counts it as a failed probe, which would bring the no-response
+    failure back through the side door. Residual: a probe whose idle
+    timeout is longer than the breaker cooldown can still meet that
+    stale-probe rule in worker mode before it reports.
 - **No retry.** A session is never moved to another backend once its
   first datagram is sent (the UDP twin of 12.3's "never retried once
   bytes have flowed"); there is no handshake that could fail first.
@@ -2159,3 +2168,4 @@ Lot A:
 | 2026-11-18 | 0.13 | HAProxy Enterprise's 10 s UDP idle traced to the module's reference page (`timeout client` of a `udp-lb` section); `docs/streams.md`, the `DEFAULT_UDP_IDLE_TIMEOUT_S` doc comment and the PRD cite it. | Romain G. |
 | 2026-11-18 | 0.14 | Lot H, the region version line in `docs/BUMP-CHECKLIST.md`; the skill's untracked copy left to the maintainer. | Romain G. |
 | 2026-11-21 | 0.15 | Phase 1 audit, finding C1: D-i amended by maintainer decision, the UDP breaker counts only ICMP errors and never a missing response, which stays on the link counter and in the SLA; the code ships with the audit's code lot. | Romain G. |
+| 2026-11-22 | 0.16 | Phase 1 audit, C1 landed: the UDP engine reports a missing response to the link counter and the SLA only; an unanswered half-open probe is answered as a success (dated note under D-i). | Romain G. |

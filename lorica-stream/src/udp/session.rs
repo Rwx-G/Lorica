@@ -83,7 +83,8 @@ impl Bounds {
     }
 
     /// Whether a session must hear back: a silent backend is then a
-    /// failure at the idle timeout (D-i). The settings' own
+    /// `no_response` failure of its link at the idle timeout, never a
+    /// breaker failure (D-i as amended). The settings' own
     /// [`UdpSettings::expects_responses`], which the stream SLA reads too.
     pub(crate) fn expects_responses(&self) -> bool {
         self.expects_responses

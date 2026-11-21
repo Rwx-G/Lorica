@@ -38,8 +38,8 @@
 //! local check, the upstream socket from `source_addresses` (D-a, D-f),
 //! the held datagrams sent; then responses within the bounds of D-b,
 //! idle and total timers, ICMP errors, the tracker's close; and at the
-//! end the breaker report, the record, and the session's counts given
-//! back.
+//! end the breaker report (an answer or an ICMP error, never a missing
+//! response), the record, and the session's counts given back.
 //!
 //! On a hot upgrade (Story 12.11 D-e) the runtime stops the receive
 //! loops, so a session takes no more requests, and its tracker entry
@@ -913,13 +913,26 @@ impl Inner {
         StreamEndReason::ConnectFailed
     }
 
-    /// The session's one breaker outcome (D-i), which is also its connect
-    /// outcome (Story 12.9 D-g).
+    /// The session's connect outcome (Story 12.9 D-g) and its breaker
+    /// outcome (D-i as the Phase 1 audit amended it): an answer is a
+    /// success, an ICMP error a failure. A missing response is neither,
+    /// since whether a datagram is answered is chosen by whoever sends
+    /// it; only a half-open probe is answered, as a success, because it
+    /// drew no ICMP error and an unreported probe would hold the probe
+    /// slot until the supervisor counts it failed.
     async fn report(&self, s: &Serving<'_>, outcome: ConnectOutcome) {
-        let success = outcome == ConnectOutcome::Answered;
-        self.breaker
-            .record(s.stream_id, &s.opened.backend, success, s.opened.was_probe)
-            .await;
+        let was_probe = s.opened.was_probe;
+        let success = match outcome {
+            ConnectOutcome::Answered => Some(true),
+            ConnectOutcome::IcmpError => Some(false),
+            ConnectOutcome::NoResponse => was_probe.then_some(true),
+            ConnectOutcome::Connected { .. } | ConnectOutcome::NotConnected => None,
+        };
+        if let Some(success) = success {
+            self.breaker
+                .record(s.stream_id, &s.opened.backend, success, was_probe)
+                .await;
+        }
         self.observer
             .connect_outcome(s.stream_id, StreamProtocol::Udp, outcome);
     }
