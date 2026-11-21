@@ -752,7 +752,14 @@ impl Inner {
                     stats.clienthello(ClientHelloOutcome::Timeout);
                     return Err(StreamEndReason::ClienthelloTimeout);
                 }
-                Ok(Ok(Ok(0)) | Ok(Err(_))) => return Err(StreamEndReason::ClientClose),
+                Ok(Ok(Ok(0))) => return Err(StreamEndReason::ClientClose),
+                // A reset or another error before the hello is complete:
+                // the client's end, logged since nothing else says why.
+                Ok(Ok(Err(e))) => {
+                    debug!(stream_id = %snapshot.id, peer = %live.conn.record.peer,
+                           error = %e, "ClientHello read failed");
+                    return Err(StreamEndReason::ClientClose);
+                }
                 Ok(Ok(Ok(n))) => filled += n,
             }
         }
