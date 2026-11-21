@@ -23,7 +23,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use lorica_config::connection_filter::parse_cidr;
+use lorica_config::connection_filter::{parse_cidr, ConnectionFilterPolicy};
 use lorica_config::models::StreamProxyProtocol;
 use lorica_core::protocols::proxy_protocol::{
     encode_v1, encode_v2, parse, Addresses, Command, ParseError, Parsed, Version, MAX_HEADER_LEN,
@@ -34,14 +34,41 @@ use tokio::time::Instant;
 
 use crate::counters::ProxyHeaderOutcome;
 
-/// Whether `peer` (canonical) is inside one of `cidrs`, a stream's
-/// `proxy_protocol_trusted_cidrs`. An entry that does not parse trusts
-/// nobody; validation refuses such a list before it is stored.
-pub fn is_trusted(peer: IpAddr, cidrs: &[String]) -> bool {
-    cidrs
-        .iter()
-        .filter_map(|entry| parse_cidr(entry).ok())
-        .any(|net| net.contains(&peer))
+/// A stream's `proxy_protocol_trusted_cidrs`, parsed once: the engine
+/// builds one per stream when its table changes, never per accept. An
+/// entry that does not parse trusts nobody; validation refuses such a
+/// list before it is stored.
+#[derive(Debug)]
+pub struct TrustedPeers {
+    /// The list as stored, which tells a connection's snapshot of the
+    /// same list from an edited one.
+    listed: Vec<String>,
+    /// The parsed entries as an allowlist; an empty one trusts nobody.
+    nets: ConnectionFilterPolicy,
+}
+
+impl TrustedPeers {
+    /// Parse `cidrs`.
+    pub fn of(cidrs: &[String]) -> TrustedPeers {
+        let nets = cidrs
+            .iter()
+            .filter_map(|entry| parse_cidr(entry).ok())
+            .collect();
+        TrustedPeers {
+            listed: cidrs.to_vec(),
+            nets: ConnectionFilterPolicy::from_nets(nets, Vec::new()),
+        }
+    }
+
+    /// Whether this was parsed from `cidrs`.
+    pub fn lists(&self, cidrs: &[String]) -> bool {
+        self.listed == cidrs
+    }
+
+    /// Whether `peer` (canonical) is inside one of the entries.
+    pub fn contains(&self, peer: IpAddr) -> bool {
+        !self.nets.is_noop() && self.nets.accepts(peer)
+    }
 }
 
 /// What reading a trusted peer's header gave.
@@ -151,10 +178,15 @@ mod tests {
     #[test]
     fn trust_reads_hosts_and_prefixes() {
         let list = vec!["10.0.0.0/8".to_string(), "192.0.2.10".to_string()];
-        assert!(is_trusted("10.1.2.3".parse().unwrap(), &list));
-        assert!(is_trusted("192.0.2.10".parse().unwrap(), &list));
-        assert!(!is_trusted("192.0.2.11".parse().unwrap(), &list));
-        assert!(!is_trusted("10.1.2.3".parse().unwrap(), &[]));
+        let trusted = TrustedPeers::of(&list);
+        assert!(trusted.contains("10.1.2.3".parse().unwrap()));
+        assert!(trusted.contains("192.0.2.10".parse().unwrap()));
+        assert!(!trusted.contains("192.0.2.11".parse().unwrap()));
+        assert!(trusted.lists(&list));
+        assert!(!trusted.lists(&list[..1]));
+        assert!(!TrustedPeers::of(&[]).contains("10.1.2.3".parse().unwrap()));
+        let unreadable = TrustedPeers::of(&["not a cidr".to_string()]);
+        assert!(!unreadable.contains("10.1.2.3".parse().unwrap()));
     }
 
     #[test]

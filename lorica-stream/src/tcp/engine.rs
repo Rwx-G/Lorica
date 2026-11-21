@@ -60,8 +60,9 @@
 //! and the server name rustls read must be the one the rule was chosen
 //! by.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -81,7 +82,7 @@ use tracing::debug;
 
 use super::connect::{Connected, Request, Rotation, Shared, UpstreamAttempt};
 use super::forward::{close, Forwarder};
-use super::proxy_header::{canonical, is_trusted, read_trusted, send_header, HeaderRead};
+use super::proxy_header::{canonical, read_trusted, send_header, HeaderRead, TrustedPeers};
 use crate::admission::{AdmissionControl, Admitted};
 use crate::counters::{
     ClientHelloOutcome, HandshakeOutcome, ProxyHeaderOutcome, StreamCounters, StreamStats,
@@ -146,6 +147,9 @@ struct Inner {
     observer: Arc<dyn ConnectionObserver>,
     admission: AdmissionControl,
     tls: TlsContext,
+    /// The trust lists of the streams that accept PROXY headers, parsed
+    /// once per table rather than on every accept.
+    trusted_peers: Mutex<HashMap<String, Arc<TrustedPeers>>>,
 }
 
 impl TcpEngine {
@@ -176,6 +180,7 @@ impl TcpEngine {
                 admission: AdmissionControl::new(parts.source_gate, Arc::clone(&parts.observer)),
                 observer: parts.observer,
                 tls: TlsContext::new(tls),
+                trusted_peers: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -196,6 +201,7 @@ impl StreamHandler for TcpEngine {
         shared.rotation.retain(table);
         self.inner.admission.table_changed(table);
         self.inner.tls.table_changed(table);
+        self.inner.trusted_peers_changed(table);
     }
 }
 
@@ -277,6 +283,40 @@ struct Route<'a> {
 }
 
 impl Inner {
+    fn trusted_peers_changed(&self, table: &StreamTable) {
+        let lists = table
+            .streams()
+            .filter(|stream| stream.proxy_protocol_accept)
+            .map(|stream| {
+                (
+                    stream.id.clone(),
+                    Arc::new(TrustedPeers::of(&stream.proxy_protocol_trusted_cidrs)),
+                )
+            })
+            .collect();
+        *self
+            .trusted_peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = lists;
+    }
+
+    /// Whether `peer` is a trusted PROXY peer of `stream`, from the list
+    /// the last table parsed when it is the list of the connection's
+    /// snapshot; a snapshot the engine has not seen parsed is read on
+    /// the spot.
+    fn trusts(&self, stream: &Stream, peer: IpAddr) -> bool {
+        let parsed = self
+            .trusted_peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream.id)
+            .cloned();
+        match parsed {
+            Some(list) if list.lists(&stream.proxy_protocol_trusted_cidrs) => list.contains(peer),
+            _ => TrustedPeers::of(&stream.proxy_protocol_trusted_cidrs).contains(peer),
+        }
+    }
+
     async fn serve(&self, conn: AcceptedConnection) {
         let accepted_at = Instant::now();
         let snapshot = Arc::clone(conn.tracked.snapshot());
@@ -284,8 +324,7 @@ impl Inner {
         let _active = stats.accept();
         let peer = canonical(conn.peer);
         let local = conn.stream.local_addr().map(canonical).unwrap_or(peer);
-        let trusted = snapshot.proxy_protocol_accept
-            && is_trusted(peer.ip(), &snapshot.proxy_protocol_trusted_cidrs);
+        let trusted = snapshot.proxy_protocol_accept && self.trusts(&snapshot, peer.ip());
         let pending = trusted || snapshot.tls_mode.reads_client_hello();
         let admitted = match self.admission.admit_connection(
             &conn.caps,
