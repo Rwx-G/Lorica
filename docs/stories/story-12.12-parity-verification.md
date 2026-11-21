@@ -826,7 +826,7 @@ Depends on: K (same smoke file); 12.1 in Review; 12.2 Lot G; 12.7 (the
 send/expect backend of D-h).
 
 - [x] `12.1-iv1-*`, `12.1-iv2-*` in the `cluster` section.
-- [ ] Both rollback scenarios per D-h; `docs/hot-upgrade.md` states
+- [x] Both rollback scenarios per D-h; `docs/hot-upgrade.md` states
       what a rollback to 1.10.7 does with streams present, as observed.
 
 ### Lot M: the performance phase - Docker perf
@@ -1762,8 +1762,9 @@ pulled images.
     its API; back on 1.11.0 the first backend reads `http /x` with
     `health_check_path` `/x`, the send/expect check and the stream with
     its link are unchanged, and the stream binds and echoes again.
-    `12.1-ac3-rollback-hot-1.10.7` **FAIL, product defect**, row
-    `pending` with a comment naming it.
+    `12.1-ac3-rollback-hot-1.10.7` **FAIL, product defect** on that
+    run, row `pending` with a comment naming it; PASS once fixed (below),
+    row `live`.
   - **Product defect: a hot downgrade to 1.10.x turns a stream's port
     into an HTTP listener.** With one TCP stream bound, the signed
     1.10.7 upload completes the handoff (new pid, the stream API now
@@ -1781,7 +1782,40 @@ pulled images.
     refuses the handoff (the old generation keeps serving) or completes
     it without serving the stream's port as anything else. Unreleased
     (streams are 1.11.0's); the scenario stays and turns PASS on either
-    outcome once fixed. `docs/hot-upgrade.md` states what was observed.
+    outcome once fixed.
+  - **Fixed, 2026-11-21: 1.10.7 now refuses the handoff.** A table
+    holding any key a 1.8.0 to 1.10.x receiver would misfile (anything
+    but the management, cluster and automation prefixes and a bare bind
+    address: `hot_upgrade::legacy_receivers_file`) is sent chunked at
+    any size, never as the legacy message. The chunked header now leads
+    with `0xFF`, never UTF-8, so the fork's `get_from_sock` in every
+    released receiver fails its key parse with `EINVAL` before taking a
+    descriptor; 1.10.x logs "failed to pull inherited listeners;
+    aborting" and exits (read from the 1.10.7 source and pinned by unit
+    test, not seen in the e2e log, which keeps no node log on a pass).
+    Before, the bare `lorica-fds/2` header parsed as two keys and no
+    descriptor and tripped the fork's count assertion, a panic.
+    Refusal over withholding the stream sockets: the outgoing side
+    cannot tell the incoming binary's version before the transfer, and
+    the refusal is safe against every released receiver at once. Tests
+    `a_released_receiver_never_takes_a_stream_socket_for_an_http_listener`,
+    `a_table_without_streams_still_hands_down_to_a_released_receiver`,
+    `only_the_families_released_receivers_know_take_the_legacy_message`
+    (`hot_upgrade.rs`),
+    `a_table_holding_a_key_legacy_receivers_misfile_never_takes_the_legacy_message`,
+    `the_chunked_header_is_not_utf8_from_its_first_byte` and the
+    strengthened `a_chunked_table_fails_against_the_legacy_receiver_without_hanging`
+    (`fd_transfer.rs`); both red runs recorded (without the key check
+    the stream test fails on the legacy receiver taking the
+    `stream-tcp:` key, without the lead byte the fork asserts at
+    `transfer_fd/mod.rs:64`). Re-run of the `hot-upgrade` profile
+    (`run.sh --build` with every other phase and the L4 phase skipped;
+    Phase 1 runs regardless): smoke 52 of 52, Lot K's four rows PASS,
+    `12.1-ac3-rollback-hot-1.10.7` PASS "1.10.7 refused the handoff
+    (exec_failed 0 -> 1): the old generation kept serving, 1270
+    requests 0 failed, route 200, backend1 through the stream 200";
+    row set `live`, the report then PASSED (5 PASS). `docs/hot-upgrade.md`
+    states the fixed behaviour; Story 12.11 D-d amended.
   - **Deviations.** (1) The registry row's order runs the cold rollback
     first in `streams-single`; it stops and restarts the node, and the
     12.2 rows after it pass on the restarted node (`L4_LOTS=A,B,L`, a
@@ -1951,7 +1985,7 @@ Lot L:
 
 - `tests-e2e-docker/l4/scenarios/12.1.sh` (new)
 - `tests-e2e-docker/l4/scenarios.tsv` (Lot L rows: three `live`, the
-  hot rollback `pending` on its defect)
+  hot rollback `pending` on its defect, then `live` once fixed)
 - `tests-e2e-docker/test-runner/run-cluster-smoke.sh` (12.1 IV1 and IV2
   section appended)
 - `tests-e2e-docker/test-runner/run-hot-upgrade-smoke.sh` (the hot
@@ -1960,7 +1994,12 @@ Lot L:
   smoke's `depends_on` on it)
 - `tests-e2e-docker/docker-compose.l4.yml` (`lorica-baseline-single`)
 - `tests-e2e-docker/l4/build-images.sh` (builds the baseline)
-- `docs/hot-upgrade.md` (the rollback statement)
+- `docs/hot-upgrade.md` (the rollback statement, then the fixed
+  behaviour)
+- The defect's fix: `lorica/src/startup/fd_transfer.rs`,
+  `lorica/src/startup/hot_upgrade.rs`, `CHANGELOG.md` (the `[Unreleased]`
+  transfer sentence corrected), `docs/stories/story-12.11-upgrade-drain.md`
+  (D-d amended)
 
 ## Change Log
 
@@ -1984,3 +2023,4 @@ Lot L:
 | 2026-11-21 | 0.16 | Lot J implemented: Story 12.10 IV1 (partial as D-d says: the form's body, not a click) and Story 12.7 IV2 in the `mcp` profile, both reporting as expected; the section's mints wait out the login limit. No product defect. | Romain G. |
 | 2026-11-21 | 0.17 | Lot K implemented: Story 12.11 IV1 and its three handover scenarios in the `hot-upgrade` profile, all passing (SSH session drained at the 120 s deadline with its report on the new `/metrics`, UDP across the upgrade with no loss, 64 range ports handed over); `ssh-backend` image. No product defect. | Romain G. |
 | 2026-11-21 | 0.18 | Lot L implemented: 12.1 IV1 and IV2 in the `cluster` smoke and the cold rollback to 1.10.7 passing; the hot rollback finds a product defect (a 1.10.x binary adopts a stream's listener as an HTTP listener) and its row stays `pending`; `docs/hot-upgrade.md` states the observed rollback. | Romain G. |
+| 2026-11-21 | 0.19 | Lot L's product defect fixed: a table holding a stream socket goes chunked at any size and the chunked header leads with a non-UTF-8 byte, so 1.10.7 refuses the hot downgrade cleanly and the old generation keeps serving; `12.1-ac3-rollback-hot-1.10.7` PASS and `live`; Lot L's boxes all ticked. | Romain G. |
