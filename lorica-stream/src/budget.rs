@@ -64,8 +64,8 @@ use serde::{Deserialize, Serialize};
 use crate::state::BindStateKind;
 
 /// `U` as the host reports it now. Re-exported so the management API,
-/// which does not depend on `lorica-worker`, reads the very figure the
-/// node's driver checks its binds against.
+/// which does not depend on `lorica-worker` directly, reads the very
+/// figure the node's driver checks its binds against.
 pub use lorica_worker::stream_sockets::usable_udp_source_ports;
 
 /// `B`: the fds held back for the process's own plumbing (databases, log

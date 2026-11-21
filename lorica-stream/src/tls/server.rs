@@ -27,9 +27,11 @@
 //!
 //! Each config takes the HTTPS listener's choices: TLS 1.2 and 1.3, no
 //! 0-RTT (a replayable first flight to a backend that cannot know it was
-//! replayed), rustls' default in-memory session cache, no tickets; its
-//! ALPN is the rule's list, so rustls negotiates the first of the rule's
-//! protocols the client offered.
+//! replayed), rustls' default in-memory session cache for stateful
+//! resumption and no stateless ticketer (the TLS 1.3 tickets rustls
+//! sends by default only name a cache entry); its ALPN is the rule's
+//! list, so rustls negotiates the first of the rule's protocols the
+//! client offered.
 
 use std::collections::HashMap;
 use std::io;

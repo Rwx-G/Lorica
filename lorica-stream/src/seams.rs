@@ -107,7 +107,12 @@ pub enum Admission {
 /// Passive failure detection (D-g). The implementation keys the breaker
 /// by (`"stream:" + stream_id`, the backend address as configured), in
 /// the registry HTTP uses, and fails open: an admission it cannot obtain
-/// is `Allow`.
+/// is `Allow`. A range stream's backend is configured without a port,
+/// so one circuit covers every port of the range: a port whose service
+/// is down opens it for the healthy ports too, and the circuit flaps
+/// while that port stays down. Keying per port is refused on purpose,
+/// since the registry never prunes (`docs/streams.md`, passive failure
+/// detection).
 pub trait BreakerGate: Send + Sync + 'static {
     /// Whether a connection of `stream_id` may try `backend`.
     fn admit<'a>(&'a self, stream_id: &'a str, backend: &'a Backend) -> SeamFuture<'a, Admission>;

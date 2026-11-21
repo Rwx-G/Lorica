@@ -179,6 +179,7 @@ it was read from.
 | Idle, UDP | 10 s (`DEFAULT_UDP_IDLE_TIMEOUT_S`) | 10 min, `proxy_timeout` ([source][n-timeout]) | Enterprise only: 10 s on the client side, `timeout client` of a `udp-lb` section; no default stated for `timeout server` ([source][hx-udp-ref]) | 1 min ([source][e-udp-idle]) | 3 s ([source][t-udp]) |
 | UDP responses per request | 1 (`DEFAULT_RESPONSES_PER_REQUEST`) | unlimited unless set ([source][n-responses]) | not documented | not documented | not documented |
 | UDP requests per session | 64 (`DEFAULT_REQUESTS_PER_SESSION`) | 0, no limit ([source][n-requests]) | not documented | not documented | not documented |
+| TCP connections per source | none, `source_max_connections` off | none, `limit_conn` applies only where it is configured ([source][n-limit-conn]) | none, `src_conn_cur` counts only in a stick table a rule tracks ([source][h-src-conn-cur]) | not documented | not documented |
 
 caddy-l4, for UDP: 30 s idle ([source][c-servers]). nginx's `least_time`
 page states it is open source since 1.31.0 while its `random` section
@@ -342,7 +343,7 @@ worker process counts on its own.
 | `protocol` | both | | `tcp` or `udp`. |
 | `enabled` | both | | Disabled: replicated, bound nowhere, ports kept. |
 | `listen_address`, `port_first`, `port_last` | both | per node | See [Concepts](#concepts). |
-| `node_selector` | both | fleet | Empty is fleet-wide (not bound on the control plane). |
+| `node_selector` | both | fleet | Empty is fleet-wide, the control plane included; a non-empty selector is never bound on the control plane. |
 | `backend_ids`, `backup_backend_ids` | both | | Empty on a TLS stream, whose links are per rule. |
 | `backend_max_active` | both | per node | The cap of each capped link (nginx `max_conns`); HTTP routes sharing the backend do not count against it. Range `Stream::MAX_ACTIVE_RANGE`. |
 
@@ -627,6 +628,22 @@ open the backend is skipped (`lorica_stream_breaker_denied_total`).
 Active health checks feed the same backend state as for routes
 ([health checks](health-checks.md)); a confirmed health change reaches every
 worker's table at once.
+
+**On a range stream, one breaker covers every port of a backend.** The
+breaker is keyed by the stream and the backend as configured, and a
+range stream's backends carry no port, so the failures of all its ports
+count against one circuit, as a route's do across paths (HAProxy's
+`observe layer4` also judges a server, not a port). The blast radius:
+a backend whose service is down on one port of the range opens the
+circuit for every port, so the healthy ports of that backend are
+skipped too while it is open. A half-open probe then lands on whichever
+port the next connection asks for; a healthy port closes the circuit
+and the dead port opens it again, so the backend flaps for as long as
+that port stays down. Keep the ports of a range served by the same
+process on each backend, or split a port whose service can fail on its
+own into a stream of its own. Keying per port would grow the
+supervisor's breaker registry, which never prunes, by one entry per
+port and backend (Story 12.3 D-g).
 
 A failed connect moves to another backend at once, up to
 `max_connect_attempts` attempts in all, each to a backend not yet tried.
@@ -928,8 +945,13 @@ including ACME and AD CS ones:
   certificate can serve it: that handshake fails (`refused`,
   `no_certificate`), and the write answers a warning.
 - TLS 1.2 and 1.3, no 0-RTT (a replayable first flight to a backend
-  that cannot know it was replayed), no session tickets. A rule's `alpn`
-  is also what the handshake negotiates, in the rule's order.
+  that cannot know it was replayed), and the HTTPS listener's resumption:
+  stateful, from rustls' in-process session cache, with no stateless
+  tickets (a TLS 1.3 client receives tickets that only name an entry of
+  that cache, which a restart empties). A resumed session keeps the
+  client certificate verified at its first handshake, as on the HTTPS
+  listener. A rule's `alpn` is also what the handshake negotiates, in
+  the rule's order.
 - The server name rustls reads must be the one the rule was chosen by;
   a disagreement between the two parsers is refused
   (`invalid_client_hello`) and counted in `lorica_stream_sni_mismatch_total`.
@@ -1289,6 +1311,15 @@ GeoIP database. A client whose country is unknown (no database on the
 node, or an address it does not cover) **passes**, and is counted
 (`lorica_stream_geoip_unknown_total`).
 
+**GeoIP is not an access control.** A country allowlist on a node with
+no GeoIP database loaded admits every client, as a route's does: one
+rule for both planes (Story 12.6 D-d). Nothing refuses the stream and
+nothing alerts; the one signal is `lorica_stream_geoip_unknown_total`
+for that stream climbing with its connections or sessions. Watch it on
+every node a stream with a country allowlist binds, and put the
+addresses that must be kept out in `source_allow_cidrs` or
+`source_deny_cidrs`, which do not depend on a database.
+
 ### The global filter and the blocklist
 
 The global connection filter and the global IP blocklist apply to every
@@ -1305,6 +1336,17 @@ that job, per node where the HTTP cap is per process.
 - `source_max_connections` (TCP) and `udp.source_session_cap` (UDP): per
   source on the node. Workers admitting one source at the same instant
   can pass it by the worker count minus one.
+- **`source_max_connections` is off by default: one source can hold the
+  whole `max_connections` of a TCP stream.** Set it on every TCP stream
+  reachable from untrusted sources. It stays off because the most common
+  TCP stream is a database or a message broker behind one application
+  host, whose connection pool opens many connections from one address,
+  and no default fits every pool; a default cap would refuse that pool
+  the day it grows. nginx (`limit_conn`) and HAProxy (`src_conn_cur`)
+  leave the same cap to the operator ([Defaults
+  compared](#defaults-compared)). A UDP stream does apply a per-source
+  session cap by default (`DEFAULT_SOURCE_SESSION_CAP`), one of the
+  bounds of [UDP streams](#udp-streams).
 - `backend_max_active`, per link: the stream's connections or sessions
   to one backend on the node, nginx's `max_conns`. HTTP routes sharing
   the backend do not count against it. A backend at its cap is no
@@ -1616,6 +1658,15 @@ A TCP stream's old listening socket is closed at once; a UDP stream's
 stays open while it drains (see
 [Draining a UDP stream](#draining-a-udp-stream)). A connection that
 ends on its own during the drain keeps its own end reason.
+
+**Every configuration change reloads both planes.** A stream edit runs
+the HTTP workers' two-phase reload as any configuration change does,
+and a route or backend edit makes every worker reload its stream table
+(so does a backend's health change, without the HTTP reload). This is
+kept on purpose: the two-phase reload is the tested path and is
+hitless, so an HTTP request in flight is not affected by a stream edit,
+and a stream connection already open keeps the settings it was accepted
+with.
 
 ### A stop
 
