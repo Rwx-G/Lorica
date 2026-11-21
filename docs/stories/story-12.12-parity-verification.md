@@ -752,10 +752,10 @@ servers), `docs/health-checks.md` (the "Backend-side noise"
 observations and the SMTP verification only).
 Depends on: C (PostgreSQL); 12.7 in Review.
 
-- [ ] `12.7-iv1-redis-paused-marked-down` as 12.7 handed it; the
+- [x] `12.7-iv1-redis-paused-marked-down` as 12.7 handed it; the
       per-probe log lines of Redis and PostgreSQL recorded in
       `docs/health-checks.md`.
-- [ ] `12.7-x-smtp-banner-template` (Resolved 4): `smtp_banner.py` in
+- [x] `12.7-x-smtp-banner-template` (Resolved 4): `smtp_banner.py` in
       two services, one that accepts and writes `220 example.com ESMTP`
       then waits, one that accepts and never writes. A backend on
       `tcp_template{smtp_banner}` is `Up` on the first and marked down on
@@ -1356,6 +1356,43 @@ pulled images.
     read as a close is not counted. The IP-literal entries are in
     `12.6-iv2`, as Lot A's note asked.
 
+- **Lot G, 2026-11-21.** Story 12.7 IV1 and the SMTP banner template,
+  lane 2 on `c01536bb`, in the same two runs as Lot F.
+  - **Verdicts**, both PASS in both runs:
+    `12.7-iv1-redis-paused-marked-down` (the pinned `redis:7.4.12`
+    behind a TCP stream beside `tcp-backend-2`, its backend on
+    `tcp_template{redis_ping}` at a 5 s interval and a 1,000 ms timeout:
+    healthy, the stream split 5/5; `docker pause`: marked down in 11.9
+    and 15.9 s, 3 `response_timeout` probe failures, then 10 of 10 on
+    `tcp-backend-2`; `docker unpause`: healthy again in 13.7 s and
+    selected again);
+    `12.7-x-smtp-banner-template` (`smtp_banner.py` in two services:
+    the backend on the server writing `220 example.com ESMTP` stays
+    healthy with no failed probe over 3 probes; the one on the server
+    that never writes is marked down 12.9 and 12.2 s after its create,
+    3 `response_timeout` failures).
+  - **Backend-side noise**, written into `docs/health-checks.md`: Redis
+    accepted one connection per probe (3 over 3 intervals) and logged
+    no line; `pg-1` logged no line over 3 or more
+    `postgresql_ssl_request` probes; the banner server saw each probe
+    end as `ConnectionResetError`, since the probe reads only the
+    expected prefix and drops the connection with the rest of the
+    greeting unread (`read_budget` in `lorica/src/health.rs`).
+  - **The flip bound.** The Lot's text bounds a flip by
+    `HEALTH_FLIP_THRESHOLD` x the interval plus the timeout, 16 s here.
+    The scenarios allow 20 s: one second more per probe for the health
+    loop's tick (`HEALTH_LOOP_TICK`, 1 s, ticks delayed by a probe
+    waiting out its timeout), and one for the API poll. The flips
+    measured in the six lane-2 runs that reached these rows since
+    2026-11-20 (the first agent's four, these two) ran from 11.9 to
+    17.8 s, so the strict 16 s would fail on timing alone.
+  - **No product defect found.** One observation, recorded in Story
+    12.7: a probe whose expected answer is shorter than what the server
+    writes ends the connection with a reset, not a FIN. Neither the AC
+    nor the IV depends on it.
+  - **Deviations.** None from the Lot's items. The runner Dockerfile
+    needed no change: it already copies `test-runner/l4/` whole.
+
 ## File List
 
 Lot A:
@@ -1427,6 +1464,17 @@ Lot F:
 - `docs/stories/story-12.6-stream-protection.md` (Lot I checkboxes, Dev
   Agent Record, File List, Change Log, Status)
 
+Lot G:
+
+- `tests-e2e-docker/l4/scenarios/12.7.sh` (new)
+- `tests-e2e-docker/test-runner/l4/smtp_banner.py` (new)
+- `tests-e2e-docker/docker-compose.l4.yml` (`redis`, `smtp-banner`,
+  `smtp-silent`)
+- `tests-e2e-docker/l4/scenarios.tsv` (Lot G rows `live`)
+- `docs/health-checks.md` ("What the backend sees")
+- `docs/stories/story-12.7-tcp-send-expect.md` (Dev Agent Record, File
+  List, Change Log)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1438,3 +1486,4 @@ Lot F:
 | 2026-11-19 | 0.5 | Lot B implemented: Story 12.2's scenarios in both profiles and the fd-reserve scenario, all passing (AC #3 partial as D-d says); budget nodes, a single-process probe, `udp_hold.py` and `http_loop.py`. No product defect. The budget item asserts `worker_fds` for 1,024 ports and `supervisor_fds` for 600, since a UDP session now holds an fd. | Romain G. |
 | 2026-11-20 | 0.6 | Lot C implemented: Story 12.3 IV1 to IV4 (IV1 on three PostgreSQL servers, IV4 in full through CoreDNS) and the five TCP matrix rows, all passing; `NET_ADMIN` on the probe recorded as Resolved 17. No product defect. | Romain G. |
 | 2026-11-21 | 0.7 | Lot F implemented: Story 12.6 IV1 to IV3 (IV3 at 10,000 silent connections, then nine sources filling the pending cap), an IP-literal allow and deny entry in IV2, and the concurrency-caps matrix row, all passing in lane 2; the client joins `streams-geo` per scenario. No product defect. | Romain G. |
+| 2026-11-21 | 0.8 | Lot G implemented: Story 12.7 IV1 against the pinned Redis frozen with `docker pause`, and the SMTP banner template against a standard-library banner server, both passing in lane 2; what Redis, PostgreSQL and the banner server see per probe recorded in `docs/health-checks.md`. No product defect. | Romain G. |

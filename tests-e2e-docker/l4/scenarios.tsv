@@ -62,8 +62,8 @@ name	source	story	profiles	level	lot	state	matrix
 12.6-iv2-geo-deny-tcp-and-udp	12.6 IV2	12.6	streams	full	F	live	GeoIP;IP allow/deny
 12.6-iv3-10k-silent-pending-cap	12.6 IV3	12.6	streams	full	F	live	-
 12.6-matrix-concurrency-caps	12.12 D-e	12.6	streams	full	F	live	Connection limit per source IP;Connection limit per listener / backend
-12.7-iv1-redis-paused-marked-down	12.7 IV1	12.7	streams	full	G	pending	Active health: send/expect
-12.7-x-smtp-banner-template	12.7 AC #3	12.7	streams	full	G	pending	Active health: send/expect
+12.7-iv1-redis-paused-marked-down	12.7 IV1	12.7	streams	full	G	live	Active health: send/expect
+12.7-x-smtp-banner-template	12.7 AC #3	12.7	streams	full	G	live	Active health: send/expect
 12.7-iv2-template-yes-payload-no	12.7 IV2	12.7	mcp	full	J	pending	-
 12.8-iv1-proxy-v2-https-real-client	12.8 IV1	12.8	geoip	full	H	pending	PROXY protocol accept on the HTTP listeners
 12.8-iv2-untrusted-and-forged-xff	12.8 IV2	12.8	geoip,workers	full	H	pending	PROXY protocol accept on the HTTP listeners

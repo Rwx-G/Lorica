@@ -1224,6 +1224,18 @@ None open.
 - Lot 4, `docs/security/threat-model.md`: section T11, the two T9
   masked-value lists extended with `send`, residual risk 16 (a payload
   is stored in clear), version 1.4.
+- Handed to Story 12.12, delivered by its Lot G (2026-11-21):
+  `12.7-iv1-redis-paused-marked-down` (the pinned Redis behind a TCP
+  stream on `tcp_template{redis_ping}`, frozen with `docker pause`) and
+  `12.7-x-smtp-banner-template` (Resolved 4 of Story 12.12) pass in the
+  L4 phase; the numbers are in Story 12.12's Completion Notes. The
+  backend-side observations are in `docs/health-checks.md`, "What the
+  backend sees": Redis and PostgreSQL log nothing per probe at their
+  defaults; Postfix was not run. One observation against D-9: the probe
+  ends a connection whose answer is longer than the bytes it reads (the
+  SMTP greeting past `220`) with a reset, not a FIN, since it closes with
+  unread data. The AC and IV do not depend on it; recorded, not
+  changed. No product defect.
 
 ## File List
 
@@ -1286,6 +1298,10 @@ None open.
 - `docs/architecture/source-tree.md` (Lot 4)
 - `CHANGELOG.md` (Lot 4, Added and Security)
 - `docs/stories/story-12.7-tcp-send-expect.md` (Lot 4, Dev Agent Record)
+- `tests-e2e-docker/l4/scenarios/12.7.sh`,
+  `tests-e2e-docker/test-runner/l4/smtp_banner.py` (new),
+  `tests-e2e-docker/docker-compose.l4.yml`, `tests-e2e-docker/l4/scenarios.tsv`,
+  `docs/health-checks.md` (Story 12.12 Lot G, the e2e scenarios handed here)
 
 ## Change Log
 
@@ -1301,3 +1317,4 @@ None open.
 | 2026-11-15 | 0.8 | Lot 2: D9 on every automation and MCP surface (a token never creates or changes a custom payload), `send` masked for tokens and for Viewer with restore on echo, MCP schema offers templates and withholds payload keys, both OpenAPI documents and their contract assertions. Status InProgress. | Romain G. |
 | 2026-11-15 | 0.9 | Lot 3: rendered template module and documentation section with their fixture test, dashboard template and send/expect editors with client-side limits. Status InProgress. | Romain G. |
 | 2026-11-16 | 1.0 | Lot 4: `docs/health-checks.md` around the rendered section, the D-7 rule and the masked `send` in `docs/automation.md` and `docs/mcp.md`, the rollback consequence in `docs/hot-upgrade.md`, threat model T11, the new files in the source tree, CHANGELOG Added and Security. Every Lot done. Status Review. | Romain G. |
+| 2026-11-21 | 1.1 | IV1 against a real Redis frozen with `docker pause` and the SMTP banner template, delivered by Story 12.12 Lot G, pass; backend-side noise observed and documented. Status Review. | Romain G. |

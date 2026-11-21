@@ -251,13 +251,29 @@ healthy for exactly that reason.
 ## What the backend sees
 
 Every probe of a protocol kind is a connection that exchanges a few
-bytes and closes, at each interval, and many servers log that. What
-Redis, Postfix and PostgreSQL log for each template has not been
-checked. Postfix is commonly reported to log a lost connection after
-`CONNECT`, and PostgreSQL may log an incomplete startup packet after an
-SSLRequest followed by a close. If the noise matters, raise the
-backend's `health_check_interval_s` or filter the probe's source address
-in the backend's logging.
+bytes and closes, at each interval, and many servers log that. What the
+e2e suite observed (the L4 phase's `12.7-iv1-redis-paused-marked-down`
+and `12.7-x-smtp-banner-template` scenarios), each server at its default
+logging:
+
+- **Redis** (the official image, 7.4): logs nothing for a `redis_ping`
+  probe. Its `total_connections_received` counter counts one connection
+  per probe.
+- **PostgreSQL** (the official image, 17): logs nothing for a
+  `postgresql_ssl_request` probe. A server without TLS answers `N` and
+  the probe closes.
+- **SMTP** was checked against a standard-library banner server
+  (`tests-e2e-docker/test-runner/l4/smtp_banner.py`), not against a real
+  MTA, so what an MTA logs per probe was not observed. Postfix is
+  commonly reported to log a lost connection after `CONNECT`. The banner
+  server sees each probe end as a connection reset, not an orderly
+  close: the probe reads only as many bytes as its longest expected
+  answer (`220`) and closes with the rest of the greeting unread, and a
+  socket closed with unread data is reset by the kernel. A server that
+  logs resets differently from closes will log the probe that way.
+
+If the noise matters, raise the backend's `health_check_interval_s` or
+filter the probe's source address in the backend's logging.
 
 ## Rolling back, and checks a binary does not know
 

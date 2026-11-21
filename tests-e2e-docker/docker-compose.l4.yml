@@ -208,6 +208,32 @@ services:
       l4-dns:
         ipv4_address: ${L4_DNS_IP:-10.89.53.53}
 
+  # ---- Story 12.7 backends (Story 12.12 Lot G) ----------------------
+
+  # 12.7 IV1: a real Redis the driver freezes with `docker pause`, which
+  # keeps the kernel completing handshakes into its listen backlog.
+  redis:
+    image: redis:7.4.12-bookworm@sha256:2e3eb11462c4e3759e6972678dd051d150ff54b1e60714b3c33b701260172a90
+    profiles: ["streams"]
+    networks:
+      - l4
+
+  # test-runner/l4/smtp_banner.py: the `smtp_banner` template's two cases,
+  # a server that greets with 220 and one that never writes (Resolved 4).
+  smtp-banner:
+    <<: *l4-runner
+    profiles: ["streams"]
+    entrypoint: ["python3", "/tests/l4/smtp_banner.py", "--mode", "banner", "--port", "2525"]
+    networks:
+      - l4
+
+  smtp-silent:
+    <<: *l4-runner
+    profiles: ["streams"]
+    entrypoint: ["python3", "/tests/l4/smtp_banner.py", "--mode", "silent", "--port", "2525"]
+    networks:
+      - l4
+
   # Has its own addresses: every source-address scenario needs a client
   # that is not the node's loopback.
   streams-client:
