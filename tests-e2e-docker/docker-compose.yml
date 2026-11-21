@@ -766,6 +766,7 @@ services:
       - lorica-hot-upgrade
       - ssh-backend
       - hot-upgrade-l4-backends
+      - hot-upgrade-baseline
     volumes:
       # Read-write: the runner writes the test public key into the same
       # volume the lorica container reads it from, and reads the
@@ -806,6 +807,23 @@ services:
       - python3 /tests/l4/udp_hold.py serve --port 5300 & exec python3 /tests/l4/tcp_backend.py --name hu-range --ports 7400-7463
     networks:
       - e2e
+
+  # Story 12.1 AC #3, the hot rollback (Story 12.12 D-h, Lot L): copies
+  # the released 1.10.7 binary (baseline/Dockerfile, D-g) to the shared
+  # volume, where the smoke signs it and uploads it as an upgrade. Runs
+  # once and exits; the smoke depends on it.
+  hot-upgrade-baseline:
+    build:
+      context: ./baseline
+      additional_contexts:
+        signing-key: ../docs
+    image: lorica-e2e/baseline:1.10.7
+    profiles: ["hot-upgrade"]
+    user: "0:0"
+    entrypoint: ["sh", "-c", "cp /usr/local/bin/lorica /shared/.lorica-1.10.7.tmp && mv /shared/.lorica-1.10.7.tmp /shared/lorica-1.10.7"]
+    network_mode: none
+    volumes:
+      - shared-hot-upgrade:/shared
 
   # ---- Log-sinks E2E (v1.7.0 Story 9.8, IV1/IV2/IV3) -----------------
   # One Lorica node (built with `--features otel` so the OTLP logs

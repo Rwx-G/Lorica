@@ -114,6 +114,33 @@ services:
     volumes:
       - l4-shared:/shared:ro
 
+  # Story 12.1 AC #3, the cold rollback (Story 12.12 D-h, Lot L): the
+  # released 1.10.7 (baseline/Dockerfile, D-g) on the streams-single
+  # node's volumes, through that node's own entrypoint (setpriv and the
+  # socat forwarder are in the baseline image too). The scenario starts it
+  # while the node is stopped; its profile is its own, so the
+  # `streams-single` profile never starts it. One image name for every
+  # lane: it holds the signed release, not this tree.
+  lorica-baseline-single:
+    build:
+      context: ./baseline
+      additional_contexts:
+        signing-key: ../docs
+    image: lorica-e2e/baseline:1.10.7
+    profiles: ["streams-single-baseline"]
+    user: "0:0"
+    entrypoint: ["sh", "/entrypoint-streams-single.sh"]
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "1024"
+    stop_grace_period: 60s
+    volumes:
+      - ./entrypoint-streams-single.sh:/entrypoint-streams-single.sh:ro
+      - l4-shared:/shared
+      - streams-single-data:/var/lib/lorica
+    networks:
+      l4:
+        aliases: ["l4-node"]
+
   # Budget nodes (Story 12.2 AC #5, Story 12.12 D-f): worker mode like
   # lorica-streams, with a fd limit low enough that the stream budget,
   # not the ephemeral ports, binds. No `l4-node` alias and a /shared of

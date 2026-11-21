@@ -973,4 +973,140 @@ set +e
 l4_kr
 set -e
 
+# ---------------------------------------------------------------------
+# Story 12.1 IV1 and IV2 (Story 12.12 Lot L). IV1: a TCP stream targeted
+# at edge-a is listed by edge-a's own API, held by the control plane,
+# absent from edge-b, which never receives it; a connection through it
+# reaches backend1 on edge-a and is refused on edge-b and on the control
+# plane (the node image has no `ss`: a connect from here is the external
+# truth). IV2: a stream on edge-a's HTTPS port is refused 409 by the
+# control plane, naming edge-a. Each prints exactly one `L4-SCENARIO`
+# line (Story 12.12 D-c).
+# ---------------------------------------------------------------------
+log "=== 12.1: a targeted stream binds on one node; a follower's HTTPS port is refused ==="
+l4_121_line() {
+    echo "L4-SCENARIO $1 $2 $3"
+    if [ "$2" = PASS ]; then ok "$1: $3"; else fail "$1: $3"; fi
+}
+# Whether <node>'s own API lists stream <id>: 1 or 0 (`cp` is the
+# control plane).
+l4_121_listed() {
+    local api session
+    case "$1" in
+        edge-a) api="$EDGE_A_API" session="$L4_KR_SESSION_A" ;;
+        edge-b) api="$EDGE_B_API" session="$L4_KR_SESSION_B" ;;
+        *) api="$CP_API" session="$CP_SESSION" ;;
+    esac
+    curl -sk -b "$session" "$api/api/v1/streams" | jq --arg id "$2" '[(.data.streams // [])[] | select(.id == $id)] | length'
+}
+# One HTTP request through <host>:<port> to backend1: the status, or
+# `refused` when nothing listens there.
+l4_121_through() {
+    python3 - "$1" "$2" <<'PY'
+import socket, sys
+try:
+    s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3)
+except ConnectionRefusedError:
+    print("refused")
+    sys.exit(0)
+except OSError as e:
+    print(f"unreachable ({e.__class__.__name__})")
+    sys.exit(0)
+s.settimeout(3)
+s.sendall(b"GET /healthz HTTP/1.0\r\nHost: backend1\r\n\r\n")
+try:
+    head = s.recv(64).decode("latin-1").split("\r\n")[0]
+except OSError as e:
+    head = f"no answer ({e.__class__.__name__})"
+print(head.split(" ")[1] if head.startswith("HTTP/") else head or "closed")
+PY
+}
+# The applied generation of <follower> in the roster.
+l4_121_generation() {
+    API="$CP_API" SESSION="$CP_SESSION" api_get /api/v1/cluster/nodes \
+        | jq -r --arg n "$1" '[(.data // [])[] | select(.name == $n)][0].applied_config_generation // 0'
+}
+l4_121() {
+    local iv1=12.1-iv1-targeted-stream-binds-on-one-node iv2=12.1-iv2-follower-https-port-refused
+    local backend_ip backend body answer stream i a_listed b_listed cp_listed a_through b_through cp_through gen_a gen_b
+    API="$CP_API"
+    SESSION="$CP_SESSION"
+    if [ -z "${L4_KR_SESSION_A:-}" ] || [ -z "${L4_KR_SESSION_B:-}" ]; then
+        API="$EDGE_A_API"; login "$(cat "$SHARED/edge-a_admin_password")"; L4_KR_SESSION_A="$SESSION"
+        API="$EDGE_B_API"; login "$(cat "$SHARED/edge-b_admin_password")"; L4_KR_SESSION_B="$SESSION"
+        API="$CP_API"; SESSION="$CP_SESSION"
+    fi
+    backend_ip=$(python3 -c 'import socket, sys; print(socket.gethostbyname(sys.argv[1]))' "${BACKEND1%%:*}")
+    backend=$(api_post /api/v1/backends "{\"address\":\"${backend_ip}:${BACKEND1##*:}\",\"health_check_enabled\":false}" | jq -r '.data.id // empty')
+    if [ -z "$backend" ]; then
+        l4_121_line "$iv1" FAIL "backend create refused"
+        l4_121_line "$iv2" FAIL "not run: the IV1 backend was refused"
+        return
+    fi
+    body="{\"name\":\"l4l-iv1-targeted\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":7602,\"node_selector\":[\"edge-a\"],\"backend_ids\":[\"${backend}\"]}"
+    # A follower's reserved ports arrive with its heartbeat; until then
+    # the control plane refuses a stream it cannot check there.
+    for i in $(seq 1 30); do
+        answer=$(api_post /api/v1/streams "$body")
+        stream=$(echo "$answer" | jq -r '.data.id // empty')
+        [ -n "$stream" ] && break
+        echo "$answer" | grep -q 'has not reported its reserved ports' || break
+        sleep 2
+    done
+    if [ -z "$stream" ]; then
+        l4_121_line "$iv1" FAIL "stream create refused: $(echo "$answer" | head -c 300)"
+    else
+        for i in $(seq 1 60); do
+            a_through=$(l4_121_through lorica-edge-a 7602)
+            [ "$a_through" = 200 ] && break
+            sleep 1
+        done
+        # edge-b never receives the stream: wait until it has applied the
+        # generation edge-a serves it from, so its absence is not a lag.
+        gen_a=$(l4_121_generation edge-a)
+        for i in $(seq 1 60); do
+            gen_b=$(l4_121_generation edge-b)
+            [ "$gen_b" -ge "$gen_a" ] 2>/dev/null && break
+            sleep 1
+        done
+        a_listed=$(l4_121_listed edge-a "$stream")
+        b_listed=$(l4_121_listed edge-b "$stream")
+        cp_listed=$(l4_121_listed cp "$stream")
+        b_through=$(l4_121_through lorica-edge-b 7602)
+        cp_through=$(l4_121_through lorica-cp 7602)
+        if [ "$a_through" != 200 ]; then
+            l4_121_line "$iv1" FAIL "nothing reached backend1 through edge-a's stream: ${a_through}"
+        elif [ "$a_listed $b_listed $cp_listed" != "1 0 1" ]; then
+            l4_121_line "$iv1" FAIL "listed by edge-a ${a_listed}, edge-b ${b_listed}, control plane ${cp_listed}; expected 1 0 1"
+        elif [ "$b_through" != refused ] || [ "$cp_through" != refused ]; then
+            l4_121_line "$iv1" FAIL "port 7602 answered elsewhere: edge-b ${b_through}, control plane ${cp_through}"
+        else
+            l4_121_line "$iv1" PASS "selector [edge-a]: listed by edge-a's API and held by the control plane's, absent from edge-b's at generation ${gen_b} (edge-a's ${gen_a}); through edge-a:7602 backend1 answered ${a_through}; edge-b:7602 ${b_through}, control plane:7602 ${cp_through}"
+        fi
+        api_del "/api/v1/streams/$stream" >/dev/null
+    fi
+
+    local https code msg
+    https=$(curl -sk -b "$L4_KR_SESSION_A" "$EDGE_A_API/api/v1/system" | jq -r '.data.proxy.https_port // empty')
+    if [ -z "$https" ]; then
+        l4_121_line "$iv2" FAIL "edge-a did not report its HTTPS port"
+        return
+    fi
+    code=$(curl -sk -o /tmp/l4l-iv2.json -w '%{http_code}' -b "$CP_SESSION" -X POST -H "Content-Type: application/json" \
+        -d "{\"name\":\"l4l-iv2-https\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":${https},\"node_selector\":[\"edge-a\"],\"backend_ids\":[\"${backend}\"]}" \
+        "$CP_API/api/v1/streams")
+    msg=$(jq -r '.error.message // .error // empty' /tmp/l4l-iv2.json 2>/dev/null | tr '\n' ' ' | head -c 300)
+    if [ "$code" = 409 ] && echo "$msg" | grep -q 'edge-a'; then
+        l4_121_line "$iv2" PASS "a stream on edge-a's HTTPS port ${https} refused 409 by the control plane: ${msg}"
+    else
+        l4_121_line "$iv2" FAIL "a stream on edge-a's HTTPS port ${https} answered ${code}: $(tr '\n' ' ' < /tmp/l4l-iv2.json | head -c 300)"
+        api_del "/api/v1/streams/$(jq -r '.data.id // empty' /tmp/l4l-iv2.json)" >/dev/null
+    fi
+    api_del "/api/v1/backends/$backend" >/dev/null
+}
+# Without errexit: every path of l4_121 ends on its two lines.
+set +e
+l4_121
+set -e
+
 print_results

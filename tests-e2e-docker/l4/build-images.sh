@@ -18,7 +18,7 @@ export MSYS_NO_PATHCONV=1
 # shellcheck source=lib.sh
 . l4/lib.sh
 
-services="lorica-streams streams-client dns-loadgen"
+services="lorica-streams streams-client dns-loadgen lorica-baseline-single"
 case "${1:-}" in
     --runner-only) services="streams-client" ;;
     "") ;;
@@ -28,7 +28,9 @@ esac
 # Every profile, so profile-gated services resolve; the Lorica image,
 # the runner image and the perf-tools image (dns-loadgen, Story 12.5
 # IV2) are each named by one service of the `streams` profile and
-# shared by every other service that uses them.
+# shared by every other service that uses them. The 1.10.7 baseline
+# (Story 12.1's cold rollback) has a profile of its own.
 # shellcheck disable=SC2086 # the service list is word-split on purpose
-l4_compose --profile streams --profile streams-single --profile l4-report build $services
+l4_compose --profile streams --profile streams-single --profile streams-single-baseline \
+    --profile l4-report build $services
 echo "Built lorica-e2e-l4 images with tag ${L4_IMAGE_TAG}"

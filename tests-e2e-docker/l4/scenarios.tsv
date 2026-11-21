@@ -22,9 +22,13 @@
 # its last pre-existing phase when none was skipped.
 name	source	story	profiles	level	lot	state	matrix
 12.12-x-harness-self-test	12.12 Lot A	12.12	streams,streams-single	full	A	live	-
-12.1-iv1-targeted-stream-binds-on-one-node	12.1 IV1	12.1	cluster	full	L	pending	Dynamic reconfiguration
-12.1-iv2-follower-https-port-refused	12.1 IV2	12.1	cluster	full	L	pending	-
-12.1-ac3-rollback-cold-1.10.7	12.1 AC #3	12.1	streams-single	full	L	pending	-
+12.1-iv1-targeted-stream-binds-on-one-node	12.1 IV1	12.1	cluster	full	L	live	Dynamic reconfiguration
+12.1-iv2-follower-https-port-refused	12.1 IV2	12.1	cluster	full	L	live	-
+12.1-ac3-rollback-cold-1.10.7	12.1 AC #3	12.1	streams-single	full	L	live	-
+# 12.1-ac3-rollback-hot-1.10.7 is pending on a product defect (Story 12.12
+# Lot L, 2026-11-21): 1.11.0 hands a stream's listener to a 1.10.x binary
+# in the legacy single message, and 1.10.x adopts it as an HTTP proxy
+# listener. Live once the handoff fix lands and the scenario passes.
 12.1-ac3-rollback-hot-1.10.7	12.1 AC #3	12.1	hot-upgrade	full	L	pending	-
 12.2-iv1-bind-and-release-within-5s	12.2 IV1	12.2	streams,streams-single	full	B	live	TCP proxying;Dynamic reconfiguration
 12.2-iv2-port-in-use-fails-cleanly	12.2 IV2	12.2	streams,streams-single	full	B	live	-

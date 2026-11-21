@@ -872,6 +872,221 @@ esac
 for name in $K_ALL; do
     k_line "$name"
 done
+
+# =========================================================================
+# Story 12.1 AC #3, the hot rollback to 1.10.7 (Story 12.12 D-h and
+# Resolved 7, Lot L). Last in this smoke: it leaves the node on 1.10.7.
+# With exactly one TCP stream bound, the released 1.10.7 binary
+# (published on the shared volume by `hot-upgrade-baseline`) is signed
+# with the smoke's key and uploaded as an upgrade, the rollback
+# docs/hot-upgrade.md describes, under sustained HTTP traffic.
+#
+# The outcomes Resolved 7 accepts pass, and the line says which: the
+# handoff completes (a new pid serves the management API without the
+# stream API, so 1.10.7; no request failed; the route still answers) and
+# the stream's port is not taken over by anything but the stream, or
+# 1.10.7 is refused (`exec_failed`) and the old generation keeps serving
+# the route and the stream. A crash, a failed request, or the stream's
+# listener lost to another use fails: the port answering HTTP after the
+# handoff is that last case.
+# Prints exactly one `L4-SCENARIO` line (Story 12.12 D-c).
+# =========================================================================
+log "=== 12.1 AC #3: hot rollback to 1.10.7 with a TCP stream bound ==="
+HR_NAME=12.1-ac3-rollback-hot-1.10.7
+HR_BIN=/shared/lorica-1.10.7
+HR_PORT=7801
+hr_line() {
+    echo "L4-SCENARIO $HR_NAME $1 $2"
+    if [ "$1" = PASS ]; then ok "$HR_NAME: $2"; else fail "$HR_NAME: $2"; fi
+}
+# GET <path> on the management API into $HR_BODY, printing the status
+# and logging in again on a 401: the replacement binary may not honour
+# the session the smoke holds. Callers run it in a command substitution,
+# so the body and the session live in files, not in variables.
+HR_BODY=/tmp/hr_body
+HR_SESSION=/tmp/hr_session
+printf '%s' "$SESSION" > "$HR_SESSION"
+hr_api() {
+    local code
+    code=$(curl -sk -o "$HR_BODY" -w '%{http_code}' -b "$(cat "$HR_SESSION")" "$API$1" 2>/dev/null || echo 000)
+    if [ "$code" = 401 ]; then
+        local hdr
+        hdr=$(mktemp)
+        curl -sk -o /dev/null -D "$hdr" "$API/api/v1/auth/login" -X POST -H "Content-Type: application/json" \
+            -d "$(jq -nc --arg pw "${NEW_PW:-$ADMIN_PW}" '{username: "admin", password: $pw}')" 2>/dev/null || true
+        grep -io 'lorica_session=[^;]*' "$hdr" | head -1 | tr -d '\r\n' > "$HR_SESSION"
+        rm -f "$hdr"
+        code=$(curl -sk -o "$HR_BODY" -w '%{http_code}' -b "$(cat "$HR_SESSION")" "$API$1" 2>/dev/null || echo 000)
+    fi
+    echo "$code"
+}
+# `<pid> <status of GET /api/v1/streams>`: the stream API is 1.11.0's,
+# 1.10.7 answers it 404. (The version in /api/v1/system is MAJOR.MINOR
+# and both binaries read 1.10 until the bump.)
+hr_generation() {
+    local pid streams
+    [ "$(hr_api /api/v1/system)" = 200 ] && pid=$(jq -r '.data.proxy.pid // "-"' "$HR_BODY")
+    rm -f "$HR_BODY"
+    streams=$(hr_api /api/v1/streams)
+    rm -f "$HR_BODY"
+    echo "${pid:--} ${streams}"
+}
+hr_exec_failed() {
+    local v
+    if [ "$(hr_api /metrics)" = 200 ]; then
+        v=$(grep '^lorica_hot_upgrade_total{' "$HR_BODY" | grep 'outcome="exec_failed"' | awk '{print $NF}' | head -1)
+    fi
+    rm -f "$HR_BODY"
+    echo "${v:-0}"
+}
+# One HTTP request on the stream port with Host <host>: the status
+# line's code, `refused`, or what else happened. Through the stream it
+# reaches backend1, which answers any host; an HTTP proxy on the port
+# would route by host instead.
+hr_on_stream_port() {
+    python3 - "$PROXY" "$HR_PORT" "$1" <<'PY'
+import socket, sys
+host = sys.argv[1].split("//", 1)[1].split(":", 1)[0]
+try:
+    s = socket.create_connection((host, int(sys.argv[2])), timeout=3)
+except ConnectionRefusedError:
+    print("refused")
+    sys.exit(0)
+except OSError as e:
+    print(f"unreachable ({e.__class__.__name__})")
+    sys.exit(0)
+s.settimeout(3)
+s.sendall(f"GET /healthz HTTP/1.0\r\nHost: {sys.argv[3]}\r\n\r\n".encode())
+try:
+    head = s.recv(256).decode("latin-1").split("\r\n")[0]
+except OSError as e:
+    head = f"no answer ({e.__class__.__name__})"
+print(head.split(" ")[1] if head.startswith("HTTP/") else head or "closed")
+PY
+}
+hr() {
+    local i ids backend_ip backend stream through preview sig code exec_before before after v consec=0 \
+        outcome="" total failed after_route after_api after_unrouted after_routed exec_after
+    for i in $(seq 1 60); do
+        [ -s "$HR_BIN" ] && break
+        sleep 1
+    done
+    [ -s "$HR_BIN" ] || { hr_line FAIL "the 1.10.7 binary was not published at ${HR_BIN}"; return; }
+
+    # Exactly one stream on the node: an earlier section's streams would
+    # change what the handoff table carries.
+    [ "$(hr_api /api/v1/streams)" = 200 ] && ids=$(jq -r '(.data.streams // [])[].id' "$HR_BODY")
+    rm -f "$HR_BODY"
+    for i in $ids; do api_del "/api/v1/streams/$i" >/dev/null; done
+    backend_ip=$(python3 -c 'import socket, sys; print(socket.gethostbyname(sys.argv[1]))' "${BACKEND1%%:*}")
+    backend=$(api_post /api/v1/backends "{\"address\":\"${backend_ip}:${BACKEND1##*:}\",\"health_check_enabled\":false}" | jq -r '.data.id // empty')
+    [ -n "$backend" ] || { hr_line FAIL "backend create refused"; return; }
+    stream=$(api_post /api/v1/streams "{\"name\":\"hr-stream\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":${HR_PORT},\"backend_ids\":[\"${backend}\"]}" | jq -r '.data.id // empty')
+    [ -n "$stream" ] || { hr_line FAIL "stream create refused"; return; }
+    for i in $(seq 1 30); do
+        through=$(hr_on_stream_port backend1)
+        [ "$through" = 200 ] && break
+        sleep 1
+    done
+    [ "$through" = 200 ] || { hr_line FAIL "the stream did not reach backend1 under 1.11.0: ${through}"; return; }
+    # A deleted UDP stream keeps its sockets while its sessions drain:
+    # wait until the preview lists this stream alone.
+    for i in $(seq 1 45); do
+        preview=""
+        [ "$(hr_api /api/v1/system/upgrade/preview)" = 200 ] \
+            && preview=$(jq -r '[(.data.streams // [])[].stream_id] | join(",")' "$HR_BODY")
+        rm -f "$HR_BODY"
+        [ "$preview" = "$stream" ] && break
+        sleep 1
+    done
+    [ "$preview" = "$stream" ] || { hr_line FAIL "the node binds other streams than ${stream}: ${preview}"; return; }
+
+    sig=$(openssl pkeyutl -sign -inkey "$PRIV_GOOD" -rawin -in "$HR_BIN" 2>/dev/null | od -An -v -tx1 | tr -d ' \n')
+    [ "${#sig}" = 128 ] || { hr_line FAIL "could not sign the 1.10.7 binary"; return; }
+    exec_before=$(hr_exec_failed)
+    before=$(hr_generation)
+    [ "${before#* }" = 200 ] || { hr_line FAIL "the node does not serve the stream API before the rollback: ${before}"; return; }
+
+    local traffic=/tmp/hr_traffic.log flag=/tmp/hr_run_traffic bg
+    : > "$traffic"
+    : > "$flag"
+    (
+        while [ -f "$flag" ]; do
+            proxy_code >> "$traffic"
+            echo >> "$traffic"
+        done
+    ) &
+    bg=$!
+    sleep 2
+    code=$(curl -s -o /tmp/hr_resp.json -w '%{http_code}' -b "$SESSION" \
+        -F "binary=@${HR_BIN};type=application/octet-stream" -F "signature=${sig}" \
+        "$API/api/v1/system/upgrade" 2>/dev/null || echo 000)
+    if [ "$code" != 200 ]; then
+        rm -f "$flag"; wait "$bg" 2>/dev/null || true
+        hr_line FAIL "the signed 1.10.7 upload answered ${code}: $(tr '\n' ' ' < /tmp/hr_resp.json | head -c 200)"
+        return
+    fi
+    # Settle on one outcome: the old supervisor counting exec_failed, or
+    # five reads in a row from one new pid that answers the stream API
+    # 404 (both generations answer the API during the overlap, as IV3
+    # above says).
+    for i in $(seq 1 90); do
+        exec_after=$(hr_exec_failed)
+        if [ "$exec_after" -gt "$exec_before" ] 2>/dev/null; then
+            outcome=refused
+            break
+        fi
+        v=$(hr_generation)
+        if [ "${v#* }" = 404 ] && [ "${v%% *}" != "${before%% *}" ] && [ "${v%% *}" != - ]; then
+            if [ "$v" = "${after:-}" ]; then consec=$((consec + 1)); else after="$v"; consec=1; fi
+            if [ "$consec" -ge 5 ]; then outcome=completed; break; fi
+        else
+            consec=0
+        fi
+        sleep 1
+    done
+    # Past the old generation's drain (worker_drain_timeout_s, 30 s), so
+    # what serves now is what stays.
+    [ "$outcome" = completed ] && sleep 35
+    rm -f "$flag"
+    wait "$bg" 2>/dev/null || true
+    total=$(wc -l < "$traffic" | tr -d ' ')
+    failed=$(grep -cvE '^2[0-9][0-9]$' "$traffic" || true)
+    after_route=$(proxy_code)
+    after_api=$(hr_generation)
+    after_unrouted=$(hr_on_stream_port backend1)
+    after_routed=$(hr_on_stream_port "$PROXY_HOST")
+
+    case "$outcome" in
+        completed)
+            if [ "$failed" != 0 ] || [ "${after_route:0:1}" != 2 ] || [ "${after_api#* }" != 404 ]; then
+                hr_line FAIL "handoff to 1.10.7 completed (pid and stream API ${before} -> ${after}) but ${failed} of ${total} requests failed, route now ${after_route}, API now ${after_api}"
+            else
+                case "$after_unrouted $after_routed" in
+                    [0-9][0-9][0-9]\ [0-9][0-9][0-9])
+                        hr_line FAIL "handoff to 1.10.7 completed (pid and stream API ${before} -> ${after}), ${total} requests across it, 0 failed; but 1.10.7 serves HTTP on the stream's port ${HR_PORT}: the stream listener was handed over and adopted as an HTTP proxy listener (Host ${PROXY_HOST}: ${after_routed}, Host backend1: ${after_unrouted}; through the stream backend1 answered 200 for any host)"
+                        ;;
+                    *)
+                        hr_line PASS "handoff to 1.10.7 completed (pid and stream API ${before} -> ${after}), ${total} requests across it, 0 failed; route ${after_route}; the stream's port ${HR_PORT}: ${after_unrouted}"
+                        ;;
+                esac
+            fi
+            ;;
+        refused)
+            if [ "$failed" != 0 ] || [ "${after_route:0:1}" != 2 ] || [ "$after_api" != "$before" ] || [ "$after_unrouted" != 200 ]; then
+                hr_line FAIL "1.10.7 refused (exec_failed ${exec_before} -> ${exec_after}) but ${failed} of ${total} requests failed, route ${after_route}, pid and stream API ${after_api} (were ${before}), stream ${after_unrouted}"
+            else
+                hr_line PASS "1.10.7 refused the handoff (exec_failed ${exec_before} -> ${exec_after}): the old generation (${before}) kept serving, ${total} requests 0 failed, route ${after_route}, backend1 through the stream ${after_unrouted}"
+            fi
+            ;;
+        *)
+            hr_line FAIL "no outcome within 90 s: pid and stream API ${after_api} (were ${before}), exec_failed ${exec_before} -> ${exec_after}, ${failed} of ${total} requests failed, route ${after_route}, stream port ${after_unrouted}"
+            ;;
+    esac
+}
+# Without errexit: every path of hr ends on its one line.
+set +e
+hr
 set -e
 
 print_results

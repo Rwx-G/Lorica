@@ -825,7 +825,7 @@ hot rollback, appended after Lot K's section),
 Depends on: K (same smoke file); 12.1 in Review; 12.2 Lot G; 12.7 (the
 send/expect backend of D-h).
 
-- [ ] `12.1-iv1-*`, `12.1-iv2-*` in the `cluster` section.
+- [x] `12.1-iv1-*`, `12.1-iv2-*` in the `cluster` section.
 - [ ] Both rollback scenarios per D-h; `docs/hot-upgrade.md` states
       what a rollback to 1.10.7 does with streams present, as observed.
 
@@ -1745,6 +1745,64 @@ pulled images.
   `cluster` phase passed after them (smoke 69 of 69, restart, automation,
   MCP and revocation runners).
 
+- **Lot L, 2026-11-21, lane 1.** Story 12.1's IVs and both rollbacks to
+  1.10.7 (D-h), on `8b19f19f` plus this Lot.
+  - **Verdicts.** `12.1-iv1-targeted-stream-binds-on-one-node` PASS (a
+    TCP stream with selector `["edge-a"]`: listed by edge-a's own API
+    and held by the control plane's, absent from edge-b's once edge-b
+    had applied edge-a's generation, 11; backend1 answered 200 through
+    edge-a:7602; edge-b:7602 and the control plane's 7602 refused).
+    `12.1-iv2-follower-https-port-refused` PASS (409: "port 8443 is
+    reserved on node `edge-a`: a proxy listener port (https listener)",
+    the port read from edge-a's own `GET /api/v1/system`).
+    `12.1-ac3-rollback-cold-1.10.7` PASS, in the lane run and alone:
+    schema_migrations 80 rows, max 80, unchanged by `lorica 1.10.7`,
+    which served the route (200), bound nothing on the stream's port
+    (refused) and listed both backends; the path set to `/x` through
+    its API; back on 1.11.0 the first backend reads `http /x` with
+    `health_check_path` `/x`, the send/expect check and the stream with
+    its link are unchanged, and the stream binds and echoes again.
+    `12.1-ac3-rollback-hot-1.10.7` **FAIL, product defect**, row
+    `pending` with a comment naming it.
+  - **Product defect: a hot downgrade to 1.10.x turns a stream's port
+    into an HTTP listener.** With one TCP stream bound, the signed
+    1.10.7 upload completes the handoff (new pid, the stream API now
+    404, 14,278 requests across it with none failed), and 1.10.7 then
+    serves the stream's port as an HTTP proxy listener: through the
+    port, `Host: hot-upgrade.local` answers 200 by the route and `Host:
+    backend1` 404, where the stream had forwarded any host to backend1.
+    1.10.7's log: "adopted inherited listener from outgoing supervisor"
+    for `stream-tcp:<id>:1:0.0.0.0:7801`, then each worker "registered
+    TCP listener" on that key. Cause: `send_table`
+    (`lorica/src/startup/fd_transfer.rs`) sends a table that fits the
+    legacy single message in it, stream entries included, and the
+    1.10.x receiver's `partition_inherited_fds` files every key it does
+    not know with the proxy listeners. Expected, per Resolved 7: 1.10.7
+    refuses the handoff (the old generation keeps serving) or completes
+    it without serving the stream's port as anything else. Unreleased
+    (streams are 1.11.0's); the scenario stays and turns PASS on either
+    outcome once fixed. `docs/hot-upgrade.md` states what was observed.
+  - **Deviations.** (1) The registry row's order runs the cold rollback
+    first in `streams-single`; it stops and restarts the node, and the
+    12.2 rows after it pass on the restarted node (`L4_LOTS=A,B,L`, a
+    third PASS of the cold rollback, report PASSED). (2) The baseline
+    image `lorica-e2e/baseline:1.10.7` is one name for both compose
+    files and every lane (it holds the signed release, not the tree);
+    `l4/build-images.sh` builds it, in the `streams-single-baseline`
+    profile of its own so `streams-single` never starts it, and the
+    scenario's `up` builds it when missing (a release run's `--build`
+    does not name that profile). (3) In the `hot-upgrade` profile,
+    `hot-upgrade-baseline` copies the binary to the shared volume and
+    the smoke `depends_on` it: one line outside "the baseline image
+    service only", without which `run.sh`'s `up` of the node never
+    starts it. (4) The hot rollback deletes any stream an earlier
+    section left and waits until the upgrade preview lists its own
+    alone, so Lot K's sections (not in this lane) cannot change the
+    table it hands over. (5) `/api/v1/system`'s version is `MAJOR.MINOR`
+    and reads 1.10 on both binaries until the bump, so the new
+    generation is told by its stream API answering 404. (6) Story 12.1
+    has no e2e checklist of its own to tick ("Handed to Story 12.12").
+
 ## File List
 
 Lot A:
@@ -1889,6 +1947,21 @@ Lot E:
 - `tests-e2e-docker/l4/build-images.sh` (builds `dns-loadgen`)
 - `docs/stories/story-12.5-udp-engine.md` (Lot I checkboxes)
 
+Lot L:
+
+- `tests-e2e-docker/l4/scenarios/12.1.sh` (new)
+- `tests-e2e-docker/l4/scenarios.tsv` (Lot L rows: three `live`, the
+  hot rollback `pending` on its defect)
+- `tests-e2e-docker/test-runner/run-cluster-smoke.sh` (12.1 IV1 and IV2
+  section appended)
+- `tests-e2e-docker/test-runner/run-hot-upgrade-smoke.sh` (the hot
+  rollback appended)
+- `tests-e2e-docker/docker-compose.yml` (`hot-upgrade-baseline`, and the
+  smoke's `depends_on` on it)
+- `tests-e2e-docker/docker-compose.l4.yml` (`lorica-baseline-single`)
+- `tests-e2e-docker/l4/build-images.sh` (builds the baseline)
+- `docs/hot-upgrade.md` (the rollback statement)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1910,3 +1983,4 @@ Lot E:
 | 2026-11-20 | 0.7 | Lot D implemented: Story 12.4 IV1 with the ALPN name, IV2 across a forced ACME renewal (full, not partial), the two-CA proof, upstream mTLS and key replication in the `cluster` profile, all passing; the key-replication defect it found is fixed in `44d6248b`. | Romain G. |
 | 2026-11-20 | 0.8 | Lot E implemented: Story 12.5 IV1 (spoofed flood, the reflection bound at the victim), the byte bound, table isolation, IV2 on two CoreDNS servers with dnsperf, reply source, worker death, the AC #6 budget and the UDP idle-timeout row, all passing. No product defect; `response_count_bound` stays 0 under IV1 by D-b's end rule, recorded. | Romain G. |
 | 2026-11-21 | 0.9 | Lots D and E re-run in lane 1, all passing; the IV2 zone renamed `iv2.test.zone` (the `.db` name was git-ignored and never committed); the IV1 client check moved first, with counters printed on a failure. | Romain G. |
+| 2026-11-21 | 0.10 | Lot L implemented: 12.1 IV1 and IV2 in the `cluster` smoke and the cold rollback to 1.10.7 passing; the hot rollback finds a product defect (a 1.10.x binary adopts a stream's listener as an HTTP listener) and its row stays `pending`; `docs/hot-upgrade.md` states the observed rollback. | Romain G. |

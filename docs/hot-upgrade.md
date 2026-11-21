@@ -287,10 +287,15 @@ the stream entries of the transfer table. A table too large for the
 legacy single message makes the 1.10.x receiver fail, so the new
 process never signals ready and the downgrade rolls back
 (`exec_failed`), which is the safe failure. A smaller table does reach
-it, but 1.10.x has no stream plane to serve the stream sockets it
-receives (read from the 1.10.x code, not run). Disable the streams
-first, which closes their sockets, or downgrade by package with a
-restart.
+it, and the handoff completes, but 1.10.x has no stream plane: it files
+every listener whose key it does not know with its HTTP listeners. As
+observed with 1.10.7 and one TCP stream (the e2e scenario
+`12.1-ac3-rollback-hot-1.10.7`, 2026-11-21), the HTTP routes kept
+serving with no failed request, and the stream's port was then served
+by 1.10.7's HTTP proxy, routing by `Host` header, instead of forwarding
+to the stream's backends. This is a defect of the 1.11.0 handoff,
+tracked for this release. Until it is fixed, disable the streams first,
+which closes their sockets, or downgrade by package with a restart.
 
 After a rollback from 1.9.0 to an older binary, or a package downgrade,
 `<data-dir>/management/served-cert.pem` stays behind, and the older
