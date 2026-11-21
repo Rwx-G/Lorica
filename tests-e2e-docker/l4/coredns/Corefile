@@ -20,6 +20,6 @@ l4.test:53 {
 # and by `coredns-2`, the two resolvers behind the DNS stream. No `log`:
 # a line per query at the scenario's rate would only cost CPU.
 iv2.test:53 {
-    file /etc/coredns/iv2.test.db
+    file /etc/coredns/iv2.test.zone
     errors
 }

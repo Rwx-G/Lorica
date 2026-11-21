@@ -1,0 +1,12 @@
+; The 12.5 IV2 zone (Story 12.12 Lot E), served by both CoreDNS
+; instances of the L4 phase. Static: the scenario only needs answers.
+$ORIGIN iv2.test.
+$TTL 60
+@       IN SOA  ns.iv2.test. admin.iv2.test. 1 3600 600 86400 60
+@       IN NS   ns
+ns      IN A    192.0.2.53
+a       IN A    192.0.2.1
+b       IN A    192.0.2.2
+c       IN A    192.0.2.3
+d       IN A    192.0.2.4
+txt     IN TXT  "lorica l4 phase"

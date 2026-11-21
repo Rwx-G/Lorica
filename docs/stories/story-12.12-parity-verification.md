@@ -1075,6 +1075,20 @@ pulled images.
   `c01536bb`: one literal carriage return in `l4/scenarios/12.6.sh`
   (inside a `tr -d` argument) replaced by `\r`, the rest kept as
   written, then both Lots run from scratch.
+- 2026-11-21, lane 1 resumed after a machine shutdown, on `8b19f19f`
+  (Lots D and E committed by the earlier lane 1 agent, unverified; Lot L
+  not started). Every Lot D and Lot E row re-run before being counted.
+  Commit `8b19f19f` lacked the 12.5 IV2 zone: it was named
+  `iv2.test.db`, which the root `.gitignore` (`*.db`) drops, so the run
+  passed on a file no checkout would have. Renamed `iv2.test.zone`
+  (Corefile and story follow). `12.5-iv1-reflection-bounded` failed
+  once in the first lane run (30,636 datagrams at the victim for 30,635
+  requests counted from its key) and passed in the eight runs after; the
+  per-key count subtracts the legitimate client's requests from the
+  stream's upload total, which is off by one exactly when one of the
+  client's requests never reaches the backend, and the client check ran
+  last. It now runs first, and a failure prints the node's counters,
+  its own count of what it reflected and the tools' records.
 
 ### Completion Notes
 
@@ -1653,7 +1667,7 @@ pulled images.
     `12.5-iv1-reflection-bounded` (600,000 spoofed datagrams at 20,000/s
     for 30 s; the victim received 30,950 datagrams, a mean of 1,857,000
     B/s against the bound 8,192,000, worst second 3,405,600 B against
-    2 B; exactly one 1,800-byte response per request accepted from its
+    2 x 8,192,000; exactly one 1,800-byte response per request accepted from its
     key, 568,938 `source_datagram_rate` drops; the legitimate client got
     300 of 300 answers); `12.5-ac2-byte-bound` (the victim received
     nothing, 0 response bytes forwarded, 30,993 `response_byte_bound`
@@ -1702,13 +1716,34 @@ pulled images.
     16,384, `S` 7,168), the limit at which one default UDP stream fits
     and two do not; Lot B's nodes are too small for one. (5) The second
     resolver is `coredns-2`; both serve `iv2.test` from
-    `l4/coredns/iv2.test.db`, a block added to Lot C's Corefile.
+    `l4/coredns/iv2.test.zone`, a block added to Lot C's Corefile.
     `dns-loadgen` runs the `perf-tools` image, which
     `l4/build-images.sh` now builds for the lanes. (6) Worker death
     asserts the "no leaked count" on a stream holding 200 sessions
     (`responses_per_request` 0, a 300 s idle timeout) beside IV2's load:
     the DNS load alone holds about one session at a time, too few for a
     leak to show.
+
+- **Lots D and E re-verified, 2026-11-21, lane 1** (Debug Log). In the
+  lane (`L4_LANE=1 L4_LOTS=D,E,L ./run.sh --only-l4`, 360 s for the
+  phase with the report, report PASSED) every Lot D and Lot E row PASS:
+  IV1 the 517-byte ClientHello byte for byte on both names and the ALPN
+  pair, one `no_match`; the reflection bound with 30,998 datagrams at
+  the victim for 30,998 requests from its key, a mean of 1,859,880 B/s,
+  worst second 3,506,400 B, client 300 of 300; byte bound 30,993
+  `response_byte_bound` drops and nothing at the victim; table isolation
+  145,008 `session_table_full` and nothing else, B 150 of 150; IV2
+  49,200 of 49,200 within 2 s; worker death 200 to 102 sessions, equal
+  to the sockets alive; the budget refusal; idle close at 2.005 s. IV1
+  alone, seven more runs, all PASS after the one failure the Debug Log
+  explains. In the main project, from the lane 1 worktree under the
+  shared lock (images built from it, the `acme`, `cluster` and
+  `hot-upgrade` phases as `run.sh` runs them, nothing else):
+  `12.4-iv2-acme-renewal-on-terminating-stream` PASS (renewed in place,
+  the new fingerprint served, 124 pings on the held connection, 0
+  failures) and `12.4-x-key-replication-targeted` PASS; the whole
+  `cluster` phase passed after them (smoke 69 of 69, restart, automation,
+  MCP and revocation runners).
 
 ## File List
 
@@ -1846,7 +1881,7 @@ Lot E:
 - `tests-e2e-docker/l4/scenarios/12.5.sh` (new)
 - `tests-e2e-docker/l4/scenarios.tsv` (Lot E rows `live`)
 - `tests-e2e-docker/test-runner/l4/udp_tools.py` (new)
-- `tests-e2e-docker/l4/coredns/iv2.test.db` (new),
+- `tests-e2e-docker/l4/coredns/iv2.test.zone` (new),
   `tests-e2e-docker/l4/coredns/Corefile` (the `iv2.test` block)
 - `tests-e2e-docker/docker-compose.l4.yml` (`udp-amplifier`,
   `udp-spoofer`, `udp-victim`, `coredns-2`, `dns-loadgen`,
@@ -1874,3 +1909,4 @@ Lot E:
 | 2026-11-21 | 0.8 | Lot J implemented: Story 12.10 IV1 (partial as D-d says: the form's body, not a click) and Story 12.7 IV2 in the `mcp` profile, both reporting as expected; the section's mints wait out the login limit. No product defect. | Romain G. |
 | 2026-11-20 | 0.7 | Lot D implemented: Story 12.4 IV1 with the ALPN name, IV2 across a forced ACME renewal (full, not partial), the two-CA proof, upstream mTLS and key replication in the `cluster` profile, all passing; the key-replication defect it found is fixed in `44d6248b`. | Romain G. |
 | 2026-11-20 | 0.8 | Lot E implemented: Story 12.5 IV1 (spoofed flood, the reflection bound at the victim), the byte bound, table isolation, IV2 on two CoreDNS servers with dnsperf, reply source, worker death, the AC #6 budget and the UDP idle-timeout row, all passing. No product defect; `response_count_bound` stays 0 under IV1 by D-b's end rule, recorded. | Romain G. |
+| 2026-11-21 | 0.9 | Lots D and E re-run in lane 1, all passing; the IV2 zone renamed `iv2.test.zone` (the `.db` name was git-ignored and never committed); the IV1 client check moved first, with counters printed on a failure. | Romain G. |

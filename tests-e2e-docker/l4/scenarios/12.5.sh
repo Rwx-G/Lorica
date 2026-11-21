@@ -6,7 +6,7 @@
 #
 # Services: `udp-amplifier`, `udp-spoofer` and `udp-victim` run
 # test-runner/l4/udp_tools.py; `coredns` and `coredns-2` serve the IV2
-# zone (l4/coredns/iv2.test.db); `dns-loadgen` runs dnsperf;
+# zone (l4/coredns/iv2.test.zone); `dns-loadgen` runs dnsperf;
 # `lorica-budget-16k` is the AC #6 node. Every stream listens on the
 # node's own `l4` address (RFC 1918) unless the item says otherwise, so a
 # stream at default settings passes the listen-address rule (D-k).
@@ -142,7 +142,7 @@ l4e_flood() {
 # datagram rate dropped the excess; the legitimate client got every
 # answer.
 scenario_12_5_iv1_reflection_bounded() {
-    local amp id c vbytes vgrams vmax mean upload cbytes accepted_bytes accepted_reqs rate_drops count_drops
+    local amp id c vbytes vgrams vmax mean upload cbytes accepted_bytes accepted_reqs rate_drops count_drops forwarded to_victim
     trap 'l4s_cleanup_streams l4e-iv1-' EXIT
     l4s_cleanup_streams l4e-iv1-
     amp=$(l4c_backend "$(l4c_ip udp-amplifier):9200" nocheck) || fail "backend: ${amp}"
@@ -163,17 +163,25 @@ scenario_12_5_iv1_reflection_bounded() {
     accepted_reqs=$(( accepted_bytes / L4E_REQUEST_BYTES ))
     rate_drops=$(l4e_count "$c" datagrams_dropped source_datagram_rate)
     count_drops=$(l4e_count "$c" datagrams_dropped response_count_bound)
+    # The node's own count of what it reflected: every response forwarded
+    # is one 1,800-byte datagram, the legitimate client's answers included.
+    forwarded=$(( $(printf '%s' "$c" | l4e_jq -r '.bytes_download_total // 0') / 1800 ))
+    to_victim=$(( forwarded - $(printf '%s' "$L4E_CLIENT" | l4e_jq -r '.answered // 0') ))
+    local diag="node forwarded ${to_victim} responses to the victim's key; counters ${c}; client ${L4E_CLIENT}; victim ${L4E_VICTIM}"
 
+    # The client first: the per-key figures below take its requests out
+    # of the stream's upload total, which is exact only when every one of
+    # them reached the backend.
+    [ "$(printf '%s' "$L4E_CLIENT" | l4e_jq -r '.answered == .sent and .sent > 0')" = true ] \
+        || fail "the legitimate client was not answered every time; ${diag}"
     [ "$vgrams" -gt 0 ] || fail "nothing reached the victim: the flood was not reflected at all, the check proves nothing (spoofer ${L4E_SPOOF}, counters ${c})"
     [ "$mean" -le "$L4E_BOUND" ] || fail "the victim received ${mean} bytes/s over ${L4E_FLOOD_SECONDS} s, above the bound ${L4E_BOUND}"
     [ "$vmax" -le $(( 2 * L4E_BOUND )) ] || fail "one second at the victim carried ${vmax} bytes, above 2 x ${L4E_BOUND}"
     [ "$vbytes" -le $(( 32 * accepted_bytes )) ] \
         || fail "the victim received ${vbytes} bytes for ${accepted_bytes} request bytes accepted from its key (ratio 32)"
     [ "$vgrams" -le "$accepted_reqs" ] \
-        || fail "the victim received ${vgrams} datagrams for ${accepted_reqs} requests accepted from its key"
+        || fail "the victim received ${vgrams} datagrams for ${accepted_reqs} requests accepted from its key; ${diag}"
     [ "$rate_drops" -gt 0 ] || fail "no source_datagram_rate drop under a 20,000/s flood from one key: $(l4e_reasons "$c" datagrams_dropped)"
-    [ "$(printf '%s' "$L4E_CLIENT" | l4e_jq -r '.answered == .sent and .sent > 0')" = true ] \
-        || fail "the legitimate client was not answered every time: ${L4E_CLIENT}"
     pass "spoofer $(printf '%s' "$L4E_SPOOF" | l4e_jq -r '"\(.sent) datagrams at \(.rate)/s"'); victim ${vgrams} datagrams, ${vbytes} bytes: mean ${mean} B/s (bound ${L4E_BOUND}), worst second ${vmax} B; ${accepted_reqs} requests (${accepted_bytes} B) accepted from its key, so <= 1 response each and <= 32x the bytes; drops $(l4e_reasons "$c" datagrams_dropped) (response_count_bound ${count_drops}: a session ends on its owed response, the other 9 never reach one); legitimate client $(printf '%s' "$L4E_CLIENT" | l4e_jq -r '"\(.answered)/\(.sent)"') answered"
 }
 
