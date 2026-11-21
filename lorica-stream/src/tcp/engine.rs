@@ -264,8 +264,9 @@ struct Route<'a> {
     rule: Option<&'a str>,
     /// The destination the PROXY header sent to the backend names.
     destination: SocketAddr,
-    /// Client bytes read before forwarding, replayed first.
-    preamble: &'a [u8],
+    /// Client bytes read before forwarding, replayed first; their
+    /// buffer becomes the forwarder's upload buffer.
+    preamble: Vec<u8>,
     /// Whether the forwarding loop checks the client's first bytes for a
     /// PROXY signature.
     classify: bool,
@@ -609,7 +610,7 @@ impl Inner {
                 let route = Route {
                     rule: Some(rule),
                     destination,
-                    preamble: &[],
+                    preamble: Vec::new(),
                     classify: false,
                     client_sni: client_sni.as_deref(),
                     upstream,
@@ -625,7 +626,7 @@ impl Inner {
                 let route = Route {
                     rule: rule.as_deref(),
                     destination,
-                    preamble: &replayed,
+                    preamble: replayed,
                     classify: classify && hello_deadline.is_none(),
                     client_sni: client_sni.as_deref(),
                     upstream,

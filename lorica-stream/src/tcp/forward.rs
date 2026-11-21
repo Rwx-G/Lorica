@@ -131,7 +131,8 @@ enum Step {
 
 /// One direction of a connection.
 pub struct Direction {
-    buf: Box<[u8]>,
+    /// Its length is the buffer's, fixed for the connection's life.
+    buf: Vec<u8>,
     state: DirectionState,
     bucket: Option<TokenBucket>,
     /// A throttled direction's timer, allocated at its first wait for
@@ -159,9 +160,9 @@ impl std::fmt::Debug for Direction {
 }
 
 impl Direction {
-    fn new(reads_from: Side, rate: Option<u64>, size: usize) -> Self {
+    fn new(reads_from: Side, rate: Option<u64>, buf: Vec<u8>) -> Self {
         Direction {
-            buf: vec![0u8; size].into_boxed_slice(),
+            buf,
             state: DirectionState::Reading,
             bucket: rate.map(TokenBucket::new),
             throttle: None,
@@ -459,30 +460,31 @@ impl Forwarder {
     /// length when that is larger: a passthrough ClientHello with what
     /// followed it fills up to the 17 KiB of the ClientHello buffer
     /// (Story 12.4 D-b), and is replayed as one chunk, never split
-    /// across a queue.
+    /// across a queue. The preamble's own allocation becomes that
+    /// buffer, so a connection never holds the ClientHello buffer beside
+    /// its two forwarding buffers.
     pub fn new(
         stream: &Stream,
         accepted_at: Instant,
-        preamble: &[u8],
+        preamble: Vec<u8>,
         classify: bool,
         stats: Arc<StreamStats>,
     ) -> Self {
-        let mut upload = Direction::new(
-            Side::Client,
-            stream.upload_rate_bps,
-            FORWARD_BUFFER_SIZE.max(preamble.len()),
-        );
+        let filled = preamble.len();
+        let mut buf = preamble;
+        buf.resize(FORWARD_BUFFER_SIZE.max(filled), 0);
+        let mut upload = Direction::new(Side::Client, stream.upload_rate_bps, buf);
         upload.classify = classify;
-        if !preamble.is_empty() {
-            upload.buf[..preamble.len()].copy_from_slice(preamble);
-            upload.state = DirectionState::Writing {
-                filled: preamble.len(),
-                written: 0,
-            };
+        if filled > 0 {
+            upload.state = DirectionState::Writing { filled, written: 0 };
         }
         Forwarder {
             upload,
-            download: Direction::new(Side::Backend, stream.download_rate_bps, FORWARD_BUFFER_SIZE),
+            download: Direction::new(
+                Side::Backend,
+                stream.download_rate_bps,
+                vec![0u8; FORWARD_BUFFER_SIZE],
+            ),
             first: Side::Client,
             idle: Duration::from_secs(u64::from(stream.idle_timeout_s)),
             total_deadline: stream
@@ -647,7 +649,7 @@ mod tests {
         let tracker = ConnectionTracker::new();
         let mut tracked = tracker.register(1, Arc::clone(&snapshot));
         let stats = Arc::new(StreamStats::default());
-        let mut forwarder = Forwarder::new(&snapshot, Instant::now(), &[], false, stats);
+        let mut forwarder = Forwarder::new(&snapshot, Instant::now(), Vec::new(), false, stats);
 
         let writer = tokio::spawn(async move {
             let chunk = vec![7u8; 1024 * 1024];
@@ -720,7 +722,7 @@ mod tests {
         let forwarder = Forwarder::new(
             &snapshot,
             Instant::now(),
-            b"hello",
+            b"hello".to_vec(),
             false,
             Arc::new(StreamStats::default()),
         );
@@ -742,13 +744,33 @@ mod tests {
         let forwarder = Forwarder::new(
             &stream(),
             Instant::now(),
-            &preamble,
+            preamble.clone(),
             false,
             Arc::new(StreamStats::default()),
         );
         assert_eq!(forwarder.upload().buffer_len(), preamble.len());
         assert_eq!(forwarder.upload().state().held_bytes(), preamble.len());
         assert_eq!(forwarder.download().buffer_len(), FORWARD_BUFFER_SIZE);
+    }
+
+    /// A passthrough ClientHello, read into a buffer larger than one
+    /// forwarding buffer, is forwarded from that same allocation: the
+    /// connection does not keep it beside a copy.
+    #[tokio::test]
+    async fn a_preamble_buffer_becomes_the_upload_buffer() {
+        let mut hello = vec![0u8; crate::tls::client_hello::CLIENTHELLO_BUFFER];
+        hello.truncate(512);
+        let allocation = hello.as_ptr();
+        let forwarder = Forwarder::new(
+            &stream(),
+            Instant::now(),
+            hello,
+            false,
+            Arc::new(StreamStats::default()),
+        );
+        assert_eq!(forwarder.upload.buf.as_ptr(), allocation);
+        assert_eq!(forwarder.upload().buffer_len(), FORWARD_BUFFER_SIZE);
+        assert_eq!(forwarder.upload().state().held_bytes(), 512);
     }
 
     /// The loop over streams that are not sockets, both half-closes
@@ -764,7 +786,7 @@ mod tests {
         let mut forwarder = Forwarder::new(
             &snapshot,
             Instant::now(),
-            b"pre-",
+            b"pre-".to_vec(),
             false,
             Arc::clone(&stats),
         );
@@ -818,7 +840,7 @@ mod tests {
         let mut forwarder = Forwarder::new(
             &snapshot,
             started,
-            &[],
+            Vec::new(),
             false,
             Arc::new(StreamStats::default()),
         );
@@ -845,7 +867,7 @@ mod tests {
         let mut forwarder = Forwarder::new(
             &snapshot,
             started,
-            &[],
+            Vec::new(),
             false,
             Arc::new(StreamStats::default()),
         );
@@ -920,7 +942,7 @@ mod tests {
         let mut forwarder = Forwarder::new(
             &snapshot,
             Instant::now(),
-            &[],
+            Vec::new(),
             false,
             Arc::new(StreamStats::default()),
         );
@@ -964,7 +986,7 @@ mod tests {
         let mut forwarder = Forwarder::new(
             &snapshot,
             accepted_at,
-            &[],
+            Vec::new(),
             false,
             Arc::new(StreamStats::default()),
         );
@@ -997,7 +1019,7 @@ mod tests {
         let mut forwarder = Forwarder::new(
             &snapshot,
             started,
-            &[],
+            Vec::new(),
             false,
             Arc::new(StreamStats::default()),
         );
