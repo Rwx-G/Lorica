@@ -39,7 +39,8 @@
 //! is [`udp`]; what a TLS stream reads before forwarding (Story 12.4) is
 //! [`tls`]. What they share sits beside them: the [`seams`] the binary
 //! implements (selection, breaker, resolution, the node's source
-//! controls), the connect-time [`local`] check, the host-name
+//! controls), the backend selection both engines run around them
+//! (`selection`), the connect-time [`local`] check, the host-name
 //! [`resolver`] cache and the [`counters`]. Every stream's per-node caps
 //! and open rates live on the stream-caps regions of [`caps`] (Story
 //! 12.5 D-d, Story 12.6 D-e): created by the supervisor, mapped by every
@@ -61,6 +62,7 @@ pub mod refusal_log;
 pub mod resolver;
 pub mod runtime;
 pub mod seams;
+mod selection;
 pub mod state;
 pub mod table;
 pub mod tcp;

@@ -1447,6 +1447,50 @@ async fn a_breaker_deny_reselects_without_opening_a_socket() {
     h.stop();
 }
 
+/// The UDP twin of TCP's local-destination test (IV4, Story 12.5 E9):
+/// a loopback backend on a stream without `allow_local_backend` is
+/// refused at each session and excluded once per transition, and the
+/// exclusion is the stream's: the same backend on a stream with the flag
+/// serves.
+#[tokio::test]
+async fn a_local_destination_is_refused_per_session_and_excluded_once_per_stream() {
+    let b1 = UdpBackend::echo().await;
+    let mut flagless = udp_stream("flagless", "127.0.0.1");
+    flagless.allow_local_backend = false;
+    let mut h = Harness::start(
+        vec![
+            (flagless, vec![backend("b1", b1.addr)]),
+            (
+                udp_stream("flagged", "127.0.0.1"),
+                vec![backend("b1", b1.addr)],
+            ),
+        ],
+        Pick::First,
+        Breaker::default(),
+    )
+    .await;
+    let c = client().await;
+    for _ in 0..2 {
+        c.send_to(b"q", h.listens[0]).await.unwrap();
+        let record = h.record().await;
+        assert_eq!(record.end_reason, StreamEndReason::NoHealthyBackend);
+        assert_eq!(record.backend_id, None);
+    }
+    assert_eq!(h.stats("flagless").local_destination_refused, 2);
+    let backends = h.handle.counters().backends;
+    assert_eq!(
+        backends["b1"].dns_local_excluded, 1,
+        "reported once per transition, not per session"
+    );
+    assert!(b1.received().is_empty());
+
+    c.send_to(b"flagged", h.listens[1]).await.unwrap();
+    assert_eq!(reply(&c).await, b"flagged");
+    assert_eq!(h.record().await.backend_id.as_deref(), Some("b1"));
+    assert_eq!(h.stats("flagged").local_destination_refused, 0);
+    h.stop();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_receive_loop_never_waits_on_a_session() {
     // Stream `hung`: the breaker never answers for its backend, so its

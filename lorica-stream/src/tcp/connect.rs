@@ -52,8 +52,7 @@ use std::time::Duration;
 
 use lorica_config::listen_ports::ReservedPorts;
 use lorica_config::models::{
-    backend_address_host, backend_address_port, Backend, HealthStatus, LifecycleState, Stream,
-    StreamEndReason, StreamRefusal, StreamUpstreamTls,
+    backend_address_host, Backend, Stream, StreamEndReason, StreamRefusal, StreamUpstreamTls,
 };
 use lorica_shmem::{BackendSlot, WorkerCaps};
 use lorica_tls::{ClientConfig, ClientTlsStream};
@@ -65,10 +64,12 @@ use tracing::{debug, warn};
 
 use crate::admission::{backend_at_cap, claim_backend};
 use crate::counters::{ConnectFailureKind, StreamCounters, StreamStats, UpstreamTlsFailure};
-use crate::local::{BoundPorts, LocalRefusal, NodeLocality};
+use crate::local::BoundPorts;
 use crate::resolver::{LocalExclusions, ResolverCache};
-use crate::seams::{Admission, BackendSelector, BreakerGate, Candidate, SelectionRequest};
-use crate::table::{LinkedBackend, StreamTable};
+use crate::seams::{Admission, BackendSelector, BreakerGate};
+pub(crate) use crate::selection::Rotation;
+use crate::selection::{choose, is_candidate, primaries_or_backups, Eligible, LocalCheck};
+use crate::table::StreamTable;
 use crate::tls::upstream;
 
 /// Interval between TCP keepalive probes on a backend socket, the
@@ -88,39 +89,6 @@ pub(crate) struct Shared {
     pub(crate) reserved: Option<ReservedPorts>,
     pub(crate) exclusions: LocalExclusions,
     pub(crate) rotation: Rotation,
-}
-
-/// Rotating counters: per stream for source addresses, one for the
-/// address choice within a backend.
-#[derive(Debug, Default)]
-pub(crate) struct Rotation {
-    sources: std::sync::Mutex<std::collections::HashMap<String, usize>>,
-    addresses: std::sync::atomic::AtomicUsize,
-}
-
-impl Rotation {
-    fn next_source(&self, stream_id: &str) -> usize {
-        let mut sources = self
-            .sources
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let n = sources.entry(stream_id.to_string()).or_default();
-        let current = *n;
-        *n = n.wrapping_add(1);
-        current
-    }
-
-    fn next_address(&self) -> usize {
-        self.addresses
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub(crate) fn retain(&self, table: &StreamTable) {
-        self.sources
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|id, _| table.stream(id).is_some());
-    }
 }
 
 /// One connection's view of its connect phase.
@@ -227,12 +195,6 @@ pub(crate) struct Connected {
     pub(crate) backend_slot: Option<BackendSlot>,
 }
 
-struct Eligible<'a> {
-    link: &'a LinkedBackend,
-    addresses: Arc<[IpAddr]>,
-    port: u16,
-}
-
 enum AttemptError {
     /// Nothing about the backend: no socket, or the source bind failed.
     Local(io::Error, bool),
@@ -259,15 +221,6 @@ fn failure_kind(error: &io::Error) -> ConnectFailureKind {
     }
 }
 
-/// The port a connection to `backend` uses: its own, or the listen port
-/// for a portless backend of a range stream.
-fn backend_port(backend: &Backend, listen_port: u16) -> u16 {
-    backend_address_port(&backend.address)
-        .ok()
-        .flatten()
-        .unwrap_or(listen_port)
-}
-
 impl Shared {
     /// The candidates of the next selection. Sets `capped` when a link
     /// at its `max_active` was left out.
@@ -280,19 +233,14 @@ impl Shared {
     ) -> Vec<Eligible<'a>> {
         let mut eligible = Vec::new();
         for link in request.table.linked_backends(&request.stream.id) {
-            let backend = &link.backend;
-            if link.rule.as_deref() != request.rule
-                || excluded.contains(&backend.id)
-                || backend.health_status == HealthStatus::Down
-                || backend.lifecycle_state != LifecycleState::Normal
-            {
+            if link.rule.as_deref() != request.rule || !is_candidate(link, excluded) {
                 continue;
             }
             if backend_at_cap(request.backend_caps, link) {
                 *capped = true;
                 continue;
             }
-            let host = backend_address_host(&backend.address);
+            let host = backend_address_host(&link.backend.address);
             let addresses = match self.resolver.cached(host) {
                 Some(known) => Some(known),
                 None => {
@@ -301,15 +249,10 @@ impl Shared {
                 }
             };
             if let Some(addresses) = addresses.filter(|a| !a.is_empty()) {
-                eligible.push(Eligible {
-                    link,
-                    addresses,
-                    port: backend_port(backend, request.listen_port),
-                });
+                eligible.push(Eligible::new(link, addresses, request.listen_port));
             }
         }
-        let has_primary = eligible.iter().any(|e| !e.link.backup);
-        eligible.retain(|e| e.link.backup != has_primary);
+        primaries_or_backups(&mut eligible);
         eligible
     }
 
@@ -350,22 +293,13 @@ impl Shared {
             if eligible.is_empty() {
                 return Err(end(*attempts, capped));
             }
-            let candidates: Vec<Candidate<'_>> = eligible
-                .iter()
-                .map(|e| Candidate {
-                    backend: &e.link.backend,
-                    ring_address: SocketAddr::new(e.addresses[0], e.port),
-                })
-                .collect();
-            let index = self
-                .selector
-                .select(&SelectionRequest {
-                    stream,
-                    candidates: &candidates,
-                    client: request.client,
-                    accepted_at: request.accepted_at,
-                })
-                .min(candidates.len() - 1);
+            let index = choose(
+                self.selector.as_ref(),
+                stream,
+                &eligible,
+                request.client,
+                request.accepted_at,
+            );
             let chosen = &eligible[index];
             let backend = Arc::clone(&chosen.link.backend);
             excluded.insert(backend.id.clone());
@@ -376,7 +310,10 @@ impl Shared {
                 continue;
             };
 
-            let Some(destinations) = self.destinations(request, chosen) else {
+            let Some(destinations) =
+                self.local_check()
+                    .destinations(stream, request.bound, request.stats, chosen)
+            else {
                 continue;
             };
             let (address, source) = match self.pick_source(request, &destinations) {
@@ -548,52 +485,14 @@ impl Shared {
         }
     }
 
-    /// The destinations of `chosen` the local check lets through, in
-    /// rotating order; `None` when it refuses them all, which excludes
-    /// the backend from this connection and is reported once per
-    /// transition (IV4).
-    fn destinations(
-        &self,
-        request: &Request<'_>,
-        chosen: &Eligible<'_>,
-    ) -> Option<Vec<SocketAddr>> {
-        let interfaces = self.resolver.interfaces();
-        let node = NodeLocality {
-            interfaces: &interfaces,
+    fn local_check(&self) -> LocalCheck<'_> {
+        LocalCheck {
+            resolver: &self.resolver,
             reserved: self.reserved.as_ref(),
-            bound: request.bound,
-        };
-        let stream = request.stream;
-        let backend = &chosen.link.backend;
-        let count = chosen.addresses.len();
-        let offset = self.rotation.next_address();
-        let mut refusal: Option<LocalRefusal> = None;
-        let allowed: Vec<SocketAddr> = (0..count)
-            .map(|i| SocketAddr::new(chosen.addresses[(offset + i) % count], chosen.port))
-            .filter(
-                |destination| match node.check(*destination, stream.allow_local_backend) {
-                    Ok(()) => true,
-                    Err(r) => {
-                        refusal = Some(r);
-                        false
-                    }
-                },
-            )
-            .collect();
-        if allowed.is_empty() {
-            request.stats.local_destination_refused();
-            if self.exclusions.set(&stream.id, &backend.id, true) {
-                self.counters.backend(&backend.id).dns_local_excluded();
-                warn!(stream_id = %stream.id, stream = %stream.name,
-                      backend_id = %backend.id, backend = %backend.name,
-                      addresses = ?chosen.addresses,
-                      rule = refusal.map_or("", |r| r.as_str()),
-                      "stream backend resolves to a refused local address: excluded from the stream");
-            }
-            return None;
+            exclusions: &self.exclusions,
+            counters: &self.counters,
+            rotation: &self.rotation,
         }
-        self.exclusions.set(&stream.id, &backend.id, false);
-        Some(allowed)
     }
 
     /// The first destination with a source address of its family, and
@@ -604,22 +503,9 @@ impl Shared {
         request: &Request<'_>,
         destinations: &[SocketAddr],
     ) -> Option<(SocketAddr, Option<IpAddr>)> {
-        let sources = &request.stream.source_addresses;
-        if sources.is_empty() {
-            return destinations.first().map(|d| (*d, None));
-        }
-        destinations.iter().find_map(|destination| {
-            let family: Vec<IpAddr> = sources
-                .iter()
-                .copied()
-                .filter(|s| s.is_ipv4() == destination.is_ipv4())
-                .collect();
-            if family.is_empty() {
-                return None;
-            }
-            let turn = self.rotation.next_source(&request.stream.id);
-            Some((*destination, Some(family[turn % family.len()])))
-        })
+        self.rotation
+            .sources(request.stream, destinations)
+            .map(|(destination, sources)| (destination, sources.first().copied()))
     }
 }
 

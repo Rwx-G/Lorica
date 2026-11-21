@@ -52,16 +52,14 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use lorica_config::listen_ports::ReservedPorts;
 use lorica_config::models::{
-    backend_address_host, backend_address_port, Backend, DatagramDropReason, HealthStatus,
-    LifecycleState, Stream, StreamEndReason, StreamProtocol, StreamProxyProtocol, StreamRefusal,
-    UdpSettings,
+    backend_address_host, Backend, DatagramDropReason, Stream, StreamEndReason, StreamProtocol,
+    StreamProxyProtocol, StreamRefusal, UdpSettings,
 };
 use lorica_core::protocols::proxy_protocol::encode_v2_dgram;
 use lorica_shmem::{now_ns, BackendSlot, NewSessionVerdict, SourceKey, StreamPermit, WorkerCaps};
@@ -83,12 +81,13 @@ use crate::handler::{
     ConnectOutcome, ConnectionObserver, ConnectionRecord, Datagram, DatagramHandler, RefusalRecord,
 };
 use crate::listener::with_receive_buffer;
-use crate::local::{BoundPorts, LocalRefusal, NodeLocality};
+use crate::local::BoundPorts;
 use crate::resolver::{LocalExclusions, ResolverCache};
-use crate::seams::{
-    Admission, BackendSelector, BreakerGate, Candidate, SelectionRequest, SourceGate,
+use crate::seams::{Admission, BackendSelector, BreakerGate, SourceGate};
+use crate::selection::{
+    choose, is_candidate, primaries_or_backups, Eligible, LocalCheck, Rotation,
 };
-use crate::table::{LinkedBackend, StreamTable};
+use crate::table::StreamTable;
 use crate::tracker::TrackedConnection;
 
 /// What the UDP engine is built from: the process's selector, breaker
@@ -136,10 +135,9 @@ struct Inner {
     reserved: Option<ReservedPorts>,
     exclusions: LocalExclusions,
     admission: AdmissionControl,
-    /// The per-stream turn among `source_addresses` (D-f).
-    source_turns: Mutex<HashMap<String, usize>>,
-    /// The turn among a backend's resolved addresses.
-    address_turn: AtomicUsize,
+    /// The turns among `source_addresses` (D-f) and among a backend's
+    /// resolved addresses, as TCP keeps them.
+    rotation: Rotation,
     /// The sessions taking requests, by key. A retired session leaves it
     /// and lives on in its task for the responses it is owed.
     sessions: Mutex<HashMap<SessionKey, Arc<Session>>>,
@@ -158,8 +156,7 @@ impl UdpEngine {
                 observer: parts.observer,
                 reserved: parts.reserved_ports,
                 exclusions: LocalExclusions::default(),
-                source_turns: Mutex::new(HashMap::new()),
-                address_turn: AtomicUsize::new(0),
+                rotation: Rotation::default(),
                 sessions: Mutex::new(HashMap::new()),
             }),
         }
@@ -178,11 +175,7 @@ impl DatagramHandler for UdpEngine {
         inner.counters.retain(table);
         inner.exclusions.retain(table);
         inner.admission.table_changed(table);
-        inner
-            .source_turns
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|id, _| table.stream(id).is_some());
+        inner.rotation.retain(table);
     }
 }
 
@@ -197,15 +190,6 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
         Some(d) => tokio::time::sleep_until(d).await,
         None => std::future::pending().await,
     }
-}
-
-/// The port a session to `backend` uses: its own, or the listen port for
-/// a portless backend of a range stream.
-fn backend_port(backend: &Backend, listen_port: u16) -> u16 {
-    backend_address_port(&backend.address)
-        .ok()
-        .flatten()
-        .unwrap_or(listen_port)
 }
 
 /// What the session task needs beyond the shared session.
@@ -249,13 +233,6 @@ enum OpenError {
     SourceBind(io::Error),
     /// The connect itself failed (no route): the backend's failure.
     Connect(io::Error),
-}
-
-/// One eligible backend of a session's selection.
-struct Eligible<'a> {
-    link: &'a LinkedBackend,
-    addresses: Arc<[IpAddr]>,
-    port: u16,
 }
 
 impl Inner {
@@ -606,23 +583,13 @@ impl Inner {
                 }
                 return Err(StreamEndReason::NoHealthyBackend);
             }
-            let index = {
-                let candidates: Vec<Candidate<'_>> = eligible
-                    .iter()
-                    .map(|e| Candidate {
-                        backend: &e.link.backend,
-                        ring_address: SocketAddr::new(e.addresses[0], e.port),
-                    })
-                    .collect();
-                self.selector
-                    .select(&SelectionRequest {
-                        stream,
-                        candidates: &candidates,
-                        client: key.client.ip(),
-                        accepted_at: accepted_at.into_std(),
-                    })
-                    .min(candidates.len() - 1)
-            };
+            let index = choose(
+                self.selector.as_ref(),
+                stream,
+                &eligible,
+                key.client.ip(),
+                accepted_at.into_std(),
+            );
             let chosen = &eligible[index];
             let backend = Arc::clone(&chosen.link.backend);
             excluded.insert(backend.id.clone());
@@ -633,10 +600,13 @@ impl Inner {
                 continue;
             };
 
-            let Some(destinations) = self.destinations(stream, bound, stats, chosen) else {
+            let Some(destinations) = self
+                .local_check()
+                .destinations(stream, bound, stats, chosen)
+            else {
                 continue;
             };
-            let Some((address, sources)) = self.pick_sources(stream, &destinations) else {
+            let Some((address, sources)) = self.rotation.sources(stream, &destinations) else {
                 stats.source_family_mismatch();
                 debug!(stream_id = %stream.id, backend_id = %backend.id,
                        "no source address of the backend's family: candidate skipped");
@@ -703,12 +673,7 @@ impl Inner {
         let mut eligible: Vec<Eligible<'a>> = table
             .linked_backends(&stream.id)
             .iter()
-            .filter(|link| {
-                let backend = &link.backend;
-                !excluded.contains(&backend.id)
-                    && backend.health_status != HealthStatus::Down
-                    && backend.lifecycle_state == LifecycleState::Normal
-            })
+            .filter(|link| is_candidate(link, excluded))
             .filter(|link| {
                 let at_cap = backend_at_cap(backend_caps, link);
                 *capped |= at_cap;
@@ -719,106 +684,21 @@ impl Inner {
                     .resolver
                     .cached(backend_address_host(&link.backend.address))
                     .filter(|a| !a.is_empty())?;
-                Some(Eligible {
-                    link,
-                    addresses,
-                    port: backend_port(&link.backend, listen_port),
-                })
+                Some(Eligible::new(link, addresses, listen_port))
             })
             .collect();
-        let has_primary = eligible.iter().any(|e| !e.link.backup);
-        eligible.retain(|e| e.link.backup != has_primary);
+        primaries_or_backups(&mut eligible);
         eligible
     }
 
-    /// The destinations of `chosen` the local check lets through, in
-    /// rotating order; `None` when it refuses them all (12.3 D-m),
-    /// reported once per transition.
-    fn destinations(
-        &self,
-        stream: &Stream,
-        bound: &BoundPorts,
-        stats: &StreamStats,
-        chosen: &Eligible<'_>,
-    ) -> Option<Vec<SocketAddr>> {
-        let interfaces = self.resolver.interfaces();
-        let node = NodeLocality {
-            interfaces: &interfaces,
+    fn local_check(&self) -> LocalCheck<'_> {
+        LocalCheck {
+            resolver: &self.resolver,
             reserved: self.reserved.as_ref(),
-            bound,
-        };
-        let backend = &chosen.link.backend;
-        let count = chosen.addresses.len();
-        let offset = self.address_turn.fetch_add(1, Ordering::Relaxed);
-        let mut refusal: Option<LocalRefusal> = None;
-        let allowed: Vec<SocketAddr> = (0..count)
-            .map(|i| SocketAddr::new(chosen.addresses[(offset + i) % count], chosen.port))
-            .filter(
-                |destination| match node.check(*destination, stream.allow_local_backend) {
-                    Ok(()) => true,
-                    Err(r) => {
-                        refusal = Some(r);
-                        false
-                    }
-                },
-            )
-            .collect();
-        if allowed.is_empty() {
-            stats.local_destination_refused();
-            if self.exclusions.set(&stream.id, &backend.id, true) {
-                self.counters.backend(&backend.id).dns_local_excluded();
-                warn!(stream_id = %stream.id, stream = %stream.name,
-                      backend_id = %backend.id, backend = %backend.name,
-                      addresses = ?chosen.addresses,
-                      rule = refusal.map_or("", |r| r.as_str()),
-                      "stream backend resolves to a refused local address: excluded from the stream");
-            }
-            return None;
+            exclusions: &self.exclusions,
+            counters: &self.counters,
+            rotation: &self.rotation,
         }
-        self.exclusions.set(&stream.id, &backend.id, false);
-        Some(allowed)
-    }
-
-    /// The first destination with a source address of its family, and
-    /// the stream's source addresses of that family from the next in turn
-    /// (D-f): the bind tries them in that order. Empty sources when the
-    /// stream sets none.
-    fn pick_sources(
-        &self,
-        stream: &Stream,
-        destinations: &[SocketAddr],
-    ) -> Option<(SocketAddr, Vec<IpAddr>)> {
-        if stream.source_addresses.is_empty() {
-            return destinations.first().map(|d| (*d, Vec::new()));
-        }
-        destinations.iter().find_map(|destination| {
-            let family: Vec<IpAddr> = stream
-                .source_addresses
-                .iter()
-                .copied()
-                .filter(|s| s.is_ipv4() == destination.is_ipv4())
-                .collect();
-            if family.is_empty() {
-                return None;
-            }
-            let turn = {
-                let mut turns = self
-                    .source_turns
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                let n = turns.entry(stream.id.clone()).or_default();
-                let current = *n;
-                *n = n.wrapping_add(1);
-                current
-            };
-            let start = turn % family.len();
-            let ordered = family[start..]
-                .iter()
-                .chain(&family[..start])
-                .copied()
-                .collect();
-            Some((*destination, ordered))
-        })
     }
 
     /// Forward responses until the session ends; returns how it ended.
