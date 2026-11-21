@@ -815,6 +815,15 @@ C4; until it lands, the paragraph above is what the code does.
 - Upload is client to backend (reads from the client), download backend
   to client. The PROXY header and the preamble are not charged.
 
+*Note (2026-11-22, Phase 1 audit, finding C8):* the capacity is now
+`max(min(rate, FORWARD_BUFFER_SIZE), rate x 2 ms)`, each read still
+clamped to the buffer. tokio's timer fires on millisecond ticks and
+rounds a wait up to the next one, so with a one-buffer cap every read
+past the first slept a tick and threw away what the tick refilled past
+16 KiB: every rate above about 16 MB/s ran at that ceiling. The burst is
+still at most one second's worth; it is no longer at most one buffer
+above 8 MB/s, where two milliseconds of the rate is the larger.
+
 ### D-p. The per-stream connection cap and the fd budget
 
 - **Field** `max_connections`, default **1,024**, range 1 to 65,535,

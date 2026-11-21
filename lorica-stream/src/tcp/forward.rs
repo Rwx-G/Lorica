@@ -49,7 +49,7 @@ use lorica_core::protocols::proxy_protocol::{classify_prefix, Prefix};
 use socket2::SockRef;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::time::{Instant, MissedTickBehavior, Sleep};
 
 use super::bandwidth::TokenBucket;
 use super::FORWARD_BUFFER_SIZE;
@@ -133,16 +133,15 @@ enum Step {
     ProxySignature,
 }
 
-/// A throttled direction's wait for tokens, holding the bucket while it
-/// waits so the wait survives a dropped [`Forwarder::run`].
-type Throttle = Pin<Box<dyn Future<Output = TokenBucket> + Send>>;
-
 /// One direction of a connection.
 pub struct Direction {
     buf: Box<[u8]>,
     state: DirectionState,
     bucket: Option<TokenBucket>,
-    throttle: Option<Throttle>,
+    /// A throttled direction's timer, allocated at its first wait for
+    /// tokens and reset for every later one. It lives in the direction,
+    /// so a wait survives a dropped [`Forwarder::run`].
+    throttle: Option<Pin<Box<Sleep>>>,
     fin_after_write: bool,
     /// The reader's FIN was read and the writer's shutdown has started;
     /// the direction is [`DirectionState::Closed`] once it completes.
@@ -199,32 +198,25 @@ impl Direction {
     }
 
     /// Ready once the bucket, if any, allows a read. A bucket with
-    /// tokens answers on the spot; one that must wait is moved into a
-    /// boxed wait, which only a throttled direction ever allocates.
+    /// tokens answers on the spot; one that must wait arms the
+    /// direction's timer for the instant it will, which a timer already
+    /// running keeps: nothing is spent while a direction waits, so that
+    /// instant does not move.
     fn poll_throttle(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.throttle.is_none() {
-            let Some(bucket) = self.bucket.as_mut() else {
-                return Poll::Ready(());
+        let Some(bucket) = self.bucket.as_mut() else {
+            return Poll::Ready(());
+        };
+        while let Some(at) = bucket.ready_at(Instant::now()) {
+            let timer = match self.throttle.as_mut() {
+                Some(timer) => {
+                    if timer.is_elapsed() {
+                        timer.as_mut().reset(at);
+                    }
+                    timer
+                }
+                None => self.throttle.insert(Box::pin(tokio::time::sleep_until(at))),
             };
-            let ready_now = {
-                let wait = bucket.ready();
-                tokio::pin!(wait);
-                wait.poll(cx).is_ready()
-            };
-            if ready_now {
-                return Poll::Ready(());
-            }
-            if let Some(mut bucket) = self.bucket.take() {
-                self.throttle = Some(Box::pin(async move {
-                    bucket.ready().await;
-                    bucket
-                }));
-            }
-        }
-        if let Some(throttle) = self.throttle.as_mut() {
-            let bucket = ready!(throttle.as_mut().poll(cx));
-            self.throttle = None;
-            self.bucket = Some(bucket);
+            ready!(timer.as_mut().poll(cx));
         }
         Poll::Ready(())
     }
