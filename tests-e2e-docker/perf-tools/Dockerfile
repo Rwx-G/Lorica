@@ -30,6 +30,8 @@ RUN curl -fsSL --retry 3 -o /usr/local/bin/oha \
     && echo "${OHA_SHA256}  /usr/local/bin/oha" | sha256sum -c - \
     && chmod 0755 /usr/local/bin/oha
 
+COPY l4_connect_latency.py udp_echo_peers.py /opt/perf/
+
 RUN useradd -r -u 10001 -s /usr/sbin/nologin perf
 WORKDIR /perf
 USER perf

@@ -844,13 +844,18 @@ behaviour only).
 Depends on: A, B (`udp_hold.py`); 12.3 Lot D2; the 12.5 engine; 12.2's
 budget view.
 
-- [ ] Topology, cpusets and environment guard per D-i.
-- [ ] Measurements 1 to 3 per D-j, NFR1 per D-l.
-- [ ] Statistics, re-runs, verdicts and output per D-k.
+- [x] Topology, cpusets and environment guard per D-i.
+- [x] Measurements 1 to 3 per D-j, NFR1 per D-l.
+- [x] Statistics, re-runs, verdicts and output per D-k.
 - [ ] A dry run on the development machine with both layouts (force the
       small one with an override variable) recorded in the Completion
       Notes, including whether any series reaches 5 % spread at all
       and how long the phase took.
+      *Open, 2026-11-22: the larger layout ran and is recorded (Lot M
+      Completion Notes, the pre-fix baseline); the small layout
+      (`PERF_LAYOUT=small`) is deliberately not run yet, by the
+      coordinator's decision, until the p99 method changes and the audit
+      fixes land, since both move what it would validate.*
 
 ### Lot N: CI and documentation - no cargo
 
@@ -1101,6 +1106,35 @@ pulled images.
   client's requests never reaches the backend, and the client check ran
   last. It now runs first, and a failure prints the node's counters,
   its own count of what it reflected and the tools' records.
+- 2026-11-21, Lot M, **D-j deviation: iperf3 runs 8 streams per proxy
+  worker, not `-P 4`.** The first `-P 4` series were bimodal for both
+  proxies, about 25 or about 52 Gbit/s upload, the low mode at the same
+  CPU per GiB. Per-process CPU ticks over each run showed why: in a low
+  run one worker carried the whole run (500 of 500 ticks on one nginx
+  worker), so one proxy core of the two worked. Both proxies' workers
+  share one TCP listening socket (Lorica: `bind_tcp_listener` in
+  `lorica-worker/src/stream_sockets.rs`, `SO_REUSEPORT` off, one socket
+  the supervisor hands to every worker; nginx: `listen` without
+  `reuseport`, kept so for that reason), and a burst of connects is
+  mostly accepted whole by the worker that wakes first. In the aborted
+  first full run, attempt 1 of `tcp-up` had nginx on one worker in 4
+  runs of 5 and Lorica in 1 of 5, for a "ratio" of 1.94 and spreads of
+  10.4 % and 3.5 %. That ratio measured the accept spread, not either
+  engine. Not taken: nginx `listen ... reuseport` (proposed on the
+  premise that Lorica's workers own reuseport sockets, which is true of
+  UDP only): it would give nginx a kernel-hashed spread over per-worker
+  queues that Lorica's TCP listener does not have, so the configuration
+  would no longer be equivalent (D-i). Measured on the shared socket, 6
+  runs per value, 5 s each (busiest worker's share of the CPU, 0.50
+  being an even split): `-P 4` nginx 4 of 6 on one worker, Lorica 1 of
+  6; `-P 8` (4 per worker) nginx 3 of 6, Lorica 0 of 6; `-P 16` (8 per
+  worker) 0 of 6 for both, every run at 0.50, Lorica 47.0 to 48.9 and
+  nginx 51.5 to 52.4 Gbit/s. So `run-perf.sh` runs
+  `-P (8 x N)`, and `analyse.py` also keeps out of its series any run
+  with N > 1 in which one process did more than 90 % of the proxy's
+  work, with the reason in the run's record, so a ratio never mixes the
+  two modes again; the report shows each attempt's count of such runs.
+  At N = 1 (the small layout) the question does not arise.
 
 ### Completion Notes
 
@@ -1849,6 +1883,124 @@ pulled images.
     generation is told by its stream API answering 404. (6) Story 12.1
     has no e2e checklist of its own to tick ("Handed to Story 12.12").
 
+- **Lot M, 2026-11-21 and 22.** The performance phase, on `46890e68`
+  (images `lorica-e2e-l4/lorica:lotm` built from this tree, `lorica
+  --version` 1.10.9 before the bump; the baseline `lorica 1.10.7`).
+  - **Topology** (`docker-compose.perf.yml`, project `lorica-e2e-perf`):
+    `perf-lorica`, `perf-lorica-baseline` and `perf-nginx` on the proxy
+    cpuset, each `--workers N` / `worker_processes N`, nofile 65,536;
+    `perf-backend` (iperf3 server 5201, `l4_connect_latency.py serve`
+    5202 with control 5203, `udp_echo_peers.py serve` 5300 with control
+    5301) and `perf-backend-http` (nginx, static 200 with a 1 KiB body,
+    `perf/nginx-http-backend.conf`) on the backends cpuset; `perf-client`
+    (iperf3, oha, the tools, `perf/analyse.py`, the Lot B `udp_hold.py`
+    mounted unchanged) on the load cpuset. Both Lorica versions start
+    through `perf/entrypoint-perf.sh` with flags 1.10.7 knows, as the
+    image's `lorica` user (ports above 1024; a same-user exec reads the
+    workers' PSS). nginx's `stream` configuration mirrors the Lorica
+    streams the driver creates: connect 5 s, idle 600 s TCP and 30 s
+    UDP, 16 KiB buffers, a buffered per-connection access log, TCP on a
+    shared listening socket and UDP with `reuseport` exactly as Lorica
+    binds them, no bound on UDP responses or requests.
+  - **Layout and guard** (`perf/run-perf.sh`): `docker info` 24 CPUs
+    gives the larger layout (proxy `2-3`, load `4-5`, backends `6-7`,
+    N = 2, read back from each container's `CpusetCpus`);
+    `PERF_LAYOUT=small` forces proxy `1`, load `2`, backends `3`, N = 1;
+    fewer than 4 CPUs writes a `NOT-RUN` report. The environment record
+    (CPU count, memory, kernel, Docker version, image ids, commit and
+    tree state, cpusets, versions) opens the runs file; the guard before
+    every attempt lists running containers outside the project, and any
+    makes every gated verdict `INCONCLUSIVE (environment)`. On the
+    release run (`run.sh` without `--skip-*`/`--only-*`, which passes
+    `PERF_RELEASE_RUN=1`), anything but the larger layout does too
+    (Resolved 13).
+  - **Statistics and output** (`perf/analyse.py`): one warm-up per arm,
+    then 5 repetitions with the first arm rotating; spread IQR over
+    median by the inclusive quartiles (the 4th minus the 2nd of 5);
+    a check settles on its first attempt whose every series has 5 values
+    within 5 %; a gated measurement re-runs whole while one of its checks
+    is unsettled, at most `PERF_MAX_RERUNS` (3) times; `PASS`, `FAIL`,
+    `INCONCLUSIVE`, `NOT-RUN`, `REPORTED` for the unguarded. Output:
+    `results/perf-<ts>.runs.jsonl` (every run as it lands, raw numbers
+    included), `perf-<ts>.json` and `perf-summary.md`. `run.sh`:
+    `--skip-perf`, `--only-perf` (skips every other phase and the L4
+    report), `--perf-advisory` (verdicts written, exit 0 on them; a
+    harness error still exits 2); the phase runs last, after the other
+    projects are torn down.
+  - **Deviations.** (1) iperf3 `-P (8 x N)`, not `-P 4`, and a
+    multi-worker run one process carried (over 90 % of the proxy's CPU
+    ticks) is kept out of its series with its reason: Debug Log, with
+    the evidence. (2) `l4_connect_latency.py` is one single-threaded
+    non-blocking loop on each side rather than "a few threads": the open
+    loop keeps its schedule (worst lag 1.5 ms), and no interpreter lock
+    sits between a socket event and its stamp. (3) The Lorica TCP
+    streams keep Lorica's defaults beyond what D-i names (backend
+    keepalive on, where nginx's is off; no run lasts the 60 s before its
+    first probe). (4) HTTPS NFR1
+    runs one attempt, no re-run, since it gates nothing. (5) D-j's
+    memory figure "PSS with S sessions minus before the fill" is the
+    first fill only for each attempt's warm-up: Lorica's allocator keeps
+    what a fill took (nginx frees it), so the later runs read what a
+    refill adds. Both are in the report.
+  - **The larger-layout dry run, the pre-fix baseline**
+    (`./run.sh --only-perf --build`, `L4_IMAGE_TAG=lotm`, ended
+    2026-11-22; `results/perf-20261121T221253Z.*`). **76.5 min** for the
+    phase (4,591 s): `tcp-up` 402 s and `tcp-down` 402 s (two attempts
+    each), `connect` 752 s (three), `udp` 523 s (one), `nfr1-http-rps`
+    290 s (one), `nfr1-http-p99` 1,522 s (four), HTTPS 292 + 382 s.
+    Verdicts, Lorica over nginx (over 1.10.7 for NFR1), median spread in
+    brackets:
+
+    | Check | Lorica / B arm | nginx / L arm | Ratio | Verdict |
+    |---|---|---|---|---|
+    | TCP upload throughput | 47.91 Gbit/s (2.4 %) | 52.98 (2.1 %) | 0.904 | PASS (attempt 2) |
+    | TCP upload CPU per GiB | 0.3565 s (2.4 %) | 0.3223 (2.1 %) | 1.11 | PASS (attempt 2) |
+    | TCP download throughput | 44.78 Gbit/s (1.3 %) | 50.84 (0.8 %) | 0.881 | **FAIL** (attempt 2; attempt 1 also 0.881) |
+    | TCP download CPU per GiB | 0.3827 s (1.3 %) | 0.3363 (0.9 %) | 1.14 | PASS (attempt 2) |
+    | Connect p99 | 485.7 us (4.3 %) | 397.3 (4.9 %) | 1.22 | PASS (attempt 3; 1.21 and 1.57 before) |
+    | UDP hold, 21,766 sessions (80 % of 27,208, bound by `source_ports`) | 5 of 5 held | 5 of 5 | - | PASS |
+    | PSS per 1,000 sessions, first fill | 3,541 KiB | 10,070 KiB | - | reported |
+    | NFR1 HTTP req/s, L0 / B | 16,000 (2.7 %) | 15,940 (0.8 %) | 1.00 | PASS |
+    | NFR1 HTTP req/s, L1 / B | 16,120 (0.8 %) | 15,940 (0.8 %) | 1.01 | PASS |
+    | NFR1 HTTP p99 at 7,970 req/s, L0 / B | 2.168 ms (4.4 %) | 2.486 (23.0 %) | 0.872 | **INCONCLUSIVE** |
+    | NFR1 HTTP p99, L1 / B | 2.575 ms (26.1 %) | 2.486 (23.0 %) | 1.04 | **INCONCLUSIVE** |
+    | NFR1 HTTPS req/s, L0 and L1 / B | 13,310 and 13,370 | 13,100 (0.4 %) | 1.02, 1.02 | reported |
+    | NFR1 HTTPS p99 at 6,550 req/s, L0 and L1 / B | 2.426 and 4.986 ms | 2.543 | 0.954, 1.96 | reported |
+
+    **NFR1 HTTP p99, the four attempts** (ms, spread; L0, L1 against
+    B): 1: 1.627 (5.4 %), 1.656 (17.2 %) against 1.799 (7.6 %), ratios
+    0.904, 0.920; 2: 2.053 (25.3 %), 1.745 (21.5 %) against 2.130
+    (16.1 %), 0.964, 0.819; 3: 2.063 (14.0 %), 1.917 (3.2 %) against
+    2.099 (11.9 %), 0.983, 0.913; 4: 2.168 (4.4 %), 2.575 (26.1 %)
+    against 2.486 (23.0 %), 0.872, 1.04. No ratio over the 1.05
+    threshold in any attempt, no attempt with all three series within
+    5 %: inconclusive, which blocks the release pending an owner
+    decision (AC #3), and the method is to change before Lot O.
+  - **Which series reach 5 % at all.** Throughput, CPU per GiB and
+    saturation req/s: yes, routinely (0.3 to 2.7 %), once the
+    accept-spread artefact is out. Every p99 series: rarely and by
+    luck. Connect p99 at 4.3 to 21.4 % (its p50 stays within 1 to 3 %);
+    NFR1 HTTP p99 at 3.2 to 26.1 %; HTTPS p99 has single runs at 127 ms
+    and 18 ms, stalls of the Docker Desktop VM, not of a proxy.
+  - **Product findings, not fixed here.** (1) **TCP download throughput
+    0.881 x nginx, a conclusive FAIL**, with download CPU per GiB at
+    1.14 (just under 1.15) and upload at 0.904 and 1.11. The proxy cores
+    are saturated in every run, so throughput is the inverse of CPU per
+    byte, and Lorica spends 11 to 14 % more CPU per GiB than nginx's
+    copy loop; the download direction (backend to client) is the worse.
+    Suspected cause: the forwarding copy path (`lorica-stream/src/tcp/forward.rs`,
+    a 16 KiB buffer per direction and a userspace copy), i.e. the
+    splice decision Story 12.3 handed to this story ("Handed to other
+    stories"), to be taken on Lot O's numbers. (2) **Connect latency:
+    Lorica's p50 is about 180 us against nginx's about 105 us**, stable
+    in every run (the p99 passes at 1.22). Suspected cause, from the
+    code, not measured: in worker mode every stream connect asks the
+    supervisor for a breaker admission over the RPC channel
+    (`StreamBreakerGate::admit`, `BreakerEngine::Rpc` in
+    `lorica/src/proxy_wiring/engines.rs`) before dialling the backend,
+    one round trip per connection that nginx does not make.
+  - **Not done.** The small-layout dry run (see the task).
+
 ## File List
 
 Lot A:
@@ -2013,6 +2165,21 @@ Lot L:
   transfer sentence corrected), `docs/stories/story-12.11-upgrade-drain.md`
   (D-d amended)
 
+Lot M:
+
+- `tests-e2e-docker/docker-compose.perf.yml` (new)
+- `tests-e2e-docker/perf/run-perf.sh` (new)
+- `tests-e2e-docker/perf/analyse.py` (new)
+- `tests-e2e-docker/perf/nginx-stream.conf` (new)
+- `tests-e2e-docker/perf/nginx-http-backend.conf` (new)
+- `tests-e2e-docker/perf/entrypoint-perf.sh` (new)
+- `tests-e2e-docker/perf-tools/l4_connect_latency.py` (new)
+- `tests-e2e-docker/perf-tools/udp_echo_peers.py` (new)
+- `tests-e2e-docker/perf-tools/Dockerfile` (the `COPY` line)
+- `tests-e2e-docker/run.sh` (`--skip-perf`, `--only-perf`,
+  `--perf-advisory`, the perf call, the L4 report and teardown skipped on
+  `--only-perf`)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -2037,3 +2204,4 @@ Lot L:
 | 2026-11-21 | 0.18 | Lot L implemented: 12.1 IV1 and IV2 in the `cluster` smoke and the cold rollback to 1.10.7 passing; the hot rollback finds a product defect (a 1.10.x binary adopts a stream's listener as an HTTP listener) and its row stays `pending`; `docs/hot-upgrade.md` states the observed rollback. | Romain G. |
 | 2026-11-21 | 0.19 | Lot L's product defect fixed: a table holding a stream socket goes chunked at any size and the chunked header leads with a non-UTF-8 byte, so 1.10.7 refuses the hot downgrade cleanly and the old generation keeps serving; `12.1-ac3-rollback-hot-1.10.7` PASS and `live`; Lot L's boxes all ticked. | Romain G. |
 | 2026-11-21 | 0.20 | Phase 1 audit item N1: a Lot O check added, the breaker RPC load under a UDP flood measured after C9, and the maintainer's decision that a worker-local breaker cache is built only if HTTP p99 then moves past NFR1. | Romain G. |
+| 2026-11-22 | 0.21 | Lot M implemented: the performance phase (`docker-compose.perf.yml`, `perf/run-perf.sh`, `perf/analyse.py`, the connect-latency and UDP-peer tools), `run.sh --only-perf`, `--skip-perf`, `--perf-advisory`; iperf3 at 8 streams per worker with single-worker runs excluded (D-j deviation, the accept spread); the larger-layout dry run recorded as the pre-fix baseline: TCP download throughput FAIL at 0.881, NFR1 HTTP p99 INCONCLUSIVE after four attempts, everything else PASS. Small-layout dry run deferred. | Romain G. |

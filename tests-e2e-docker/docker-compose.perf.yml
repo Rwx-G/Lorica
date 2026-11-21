@@ -1,0 +1,124 @@
+# The performance phase of the e2e suite (Story 12.12 D-i to D-l): Lorica
+# 1.11.0 against nginx `stream` and against the released 1.10.7, on one
+# machine, comparing ratios. A compose project of its own
+# (`lorica-e2e-perf`), driven by perf/run-perf.sh, which run.sh calls; never
+# start it with a bare `docker compose up`, since the cpusets and the
+# worker counts come from the driver's environment:
+#
+#   PERF_CPUS_PROXY, PERF_CPUS_LOAD, PERF_CPUS_BACKEND  disjoint cpusets
+#   PERF_WORKERS          the proxy cpuset's size, for all three proxies
+#   PERF_BACKEND_WORKERS  the backends cpuset's size, for the HTTP upstream
+#
+# The defaults below are the larger layout (8 CPUs or more). All three
+# proxies share the proxy cpuset and stay up for the whole phase; the load
+# alternates between them, so no container restarts between runs. No
+# service publishes a host port.
+#
+# Images: the Lorica one is the L4 phase's (one name, built once per run,
+# D-b), the baseline is l4/build-images.sh's, and the tools are the
+# perf-tools image, which the L4 phase's DNS load generator also uses.
+name: lorica-e2e-perf
+
+x-proxy: &proxy
+  cpuset: "${PERF_CPUS_PROXY:-2-3}"
+  # The UDP ceiling is then bound by ephemeral ports, not fds (D-i).
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
+  networks:
+    - perf
+
+x-lorica: &lorica
+  <<: *proxy
+  entrypoint: ["sh", "/perf/entrypoint-perf.sh"]
+  environment:
+    PERF_WORKERS: "${PERF_WORKERS:-2}"
+  volumes:
+    - ./perf/entrypoint-perf.sh:/perf/entrypoint-perf.sh:ro
+
+x-perf-tools: &perf-tools
+  build:
+    context: ./perf-tools
+  image: lorica-e2e-l4/perf-tools:${L4_IMAGE_TAG:-local}
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
+  networks:
+    - perf
+
+services:
+  perf-lorica:
+    <<: *lorica
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    image: lorica-e2e-l4/lorica:${L4_IMAGE_TAG:-local}
+
+  perf-lorica-baseline:
+    <<: *lorica
+    build:
+      context: ./baseline
+      additional_contexts:
+        signing-key: ../docs
+    image: lorica-e2e/baseline:1.10.7
+
+  perf-nginx:
+    <<: *proxy
+    image: nginx:1.30.7@sha256:8a7280c664b1a205092ffea6443299e6d307fe65b6f946b02028fa311c29fd01
+    # nginx resolves its upstreams once, at start, and refuses to start
+    # on a name Docker's DNS does not know yet.
+    depends_on:
+      - perf-backend
+    environment:
+      PERF_WORKERS: "${PERF_WORKERS:-2}"
+    command:
+      - sh
+      - -c
+      - sed "s/@WORKERS@/$$PERF_WORKERS/" /perf/nginx-stream.conf > /tmp/nginx.conf && exec nginx -c /tmp/nginx.conf
+    volumes:
+      - ./perf/nginx-stream.conf:/perf/nginx-stream.conf:ro
+
+  # iperf3's server (5201), the connect-latency backend (5202, control
+  # 5203) and the UDP echo that counts its peers (5300, control 5301).
+  perf-backend:
+    <<: *perf-tools
+    cpuset: "${PERF_CPUS_BACKEND:-6-7}"
+    command:
+      - sh
+      - -c
+      - >-
+        iperf3 -s -p 5201 &
+        python3 /opt/perf/l4_connect_latency.py serve --port 5202 --control-port 5203 &
+        exec python3 /opt/perf/udp_echo_peers.py serve --port 5300 --control-port 5301
+
+  # The NFR1 upstream: a static 200 with a 1 KiB body.
+  perf-backend-http:
+    image: nginx:1.30.7@sha256:8a7280c664b1a205092ffea6443299e6d307fe65b6f946b02028fa311c29fd01
+    cpuset: "${PERF_CPUS_BACKEND:-6-7}"
+    environment:
+      PERF_BACKEND_WORKERS: "${PERF_BACKEND_WORKERS:-2}"
+    command:
+      - sh
+      - -c
+      - sed "s/@WORKERS@/$$PERF_BACKEND_WORKERS/" /perf/nginx-http-backend.conf > /tmp/nginx.conf && exec nginx -c /tmp/nginx.conf
+    volumes:
+      - ./perf/nginx-http-backend.conf:/perf/nginx-http-backend.conf:ro
+    networks:
+      - perf
+
+  # The load generator: iperf3, oha, the Python tools, and the driver's
+  # API client and analysis (perf/analyse.py), which write results/.
+  # udp_hold.py is the L4 phase's, mounted unchanged (Lot B).
+  perf-client:
+    <<: *perf-tools
+    cpuset: "${PERF_CPUS_LOAD:-4-5}"
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - ./perf:/perf-driver:ro
+      - ./test-runner/l4/udp_hold.py:/opt/perf-l4/udp_hold.py:ro
+      - ./results:/results
+
+networks:
+  perf: {}

@@ -28,7 +28,8 @@
 #   --skip-perf         Skip the Story 12.12 performance phase
 #   --only-l4           Run the L4 phase alone: every pre-existing phase,
 #                       Phase 1 included, is skipped
-#   --only-perf         Run the performance phase alone
+#   --only-perf         Run the performance phase alone: every other phase,
+#                       Phase 1 and the L4 phase included, is skipped
 #   --perf-advisory     Report the performance verdicts without gating (CI)
 #
 # Every run is teed to results/e2e-<UTC timestamp>.log. After the last
@@ -46,9 +47,15 @@
 # (any run) runs only those Lots' L4 rows; the report reads the others
 # as not run. The lane's report is results/l4-summary-lane-N.md.
 #
-# The performance phase is Story 12.12 Lot M and is not built yet:
-# --only-perf and --perf-advisory are refused until it lands, and
-# --skip-perf skips nothing.
+# The performance phase (Story 12.12 D-i to D-m, perf/run-perf.sh) runs
+# last, in its own compose project (lorica-e2e-perf), after the other
+# projects are torn down: its environment guard makes every gated verdict
+# INCONCLUSIVE when a container outside it is running, so with --keep a
+# full run's perf verdicts are inconclusive by design. It gates the run
+# (any FAIL, INCONCLUSIVE or NOT-RUN) unless --perf-advisory; on the
+# release run (no --skip-* or --only-* flag) it also requires the larger
+# cpuset layout. Its own knobs (PERF_LAYOUT, PERF_REPS, ...) are listed in
+# perf/run-perf.sh.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -71,8 +78,10 @@ SKIP_CAPTURE_WORKERS=false
 SKIP_MCP=false
 SKIP_ADCS=false
 SKIP_L4=false
+SKIP_PERF=false
 ONLY_L4=false
 ONLY_PERF=false
+PERF_ADVISORY=false
 STRICT_REPORT=true
 
 for arg in "$@"; do
@@ -95,27 +104,32 @@ for arg in "$@"; do
         --skip-mcp)          SKIP_MCP=true ;;
         --skip-adcs)         SKIP_ADCS=true ;;
         --skip-l4)           SKIP_L4=true ;;
-        --skip-perf)         ;;
+        --skip-perf)         SKIP_PERF=true ;;
         --only-l4)           ONLY_L4=true ;;
         --only-perf)         ONLY_PERF=true ;;
-        --perf-advisory)
-            echo "run.sh: --perf-advisory needs the performance phase (Story 12.12 Lot M), not built yet" >&2
-            exit 2 ;;
+        --perf-advisory)     PERF_ADVISORY=true ;;
     esac
     case "$arg" in
         --skip-*|--only-*) STRICT_REPORT=false ;;
     esac
 done
 
-if [ "$ONLY_PERF" = true ]; then
-    echo "run.sh: --only-perf needs the performance phase (Story 12.12 Lot M), not built yet" >&2
+if [ "$ONLY_L4" = true ] && [ "$ONLY_PERF" = true ]; then
+    echo "run.sh: --only-l4 and --only-perf exclude each other" >&2
     exit 2
 fi
 
-# --only-l4 skips every pre-existing phase. A new phase gets its SKIP_
+# --only-l4 skips every pre-existing phase and the performance phase;
+# --only-perf skips them and the L4 phase. A new phase gets its SKIP_
 # variable set here too.
 RUN_PHASE_1=true
 if [ "$ONLY_L4" = true ]; then
+    SKIP_PERF=true
+fi
+if [ "$ONLY_PERF" = true ]; then
+    SKIP_L4=true
+fi
+if [ "$ONLY_L4" = true ] || [ "$ONLY_PERF" = true ]; then
     RUN_PHASE_1=false
     SKIP_WORKERS=true
     SKIP_GEOIP=true
@@ -202,8 +216,9 @@ ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profil
 # verification error against the now-self-signed endpoint.
 # The L4 report runs after every run (except --only-perf), so its image
 # is rebuilt whatever is skipped: a stale one would check the log with an
-# old report.
-if [ -n "$BUILD_FLAG" ]; then
+# old report. The performance phase builds its own images when it starts
+# (perf/run-perf.sh --build); the Lorica one is cached by then.
+if [ -n "$BUILD_FLAG" ] && [ "$ONLY_PERF" = false ]; then
     if [ "$ONLY_L4" = false ]; then
         docker compose $ALL_PROFILES build
     fi
@@ -915,21 +930,39 @@ fi
 if [ -n "${L4_LOTS:-}" ]; then
     REPORT_ARGS="$REPORT_ARGS --lots ${L4_LOTS}"
 fi
-echo ""
-echo "=== L4 scenario report ==="
-if ! MSYS_NO_PATHCONV=1 $L4_COMPOSE --profile l4-report run --rm -T \
-        --user "$(id -u):$(id -g)" l4-report $REPORT_ARGS; then
-    EXIT_CODE=1
+if [ "$ONLY_PERF" = false ]; then
+    echo ""
+    echo "=== L4 scenario report ==="
+    if ! MSYS_NO_PATHCONV=1 $L4_COMPOSE --profile l4-report run --rm -T \
+            --user "$(id -u):$(id -g)" l4-report $REPORT_ARGS; then
+        EXIT_CODE=1
+    fi
 fi
 
-# Cleanup unless --keep. An --only-l4 run started nothing in the main
-# project, and tearing it down would stop another run's containers: it
-# leaves it alone.
+# Cleanup unless --keep. An --only-l4 or --only-perf run started nothing
+# in the main project, and tearing it down would stop another run's
+# containers: it leaves it alone.
 if [ "$KEEP" = false ]; then
-    if [ "$ONLY_L4" = false ]; then
+    if [ "$ONLY_L4" = false ] && [ "$ONLY_PERF" = false ]; then
         docker compose $ALL_PROFILES down -v
     fi
-    $L4_COMPOSE $L4_ALL_PROFILES down -v --remove-orphans
+    if [ "$ONLY_PERF" = false ]; then
+        $L4_COMPOSE $L4_ALL_PROFILES down -v --remove-orphans
+    fi
+fi
+
+# ---- Phase: performance (Story 12.12 D-i to D-m) ------------------------
+# Last, with the other projects gone (see the header). The release run
+# passes PERF_RELEASE_RUN=1, which holds it to the larger cpuset layout.
+# --perf-advisory reports the verdicts and never fails the run on them.
+if [ "$SKIP_PERF" = false ] && [ "$EXIT_CODE" = "0" ]; then
+    PERF_ARGS=""
+    [ -n "$BUILD_FLAG" ] && PERF_ARGS="$PERF_ARGS --build"
+    [ "$KEEP" = true ] && PERF_ARGS="$PERF_ARGS --keep"
+    [ "$PERF_ADVISORY" = true ] && PERF_ARGS="$PERF_ARGS --advisory"
+    PERF_RELEASE_RUN=0
+    [ "$STRICT_REPORT" = true ] && PERF_RELEASE_RUN=1
+    PERF_RELEASE_RUN=$PERF_RELEASE_RUN bash perf/run-perf.sh $PERF_ARGS || EXIT_CODE=$?
 fi
 
 if [ "$EXIT_CODE" = "0" ]; then
