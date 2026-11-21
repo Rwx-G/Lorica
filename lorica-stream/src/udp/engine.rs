@@ -298,18 +298,21 @@ impl Inner {
         stats: Arc<StreamStats>,
     ) {
         let snapshot = d.snapshot;
+        // A flood is refused here datagram by datagram: the row is built
+        // only for the refusal the log writes.
         let refuse = |refusal: StreamRefusal| {
             stats.refused(refusal);
-            self.admission.report(RefusalRecord {
-                stream_id: snapshot.id.clone(),
-                stream_name: snapshot.name.clone(),
-                protocol: StreamProtocol::Udp,
-                listen_port: key.local.port(),
-                client: key.client,
-                proxied_from: None,
-                refusal,
-                at: Utc::now(),
-            });
+            self.admission
+                .report_with(snapshot, refusal, || RefusalRecord {
+                    stream_id: snapshot.id.clone(),
+                    stream_name: snapshot.name.clone(),
+                    protocol: StreamProtocol::Udp,
+                    listen_port: key.local.port(),
+                    client: key.client,
+                    proxied_from: None,
+                    refusal,
+                    at: Utc::now(),
+                });
         };
         let Some(caps) = d.caps.get(&snapshot.id) else {
             // The supervisor sends `caps` before a stream's first `attach`

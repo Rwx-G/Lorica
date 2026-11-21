@@ -352,6 +352,26 @@ impl AdmissionControl {
         self.log.report(record);
     }
 
+    /// Hand `stream`'s `refusal` to the refusal log, its row built by
+    /// `record` only when the log writes one: a flood the window holds
+    /// back (one row per stream and refusal per window) builds no row,
+    /// copies no name and reads no clock per refused datagram.
+    pub(crate) fn report_with(
+        &self,
+        stream: &Stream,
+        refusal: StreamRefusal,
+        record: impl FnOnce() -> RefusalRecord,
+    ) {
+        let subject = Subject {
+            stream_id: &stream.id,
+            stream_name: &stream.name,
+            protocol: stream.protocol,
+        };
+        if self.log.admit(StreamLogKey::Refused(refusal), subject) {
+            self.log.write(record());
+        }
+    }
+
     /// Hand over the record of a connection or session that ended
     /// (Story 12.9 D-c): a refusal becomes a refusal row, an end before
     /// forwarding passes the refusal log, any other end goes to the
@@ -450,9 +470,13 @@ impl RefusalLog {
             stream_name: &record.stream_name,
             protocol: record.protocol,
         };
-        if !self.admit(StreamLogKey::Refused(record.refusal), subject) {
-            return;
+        if self.admit(StreamLogKey::Refused(record.refusal), subject) {
+            self.write(record);
         }
+    }
+
+    /// Write one refusal row the limiter admitted.
+    fn write(&self, record: RefusalRecord) {
         debug!(
             stream_id = %record.stream_id,
             stream = %record.stream_name,
@@ -978,6 +1002,35 @@ mod tests {
         let refused = recorder.refused.lock().unwrap();
         assert_eq!(refused[0].refusal, StreamRefusal::SourceOpenRate);
         assert_eq!(refused[0].client, SocketAddr::new(ip(PEER), 40_000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lazy_refusal_row_is_built_once_per_window() {
+        let stream = tcp();
+        let (control, recorder) = control(Gate::default());
+        control.table_changed(&StreamTable::new(vec![stream.clone()], &[]));
+        let built = AtomicU64::new(0);
+        let report = || {
+            control.report_with(&stream, StreamRefusal::SourceOpenRate, || {
+                built.fetch_add(1, Ordering::Relaxed);
+                refusal(&stream, StreamRefusal::SourceOpenRate)
+            })
+        };
+        for _ in 0..1_000 {
+            report();
+        }
+        assert_eq!(built.load(Ordering::Relaxed), 1);
+        assert_eq!(recorder.refused.lock().unwrap().len(), 1);
+
+        tokio::time::sleep(
+            crate::refusal_log::REFUSAL_LOG_WINDOW + std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(
+            recorder.suppressed.lock().unwrap()[0].suppressed,
+            999,
+            "the rows not built are still counted"
+        );
     }
 
     #[test]
