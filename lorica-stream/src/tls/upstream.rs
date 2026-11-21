@@ -121,6 +121,14 @@ pub fn server_name(
         .map_err(|_| format!("`{name}` is not a server name upstream TLS can verify"))
 }
 
+/// Whether the name [`server_name`] gives for `mode` is the client's
+/// choice: its SNI, which a wildcard rule lets it pick. A backend that
+/// refuses such a name says nothing about its health, so the breaker
+/// does not count that refusal (Phase 1 audit C3).
+pub fn named_by_client(mode: &UpstreamServerName, client_sni: Option<&str>) -> bool {
+    matches!(mode, UpstreamServerName::Client {}) && client_sni.is_some()
+}
+
 /// Run the client handshake on `socket`, rustls' plaintext send buffer
 /// capped at one forwarding buffer. The caller bounds it in time.
 ///
@@ -216,6 +224,26 @@ mod tests {
             server_name(&fixed, &ip, Some("app.example.com")).unwrap(),
             named("pinned.example.com")
         );
+    }
+
+    #[test]
+    fn only_a_client_sni_sent_in_client_mode_is_the_clients_choice() {
+        let client = UpstreamServerName::Client {};
+        assert!(named_by_client(&client, Some("zz.example.com")));
+        assert!(
+            !named_by_client(&client, None),
+            "the fallback is the backend's own host"
+        );
+        assert!(!named_by_client(
+            &UpstreamServerName::BackendAddress {},
+            Some("zz.example.com")
+        ));
+        assert!(!named_by_client(
+            &UpstreamServerName::Fixed {
+                name: "pinned.example.com".into()
+            },
+            Some("zz.example.com")
+        ));
     }
 
     #[test]

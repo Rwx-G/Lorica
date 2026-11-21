@@ -240,6 +240,14 @@ enum AttemptError {
     Backend(ConnectFailureKind, Option<io::Error>),
 }
 
+/// A failed upstream handshake, with what the breaker needs to judge it.
+struct TlsFailure {
+    kind: UpstreamTlsFailure,
+    /// The name sent was the client's SNI (`server_name = client`).
+    named_by_client: bool,
+    was_probe: bool,
+}
+
 fn failure_kind(error: &io::Error) -> ConnectFailureKind {
     match error.kind() {
         io::ErrorKind::ConnectionRefused => ConnectFailureKind::Refused,
@@ -394,7 +402,15 @@ impl Shared {
                         attempt.client_sni,
                     ),
                 ) {
-                    (Ok(config), Ok(name)) => Some((attempt, Arc::clone(config), name)),
+                    (Ok(config), Ok(name)) => Some((
+                        attempt,
+                        Arc::clone(config),
+                        name,
+                        upstream::named_by_client(
+                            &attempt.settings.server_name,
+                            attempt.client_sni,
+                        ),
+                    )),
                     (config, name) => {
                         *attempts += 1;
                         request.stats.connect_attempt(*attempts == 1);
@@ -423,7 +439,7 @@ impl Shared {
                 Ok(socket) => {
                     let socket = match tls {
                         None => Upstream::Plain(socket),
-                        Some((attempt, config, name)) => {
+                        Some((attempt, config, name, named_by_client)) => {
                             let left = connect_timeout.saturating_sub(started.elapsed());
                             let established = tokio::time::timeout(
                                 left,
@@ -434,10 +450,13 @@ impl Shared {
                             match established {
                                 Ok(tls) => Upstream::Tls(Box::new(tls)),
                                 Err(kind) => {
-                                    self.upstream_tls_failed(
-                                        stream, &backend, address, kind, was_probe,
-                                    )
-                                    .await;
+                                    let failure = TlsFailure {
+                                        kind,
+                                        named_by_client,
+                                        was_probe,
+                                    };
+                                    self.upstream_tls_failed(stream, &backend, address, failure)
+                                        .await;
                                     continue;
                                 }
                             }
@@ -482,26 +501,36 @@ impl Shared {
         }
     }
 
-    /// Count a failed upstream handshake of `kind` and tell the breaker
-    /// what it means. A reset, an alert or a timeout says the backend
-    /// does not serve TLS correctly and counts against it. A certificate
-    /// that does not verify says the configuration and the backend
-    /// disagree: it is not counted, or one wrong bundle would trip every
-    /// backend's breaker; only a half-open breaker's probe is answered,
-    /// as a success, since the backend did answer.
+    /// Count a failed upstream handshake and tell the breaker what it
+    /// means. A reset, an alert or a timeout says the backend does not
+    /// serve TLS correctly and counts against it. A certificate that does
+    /// not verify says the configuration and the backend disagree: it is
+    /// not counted, or one wrong bundle would trip every backend's
+    /// breaker. Nor is a handshake refused on a name the client chose
+    /// (`server_name = client`, Phase 1 audit C3): a strict-SNI backend
+    /// refuses the names it does not serve, and a wildcard rule lets the
+    /// client pick any, so counting it would let five clients open the
+    /// circuit for all; a timeout still counts. A failure not counted
+    /// answers only a half-open breaker's probe, as a success, since the
+    /// backend did answer.
     async fn upstream_tls_failed(
         &self,
         stream: &Stream,
         backend: &Backend,
         address: SocketAddr,
-        kind: UpstreamTlsFailure,
-        was_probe: bool,
+        failure: TlsFailure,
     ) {
+        let TlsFailure {
+            kind,
+            named_by_client,
+            was_probe,
+        } = failure;
         let first = self
             .counters
             .link(&stream.id, &backend.id)
             .upstream_tls_failed(kind);
-        if kind.is_backend_failure() {
+        let client_chosen = named_by_client && kind == UpstreamTlsFailure::Handshake;
+        if kind.is_backend_failure() && !client_chosen {
             self.breaker
                 .record(&stream.id, backend, false, was_probe)
                 .await;

@@ -998,9 +998,17 @@ refuses it. The backend's own `tls_upstream`, `tls_sni` and
   (`UpstreamTlsFailure` in `lorica-stream/src/counters.rs`). A failed
   or timed-out handshake counts against the breaker; a certificate that
   does not verify does not, since the configuration and the backend
-  disagree rather than the backend being down. A node that cannot build
-  the stream's upstream TLS (its CA bundle or client key not held there)
-  opens no connection and the client ends `connect_failed`.
+  disagree rather than the backend being down. With `server_name =
+  client`, a handshake the backend refuses (an alert or a reset) does
+  not count either, when the name sent was the client's SNI: a backend
+  that refuses names it does not serve (nginx `ssl_reject_handshake`,
+  HAProxy `strict-sni`) would otherwise let a client pick names under a
+  wildcard rule and open the circuit for everyone. A timed-out handshake
+  still counts. A failure the breaker does not count answers a
+  half-open probe as a success, since the backend did answer. A node
+  that cannot build the stream's upstream TLS (its CA bundle or client
+  key not held there) opens no connection and the client ends
+  `connect_failed`.
 
 ### What the byte counters count
 

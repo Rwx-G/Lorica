@@ -1532,6 +1532,118 @@ async fn a_verification_failure_is_not_counted_by_the_breaker_while_a_reset_is()
     assert_eq!(h.breaker.recorded("dropping"), vec![false]);
 }
 
+/// Serves `names` only: a ClientHello naming anything else draws a fatal
+/// alert, as nginx's `ssl_reject_handshake` or HAProxy's `strict-sni`
+/// answer a name they do not serve.
+#[derive(Debug)]
+struct StrictSni {
+    names: Vec<String>,
+    key: Arc<rustls::sign::CertifiedKey>,
+}
+
+impl rustls::server::ResolvesServerCert for StrictSni {
+    fn resolve(
+        &self,
+        hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let name = hello.server_name()?;
+        self.names
+            .iter()
+            .any(|served| served == name)
+            .then(|| Arc::clone(&self.key))
+    }
+}
+
+/// A TLS echo backend presenting `cert` for `names` and refusing every
+/// other server name.
+async fn strict_sni_backend(cert: &Issued, names: &[&str]) -> SocketAddr {
+    let key = crypto_provider()
+        .key_provider
+        .load_private_key(cert.key())
+        .unwrap();
+    let resolver = StrictSni {
+        names: names.iter().map(|n| n.to_string()).collect(),
+        key: Arc::new(rustls::sign::CertifiedKey::new(cert.chain(), key)),
+    };
+    let config = ServerConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(resolver));
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind((LOOPBACK, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                if let Ok(tls) = acceptor.accept(socket).await {
+                    echo_on(tls).await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// Phase 1 audit C3: with `server_name = client` behind a wildcard rule,
+/// the name sent upstream is the client's choice, and a strict-SNI
+/// backend refuses the names it does not serve. Six such handshakes,
+/// more than the breaker's threshold, count on the link and report
+/// nothing to the breaker; the name the backend serves still connects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handshake_refused_on_a_client_chosen_name_never_reaches_the_breaker() {
+    let ca = Ca::new("Server CA");
+    let mut h = Harness::new(None);
+    h.resolver
+        .reload(vec![ca
+            .issue(&["*.example.com"], None)
+            .cert_data(&["*.example.com"])])
+        .unwrap();
+    let served = ca.issue(&["app.example.com"], None);
+    let addr = strict_sni_backend(&served, &["app.example.com"]).await;
+    let mut s = terminating("s", vec![rule("any", &["*.example.com"], &[])], None);
+    s.max_connect_attempts = 1;
+    s.upstream_tls = Some(StreamUpstreamTls {
+        server_name: UpstreamServerName::Client {},
+        ca_cert_pem: Some(ca.pem()),
+        ..StreamUpstreamTls::default()
+    });
+    h.set(table(vec![s], vec![("s", backend("b", addr), Some("any"))]));
+    let listen = h.listen("s").await;
+
+    for n in 0..6 {
+        let label = format!("zz{n}.example.com");
+        let mut client = tls_connect(listen, &label, client_config(ca.roots(), None, &[]))
+            .await
+            .unwrap();
+        let _ = client.write_all(b"never forwarded").await;
+        assert_eq!(
+            h.record().await.end_reason,
+            StreamEndReason::ConnectFailed,
+            "{label}"
+        );
+    }
+    let links = h.counters.snapshot().links;
+    assert_eq!(
+        links[&("s".to_string(), "b".to_string())].upstream_tls_failures
+            [&UpstreamTlsFailure::Handshake],
+        6
+    );
+    assert_eq!(h.breaker.recorded("b"), Vec::<bool>::new());
+
+    let mut client = tls_connect(
+        listen,
+        "app.example.com",
+        client_config(ca.roots(), None, &[]),
+    )
+    .await
+    .unwrap();
+    round_trip(&mut client, b"served").await.unwrap();
+    assert_eq!(h.breaker.recorded("b"), vec![true]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_proxy_header_goes_in_plaintext_before_the_backend_s_tls() {
     let ca = Ca::new("Backend CA");

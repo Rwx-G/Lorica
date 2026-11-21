@@ -660,6 +660,23 @@ byte has been forwarded yet. Breaker accounting extends 12.3 D-g:
 - not counted: `no_trust` (above).
 A connection whose attempts all fail ends `connect_failed`, as in 12.3.
 
+**Amended 2026-11-22 (Phase 1 audit, finding C3).** With
+`server_name = client` the name sent upstream is the client's SNI, and
+a wildcard rule lets the client choose any label. A backend that
+refuses names it does not serve (nginx `ssl_reject_handshake`, HAProxy
+`strict-sni`, Envoy without a matching filter chain) answers with a
+fatal alert or a reset, which the first bullet counted: five clients
+with random labels opened every backend's circuit. A `handshake`
+failure on a name the client chose is now **not counted**, like a
+`verify` failure (counted on the link, a half-open probe answered as a
+success); a `timeout` still counts, and Client mode without a client
+SNI, which falls back to the backend's host, counts as before
+(`upstream::named_by_client`, `Shared::upstream_tls_failed` in
+`lorica-stream/src/tcp/connect.rs`). What this gives up: in Client
+mode a backend whose TLS is broken for every name is no longer opened
+by the breaker on handshake failures; its TCP connect failures and
+handshake timeouts still are.
+
 Session resumption towards backends uses rustls' default client cache,
 one per stream config; resumption across streams never happens.
 
@@ -1940,3 +1957,4 @@ Lot A:
 | 2026-11-18 | 0.9 | Lot G, threat model, cluster and upgrade part: the TLS rows of T12, the certificate entitlement of a terminating stream in `docs/cluster.md`, `drains_on_upgrade` in `docs/hot-upgrade.md`. The survey check, `docs/streams.md` and `CHANGELOG.md` stay open. | Romain G. |
 | 2026-11-18 | 0.10 | Lot G, the `docs/streams.md` and CHANGELOG parts: survey values verified with a URL each (Envoy's ClientHello size now documented), TLS at layer 4 documented; with the other documentation pass's boxes, every box of the Lot is ticked. Status InProgress. | Romain G. |
 | 2026-11-18 | 0.11 | Dated note under D-d: a source allowlist, not only the acknowledgement, admits a `no_sni` rule since Story 12.6. | Romain G. |
+| 2026-11-22 | 0.12 | Phase 1 audit, finding C3: dated amendment under D-i, a handshake refused on a name the client chose (`server_name = client`) is no longer a breaker failure. | Romain G. |
