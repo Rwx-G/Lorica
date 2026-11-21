@@ -63,11 +63,56 @@ struct Entry {
     close: watch::Sender<Option<StreamEndReason>>,
 }
 
+/// The live entries of one binding, and the wait for its last end once
+/// someone waits for it.
+#[derive(Debug, Default)]
+struct Binding {
+    live: usize,
+    ended: Option<Arc<Notify>>,
+}
+
 #[derive(Debug, Default)]
 struct State {
     next_id: u64,
     entries: HashMap<u64, Entry>,
+    /// Per stream id, per `bind_gen`, kept by register and deregister so
+    /// a binding's count and its end are never a walk of `entries`; a
+    /// binding leaves at its last end.
+    bindings: HashMap<String, HashMap<u64, Binding>>,
     upgrade_counts: BTreeMap<String, UpgradeDrainCounts>,
+}
+
+impl State {
+    fn binding(&self, stream_id: &str, bind_gen: u64) -> Option<&Binding> {
+        self.bindings.get(stream_id)?.get(&bind_gen)
+    }
+
+    fn binding_registered(&mut self, stream_id: &str, bind_gen: u64) {
+        // Looked up by `&str` first: the stream id is copied only when
+        // the stream has no live entry yet.
+        let bindings = match self.bindings.get_mut(stream_id) {
+            Some(bindings) => bindings,
+            None => self.bindings.entry(stream_id.to_string()).or_default(),
+        };
+        bindings.entry(bind_gen).or_default().live += 1;
+    }
+
+    /// Count one entry of the binding out; at its last, the binding
+    /// leaves and its waiters, if any, are returned to be woken once the
+    /// lock is released.
+    fn binding_deregistered(&mut self, stream_id: &str, bind_gen: u64) -> Option<Arc<Notify>> {
+        let bindings = self.bindings.get_mut(stream_id)?;
+        let binding = bindings.get_mut(&bind_gen)?;
+        binding.live -= 1;
+        if binding.live > 0 {
+            return None;
+        }
+        let ended = bindings.remove(&bind_gen).and_then(|b| b.ended);
+        if bindings.is_empty() {
+            self.bindings.remove(stream_id);
+        }
+        ended
+    }
 }
 
 /// What an upgrade drain did to one stream's connections and sessions
@@ -84,7 +129,6 @@ pub struct UpgradeDrainCounts {
 struct Inner {
     state: Mutex<State>,
     drains_changed: Notify,
-    deregistered: Notify,
 }
 
 /// What a drain predicate sees of one tracked connection.
@@ -142,6 +186,7 @@ impl ConnectionTracker {
                     close,
                 },
             );
+            s.binding_registered(&snapshot.id, bind_gen);
             id
         });
         TrackedConnection {
@@ -264,28 +309,38 @@ impl ConnectionTracker {
     /// Live connections and sessions of binding `bind_gen` of
     /// `stream_id`.
     pub fn binding_len(&self, stream_id: &str, bind_gen: u64) -> usize {
+        self.with_state(|s| s.binding(stream_id, bind_gen).map_or(0, |b| b.live))
+    }
+
+    /// The wait for the last end of binding `bind_gen` of `stream_id`,
+    /// `None` when it has no live entry.
+    fn binding_end_signal(&self, stream_id: &str, bind_gen: u64) -> Option<Arc<Notify>> {
         self.with_state(|s| {
-            s.entries
-                .values()
-                .filter(|e| e.bind_gen == bind_gen && e.stream_id == stream_id)
-                .count()
+            let binding = s.bindings.get_mut(stream_id)?.get_mut(&bind_gen)?;
+            Some(Arc::clone(binding.ended.get_or_insert_with(Arc::default)))
         })
     }
 
     /// Resolve once binding `bind_gen` of `stream_id` has no live entry:
     /// the moment a draining UDP binding's sockets may close (Story 12.5
-    /// D-m).
+    /// D-m). Only that binding's last end wakes it.
     pub async fn binding_ended(&self, stream_id: &str, bind_gen: u64) {
         loop {
-            // Enabled before the count is read, so an entry leaving in
-            // between still wakes this wait.
-            let deregistered = self.inner.deregistered.notified();
-            tokio::pin!(deregistered);
-            deregistered.as_mut().enable();
-            if self.binding_len(stream_id, bind_gen) == 0 {
+            let Some(signal) = self.binding_end_signal(stream_id, bind_gen) else {
                 return;
+            };
+            // Enabled before the binding is read again, so a last end in
+            // between still wakes this wait.
+            let ended = signal.notified();
+            tokio::pin!(ended);
+            ended.as_mut().enable();
+            match self.binding_end_signal(stream_id, bind_gen) {
+                None => return,
+                Some(current) if Arc::ptr_eq(&current, &signal) => ended.await,
+                // The binding ended and live entries came back on it in
+                // between: wait on the signal they brought.
+                Some(_) => {}
             }
-            deregistered.await;
         }
     }
 
@@ -312,25 +367,26 @@ impl ConnectionTracker {
     /// so ([`TrackedConnection::finish`]), and count it if the upgrade
     /// marked it.
     fn deregister(&self, id: u64, ended: Option<StreamEndReason>) {
-        self.with_state(|s| {
-            let Some(entry) = s.entries.remove(&id) else {
-                return;
-            };
-            let Some(drain) = entry
+        let binding_ended = self.with_state(|s| {
+            let entry = s.entries.remove(&id)?;
+            let binding_ended = s.binding_deregistered(&entry.stream_id, entry.bind_gen);
+            if let Some(drain) = entry
                 .drain
                 .filter(|d| d.reason == StreamEndReason::DrainedByUpgrade)
-            else {
-                return;
-            };
-            let ended = ended.or(drain.signalled.then_some(drain.reason));
-            let counts = s.upgrade_counts.entry(entry.stream_id).or_default();
-            if ended == Some(StreamEndReason::DrainedByUpgrade) {
-                counts.closed += 1;
-            } else {
-                counts.finished += 1;
+            {
+                let ended = ended.or(drain.signalled.then_some(drain.reason));
+                let counts = s.upgrade_counts.entry(entry.stream_id).or_default();
+                if ended == Some(StreamEndReason::DrainedByUpgrade) {
+                    counts.closed += 1;
+                } else {
+                    counts.finished += 1;
+                }
             }
+            binding_ended
         });
-        self.inner.deregistered.notify_waiters();
+        if let Some(waiters) = binding_ended {
+            waiters.notify_waiters();
+        }
     }
 }
 
@@ -599,6 +655,49 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), tracker.binding_ended("s", 9))
             .await
             .expect("a binding without entries has ended");
+    }
+
+    /// A waker that counts its wakes.
+    struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A draining binding's wait is woken by its own last end only, never
+    /// by the ends of other bindings, of its stream or another.
+    #[test]
+    fn other_bindings_ends_never_wake_a_binding_ended_wait() {
+        use std::future::Future;
+        use std::sync::atomic::Ordering;
+        use std::task::{Context, Waker};
+
+        let tracker = ConnectionTracker::new();
+        let draining = tracker.register(1, stream("s"));
+        let wakes = Arc::new(CountingWaker(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
+        let mut ended = Box::pin(tracker.binding_ended("s", 1));
+        assert!(ended.as_mut().poll(&mut cx).is_pending());
+        for _ in 0..100 {
+            drop(tracker.register(2, stream("s")));
+            drop(tracker.register(1, stream("t")));
+            assert!(ended.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            0,
+            "woken by the ends of other bindings"
+        );
+        drop(draining);
+        assert!(wakes.0.load(Ordering::SeqCst) >= 1, "its own end wakes it");
+        assert!(ended.as_mut().poll(&mut cx).is_ready());
     }
 
     #[tokio::test]
