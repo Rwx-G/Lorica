@@ -59,6 +59,8 @@ A stream opens a TCP or UDP port on every node it targets, from the moment it is
 - **Leave `allow_local_backend` off.** A stream that forwards to the node itself can expose the management API, the cluster plane or a loopback-only database. The flag is badged in the dashboard; audit every stream that carries it.
 - **PROXY accept on a stream** trusts exactly the CIDRs you list; list the balancer and nothing else.
 - **Set open rates on public streams.** `open_rate` and `source_open_rate` are off by default because the right value depends on the protocol; on a stream reachable from the Internet, set them from the traffic you expect.
+- **Cap connections per source on exposed TCP streams.** `source_max_connections` is off by default, so one source can hold a TCP stream's whole `max_connections` on a node. It is off because one application host's connection pool to a database or a broker stream is the common case and no default fits every pool size; nginx (`limit_conn`) and HAProxy (`src_conn_cur`) leave it to the operator too. On a stream reachable from sources you do not run, set it above the largest pool a legitimate client opens.
+- **A country allowlist is not an access control.** A stream's `geoip` allowlist admits every client on a node with no GeoIP database loaded, as a route's does. Watch `lorica_stream_geoip_unknown_total` on every node such a stream binds, and keep the addresses that must stay out in `source_allow_cidrs` or `source_deny_cidrs`.
 - **Mirror streams in the firewall.** A host firewall that drops everything not listed must list each stream port, or the stream binds and serves nobody; a firewall that allows everything gives no second layer. Either way, the process-side source lists are the ones that still hold when a firewall rule is flushed by mistake.
 
 ### Cluster Plane (v1.7.0+, opt-in)
@@ -579,7 +581,8 @@ Run this checklist periodically:
 - [ ] (MCP) Config-tier grants no wider than the change; MCP audit rows (`spans_tiers`, `forbidden` from an MCP token, `rate_limited`, `settings.update` under `automation`) alerted on
 - [ ] (Capture) No rule left armed past the investigation that justified it, and every `output.dir` sized, pruned and off shared storage
 - [ ] (Capture) `lorica_captures_total{outcome="dropped_sink"}` alerted on
-- [ ] (Streams) Every stream reviewed as a firewall change: a source allowlist where the service is not public, no `allow_local_backend` without a reason, no `udp.unbounded_responses` outside stateful UDP protocols
+- [ ] (Streams) Every stream reviewed as a firewall change: a source allowlist where the service is not public, no `allow_local_backend` without a reason, no `udp.unbounded_responses` outside stateful UDP protocols, a `source_max_connections` on every exposed TCP stream
+- [ ] (Streams) `lorica_stream_geoip_unknown_total` watched on every node that binds a stream with a country allowlist
 - [ ] (Streams) Stream refusals (`lorica_stream_refused_total`) and the `stream_bind_failed` and `stream_udp_ceiling_reached` notifications watched
 - [ ] (PROXY protocol) `proxy_protocol_trusted_cidrs` holds the balancer's addresses only, on each node; loopback absent unless the 443 hairpin is configured
 - [ ] (Drain) `worker_drain_timeout_s` sized for the longest connection that must survive a stop or an upgrade; Docker `stop_grace_period` above it
