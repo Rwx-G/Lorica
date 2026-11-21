@@ -704,25 +704,34 @@ impl Inner {
     /// Forward responses until the session ends; returns how it ended.
     async fn serve(&self, s: &Serving<'_>, tracked: &mut TrackedConnection) -> StreamEndReason {
         let mut reported = false;
+        // One timer each for the session's life, never one per relayed
+        // datagram: the idle one fires at the deadline it was armed for
+        // and, when activity has moved it since, is re-armed there, so a
+        // busy session pays one re-arm per idle window.
+        let total = sleep_until_opt(s.total);
+        tokio::pin!(total);
+        let idle = tokio::time::sleep_until(s.session.last_activity() + s.idle);
+        tokio::pin!(idle);
         loop {
-            let idle_at = s.session.last_activity() + s.idle;
             tokio::select! {
                 biased;
                 reason = tracked.closed() => return reason,
-                _ = sleep_until_opt(s.total) => return StreamEndReason::TotalTimeout,
+                _ = &mut total => return StreamEndReason::TotalTimeout,
                 _ = s.session.wake.notified() => match s.session.take_pending_end() {
                     Some(Ending::Natural(reason)) => return reason,
                     Some(Ending::Icmp(kind)) => return self.icmp_end(s, kind, reported).await,
                     None => {}
                 },
-                _ = tokio::time::sleep_until(idle_at) => {
-                    if s.session.last_activity() + s.idle <= Instant::now() {
+                _ = &mut idle => {
+                    let idle_at = s.session.last_activity() + s.idle;
+                    if idle_at <= Instant::now() {
                         if s.session.bounds().expects_responses() && !s.session.received_any() {
                             s.link.connect_failed(ConnectFailureKind::NoResponse);
                             self.report(s, ConnectOutcome::NoResponse).await;
                         }
                         return idle_end(tracked);
                     }
+                    idle.as_mut().reset(idle_at);
                 },
                 // An ICMP error raises only `EPOLLERR` on a UDP socket,
                 // which read readiness alone never sees.

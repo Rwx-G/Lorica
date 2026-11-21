@@ -863,6 +863,34 @@ async fn an_unanswered_probe_is_answered_as_a_success() {
     h.stop();
 }
 
+/// Activity moves the idle deadline (Phase 1 audit C17 keeps one idle
+/// timer per session and re-arms it only when it fires early): requests
+/// spaced closer than the idle timeout, over more than one idle window,
+/// keep one session, which ends `idle_timeout` one timeout after its
+/// last datagram.
+#[tokio::test]
+async fn activity_keeps_a_session_past_one_idle_window_and_it_idles_out_after() {
+    let b1 = UdpBackend::echo().await;
+    let mut stream = udp_stream("game", "127.0.0.1");
+    stream.idle_timeout_s = 1;
+    udp(&mut stream).unbounded_responses = true;
+    let mut h = Harness::one(stream, vec![backend("b1", b1.addr)]).await;
+    let c = client().await;
+    let mut sent_at = Vec::new();
+    for n in 0..4u8 {
+        c.send_to(&[n], h.listen()).await.unwrap();
+        sent_at.push(Instant::now());
+        assert_eq!(reply(&c).await, [n]);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    let record = h.record().await;
+    assert_eq!(record.end_reason, StreamEndReason::IdleTimeout);
+    assert!(sent_at[3].elapsed() >= Duration::from_secs(1));
+    assert_eq!(record.datagrams_upload, Some(4));
+    assert_eq!(h.stats("game").accepted, 1, "one session throughout");
+    h.stop();
+}
+
 #[tokio::test]
 async fn the_total_timeout_ends_a_session_that_never_idles() {
     let b1 = UdpBackend::sink().await;
