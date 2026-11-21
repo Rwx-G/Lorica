@@ -699,7 +699,7 @@ Allowlist: `tests-e2e-docker/test-runner/run-mcp-smoke.sh`,
 `tests-e2e-docker/test-runner/mcp-helpers.sh`. LF line endings checked
 before the run (a tool-written `.sh` keeps CRLF).
 
-- [ ] A "streams" phase in the MCP smoke: a management session posts the
+- [x] A "streams" phase in the MCP smoke: a management session posts the
       Lot D2 fixture body to `POST /api/v1/streams` (the request the
       form sends) on a free high port; `ss -ltn` shows it; a token minted
       by `lorica mcp token create --tier read` reads it on

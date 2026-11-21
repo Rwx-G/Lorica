@@ -64,14 +64,14 @@ name	source	story	profiles	level	lot	state	matrix
 12.6-matrix-concurrency-caps	12.12 D-e	12.6	streams	full	F	live	Connection limit per source IP;Connection limit per listener / backend
 12.7-iv1-redis-paused-marked-down	12.7 IV1	12.7	streams	full	G	live	Active health: send/expect
 12.7-x-smtp-banner-template	12.7 AC #3	12.7	streams	full	G	live	Active health: send/expect
-12.7-iv2-template-yes-payload-no	12.7 IV2	12.7	mcp	full	J	pending	-
+12.7-iv2-template-yes-payload-no	12.7 IV2	12.7	mcp	full	J	live	-
 12.8-iv1-proxy-v2-https-real-client	12.8 IV1	12.8	geoip	full	H	live	PROXY protocol accept on the HTTP listeners
 12.8-iv2-untrusted-and-forged-xff	12.8 IV2	12.8	geoip,workers	full	H	live	PROXY protocol accept on the HTTP listeners
 12.8-iv3-proxy-off-suite-unchanged	12.8 IV3	12.8	suite	partial	H	live	-
 12.9-iv1-end-reasons-in-api-and-syslog	12.9 IV1	12.9	streams	partial	I	live	L4 access log
 12.9-x-metrics-and-sink-up	12.9 Lot J	12.9	streams	full	I	live	L4 metrics
 12.9-x-stream-sla	12.9 Lot J	12.9	streams	full	I	live	-
-12.10-iv1-dashboard-stream-visible-read-only	12.10 IV1	12.10	mcp	partial	J	pending	-
+12.10-iv1-dashboard-stream-visible-read-only	12.10 IV1	12.10	mcp	partial	J	live	-
 12.11-iv1-stream-ssh-drained-by-upgrade	12.11 IV1	12.11	hot-upgrade	full	K	live	Connection draining;Hot binary upgrade
 12.11-x-stream-new-connection-after-upgrade	12.11 Lot G	12.11	hot-upgrade	full	K	live	Hot binary upgrade
 12.11-x-udp-across-upgrade	12.11 Lot G	12.11	hot-upgrade	full	K	live	Hot binary upgrade

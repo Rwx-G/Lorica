@@ -797,7 +797,7 @@ section appended), `tests-e2e-docker/test-runner/mcp-helpers.sh`,
 `docs/stories/story-12.10-stream-surfaces.md` (Lot H checkboxes only).
 Depends on: 12.10 Lots B and D2; 12.7 in Review.
 
-- [ ] Every item of 12.10 Lot H; `12.7-iv2-template-yes-payload-no` in
+- [x] Every item of 12.10 Lot H; `12.7-iv2-template-yes-payload-no` in
       the same section.
 
 ### Lot K: Story 12.11 scenarios - Docker e2e
@@ -1560,6 +1560,50 @@ pulled images.
     own projects at the same time. IV1 is timing-bound and passed
     regardless; the release run (Lot O) is where the machine is alone.
 
+- **Lot J, 2026-11-21.** Story 12.10 IV1 and Story 12.7 IV2, a streams
+  section appended to `run-mcp-smoke.sh` after the Story 11.4
+  assertions; each scenario prints its line at the section's end.
+  - **Verdicts** (lane 4, the `mcp` phase alone under the main-compose
+    lock, then the report with `--lots J,K`):
+    `12.10-iv1-dashboard-stream-visible-read-only` PARTIAL with its D-d
+    note (the Lot D2 fixture body posted by a management session, not a
+    browser click): `iv1-tcp` created 201 and listening on 40100 (read
+    from `/proc/net/tcp` in the node's namespace, the image has no
+    `ss`); a `--tier read` token lists it on `/automation/v1/streams`
+    and reads `bind.state` `bound` on `/automation/v1/streams/status`;
+    the read-tier MCP session finds it through `lorica_streams` and
+    `lorica_stream_status`; the config (19 tools) and admin (2 tools)
+    tiers list no stream tool; `lorica_backend_delete` on its backend is
+    refused listing the stream's id and the backend stays; a token
+    holding all 14 scopes gets 403 on POST, PUT and DELETE of
+    `/automation/v1/streams` and `/automation/v1/streams/{id}`, five
+    audit rows `automation.request.forbidden:no_declared_scope`; one
+    `stream.create` row by the admin session, chain verified.
+    `12.7-iv2-template-yes-payload-no` PASS: a `backends:write` config
+    token creates a `tcp_template` (`redis_ping`) backend on the
+    automation API (201) and moves it to `smtp_banner` through
+    `lorica_backend_update`; a raw send/expect payload is refused on
+    POST and PUT (403, nothing stored, the template kept) and by the MCP
+    tool naming `send`, with no audit row, so no plane call.
+  - **No product defect found.** Three runs; the failures were the
+    scenario's. (1) The management API admits five logins a minute per
+    address and every CLI mint logs in: the smoke's own login and four
+    mints use the window up, so the section's mints were refused 429.
+    They now retry once the window has rolled. (2) A token carrying
+    `settings:write` is refused past a seven-day lifetime: the
+    every-scope mint passes `--lifetime-days 1`. (3) 12.10 Lot H reads
+    "403 `no_declared_scope`"; the 403 body says the path "declares no
+    automation scope and is reachable by no token", and
+    `no_declared_scope` is the refusal's reason, in the audit row's
+    action, as docs/automation.md's reasons table states. The scenario
+    asserts both.
+  - **Run time.** The section adds about 50 s to the `mcp` phase (72 s
+    for the whole phase), most of it waiting out the login window.
+  - **Not done here.** 12.10 Lot H's last box ("run alone on the
+    machine") stays open: this run held the main-compose lock while L4
+    lanes ran their own projects. 12.7 has no handed-over e2e Lot (its
+    IV2 is automated in its Lot 2), so nothing is ticked there.
+
 ## File List
 
 Lot A:
@@ -1672,6 +1716,13 @@ Lot K:
 - `tests-e2e-docker/l4/scenarios.tsv` (Lot K rows `live`)
 - `docs/stories/story-12.11-upgrade-drain.md` (Lot G checkboxes)
 
+Lot J:
+
+- `tests-e2e-docker/test-runner/run-mcp-smoke.sh` (the streams section
+  appended)
+- `tests-e2e-docker/l4/scenarios.tsv` (Lot J rows `live`)
+- `docs/stories/story-12.10-stream-surfaces.md` (Lot H checkboxes)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1689,3 +1740,4 @@ Lot K:
 | 2026-11-21 | 0.7 (Lot H) | Lot H re-verified by a fresh run after the lane was interrupted: same verdicts, no file change. | Romain G. |
 | 2026-11-21 | 0.7 (Lot I) | Lot I re-verified by a fresh run after the lane was interrupted: same verdicts, no file change. | Romain G. |
 | 2026-11-21 | 0.7 | Lot K implemented: Story 12.11 IV1 and its three handover scenarios in the `hot-upgrade` profile, all passing (SSH session drained at the 120 s deadline with its report on the new `/metrics`, UDP across the upgrade with no loss, 64 range ports handed over); `ssh-backend` image. No product defect. | Romain G. |
+| 2026-11-21 | 0.8 | Lot J implemented: Story 12.10 IV1 (partial as D-d says: the form's body, not a click) and Story 12.7 IV2 in the `mcp` profile, both reporting as expected; the section's mints wait out the login limit. No product defect. | Romain G. |
