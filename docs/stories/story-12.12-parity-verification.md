@@ -877,6 +877,18 @@ Depends on: every Lot above; every Phase 1 story in Review.
 
 - [ ] The procedure of D-n; results recorded; owner decision recorded
       for any `INCONCLUSIVE`.
+- [ ] The breaker RPC load under a UDP flood (added 2026-11-21, Phase 1
+      audit item N1, maintainer decision). Worker mode, a DNS flood with
+      a fresh source port per query at about 30,000 queries a second
+      through one UDP stream while HTTP is measured, taken after the
+      audit's fix that stops awaiting the breaker report (C9) has landed:
+      HTTP p99 and the supervisor's breaker RPC rate, recorded with the
+      other numbers. Every new session asks the supervisor for one
+      breaker admission over the RPC endpoint HTTP shares. A worker-local
+      cache of closed circuits is built only if HTTP p99 then moves past
+      NFR1; it is not built otherwise, because it would let a circuit
+      stay closed on a worker for the cache's lifetime after the
+      supervisor opened it, which changes 12.3 D-g's coordination.
 
 ## Dev Notes
 
@@ -2024,3 +2036,4 @@ Lot L:
 | 2026-11-21 | 0.17 | Lot K implemented: Story 12.11 IV1 and its three handover scenarios in the `hot-upgrade` profile, all passing (SSH session drained at the 120 s deadline with its report on the new `/metrics`, UDP across the upgrade with no loss, 64 range ports handed over); `ssh-backend` image. No product defect. | Romain G. |
 | 2026-11-21 | 0.18 | Lot L implemented: 12.1 IV1 and IV2 in the `cluster` smoke and the cold rollback to 1.10.7 passing; the hot rollback finds a product defect (a 1.10.x binary adopts a stream's listener as an HTTP listener) and its row stays `pending`; `docs/hot-upgrade.md` states the observed rollback. | Romain G. |
 | 2026-11-21 | 0.19 | Lot L's product defect fixed: a table holding a stream socket goes chunked at any size and the chunked header leads with a non-UTF-8 byte, so 1.10.7 refuses the hot downgrade cleanly and the old generation keeps serving; `12.1-ac3-rollback-hot-1.10.7` PASS and `live`; Lot L's boxes all ticked. | Romain G. |
+| 2026-11-21 | 0.20 | Phase 1 audit item N1: a Lot O check added, the breaker RPC load under a UDP flood measured after C9, and the maintainer's decision that a worker-local breaker cache is built only if HTTP p99 then moves past NFR1. | Romain G. |

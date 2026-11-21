@@ -557,6 +557,22 @@ The UDP engine uses the seams 12.3 D-a defines and implements in
   - **Success**: the session's first response.
   - **Not reported**, as 12.3 D-g: a local-address refusal, an unresolved
     name, a failed source bind, a session drained before any outcome.
+  - **Amended 2026-11-21 (Phase 1 audit, finding C1, maintainer
+    decision): the breaker counts only ICMP errors, never a missing
+    response.** The no-response failure above was a flaw: whether a
+    datagram is answered is chosen by whoever sends it, and many UDP
+    protocols drop bad input silently by specification (RADIUS, SNMP,
+    WireGuard, DNS response rate limiting), so five spoofed datagrams
+    per backend per cooldown opened the circuit for every client of the
+    stream and raised `stream_backend_down` for a healthy backend. A
+    session that idles out unanswered still counts as `no_response` on
+    its link and in the SLA; it is no longer reported to the breaker.
+    What this gives up: passive detection of a UDP backend that goes
+    silent without sending ICMP, which Story 12.14's UDP checks provide
+    (recorded there). Ratios or distinct-source counts were weighed and
+    refused: each stays poisonable by spoofing. The change ships with
+    the audit's code lot for C1; until it lands, the Failure bullet
+    above is what the code does.
 - **No retry.** A session is never moved to another backend once its
   first datagram is sent (the UDP twin of 12.3's "never retried once
   bytes have flowed"); there is no handshake that could fail first.
@@ -2142,3 +2158,4 @@ Lot A:
 | 2026-11-18 | 0.12 | Lot H, the `docs/streams.md` and CHANGELOG parts: UDP streams documented, survey values and PROXY v2 receivers verified from their documentation (HAProxy Enterprise's 10 s not documented); with the other documentation pass's boxes, every box of the Lot is ticked. Status InProgress. | Romain G. |
 | 2026-11-18 | 0.13 | HAProxy Enterprise's 10 s UDP idle traced to the module's reference page (`timeout client` of a `udp-lb` section); `docs/streams.md`, the `DEFAULT_UDP_IDLE_TIMEOUT_S` doc comment and the PRD cite it. | Romain G. |
 | 2026-11-18 | 0.14 | Lot H, the region version line in `docs/BUMP-CHECKLIST.md`; the skill's untracked copy left to the maintainer. | Romain G. |
+| 2026-11-21 | 0.15 | Phase 1 audit, finding C1: D-i amended by maintainer decision, the UDP breaker counts only ICMP errors and never a missing response, which stays on the link counter and in the SLA; the code ships with the audit's code lot. | Romain G. |

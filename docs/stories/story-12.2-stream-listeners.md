@@ -265,6 +265,21 @@ in Pingora's set, no task on Pingora's runtimes. It subscribes to
 `quiesce` (the upgrade path until Story 12.11) still stops its accept
 loops and arms the drain watcher (D-f).
 
+*Amendment (maintainer, 2026-11-21, Phase 1 audit, finding C7): a dead
+stream loop or thread is fatal to its process.* Nothing supervised the
+runtime: a panic in an accept or receive loop, or the end of the
+`lorica-stream` thread, left the HTTP side serving while the stream's
+port accepted nothing, or, on UDP, kept its socket slot and dropped
+every datagram sent to it. An unexpected end of the thread or of any
+loop not asked to stop now makes the worker exit non-zero with a
+counted reason, so the supervisor's respawn and replay run; in
+single-process mode the process exits non-zero and systemd restarts it
+(`Restart=on-failure` in `dist/lorica.service`). A panic inside one
+connection's or session's task stays contained, its access-log row
+lost. What it gives up: the HTTP side of that worker for the restart
+time, in exchange for no silent blackhole. The change ships with the
+audit's code lot for C7; until it lands, nothing watches the thread.
+
 *Before Story 12.3 lands on the branch,* the worker installs no engine:
 the accept loop closes an accepted TCP connection at once and drops a
 datagram, both logged at debug. 12.3 and 12.5 replace that with their
@@ -1726,3 +1741,4 @@ the budget view stays Operator and SuperAdmin.
 | 2026-11-18 | 0.12 | Lot G, security, operations and architecture part: the drain setting and the stop path in the installation, hot-upgrade and hardening documents, the stream control channel in `worker-shared-state.md`, `lorica-stream` in the source tree and the component architecture. The crate lists, `FORK.md`, backlog #81, `docs/streams.md` and `CHANGELOG.md` stay open. | Romain G. |
 | 2026-11-18 | 0.13 | Lot G, the `docs/streams.md`, README and CHANGELOG parts: bind states, the fd budget, the listen-address rule and the stop drain documented; the other Lot G items stay open. Status InProgress. | Romain G. |
 | 2026-11-18 | 0.14 | Lot G closed: `lorica-stream` in the crate lists, `5104a3e0` and `4a9d66d8` ruled out in `FORK.md` and dropped from backlog #81; a dated note under D-f on `stop_grace_period`. | Romain G. |
+| 2026-11-21 | 0.15 | Phase 1 audit, finding C7: maintainer decision recorded under D-b, a dead stream loop or thread makes the worker exit non-zero and respawn (single-process: the process exits for systemd); the code ships with the audit's code lot. | Romain G. |

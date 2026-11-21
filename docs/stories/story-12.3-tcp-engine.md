@@ -737,6 +737,23 @@ write scope), and a refusal must not hand the name out instead. The
 spelling is one helper, `streams_as_seen_by` in `automation/write.rs`,
 shared with 12.10's backend delete refusal.
 
+*Amendment (maintainer, 2026-11-21, Phase 1 audit, finding C4):* the
+narrowness above was a flaw. A token's address change on a backend
+**any** stream links is refused (403), whether or not the stream sets
+`allow_local_backend`; the message and `streams_as_seen_by` stay as
+amended on 2026-11-18. Reason: D9 says no tier gains a stream mutation,
+and deleting a linked backend is already refused (409) because it
+changes what a stream forwards to; an address change, port included,
+changes it just as much (a public 5432 re-pointed at an internal Redis,
+anywhere in the token's `allowed_backend_cidrs`). Management sessions
+stay free: an Operator may still move such a backend from the dashboard
+or the management API, which is where stream changes belong. No released
+behaviour is lost, since streams are new in 1.11.0 and an environment's
+managed backend cannot be linked to a stream (`AttachmentRule::ManagedBackend`).
+What it gives up: token-driven moves of stream backends, which no
+released version had. The change ships with the audit's code lot for
+C4; until it lands, the paragraph above is what the code does.
+
 ### D-n. DNS re-resolution
 
 - **Per process**, inside the engine: one `ResolverCache` per worker
@@ -1301,10 +1318,17 @@ torn down first.
 
 ### Pitfalls
 
-- **The stream runtime has one thread per process.** A blocking call
-  in the engine (std DNS, a `std::sync::Mutex` held across an await, a
-  store read) stalls every stream of the worker. Resolution goes
-  through hickory; nothing in the engine touches the store.
+- **The stream runtime has two threads per process.** `run` is
+  `block_on` on the `lorica-stream` OS thread and handles control
+  messages and table loads (the store read included); the accept and
+  receive loops and every connection run on the runtime's one worker
+  thread (`worker_threads(1)`). A blocking call in the engine (std DNS,
+  a `std::sync::Mutex` held across an await, a store read) stalls every
+  stream of the worker. Resolution goes through hickory; nothing in the
+  engine touches the store. Never move a loop into `run`: it would
+  then share the control thread and a table load would stall it.
+  (Corrected 2026-11-21 after the Phase 1 audit, which found "one
+  thread" imprecise.)
 - **`IP_BIND_ADDRESS_NO_PORT`** must be set before `bind`. I'm not sure
   `socket2` 0.6 exposes it; if not, `nix`'s socket option or a
   `setsockopt` in `lorica-worker` (which already uses `nix`), never an
@@ -1921,3 +1945,4 @@ Lot B:
 | 2026-11-18 | 0.10 | Lot F, threat-model part: local services, forwarding loops, DNS rebinding and PROXY-header spoofing on streams in T12; source addresses in the hardening guide. The survey check, `docs/streams.md` and `CHANGELOG.md` stay open. | Romain G. |
 | 2026-11-18 | 0.11 | Lot F, the `docs/streams.md` and CHANGELOG parts: survey values verified with a URL each (two D-d values not documented by HAProxy 3.4, recorded in the Completion Notes), the TCP engine documented; with the other documentation pass's boxes, every box of the Lot is ticked. Status InProgress. | Romain G. |
 | 2026-11-18 | 0.12 | Dated notes under D-d (HAProxy `retries` and `srvtcpka` defaults not in the 3.4 manual) and D-p (`max_connections` per node since Story 12.6). | Romain G. |
+| 2026-11-21 | 0.13 | Phase 1 audit: finding C4's maintainer decision recorded under D-m (a token's address change on a backend any stream links is refused, 403; the code ships with the audit's code lot); the "one thread per process" pitfall corrected to two threads (A-I1). | Romain G. |

@@ -272,6 +272,26 @@ Reading the table:
   synthetic, checksummed streams, which are stricter on bytes but say
   nothing about a real client's timers.
 
+## Constraints from the Phase 1 audit (2026-11-21)
+
+Recorded in the PRD under "Story 12.16", "Constraints recorded by the
+Phase 1 audit"; the 1.12.0 cycle starts from them with the outcome
+above.
+
+- **AC #3 holds for transferred connections only.** The caps regions
+  are per generation, so the connections that drain keep the
+  up-to-twice-the-caps window of the threat model's residual risk #19,
+  and each upgrade gives every source a fresh rate burst. This answers
+  half of "Cap permits and the bandwidth budget" above: the permit of a
+  transferred connection moves, the drained remainder does not.
+- **The worker-to-worker path above is a channel of its own**, not an
+  extension of `stream_ctl`: length-prefixed, able to carry the held
+  bytes of the no-quiesce park (outcome item 1) and fds out of a
+  worker, with `stream_ctl`'s stop-and-wait flow control and its bound
+  on fds in flight.
+
 ## Change Log
 
 - 2026-11-18: Spike outcome recorded (Romain G.). Status: Spike done.
+- 2026-11-21: Constraints from the Phase 1 audit recorded (A-M4 on AC
+  #3, A-L4 on the transfer channel) (Romain G.).

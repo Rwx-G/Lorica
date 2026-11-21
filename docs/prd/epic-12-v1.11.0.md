@@ -506,6 +506,10 @@ so that I do not trade them away by choosing Lorica.
 
 - IV1: A backend behind a transparent stream sees the client's own address as the TCP peer.
 
+### Constraints recorded by the Phase 1 audit (2026-11-21)
+
+- **Decide the replication rule for format 4 before this story starts.** `decode_canonical` (`lorica-config/src/canonical.rs`) refuses any blob whose format version is not `CANONICAL_FORMAT_VERSION`, so every shape-changing rollout freezes replication from the moment the control plane moves until each follower has. Format 4 is certain in Phase 2: this story's P2C variant changes `LoadBalancing`, and Story 12.15 adds its read mode. Decide, and write in this story, whether a node accepts an N-1 blob, treating the tables N-1 lacks as "keep local", never as "empty", or keeps the strict equality and documents the freeze in the upgrade order.
+
 ---
 
 ## Story 12.14: Active health checks for UDP backends
@@ -523,6 +527,12 @@ so that a dead DNS resolver leaves the pool although its port is "open".
 ### Integration Verification
 
 - IV1: A DNS resolver that stops answering is marked down by its UDP check and leaves the stream within the configured thresholds.
+
+### Constraints recorded by the Phase 1 audit (2026-11-21)
+
+- **These checks are what detects a silent UDP backend.** By the maintainer's decision on finding C1 (Story 12.5 D-i, amended the same day), the circuit breaker counts only ICMP errors on UDP, never a session left unanswered, because whether a datagram is answered is chosen by whoever sends it. Passive detection therefore no longer sees a UDP backend that stops answering without sending ICMP; IV1 is the proof that this story covers it.
+- **`close_on_backend_down` on UDP is lifted here.** Nothing writes `Down` for a UDP backend in 1.11.0, so the audit's code lot for C20 refuses the field on a UDP stream; this story allows it again once UDP checks ship.
+- **Range streams with portless links.** A range stream's backend carries no port and its breaker is one circuit for every port of the range (Story 12.3 D-g, `docs/streams.md`). Decide whether an active check on such a backend probes a representative port, and which, or whether portless links stay without checks; `close_on_backend_down` on such a stream is inert until that is decided.
 
 ---
 
@@ -546,6 +556,10 @@ so that I can cover network setups where only one port is open.
 - IV2: The 443 hairpin serves HTTPS routes with the client's real address and SSH on the same port.
 - IV3: PostgreSQL through the PostgreSQL matcher: a client opening with SSLRequest and a client opening with a plain StartupMessage each reach the PostgreSQL backend, in a test of their own.
 - IV4: PostgreSQL 17 direct SSL (`sslnegotiation=direct`) reaches the same backend through the TLS matcher on ALPN `postgresql`, in a separate test, so neither detection path can regress unnoticed behind the other.
+
+### Constraints recorded by the Phase 1 audit (2026-11-21)
+
+- **`tls_mode` cannot carry detection.** In 1.11.0 one field, `tls_mode` (`StreamTlsMode` in `lorica-config/src/models/stream.rs`), decides both what the stream reads before choosing a backend (`reads_client_hello`) and what it does with TLS. The non-TLS matchers of AC #1 fit neither value. Add a `detect` read mode or a separate `read` field, and land it in the same format-4 change as Story 12.13 (see its constraints), so the canonical format moves once in the release.
 
 ---
 
@@ -576,6 +590,11 @@ A time-boxed spike runs during the 1.11.0 cycle, without production code: a prot
 - IV2: A DNS client with a live UDP session keeps getting answers across a hot upgrade with no session re-created on the backend.
 - IV3: A transfer forced to fail mid-way (test hook) leaves the connection draining on the old generation, and the connection completes normally.
 - IV4: Under continuous bidirectional traffic with injected loss and reordering, 50 consecutive hot upgrades transfer a TCP passthrough connection and a UDP session with no byte lost, duplicated or reordered, checked by checksums at both ends.
+
+### Constraints recorded by the Phase 1 audit (2026-11-21)
+
+- **AC #3's "caps never exceeded across the handover" holds for transferred connections only.** Each process generation counts in caps regions of its own (`lorica-shmem/src/stream_caps.rs`: regions are never shared across generations, which is why `STREAM_CAPS_LAYOUT_VERSION` has no upgrade consequence), so the connections that drain on the old generation keep the up-to-twice-the-caps window of the threat model's residual risk #19. Recommended reading, kept unless the story finds a reason against it: a transferred connection re-registers its permit in the new generation's region before the old one is released, and the drained remainder keeps the 2x window. Making the new generation count the old one's drained remainder would mean sharing a region across generations, which gives up the "no upgrade consequence" property of the layout version. The per-source rate state (GCRA cells) also starts fresh in each generation, so every upgrade grants each source a fresh burst; residual risk #19 is to name it when this story ships.
+- **A transfer channel of its own.** `stream_ctl` (`lorica-worker/src/stream_ctl.rs`) carries text messages of space-separated tokens in one fixed-size payload buffer, and fds from the supervisor to a worker only. A transfer needs held bytes and fds out of a worker. Use a separate, length-prefixed channel for it, keeping `stream_ctl`'s stop-and-wait flow control and its bound of one message's fds in flight per worker (in-flight `SCM_RIGHTS` fds are charged to the sender's `RLIMIT_NOFILE`).
 
 ---
 
