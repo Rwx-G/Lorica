@@ -23,10 +23,11 @@
 //! of keys and makes room for 32 descriptors; past either, keys arrive
 //! truncated or descriptors are dropped by the kernel (`MSG_CTRUNC`).
 //!
-//! **Chunked**, `lorica-fds/2`: a header line `lorica-fds/2 <entries>\n`
-//! carrying no descriptor, then chunks of at most [`CHUNK_MAX_FDS`]
-//! descriptors whose keys fit [`CHUNK_MAX_KEY_BYTES`]. A chunk is one
-//! frame, `[u32 BE body length][body]`, the body a sequence of
+//! **Chunked**, `lorica-fds/2`: a header line, the byte [`HEADER_LEAD`]
+//! then `lorica-fds/2 <entries>\n`, carrying no descriptor, then chunks
+//! of at most [`CHUNK_MAX_FDS`] descriptors whose keys fit
+//! [`CHUNK_MAX_KEY_BYTES`]. A chunk is one frame,
+//! `[u32 BE body length][body]`, the body a sequence of
 //! `[u16 BE key length][key]`, the i-th key naming the i-th descriptor.
 //! The receiver acknowledges the header and every chunk with one byte,
 //! and the sender waits for it before sending anything more: a unix
@@ -36,12 +37,16 @@
 //!
 //! # Compatibility, both ways
 //!
-//! The sender uses the legacy message whenever the table fits it, so a
-//! node whose table fits (every node without streams) still hot-downgrades
-//! to a 1.10.x binary. A table that does not fit is sent chunked; a 1.10.x
-//! receiver then fails, the new process never signals ready and the
-//! upgrade rolls back. The receiver reads the first message and tells the
-//! two apart by the format token.
+//! A legacy receiver files every key it does not know with its HTTP
+//! listeners, so the legacy message is used only when the table fits it
+//! AND the caller vouches that a legacy receiver files every key where it
+//! belongs: a node without streams still hot-downgrades to a 1.10.x
+//! binary. Any other table is sent chunked, and a legacy receiver refuses
+//! it cleanly: the header's first byte is not UTF-8, so the fork's key
+//! parse fails with `EINVAL` before any descriptor is taken, the new
+//! process exits without signalling ready, and the upgrade rolls back.
+//! The receiver reads the first message and tells the two apart by that
+//! byte.
 //!
 //! # Failure closes everything received
 //!
@@ -59,7 +64,18 @@ use std::time::{Duration, Instant};
 use lorica_core::server::Fds;
 use lorica_worker::fd_passing::{self, ReceivedRights};
 
-/// First bytes of a chunked transfer's header line.
+/// First byte of a chunked transfer's header line, before
+/// [`FORMAT_TOKEN`].
+///
+/// It is never valid UTF-8. The legacy receiver (the fork's
+/// `get_from_sock`, which every release from 1.8.0 to 1.10.x pulls with)
+/// reads the header as its one message and parses its keys as UTF-8: this
+/// byte makes it return `EINVAL`, which those releases log and exit on.
+/// Without it the header parses as two keys and no descriptor, and the
+/// fork asserts.
+const HEADER_LEAD: u8 = 0xFF;
+
+/// The format name in a chunked transfer's header line.
 const FORMAT_TOKEN: &str = "lorica-fds/2";
 
 /// Most descriptors one chunk carries.
@@ -86,8 +102,9 @@ const LEGACY_KEYS_MAX_BYTES: usize = 2048;
 /// The byte a receiver answers the header and each chunk with.
 const ACK: u8 = 0x06;
 
-/// Longest header line accepted: the token, a space, a `usize` and `\n`.
-const HEADER_MAX_LEN: usize = FORMAT_TOKEN.len() + 1 + 20 + 1;
+/// Longest header line accepted: the lead byte, the token, a space, a
+/// `usize` and `\n`.
+const HEADER_MAX_LEN: usize = 1 + FORMAT_TOKEN.len() + 1 + 20 + 1;
 
 /// How long either side waits for the other to show up on the socket,
 /// the budget the fork's sender and receiver have always had.
@@ -117,10 +134,26 @@ fn fits_legacy_message(keys: &[String]) -> bool {
 }
 
 /// Send `table` to the receiver listening on `path` (BLOCKING): the
-/// legacy single message when it fits, the chunked transfer otherwise.
-pub(crate) fn send_table(table: &Fds, path: &Path) -> Result<(), String> {
+/// legacy single message when it fits and `legacy_receivers_file` holds
+/// for every key, the chunked transfer otherwise.
+///
+/// `legacy_receivers_file(key)` says whether a legacy receiver adopts
+/// `key`'s descriptor as what it is. A key it does not know lands with its
+/// HTTP listeners, so one such key is enough to rule the legacy message
+/// out: the chunked header is what a legacy receiver refuses.
+pub(crate) fn send_table(
+    table: &Fds,
+    path: &Path,
+    legacy_receivers_file: fn(&str) -> bool,
+) -> Result<(), String> {
     let (keys, fds) = table.serialize();
-    if fits_legacy_message(&keys) {
+    if !keys.iter().all(|k| legacy_receivers_file(k)) {
+        tracing::info!(
+            entries = keys.len(),
+            "hot upgrade: the listener table holds entries a binary before 1.11.0 \
+             would serve as HTTP listeners; sending it chunked, which such a binary refuses"
+        );
+    } else if fits_legacy_message(&keys) {
         let path_str = path.to_string_lossy();
         return table
             .send_to_sock(path_str.as_ref())
@@ -128,6 +161,13 @@ pub(crate) fn send_table(table: &Fds, path: &Path) -> Result<(), String> {
             .map_err(|e| format!("legacy transfer failed: {e}"));
     }
     send_chunked(&keys, &fds, path)
+}
+
+/// The header line of a chunked transfer of `entries` entries.
+fn header_line(entries: usize) -> Vec<u8> {
+    let mut line = vec![HEADER_LEAD];
+    line.extend_from_slice(format!("{FORMAT_TOKEN} {entries}\n").as_bytes());
+    line
 }
 
 /// The chunks a table is sent in, as ranges of its entries: at most
@@ -169,9 +209,14 @@ fn encode_chunk(keys: &[String]) -> Vec<u8> {
 fn send_chunked(keys: &[String], fds: &[RawFd], path: &Path) -> Result<(), String> {
     let chunks = plan_chunks(keys)?;
     let mut conn = connect_with_retry(path)?;
-    conn.write_all(format!("{FORMAT_TOKEN} {}\n", keys.len()).as_bytes())
+    conn.write_all(&header_line(keys.len()))
         .map_err(|e| format!("sending the transfer header failed: {e}"))?;
-    await_ack(&mut conn, "header")?;
+    await_ack(&mut conn, "header").map_err(|e| {
+        format!(
+            "{e} (an incoming binary before 1.11.0 refuses the {FORMAT_TOKEN} \
+             transfer, and the handoff rolls back)"
+        )
+    })?;
     for (n, range) in chunks.into_iter().enumerate() {
         let frame = encode_chunk(&keys[range.clone()]);
         let sent = fd_passing::send_with_rights(conn.as_raw_fd(), &frame, &fds[range])
@@ -293,7 +338,7 @@ fn receive_from(mut conn: UnixStream) -> Result<Vec<(String, OwnedFd)>, String> 
         return Err("the outgoing supervisor closed the transfer without sending".to_string());
     }
     let payload = &buf[..first.bytes];
-    if !payload.starts_with(format!("{FORMAT_TOKEN} ").as_bytes()) {
+    if payload.first() != Some(&HEADER_LEAD) {
         return decode_legacy(payload, first.fds);
     }
     if !first.fds.is_empty() {
@@ -337,8 +382,9 @@ fn read_header(conn: &mut UnixStream, mut line: Vec<u8>) -> Result<usize, String
             .map_err(|e| format!("transfer header cut short: {e}"))?;
         line.push(byte[0]);
     }
-    let text = std::str::from_utf8(&line)
-        .ok()
+    let text = line
+        .strip_prefix(&[HEADER_LEAD])
+        .and_then(|l| std::str::from_utf8(l).ok())
         .and_then(|l| l.strip_prefix(FORMAT_TOKEN))
         .and_then(|l| l.strip_prefix(' '))
         .and_then(|l| l.strip_suffix('\n'))
@@ -566,7 +612,7 @@ mod tests {
                 .get_from_sock(receiver_path.as_str())
                 .map(|()| legacy)
         });
-        send_table(&table, &path).expect("send");
+        send_table(&table, &path, |_| true).expect("send");
         let legacy = receiver
             .join()
             .expect("the legacy receiver does not panic")
@@ -605,31 +651,81 @@ mod tests {
         assert!(!path.exists(), "the transfer socket is removed after use");
     }
 
-    #[test]
-    fn a_chunked_table_fails_against_the_legacy_receiver_without_hanging() {
-        // D-d's safe failure: a 1.10.x incoming binary cannot read a
-        // table past the legacy limits, and the outgoing side gives up
-        // instead of waiting for an acknowledgement that never comes.
-        let fixture = DescriptorFixture::new(33);
-        let table = table_of(&fixture, &short_keys(33));
+    /// Send `table` through [`send_table`] with `legacy_receivers_file`
+    /// to the fork's `get_from_sock`, the receiver of every release from
+    /// 1.8.0 to 1.10.x, and return what each side made of it.
+    fn send_to_legacy_receiver(
+        table: &Fds,
+        legacy_receivers_file: fn(&str) -> bool,
+    ) -> (Result<(), String>, Result<Fds, String>) {
         let dir = tempfile::tempdir().expect("test dir");
         let path = socket_in(&dir);
         let receiver_path = path.to_string_lossy().into_owned();
         let receiver = std::thread::spawn(move || {
             let mut legacy = Fds::new();
-            legacy.get_from_sock(receiver_path.as_str())
+            legacy
+                .get_from_sock(receiver_path.as_str())
+                .map(|()| legacy)
+                .map_err(|e| format!("{e:?}"))
         });
-        let err = send_table(&table, &path).expect_err("the legacy receiver cannot take it");
+        let sent = send_table(table, &path, legacy_receivers_file);
+        let received = receiver
+            .join()
+            .expect("the legacy receiver refuses without a panic");
+        (sent, received)
+    }
+
+    #[test]
+    fn a_chunked_table_fails_against_the_legacy_receiver_without_hanging() {
+        // D-d's safe failure: a 1.10.x incoming binary cannot read a
+        // table past the legacy limits. It refuses the header with
+        // EINVAL, which 1.10.x logs and exits on, rather than asserting,
+        // and the outgoing side gives up instead of waiting for an
+        // acknowledgement that never comes.
+        let fixture = DescriptorFixture::new(33);
+        let table = table_of(&fixture, &short_keys(33));
+        let (sent, received) = send_to_legacy_receiver(&table, |_| true);
+        let err = sent.expect_err("the legacy receiver cannot take it");
         assert!(err.contains("acknowledgement"), "{err}");
-        let _ = receiver.join();
+        assert!(err.contains("before 1.11.0"), "{err}");
+        assert_eq!(received.err().as_deref(), Some("EINVAL"));
+    }
+
+    #[test]
+    fn a_table_holding_a_key_legacy_receivers_misfile_never_takes_the_legacy_message() {
+        // Two entries fit the legacy message, but a legacy receiver files
+        // a key it does not know with its HTTP listeners: the table goes
+        // chunked, which the legacy receiver refuses before taking any
+        // descriptor, and which the current receiver reads.
+        let fixture = DescriptorFixture::new(2);
+        let keys = vec![
+            "192.0.2.10:8080".to_string(),
+            "unknown:192.0.2.10:1".to_string(),
+        ];
+        assert!(fits_legacy_message(&keys));
+        let table = table_of(&fixture, &keys);
+        let only_bare_addresses: fn(&str) -> bool = |k| !k.starts_with("unknown:");
+
+        let (sent, received) = send_to_legacy_receiver(&table, only_bare_addresses);
+        sent.expect_err("the legacy receiver does not acknowledge the header");
+        assert_eq!(received.err().as_deref(), Some("EINVAL"));
+        assert_eq!(fixture.open_descriptors(), 2, "no descriptor reached it");
+
+        let dir = tempfile::tempdir().expect("test dir");
+        let path = socket_in(&dir);
+        let receiver_path = path.clone();
+        let receiver = std::thread::spawn(move || receive_table(&receiver_path));
+        send_table(&table, &path, only_bare_addresses).expect("send");
+        let received = receiver.join().expect("no panic").expect("receive");
+        assert_received(&fixture, &keys, &received);
     }
 
     /// Play the outgoing side by hand: send `header`, then each chunk as
     /// one frame and its descriptors, waiting for every acknowledgement
     /// but the last chunk's, then hang up.
-    fn send_by_hand(path: &Path, header: &str, chunks: &[(Vec<u8>, Vec<RawFd>)]) {
+    fn send_by_hand(path: &Path, header: &[u8], chunks: &[(Vec<u8>, Vec<RawFd>)]) {
         let mut conn = connect_with_retry(path).expect("connect");
-        conn.write_all(header.as_bytes()).expect("header");
+        conn.write_all(header).expect("header");
         if await_ack(&mut conn, "header").is_err() {
             return;
         }
@@ -641,8 +737,15 @@ mod tests {
         }
     }
 
+    /// A header line: [`HEADER_LEAD`], then `rest`.
+    fn header(rest: &str) -> Vec<u8> {
+        let mut line = vec![HEADER_LEAD];
+        line.extend_from_slice(rest.as_bytes());
+        line
+    }
+
     fn receive_from_hand_sender(
-        header: &str,
+        header: &[u8],
         chunks: Vec<(Vec<u8>, Vec<RawFd>)>,
     ) -> Result<Vec<(String, OwnedFd)>, String> {
         let dir = tempfile::tempdir().expect("test dir");
@@ -660,7 +763,7 @@ mod tests {
         let mut frame = encode_chunk(&keys);
         frame.truncate(frame.len() - 5);
         let fds = (0..3).map(|i| fixture.fd(i)).collect();
-        let err = receive_from_hand_sender("lorica-fds/2 3\n", vec![(frame, fds)])
+        let err = receive_from_hand_sender(&header("lorica-fds/2 3\n"), vec![(frame, fds)])
             .expect_err("a short chunk fails the pull");
         assert!(err.contains("middle of a chunk"), "{err}");
         assert_eq!(
@@ -677,9 +780,11 @@ mod tests {
 
         // Two keys for three descriptors.
         let fds = (0..3).map(|i| fixture.fd(i)).collect();
-        let err =
-            receive_from_hand_sender("lorica-fds/2 3\n", vec![(encode_chunk(&keys[..2]), fds)])
-                .expect_err("keys and descriptors disagree");
+        let err = receive_from_hand_sender(
+            &header("lorica-fds/2 3\n"),
+            vec![(encode_chunk(&keys[..2]), fds)],
+        )
+        .expect_err("keys and descriptors disagree");
         assert!(err.contains("2 keys and 3 descriptors"), "{err}");
         assert_eq!(fixture.open_descriptors(), 5);
 
@@ -689,15 +794,20 @@ mod tests {
         // acknowledgement or at the next read is a race; the outcome is
         // the same.
         let fds = (0..2).map(|i| fixture.fd(i)).collect();
-        receive_from_hand_sender("lorica-fds/2 5\n", vec![(encode_chunk(&keys[..2]), fds)])
-            .expect_err("fewer entries than announced");
+        receive_from_hand_sender(
+            &header("lorica-fds/2 5\n"),
+            vec![(encode_chunk(&keys[..2]), fds)],
+        )
+        .expect_err("fewer entries than announced");
         assert_eq!(fixture.open_descriptors(), 5);
 
         // More entries than announced.
         let fds = (0..3).map(|i| fixture.fd(i)).collect();
-        let err =
-            receive_from_hand_sender("lorica-fds/2 2\n", vec![(encode_chunk(&keys[..3]), fds)])
-                .expect_err("more entries than announced");
+        let err = receive_from_hand_sender(
+            &header("lorica-fds/2 2\n"),
+            vec![(encode_chunk(&keys[..3]), fds)],
+        )
+        .expect_err("more entries than announced");
         assert!(err.contains("more than the 2 entries"), "{err}");
         assert_eq!(fixture.open_descriptors(), 5);
     }
@@ -724,12 +834,27 @@ mod tests {
 
     #[test]
     fn a_malformed_header_fails_the_pull() {
-        for header in ["lorica-fds/2 \n", "lorica-fds/2 -1\n", "lorica-fds/2 1x\n"] {
-            let err = receive_from_hand_sender(header, Vec::new())
+        for rest in [
+            "lorica-fds/2 \n",
+            "lorica-fds/2 -1\n",
+            "lorica-fds/2 1x\n",
+            "lorica-fds/9 1\n",
+        ] {
+            let err = receive_from_hand_sender(&header(rest), Vec::new())
                 .expect_err("a malformed header fails the pull");
+            assert!(err.contains("malformed transfer header"), "{rest:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_chunked_header_is_not_utf8_from_its_first_byte() {
+        // A legacy receiver may read any prefix of the header in its one
+        // receive; every non-empty prefix must fail its UTF-8 key parse.
+        let line = header_line(3);
+        for end in 1..=line.len() {
             assert!(
-                err.contains("malformed transfer header"),
-                "{header:?}: {err}"
+                std::str::from_utf8(&line[..end]).is_err(),
+                "prefix of {end} bytes"
             );
         }
     }

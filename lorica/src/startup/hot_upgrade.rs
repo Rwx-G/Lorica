@@ -439,13 +439,35 @@ fn build_fds_table(
     fds
 }
 
+/// Whether every release from 1.8.0 to 1.10.x adopts `key`'s descriptor
+/// as what it is when it pulls the legacy single message.
+///
+/// Those receivers know the management, cluster and automation prefixes
+/// and file every other key with their HTTP listeners, which are keyed by
+/// a bare bind address. Any other key, a stream listener's or a family
+/// added later, would have its socket served as an HTTP listener: HTTP
+/// routes answering on a port the operator opened for a TCP service.
+fn legacy_receivers_file(key: &str) -> bool {
+    [
+        MANAGEMENT_KEY_PREFIX,
+        CLUSTER_KEY_PREFIX,
+        AUTOMATION_KEY_PREFIX,
+    ]
+    .iter()
+    .any(|prefix| key.starts_with(prefix))
+        || key.parse::<SocketAddr>().is_ok()
+}
+
 /// Serve the listening-socket FDs on `transfer.sock` (BLOCKING).
 ///
 /// Runs on a blocking thread (the transfer sleeps between connect
 /// attempts). Returns once the new supervisor has connected and pulled
 /// the FDs, or on error/timeout. The table goes as the legacy single
-/// message when it fits, so a 1.10.x binary can still take it, and
-/// chunked otherwise ([`super::fd_transfer`]).
+/// message when it fits and holds only keys [`legacy_receivers_file`],
+/// so a 1.10.x binary can still take a node without streams, and chunked
+/// otherwise, which a 1.10.x binary refuses: the handoff rolls back
+/// (`exec_failed`) and this generation keeps serving
+/// ([`super::fd_transfer`]).
 pub fn serve_listener_fds_blocking(
     data_dir: &Path,
     proxy: &[(String, RawFd)],
@@ -464,7 +486,7 @@ pub fn serve_listener_fds_blocking(
         streams,
     );
     let sock = transfer_sock_path(data_dir);
-    fd_transfer::send_table(&table, &sock)
+    fd_transfer::send_table(&table, &sock, legacy_receivers_file)
         .map_err(|e| format!("failed to serve listener FDs on {}: {e}", sock.display()))
 }
 
@@ -1504,6 +1526,129 @@ mod tests {
             assert_eq!(received.addr, streams[i].addr);
             assert_eq!(path_of(received.fd), fixture.path(i));
             close_received(received.fd);
+        }
+    }
+
+    /// Pull `transfer.sock` under `data_dir` as every release from 1.8.0
+    /// to 1.10.x does: the fork's `get_from_sock`, then that release's
+    /// partition, whose last arm files every key without a management,
+    /// cluster or automation prefix with the HTTP listeners. Returns the
+    /// keys it would serve as HTTP listeners, every received descriptor
+    /// closed.
+    fn pull_as_a_released_receiver(data_dir: &Path) -> Result<Vec<String>, String> {
+        let sock = transfer_sock_path(data_dir);
+        let mut fds = Fds::new();
+        fds.get_from_sock(sock.to_string_lossy().as_ref())
+            .map_err(|e| format!("{e:?}"))?;
+        let (keys, received) = fds.serialize();
+        received.into_iter().for_each(close_received);
+        Ok(keys
+            .into_iter()
+            .filter(|k| {
+                !["management:", "cluster:", "automation:"]
+                    .iter()
+                    .any(|prefix| k.starts_with(prefix))
+            })
+            .collect())
+    }
+
+    /// Serve `streams` with one proxy and the management listener to a
+    /// released receiver, returning what the old side and the receiver
+    /// each made of it.
+    fn hand_down_to_a_released_receiver(
+        fixture: &DescriptorFixture,
+        streams: &StreamHandoffFds,
+    ) -> (Result<(), String>, Result<Vec<String>, String>) {
+        let data_dir = tempfile::tempdir().expect("test data dir");
+        std::fs::create_dir(upgrade_dir(data_dir.path())).expect("test upgrade dir");
+        let receiver_dir = data_dir.path().to_path_buf();
+        let receiver = std::thread::spawn(move || pull_as_a_released_receiver(&receiver_dir));
+        let sent = serve_listener_fds_blocking(
+            data_dir.path(),
+            &[("0.0.0.0:8080".to_string(), fixture.fd(0))],
+            fixture.fd(1),
+            9443,
+            &[],
+            &[],
+            streams,
+        );
+        let pulled = receiver
+            .join()
+            .expect("the released receiver refuses without a panic");
+        (sent, pulled)
+    }
+
+    #[test]
+    fn a_released_receiver_never_takes_a_stream_socket_for_an_http_listener() {
+        // The hot downgrade to 1.10.7 with one TCP stream bound: a table
+        // that small fits the legacy message, and 1.10.x would serve the
+        // stream's port as an HTTP listener. It must be refused instead,
+        // before any descriptor reaches the receiver, for TCP listeners
+        // and UDP slot sockets alike.
+        let tcp = StreamHandoffFds {
+            tcp: vec![StreamTcpFd {
+                stream_id: "6f1c1a52-5b0e-4f7e-9a51-1a7c5a1b2c3d".to_string(),
+                bind_gen: 1,
+                addr: "0.0.0.0:7801".parse().unwrap(),
+                fd: 0,
+            }],
+            udp: Vec::new(),
+        };
+        let udp = StreamHandoffFds {
+            tcp: Vec::new(),
+            udp: vec![StreamUdpFd {
+                stream_id: "6f1c1a52-5b0e-4f7e-9a51-1a7c5a1b2c3d".to_string(),
+                bind_gen: 1,
+                slot: 0,
+                addr: "0.0.0.0:5353".parse().unwrap(),
+                fd: 0,
+            }],
+        };
+        for mut streams in [tcp, udp] {
+            let fixture = DescriptorFixture::new(3);
+            streams.tcp.iter_mut().for_each(|s| s.fd = fixture.fd(2));
+            streams.udp.iter_mut().for_each(|s| s.fd = fixture.fd(2));
+            let (sent, pulled) = hand_down_to_a_released_receiver(&fixture, &streams);
+            assert_eq!(pulled, Err("EINVAL".to_string()), "{streams:?}");
+            let err = sent.expect_err("the released receiver acknowledges nothing");
+            assert!(err.contains("before 1.11.0"), "{err}");
+            assert_eq!(
+                fixture.open_descriptors(),
+                3,
+                "no descriptor reached the receiver"
+            );
+        }
+    }
+
+    #[test]
+    fn a_table_without_streams_still_hands_down_to_a_released_receiver() {
+        // Every family a released receiver knows still goes as the legacy
+        // message, so a node without streams keeps its hot downgrade.
+        let fixture = DescriptorFixture::new(2);
+        let (sent, pulled) = hand_down_to_a_released_receiver(&fixture, &no_streams());
+        sent.expect("the released receiver takes the table");
+        assert_eq!(pulled, Ok(vec!["0.0.0.0:8080".to_string()]));
+    }
+
+    #[test]
+    fn only_the_families_released_receivers_know_take_the_legacy_message() {
+        let addr: SocketAddr = "0.0.0.0:7801".parse().unwrap();
+        for known in [
+            "0.0.0.0:8080".to_string(),
+            "[::]:8443".to_string(),
+            management_fds_key(9443),
+            cluster_fds_key(ClusterListenerRole::Operational, "192.0.2.10:9444"),
+            cluster_fds_key(ClusterListenerRole::Enrollment, "[2001:db8::1]:9445"),
+            automation_fds_key("192.0.2.10:9600"),
+        ] {
+            assert!(legacy_receivers_file(&known), "{known}");
+        }
+        for unknown in [
+            stream_tcp_fds_key("s1", 1, addr),
+            stream_udp_fds_key("s1", 1, 0, addr),
+            "mystery:192.0.2.10:1".to_string(),
+        ] {
+            assert!(!legacy_receivers_file(&unknown), "{unknown}");
         }
     }
 

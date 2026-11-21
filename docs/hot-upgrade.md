@@ -69,14 +69,14 @@ but no live swap happens: the API response's `handoff` field reports
    Deferring the MainPID handover until the old has acked is what keeps a
    lost datagram from stranding systemd on a killed PID.
    The listening sockets cross on `<data_dir>/upgrade/transfer.sock`. A
-   table that fits the legacy single message (at most 32 descriptors,
-   keys within 2,048 bytes) is sent in it, so a node without streams
-   still hands over to a 1.10.x binary; a larger table, which a node
-   with streams reaches quickly (a TCP stream holds one socket per port,
-   a UDP stream one per port per worker), is sent in acknowledged chunks
-   of at most 32 descriptors (`lorica-fds/2`). A receiver that meets any
-   framing error closes everything it received and fails the pull, and
-   the upgrade rolls back.
+   table that holds no stream socket and fits the legacy single message
+   (at most 32 descriptors, keys within 2,048 bytes) is sent in it, so a
+   node without streams still hands over to a 1.10.x binary. Any other
+   table, which every node with a stream bound produces, is sent in
+   acknowledged chunks of at most 32 descriptors (`lorica-fds/2`), a
+   format a 1.10.x binary refuses (see [Rollback](#rollback)). A
+   receiver that meets any framing error closes everything it received
+   and fails the pull, and the upgrade rolls back.
 5. **Drain.** Once it has acked the new process, the old supervisor
    shuts its cluster planes down, stops its worker monitor and **stops
    serving its management and automation APIs**: the new supervisor
@@ -281,21 +281,23 @@ A drain that reaches `worker_drain_timeout_s` with traffic still open
 records the `drain_timeout` outcome but is still a completed upgrade,
 not a rollback.
 
-**Hot-downgrading a node that serves streams.** Uploading an older
-binary is an upgrade like any other, and a 1.10.x binary does not know
-the stream entries of the transfer table. A table too large for the
-legacy single message makes the 1.10.x receiver fail, so the new
-process never signals ready and the downgrade rolls back
-(`exec_failed`), which is the safe failure. A smaller table does reach
-it, and the handoff completes, but 1.10.x has no stream plane: it files
-every listener whose key it does not know with its HTTP listeners. As
-observed with 1.10.7 and one TCP stream (the e2e scenario
-`12.1-ac3-rollback-hot-1.10.7`, 2026-11-21), the HTTP routes kept
-serving with no failed request, and the stream's port was then served
-by 1.10.7's HTTP proxy, routing by `Host` header, instead of forwarding
-to the stream's backends. This is a defect of the 1.11.0 handoff,
-tracked for this release. Until it is fixed, disable the streams first,
-which closes their sockets, or downgrade by package with a restart.
+**Hot-downgrading a node that serves streams is refused.** Uploading an
+older binary is an upgrade like any other, but a binary before 1.11.0
+has no stream plane, and it files every listener whose key it does not
+know with its HTTP listeners: handed a stream's socket, it would serve
+HTTP routes on a port opened for a TCP or UDP service. So a table that
+holds any stream socket is never sent in the format those binaries
+read. It goes chunked, whatever its size, and a 1.8.0 to 1.10.x binary
+refuses it before taking any socket: it logs `hot upgrade: failed to
+pull inherited listeners; aborting` (`EINVAL`) and exits. The 1.11.0
+generation logs that it sent the table chunked and, at the rollback,
+why the transfer failed; it counts `exec_failed`, quarantines the
+binary, and keeps serving every route and every stream with no request
+dropped (the e2e scenario `12.1-ac3-rollback-hot-1.10.7`). To go back
+to 1.10.x on a node with streams, disable or delete its streams first
+and wait until the upgrade preview lists none (a UDP stream keeps its
+sockets while its sessions drain): the table then hands down as
+before. Or downgrade by package with a restart.
 
 After a rollback from 1.9.0 to an older binary, or a package downgrade,
 `<data-dir>/management/served-cert.pem` stays behind, and the older

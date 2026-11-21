@@ -240,14 +240,26 @@ not changed, so `FORK.md` gets no entry.
   stream sockets do not frame `SCM_RIGHTS`, and an acknowledged chunk
   cannot merge with the next one).
 - **Compatibility, both ways.** The receiver reads the first message:
-  if it starts with the format token it loops; otherwise it is the
-  legacy single message and is parsed as today. The sender uses the
-  legacy single message whenever the table fits it (at most 32
-  descriptors and keys within 2,048 bytes), so a node without streams
-  still hot-downgrades to a 1.10.x binary. A table that does not fit is
-  sent chunked; a 1.10.x receiver then fails, the new process never
-  signals ready, and the upgrade rolls back (`exec_failed`), which is
-  the safe failure. The docs say so.
+  if it starts with the header's lead byte it loops; otherwise it is
+  the legacy single message and is parsed as today. The sender uses the
+  legacy single message only when the table fits it (at most 32
+  descriptors and keys within 2,048 bytes) and every key is one a
+  1.8.0 to 1.10.x receiver files where it belongs (management, cluster,
+  automation, or a bare proxy bind address:
+  `hot_upgrade::legacy_receivers_file`), so a node without streams
+  still hot-downgrades to a 1.10.x binary. Any other table is sent
+  chunked; a 1.10.x receiver then fails, the new process never signals
+  ready, and the upgrade rolls back (`exec_failed`), which is the safe
+  failure. The docs say so.
+  *Amended 2026-11-21 (Story 12.12 Lot L):* the draft sent every table
+  that fit in the legacy message, stream entries included, and 1.10.7,
+  whose partition files unknown keys with its HTTP listeners, served a
+  TCP stream's port as an HTTP listener. A stream key now forces the
+  chunked format at any size. The header also gains a lead byte, `0xFF`,
+  ahead of the token: it is never UTF-8, so the fork's `get_from_sock`
+  refuses the header with `EINVAL`, which 1.10.x logs and exits on,
+  where the bare token parsed as two keys without descriptors and
+  tripped the fork's count assertion.
 - **The receiver closes on error.** Any framing error, a short chunk or
   a count mismatch closes every descriptor received so far and fails the
   pull; the new supervisor exits and the old one rolls back.
@@ -1255,3 +1267,4 @@ otel` (989), the forked crates (915), the rustls line (592) and
 | 2026-11-18 | 0.8 | Lot E: the Binary Upgrade confirmation loads the preview when it opens, states the drain delay from the setting instead of "up to 30 seconds", lists the streams holding connections and what the upgrade does to them, says a single-process node only stages, and warns of a previous generation still draining in the warning toast's colours; Enter no longer confirms. | Romain G. |
 | 2026-11-18 | 0.9 | Lot F, all but `docs/streams.md` and `CHANGELOG.md`: the upgrade drain, the preview, the drain report and its metric, chained upgrades, the stop path and the rollback in `docs/hot-upgrade.md`; `TimeoutStopSec` and the drain in `docs/installation.md`. | Romain G. |
 | 2026-11-18 | 0.10 | Lot F, the `docs/streams.md` and CHANGELOG parts: the upgrade section and the Added, Changed and Fixed entries (no fd-transfer Fixed line, per the Lot A correction); with the other documentation pass's boxes, every box of the Lot is ticked. Status InProgress. | Romain G. |
+| 2026-11-21 | 0.11 | D-d amended for the defect Story 12.12 Lot L found (a hot downgrade to 1.10.7 served a TCP stream's port as an HTTP listener): a table holding a key a 1.10.x receiver would misfile goes chunked at any size, and the chunked header leads with `0xFF` so a 1.10.x receiver refuses it with `EINVAL` instead of asserting. | Romain G. |
