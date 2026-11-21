@@ -659,8 +659,10 @@ x connect_timeout_ms` before that.
 - `connect_timeout_ms` bounds each attempt (on a stream with upstream
   TLS, the TCP connect and the handshake together).
 - `idle_timeout_s` closes a connection with no forwarded byte in either
-  direction, checked every `IDLE_CHECK_INTERVAL`, so it fires within a
-  second of its value; it ends `idle_timeout`.
+  direction; it ends `idle_timeout`. One timer per connection is set to
+  the last activity plus the timeout and set again when it finds the
+  connection active since, so it fires at its value and an idle
+  connection wakes once per idle window, with no timer set per read.
 - `total_timeout_s`, off by default, runs from accept; it ends
   `total_timeout`.
 - `backend_keepalive` sets TCP keepalive on the backend socket: the first

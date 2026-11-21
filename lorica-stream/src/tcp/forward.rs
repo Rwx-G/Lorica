@@ -49,16 +49,12 @@ use lorica_core::protocols::proxy_protocol::{classify_prefix, Prefix};
 use socket2::SockRef;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::time::{Instant, MissedTickBehavior, Sleep};
+use tokio::time::{Instant, Sleep};
 
 use super::bandwidth::TokenBucket;
 use super::FORWARD_BUFFER_SIZE;
 use crate::counters::{LinkStats, ProxyHeaderOutcome, StreamStats};
 use crate::tracker::TrackedConnection;
-
-/// How often the idle timeout is checked against the last activity: it
-/// fires within this much of its value, with no timer re-armed per read.
-pub const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Where one direction stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,7 +222,6 @@ impl Direction {
         cx: &mut Context<'_>,
         reader: &mut R,
         writer: &mut W,
-        count: &dyn Fn(u64),
     ) -> Poll<Result<Step, Side>>
     where
         R: AsyncRead + Unpin,
@@ -251,7 +246,6 @@ impl Direction {
                         Ok(n) => n,
                     };
                     self.forwarded += n as u64;
-                    count(n as u64);
                     if written + n < filled {
                         self.state = DirectionState::Writing {
                             filled,
@@ -321,13 +315,10 @@ impl Direction {
     }
 }
 
-/// Wait until `deadline`, or forever without one.
-async fn sleep_until_opt(deadline: Option<Instant>) {
-    match deadline {
-        Some(d) => tokio::time::sleep_until(d).await,
-        None => std::future::pending().await,
-    }
-}
+/// The most steps one turn of the loop takes before it looks at the
+/// close signal and the timers again. tokio's cooperative budget, which
+/// every socket call spends, ends a turn sooner on a busy runtime.
+const STEPS_PER_TURN: usize = 32;
 
 /// Where forwarded bytes are counted: the stream, and the backend's link
 /// (Story 12.9 D-e) when the forwarder was given it.
@@ -339,6 +330,9 @@ struct Tally<'a> {
 
 impl Tally<'_> {
     fn upload(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
         self.stream.add_upload(bytes);
         if let Some(link) = self.link {
             link.add_upload(bytes);
@@ -346,6 +340,9 @@ impl Tally<'_> {
     }
 
     fn download(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
         self.stream.add_download(bytes);
         if let Some(link) = self.link {
             link.add_download(bytes);
@@ -353,8 +350,28 @@ impl Tally<'_> {
     }
 }
 
-/// Poll the open directions once each, starting with `first`, until one
-/// completes a step; returns its outcome and the side it reads from.
+/// A step that ends a turn early.
+enum Event {
+    /// The direction reading from this side has ended.
+    Finished(Side),
+    /// An untrusted client opened with a PROXY signature.
+    ProxySignature,
+    /// A read or write on this side failed.
+    Failed(Side),
+}
+
+/// What one turn of the two directions did.
+struct Turn {
+    /// At least one step completed.
+    progressed: bool,
+    event: Option<Event>,
+}
+
+/// Step the open directions in turn, alternating which goes first, until
+/// neither can step, one ends the turn, or [`STEPS_PER_TURN`] passes;
+/// then count what was written. Pending only when no step completed, so
+/// a dropped turn loses nothing: every completed step is in its
+/// direction's state.
 fn poll_directions<C, B>(
     cx: &mut Context<'_>,
     upload: &mut Direction,
@@ -363,30 +380,57 @@ fn poll_directions<C, B>(
     client: &mut C,
     backend: &mut B,
     tally: Tally<'_>,
-) -> Poll<(Result<Step, Side>, Side)>
+) -> Poll<Turn>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    // Alternating which direction is polled first keeps a direction
-    // that is always ready from starving the other.
-    let order = [*first, first.other()];
-    *first = first.other();
-    for side in order {
-        let stepped = match side {
-            Side::Client if !upload.is_closed() => {
-                upload.poll_step(cx, client, backend, &|n| tally.upload(n))
+    let (uploaded, downloaded) = (upload.forwarded, download.forwarded);
+    let mut progressed = false;
+    let mut event = None;
+    'turn: for _ in 0..STEPS_PER_TURN {
+        // Alternating which direction is polled first keeps a direction
+        // that is always ready from starving the other.
+        let order = [*first, first.other()];
+        *first = first.other();
+        let mut stepped = false;
+        for side in order {
+            let polled = match side {
+                Side::Client if !upload.is_closed() => upload.poll_step(cx, client, backend),
+                Side::Backend if !download.is_closed() => download.poll_step(cx, backend, client),
+                _ => Poll::Pending,
+            };
+            match polled {
+                Poll::Pending => {}
+                Poll::Ready(Ok(Step::Progress)) => {
+                    progressed = true;
+                    stepped = true;
+                }
+                Poll::Ready(Ok(Step::Finished)) => {
+                    event = Some(Event::Finished(side));
+                    break 'turn;
+                }
+                Poll::Ready(Ok(Step::ProxySignature)) => {
+                    event = Some(Event::ProxySignature);
+                    break 'turn;
+                }
+                Poll::Ready(Err(failed)) => {
+                    event = Some(Event::Failed(failed));
+                    break 'turn;
+                }
             }
-            Side::Backend if !download.is_closed() => {
-                download.poll_step(cx, backend, client, &|n| tally.download(n))
-            }
-            _ => Poll::Pending,
-        };
-        if let Poll::Ready(stepped) = stepped {
-            return Poll::Ready((stepped, side));
+        }
+        if !stepped {
+            break;
         }
     }
-    Poll::Pending
+    tally.upload(upload.forwarded - uploaded);
+    tally.download(download.forwarded - downloaded);
+    if progressed || event.is_some() {
+        Poll::Ready(Turn { progressed, event })
+    } else {
+        Poll::Pending
+    }
 }
 
 /// The two directions of one connection and its timers.
@@ -478,10 +522,26 @@ impl Forwarder {
         self.first_end.unwrap_or(Side::Client).end_reason()
     }
 
+    /// The next instant a timer may end the connection: the idle
+    /// deadline from the last activity, or the total deadline when that
+    /// comes first.
+    fn next_deadline(&self) -> Instant {
+        let idle_at = self.last_activity + self.idle;
+        self.total_deadline
+            .map_or(idle_at, |total| total.min(idle_at))
+    }
+
     /// Forward between `client` and `backend` until both directions have
     /// ended, a timer fires, or the tracker closes the connection;
     /// returns the end reason. Dropping the future at any await leaves
     /// the forwarder consistent and callable again.
+    ///
+    /// One timer and one close wait serve the whole call, polled by
+    /// reference on every turn: nothing is registered per read or write.
+    /// The timer is set to [`Forwarder::next_deadline`]; when it fires on
+    /// a connection that was active since, it is set again from the last
+    /// activity, so an idle connection wakes once per idle window, not on
+    /// a periodic check.
     pub async fn run<C, B>(
         &mut self,
         client: &mut C,
@@ -492,9 +552,10 @@ impl Forwarder {
         C: AsyncRead + AsyncWrite + Unpin,
         B: AsyncRead + AsyncWrite + Unpin,
     {
-        let mut idle_check =
-            tokio::time::interval_at(Instant::now() + IDLE_CHECK_INTERVAL, IDLE_CHECK_INTERVAL);
-        idle_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let closed = tracked.closed();
+        tokio::pin!(closed);
+        let timer = tokio::time::sleep_until(self.next_deadline());
+        tokio::pin!(timer);
         loop {
             if self.upload.is_closed() && self.download.is_closed() {
                 return self.natural_end();
@@ -504,31 +565,38 @@ impl Forwarder {
                 stream: &self.stats,
                 link: self.link.as_deref(),
             };
-            let (stepped, from) = tokio::select! {
+            let turn = tokio::select! {
                 biased;
-                reason = tracked.closed() => return reason,
-                _ = sleep_until_opt(self.total_deadline) => return StreamEndReason::TotalTimeout,
-                _ = idle_check.tick() => {
-                    if self.last_activity.elapsed() >= self.idle {
+                reason = &mut closed => return reason,
+                () = &mut timer => {
+                    let now = Instant::now();
+                    if self.total_deadline.is_some_and(|total| total <= now) {
+                        return StreamEndReason::TotalTimeout;
+                    }
+                    if self.last_activity + self.idle <= now {
                         return StreamEndReason::IdleTimeout;
                     }
+                    timer.as_mut().reset(self.next_deadline());
                     continue;
                 }
-                stepped = std::future::poll_fn(|cx| {
+                turn = std::future::poll_fn(|cx| {
                     poll_directions(cx, upload, download, first, client, backend, tally)
-                }) => stepped,
+                }) => turn,
             };
-            match stepped {
-                Ok(Step::Progress) => self.last_activity = Instant::now(),
-                Ok(Step::Finished) => {
-                    self.first_end.get_or_insert(from);
+            if turn.progressed {
+                self.last_activity = Instant::now();
+            }
+            match turn.event {
+                None => {}
+                Some(Event::Finished(side)) => {
+                    self.first_end.get_or_insert(side);
                 }
-                Ok(Step::ProxySignature) => {
+                Some(Event::ProxySignature) => {
                     self.stats
                         .proxy_header(ProxyHeaderOutcome::RefusedUntrustedPeer);
                     return StreamEndReason::ProxyHeaderInvalid;
                 }
-                Err(side) => {
+                Some(Event::Failed(side)) => {
                     return self.first_end.get_or_insert(side).end_reason();
                 }
             }
@@ -733,11 +801,14 @@ mod tests {
         s
     }
 
-    /// A quiet connection ends `idle_timeout` no sooner than its idle
-    /// timeout and no later than one check interval after it. On a
+    /// How late a timer may fire on a paused clock: tokio rounds a
+    /// deadline up to its next millisecond tick.
+    const TIMER_TICK: Duration = Duration::from_millis(1);
+
+    /// A quiet connection ends `idle_timeout` at its idle timeout. On a
     /// paused clock the host's load cannot stretch the bound.
     #[tokio::test(start_paused = true)]
-    async fn a_quiet_connection_ends_within_one_check_interval_of_its_idle_timeout() {
+    async fn a_quiet_connection_ends_at_its_idle_timeout() {
         let (_client_peer, mut client) = tokio::io::duplex(64);
         let (mut backend, _backend_peer) = tokio::io::duplex(64);
         let snapshot = stream_with(|s| s.idle_timeout_s = 2);
@@ -755,8 +826,116 @@ mod tests {
         let took = started.elapsed();
         assert_eq!(reason, StreamEndReason::IdleTimeout);
         assert!(
-            took >= Duration::from_secs(2) && took <= Duration::from_secs(2) + IDLE_CHECK_INTERVAL,
+            took >= Duration::from_secs(2) && took <= Duration::from_secs(2) + TIMER_TICK,
             "{took:?}"
+        );
+    }
+
+    /// Activity before the idle deadline moves it: the timer that fires
+    /// at the first deadline finds the connection active since and is set
+    /// again from the last activity, where the connection then ends.
+    #[tokio::test(start_paused = true)]
+    async fn activity_moves_the_idle_deadline_to_the_last_activity() {
+        let (mut client_peer, mut client) = tokio::io::duplex(64);
+        let (mut backend, mut backend_peer) = tokio::io::duplex(64);
+        let snapshot = stream_with(|s| s.idle_timeout_s = 2);
+        let tracker = ConnectionTracker::new();
+        let mut tracked = tracker.register(1, Arc::new(snapshot.clone()));
+        let started = Instant::now();
+        let mut forwarder = Forwarder::new(
+            &snapshot,
+            started,
+            &[],
+            false,
+            Arc::new(StreamStats::default()),
+        );
+        let late_word = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            client_peer.write_all(b"still here").await.unwrap();
+            let mut got = [0u8; 10];
+            backend_peer.read_exact(&mut got).await.unwrap();
+            (client_peer, backend_peer)
+        });
+        let reason = forwarder.run(&mut client, &mut backend, &mut tracked).await;
+        let took = started.elapsed();
+        assert_eq!(reason, StreamEndReason::IdleTimeout);
+        assert!(
+            took >= Duration::from_millis(3_500)
+                && took <= Duration::from_millis(3_500) + TIMER_TICK * 2,
+            "{took:?}"
+        );
+        drop(late_word.await.unwrap());
+    }
+
+    /// A stream that counts the reads polled on it.
+    struct CountingReads<S> {
+        inner: S,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for CountingReads<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for CountingReads<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A quiet connection under a long idle timeout is not woken until
+    /// that timeout: its sockets are polled once, when the loop starts,
+    /// and never again by a periodic check.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_connection_is_not_woken_before_its_idle_timeout() {
+        let (_client_peer, client) = tokio::io::duplex(64);
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut client = CountingReads {
+            inner: client,
+            polls: Arc::clone(&polls),
+        };
+        let (mut backend, _backend_peer) = tokio::io::duplex(64);
+        let snapshot = stream_with(|s| s.idle_timeout_s = 3_600);
+        let tracker = ConnectionTracker::new();
+        let mut tracked = tracker.register(1, Arc::new(snapshot.clone()));
+        let mut forwarder = Forwarder::new(
+            &snapshot,
+            Instant::now(),
+            &[],
+            false,
+            Arc::new(StreamStats::default()),
+        );
+        // The ten seconds are looked at first, so their end polls nothing.
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep(Duration::from_secs(10)) => {}
+            reason = forwarder.run(&mut client, &mut backend, &mut tracked) => {
+                panic!("the connection is far from its idle timeout, ended {reason:?}")
+            }
+        }
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the quiet client was polled again before its idle timeout"
         );
     }
 
@@ -793,7 +972,7 @@ mod tests {
         let took = accepted_at.elapsed();
         assert_eq!(reason, StreamEndReason::TotalTimeout);
         assert!(
-            took >= Duration::from_secs(3) && took < Duration::from_secs(3) + IDLE_CHECK_INTERVAL,
+            took >= Duration::from_secs(3) && took <= Duration::from_secs(3) + TIMER_TICK,
             "{took:?}"
         );
         assert!(

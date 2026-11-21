@@ -356,6 +356,20 @@ either value.
   direction, checked on a 1 s tick against a last-activity instant, so
   it fires within one second of its value without re-arming a timer per
   read. It ends with `idle_timeout`.
+
+  *Note (2026-11-22, Phase 1 audit, findings C10 and C11):* the 1 s
+  tick woke every connection once a second for its whole life, and the
+  forwarding loop built a total-timeout timer and a close waiter on
+  every read and write. One timer per `Forwarder::run` call now covers
+  both timeouts: it is set to the earlier of the total deadline and the
+  last activity plus the idle timeout, and when it fires on a
+  connection active since, it is set again from the last activity. Idle
+  then fires at its value rather than within a second of it, still with
+  no timer re-armed per read, and an idle connection wakes once per
+  idle window. The close waiter is built once per call too, and a turn
+  of the loop runs up to `STEPS_PER_TURN` steps before it looks at
+  either again; every step is still one read or one write, so the loop
+  stays cancel-safe.
 - **Total off by default**, as everywhere in the survey. When set, it
   runs from accept and ends with `total_timeout`.
 - **Keepalive on by default**, unlike nginx and HAProxy (Resolved 7): a
