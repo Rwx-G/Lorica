@@ -810,7 +810,7 @@ plus `docs/stories/story-12.11-upgrade-drain.md` (Lot G checkboxes
 only).
 Depends on: E (the UDP stand-in), I; 12.11 Lots C and D; 12.2 Lot G.
 
-- [ ] Every item of 12.11 Lot G under its four names.
+- [x] Every item of 12.11 Lot G under its four names.
 
 ### Lot L: Story 12.1 scenarios and the rollbacks - Docker e2e
 
@@ -1514,6 +1514,51 @@ pulled images.
     stop, 1 at 1.8 s after the start), SLA PASS (5 judged, 5 successes);
     `=== L4 REPORT PASSED ===`; the lane project left nothing behind.
     Nothing changed in the files.
+- **Lot K, 2026-11-21.** Story 12.11's IV1 and its three handover
+  scenarios, a section appended to `run-hot-upgrade-smoke.sh` after the
+  Story 8.4 assertions: a second upgrade of the same binary once the
+  first one's old generation has left, `worker_drain_timeout_s` 120,
+  three streams bound (SSH, a bounded UDP stream, a 64-port TCP range).
+  - **Verdicts** (lane 4, the `hot-upgrade` phase alone under the
+    main-compose lock, then the report with `--lots J,K`), all PASS:
+    `12.11-iv1-stream-ssh-drained-by-upgrade` (preview
+    `drain_timeout_s=120`, the SSH stream `established=1`
+    `on_upgrade=drain`; the session still printed at T0 + 115 s and
+    ended at T0 + 121 s with "closed by remote host", a FIN; one
+    stream-log row `drained_by_upgrade`; the new generation's `/metrics`
+    then showed `lorica_hot_upgrade_stream_connections_total{outcome="drained"} 1`
+    for the stream, `lorica_hot_upgrade_drain_seconds_count` 1 and
+    `lorica_hot_upgrade_total{outcome="completed"}` 1);
+    `12.11-x-stream-new-connection-after-upgrade` (the API answered from
+    the new supervisor 1 s after T0 and, at T0 + 15 s, the preview named
+    the old one as `previous_generation`; a session opened at T0 + 10 s
+    still printed at T0 + 150 s with the old generation gone);
+    `12.11-x-udp-across-upgrade` (700 queries 50 ms apart from T0 - 3 s
+    to T0 + 32 s on one socket, every one answered within 1 s, no
+    `binding_draining` drop; the stream previewed `relay_in_flight`);
+    `12.11-x-fd-transfer-past-32` (64 of 64 range ports and the UDP
+    stream answered before and after; upgrade `completed`).
+  - **No product defect found.** The first run's four FAILs were the
+    scenario's: the UDP stream listened on `0.0.0.0` without a source
+    allowlist or an explicit `udp.source_session_cap`, which the
+    exposed-address rule refuses (422, docs/streams.md); it now sets
+    `udp.source_session_cap` 64, which also makes `udp` present, so its
+    upgrade policy is `relay_in_flight` as the scenario expects.
+  - **Topology.** `ssh-backend` (new image on the pinned
+    `debian:bookworm-20261104-slim` digest with `openssh-server`, host
+    and client keys generated at start, the client's private key
+    published on `shared-hot-upgrade`, nothing in the image or the
+    repository) and `hot-upgrade-l4-backends` (the runner image:
+    `udp_hold.py serve` on 5300 and `tcp_backend.py` on 7400 to 7463),
+    both in the `hot-upgrade` profile; the smoke depends on them.
+  - **Run time.** The section adds about 155 s to the `hot-upgrade`
+    phase (173 s for the whole phase in this run), most of it the 120 s
+    drain IV1 waits out.
+  - **Not done here.** 12.11 Lot G's last box ("the full suite passes
+    with the machine to itself") stays open: this run held the
+    main-compose lock, not the machine, since L4 lanes 1 and 2 ran their
+    own projects at the same time. IV1 is timing-bound and passed
+    regardless; the release run (Lot O) is where the machine is alone.
 
 ## File List
 
@@ -1616,6 +1661,16 @@ Lot G:
 - `docs/health-checks.md` ("What the backend sees")
 - `docs/stories/story-12.7-tcp-send-expect.md` (Dev Agent Record, File
   List, Change Log)
+Lot K:
+
+- `tests-e2e-docker/test-runner/run-hot-upgrade-smoke.sh` (the streams
+  section appended)
+- `tests-e2e-docker/ssh-backend/Dockerfile`, `entrypoint.sh` (new)
+- `tests-e2e-docker/docker-compose.yml` (`hot-upgrade` profile:
+  `ssh-backend`, `hot-upgrade-l4-backends`, the smoke's environment and
+  `depends_on`)
+- `tests-e2e-docker/l4/scenarios.tsv` (Lot K rows `live`)
+- `docs/stories/story-12.11-upgrade-drain.md` (Lot G checkboxes)
 
 ## Change Log
 
@@ -1633,3 +1688,4 @@ Lot G:
 | 2026-11-20 | 0.7 (Lot I) | Lot I implemented: Story 12.9 IV1 (partial as D-d says), the metrics and sink gauge, and the stream SLA, in the `streams` profile with a syslog collector, all passing. No product defect. | Romain G. |
 | 2026-11-21 | 0.7 (Lot H) | Lot H re-verified by a fresh run after the lane was interrupted: same verdicts, no file change. | Romain G. |
 | 2026-11-21 | 0.7 (Lot I) | Lot I re-verified by a fresh run after the lane was interrupted: same verdicts, no file change. | Romain G. |
+| 2026-11-21 | 0.7 | Lot K implemented: Story 12.11 IV1 and its three handover scenarios in the `hot-upgrade` profile, all passing (SSH session drained at the 120 s deadline with its report on the new `/metrics`, UDP across the upgrade with no loss, 64 range ports handed over); `ssh-backend` image. No product defect. | Romain G. |

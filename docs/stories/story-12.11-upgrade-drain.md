@@ -676,7 +676,7 @@ LF.
 The new section runs after the existing 8.4 assertions, as a second
 upgrade of the same binary, so those assertions stay as they are.
 
-- [ ] **IV1, `stream-ssh-drained-by-upgrade`.** An `ssh-backend` service
+- [x] **IV1, `stream-ssh-drained-by-upgrade`.** An `ssh-backend` service
       (Debian `openssh-server`, key generated at runtime on the shared
       volume, Resolved 4). Set `worker_drain_timeout_s=120` through
       `PUT /api/v1/settings`; create a TCP stream to it; open
@@ -691,15 +691,15 @@ upgrade of the same binary, so those assertions stay as they are.
       the new generation's `/metrics` shows
       `lorica_hot_upgrade_stream_connections_total{stream_id="<id>",outcome="drained"} 1`
       and `lorica_hot_upgrade_total{outcome="completed"}` incremented.
-- [ ] **`stream-new-connection-after-upgrade`.** A second SSH session
+- [x] **`stream-new-connection-after-upgrade`.** A second SSH session
       opened at `T0 + 10 s` is served by the new generation and is still
       alive at `T0 + 150 s`: no connection is served by the old one
       after the handoff.
-- [ ] **`udp-across-upgrade`.** A bounded UDP stream to the UDP
+- [x] **`udp-across-upgrade`.** A bounded UDP stream to the UDP
       stand-in of 12.5 Lot I; a client sending one query every 50 ms
       across the upgrade gets every answer (no timeout, no
       `binding_draining` drop in the counters).
-- [ ] **`fd-transfer-past-32`.** A TCP stream on a 64-port range and a
+- [x] **`fd-transfer-past-32`.** A TCP stream on a 64-port range and a
       UDP stream exist during the upgrade; the upgrade completes and
       every port answers afterwards.
 - [ ] The full suite passes with the machine to itself; the run time

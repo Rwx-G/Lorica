@@ -398,4 +398,480 @@ POST_API=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" "$API/api/v1/sys
 [ "$POST_API" = "200" ] && ok "post-swap: management API serving on the replacement supervisor" \
     || fail "post-swap: management API not serving (HTTP $POST_API)"
 
+# =========================================================================
+# Streams across a hot upgrade (Story 12.11 Lot G, delivered by Story
+# 12.12 Lot K). A second upgrade of the same binary, after the first
+# one's old generation has finished, with worker_drain_timeout_s at
+# 120 s and three streams bound:
+#
+#   12.11-iv1-stream-ssh-drained-by-upgrade
+#       IV1: an SSH session through a TCP stream outlives the upgrade
+#       for the drain, then ends on a FIN with drained_by_upgrade in the
+#       stream log, and the old generation's drain report reaches the
+#       new generation's /metrics;
+#   12.11-x-stream-new-connection-after-upgrade
+#       a session opened at T0 + 10 s belongs to the new generation and
+#       outlives the old one, and the management API answers from the
+#       new binary while the old one drains;
+#   12.11-x-udp-across-upgrade
+#       one UDP query every 50 ms across the upgrade on a bounded
+#       stream, every one answered within 1 s, no binding_draining drop;
+#   12.11-x-fd-transfer-past-32
+#       a 64-port TCP range and a UDP stream in the transfer table, the
+#       upgrade completes, every port answers afterwards.
+#
+# Each prints its one L4-SCENARIO line (Story 12.12 D-c) at the end.
+# Everything this section creates is named `l4k-`, and it is removed at
+# the end, the drain setting restored.
+# =========================================================================
+log "=== hot-upgrade smoke: streams across an upgrade (Story 12.11 Lot G) ==="
+# Every check below records its outcome; `-e` would end the section at
+# the first failing probe and lose the scenario lines.
+set +e
+
+STREAM_HOST="${LORICA_STREAM_HOST}"
+SSH_HOST="${SSH_BACKEND_HOST}"
+L4_BACKENDS="${L4_BACKENDS_HOST}"
+DRAIN_S=120
+SSH_PORT=2222
+UDP_PORT=5300
+RANGE_FIRST=7400
+RANGE_LAST=7463
+K_IV1=12.11-iv1-stream-ssh-drained-by-upgrade
+K_NEW=12.11-x-stream-new-connection-after-upgrade
+K_UDP=12.11-x-udp-across-upgrade
+K_FDS=12.11-x-fd-transfer-past-32
+K_ALL="$K_IV1 $K_NEW $K_UDP $K_FDS"
+K_DIR=/tmp/l4k
+rm -rf "$K_DIR"
+mkdir -p "$K_DIR"
+declare -A K_FAILED=()
+declare -A K_NOTE=()
+
+k_ok() { ok "[$1] $2"; }
+k_fail() {
+    fail "[$1] $2"
+    K_FAILED[$1]="${K_FAILED[$1]:+${K_FAILED[$1]}; }$2"
+}
+k_fail_all() {
+    local name
+    for name in $K_ALL; do k_fail "$name" "$1"; done
+}
+k_note() { K_NOTE[$1]="${K_NOTE[$1]:+${K_NOTE[$1]}; }$2"; }
+k_line() {
+    local name="$1" status=PASS detail
+    detail="${K_NOTE[$name]:--}"
+    if [ -n "${K_FAILED[$name]:-}" ]; then
+        status=FAIL
+        detail="${K_FAILED[$name]}"
+    fi
+    printf 'L4-SCENARIO %s %s %s\n' "$name" "$status" "$(printf '%s' "$detail" | tr '\r\n\t' '   ')"
+}
+k_now() { date +%s; }
+k_sleep_until() {
+    local wait=$(( $1 - $(k_now) ))
+    [ "$wait" -gt 0 ] && sleep "$wait"
+}
+k_ip() {
+    python3 -c 'import socket, sys; print(socket.gethostbyname(sys.argv[1]))' "$1" 2>/dev/null
+}
+k_metrics() { curl -sf -b "$SESSION" "$API/metrics" 2>/dev/null; }
+# The value of one series, or empty: $1 family, then label="value"
+# fragments every one of which the series must carry.
+k_series() {
+    local family="$1" lines
+    shift
+    lines=$(k_metrics | grep "^${family}{")
+    local fragment
+    for fragment in "$@"; do
+        lines=$(printf '%s\n' "$lines" | grep -F "$fragment")
+    done
+    printf '%s\n' "$lines" | awk 'NF {print $NF}' | head -1
+}
+k_preview() { api_get /api/v1/system/upgrade/preview; }
+k_bind_state() {
+    api_get /api/v1/streams/status \
+        | jq -r --arg id "$1" '[.data.streams[] | select(.id == $id) | .bind.state // "none"][0] // "absent"'
+}
+k_wait_bound() {
+    local i
+    for i in $(seq 1 50); do
+        [ "$(k_bind_state "$1")" = bound ] && return 0
+        sleep 0.2
+    done
+    return 1
+}
+k_backend() {
+    api_post /api/v1/backends \
+        "{\"name\":\"$1\",\"group\":\"l4k\",\"address\":\"$2\",\"health_check_enabled\":false}" \
+        | jq -r '.data.id // empty'
+}
+k_stream() {
+    local answer
+    answer=$(api_post /api/v1/streams "$1")
+    printf '%s' "$answer" | jq -r '.data.id // empty' 2>/dev/null | grep . \
+        || { printf 'refused: %s' "$(printf '%s' "$answer" | head -c 300)"; return 1; }
+}
+# Session $1: an SSH command printing the remote clock every second,
+# its stdout, stderr and exit code under $K_DIR/$1.*.
+k_ssh() {
+    ssh -i "$K_DIR/client_key" -p "$SSH_PORT" -o BatchMode=yes \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=10 "tester@${STREAM_HOST}" \
+        'while sleep 1; do date +%s; done' \
+        > "$K_DIR/$1.out" 2> "$K_DIR/$1.err" < /dev/null
+    echo $? > "$K_DIR/$1.code"
+}
+k_last_tick() { tail -n 1 "$K_DIR/$1.out" 2>/dev/null | tr -dc '0-9'; }
+
+# Every port of the range answers as itself: port N reaches backend
+# port N, whose first line names it.
+K_RANGE_CHECK='
+import socket, sys
+host, first, last = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+bad = []
+for port in range(first, last + 1):
+    try:
+        with socket.create_connection((host, port), timeout=3) as s:
+            s.settimeout(3)
+            s.sendall(b"x\n")
+            got = b""
+            while b"\n" not in got:
+                chunk = s.recv(256)
+                if not chunk:
+                    break
+                got += chunk
+        if not got.startswith(b"name=hu-range port=%d " % port):
+            bad.append("%d:%r" % (port, got[:40]))
+    except OSError as e:
+        bad.append("%d:%s" % (port, e))
+print("ok %d" % (last - first + 1) if not bad else "bad " + " ".join(bad[:8]))
+'
+# One datagram echoed through the UDP stream.
+K_UDP_ONCE='
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(1)
+s.connect((sys.argv[1], int(sys.argv[2])))
+for attempt in range(5):
+    probe = b"once %d" % attempt
+    try:
+        s.send(probe)
+        if s.recv(2048) == probe:
+            print("ok")
+            sys.exit(0)
+    except OSError:
+        pass
+print("no echo in 5 tries")
+sys.exit(1)
+'
+# One query every 50 ms from one socket for the duration, each owed its
+# echo within 1 s. The socket is connected, so an answer from any other
+# address than the one queried is dropped by the kernel and counts lost.
+K_UDP_SERIES='
+import json, socket, sys, time
+host, port, duration = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
+interval, timeout = 0.05, 1.0
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect((host, port))
+s.setblocking(False)
+sent, answered, late, errors = {}, set(), 0, 0
+start = time.monotonic()
+n = 0
+while True:
+    now = time.monotonic()
+    if now - start >= duration + timeout:
+        break
+    if now - start < duration and now >= start + n * interval:
+        sent[n] = now
+        try:
+            s.send(b"q %d" % n)
+        except OSError:
+            errors += 1
+        n += 1
+    try:
+        while True:
+            data = s.recv(2048)
+            k = int(data.split()[1])
+            if k in sent and k not in answered:
+                if time.monotonic() - sent[k] <= timeout:
+                    answered.add(k)
+                else:
+                    late += 1
+    except (BlockingIOError, ValueError, IndexError):
+        pass
+    except OSError:
+        errors += 1
+    time.sleep(0.002)
+lost = sorted(k for k in sent if k not in answered)
+print(json.dumps({"sent": len(sent), "answered": len(answered), "lost": len(lost),
+                  "late": late, "errors": errors, "first_lost": lost[:10]}))
+'
+
+# ---- Setup -----------------------------------------------------------
+K_SETUP=ok
+# The first upgrade's old generation drains until idle; this upgrade
+# starts once it is gone, so the preview's previous_generation below is
+# this upgrade's own.
+for i in $(seq 1 120); do
+    [ "$(k_preview | jq -r '.data.previous_generation')" = null ] && break
+    sleep 1
+done
+if [ "$(k_preview | jq -r '.data.previous_generation')" = null ]; then
+    ok "the first upgrade's old generation has finished its drain"
+else
+    k_fail_all "the first upgrade's old generation still drains after 120 s"
+    K_SETUP=failed
+fi
+GEN2_PID=$(system_pid)
+
+DRAIN_BEFORE=$(api_get /api/v1/settings | jq -r '.data.worker_drain_timeout_s')
+api_put /api/v1/settings "{\"worker_drain_timeout_s\":${DRAIN_S}}" >/dev/null
+if [ "$(api_get /api/v1/settings | jq -r '.data.worker_drain_timeout_s')" = "$DRAIN_S" ]; then
+    ok "worker_drain_timeout_s set to ${DRAIN_S} (was ${DRAIN_BEFORE})"
+else
+    k_fail_all "worker_drain_timeout_s could not be set to ${DRAIN_S}"
+    K_SETUP=failed
+fi
+
+for i in $(seq 1 60); do
+    [ -s /shared/ssh-client-key ] && break
+    sleep 1
+done
+cp /shared/ssh-client-key "$K_DIR/client_key" 2>/dev/null && chmod 0600 "$K_DIR/client_key"
+[ -s "$K_DIR/client_key" ] || { k_fail_all "the ssh backend published no client key"; K_SETUP=failed; }
+
+SSH_IP=$(k_ip "$SSH_HOST")
+BACKENDS_IP=$(k_ip "$L4_BACKENDS")
+SSH_BID=$(k_backend l4k-ssh "${SSH_IP}:22")
+UDP_BID=$(k_backend l4k-udp-echo "${BACKENDS_IP}:${UDP_PORT}")
+RANGE_BID=$(k_backend l4k-range "${BACKENDS_IP}")
+if [ -n "$SSH_BID" ] && [ -n "$UDP_BID" ] && [ -n "$RANGE_BID" ]; then
+    ok "backends created: ssh ${SSH_IP}:22, udp echo ${BACKENDS_IP}:${UDP_PORT}, range ${BACKENDS_IP}"
+else
+    k_fail_all "backend create failed (ssh='$SSH_BID' udp='$UDP_BID' range='$RANGE_BID')"
+    K_SETUP=failed
+fi
+
+SSH_SID=$(k_stream "{\"name\":\"l4k-ssh\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":${SSH_PORT},\"backend_ids\":[\"${SSH_BID}\"]}") \
+    || { k_fail_all "ssh stream: $SSH_SID"; K_SETUP=failed; }
+# An exposed UDP listen address needs a source allowlist or an explicit
+# source session cap (docs/streams.md, the listen-address rule). Setting
+# `udp` keeps the default bounds, so the stream expects responses and
+# its upgrade policy is relay_in_flight.
+UDP_SID=$(k_stream "{\"name\":\"l4k-udp\",\"protocol\":\"udp\",\"listen_address\":\"0.0.0.0\",\"port_first\":${UDP_PORT},\"backend_ids\":[\"${UDP_BID}\"],\"udp\":{\"source_session_cap\":64}}") \
+    || { k_fail_all "udp stream: $UDP_SID"; K_SETUP=failed; }
+RANGE_SID=$(k_stream "{\"name\":\"l4k-range\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":${RANGE_FIRST},\"port_last\":${RANGE_LAST},\"backend_ids\":[\"${RANGE_BID}\"]}") \
+    || { k_fail_all "range stream: $RANGE_SID"; K_SETUP=failed; }
+for sid in "$SSH_SID" "$UDP_SID" "$RANGE_SID"; do
+    [ "$K_SETUP" = ok ] || break
+    if ! k_wait_bound "$sid"; then
+        k_fail_all "stream $sid not bound within 10 s ($(k_bind_state "$sid"))"
+        K_SETUP=failed
+    fi
+done
+
+if [ "$K_SETUP" = ok ]; then
+    ok "three streams bound: ssh :${SSH_PORT}, udp :${UDP_PORT}, tcp :${RANGE_FIRST}-${RANGE_LAST}"
+
+    # ---- Before the upgrade --------------------------------------------
+    RANGE_BEFORE=$(python3 -c "$K_RANGE_CHECK" "$STREAM_HOST" "$RANGE_FIRST" "$RANGE_LAST")
+    [ "$RANGE_BEFORE" = "ok 64" ] \
+        && k_ok "$K_FDS" "all 64 range ports answer before the upgrade" \
+        || k_fail "$K_FDS" "range before the upgrade: $RANGE_BEFORE"
+    UDP_BEFORE=$(python3 -c "$K_UDP_ONCE" "$STREAM_HOST" "$UDP_PORT")
+    [ "$UDP_BEFORE" = ok ] \
+        && k_ok "$K_UDP" "the UDP stream echoes before the upgrade" \
+        || k_fail "$K_UDP" "the UDP stream before the upgrade: $UDP_BEFORE"
+
+    k_ssh a &
+    SSH_A=$!
+    for i in $(seq 1 30); do
+        [ "$(wc -l < "$K_DIR/a.out" 2>/dev/null || echo 0)" -ge 2 ] && break
+        sleep 0.5
+    done
+    if [ "$(wc -l < "$K_DIR/a.out" 2>/dev/null || echo 0)" -ge 2 ]; then
+        k_ok "$K_IV1" "session A prints the remote clock through the stream"
+    else
+        k_fail "$K_IV1" "session A never printed: $(tr '\n' ' ' < "$K_DIR/a.err" 2>/dev/null | head -c 300)"
+    fi
+
+    PREVIEW=$(k_preview)
+    P_DRAIN=$(printf '%s' "$PREVIEW" | jq -r '.data.drain_timeout_s')
+    P_HANDOFF=$(printf '%s' "$PREVIEW" | jq -r '.data.handoff_available')
+    P_SSH=$(printf '%s' "$PREVIEW" | jq -c --arg id "$SSH_SID" '[.data.streams[] | select(.stream_id == $id) | {established, on_upgrade}][0]')
+    P_UDP=$(printf '%s' "$PREVIEW" | jq -r --arg id "$UDP_SID" '[.data.streams[] | select(.stream_id == $id) | .on_upgrade][0]')
+    if [ "$P_DRAIN" = "$DRAIN_S" ] && [ "$P_HANDOFF" = true ] \
+        && [ "$P_SSH" = '{"established":1,"on_upgrade":"drain"}' ]; then
+        k_ok "$K_IV1" "preview: drain_timeout_s=${P_DRAIN}, the ssh stream established=1 on_upgrade=drain"
+    else
+        k_fail "$K_IV1" "preview answered drain=${P_DRAIN} handoff=${P_HANDOFF} ssh=${P_SSH}"
+    fi
+    [ "$P_UDP" = relay_in_flight ] \
+        && k_ok "$K_UDP" "preview: the bounded UDP stream is relay_in_flight" \
+        || k_fail "$K_UDP" "preview: the UDP stream on_upgrade=${P_UDP}"
+
+    # ---- The upgrade at T0 ---------------------------------------------
+    python3 -c "$K_UDP_SERIES" "$STREAM_HOST" "$UDP_PORT" 35 > "$K_DIR/udp.json" 2>&1 &
+    UDP_BG=$!
+    sleep 3
+    T0=$(k_now)
+    UP_CODE=$(upload "$SIG_GOOD")
+    if [ "$UP_CODE" = "200" ]; then
+        ok "second upgrade accepted at T0=${T0} (HTTP 200)"
+    else
+        k_fail_all "second upgrade answered HTTP ${UP_CODE}: $(head -c 300 /tmp/hu_resp.json 2>/dev/null)"
+    fi
+
+    GEN3_PID=""
+    for i in $(seq 1 40); do
+        p=$(system_pid)
+        if [ -n "$p" ] && [ "$p" != "$GEN2_PID" ]; then
+            GEN3_PID="$p"
+            break
+        fi
+        sleep 0.25
+    done
+    HANDOFF_S=$(( $(k_now) - T0 ))
+    if [ -n "$GEN3_PID" ]; then
+        ok "the management API answers from the new supervisor ${GEN3_PID} ${HANDOFF_S} s after T0"
+    else
+        k_fail_all "proxy.pid still ${GEN2_PID} 10 s after T0"
+    fi
+
+    k_sleep_until $(( T0 + 10 ))
+    k_ssh b &
+    SSH_B=$!
+
+    k_sleep_until $(( T0 + 15 ))
+    DURING_PREVIOUS=$(k_preview | jq -r '.data.previous_generation.pid // empty')
+    DURING_PID=$(system_pid)
+    if [ -n "$GEN3_PID" ] && [ "$DURING_PID" = "$GEN3_PID" ] && [ "$DURING_PREVIOUS" = "$GEN2_PID" ]; then
+        k_ok "$K_NEW" "at T0+15 s the API answers from ${GEN3_PID} while the preview names ${GEN2_PID} as draining"
+        k_note "$K_NEW" "API during the drain answered by the new supervisor ${GEN3_PID}, preview naming ${GEN2_PID} as the previous generation"
+    else
+        k_fail "$K_NEW" "at T0+15 s system pid=${DURING_PID} previous_generation=${DURING_PREVIOUS} (old ${GEN2_PID}, new ${GEN3_PID})"
+    fi
+
+    # ---- The fd transfer: every port of both streams, new generation ---
+    RANGE_AFTER=$(python3 -c "$K_RANGE_CHECK" "$STREAM_HOST" "$RANGE_FIRST" "$RANGE_LAST")
+    UDP_AFTER=$(python3 -c "$K_UDP_ONCE" "$STREAM_HOST" "$UDP_PORT")
+    if [ "$RANGE_AFTER" = "ok 64" ] && [ "$UDP_AFTER" = ok ] && [ -n "$GEN3_PID" ]; then
+        k_ok "$K_FDS" "after the upgrade all 64 range ports and the UDP stream answer"
+    else
+        k_fail "$K_FDS" "after the upgrade: range '${RANGE_AFTER}', udp '${UDP_AFTER}'"
+    fi
+    COMPLETED=$(hu_counter completed)
+    if [ "$COMPLETED" = "1" ]; then
+        k_ok "$K_FDS" "the new generation recorded lorica_hot_upgrade_total{outcome=completed} 1"
+        k_note "$K_FDS" "a 64-port TCP stream, the ssh stream and a UDP stream handed over (a table past 32 fds), upgrade completed, 64 of 64 ports and the UDP stream answering"
+    else
+        k_fail "$K_FDS" "lorica_hot_upgrade_total{outcome=completed} on the new generation is '${COMPLETED}'"
+    fi
+
+    # ---- UDP across the upgrade ------------------------------------------
+    wait "$UDP_BG"
+    UDP_RESULT=$(tail -n 1 "$K_DIR/udp.json")
+    UDP_SENT=$(printf '%s' "$UDP_RESULT" | jq -r '.sent // 0' 2>/dev/null)
+    UDP_LOST=$(printf '%s' "$UDP_RESULT" | jq -r '.lost // "?"' 2>/dev/null)
+    UDP_LATE=$(printf '%s' "$UDP_RESULT" | jq -r '.late // "?"' 2>/dev/null)
+    if [ "${UDP_SENT:-0}" -ge 600 ] 2>/dev/null && [ "$UDP_LOST" = 0 ] && [ "$UDP_LATE" = 0 ]; then
+        k_ok "$K_UDP" "${UDP_SENT} queries 50 ms apart across the upgrade, every one answered within 1 s"
+    else
+        k_fail "$K_UDP" "queries across the upgrade: ${UDP_RESULT}"
+    fi
+    DRAINING_DROPS=$(k_series lorica_stream_datagrams_dropped_total "stream_id=\"${UDP_SID}\"" 'reason="binding_draining"')
+    if [ -z "$DRAINING_DROPS" ] || [ "$DRAINING_DROPS" = 0 ]; then
+        k_ok "$K_UDP" "no binding_draining drop on the new generation (${DRAINING_DROPS:-no series})"
+        k_note "$K_UDP" "${UDP_SENT} queries every 50 ms from T0-3 s to T0+32 s, 0 lost, 0 late, no binding_draining drop"
+    else
+        k_fail "$K_UDP" "lorica_stream_datagrams_dropped_total{reason=binding_draining} is ${DRAINING_DROPS}"
+    fi
+
+    # ---- IV1: session A through the drain --------------------------------
+    k_sleep_until $(( T0 + 115 ))
+    A_TICK=$(k_last_tick a)
+    if kill -0 "$SSH_A" 2>/dev/null && [ "${A_TICK:-0}" -ge $(( T0 + 113 )) ]; then
+        k_ok "$K_IV1" "session A still prints at T0+115 s (last tick T0+$(( A_TICK - T0 )) s)"
+    else
+        k_fail "$K_IV1" "session A at T0+115 s: last tick ${A_TICK:-none} (T0 ${T0}), exit $(cat "$K_DIR/a.code" 2>/dev/null || echo running)"
+    fi
+    while [ ! -f "$K_DIR/a.code" ] && [ "$(k_now)" -lt $(( T0 + 150 )) ]; do
+        sleep 0.5
+    done
+    A_END=$(k_now)
+    A_TICK=$(k_last_tick a)
+    if [ -f "$K_DIR/a.code" ]; then
+        k_ok "$K_IV1" "session A ended at T0+$(( A_END - T0 )) s, last tick T0+$(( ${A_TICK:-0} - T0 )) s, ssh exit $(cat "$K_DIR/a.code")"
+    else
+        k_fail "$K_IV1" "session A still open at T0+150 s"
+        kill "$SSH_A" 2>/dev/null
+    fi
+    if grep -q "closed by remote host" "$K_DIR/a.err" 2>/dev/null; then
+        k_ok "$K_IV1" "ssh reports the connection closed by remote host (a FIN)"
+    else
+        k_fail "$K_IV1" "ssh did not report a close by the remote host: $(tr '\r\n' '  ' < "$K_DIR/a.err" 2>/dev/null | head -c 300)"
+    fi
+
+    LOGGED=""
+    for i in $(seq 1 40); do
+        LOGGED=$(api_get "/api/v1/stream-logs?stream_id=${SSH_SID}&end_reason=drained_by_upgrade" \
+            | jq -r '[.data.entries[] | select(.listen_port == '"$SSH_PORT"')] | length' 2>/dev/null)
+        [ "${LOGGED:-0}" -ge 1 ] 2>/dev/null && break
+        sleep 0.5
+    done
+    if [ "$LOGGED" = 1 ]; then
+        k_ok "$K_IV1" "the stream log lists the connection with end_reason=drained_by_upgrade"
+    else
+        k_fail "$K_IV1" "stream log rows ended drained_by_upgrade on the ssh stream: '${LOGGED}' (1 expected)"
+    fi
+
+    DRAINED=""
+    for i in $(seq 1 120); do
+        DRAINED=$(k_series lorica_hot_upgrade_stream_connections_total "stream_id=\"${SSH_SID}\"" 'outcome="drained"')
+        [ "$DRAINED" = 1 ] && break
+        sleep 1
+    done
+    REPORT_AT=$(( $(k_now) - T0 ))
+    DRAIN_COUNT=$(k_metrics | grep '^lorica_hot_upgrade_drain_seconds_count' | awk '{print $NF}' | head -1)
+    COMPLETED=$(hu_counter completed)
+    if [ "$DRAINED" = 1 ] && [ "${DRAIN_COUNT:-0}" -ge 1 ] 2>/dev/null && [ "$COMPLETED" = 1 ]; then
+        k_ok "$K_IV1" "new /metrics at T0+${REPORT_AT} s: stream_connections_total{outcome=drained} 1, drain_seconds_count ${DRAIN_COUNT}, hot_upgrade_total{completed} 1"
+        k_note "$K_IV1" "drain ${DRAIN_S} s; session alive at T0+115 s, closed by remote host at T0+$(( A_END - T0 )) s; one stream-log row drained_by_upgrade; report on the new /metrics (drained 1, drain_seconds_count ${DRAIN_COUNT}, completed 1)"
+    else
+        k_fail "$K_IV1" "new /metrics: drained='${DRAINED}' drain_seconds_count='${DRAIN_COUNT}' completed='${COMPLETED}'"
+    fi
+
+    # ---- Session B outlives the old generation ---------------------------
+    k_sleep_until $(( T0 + 150 ))
+    B_TICK=$(k_last_tick b)
+    AFTER_PREVIOUS=$(k_preview | jq -r '.data.previous_generation')
+    if kill -0 "$SSH_B" 2>/dev/null && [ ! -f "$K_DIR/b.code" ] && [ "${B_TICK:-0}" -ge $(( T0 + 148 )) ] \
+        && [ "$AFTER_PREVIOUS" = null ]; then
+        k_ok "$K_NEW" "session B, opened at T0+10 s, still prints at T0+150 s, after the old generation left"
+        k_note "$K_NEW" "session B opened at T0+10 s alive at T0+150 s with the old generation gone"
+    else
+        k_fail "$K_NEW" "session B at T0+150 s: last tick ${B_TICK:-none} (T0 ${T0}), exit $(cat "$K_DIR/b.code" 2>/dev/null || echo running), previous_generation ${AFTER_PREVIOUS}: $(tr '\r\n' '  ' < "$K_DIR/b.err" 2>/dev/null | head -c 200)"
+    fi
+    kill "$SSH_B" 2>/dev/null
+    pkill -f "tester@${STREAM_HOST}" 2>/dev/null
+fi
+
+# ---- Cleanup: streams, backends, the drain setting ---------------------
+for sid in "${SSH_SID:-}" "${UDP_SID:-}" "${RANGE_SID:-}"; do
+    case "$sid" in ""|refused*) ;; *) api_del "/api/v1/streams/$sid" >/dev/null ;; esac
+done
+for bid in "${SSH_BID:-}" "${UDP_BID:-}" "${RANGE_BID:-}"; do
+    [ -n "$bid" ] && api_del "/api/v1/backends/$bid" >/dev/null
+done
+case "$DRAIN_BEFORE" in
+    ''|null) ;;
+    *) api_put /api/v1/settings "{\"worker_drain_timeout_s\":${DRAIN_BEFORE}}" >/dev/null ;;
+esac
+
+for name in $K_ALL; do
+    k_line "$name"
+done
+set -e
+
 print_results

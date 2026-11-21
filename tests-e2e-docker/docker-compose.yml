@@ -764,6 +764,8 @@ services:
     user: "0:0"
     depends_on:
       - lorica-hot-upgrade
+      - ssh-backend
+      - hot-upgrade-l4-backends
     volumes:
       # Read-write: the runner writes the test public key into the same
       # volume the lorica container reads it from, and reads the
@@ -773,6 +775,35 @@ services:
       - LORICA_API=https://lorica-hot-upgrade:9443
       - LORICA_PROXY=http://lorica-hot-upgrade:8080
       - BACKEND1_ADDR=backend1:80
+      - LORICA_STREAM_HOST=lorica-hot-upgrade
+      - SSH_BACKEND_HOST=ssh-backend
+      - L4_BACKENDS_HOST=hot-upgrade-l4-backends
+    networks:
+      - e2e
+
+  # ---- Streams across a hot upgrade (Story 12.11 Lot G, Story 12.12 Lot K)
+  # The SSH server the IV1 session runs through a TCP stream. It writes
+  # the client's private key to the shared volume at start.
+  ssh-backend:
+    build:
+      context: ./ssh-backend
+    profiles: ["hot-upgrade"]
+    volumes:
+      - shared-hot-upgrade:/shared
+    networks:
+      - e2e
+
+  # The UDP echo (the stand-in of Story 12.5 Lot I's role, Lot B's
+  # `udp_hold.py serve`) and the 64-port TCP backend of the fd-transfer
+  # scenario (port N answers as N), both from the runner image.
+  hot-upgrade-l4-backends:
+    build:
+      context: ./test-runner
+    profiles: ["hot-upgrade"]
+    entrypoint:
+      - sh
+      - -c
+      - python3 /tests/l4/udp_hold.py serve --port 5300 & exec python3 /tests/l4/tcp_backend.py --name hu-range --ports 7400-7463
     networks:
       - e2e
 
