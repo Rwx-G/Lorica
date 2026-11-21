@@ -740,7 +740,7 @@ attachments, `NET_ADMIN`, the GeoIP database mount),
 `docs/stories/story-12.6-stream-protection.md` (Lot I checkboxes only).
 Depends on: D, E; 12.6 Lots D, E, F.
 
-- [ ] Every item of 12.6 Lot I; `12.6-matrix-concurrency-caps`.
+- [x] Every item of 12.6 Lot I; `12.6-matrix-concurrency-caps`.
 
 ### Lot G: Story 12.7 IV1 - Docker e2e
 
@@ -1065,6 +1065,16 @@ pulled images.
   then passed with Lot D's sections (12.4 IV2 renewal and key
   replication, PASS). Lot D's files are not committed: they wait in the
   Lot D agent's hands (see its report).
+- Lots F and G, lane 2: a first agent wrote them on 2026-11-20 and was
+  stopped by a machine shutdown before committing. Its last full-lane
+  run (`results/e2e-l4-lane-2-20261120T225341Z.log`) lost the `streams`
+  profile's containers in the middle of `12.6-iv1`: the client was no
+  longer running and the node's log came back empty, so every later
+  row of the profile failed on Docker, not on Lorica; the cause was not
+  found, and no run since has repeated it. Resumed 2026-11-21 on
+  `c01536bb`: one literal carriage return in `l4/scenarios/12.6.sh`
+  (inside a `tr -d` argument) replaced by `\r`, the rest kept as
+  written, then both Lots run from scratch.
 
 ### Completion Notes
 
@@ -1301,6 +1311,51 @@ pulled images.
     address, which `dns:` needs. `tcp_backend.py` also reports the TCP
     peer (`peer=`), which the proxy-bind row reads.
 
+- **Lot F, 2026-11-21.** Story 12.6's IVs, an IP allow/deny entry and
+  the concurrency-caps row, lane 2 on `c01536bb`.
+  - **Verdicts**, all PASS in both runs (`L4_LOTS=A,F,G`, 3 min 36 s for
+    the phase with the report; `L4_LOTS=A,B,C,F,G`, about 10 min 16 s,
+    Lots A to C PASS beside them). Numbers from the first:
+    `12.6-iv1-source-rate-refused-other-served` (`source_open_rate` 5:
+    30 connects in one second from the US address, 9 served, 21 closed
+    before any echo, 21 counted `source_open_rate`; 3 of 3 from the `l4`
+    address served in the same second; the access log holds 2 refusal
+    rows, one per worker, and 2 suppressed rows counting the other 19);
+    `12.6-iv2-geo-deny-tcp-and-udp` (GeoIP denylist `US`: TCP closed with
+    no echo and UDP unanswered from the US address, both served from the
+    `l4` address, which the test database does not know; both counted
+    `geoip` with access-log rows; a TCP stream denying the US /32 and a
+    UDP stream allowing the `l4` /32 with no explicit session cap each
+    serve one source and refuse the other, counted `source_denied`);
+    `12.6-iv3-10k-silent-pending-cap` (10,000 silent connections at
+    1,000 a second from one address: at most 32 held at once, the share;
+    9,936 closed at once and counted `source_pending_cap`, 64 at their
+    5 s ClientHello deadline; 66 of 66 TLS handshakes from `l4` completed
+    throughout; 2 refusal rows and 2 suppressed rows counting 9,934.
+    Then nine US addresses x 40: at most 256 held, the cap; a TLS
+    connection opened before echoed 24 times with no failure; 0 of 10
+    new handshakes completed while the cap was full (`pending_cap`), the
+    last refused at 4.97 s, 16 of 16 completed from 7 s);
+    `12.6-matrix-concurrency-caps` (`max_connections` 5 with
+    `source_max_connections` 3: three held from one source, its fourth
+    refused `source_connection_cap`, two from another, its third refused
+    `connection_cap`; `backend_max_active` 1 and 2 on two backends: one
+    and two held, the fourth refused `backend_cap`).
+  - **No product defect found.**
+  - **Deviations**, recorded in Story 12.6's Dev Agent Record with the
+    reason for each: the client is connected to `streams-geo` by each
+    Story 12.6 scenario and disconnected when it ends (attached for the
+    whole profile, its host name resolved to either address and broke
+    `12.3-iv3` once); its US address is the one Docker gives it on the
+    lane's /24, not `214.78.120.5`; the node reaches `streams-geo` under
+    the alias `l4-node-geo`; the refusal rows are read in
+    `GET /api/v1/stream-logs`, where the limiter writes at most one per
+    worker per window, so IV1 accepts one row per worker and checks that
+    rows plus suppressed counts equal the counter; IV3 counts a silent
+    socket as held once it has been open a second, so a refusal not yet
+    read as a close is not counted. The IP-literal entries are in
+    `12.6-iv2`, as Lot A's note asked.
+
 ## File List
 
 Lot A:
@@ -1361,6 +1416,17 @@ Lanes (between Lots C and D):
   and summary names, `--lots`, no main-project teardown on `--only-l4`)
 - `tests-e2e-docker/test-runner/l4/report.py` (`--lots`)
 
+Lot F:
+
+- `tests-e2e-docker/l4/scenarios/12.6.sh` (new)
+- `tests-e2e-docker/test-runner/l4/protect_tools.py` (new)
+- `tests-e2e-docker/docker-compose.l4.yml` (the worker node on
+  `streams-geo` and the GeoIP database mount, `NET_ADMIN` on
+  `streams-client`)
+- `tests-e2e-docker/l4/scenarios.tsv` (Lot F rows `live`)
+- `docs/stories/story-12.6-stream-protection.md` (Lot I checkboxes, Dev
+  Agent Record, File List, Change Log, Status)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1371,3 +1437,4 @@ Lanes (between Lots C and D):
 | 2026-11-18 | 0.4 | Lot A implemented: L4 compose project, driver, scenario registry with pending rows, report gated on the registry and the PRD matrix, `perf-tools` and `baseline` images, toolchain pin, `run.sh` flags; digests and checksums recorded. The full pre-existing suite with the pin is still to run. Status InProgress. | Romain G. |
 | 2026-11-19 | 0.5 | Lot B implemented: Story 12.2's scenarios in both profiles and the fd-reserve scenario, all passing (AC #3 partial as D-d says); budget nodes, a single-process probe, `udp_hold.py` and `http_loop.py`. No product defect. The budget item asserts `worker_fds` for 1,024 ports and `supervisor_fds` for 600, since a UDP session now holds an fd. | Romain G. |
 | 2026-11-20 | 0.6 | Lot C implemented: Story 12.3 IV1 to IV4 (IV1 on three PostgreSQL servers, IV4 in full through CoreDNS) and the five TCP matrix rows, all passing; `NET_ADMIN` on the probe recorded as Resolved 17. No product defect. | Romain G. |
+| 2026-11-21 | 0.7 | Lot F implemented: Story 12.6 IV1 to IV3 (IV3 at 10,000 silent connections, then nine sources filling the pending cap), an IP-literal allow and deny entry in IV2, and the concurrency-caps matrix row, all passing in lane 2; the client joins `streams-geo` per scenario. No product defect. | Romain G. |

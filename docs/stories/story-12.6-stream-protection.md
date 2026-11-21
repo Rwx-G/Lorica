@@ -1,7 +1,7 @@
 # Story 12.6: Protecting Stream Listeners
 
 **Epic:** [Epic 12 - TCP and UDP Stream Proxying (v1.11.0 and v1.12.0)](../prd/epic-12-v1.11.0.md)
-**Status:** InProgress
+**Status:** Review
 **Priority:** P0
 **Author:** Romain G.
 **Depends on:**
@@ -724,20 +724,20 @@ profile and one network), `tests-e2e-docker/run.sh` (one call).
 Depends on: D, E, F, 12.3 Lot G, 12.4 Lot H, 12.5 Lot I. The machine to
 itself, orphan containers torn down first.
 
-- [ ] A second compose network `streams-geo`, subnet `214.78.120.0/24`,
+- [x] A second compose network `streams-geo`, subnet `214.78.120.0/24`,
       the runner at `214.78.120.5` (US in `GeoIP2-Country-Test.mmdb`,
       the value `run-geoip-smoke.sh` already relies on), Lorica attached
       to both networks, `geoip_db_path` set as the GeoIP smoke does.
-- [ ] IV1: a TCP echo stream with `source_open_rate = 5`; 30 connects
+- [x] IV1: a TCP echo stream with `source_open_rate = 5`; 30 connects
       in one second from `214.78.120.5` are partly refused (closed
       before any echo); a connect from the runner's address on the
       default network at the same time echoes. The `source_open_rate`
       refusal row appears once in the log, then a suppressed row.
-- [ ] IV2: `geoip` denylist `US` on a TCP stream and a UDP stream; from
+- [x] IV2: `geoip` denylist `US` on a TCP stream and a UDP stream; from
       `214.78.120.5` the TCP connect closes with no echo and the UDP
       query gets no answer; from the default network both are served;
       the `geoip` refusal rows appear in the log.
-- [ ] IV3: a TLS passthrough stream with defaults; 10,000 silent
+- [x] IV3: a TLS passthrough stream with defaults; 10,000 silent
       connections from `214.78.120.5`, held open: a TLS client from the
       default network completes its handshake throughout; the
       `source_pending_cap` refusal row and its suppressed counts appear;
@@ -1205,6 +1205,32 @@ lint` and `vitest run` clean.
 
 - **The region version line, 2026-11-18** (commit `ba176913`): `docs/BUMP-CHECKLIST.md` gains a "Shared-memory layout versions" section naming `LAYOUT_VERSION` and `STREAM_CAPS_LAYOUT_VERSION`, where each lives and when each moves, without their current values. `.claude/skills/bump-version/bump-checklist.md` is not tracked by git on this branch or on `main`, so its copy of the line is for the maintainer to add in the main checkout.
 
+- **Lot I, delivered by Story 12.12 Lot F (2026-11-21).** IV1 to IV3 run
+  in the L4 phase's `streams` profile (worker node, two workers) as
+  `12.6-iv1-source-rate-refused-other-served`,
+  `12.6-iv2-geo-deny-tcp-and-udp` and `12.6-iv3-10k-silent-pending-cap`,
+  all PASS in two runs of lane 2; Story 12.12's Completion Notes give
+  the numbers. No product
+  defect found. Deviations from the Lot's text: the files are the L4
+  phase's (`l4/scenarios/12.6.sh`, `test-runner/l4/protect_tools.py`,
+  `docker-compose.l4.yml`), not `run-streams-protect.sh` and the main
+  compose file (Story 12.12 D-a); the client's US address is the one
+  Docker gives it on its lane's `streams-geo` /24 (all four /24s of
+  `214.78.120.0/22` are US), not `214.78.120.5`, and each scenario
+  connects the client to `streams-geo` and disconnects it when it ends
+  (attached for the whole profile, its host name resolved to the US
+  address at random, which broke a Story 12.3 scenario that takes the
+  client's address from it, `12.3-iv3-proxy-v2-send-and-accept`, in a
+  run of 2026-11-20); the refusal rows are
+  read in the stream access log (`GET /api/v1/stream-logs`), where
+  Lot C's limiter sends them, at most one per worker per window, and the
+  scenarios assert that the rows plus the suppressed counts equal the
+  refusal counter; IV3's held count is the silent sockets open for a
+  second or more, so a connection refused at once and not yet read as
+  closed is not counted. IV2 also asserts an IP-literal deny entry (TCP)
+  and allow entry (UDP, no explicit session cap), which no planned
+  scenario covered.
+
 ## File List
 
 Lot A:
@@ -1281,6 +1307,14 @@ Lot G:
 - `docs/security/threat-model.md`, `docs/architecture/worker-shared-state.md` (Lot H, threat model and architecture part)
 - `docs/streams.md` (new), `CHANGELOG.md` (Lot H, the protection parts)
 
+Lot I (delivered by Story 12.12 Lot F):
+
+- `tests-e2e-docker/l4/scenarios/12.6.sh` (new)
+- `tests-e2e-docker/test-runner/l4/protect_tools.py` (new)
+- `tests-e2e-docker/docker-compose.l4.yml` (the node on `streams-geo`,
+  `NET_ADMIN` on the client, the GeoIP database mount)
+- `tests-e2e-docker/l4/scenarios.tsv` (the Lot F rows `live`)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -1297,3 +1331,4 @@ Lot G:
 | 2026-11-18 | 0.10 | Lot H, threat model and architecture part: slow reads, log amplification, table fill and handshake CPU in T12; region version 2 in `worker-shared-state.md`. The bump-checklist line, `docs/streams.md` and `CHANGELOG.md` stay open. | Romain G. |
 | 2026-11-18 | 0.11 | Lot H, the `docs/streams.md` and CHANGELOG parts: "Protecting a stream" documented with the two plain statements; with the other documentation pass's boxes, every box of the Lot is ticked. Status InProgress. | Romain G. |
 | 2026-11-18 | 0.12 | Lot H, the region version line in `docs/BUMP-CHECKLIST.md`; the skill's untracked copy left to the maintainer. | Romain G. |
+| 2026-11-21 | 0.13 | Lot I delivered by Story 12.12 Lot F: IV1 to IV3 pass end to end in the L4 phase, with an IP allow/deny entry beside IV2's GeoIP. No product defect. Every Lot done. Status Review. | Romain G. |

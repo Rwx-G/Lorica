@@ -54,6 +54,8 @@ services:
     volumes:
       - l4-shared:/shared
       - streams-data:/var/lib/lorica
+      # Story 12.6's GeoIP scenarios point `geoip_db_path` at it.
+      - ./fixtures/GeoIP2-Country-Test.mmdb:/etc/lorica-l4/GeoIP2-Country-Test.mmdb:ro
     # Names Docker's embedded DNS does not own (the 12.3 IV4 test name)
     # are forwarded to the CoreDNS service, which the node reaches on
     # l4-dns.
@@ -63,6 +65,10 @@ services:
       l4:
         aliases: ["l4-node"]
       l4-dns: {}
+      # `l4-node-geo` resolves to the node's address on streams-geo only,
+      # so a client reaching it there speaks from its US address.
+      streams-geo:
+        aliases: ["l4-node-geo"]
 
   lorica-streams-single:
     <<: *lorica-node
@@ -209,6 +215,15 @@ services:
     profiles: ["streams", "streams-single"]
     volumes:
       - l4-shared:/shared:ro
+    # Story 12.6 IV3 adds source addresses on streams-geo (`ip addr add`,
+    # run as root). Test environment only (Story 12.12 D-p).
+    cap_add:
+      - NET_ADMIN
+    # Not attached to streams-geo here: the Story 12.6 scenarios connect
+    # it for their own run and disconnect it after (l4/scenarios/12.6.sh).
+    # Attached for the whole profile, its host name would resolve to
+    # either network's address, and the scenarios that take the client's
+    # address from its host name would get the US one at random.
     networks:
       - l4
 
