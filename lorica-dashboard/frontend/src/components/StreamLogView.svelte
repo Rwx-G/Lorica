@@ -7,8 +7,9 @@
     type StreamStatus,
   } from '../lib/api';
   import { canReadFleet, canWrite } from '../lib/auth';
-  import { nodeScope, type NodeScope } from '../lib/cluster';
+  import { nodeScope } from '../lib/cluster';
   import { formatBytes } from '../lib/format';
+  import { TIME_RANGES, createScopedLoader, formatLogTimestamp, rangeStart, type LogScope } from '../lib/log-view';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import NodeFilter from './NodeFilter.svelte';
 
@@ -47,13 +48,20 @@
    * rows at a time.
    */
   let filterNode = $state('');
-  /** Where the next read goes. Without `canReadFleet` there is no filter, so always here. */
-  const scope = $derived<NodeScope>($canReadFleet ? nodeScope(filterNode) : { store: 'local' });
+  /**
+   * Where the next read goes. Without `canReadFleet` there is no filter,
+   * so always here. The filter offers no "All followers", so a fan-in
+   * read always names one.
+   */
+  const scope = $derived.by<LogScope<string>>(() => {
+    const choice = $canReadFleet ? nodeScope(filterNode) : { store: 'local' as const };
+    return choice.store === 'fan-in' && choice.node ? { store: 'fan-in', node: choice.node } : { store: 'local' };
+  });
   /**
    * Which store the rows on screen came from. The Node column and the
    * actions on this node's own log follow it rather than the filter.
    */
-  let entriesSource = $state<NodeScope['store']>('local');
+  let entriesSource = $state<LogScope<string>['store']>('local');
   /** The follower the fan-in rows on screen came from, for the Node column. */
   let entriesNode = $state('');
 
@@ -72,67 +80,41 @@
     [...new Set(entries.map((e) => e.refusal_reason).filter((w) => w))].sort(),
   );
 
-  const TIME_RANGES: { value: string; label: string; ms: number }[] = [
-    { value: '', label: 'All time', ms: 0 },
-    { value: '5m', label: 'Last 5 min', ms: 5 * 60_000 },
-    { value: '15m', label: 'Last 15 min', ms: 15 * 60_000 },
-    { value: '1h', label: 'Last 1 hour', ms: 60 * 60_000 },
-    { value: '6h', label: 'Last 6 hours', ms: 6 * 60 * 60_000 },
-    { value: '24h', label: 'Last 24 hours', ms: 24 * 60 * 60_000 },
-  ];
-
   function currentFilter(): StreamLogsFilter {
     const filter: StreamLogsFilter = {};
     if (filterStream) filter.stream_id = filterStream;
     if (filterEndReason.trim()) filter.end_reason = filterEndReason.trim();
     if (filterRefusalReason.trim()) filter.refusal_reason = filterRefusalReason.trim();
     if (filterClientIp.trim()) filter.client_ip = filterClientIp.trim();
-    const range = TIME_RANGES.find((r) => r.value === filterTimeRange);
-    if (range && range.ms > 0) filter.from = new Date(Date.now() - range.ms).toISOString();
+    const from = rangeStart(filterTimeRange);
+    if (from) filter.from = from;
     return filter;
   }
 
-  /**
-   * Bumped by every read. Polls, Refresh, filter changes and node
-   * switches overlap, and a response that is no longer the latest is
-   * dropped, or one store's rows would land under the other's controls.
-   */
-  let latestLoad = 0;
+  const readScoped = createScopedLoader();
 
   async function loadRows() {
-    const load = ++latestLoad;
-    const requested = scope;
     const query = { ...currentFilter(), limit: filterLimit };
-
-    // A follower's rows come from the fan-in store, under the same
-    // filters, with no count: the count is the page itself.
-    if (requested.store === 'fan-in' && requested.node) {
-      const res = await api.getFleetStreamLogs(requested.node, query);
-      if (load !== latestLoad) return;
-      if (res.error) {
-        error = res.error.message;
-      } else if (res.data) {
-        entries = res.data.entries;
-        entriesNode = res.data.node;
+    const outcome = await readScoped(scope, {
+      local: () => api.getStreamLogs(query),
+      // A follower's rows come from the fan-in store, under the same
+      // filters, with no count: the count is the page itself.
+      fanIn: (node) => api.getFleetStreamLogs(node, query),
+      showLocal: (data) => {
+        entries = data.entries;
+        entriesNode = '';
+        entriesSource = 'local';
+        total = data.total;
+      },
+      showFanIn: (data) => {
+        entries = data.entries;
+        entriesNode = data.node;
         entriesSource = 'fan-in';
-        total = res.data.entries.length;
-        error = '';
-      }
-      loading = false;
-      return;
-    }
-
-    const res = await api.getStreamLogs(query);
-    if (load !== latestLoad) return;
-    if (res.error) {
-      error = res.error.message;
-    } else if (res.data) {
-      entries = res.data.entries;
-      entriesNode = '';
-      entriesSource = 'local';
-      total = res.data.total;
-      error = '';
-    }
+        total = data.entries.length;
+      },
+    });
+    if (outcome.stale) return;
+    error = outcome.error;
     loading = false;
   }
 
@@ -181,12 +163,6 @@
     const timer = setInterval(() => void loadRows(), REFRESH_MS);
     return () => clearInterval(timer);
   });
-
-  function formatTimestamp(ts: string): string {
-    const d = new Date(ts);
-    if (Number.isNaN(d.getTime())) return ts;
-    return d.toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  }
 
   function client(e: StreamLogEntry): string {
     if (!e.client_ip) return '-';
@@ -333,7 +309,7 @@
             {#if entriesSource === 'fan-in'}
               <td class="mono">{entriesNode}</td>
             {/if}
-            <td class="mono time-col">{formatTimestamp(entry.timestamp)}</td>
+            <td class="mono time-col">{formatLogTimestamp(entry.timestamp)}</td>
             <td>
               {entry.stream_name || entry.stream_id}
               <span class="proto">{entry.protocol.toUpperCase()}</span>

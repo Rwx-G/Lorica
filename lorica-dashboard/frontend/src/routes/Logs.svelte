@@ -8,6 +8,7 @@
   import StreamLogView from '../components/StreamLogView.svelte';
   import { canReadFleet, canWrite } from '../lib/auth';
   import { nodeScope, type NodeScope } from '../lib/cluster';
+  import { TIME_RANGES, createScopedLoader, formatLogTimestamp, rangeStart } from '../lib/log-view';
   import { currentQuery } from '../lib/router';
   import { logsViewOf, streamOf, type LogsView } from '../lib/stream-links';
 
@@ -106,17 +107,10 @@
     return true;
   }
 
-  /**
-   * Bumped by every read. Polls, Refresh, filter changes and node
-   * switches overlap, and responses land in any order: one that is no
-   * longer the latest is dropped, or a late fan-in page would land
-   * under this node's live tail, or the reverse.
-   */
-  let latestLoad = 0;
+  /** A late fan-in page would otherwise land under this node's live tail, or the reverse. */
+  const readScoped = createScopedLoader();
 
   async function loadLogs() {
-    const load = ++latestLoad;
-    const requested = scope;
     const params: LogsQuery = { limit: filterLimit };
     if (searchText.trim()) params.search = searchText.trim();
     if (filterRoute.trim()) params.route = filterRoute.trim();
@@ -126,34 +120,30 @@
     else if (filterStatusCategory === '4xx') { params.status_min = 400; params.status_max = 499; }
     else if (filterStatusCategory === '5xx') { params.status_min = 500; params.status_max = 599; }
 
-    if (filterTimeRange) {
-      const now = new Date();
-      let from: Date;
-      if (filterTimeRange === '5m') from = new Date(now.getTime() - 5 * 60 * 1000);
-      else if (filterTimeRange === '15m') from = new Date(now.getTime() - 15 * 60 * 1000);
-      else if (filterTimeRange === '1h') from = new Date(now.getTime() - 60 * 60 * 1000);
-      else if (filterTimeRange === '6h') from = new Date(now.getTime() - 6 * 60 * 60 * 1000);
-      else from = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-      params.time_from = from.toISOString();
-    }
+    const from = rangeStart(filterTimeRange);
+    if (from) params.time_from = from;
 
-    // On a control plane with a follower picked, or all of them, read
-    // the FAN-IN store rather than this node's own log. It filters on
-    // host and time only, so the page hides the other filters there.
-    // The fan-in view has no total, by design, so the count is the
-    // page itself rather than a number the server had to scan for.
-    if (requested.store === 'fan-in') {
-      const res = await api.getFleetLogs({
-        ...(requested.node ? { node: requested.node } : {}),
-        ...(filterRoute.trim() ? { route: filterRoute.trim() } : {}),
-        ...(typeof params.time_from === 'string' ? { from: params.time_from } : {}),
-        limit: filterLimit,
-      });
-      if (load !== latestLoad) return;
-      if (res.error) {
-        error = res.error.message;
-      } else if (res.data) {
-        entries = res.data.rows.map((r) => ({
+    const outcome = await readScoped(scope, {
+      local: () => api.getLogs(params),
+      // On a control plane with a follower picked, or all of them, read
+      // the FAN-IN store rather than this node's own log. It filters on
+      // host and time only, so the page hides the other filters there.
+      fanIn: (node) =>
+        api.getFleetLogs({
+          ...(node ? { node } : {}),
+          ...(filterRoute.trim() ? { route: filterRoute.trim() } : {}),
+          ...(from ? { from } : {}),
+          limit: filterLimit,
+        }),
+      showLocal: (data) => {
+        entries = data.entries;
+        entriesSource = 'local';
+        total = data.total;
+      },
+      // The fan-in view has no total, by design, so the count is the
+      // page itself rather than a number the server had to scan for.
+      showFanIn: (data) => {
+        entries = data.rows.map((r) => ({
           id: r.id,
           timestamp: r.timestamp,
           method: r.method,
@@ -171,25 +161,13 @@
           source: '',
           request_id: r.request_id,
         }));
-        fleetNodeById = Object.fromEntries(res.data.rows.map((r) => [r.id, r.node_id]));
+        fleetNodeById = Object.fromEntries(data.rows.map((r) => [r.id, r.node_id]));
         entriesSource = 'fan-in';
-        total = res.data.rows.length;
-        error = '';
-      }
-      loading = false;
-      return;
-    }
-
-    const res = await api.getLogs(params);
-    if (load !== latestLoad) return;
-    if (res.error) {
-      error = res.error.message;
-    } else if (res.data) {
-      entries = res.data.entries;
-      entriesSource = 'local';
-      total = res.data.total;
-      error = '';
-    }
+        total = data.rows.length;
+      },
+    });
+    if (outcome.stale) return;
+    error = outcome.error;
     loading = false;
   }
 
@@ -225,15 +203,6 @@
     if (status >= 300) return 'var(--color-text-muted)';
     if (status >= 200) return 'var(--color-green)';
     return 'var(--color-text)';
-  }
-
-  function formatTimestamp(ts: string): string {
-    try {
-      const d = new Date(ts);
-      return d.toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    } catch {
-      return ts;
-    }
   }
 
   onMount(() => {
@@ -310,15 +279,6 @@
     { value: '3xx', label: '3xx Redirect' },
     { value: '4xx', label: '4xx Client Error' },
     { value: '5xx', label: '5xx Server Error' },
-  ];
-
-  const timeRanges = [
-    { value: '', label: 'All time' },
-    { value: '5m', label: 'Last 5 min' },
-    { value: '15m', label: 'Last 15 min' },
-    { value: '1h', label: 'Last 1 hour' },
-    { value: '6h', label: 'Last 6 hours' },
-    { value: '24h', label: 'Last 24 hours' },
   ];
 </script>
 
@@ -420,7 +380,7 @@
       </select>
     {/if}
     <select class="filter-select" bind:value={filterTimeRange} onchange={loadLogs}>
-      {#each timeRanges as tr (tr.value)}
+      {#each TIME_RANGES as tr (tr.value)}
         <option value={tr.value}>{tr.label}</option>
       {/each}
     </select>
@@ -469,7 +429,7 @@
               {#if entriesSource === 'fan-in'}
                 <td class="mono">{fleetNodeById[entry.id] ?? '-'}</td>
               {/if}
-              <td class="mono time-col">{formatTimestamp(entry.timestamp)}</td>
+              <td class="mono time-col">{formatLogTimestamp(entry.timestamp)}</td>
               <td class="method-col">
                 <span class="method-badge">{entry.method}</span>
               </td>
