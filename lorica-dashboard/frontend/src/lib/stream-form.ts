@@ -37,7 +37,11 @@ export const STREAM_TABS: { id: StreamTab; label: string }[] = [
   { id: 'protection', label: 'Protection' },
 ];
 
-/** The tab holding each writable field. A field added to the view is a type error here until placed. */
+/**
+ * The tab holding each writable field, in the order the tab shows them
+ * (`scalarsOn`). A field added to the view is a type error here until
+ * placed.
+ */
 export const FIELD_TAB: Record<StreamField, StreamTab> = {
   name: 'general',
   group_name: 'general',
@@ -52,8 +56,8 @@ export const FIELD_TAB: Record<StreamField, StreamTab> = {
   backend_max_active: 'backends',
   tls_mode: 'tls',
   match_rules: 'tls',
-  no_sni_acknowledged: 'tls',
   clienthello_timeout_ms: 'tls',
+  no_sni_acknowledged: 'tls',
   tls_terminate: 'tls',
   upstream_tls: 'tls',
   load_balancing: 'connection',
@@ -64,14 +68,14 @@ export const FIELD_TAB: Record<StreamField, StreamTab> = {
   backend_keepalive: 'connection',
   backend_keepalive_idle_s: 'connection',
   close_on_backend_down: 'connection',
+  max_connections: 'connection',
+  upload_rate_bps: 'connection',
+  download_rate_bps: 'connection',
   proxy_protocol_send: 'connection',
   proxy_protocol_accept: 'connection',
   proxy_protocol_trusted_cidrs: 'connection',
   source_addresses: 'connection',
   allow_local_backend: 'connection',
-  upload_rate_bps: 'connection',
-  download_rate_bps: 'connection',
-  max_connections: 'connection',
   udp: 'udp',
   source_allow_cidrs: 'protection',
   source_deny_cidrs: 'protection',
@@ -271,6 +275,16 @@ export const UDP_SPECS: Record<UdpField, ScalarSpec> = {
   source_byte_rate: { label: 'Bytes per second per source', kind: 'int', perNode: true, empty: 'server default' },
   max_datagram_bytes: { label: 'Max datagram bytes', kind: 'int', empty: 'server default' },
 };
+
+/**
+ * The scalar fields `tab` holds, in display order: what the tab renders
+ * as one control each, next to the controls it builds by hand.
+ */
+export function scalarsOn(tab: StreamTab): ScalarField[] {
+  return (Object.keys(FIELD_TAB) as StreamField[]).filter(
+    (field): field is ScalarField => FIELD_TAB[field] === tab && field in SCALAR_SPECS,
+  );
+}
 
 /** The label a control shows: every cap says it applies per node (12.6 D-k). */
 export function labelOf(spec: ScalarSpec): string {

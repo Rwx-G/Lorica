@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { StreamProtocol } from '../../lib/api';
-  import type { ScalarField, StreamDraft, StreamField } from '../../lib/stream-form';
+  import { scalarsOn, type StreamDraft, type StreamField } from '../../lib/stream-form';
   import CountryPicker from '../CountryPicker.svelte';
   import ScalarFields from './ScalarFields.svelte';
 
@@ -13,14 +13,7 @@
 
   let { draft = $bindable(), fields, protocol, creating }: Props = $props();
 
-  const KEYS: ScalarField[] = [
-    'source_allow_cidrs',
-    'source_deny_cidrs',
-    'source_max_connections',
-    'max_pending_connections',
-    'source_open_rate',
-    'open_rate',
-  ];
+  const KEYS = scalarsOn('protection');
 </script>
 
 <div class="tab-content">

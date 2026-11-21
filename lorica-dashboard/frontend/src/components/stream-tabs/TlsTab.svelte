@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { CertificateResponse, StreamProtocol } from '../../lib/api';
-  import { emptyRule, type ScalarField, type StreamDraft, type StreamField } from '../../lib/stream-form';
+  import { emptyRule, scalarsOn, type StreamDraft, type StreamField } from '../../lib/stream-form';
   import ScalarFields from './ScalarFields.svelte';
 
   interface Props {
@@ -13,7 +13,7 @@
 
   let { draft = $bindable(), fields, protocol, creating, certificates }: Props = $props();
 
-  const KEYS: ScalarField[] = ['tls_mode', 'clienthello_timeout_ms', 'no_sni_acknowledged'];
+  const KEYS = scalarsOn('tls');
 
   function addRule() {
     draft.rules = [...draft.rules, emptyRule()];

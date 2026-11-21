@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { StreamProtocol } from '../../lib/api';
-  import type { ScalarField, StreamDraft, StreamField } from '../../lib/stream-form';
+  import { scalarsOn, type StreamDraft, type StreamField } from '../../lib/stream-form';
   import ScalarFields from './ScalarFields.svelte';
 
   interface Props {
@@ -12,16 +12,7 @@
 
   let { draft = $bindable(), fields, protocol, creating }: Props = $props();
 
-  const KEYS: ScalarField[] = [
-    'name',
-    'group_name',
-    'protocol',
-    'enabled',
-    'listen_address',
-    'port_first',
-    'port_last',
-    'node_selector',
-  ];
+  const KEYS = scalarsOn('general');
 </script>
 
 <div class="tab-content">
