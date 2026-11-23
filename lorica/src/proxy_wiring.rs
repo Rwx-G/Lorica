@@ -985,6 +985,7 @@ impl ProxyHttp for LoricaProxy {
             http.response.status_code = tracing::field::Empty,
             client.geo.country_iso_code = tracing::field::Empty,
             server.address = tracing::field::Empty,
+            client.address = tracing::field::Empty,
             network.peer.address = tracing::field::Empty,
             lorica.latency_ms = tracing::field::Empty,
             lorica.trace.origin = tracing::field::Empty,
@@ -2890,6 +2891,16 @@ impl ProxyHttp for LoricaProxy {
 
         let backend_addr = ctx.backend_addr.as_deref().unwrap_or("-");
 
+        // A request refused before the client-IP stage (the global
+        // connection limit) never resolved one; its TCP peer is still
+        // the address an operator needs to see in the console line.
+        let console_client_ip = ctx.client_ip.clone().unwrap_or_else(|| {
+            downstream
+                .client_addr()
+                .and_then(|addr| addr.as_inet())
+                .map_or_else(|| "-".to_string(), |addr| addr.ip().to_string())
+        });
+
         let error_str = if let Some(ref reason) = ctx.block_reason {
             Some(reason.clone())
         } else if ctx.waf_blocked {
@@ -2915,6 +2926,7 @@ impl ProxyHttp for LoricaProxy {
                 method = method,
                 path = path,
                 host = host,
+                client_ip = %console_client_ip,
                 status = status,
                 latency_ms = latency_ms,
                 backend = backend_addr,
@@ -2926,6 +2938,7 @@ impl ProxyHttp for LoricaProxy {
                 method = method,
                 path = path,
                 host = host,
+                client_ip = %console_client_ip,
                 status = status,
                 latency_ms = latency_ms,
                 backend = backend_addr,
@@ -2948,6 +2961,9 @@ impl ProxyHttp for LoricaProxy {
             span.record("lorica.latency_ms", latency_ms as i64);
             if host != "-" {
                 span.record("server.address", host);
+            }
+            if console_client_ip != "-" {
+                span.record("client.address", console_client_ip.as_str());
             }
             if backend_addr != "-" {
                 span.record("network.peer.address", backend_addr);

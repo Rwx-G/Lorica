@@ -11,6 +11,8 @@ Author: Rwx-G
 
 ### Added
 
+- **The console request lines carry the client address (#63).** `request completed` and `request completed with error`, the lines `docker logs` and journald show for every request, now include `client_ip`: the address the access log, the bans and the rate limits use, read from `X-Forwarded-For` only behind a trusted proxy. A request refused before that address is resolved, by the global connection limit, shows its TCP peer. A tool such as Fail2ban can count `error=IP banned` per address from the console output alone. The OpenTelemetry `http_request` span records the same address as `client.address`.
+
 ### Changed
 
 ### Fixed
