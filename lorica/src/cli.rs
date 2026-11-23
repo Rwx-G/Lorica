@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
@@ -928,6 +929,16 @@ pub(crate) fn validate_cluster_listen(
 static LOG_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
     std::sync::OnceLock::new();
 
+/// Whether the stdout text layer may emit ANSI colour escapes. Colour
+/// is for interactive terminals only: when stdout is not a TTY
+/// (containers, pipes, file redirects) escape sequences would end up
+/// verbatim in the collected output, breaking line-oriented parsing of
+/// the log stream. A non-empty `NO_COLOR` value (https://no-color.org)
+/// disables colour explicitly, even on a TTY.
+fn stdout_ansi(is_tty: bool, no_color: bool) -> bool {
+    is_tty && !no_color
+}
+
 pub(crate) fn init_logging(log_level: &str, log_format: &str, log_file: Option<&str>) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -946,8 +957,8 @@ pub(crate) fn init_logging(log_level: &str, log_format: &str, log_file: Option<&
     // composition below has a single source of truth. The non-blocking
     // file path keeps its `WorkerGuard` alive in a process-wide
     // static so flushes continue until shutdown; the stdout path
-    // uses ANSI colours. Daily rotation with 14-file retention
-    // bounds disk usage on unattended installs.
+    // colours only interactive terminals. Daily rotation with 14-file
+    // retention bounds disk usage on unattended installs.
     let (writer, ansi): (tracing_subscriber::fmt::writer::BoxMakeWriter, bool) = if let Some(path) =
         log_file
     {
@@ -979,9 +990,10 @@ pub(crate) fn init_logging(log_level: &str, log_format: &str, log_file: Option<&
             false,
         )
     } else {
+        let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
         (
             tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout),
-            true,
+            stdout_ansi(std::io::stdout().is_terminal(), no_color),
         )
     };
 
@@ -1257,6 +1269,14 @@ pub(crate) fn run_upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stdout_ansi_requires_a_terminal_and_no_no_color() {
+        assert!(stdout_ansi(true, false));
+        assert!(!stdout_ansi(false, false));
+        assert!(!stdout_ansi(true, true));
+        assert!(!stdout_ansi(false, true));
+    }
 
     #[test]
     fn parse_workers_accepts_auto_zero_and_positive() {
