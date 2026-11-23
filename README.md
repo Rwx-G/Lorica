@@ -9,8 +9,8 @@
   <img src="https://img.shields.io/badge/version-1.10.10-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-3738-brightgreen.svg" alt="Lorica Tests">
-  <img src="https://img.shields.io/badge/Pingora%20Tests-880-blue.svg" alt="Inherited Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-4794-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Pingora%20Tests-919-blue.svg" alt="Inherited Tests">
 </p>
 
 ---
@@ -771,18 +771,19 @@ cargo test -p lorica-cluster --tests
 cd lorica-dashboard/frontend && pnpm install --frozen-lockfile && pnpm run check && pnpm run lint && pnpm exec vitest run
 ```
 
-At 1.10.10 the two product-crate steps run 3738 Rust tests and the
-forked-crate step 880; the rustls build runs 539 more, most of them the
+At 1.10.10 the two product-crate steps run 4794 Rust tests and the
+forked-crate step 919; the rustls build runs 592 more, most of them the
 default-feature tests of `lorica-core` and `lorica-lb` again with TLS on,
-so they are left out of the forked figure. The frontend suite is 825
-Vitest cases across 48 files.
+so they are left out of the forked figure. The frontend suite is 1055
+Vitest cases across 61 files.
 
-The `lorica` binary crate carries 26 end-to-end binaries under
+The `lorica` binary crate carries 34 end-to-end binaries under
 `lorica/tests/` that drive a real Pingora `Server` against mock backends
 (mTLS, the certificate for a client dialing an IP, response rewriting, mirroring, forward auth, stale-while-revalidate,
 the connection pre-filter, canary and header routing, config reload, rate
 limits and their cross-worker sync, the circuit breaker, the downstream
-idle timeout, the timeouts of an upgraded tunnel and the RPC plane). They run as part of `cargo test -p lorica`.
+idle timeout, the timeouts of an upgraded tunnel, the RPC plane, PROXY
+protocol on the HTTP listeners and the TCP, UDP and TLS stream engines). They run as part of `cargo test -p lorica`.
 
 #### Docker end-to-end suites
 
