@@ -11,6 +11,20 @@ Author: Rwx-G
 
 ### Added
 
+### Changed
+
+### Fixed
+
+### Removed
+
+### Security
+
+## [1.10.10] - 2026-11-23
+
+Behind a trusted proxy, `X-Forwarded-For` is read from the right, so a client can no longer choose the address Lorica's bans, rate limits and WAF whitelist see. The console request lines start with the client address (#63), and alert emails and Slack messages name routes, backends and alert types in words. No schema migration.
+
+### Added
+
 - **The console request lines carry the client address (#63).** `request completed` and `request completed with error`, the lines `docker logs` and journald show for every request, now start with `client_ip`: the address the access log, the bans and the rate limits use, read from `X-Forwarded-For` only behind a trusted proxy. It is the first field so that a filter anchored right after the message can never read an address a client planted in the path or the `Host` header, which follow it. A tool such as Fail2ban can count `error=IP banned` per address from the console output alone; `docs/security.md` gives a filter anchored that way. The OpenTelemetry `http_request` span records the same address as `client.address`.
 
 ### Changed
@@ -20,10 +34,6 @@ Author: Rwx-G
 - **`X-Real-IP` sent to backends is the client Lorica resolved**, the address its own logs and controls use. Behind a trusted proxy it used to be the proxy's address. The `X-Forwarded-For` sent upstream keeps every line the request carried, joined, then the hop Lorica saw; only the first line was kept, so a line a front proxy added was dropped.
 - **An IPv4-mapped address (`::ffff:192.0.2.1`) is read as the IPv4 address it carries**, for the TCP peer and in `X-Forwarded-For`, so a ban, an allow list or a trusted proxy written in IPv4 matches it.
 - **Alert emails and Slack messages name what they are about.** The email subject reads `[Lorica Alert] SLA breached - ...` instead of `sla_breached`, the body shows both (`Type: SLA breached (sla_breached)`), and the Slack header uses the same words (`*[CERTIFICATE EXPIRING]*` where it read `*[CERT EXPIRING]*`). An SLA breach, an SLA recovery and a failed active probe name the route by its host and path prefix (`app.example.com/api`) instead of its id; the id stays among the details as `route_id`, beside a new `route`. A backend that goes down is named by its label as well as its address. A WAF alert reads the same in single-process and worker mode, `WAF blocked sql_injection on app.example.com/search: SQL injection (rule 942100)`, with the same details in both (`rule_id`, `category`, `severity`, `host`, `client_ip`), plus `path` where the raising process still has it, which worker mode does not. The details are listed in key order instead of a different order on every send. Webhook payloads keep their shape: `alert_type` is still the `snake_case` value, and `details` gains the `route`, `host` and `severity` keys where they apply.
-
-### Fixed
-
-### Removed
 
 ### Security
 
