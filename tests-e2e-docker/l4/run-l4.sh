@@ -23,7 +23,10 @@
 # every profile the row names, the driver calls `scenario <name>` and
 # then the function, in a subshell under `set -euo pipefail`, stdin
 # closed. The function asserts through l4_client, l4_probe, l4_node and
-# l4_api (l4/lib.sh) and ends with one `pass`, `fail` or `partial`.
+# l4_api (l4/lib.sh) and ends with one `pass`, `fail` or `partial`. A
+# helper of its own takes the file's prefix; one another file needs
+# moves to l4/lib.sh as `l4s_*` (l4_check_scenario_files refuses the run
+# otherwise).
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -35,6 +38,10 @@ for scenario_file in l4/scenarios/*.sh; do
     # shellcheck source=/dev/null
     . "$scenario_file"
 done
+if ! l4_check_scenario_files l4/scenarios/*.sh; then
+    echo "run-l4.sh: move a helper two scenario files use into l4/lib.sh" >&2
+    exit 2
+fi
 
 BUILD_FLAG=""
 KEEP=false
@@ -50,19 +57,6 @@ done
 L4_PROFILES="streams:lorica-streams streams-single:lorica-streams-single"
 
 mapfile -t REGISTRY_ROWS < <(l4_registry_rows)
-
-wait_for_node() {
-    local i
-    for i in $(seq 1 60); do
-        if l4_node sh -c 'test -s /shared/admin_password && curl -skf https://127.0.0.1:19443/ >/dev/null' >/dev/null 2>&1; then
-            echo "${L4_NODE} is ready."
-            return 0
-        fi
-        sleep 2
-    done
-    echo "ERROR: ${L4_NODE} did not start within 120s"
-    return 1
-}
 
 # Runs one scenario and returns 1 when it failed. Never call it from a
 # conditional context (`if`, `||`, `&&`): bash ignores `set -e` in
@@ -106,7 +100,7 @@ run_profile() {
         build="--no-build"
     fi
     l4_compose --profile "$profile" up $build -d
-    wait_for_node
+    l4_wait_for_node
     if [ $? -ne 0 ]; then
         l4_dump_node_log "$L4_NODE"
         return 1

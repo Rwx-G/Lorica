@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Story 12.3 scenarios (Story 12.12 Lot C: IV1 to IV4 and the TCP rows
 # of the parity matrix, D-e). Sourced by l4/run-l4.sh; see that file for
-# the scenario contract. The `l4s_*` helpers are l4/scenarios/12.2.sh's.
+# the scenario contract. Its own helpers are `l4c_*`; the shared `l4s_*` helpers are l4/lib.sh's.
 #
 # Backends: three PostgreSQL servers and a `pg-client` for `psql` (IV1),
 # test-runner/l4/tcp_backend.py in five services (an identity line then
@@ -173,81 +173,6 @@ l4c_tcp() {
     l4_client python3 -c "$L4C_TCP_CLIENT" "$@" | tr -d '\r'
 }
 
-# A service's address on `l4`, from the client.
-l4c_ip() {
-    l4_client python3 -c 'import socket, sys; print(socket.gethostbyname(sys.argv[1]))' "$1" | tr -d '\r'
-}
-
-# A backend object for <address>, with an active TCP-connect check at
-# the health loop's 5 s floor (a flip is confirmed after three probes,
-# each bounded by a 5 s connect timeout: up to about 30 s), or none with
-# `nocheck`. Prints its id, or the refusal and returns 1.
-l4c_backend() {
-    local check='"health_check_enabled":true,"health_check_interval_s":1'
-    [ "${2:-}" = nocheck ] && check='"health_check_enabled":false'
-    l4s_create_backend "{\"address\":\"$1\",${check}}"
-}
-
-# The count under one reason in a stream's live counters, refusals and
-# ends together.
-l4c_reason_count() {
-    l4s_client_script '
-        api GET /api/v1/streams/status | jq -r --arg id "$1" --arg r "$2" \
-            "[.data.streams[] | select(.id == \$id) | .counters | (.refused // []) + (.ended // []) | .[] | select(.reason == \$r) | .count] | add // 0"
-    ' "$1" "$2" | tr -d '\r'
-}
-
-# l4c_reason_count, polled for up to 5 s until it reaches <at least>:
-# a connection's end is counted once its task has finished, a moment
-# after the client saw the close. Prints the last count read.
-l4c_wait_reason_count() {
-    local i count=0
-    for i in $(seq 1 25); do
-        count=$(l4c_reason_count "$1" "$2")
-        [ "${count:-0}" -ge "$3" ] && break
-        sleep 0.2
-    done
-    echo "${count:-0}"
-}
-
-# Poll a backend's health_status until it reads <status>, within
-# <seconds>; prints the elapsed milliseconds.
-L4C_WAIT_HEALTH_SCRIPT='
-id=$1 want=$2 limit_ms=$(( $3 * 1000 ))
-t0=$(now_us)
-while :; do
-    got=$(api GET "/api/v1/backends/$id" | jq -r .data.health_status)
-    elapsed=$(( ($(now_us) - t0) / 1000 ))
-    [ "$got" = "$want" ] && { echo "$elapsed"; exit 0; }
-    [ "$elapsed" -ge "$limit_ms" ] && { echo "$got after $elapsed ms"; exit 1; }
-    sleep 0.2
-done
-'
-
-l4c_wait_health() {
-    l4s_client_script "$L4C_WAIT_HEALTH_SCRIPT" "$@" | tr -d '\r'
-}
-
-# The node's interface on `l4` and its prefix length, read in the probe:
-# prints `<dev> <prefix>`. (The worker node is also on l4-dns.)
-l4c_l4_interface() {
-    l4s_probe ip -o -4 addr show | tr -d '\r' | awk -v ip="$1" '{ split($4, a, "/"); if (a[1] == ip) print $2, a[2] }'
-}
-
-# The address at <index> of a subnet, counted from the top as Python
-# does with a negative index: one Docker has not handed out, on a
-# network this lightly used.
-l4c_subnet_address() {
-    l4_client python3 -c 'import ipaddress, sys; print(ipaddress.ip_network(sys.argv[1], strict=False)[int(sys.argv[2])])' "$1" "$2" | tr -d '\r'
-}
-
-# The count of <name> in a `name=count ...` tally (0 when absent).
-l4c_count() {
-    local n
-    n=$(printf '%s' "$1" | grep -o "\(^\| \)$2=[0-9]*" | cut -d= -f2)
-    echo "${n:-0}"
-}
-
 # ---- IV1 -------------------------------------------------------------
 
 # Runs in pg-client: <n> `psql` connections through the stream on
@@ -309,7 +234,7 @@ scenario_12_3_iv1_pg_balance_and_failover() {
     trap 'l4s_cleanup_streams l4c-iv1-; l4_compose start pg-1 pg-2 pg-3 >/dev/null 2>&1 || true' EXIT
     l4s_cleanup_streams l4c-iv1-
     for p in pg-1 pg-2 pg-3; do
-        id=$(l4c_backend "$(l4c_ip "$p"):5432") || fail "backend ${p}: ${id}"
+        id=$(l4s_backend "$(l4s_ip "$p"):5432") || fail "backend ${p}: ${id}"
         ids+=("\"${id}\"")
     done
     id=$(l4s_create_stream "{\"name\":\"l4c-iv1-pg\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":5432,\"backend_ids\":[$(IFS=,; echo "${ids[*]}")],\"connect_timeout_ms\":1000}") \
@@ -322,7 +247,7 @@ scenario_12_3_iv1_pg_balance_and_failover() {
 
     rr=$(l4c_pg_tally 300)
     for p in pg-1 pg-2 pg-3; do
-        n=$(l4c_count "$rr" "$p")
+        n=$(l4s_count "$rr" "$p")
         [ "$n" -ge 95 ] && [ "$n" -le 105 ] || fail "round robin over 300 connections: ${rr}"
     done
 
@@ -336,14 +261,14 @@ scenario_12_3_iv1_pg_balance_and_failover() {
     l4c_set_algorithm "$id" random
     rnd=$(l4c_pg_tally 300)
     for p in pg-1 pg-2 pg-3; do
-        [ "$(l4c_count "$rnd" "$p")" -ge 60 ] || fail "random over 300 connections: ${rnd}"
+        [ "$(l4s_count "$rnd" "$p")" -ge 60 ] || fail "random over 300 connections: ${rnd}"
     done
 
     l4c_set_algorithm "$id" least_conn
     lc=$(l4c_pg_tally 30 concurrent)
     min=30 max=0
     for p in pg-1 pg-2 pg-3; do
-        n=$(l4c_count "$lc" "$p")
+        n=$(l4s_count "$lc" "$p")
         [ "$n" -lt "$min" ] && min=$n
         [ "$n" -gt "$max" ] && max=$n
     done
@@ -351,7 +276,7 @@ scenario_12_3_iv1_pg_balance_and_failover() {
 
     l4c_set_algorithm "$id" peak_ewma
     ew=$(l4c_pg_tally 100)
-    [ "$(l4c_count "$ew" fail)" = 0 ] || fail "peak EWMA: failed connections: ${ew}"
+    [ "$(l4s_count "$ew" fail)" = 0 ] || fail "peak EWMA: failed connections: ${ew}"
 
     # Failover, round robin.
     l4c_set_algorithm "$id" round_robin
@@ -365,16 +290,16 @@ scenario_12_3_iv1_pg_balance_and_failover() {
     [ -n "$held" ] || fail "the held psql session did not start"
     victim=""
     for p in pg-1 pg-2 pg-3; do
-        if [ "$(l4c_ip "$p")" != "$held" ]; then victim=$p; break; fi
+        if [ "$(l4s_ip "$p")" != "$held" ]; then victim=$p; break; fi
     done
     local victim_backend
-    victim_backend=$(l4s_client_script 'api GET /api/v1/backends | jq -r --arg a "$1:5432" ".data.backends[] | select(.address == \$a) | .id" | head -n 1' "$(l4c_ip "$victim")" | tr -d '\r')
+    victim_backend=$(l4s_client_script 'api GET /api/v1/backends | jq -r --arg a "$1:5432" ".data.backends[] | select(.address == \$a) | .id" | head -n 1' "$(l4s_ip "$victim")" | tr -d '\r')
     l4_compose kill "$victim" >/dev/null
-    down=$(l4c_wait_health "$victim_backend" down 45) || fail "${victim} not marked down after the kill: ${down}"
+    down=$(l4s_wait_health "$victim_backend" down 45) || fail "${victim} not marked down after the kill: ${down}"
     after=$(l4c_pg_tally 100)
     local survivors=0
     for p in pg-1 pg-2 pg-3; do
-        [ "$p" = "$victim" ] || survivors=$(( survivors + $(l4c_count "$after" "$p") ))
+        [ "$p" = "$victim" ] || survivors=$(( survivors + $(l4s_count "$after" "$p") ))
     done
     [ "$survivors" = 100 ] || fail "after ${victim} was marked down, 100 new connections went: ${after}"
     survived=""
@@ -401,9 +326,9 @@ scenario_12_3_iv2_shared_backend_down_both_planes() {
     local shared other id route down http stream held
     trap 'l4s_cleanup_streams l4c-iv2-; l4_client touch /tmp/l4c-held.stop >/dev/null 2>&1 || true; l4_compose kill -s USR2 tcp-backend-1 >/dev/null 2>&1 || true' EXIT
     l4s_cleanup_streams l4c-iv2-
-    shared=$(l4c_backend "$(l4c_ip tcp-backend-1):9000") || fail "backend: ${shared}"
-    other=$(l4c_backend "$(l4c_ip tcp-backend-2):9000") || fail "backend: ${other}"
-    l4c_wait_health "$shared" healthy 45 >/dev/null || fail "the shared backend never read healthy"
+    shared=$(l4s_backend "$(l4s_ip tcp-backend-1):9000") || fail "backend: ${shared}"
+    other=$(l4s_backend "$(l4s_ip tcp-backend-2):9000") || fail "backend: ${other}"
+    l4s_wait_health "$shared" healthy 45 >/dev/null || fail "the shared backend never read healthy"
     route=$(l4s_client_script 'api_try POST /api/v1/routes "$1" | head -n 1' \
         "{\"hostname\":\"l4c-iv2.test\",\"backend_ids\":[\"${shared}\",\"${other}\"]}" | tr -d '\r')
     [ "$route" = 2xx ] || l4s_client_script 'api GET /api/v1/routes | jq -e ".data.routes[] | select(.hostname == \"l4c-iv2.test\")" >/dev/null' \
@@ -422,7 +347,7 @@ scenario_12_3_iv2_shared_backend_down_both_planes() {
     l4_client grep -q '"target": "tcp-backend-1"' /tmp/l4c-held.json || fail "no stream connection reached the shared backend"
 
     l4_compose kill -s USR1 tcp-backend-1 >/dev/null
-    down=$(l4c_wait_health "$shared" down 45) || fail "the shared backend was not marked down: ${down}"
+    down=$(l4s_wait_health "$shared" down 45) || fail "the shared backend was not marked down: ${down}"
     sleep 1
     http=$(l4c_tcp http l4c-iv2.test 20)
     stream=$(l4c_tcp idents 7401 20)
@@ -456,8 +381,8 @@ scenario_12_3_iv3_proxy_v2_send_and_accept() {
     trap 'l4s_cleanup_streams l4c-iv3-' EXIT
     l4s_cleanup_streams l4c-iv3-
     client=$(l4s_client_ip)
-    proxied=$(l4c_backend "$(l4c_ip tcp-backend-proxy):9000") || fail "backend: ${proxied}"
-    echo=$(l4c_backend "$(l4c_ip tcp-backend-1):9000") || fail "backend: ${echo}"
+    proxied=$(l4s_backend "$(l4s_ip tcp-backend-proxy):9000") || fail "backend: ${proxied}"
+    echo=$(l4s_backend "$(l4s_ip tcp-backend-1):9000") || fail "backend: ${echo}"
     send=$(l4s_create_stream "{\"name\":\"l4c-iv3-send\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":7402,\"backend_ids\":[\"${proxied}\"],\"proxy_protocol_send\":\"v2\"}") \
         || fail "stream create refused: ${send}"
     untrusted=$(l4s_create_stream "{\"name\":\"l4c-iv3-untrusted\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":7403,\"backend_ids\":[\"${echo}\"],\"proxy_protocol_accept\":true,\"proxy_protocol_trusted_cidrs\":[\"192.0.2.0/24\"]}") \
@@ -478,7 +403,7 @@ scenario_12_3_iv3_proxy_v2_send_and_accept() {
     [ "$v1" = closed ] && [ "$v2" = closed ] \
         || fail "an untrusted client's PROXY header was not refused: v1 '${v1}', v2 '${v2}'"
     case "$plain" in name=tcp-backend-1*) ;; *) fail "a direct client without a header was not served: ${plain}" ;; esac
-    counted=$(l4c_wait_reason_count "$untrusted" proxy_header_invalid 2)
+    counted=$(l4s_wait_reason_count "$untrusted" proxy_header_invalid 2)
     [ "${counted:-0}" -ge 2 ] || fail "the two refused headers were counted ${counted} times as proxy_header_invalid"
 
     carried=$(l4c_tcp ident 7404 v2 203.0.113.7)
@@ -509,7 +434,7 @@ scenario_12_3_iv4_local_backend_refused_and_rebind_excluded() {
     local mgmt with without hostname id served moved after excluded backend_ip
     trap 'l4s_cleanup_streams l4c-iv4-' EXIT
     l4s_cleanup_streams l4c-iv4-
-    mgmt=$(l4c_backend 127.0.0.1:19443 nocheck) || fail "backend: ${mgmt}"
+    mgmt=$(l4s_backend 127.0.0.1:19443 nocheck) || fail "backend: ${mgmt}"
     with=$(l4s_client_script 'api_try POST /api/v1/streams "$1" | tr "\n" " "' \
         "{\"name\":\"l4c-iv4-mgmt\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":7405,\"backend_ids\":[\"${mgmt}\"],\"allow_local_backend\":true}" | tr -d '\r')
     without=$(l4s_client_script 'api_try POST /api/v1/streams "$1" | tr "\n" " "' \
@@ -517,11 +442,11 @@ scenario_12_3_iv4_local_backend_refused_and_rebind_excluded() {
     case "$with" in 409\ *stream_local_backend*) ;; *) fail "the management port with allow_local_backend was not refused 409: ${with}" ;; esac
     case "$without" in 409\ *stream_local_backend*) ;; *) fail "the management port without allow_local_backend was not refused 409: ${without}" ;; esac
 
-    backend_ip=$(l4c_ip tcp-backend-1)
+    backend_ip=$(l4s_ip tcp-backend-1)
     mkdir -p results
     printf '%s rebind.l4.test\n' "$backend_ip" > "${L4_RESULTS}-coredns-hosts"
     l4_compose cp "${L4_RESULTS}-coredns-hosts" coredns:/l4-hosts >/dev/null 2>&1 || fail "could not install the CoreDNS hosts file"
-    hostname=$(l4c_backend rebind.l4.test:9000 nocheck) || fail "backend: ${hostname}"
+    hostname=$(l4s_backend rebind.l4.test:9000 nocheck) || fail "backend: ${hostname}"
     id=$(l4s_create_stream "{\"name\":\"l4c-iv4-rebind\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":7406,\"backend_ids\":[\"${hostname}\"]}") \
         || fail "stream create refused: ${id}"
     l4s_wait_bind "$id" bound 5 >/dev/null || fail "the stream did not bind"
@@ -565,18 +490,18 @@ scenario_12_3_matrix_backup_backends() {
     local primary backup id up down back
     trap 'l4s_cleanup_streams l4c-bk-; l4_compose kill -s USR2 tcp-backend-3 >/dev/null 2>&1 || true' EXIT
     l4s_cleanup_streams l4c-bk-
-    primary=$(l4c_backend "$(l4c_ip tcp-backend-3):9000") || fail "backend: ${primary}"
-    backup=$(l4c_backend "$(l4c_ip tcp-backend-2):9000") || fail "backend: ${backup}"
+    primary=$(l4s_backend "$(l4s_ip tcp-backend-3):9000") || fail "backend: ${primary}"
+    backup=$(l4s_backend "$(l4s_ip tcp-backend-2):9000") || fail "backend: ${backup}"
     id=$(l4s_create_stream "{\"name\":\"l4c-bk-stream\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":7407,\"backend_ids\":[\"${primary}\"],\"backup_backend_ids\":[\"${backup}\"]}") \
         || fail "stream create refused: ${id}"
     l4s_wait_bind "$id" bound 5 >/dev/null || fail "the stream did not bind"
-    l4c_wait_health "$primary" healthy 45 >/dev/null || fail "the primary never read healthy"
+    l4s_wait_health "$primary" healthy 45 >/dev/null || fail "the primary never read healthy"
     up=$(l4c_tcp idents 7407 10)
     l4_compose kill -s USR1 tcp-backend-3 >/dev/null
-    l4c_wait_health "$primary" down 45 >/dev/null || fail "the primary was not marked down"
+    l4s_wait_health "$primary" down 45 >/dev/null || fail "the primary was not marked down"
     down=$(l4c_tcp idents 7407 10)
     l4_compose kill -s USR2 tcp-backend-3 >/dev/null
-    l4c_wait_health "$primary" healthy 45 >/dev/null || fail "the primary did not come back healthy"
+    l4s_wait_health "$primary" healthy 45 >/dev/null || fail "the primary did not come back healthy"
     back=$(l4c_tcp idents 7407 10)
     [ "$up" = tcp-backend-3=10 ] && [ "$down" = tcp-backend-2=10 ] && [ "$back" = tcp-backend-3=10 ] \
         || fail "primary up: ${up}; primary down: ${down}; primary back: ${back}"
@@ -590,7 +515,7 @@ scenario_12_3_matrix_bandwidth() {
     local echo up down free tu td tf
     trap 'l4s_cleanup_streams l4c-bw-' EXIT
     l4s_cleanup_streams l4c-bw-
-    echo=$(l4c_backend "$(l4c_ip tcp-backend-1):9000") || fail "backend: ${echo}"
+    echo=$(l4s_backend "$(l4s_ip tcp-backend-1):9000") || fail "backend: ${echo}"
     local base="\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"backend_ids\":[\"${echo}\"]"
     up=$(l4s_create_stream "{\"name\":\"l4c-bw-up\",${base},\"port_first\":7408,\"upload_rate_bps\":16384}") || fail "stream create refused: ${up}"
     down=$(l4s_create_stream "{\"name\":\"l4c-bw-down\",${base},\"port_first\":7409,\"download_rate_bps\":16384}") || fail "stream create refused: ${down}"
@@ -623,12 +548,12 @@ scenario_12_3_matrix_timeouts() {
     # unanswered, so the SYN is never answered and the connect hangs
     # until Lorica's timeout (the kernel's own gives up after seconds).
     local node_ip prefix
-    node_ip=$(l4c_ip l4-node)
-    read -r _ prefix <<< "$(l4c_l4_interface "$node_ip")"
+    node_ip=$(l4s_ip l4-node)
+    read -r _ prefix <<< "$(l4s_l4_interface "$node_ip")"
     [ -n "$prefix" ] || fail "no interface of the node carries ${node_ip}"
-    dead=$(l4c_subnet_address "${node_ip}/${prefix}" -7)
-    black=$(l4c_backend "${dead}:9" nocheck) || fail "backend: ${black}"
-    echo=$(l4c_backend "$(l4c_ip tcp-backend-1):9000") || fail "backend: ${echo}"
+    dead=$(l4s_subnet_address "${node_ip}/${prefix}" -7)
+    black=$(l4s_backend "${dead}:9" nocheck) || fail "backend: ${black}"
+    echo=$(l4s_backend "$(l4s_ip tcp-backend-1):9000") || fail "backend: ${echo}"
     connect=$(l4s_create_stream "{\"name\":\"l4c-to-connect\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":7411,\"backend_ids\":[\"${black}\"],\"connect_timeout_ms\":500,\"max_connect_attempts\":1}") || fail "stream create refused: ${connect}"
     idle=$(l4s_create_stream "{\"name\":\"l4c-to-idle\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":7412,\"backend_ids\":[\"${echo}\"],\"idle_timeout_s\":2}") || fail "stream create refused: ${idle}"
     total=$(l4s_create_stream "{\"name\":\"l4c-to-total\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":7413,\"backend_ids\":[\"${echo}\"],\"total_timeout_s\":3}") || fail "stream create refused: ${total}"
@@ -641,9 +566,9 @@ scenario_12_3_matrix_timeouts() {
     l4s_less_than 0.3 "${tc%% *}" && l4s_less_than "${tc%% *}" 2.5 || fail "the connect timeout of 500 ms ended the connection after ${tc%% *} s"
     l4s_less_than 1.5 "${ti%% *}" && l4s_less_than "${ti%% *}" 4.5 || fail "the idle timeout of 2 s ended the connection after ${ti%% *} s"
     l4s_less_than 2.5 "${tt%% *}" && l4s_less_than "${tt%% *}" 4.5 || fail "the total timeout of 3 s ended the connection after ${tt%% *} s"
-    [ "$(l4c_wait_reason_count "$connect" connect_failed 1)" -ge 1 ] || fail "the connect timeout did not end as connect_failed"
-    [ "$(l4c_wait_reason_count "$idle" idle_timeout 1)" -ge 1 ] || fail "the idle timeout did not end as idle_timeout"
-    [ "$(l4c_wait_reason_count "$total" total_timeout 1)" -ge 1 ] || fail "the total timeout did not end as total_timeout"
+    [ "$(l4s_wait_reason_count "$connect" connect_failed 1)" -ge 1 ] || fail "the connect timeout did not end as connect_failed"
+    [ "$(l4s_wait_reason_count "$idle" idle_timeout 1)" -ge 1 ] || fail "the idle timeout did not end as idle_timeout"
+    [ "$(l4s_wait_reason_count "$total" total_timeout 1)" -ge 1 ] || fail "the total timeout did not end as total_timeout"
     pass "connect 500 ms: closed after ${tc%% *} s (connect_failed); idle 2 s: ${ti%% *} s (idle_timeout); total 3 s while busy: ${tt%% *} s (total_timeout)"
 }
 
@@ -653,14 +578,14 @@ scenario_12_3_matrix_timeouts() {
 # one from the node's own address.
 scenario_12_3_matrix_proxy_bind() {
     local node_ip second dev prefix echo bound plain via direct
-    node_ip=$(l4c_ip l4-node)
-    read -r dev prefix <<< "$(l4c_l4_interface "$node_ip")"
+    node_ip=$(l4s_ip l4-node)
+    read -r dev prefix <<< "$(l4s_l4_interface "$node_ip")"
     [ -n "$dev" ] || fail "no interface of the node carries ${node_ip}"
-    second=$(l4c_subnet_address "${node_ip}/${prefix}" -6)
+    second=$(l4s_subnet_address "${node_ip}/${prefix}" -6)
     trap 'l4s_cleanup_streams l4c-pb-; l4s_probe ip addr del "'"${second}/${prefix}"'" dev "'"${dev}"'" >/dev/null 2>&1 || true' EXIT
     l4s_cleanup_streams l4c-pb-
     l4s_probe ip addr add "${second}/${prefix}" dev "$dev" || fail "could not add ${second} to ${dev}"
-    echo=$(l4c_backend "$(l4c_ip tcp-backend-1):9000") || fail "backend: ${echo}"
+    echo=$(l4s_backend "$(l4s_ip tcp-backend-1):9000") || fail "backend: ${echo}"
     bound=$(l4s_create_stream "{\"name\":\"l4c-pb-bound\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":7414,\"backend_ids\":[\"${echo}\"],\"source_addresses\":[\"${second}\"]}") || fail "stream create refused: ${bound}"
     plain=$(l4s_create_stream "{\"name\":\"l4c-pb-plain\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":7415,\"backend_ids\":[\"${echo}\"]}") || fail "stream create refused: ${plain}"
     for id in "$bound" "$plain"; do
@@ -679,7 +604,7 @@ scenario_12_3_matrix_port_range() {
     local range id port got wrong=""
     trap 'l4s_cleanup_streams l4c-pr-' EXIT
     l4s_cleanup_streams l4c-pr-
-    range=$(l4c_backend "$(l4c_ip tcp-backend-range)" nocheck) || fail "backend: ${range}"
+    range=$(l4s_backend "$(l4s_ip tcp-backend-range)" nocheck) || fail "backend: ${range}"
     id=$(l4s_create_stream "{\"name\":\"l4c-pr-range\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":7300,\"port_last\":7315,\"backend_ids\":[\"${range}\"]}") || fail "stream create refused: ${id}"
     l4s_wait_bind "$id" bound 5 >/dev/null || fail "the range did not bind"
     got=$(for port in $(seq 7300 7315); do l4c_tcp ident "$port"; done)

@@ -2,7 +2,7 @@
 # Story 12.9 scenarios (Story 12.12 Lot I, the items of Story 12.9 Lot J),
 # in the `streams` profile: one node, two workers. Sourced by
 # l4/run-l4.sh; see that file for the scenario contract. Uses the
-# `l4s_*` helpers of 12.2.sh.
+# shared `l4s_*` helpers of l4/lib.sh.
 #
 # Every row is asserted where the dashboard reads it (`GET
 # /api/v1/stream-logs`) and as an RFC 5424 frame with MSGID `stream` in

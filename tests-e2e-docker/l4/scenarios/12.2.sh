@@ -1,268 +1,13 @@
 # shellcheck shell=bash
 # Story 12.2 scenarios (Story 12.12 Lot B, the items of Story 12.2 Lot H).
 # Sourced by l4/run-l4.sh; see that file for the scenario contract.
-#
-# The helpers below (`l4s_*`) are shared by every scenario file: they
-# are defined here because the scenario files are sourced together and
-# this is the first one that needs them. Each in-container script is a
-# literal string run by `bash -c` in one container command, so a timed
-# assertion keeps its timer inside the container (Story 12.12 D-c).
-
-# The HTTP route every scenario that needs HTTP traffic uses: a backend
-# served by test-runner/l4/http_loop.py in the client, on this port.
-L4S_HTTP_HOST=l4-http.test
-L4S_HTTP_PORT=8000
-# The UDP and TCP echo backends in the client.
-L4S_UDP_ECHO_PORT=9100
-L4S_TCP_ECHO_PORT=9000
-
-# Prepended to a client script: `api METHOD PATH [BODY]` (the body on
-# stdout, exit 22 on a status outside 2xx) and `api_try METHOD PATH
-# [BODY]` (prints `<status>` then the body on the next line, never
-# fails), both over the l4/lib.sh API script given as the script's
-# first argument, both waiting out a 429 of the management API's rate
-# limits instead of failing on it.
-L4S_PRELUDE='
-set -euo pipefail
-API_SCRIPT=$1
-shift
-api_try() {
-    local i err out code
-    for i in $(seq 1 30); do
-        err=$(mktemp)
-        if out=$(bash -c "$API_SCRIPT" l4_api body "$@" 2>"$err"); then
-            rm -f "$err"
-            printf "2xx\n%s\n" "$out"
-            return 0
-        fi
-        code=$(grep -o "answered HTTP [0-9]*" "$err" | grep -o "[0-9]*$" || true)
-        if [ "$code" = 429 ]; then
-            rm -f "$err"
-            sleep 3
-            continue
-        fi
-        if [ -z "$code" ]; then
-            code="error: $(tr "\n" " " < "$err")"
-        fi
-        rm -f "$err"
-        printf "%s\n%s\n" "$code" "$out"
-        return 0
-    done
-    printf "429\nstill rate-limited after 90 s\n"
-}
-api() {
-    local res
-    res=$(api_try "$@")
-    if [ "${res%%$'"'"'\n'"'"'*}" != 2xx ]; then
-        echo "api $1 $2: ${res//$'"'"'\n'"'"'/ }" >&2
-        return 22
-    fi
-    printf "%s\n" "${res#*$'"'"'\n'"'"'}"
-}
-now_us() {
-    echo "${EPOCHREALTIME/./}"
-}
-'
-
-# Run a script in the client with the prelude: l4s_client_script
-# <script> [args...]. The API script is l4/lib.sh's, which talks to
-# l4-node; l4s_node_api_script gives one for another node.
-l4s_client_script() {
-    local script="$1"
-    shift
-    l4_client bash -c "${L4S_PRELUDE}${script}" l4s "${L4S_API_SCRIPT:-$L4_API_SCRIPT}" "$@"
-}
-
-# The lib.sh API script, aimed at another node of the project: its own
-# address, its own session files in the client, and the bootstrap
-# password the host reads from the node and leaves in the client.
-# Usage: L4S_API_SCRIPT=$(l4s_node_api_script <service>)
-l4s_node_api_script() {
-    local node="$1" script pw
-    pw=$(l4_compose exec -T "$node" cat /shared/admin_password | tr -d '\r\n')
-    printf '%s' "$pw" | l4_compose exec -T streams-client sh -c "cat > /tmp/l4s-${node}-initial"
-    script=${L4_API_SCRIPT//https:\/\/l4-node:9443/https://${node}:9443}
-    script=${script//\/tmp\/l4-api-session/\/tmp\/l4s-${node}-session}
-    script=${script//\/tmp\/l4-api-password/\/tmp\/l4s-${node}-password}
-    script=${script//\/shared\/admin_password/\/tmp\/l4s-${node}-initial}
-    printf '%s' "$script"
-}
-
-# Wait until another node of the project answers its management API.
-l4s_wait_ready() {
-    local node="$1" i
-    for i in $(seq 1 60); do
-        if l4_compose exec -T "$node" sh -c 'test -s /shared/admin_password && curl -skf https://127.0.0.1:19443/ >/dev/null' >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 2
-    done
-    fail "${node} did not answer its management API within 120 s"
-}
-
-# The probe of the profile being run: in the node's network and pid
-# namespaces.
-l4s_probe_service() {
-    case "$L4_PROFILE" in
-        streams-single) echo streams-single-probe ;;
-        *) echo streams-probe ;;
-    esac
-}
-
-l4s_probe() {
-    l4_compose exec -T "$(l4s_probe_service)" "$@"
-}
-
-# The supervisor (or the single process): the `lorica` process whose
-# parent is not one. Busybox ps, by comm (see 12.12.sh's self-test).
-L4S_PIDS_SCRIPT='
-ps -o pid,ppid,comm | awk -v want="$1" '"'"'
-    $3 == "lorica" { parent[$1] = $2 }
-    END {
-        for (p in parent) {
-            top = !(parent[p] in parent)
-            if ((want == "top" && top) || (want == "workers" && !top)) print p
-        }
-    }'"'"'
-'
-
-l4s_supervisor_pid() {
-    l4s_probe bash -c "$L4S_PIDS_SCRIPT" pids top | tr -d '\r'
-}
-
-l4s_worker_pids() {
-    l4s_probe bash -c "$L4S_PIDS_SCRIPT" pids workers | tr -d '\r' | sort -n | tr '\n' ' '
-}
-
-# The client's own IPv4 address on the `l4` network.
-l4s_client_ip() {
-    l4_client python3 -c 'import socket; print(socket.gethostbyname(socket.gethostname()))' | tr -d '\r'
-}
-
-# Start a long-running tool in the client unless something already
-# listens on its port: l4s_client_daemon <proto tcp|udp> <port> <cmd...>
-l4s_client_daemon() {
-    local proto="$1" port="$2" flag=-ltnH i
-    shift 2
-    [ "$proto" = udp ] && flag=-lunH
-    if [ -n "$(l4_client ss "$flag" "sport = :${port}" | tr -d '\r')" ]; then
-        return 0
-    fi
-    l4_compose exec -d streams-client "$@"
-    for i in $(seq 1 50); do
-        [ -n "$(l4_client ss "$flag" "sport = :${port}" | tr -d '\r')" ] && return 0
-        sleep 0.2
-    done
-    fail "the client's ${proto} ${port} service did not start: $*"
-}
-
-l4s_echo_backends() {
-    l4s_client_daemon udp "$L4S_UDP_ECHO_PORT" python3 /tests/l4/udp_hold.py serve --port "$L4S_UDP_ECHO_PORT"
-    l4s_client_daemon tcp "$L4S_TCP_ECHO_PORT" socat "TCP-LISTEN:${L4S_TCP_ECHO_PORT},fork,reuseaddr" EXEC:cat
-}
-
-# The HTTP backend in the client and, on the node the API script
-# targets, a route `l4-http.test` to it; returns once the route answers
-# 200 through the node's HTTP listener (`l4s_http_ready [<node host>]`).
-L4S_HTTP_ROUTE_SCRIPT='
-host=$1 backend=$2 node=$3
-if ! api GET /api/v1/routes | jq -e --arg h "$host" ".data.routes[] | select(.hostname == \$h)" >/dev/null; then
-    bid=$(api POST /api/v1/backends "{\"address\":\"$backend\",\"health_check_enabled\":false}" | jq -r .data.id)
-    api POST /api/v1/routes "{\"hostname\":\"$host\",\"backend_ids\":[\"$bid\"]}" >/dev/null
-fi
-for i in $(seq 1 100); do
-    status=$(python3 /tests/l4/http_loop.py get --target "$node:8080" --host-header "$host" --timeout 2 | jq -r .status)
-    [ "$status" = 200 ] && exit 0
-    sleep 0.2
-done
-echo "route $host on $node never answered 200 (last: $status)" >&2
-exit 1
-'
-
-l4s_http_ready() {
-    local node="${1:-l4-node}"
-    l4s_client_daemon tcp "$L4S_HTTP_PORT" python3 /tests/l4/http_loop.py serve --port "$L4S_HTTP_PORT"
-    l4s_client_script "$L4S_HTTP_ROUTE_SCRIPT" "$L4S_HTTP_HOST" "$(l4s_client_ip):${L4S_HTTP_PORT}" "$node"
-}
-
-# A detached HTTP loop in the client (50 new connections per second to
-# the route), stopped and read by l4s_loop_stop. Usage: l4s_loop_start
-# <tag> [<node host>]
-l4s_loop_start() {
-    local tag="$1" node="${2:-l4-node}"
-    l4_client rm -f "/tmp/loop-${tag}.stop" "/tmp/loop-${tag}.json"
-    l4_compose exec -d streams-client python3 /tests/l4/http_loop.py loop \
-        --target "${node}:8080" --host-header "$L4S_HTTP_HOST" --rate 50 \
-        --stop-file "/tmp/loop-${tag}.stop" --out "/tmp/loop-${tag}.json"
-}
-
-# Prints `sent=<n> failed=<n> errors=<json>`.
-l4s_loop_stop() {
-    local tag="$1"
-    l4_client bash -c '
-        touch "/tmp/loop-$1.stop"
-        for i in $(seq 1 100); do
-            [ -s "/tmp/loop-$1.json" ] && break
-            sleep 0.1
-        done
-        jq -r "\"sent=\(.sent) failed=\(.failed) errors=\(.errors|tojson)\"" "/tmp/loop-$1.json"
-    ' l4s "$tag" | tr -d '\r'
-}
+# Its own helpers are `l4b_*`; the shared `l4s_*` helpers are l4/lib.sh's.
 
 # The session cookie of the client's API session, for a probe script
 # that calls the API from inside the node's namespace.
-l4s_cookie() {
+l4b_cookie() {
     l4_api GET /api/v1/streams >/dev/null
     l4_client cat /tmp/l4-api-session | tr -d '\r\n'
-}
-
-# Delete every stream whose name starts with a prefix, on l4-node.
-L4S_CLEANUP_SCRIPT='
-api GET /api/v1/streams | jq -r --arg p "$1" ".data.streams[] | select(.name | startswith(\$p)) | .id" |
-while read -r id; do
-    api DELETE "/api/v1/streams/$id" >/dev/null || true
-done
-'
-
-l4s_cleanup_streams() {
-    l4s_client_script "$L4S_CLEANUP_SCRIPT" "$1" >/dev/null 2>&1 || true
-}
-
-# Poll a stream's bind state in the client until it is <state>, within
-# <seconds>: prints `<elapsed ms> <bind json>`; exit 1 on a timeout.
-L4S_WAIT_BIND_SCRIPT='
-id=$1 want=$2 limit_ms=$(( $3 * 1000 ))
-t0=$(now_us)
-while :; do
-    bind=$(api GET "/api/v1/streams/$id" | jq -c .data.bind)
-    elapsed=$(( ($(now_us) - t0) / 1000 ))
-    if [ "$(printf "%s" "$bind" | jq -r ".state // empty")" = "$want" ]; then
-        echo "$elapsed $bind"
-        exit 0
-    fi
-    if [ "$elapsed" -ge "$limit_ms" ]; then
-        echo "$elapsed $bind"
-        exit 1
-    fi
-    sleep 0.2
-done
-'
-
-l4s_wait_bind() {
-    l4s_client_script "$L4S_WAIT_BIND_SCRIPT" "$@" | tr -d '\r'
-}
-
-# Create a stream (a backend) through the API script in use and print
-# its id; on a refusal, print the refusal and return 1. Helpers whose
-# output a scenario captures never call `fail` themselves: the verdict
-# line would land in the variable. Usage: id=$(l4s_create_stream
-# <json>) || fail "...: ${id}"
-l4s_create_stream() {
-    l4s_client_script 'api POST /api/v1/streams "$1" | jq -r .data.id' "$1" 2>&1 | tr -d '\r'
-}
-
-l4s_create_backend() {
-    l4s_client_script 'api POST /api/v1/backends "$1" | jq -r .data.id' "$1" 2>&1 | tr -d '\r'
 }
 
 # ---- The probe's timed API scripts -----------------------------------
@@ -272,7 +17,7 @@ l4s_create_backend() {
 
 # Create the stream, then poll `ss -ltn` until its port listens:
 # prints `id=<id> ms=<elapsed>`, exit 1 past the limit.
-L4S_PROBE_CREATE_SCRIPT='
+L4B_PROBE_CREATE_SCRIPT='
 cookie=$1 port=$2 body=$3 limit_ms=$4
 t0=${EPOCHREALTIME/./}
 resp=$(curl -s -w "\n%{http_code}" -b "$cookie" -H "Content-Type: application/json" \
@@ -296,7 +41,7 @@ echo "id=$id ms=$(( (${EPOCHREALTIME/./} - t0) / 1000 ))"
 '
 
 # Delete the stream, then poll until no socket listens on its port.
-L4S_PROBE_DELETE_SCRIPT='
+L4B_PROBE_DELETE_SCRIPT='
 cookie=$1 port=$2 id=$3 limit_ms=$4
 t0=${EPOCHREALTIME/./}
 code=$(curl -s -o /dev/null -w "%{http_code}" -b "$cookie" -X DELETE \
@@ -331,9 +76,9 @@ scenario_12_2_iv1_bind_and_release_within_5s() {
     sup_before=$(l4s_supervisor_pid)
     l4s_loop_start iv1
     sleep 1
-    cookie=$(l4s_cookie)
+    cookie=$(l4b_cookie)
 
-    created=$(l4_compose exec -T "$probe" bash -c "$L4S_PROBE_CREATE_SCRIPT" l4s "$cookie" "$port" \
+    created=$(l4_compose exec -T "$probe" bash -c "$L4B_PROBE_CREATE_SCRIPT" l4s "$cookie" "$port" \
         "{\"name\":\"l4s-iv1-pg\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":${port}}" \
         5000 | tr -d '\r') || fail "create on :${port}: ${created}"
     id=${created#id=}
@@ -345,7 +90,7 @@ with socket.create_connection(('l4-node', ${port}), timeout=3):
     pass
 " || fail "a TCP connect to l4-node:${port} was not accepted"
 
-    deleted=$(l4_compose exec -T "$probe" bash -c "$L4S_PROBE_DELETE_SCRIPT" l4s "$cookie" "$port" "$id" 5000 \
+    deleted=$(l4_compose exec -T "$probe" bash -c "$L4B_PROBE_DELETE_SCRIPT" l4s "$cookie" "$port" "$id" 5000 \
         | tr -d '\r') || fail "delete of :${port}: ${deleted}"
 
     sleep 1
@@ -366,7 +111,7 @@ with socket.create_connection(('l4-node', ${port}), timeout=3):
 # ---- IV2 -------------------------------------------------------------
 
 # A process outside Lorica holding a TCP port in the node's namespace.
-L4S_SQUATTER='import socket, time
+L4B_SQUATTER='import socket, time
 s = socket.socket()
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("0.0.0.0", 6000))
@@ -385,7 +130,7 @@ scenario_12_2_iv2_port_in_use_fails_cleanly() {
     l4s_cleanup_streams l4s-iv2-
     l4s_http_ready
     l4_compose exec -T "$probe" pkill -f l4s-squatter >/dev/null 2>&1 || true
-    l4_compose exec -d "$probe" python3 -c "$L4S_SQUATTER" l4s-squatter
+    l4_compose exec -d "$probe" python3 -c "$L4B_SQUATTER" l4s-squatter
     local i
     for i in $(seq 1 50); do
         [ -n "$(l4s_probe ss -ltnH 'sport = :6000' | tr -d '\r')" ] && break
@@ -459,7 +204,7 @@ except PermissionError:
 # capability, are not dumpable, so their /proc/<pid>/fd is closed to it.
 # Prints `victim=<pid> respawn_ms=<n> killed=<pids>`.
 # Usage: <pids script> <dport>
-L4S_KILL_SESSION_OWNER='import os, subprocess, sys, time
+L4B_KILL_SESSION_OWNER='import os, subprocess, sys, time
 pids_script, dport = sys.argv[1], int(sys.argv[2])
 def workers():
     out = subprocess.run(["bash", "-c", pids_script, "pids", "workers"],
@@ -523,7 +268,7 @@ scenario_12_2_ac1_udp_group_survives_worker_respawn() {
 
     # Kill the worker that holds the client's session (and, if the first
     # killed was the other one, that one too).
-    respawn=$(l4s_probe python3 -c "$L4S_KILL_SESSION_OWNER" "$L4S_PIDS_SCRIPT" "$L4S_UDP_ECHO_PORT" | tr -d '\r') || fail "${respawn}"
+    respawn=$(l4s_probe python3 -c "$L4B_KILL_SESSION_OWNER" "$L4S_PIDS_SCRIPT" "$L4S_UDP_ECHO_PORT" | tr -d '\r') || fail "${respawn}"
 
     after=$(l4s_probe ss -uanH "sport = :${port}" | tr -d '\r' | grep -c . || true)
     [ "$after" -eq "$before" ] || fail "the group shrank: ${before} sockets before the kill, ${after} after"
@@ -575,7 +320,7 @@ print(', '.join(out))
 
 # Sends SIGTERM to the supervisor from the probe and prints the time it
 # was sent (CLOCK_REALTIME, seconds with microseconds).
-L4S_PROBE_TERM_SCRIPT='
+L4B_PROBE_TERM_SCRIPT='
 sup=$(bash -c "$1" pids top)
 [ -n "$sup" ] || { echo "no lorica process"; exit 1; }
 echo "$EPOCHREALTIME"
@@ -585,7 +330,7 @@ kill -TERM "$sup"
 # Wait for the node's container to exit and print its exit time as
 # seconds since the epoch (Docker's FinishedAt, the VM clock); return 1
 # if it still runs after 70 s.
-l4s_wait_exited() {
+l4b_wait_exited() {
     local cid i finished
     cid=$(l4_compose ps -aq "$L4_NODE" | tr -d '\r')
     for i in $(seq 1 700); do
@@ -602,22 +347,6 @@ import datetime, re, sys
 stamp = re.sub(r'(\.\d{6})\d*', r'\1', sys.argv[1]).replace('Z', '+00:00')
 print(f'{datetime.datetime.fromisoformat(stamp).timestamp():.6f}')
 " "$finished" | tr -d '\r'
-}
-
-# Start the node again after a stop, its probe with it (the probe's
-# namespaces are the node's container's), and wait for the API.
-l4s_restart_node() {
-    l4_compose start "$L4_NODE" >/dev/null
-    l4_compose restart "$(l4s_probe_service)" >/dev/null
-    wait_for_node >/dev/null || fail "${L4_NODE} did not come back after the stop"
-}
-
-l4s_seconds_between() {
-    awk -v a="$1" -v b="$2" 'BEGIN { printf "%.3f", b - a }'
-}
-
-l4s_less_than() {
-    awk -v a="$1" -v b="$2" 'BEGIN { exit !(a < b) }'
 }
 
 # AC #7: with no traffic, SIGTERM ends the process in under 10 s; with
@@ -647,8 +376,8 @@ scenario_12_2_ac7_stop_drains_then_exits() {
             sleep 0.5
         done' | tr -d '\r') || fail "the node never went quiet before the stop: ${quiet}"
 
-    term=$(l4_compose exec -T "$probe" bash -c "$L4S_PROBE_TERM_SCRIPT" l4s "$L4S_PIDS_SCRIPT" | tr -d '\r')
-    finished=$(l4s_wait_exited) || fail "${finished}"
+    term=$(l4_compose exec -T "$probe" bash -c "$L4B_PROBE_TERM_SCRIPT" l4s "$L4S_PIDS_SCRIPT" | tr -d '\r')
+    finished=$(l4b_wait_exited) || fail "${finished}"
     idle=$(l4s_seconds_between "$term" "$finished")
     l4s_restart_node
     l4s_less_than "$idle" 10 || fail "with no traffic the stop took ${idle} s"
@@ -659,8 +388,8 @@ scenario_12_2_ac7_stop_drains_then_exits() {
     l4_compose exec -d streams-client python3 /tests/l4/http_loop.py get --target l4-node:8080 \
         --host-header "$L4S_HTTP_HOST" --path /delay/8 --timeout 30 --out /tmp/l4s-slow.json
     sleep 2
-    term=$(l4_compose exec -T "$probe" bash -c "$L4S_PROBE_TERM_SCRIPT" l4s "$L4S_PIDS_SCRIPT" | tr -d '\r')
-    finished=$(l4s_wait_exited) || fail "${finished}"
+    term=$(l4_compose exec -T "$probe" bash -c "$L4B_PROBE_TERM_SCRIPT" l4s "$L4S_PIDS_SCRIPT" | tr -d '\r')
+    finished=$(l4b_wait_exited) || fail "${finished}"
     req=$(l4_client cat /tmp/l4s-slow.json | tr -d '\r')
     l4s_restart_node
     l4_api PUT /api/v1/settings '{"worker_drain_timeout_s":30}' >/dev/null

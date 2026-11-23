@@ -54,7 +54,7 @@ print(f"{status} in {(time.monotonic() - start) * 1000:.1f} ms")
 # connections (`R` the HTTP reserve) opened after the fill, each
 # answering twice. The sessions past `C` are refused as `session_cap`
 # and counted; no EMFILE or accept error reaches the node's log. The
-# helpers are l4/scenarios/12.2.sh's.
+# shared `l4s_*` helpers are l4/lib.sh's.
 #
 # The stream sets `unbounded_responses` and no request bound: with the
 # defaults a session ends on its one answer (`response_bound_reached`),

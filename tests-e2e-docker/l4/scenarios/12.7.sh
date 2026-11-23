@@ -1,8 +1,8 @@
 # shellcheck shell=bash
 # Story 12.7 scenarios (Story 12.12 Lot G: IV1 as Story 12.7 handed it,
 # and the SMTP banner template, Resolved 4). Sourced by l4/run-l4.sh;
-# see that file for the scenario contract. The `l4s_*` and `l4c_*`
-# helpers are l4/scenarios/12.2.sh's and 12.3.sh's.
+# see that file for the scenario contract. The shared `l4s_*`
+# helpers are l4/lib.sh's.
 #
 # Backends: the pinned `redis` image, test-runner/l4/smtp_banner.py in
 # two services (one greets with 220, one never writes), and Lot C's
@@ -103,24 +103,24 @@ scenario_12_7_iv1_redis_paused_marked_down() {
         sleep 1
     done
     since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    redis=$(l4g_template_backend "$(l4c_ip redis):6379" redis_ping) || fail "backend: ${redis}"
-    other=$(l4c_backend "$(l4c_ip tcp-backend-2):9000" nocheck) || fail "backend: ${other}"
+    redis=$(l4g_template_backend "$(l4s_ip redis):6379" redis_ping) || fail "backend: ${redis}"
+    other=$(l4s_backend "$(l4s_ip tcp-backend-2):9000" nocheck) || fail "backend: ${other}"
     id=$(l4s_create_stream "{\"name\":\"l4g-iv1-redis\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":7750,\"backend_ids\":[\"${redis}\",\"${other}\"]}") \
         || fail "stream create refused: ${id}"
     l4s_wait_bind "$id" bound 5 >/dev/null || fail "the stream did not bind"
     # Healthy, and staying so over the threshold's probes, before the pause.
-    l4c_wait_health "$redis" healthy 30 >/dev/null || fail "the Redis backend never read healthy"
+    l4s_wait_health "$redis" healthy 30 >/dev/null || fail "the Redis backend never read healthy"
     conns=$(l4g_redis_connections)
     sleep $(( L4G_FLIP_THRESHOLD * L4G_INTERVAL_S ))
     conns=$(( $(l4g_redis_connections) - conns ))
     [ "$(l4g_probe_failures "$redis" response_timeout)" = 0 ] || fail "redis_ping probes failed against a running Redis"
     before=$(l4g_ping_tally 7750 10)
-    [ "$(l4c_count "$before" redis)" -ge 1 ] && [ "$(l4c_count "$before" tcp-backend-2)" -ge 1 ] \
+    [ "$(l4s_count "$before" redis)" -ge 1 ] && [ "$(l4s_count "$before" tcp-backend-2)" -ge 1 ] \
         || fail "the stream does not balance over Redis and the second backend: ${before}"
     redis_lines=$(l4g_logs_since redis "$since" | grep -c . || true)
 
     l4_compose pause redis >/dev/null || fail "docker pause of redis failed"
-    down=$(l4c_wait_health "$redis" down "$L4G_FLIP_LIMIT_S") \
+    down=$(l4s_wait_health "$redis" down "$L4G_FLIP_LIMIT_S") \
         || fail "the paused Redis was not marked down within ${L4G_FLIP_LIMIT_S} s: ${down}"
     failures=$(l4g_probe_failures "$redis" response_timeout)
     [ "$failures" -ge "$L4G_FLIP_THRESHOLD" ] || fail "${failures} response_timeout probe failures counted for the paused Redis"
@@ -128,13 +128,13 @@ scenario_12_7_iv1_redis_paused_marked_down() {
     [ "$during" = "tcp-backend-2=10" ] || fail "the stream still selected the paused Redis: ${during}"
 
     l4_compose unpause redis >/dev/null || fail "docker unpause of redis failed"
-    up=$(l4c_wait_health "$redis" healthy $(( L4G_FLIP_LIMIT_S + 10 ))) || fail "Redis was not healthy again after the unpause: ${up}"
+    up=$(l4s_wait_health "$redis" healthy $(( L4G_FLIP_LIMIT_S + 10 ))) || fail "Redis was not healthy again after the unpause: ${up}"
     after=$(l4g_ping_tally 7750 10)
-    [ "$(l4c_count "$after" redis)" -ge 1 ] || fail "the stream did not select Redis again: ${after}"
+    [ "$(l4s_count "$after" redis)" -ge 1 ] || fail "the stream did not select Redis again: ${after}"
 
     # PostgreSQL under its template, for the threshold's probes.
     pg_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    pg=$(l4g_template_backend "$(l4c_ip pg-1):5432" postgresql_ssl_request) || fail "backend: ${pg}"
+    pg=$(l4g_template_backend "$(l4s_ip pg-1):5432" postgresql_ssl_request) || fail "backend: ${pg}"
     sleep $(( L4G_FLIP_THRESHOLD * L4G_INTERVAL_S + 2 ))
     pg_status=$(l4_api GET "/api/v1/backends/${pg}" | l4_client jq -r .data.health_status | tr -d '\r')
     l4g_delete_backend "$pg"
@@ -156,10 +156,10 @@ scenario_12_7_iv1_redis_paused_marked_down() {
 scenario_12_7_x_smtp_banner_template() {
     local since banner silent down banner_status banner_failures silent_failures probes sent
     since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    banner=$(l4g_template_backend "$(l4c_ip smtp-banner):2525" smtp_banner) || fail "backend: ${banner}"
-    silent=$(l4g_template_backend "$(l4c_ip smtp-silent):2525" smtp_banner) || fail "backend: ${silent}"
+    banner=$(l4g_template_backend "$(l4s_ip smtp-banner):2525" smtp_banner) || fail "backend: ${banner}"
+    silent=$(l4g_template_backend "$(l4s_ip smtp-silent):2525" smtp_banner) || fail "backend: ${silent}"
     trap 'l4g_delete_backend '"$banner"'; l4g_delete_backend '"$silent" EXIT
-    down=$(l4c_wait_health "$silent" down "$L4G_FLIP_LIMIT_S") \
+    down=$(l4s_wait_health "$silent" down "$L4G_FLIP_LIMIT_S") \
         || fail "the server that never writes was not marked down within ${L4G_FLIP_LIMIT_S} s of the create: ${down}"
     banner_status=$(l4_api GET "/api/v1/backends/${banner}" | l4_client jq -r .data.health_status | tr -d '\r')
     banner_failures=$(l4g_probe_failures "$banner")

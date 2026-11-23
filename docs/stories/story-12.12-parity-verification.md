@@ -1314,6 +1314,16 @@ pulled images.
     the loop, the echo backends, `l4s_cleanup_streams <prefix>`. A
     deleted UDP stream with live sessions keeps its port for the drain:
     give every scenario its own ports.
+    *Amended 2026-11-24 (Phase 1 audit C32): the shared helpers moved
+    from `12.2.sh` to `l4/lib.sh`, with the ones 12.3.sh lent to later
+    Lots (`l4c_backend`, `l4c_ip`, the reason-count and health waits,
+    `l4c_subnet_address`, `l4c_count`, the interface lookup) renamed
+    `l4s_*`, and the copies of a `jq` and a tool runner in 12.5.sh and
+    12.6.sh merged as `l4s_jq` and `l4s_tool`. A scenario file now runs
+    with `lib.sh` and itself alone: its own helpers keep its prefix, and
+    `run-l4.sh` refuses to start (exit 2) when a file names an `l4<x>_*`
+    or `L4<X>_*` name that neither `lib.sh` nor the file defines
+    (`l4_check_scenario_files`).*
   - **The fd-reserve test client**: one address, 3,378 UDP sockets and
     4,032 TCP connections, within Docker's default `nofile`; the budget
     nodes are `lorica-budget-4k` and `lorica-budget-8k`, worker mode,

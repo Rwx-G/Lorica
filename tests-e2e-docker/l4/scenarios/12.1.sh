@@ -3,8 +3,7 @@
 # rollback to the released 1.10.7 of AC #3 (D-h), in the
 # `streams-single` profile. IV1 and IV2 run in the `cluster` profile's
 # smoke, the hot rollback in the `hot-upgrade` profile's. Sourced by
-# l4/run-l4.sh; the `l4s_*` and `l4c_*` helpers are 12.2.sh's and
-# 12.3.sh's.
+# l4/run-l4.sh; the shared `l4s_*` helpers are l4/lib.sh's.
 #
 # The baseline is `lorica-baseline-single` (docker-compose.l4.yml): the
 # 1.10.7 package's binary on the streams-single node's volumes, started

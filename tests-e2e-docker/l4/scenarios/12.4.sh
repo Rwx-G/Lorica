@@ -2,8 +2,8 @@
 # Story 12.4 scenarios in the `streams` profile (Story 12.12 Lot D: IV1
 # with its ALPN-routed name, the two-CA proof of AC #5, upstream mTLS of
 # AC #4). IV2 runs in the `acme` profile's smoke and the key-replication
-# check in the `cluster` profile's smoke. Sourced by l4/run-l4.sh; the
-# `l4s_*` and `l4c_*` helpers are 12.2.sh's and 12.3.sh's.
+# check in the `cluster` profile's smoke. Sourced by l4/run-l4.sh;
+# the shared `l4s_*` helpers are l4/lib.sh's.
 #
 # Backends: test-runner/l4/tls_backend.py (`tls-raw-1`, `tls-raw-2`
 # behind passthrough, `tls-backend` behind upstream TLS) and Lot C's
@@ -101,10 +101,10 @@ scenario_12_4_iv1_sni_passthrough_two_names() {
     local r1 r2 r3 r4 id one two three h2 h1 counted
     trap 'l4s_cleanup_streams l4d-iv1-' EXIT
     l4s_cleanup_streams l4d-iv1-
-    r1=$(l4c_backend "$(l4c_ip tls-raw-1):9443" nocheck) || fail "backend: ${r1}"
-    r2=$(l4c_backend "$(l4c_ip tls-raw-2):9443" nocheck) || fail "backend: ${r2}"
-    r3=$(l4c_backend "$(l4c_ip tls-raw-1):9443" nocheck) || fail "backend: ${r3}"
-    r4=$(l4c_backend "$(l4c_ip tls-raw-2):9443" nocheck) || fail "backend: ${r4}"
+    r1=$(l4s_backend "$(l4s_ip tls-raw-1):9443" nocheck) || fail "backend: ${r1}"
+    r2=$(l4s_backend "$(l4s_ip tls-raw-2):9443" nocheck) || fail "backend: ${r2}"
+    r3=$(l4s_backend "$(l4s_ip tls-raw-1):9443" nocheck) || fail "backend: ${r3}"
+    r4=$(l4s_backend "$(l4s_ip tls-raw-2):9443" nocheck) || fail "backend: ${r4}"
     id=$(l4s_create_stream "{\"name\":\"l4d-iv1-sni\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":7500,\"tls_mode\":\"passthrough\",\"match_rules\":[
         {\"name\":\"one\",\"matcher\":{\"kind\":\"tls\",\"server_names\":[\"one.l4d.test\"]},\"backend_ids\":[\"${r1}\"]},
         {\"name\":\"two\",\"matcher\":{\"kind\":\"tls\",\"server_names\":[\"two.l4d.test\"]},\"backend_ids\":[\"${r2}\"]},
@@ -135,7 +135,7 @@ scenario_12_4_iv1_sni_passthrough_two_names() {
     case "$h2" in name=tls-raw-1\ *) ;; *) fail "alpn.l4d.test offering h2 reached ${h2%% *}" ;; esac
     case "$h1" in name=tls-raw-2\ *) ;; *) fail "alpn.l4d.test offering http/1.1 reached ${h1%% *}" ;; esac
     case "$three" in closed\ *) ;; *) fail "three.l4d.test was not closed: ${three}" ;; esac
-    counted=$(l4c_wait_reason_count "$id" no_match 1)
+    counted=$(l4s_wait_reason_count "$id" no_match 1)
     [ "${counted:-0}" -ge 1 ] || fail "the unmatched name was not counted no_match"
     pass "one.l4d.test to tls-raw-1 and two.l4d.test to tls-raw-2, each ClientHello byte for byte (${one#* bytes=}); alpn.l4d.test with h2 to tls-raw-1, with http/1.1 to tls-raw-2; three.l4d.test closed, ${counted} no_match counted"
 }
@@ -151,8 +151,8 @@ scenario_12_4_ac5_two_cas_two_streams() {
     cert=$(l4d_upload a.l4d.test server) || fail "certificate upload refused: ${cert}"
     ca_a=$(l4_client cat /tmp/l4d-pki/ca-a.crt | tr -d '\r')
     ca_b=$(l4_client cat /tmp/l4d-pki/ca-b.crt | tr -d '\r')
-    e1=$(l4c_backend "$(l4c_ip tcp-backend-1):9000" nocheck) || fail "backend: ${e1}"
-    e2=$(l4c_backend "$(l4c_ip tcp-backend-1):9000" nocheck) || fail "backend: ${e2}"
+    e1=$(l4s_backend "$(l4s_ip tcp-backend-1):9000" nocheck) || fail "backend: ${e1}"
+    e2=$(l4s_backend "$(l4s_ip tcp-backend-1):9000" nocheck) || fail "backend: ${e2}"
     sa=$(l4s_client_script 'api POST /api/v1/streams "$(jq -n --arg ca "$2" --arg cert "$3" --arg b "$4" --arg name "$1" --arg host "$5" --argjson port "$6" \
         "{name: \$name, protocol: \"tcp\", listen_address: \"0.0.0.0\", port_first: \$port, tls_mode: \"terminate\",
           match_rules: [{name: \"r\", matcher: {kind: \"tls\", server_names: [\$host]}, backend_ids: [\$b]}],
@@ -190,7 +190,7 @@ scenario_12_4_ac4_upstream_mtls() {
     cert=$(l4d_upload tls.l4d.test server) || fail "certificate upload refused: ${cert}"
     ident=$(l4d_upload lorica-upstream.l4d.test lorica-upstream.l4d.test) || fail "client identity upload refused: ${ident}"
     ca_up=$(l4_client cat /tmp/l4d-pki/ca-up.crt | tr -d '\r')
-    b=$(l4c_backend "$(l4c_ip tls-backend):9443" nocheck) || fail "backend: ${b}"
+    b=$(l4s_backend "$(l4s_ip tls-backend):9443" nocheck) || fail "backend: ${b}"
     id=$(l4s_client_script 'api POST /api/v1/streams "$(jq -n --arg ca "$1" --arg cert "$2" --arg ident "$3" --arg b "$4" \
         "{name: \"l4d-ac4-mtls\", protocol: \"tcp\", listen_address: \"0.0.0.0\", port_first: 7503, tls_mode: \"terminate\",
           match_rules: [{name: \"r\", matcher: {kind: \"tls\", server_names: [\"tls.l4d.test\"]}, backend_ids: [\$b]}],
