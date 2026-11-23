@@ -373,6 +373,11 @@ struct Turn {
 /// then count what was written. Pending only when no step completed, so
 /// a dropped turn loses nothing: every completed step is in its
 /// direction's state.
+///
+/// A direction that answered `Pending` is not polled again in the turn:
+/// its waker is registered, so its readiness wakes the task for the next
+/// one. A one-way transfer then pays one readiness check on its quiet
+/// socket per turn, not one per chunk the busy direction forwards.
 fn poll_directions<C, B>(
     cx: &mut Context<'_>,
     upload: &mut Direction,
@@ -389,6 +394,7 @@ where
     let (uploaded, downloaded) = (upload.forwarded, download.forwarded);
     let mut progressed = false;
     let mut event = None;
+    let (mut upload_waits, mut download_waits) = (upload.is_closed(), download.is_closed());
     'turn: for _ in 0..STEPS_PER_TURN {
         // Alternating which direction is polled first keeps a direction
         // that is always ready from starving the other.
@@ -397,12 +403,15 @@ where
         let mut stepped = false;
         for side in order {
             let polled = match side {
-                Side::Client if !upload.is_closed() => upload.poll_step(cx, client, backend),
-                Side::Backend if !download.is_closed() => download.poll_step(cx, backend, client),
-                _ => Poll::Pending,
+                Side::Client if !upload_waits => upload.poll_step(cx, client, backend),
+                Side::Backend if !download_waits => download.poll_step(cx, backend, client),
+                _ => continue,
             };
             match polled {
-                Poll::Pending => {}
+                Poll::Pending => match side {
+                    Side::Client => upload_waits = true,
+                    Side::Backend => download_waits = true,
+                },
                 Poll::Ready(Ok(Step::Progress)) => {
                     progressed = true;
                     stepped = true;
@@ -958,6 +967,54 @@ mod tests {
             polls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the quiet client was polled again before its idle timeout"
+        );
+    }
+
+    /// A one-way transfer polls its quiet direction once per turn, not
+    /// once per step of the busy one: 4 MiB downloaded is at least 512
+    /// steps (a read and a write per buffer), the quiet client far fewer
+    /// polls.
+    #[tokio::test]
+    async fn a_quiet_direction_is_not_polled_for_every_step_of_the_other() {
+        const TOTAL: usize = 4 * 1024 * 1024;
+        let (mut client_peer, client) = tokio::io::duplex(TOTAL);
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut client = CountingReads {
+            inner: client,
+            polls: Arc::clone(&polls),
+        };
+        let (mut backend, mut backend_peer) = tokio::io::duplex(TOTAL);
+        backend_peer.write_all(&vec![5u8; TOTAL]).await.unwrap();
+        backend_peer.shutdown().await.unwrap();
+        // The client takes the whole answer, then hangs up, which ends
+        // the upload direction and the call.
+        let reader = tokio::spawn(async move {
+            let mut got = vec![0u8; TOTAL];
+            client_peer.read_exact(&mut got).await.unwrap();
+        });
+        let snapshot = stream();
+        let tracker = ConnectionTracker::new();
+        let mut tracked = tracker.register(1, Arc::clone(&snapshot));
+        let mut forwarder = Forwarder::new(
+            &snapshot,
+            Instant::now(),
+            Vec::new(),
+            false,
+            Arc::new(StreamStats::default()),
+        );
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            forwarder.run(&mut client, &mut backend, &mut tracked),
+        )
+        .await
+        .expect("the transfer ends");
+        reader.await.unwrap();
+        assert_eq!(forwarder.download().forwarded() as usize, TOTAL);
+        let polls = polls.load(std::sync::atomic::Ordering::SeqCst);
+        let steps = 2 * TOTAL / FORWARD_BUFFER_SIZE;
+        assert!(
+            polls * 4 < steps,
+            "the quiet client was polled {polls} times for at least {steps} steps"
         );
     }
 
