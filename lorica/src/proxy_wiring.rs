@@ -983,6 +983,7 @@ impl ProxyHttp for LoricaProxy {
             request_id = %ctx.request_id,
             lorica.route_id = tracing::field::Empty,
             http.response.status_code = tracing::field::Empty,
+            client.address = tracing::field::Empty,
             client.geo.country_iso_code = tracing::field::Empty,
             server.address = tracing::field::Empty,
             network.peer.address = tracing::field::Empty,
@@ -2910,11 +2911,18 @@ impl ProxyHttp for LoricaProxy {
         };
         let latency_ms = elapsed.as_millis() as u64;
 
+        // Effective client IP resolved in `request_filter`
+        // (`resolve_client_ip`): the direct TCP peer, or the leftmost
+        // X-Forwarded-For entry when the peer is a configured trusted
+        // proxy.
+        let client_ip = ctx.client_ip.as_deref().unwrap_or("-");
+
         if let Some(ref err) = error_str {
             warn!(
                 method = method,
                 path = path,
                 host = host,
+                client_ip = client_ip,
                 status = status,
                 latency_ms = latency_ms,
                 backend = backend_addr,
@@ -2926,6 +2934,7 @@ impl ProxyHttp for LoricaProxy {
                 method = method,
                 path = path,
                 host = host,
+                client_ip = client_ip,
                 status = status,
                 latency_ms = latency_ms,
                 backend = backend_addr,
@@ -2946,6 +2955,9 @@ impl ProxyHttp for LoricaProxy {
             let span = &ctx.root_tracing_span;
             span.record("http.response.status_code", status as i64);
             span.record("lorica.latency_ms", latency_ms as i64);
+            if client_ip != "-" {
+                span.record("client.address", client_ip);
+            }
             if host != "-" {
                 span.record("server.address", host);
             }

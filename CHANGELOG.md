@@ -11,6 +11,8 @@ Author: Rwx-G
 
 ### Added
 
+- **The request console logs carry the client IP.** The `request completed` and `request completed with error` lines on stdout/stderr, and the WAF `rules matched` warnings (request and body), now include a `client_ip` field, so the process logs can be filtered and aggregated by source IP. The logged IP is the effective client address resolved for the request: the direct TCP peer, or the leftmost `X-Forwarded-For` entry when the peer is a configured trusted proxy, the same address the blocklist, GeoIP and rate limiting act on. The exported `http_request` OTel span also gains the `client.address` attribute.
+
 ### Changed
 
 ### Fixed

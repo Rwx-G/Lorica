@@ -189,6 +189,7 @@ impl WafEngine {
                     warn!(
                         host = host,
                         path = path,
+                        client_ip = client_ip,
                         rules = ?rule_ids,
                         categories = ?categories,
                         mode = "detection",
@@ -201,6 +202,7 @@ impl WafEngine {
                     warn!(
                         host = host,
                         path = path,
+                        client_ip = client_ip,
                         rules = ?rule_ids,
                         categories = ?categories,
                         mode = "blocking",
@@ -298,6 +300,7 @@ impl WafEngine {
             WafMode::Detection => {
                 warn!(
                     host = host,
+                    client_ip = client_ip,
                     rules = ?rule_ids,
                     categories = ?categories,
                     mode = "detection",
@@ -309,6 +312,7 @@ impl WafEngine {
             WafMode::Blocking => {
                 warn!(
                     host = host,
+                    client_ip = client_ip,
                     rules = ?rule_ids,
                     categories = ?categories,
                     mode = "blocking",
