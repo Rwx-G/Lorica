@@ -15,9 +15,13 @@ Author: Rwx-G
 
 ### Fixed
 
+- **Text logs on stdout are coloured only on an interactive terminal.** With `--log-format text`, the log lines on stdout always carried ANSI colour escapes, which ended up verbatim in container logs, pipes and file redirects and broke line-oriented parsing of the stream. Colour is now emitted only when stdout is a terminal, and a non-empty `NO_COLOR` environment variable disables it explicitly everywhere. File logging and the JSON format were already escape-free and are unchanged.
+
 ### Removed
 
 ### Security
+
+- Dependencies refreshed to clear two advisories: `cookie` 0.18.3 (RUSTSEC-2026-0594) and `url` 2.5.9 (RUSTSEC-2026-0592, with `form_urlencoded` 1.2.3).
 
 ## [1.10.9] - 2026-11-20
 
