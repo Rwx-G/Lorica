@@ -19,14 +19,20 @@
 #                      for a dry run of it
 #   PERF_RELEASE_RUN   1 on the local release run (run.sh sets it): anything
 #                      but the larger layout is INCONCLUSIVE (environment)
-#   PERF_REPS          repetitions per arm and attempt, at least 5 (default 5)
-#   PERF_MAX_RERUNS    re-runs of an inconclusive measurement (default 3)
+#   PERF_REPS          repetitions per arm and attempt of the spread-rule
+#                      measurements, at least 5 (default 5)
+#   PERF_P99_REPS      repetitions per arm of the p99 measurements (connect,
+#                      nfr1-*-p99), at least 10 (default 10, D-k amendment)
+#   PERF_BOOTSTRAP_SEED  seed of the p99 bootstrap (default 12012), recorded
+#   PERF_MAX_RERUNS    re-runs of an inconclusive spread-rule measurement, or
+#                      of a p99 one that came back with too few runs (default 3)
 #   PERF_MEASUREMENTS  comma list, default every one:
 #                      tcp-up,tcp-down,connect,udp,nfr1-http,nfr1-https;
 #                      a measurement left out reports NOT-RUN, which gates
 #   L4_IMAGE_TAG       the Lorica and perf-tools image tag (default local)
 #
 # Output: results/perf-<ts>.runs.jsonl (every run, appended as it lands),
+# results/perf-<ts>.samples/ (every latency of every p99 run, gzip),
 # results/perf-<ts>.json and results/perf-summary.md (perf/analyse.py).
 # Exit 0 when every gated check passes, 1 otherwise, 2 on a harness error.
 
@@ -50,10 +56,17 @@ PERF_PROJECT=lorica-e2e-perf
 export L4_IMAGE_TAG="${L4_IMAGE_TAG:-local}"
 PERF_RELEASE_RUN="${PERF_RELEASE_RUN:-0}"
 PERF_REPS="${PERF_REPS:-5}"
+PERF_P99_REPS="${PERF_P99_REPS:-10}"
+PERF_BOOTSTRAP_SEED="${PERF_BOOTSTRAP_SEED:-12012}"
 PERF_MAX_RERUNS="${PERF_MAX_RERUNS:-3}"
 PERF_MEASUREMENTS="${PERF_MEASUREMENTS:-tcp-up,tcp-down,connect,udp,nfr1-http,nfr1-https}"
 if [ "$PERF_REPS" -lt 5 ]; then
     echo "run-perf.sh: PERF_REPS must be at least 5 (Story 12.12 AC #2)" >&2
+    exit 2
+fi
+# analyse.py's P99_RUNS: an attempt with fewer runs per arm is incomplete.
+if [ "$PERF_P99_REPS" -lt 10 ]; then
+    echo "run-perf.sh: PERF_P99_REPS must be at least 10 (Story 12.12 D-k, amended 2026-11-24)" >&2
     exit 2
 fi
 
@@ -144,7 +157,7 @@ trap finish EXIT
 report() {
     local status=0
     analyse report --runs "$RUNS" --json "/results/perf-${TS}.json" \
-        --markdown /results/perf-summary.md "$@" || status=$?
+        --markdown /results/perf-summary.md --seed "$PERF_BOOTSTRAP_SEED" "$@" || status=$?
     echo "Wrote tests-e2e-docker/results/perf-${TS}.json and perf-summary.md"
     if [ "$ADVISORY" = true ]; then
         [ "$status" -le 1 ] || exit "$status"
@@ -160,7 +173,7 @@ if [ "$LAYOUT" = none ]; then
     status=0
     perf_compose run --rm --no-deps -T --entrypoint python3 perf-client /perf-driver/analyse.py \
         report --runs "$RUNS" --json "/results/perf-${TS}.json" --markdown /results/perf-summary.md \
-        --not-run "Docker reports ${NCPU} CPUs, fewer than the 4 the smallest layout needs" || status=$?
+        --seed "$PERF_BOOTSTRAP_SEED" --not-run "Docker reports ${NCPU} CPUs, fewer than the 4 the smallest layout needs" || status=$?
     [ "$ADVISORY" = true ] && exit 0
     exit "$status"
 fi
@@ -363,7 +376,8 @@ container_of() {
 }
 env_pairs=(
     "layout=${LAYOUT}" "ncpu=${NCPU}" "release_run=${PERF_RELEASE_RUN}" "advisory=${ADVISORY}"
-    "reps=${PERF_REPS}" "max_reruns=${PERF_MAX_RERUNS}" "measurements=${PERF_MEASUREMENTS}"
+    "reps=${PERF_REPS}" "p99_reps=${PERF_P99_REPS}" "bootstrap_seed=${PERF_BOOTSTRAP_SEED}"
+    "max_reruns=${PERF_MAX_RERUNS}" "measurements=${PERF_MEASUREMENTS}"
     "workers_per_proxy=${PERF_WORKERS}"
     "iperf_streams=$(( IPERF_STREAMS_PER_WORKER * PERF_WORKERS ))"
     "docker_memory_bytes=$(docker info --format '{{.MemTotal}}' | tr -d '\r')"
@@ -470,11 +484,11 @@ run_iperf() {
 run_connect() {
     local m="$1" attempt="$2" rep="$3" arm="$4" svc
     svc=$(service_of "$arm")
-    in_client rm -f /tmp/run.json
+    in_client rm -f /tmp/run.json /tmp/run.samples
     in_client python3 /opt/perf/l4_connect_latency.py run --target "${svc}:7002" --control perf-backend:5203 \
-        --count "$CONNECT_COUNT" --rate "$CONNECT_RATE" --out /tmp/run.json >/dev/null || true
+        --count "$CONNECT_COUNT" --rate "$CONNECT_RATE" --out /tmp/run.json --samples /tmp/run.samples >/dev/null || true
     analyse record --runs "$RUNS" --measurement "$m" --attempt "$attempt" --rep "$rep" --arm "$arm" \
-        --kind connect --file /tmp/run.json
+        --kind connect --file /tmp/run.json --samples /tmp/run.samples
 }
 
 # A proxy keeps a session for the idle timeout after its last datagram, so
@@ -510,9 +524,11 @@ run_udp() {
 
 # NFR1: oha on the route, closed loop at saturation (`*-rps`) or at the
 # fixed rate NFR1_RATE with coordinated-omission correction (`*-p99`). The
-# L1 arm is L0's container with one idle TCP stream bound for the run.
+# L1 arm is L0's container with one idle TCP stream bound for the run. A
+# p99 run also writes every request to SQLite (`--db-url`), which
+# analyse.py keeps as the run's samples.
 run_oha() {
-    local m="$1" attempt="$2" rep="$3" arm="$4" svc idle="" target load
+    local m="$1" attempt="$2" rep="$3" arm="$4" svc idle="" target load db=()
     svc=$(service_of "$arm")
     case "$m" in
         nfr1-http-*) target="-H 'Host: perf.test' http://${svc}:8080/" ;;
@@ -520,26 +536,31 @@ run_oha() {
     esac
     case "$m" in
         *-rps) load="-z ${OHA_SATURATION_S} -c ${OHA_CONNECTIONS}" ;;
-        *-p99) load="-z ${OHA_FIXED_RATE_S} -c ${OHA_CONNECTIONS} -q ${NFR1_RATE} --latency-correction" ;;
+        *-p99) load="-z ${OHA_FIXED_RATE_S} -c ${OHA_CONNECTIONS} -q ${NFR1_RATE} --latency-correction --db-url /tmp/run.db"
+               db=(--db /tmp/run.db) ;;
     esac
     if [ "$arm" = L1 ]; then
         idle=$(create_stream "{\"name\":\"perf-idle\",\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"port_first\":7101,\"backend_ids\":[\"${IPERF_BACKEND}\"]}")
     fi
-    in_client rm -f /tmp/run.json
+    in_client rm -f /tmp/run.json /tmp/run.db
     in_client sh -c "oha ${load} --no-tui --output-format json ${target} > /tmp/run.json" || true
     [ -n "$idle" ] && delete_stream "$idle"
     analyse record --runs "$RUNS" --measurement "$m" --attempt "$attempt" --rep "$rep" --arm "$arm" \
-        --kind oha --file /tmp/run.json
+        --kind oha --file /tmp/run.json "${db[@]}"
 }
 
 # ---- Attempts, alternation and re-runs (D-j, D-k) --------------------------
-# One attempt: a discarded warm-up run per arm, then PERF_REPS repetitions,
+# One attempt: a discarded warm-up run per arm, then <reps> repetitions,
 # every arm once each, the first arm rotating. A gated measurement is run
-# again whole while one of its checks has no conclusive attempt, at most
-# PERF_MAX_RERUNS times; a reported-only one runs once.
+# again whole while one of its checks has no conclusive attempt (a p99
+# check: no complete one, analyse.py's P99_RUNS runs per arm), at most
+# PERF_MAX_RERUNS times; a reported-only one runs once. A complete p99
+# attempt is never re-run, whatever its interval says: the verdict is the
+# first complete attempt's.
+# Usage: measure <measurement> <runner> <gated|reported> <reps> <arm>...
 measure() {
-    local m="$1" runner="$2" gated="$3" attempt=1 rep arm k started
-    shift 3
+    local m="$1" runner="$2" gated="$3" reps="$4" attempt=1 rep arm k started
+    shift 4
     local arms=("$@") order
     started=$(date +%s)
     while :; do
@@ -549,7 +570,7 @@ measure() {
         for arm in "${arms[@]}"; do
             "$runner" "$m" "$attempt" 0 "$arm"
         done
-        for rep in $(seq 1 "$PERF_REPS"); do
+        for rep in $(seq 1 "$reps"); do
             k=$(( (rep - 1) % ${#arms[@]} ))
             order=("${arms[@]:$k}" "${arms[@]:0:$k}")
             for arm in "${order[@]}"; do
@@ -581,15 +602,15 @@ TCP_STREAM_BASE='"protocol":"tcp","listen_address":"0.0.0.0","connect_timeout_ms
 # 1. TCP throughput and CPU per GiB, upload then download.
 if wanted tcp-up || wanted tcp-down; then
     stream=$(create_stream "{\"name\":\"perf-iperf\",${TCP_STREAM_BASE},\"port_first\":7001,\"backend_ids\":[\"${IPERF_BACKEND}\"]}")
-    wanted tcp-up && measure tcp-up run_iperf gated lorica nginx
-    wanted tcp-down && measure tcp-down run_iperf gated lorica nginx
+    wanted tcp-up && measure tcp-up run_iperf gated "$PERF_REPS" lorica nginx
+    wanted tcp-down && measure tcp-down run_iperf gated "$PERF_REPS" lorica nginx
     delete_stream "$stream"
 fi
 
 # 2. Connection setup.
 if wanted connect; then
     stream=$(create_stream "{\"name\":\"perf-connect\",${TCP_STREAM_BASE},\"port_first\":7002,\"backend_ids\":[\"${CONNECT_BACKEND}\"]}")
-    measure connect run_connect gated lorica nginx
+    measure connect run_connect gated "$PERF_P99_REPS" lorica nginx
     delete_stream "$stream"
 fi
 
@@ -608,7 +629,7 @@ if wanted udp; then
     echo "UDP ceiling ${UDP_CEILING} (bound by ${UDP_BOUND_BY}): holding ${UDP_SESSIONS} sessions per run"
     analyse env --runs "$RUNS" "udp_ceiling=${UDP_CEILING}" "udp_ceiling_bound_by=${UDP_BOUND_BY}" \
         "udp_sessions=${UDP_SESSIONS}"
-    measure udp run_udp gated lorica nginx
+    measure udp run_udp gated "$PERF_REPS" lorica nginx
     delete_stream "$stream"
 fi
 
@@ -619,18 +640,18 @@ if wanted nfr1-http || wanted nfr1-https; then
     [ "$remaining" = "[]" ] || die "streams left on perf-lorica before NFR1: ${remaining}"
 fi
 if wanted nfr1-http; then
-    measure nfr1-http-rps run_oha gated B L0 L1
+    measure nfr1-http-rps run_oha gated "$PERF_REPS" B L0 L1
     NFR1_RATE=$(analyse rate --runs "$RUNS" --measurement nfr1-http-rps --arm B --fraction 0.5 | tr -d '\r')
     echo "NFR1 HTTP fixed rate: ${NFR1_RATE} requests/s"
     analyse env --runs "$RUNS" "nfr1_http_rate=${NFR1_RATE}"
-    measure nfr1-http-p99 run_oha gated B L0 L1
+    measure nfr1-http-p99 run_oha gated "$PERF_P99_REPS" B L0 L1
 fi
 if wanted nfr1-https; then
-    measure nfr1-https-rps run_oha reported B L0 L1
+    measure nfr1-https-rps run_oha reported "$PERF_REPS" B L0 L1
     NFR1_RATE=$(analyse rate --runs "$RUNS" --measurement nfr1-https-rps --arm B --fraction 0.5 | tr -d '\r')
     echo "NFR1 HTTPS fixed rate: ${NFR1_RATE} requests/s"
     analyse env --runs "$RUNS" "nfr1_https_rate=${NFR1_RATE}"
-    measure nfr1-https-p99 run_oha reported B L0 L1
+    measure nfr1-https-p99 run_oha reported "$PERF_P99_REPS" B L0 L1
 fi
 
 guard "end of the phase"

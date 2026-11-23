@@ -22,7 +22,8 @@ proxies pay alike.
 Both halves are single-threaded non-blocking loops: one thread means no
 interpreter lock between a socket event and its stamp.
 
-The result of `run` is one JSON line on stdout and, with --out, a file.
+The result of `run` is one JSON line on stdout and, with --out, a file;
+with --samples, every matched latency is written to a second file.
 """
 
 from __future__ import annotations
@@ -252,7 +253,17 @@ def run(args: argparse.Namespace) -> None:
                 "mean_us": round(sum(latencies_us) / len(latencies_us), 1),
             }
         )
+    if args.samples:
+        write_samples(latencies_us, args.samples)
     write_result(result, args.out)
+
+
+def write_samples(latencies_us: list[float], out: str) -> None:
+    """Every matched latency, in us, one per line: the performance phase
+    pools them over a measurement's runs for its p99 (Story 12.12 D-k)."""
+    tmp = Path(out + ".tmp")
+    tmp.write_text("".join(f"{v:.3f}\n" for v in latencies_us))
+    tmp.replace(out)
 
 
 def main() -> None:
@@ -271,6 +282,7 @@ def main() -> None:
     r.add_argument("--count", type=int, default=10_000)
     r.add_argument("--rate", type=float, default=500.0, help="new connections per second")
     r.add_argument("--out")
+    r.add_argument("--samples", help="also write every matched latency here, in us, one per line")
 
     args = p.parse_args()
     {"serve": serve, "run": run}[args.cmd](args)

@@ -8,7 +8,8 @@ host needs no Python. perf/run-perf.sh drives it, one subcommand per step:
   guard    append an environment-guard result: the containers found running
            outside the perf project (none is a clean guard)
   record   parse one tool output (iperf3, the connect-latency client, the UDP
-           hold, oha) into one run record and append it
+           hold, oha) into one run record and append it; with --samples or
+           --db, keep the run's every latency beside the runs file
   settled  whether every gated check of a measurement has a conclusive attempt
            yet (exit 0) or needs another attempt (exit 1)
   rate     a fraction of one arm's median requests per second, from the last
@@ -26,23 +27,48 @@ inclusive quartile method gives); a check is conclusive on an attempt when each
 series it compares has at least MIN_REPS values and a spread of at most
 MAX_SPREAD; the ratio is median over median; the verdict is taken on the first
 conclusive attempt.
+
+p99 checks (D-k as amended on 2026-11-24) do not use the spread rule. Each arm's
+latencies are pooled over its runs and the pooled p99 is the nearest-rank
+99th percentile; the ratio is pooled p99 over pooled p99. Its 95 % interval
+is a percentile bootstrap that resamples whole runs, with replacement, within
+each arm, so the interval carries the run-to-run variation the spread rule
+was about. An attempt is complete with P99_RUNS runs per arm. Verdict, for a
+`<=` threshold: PASS when the upper bound is within it, FAIL when the lower
+bound is past it, INCONCLUSIVE otherwise. The bootstrap is seeded (report
+--seed) and the seed is in the report.
+
+Samples live beside the runs file, one gzip text file per run (one latency
+per line, in the check's unit) under perf-<ts>.samples/, named in the run
+record.
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
+import gzip
 import json
+import random
+import sqlite3
 import statistics
 import sys
+from array import array
+from functools import lru_cache
 from pathlib import Path
 
 MIN_REPS = 5
 MAX_SPREAD = 0.05
 GIB = 2**30
+P99_RUNS = 10
+BOOTSTRAP_RESAMPLES = 2000
+BOOTSTRAP_LEVEL = 0.95
+DEFAULT_SEED = 12012
 
 # Every check the phase reports. `gated` ones decide the phase's exit; the
 # others are printed beside them. `num` over `den` is the ratio held to
-# `threshold` with `op`.
+# `threshold` with `op`. `method: bootstrap` checks are judged on pooled
+# samples and a bootstrap interval, every other ratio on the spread rule.
 CHECKS: list[dict] = [
     {"id": "tcp-up-throughput", "measurement": "tcp-up", "metric": "gbps", "num": "lorica", "den": "nginx",
      "op": ">=", "threshold": 0.90, "gated": True, "label": "TCP upload throughput, Gbit/s"},
@@ -52,7 +78,7 @@ CHECKS: list[dict] = [
      "op": ">=", "threshold": 0.90, "gated": True, "label": "TCP download throughput, Gbit/s"},
     {"id": "tcp-down-cpu-per-gib", "measurement": "tcp-down", "metric": "cpu_s_per_gib", "num": "lorica", "den": "nginx",
      "op": "<=", "threshold": 1.15, "gated": True, "label": "TCP download proxy CPU, s per GiB"},
-    {"id": "connect-p99", "measurement": "connect", "metric": "p99_us", "num": "lorica", "den": "nginx",
+    {"id": "connect-p99", "method": "bootstrap", "measurement": "connect", "metric": "p99_us", "num": "lorica", "den": "nginx",
      "op": "<=", "threshold": 1.5, "gated": True, "label": "Accept to backend connect p99, us"},
     {"id": "udp-hold", "measurement": "udp", "kind": "hold", "gated": True,
      "label": "UDP hold at 80 % of the ceiling, no loss, no eviction"},
@@ -62,17 +88,17 @@ CHECKS: list[dict] = [
      "op": ">=", "threshold": 0.95, "gated": True, "label": "NFR1 HTTP requests/s, 1.11.0 no stream vs 1.10.7"},
     {"id": "nfr1-http-rps-l1", "measurement": "nfr1-http-rps", "metric": "rps", "num": "L1", "den": "B",
      "op": ">=", "threshold": 0.95, "gated": True, "label": "NFR1 HTTP requests/s, 1.11.0 idle stream vs 1.10.7"},
-    {"id": "nfr1-http-p99-l0", "measurement": "nfr1-http-p99", "metric": "p99_ms", "num": "L0", "den": "B",
+    {"id": "nfr1-http-p99-l0", "method": "bootstrap", "measurement": "nfr1-http-p99", "metric": "p99_ms", "num": "L0", "den": "B",
      "op": "<=", "threshold": 1.05, "gated": True, "label": "NFR1 HTTP p99 at a fixed rate, ms, no stream"},
-    {"id": "nfr1-http-p99-l1", "measurement": "nfr1-http-p99", "metric": "p99_ms", "num": "L1", "den": "B",
+    {"id": "nfr1-http-p99-l1", "method": "bootstrap", "measurement": "nfr1-http-p99", "metric": "p99_ms", "num": "L1", "den": "B",
      "op": "<=", "threshold": 1.05, "gated": True, "label": "NFR1 HTTP p99 at a fixed rate, ms, idle stream"},
     {"id": "nfr1-https-rps-l0", "measurement": "nfr1-https-rps", "metric": "rps", "num": "L0", "den": "B",
      "op": ">=", "threshold": 0.95, "gated": False, "label": "NFR1 HTTPS requests/s, no stream (reported)"},
     {"id": "nfr1-https-rps-l1", "measurement": "nfr1-https-rps", "metric": "rps", "num": "L1", "den": "B",
      "op": ">=", "threshold": 0.95, "gated": False, "label": "NFR1 HTTPS requests/s, idle stream (reported)"},
-    {"id": "nfr1-https-p99-l0", "measurement": "nfr1-https-p99", "metric": "p99_ms", "num": "L0", "den": "B",
+    {"id": "nfr1-https-p99-l0", "method": "bootstrap", "measurement": "nfr1-https-p99", "metric": "p99_ms", "num": "L0", "den": "B",
      "op": "<=", "threshold": 1.05, "gated": False, "label": "NFR1 HTTPS p99, ms, no stream (reported)"},
-    {"id": "nfr1-https-p99-l1", "measurement": "nfr1-https-p99", "metric": "p99_ms", "num": "L1", "den": "B",
+    {"id": "nfr1-https-p99-l1", "method": "bootstrap", "measurement": "nfr1-https-p99", "metric": "p99_ms", "num": "L1", "den": "B",
      "op": "<=", "threshold": 1.05, "gated": False, "label": "NFR1 HTTPS p99, ms, idle stream (reported)"},
 ]
 
@@ -200,15 +226,65 @@ def parse_oha(data: dict, args: argparse.Namespace) -> tuple[dict, dict, str | N
 PARSERS = {"iperf": parse_iperf, "connect": parse_connect, "udp": parse_udp, "oha": parse_oha}
 
 
+# ---- Samples -----------------------------------------------------------------
+
+def samples_dir(runs: str) -> Path:
+    """perf-<ts>.samples/ beside perf-<ts>.runs.jsonl."""
+    path = Path(runs)
+    stem = path.name[: -len(".runs.jsonl")] if path.name.endswith(".runs.jsonl") else path.stem
+    return path.parent / f"{stem}.samples"
+
+
+def read_tool_samples(args: argparse.Namespace) -> list[float] | None:
+    """The run's every latency, in the unit of its check: oha's SQLite
+    database in ms, the connect tool's sample file in us. With
+    --latency-correction, oha 1.16 stores as `duration` the end minus the
+    scheduled start, the latency its own percentiles are taken on."""
+    if args.db:
+        db = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+        try:
+            return [row[0] * 1000 for row in db.execute("SELECT duration FROM oha")]
+        finally:
+            db.close()
+    if args.samples:
+        return [float(word) for word in Path(args.samples).read_text(encoding="ascii").split()]
+    return None
+
+
+def write_samples(runs: str, name: str, values: list[float]) -> str:
+    """Writes one run's samples and returns their path relative to the
+    runs file's directory, which is what the run record names."""
+    directory = samples_dir(runs)
+    directory.mkdir(exist_ok=True)
+    path = directory / f"{name}.txt.gz"
+    with gzip.open(path, "wt", encoding="ascii") as f:
+        f.write("".join(f"{v:.6g}\n" for v in values))
+    return f"{directory.name}/{path.name}"
+
+
+@lru_cache(maxsize=None)
+def load_samples(base: Path, relative: str) -> array:
+    with gzip.open(base / relative, "rt", encoding="ascii") as f:
+        return array("d", sorted(float(word) for word in f.read().split()))
+
+
 def cmd_record(args: argparse.Namespace) -> None:
     error = None
     metrics: dict = {}
     raw: dict = {}
+    values: list[float] | None = None
     try:
         data = json.loads(Path(args.file).read_text(encoding="utf-8"))
         metrics, raw, error = PARSERS[args.kind](data, args)
-    except (OSError, ValueError, KeyError) as exc:
-        error = f"{type(exc).__name__}: {exc}"
+        values = read_tool_samples(args)
+    except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
+        error = error or f"{type(exc).__name__}: {exc}"
+    samples = None
+    if values:
+        samples = write_samples(args.runs, f"{args.measurement}.a{args.attempt}.r{args.rep}.{args.arm}", values)
+        raw["samples_n"] = len(values)
+    elif values is not None and error is None:
+        error = "the run kept no latency sample"
     record = {
         "type": "run",
         "measurement": args.measurement,
@@ -220,6 +296,7 @@ def cmd_record(args: argparse.Namespace) -> None:
         "error": error,
         "metrics": metrics,
         "raw": raw,
+        "samples": samples,
     }
     append(args.runs, record)
     shown = ", ".join(f"{k} {v:.4g}" for k, v in metrics.items())
@@ -284,6 +361,98 @@ def ratio_attempt(check: dict, runs: list[dict], attempt: int) -> dict:
             "conclusive": conclusive, "errors": errors, "one_worker_runs": one_worker}
 
 
+def pooled_percentile(runs: list[array], weights: list[int], percent: int, union: array) -> float:
+    """Nearest-rank percentile of the multiset that holds each sorted run
+    `weights[i]` times. `union` is every run's values, sorted: the answer
+    is one of them, the smallest whose rank reaches the target."""
+    chosen = [(run, weight) for run, weight in zip(runs, weights) if weight]
+    total = sum(weight * len(run) for run, weight in chosen)
+    target = max(1, -(-total * percent // 100))
+    lo, hi = 0, len(union) - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if sum(weight * bisect.bisect_right(run, union[mid]) for run, weight in chosen) >= target:
+            hi = mid
+        else:
+            lo = mid + 1
+    return union[lo]
+
+
+def resample_weights(rng: random.Random, n: int) -> list[int]:
+    """How many times each of n runs is drawn in one resample of n runs
+    with replacement."""
+    weights = [0] * n
+    for _ in range(n):
+        weights[rng.randrange(n)] += 1
+    return weights
+
+
+def merged(runs: list[array]) -> array:
+    return array("d", sorted(v for run in runs for v in run))
+
+
+def bootstrap_interval(
+    num: list[array], den: list[array], rng: random.Random,
+    resamples: int = BOOTSTRAP_RESAMPLES, level: float = BOOTSTRAP_LEVEL, percent: int = 99,
+) -> tuple[float, float]:
+    """Percentile bootstrap interval of pooled-p99(num) / pooled-p99(den),
+    each arm's runs resampled whole and independently."""
+    num_union, den_union = merged(num), merged(den)
+    ratios = sorted(
+        pooled_percentile(num, resample_weights(rng, len(num)), percent, num_union)
+        / pooled_percentile(den, resample_weights(rng, len(den)), percent, den_union)
+        for _ in range(resamples)
+    )
+    cut = round((1 - level) / 2 * resamples)
+    return ratios[cut], ratios[resamples - 1 - cut]
+
+
+def interval_verdict(check: dict, low: float, high: float) -> str:
+    threshold = check["threshold"]
+    if check["op"] == "<=":
+        if high <= threshold:
+            return "PASS"
+        if low > threshold:
+            return "FAIL"
+    else:
+        if low >= threshold:
+            return "PASS"
+        if high < threshold:
+            return "FAIL"
+    return "INCONCLUSIVE"
+
+
+def bootstrap_attempt(check: dict, runs: list[dict], attempt: int,
+                      base: Path | None = None, seed: int | None = None) -> dict:
+    """One attempt of a p99 check. Complete (`conclusive`) with P99_RUNS
+    runs per arm that kept their samples. With `base` (the samples'
+    directory), the pooled p99s and the ratio; with `seed` too, the
+    bootstrap interval, seeded per check and attempt."""
+    m = check["measurement"]
+    measured = [
+        r for r in runs
+        if r["type"] == "run" and r["measurement"] == m and r["attempt"] == attempt and not r["warmup"]
+    ]
+    result: dict = {"attempt": attempt, "ratio": None, "interval": None,
+                    "errors": [r["error"] for r in measured if not r["ok"]], "one_worker_runs": {}}
+    loaded: dict[str, list[array]] = {}
+    for arm in (check["num"], check["den"]):
+        mine = [r for r in measured if r["arm"] == arm and r["ok"] and r.get("samples")]
+        result[arm] = {"n": len(mine), "values": [r["metrics"].get(check["metric"]) for r in mine],
+                       "samples": [r["samples"] for r in mine], "pooled_p99": None}
+        if base is not None and mine:
+            loaded[arm] = [load_samples(base, r["samples"]) for r in mine]
+            result[arm]["pooled_p99"] = pooled_percentile(loaded[arm], [1] * len(mine), 99, merged(loaded[arm]))
+    result["conclusive"] = all(result[arm]["n"] >= P99_RUNS for arm in (check["num"], check["den"]))
+    num, den = result[check["num"]]["pooled_p99"], result[check["den"]]["pooled_p99"]
+    if num is not None and den:
+        result["ratio"] = num / den
+        if seed is not None:
+            rng = random.Random(f"{seed}:{check['id']}:{attempt}")
+            result["interval"] = list(bootstrap_interval(loaded[check["num"]], loaded[check["den"]], rng))
+    return result
+
+
 def hold_attempt(check: dict, runs: list[dict], attempt: int) -> dict:
     m = check["measurement"]
     held = {arm: series(runs, m, attempt, arm, "held") for arm in ("lorica", "nginx")}
@@ -303,18 +472,39 @@ def meets(check: dict, ratio: float) -> bool:
     return ratio >= check["threshold"] if check["op"] == ">=" else ratio <= check["threshold"]
 
 
-def evaluate(check: dict, runs: list[dict]) -> dict:
+def attempt_of(check: dict, runs: list[dict], attempt: int) -> dict:
+    if check.get("kind") == "hold":
+        return hold_attempt(check, runs, attempt)
+    if check.get("method") == "bootstrap":
+        return bootstrap_attempt(check, runs, attempt)
+    return ratio_attempt(check, runs, attempt)
+
+
+def evaluate(check: dict, runs: list[dict], base: Path | None = None, seed: int | None = None) -> dict:
+    """A check's verdict over every attempt. A bootstrap check reads its
+    samples (under `base`) and resamples (with `seed`) only for the attempt
+    it shows; without them it reports completeness alone (`settled`)."""
     attempts = attempts_of(runs, check["measurement"])
-    per_attempt = [
-        hold_attempt(check, runs, a) if check.get("kind") == "hold" else ratio_attempt(check, runs, a)
-        for a in attempts
-    ]
-    result = {**check, "attempts": per_attempt, "verdict": "NOT-RUN", "decided_on": None, "ratio": None}
+    per_attempt = [attempt_of(check, runs, a) for a in attempts]
+    result = {**check, "attempts": per_attempt, "verdict": "NOT-RUN", "decided_on": None, "ratio": None,
+              "interval": None}
     if not per_attempt:
         return result
     decided = next((a for a in per_attempt if a["conclusive"]), None)
     shown = decided or per_attempt[-1]
     result["decided_on"] = decided["attempt"] if decided else None
+    if check.get("method") == "bootstrap":
+        if base is not None:
+            index = per_attempt.index(shown)
+            shown = per_attempt[index] = bootstrap_attempt(check, runs, shown["attempt"], base, seed)
+        result["ratio"], result["interval"] = shown["ratio"], shown["interval"]
+        if not check["gated"]:
+            result["verdict"] = "REPORTED"
+        elif decided is None or shown["interval"] is None:
+            result["verdict"] = "INCONCLUSIVE"
+        else:
+            result["verdict"] = interval_verdict(check, *shown["interval"])
+        return result
     if check.get("kind") == "hold":
         if decided is None:
             result["verdict"] = "INCONCLUSIVE"
@@ -341,7 +531,10 @@ def cmd_settled(args: argparse.Namespace) -> None:
         last = result["attempts"][-1] if result["attempts"] else None
         if result["decided_on"] is None:
             unsettled.append(check["id"])
-        state = f"conclusive on attempt {result['decided_on']}" if result["decided_on"] else "not conclusive yet"
+        if check.get("method") == "bootstrap":
+            state = f"complete on attempt {result['decided_on']}" if result["decided_on"] else "not complete yet"
+        else:
+            state = f"conclusive on attempt {result['decided_on']}" if result["decided_on"] else "not conclusive yet"
         print(f"  {check['id']}: {state}; last attempt {summarise(check, last)}")
     sys.exit(1 if unsettled else 0)
 
@@ -367,6 +560,10 @@ def pct(value: float | None) -> str:
     return "-" if value is None else f"{value * 100:.1f} %"
 
 
+def interval_text(interval: list[float] | None) -> str:
+    return "[-]" if interval is None else f"[{interval[0]:.3f}, {interval[1]:.3f}]"
+
+
 def summarise(check: dict, attempt: dict | None) -> str:
     if attempt is None:
         return "none"
@@ -374,6 +571,10 @@ def summarise(check: dict, attempt: dict | None) -> str:
         return (f"lorica held {sum(attempt['held']['lorica'])}/{len(attempt['held']['lorica'])}, "
                 f"nginx held {sum(attempt['held']['nginx'])}/{len(attempt['held']['nginx'])}")
     num, den = attempt[check["num"]], attempt[check["den"]]
+    if check.get("method") == "bootstrap":
+        return (f"{check['num']} {num['n']} runs, pooled p99 {fmt(num['pooled_p99'])}; "
+                f"{check['den']} {den['n']} runs, pooled p99 {fmt(den['pooled_p99'])}; "
+                f"ratio {fmt(attempt['ratio'], 3)} {interval_text(attempt['interval'])}")
     one = attempt.get("one_worker_runs")
     return (f"{check['num']} {fmt(num['median'])} ({pct(num['spread'])}), "
             f"{check['den']} {fmt(den['median'])} ({pct(den['spread'])}), ratio {fmt(attempt['ratio'], 3)}"
@@ -396,7 +597,8 @@ def cmd_report(args: argparse.Namespace) -> None:
             f"a release run needs the larger layout (8 CPUs or more, Resolved 13); this one ran {env.get('layout')}"
         )
 
-    results = [evaluate(check, runs) for check in CHECKS]
+    base = Path(args.runs).parent
+    results = [evaluate(check, runs, base, args.seed) for check in CHECKS]
     if args.not_run:
         for result in results:
             result["verdict"] = "NOT-RUN"
@@ -412,6 +614,8 @@ def cmd_report(args: argparse.Namespace) -> None:
     Path(args.json).write_text(json.dumps(
         {"environment": env, "environment_problems": environment_problems, "guards": guards,
          "not_run": args.not_run, "checks": results,
+         "bootstrap": {"seed": args.seed, "resamples": BOOTSTRAP_RESAMPLES, "level": BOOTSTRAP_LEVEL,
+                       "runs_per_arm": P99_RUNS, "percentile": "nearest rank, pooled over an arm's runs"},
          "runs": [r for r in runs if r["type"] == "run"],
          "passed": passed},
         indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -432,15 +636,35 @@ def cmd_report(args: argparse.Namespace) -> None:
         threshold = f"{r['op']} {r['threshold']}" if "threshold" in r and r.get("op") else "-"
         if r.get("kind") == "hold":
             threshold = "every Lorica run holds"
+        ratio = fmt(r["ratio"], 3)
+        if r.get("method") == "bootstrap":
+            ratio += f" {interval_text(r['interval'])}"
         lines.append(f"| {r['label']} | {'yes' if r['gated'] else 'no'} | {threshold} | "
-                     f"{fmt(r['ratio'], 3)} | {r['decided_on'] or '-'} | {r['verdict']} |")
+                     f"{ratio} | {r['decided_on'] or '-'} | {r['verdict']} |")
     lines += ["", f"Spread is IQR over median; a series is conclusive at {MAX_SPREAD * 100:.0f} % or less "
-              f"with at least {MIN_REPS} runs. Every attempt is listed below.", ""]
+              f"with at least {MIN_REPS} runs. A p99 check pools every latency of an arm's runs (nearest-rank "
+              f"p99) and brackets the ratio with a {BOOTSTRAP_LEVEL * 100:.0f} % bootstrap interval, "
+              f"{BOOTSTRAP_RESAMPLES} resamples of whole runs, seed {args.seed}; an attempt is complete with "
+              f"{P99_RUNS} runs per arm; PASS when the interval is within the threshold, FAIL when it is "
+              "wholly past it, INCONCLUSIVE otherwise. Every attempt is listed below.", ""]
     for r in results:
         if not r["attempts"]:
             continue
         lines += [f"### {r['label']}", ""]
-        if r.get("kind") == "hold":
+        if r.get("method") == "bootstrap":
+            lines += [f"| Attempt | {r['num']} pooled p99 | {r['num']} runs | {r['den']} pooled p99 | "
+                      f"{r['den']} runs | Ratio | {BOOTSTRAP_LEVEL * 100:.0f} % interval | Complete | Errors |",
+                      "|---|---|---|---|---|---|---|---|---|"]
+            for a in r["attempts"]:
+                num, den = a[r["num"]], a[r["den"]]
+                lines.append(f"| {a['attempt']} | {fmt(num['pooled_p99'])} | {num['n']} | "
+                             f"{fmt(den['pooled_p99'])} | {den['n']} | {fmt(a['ratio'], 3)} | "
+                             f"{interval_text(a['interval'])} | {'yes' if a['conclusive'] else 'no'} | "
+                             f"{len(a['errors'])} |")
+                values = "; ".join(f"{arm} per-run p99 " + ", ".join(fmt(v) for v in a[arm]["values"])
+                                   for arm in (r["num"], r["den"]))
+                lines.append(f"| | {values} | | | | | | | |")
+        elif r.get("kind") == "hold":
             lines += ["| Attempt | Rep | Arm | Held | Lost | Every round | Backend peers | Sessions |",
                       "|---|---|---|---|---|---|---|---|"]
             for a in r["attempts"]:
@@ -519,6 +743,8 @@ def main() -> None:
     r.add_argument("--peers", type=int, default=0)
     r.add_argument("--pss-before", type=int)
     r.add_argument("--pss-during", type=int)
+    r.add_argument("--samples", help="the connect tool's latency file, one value in us per line")
+    r.add_argument("--db", help="oha's --db-url SQLite file, every request of the run")
 
     s = sub.add_parser("settled")
     s.add_argument("--runs", required=True)
@@ -535,6 +761,7 @@ def main() -> None:
     o.add_argument("--json", required=True)
     o.add_argument("--markdown", required=True)
     o.add_argument("--not-run", default="", help="the reason the phase did not run")
+    o.add_argument("--seed", type=int, default=DEFAULT_SEED, help="the p99 bootstrap's seed, recorded in the report")
 
     args = p.parse_args()
     {"env": cmd_env, "guard": cmd_guard, "record": cmd_record, "settled": cmd_settled,

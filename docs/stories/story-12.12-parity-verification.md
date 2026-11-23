@@ -435,7 +435,9 @@ repetition, after one discarded warm-up run per arm.
    backend connect plus wake-up costs both proxies pay alike. One p99
    per run; the series is the per-run p99s; threshold: median ratio at
    most 1.5. The backend closes first, so TIME_WAIT lands on the
-   backend, not on the proxy's ephemeral ports.
+   backend, not on the proxy's ephemeral ports. *Amended 2026-11-24:
+   the p99 is pooled over the runs' every latency and judged on a
+   bootstrap interval (D-k, amendment); the threshold is unchanged.*
 3. **UDP hold.** The driver reads Lorica's derived ceiling `C` from the
    budget view and sets `S = floor(0.8 x C)`. Both proxies get a UDP
    stream with idle timeout 30 s, responses unbounded
@@ -480,6 +482,41 @@ repetition, after one discarded warm-up run per arm.
   spreads, ratios, thresholds, attempts, verdict, and the environment
   record). Analysis is `perf/analyse.py`, standard library, run in the
   `perf-tools` container, so the Windows host needs no Python.
+- **Amendment, 2026-11-24 (Phase 1 audit, maintainer decision): p99
+  checks.** The connection-setup p99 (D-j 2) and the NFR1 p99s (D-l) no
+  longer use the spread rule. The larger-layout dry run (Lot M
+  Completion Notes) had per-run p99s at 3 to 26 % spread while the p50s
+  held 1 to 3 %: a p99 series met 5 % rarely and by luck, so AC #3
+  became a re-run lottery and NFR1 HTTP p99 stayed `INCONCLUSIVE` after
+  four attempts. AC #3 is read as "an uncertain result is not a pass",
+  which an interval states directly. The method:
+  - Each p99 run keeps every latency: the connect tool's `--samples`
+    file (us), oha 1.16's `--db-url` SQLite (the `duration` column,
+    which with `--latency-correction` is the corrected latency oha's own
+    percentiles use; ms). `analyse.py record` stores them gzip under
+    `results/perf-<ts>.samples/`, named in the run record.
+  - Per arm, the latencies of its runs are pooled; the pooled p99 is the
+    nearest-rank 99th percentile, and the ratio is pooled p99 over
+    pooled p99.
+  - A 95 % percentile bootstrap interval brackets the ratio: each
+    resample draws whole runs with replacement within each arm,
+    independently, so the run-to-run variation the spread rule was
+    about stays in the interval. The resample count is
+    `BOOTSTRAP_RESAMPLES` in `analyse.py`; the seed is
+    `PERF_BOOTSTRAP_SEED` (default `analyse.py`'s `DEFAULT_SEED`),
+    recorded in the report, so a report recomputes to the same interval.
+  - A p99 series is 10 runs per arm (`PERF_P99_REPS`, at least
+    `analyse.py`'s `P99_RUNS`, which `perf/test_analyse.py` pins against
+    `run-perf.sh`). An attempt is complete with that many good runs per
+    arm; an incomplete one is re-run whole, at most 3 times, as before.
+  - Verdict on the first complete attempt: `PASS` when the interval's
+    upper bound is within the threshold, `FAIL` when its lower bound
+    exceeds it, `INCONCLUSIVE` otherwise, which blocks the release
+    pending an owner decision as AC #3 says. A complete attempt is not
+    re-run for an inconclusive interval: re-running until an interval
+    clears would bring the lottery back.
+  - Throughput, CPU per GiB and requests per second keep the 5 % spread
+    rule and its re-runs unchanged.
 
 ### D-l. NFR1
 
@@ -496,13 +533,17 @@ through endpoints both versions accept, to `perf-backend-http`.
   `R` = 50 % of B's median saturation throughput from the throughput
   series of the same run, so latency is measured below saturation and
   corrected for coordinated omission. Threshold: median p99 of L0 and of
-  L1 each at most 1.05 x B.
+  L1 each at most 1.05 x B. *Amended 2026-11-24: pooled p99 over 10
+  runs per arm, judged on a bootstrap interval (D-k, amendment); the
+  1.05 threshold is unchanged.*
 - **HTTPS** is measured the same way and reported, not gated (D-g, the
   crypto library's C compiler differs between the two builds).
 - The p99 threshold is tight against the 5 % spread rule. Twenty
   seconds at a fixed rate gives tens of thousands of samples per run,
   which is what keeps a per-run p99 stable; if it still is not, the
   rule says inconclusive, and that blocks the release by design.
+  *Superseded 2026-11-24: the dry run showed it is not stable (3 to
+  26 % spread); see D-k's amendment.*
 
 ### D-m. Gating and CI
 
@@ -856,6 +897,13 @@ budget view.
       (`PERF_LAYOUT=small`) is deliberately not run yet, by the
       coordinator's decision, until the p99 method changes and the audit
       fixes land, since both move what it would validate.*
+      *2026-11-24: the p99 method changed (D-k, amendment): raw
+      latencies per run (`l4_connect_latency.py --samples`, oha
+      `--db-url`), pooled p99 per arm, seeded bootstrap interval on
+      whole runs, 10 runs per p99 series, unit-tested in
+      `perf/test_analyse.py` (stdlib `unittest`, no Docker). The phase
+      has not run with it yet: the larger-layout baseline above is the
+      old method's, and both layouts' dry runs are owed.*
 
 ### Lot N: CI and documentation - no cargo
 
@@ -2189,6 +2237,8 @@ Lot M:
 - `tests-e2e-docker/run.sh` (`--skip-perf`, `--only-perf`,
   `--perf-advisory`, the perf call, the L4 report and teardown skipped on
   `--only-perf`)
+- `tests-e2e-docker/perf/test_analyse.py` (new, 2026-11-24, the p99
+  method of D-k's amendment)
 
 ## Change Log
 
@@ -2215,3 +2265,4 @@ Lot M:
 | 2026-11-21 | 0.19 | Lot L's product defect fixed: a table holding a stream socket goes chunked at any size and the chunked header leads with a non-UTF-8 byte, so 1.10.7 refuses the hot downgrade cleanly and the old generation keeps serving; `12.1-ac3-rollback-hot-1.10.7` PASS and `live`; Lot L's boxes all ticked. | Romain G. |
 | 2026-11-21 | 0.20 | Phase 1 audit item N1: a Lot O check added, the breaker RPC load under a UDP flood measured after C9, and the maintainer's decision that a worker-local breaker cache is built only if HTTP p99 then moves past NFR1. | Romain G. |
 | 2026-11-22 | 0.21 | Lot M implemented: the performance phase (`docker-compose.perf.yml`, `perf/run-perf.sh`, `perf/analyse.py`, the connect-latency and UDP-peer tools), `run.sh --only-perf`, `--skip-perf`, `--perf-advisory`; iperf3 at 8 streams per worker with single-worker runs excluded (D-j deviation, the accept spread); the larger-layout dry run recorded as the pre-fix baseline: TCP download throughput FAIL at 0.881, NFR1 HTTP p99 INCONCLUSIVE after four attempts, everything else PASS. Small-layout dry run deferred. | Romain G. |
+| 2026-11-24 | 0.22 | Phase 1 audit fixes: p99 checks judged on pooled samples with a seeded bootstrap interval on whole runs, 10 runs per p99 series (D-k amended, D-j 2 and D-l noted, Lot M note); shared e2e helpers moved to `l4/lib.sh` with a check that each scenario file runs on its own (C32); `report.py` covered by `test_report.py` (C15). | Romain G. |
