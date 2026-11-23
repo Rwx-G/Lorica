@@ -22,7 +22,7 @@
 use std::fmt::Display;
 
 use lorica_notify::events::{AlertEvent, AlertType};
-use lorica_waf::WafEvent;
+use lorica_waf::{LostEvents, WafEvent};
 
 /// Why an address was banned automatically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +71,30 @@ pub fn waf_alert(event: &WafEvent, path: Option<&str>) -> AlertEvent {
         alert = alert.with_detail("path", path);
     }
     alert
+}
+
+/// The `waf_alert` for the events of one source a worker dropped before
+/// forwarding them, which worker mode alone raises. A dropped event left
+/// no rule, host or path behind, so the alert names the category and
+/// the client, and counts the events under
+/// [`lorica_notify::coalesce::EVENTS_DETAIL`] so the coalescing weighs
+/// them as that many.
+pub fn waf_events_lost(lost: &LostEvents) -> AlertEvent {
+    AlertEvent::new(
+        AlertType::WafAlert,
+        format!(
+            "WAF {}: {} events from {} a worker dropped before forwarding",
+            lost.category.as_str(),
+            lost.count,
+            lost.client_ip
+        ),
+    )
+    .with_detail("category", lost.category.as_str())
+    .with_detail("client_ip", lost.client_ip.clone())
+    .with_detail(
+        lorica_notify::coalesce::EVENTS_DETAIL,
+        lost.count.to_string(),
+    )
 }
 
 /// The `ip_banned` alert for `ip`, banned for `ban_duration_s` seconds

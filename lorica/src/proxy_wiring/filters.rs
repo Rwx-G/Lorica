@@ -983,15 +983,12 @@ impl LoricaProxy {
             "IP auto-banned for rate limit abuse"
         );
         if let Some(ref sender) = self.alert_sender {
-            sender.send(
-                lorica_notify::AlertEvent::new(
-                    lorica_notify::events::AlertType::IpBanned,
-                    format!("IP {ip} auto-banned for rate limit abuse"),
-                )
-                .with_detail("ip", ip.to_string())
-                .with_detail("violations", violations.to_string())
-                .with_detail("ban_duration_s", ban_duration_s.to_string()),
-            );
+            sender.send(crate::alerts::ip_banned(
+                ip,
+                crate::alerts::BanCause::RateLimitAbuse,
+                violations,
+                ban_duration_s,
+            ));
         }
         if self.shmem.is_some() {
             let queued = self.rate_limit_bans.push(RateLimitBan {

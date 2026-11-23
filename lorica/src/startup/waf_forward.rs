@@ -36,7 +36,6 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use lorica::proxy_wiring::RateLimitBan;
-use lorica_notify::events::{AlertEvent, AlertType};
 use lorica_waf::{LostEvents, RuleCategory, WafEngine, WafEvent};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -223,15 +222,12 @@ impl SupervisorWafIngest {
             ban.duration_s,
             lorica_api::ban::BanReason::RateLimit.as_i32(),
         ));
-        self.alerts.send(
-            AlertEvent::new(
-                AlertType::IpBanned,
-                format!("IP {} auto-banned for rate limit abuse", ban.client_ip),
-            )
-            .with_detail("ip", ban.client_ip.clone())
-            .with_detail("violations", ban.violations_per_s.to_string())
-            .with_detail("ban_duration_s", ban.duration_s.to_string()),
-        );
+        self.alerts.send(lorica::alerts::ip_banned(
+            &ban.client_ip,
+            lorica::alerts::BanCause::RateLimitAbuse,
+            ban.violations_per_s,
+            ban.duration_s,
+        ));
     }
 
     fn handle_event(&self, event: WafEvent) {
@@ -248,23 +244,7 @@ impl SupervisorWafIngest {
     fn handle_lost(&self, lost: LostEvents) {
         self.engine.record_lost_events(&lost.category, lost.count);
         if alerts_on(&lost.category) {
-            self.alerts.send(
-                AlertEvent::new(
-                    AlertType::WafAlert,
-                    format!(
-                        "WAF {}: {} events from {} a worker dropped before forwarding",
-                        lost.category.as_str(),
-                        lost.count,
-                        lost.client_ip
-                    ),
-                )
-                .with_detail("category", lost.category.as_str())
-                .with_detail("client_ip", lost.client_ip.clone())
-                .with_detail(
-                    lorica_notify::coalesce::EVENTS_DETAIL,
-                    lost.count.to_string(),
-                ),
-            );
+            self.alerts.send(lorica::alerts::waf_events_lost(&lost));
         }
         self.check_auto_ban(&lost.client_ip);
     }
@@ -325,6 +305,7 @@ fn alerts_on(category: &RuleCategory) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lorica_notify::events::{AlertEvent, AlertType};
 
     const HOUR: Duration = Duration::from_secs(3600);
 
