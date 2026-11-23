@@ -290,10 +290,11 @@ async fn a_header_from_outside_the_trust_list_is_disconnected_and_counted() {
     );
 
     // The same peer without a header is a direct client: served, and
-    // since loopback is in `trusted_proxies`, its header is read as before.
+    // since loopback is in `trusted_proxies`, its header is read as before,
+    // and `X-Real-IP` names the client it resolved (1.10.10).
     let answer = harness.exchange(request_with_forged_xff().as_bytes()).await;
     assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
-    assert!(answer.contains("x-real-ip: 127.0.0.1"), "{answer}");
+    assert!(answer.contains(&format!("x-real-ip: {FORGED}")), "{answer}");
     assert_eq!(harness.last_logged_client().as_deref(), Some(FORGED));
 }
 

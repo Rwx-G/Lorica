@@ -1,6 +1,6 @@
 [package]
 name = "lorica-fleet"
-version = "1.10.9"
+version = "1.10.10"
 authors = ["Romain G."]
 license = "Apache-2.0"
 edition = "2021"
@@ -15,8 +15,8 @@ description = "Fleet runtime for Lorica: control-plane and follower runtimes, th
 # transport crate, whose wire layer treats the replicated blob as
 # opaque bytes.
 [dependencies]
-lorica-cluster = { version = "1.10.9", path = "../lorica-cluster" }
-lorica-config = { version = "1.10.9", path = "../lorica-config" }
+lorica-cluster = { version = "1.10.10", path = "../lorica-cluster" }
+lorica-config = { version = "1.10.10", path = "../lorica-config" }
 chrono = "0.4"
 # `catch_unwind` on a unit's future, so a panicking unit is caught on
 # its own task.

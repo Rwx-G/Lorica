@@ -906,3 +906,17 @@ fn route_rate_limit_roundtrips_via_json() {
         Some(RateLimitScope::PerIp)
     );
 }
+
+#[test]
+fn a_route_display_name_is_its_host_and_any_path_prefix() {
+    let mut route = example_route_for_serde();
+    route.hostname = "app.example.com".to_string();
+    for (prefix, name) in [
+        ("/", "app.example.com"),
+        ("", "app.example.com"),
+        ("/api", "app.example.com/api"),
+    ] {
+        route.path_prefix = prefix.to_string();
+        assert_eq!(route.display_name(), name, "{prefix:?}");
+    }
+}

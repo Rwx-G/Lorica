@@ -60,13 +60,18 @@ pub struct RequestCtx {
     pub client_ip: Option<String>,
     /// Parsed form of `client_ip`, resolved once per request so the
     /// whitelist / blocklist / GeoIP / bot-protection checks reuse it
-    /// instead of re-parsing the string (audit #41f). `None` when
-    /// `client_ip` is absent or not a valid IP literal.
+    /// instead of re-parsing the string (audit #41f). `None` exactly
+    /// when `client_ip` is `None`.
     pub client_ip_addr: Option<std::net::IpAddr>,
     /// Whether the client IP was extracted from X-Forwarded-For header.
     pub is_xff: bool,
     /// The direct TCP peer IP when XFF is used (the forwarding proxy's IP).
     pub xff_proxy_ip: Option<String>,
+    /// The scheme a trusted proxy reported in `X-Forwarded-Proto`
+    /// (`forwarded_proto`), resolved with the client IP. `None` when the
+    /// peer is not trusted or sent no usable value; the TLS state of the
+    /// connection then decides.
+    pub forwarded_proto: Option<&'static str>,
     /// Request source (from X-Lorica-Source header, e.g., "loadtest").
     pub source: String,
     /// Per-route connection counter for max_connections enforcement.

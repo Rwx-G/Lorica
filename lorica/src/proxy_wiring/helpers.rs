@@ -226,6 +226,125 @@ pub(crate) fn host_without_port(authority: &str) -> &str {
         .map_or(authority, |(host, _port)| host)
 }
 
+/// The address a request is attributed to, and whether it was read
+/// from `X-Forwarded-For` rather than taken from the TCP peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForwardedClient {
+    /// The client address every per-IP control keys on.
+    pub ip: std::net::IpAddr,
+    /// Whether `ip` came from an `X-Forwarded-For` entry.
+    pub via_forwarded_for: bool,
+}
+
+/// Resolve the client of a request that reached Lorica from `peer`.
+///
+/// `X-Forwarded-For` is read only when `peer` is in `trusted`, and then
+/// from the right: each entry was written by the hop to its right, so an
+/// entry is believed only while its writer is trusted. The walk stops at
+/// the first entry that is not a trusted proxy, which is the client. The
+/// leftmost entry is never taken on its own: a proxy that appends to the
+/// header (nginx `$proxy_add_x_forwarded_for`, most load balancers)
+/// leaves whatever the client sent on the left, so reading it there
+/// would let any client choose the address its bans, rate limits and
+/// WAF whitelist are checked against.
+///
+/// Every `X-Forwarded-For` field line counts, in order, as one list, and
+/// each comma-separated entry is decoded on its own: proxies merge the
+/// client's value and their own append into one line, so a byte the
+/// client sent that is not text must spoil only the client's entries,
+/// never the trusted hop's. An entry is an IP literal, optionally with a
+/// port (`192.0.2.1:4711`, `[2001:db8::1]:4711`); an IPv4-mapped IPv6
+/// entry is read as the IPv4 address it carries. An entry that is not an
+/// address ends the walk at the trusted hop that wrote it: that hop is
+/// the last address known not to come from the client. Only the entries
+/// the walk reaches are parsed.
+pub(crate) fn forwarded_client(
+    peer: std::net::IpAddr,
+    req: &lorica_http::RequestHeader,
+    trusted: &[ipnet::IpNet],
+) -> ForwardedClient {
+    let is_trusted = |ip: &std::net::IpAddr| trusted.iter().any(|net| net.contains(ip));
+    let mut client = ForwardedClient {
+        ip: peer.to_canonical(),
+        via_forwarded_for: false,
+    };
+    if !is_trusted(&client.ip) {
+        return client;
+    }
+    let entries = req
+        .headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .rev()
+        .flat_map(|line| line.as_bytes().rsplit(|byte| *byte == b','))
+        .map(<[u8]>::trim_ascii)
+        .filter(|entry| !entry.is_empty());
+    for entry in entries {
+        let Some(ip) = parse_forwarded_entry(entry) else {
+            break;
+        };
+        client = ForwardedClient {
+            ip,
+            via_forwarded_for: true,
+        };
+        if !is_trusted(&ip) {
+            break;
+        }
+    }
+    client
+}
+
+fn parse_forwarded_entry(entry: &[u8]) -> Option<std::net::IpAddr> {
+    let entry = std::str::from_utf8(entry).ok()?;
+    entry
+        .parse::<std::net::IpAddr>()
+        .or_else(|_| entry.parse::<std::net::SocketAddr>().map(|addr| addr.ip()))
+        .ok()
+        .map(|ip| ip.to_canonical())
+}
+
+/// The `X-Forwarded-For` value sent upstream: every field line the
+/// request carried, in order, joined into one list, then `peer`. Reading
+/// only the first line would drop a line a front proxy added, leaving the
+/// backend the client-written entries alone.
+pub(crate) fn upstream_forwarded_for(req: &lorica_http::RequestHeader, peer: &str) -> Vec<u8> {
+    let mut value: Vec<u8> = Vec::new();
+    for line in req.headers.get_all("x-forwarded-for") {
+        value.extend_from_slice(line.as_bytes());
+        value.extend_from_slice(b", ");
+    }
+    value.extend_from_slice(peer.as_bytes());
+    value
+}
+
+/// The scheme `X-Forwarded-Proto` names for a request that reached Lorica
+/// from `peer`, read under the same trust as `X-Forwarded-For`: only when
+/// `peer` is in `trusted`. From any other peer the header is the client's
+/// own claim, and believing it would let a plain-HTTP client skip
+/// `force_https` and tell the backend its connection was encrypted.
+///
+/// Only `http` or `https`, in any case, is read. Any other value is
+/// ignored, so it can never become the scheme of a `Location` Lorica
+/// writes.
+pub(crate) fn forwarded_proto(
+    peer: std::net::IpAddr,
+    req: &lorica_http::RequestHeader,
+    trusted: &[ipnet::IpNet],
+) -> Option<&'static str> {
+    let peer = peer.to_canonical();
+    if !trusted.iter().any(|net| net.contains(&peer)) {
+        return None;
+    }
+    let value = req.headers.get("x-forwarded-proto")?.as_bytes();
+    if value.eq_ignore_ascii_case(b"https") {
+        Some("https")
+    } else if value.eq_ignore_ascii_case(b"http") {
+        Some("http")
+    } else {
+        None
+    }
+}
+
 /// Pick a backend index using the Ketama consistent-hash ring keyed
 /// by `client_ip`. Each input is a `(address, weight)` pair extracted
 /// from the route's healthy backends, in the order the caller wants

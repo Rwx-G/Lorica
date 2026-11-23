@@ -1245,3 +1245,98 @@ fn test_list_rules_includes_header_scoped() {
     assert!(summaries.iter().any(|s| s.id == 920120));
     assert!(summaries.iter().any(|s| s.id == 920140));
 }
+
+// --- Console warnings ---
+
+std::thread_local! {
+    /// The WARN events' field names recorded on this thread, while a
+    /// test is collecting them (`warn_fields_during`).
+    static WARN_FIELDS: std::cell::RefCell<Option<Vec<Vec<&'static str>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A process-wide subscriber that records, for the threads collecting,
+/// the field names of every WARN event in the order a formatter writes
+/// them, the message left out. It is global rather than scoped with
+/// `with_default` because tracing caches each callsite's interest for
+/// the whole process: a test on another thread that reaches a warning
+/// first, with no subscriber, would leave it disabled for this one.
+struct WarnFieldTap;
+
+struct FieldNames(Vec<&'static str>);
+
+impl tracing::field::Visit for FieldNames {
+    fn record_debug(&mut self, field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {
+        if field.name() != "message" {
+            self.0.push(field.name());
+        }
+    }
+}
+
+impl tracing::Subscriber for WarnFieldTap {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        WARN_FIELDS.with(|collected| {
+            if let Some(collected) = collected.borrow_mut().as_mut() {
+                let mut names = FieldNames(Vec::new());
+                event.record(&mut names);
+                collected.push(names.0);
+            }
+        });
+    }
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// The field names of the WARN events `run` emits on this thread.
+fn warn_fields_during(run: impl FnOnce()) -> Vec<Vec<&'static str>> {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        tracing::subscriber::set_global_default(WarnFieldTap)
+            .expect("no other test in this crate installs a global subscriber");
+    });
+    WARN_FIELDS.with(|collected| *collected.borrow_mut() = Some(Vec::new()));
+    run();
+    WARN_FIELDS.with(|collected| collected.borrow_mut().take().unwrap_or_default())
+}
+
+/// Every "rules matched" warning, request and body, in both modes, leads
+/// with `client_ip`: `host` and `path` carry text the client chose, so a
+/// log filter anchored after the message must meet the real address
+/// before anything planted there.
+#[test]
+fn rule_match_warnings_lead_with_the_client_ip() {
+    let warnings = warn_fields_during(|| {
+        let e = engine();
+        for mode in [WafMode::Detection, WafMode::Blocking] {
+            e.evaluate(
+                mode,
+                "/search",
+                Some("q=1%20UNION%20SELECT%20*%20FROM%20users"),
+                &[],
+                "example.com",
+                "192.0.2.10",
+            );
+            e.evaluate_body(
+                mode,
+                b"username=admin&password=1' OR 1=1--",
+                "example.com",
+                "192.0.2.10",
+            );
+        }
+    });
+    assert_eq!(warnings.len(), 4, "{warnings:?}");
+    for fields in &warnings {
+        assert_eq!(fields.first(), Some(&"client_ip"), "{fields:?}");
+    }
+}

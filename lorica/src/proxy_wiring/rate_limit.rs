@@ -48,11 +48,10 @@ use lorica_limits::token_bucket::{AuthoritativeBucket, LocalBucket};
 /// cannot collide with a `per_ip` bucket of the same route.
 pub const PER_ROUTE_SCOPE_KEY: &str = "__route__";
 
-/// Scope key of a `per_ip` bucket whose client address is unknown or is
-/// not an IP literal (an `X-Forwarded-For` entry is client-supplied text
-/// behind a trusted proxy). Sharing one bucket keeps a client from
-/// minting a fresh bucket per request, and keeps the scope key free of
-/// the `|` separator.
+/// Scope key of a `per_ip` bucket whose client address is unknown (a
+/// connection with no inet peer). Sharing one bucket keeps such clients
+/// from minting a fresh bucket per request, and keeps the scope key free
+/// of the `|` separator.
 pub const UNKNOWN_CLIENT_SCOPE_KEY: &str = "unknown";
 
 /// `<rule>` segment of a route-level bucket.

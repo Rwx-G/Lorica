@@ -295,8 +295,9 @@ pub mod helpers;
 // because they're re-exported by integration tests under `tests/`
 // (canary_e2e_test, mtls_e2e_test).
 pub(crate) use helpers::{
-    cache_vary_for_request, downstream_ssl_digest, extract_host, host_without_port,
-    path_after_strip, pick_consistent_hash, request_host, sanitize_html,
+    cache_vary_for_request, downstream_ssl_digest, extract_host, forwarded_client, forwarded_proto,
+    host_without_port, path_after_strip, pick_consistent_hash, request_host, sanitize_html,
+    upstream_forwarded_for, ForwardedClient,
 };
 pub use helpers::{
     canary_bucket, evaluate_mtls, mtls_refusal_status, route_client_cert, HandshakeName,
@@ -885,6 +886,7 @@ impl ProxyHttp for LoricaProxy {
             client_ip_addr: None,
             is_xff: false,
             xff_proxy_ip: None,
+            forwarded_proto: None,
             source: String::new(),
             route_conn_counter: None,
             rate_limit_info: None,
@@ -994,6 +996,7 @@ impl ProxyHttp for LoricaProxy {
             http.response.status_code = tracing::field::Empty,
             client.geo.country_iso_code = tracing::field::Empty,
             server.address = tracing::field::Empty,
+            client.address = tracing::field::Empty,
             network.peer.address = tracing::field::Empty,
             lorica.latency_ms = tracing::field::Empty,
             lorica.trace.origin = tracing::field::Empty,
@@ -1030,6 +1033,16 @@ impl ProxyHttp for LoricaProxy {
         // only accepts trait methods.
         use tracing::Instrument as _;
         async move {
+            let config = self.config.load();
+
+            // Client IP resolution (the connection's client address, or
+            // XFF behind a trusted proxy on a connection that did not
+            // come through a PROXY header), first of all: it is never terminal, and
+            // every stage that can answer the request, the access log
+            // and the console line read the address it stamps on ctx,
+            // so all of them name the same client.
+            let check_ip = self.resolve_client_ip(session, ctx, &config);
+
             // ACME HTTP-01 challenge intercept (must respond before any other check)
             if let Some(ref challenge_store) = self.acme_challenge_store {
                 let path = session.req_header().uri.path();
@@ -1057,28 +1070,23 @@ impl ProxyHttp for LoricaProxy {
             }
 
             // Bot-protection cross-cutting endpoints (solve + captcha image)
-            if let Some(handled) = self.check_bot_endpoints(session).await? {
+            if let Some(handled) = self.check_bot_endpoints(session, ctx).await? {
                 return Ok(handled);
             }
 
-            // Global flood tracking and connection limit (before any
-            // other processing)
-            let config = self.config.load();
+            // Global flood tracking (before any other processing)
             self.count_request_for_flood_defence(
                 config.flood_threshold_rps,
                 lorica_shmem::now_ns(),
             );
+
+            // Global connection limit (before any other processing)
             if let Some(handled) = self
                 .check_global_connection_limit(session, ctx, &config)
                 .await?
             {
                 return Ok(handled);
             }
-
-            // Client IP resolution (direct TCP peer, or XFF behind a
-            // trusted proxy); stamps the ctx fields every later check
-            // and the access log rely on.
-            let check_ip = self.resolve_client_ip(session, ctx, &config);
 
             // Global WAF whitelist: IPs in this list bypass ban checks, IP blocklist,
             // rate limiting, and WAF evaluation entirely.
@@ -1201,10 +1209,7 @@ impl ProxyHttp for LoricaProxy {
             }
 
             // Force HTTPS redirect + hostname redirect
-            if let Some(handled) = self
-                .check_route_redirects(session, entry, &ctx.request_host)
-                .await?
-            {
+            if let Some(handled) = self.check_route_redirects(session, ctx, entry).await? {
                 return Ok(handled);
             }
 
@@ -2339,24 +2344,21 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
-        // Default proxy headers
+        // Default proxy headers. X-Forwarded-For extends the chain with
+        // the hop Lorica saw; X-Real-IP names the client Lorica resolved,
+        // the one its own controls and logs use.
         let req = session.req_header();
-        let client_ip = session
+        let peer_ip = session
             .as_downstream()
             .client_addr()
             .and_then(|addr| addr.as_inet())
             .map(|addr| addr.ip().to_string())
             .unwrap_or_default();
-
-        let xff = req
-            .headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .map(|existing| format!("{existing}, {client_ip}"))
-            .unwrap_or_else(|| client_ip.clone());
+        let real_ip = ctx.client_ip.as_deref().unwrap_or(&peer_ip).to_string();
+        let xff = upstream_forwarded_for(req, &peer_ip);
 
         // Detect TLS via session digest (same as force_https), then fall back to
-        // incoming X-Forwarded-Proto header (for proxied requests).
+        // the X-Forwarded-Proto a trusted proxy reported.
         let is_tls = session
             .digest()
             .and_then(|d| d.ssl_digest.as_ref())
@@ -2364,16 +2366,13 @@ impl ProxyHttp for LoricaProxy {
         let proto = if is_tls {
             "https"
         } else {
-            req.headers
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("http")
+            ctx.forwarded_proto.unwrap_or("http")
         };
 
         let host_val = extract_host(req).to_string();
 
-        let _ = upstream_request.insert_header("X-Real-IP", &client_ip);
-        let _ = upstream_request.insert_header("X-Forwarded-For", &xff);
+        let _ = upstream_request.insert_header("X-Real-IP", &real_ip);
+        let _ = upstream_request.insert_header("X-Forwarded-For", xff);
         let _ = upstream_request.insert_header("X-Forwarded-Proto", proto);
         let _ = upstream_request.insert_header("Host", &host_val);
 
@@ -2865,6 +2864,8 @@ impl ProxyHttp for LoricaProxy {
 
         let backend_addr = ctx.backend_addr.as_deref().unwrap_or("-");
 
+        let client_ip = ctx.client_ip.as_deref().unwrap_or("-").to_string();
+
         let error_str = if let Some(ref reason) = ctx.block_reason {
             Some(reason.clone())
         } else if ctx.waf_blocked {
@@ -2886,7 +2887,12 @@ impl ProxyHttp for LoricaProxy {
         let latency_ms = elapsed.as_millis() as u64;
 
         if let Some(ref err) = error_str {
+            // `client_ip` leads the fields: everything after it can carry
+            // client-chosen text (`path`, `host`), so a log filter that
+            // reads the field right after the message cannot be fed a
+            // forged address.
             warn!(
+                client_ip = %client_ip,
                 method = method,
                 path = path,
                 host = host,
@@ -2898,6 +2904,7 @@ impl ProxyHttp for LoricaProxy {
             );
         } else {
             info!(
+                client_ip = %client_ip,
                 method = method,
                 path = path,
                 host = host,
@@ -2923,6 +2930,9 @@ impl ProxyHttp for LoricaProxy {
             span.record("lorica.latency_ms", latency_ms as i64);
             if host != "-" {
                 span.record("server.address", host);
+            }
+            if client_ip != "-" {
+                span.record("client.address", client_ip.as_str());
             }
             if backend_addr != "-" {
                 span.record("network.peer.address", backend_addr);
@@ -2978,7 +2988,7 @@ impl ProxyHttp for LoricaProxy {
                 latency_ms,
                 backend: backend_addr.to_string(),
                 error: error_str,
-                client_ip: ctx.client_ip.as_deref().unwrap_or("-").to_string(),
+                client_ip: client_ip.clone(),
                 is_xff: ctx.is_xff,
                 xff_proxy_ip: ctx.xff_proxy_ip.as_deref().unwrap_or("").to_string(),
                 source: ctx.source.clone(),

@@ -184,9 +184,14 @@ impl WafEngine {
             let rule_ids: Vec<u32> = events.iter().map(|e| e.rule_id).collect();
             let categories: Vec<&str> = events.iter().map(|e| e.category.as_str()).collect();
 
+            // `client_ip` leads the fields, as on the proxy's request
+            // lines: `host` and `path` carry text the client chose, and a
+            // log filter anchored right after the message must never meet
+            // a `client_ip=` planted there before the real one.
             match mode {
                 WafMode::Detection => {
                     warn!(
+                        client_ip = %client_ip,
                         host = host,
                         path = path,
                         rules = ?rule_ids,
@@ -199,6 +204,7 @@ impl WafEngine {
                 }
                 WafMode::Blocking => {
                     warn!(
+                        client_ip = %client_ip,
                         host = host,
                         path = path,
                         rules = ?rule_ids,
@@ -294,9 +300,11 @@ impl WafEngine {
         let rule_ids: Vec<u32> = events.iter().map(|e| e.rule_id).collect();
         let categories: Vec<&str> = events.iter().map(|e| e.category.as_str()).collect();
 
+        // `client_ip` first, for the reason given in `evaluate`.
         match mode {
             WafMode::Detection => {
                 warn!(
+                    client_ip = %client_ip,
                     host = host,
                     rules = ?rule_ids,
                     categories = ?categories,
@@ -308,6 +316,7 @@ impl WafEngine {
             }
             WafMode::Blocking => {
                 warn!(
+                    client_ip = %client_ip,
                     host = host,
                     rules = ?rule_ids,
                     categories = ?categories,

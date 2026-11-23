@@ -491,15 +491,9 @@ async fn persist_health_flips(health: &HealthLoop, commits: &[HealthFlip]) -> bo
         // a payload, never a byte the backend sent.
         if let ProbeResult::Down(reason) = outcome.result {
             if let Some(ref sender) = health.alert_sender {
-                let alert = lorica_notify::AlertEvent::new(
-                    lorica_notify::events::AlertType::BackendDown,
-                    format!("Backend {} is down", backend.address),
-                )
-                .with_detail("backend_id", backend.id.clone())
-                .with_detail("address", backend.address.clone())
-                .with_detail("name", backend.name.clone())
-                .with_detail("check", check_label(&backend.health_check))
-                .with_detail("reason", reason.as_str());
+                let alert = backend_down_alert(backend)
+                    .with_detail("check", check_label(&backend.health_check))
+                    .with_detail("reason", reason.as_str());
                 // A stream operator learns the flip is theirs from the
                 // same alert (Story 12.9 D-h).
                 let alert = match linked_stream_names(&store, &backend.id) {
@@ -1013,6 +1007,20 @@ fn confirm_status_flip(
     }
 }
 
+/// The `backend_down` alert for `backend`, named as the dashboard lists
+/// it: its label when it has one, its address otherwise.
+fn backend_down_alert(backend: &Backend) -> lorica_notify::AlertEvent {
+    let summary = if backend.name.is_empty() {
+        format!("Backend {} is down", backend.address)
+    } else {
+        format!("Backend {} ({}) is down", backend.name, backend.address)
+    };
+    lorica_notify::AlertEvent::new(lorica_notify::events::AlertType::BackendDown, summary)
+        .with_detail("backend_id", backend.id.clone())
+        .with_detail("address", backend.address.clone())
+        .with_detail("name", backend.name.clone())
+}
+
 /// Determine probe result from a latency value (for testing).
 #[cfg(test)]
 fn classify_latency(connected: bool, latency_ms: u128) -> ProbeResult {
@@ -1028,6 +1036,22 @@ fn classify_latency(connected: bool, latency_ms: u128) -> ProbeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_backend_down_alert_names_the_backend() {
+        let mut backend = backend_checked_by(None, false);
+        backend.address = "10.0.0.10:8080".into();
+        backend.name = "api-1".into();
+        assert_eq!(
+            backend_down_alert(&backend).summary,
+            "Backend api-1 (10.0.0.10:8080) is down"
+        );
+        backend.name.clear();
+        assert_eq!(
+            backend_down_alert(&backend).summary,
+            "Backend 10.0.0.10:8080 is down"
+        );
+    }
 
     // ---- Latency classification ----
 
