@@ -15,6 +15,7 @@ Author: Rwx-G
 
 ### Changed
 
+- Dependencies refreshed: anyhow 1.0.105, clap 4.6.9, url 2.5.9, toml 1.2.2, pin-project 1.2.0, the AWS Route 53 client, and jiff 1.0.2 under env_logger; dashboard svelte 5.59.1, svelte-eslint-parser 1.11.0, @testing-library/jest-dom 8.0.0. TypeScript 7 stays out: svelte-check and typescript-eslint do not accept it yet.
 - **The client address is resolved before anything can answer a request.** The ACME HTTP-01 answer, the bot-protection solve and captcha endpoints and the global connection limit used to run first, so their access-log rows had no client address and the solve path resolved its own. All of them now see the address every other stage uses.
 - **`X-Real-IP` sent to backends is the client Lorica resolved**, the address its own logs and controls use. Behind a trusted proxy it used to be the proxy's address. The `X-Forwarded-For` sent upstream keeps every line the request carried, joined, then the hop Lorica saw; only the first line was kept, so a line a front proxy added was dropped.
 - **An IPv4-mapped address (`::ffff:192.0.2.1`) is read as the IPv4 address it carries**, for the TCP peer and in `X-Forwarded-For`, so a ban, an allow list or a trusted proxy written in IPv4 matches it.
