@@ -226,6 +226,80 @@ pub(crate) fn host_without_port(authority: &str) -> &str {
         .map_or(authority, |(host, _port)| host)
 }
 
+/// The address a request is attributed to, and whether it was read
+/// from `X-Forwarded-For` rather than taken from the TCP peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForwardedClient {
+    /// The client address every per-IP control keys on.
+    pub ip: std::net::IpAddr,
+    /// Whether `ip` came from an `X-Forwarded-For` entry.
+    pub via_forwarded_for: bool,
+}
+
+/// Resolve the client of a request that reached Lorica from `peer`.
+///
+/// `X-Forwarded-For` is read only when `peer` is in `trusted`, and then
+/// from the right: each entry was written by the hop to its right, so an
+/// entry is believed only while its writer is trusted. The walk stops at
+/// the first entry that is not a trusted proxy, which is the client. The
+/// leftmost entry is never taken on its own: a proxy that appends to the
+/// header (nginx `$proxy_add_x_forwarded_for`, most load balancers)
+/// leaves whatever the client sent on the left, so reading it there
+/// would let any client choose the address its bans, rate limits and
+/// WAF whitelist are checked against.
+///
+/// Every `X-Forwarded-For` field line counts, in order, as one list. An
+/// entry is an IP literal, optionally with a port (`192.0.2.1:4711`,
+/// `[2001:db8::1]:4711`). An entry that is neither, or a field line that
+/// is not text, ends the walk at the trusted hop that wrote it: that
+/// hop is the last address known not to come from the client.
+pub(crate) fn forwarded_client(
+    peer: std::net::IpAddr,
+    req: &lorica_http::RequestHeader,
+    trusted: &[ipnet::IpNet],
+) -> ForwardedClient {
+    let is_trusted = |ip: &std::net::IpAddr| trusted.iter().any(|net| net.contains(ip));
+    let mut client = ForwardedClient {
+        ip: peer,
+        via_forwarded_for: false,
+    };
+    if !is_trusted(&peer) {
+        return client;
+    }
+    let mut entries: Vec<Option<std::net::IpAddr>> = Vec::new();
+    for value in req.headers.get_all("x-forwarded-for") {
+        match value.to_str() {
+            Ok(list) => entries.extend(
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(parse_forwarded_entry),
+            ),
+            Err(_) => entries.push(None),
+        }
+    }
+    for entry in entries.into_iter().rev() {
+        let Some(ip) = entry else {
+            break;
+        };
+        client = ForwardedClient {
+            ip,
+            via_forwarded_for: true,
+        };
+        if !is_trusted(&ip) {
+            break;
+        }
+    }
+    client
+}
+
+fn parse_forwarded_entry(entry: &str) -> Option<std::net::IpAddr> {
+    entry
+        .parse::<std::net::IpAddr>()
+        .or_else(|_| entry.parse::<std::net::SocketAddr>().map(|addr| addr.ip()))
+        .ok()
+}
+
 /// Pick a backend index using the Ketama consistent-hash ring keyed
 /// by `client_ip`. Each input is a `(address, weight)` pair extracted
 /// from the route's healthy backends, in the order the caller wants

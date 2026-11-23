@@ -19,6 +19,8 @@ Author: Rwx-G
 
 ### Security
 
+- **`X-Forwarded-For` is read from the right, so a client can no longer choose its own address behind a trusted proxy.** Lorica took the leftmost entry of the header whenever the TCP peer was in `trusted_proxies`. A proxy that appends to the header (nginx `$proxy_add_x_forwarded_for`, most load balancers) keeps what the client sent on the left, so any client could name an arbitrary address: escape a ban, a rate limit or a GeoIP rule, get a WAF whitelisted address and skip the WAF entirely, or have another address banned in its place. The header is now walked from the right, every field line counted, and the client is the first entry that is not itself a trusted proxy; an entry that is not an address stops the walk at the trusted hop that wrote it. The bot-protection solve path read the header the same way and now shares the same resolution. A deployment whose front proxy overwrites the header instead of appending to it sees no change. Affected releases: 1.0.0 to 1.10.9.
+
 ## [1.10.9] - 2026-11-20
 
 A cluster's control plane shows its own access logs, WAF events and bans again, and no page offers an action on the control plane's data while it shows a follower's. Dashboard only, no schema migration.

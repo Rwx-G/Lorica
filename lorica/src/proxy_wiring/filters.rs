@@ -26,10 +26,10 @@ use tracing::{debug, warn};
 use super::ai_bot_merged::{self, MergedCrawler, MergedVerification};
 use super::{
     bot_handlers, build_mirror_forward_headers, canary_bucket, downstream_ssl_digest, extract_host,
-    host_without_port, mirror_sample_hit, mtls_refusal_status, render_error_body, request_has_body,
-    route_client_cert, run_forward_auth_keyed, spawn_mirrors, ForwardAuthOutcome, HandshakeName,
-    LoricaProxy, MirrorBodyState, MirrorPending, ProxyConfig, RequestCtx, RouteEntry,
-    VerdictCacheEngine, WAF_BODY_SCAN_DEFAULT,
+    forwarded_client, host_without_port, mirror_sample_hit, mtls_refusal_status, render_error_body,
+    request_has_body, route_client_cert, run_forward_auth_keyed, spawn_mirrors, ForwardAuthOutcome,
+    HandshakeName, LoricaProxy, MirrorBodyState, MirrorPending, ProxyConfig, RequestCtx,
+    RouteEntry, VerdictCacheEngine, WAF_BODY_SCAN_DEFAULT,
 };
 use crate::ai_bot::build_robots_txt_from_names;
 
@@ -451,33 +451,19 @@ impl LoricaProxy {
     pub(super) async fn check_bot_endpoints(&self, session: &mut Session) -> Result<Option<bool>> {
         let path: String = session.req_header().uri.path().to_owned();
         if crate::bot::is_bot_solve_path(&path) {
-            // Client IP must go through the SAME XFF unwrap that
-            // the challenge-render path used; otherwise the
-            // stashed entry's IP prefix (XFF-unwrapped) won't
-            // match the current TCP client's prefix and the
-            // handler rejects with 403 "client network changed".
-            // Duplicates the xff_used logic from the client-IP
-            // resolution stage, because that stage is skipped
-            // entirely when we take this early return.
+            // Client IP must be the one the challenge-render path
+            // saw; otherwise the stashed entry's IP prefix won't
+            // match and the handler rejects with 403 "client network
+            // changed". The client-IP resolution stage is skipped
+            // entirely when we take this early return, so the same
+            // resolution runs here.
             let config = self.config.load();
-            let tcp_ip = session
+            let client_ip = session
                 .client_addr()
                 .and_then(|addr| addr.as_inet())
-                .map(|a| a.ip());
-            let xff_header = session
-                .req_header()
-                .headers
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok());
-            let direct_is_trusted =
-                tcp_ip.is_some_and(|ip| config.trusted_proxies.iter().any(|net| net.contains(&ip)));
-            let client_ip = if direct_is_trusted {
-                xff_header
-                    .and_then(|xff| xff.split(',').next().unwrap_or(xff).trim().parse().ok())
-                    .or(tcp_ip)
-            } else {
-                tcp_ip
-            };
+                .map(|peer| {
+                    forwarded_client(peer.ip(), session.req_header(), &config.trusted_proxies).ip
+                });
             let now_secs = chrono::Utc::now().timestamp();
             let secret = lorica_challenge::secret::handle();
             let secret_ref = secret.as_deref();
@@ -547,9 +533,9 @@ impl LoricaProxy {
     }
 
     /// Stage: client IP resolution (never terminal). Derives the
-    /// effective client IP - the direct TCP peer, or the leftmost
-    /// X-Forwarded-For entry when the direct peer is a trusted proxy -
-    /// stamps `ctx.client_ip`, `ctx.client_ip_addr`, `ctx.is_xff`,
+    /// effective client IP - the direct TCP peer, or the
+    /// X-Forwarded-For entry [`forwarded_client`] attributes the request
+    /// to when the direct peer is a trusted proxy - stamps `ctx.client_ip`, `ctx.client_ip_addr`, `ctx.is_xff`,
     /// `ctx.xff_proxy_ip` and `ctx.source`, and returns the IP string
     /// every later check keys on.
     pub(super) fn resolve_client_ip(
@@ -558,50 +544,27 @@ impl LoricaProxy {
         ctx: &mut RequestCtx,
         config: &ProxyConfig,
     ) -> Option<String> {
-        let client_ip = session
+        let req = session.req_header();
+        let peer = session
             .as_downstream()
             .client_addr()
             .and_then(|addr| addr.as_inet())
-            .map(|addr| addr.ip().to_string());
-
-        // Only trust X-Forwarded-For when the direct TCP client is a trusted proxy.
-        // When trusted_proxies is empty, XFF is never used (secure default).
-        let req = session.req_header();
-        let has_xff = req.headers.get("x-forwarded-for").is_some();
-        let direct_ip = client_ip.clone();
-
-        let direct_is_trusted = direct_ip.as_ref().is_some_and(|ip| {
-            if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
-                config.trusted_proxies.iter().any(|net| net.contains(&addr))
-            } else {
-                false
-            }
-        });
-
-        let xff_used = direct_is_trusted && has_xff;
-        let check_ip = if xff_used {
-            // Trusted proxy: extract real client IP from XFF (leftmost entry)
-            req.headers
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .map(|xff| xff.split(',').next().unwrap_or(xff).trim().to_string())
-                .or(client_ip)
-        } else {
-            // Not trusted or no XFF: use direct TCP client IP
-            client_ip
-        };
+            .map(|addr| addr.ip());
+        let client = peer.map(|peer| forwarded_client(peer, req, &config.trusted_proxies));
 
         // Store client IP and source in context for access logging.
-        // Parse the string form once; every later per-request
-        // consumer (whitelist, blocklist, GeoIP, bot protection)
-        // reuses `ctx.client_ip_addr` instead of re-parsing
-        // (audit #41f).
+        // Every later per-request consumer (whitelist, blocklist, GeoIP,
+        // bot protection) reuses `ctx.client_ip_addr` instead of
+        // re-parsing the string form (audit #41f).
+        let check_ip = client.map(|client| client.ip.to_string());
         ctx.client_ip = check_ip.clone();
-        ctx.client_ip_addr = check_ip
-            .as_deref()
-            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok());
-        ctx.is_xff = xff_used && check_ip.is_some();
-        ctx.xff_proxy_ip = if ctx.is_xff { direct_ip } else { None };
+        ctx.client_ip_addr = client.map(|client| client.ip);
+        ctx.is_xff = client.is_some_and(|client| client.via_forwarded_for);
+        ctx.xff_proxy_ip = if ctx.is_xff {
+            peer.map(|peer| peer.to_string())
+        } else {
+            None
+        };
         ctx.source = req
             .headers
             .get("x-lorica-source")
@@ -822,8 +785,6 @@ impl LoricaProxy {
             return Ok(None);
         };
 
-        // Only an address that parsed as an IP names a client: an
-        // `X-Forwarded-For` entry behind a trusted proxy is free text.
         let client_ip = ctx.client_ip_addr.and(ctx.client_ip.as_deref());
         let key = super::rate_limit::bucket_key(
             &entry.route.id,

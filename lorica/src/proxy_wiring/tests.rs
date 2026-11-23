@@ -1698,6 +1698,100 @@ fn test_trusted_proxies_cidr_parsed() {
         .any(|net| net.contains(&addr2)));
 }
 
+/// `(peer, X-Forwarded-For field lines, expected client, read from XFF)`
+/// against a trust list of `10.0.0.0/8`.
+fn assert_forwarded_client(peer: &str, lines: &[&[u8]], client: &str, via_forwarded_for: bool) {
+    let trusted: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+    let mut req = lorica_http::RequestHeader::build("GET", b"/", None).unwrap();
+    for line in lines {
+        req.append_header(
+            "X-Forwarded-For",
+            http::HeaderValue::from_bytes(line).unwrap(),
+        )
+        .unwrap();
+    }
+    let resolved = forwarded_client(peer.parse().unwrap(), &req, &trusted);
+    assert_eq!(
+        (resolved.ip.to_string().as_str(), resolved.via_forwarded_for),
+        (client, via_forwarded_for),
+        "peer {peer}, lines {lines:?}"
+    );
+}
+
+#[test]
+fn forwarded_for_is_ignored_from_an_untrusted_peer() {
+    assert_forwarded_client("198.51.100.9", &[b"203.0.113.7"], "198.51.100.9", false);
+}
+
+#[test]
+fn a_trusted_peer_without_forwarded_for_is_the_client() {
+    assert_forwarded_client("10.0.0.2", &[], "10.0.0.2", false);
+}
+
+/// A proxy that appends to the header leaves what the client sent on
+/// the left: the client is the entry the trusted proxy wrote, never the
+/// leftmost one.
+#[test]
+fn a_spoofed_leftmost_entry_is_not_the_client() {
+    assert_forwarded_client(
+        "10.0.0.2",
+        &[b"192.0.2.66, 203.0.113.7"],
+        "203.0.113.7",
+        true,
+    );
+}
+
+#[test]
+fn trusted_hops_are_walked_through_to_the_client() {
+    assert_forwarded_client(
+        "10.0.0.2",
+        &[b"192.0.2.66, 203.0.113.7, 10.0.0.5, 10.0.0.4"],
+        "203.0.113.7",
+        true,
+    );
+}
+
+/// A field line the proxy appends is read after the one the client sent.
+#[test]
+fn every_forwarded_for_field_line_counts_in_order() {
+    assert_forwarded_client(
+        "10.0.0.2",
+        &[b"192.0.2.66", b"203.0.113.7"],
+        "203.0.113.7",
+        true,
+    );
+}
+
+#[test]
+fn a_chain_of_trusted_hops_only_ends_at_its_leftmost_entry() {
+    assert_forwarded_client("10.0.0.2", &[b"10.0.0.9, 10.0.0.5"], "10.0.0.9", true);
+}
+
+#[test]
+fn entries_may_carry_a_port() {
+    assert_forwarded_client("10.0.0.2", &[b"203.0.113.7:4711"], "203.0.113.7", true);
+    assert_forwarded_client("10.0.0.2", &[b"[2001:db8::7]:4711"], "2001:db8::7", true);
+}
+
+/// An entry that is not an address stops the walk at the trusted hop
+/// that wrote it.
+#[test]
+fn an_unreadable_entry_ends_the_walk_at_its_writer() {
+    assert_forwarded_client("10.0.0.2", &[b"unknown"], "10.0.0.2", false);
+    assert_forwarded_client(
+        "10.0.0.2",
+        &[b"203.0.113.7, unknown, 10.0.0.5"],
+        "10.0.0.5",
+        true,
+    );
+    assert_forwarded_client("10.0.0.2", &[b"203.0.113.7", b"\xff"], "10.0.0.2", false);
+}
+
+#[test]
+fn empty_entries_are_skipped() {
+    assert_forwarded_client("10.0.0.2", &[b"203.0.113.7, , "], "203.0.113.7", true);
+}
+
 #[test]
 fn test_trusted_proxies_bare_ip_converted() {
     let cidrs = vec!["10.0.0.1".to_string()];

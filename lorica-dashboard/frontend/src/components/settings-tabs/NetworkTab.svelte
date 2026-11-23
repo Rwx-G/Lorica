@@ -126,7 +126,9 @@
         {#if trustedProxiesErr}<span class="field-error" role="alert">{trustedProxiesErr}</span>{/if}
         <span class="hint">
           One CIDR range or IP per line. X-Forwarded-For is only trusted from
-          these addresses. Empty = trust no XFF (direct client IP always used).
+          these addresses, and read from the right: the client is the last
+          address in it that is not one of them. Empty = trust no XFF (direct
+          client IP always used).
         </span>
       </div>
 
