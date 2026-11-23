@@ -858,15 +858,12 @@ impl LoricaProxy {
                     "IP auto-banned for rate limit abuse"
                 );
                 if let Some(ref sender) = self.alert_sender {
-                    sender.send(
-                        lorica_notify::AlertEvent::new(
-                            lorica_notify::events::AlertType::IpBanned,
-                            format!("IP {ip} auto-banned for rate limit abuse"),
-                        )
-                        .with_detail("ip", ip.to_string())
-                        .with_detail("violations", violations.to_string())
-                        .with_detail("ban_duration_s", ban_duration.to_string()),
-                    );
+                    sender.send(crate::alerts::ip_banned(
+                        ip,
+                        crate::alerts::BanCause::RateLimitAbuse,
+                        violations,
+                        ban_duration,
+                    ));
                 }
             }
         }
@@ -2325,17 +2322,7 @@ impl LoricaProxy {
                 }
                 // Dispatch waf_alert notification
                 if let (Some(ref sender), Some(ev)) = (&self.alert_sender, events.first()) {
-                    sender.send(
-                        lorica_notify::AlertEvent::new(
-                            lorica_notify::events::AlertType::WafAlert,
-                            format!("WAF blocked {} on {}{}", ev.category.as_str(), host, path),
-                        )
-                        .with_detail("rule_id", ev.rule_id.to_string())
-                        .with_detail("category", ev.category.as_str().to_string())
-                        .with_detail("host", host.to_string())
-                        .with_detail("path", path.to_string())
-                        .with_detail("client_ip", check_ip.unwrap_or("-").to_string()),
-                    );
+                    sender.send(crate::alerts::waf_alert(ev, Some(path)));
                 }
                 ctx.waf_blocked = true;
                 ctx.matched_host = Some(host.to_string());
@@ -2391,18 +2378,12 @@ impl LoricaProxy {
                                     "IP auto-banned for repeated WAF violations (local counter)"
                                 );
                                 if let Some(ref sender) = self.alert_sender {
-                                    sender.send(
-                                        lorica_notify::AlertEvent::new(
-                                            lorica_notify::events::AlertType::IpBanned,
-                                            format!(
-                                                "IP {} auto-banned for repeated WAF violations",
-                                                ip
-                                            ),
-                                        )
-                                        .with_detail("ip", ip.to_string())
-                                        .with_detail("violations", violations.to_string())
-                                        .with_detail("ban_duration_s", ban_duration.to_string()),
-                                    );
+                                    sender.send(crate::alerts::ip_banned(
+                                        ip,
+                                        crate::alerts::BanCause::RepeatedWafViolations,
+                                        violations,
+                                        ban_duration,
+                                    ));
                                 }
                             }
                         }

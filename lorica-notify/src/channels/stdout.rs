@@ -52,12 +52,7 @@ mod tests {
 
     #[test]
     fn test_emit_all_event_types() {
-        for alert_type in [
-            AlertType::CertExpiring,
-            AlertType::BackendDown,
-            AlertType::WafAlert,
-            AlertType::ConfigChanged,
-        ] {
+        for alert_type in AlertType::ALL {
             let event = AlertEvent::new(alert_type, "test");
             emit(&event);
         }

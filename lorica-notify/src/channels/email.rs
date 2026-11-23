@@ -82,12 +82,7 @@ fn email_outcome(result: &Result<(), NotifyError>) -> &'static str {
 /// dispatch-outcome metric is recorded exactly once regardless of which
 /// `?` early-return fires.
 async fn send_message(config: &EmailConfig, event: &AlertEvent) -> Result<(), NotifyError> {
-    let subject = format!(
-        "[Lorica Alert] {} - {}",
-        event.alert_type.label(),
-        event.summary
-    );
-
+    let subject = email_subject(event);
     let body = format_email_body(event);
 
     let email = Message::builder()
@@ -143,6 +138,14 @@ async fn send_message(config: &EmailConfig, event: &AlertEvent) -> Result<(), No
     Ok(())
 }
 
+fn email_subject(event: &AlertEvent) -> String {
+    format!(
+        "[Lorica Alert] {} - {}",
+        event.alert_type.label(),
+        event.summary
+    )
+}
+
 fn format_email_body(event: &AlertEvent) -> String {
     let mut body = format!(
         "Lorica Alert Notification\n\
@@ -190,6 +193,15 @@ mod tests {
         assert!(body.contains("Details:"));
         assert!(body.contains("example.com"));
         assert!(body.contains("days_remaining"));
+    }
+
+    #[test]
+    fn the_subject_names_the_alert_type_in_words() {
+        let event = AlertEvent::new(AlertType::SlaBreached, "SLA breach on app.example.com");
+        assert_eq!(
+            email_subject(&event),
+            "[Lorica Alert] SLA breached - SLA breach on app.example.com"
+        );
     }
 
     #[test]

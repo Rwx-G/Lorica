@@ -37,6 +37,7 @@
 //! If looking to build a (reverse) proxy, see [`lorica-proxy`](https://docs.rs/lorica-proxy) crate.
 
 pub mod ai_bot;
+pub mod alerts;
 pub mod bot;
 pub mod bot_rdns;
 pub mod byte_budget;

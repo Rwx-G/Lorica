@@ -159,7 +159,6 @@ pub(super) fn check_thresholds(collector: &SlaCollector, store: &ConfigStore) ->
         let was_breached = *breach_state.get(&config.route_id).unwrap_or(&false);
         let is_breached = !summary.meets_target;
 
-        let route = crate::route_display_name(store, &config.route_id);
         if is_breached && !was_breached {
             // Transition OK -> breached. Count the breach once per
             // transition (not per sample). The passive-SLA check reduces
@@ -169,6 +168,7 @@ pub(super) fn check_thresholds(collector: &SlaCollector, store: &ConfigStore) ->
                 &config.route_id,
                 crate::metrics::SLA_THRESHOLD_TARGET_PCT,
             );
+            let route = crate::route_display_name(store, &config.route_id);
             let event = AlertEvent::new(
                 AlertType::SlaBreached,
                 format!(
@@ -184,6 +184,7 @@ pub(super) fn check_thresholds(collector: &SlaCollector, store: &ConfigStore) ->
             alerts.push(event);
         } else if !is_breached && was_breached {
             // Transition breached -> OK
+            let route = crate::route_display_name(store, &config.route_id);
             let event = AlertEvent::new(
                 AlertType::SlaRecovered,
                 format!(

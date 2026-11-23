@@ -96,17 +96,29 @@ fn slack_text(event: &AlertEvent) -> String {
         "{} *[{}]* {}\n",
         emoji,
         event.alert_type.label().to_uppercase(),
-        event.summary,
+        escape_slack_text(&event.summary),
     );
 
-    if !event.details.is_empty() {
-        for (key, value) in &event.details {
-            text.push_str(&format!("  - _{key}_: `{value}`\n"));
-        }
+    for (key, value) in &event.details {
+        let value = escape_slack_text(value).replace('`', "'");
+        text.push_str(&format!("  - _{key}_: `{value}`\n"));
     }
 
     text.push_str(&format!("_{}_ | Lorica Reverse Proxy", event.timestamp));
     text
+}
+
+/// `text` safe to place in a Slack message: an alert summary or detail
+/// can carry a hostname or a path a client chose, and must not be able to
+/// ping a channel (`<!channel>`, `<@U...>`) or, on Discord's
+/// Slack-compatible endpoint, `@everyone`. Slack's own escaping covers
+/// `&`, `<` and `>`; a zero-width space after `@` defuses Discord's
+/// plain-text mentions.
+fn escape_slack_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('@', "@\u{200B}")
 }
 
 #[cfg(test)]
@@ -121,16 +133,28 @@ mod tests {
         let text = slack_text(&event);
         assert!(
             text.starts_with(
-                ":chart_with_downwards_trend: *[SLA BREACHED]* SLA breach on app.example.com
-"
+                ":chart_with_downwards_trend: *[SLA BREACHED]* SLA breach on app.example.com\n"
             ),
             "{text}"
         );
+        assert!(text.contains("  - _route_: `app.example.com`\n"), "{text}");
+    }
+
+    /// A host or path a client chose reaches WAF alerts: it must not be
+    /// able to mention a channel, or break out of a detail's code span.
+    #[test]
+    fn client_text_cannot_mention_or_escape_a_code_span() {
+        let event = AlertEvent::new(
+            AlertType::WafAlert,
+            "WAF blocked xss on <!channel> @everyone",
+        )
+        .with_detail("host", "a`<@U123>`b & c");
+        let text = slack_text(&event);
+        assert!(!text.contains("<!channel>"), "{text}");
+        assert!(!text.contains("<@U123>"), "{text}");
+        assert!(!text.contains("@everyone"), "{text}");
         assert!(
-            text.contains(
-                "  - _route_: `app.example.com`
-"
-            ),
+            text.contains("  - _host_: `a'&lt;@\u{200B}U123&gt;'b &amp; c`\n"),
             "{text}"
         );
     }
