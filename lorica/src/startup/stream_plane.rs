@@ -489,7 +489,19 @@ struct Sent {
 #[derive(Debug, Default)]
 struct SlotRun {
     sent: Vec<Sent>,
-    stale: Vec<StreamCtlMsg>,
+    stale: Vec<Stale>,
+}
+
+/// A worker message read while the answer to another was awaited, kept
+/// for the end of the pass. Only what a worker may send is kept: a
+/// message of any other kind is dropped on receipt, closing the fds it
+/// carries.
+#[derive(Debug)]
+enum Stale {
+    /// A late `ack` (`acked`) or `nack`.
+    Answer { seq: u64, acked: bool },
+    /// A drain report message.
+    Report(StreamCtlMsg),
 }
 
 struct WorkerSlot<L> {
@@ -626,7 +638,7 @@ impl<L: WorkerLink> WorkerSlot<L> {
         worker: u32,
         msg: StreamCtlMsg,
         timeout: Duration,
-        stale: &mut Vec<StreamCtlMsg>,
+        stale: &mut Vec<Stale>,
     ) -> Answer {
         let seq = msg.seq();
         let Some(link) = self.link.as_mut() else {
@@ -653,7 +665,24 @@ impl<L: WorkerLink> WorkerSlot<L> {
                 Ok(Ok(StreamCtlMsg::Nack { seq: s, reason })) if s == seq => {
                     return Answer::Nack(reason)
                 }
-                Ok(Ok(other)) => stale.push(other),
+                Ok(Ok(StreamCtlMsg::Ack { seq: late, .. })) => stale.push(Stale::Answer {
+                    seq: late,
+                    acked: true,
+                }),
+                Ok(Ok(StreamCtlMsg::Nack { seq: late, .. })) => stale.push(Stale::Answer {
+                    seq: late,
+                    acked: false,
+                }),
+                Ok(Ok(
+                    report @ (StreamCtlMsg::Drained { .. } | StreamCtlMsg::DrainedEnd { .. }),
+                )) => stale.push(Stale::Report(report)),
+                Ok(Ok(other)) => {
+                    warn!(
+                        worker_id = worker,
+                        seq = other.seq(),
+                        "unexpected message from a worker on the stream control channel dropped"
+                    );
+                }
                 Ok(Err(e @ LinkError::Lost(_))) => {
                     warn!(worker_id = worker, error = %e, "stream control channel lost");
                     self.link = None;
@@ -1905,24 +1934,15 @@ impl<L: WorkerLink> StreamPlane<L> {
         }
     }
 
-    fn late_answer(&mut self, worker: u32, msg: StreamCtlMsg) {
-        let (seq, acked) = match msg {
-            StreamCtlMsg::Ack { seq, .. } => (seq, true),
-            StreamCtlMsg::Nack { seq, .. } => (seq, false),
+    fn late_answer(&mut self, worker: u32, stale: Stale) {
+        let (seq, acked) = match stale {
+            Stale::Answer { seq, acked } => (seq, acked),
             // A drain report read while another answer was awaited: kept
             // for the collection that follows the workers' exit.
-            report @ (StreamCtlMsg::Drained { .. } | StreamCtlMsg::DrainedEnd { .. }) => {
+            Stale::Report(report) => {
                 if let Some(slot) = self.workers.get_mut(&worker) {
                     slot.reports.push(report);
                 }
-                return;
-            }
-            other => {
-                warn!(
-                    worker_id = worker,
-                    seq = other.seq(),
-                    "unexpected message from a worker on the stream control channel"
-                );
                 return;
             }
         };
@@ -3178,6 +3198,50 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(bindable(first + 1));
+    }
+
+    /// A worker sends answers and drain reports only: anything else read
+    /// while an answer is awaited is dropped at once, which closes the
+    /// fds it carries, instead of being held until the pass ends.
+    #[tokio::test]
+    async fn a_worker_message_that_answers_nothing_is_dropped_with_its_fds() {
+        use std::io::Read;
+
+        let (carried, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut link, _) = FakeLink::new(&[]);
+        link.outbox.push_back(StreamCtlMsg::Attach {
+            seq: 7,
+            stream_id: "a".into(),
+            bind_gen: 1,
+            sockets: vec![StreamSocket {
+                proto: StreamProto::Tcp,
+                addr: "127.0.0.1:1".parse().unwrap(),
+                fd: OwnedFd::from(carried),
+            }],
+        });
+        let mut slot = WorkerSlot::new(link);
+        let mut stale = Vec::new();
+
+        let answer = slot
+            .exchange(
+                0,
+                StreamCtlMsg::Refresh {
+                    seq: 1,
+                    drain_ms: 0,
+                },
+                TEST_ACK_TIMEOUT,
+                &mut stale,
+            )
+            .await;
+
+        assert_eq!(answer, Answer::Ack);
+        peer.set_nonblocking(true).unwrap();
+        let read = (&peer).read(&mut [0u8; 1]);
+        assert!(
+            matches!(read, Ok(0)),
+            "the carried fd is still open: {read:?}"
+        );
+        assert!(stale.is_empty());
     }
 
     #[tokio::test]
