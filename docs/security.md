@@ -592,8 +592,14 @@ anywhere in the line, or a request whose path or `Host` contains
 failregex = request completed with error client_ip=<HOST> .* error=IP banned$
 ```
 
+The WAF `rules matched` warnings (request and body, detection and
+blocking) lead with `client_ip` the same way, so a filter on those lines
+anchors after their message too.
+
 In the default JSON format the field is `"client_ip":"<address>"`, and
-JSON escaping keeps a client's text from forming that sequence.
+JSON escaping keeps a client's text from forming that sequence. The text
+format carries colour escapes only when stdout is a terminal, so
+`docker logs` and the journal hold the plain line shown above.
 
 ### Management plane authentication (v1.6.0)
 

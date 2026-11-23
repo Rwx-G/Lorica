@@ -25,7 +25,7 @@ Behind a trusted proxy, `X-Forwarded-For` is read from the right, so a client ca
 
 ### Added
 
-- **The console request lines carry the client address (#63).** `request completed` and `request completed with error`, the lines `docker logs` and journald show for every request, now start with `client_ip`: the address the access log, the bans and the rate limits use, read from `X-Forwarded-For` only behind a trusted proxy. It is the first field so that a filter anchored right after the message can never read an address a client planted in the path or the `Host` header, which follow it. A tool such as Fail2ban can count `error=IP banned` per address from the console output alone; `docs/security.md` gives a filter anchored that way. The OpenTelemetry `http_request` span records the same address as `client.address`.
+- **The console request lines carry the client address (#63).** `request completed` and `request completed with error`, the lines `docker logs` and journald show for every request, now start with `client_ip`: the address the access log, the bans and the rate limits use, read from `X-Forwarded-For` only behind a trusted proxy. It is the first field so that a filter anchored right after the message can never read an address a client planted in the path or the `Host` header, which follow it. A tool such as Fail2ban can count `error=IP banned` per address from the console output alone; `docs/security.md` gives a filter anchored that way. The OpenTelemetry `http_request` span records the same address as `client.address`. The WAF `rules matched` warnings, for the request and for the body, lead with the same `client_ip` field (from #64).
 
 ### Changed
 
