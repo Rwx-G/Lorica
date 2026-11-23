@@ -21,6 +21,8 @@ Author: Rwx-G
 
 ### Security
 
+- Dependencies refreshed to clear two advisories: `cookie` 0.18.3 (RUSTSEC-2026-0594) and `url` 2.5.9 (RUSTSEC-2026-0592, with `form_urlencoded` 1.2.3).
+
 ## [1.10.9] - 2026-11-20
 
 A cluster's control plane shows its own access logs, WAF events and bans again, and no page offers an action on the control plane's data while it shows a follower's. Dashboard only, no schema migration.
