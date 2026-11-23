@@ -147,11 +147,16 @@ impl StreamAlerts {
         } else {
             &stream_name
         };
+        // Named as the dashboard lists the backend, as `backend_down` is.
+        let backend_shown = match backend.map(|b| b.name.as_str()) {
+            Some(name) if !name.is_empty() => format!("{name} ({backend_address})"),
+            _ => backend_address.to_string(),
+        };
         Some(
             AlertEvent::new(
                 AlertType::StreamBackendDown,
                 format!(
-                    "stream `{shown}`: backend {backend_address} is down on {}, its circuit breaker opened",
+                    "stream `{shown}`: backend {backend_shown} is down on {}, its circuit breaker opened",
                     self.node
                 ),
             )
@@ -264,6 +269,49 @@ mod tests {
             Arc::new(StreamTable::new(streams, &[])),
             Some(CeilingBound::FdBudget),
         );
+    }
+
+    #[test]
+    fn a_backend_alert_names_the_backend_by_its_label() {
+        let alerts = alerts();
+        let backend: lorica_config::models::Backend = serde_json::from_value(serde_json::json!({
+            "id": "b1",
+            "address": ADDRESS,
+            "name": "dns-1",
+            "weight": 100,
+            "health_status": "healthy",
+            "health_check_enabled": false,
+            "health_check_interval_s": 10,
+            "lifecycle_state": "normal",
+            "active_connections": 0,
+            "tls_upstream": false,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        }))
+        .expect("test setup: a backend");
+        alerts.table_changed(
+            Arc::new(StreamTable::with_backends(
+                vec![udp_stream("s1", 100)],
+                &[lorica_config::models::StreamBackend::primary("s1", "b1")],
+                vec![backend],
+            )),
+            Some(CeilingBound::FdBudget),
+        );
+        let alert = alerts
+            .breaker_opened_at("s1", ADDRESS, Instant::now())
+            .expect("the first incident alerts");
+        assert_eq!(
+            alert.summary,
+            format!(
+                "stream `s1-name`: backend dns-1 ({ADDRESS}) is down on node01, \
+                 its circuit breaker opened"
+            )
+        );
+        // An address no linked backend holds is named by the address.
+        let unknown = alerts
+            .breaker_opened_at("s1", "192.0.2.11:53", Instant::now())
+            .expect("another pair alerts");
+        assert!(unknown.summary.contains("backend 192.0.2.11:53 is down"));
     }
 
     #[test]
