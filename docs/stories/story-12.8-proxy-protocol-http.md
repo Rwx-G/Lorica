@@ -86,15 +86,18 @@ Read, not run, unless said otherwise.
   `rewind_read_buf` are not.
 - **Client address resolution in Lorica**, all from
   `session.client_addr()`:
-  - `resolve_client_ip` (`lorica/src/proxy_wiring/filters.rs`) reads the
-    leftmost `X-Forwarded-For` entry when the socket peer is in
-    `trusted_proxies`, and stamps `ctx.client_ip`, `ctx.client_ip_addr`,
+  - `resolve_client_ip` (`lorica/src/proxy_wiring/filters.rs`) read the
+    leftmost `X-Forwarded-For` entry when the socket peer was in
+    `trusted_proxies` (since 1.10.10 it reads the header from the right,
+    `helpers::forwarded_client`, and `X-Forwarded-Proto` under the same
+    trust), and stamps `ctx.client_ip`, `ctx.client_ip_addr`,
     `ctx.is_xff`, `ctx.xff_proxy_ip`. Access logs, WAF, the ban list and
     blocklist, GeoIP, rate limits, bot protection, the consistent-hash
     key, capture and forward-auth all read `ctx`.
-  - `check_bot_endpoints` (same file) repeats the `trusted_proxies` and
-    `X-Forwarded-For` logic for the bot solve path, which returns before
-    `resolve_client_ip` runs.
+  - `check_bot_endpoints` (same file) repeated the `trusted_proxies` and
+    `X-Forwarded-For` logic for the bot solve path, which returned before
+    `resolve_client_ip` ran (since 1.10.10 `resolve_client_ip` runs first
+    and the solve path reads `ctx`).
   - `is_purge` (`lorica/src/proxy_wiring.rs`) admits `PURGE` from a
     loopback or `trusted_proxies` socket peer.
   - `upstream_request_filter` (`lorica/src/proxy_wiring.rs`) sets

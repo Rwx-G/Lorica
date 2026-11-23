@@ -170,8 +170,8 @@ pub(crate) fn parse_cidrs_skipping(entries: &[String], field: &str) -> Vec<ipnet
 }
 
 /// Whether the client's `X-Forwarded-For` may name the client of
-/// `session`: the one rule every reader of that header goes through
-/// (Story 12.8 D-g).
+/// `session`, and its `X-Forwarded-Proto` the scheme: the one rule every
+/// reader of those headers goes through (Story 12.8 D-g).
 ///
 /// The header is read when the socket peer is in `trusted_proxies`, and
 /// never on a connection whose client address came from a PROXY header,
@@ -641,8 +641,8 @@ impl LoricaProxy {
     /// entry [`forwarded_client`] attributes the request to when
     /// [`forwarded_for_is_trusted`] admits the connection - stamps
     /// `ctx.client_ip`, `ctx.client_ip_addr`, `ctx.is_xff`,
-    /// `ctx.xff_proxy_ip`, `ctx.forwarded_proto` (same trust) and
-    /// `ctx.source`, and returns the IP string every later
+    /// `ctx.xff_proxy_ip`, `ctx.forwarded_proto` (read under the same
+    /// rule) and `ctx.source`, and returns the IP string every later
     /// check keys on.
     pub(super) fn resolve_client_ip(
         &self,
@@ -661,10 +661,7 @@ impl LoricaProxy {
             if forwarding_trusted {
                 forwarded_client(peer, req, &config.trusted_proxies)
             } else {
-                ForwardedClient {
-                    ip: peer.to_canonical(),
-                    via_forwarded_for: false,
-                }
+                ForwardedClient::peer(peer)
             }
         });
 
@@ -681,8 +678,11 @@ impl LoricaProxy {
         } else {
             None
         };
-        ctx.forwarded_proto =
-            peer.and_then(|peer| forwarded_proto(peer, req, &config.trusted_proxies));
+        ctx.forwarded_proto = if forwarding_trusted {
+            forwarded_proto(req)
+        } else {
+            None
+        };
         ctx.source = req
             .headers
             .get("x-lorica-source")

@@ -1887,13 +1887,15 @@ fn the_upstream_forwarded_for_keeps_every_line_then_the_peer() {
     );
 }
 
+/// The scheme a direct connection from `peer` reports, read under the
+/// rule `resolve_client_ip` applies (`forwarded_for_trusted_from`).
 fn forwarded_proto_from(peer: &str, lines: &[&[u8]]) -> Option<&'static str> {
     let trusted: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
-    forwarded_proto(
-        peer.parse().unwrap(),
-        &request_with("X-Forwarded-Proto", lines),
-        &trusted,
-    )
+    let peer: std::net::IpAddr = peer.parse().unwrap();
+    if !super::filters::forwarded_for_trusted_from(Some(peer), false, &trusted) {
+        return None;
+    }
+    forwarded_proto(&request_with("X-Forwarded-Proto", lines))
 }
 
 #[test]
@@ -4750,6 +4752,71 @@ mod proxy_protocol_client_address {
         assert!(!forwarded_for_trusted_from(None, false, &trusted));
         // Proxied: never, even when the carried address is itself trusted.
         assert!(!forwarded_for_trusted_from(Some(carried), true, &trusted));
+        // An IPv4-mapped peer is the IPv4 address it carries.
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().expect("literal");
+        assert!(forwarded_for_trusted_from(Some(mapped), false, &trusted));
+        assert!(!forwarded_for_trusted_from(Some(mapped), true, &trusted));
+    }
+
+    fn get_with_forged_xff_and_proto() -> String {
+        format!(
+            "GET / HTTP/1.1\r\nHost: example.com\r\nX-Forwarded-For: {FORGED}\r\n\
+             X-Forwarded-Proto: https\r\n\r\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn a_proxied_connection_ignores_forwarded_for_and_forwarded_proto() {
+        // Both headers go through the one rule: with the balancer and
+        // the carried address both in `trusted_proxies`, neither the
+        // forged client nor the claimed scheme is believed.
+        let (proxy, config) = proxy(&["127.0.0.0/8", "203.0.113.0/24"]);
+        let (session, _client) = session(Some(CARRIED), &get_with_forged_xff_and_proto()).await;
+        let mut ctx = proxy.new_ctx();
+        let resolved = proxy.resolve_client_ip(&session, &mut ctx, &config);
+        assert_eq!(resolved.as_deref(), Some(CARRIED));
+        assert!(!ctx.is_xff);
+        assert_eq!(ctx.forwarded_proto, None);
+    }
+
+    #[tokio::test]
+    async fn a_direct_trusted_peer_reports_the_client_and_the_scheme() {
+        // The same request on a direct connection from the trusted
+        // loopback peer: both headers are read, the client from the
+        // right of `X-Forwarded-For`.
+        let (proxy, config) = proxy(&["127.0.0.0/8"]);
+        let (session, _client) = session(None, &get_with_forged_xff_and_proto()).await;
+        let mut ctx = proxy.new_ctx();
+        let resolved = proxy.resolve_client_ip(&session, &mut ctx, &config);
+        assert_eq!(resolved.as_deref(), Some(FORGED));
+        assert!(ctx.is_xff);
+        assert_eq!(ctx.forwarded_proto, Some("https"));
+    }
+
+    #[tokio::test]
+    async fn a_proxied_plain_http_request_reaches_the_backend_as_http() {
+        // The scheme a client claims on a PROXY connection is not sent
+        // upstream: the connection is plain HTTP, and so is the header.
+        let (proxy, config) = proxy(&["127.0.0.0/8", "203.0.113.0/24"]);
+        let (mut session, _client) = session(Some(CARRIED), &get_with_forged_xff_and_proto()).await;
+        let mut ctx = proxy.new_ctx();
+        proxy.resolve_client_ip(&session, &mut ctx, &config);
+        ctx.route_snapshot = Some(Arc::new(make_route("r-pp", "example.com", "/", true)));
+        let mut upstream =
+            lorica_http::RequestHeader::build("GET", b"/", None).expect("test setup: header");
+        proxy
+            .upstream_request_filter(&mut session, &mut upstream, &mut ctx)
+            .await
+            .expect("the filter runs");
+        let header = |name: &str| {
+            upstream
+                .headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        assert_eq!(header("x-forwarded-proto").as_deref(), Some("http"));
+        assert_eq!(header("x-real-ip").as_deref(), Some(CARRIED));
     }
 
     #[tokio::test]

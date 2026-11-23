@@ -236,7 +236,22 @@ pub(crate) struct ForwardedClient {
     pub via_forwarded_for: bool,
 }
 
+impl ForwardedClient {
+    /// The connection's own client address, `X-Forwarded-For` unread.
+    /// An IPv4-mapped address is the IPv4 address it carries.
+    pub(crate) fn peer(peer: std::net::IpAddr) -> Self {
+        Self {
+            ip: peer.to_canonical(),
+            via_forwarded_for: false,
+        }
+    }
+}
+
 /// Resolve the client of a request that reached Lorica from `peer`.
+///
+/// A request reaches this walk only once `filters::forwarded_for_is_trusted`
+/// admits its connection, which also refuses one whose client address
+/// came from a PROXY header (Story 12.8 D-g).
 ///
 /// `X-Forwarded-For` is read only when `peer` is in `trusted`, and then
 /// from the right: each entry was written by the hop to its right, so an
@@ -264,10 +279,7 @@ pub(crate) fn forwarded_client(
     trusted: &[ipnet::IpNet],
 ) -> ForwardedClient {
     let is_trusted = |ip: &std::net::IpAddr| trusted.iter().any(|net| net.contains(ip));
-    let mut client = ForwardedClient {
-        ip: peer.to_canonical(),
-        via_forwarded_for: false,
-    };
+    let mut client = ForwardedClient::peer(peer);
     if !is_trusted(&client.ip) {
         return client;
     }
@@ -317,24 +329,18 @@ pub(crate) fn upstream_forwarded_for(req: &lorica_http::RequestHeader, peer: &st
     value
 }
 
-/// The scheme `X-Forwarded-Proto` names for a request that reached Lorica
-/// from `peer`, read under the same trust as `X-Forwarded-For`: only when
-/// `peer` is in `trusted`. From any other peer the header is the client's
-/// own claim, and believing it would let a plain-HTTP client skip
-/// `force_https` and tell the backend its connection was encrypted.
+/// The scheme `X-Forwarded-Proto` names in `req`. The caller reads it
+/// under the same rule as `X-Forwarded-For`,
+/// `filters::forwarded_for_is_trusted`: only from a socket peer in
+/// `trusted_proxies`, and never on a connection whose client address came
+/// from a PROXY header. From any other connection the header is the
+/// client's own claim, and believing it would let a plain-HTTP client
+/// skip `force_https` and tell the backend its connection was encrypted.
 ///
 /// Only `http` or `https`, in any case, is read. Any other value is
 /// ignored, so it can never become the scheme of a `Location` Lorica
 /// writes.
-pub(crate) fn forwarded_proto(
-    peer: std::net::IpAddr,
-    req: &lorica_http::RequestHeader,
-    trusted: &[ipnet::IpNet],
-) -> Option<&'static str> {
-    let peer = peer.to_canonical();
-    if !trusted.iter().any(|net| net.contains(&peer)) {
-        return None;
-    }
+pub(crate) fn forwarded_proto(req: &lorica_http::RequestHeader) -> Option<&'static str> {
     let value = req.headers.get("x-forwarded-proto")?.as_bytes();
     if value.eq_ignore_ascii_case(b"https") {
         Some("https")

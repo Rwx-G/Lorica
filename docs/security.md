@@ -186,7 +186,9 @@ timeout every direct client already has.
 **Precedence: no stacking.** On a connection whose client address came
 from a PROXY header, the client's `X-Forwarded-For` is never read,
 whatever `trusted_proxies` holds, even when the carried address is
-itself in `trusted_proxies`. A trusted peer whose header carried no
+itself in `trusted_proxies`, and neither is its `X-Forwarded-Proto`: the
+scheme of such a connection is the one Lorica sees, `https` when it
+terminated TLS and `http` otherwise. A trusted peer whose header carried no
 address (`LOCAL`, `UNKNOWN`) or that sent none under `optional` is a
 direct connection from that peer and follows the `trusted_proxies` rule
 on its socket address, as before. The two lists may overlap; nothing
@@ -672,19 +674,26 @@ per request before any stage can answer it:
   entry that is not an IP stops the reading at the trusted hop that wrote
   it. What a client writes into the header itself sits left of what the
   trusted proxy appends, so it is never picked.
+- On a connection whose client address came from a PROXY header (v1.11.0,
+  see "Client address from a PROXY header" above), the carried address.
+  `X-Forwarded-For` is ignored whatever `trusted_proxies` holds, even when
+  the balancer or the carried address is in it: the balancer already
+  named the client, and a header the client wrote cannot override it.
+  This is one rule for both headers, applied in one place.
 
 The result is only as narrow as `trusted_proxies`: a range clients can
 also connect from, or a front proxy that passes the header through
 without appending, lets a client choose its address again.
 
 `X-Forwarded-Proto` follows the same trust. On a plain-HTTP connection
-from a peer inside `trusted_proxies`, its value decides the scheme
-`force_https` and `redirect_hostname` see and the `X-Forwarded-Proto`
-sent upstream, provided it is `http` or `https`; any other value is
-ignored. From any other peer the header is ignored and a plain-HTTP
-connection is `http`, so a client cannot skip `force_https` or tell a
-backend its connection was encrypted. A connection Lorica terminated
-TLS on is `https` whatever the header says.
+from a peer inside `trusted_proxies` that did not come through a PROXY
+header, its value decides the scheme `force_https` and
+`redirect_hostname` see and the `X-Forwarded-Proto` sent upstream,
+provided it is `http` or `https`; any other value is ignored. From any
+other peer, and on a PROXY-header connection, the header is ignored and
+a plain-HTTP connection is `http`, so a client cannot skip `force_https`
+or tell a backend its connection was encrypted. A connection Lorica
+terminated TLS on is `https` whatever the header says.
 
 Up to 1.10.9 the header was believed from any peer. A deployment behind
 a proxy that terminates TLS and forwards plain HTTP to a `force_https`
