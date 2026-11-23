@@ -679,6 +679,12 @@ the count of workers serving it from the acks.
   listener, a UDP stream's socket for that worker slot) and a refresh.
   The connections the dead worker held are gone with its process and
   end without an access-log row: that is a crash, not a drain.
+- **A stream loop or the stream thread dies** while the process lives
+  (a panic, or a loop that ends without being told to). Nothing
+  restarts it in place: the worker exits with status 70 and takes the
+  path above, so a UDP slot is never left in its group with nobody
+  reading it (Story 12.2 D-b, `docs/streams.md`, "A crash of the stream
+  runtime").
 - **UDP slots across a worker death.** The supervisor keeps every UDP
   slot socket for the binding's whole life. The kernel picks a socket
   of a `SO_REUSEPORT` group by a hash of the 4-tuple scaled to the

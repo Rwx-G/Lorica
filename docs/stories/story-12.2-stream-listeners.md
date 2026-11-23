@@ -277,8 +277,21 @@ single-process mode the process exits non-zero and systemd restarts it
 (`Restart=on-failure` in `dist/lorica.service`). A panic inside one
 connection's or session's task stays contained, its access-log row
 lost. What it gives up: the HTTP side of that worker for the restart
-time, in exchange for no silent blackhole. The change ships with the
-audit's code lot for C7; until it lands, nothing watches the thread.
+time, in exchange for no silent blackhole.
+
+*As built (2026-11-24, audit lot C):* each loop catches its own panic
+at the loop (the UDP engine runs inline in the receive loop, so its
+panic is the loop's) and reports it, or an end its mode did not ask
+for, as a `StreamDeath`; the control thread catches a panic of `run`
+the same way. `StreamRuntimeHandle::died` carries the first death. A
+`lorica-stream-watch` thread in the worker and in single-process mode
+logs it once at error level with the stream, protocol and panic
+message, flushes the stream log rows, the SLA minute and the OTel
+spans as the drain exit does, and exits with status 70 (`EX_SOFTWARE`).
+The "counted reason" is that exit status, which the supervisor's
+`worker exited` line carries: no metric counts it, because the process
+holding the counters is the one exiting and the supervisor keeps no
+per-reason exit counter.
 
 *Before Story 12.3 lands on the branch,* the worker installs no engine:
 the accept loop closes an accepted TCP connection at once and drops a
@@ -1742,3 +1755,4 @@ the budget view stays Operator and SuperAdmin.
 | 2026-11-18 | 0.13 | Lot G, the `docs/streams.md`, README and CHANGELOG parts: bind states, the fd budget, the listen-address rule and the stop drain documented; the other Lot G items stay open. Status InProgress. | Romain G. |
 | 2026-11-18 | 0.14 | Lot G closed: `lorica-stream` in the crate lists, `5104a3e0` and `4a9d66d8` ruled out in `FORK.md` and dropped from backlog #81; a dated note under D-f on `stop_grace_period`. | Romain G. |
 | 2026-11-21 | 0.15 | Phase 1 audit, finding C7: maintainer decision recorded under D-b, a dead stream loop or thread makes the worker exit non-zero and respawn (single-process: the process exits for systemd); the code ships with the audit's code lot. | Romain G. |
+| 2026-11-24 | 0.16 | Phase 1 audit lot C, finding C7 built: loops and the control thread report their death through `StreamRuntimeHandle::died`, the worker and single-process mode exit with status 70; the "as built" note under D-b. | Romain G. |

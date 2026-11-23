@@ -643,6 +643,25 @@ pub(crate) fn run_single_process(cli: Cli) {
         // Flushed at exit, after the drain (see the stop path below).
         let exit_sla_collector = Arc::clone(&sla_collector);
         let exit_stream_sla_collector = Arc::clone(&stream_sla_collector);
+        // A dead stream loop or thread is fatal to the process (Story
+        // 12.2 D-b): systemd restarts it with its streams.
+        let died_log_store = log_store.clone();
+        let died_sla = (
+            Arc::clone(&store),
+            Arc::clone(&sla_collector),
+            Arc::clone(&stream_sla_collector),
+        );
+        if let Err(e) = startup::worker::exit_when_stream_runtime_dies(
+            stream_runtime.died(),
+            move || {
+                lorica::stream_log::flush_rows_at_exit_blocking(&died_log_store);
+                startup::worker::flush_sla_at_exit(&died_sla.0, &died_sla.1, &died_sla.2);
+                lorica::otel::shutdown();
+            },
+        ) {
+            error!(error = %e, "stream runtime watcher not started");
+            std::process::exit(1);
+        }
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store.clone(),

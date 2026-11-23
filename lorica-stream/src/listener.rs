@@ -24,12 +24,19 @@
 //! wide port range costs no buffer per socket and a datagram costs no
 //! allocation (Story 12.5 D-h). It keeps serving while its binding
 //! drains (D-m) and stops only when told to.
+//!
+//! A loop that panics, which on UDP includes a panic of the engine it
+//! runs inline, or that ends without being told to, raises the runtime's
+//! [`StreamDeath`] (Story 12.2 D-b).
 
 use std::cell::RefCell;
+use std::future::Future;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, SockaddrStorage};
@@ -44,6 +51,7 @@ use lorica_worker::fd_passing::StreamProto;
 use crate::caps::CapsRegistry;
 use crate::handler::{AcceptedConnection, Datagram, Engines};
 use crate::local::BoundPorts;
+use crate::runtime::{panic_message, DeathSignal, StreamDeath};
 use crate::table::SharedTable;
 use crate::tracker::ConnectionTracker;
 
@@ -98,6 +106,15 @@ pub(crate) struct LoopContext {
     pub(crate) engines: Engines,
     pub(crate) bound_ports: BoundPorts,
     pub(crate) caps: CapsRegistry,
+    pub(crate) death: DeathSignal,
+}
+
+/// How a loop ended.
+enum LoopEnd {
+    /// Its mode told it to stop, or the mode's sender went away.
+    Asked,
+    /// On its own, for this reason.
+    Unasked(String),
 }
 
 /// A socket adopted from an `attach`, ready for its loop.
@@ -113,6 +130,13 @@ impl AdoptedSocket {
         match self {
             AdoptedSocket::Tcp(listener) => listener.local_addr().map(|a| a.port()),
             AdoptedSocket::Udp(socket) => socket.local_addr().map(|a| a.port()),
+        }
+    }
+
+    fn proto(&self) -> StreamProto {
+        match self {
+            AdoptedSocket::Tcp(_) => StreamProto::Tcp,
+            AdoptedSocket::Udp(_) => StreamProto::Udp,
         }
     }
 }
@@ -149,11 +173,38 @@ pub(crate) fn adopt(proto: StreamProto, fd: OwnedFd) -> io::Result<AdoptedSocket
 }
 
 /// Serve `socket` until `mode` stops it or its sender goes away. The
-/// socket is closed when this returns.
+/// socket is closed when this returns. A panic of the loop is caught
+/// here, at the loop, so that it and an end nobody asked for raise the
+/// runtime's death rather than leave the socket unread.
 pub(crate) async fn run(socket: AdoptedSocket, ctx: LoopContext, mode: watch::Receiver<LoopMode>) {
-    match socket {
-        AdoptedSocket::Tcp(listener) => accept_loop(listener, ctx, mode).await,
-        AdoptedSocket::Udp(socket) => receive_loop(socket, ctx, mode).await,
+    let proto = socket.proto();
+    let death = ctx.death.clone();
+    let stream_id = ctx.stream_id.clone();
+    let bind_gen = ctx.bind_gen;
+    let mut serving = Box::pin(async move {
+        match socket {
+            AdoptedSocket::Tcp(listener) => accept_loop(listener, ctx, mode).await,
+            AdoptedSocket::Udp(socket) => receive_loop(socket, ctx, mode).await,
+        }
+    });
+    let end = std::future::poll_fn(|cx| {
+        match panic::catch_unwind(AssertUnwindSafe(|| serving.as_mut().poll(cx))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(end)) => Poll::Ready(end),
+            Err(payload) => Poll::Ready(LoopEnd::Unasked(format!(
+                "panicked: {}",
+                panic_message(&*payload)
+            ))),
+        }
+    })
+    .await;
+    if let LoopEnd::Unasked(cause) = end {
+        death.raise(StreamDeath::Loop {
+            stream_id,
+            bind_gen,
+            proto,
+            cause,
+        });
     }
 }
 
@@ -168,11 +219,15 @@ async fn reached(mode: &mut watch::Receiver<LoopMode>, until: impl FnMut(&LoopMo
 /// listening socket is one kernel object shared with the supervisor and,
 /// across a hot upgrade, with the new generation's workers, and a
 /// `shutdown` would stop their accepts too (Story 12.11 D-c).
-async fn accept_loop(listener: TcpListener, ctx: LoopContext, mut mode: watch::Receiver<LoopMode>) {
+async fn accept_loop(
+    listener: TcpListener,
+    ctx: LoopContext,
+    mut mode: watch::Receiver<LoopMode>,
+) -> LoopEnd {
     loop {
         let accepted = tokio::select! {
             biased;
-            _ = reached(&mut mode, |m| *m != LoopMode::Serving) => return,
+            _ = reached(&mut mode, |m| *m != LoopMode::Serving) => return LoopEnd::Asked,
             accepted = listener.accept() => accepted,
         };
         let (stream, peer) = match accepted {
@@ -212,14 +267,10 @@ async fn receive_loop(
     socket: Arc<UdpSocket>,
     ctx: LoopContext,
     mut mode: watch::Receiver<LoopMode>,
-) {
+) -> LoopEnd {
     let bound = match socket.local_addr() {
         Ok(addr) => addr,
-        Err(e) => {
-            warn!(stream_id = %ctx.stream_id, bind_gen = ctx.bind_gen, error = %e,
-                  "stream UDP socket has no local address; not served");
-            return;
-        }
+        Err(e) => return LoopEnd::Unasked(format!("the socket has no local address: {e}")),
     };
     // Only a wildcard socket asked for the destination (Lot A sets
     // `IP_PKTINFO` / `IPV6_RECVPKTINFO` on unspecified addresses only).
@@ -227,7 +278,7 @@ async fn receive_loop(
     loop {
         let ready = tokio::select! {
             biased;
-            _ = reached(&mut mode, |m| *m == LoopMode::Stopped) => return,
+            _ = reached(&mut mode, |m| *m == LoopMode::Stopped) => return LoopEnd::Asked,
             ready = socket.readable() => ready,
         };
         if let Err(e) = ready {

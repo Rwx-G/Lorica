@@ -1757,6 +1757,33 @@ draining once a later release transfers TCP passthrough connections and
 UDP sessions to the new binary (Story 12.16, planned for 1.12.0 after a
 feasibility spike): those whose TLS Lorica terminates or originates.
 
+### A crash of the stream runtime
+
+A process's streams run on their own thread, `lorica-stream`, beside
+HTTP. If that thread panics, or a TCP accept loop or a UDP receive loop
+panics or ends without having been told to stop, **the process exits**
+rather than keep serving HTTP with a stream that no longer reads its
+socket. A UDP loop that died silently would otherwise leave its slot in
+the port's `SO_REUSEPORT` group, and the kernel would keep handing it a
+share of the clients whose datagrams nobody reads.
+
+- In worker mode the worker logs the cause once at error level
+  (`the stream runtime died; exiting so the process restarts with its
+  streams`, with the stream, protocol and panic message) and exits with
+  status 70. The supervisor logs `worker exited` with that status,
+  respawns the worker after its usual backoff and replays every live
+  stream binding to it, as for any worker crash. The other workers keep
+  serving throughout.
+- In single-process mode the process logs the same line and exits with
+  status 70; systemd restarts it (`Restart=on-failure` in the packaged
+  unit). Without systemd, the container's restart policy decides.
+
+What the exit costs: the HTTP requests and stream connections of that
+process are cut, and its connections write no access-log row. A panic
+inside one connection's or one session's own task is different: it ends
+that connection only, the process keeps running, and that connection's
+access-log row is lost.
+
 ### Which end reason, when
 
 | What happened | End reason of the connections it closes |

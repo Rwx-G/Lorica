@@ -864,6 +864,18 @@ pub(crate) fn run_worker(
         Arc::clone(&stream_sla_collector),
     );
     let served_sla = exit_sla.clone();
+    // A dead stream loop or thread is fatal to the worker (Story 12.2
+    // D-b): the supervisor respawns it and replays its streams.
+    let died_log_store = worker_log_store.clone();
+    let died_sla = exit_sla.clone();
+    if let Err(e) = exit_when_stream_runtime_dies(stream_runtime.died(), move || {
+        lorica::stream_log::flush_rows_at_exit_blocking(&died_log_store);
+        flush_sla_at_exit(&died_sla.0, &died_sla.1, &died_sla.2);
+        lorica::otel::shutdown();
+    }) {
+        error!(worker_id = id, error = %e, "stream runtime watcher not started");
+        std::process::exit(1);
+    }
     // The capture self-disable writer. Capture admission happens in
     // this process, so the queue it drains is this process's; without
     // the task a rule that spent its total keeps its stored `enabled`
@@ -1027,12 +1039,58 @@ pub(crate) fn run_worker(
     std::process::exit(0);
 }
 
+/// The exit status of a process whose stream runtime died
+/// (`EX_SOFTWARE`): non-zero, so the supervisor respawns a worker and
+/// systemd restarts a single-process node.
+pub(crate) const STREAM_RUNTIME_DIED_EXIT: i32 = 70;
+
+/// Exit the process with [`STREAM_RUNTIME_DIED_EXIT`] as soon as `died`
+/// reports the stream runtime dead (Story 12.2 D-b, amended 2026-11-21),
+/// after logging the cause once at error level and running `flush`.
+/// Nothing restarts a dead loop or control thread in place, and a
+/// process left running would keep serving HTTP while a stream port
+/// accepts nothing, or a UDP slot drops what the kernel hashes to it. A
+/// runtime that stops on its own terms ends the watch without an exit.
+pub(crate) fn exit_when_stream_runtime_dies(
+    mut died: tokio::sync::watch::Receiver<Option<lorica_stream::StreamDeath>>,
+    flush: impl FnOnce() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("lorica-stream-watch".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    error!(error = %e, "stream runtime watcher has no runtime; a dead stream loop will not restart the process");
+                    return;
+                }
+            };
+            let death = rt.block_on(async {
+                died.wait_for(Option::is_some)
+                    .await
+                    .ok()
+                    .and_then(|death| death.clone())
+            });
+            drop(rt);
+            let Some(death) = death else {
+                return;
+            };
+            error!(
+                %death,
+                exit_status = STREAM_RUNTIME_DIED_EXIT,
+                "the stream runtime died; exiting so the process restarts with its streams"
+            );
+            flush();
+            std::process::exit(STREAM_RUNTIME_DIED_EXIT);
+        })
+}
+
 /// Merge every SLA minute this worker holds, the open one included,
 /// before it exits: its flush loops run every minute, so without this a
 /// stop or a hot upgrade loses up to a minute of the worker's SLA, which
 /// the new generation's reports then lack. Blocking: called off the
 /// runtime, on the exit path.
-fn flush_sla_at_exit(
+pub(crate) fn flush_sla_at_exit(
     store: &Arc<Mutex<ConfigStore>>,
     sla: &lorica_bench::SlaCollector,
     stream_sla: &lorica_bench::StreamSlaCollector,

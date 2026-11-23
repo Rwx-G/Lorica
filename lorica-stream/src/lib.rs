@@ -87,7 +87,7 @@ pub use reconcile::{diff, Actions, BindKey, BoundBinding, Detach, ReleaseCause, 
 pub use refusal_log::{RefusalLogDecision, RefusalLogLimiter, REFUSAL_LOG_WINDOW};
 pub use resolver::ResolverCache;
 pub use runtime::{
-    quiesce_end_reason, DrainReportError, Quiesced, StreamRuntime, StreamRuntimeError,
+    quiesce_end_reason, DrainReportError, Quiesced, StreamDeath, StreamRuntime, StreamRuntimeError,
     StreamRuntimeHandle,
 };
 pub use seams::{

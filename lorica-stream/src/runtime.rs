@@ -81,10 +81,20 @@
 //! Every drain duration is capped at
 //! [`GlobalSettings::WORKER_DRAIN_TIMEOUT_MAX_S`], the setting's hard
 //! maximum, whatever the message says.
+//!
+//! Nothing restarts a part of the runtime that dies (Story 12.2 D-b, as
+//! amended on 2026-11-21): when the control thread panics, or a TCP
+//! accept loop or UDP receive loop panics or ends without being told to
+//! stop, [`StreamRuntimeHandle::died`] says why, and the process is
+//! expected to exit so that a fresh one serves the streams again. A
+//! panic inside one connection's or session's own task ends that task
+//! only.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::OwnedFd;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -170,6 +180,66 @@ pub enum DrainReportError {
     Channel(StreamCtlError),
 }
 
+/// What stopped part of a stream runtime without it being asked to:
+/// the process should exit on it (Story 12.2 D-b).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StreamDeath {
+    /// The control thread panicked: no control message is applied any
+    /// more, and every loop of the runtime is gone with it.
+    #[error("the stream control thread panicked: {cause}")]
+    Control {
+        /// The panic message.
+        cause: String,
+    },
+    /// A TCP accept loop or a UDP receive loop panicked, or ended while
+    /// its binding was still serving or draining: its socket is read by
+    /// nothing in this process.
+    #[error("the {proto} loop of stream {stream_id} (bind_gen {bind_gen}) ended: {cause}")]
+    Loop {
+        /// The loop's stream.
+        stream_id: String,
+        /// The loop's binding generation.
+        bind_gen: u64,
+        /// The loop's socket protocol.
+        proto: StreamProto,
+        /// Why it ended: the panic message, or what made it return.
+        cause: String,
+    },
+}
+
+/// The sending side of [`StreamRuntimeHandle::died`], shared by the
+/// control thread and every loop. The first death raised stands.
+#[derive(Debug, Clone)]
+pub(crate) struct DeathSignal(Arc<watch::Sender<Option<StreamDeath>>>);
+
+impl DeathSignal {
+    fn new() -> (Self, watch::Receiver<Option<StreamDeath>>) {
+        let (tx, rx) = watch::channel(None);
+        (DeathSignal(Arc::new(tx)), rx)
+    }
+
+    pub(crate) fn raise(&self, death: StreamDeath) {
+        self.0.send_if_modified(|slot| {
+            if slot.is_some() {
+                return false;
+            }
+            *slot = Some(death);
+            true
+        });
+    }
+}
+
+/// The message of a caught panic.
+pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_else(|| "a panic without a message".to_string())
+}
+
 enum Command {
     Terminate(Duration),
     Report {
@@ -185,11 +255,21 @@ pub struct StreamRuntimeHandle {
     tracker: ConnectionTracker,
     counters: Arc<StreamCounters>,
     quiesced: watch::Receiver<Option<Quiesced>>,
+    died: watch::Receiver<Option<StreamDeath>>,
     commands: mpsc::UnboundedSender<Command>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl StreamRuntimeHandle {
+    /// Turns `Some` when part of the runtime stops without being asked
+    /// to (see [`StreamDeath`]): nothing restarts it, so the process
+    /// exits on it. Its sender goes away with the value still `None`
+    /// once the runtime has stopped on its own terms ([`Self::stop`], or
+    /// dropping the handle).
+    pub fn died(&self) -> watch::Receiver<Option<StreamDeath>> {
+        self.died.clone()
+    }
+
     /// The runtime's connection tracker; the drain watcher waits for it
     /// to be empty.
     pub fn tracker(&self) -> &ConnectionTracker {
@@ -307,6 +387,7 @@ pub struct StreamRuntime {
     /// The seq of the `quiesce reason=upgrade` this runtime applied: the
     /// drain report answers it.
     upgrade_seq: Option<u64>,
+    death: DeathSignal,
 }
 
 struct Binding {
@@ -350,6 +431,7 @@ impl StreamRuntime {
         let tracker = ConnectionTracker::new();
         let (quiesced_tx, quiesced_rx) = watch::channel(None);
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let (death, died) = DeathSignal::new();
         let counters = Arc::clone(&engines.counters);
         let runtime = StreamRuntime {
             transport,
@@ -364,15 +446,25 @@ impl StreamRuntime {
             ending: watch::channel(false).0,
             quiesced: quiesced_tx,
             upgrade_seq: None,
+            death: death.clone(),
         };
         let thread = thread::Builder::new()
             .name(STREAM_THREAD_NAME.into())
-            .spawn(move || rt.block_on(runtime.run(commands_rx)))
+            .spawn(move || {
+                let served =
+                    panic::catch_unwind(AssertUnwindSafe(|| rt.block_on(runtime.run(commands_rx))));
+                if let Err(payload) = served {
+                    death.raise(StreamDeath::Control {
+                        cause: panic_message(&*payload),
+                    });
+                }
+            })
             .map_err(StreamRuntimeError::Thread)?;
         Ok(StreamRuntimeHandle {
             tracker,
             counters,
             quiesced: quiesced_rx,
+            died,
             commands: commands_tx,
             thread: Some(thread),
         })
@@ -596,6 +688,7 @@ impl StreamRuntime {
             engines: self.engines.clone(),
             bound_ports: self.bound_ports.clone(),
             caps: self.caps.clone(),
+            death: self.death.clone(),
         };
         for socket in adopted {
             binding.loops.push(tokio::spawn(listener::run(
