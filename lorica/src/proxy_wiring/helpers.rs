@@ -248,11 +248,16 @@ pub(crate) struct ForwardedClient {
 /// would let any client choose the address its bans, rate limits and
 /// WAF whitelist are checked against.
 ///
-/// Every `X-Forwarded-For` field line counts, in order, as one list. An
-/// entry is an IP literal, optionally with a port (`192.0.2.1:4711`,
-/// `[2001:db8::1]:4711`). An entry that is neither, or a field line that
-/// is not text, ends the walk at the trusted hop that wrote it: that
-/// hop is the last address known not to come from the client.
+/// Every `X-Forwarded-For` field line counts, in order, as one list, and
+/// each comma-separated entry is decoded on its own: proxies merge the
+/// client's value and their own append into one line, so a byte the
+/// client sent that is not text must spoil only the client's entries,
+/// never the trusted hop's. An entry is an IP literal, optionally with a
+/// port (`192.0.2.1:4711`, `[2001:db8::1]:4711`); an IPv4-mapped IPv6
+/// entry is read as the IPv4 address it carries. An entry that is not an
+/// address ends the walk at the trusted hop that wrote it: that hop is
+/// the last address known not to come from the client. Only the entries
+/// the walk reaches are parsed.
 pub(crate) fn forwarded_client(
     peer: std::net::IpAddr,
     req: &lorica_http::RequestHeader,
@@ -260,26 +265,22 @@ pub(crate) fn forwarded_client(
 ) -> ForwardedClient {
     let is_trusted = |ip: &std::net::IpAddr| trusted.iter().any(|net| net.contains(ip));
     let mut client = ForwardedClient {
-        ip: peer,
+        ip: peer.to_canonical(),
         via_forwarded_for: false,
     };
-    if !is_trusted(&peer) {
+    if !is_trusted(&client.ip) {
         return client;
     }
-    let mut entries: Vec<Option<std::net::IpAddr>> = Vec::new();
-    for value in req.headers.get_all("x-forwarded-for") {
-        match value.to_str() {
-            Ok(list) => entries.extend(
-                list.split(',')
-                    .map(str::trim)
-                    .filter(|entry| !entry.is_empty())
-                    .map(parse_forwarded_entry),
-            ),
-            Err(_) => entries.push(None),
-        }
-    }
-    for entry in entries.into_iter().rev() {
-        let Some(ip) = entry else {
+    let entries = req
+        .headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .rev()
+        .flat_map(|line| line.as_bytes().rsplit(|byte| *byte == b','))
+        .map(<[u8]>::trim_ascii)
+        .filter(|entry| !entry.is_empty());
+    for entry in entries {
+        let Some(ip) = parse_forwarded_entry(entry) else {
             break;
         };
         client = ForwardedClient {
@@ -293,11 +294,42 @@ pub(crate) fn forwarded_client(
     client
 }
 
-fn parse_forwarded_entry(entry: &str) -> Option<std::net::IpAddr> {
+fn parse_forwarded_entry(entry: &[u8]) -> Option<std::net::IpAddr> {
+    let entry = std::str::from_utf8(entry).ok()?;
     entry
         .parse::<std::net::IpAddr>()
         .or_else(|_| entry.parse::<std::net::SocketAddr>().map(|addr| addr.ip()))
         .ok()
+        .map(|ip| ip.to_canonical())
+}
+
+/// The `X-Forwarded-For` value sent upstream: every field line the
+/// request carried, in order, joined into one list, then `peer`. Reading
+/// only the first line would drop a line a front proxy added, leaving the
+/// backend the client-written entries alone.
+pub(crate) fn upstream_forwarded_for(req: &lorica_http::RequestHeader, peer: &str) -> Vec<u8> {
+    let mut value: Vec<u8> = Vec::new();
+    for line in req.headers.get_all("x-forwarded-for") {
+        value.extend_from_slice(line.as_bytes());
+        value.extend_from_slice(b", ");
+    }
+    value.extend_from_slice(peer.as_bytes());
+    value
+}
+
+/// The scheme a client-side `X-Forwarded-Proto` names, when it names one
+/// Lorica can redirect to or pass on: `http` or `https`, in any case.
+/// Any other value is ignored, so it can never become the scheme of a
+/// `Location` Lorica writes.
+pub(crate) fn forwarded_proto(req: &lorica_http::RequestHeader) -> Option<&'static str> {
+    let value = req.headers.get("x-forwarded-proto")?.as_bytes();
+    if value.eq_ignore_ascii_case(b"https") {
+        Some("https")
+    } else if value.eq_ignore_ascii_case(b"http") {
+        Some("http")
+    } else {
+        None
+    }
 }
 
 /// Pick a backend index using the Ketama consistent-hash ring keyed

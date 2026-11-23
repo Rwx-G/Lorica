@@ -255,7 +255,8 @@ pub struct ProxyConfig {
     pub waf_ban_duration_s: u32,
     /// Parsed CIDR ranges of trusted reverse proxies. Only when the direct TCP
     /// client IP matches one of these will X-Forwarded-For be used for the
-    /// real client IP. Empty = trust no XFF (secure default).
+    /// real client IP, read from the right (`helpers::forwarded_client`).
+    /// Empty = trust no XFF (secure default).
     pub trusted_proxies: Vec<ipnet::IpNet>,
     /// Parsed CIDR ranges of IPs that bypass WAF, rate limiting, and auto-ban.
     pub waf_whitelist: Vec<ipnet::IpNet>,

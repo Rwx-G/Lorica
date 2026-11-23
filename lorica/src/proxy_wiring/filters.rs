@@ -26,10 +26,10 @@ use tracing::{debug, warn};
 use super::ai_bot_merged::{self, MergedCrawler, MergedVerification};
 use super::{
     bot_handlers, build_mirror_forward_headers, canary_bucket, downstream_ssl_digest, extract_host,
-    forwarded_client, host_without_port, mirror_sample_hit, mtls_refusal_status, render_error_body,
-    request_has_body, route_client_cert, run_forward_auth_keyed, spawn_mirrors, ForwardAuthOutcome,
-    HandshakeName, LoricaProxy, MirrorBodyState, MirrorPending, ProxyConfig, RequestCtx,
-    RouteEntry, VerdictCacheEngine, WAF_BODY_SCAN_DEFAULT,
+    forwarded_client, forwarded_proto, host_without_port, mirror_sample_hit, mtls_refusal_status,
+    render_error_body, request_has_body, route_client_cert, run_forward_auth_keyed, spawn_mirrors,
+    ForwardAuthOutcome, HandshakeName, LoricaProxy, MirrorBodyState, MirrorPending, ProxyConfig,
+    RequestCtx, RouteEntry, VerdictCacheEngine, WAF_BODY_SCAN_DEFAULT,
 };
 use crate::ai_bot::build_robots_txt_from_names;
 
@@ -445,25 +445,18 @@ impl LoricaProxy {
     /// `/lorica/bot/captcha/{nonce}` (serve the captcha PNG). Both are
     /// route-independent: the stashed entry carries the route_id the
     /// cookie gets bound to, and the captcha nonce is self-scoped.
-    /// Client IP extraction + cookie-bound scope validation happen
-    /// inside the handlers. Terminal: handler-defined status, or 503
-    /// when the client address is unavailable on the solve path.
-    pub(super) async fn check_bot_endpoints(&self, session: &mut Session) -> Result<Option<bool>> {
+    /// The solve path binds the verdict to the client address the
+    /// client-IP stage resolved, the one the challenge-render path saw.
+    /// Terminal: handler-defined status, or 503 when the client address
+    /// is unavailable on the solve path.
+    pub(super) async fn check_bot_endpoints(
+        &self,
+        session: &mut Session,
+        ctx: &RequestCtx,
+    ) -> Result<Option<bool>> {
         let path: String = session.req_header().uri.path().to_owned();
         if crate::bot::is_bot_solve_path(&path) {
-            // Client IP must be the one the challenge-render path
-            // saw; otherwise the stashed entry's IP prefix won't
-            // match and the handler rejects with 403 "client network
-            // changed". The client-IP resolution stage is skipped
-            // entirely when we take this early return, so the same
-            // resolution runs here.
-            let config = self.config.load();
-            let client_ip = session
-                .client_addr()
-                .and_then(|addr| addr.as_inet())
-                .map(|peer| {
-                    forwarded_client(peer.ip(), session.req_header(), &config.trusted_proxies).ip
-                });
+            let client_ip = ctx.client_ip_addr;
             let now_secs = chrono::Utc::now().timestamp();
             let secret = lorica_challenge::secret::handle();
             let secret_ref = secret.as_deref();
@@ -532,12 +525,13 @@ impl LoricaProxy {
         Ok(None)
     }
 
-    /// Stage: client IP resolution (never terminal). Derives the
-    /// effective client IP - the direct TCP peer, or the
-    /// X-Forwarded-For entry [`forwarded_client`] attributes the request
-    /// to when the direct peer is a trusted proxy - stamps `ctx.client_ip`, `ctx.client_ip_addr`, `ctx.is_xff`,
-    /// `ctx.xff_proxy_ip` and `ctx.source`, and returns the IP string
-    /// every later check keys on.
+    /// Stage: client IP resolution (never terminal), run before every
+    /// stage that can answer the request. Derives the effective client
+    /// IP - the direct TCP peer, or the X-Forwarded-For entry
+    /// [`forwarded_client`] attributes the request to when the direct
+    /// peer is a trusted proxy - stamps `ctx.client_ip`,
+    /// `ctx.client_ip_addr`, `ctx.is_xff`, `ctx.xff_proxy_ip` and
+    /// `ctx.source`, and returns the IP string every later check keys on.
     pub(super) fn resolve_client_ip(
         &self,
         session: &Session,
@@ -714,10 +708,7 @@ impl LoricaProxy {
             let scheme = if is_tls {
                 "https"
             } else {
-                req.headers
-                    .get("x-forwarded-proto")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("http")
+                forwarded_proto(req).unwrap_or("http")
             };
             if scheme != "https" {
                 let redir_host = extract_host(req);
@@ -738,11 +729,7 @@ impl LoricaProxy {
             if !lorica_config::route_selection::same_name(host, target) {
                 let redir_path = req.uri.path();
                 let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-                let scheme = req
-                    .headers
-                    .get("x-forwarded-proto")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("https");
+                let scheme = forwarded_proto(req).unwrap_or("https");
                 let location = format!("{scheme}://{target}{redir_path}{redir_query}");
                 let mut header = lorica_http::ResponseHeader::build(301, None)?;
                 header.insert_header("Location", &location)?;

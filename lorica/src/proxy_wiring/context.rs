@@ -60,8 +60,8 @@ pub struct RequestCtx {
     pub client_ip: Option<String>,
     /// Parsed form of `client_ip`, resolved once per request so the
     /// whitelist / blocklist / GeoIP / bot-protection checks reuse it
-    /// instead of re-parsing the string (audit #41f). `None` when
-    /// `client_ip` is absent or not a valid IP literal.
+    /// instead of re-parsing the string (audit #41f). `None` exactly
+    /// when `client_ip` is `None`.
     pub client_ip_addr: Option<std::net::IpAddr>,
     /// Whether the client IP was extracted from X-Forwarded-For header.
     pub is_xff: bool,

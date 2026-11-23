@@ -539,6 +539,48 @@ window.
 - Structured JSON logging via tracing for SIEM integration
 - WAF events logged with alert_type and matched rule details
 
+### The client address (v1.10.10)
+
+Every per-IP control (bans, the IP blocklist, rate limits, GeoIP, the
+WAF whitelist, bot protection) and every record of a request (the
+access log, the console request line, the `client.address` span
+attribute, the `X-Real-IP` sent upstream) use one address, resolved once
+per request before any stage can answer it:
+
+- From a peer outside `trusted_proxies` (the default, an empty list), the
+  TCP peer. `X-Forwarded-For` is ignored.
+- From a peer inside `trusted_proxies`, `X-Forwarded-For` is read from
+  the right, every field line counted: the client is the first entry that
+  is not itself a trusted proxy, or the leftmost entry when all are. An
+  entry that is not an IP stops the reading at the trusted hop that wrote
+  it. What a client writes into the header itself sits left of what the
+  trusted proxy appends, so it is never picked.
+
+The result is only as narrow as `trusted_proxies`: a range clients can
+also connect from, or a front proxy that passes the header through
+without appending, lets a client choose its address again.
+
+Each request produces one console line, `request completed` or
+`request completed with error`, and `client_ip` is its first field. In
+`--log-format text` it comes right after the message, before `path` and
+`host`, which carry text the client chose:
+
+```
+... lorica::proxy_wiring: request completed with error client_ip=203.0.113.7 method="GET" path="/.git/config" host="www.example.com" status=403 latency_ms=0 backend="-" error=IP banned
+```
+
+A tool that bans from these lines (Fail2ban reading `docker logs` or the
+journal) must anchor on that position, never on a `client_ip=` found
+anywhere in the line, or a request whose path or `Host` contains
+`client_ip=<someone else>` gets that address banned:
+
+```
+failregex = request completed with error client_ip=<HOST> .* error=IP banned$
+```
+
+In the default JSON format the field is `"client_ip":"<address>"`, and
+JSON escaping keeps a client's text from forming that sequence.
+
 ### Management plane authentication (v1.6.0)
 
 The management API (default port 9443) binds to loopback only and is

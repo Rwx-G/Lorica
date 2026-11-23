@@ -1787,6 +1787,76 @@ fn an_unreadable_entry_ends_the_walk_at_its_writer() {
     assert_forwarded_client("10.0.0.2", &[b"203.0.113.7", b"\xff"], "10.0.0.2", false);
 }
 
+/// A proxy merges the client's value and its own append into one line:
+/// a byte the client sent that is not text spoils only the client's
+/// entry, which sits left of the one the trusted hop wrote.
+#[test]
+fn a_non_text_client_entry_does_not_spoil_the_trusted_append() {
+    assert_forwarded_client("10.0.0.2", &[b"\xff, 203.0.113.7"], "203.0.113.7", true);
+    assert_forwarded_client(
+        "10.0.0.2",
+        &[b"caf\xc3\xa9, 203.0.113.7"],
+        "203.0.113.7",
+        true,
+    );
+}
+
+/// An IPv4-mapped entry is the IPv4 address it carries, so a trusted hop
+/// written that way is still recognised as trusted.
+#[test]
+fn ipv4_mapped_entries_are_read_as_ipv4() {
+    assert_forwarded_client(
+        "10.0.0.2",
+        &[b"203.0.113.7, ::ffff:10.0.0.5"],
+        "203.0.113.7",
+        true,
+    );
+    assert_forwarded_client("::ffff:10.0.0.2", &[b"203.0.113.7"], "203.0.113.7", true);
+}
+
+fn request_with(name: &str, lines: &[&[u8]]) -> lorica_http::RequestHeader {
+    let mut req = lorica_http::RequestHeader::build("GET", b"/", None).unwrap();
+    for line in lines {
+        req.append_header(
+            name.to_string(),
+            http::HeaderValue::from_bytes(line).unwrap(),
+        )
+        .unwrap();
+    }
+    req
+}
+
+/// Upstream, the chain keeps every line the request carried, in order,
+/// so a line a front proxy added is never dropped.
+#[test]
+fn the_upstream_forwarded_for_keeps_every_line_then_the_peer() {
+    let req = request_with("X-Forwarded-For", &[]);
+    assert_eq!(upstream_forwarded_for(&req, "10.0.0.2"), b"10.0.0.2");
+    let req = request_with("X-Forwarded-For", &[b"192.0.2.66", b"203.0.113.7"]);
+    assert_eq!(
+        upstream_forwarded_for(&req, "10.0.0.2"),
+        b"192.0.2.66, 203.0.113.7, 10.0.0.2"
+    );
+}
+
+#[test]
+fn only_http_and_https_are_read_from_forwarded_proto() {
+    for (sent, read) in [
+        (&b"https"[..], Some("https")),
+        (b"HTTPS", Some("https")),
+        (b"http", Some("http")),
+        (b"javascript", None),
+        (b"https, http", None),
+    ] {
+        let req = request_with("X-Forwarded-Proto", &[sent]);
+        assert_eq!(forwarded_proto(&req), read, "{sent:?}");
+    }
+    assert_eq!(
+        forwarded_proto(&request_with("X-Forwarded-Proto", &[])),
+        None
+    );
+}
+
 #[test]
 fn empty_entries_are_skipped() {
     assert_forwarded_client("10.0.0.2", &[b"203.0.113.7, , "], "203.0.113.7", true);
