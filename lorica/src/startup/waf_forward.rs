@@ -198,8 +198,9 @@ impl SupervisorWafIngest {
                 AlertEvent::new(
                     AlertType::WafAlert,
                     format!(
-                        "WAF {}: {} (rule {})",
+                        "WAF {} on {}: {} (rule {})",
                         event.category.as_str(),
+                        event.route_hostname,
                         event.description,
                         event.rule_id
                     ),
@@ -207,6 +208,7 @@ impl SupervisorWafIngest {
                 .with_detail("rule_id", event.rule_id.to_string())
                 .with_detail("category", event.category.as_str())
                 .with_detail("severity", event.severity.to_string())
+                .with_detail("host", event.route_hostname.clone())
                 .with_detail("client_ip", event.client_ip.clone()),
             );
         }

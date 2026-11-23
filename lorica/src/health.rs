@@ -276,15 +276,7 @@ pub async fn health_check_loop(
                 // filtered those out).
                 if *new_status == HealthStatus::Down {
                     if let Some(ref sender) = alert_sender {
-                        sender.send(
-                            lorica_notify::AlertEvent::new(
-                                lorica_notify::events::AlertType::BackendDown,
-                                format!("Backend {} is down", backend.address),
-                            )
-                            .with_detail("backend_id", backend.id.clone())
-                            .with_detail("address", backend.address.clone())
-                            .with_detail("name", backend.name.clone()),
-                        );
+                        sender.send(backend_down_alert(backend));
                     }
                 }
 
@@ -416,6 +408,20 @@ fn confirm_status_flip(
     }
 }
 
+/// The `backend_down` alert for `backend`, named as the dashboard lists
+/// it: its label when it has one, its address otherwise.
+fn backend_down_alert(backend: &Backend) -> lorica_notify::AlertEvent {
+    let summary = if backend.name.is_empty() {
+        format!("Backend {} is down", backend.address)
+    } else {
+        format!("Backend {} ({}) is down", backend.name, backend.address)
+    };
+    lorica_notify::AlertEvent::new(lorica_notify::events::AlertType::BackendDown, summary)
+        .with_detail("backend_id", backend.id.clone())
+        .with_detail("address", backend.address.clone())
+        .with_detail("name", backend.name.clone())
+}
+
 /// Determine probe result from a latency value (for testing).
 #[cfg(test)]
 fn classify_latency(connected: bool, latency_ms: u128) -> ProbeResult {
@@ -431,6 +437,40 @@ fn classify_latency(connected: bool, latency_ms: u128) -> ProbeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_backend_down_alert_names_the_backend() {
+        let now = chrono::Utc::now();
+        let mut backend = Backend {
+            id: "<UUID>".into(),
+            address: "10.0.0.10:8080".into(),
+            name: "api-1".into(),
+            group_name: String::new(),
+            weight: 100,
+            health_status: HealthStatus::Healthy,
+            health_check_enabled: true,
+            health_check_interval_s: 10,
+            health_check_path: None,
+            lifecycle_state: LifecycleState::Normal,
+            active_connections: 0,
+            tls_upstream: false,
+            tls_skip_verify: false,
+            managed_by: None,
+            tls_sni: None,
+            h2_upstream: false,
+            created_at: now,
+            updated_at: now,
+        };
+        assert_eq!(
+            backend_down_alert(&backend).summary,
+            "Backend api-1 (10.0.0.10:8080) is down"
+        );
+        backend.name.clear();
+        assert_eq!(
+            backend_down_alert(&backend).summary,
+            "Backend 10.0.0.10:8080 is down"
+        );
+    }
 
     // ---- Latency classification ----
 

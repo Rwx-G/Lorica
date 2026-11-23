@@ -203,14 +203,16 @@ impl ProbeScheduler {
                 // Alert on probe failure
                 if !result.success {
                     if let Some(ref dispatcher) = dispatcher {
+                        let route =
+                            crate::route_display_name(&*store.lock().await, &result.route_id);
                         let event = AlertEvent::new(
                             AlertType::SlaBreached,
                             format!(
-                                "Active probe failed for route {}: {}",
-                                result.route_id,
+                                "Active probe failed for {route}: {}",
                                 result.error.as_deref().unwrap_or("unexpected status")
                             ),
                         )
+                        .with_detail("route", route)
                         .with_detail("route_id", &result.route_id)
                         .with_detail("probe_id", &probe.id)
                         .with_detail("status_code", result.status_code.to_string())

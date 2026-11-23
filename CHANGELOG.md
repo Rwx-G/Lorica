@@ -15,6 +15,8 @@ Author: Rwx-G
 
 ### Changed
 
+- **Alert emails and Slack messages name what they are about.** The subject reads `[Lorica Alert] SLA breached - ...` instead of `sla_breached`, and the body shows both (`Type: SLA breached (sla_breached)`). An SLA breach, an SLA recovery and a failed active probe name the route by its host and path prefix (`app.example.com/api`) instead of its id; the id stays among the details as `route_id`, beside a new `route`. A backend that goes down is named by its label as well as its address. A WAF alert raised in worker mode names the host it hit, as single-process mode always did. The details are listed in key order instead of a different order on every send. Webhook payloads keep their shape: `alert_type` is still the `snake_case` value, and `details` gains the `route` and `host` keys where they apply.
+
 ### Fixed
 
 ### Removed

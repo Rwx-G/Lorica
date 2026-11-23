@@ -84,7 +84,7 @@ fn email_outcome(result: &Result<(), NotifyError>) -> &'static str {
 async fn send_message(config: &EmailConfig, event: &AlertEvent) -> Result<(), NotifyError> {
     let subject = format!(
         "[Lorica Alert] {} - {}",
-        event.alert_type.as_str(),
+        event.alert_type.label(),
         event.summary
     );
 
@@ -147,9 +147,10 @@ fn format_email_body(event: &AlertEvent) -> String {
     let mut body = format!(
         "Lorica Alert Notification\n\
          ========================\n\n\
-         Type:    {}\n\
+         Type:    {} ({})\n\
          Summary: {}\n\
          Time:    {}\n",
+        event.alert_type.label(),
         event.alert_type.as_str(),
         event.summary,
         event.timestamp,
@@ -175,7 +176,7 @@ mod tests {
     fn test_format_email_body_basic() {
         let event = AlertEvent::new(AlertType::BackendDown, "Backend 10.0.0.1:8080 is down");
         let body = format_email_body(&event);
-        assert!(body.contains("backend_down"));
+        assert!(body.contains("Type:    Backend down (backend_down)"));
         assert!(body.contains("10.0.0.1:8080"));
         assert!(body.contains("Lorica Alert"));
     }
@@ -192,6 +193,21 @@ mod tests {
     }
 
     #[test]
+    fn email_details_are_listed_in_key_order() {
+        let event = AlertEvent::new(AlertType::SlaBreached, "SLA breach")
+            .with_detail("total_requests", "120")
+            .with_detail("route", "app.example.com")
+            .with_detail("route_id", "<UUID>");
+        let body = format_email_body(&event);
+        let route = body.find("  route: ").expect("route listed");
+        let route_id = body.find("  route_id: ").expect("route_id listed");
+        let total = body
+            .find("  total_requests: ")
+            .expect("total_requests listed");
+        assert!(route < route_id && route_id < total, "{body}");
+    }
+
+    #[test]
     fn test_format_email_body_no_details() {
         let event = AlertEvent::new(AlertType::WafAlert, "SQL injection detected");
         let body = format_email_body(&event);
@@ -203,14 +219,10 @@ mod tests {
 
     #[test]
     fn test_format_email_body_all_event_types() {
-        for alert_type in [
-            AlertType::CertExpiring,
-            AlertType::BackendDown,
-            AlertType::WafAlert,
-            AlertType::ConfigChanged,
-        ] {
+        for alert_type in AlertType::ALL {
             let event = AlertEvent::new(alert_type.clone(), "test summary");
             let body = format_email_body(&event);
+            assert!(body.contains(alert_type.label()));
             assert!(body.contains(alert_type.as_str()));
             assert!(body.contains("test summary"));
         }
