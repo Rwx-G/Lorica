@@ -507,6 +507,20 @@ stream's algorithm among themselves.
   the endpoint is created; until then it admits (fail open, the same
   policy as an RPC failure). The window is the worker's start-up, before
   its first `refresh`.
+- **Success reports are not awaited** (amended 2026-11-24, Phase 1
+  audit, finding C9). In worker mode the admission stays awaited, but a
+  success report (`BreakerReport`, `success = true`) leaves from a task
+  of its own and the connection, or the UDP session at its first
+  answer, goes on at once: the report never changes the attempt that
+  made it, and awaiting it put a second supervisor round trip before
+  every connection's first byte. A failure report is still awaited: the
+  attempt has already paid a refused connect or a timeout, and awaiting
+  keeps the failure that opens a circuit ahead of this worker's next
+  admission. What it gives up: a success report still in flight when
+  the next admission is asked (a probe that closes a circuit, mostly)
+  can leave that admission to see the circuit as it was a moment
+  before. The local breaker of single-process mode records inline, as
+  before.
 
 ### D-h. Retry semantics
 
@@ -1970,3 +1984,4 @@ Lot B:
 | 2026-11-18 | 0.12 | Dated notes under D-d (HAProxy `retries` and `srvtcpka` defaults not in the 3.4 manual) and D-p (`max_connections` per node since Story 12.6). | Romain G. |
 | 2026-11-21 | 0.13 | Phase 1 audit: finding C4's maintainer decision recorded under D-m (a token's address change on a backend any stream links is refused, 403; the code ships with the audit's code lot); the "one thread per process" pitfall corrected to two threads (A-I1). | Romain G. |
 | 2026-11-22 | 0.14 | Phase 1 audit, TCP data path lot: dated notes under D-d (one timer per forwarding call for the idle and total timeouts, idle fires at its value; findings C10, C11) and D-o (bucket capacity covers two timer ticks of the rate; finding C8). The client socket now gets the `TCP_NODELAY` D-c always promised (C2). | Romain G. |
+| 2026-11-24 | 0.14 | Phase 1 audit lot C, finding C9: D-g amended, a breaker success report is no longer awaited in worker mode. | Romain G. |

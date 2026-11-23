@@ -271,7 +271,9 @@ impl BackendSelector for StreamSelector {
 /// With [`StreamBreakerGate::with_alerts`] (single-process mode, whose
 /// breaker is this process's own) a circuit a stream's failure opens
 /// raises `stream_backend_down` (Story 12.9 D-h). In worker mode the
-/// registry, and so the alert, is the supervisor's.
+/// registry, and so the alert, is the supervisor's: an admission and a
+/// failure report wait for their answer (D-g), a success report is sent
+/// from a task of its own and waits for nothing.
 #[derive(Default)]
 pub struct StreamBreakerGate {
     engine: ArcSwapOption<BreakerEngine>,
@@ -351,6 +353,19 @@ impl BreakerGate for StreamBreakerGate {
                     } else if breaker.record_failure(&key, &backend.address) {
                         alerts.breaker_opened(stream_id, &backend.address);
                     }
+                }
+                // Over RPC a success report is a supervisor round trip on
+                // every connection, and its answer changes nothing for the
+                // attempt that made it: the connection or session goes on
+                // without waiting for it (Phase 1 audit, C9). A failure
+                // report is still awaited: the attempt already failed, and
+                // this worker's next admission must not overtake the
+                // failure that opens the circuit.
+                (BreakerEngine::Rpc { .. }, _) if success => {
+                    let address = backend.address.clone();
+                    tokio::spawn(async move {
+                        engine.record(&key, &address, success, was_probe).await;
+                    });
                 }
                 _ => {
                     engine

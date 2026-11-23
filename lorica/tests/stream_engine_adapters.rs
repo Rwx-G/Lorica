@@ -41,17 +41,19 @@ use hickory_resolver::config::{
     ResolverOpts,
 };
 use lorica::proxy_wiring::BreakerEngine;
-use lorica::stream_engine::{HickoryResolve, StreamBreakerGate, StreamSelector};
+use lorica::stream_engine::{
+    stream_breaker_key, HickoryResolve, StreamBreakerGate, StreamSelector,
+};
 use lorica_config::listen_ports::ReservedPorts;
 use lorica_config::models::{
     Backend, HealthCheck, HealthStatus, LifecycleState, LoadBalancing, Stream, StreamBackend,
     StreamEndReason, StreamProtocol, StreamRefusal,
 };
 use lorica_stream::{
-    BackendSelector, Candidate, ConnectionObserver, ConnectionRecord, ControlTransport, Engines,
-    InProcessPeer, NodeCapsRegions, Resolve, ResolverCache, SelectionRequest, SourceGate,
-    StreamCounters, StreamRuntime, StreamRuntimeHandle, StreamTable, StreamTableSource, TcpEngine,
-    TcpEngineParts,
+    BackendSelector, BreakerGate, Candidate, ConnectionObserver, ConnectionRecord,
+    ControlTransport, Engines, InProcessPeer, NodeCapsRegions, Resolve, ResolverCache,
+    SelectionRequest, SourceGate, StreamCounters, StreamRuntime, StreamRuntimeHandle, StreamTable,
+    StreamTableSource, TcpEngine, TcpEngineParts,
 };
 use lorica_worker::fd_passing::StreamProto;
 use lorica_worker::stream_ctl::{StreamCtlMsg, StreamSocket};
@@ -636,4 +638,54 @@ async fn iv2_a_backend_marked_down_leaves_selection_and_keeps_its_connection() {
     echo_once(&mut established, b"still open").await;
     drop(established);
     h.stop();
+}
+
+/// In worker mode a success report goes to the supervisor without the
+/// connection that made it waiting for the answer, which never changes
+/// that connection's outcome; the report still arrives. A failure report
+/// is still awaited, so that the failure opening a circuit lands before
+/// the worker's next admission.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_success_report_does_not_wait_for_the_supervisor_and_a_failure_does() {
+    const REPORT_DELAY: Duration = Duration::from_millis(200);
+    let (worker_end, supervisor_end) = tokio::net::UnixStream::pair().unwrap();
+    let (endpoint, _worker_incoming) = lorica_command::RpcEndpoint::new(worker_end);
+    let (supervisor, mut incoming) = lorica_command::RpcEndpoint::new(supervisor_end);
+    let (reported_tx, mut reported) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let _supervisor = supervisor;
+        while let Some(request) = incoming.recv().await {
+            let report = match &request.command().payload {
+                Some(lorica_command::command::Payload::BreakerReport(r)) => r.clone(),
+                _ => continue,
+            };
+            tokio::time::sleep(REPORT_DELAY).await;
+            let _ = reported_tx.send(report);
+            let _ = request.reply_ok().await;
+        }
+    });
+    let gate = StreamBreakerGate::with_engine(BreakerEngine::rpc(endpoint, WAIT));
+    let b = backend("b", "192.0.2.10:5432", HealthStatus::Healthy);
+
+    let started = Instant::now();
+    gate.record(STREAM_ID, &b, true, false).await;
+    let took = started.elapsed();
+    assert!(
+        took < REPORT_DELAY / 2,
+        "the report held its connection for {took:?}"
+    );
+
+    let report = tokio::time::timeout(WAIT, reported.recv())
+        .await
+        .expect("the report reaches the supervisor")
+        .unwrap();
+    assert_eq!(report.route_id, stream_breaker_key(STREAM_ID));
+    assert_eq!(report.backend, "192.0.2.10:5432");
+    assert!(report.success);
+
+    gate.record(STREAM_ID, &b, false, false).await;
+    let failure = reported
+        .try_recv()
+        .expect("the failure is in the registry when its report returns");
+    assert!(!failure.success);
 }
