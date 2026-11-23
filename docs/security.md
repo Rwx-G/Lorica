@@ -560,6 +560,20 @@ The result is only as narrow as `trusted_proxies`: a range clients can
 also connect from, or a front proxy that passes the header through
 without appending, lets a client choose its address again.
 
+`X-Forwarded-Proto` follows the same trust. On a plain-HTTP connection
+from a peer inside `trusted_proxies`, its value decides the scheme
+`force_https` and `redirect_hostname` see and the `X-Forwarded-Proto`
+sent upstream, provided it is `http` or `https`; any other value is
+ignored. From any other peer the header is ignored and a plain-HTTP
+connection is `http`, so a client cannot skip `force_https` or tell a
+backend its connection was encrypted. A connection Lorica terminated
+TLS on is `https` whatever the header says.
+
+Up to 1.10.9 the header was believed from any peer. A deployment behind
+a proxy that terminates TLS and forwards plain HTTP to a `force_https`
+route must list that proxy in `trusted_proxies`, or every request is
+redirected to `https://` again and the browser loops.
+
 Each request produces one console line, `request completed` or
 `request completed with error`, and `client_ip` is its first field. In
 `--log-format text` it comes right after the message, before `path` and

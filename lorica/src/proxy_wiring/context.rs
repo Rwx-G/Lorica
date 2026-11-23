@@ -67,6 +67,11 @@ pub struct RequestCtx {
     pub is_xff: bool,
     /// The direct TCP peer IP when XFF is used (the forwarding proxy's IP).
     pub xff_proxy_ip: Option<String>,
+    /// The scheme a trusted proxy reported in `X-Forwarded-Proto`
+    /// (`forwarded_proto`), resolved with the client IP. `None` when the
+    /// peer is not trusted or sent no usable value; the TLS state of the
+    /// connection then decides.
+    pub forwarded_proto: Option<&'static str>,
     /// Request source (from X-Lorica-Source header, e.g., "loadtest").
     pub source: String,
     /// Per-route connection counter for max_connections enforcement.

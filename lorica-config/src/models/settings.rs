@@ -199,8 +199,9 @@ pub struct GlobalSettings {
     /// CIDR ranges of trusted reverse proxies. Only when the direct TCP client
     /// IP falls within one of these ranges will X-Forwarded-For be used to
     /// determine the real client IP, reading the header from the right: the
-    /// client is the first entry that is not itself a trusted proxy. Empty
-    /// list = trust no XFF (secure default).
+    /// client is the first entry that is not itself a trusted proxy. The
+    /// same peers are the only ones whose X-Forwarded-Proto is believed.
+    /// Empty list = trust neither header (secure default).
     /// Examples: `["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"]`.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,

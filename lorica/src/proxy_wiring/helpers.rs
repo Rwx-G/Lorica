@@ -317,11 +317,24 @@ pub(crate) fn upstream_forwarded_for(req: &lorica_http::RequestHeader, peer: &st
     value
 }
 
-/// The scheme a client-side `X-Forwarded-Proto` names, when it names one
-/// Lorica can redirect to or pass on: `http` or `https`, in any case.
-/// Any other value is ignored, so it can never become the scheme of a
-/// `Location` Lorica writes.
-pub(crate) fn forwarded_proto(req: &lorica_http::RequestHeader) -> Option<&'static str> {
+/// The scheme `X-Forwarded-Proto` names for a request that reached Lorica
+/// from `peer`, read under the same trust as `X-Forwarded-For`: only when
+/// `peer` is in `trusted`. From any other peer the header is the client's
+/// own claim, and believing it would let a plain-HTTP client skip
+/// `force_https` and tell the backend its connection was encrypted.
+///
+/// Only `http` or `https`, in any case, is read. Any other value is
+/// ignored, so it can never become the scheme of a `Location` Lorica
+/// writes.
+pub(crate) fn forwarded_proto(
+    peer: std::net::IpAddr,
+    req: &lorica_http::RequestHeader,
+    trusted: &[ipnet::IpNet],
+) -> Option<&'static str> {
+    let peer = peer.to_canonical();
+    if !trusted.iter().any(|net| net.contains(&peer)) {
+        return None;
+    }
     let value = req.headers.get("x-forwarded-proto")?.as_bytes();
     if value.eq_ignore_ascii_case(b"https") {
         Some("https")

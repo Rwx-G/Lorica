@@ -129,8 +129,10 @@
           these addresses, and read from the right: the client is the
           rightmost address in it that is not one of them (the leftmost one
           when all are). An entry that is not an IP stops the reading at the
-          proxy that wrote it. Empty = trust no XFF (direct client IP always
-          used).
+          proxy that wrote it. X-Forwarded-Proto is also only trusted from
+          these addresses: list a proxy that terminates TLS here, or
+          Force HTTPS redirects its requests in a loop. Empty = trust
+          neither header (direct client IP always used).
         </span>
       </div>
 

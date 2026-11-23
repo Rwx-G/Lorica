@@ -1839,6 +1839,15 @@ fn the_upstream_forwarded_for_keeps_every_line_then_the_peer() {
     );
 }
 
+fn forwarded_proto_from(peer: &str, lines: &[&[u8]]) -> Option<&'static str> {
+    let trusted: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+    forwarded_proto(
+        peer.parse().unwrap(),
+        &request_with("X-Forwarded-Proto", lines),
+        &trusted,
+    )
+}
+
 #[test]
 fn only_http_and_https_are_read_from_forwarded_proto() {
     for (sent, read) in [
@@ -1848,12 +1857,28 @@ fn only_http_and_https_are_read_from_forwarded_proto() {
         (b"javascript", None),
         (b"https, http", None),
     ] {
-        let req = request_with("X-Forwarded-Proto", &[sent]);
-        assert_eq!(forwarded_proto(&req), read, "{sent:?}");
+        assert_eq!(forwarded_proto_from("10.0.0.2", &[sent]), read, "{sent:?}");
     }
+    assert_eq!(forwarded_proto_from("10.0.0.2", &[]), None);
+}
+
+/// From a peer outside `trusted_proxies` the header is the client's own
+/// claim: a plain-HTTP client saying `https` must not skip `force_https`
+/// or reach the backend as encrypted.
+#[test]
+fn forwarded_proto_is_ignored_from_an_untrusted_peer() {
+    assert_eq!(forwarded_proto_from("198.51.100.9", &[b"https"]), None);
     assert_eq!(
-        forwarded_proto(&request_with("X-Forwarded-Proto", &[])),
+        forwarded_proto_from("::ffff:198.51.100.9", &[b"https"]),
         None
+    );
+}
+
+#[test]
+fn forwarded_proto_is_read_from_an_ipv4_mapped_trusted_peer() {
+    assert_eq!(
+        forwarded_proto_from("::ffff:10.0.0.2", &[b"https"]),
+        Some("https")
     );
 }
 

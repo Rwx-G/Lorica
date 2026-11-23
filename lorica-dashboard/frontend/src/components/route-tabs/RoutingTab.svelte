@@ -588,6 +588,12 @@
       ACME HTTP-01 challenges are excluded from this redirect so
       certificate renewal continues to work.
     </p>
+    <p>
+      Behind a proxy that terminates TLS and forwards plain HTTP, list
+      that proxy in Settings, Network, Trusted Proxies. Its
+      X-Forwarded-Proto is only believed from there; otherwise every
+      request is redirected again and the browser loops.
+    </p>
   </HelpModal>
 {:else if activeHelp === 'sticky_session'}
   <HelpModal title="Sticky sessions" onclose={() => { activeHelp = null; }}>

@@ -877,6 +877,7 @@ impl ProxyHttp for LoricaProxy {
             client_ip_addr: None,
             is_xff: false,
             xff_proxy_ip: None,
+            forwarded_proto: None,
             source: String::new(),
             route_conn_counter: None,
             rate_limit_info: None,
@@ -1195,10 +1196,7 @@ impl ProxyHttp for LoricaProxy {
             }
 
             // Force HTTPS redirect + hostname redirect
-            if let Some(handled) = self
-                .check_route_redirects(session, entry, &ctx.request_host)
-                .await?
-            {
+            if let Some(handled) = self.check_route_redirects(session, ctx, entry).await? {
                 return Ok(handled);
             }
 
@@ -2383,7 +2381,7 @@ impl ProxyHttp for LoricaProxy {
         let xff = upstream_forwarded_for(req, &peer_ip);
 
         // Detect TLS via session digest (same as force_https), then fall back to
-        // incoming X-Forwarded-Proto header (for proxied requests).
+        // the X-Forwarded-Proto a trusted proxy reported.
         let is_tls = session
             .digest()
             .and_then(|d| d.ssl_digest.as_ref())
@@ -2391,7 +2389,7 @@ impl ProxyHttp for LoricaProxy {
         let proto = if is_tls {
             "https"
         } else {
-            forwarded_proto(req).unwrap_or("http")
+            ctx.forwarded_proto.unwrap_or("http")
         };
 
         let host_val = extract_host(req).to_string();

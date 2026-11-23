@@ -530,8 +530,9 @@ impl LoricaProxy {
     /// IP - the direct TCP peer, or the X-Forwarded-For entry
     /// [`forwarded_client`] attributes the request to when the direct
     /// peer is a trusted proxy - stamps `ctx.client_ip`,
-    /// `ctx.client_ip_addr`, `ctx.is_xff`, `ctx.xff_proxy_ip` and
-    /// `ctx.source`, and returns the IP string every later check keys on.
+    /// `ctx.client_ip_addr`, `ctx.is_xff`, `ctx.xff_proxy_ip`,
+    /// `ctx.forwarded_proto` (same trust) and `ctx.source`, and returns
+    /// the IP string every later check keys on.
     pub(super) fn resolve_client_ip(
         &self,
         session: &Session,
@@ -559,6 +560,8 @@ impl LoricaProxy {
         } else {
             None
         };
+        ctx.forwarded_proto =
+            peer.and_then(|peer| forwarded_proto(peer, req, &config.trusted_proxies));
         ctx.source = req
             .headers
             .get("x-lorica-source")
@@ -687,15 +690,18 @@ impl LoricaProxy {
 
     /// Stage: route-level redirects. Covers the force-HTTPS redirect
     /// (skipped for ACME challenge paths, which must stay on HTTP) and
-    /// the hostname redirect (`redirect_hostname`), which `host`, the
-    /// request's host as routes are looked up, already names or not.
+    /// the hostname redirect (`redirect_hostname`), which
+    /// `ctx.request_host`, the request's host as routes are looked up,
+    /// already names or not. The scheme of a plain-HTTP connection is
+    /// the one a trusted proxy reported (`ctx.forwarded_proto`).
     /// Terminal: 301.
     pub(super) async fn check_route_redirects(
         &self,
         session: &mut Session,
+        ctx: &RequestCtx,
         entry: &RouteEntry,
-        host: &str,
     ) -> Result<Option<bool>> {
+        let host = ctx.request_host.as_str();
         let req = session.req_header();
         let path = req.uri.path();
 
@@ -708,7 +714,7 @@ impl LoricaProxy {
             let scheme = if is_tls {
                 "https"
             } else {
-                forwarded_proto(req).unwrap_or("http")
+                ctx.forwarded_proto.unwrap_or("http")
             };
             if scheme != "https" {
                 let redir_host = extract_host(req);
@@ -729,7 +735,7 @@ impl LoricaProxy {
             if !lorica_config::route_selection::same_name(host, target) {
                 let redir_path = req.uri.path();
                 let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-                let scheme = forwarded_proto(req).unwrap_or("https");
+                let scheme = ctx.forwarded_proto.unwrap_or("https");
                 let location = format!("{scheme}://{target}{redir_path}{redir_query}");
                 let mut header = lorica_http::ResponseHeader::build(301, None)?;
                 header.insert_header("Location", &location)?;

@@ -1569,6 +1569,17 @@ PY
     else
         ok "Force HTTPS: got $HTTPS_REDIR (proxy may not see x-forwarded-proto)"
     fi
+    # The runner is not in trusted_proxies, so an X-Forwarded-Proto it
+    # sends is its own claim and must not skip the redirect.
+    if [ "$HTTPS_REDIR" = "301" ]; then
+        SPOOFED_PROTO=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+            -H "Host: app1.local" -H "X-Forwarded-Proto: https" "$PROXY/" 2>/dev/null || true)
+        if [ "$SPOOFED_PROTO" = "301" ]; then
+            ok "Force HTTPS ignores X-Forwarded-Proto from an untrusted peer"
+        else
+            fail "Force HTTPS skipped on a client-sent X-Forwarded-Proto: got $SPOOFED_PROTO"
+        fi
+    fi
     api_put "/api/v1/routes/$R1_ID" '{"force_https": false}' >/dev/null
     sleep 1
 
