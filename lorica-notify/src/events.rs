@@ -85,6 +85,27 @@ impl AlertType {
         }
     }
 
+    /// This alert type in words: what an email subject, a Slack message
+    /// and a notification channel's settings show an operator.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::CertExpiring => "Certificate expiring",
+            Self::BackendDown => "Backend down",
+            Self::WafAlert => "WAF alert",
+            Self::ConfigChanged => "Configuration changed",
+            Self::SlaBreached => "SLA breached",
+            Self::SlaRecovered => "SLA recovered",
+            Self::IpBanned => "IP banned",
+            Self::ClusterNodeLeft => "Cluster node left",
+            Self::ClusterConfigRefused => "Cluster configuration refused",
+            Self::ClusterDrift => "Cluster drift",
+            Self::LogStoreUnavailable => "Log persistence lost",
+            Self::LogStoreRecovered => "Log persistence restored",
+            Self::AdcsAuthorityFailed => "AD CS authority failed",
+            Self::CertIssuanceFailed => "Certificate issuance failed",
+        }
+    }
+
     /// Every alert type, in declaration order: the vocabulary a
     /// notification channel can subscribe to.
     pub const ALL: [AlertType; 14] = [
@@ -135,8 +156,9 @@ pub struct AlertEvent {
     pub alert_type: AlertType,
     /// Human-readable summary.
     pub summary: String,
-    /// Additional details as key-value pairs.
-    pub details: std::collections::HashMap<String, String>,
+    /// Additional details as key-value pairs, ordered by key so every
+    /// channel lists them the same way on every send.
+    pub details: std::collections::BTreeMap<String, String>,
     /// When the event occurred.
     pub timestamp: String,
 }
@@ -147,7 +169,7 @@ impl AlertEvent {
         Self {
             alert_type,
             summary: summary.into(),
-            details: std::collections::HashMap::new(),
+            details: std::collections::BTreeMap::new(),
             timestamp: chrono::Utc::now().to_rfc3339(),
         }
     }
@@ -191,6 +213,13 @@ mod tests {
         for (index, alert_type) in AlertType::ALL.iter().enumerate() {
             assert_eq!(declared_position(alert_type), index, "{alert_type:?}");
         }
+    }
+
+    #[test]
+    fn every_alert_type_has_a_distinct_label() {
+        let labels: std::collections::BTreeSet<&str> =
+            AlertType::ALL.iter().map(AlertType::label).collect();
+        assert_eq!(labels.len(), AlertType::ALL.len());
     }
 
     #[test]

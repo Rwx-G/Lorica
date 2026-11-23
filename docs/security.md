@@ -539,6 +539,68 @@ window.
 - Structured JSON logging via tracing for SIEM integration
 - WAF events logged with alert_type and matched rule details
 
+### The client address (v1.10.10)
+
+Every per-IP control (bans, the IP blocklist, rate limits, GeoIP, the
+WAF whitelist, bot protection) and every record of a request (the
+access log, the console request line, the `client.address` span
+attribute, the `X-Real-IP` sent upstream) use one address, resolved once
+per request before any stage can answer it:
+
+- From a peer outside `trusted_proxies` (the default, an empty list), the
+  TCP peer. `X-Forwarded-For` is ignored.
+- From a peer inside `trusted_proxies`, `X-Forwarded-For` is read from
+  the right, every field line counted: the client is the first entry that
+  is not itself a trusted proxy, or the leftmost entry when all are. An
+  entry that is not an IP stops the reading at the trusted hop that wrote
+  it. What a client writes into the header itself sits left of what the
+  trusted proxy appends, so it is never picked.
+
+The result is only as narrow as `trusted_proxies`: a range clients can
+also connect from, or a front proxy that passes the header through
+without appending, lets a client choose its address again.
+
+`X-Forwarded-Proto` follows the same trust. On a plain-HTTP connection
+from a peer inside `trusted_proxies`, its value decides the scheme
+`force_https` and `redirect_hostname` see and the `X-Forwarded-Proto`
+sent upstream, provided it is `http` or `https`; any other value is
+ignored. From any other peer the header is ignored and a plain-HTTP
+connection is `http`, so a client cannot skip `force_https` or tell a
+backend its connection was encrypted. A connection Lorica terminated
+TLS on is `https` whatever the header says.
+
+Up to 1.10.9 the header was believed from any peer. A deployment behind
+a proxy that terminates TLS and forwards plain HTTP to a `force_https`
+route must list that proxy in `trusted_proxies`, or every request is
+redirected to `https://` again and the browser loops.
+
+Each request produces one console line, `request completed` or
+`request completed with error`, and `client_ip` is its first field. In
+`--log-format text` it comes right after the message, before `path` and
+`host`, which carry text the client chose:
+
+```
+... lorica::proxy_wiring: request completed with error client_ip=203.0.113.7 method="GET" path="/.git/config" host="www.example.com" status=403 latency_ms=0 backend="-" error=IP banned
+```
+
+A tool that bans from these lines (Fail2ban reading `docker logs` or the
+journal) must anchor on that position, never on a `client_ip=` found
+anywhere in the line, or a request whose path or `Host` contains
+`client_ip=<someone else>` gets that address banned:
+
+```
+failregex = request completed with error client_ip=<HOST> .* error=IP banned$
+```
+
+The WAF `rules matched` warnings (request and body, detection and
+blocking) lead with `client_ip` the same way, so a filter on those lines
+anchors after their message too.
+
+In the default JSON format the field is `"client_ip":"<address>"`, and
+JSON escaping keeps a client's text from forming that sequence. The text
+format carries colour escapes only when stdout is a terminal, so
+`docker logs` and the journal hold the plain line shown above.
+
 ### Management plane authentication (v1.6.0)
 
 The management API (default port 9443) binds to loopback only and is

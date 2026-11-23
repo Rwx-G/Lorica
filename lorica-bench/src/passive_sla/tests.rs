@@ -22,6 +22,86 @@ use super::bucket::RouteBucket;
 use super::helpers::{compute_percentiles, current_bucket_start};
 use super::SlaCollector;
 
+/// The route the store-backed tests create: `r1` on `example.com/`.
+fn example_route() -> lorica_config::models::Route {
+    lorica_config::models::Route {
+        id: "r1".to_string(),
+        hostname: "example.com".to_string(),
+        path_prefix: "/".to_string(),
+        certificate_id: None,
+        load_balancing: lorica_config::models::LoadBalancing::RoundRobin,
+        waf_enabled: false,
+        waf_mode: lorica_config::models::WafMode::Detection,
+
+        enabled: true,
+        force_https: false,
+        redirect_hostname: None,
+        redirect_to: None,
+        hostname_aliases: Vec::new(),
+        proxy_headers: std::collections::HashMap::new(),
+        response_headers: std::collections::HashMap::new(),
+        security_headers: "moderate".to_string(),
+        connect_timeout_s: 5,
+        read_timeout_s: 60,
+        send_timeout_s: 60,
+        strip_path_prefix: None,
+        add_path_prefix: None,
+        path_rewrite_pattern: None,
+        path_rewrite_replacement: None,
+        access_log_enabled: true,
+        proxy_headers_remove: Vec::new(),
+        response_headers_remove: Vec::new(),
+        max_request_body_bytes: None,
+        waf_body_scan_max_bytes: None,
+        websocket_enabled: true,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        ip_allowlist: Vec::new(),
+        ip_denylist: Vec::new(),
+        cors_allowed_origins: Vec::new(),
+        cors_allowed_methods: Vec::new(),
+        cors_max_age_s: None,
+        compression_enabled: false,
+        retry_attempts: None,
+        cache_enabled: false,
+        cache_ttl_s: 300,
+        cache_max_bytes: 52428800,
+        max_connections: None,
+        slowloris_threshold_ms: 5000,
+        auto_ban_threshold: None,
+        auto_ban_duration_s: 3600,
+        path_rules: vec![],
+        return_status: None,
+        sticky_session: false,
+        basic_auth_username: None,
+        basic_auth_password_hash: None,
+        stale_while_revalidate_s: 10,
+        stale_if_error_s: 60,
+        retry_on_methods: vec![],
+        maintenance_mode: false,
+        error_page_html: None,
+        cache_vary_headers: vec![],
+        header_rules: vec![],
+        traffic_splits: vec![],
+        forward_auth: None,
+        mirror: None,
+        response_rewrite: None,
+        mtls: None,
+        rate_limit: None,
+        geoip: None,
+        bot_protection: None,
+        ai_bot_policy: None,
+        ai_bot_spoofed_fallback: None,
+        serve_robots_txt: false,
+        case_insensitive_paths: false,
+        managed_by: None,
+        group_name: String::new(),
+        node_selector: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
 #[test]
 fn test_compute_percentiles_empty() {
     let mut samples: Vec<u64> = vec![];
@@ -145,82 +225,7 @@ fn test_store_sla_bucket_insert_and_query() {
     let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
 
     // Create a route first (FK constraint)
-    let route = lorica_config::models::Route {
-        id: "r1".to_string(),
-        hostname: "example.com".to_string(),
-        path_prefix: "/".to_string(),
-        certificate_id: None,
-        load_balancing: lorica_config::models::LoadBalancing::RoundRobin,
-        waf_enabled: false,
-        waf_mode: lorica_config::models::WafMode::Detection,
-
-        enabled: true,
-        force_https: false,
-        redirect_hostname: None,
-        redirect_to: None,
-        hostname_aliases: Vec::new(),
-        proxy_headers: std::collections::HashMap::new(),
-        response_headers: std::collections::HashMap::new(),
-        security_headers: "moderate".to_string(),
-        connect_timeout_s: 5,
-        read_timeout_s: 60,
-        send_timeout_s: 60,
-        strip_path_prefix: None,
-        add_path_prefix: None,
-        path_rewrite_pattern: None,
-        path_rewrite_replacement: None,
-        access_log_enabled: true,
-        proxy_headers_remove: Vec::new(),
-        response_headers_remove: Vec::new(),
-        max_request_body_bytes: None,
-        waf_body_scan_max_bytes: None,
-        websocket_enabled: true,
-        rate_limit_rps: None,
-        rate_limit_burst: None,
-        ip_allowlist: Vec::new(),
-        ip_denylist: Vec::new(),
-        cors_allowed_origins: Vec::new(),
-        cors_allowed_methods: Vec::new(),
-        cors_max_age_s: None,
-        compression_enabled: false,
-        retry_attempts: None,
-        cache_enabled: false,
-        cache_ttl_s: 300,
-        cache_max_bytes: 52428800,
-        max_connections: None,
-        slowloris_threshold_ms: 5000,
-        auto_ban_threshold: None,
-        auto_ban_duration_s: 3600,
-        path_rules: vec![],
-        return_status: None,
-        sticky_session: false,
-        basic_auth_username: None,
-        basic_auth_password_hash: None,
-        stale_while_revalidate_s: 10,
-        stale_if_error_s: 60,
-        retry_on_methods: vec![],
-        maintenance_mode: false,
-        error_page_html: None,
-        cache_vary_headers: vec![],
-        header_rules: vec![],
-        traffic_splits: vec![],
-        forward_auth: None,
-        mirror: None,
-        response_rewrite: None,
-        mtls: None,
-        rate_limit: None,
-        geoip: None,
-        bot_protection: None,
-        ai_bot_policy: None,
-        ai_bot_spoofed_fallback: None,
-        serve_robots_txt: false,
-        case_insensitive_paths: false,
-        managed_by: None,
-        group_name: String::new(),
-        node_selector: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    };
+    let route = example_route();
     store
         .create_route(&route)
         .expect("test setup: create route");
@@ -264,82 +269,7 @@ fn test_store_sla_bucket_insert_and_query() {
 fn test_store_sla_summary() {
     let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
 
-    let route = lorica_config::models::Route {
-        id: "r1".to_string(),
-        hostname: "example.com".to_string(),
-        path_prefix: "/".to_string(),
-        certificate_id: None,
-        load_balancing: lorica_config::models::LoadBalancing::RoundRobin,
-        waf_enabled: false,
-        waf_mode: lorica_config::models::WafMode::Detection,
-
-        enabled: true,
-        force_https: false,
-        redirect_hostname: None,
-        redirect_to: None,
-        hostname_aliases: Vec::new(),
-        proxy_headers: std::collections::HashMap::new(),
-        response_headers: std::collections::HashMap::new(),
-        security_headers: "moderate".to_string(),
-        connect_timeout_s: 5,
-        read_timeout_s: 60,
-        send_timeout_s: 60,
-        strip_path_prefix: None,
-        add_path_prefix: None,
-        path_rewrite_pattern: None,
-        path_rewrite_replacement: None,
-        access_log_enabled: true,
-        proxy_headers_remove: Vec::new(),
-        response_headers_remove: Vec::new(),
-        max_request_body_bytes: None,
-        waf_body_scan_max_bytes: None,
-        websocket_enabled: true,
-        rate_limit_rps: None,
-        rate_limit_burst: None,
-        ip_allowlist: Vec::new(),
-        ip_denylist: Vec::new(),
-        cors_allowed_origins: Vec::new(),
-        cors_allowed_methods: Vec::new(),
-        cors_max_age_s: None,
-        compression_enabled: false,
-        retry_attempts: None,
-        cache_enabled: false,
-        cache_ttl_s: 300,
-        cache_max_bytes: 52428800,
-        max_connections: None,
-        slowloris_threshold_ms: 5000,
-        auto_ban_threshold: None,
-        auto_ban_duration_s: 3600,
-        path_rules: vec![],
-        return_status: None,
-        sticky_session: false,
-        basic_auth_username: None,
-        basic_auth_password_hash: None,
-        stale_while_revalidate_s: 10,
-        stale_if_error_s: 60,
-        retry_on_methods: vec![],
-        maintenance_mode: false,
-        error_page_html: None,
-        cache_vary_headers: vec![],
-        header_rules: vec![],
-        traffic_splits: vec![],
-        forward_auth: None,
-        mirror: None,
-        response_rewrite: None,
-        mtls: None,
-        rate_limit: None,
-        geoip: None,
-        bot_protection: None,
-        ai_bot_policy: None,
-        ai_bot_spoofed_fallback: None,
-        serve_robots_txt: false,
-        case_insensitive_paths: false,
-        managed_by: None,
-        group_name: String::new(),
-        node_selector: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    };
+    let route = example_route();
     store
         .create_route(&route)
         .expect("test setup: create route");
@@ -398,82 +328,7 @@ fn test_store_sla_summary_no_data() {
 fn test_store_prune_buckets() {
     let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
 
-    let route = lorica_config::models::Route {
-        id: "r1".to_string(),
-        hostname: "example.com".to_string(),
-        path_prefix: "/".to_string(),
-        certificate_id: None,
-        load_balancing: lorica_config::models::LoadBalancing::RoundRobin,
-        waf_enabled: false,
-        waf_mode: lorica_config::models::WafMode::Detection,
-
-        enabled: true,
-        force_https: false,
-        redirect_hostname: None,
-        redirect_to: None,
-        hostname_aliases: Vec::new(),
-        proxy_headers: std::collections::HashMap::new(),
-        response_headers: std::collections::HashMap::new(),
-        security_headers: "moderate".to_string(),
-        connect_timeout_s: 5,
-        read_timeout_s: 60,
-        send_timeout_s: 60,
-        strip_path_prefix: None,
-        add_path_prefix: None,
-        path_rewrite_pattern: None,
-        path_rewrite_replacement: None,
-        access_log_enabled: true,
-        proxy_headers_remove: Vec::new(),
-        response_headers_remove: Vec::new(),
-        max_request_body_bytes: None,
-        waf_body_scan_max_bytes: None,
-        websocket_enabled: true,
-        rate_limit_rps: None,
-        rate_limit_burst: None,
-        ip_allowlist: Vec::new(),
-        ip_denylist: Vec::new(),
-        cors_allowed_origins: Vec::new(),
-        cors_allowed_methods: Vec::new(),
-        cors_max_age_s: None,
-        compression_enabled: false,
-        retry_attempts: None,
-        cache_enabled: false,
-        cache_ttl_s: 300,
-        cache_max_bytes: 52428800,
-        max_connections: None,
-        slowloris_threshold_ms: 5000,
-        auto_ban_threshold: None,
-        auto_ban_duration_s: 3600,
-        path_rules: vec![],
-        return_status: None,
-        sticky_session: false,
-        basic_auth_username: None,
-        basic_auth_password_hash: None,
-        stale_while_revalidate_s: 10,
-        stale_if_error_s: 60,
-        retry_on_methods: vec![],
-        maintenance_mode: false,
-        error_page_html: None,
-        cache_vary_headers: vec![],
-        header_rules: vec![],
-        traffic_splits: vec![],
-        forward_auth: None,
-        mirror: None,
-        response_rewrite: None,
-        mtls: None,
-        rate_limit: None,
-        geoip: None,
-        bot_protection: None,
-        ai_bot_policy: None,
-        ai_bot_spoofed_fallback: None,
-        serve_robots_txt: false,
-        case_insensitive_paths: false,
-        managed_by: None,
-        group_name: String::new(),
-        node_selector: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    };
+    let route = example_route();
     store
         .create_route(&route)
         .expect("test setup: create route");
@@ -519,82 +374,7 @@ fn test_store_prune_buckets() {
 fn test_store_sla_config_upsert_and_get() {
     let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
 
-    let route = lorica_config::models::Route {
-        id: "r1".to_string(),
-        hostname: "example.com".to_string(),
-        path_prefix: "/".to_string(),
-        certificate_id: None,
-        load_balancing: lorica_config::models::LoadBalancing::RoundRobin,
-        waf_enabled: false,
-        waf_mode: lorica_config::models::WafMode::Detection,
-
-        enabled: true,
-        force_https: false,
-        redirect_hostname: None,
-        redirect_to: None,
-        hostname_aliases: Vec::new(),
-        proxy_headers: std::collections::HashMap::new(),
-        response_headers: std::collections::HashMap::new(),
-        security_headers: "moderate".to_string(),
-        connect_timeout_s: 5,
-        read_timeout_s: 60,
-        send_timeout_s: 60,
-        strip_path_prefix: None,
-        add_path_prefix: None,
-        path_rewrite_pattern: None,
-        path_rewrite_replacement: None,
-        access_log_enabled: true,
-        proxy_headers_remove: Vec::new(),
-        response_headers_remove: Vec::new(),
-        max_request_body_bytes: None,
-        waf_body_scan_max_bytes: None,
-        websocket_enabled: true,
-        rate_limit_rps: None,
-        rate_limit_burst: None,
-        ip_allowlist: Vec::new(),
-        ip_denylist: Vec::new(),
-        cors_allowed_origins: Vec::new(),
-        cors_allowed_methods: Vec::new(),
-        cors_max_age_s: None,
-        compression_enabled: false,
-        retry_attempts: None,
-        cache_enabled: false,
-        cache_ttl_s: 300,
-        cache_max_bytes: 52428800,
-        max_connections: None,
-        slowloris_threshold_ms: 5000,
-        auto_ban_threshold: None,
-        auto_ban_duration_s: 3600,
-        path_rules: vec![],
-        return_status: None,
-        sticky_session: false,
-        basic_auth_username: None,
-        basic_auth_password_hash: None,
-        stale_while_revalidate_s: 10,
-        stale_if_error_s: 60,
-        retry_on_methods: vec![],
-        maintenance_mode: false,
-        error_page_html: None,
-        cache_vary_headers: vec![],
-        header_rules: vec![],
-        traffic_splits: vec![],
-        forward_auth: None,
-        mirror: None,
-        response_rewrite: None,
-        mtls: None,
-        rate_limit: None,
-        geoip: None,
-        bot_protection: None,
-        ai_bot_policy: None,
-        ai_bot_spoofed_fallback: None,
-        serve_robots_txt: false,
-        case_insensitive_paths: false,
-        managed_by: None,
-        group_name: String::new(),
-        node_selector: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    };
+    let route = example_route();
     store
         .create_route(&route)
         .expect("test setup: create route");
@@ -625,82 +405,7 @@ fn test_store_sla_config_upsert_and_get() {
 fn test_store_export_sla_data() {
     let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
 
-    let route = lorica_config::models::Route {
-        id: "r1".to_string(),
-        hostname: "example.com".to_string(),
-        path_prefix: "/".to_string(),
-        certificate_id: None,
-        load_balancing: lorica_config::models::LoadBalancing::RoundRobin,
-        waf_enabled: false,
-        waf_mode: lorica_config::models::WafMode::Detection,
-
-        enabled: true,
-        force_https: false,
-        redirect_hostname: None,
-        redirect_to: None,
-        hostname_aliases: Vec::new(),
-        proxy_headers: std::collections::HashMap::new(),
-        response_headers: std::collections::HashMap::new(),
-        security_headers: "moderate".to_string(),
-        connect_timeout_s: 5,
-        read_timeout_s: 60,
-        send_timeout_s: 60,
-        strip_path_prefix: None,
-        add_path_prefix: None,
-        path_rewrite_pattern: None,
-        path_rewrite_replacement: None,
-        access_log_enabled: true,
-        proxy_headers_remove: Vec::new(),
-        response_headers_remove: Vec::new(),
-        max_request_body_bytes: None,
-        waf_body_scan_max_bytes: None,
-        websocket_enabled: true,
-        rate_limit_rps: None,
-        rate_limit_burst: None,
-        ip_allowlist: Vec::new(),
-        ip_denylist: Vec::new(),
-        cors_allowed_origins: Vec::new(),
-        cors_allowed_methods: Vec::new(),
-        cors_max_age_s: None,
-        compression_enabled: false,
-        retry_attempts: None,
-        cache_enabled: false,
-        cache_ttl_s: 300,
-        cache_max_bytes: 52428800,
-        max_connections: None,
-        slowloris_threshold_ms: 5000,
-        auto_ban_threshold: None,
-        auto_ban_duration_s: 3600,
-        path_rules: vec![],
-        return_status: None,
-        sticky_session: false,
-        basic_auth_username: None,
-        basic_auth_password_hash: None,
-        stale_while_revalidate_s: 10,
-        stale_if_error_s: 60,
-        retry_on_methods: vec![],
-        maintenance_mode: false,
-        error_page_html: None,
-        cache_vary_headers: vec![],
-        header_rules: vec![],
-        traffic_splits: vec![],
-        forward_auth: None,
-        mirror: None,
-        response_rewrite: None,
-        mtls: None,
-        rate_limit: None,
-        geoip: None,
-        bot_protection: None,
-        ai_bot_policy: None,
-        ai_bot_spoofed_fallback: None,
-        serve_robots_txt: false,
-        case_insensitive_paths: false,
-        managed_by: None,
-        group_name: String::new(),
-        node_selector: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    };
+    let route = example_route();
     store
         .create_route(&route)
         .expect("test setup: create route");
@@ -742,5 +447,79 @@ fn test_store_export_sla_data() {
             .expect("test setup: buckets field is an array")
             .len(),
         1
+    );
+}
+
+/// A breach and its recovery name the route by its host and path, and
+/// keep its id among the details for whatever scripts on it.
+#[test]
+fn sla_alerts_name_the_route() {
+    let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
+    let mut route = example_route();
+    route.path_prefix = "/api".to_string();
+    store
+        .create_route(&route)
+        .expect("test setup: create route");
+    store
+        .upsert_sla_config(&SlaConfig::default_for_route("r1"))
+        .expect("test setup: sla config");
+    let collector = SlaCollector::new();
+    let now = current_bucket_start();
+    let mut bucket = SlaBucket {
+        id: None,
+        route_id: "r1".to_string(),
+        bucket_start: now - chrono::Duration::minutes(1),
+        request_count: 100,
+        success_count: 50,
+        error_count: 50,
+        latency_sum_ms: 5000,
+        latency_min_ms: 10,
+        latency_max_ms: 200,
+        latency_p50_ms: 40,
+        latency_p95_ms: 150,
+        latency_p99_ms: 190,
+        source: "passive".to_string(),
+        cfg_max_latency_ms: 500,
+        cfg_status_min: 200,
+        cfg_status_max: 399,
+        cfg_target_pct: 99.9,
+    };
+    store
+        .merge_sla_bucket(&bucket)
+        .expect("test setup: insert failing bucket");
+
+    let breached = super::persistence::check_thresholds(&collector, &store);
+    assert_eq!(breached.len(), 1);
+    assert!(
+        breached[0]
+            .summary
+            .starts_with("SLA breach on example.com/api:"),
+        "{}",
+        breached[0].summary
+    );
+    assert_eq!(
+        breached[0].details.get("route").map(String::as_str),
+        Some("example.com/api")
+    );
+    assert_eq!(
+        breached[0].details.get("route_id").map(String::as_str),
+        Some("r1")
+    );
+
+    bucket.bucket_start = now - chrono::Duration::minutes(2);
+    bucket.request_count = 100_000;
+    bucket.success_count = 100_000;
+    bucket.error_count = 0;
+    store
+        .merge_sla_bucket(&bucket)
+        .expect("test setup: insert healthy bucket");
+    let recovered = super::persistence::check_thresholds(&collector, &store);
+    assert_eq!(recovered.len(), 1);
+    assert!(
+        recovered[0]
+            .summary
+            .starts_with("SLA recovered on example.com/api:"),
+        "{}",
+        recovered[0].summary
     );
 }

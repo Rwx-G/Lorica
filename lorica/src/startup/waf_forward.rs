@@ -194,21 +194,7 @@ impl SupervisorWafIngest {
         // route_hostname and action stamped), so the supervisor only
         // records them in memory.
         if alerts_on(&event.category) {
-            self.alerts.send(
-                AlertEvent::new(
-                    AlertType::WafAlert,
-                    format!(
-                        "WAF {}: {} (rule {})",
-                        event.category.as_str(),
-                        event.description,
-                        event.rule_id
-                    ),
-                )
-                .with_detail("rule_id", event.rule_id.to_string())
-                .with_detail("category", event.category.as_str())
-                .with_detail("severity", event.severity.to_string())
-                .with_detail("client_ip", event.client_ip.clone()),
-            );
+            self.alerts.send(lorica::alerts::waf_alert(&event, None));
         }
         self.check_auto_ban(&event.client_ip);
         self.engine.record_events(vec![event]);
@@ -275,15 +261,12 @@ impl SupervisorWafIngest {
             policy.duration_s,
             lorica_api::ban::BanReason::WafCriticalRule.as_i32(),
         ));
-        self.alerts.send(
-            AlertEvent::new(
-                AlertType::IpBanned,
-                format!("IP {client_ip} auto-banned for repeated WAF violations"),
-            )
-            .with_detail("ip", client_ip)
-            .with_detail("violations", count.to_string())
-            .with_detail("ban_duration_s", policy.duration_s.to_string()),
-        );
+        self.alerts.send(lorica::alerts::ip_banned(
+            client_ip,
+            lorica::alerts::BanCause::RepeatedWafViolations,
+            count,
+            policy.duration_s,
+        ));
     }
 }
 
@@ -448,6 +431,10 @@ mod tests {
         assert_eq!(
             alerts[0].details.get("client_ip").map(String::as_str),
             Some("192.0.2.10")
+        );
+        assert_eq!(
+            alerts[0].details.get("host").map(String::as_str),
+            Some("example.com")
         );
     }
 

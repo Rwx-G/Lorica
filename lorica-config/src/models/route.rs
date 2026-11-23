@@ -1196,6 +1196,16 @@ pub fn validate_node_selector_names(names: &[String]) -> Result<(), String> {
 }
 
 impl Route {
+    /// The route as an operator names it: its hostname, followed by its
+    /// path prefix unless the route answers on the whole host:
+    /// `app.example.com`, `app.example.com/api`.
+    pub fn display_name(&self) -> String {
+        match self.path_prefix.as_str() {
+            "" | "/" => self.hostname.clone(),
+            prefix => format!("{}{prefix}", self.hostname),
+        }
+    }
+
     /// Rewrite `hostname` and every alias to the form the store keeps
     /// and the proxy looks a request up by
     /// ([`crate::route_selection::canonical_hostname`]), dropping an

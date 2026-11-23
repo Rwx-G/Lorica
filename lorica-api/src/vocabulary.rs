@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! How the dashboard shows the alert types: a label, a tone, and which
-//! alert a recovery closes.
+//! How the dashboard shows the alert types: a tone, and which alert a
+//! recovery closes. The label is [`AlertType::label`], held by
+//! `lorica_notify` because the email and Slack channels write it too.
 //!
-//! The alert vocabulary is `lorica_notify`'s [`AlertType::ALL`]; what an
-//! operator reads for each entry is held here, beside the API that
-//! serves the notification channels, by exhaustive matches, so a new
-//! alert type does not compile until it has its words. The dashboard
+//! The alert vocabulary is `lorica_notify`'s [`AlertType::ALL`]; how an
+//! operator reads each entry is held here, beside the API that serves
+//! the notification channels, by exhaustive matches, so a new alert type
+//! does not compile until it has a tone and a recovery. The dashboard
 //! reads them from `adcs.generated.ts`, which
 //! `lorica-api/tests/adcs_vocabulary_fixture.rs` renders from these
 //! functions and pins byte for byte.
@@ -55,26 +56,6 @@ impl AlertTone {
             AlertTone::Warning => "warning",
             AlertTone::Info => "info",
         }
-    }
-}
-
-/// `alert_type` in words, as a notification channel's settings offer it.
-pub fn alert_type_label(alert_type: &AlertType) -> &'static str {
-    match alert_type {
-        AlertType::CertExpiring => "Certificate expiring",
-        AlertType::BackendDown => "Backend down",
-        AlertType::WafAlert => "WAF alert",
-        AlertType::ConfigChanged => "Configuration changed",
-        AlertType::SlaBreached => "SLA breached",
-        AlertType::SlaRecovered => "SLA recovered",
-        AlertType::IpBanned => "IP banned",
-        AlertType::ClusterNodeLeft => "Cluster node left",
-        AlertType::ClusterConfigRefused => "Cluster configuration refused",
-        AlertType::ClusterDrift => "Cluster drift",
-        AlertType::LogStoreUnavailable => "Log persistence lost",
-        AlertType::LogStoreRecovered => "Log persistence restored",
-        AlertType::AdcsAuthorityFailed => "AD CS authority failed",
-        AlertType::CertIssuanceFailed => "Certificate issuance failed",
     }
 }
 
@@ -119,15 +100,7 @@ pub fn alert_type_recovers(alert_type: &AlertType) -> Option<AlertType> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use super::*;
-
-    #[test]
-    fn every_alert_type_has_a_distinct_label() {
-        let labels: BTreeSet<&str> = AlertType::ALL.iter().map(alert_type_label).collect();
-        assert_eq!(labels.len(), AlertType::ALL.len());
-    }
 
     #[test]
     fn a_recovery_closes_a_problem_and_only_a_recovery_closes_anything() {

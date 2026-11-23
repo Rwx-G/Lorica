@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: Lorica API
   description: REST API for Lorica reverse proxy management
-  version: "1.10.9"
+  version: "1.10.10"
   license:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
@@ -440,7 +440,9 @@ paths:
         Updates global settings. All fields are optional - only provided fields
         are changed. The `trusted_proxies` field accepts an array of CIDR ranges
         or IP addresses. X-Forwarded-For is only trusted when the direct TCP
-        client IP matches a trusted proxy entry. Empty array = trust no XFF.
+        client IP matches a trusted proxy entry, and is then read from the
+        right: the client is the first entry that is not itself a trusted
+        proxy. Empty array = trust no XFF.
       security:
         - sessionCookie: []
       requestBody:

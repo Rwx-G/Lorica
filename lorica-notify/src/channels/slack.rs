@@ -28,37 +28,7 @@ struct SlackMessage {
 /// [`NotifyError::Webhook`] on transport failures or non-2xx responses,
 /// a redirect included.
 pub async fn send(config: &WebhookConfig, event: &AlertEvent) -> Result<(), NotifyError> {
-    let emoji = match event.alert_type {
-        crate::events::AlertType::CertExpiring => ":lock:",
-        crate::events::AlertType::BackendDown => ":red_circle:",
-        crate::events::AlertType::WafAlert => ":shield:",
-        crate::events::AlertType::ConfigChanged => ":gear:",
-        crate::events::AlertType::SlaBreached => ":chart_with_downwards_trend:",
-        crate::events::AlertType::SlaRecovered => ":white_check_mark:",
-        crate::events::AlertType::IpBanned => ":no_entry:",
-        crate::events::AlertType::ClusterNodeLeft => ":wave:",
-        crate::events::AlertType::ClusterConfigRefused => ":no_entry_sign:",
-        crate::events::AlertType::ClusterDrift => ":arrows_counterclockwise:",
-        crate::events::AlertType::LogStoreUnavailable => ":rotating_light:",
-        crate::events::AlertType::LogStoreRecovered => ":floppy_disk:",
-        crate::events::AlertType::AdcsAuthorityFailed => ":key:",
-        crate::events::AlertType::CertIssuanceFailed => ":warning:",
-    };
-
-    let mut text = format!(
-        "{} *[{}]* {}\n",
-        emoji,
-        event.alert_type.as_str().to_uppercase().replace('_', " "),
-        event.summary,
-    );
-
-    if !event.details.is_empty() {
-        for (key, value) in &event.details {
-            text.push_str(&format!("  - _{key}_: `{value}`\n"));
-        }
-    }
-
-    text.push_str(&format!("_{}_ | Lorica Reverse Proxy", event.timestamp));
+    let text = slack_text(event);
 
     let message = SlackMessage {
         text,
@@ -102,6 +72,55 @@ pub async fn send(config: &WebhookConfig, event: &AlertEvent) -> Result<(), Noti
     Ok(())
 }
 
+/// The Slack message for `event`: an emoji and the alert type's label,
+/// the summary, then one line per detail.
+fn slack_text(event: &AlertEvent) -> String {
+    let emoji = match event.alert_type {
+        crate::events::AlertType::CertExpiring => ":lock:",
+        crate::events::AlertType::BackendDown => ":red_circle:",
+        crate::events::AlertType::WafAlert => ":shield:",
+        crate::events::AlertType::ConfigChanged => ":gear:",
+        crate::events::AlertType::SlaBreached => ":chart_with_downwards_trend:",
+        crate::events::AlertType::SlaRecovered => ":white_check_mark:",
+        crate::events::AlertType::IpBanned => ":no_entry:",
+        crate::events::AlertType::ClusterNodeLeft => ":wave:",
+        crate::events::AlertType::ClusterConfigRefused => ":no_entry_sign:",
+        crate::events::AlertType::ClusterDrift => ":arrows_counterclockwise:",
+        crate::events::AlertType::LogStoreUnavailable => ":rotating_light:",
+        crate::events::AlertType::LogStoreRecovered => ":floppy_disk:",
+        crate::events::AlertType::AdcsAuthorityFailed => ":key:",
+        crate::events::AlertType::CertIssuanceFailed => ":warning:",
+    };
+
+    let mut text = format!(
+        "{} *[{}]* {}\n",
+        emoji,
+        event.alert_type.label().to_uppercase(),
+        escape_slack_text(&event.summary),
+    );
+
+    for (key, value) in &event.details {
+        let value = escape_slack_text(value).replace('`', "'");
+        text.push_str(&format!("  - _{key}_: `{value}`\n"));
+    }
+
+    text.push_str(&format!("_{}_ | Lorica Reverse Proxy", event.timestamp));
+    text
+}
+
+/// `text` safe to place in a Slack message: an alert summary or detail
+/// can carry a hostname or a path a client chose, and must not be able to
+/// ping a channel (`<!channel>`, `<@U...>`) or, on Discord's
+/// Slack-compatible endpoint, `@everyone`. Slack's own escaping covers
+/// `&`, `<` and `>`; a zero-width space after `@` defuses Discord's
+/// plain-text mentions.
+fn escape_slack_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('@', "@\u{200B}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,16 +128,35 @@ mod tests {
 
     #[test]
     fn test_slack_message_format() {
-        let event = AlertEvent::new(AlertType::BackendDown, "Backend 10.0.0.1:8080 is down")
-            .with_detail("route", "web-frontend");
-        let msg = SlackMessage {
-            text: format!(":red_circle: *[BACKEND DOWN]* {}", event.summary),
-            username: "Lorica".into(),
-            icon_emoji: ":shield:".into(),
-        };
-        let json = serde_json::to_string(&msg).expect("SlackMessage fixture serializes cleanly");
-        assert!(json.contains("BACKEND DOWN"));
-        assert!(json.contains("Lorica"));
+        let event = AlertEvent::new(AlertType::SlaBreached, "SLA breach on app.example.com")
+            .with_detail("route", "app.example.com");
+        let text = slack_text(&event);
+        assert!(
+            text.starts_with(
+                ":chart_with_downwards_trend: *[SLA BREACHED]* SLA breach on app.example.com\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("  - _route_: `app.example.com`\n"), "{text}");
+    }
+
+    /// A host or path a client chose reaches WAF alerts: it must not be
+    /// able to mention a channel, or break out of a detail's code span.
+    #[test]
+    fn client_text_cannot_mention_or_escape_a_code_span() {
+        let event = AlertEvent::new(
+            AlertType::WafAlert,
+            "WAF blocked xss on <!channel> @everyone",
+        )
+        .with_detail("host", "a`<@U123>`b & c");
+        let text = slack_text(&event);
+        assert!(!text.contains("<!channel>"), "{text}");
+        assert!(!text.contains("<@U123>"), "{text}");
+        assert!(!text.contains("@everyone"), "{text}");
+        assert!(
+            text.contains("  - _host_: `a'&lt;@\u{200B}U123&gt;'b &amp; c`\n"),
+            "{text}"
+        );
     }
 
     #[tokio::test]

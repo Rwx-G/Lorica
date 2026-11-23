@@ -168,13 +168,15 @@ pub(super) fn check_thresholds(collector: &SlaCollector, store: &ConfigStore) ->
                 &config.route_id,
                 crate::metrics::SLA_THRESHOLD_TARGET_PCT,
             );
+            let route = crate::route_display_name(store, &config.route_id);
             let event = AlertEvent::new(
                 AlertType::SlaBreached,
                 format!(
-                    "SLA breach on route {}: {:.2}% (target: {:.1}%)",
-                    config.route_id, summary.sla_pct, config.target_pct
+                    "SLA breach on {route}: {:.2}% (target: {:.1}%)",
+                    summary.sla_pct, config.target_pct
                 ),
             )
+            .with_detail("route", route)
             .with_detail("route_id", &config.route_id)
             .with_detail("sla_pct", format!("{:.2}", summary.sla_pct))
             .with_detail("target_pct", format!("{:.1}", config.target_pct))
@@ -182,13 +184,15 @@ pub(super) fn check_thresholds(collector: &SlaCollector, store: &ConfigStore) ->
             alerts.push(event);
         } else if !is_breached && was_breached {
             // Transition breached -> OK
+            let route = crate::route_display_name(store, &config.route_id);
             let event = AlertEvent::new(
                 AlertType::SlaRecovered,
                 format!(
-                    "SLA recovered on route {}: {:.2}% (target: {:.1}%)",
-                    config.route_id, summary.sla_pct, config.target_pct
+                    "SLA recovered on {route}: {:.2}% (target: {:.1}%)",
+                    summary.sla_pct, config.target_pct
                 ),
             )
+            .with_detail("route", route)
             .with_detail("route_id", &config.route_id)
             .with_detail("sla_pct", format!("{:.2}", summary.sla_pct))
             .with_detail("target_pct", format!("{:.1}", config.target_pct))

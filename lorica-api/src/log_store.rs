@@ -1750,13 +1750,13 @@ impl LogStore {
             // A parse failure at read time means storage corruption;
             // surface it as an empty map + warn so the alert history
             // stays viewable rather than blowing up the whole query.
-            let details: std::collections::HashMap<String, String> =
+            let details: std::collections::BTreeMap<String, String> =
                 serde_json::from_str(&details_json).unwrap_or_else(|e| {
                     tracing::warn!(
                         error = %e,
                         "notification history row has corrupt details JSON; returning empty map"
                     );
-                    std::collections::HashMap::new()
+                    std::collections::BTreeMap::new()
                 });
             events.push(lorica_notify::AlertEvent {
                 alert_type,
@@ -3524,7 +3524,7 @@ mod notification_history_tests {
         lorica_notify::AlertEvent {
             alert_type: lorica_notify::events::AlertType::ConfigChanged,
             summary: format!("event {i}"),
-            details: std::collections::HashMap::new(),
+            details: std::collections::BTreeMap::new(),
             timestamp: "2026-04-21T12:00:00Z".into(),
         }
     }

@@ -30,7 +30,7 @@
 
 use lorica_adcs::{kdc_error_meaning, kdc_rejection_codes, FailureStep};
 use lorica_api::adcs::{AdoptionUnavailable, IssuanceStep, ADCS_CODES};
-use lorica_api::vocabulary::{alert_type_label, alert_type_recovers, alert_type_tone, AlertTone};
+use lorica_api::vocabulary::{alert_type_recovers, alert_type_tone, AlertTone};
 use lorica_config::models::{AdcsKeyType, AdcsSubjectDefaults, CertificateSource};
 use lorica_notify::events::AlertType;
 
@@ -118,7 +118,7 @@ fn rendered() -> String {
         out.push_str(&format!(
             "  {{ value: {}, label: {}, tone: {}, recovers: {} }},\n",
             ts(alert_type.as_str()),
-            ts(alert_type_label(&alert_type)),
+            ts(alert_type.label()),
             ts(alert_type_tone(&alert_type).as_str()),
             alert_type_recovers(&alert_type)
                 .map_or_else(|| "null".to_string(), |closed| ts(closed.as_str())),

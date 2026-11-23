@@ -6,10 +6,10 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.10.9-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.10.10-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-3711-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-3738-brightgreen.svg" alt="Lorica Tests">
   <img src="https://img.shields.io/badge/Pingora%20Tests-880-blue.svg" alt="Inherited Tests">
 </p>
 
@@ -53,7 +53,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **Rate limiting** - per-route, per-client-IP with configurable RPS and burst tolerance (legacy event-rate estimator `rate_limit_rps` / `rate_limit_burst`)
 - **Per-route token-bucket limiter** - exact-semantic admission control via `rate_limit: { capacity, refill_per_sec, scope }`. Runs ahead of mTLS / forward-auth / WAF so abusive clients are rejected cheaply with `429 Too Many Requests` + `Retry-After`. `scope: per_ip` isolates individual clients; `scope: per_route` caps aggregate traffic to a fragile origin. Cross-worker under `--workers N`: each worker's CAS-based `LocalBucket` cache syncs every 100 ms with the supervisor's authoritative state over a dedicated pipelined RPC channel. Aggregate bound: `capacity + 100 ms × N_workers × refill_per_sec` (documented in `docs/architecture/worker-shared-state.md` § 6)
 - **Auto-ban** - IPs that repeatedly exceed rate limits (or trip the WAF) are banned automatically (configurable threshold and duration). Under `--workers N`, the WAF auto-ban counter lives in an anonymous `memfd` shared by all workers (no UDS round-trip per block), and the supervisor is the sole ban issuer, broadcasting `BanIp` on threshold crossing
-- **Trusted proxies** - CIDR list for X-Forwarded-For validation, prevents IP spoofing via header injection
+- **Trusted proxies** - CIDR list for X-Forwarded-For validation. Since v1.10.10 the header is read from the right, so a client behind a proxy that appends to it cannot choose the address its bans, rate limits and WAF whitelist are checked against; one address per request feeds every control, the access log, the console line and the `X-Real-IP` sent upstream. The same list is the only source of a believed X-Forwarded-Proto, so a proxy that terminates TLS in front of a `force_https` route must be listed. See `docs/security.md`
 - **DDoS protection** - per-route max connections, global flood rate tracking
 - **Slowloris protection** - a client trickling its request header is answered 408 and disconnected once `header_timeout_s` (default 10 s, counted from the header's first byte) elapses, enforced while the header is read; a per-route `slowloris_threshold_ms` refuses with 408 a request whose header took longer, before it reaches the backend
 - **Idle connection timeout** (v1.9.0) - closes a client connection idle longer than `downstream_idle_timeout_s` (default 75 s, as nginx): an HTTP/1.1 keep-alive connection between requests, an HTTP/2 connection with no stream in flight. Streaming responses and WebSockets are not idle. Applies on reload, no restart
@@ -134,7 +134,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **ACME / Let's Encrypt** - automatic TLS provisioning via HTTP-01 and DNS-01 challenges (Cloudflare, Route53, OVH providers), multi-domain SAN and wildcard support, smart auto-renewal, OCSP stapling
 - **AD CS enrollment** (v1.10.0) - issue, renew and adopt internal certificates from an Active Directory Certificate Services authority through its enrollment web service, with Kerberos bound to the TLS channel and no Kerberos setup on the host; one confirmed click from the route form or the certificate page, names bounded by a SuperAdmin-owned DNS suffix allowlist, renewal in place with a new key, control plane only. See [docs/adcs.md](docs/adcs.md)
 - **DNS providers** - global DNS credentials configured once in Settings and referenced by ID for certificate provisioning (Cloudflare, Route53, OVH)
-- **Notification channels** - stdout, SMTP email, HTTP webhook, Slack with per-channel rate limiting
+- **Notification channels** - stdout, SMTP email, HTTP webhook, Slack with per-channel rate limiting; since v1.10.10 emails and Slack messages name the alert type in words and the route, backend or host by name, with Slack text escaped so client-chosen hosts cannot mention a channel
 - **Ban list management** - view and unban auto-banned IPs from the dashboard
 
 ### :zap: Performance
@@ -768,7 +768,7 @@ cargo test -p lorica-cluster --tests
 cd lorica-dashboard/frontend && pnpm install --frozen-lockfile && pnpm run check && pnpm run lint && pnpm exec vitest run
 ```
 
-At 1.10.9 the two product-crate steps run 3711 Rust tests and the
+At 1.10.10 the two product-crate steps run 3738 Rust tests and the
 forked-crate step 880; the rustls build runs 539 more, most of them the
 default-feature tests of `lorica-core` and `lorica-lb` again with TLS on,
 so they are left out of the forked figure. The frontend suite is 825

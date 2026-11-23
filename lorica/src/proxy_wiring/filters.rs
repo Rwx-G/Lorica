@@ -26,10 +26,10 @@ use tracing::{debug, warn};
 use super::ai_bot_merged::{self, MergedCrawler, MergedVerification};
 use super::{
     bot_handlers, build_mirror_forward_headers, canary_bucket, downstream_ssl_digest, extract_host,
-    host_without_port, mirror_sample_hit, mtls_refusal_status, render_error_body, request_has_body,
-    route_client_cert, run_forward_auth_keyed, spawn_mirrors, ForwardAuthOutcome, HandshakeName,
-    LoricaProxy, MirrorBodyState, MirrorPending, ProxyConfig, RequestCtx, RouteEntry,
-    VerdictCacheEngine, WAF_BODY_SCAN_DEFAULT,
+    forwarded_client, forwarded_proto, host_without_port, mirror_sample_hit, mtls_refusal_status,
+    render_error_body, request_has_body, route_client_cert, run_forward_auth_keyed, spawn_mirrors,
+    ForwardAuthOutcome, HandshakeName, LoricaProxy, MirrorBodyState, MirrorPending, ProxyConfig,
+    RequestCtx, RouteEntry, VerdictCacheEngine, WAF_BODY_SCAN_DEFAULT,
 };
 use crate::ai_bot::build_robots_txt_from_names;
 
@@ -445,39 +445,18 @@ impl LoricaProxy {
     /// `/lorica/bot/captcha/{nonce}` (serve the captcha PNG). Both are
     /// route-independent: the stashed entry carries the route_id the
     /// cookie gets bound to, and the captcha nonce is self-scoped.
-    /// Client IP extraction + cookie-bound scope validation happen
-    /// inside the handlers. Terminal: handler-defined status, or 503
-    /// when the client address is unavailable on the solve path.
-    pub(super) async fn check_bot_endpoints(&self, session: &mut Session) -> Result<Option<bool>> {
+    /// The solve path binds the verdict to the client address the
+    /// client-IP stage resolved, the one the challenge-render path saw.
+    /// Terminal: handler-defined status, or 503 when the client address
+    /// is unavailable on the solve path.
+    pub(super) async fn check_bot_endpoints(
+        &self,
+        session: &mut Session,
+        ctx: &RequestCtx,
+    ) -> Result<Option<bool>> {
         let path: String = session.req_header().uri.path().to_owned();
         if crate::bot::is_bot_solve_path(&path) {
-            // Client IP must go through the SAME XFF unwrap that
-            // the challenge-render path used; otherwise the
-            // stashed entry's IP prefix (XFF-unwrapped) won't
-            // match the current TCP client's prefix and the
-            // handler rejects with 403 "client network changed".
-            // Duplicates the xff_used logic from the client-IP
-            // resolution stage, because that stage is skipped
-            // entirely when we take this early return.
-            let config = self.config.load();
-            let tcp_ip = session
-                .client_addr()
-                .and_then(|addr| addr.as_inet())
-                .map(|a| a.ip());
-            let xff_header = session
-                .req_header()
-                .headers
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok());
-            let direct_is_trusted =
-                tcp_ip.is_some_and(|ip| config.trusted_proxies.iter().any(|net| net.contains(&ip)));
-            let client_ip = if direct_is_trusted {
-                xff_header
-                    .and_then(|xff| xff.split(',').next().unwrap_or(xff).trim().parse().ok())
-                    .or(tcp_ip)
-            } else {
-                tcp_ip
-            };
+            let client_ip = ctx.client_ip_addr;
             let now_secs = chrono::Utc::now().timestamp();
             let secret = lorica_challenge::secret::handle();
             let secret_ref = secret.as_deref();
@@ -546,62 +525,43 @@ impl LoricaProxy {
         Ok(None)
     }
 
-    /// Stage: client IP resolution (never terminal). Derives the
-    /// effective client IP - the direct TCP peer, or the leftmost
-    /// X-Forwarded-For entry when the direct peer is a trusted proxy -
-    /// stamps `ctx.client_ip`, `ctx.client_ip_addr`, `ctx.is_xff`,
-    /// `ctx.xff_proxy_ip` and `ctx.source`, and returns the IP string
-    /// every later check keys on.
+    /// Stage: client IP resolution (never terminal), run before every
+    /// stage that can answer the request. Derives the effective client
+    /// IP - the direct TCP peer, or the X-Forwarded-For entry
+    /// [`forwarded_client`] attributes the request to when the direct
+    /// peer is a trusted proxy - stamps `ctx.client_ip`,
+    /// `ctx.client_ip_addr`, `ctx.is_xff`, `ctx.xff_proxy_ip`,
+    /// `ctx.forwarded_proto` (same trust) and `ctx.source`, and returns
+    /// the IP string every later check keys on.
     pub(super) fn resolve_client_ip(
         &self,
         session: &Session,
         ctx: &mut RequestCtx,
         config: &ProxyConfig,
     ) -> Option<String> {
-        let client_ip = session
+        let req = session.req_header();
+        let peer = session
             .as_downstream()
             .client_addr()
             .and_then(|addr| addr.as_inet())
-            .map(|addr| addr.ip().to_string());
-
-        // Only trust X-Forwarded-For when the direct TCP client is a trusted proxy.
-        // When trusted_proxies is empty, XFF is never used (secure default).
-        let req = session.req_header();
-        let has_xff = req.headers.get("x-forwarded-for").is_some();
-        let direct_ip = client_ip.clone();
-
-        let direct_is_trusted = direct_ip.as_ref().is_some_and(|ip| {
-            if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
-                config.trusted_proxies.iter().any(|net| net.contains(&addr))
-            } else {
-                false
-            }
-        });
-
-        let xff_used = direct_is_trusted && has_xff;
-        let check_ip = if xff_used {
-            // Trusted proxy: extract real client IP from XFF (leftmost entry)
-            req.headers
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .map(|xff| xff.split(',').next().unwrap_or(xff).trim().to_string())
-                .or(client_ip)
-        } else {
-            // Not trusted or no XFF: use direct TCP client IP
-            client_ip
-        };
+            .map(|addr| addr.ip());
+        let client = peer.map(|peer| forwarded_client(peer, req, &config.trusted_proxies));
 
         // Store client IP and source in context for access logging.
-        // Parse the string form once; every later per-request
-        // consumer (whitelist, blocklist, GeoIP, bot protection)
-        // reuses `ctx.client_ip_addr` instead of re-parsing
-        // (audit #41f).
+        // Every later per-request consumer (whitelist, blocklist, GeoIP,
+        // bot protection) reuses `ctx.client_ip_addr` instead of
+        // re-parsing the string form (audit #41f).
+        let check_ip = client.map(|client| client.ip.to_string());
         ctx.client_ip = check_ip.clone();
-        ctx.client_ip_addr = check_ip
-            .as_deref()
-            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok());
-        ctx.is_xff = xff_used && check_ip.is_some();
-        ctx.xff_proxy_ip = if ctx.is_xff { direct_ip } else { None };
+        ctx.client_ip_addr = client.map(|client| client.ip);
+        ctx.is_xff = client.is_some_and(|client| client.via_forwarded_for);
+        ctx.xff_proxy_ip = if ctx.is_xff {
+            peer.map(|peer| peer.to_string())
+        } else {
+            None
+        };
+        ctx.forwarded_proto =
+            peer.and_then(|peer| forwarded_proto(peer, req, &config.trusted_proxies));
         ctx.source = req
             .headers
             .get("x-lorica-source")
@@ -730,15 +690,18 @@ impl LoricaProxy {
 
     /// Stage: route-level redirects. Covers the force-HTTPS redirect
     /// (skipped for ACME challenge paths, which must stay on HTTP) and
-    /// the hostname redirect (`redirect_hostname`), which `host`, the
-    /// request's host as routes are looked up, already names or not.
+    /// the hostname redirect (`redirect_hostname`), which
+    /// `ctx.request_host`, the request's host as routes are looked up,
+    /// already names or not. The scheme of a plain-HTTP connection is
+    /// the one a trusted proxy reported (`ctx.forwarded_proto`).
     /// Terminal: 301.
     pub(super) async fn check_route_redirects(
         &self,
         session: &mut Session,
+        ctx: &RequestCtx,
         entry: &RouteEntry,
-        host: &str,
     ) -> Result<Option<bool>> {
+        let host = ctx.request_host.as_str();
         let req = session.req_header();
         let path = req.uri.path();
 
@@ -751,10 +714,7 @@ impl LoricaProxy {
             let scheme = if is_tls {
                 "https"
             } else {
-                req.headers
-                    .get("x-forwarded-proto")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("http")
+                ctx.forwarded_proto.unwrap_or("http")
             };
             if scheme != "https" {
                 let redir_host = extract_host(req);
@@ -775,11 +735,7 @@ impl LoricaProxy {
             if !lorica_config::route_selection::same_name(host, target) {
                 let redir_path = req.uri.path();
                 let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-                let scheme = req
-                    .headers
-                    .get("x-forwarded-proto")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("https");
+                let scheme = ctx.forwarded_proto.unwrap_or("https");
                 let location = format!("{scheme}://{target}{redir_path}{redir_query}");
                 let mut header = lorica_http::ResponseHeader::build(301, None)?;
                 header.insert_header("Location", &location)?;
@@ -822,8 +778,6 @@ impl LoricaProxy {
             return Ok(None);
         };
 
-        // Only an address that parsed as an IP names a client: an
-        // `X-Forwarded-For` entry behind a trusted proxy is free text.
         let client_ip = ctx.client_ip_addr.and(ctx.client_ip.as_deref());
         let key = super::rate_limit::bucket_key(
             &entry.route.id,
@@ -910,15 +864,12 @@ impl LoricaProxy {
                     "IP auto-banned for rate limit abuse"
                 );
                 if let Some(ref sender) = self.alert_sender {
-                    sender.send(
-                        lorica_notify::AlertEvent::new(
-                            lorica_notify::events::AlertType::IpBanned,
-                            format!("IP {ip} auto-banned for rate limit abuse"),
-                        )
-                        .with_detail("ip", ip.to_string())
-                        .with_detail("violations", violations.to_string())
-                        .with_detail("ban_duration_s", ban_duration.to_string()),
-                    );
+                    sender.send(crate::alerts::ip_banned(
+                        ip,
+                        crate::alerts::BanCause::RateLimitAbuse,
+                        violations,
+                        ban_duration,
+                    ));
                 }
             }
         }
@@ -2377,17 +2328,7 @@ impl LoricaProxy {
                 }
                 // Dispatch waf_alert notification
                 if let (Some(ref sender), Some(ev)) = (&self.alert_sender, events.first()) {
-                    sender.send(
-                        lorica_notify::AlertEvent::new(
-                            lorica_notify::events::AlertType::WafAlert,
-                            format!("WAF blocked {} on {}{}", ev.category.as_str(), host, path),
-                        )
-                        .with_detail("rule_id", ev.rule_id.to_string())
-                        .with_detail("category", ev.category.as_str().to_string())
-                        .with_detail("host", host.to_string())
-                        .with_detail("path", path.to_string())
-                        .with_detail("client_ip", check_ip.unwrap_or("-").to_string()),
-                    );
+                    sender.send(crate::alerts::waf_alert(ev, Some(path)));
                 }
                 ctx.waf_blocked = true;
                 ctx.matched_host = Some(host.to_string());
@@ -2443,18 +2384,12 @@ impl LoricaProxy {
                                     "IP auto-banned for repeated WAF violations (local counter)"
                                 );
                                 if let Some(ref sender) = self.alert_sender {
-                                    sender.send(
-                                        lorica_notify::AlertEvent::new(
-                                            lorica_notify::events::AlertType::IpBanned,
-                                            format!(
-                                                "IP {} auto-banned for repeated WAF violations",
-                                                ip
-                                            ),
-                                        )
-                                        .with_detail("ip", ip.to_string())
-                                        .with_detail("violations", violations.to_string())
-                                        .with_detail("ban_duration_s", ban_duration.to_string()),
-                                    );
+                                    sender.send(crate::alerts::ip_banned(
+                                        ip,
+                                        crate::alerts::BanCause::RepeatedWafViolations,
+                                        violations,
+                                        ban_duration,
+                                    ));
                                 }
                             }
                         }

@@ -203,18 +203,9 @@ impl ProbeScheduler {
                 // Alert on probe failure
                 if !result.success {
                     if let Some(ref dispatcher) = dispatcher {
-                        let event = AlertEvent::new(
-                            AlertType::SlaBreached,
-                            format!(
-                                "Active probe failed for route {}: {}",
-                                result.route_id,
-                                result.error.as_deref().unwrap_or("unexpected status")
-                            ),
-                        )
-                        .with_detail("route_id", &result.route_id)
-                        .with_detail("probe_id", &probe.id)
-                        .with_detail("status_code", result.status_code.to_string())
-                        .with_detail("latency_ms", result.latency_ms.to_string());
+                        let route =
+                            crate::route_display_name(&*store.lock().await, &result.route_id);
+                        let event = probe_failure_alert(route, &result, &probe.id);
 
                         let d = dispatcher.lock().await;
                         d.dispatch(&event).await;
@@ -236,6 +227,22 @@ impl ProbeScheduler {
     pub async fn active_count(&self) -> usize {
         self.tasks.lock().await.len()
     }
+}
+
+/// The alert a failed probe raises, naming the route as `route`.
+fn probe_failure_alert(route: String, result: &ProbeResult, probe_id: &str) -> AlertEvent {
+    AlertEvent::new(
+        AlertType::SlaBreached,
+        format!(
+            "Active probe failed for {route}: {}",
+            result.error.as_deref().unwrap_or("unexpected status")
+        ),
+    )
+    .with_detail("route", route)
+    .with_detail("route_id", &result.route_id)
+    .with_detail("probe_id", probe_id)
+    .with_detail("status_code", result.status_code.to_string())
+    .with_detail("latency_ms", result.latency_ms.to_string())
 }
 
 /// Resolve the first healthy backend address for a route from the database.
@@ -359,6 +366,41 @@ async fn execute_probe(
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn a_failed_probe_alert_names_the_route() {
+        let result = ProbeResult {
+            route_id: "r1".to_string(),
+            status_code: 503,
+            latency_ms: 12,
+            success: false,
+            error: None,
+        };
+        let alert = probe_failure_alert("app.example.com/api".to_string(), &result, "p1");
+        assert_eq!(
+            alert.summary,
+            "Active probe failed for app.example.com/api: unexpected status"
+        );
+        for (key, value) in [
+            ("route", "app.example.com/api"),
+            ("route_id", "r1"),
+            ("probe_id", "p1"),
+            ("status_code", "503"),
+        ] {
+            assert_eq!(
+                alert.details.get(key).map(String::as_str),
+                Some(value),
+                "{key}"
+            );
+        }
+    }
+
+    /// An alert about a route deleted meanwhile still says which one.
+    #[test]
+    fn a_route_the_store_no_longer_holds_is_named_by_its_id() {
+        let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
+        assert_eq!(crate::route_display_name(&store, "gone"), "gone");
+    }
 
     fn make_probe_config(id: &str, route_id: &str) -> ProbeConfig {
         let now = Utc::now();
