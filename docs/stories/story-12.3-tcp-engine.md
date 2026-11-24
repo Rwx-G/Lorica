@@ -1984,4 +1984,4 @@ Lot B:
 | 2026-11-18 | 0.12 | Dated notes under D-d (HAProxy `retries` and `srvtcpka` defaults not in the 3.4 manual) and D-p (`max_connections` per node since Story 12.6). | Romain G. |
 | 2026-11-21 | 0.13 | Phase 1 audit: finding C4's maintainer decision recorded under D-m (a token's address change on a backend any stream links is refused, 403; the code ships with the audit's code lot); the "one thread per process" pitfall corrected to two threads (A-I1). | Romain G. |
 | 2026-11-22 | 0.14 | Phase 1 audit, TCP data path lot: dated notes under D-d (one timer per forwarding call for the idle and total timeouts, idle fires at its value; findings C10, C11) and D-o (bucket capacity covers two timer ticks of the rate; finding C8). The client socket now gets the `TCP_NODELAY` D-c always promised (C2). | Romain G. |
-| 2026-11-24 | 0.14 | Phase 1 audit lot C, finding C9: D-g amended, a breaker success report is no longer awaited in worker mode. | Romain G. |
+| 2026-11-24 | 0.15 | Phase 1 audit lot C, finding C9: D-g amended, a breaker success report is no longer awaited in worker mode. | Romain G. |
