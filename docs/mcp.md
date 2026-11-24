@@ -610,8 +610,9 @@ one.** Beside the table, and not in it, since it is not a control that
 strengthens one way: `HEALTH_CHECK_PAYLOAD`
 (`lorica-automation-policy/src/protections.rs`) says that a check whose
 bytes ship with the release, a template included, is set freely, and a
-stored custom send/expect check may be kept exactly as it is or
-replaced, but never created or changed by a token. A custom check makes
+stored custom send/expect check may be kept exactly as it is, on the
+address it was written for, or replaced, but never created, changed or
+moved to another address by a token. A custom check makes
 the node send bytes an operator chose to the backend's address on every
 probe (PRD D9), so a model that read attacker text must not be the one
 choosing them; the template set is the whole of what a token can make

@@ -825,24 +825,35 @@ fn streams_as_seen_by(principal: &AutomationPrincipal, streams: &[Stream]) -> St
 /// changes a health check carrying bytes an operator chose
 /// ([`HealthCheck::carries_raw_payload`], the one predicate every
 /// enforcement point calls), and may leave a stored one exactly as it
-/// is.
+/// is, on the address it was written for.
 ///
 /// Weighed on the row after the patch, never on the body: a patch of
 /// the weight alone carries the stored payload in `after`, and refusing
 /// "a payload in `after`" would lock every token edit of such a
-/// backend. Moving away from a custom check (to a template, a connect,
-/// or checks off) is allowed: a health check is not an access control.
-/// The refusal names the field and the rule, never the payload.
+/// backend. The address is part of what is kept (audit finding C18):
+/// the operator chose those bytes for that destination, and a token
+/// moving the backend would send them to a host of its own choosing
+/// inside its grant. Moving away from a custom check (to a template, a
+/// connect, or checks off), in the same write as an address change
+/// included, is allowed: a health check is not an access control. The
+/// refusal names the field and the rule, never the payload.
 ///
 /// [`HealthCheck::carries_raw_payload`]: lorica_config::models::HealthCheck::carries_raw_payload
 fn ensure_no_new_raw_payload(before: Option<&Backend>, after: &Backend) -> Result<(), ApiError> {
-    let kept_as_stored = before.is_some_and(|before| before.health_check == after.health_check);
-    if !after.health_check.carries_raw_payload() || kept_as_stored {
+    if !after.health_check.carries_raw_payload() {
         return Ok(());
     }
+    let resolution = match before.filter(|before| before.health_check == after.health_check) {
+        Some(stored) if stored.address == after.address => return Ok(()),
+        Some(_) => {
+            "a backend carrying one moves to another address in the dashboard, or with the \
+             check moved to a template in the same write"
+        }
+        None => "a custom send/expect check is set in the dashboard",
+    };
     let rule = backend_rule::HEALTH_CHECK_PAYLOAD;
     Err(ApiError::Forbidden(format!(
-        "{}: {}, because {}; a custom send/expect check is set in the dashboard",
+        "{}: {}, because {}; {resolution}",
         rule.fields.join(" / "),
         rule.rule,
         rule.why

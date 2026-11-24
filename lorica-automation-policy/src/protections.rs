@@ -181,8 +181,9 @@ pub mod backend {
     pub const HEALTH_CHECK_PAYLOAD: ProtectionRule = ProtectionRule {
         fields: &["health_check"],
         rule: "any check whose bytes ship with the release, a named template included, is set \
-               freely, and a stored custom send/expect check may be kept exactly as it is or \
-               replaced; a custom send/expect check is never created or changed",
+               freely, and a stored custom send/expect check may be kept exactly as it is, on \
+               the address it was written for, or replaced; a custom send/expect check is never \
+               created, changed or moved to another address",
         why: "a custom check makes the node send bytes an operator chose to the backend's \
               address on every probe, so it is written in the dashboard, while a template's \
               bytes are the release's",

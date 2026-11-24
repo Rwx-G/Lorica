@@ -3884,6 +3884,82 @@ async fn iv2_a_token_sets_a_template_and_never_authors_a_custom_payload() {
     );
 }
 
+#[tokio::test]
+async fn a_token_never_moves_a_custom_payload_to_another_address() {
+    // Audit finding C18 on Story 12.7 D-7: a stored payload is kept only
+    // on the address the operator wrote it for. Moving the backend while
+    // the payload rides the patch would send the operator's bytes to a
+    // host the token picks inside its grant, so it is a 403, preview
+    // included, that moves nothing; the same move with the check turned
+    // into a template is the token's to make.
+    let f = a_node_with_something_to_write().await;
+    let backend_path = format!("/automation/v1/backends/{}", f.backend_id);
+    let custom = a_custom_check("AUTH s3cr3t\r\nPING\r\n");
+    let response = send(
+        &f.state,
+        &f.session_store,
+        &f.rate_limiter,
+        "PUT",
+        &format!("/api/v1/backends/{}", f.backend_id),
+        &f.admin,
+        Some(serde_json::json!({ "health_check": custom })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "the dashboard sets one");
+    let stored_address = || async {
+        f.state
+            .store
+            .lock()
+            .await
+            .get_backend(&f.backend_id)
+            .expect("store")
+            .expect("the backend")
+            .address
+    };
+    let original = stored_address().await;
+
+    for suffix in ["?dry_run=true", ""] {
+        let response = automation_call(
+            &f.state,
+            "PUT",
+            &format!("{backend_path}{suffix}"),
+            &f.bearer,
+            Some(serde_json::json!({ "address": "10.0.0.66:6379" })),
+        )
+        .await;
+        assert_payload_refused(response, "s3cr3t", &format!("moved{suffix}")).await;
+    }
+    assert_eq!(stored_address().await, original, "nothing moved");
+    assert_eq!(stored_check(&f.state, &f.backend_id).await, custom);
+
+    // The stored address sent back is no move.
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &backend_path,
+        &f.bearer,
+        Some(serde_json::json!({ "address": original.clone(), "weight": 30 })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(stored_check(&f.state, &f.backend_id).await, custom);
+
+    // Away from the payload in the same write, the move is the token's.
+    let template = serde_json::json!({ "kind": "tcp_template", "template": "redis_ping",
+                                       "timeout_ms": 2000 });
+    let response = automation_call(
+        &f.state,
+        "PUT",
+        &backend_path,
+        &f.bearer,
+        Some(serde_json::json!({ "address": "10.0.0.66:6379", "health_check": template })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(stored_address().await, "10.0.0.66:6379");
+    assert_eq!(stored_check(&f.state, &f.backend_id).await, template);
+}
+
 // ---- Story 12.10 D-i: a token never unlinks a backend from a stream ----
 
 /// A TCP stream named `name` on `port` linking `backends` as primaries,

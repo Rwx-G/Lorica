@@ -1866,10 +1866,11 @@ pub const MUTATIONS: &[Mutation] = &[
                   `[redacted]` values included, keeps the stored path; any other path carrying \
                   `[redacted]` is refused. A custom send/expect check is set in the dashboard: \
                   this tool refuses its `send` and `expect` keys, so it cannot send one back, \
-                  even exactly as read; a patch that leaves `health_check` out keeps it. \
-                  Moving a backend from one to a template or a connect is allowed. The \
-                  address of a backend any stream uses does not move through this tool; it is \
-                  moved in the dashboard.",
+                  even exactly as read; a patch that leaves `health_check` out keeps it, on \
+                  the backend's current address only: moving such a backend needs the same \
+                  patch to move it to a template or a connect, which is allowed. The address \
+                  of a backend any stream uses does not move through this tool; it is moved in \
+                  the dashboard.",
         scope: AutomationScope::BackendsWrite,
         verb: Verb::Put,
         path: "/automation/v1/backends",

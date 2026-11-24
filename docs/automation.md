@@ -1258,7 +1258,12 @@ or change a stored one, is a 403 naming `health_check` and the rule,
 preview included, and nothing is written. A token may set
 `tcp_connect`, `http` or `tcp_template` freely, which also moves a
 backend away from a custom check, and a stored custom check survives a
-token's patch of other fields, or the check sent back as read (above).
+token's patch of other fields, or the check sent back as read (above),
+on the address it was written for: a patch that moves the backend to
+another address while the custom check stays is a 403 too, since it
+would send the operator's bytes to a host the token chose. The same
+move with the check turned into a template in the same write is the
+token's to make.
 The guard compares the check after the patch with the stored one and
 never matches a kind of its own: the rule is
 `HEALTH_CHECK_PAYLOAD` in `lorica-automation-policy/src/protections.rs`,
