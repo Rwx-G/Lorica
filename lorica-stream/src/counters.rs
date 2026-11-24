@@ -727,21 +727,15 @@ impl Drop for ActiveGuard {
     }
 }
 
-type Family<K, V> = Mutex<HashMap<K, Arc<V>>>;
+type Family<V> = Mutex<HashMap<String, Arc<V>>>;
 
-fn entry<K: Eq + Hash, V: Default>(family: &Family<K, V>, key: K) -> Arc<V> {
-    Arc::clone(
-        family
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(key)
-            .or_default(),
-    )
-}
+/// A family keyed by a pair of ids, nested so that a lookup borrows both.
+type PairFamily<V> = Mutex<HashMap<String, HashMap<String, Arc<V>>>>;
 
-/// [`entry`] for a family keyed by id, which allocates the key only on
-/// first use: the UDP engine reads a stream's counters per datagram.
-fn entry_by_id<V: Default>(family: &Family<String, V>, id: &str) -> Arc<V> {
+/// The counters of `id`, created on first use, which is the only time
+/// the key is allocated: the UDP engine reads a stream's counters per
+/// datagram.
+fn entry_by_id<V: Default>(family: &Family<V>, id: &str) -> Arc<V> {
     let mut map = family.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(found) = map.get(id) {
         return Arc::clone(found);
@@ -749,7 +743,23 @@ fn entry_by_id<V: Default>(family: &Family<String, V>, id: &str) -> Arc<V> {
     Arc::clone(map.entry(id.to_string()).or_default())
 }
 
-fn read<K: Clone + Ord, V, S>(family: &Family<K, V>, snap: impl Fn(&V) -> S) -> BTreeMap<K, S> {
+/// The counters of (`first`, `second`), created on first use, which is
+/// the only time the keys are allocated: the engines read a link's
+/// counters per connection and per session (Phase 1 audit C25).
+fn entry_by_pair<V: Default>(family: &PairFamily<V>, first: &str, second: &str) -> Arc<V> {
+    let mut map = family.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(found) = map.get(first).and_then(|inner| inner.get(second)) {
+        return Arc::clone(found);
+    }
+    Arc::clone(
+        map.entry(first.to_string())
+            .or_default()
+            .entry(second.to_string())
+            .or_default(),
+    )
+}
+
+fn read<V, S>(family: &Family<V>, snap: impl Fn(&V) -> S) -> BTreeMap<String, S> {
     family
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -758,14 +768,43 @@ fn read<K: Clone + Ord, V, S>(family: &Family<K, V>, snap: impl Fn(&V) -> S) -> 
         .collect()
 }
 
+fn read_pairs<V, S>(
+    family: &PairFamily<V>,
+    snap: impl Fn(&V) -> S,
+) -> BTreeMap<(String, String), S> {
+    let snap = &snap;
+    family
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .flat_map(|(first, inner)| {
+            inner
+                .iter()
+                .map(move |(second, v)| ((first.clone(), second.clone()), snap(v)))
+        })
+        .collect()
+}
+
+fn retain_pairs<V>(family: &PairFamily<V>, keep: impl Fn(&str, &str) -> bool) {
+    family
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|first, inner| {
+            inner.retain(|second, _| keep(first, second));
+            !inner.is_empty()
+        });
+}
+
 /// The counters of one process's stream engines. One instance, shared
 /// by both engines through [`crate::Engines::counters`].
 #[derive(Debug, Default)]
 pub struct StreamCounters {
-    streams: Family<String, StreamStats>,
-    links: Family<(String, String), LinkStats>,
-    backends: Family<String, BackendStats>,
-    rules: Family<(String, String), RuleStats>,
+    streams: Family<StreamStats>,
+    /// By stream id, then backend id.
+    links: PairFamily<LinkStats>,
+    backends: Family<BackendStats>,
+    /// By stream id, then rule name.
+    rules: PairFamily<RuleStats>,
 }
 
 /// The counters of one rule of a TLS stream (Story 12.4 D-n).
@@ -800,7 +839,7 @@ impl StreamCounters {
 
     /// The counters of `backend_id` on `stream_id`, created on first use.
     pub fn link(&self, stream_id: &str, backend_id: &str) -> Arc<LinkStats> {
-        entry(&self.links, (stream_id.to_string(), backend_id.to_string()))
+        entry_by_pair(&self.links, stream_id, backend_id)
     }
 
     /// The counters of `backend_id`, created on first use.
@@ -810,7 +849,7 @@ impl StreamCounters {
 
     /// The counters of rule `rule` of `stream_id`, created on first use.
     pub fn rule(&self, stream_id: &str, rule: &str) -> Arc<RuleStats> {
-        entry(&self.rules, (stream_id.to_string(), rule.to_string()))
+        entry_by_pair(&self.rules, stream_id, rule)
     }
 
     /// Drop the counters of streams, links and backends `table` no
@@ -820,31 +859,27 @@ impl StreamCounters {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|id, _| table.stream(id).is_some());
-        self.links
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|(stream, backend), _| table.holds(stream, Some(backend)));
+        retain_pairs(&self.links, |stream, backend| {
+            table.holds(stream, Some(backend))
+        });
         self.backends
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|id, _| table.backend(id).is_some());
-        self.rules
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|(stream, rule), _| {
-                table
-                    .stream(stream)
-                    .is_some_and(|s| s.match_rule(rule).is_some())
-            });
+        retain_pairs(&self.rules, |stream, rule| {
+            table
+                .stream(stream)
+                .is_some_and(|s| s.match_rule(rule).is_some())
+        });
     }
 
     /// Every counter as it stands.
     pub fn snapshot(&self) -> CountersSnapshot {
         CountersSnapshot {
             streams: read(&self.streams, StreamStats::snapshot),
-            links: read(&self.links, LinkStats::snapshot),
+            links: read_pairs(&self.links, LinkStats::snapshot),
             backends: read(&self.backends, BackendStats::snapshot),
-            rules: read(&self.rules, RuleStats::snapshot),
+            rules: read_pairs(&self.rules, RuleStats::snapshot),
         }
     }
 }
@@ -982,6 +1017,55 @@ mod tests {
         drop(first);
         drop(second);
         assert_eq!(counters.snapshot().streams["s"].active, 0);
+    }
+
+    #[test]
+    fn a_table_change_prunes_the_links_and_rules_it_no_longer_holds() {
+        use chrono::Utc;
+        use lorica_config::models::{
+            Stream, StreamBackend, StreamMatchRule, StreamMatcher, StreamProtocol,
+        };
+
+        let mut stream = Stream::new(
+            "s".into(),
+            "s".into(),
+            StreamProtocol::Tcp,
+            "127.0.0.1".parse().unwrap(),
+            1,
+            1,
+            Utc::now(),
+        );
+        stream.match_rules = vec![StreamMatchRule {
+            name: "kept".into(),
+            matcher: StreamMatcher::NoSni { alpn: Vec::new() },
+        }];
+        let table = StreamTable::new(vec![stream], &[StreamBackend::primary("s", "b1")]);
+        let counters = StreamCounters::new();
+        for (stream, other) in [("s", "b1"), ("s", "b2"), ("gone", "b1")] {
+            counters.link(stream, other);
+        }
+        for (stream, rule) in [("s", "kept"), ("s", "removed"), ("gone", "kept")] {
+            counters.rule(stream, rule);
+        }
+        counters.retain(&table);
+        let snapshot = counters.snapshot();
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            snapshot.links.keys().cloned().collect::<Vec<_>>(),
+            vec![pair("s", "b1")]
+        );
+        assert_eq!(
+            snapshot.rules.keys().cloned().collect::<Vec<_>>(),
+            vec![pair("s", "kept")]
+        );
+        assert!(
+            !counters
+                .links
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key("gone"),
+            "a stream left without links leaves no empty map behind"
+        );
     }
 
     #[test]

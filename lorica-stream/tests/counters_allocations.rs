@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! What the stream counters allocate on the paths the engines take per
-//! connection, session and dropped datagram (Phase 1 audit C24).
+//! connection, session and dropped datagram (Phase 1 audit C24, C25).
 //! A binary of its own: it installs a global allocator that counts the
 //! allocations of the thread asking.
 
@@ -123,4 +123,26 @@ fn counting_on_existing_counters_allocates_nothing() {
         link.upstream_tls_failures.len(),
         UpstreamTlsFailure::ALL.len()
     );
+}
+
+/// The engines look their counters up per connection and per session:
+/// finding counters that exist allocates nothing.
+#[test]
+fn finding_existing_counters_allocates_nothing() {
+    let counters = StreamCounters::new();
+    drop((
+        counters.stream("s"),
+        counters.link("s", "b"),
+        counters.backend("b"),
+        counters.rule("s", "r"),
+    ));
+    let allocations = allocations_of(|| {
+        for _ in 0..100 {
+            drop(counters.stream("s"));
+            drop(counters.link("s", "b"));
+            drop(counters.backend("b"));
+            drop(counters.rule("s", "r"));
+        }
+    });
+    assert_eq!(allocations, 0);
 }
