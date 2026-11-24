@@ -1127,11 +1127,14 @@ written, and two backend writes would otherwise write one:
   the delete would unlink it from the stream, and a stream's backend
   set is a stream field. Unlink it in the dashboard first; a backend no
   stream uses is the token's to delete as before.
-- **Changing the address of a backend that a stream with
-  `allow_local_backend` uses is a `403`**: the stream's permission to
-  forward to the node itself was given to the stream, never to the
-  token. A backend of any other stream stays the token's to move, and a
-  local address is refused for it on its own.
+- **Changing the address of a backend any stream uses is a `403`**,
+  preview included, whether or not the stream sets
+  `allow_local_backend`: a stream forwards raw bytes to its backends'
+  addresses, so moving one, port included, changes what the stream
+  forwards to as much as the delete does. Every other field of the
+  backend stays the token's, and a backend no stream uses is the
+  token's to move as before. A dashboard session or the management API
+  moves it.
 
 Both refusals name the streams **only to a token holding
 `streams:read`**; any other token, which is every config-tier token,

@@ -476,8 +476,9 @@ same path.
 
 No config-tier tool names a stream (v1.11.0), and a backend tool does
 not reach one either: deleting a backend a stream uses is refused with
-a `409`, preview included, and changing the address of a backend that
-a stream with `allow_local_backend` uses with a `403`. Since the tier
+a `409`, preview included, and changing the address of a backend any
+stream uses with a `403`, whether or not the stream sets
+`allow_local_backend`. Since the tier
 rule keeps `streams:read` off a config-tier token, both refusals list
 the streams by id, not by name; unlink the backend, or move it, in the
 dashboard.

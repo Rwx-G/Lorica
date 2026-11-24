@@ -958,7 +958,10 @@ paths:
         keeps the stored path. A custom send/expect check is neither
         created nor changed (403 naming `health_check`); a stored one
         rides a patch of other fields, and sent back exactly as read
-        keeps the stored payload (see `AutomationHealthCheck`).
+        keeps the stored payload (see `AutomationHealthCheck`). The
+        address of a backend any stream links does not move (403 naming
+        the streams, by id to a token without `streams:read`); it is
+        moved in the dashboard.
 
 
         With `?dry_run=true`, the backend before and after the patch,

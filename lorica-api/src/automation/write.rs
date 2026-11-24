@@ -743,7 +743,7 @@ fn check_backend_target(
         ensure_not_weakened(BACKEND_PROTECTIONS, "backend", &after.id, before, after)?;
     }
     if let (Some(before), Some(after)) = (target.before, target.after) {
-        ensure_not_moved_under_a_local_stream(store, principal, before, after)?;
+        ensure_not_moved_under_a_stream(store, principal, before, after)?;
     }
     Ok(())
 }
@@ -849,18 +849,19 @@ fn ensure_no_new_raw_payload(before: Option<&Backend>, after: &Backend) -> Resul
     )))
 }
 
-/// A token may not change the address of a backend that a stream with
-/// `allow_local_backend` forwards to (Story 12.3 D-m, D9 of the PRD).
+/// A token may not change the address of a backend any stream links
+/// (Story 12.3 D-m as amended for audit finding C4, D9 of the PRD).
 ///
-/// The flag itself is a stream field, and no automation or MCP path
-/// writes a stream. Without this a token holding `backends:write` could
-/// still repoint such a backend anywhere its CIDR grant reaches, the
-/// node's own addresses included, under a permission an operator gave
-/// the stream and never the token. Narrow on purpose: a backend of a
-/// stream without the flag stays the token's to move, since rule A then
-/// refuses a local address on its own. The refusal lists the stream as
-/// [`streams_as_seen_by`] spells it to the token, and never the address.
-fn ensure_not_moved_under_a_local_stream(
+/// A stream forwards raw bytes to its backends' addresses, so moving one,
+/// port included, changes what the stream forwards to exactly as the
+/// delete [`ensure_not_unlinked_from_a_stream`] refuses does: a public
+/// 5432 re-pointed at an internal Redis anywhere the token's CIDR grant
+/// reaches. No automation or MCP path writes a stream, and this is the
+/// one write through which a backend would. Management sessions are not
+/// held to it: an operator moves such a backend in the dashboard. The
+/// refusal lists every such stream as [`streams_as_seen_by`] spells them
+/// to the token, and never the address.
+fn ensure_not_moved_under_a_stream(
     store: &ConfigStore,
     principal: &AutomationPrincipal,
     before: &Backend,
@@ -869,20 +870,19 @@ fn ensure_not_moved_under_a_local_stream(
     if before.address == after.address {
         return Ok(());
     }
+    let mut streams: Vec<Stream> = Vec::new();
     for stream_id in store.list_streams_for_backend(&after.id)? {
-        if let Some(stream) = store
-            .get_stream(&stream_id)?
-            .filter(|stream| stream.allow_local_backend)
-        {
-            return Err(ApiError::Forbidden(format!(
-                "backend `{}` serves stream {}, which allows local backends: its address \
-                 is changed in the dashboard, not with an automation token",
-                after.id,
-                streams_as_seen_by(principal, std::slice::from_ref(&stream))
-            )));
-        }
+        streams.extend(store.get_stream(&stream_id)?);
     }
-    Ok(())
+    if streams.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::Forbidden(format!(
+        "backend `{}` serves streams {}: the address of a stream's backend is changed in the \
+         dashboard, not with an automation token",
+        after.id,
+        streams_as_seen_by(principal, &streams)
+    )))
 }
 
 /// The token's grant as the guard a renewal runs on the certificate
@@ -1136,8 +1136,8 @@ pub async fn create_backend(
 /// no other principal's environment (403); an address the patch names
 /// is checked against the grant exactly as on create, a control of
 /// [`BACKEND_PROTECTIONS`] may only be strengthened (403), and the
-/// address of a backend a stream allowing local backends forwards to
-/// does not move (403 naming the stream, Story 12.3 D-m). A custom
+/// address of a backend any stream links does not move (403 naming the
+/// streams, [`ensure_not_moved_under_a_stream`]). A custom
 /// send/expect health check is neither created nor changed (403,
 /// [`ensure_no_new_raw_payload`]); a stored one rides a patch of other
 /// fields untouched, and its payload sent back as the mask this plane
