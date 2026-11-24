@@ -308,13 +308,142 @@ jobs:
     # the workflow triggers keep it to PRs against main plus main/tag pushes,
     # not every feature-branch push. run.sh exits non-zero if any phase fails
     # and its per-assertion output lands in this job log.
+    # The suite runs in three jobs (Story 12.12 D-m), because the L4 and
+    # performance phases on top of this one would not fit one job's time:
+    # this one runs every pre-existing profile with the stream sections
+    # appended to them, E2E (L4) the L4 phase, E2E (performance) the
+    # performance phase. Each builds its own images.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       - name: Run the Docker e2e suite
         run: |
           cd tests-e2e-docker
-          ./run.sh --build
+          ./run.sh --build --skip-l4 --skip-perf
+      - name: Publish the stream scenarios of the pre-existing profiles
+        if: always()
+        run: |
+          if [ -f tests-e2e-docker/results/l4-summary.md ]; then
+            cat tests-e2e-docker/results/l4-summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "The run wrote no L4 report: see the job log." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      # E2E scenario report reads this job's log.
+      - name: Upload the run's results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-docker-results
+          path: tests-e2e-docker/results/
+          retention-days: 30
+
+  e2e-l4:
+    name: E2E (L4)
+    needs: lint
+    runs-on: ubuntu-latest
+    # The L4 phase of Story 12.12: every Integration Verification of
+    # Stories 12.1 to 12.11 that runs in the streams and streams-single
+    # profiles (docker-compose.l4.yml), as named scenarios against real
+    # backends. It gates the release like E2E (Docker).
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run the L4 phase
+        run: |
+          cd tests-e2e-docker
+          ./run.sh --build --only-l4
+      - name: Publish the scenario table and the parity matrix
+        if: always()
+        run: |
+          if [ -f tests-e2e-docker/results/l4-summary.md ]; then
+            cat tests-e2e-docker/results/l4-summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "The run wrote no L4 report: see the job log." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload the run's results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-l4-results
+          path: tests-e2e-docker/results/
+          retention-days: 30
+
+  # Each e2e job's report judges only the profiles that job ran, so no
+  # job alone checks that every registry row reported. The release run
+  # does (run.sh with no --skip-* or --only-* flag passes --strict);
+  # here the two logs together are held to the same rule, so a phase
+  # that silently stopped announcing its profile fails the release
+  # instead of reading as "did not run" in both jobs.
+  e2e-report:
+    name: E2E scenario report (every row)
+    needs: [e2e-docker, e2e-l4]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: e2e-docker-results
+          path: e2e-docker-results/
+      - uses: actions/download-artifact@v8
+        with:
+          name: e2e-l4-results
+          path: e2e-l4-results/
+      - name: Every registry row reports across both jobs
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          docker_logs=(e2e-docker-results/e2e-*.log)
+          l4_logs=(e2e-l4-results/e2e-*.log)
+          if [ "${#docker_logs[@]}" != 1 ] || [ "${#l4_logs[@]}" != 1 ]; then
+            echo "::error::expected one run log per job, found: ${docker_logs[*]} ${l4_logs[*]}"
+            exit 1
+          fi
+          cat "${docker_logs[0]}" "${l4_logs[0]}" > e2e-union.log
+          rc=0
+          python3 tests-e2e-docker/test-runner/l4/report.py --strict --log e2e-union.log \
+            --registry tests-e2e-docker/l4/scenarios.tsv \
+            --prd docs/prd/epic-12-v1.11.0.md \
+            --markdown e2e-union-summary.md || rc=$?
+          cat e2e-union-summary.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+  e2e-perf:
+    name: E2E (performance)
+    needs: lint
+    runs-on: ubuntu-latest
+    # The performance phase of Story 12.12: Lorica against nginx `stream`
+    # and against the released 1.10.7, as ratios. A shared runner is too
+    # noisy for those ratios (AC #5), so here they are published, never
+    # gated: --perf-advisory exits 0 on any verdict, and continue-on-error
+    # keeps a harness error or a timeout from failing the workflow. The
+    # release waits for this job, so the numbers land in the run that
+    # released, and never fails on them. On a 4-CPU runner the phase
+    # takes the small cpuset layout; the summary says which ran. The
+    # gate is the local release run, which has the machine to itself.
+    continue-on-error: true
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run the performance phase (advisory)
+        run: |
+          cd tests-e2e-docker
+          ./run.sh --build --only-perf --perf-advisory
+      - name: Publish the verdict table
+        if: always()
+        run: |
+          if [ -f tests-e2e-docker/results/perf-summary.md ]; then
+            cat tests-e2e-docker/results/perf-summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "The performance phase wrote no summary: see the job log." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload the run's results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-perf-results
+          path: tests-e2e-docker/results/
+          retention-days: 30
 
   adcs-harness:
     name: AD CS Kerberos harness
@@ -956,7 +1085,10 @@ jobs:
   verify-tag:
     name: Verify tag signature
     timeout-minutes: 10
-    needs: [run-on-oldest, test-deb-install, test-rpm-install, test-deb-upgrade, test-rpm-upgrade, test-package-repo, e2e-docker, adcs-harness]
+    # e2e-perf is here so a release waits for its numbers and publishes
+    # them in the run that released; its continue-on-error means it never
+    # holds the release (Story 12.12 AC #5).
+    needs: [run-on-oldest, test-deb-install, test-rpm-install, test-deb-upgrade, test-rpm-upgrade, test-package-repo, e2e-docker, e2e-l4, e2e-report, e2e-perf, adcs-harness]
     # Only a tag push reaches this. A branch build has no tag to verify.
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
