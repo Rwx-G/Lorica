@@ -28,7 +28,6 @@
 
 #![cfg(target_os = "linux")]
 
-use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,25 +36,20 @@ use std::time::Duration;
 use chrono::Utc;
 use lorica_config::listen_ports::ReservedPorts;
 use lorica_config::models::{
-    Backend, GeoIpConfig, GeoIpMode, HealthCheck, HealthStatus, LifecycleState, Stream,
-    StreamBackend, StreamEndKind, StreamEndReason, StreamProtocol, StreamProxyProtocol,
-    StreamRefusal, StreamTlsMode,
+    Backend, GeoIpConfig, GeoIpMode, HealthStatus, LifecycleState, Stream, StreamBackend,
+    StreamEndKind, StreamEndReason, StreamProtocol, StreamProxyProtocol, StreamRefusal,
+    StreamTlsMode,
 };
 use lorica_core::protocols::proxy_protocol::{
     encode_v2, encode_v2_dgram, parse, Addresses, Parsed, V2_SIGNATURE,
 };
-use lorica_shmem::StreamCapsRegion;
-use lorica_stream::caps::admitted_cap;
 use lorica_stream::counters::{ConnectFailureKind, ProxyHeaderOutcome, StreamCountersSnapshot};
-use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
-    AcceptedConnection, Admission, BackendSelector, BoundPorts, BreakerGate, CapsRegistry,
-    ConnectOutcome, ConnectionObserver, ConnectionRecord, ConnectionTracker, NodeCapsRegions,
-    RefusalRecord, Resolve, ResolveError, Resolved, ResolverCache, SelectionRequest, SourceGate,
-    StreamCounters, StreamHandler, StreamLogKey, StreamTable, SuppressedRecord, TcpEngine,
-    TcpEngineParts,
+    AcceptedConnection, BackendSelector, BoundPorts, BreakerGate, CapsRegistry, ConnectOutcome,
+    ConnectionRecord, ConnectionTracker, NodeCapsRegions, RefusalRecord, Resolve, ResolverCache,
+    SourceGate, StreamCounters, StreamHandler, StreamLogKey, StreamTable, SuppressedRecord,
+    TcpEngine, TcpEngineParts,
 };
-use lorica_worker::stream_ctl::StreamCtlMsg;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::mpsc;
@@ -68,148 +62,9 @@ const STREAM_ID: &str = "s";
 /// assertion here may depend on how much.
 const WAIT: Duration = Duration::from_secs(60);
 
-// ---- fake seams ------------------------------------------------------
+mod common;
 
-#[derive(Default)]
-struct FirstCandidate {
-    connected: Mutex<Vec<String>>,
-    closed: Mutex<Vec<String>>,
-}
-
-impl BackendSelector for FirstCandidate {
-    fn select(&self, _request: &SelectionRequest<'_>) -> usize {
-        0
-    }
-
-    fn connected(&self, _stream_id: &str, backend: &Backend, _: SocketAddr, _: Duration) {
-        self.connected.lock().unwrap().push(backend.id.clone());
-    }
-
-    fn closed(&self, _stream_id: &str, backend: &Backend, _: SocketAddr) {
-        self.closed.lock().unwrap().push(backend.id.clone());
-    }
-}
-
-#[derive(Default)]
-struct Breaker {
-    deny: Mutex<HashSet<String>>,
-    records: Mutex<Vec<(String, bool, bool)>>,
-}
-
-impl BreakerGate for Breaker {
-    fn admit<'a>(&'a self, _stream_id: &'a str, backend: &'a Backend) -> SeamFuture<'a, Admission> {
-        let denied = self.deny.lock().unwrap().contains(&backend.id);
-        Box::pin(async move {
-            if denied {
-                Admission::Deny
-            } else {
-                Admission::Allow
-            }
-        })
-    }
-
-    fn record<'a>(
-        &'a self,
-        _stream_id: &'a str,
-        backend: &'a Backend,
-        success: bool,
-        was_probe: bool,
-    ) -> SeamFuture<'a, ()> {
-        self.records
-            .lock()
-            .unwrap()
-            .push((backend.id.clone(), success, was_probe));
-        Box::pin(async {})
-    }
-}
-
-/// Answers the names it holds, hangs on any other.
-#[derive(Default)]
-struct Dns(Mutex<HashMap<String, Vec<IpAddr>>>);
-
-impl Resolve for Dns {
-    fn lookup<'a>(&'a self, host: &'a str) -> SeamFuture<'a, Result<Resolved, ResolveError>> {
-        let answer = self.0.lock().unwrap().get(host).cloned();
-        Box::pin(async move {
-            match answer {
-                Some(addresses) => Ok(Resolved {
-                    addresses,
-                    ttl: Duration::from_secs(30),
-                }),
-                None => std::future::pending().await,
-            }
-        })
-    }
-}
-
-/// Refuses the addresses it holds; knows the countries it is told.
-#[derive(Default)]
-struct Gate {
-    filtered: Mutex<HashSet<IpAddr>>,
-    blocked: Mutex<HashSet<IpAddr>>,
-    countries: Mutex<HashMap<IpAddr, [u8; 2]>>,
-}
-
-impl SourceGate for Gate {
-    fn global(&self, client: IpAddr) -> Option<StreamRefusal> {
-        if self.filtered.lock().unwrap().contains(&client) {
-            Some(StreamRefusal::ConnectionFilter)
-        } else if self.blocked.lock().unwrap().contains(&client) {
-            Some(StreamRefusal::IpBlocklist)
-        } else {
-            None
-        }
-    }
-
-    fn country(&self, client: IpAddr) -> Option<[u8; 2]> {
-        self.countries.lock().unwrap().get(&client).copied()
-    }
-}
-
-/// A connect outcome as the observer heard it.
-type Outcome = (String, StreamProtocol, ConnectOutcome);
-
-struct Records {
-    ended: mpsc::UnboundedSender<ConnectionRecord>,
-    refused: mpsc::UnboundedSender<RefusalRecord>,
-    suppressed: mpsc::UnboundedSender<SuppressedRecord>,
-    outcomes: mpsc::UnboundedSender<Outcome>,
-    /// The harness's tracker, read at each record and refusal.
-    tracker: ConnectionTracker,
-    /// The entries the tracker held when each record or refusal arrived.
-    tracked_at_report: Arc<Mutex<Vec<usize>>>,
-}
-
-impl Records {
-    fn note_tracked(&self) {
-        self.tracked_at_report
-            .lock()
-            .unwrap()
-            .push(self.tracker.len());
-    }
-}
-
-impl ConnectionObserver for Records {
-    fn observe(&self, record: ConnectionRecord) {
-        self.note_tracked();
-        let _ = self.ended.send(record);
-    }
-
-    fn connect_outcome(&self, stream_id: &str, protocol: StreamProtocol, outcome: ConnectOutcome) {
-        let _ = self
-            .outcomes
-            .send((stream_id.to_string(), protocol, outcome));
-    }
-
-    fn refused(&self, record: RefusalRecord) {
-        self.note_tracked();
-        let _ = self.refused.send(record);
-    }
-
-    fn refusals_suppressed(&self, record: SuppressedRecord) {
-        let _ = self.suppressed.send(record);
-    }
-}
+use common::{backend, Breaker, Dns, Gate, Outcome, Selector};
 
 // ---- fixtures --------------------------------------------------------
 
@@ -230,41 +85,17 @@ fn stream() -> Stream {
     s
 }
 
-fn backend(id: &str, address: impl ToString) -> Backend {
-    Backend {
-        id: id.into(),
-        address: address.to_string(),
-        name: format!("backend-{id}"),
-        group_name: String::new(),
-        weight: 1,
-        health_status: HealthStatus::Healthy,
-        health_check_enabled: false,
-        health_check_interval_s: 10,
-        health_check_path: None,
-        health_check: HealthCheck::default(),
-        lifecycle_state: LifecycleState::Normal,
-        active_connections: 0,
-        tls_upstream: false,
-        tls_skip_verify: false,
-        tls_sni: None,
-        h2_upstream: false,
-        managed_by: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    }
-}
-
 struct Harness {
     engine: TcpEngine,
     tracker: ConnectionTracker,
     records: mpsc::UnboundedReceiver<ConnectionRecord>,
     refusals: mpsc::UnboundedReceiver<RefusalRecord>,
     suppressed: mpsc::UnboundedReceiver<SuppressedRecord>,
-    outcomes: mpsc::UnboundedReceiver<Outcome>,
+    outcomes: Arc<Mutex<Vec<Outcome>>>,
     counters: Arc<StreamCounters>,
     breaker: Arc<Breaker>,
     dns: Arc<Dns>,
-    selector: Arc<FirstCandidate>,
+    selector: Arc<Selector>,
     gate: Arc<Gate>,
     bound: BoundPorts,
     table: Arc<Mutex<Arc<StreamTable>>>,
@@ -287,14 +118,11 @@ impl Harness {
         let counters = Arc::new(StreamCounters::new());
         let breaker = Arc::new(Breaker::default());
         let dns = Arc::new(Dns::default());
-        let selector = Arc::new(FirstCandidate::default());
+        let selector = Arc::new(Selector::first());
         let gate = Arc::new(Gate::default());
-        let (ended, records) = mpsc::unbounded_channel();
-        let (refused, refusals) = mpsc::unbounded_channel();
-        let (held_back, suppressed) = mpsc::unbounded_channel();
-        let (outcome, outcomes) = mpsc::unbounded_channel();
+        let (observer, observed) = common::observer();
         let tracker = ConnectionTracker::new();
-        let tracked_at_report = Arc::default();
+        let _ = observed.tracker.set(tracker.clone());
         let engine = TcpEngine::new(TcpEngineParts {
             selector: Arc::clone(&selector) as Arc<dyn BackendSelector>,
             breaker: Arc::clone(&breaker) as Arc<dyn BreakerGate>,
@@ -303,14 +131,7 @@ impl Harness {
                 Arc::clone(&counters),
             ),
             counters: Arc::clone(&counters),
-            observer: Arc::new(Records {
-                ended,
-                refused,
-                suppressed: held_back,
-                outcomes: outcome,
-                tracker: tracker.clone(),
-                tracked_at_report: Arc::clone(&tracked_at_report),
-            }),
+            observer,
             reserved_ports,
             source_gate: Arc::clone(&gate) as Arc<dyn SourceGate>,
         });
@@ -348,10 +169,10 @@ impl Harness {
         Harness {
             engine,
             tracker,
-            records,
-            refusals,
-            suppressed,
-            outcomes,
+            records: observed.records,
+            refusals: observed.refusals,
+            suppressed: observed.suppressed,
+            outcomes: observed.outcomes,
             counters,
             breaker,
             dns,
@@ -362,7 +183,7 @@ impl Harness {
             node: Mutex::new(NodeCapsRegions::new(1)),
             caps,
             listen,
-            tracked_at_report,
+            tracked_at_report: observed.tracked_at_report,
         }
     }
 
@@ -397,19 +218,7 @@ impl Harness {
     }
 
     fn ensure_region(&self, stream: &Stream) {
-        let mut node = self.node.lock().unwrap();
-        let created = node
-            .ensure(&stream.id, admitted_cap(stream).unwrap(), 0)
-            .unwrap();
-        if created.is_some() {
-            let Some(StreamCtlMsg::Caps { region, slot, .. }) =
-                node.caps_message(&stream.id, 1, 0).unwrap()
-            else {
-                panic!("test setup: a caps message");
-            };
-            let region = Arc::new(StreamCapsRegion::open(region).unwrap());
-            self.caps.adopt(&stream.id, region.worker(slot).unwrap());
-        }
+        common::adopt_region(&mut self.node.lock().unwrap(), &self.caps, stream);
     }
 
     async fn connect(&self) -> TcpStream {
@@ -427,33 +236,29 @@ impl Harness {
     }
 
     async fn record(&mut self) -> ConnectionRecord {
-        tokio::time::timeout(WAIT, self.records.recv())
-            .await
-            .expect("a connection record in time")
-            .expect("the engine is alive")
+        common::next(&mut self.records, "a connection record").await
     }
 
     /// The next refusal row the refusal log admitted.
     async fn refusal(&mut self) -> RefusalRecord {
-        tokio::time::timeout(WAIT, self.refusals.recv())
-            .await
-            .expect("a refusal row in time")
-            .expect("the engine is alive")
+        common::next(&mut self.refusals, "a refusal row").await
     }
 
     /// The connect outcomes heard so far. The engine reports one before
     /// it hands the connection's record, so once a record is in, its
     /// outcome is too.
     fn outcomes(&mut self) -> Vec<ConnectOutcome> {
-        let mut heard = Vec::new();
-        while let Ok((stream_id, protocol, outcome)) = self.outcomes.try_recv() {
-            assert_eq!(
-                (stream_id.as_str(), protocol),
-                (STREAM_ID, StreamProtocol::Tcp)
-            );
-            heard.push(outcome);
-        }
+        let heard = std::mem::take(&mut *self.outcomes.lock().unwrap());
         heard
+            .into_iter()
+            .map(|(stream_id, protocol, outcome)| {
+                assert_eq!(
+                    (stream_id.as_str(), protocol),
+                    (STREAM_ID, StreamProtocol::Tcp)
+                );
+                outcome
+            })
+            .collect()
     }
 
     fn refused(&self, refusal: StreamRefusal) -> u64 {
@@ -1270,10 +1075,7 @@ async fn a_name_resolving_to_loopback_is_excluded_and_never_connected() {
     let mut h = Harness::new().await;
     let (addr, accepted) = echo().await;
     h.dns
-        .0
-        .lock()
-        .unwrap()
-        .insert("db.example.com".into(), vec!["127.0.0.1".parse().unwrap()]);
+        .answer("db.example.com", vec!["127.0.0.1".parse().unwrap()]);
     let named = backend("b1", format!("db.example.com:{}", addr.port()));
 
     let mut flagless = stream();

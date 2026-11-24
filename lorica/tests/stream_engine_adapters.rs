@@ -32,7 +32,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -46,14 +46,13 @@ use lorica::stream_engine::{
 };
 use lorica_config::listen_ports::ReservedPorts;
 use lorica_config::models::{
-    Backend, HealthCheck, HealthStatus, LifecycleState, LoadBalancing, Stream, StreamBackend,
-    StreamEndReason, StreamProtocol, StreamRefusal,
+    Backend, HealthCheck, HealthStatus, LoadBalancing, Stream, StreamBackend, StreamEndReason,
+    StreamProtocol,
 };
 use lorica_stream::{
-    BackendSelector, BreakerGate, Candidate, ConnectionObserver, ConnectionRecord,
-    ControlTransport, Engines, InProcessPeer, NodeCapsRegions, Resolve, ResolverCache,
-    SelectionRequest, SourceGate, StreamCounters, StreamRuntime, StreamRuntimeHandle, StreamTable,
-    StreamTableSource, TcpEngine, TcpEngineParts,
+    BackendSelector, BreakerGate, Candidate, ConnectionRecord, ControlTransport, Engines,
+    InProcessPeer, NodeCapsRegions, Resolve, ResolverCache, SelectionRequest, StreamCounters,
+    StreamRuntime, StreamRuntimeHandle, StreamTable, StreamTableSource, TcpEngine, TcpEngineParts,
 };
 use lorica_worker::fd_passing::StreamProto;
 use lorica_worker::stream_ctl::{StreamCtlMsg, StreamSocket};
@@ -61,6 +60,12 @@ use lorica_worker::stream_sockets::bind_tcp_stream_listener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
+
+// The engine tests' fake seams and fixtures, shared with `lorica-stream`.
+#[path = "../../lorica-stream/tests/common/mod.rs"]
+mod stream_common;
+
+use stream_common::{Gate, Source};
 
 const WAIT: Duration = Duration::from_secs(10);
 const STREAM_ID: &str = "6f1c1a52-5b0e-4f7e-9a51-1a7c5a1b2c3d";
@@ -85,27 +90,11 @@ fn stream(id: &str, load_balancing: LoadBalancing) -> Stream {
 }
 
 fn backend(id: &str, address: impl ToString, health_status: HealthStatus) -> Backend {
-    Backend {
-        id: id.into(),
-        address: address.to_string(),
-        name: id.into(),
-        group_name: String::new(),
-        weight: 1,
-        health_status,
-        health_check_enabled: false,
-        health_check_interval_s: 10,
-        health_check_path: None,
-        health_check: HealthCheck::TcpConnect,
-        lifecycle_state: LifecycleState::Normal,
-        active_connections: 0,
-        tls_upstream: false,
-        tls_skip_verify: false,
-        tls_sni: None,
-        h2_upstream: false,
-        managed_by: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    }
+    let mut backend = stream_common::backend(id, address);
+    backend.name = id.into();
+    backend.health_status = health_status;
+    backend.health_check = HealthCheck::TcpConnect;
+    backend
 }
 
 fn candidates(backends: &[Backend]) -> Vec<Candidate<'_>> {
@@ -307,23 +296,6 @@ async fn a_name_no_server_answers_is_a_resolve_error() {
     assert!(resolver.lookup(TEST_HOST).await.is_err());
 }
 
-struct Records(mpsc::UnboundedSender<ConnectionRecord>);
-
-impl ConnectionObserver for Records {
-    fn observe(&self, record: ConnectionRecord) {
-        let _ = self.0.send(record);
-    }
-}
-
-#[derive(Default)]
-struct Source(Mutex<StreamTable>);
-
-impl StreamTableSource for Source {
-    fn load(&self) -> Result<StreamTable, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.0.lock().unwrap().clone())
-    }
-}
-
 /// An echo server counting the connections it accepted.
 async fn counting_echo() -> (SocketAddr, Arc<AtomicU64>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -349,20 +321,6 @@ async fn counting_echo() -> (SocketAddr, Arc<AtomicU64>) {
     (addr, accepted)
 }
 
-/// No node-wide source control: these tests exercise selection, the
-/// breaker and resolution.
-struct Ungated;
-
-impl SourceGate for Ungated {
-    fn global(&self, _: IpAddr) -> Option<StreamRefusal> {
-        None
-    }
-
-    fn country(&self, _: IpAddr) -> Option<[u8; 2]> {
-        None
-    }
-}
-
 /// A real TCP engine over the binary's seams, in a stream runtime fed
 /// from `source`.
 struct Harness {
@@ -382,15 +340,17 @@ impl Harness {
         reserved_ports: Option<ReservedPorts>,
     ) -> Self {
         let counters = Arc::new(StreamCounters::new());
-        let (tx, records) = mpsc::unbounded_channel();
+        let (observer, observed) = stream_common::observer();
         let engine = TcpEngine::new(TcpEngineParts {
             selector: Arc::new(StreamSelector::new(0)),
             breaker: Arc::new(StreamBreakerGate::with_engine(BreakerEngine::local(5, 10))),
             resolver: ResolverCache::new(resolver, Arc::clone(&counters)),
             counters: Arc::clone(&counters),
-            observer: Arc::new(Records(tx)),
+            observer,
             reserved_ports,
-            source_gate: Arc::new(Ungated),
+            // No node-wide source control: these tests exercise
+            // selection, the breaker and resolution.
+            source_gate: Arc::new(Gate::default()),
         });
         let (peer, transport) = ControlTransport::in_process_pair(8);
         let runtime = StreamRuntime::spawn(
@@ -407,7 +367,7 @@ impl Harness {
             peer,
             node: NodeCapsRegions::new(1),
             runtime: Some(runtime),
-            records,
+            records: observed.records,
             seq: 0,
             _listeners: Vec::new(),
         }
@@ -479,10 +439,7 @@ impl Harness {
     }
 
     async fn record(&mut self) -> ConnectionRecord {
-        tokio::time::timeout(WAIT, self.records.recv())
-            .await
-            .expect("the connection ends in time")
-            .expect("the engine is alive")
+        stream_common::next(&mut self.records, "the connection's end").await
     }
 
     fn stop(mut self) {

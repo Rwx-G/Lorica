@@ -27,22 +27,18 @@
 use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use lorica_config::models::{
-    Backend, HealthCheck, HealthStatus, LifecycleState, Stream, StreamBackend, StreamEndReason,
-    StreamProtocol, StreamRefusal,
+    Backend, HealthStatus, Stream, StreamBackend, StreamEndReason, StreamProtocol,
 };
 use lorica_stream::handler::HandlerFuture;
-use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
-    AcceptedConnection, Admission, BackendSelector, BreakerGate, ConnectionObserver,
-    ConnectionRecord, ControlTransport, Datagram, DatagramHandler, Engines, InProcessPeer,
-    NodeCapsRegions, Resolve, ResolveError, Resolved, ResolverCache, SelectionRequest, SourceGate,
-    StreamCounters, StreamDeath, StreamHandler, StreamRuntime, StreamRuntimeHandle, StreamTable,
-    StreamTableSource, TcpEngine, TcpEngineParts,
+    AcceptedConnection, ControlTransport, Datagram, DatagramHandler, Engines, InProcessPeer,
+    NodeCapsRegions, ResolverCache, StreamCounters, StreamDeath, StreamHandler, StreamRuntime,
+    StreamRuntimeHandle, StreamTable, StreamTableSource, TcpEngine, TcpEngineParts,
 };
 use lorica_worker::fd_passing::StreamProto;
 use lorica_worker::stream_ctl::{QuiesceReason, StreamCtlMsg, StreamSocket};
@@ -50,69 +46,15 @@ use lorica_worker::stream_sockets::bind_tcp_stream_listener;
 use socket2::SockRef;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 const WAIT: Duration = Duration::from_secs(10);
 /// How soon a death must be reported.
 const DEATH_REPORTED_WITHIN: Duration = Duration::from_secs(1);
 
-struct FirstCandidate;
+mod common;
 
-impl BackendSelector for FirstCandidate {
-    fn select(&self, _request: &SelectionRequest<'_>) -> usize {
-        0
-    }
-    fn connected(&self, _: &str, _: &Backend, _: SocketAddr, _: Duration) {}
-    fn closed(&self, _: &str, _: &Backend, _: SocketAddr) {}
-}
-
-struct Open;
-
-impl BreakerGate for Open {
-    fn admit<'a>(&'a self, _: &'a str, _: &'a Backend) -> SeamFuture<'a, Admission> {
-        Box::pin(async { Admission::Allow })
-    }
-    fn record<'a>(&'a self, _: &'a str, _: &'a Backend, _: bool, _: bool) -> SeamFuture<'a, ()> {
-        Box::pin(async {})
-    }
-}
-
-struct NoDns;
-
-impl Resolve for NoDns {
-    fn lookup<'a>(&'a self, host: &'a str) -> SeamFuture<'a, Result<Resolved, ResolveError>> {
-        Box::pin(async move { Err(ResolveError(format!("{host}: no resolver in this test"))) })
-    }
-}
-
-/// No node-wide source control.
-struct Ungated;
-
-impl SourceGate for Ungated {
-    fn global(&self, _: std::net::IpAddr) -> Option<StreamRefusal> {
-        None
-    }
-    fn country(&self, _: std::net::IpAddr) -> Option<[u8; 2]> {
-        None
-    }
-}
-
-struct Records(mpsc::UnboundedSender<ConnectionRecord>);
-
-impl ConnectionObserver for Records {
-    fn observe(&self, record: ConnectionRecord) {
-        let _ = self.0.send(record);
-    }
-}
-
-#[derive(Default)]
-struct Source(Mutex<StreamTable>);
-
-impl StreamTableSource for Source {
-    fn load(&self) -> Result<StreamTable, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.0.lock().unwrap().clone())
-    }
-}
+use common::{Breaker, Dns, Gate, Selector, Source};
 
 fn stream(id: &str, close_on_backend_down: bool) -> Stream {
     let mut s = Stream::new(
@@ -130,27 +72,11 @@ fn stream(id: &str, close_on_backend_down: bool) -> Stream {
 }
 
 fn backend(id: &str, address: SocketAddr, health_status: HealthStatus) -> Backend {
-    Backend {
-        id: id.into(),
-        address: address.to_string(),
-        name: id.into(),
-        group_name: String::new(),
-        weight: 1,
-        health_status,
-        health_check_enabled: true,
-        health_check_interval_s: 10,
-        health_check_path: None,
-        health_check: HealthCheck::default(),
-        lifecycle_state: LifecycleState::Normal,
-        active_connections: 0,
-        tls_upstream: false,
-        tls_skip_verify: false,
-        tls_sni: None,
-        h2_upstream: false,
-        managed_by: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    }
+    let mut backend = common::backend(id, address);
+    backend.name = id.into();
+    backend.health_status = health_status;
+    backend.health_check_enabled = true;
+    backend
 }
 
 async fn echo() -> SocketAddr {
@@ -266,15 +192,15 @@ async fn a_backend_going_down_closes_only_the_connections_that_follow_it() {
     *source.0.lock().unwrap() = table(HealthStatus::Healthy, addresses);
 
     let counters = Arc::new(StreamCounters::new());
-    let (tx, mut records) = mpsc::unbounded_channel();
+    let (observer, mut observed) = common::observer();
     let engine = TcpEngine::new(TcpEngineParts {
-        selector: Arc::new(FirstCandidate),
-        breaker: Arc::new(Open),
-        resolver: ResolverCache::new(Arc::new(NoDns), Arc::clone(&counters)),
+        selector: Arc::new(Selector::first()),
+        breaker: Arc::new(Breaker::default()),
+        resolver: ResolverCache::new(Arc::new(Dns::default()), Arc::clone(&counters)),
         counters: Arc::clone(&counters),
-        observer: Arc::new(Records(tx)),
+        observer,
         reserved_ports: None,
-        source_gate: Arc::new(Ungated),
+        source_gate: Arc::new(Gate::default()),
     });
     let (mut peer, transport) = ControlTransport::in_process_pair(8);
     let handle = StreamRuntime::spawn(
@@ -309,10 +235,7 @@ async fn a_backend_going_down_closes_only_the_connections_that_follow_it() {
         StreamCtlMsg::Ack { seq: 3, count: 0 }
     ));
 
-    let record = tokio::time::timeout(WAIT, records.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let record = common::next(&mut observed.records, "the follower's record").await;
     assert_eq!(record.stream_id, "follows");
     assert_eq!(record.end_reason, StreamEndReason::BackendDown);
     let mut buf = [0u8; 8];
@@ -324,7 +247,7 @@ async fn a_backend_going_down_closes_only_the_connections_that_follow_it() {
     // The established connection of the stream without the flag is not
     // cut by its backend going down (AC #7).
     echo_once(&mut stays, b"still here").await;
-    assert!(records.try_recv().is_err());
+    assert!(observed.records.try_recv().is_err());
 
     let snapshot = handle.counters();
     assert_eq!(snapshot.streams["follows"].accepted, 1);

@@ -55,9 +55,12 @@ use tokio::sync::oneshot;
 // the shared reservation scheme instead, below the ephemeral range and
 // locked across processes, which no autobind ever reaches.
 #[path = "../../lorica/tests/common/mod.rs"]
+mod ports;
+
 mod common;
 
-use common::reserve_port;
+use common::Source;
+use ports::reserve_port;
 
 /// How long an expected answer or event may take before the test calls
 /// it lost. It bounds a hang, never a duration: a loaded host delays
@@ -79,28 +82,6 @@ fn stream(id: &str, protocol: StreamProtocol) -> Stream {
         1,
         Utc::now(),
     )
-}
-
-/// A table source the test rewrites between messages.
-#[derive(Default)]
-struct Source(Mutex<StreamTable>);
-
-impl Source {
-    fn with(streams: Vec<Stream>, links: &[StreamBackend]) -> Arc<Self> {
-        let source = Arc::new(Source::default());
-        source.set(streams, links);
-        source
-    }
-
-    fn set(&self, streams: Vec<Stream>, links: &[StreamBackend]) {
-        *self.0.lock().unwrap() = StreamTable::new(streams, links);
-    }
-}
-
-impl StreamTableSource for Source {
-    fn load(&self) -> Result<StreamTable, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.0.lock().unwrap().clone())
-    }
 }
 
 /// Echoes until the client closes or the tracker closes the connection,

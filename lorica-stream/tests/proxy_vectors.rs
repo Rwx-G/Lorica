@@ -27,30 +27,24 @@
 
 #![cfg(target_os = "linux")]
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use lorica_config::models::{
-    Backend, HealthCheck, HealthStatus, LifecycleState, Stream, StreamBackend, StreamEndReason,
-    StreamProtocol, StreamProxyProtocol, StreamRefusal,
+    Stream, StreamBackend, StreamEndReason, StreamProtocol, StreamProxyProtocol,
 };
 use lorica_core::protocols::proxy_protocol::accept_vectors::{
     vectors, AcceptVector, Outcome, Peer, Refusal, Then,
 };
 use lorica_core::protocols::proxy_protocol::{parse, Addresses, Parsed, Version};
-use lorica_shmem::StreamCapsRegion;
-use lorica_stream::caps::admitted_cap;
 use lorica_stream::counters::ProxyHeaderOutcome;
-use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
-    AcceptedConnection, Admission, BackendSelector, BoundPorts, BreakerGate, CapsRegistry,
-    ConnectionObserver, ConnectionRecord, ConnectionTracker, NodeCapsRegions, Resolve,
-    ResolveError, Resolved, ResolverCache, SelectionRequest, SourceGate, StreamCounters,
-    StreamHandler, StreamTable, TcpEngine, TcpEngineParts,
+    AcceptedConnection, BoundPorts, CapsRegistry, ConnectionRecord, ConnectionTracker,
+    NodeCapsRegions, ResolverCache, StreamCounters, StreamHandler, StreamTable, TcpEngine,
+    TcpEngineParts,
 };
-use lorica_worker::stream_ctl::StreamCtlMsg;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -60,60 +54,9 @@ const STREAM_ID: &str = "s";
 /// header read timeout plus its own pauses.
 const WAIT: Duration = Duration::from_secs(60);
 
-// ---- seams: one backend, always admitted, no name, no source refused ----
+mod common;
 
-struct FirstCandidate;
-
-impl BackendSelector for FirstCandidate {
-    fn select(&self, _request: &SelectionRequest<'_>) -> usize {
-        0
-    }
-
-    fn connected(&self, _: &str, _: &Backend, _: SocketAddr, _: Duration) {}
-
-    fn closed(&self, _: &str, _: &Backend, _: SocketAddr) {}
-}
-
-struct AlwaysAdmit;
-
-impl BreakerGate for AlwaysAdmit {
-    fn admit<'a>(&'a self, _: &'a str, _: &'a Backend) -> SeamFuture<'a, Admission> {
-        Box::pin(async { Admission::Allow })
-    }
-
-    fn record<'a>(&'a self, _: &'a str, _: &'a Backend, _: bool, _: bool) -> SeamFuture<'a, ()> {
-        Box::pin(async {})
-    }
-}
-
-/// Every backend is an address literal: a lookup never happens.
-struct NoNames;
-
-impl Resolve for NoNames {
-    fn lookup<'a>(&'a self, _host: &'a str) -> SeamFuture<'a, Result<Resolved, ResolveError>> {
-        Box::pin(std::future::pending())
-    }
-}
-
-struct OpenGate;
-
-impl SourceGate for OpenGate {
-    fn global(&self, _client: IpAddr) -> Option<StreamRefusal> {
-        None
-    }
-
-    fn country(&self, _client: IpAddr) -> Option<[u8; 2]> {
-        None
-    }
-}
-
-struct Records(mpsc::UnboundedSender<ConnectionRecord>);
-
-impl ConnectionObserver for Records {
-    fn observe(&self, record: ConnectionRecord) {
-        let _ = self.0.send(record);
-    }
-}
+use common::{backend, Breaker, Dns, Gate, Selector};
 
 // ---- the harness ---------------------------------------------------------
 
@@ -125,18 +68,19 @@ struct Harness {
 
 impl Harness {
     /// An engine serving one stream that accepts PROXY from `trusted`
-    /// and sends a v2 header to `backend`, behind a listener of its own.
-    async fn serving(trusted: &str, backend: SocketAddr) -> Harness {
+    /// and sends a v2 header to the backend at `backend_address`, behind
+    /// a listener of its own.
+    async fn serving(trusted: &str, backend_address: SocketAddr) -> Harness {
         let counters = Arc::new(StreamCounters::new());
-        let (ended, records) = mpsc::unbounded_channel();
+        let (observer, observed) = common::observer();
         let engine = TcpEngine::new(TcpEngineParts {
-            selector: Arc::new(FirstCandidate),
-            breaker: Arc::new(AlwaysAdmit),
-            resolver: ResolverCache::new(Arc::new(NoNames), Arc::clone(&counters)),
+            selector: Arc::new(Selector::first()),
+            breaker: Arc::new(Breaker::default()),
+            resolver: ResolverCache::new(Arc::new(Dns::default()), Arc::clone(&counters)),
             counters: Arc::clone(&counters),
-            observer: Arc::new(Records(ended)),
+            observer,
             reserved_ports: None,
-            source_gate: Arc::new(OpenGate),
+            source_gate: Arc::new(Gate::default()),
         });
 
         let mut stream = Stream::new(
@@ -156,21 +100,13 @@ impl Harness {
 
         let caps = CapsRegistry::new();
         let mut node = NodeCapsRegions::new(1);
-        node.ensure(&stream.id, admitted_cap(&stream).unwrap(), 0)
-            .unwrap();
-        let Some(StreamCtlMsg::Caps { region, slot, .. }) =
-            node.caps_message(&stream.id, 1, 0).unwrap()
-        else {
-            panic!("test setup: a caps message");
-        };
-        let region = Arc::new(StreamCapsRegion::open(region).unwrap());
-        caps.adopt(&stream.id, region.worker(slot).unwrap());
+        common::adopt_region(&mut node, &caps, &stream);
 
         let link = StreamBackend::primary(&stream.id, "b1");
         let table = Arc::new(StreamTable::with_backends(
             vec![stream],
             &[link],
-            vec![backend_row("b1", backend)],
+            vec![backend("b1", backend_address)],
         ));
         engine.table_changed(&table);
 
@@ -197,16 +133,13 @@ impl Harness {
         });
         Harness {
             counters,
-            records,
+            records: observed.records,
             listen,
         }
     }
 
     async fn record(&mut self) -> ConnectionRecord {
-        tokio::time::timeout(WAIT, self.records.recv())
-            .await
-            .expect("a connection record in time")
-            .expect("the engine is alive")
+        common::next(&mut self.records, "a connection record").await
     }
 
     /// The PROXY header outcomes the stream counted, each once.
@@ -222,30 +155,6 @@ impl Harness {
             }
         }
         counted
-    }
-}
-
-fn backend_row(id: &str, address: SocketAddr) -> Backend {
-    Backend {
-        id: id.into(),
-        address: address.to_string(),
-        name: format!("backend-{id}"),
-        group_name: String::new(),
-        weight: 1,
-        health_status: HealthStatus::Healthy,
-        health_check_enabled: false,
-        health_check_interval_s: 10,
-        health_check_path: None,
-        health_check: HealthCheck::default(),
-        lifecycle_state: LifecycleState::Normal,
-        active_connections: 0,
-        tls_upstream: false,
-        tls_skip_verify: false,
-        tls_sni: None,
-        h2_upstream: false,
-        managed_by: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
     }
 }
 

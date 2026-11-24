@@ -25,29 +25,24 @@
 
 #![cfg(target_os = "linux")]
 
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
 use lorica_config::models::{
-    Backend, DatagramDropReason, GeoIpConfig, GeoIpMode, HealthCheck, HealthStatus, LifecycleState,
-    Stream, StreamBackend, StreamEndKind, StreamEndReason, StreamProtocol, StreamProxyProtocol,
-    StreamRefusal, UdpSettings,
+    Backend, DatagramDropReason, GeoIpConfig, GeoIpMode, HealthStatus, Stream, StreamBackend,
+    StreamEndKind, StreamEndReason, StreamProtocol, StreamProxyProtocol, StreamRefusal,
+    UdpSettings,
 };
 use lorica_core::protocols::proxy_protocol::V2_SIGNATURE;
 use lorica_shmem::{RateLimits, SourceKey, StreamCapsRegion};
 use lorica_stream::counters::{ConnectFailureKind, LinkCountersSnapshot, StreamCountersSnapshot};
-use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
-    Admission, BackendSelector, BreakerGate, ConnectOutcome, ConnectionObserver, ConnectionRecord,
-    ConnectionTracker, ControlTransport, Engines, InProcessPeer, NodeCapsRegions, RefusalRecord,
-    Resolve, ResolveError, Resolved, ResolverCache, SelectionRequest, SourceGate, StreamCounters,
-    StreamRuntime, StreamRuntimeHandle, StreamTable, StreamTableSource, UdpEngine, UdpEngineParts,
-    UpgradeDrainCounts,
+    BackendSelector, BreakerGate, ConnectOutcome, ConnectionRecord, ControlTransport, Engines,
+    InProcessPeer, NodeCapsRegions, RefusalRecord, ResolverCache, SourceGate, StreamCounters,
+    StreamRuntime, StreamRuntimeHandle, StreamTable, UdpEngine, UdpEngineParts, UpgradeDrainCounts,
 };
 use lorica_worker::fd_passing::StreamProto;
 use lorica_worker::stream_ctl::{QuiesceReason, StreamCtlMsg, StreamSocket};
@@ -70,205 +65,18 @@ use tokio::time::Instant;
 // ephemeral range and locked across processes, which no autobind ever
 // reaches and nobody else is handed.
 #[path = "../../lorica/tests/common/mod.rs"]
+mod ports;
+
 mod common;
 
-use common::reserve_port;
+use common::{backend, Breaker, Dns, Gate, Pick, Selector, Source};
+use ports::reserve_port;
 
 /// How long an expected event may take before the test calls it lost. It
 /// bounds a hang, never a duration: a loaded host delays every event,
 /// and no assertion here may depend on how much.
 const WAIT: Duration = Duration::from_secs(60);
 const QUIET: Duration = Duration::from_millis(300);
-
-// ---- fake seams ------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Pick {
-    First,
-    FewestSessions,
-    ClientHash,
-}
-
-struct Selector {
-    pick: Pick,
-    clients: Mutex<Vec<IpAddr>>,
-    sessions: Mutex<HashMap<String, i64>>,
-    connected: Mutex<Vec<String>>,
-    closed: Mutex<Vec<String>>,
-}
-
-impl Selector {
-    fn new(pick: Pick) -> Self {
-        Selector {
-            pick,
-            clients: Mutex::default(),
-            sessions: Mutex::default(),
-            connected: Mutex::default(),
-            closed: Mutex::default(),
-        }
-    }
-}
-
-impl BackendSelector for Selector {
-    fn select(&self, request: &SelectionRequest<'_>) -> usize {
-        self.clients.lock().unwrap().push(request.client);
-        match self.pick {
-            Pick::First => 0,
-            Pick::FewestSessions => {
-                let sessions = self.sessions.lock().unwrap();
-                (0..request.candidates.len())
-                    .min_by_key(|&i| {
-                        sessions
-                            .get(&request.candidates[i].backend.id)
-                            .copied()
-                            .unwrap_or(0)
-                    })
-                    .unwrap()
-            }
-            Pick::ClientHash => {
-                let mut hasher = DefaultHasher::new();
-                request.client.to_string().hash(&mut hasher);
-                (hasher.finish() % request.candidates.len() as u64) as usize
-            }
-        }
-    }
-
-    fn connected(&self, _stream_id: &str, backend: &Backend, _: SocketAddr, _: Duration) {
-        *self
-            .sessions
-            .lock()
-            .unwrap()
-            .entry(backend.id.clone())
-            .or_default() += 1;
-        self.connected.lock().unwrap().push(backend.id.clone());
-    }
-
-    fn closed(&self, _stream_id: &str, backend: &Backend, _: SocketAddr) {
-        *self
-            .sessions
-            .lock()
-            .unwrap()
-            .entry(backend.id.clone())
-            .or_default() -= 1;
-        self.closed.lock().unwrap().push(backend.id.clone());
-    }
-}
-
-#[derive(Default)]
-struct Breaker {
-    deny: HashSet<String>,
-    hang: HashSet<String>,
-    /// Backends whose breaker is half-open: each admission is a probe.
-    probe: HashSet<String>,
-    records: Mutex<Vec<(String, bool, bool)>>,
-}
-
-impl BreakerGate for Breaker {
-    fn admit<'a>(&'a self, _stream_id: &'a str, backend: &'a Backend) -> SeamFuture<'a, Admission> {
-        let (denied, hangs, probes) = (
-            self.deny.contains(&backend.id),
-            self.hang.contains(&backend.id),
-            self.probe.contains(&backend.id),
-        );
-        Box::pin(async move {
-            if hangs {
-                std::future::pending::<()>().await;
-            }
-            if denied {
-                Admission::Deny
-            } else if probes {
-                Admission::AllowProbe
-            } else {
-                Admission::Allow
-            }
-        })
-    }
-
-    fn record<'a>(
-        &'a self,
-        _stream_id: &'a str,
-        backend: &'a Backend,
-        success: bool,
-        was_probe: bool,
-    ) -> SeamFuture<'a, ()> {
-        self.records
-            .lock()
-            .unwrap()
-            .push((backend.id.clone(), success, was_probe));
-        Box::pin(async {})
-    }
-}
-
-/// Every backend of these tests is an IP literal: a lookup is a bug.
-struct NoDns;
-
-impl Resolve for NoDns {
-    fn lookup<'a>(&'a self, host: &'a str) -> SeamFuture<'a, Result<Resolved, ResolveError>> {
-        Box::pin(async move { Err(ResolveError(format!("unexpected lookup of {host}"))) })
-    }
-}
-
-struct Records {
-    ended: mpsc::UnboundedSender<ConnectionRecord>,
-    refused: mpsc::UnboundedSender<RefusalRecord>,
-    outcomes: Arc<Mutex<Vec<(String, StreamProtocol, ConnectOutcome)>>>,
-    /// The runtime's tracker, known once the runtime is spawned.
-    tracker: Arc<std::sync::OnceLock<ConnectionTracker>>,
-    /// The entries the tracker held when each record arrived.
-    tracked_at_report: Arc<Mutex<Vec<usize>>>,
-}
-
-impl ConnectionObserver for Records {
-    fn observe(&self, record: ConnectionRecord) {
-        if let Some(tracker) = self.tracker.get() {
-            self.tracked_at_report.lock().unwrap().push(tracker.len());
-        }
-        let _ = self.ended.send(record);
-    }
-
-    fn connect_outcome(&self, stream_id: &str, protocol: StreamProtocol, outcome: ConnectOutcome) {
-        self.outcomes
-            .lock()
-            .unwrap()
-            .push((stream_id.to_string(), protocol, outcome));
-    }
-
-    fn refused(&self, record: RefusalRecord) {
-        let _ = self.refused.send(record);
-    }
-}
-
-/// Refuses the addresses it holds; knows the countries it is told.
-#[derive(Default)]
-struct Gate {
-    filtered: Mutex<HashSet<IpAddr>>,
-    blocked: Mutex<HashSet<IpAddr>>,
-    countries: Mutex<HashMap<IpAddr, [u8; 2]>>,
-}
-
-impl SourceGate for Gate {
-    fn global(&self, client: IpAddr) -> Option<StreamRefusal> {
-        if self.filtered.lock().unwrap().contains(&client) {
-            Some(StreamRefusal::ConnectionFilter)
-        } else if self.blocked.lock().unwrap().contains(&client) {
-            Some(StreamRefusal::IpBlocklist)
-        } else {
-            None
-        }
-    }
-
-    fn country(&self, client: IpAddr) -> Option<[u8; 2]> {
-        self.countries.lock().unwrap().get(&client).copied()
-    }
-}
-
-struct FixedTable(StreamTable);
-
-impl StreamTableSource for FixedTable {
-    fn load(&self) -> Result<StreamTable, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.0.clone())
-    }
-}
 
 // ---- fixtures --------------------------------------------------------
 
@@ -293,30 +101,6 @@ fn udp(stream: &mut Stream) -> &mut UdpSettings {
         .udp
         .as_mut()
         .expect("a UDP stream carries its settings")
-}
-
-fn backend(id: &str, address: SocketAddr) -> Backend {
-    Backend {
-        id: id.into(),
-        address: address.to_string(),
-        name: format!("backend-{id}"),
-        group_name: String::new(),
-        weight: 1,
-        health_status: HealthStatus::Healthy,
-        health_check_enabled: false,
-        health_check_interval_s: 10,
-        health_check_path: None,
-        health_check: HealthCheck::default(),
-        lifecycle_state: LifecycleState::Normal,
-        active_connections: 0,
-        tls_upstream: false,
-        tls_skip_verify: false,
-        tls_sni: None,
-        h2_upstream: false,
-        managed_by: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    }
 }
 
 type Seen = Arc<Mutex<Vec<(SocketAddr, Vec<u8>)>>>;
@@ -427,23 +211,13 @@ impl Harness {
         let selector = Arc::new(Selector::new(pick));
         let breaker = Arc::new(breaker);
         let gate = Arc::new(Gate::default());
-        let (ended, records) = mpsc::unbounded_channel();
-        let (refused, refusals) = mpsc::unbounded_channel();
-        let outcomes = Arc::default();
-        let tracker: Arc<std::sync::OnceLock<ConnectionTracker>> = Arc::default();
-        let tracked_at_report = Arc::default();
+        let (observer, observed) = common::observer();
         let engine = UdpEngine::new(UdpEngineParts {
             selector: Arc::clone(&selector) as Arc<dyn BackendSelector>,
             breaker: Arc::clone(&breaker) as Arc<dyn BreakerGate>,
-            resolver: ResolverCache::new(Arc::new(NoDns), Arc::clone(&counters)),
+            resolver: ResolverCache::new(Arc::new(Dns::default()), Arc::clone(&counters)),
             counters: Arc::clone(&counters),
-            observer: Arc::new(Records {
-                ended,
-                refused,
-                outcomes: Arc::clone(&outcomes),
-                tracker: Arc::clone(&tracker),
-                tracked_at_report: Arc::clone(&tracked_at_report),
-            }),
+            observer,
             reserved_ports: None,
             source_gate: Arc::clone(&gate) as Arc<dyn SourceGate>,
         });
@@ -473,23 +247,23 @@ impl Harness {
                 udp: Some(Arc::new(engine)),
                 counters,
             },
-            Arc::new(FixedTable(table)),
+            Arc::new(Source(Mutex::new(table))),
         )
         .unwrap();
-        let _ = tracker.set(handle.tracker().clone());
+        let _ = observed.tracker.set(handle.tracker().clone());
         let mut harness = Harness {
             peer,
             handle,
-            records,
-            refusals,
-            outcomes,
+            records: observed.records,
+            refusals: observed.refusals,
+            outcomes: observed.outcomes,
             selector,
             breaker,
             gate,
             node: NodeCapsRegions::new(1),
             listens: Vec::new(),
             seq: 0,
-            tracked_at_report,
+            tracked_at_report: observed.tracked_at_report,
         };
         for (n, (stream, _)) in streams.iter().enumerate() {
             if !without_region.contains(&stream.id.as_str()) {
@@ -553,18 +327,12 @@ impl Harness {
     }
 
     async fn record(&mut self) -> ConnectionRecord {
-        tokio::time::timeout(WAIT, self.records.recv())
-            .await
-            .expect("a session record in time")
-            .expect("the engine is alive")
+        common::next(&mut self.records, "a session record").await
     }
 
     /// The next refusal row the refusal log admitted.
     async fn refusal(&mut self) -> RefusalRecord {
-        tokio::time::timeout(WAIT, self.refusals.recv())
-            .await
-            .expect("a refusal row in time")
-            .expect("the engine is alive")
+        common::next(&mut self.refusals, "a refusal row").await
     }
 
     fn stats(&self, stream_id: &str) -> StreamCountersSnapshot {
@@ -847,10 +615,7 @@ async fn an_unanswered_probe_is_answered_as_a_success() {
     let mut h = Harness::start(
         vec![(stream, vec![backend("b1", b1.addr)])],
         Pick::First,
-        Breaker {
-            probe: ["b1".to_string()].into(),
-            ..Breaker::default()
-        },
+        Breaker::default().probing("b1"),
     )
     .await;
     let c = client().await;
@@ -1458,10 +1223,7 @@ async fn a_breaker_deny_reselects_without_opening_a_socket() {
             vec![backend("b1", b1.addr), backend("b2", b2.addr)],
         )],
         Pick::First,
-        Breaker {
-            deny: ["b1".to_string()].into(),
-            ..Breaker::default()
-        },
+        Breaker::default().denying("b1"),
     )
     .await;
     let c = client().await;
@@ -1545,10 +1307,7 @@ async fn the_receive_loop_never_waits_on_a_session() {
             ),
         ],
         Pick::First,
-        Breaker {
-            hang: ["bh".to_string()].into(),
-            ..Breaker::default()
-        },
+        Breaker::default().hanging("bh"),
     )
     .await;
     let (hung, flooded, served) = (h.listens[0], h.listens[1], h.listens[2]);

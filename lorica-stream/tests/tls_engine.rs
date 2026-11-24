@@ -31,25 +31,20 @@ use std::time::Duration;
 
 use chrono::Utc;
 use lorica_config::models::{
-    Backend, HealthCheck, HealthStatus, LifecycleState, MtlsConfig, Stream, StreamBackend,
-    StreamEndReason, StreamMatchRule, StreamMatcher, StreamProtocol, StreamProxyProtocol,
-    StreamRefusal, StreamTlsMode, StreamTlsTerminate, StreamUpstreamTls, UpstreamServerName,
+    Backend, MtlsConfig, Stream, StreamBackend, StreamEndReason, StreamMatchRule, StreamMatcher,
+    StreamProtocol, StreamProxyProtocol, StreamRefusal, StreamTlsMode, StreamTlsTerminate,
+    StreamUpstreamTls, UpstreamServerName,
 };
 use lorica_core::protocols::proxy_protocol::{encode_v2, parse, Addresses, Parsed};
-use lorica_shmem::StreamCapsRegion;
-use lorica_stream::caps::admitted_cap;
 use lorica_stream::counters::{
     ClientHelloOutcome, HandshakeOutcome, StreamCountersSnapshot, UpstreamTlsFailure,
 };
-use lorica_stream::seams::SeamFuture;
 use lorica_stream::tls::rewind::Rewind;
 use lorica_stream::tls::server::{accept, TerminateConfigs};
 use lorica_stream::{
-    AcceptedConnection, Admission, BackendSelector, BoundPorts, BreakerGate, CapsRegistry,
-    ClientCertificateOutcome, ClientIdentity, ConnectionObserver, ConnectionRecord,
-    ConnectionTracker, NodeCapsRegions, RefusalRecord, Resolve, ResolveError, Resolved,
-    ResolverCache, SelectionRequest, SourceGate, StreamCounters, StreamHandler, StreamTable,
-    TcpEngine, TcpEngineParts, TlsParts,
+    AcceptedConnection, BoundPorts, BreakerGate, CapsRegistry, ClientCertificateOutcome,
+    ClientIdentity, ConnectionRecord, ConnectionTracker, NodeCapsRegions, RefusalRecord,
+    ResolverCache, StreamCounters, StreamHandler, StreamTable, TcpEngine, TcpEngineParts, TlsParts,
 };
 use lorica_tls::cert_resolver::{CertData, CertResolver, ResolvesServerCertByLocalIp};
 use lorica_tls::http_client::{config_builder, crypto_provider};
@@ -57,7 +52,6 @@ use lorica_tls::{
     CertificateDer, ClientTlsStream, PrivateKeyDer, RootCertStore, ServerConfig, ServerName,
     TlsAcceptor, TlsConnector, WebPkiClientVerifier,
 };
-use lorica_worker::stream_ctl::StreamCtlMsg;
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
 use rustls::HandshakeKind;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -68,102 +62,9 @@ use tokio::time::Instant;
 const WAIT: Duration = Duration::from_secs(10);
 const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
-// ---- fake seams ------------------------------------------------------
+mod common;
 
-struct FirstCandidate;
-
-impl BackendSelector for FirstCandidate {
-    fn select(&self, _request: &SelectionRequest<'_>) -> usize {
-        0
-    }
-
-    fn connected(&self, _: &str, _: &Backend, _: SocketAddr, _: Duration) {}
-
-    fn closed(&self, _: &str, _: &Backend, _: SocketAddr) {}
-}
-
-#[derive(Default)]
-struct Breaker {
-    records: Mutex<Vec<(String, bool, bool)>>,
-}
-
-impl Breaker {
-    fn recorded(&self, backend_id: &str) -> Vec<bool> {
-        self.records
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(id, _, _)| id == backend_id)
-            .map(|(_, success, _)| *success)
-            .collect()
-    }
-}
-
-impl BreakerGate for Breaker {
-    fn admit<'a>(&'a self, _: &'a str, _: &'a Backend) -> SeamFuture<'a, Admission> {
-        Box::pin(async { Admission::Allow })
-    }
-
-    fn record<'a>(
-        &'a self,
-        _: &'a str,
-        backend: &'a Backend,
-        success: bool,
-        was_probe: bool,
-    ) -> SeamFuture<'a, ()> {
-        self.records
-            .lock()
-            .unwrap()
-            .push((backend.id.clone(), success, was_probe));
-        Box::pin(async {})
-    }
-}
-
-/// Answers `localhost` with loopback, hangs on any other name.
-struct Dns;
-
-impl Resolve for Dns {
-    fn lookup<'a>(&'a self, host: &'a str) -> SeamFuture<'a, Result<Resolved, ResolveError>> {
-        Box::pin(async move {
-            if host == "localhost" {
-                Ok(Resolved {
-                    addresses: vec![LOOPBACK],
-                    ttl: Duration::from_secs(30),
-                })
-            } else {
-                std::future::pending().await
-            }
-        })
-    }
-}
-
-struct Records {
-    ended: mpsc::UnboundedSender<ConnectionRecord>,
-    refused: mpsc::UnboundedSender<RefusalRecord>,
-}
-
-impl ConnectionObserver for Records {
-    fn observe(&self, record: ConnectionRecord) {
-        let _ = self.ended.send(record);
-    }
-
-    fn refused(&self, record: RefusalRecord) {
-        let _ = self.refused.send(record);
-    }
-}
-
-/// No node-wide source control.
-struct Ungated;
-
-impl SourceGate for Ungated {
-    fn global(&self, _: IpAddr) -> Option<StreamRefusal> {
-        None
-    }
-
-    fn country(&self, _: IpAddr) -> Option<[u8; 2]> {
-        None
-    }
-}
+use common::{backend, Breaker, Dns, Gate, Selector};
 
 // ---- certificates ----------------------------------------------------
 
@@ -305,30 +206,6 @@ fn terminating(id: &str, rules: Vec<StreamMatchRule>, client_auth: Option<MtlsCo
     s
 }
 
-fn backend(id: &str, address: impl ToString) -> Backend {
-    Backend {
-        id: id.into(),
-        address: address.to_string(),
-        name: format!("backend-{id}"),
-        group_name: String::new(),
-        weight: 1,
-        health_status: HealthStatus::Healthy,
-        health_check_enabled: false,
-        health_check_interval_s: 10,
-        health_check_path: None,
-        health_check: HealthCheck::default(),
-        lifecycle_state: LifecycleState::Normal,
-        active_connections: 0,
-        tls_upstream: false,
-        tls_skip_verify: false,
-        tls_sni: None,
-        h2_upstream: false,
-        managed_by: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    }
-}
-
 /// `streams` with `links` of (stream id, backend, rule).
 fn table(streams: Vec<Stream>, links: Vec<(&str, Backend, Option<&str>)>) -> StreamTable {
     let rows: Vec<StreamBackend> = links
@@ -364,17 +241,17 @@ impl Harness {
         let counters = Arc::new(StreamCounters::new());
         let breaker = Arc::new(Breaker::default());
         let resolver = Arc::new(CertResolver::new());
-        let (ended, records) = mpsc::unbounded_channel();
-        let (refused, refusals) = mpsc::unbounded_channel();
+        let (observer, observed) = common::observer();
+        let dns = Dns::default().answering("localhost", vec![LOOPBACK]);
         let engine = TcpEngine::with_tls(
             TcpEngineParts {
-                selector: Arc::new(FirstCandidate),
+                selector: Arc::new(Selector::first()),
                 breaker: Arc::clone(&breaker) as Arc<dyn BreakerGate>,
-                resolver: ResolverCache::new(Arc::new(Dns), Arc::clone(&counters)),
+                resolver: ResolverCache::new(Arc::new(dns), Arc::clone(&counters)),
                 counters: Arc::clone(&counters),
-                observer: Arc::new(Records { ended, refused }),
+                observer,
                 reserved_ports: None,
-                source_gate: Arc::new(Ungated),
+                source_gate: Arc::new(Gate::default()),
             },
             TlsParts {
                 resolver: Arc::clone(&resolver) as Arc<dyn ResolvesServerCertByLocalIp>,
@@ -384,8 +261,8 @@ impl Harness {
         Harness {
             engine,
             tracker: ConnectionTracker::new(),
-            records,
-            refusals,
+            records: observed.records,
+            refusals: observed.refusals,
             node: Mutex::new(NodeCapsRegions::new(1)),
             caps: CapsRegistry::new(),
             counters,
@@ -398,18 +275,7 @@ impl Harness {
     fn set(&self, table: StreamTable) {
         let mut node = self.node.lock().unwrap();
         for stream in table.streams() {
-            let created = node
-                .ensure(&stream.id, admitted_cap(stream).unwrap(), 0)
-                .unwrap();
-            if created.is_some() {
-                let Some(StreamCtlMsg::Caps { region, slot, .. }) =
-                    node.caps_message(&stream.id, 1, 0).unwrap()
-                else {
-                    panic!("test setup: a caps message");
-                };
-                let region = Arc::new(StreamCapsRegion::open(region).unwrap());
-                self.caps.adopt(&stream.id, region.worker(slot).unwrap());
-            }
+            common::adopt_region(&mut node, &self.caps, stream);
         }
         self.engine.table_changed(&table);
         *self.table.lock().unwrap() = Arc::new(table);
@@ -447,20 +313,14 @@ impl Harness {
     }
 
     async fn record(&mut self) -> ConnectionRecord {
-        tokio::time::timeout(WAIT, self.records.recv())
-            .await
-            .expect("a connection record in time")
-            .expect("the engine is alive")
+        common::next(&mut self.records, "a connection record").await
     }
 
     /// The next refusal row: a refused connection hands no record (Story
     /// 12.6 D-j), and the refusal log writes one row per stream and
     /// refusal per window.
     async fn refusal(&mut self) -> RefusalRecord {
-        tokio::time::timeout(WAIT, self.refusals.recv())
-            .await
-            .expect("a refusal row in time")
-            .expect("the engine is alive")
+        common::next(&mut self.refusals, "a refusal row").await
     }
 
     fn stats(&self, stream_id: &str) -> StreamCountersSnapshot {
