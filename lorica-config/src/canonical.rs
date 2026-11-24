@@ -2155,8 +2155,20 @@ mod tests {
     /// from before them is refused by schema (migration 79) at the
     /// handshake. Pinned by
     /// `a_blob_without_the_stream_observability_fields_decodes_to_their_defaults`.
+    ///
+    /// The Phase 1 audit of 1.11.0 (finding C6) moved it without moving
+    /// the shape: no field, type or variant changed, only what the guard
+    /// reads. It used to watch the variants of the enums someone had
+    /// listed, so `LoadBalancing`, `StreamProtocol`, `StreamProxyProtocol`
+    /// and every other enum held by a field went unwatched, and a variant
+    /// added to one (Story 12.13 adds one to `LoadBalancing`) would have
+    /// met an older peer's positional decode error with no red gate. The
+    /// variant lines are now derived from every field of the inventory
+    /// (`enum_field_lines`), which replaced the hand-listed `GeoIpMode`
+    /// and `StreamTlsMode` lines. No version step: the blob decodes as
+    /// before on every peer.
     const CANONICAL_SHAPE_DIGEST: &str =
-        "15883c35aaf50a34afd21b65e457906e5095f374c6c1a46b7b204bc8b0457c08";
+        "0018b0caa2ccd5567c85cfaa1c672d31e625b8c384c2ae9666c6efe13dfb210c";
 
     /// Every field name `T` accepts, read from the type itself rather
     /// than from the JSON of some fixture.
@@ -2216,6 +2228,60 @@ mod tests {
         names
     }
 
+    /// The variant lines of every field of `T` that holds an enum, read
+    /// from the type: each field [`field_names`] returns is sent
+    /// [`SHAPE_PROBE`] alone, as a scalar, then as the one element of a
+    /// list and as the one key and value of a map, and the first form
+    /// answered with "unknown variant" yields
+    /// `Type.field(variant,variant,...)`, with `[]` or `{}` after the
+    /// field name for the list and map forms.
+    ///
+    /// The scalar form reaches a unit enum. The list form reaches a list
+    /// of them, and also a struct or an internally tagged enum, which
+    /// serde reads from a sequence too, first element first: a struct
+    /// whose first field is an enum, and a tagged enum's tags, answer
+    /// there (`Backend.health_check[]`, `Backend.managed_by[]`). The map
+    /// form reaches a map's values and an externally tagged enum. A field
+    /// whose every form answers otherwise yields nothing; the structs it
+    /// reaches have their own lines, and the fields of each variant of
+    /// the tagged enums that carry data come from their own helpers
+    /// ([`health_check_shape_lines`], [`stream_tls_shape_lines`]).
+    ///
+    /// Derived rather than listed (audit finding C6): a unit enum field
+    /// added to an inventoried type, or a variant added to its enum, moves
+    /// the digest with nothing to remember.
+    fn enum_field_lines<T: serde::de::DeserializeOwned>(type_name: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        for field in field_names::<T>(type_name) {
+            let forms = [
+                ("", serde_json::json!(SHAPE_PROBE)),
+                ("[]", serde_json::json!([SHAPE_PROBE])),
+                ("{}", serde_json::json!({ SHAPE_PROBE: SHAPE_PROBE })),
+            ];
+            for (form, value) in forms {
+                let probe = serde_json::json!({ field.as_str(): value });
+                let Err(error) = serde_json::from_value::<T>(probe) else {
+                    continue;
+                };
+                let message = error.to_string();
+                if !message.starts_with("unknown variant") {
+                    continue;
+                }
+                let mut quoted = message.split('`').skip(1).step_by(2);
+                assert_eq!(
+                    quoted.next(),
+                    Some(SHAPE_PROBE),
+                    "{type_name}.{field}: {message}"
+                );
+                let mut variants: Vec<&str> = quoted.collect();
+                variants.sort_unstable();
+                lines.push(format!("{type_name}.{field}{form}({})", variants.join(",")));
+                break;
+            }
+        }
+        lines
+    }
+
     /// The shape lines of a backend's health check (Story 12.7, D-4),
     /// with `template_names` as the template catalogue: the accepted
     /// kinds, each kind's fields, the payload spellings, the
@@ -2261,18 +2327,15 @@ mod tests {
         lines
     }
 
-    /// The shape lines of a stream's TLS enums (Story 12.4): the modes,
-    /// the matcher kinds and each kind's fields, the upstream name modes
-    /// and each mode's fields. A kind or mode a peer does not know makes
-    /// it refuse the blob, so each moves the digest.
+    /// The shape lines of a stream's internally tagged TLS enums (Story
+    /// 12.4): the matcher kinds and each kind's fields, the upstream name
+    /// modes and each mode's fields. A kind or mode a peer does not know
+    /// makes it refuse the blob, so each moves the digest. The TLS modes,
+    /// a unit enum, are read through `Stream.tls_mode`
+    /// ([`enum_field_lines`]).
     fn stream_tls_shape_lines() -> Vec<String> {
-        use crate::models::{StreamMatcher, StreamTlsMode, UpstreamServerName};
-        let modes = names_refused_with::<StreamTlsMode>(
-            "StreamTlsMode",
-            serde_json::json!(SHAPE_PROBE),
-            "unknown variant",
-        );
-        let mut lines = vec![format!("StreamTlsMode({})", modes.join(","))];
+        use crate::models::{StreamMatcher, UpstreamServerName};
+        let mut lines = Vec::new();
         fn tagged<T: serde::de::DeserializeOwned>(
             lines: &mut Vec<String>,
             type_name: &str,
@@ -2298,18 +2361,6 @@ mod tests {
         lines
     }
 
-    /// The shape lines of the GeoIP modes a route or a stream filters by
-    /// (Story 12.6): a mode a peer does not know makes it refuse the
-    /// blob.
-    fn geoip_shape_lines() -> Vec<String> {
-        let modes = names_refused_with::<crate::models::GeoIpMode>(
-            "GeoIpMode",
-            serde_json::json!(SHAPE_PROBE),
-            "unknown variant",
-        );
-        vec![format!("GeoIpMode({})", modes.join(","))]
-    }
-
     fn catalogue_template_names() -> Vec<&'static str> {
         lorica_automation_policy::TCP_CHECK_TEMPLATES
             .iter()
@@ -2317,32 +2368,40 @@ mod tests {
             .collect()
     }
 
-    /// One line per type, `Type(field,field,...)`, sorted twice so the
-    /// digest depends on the shape and on nothing else.
+    /// One line per type, `Type(field,field,...)`, and one per unit
+    /// enum field of a type, sorted twice so the digest depends on the
+    /// shape and on nothing else.
     fn shape_lines() -> Vec<String> {
         shape_lines_with(&catalogue_template_names())
     }
 
-    /// [`shape_lines`] with `template_names` as the template catalogue.
-    fn shape_lines_with(template_names: &[&str]) -> Vec<String> {
-        macro_rules! shapes {
-            ($($t:ty),+ $(,)?) => {{
-                let mut lines: Vec<String> = Vec::new();
-                $(
-                    let name = stringify!($t);
-                    lines.push(format!("{name}({})", field_names::<$t>(name).join(",")));
-                )+
-                lines.sort();
-                lines
-            }};
+    /// One type of the blob's inventory, with the readers the guard runs
+    /// on it.
+    struct Inventoried {
+        name: &'static str,
+        fields: fn(&str) -> Vec<String>,
+        enum_fields: fn(&str) -> Vec<String>,
+    }
+
+    /// The blob's type inventory: `CanonicalConfig` and every struct
+    /// reachable from its fields. A canonical type absent from this list
+    /// is a type the guard does not watch, so adding one is part of
+    /// adding a replicated table. An enum reached through a field is read
+    /// through that field ([`enum_field_lines`]) and needs no entry; the
+    /// fields of each variant of `HealthCheck`, `StreamMatcher` and
+    /// `UpstreamServerName` come from [`health_check_shape_lines`] and
+    /// [`stream_tls_shape_lines`].
+    fn inventory() -> Vec<Inventoried> {
+        macro_rules! inventory {
+            ($($t:ty),+ $(,)?) => {
+                vec![$(Inventoried {
+                    name: stringify!($t),
+                    fields: field_names::<$t>,
+                    enum_fields: enum_field_lines::<$t>,
+                }),+]
+            };
         }
-        // The blob's type inventory: `CanonicalConfig` and everything
-        // reachable from its fields. A canonical type absent from this
-        // list is a type the guard does not watch, so adding one is
-        // part of adding a replicated table. `HealthCheck` and the types
-        // under it are enums or reached through one, so their lines come
-        // from `health_check_shape_lines`.
-        let mut lines = shapes![
+        inventory![
             CanonicalConfig,
             CanonicalGlobalSettings,
             CanonicalWafRule,
@@ -2376,12 +2435,54 @@ mod tests {
             crate::models::MtlsConfig,
             crate::models::GeoIpConfig,
             crate::models::StreamSlaConfig,
-        ];
+        ]
+    }
+
+    /// [`shape_lines`] with `template_names` as the template catalogue.
+    fn shape_lines_with(template_names: &[&str]) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        for t in inventory() {
+            lines.push(format!("{}({})", t.name, (t.fields)(t.name).join(",")));
+            lines.extend((t.enum_fields)(t.name));
+        }
         lines.extend(health_check_shape_lines(template_names));
         lines.extend(stream_tls_shape_lines());
-        lines.extend(geoip_shape_lines());
         lines.sort();
         lines
+    }
+
+    /// Every unit enum a field of the inventory holds has its variants
+    /// in the digest (audit finding C6): before, only the enums someone
+    /// had listed by hand did, and a variant added to `LoadBalancing` or
+    /// `StreamProtocol` would have met a 1.11.x peer's positional decode
+    /// error with no red gate.
+    #[test]
+    fn every_enum_field_of_the_inventory_has_a_variant_line() {
+        let lines = shape_lines();
+        let derived: Vec<String> = inventory()
+            .iter()
+            .flat_map(|t| (t.enum_fields)(t.name))
+            .collect();
+        let missing: Vec<&String> = derived.iter().filter(|l| !lines.contains(*l)).collect();
+        assert!(
+            missing.is_empty(),
+            "enum fields whose variants the digest does not watch: {missing:#?}"
+        );
+        // The probe reads what it is meant to: fields the audit found
+        // unwatched, on a route and on a stream, each a scalar enum.
+        for field in [
+            "crate::models::Route.load_balancing(",
+            "crate::models::Stream.load_balancing(",
+            "crate::models::Stream.protocol(",
+            "crate::models::Stream.proxy_protocol_send(",
+            "crate::models::Stream.tls_mode(",
+            "crate::models::GeoIpConfig.mode(",
+        ] {
+            assert!(
+                lines.iter().any(|line| line.starts_with(field)),
+                "{field} not read: {derived:#?}"
+            );
+        }
     }
 
     /// The guard `CANONICAL_FORMAT_VERSION` cannot be on its own.
