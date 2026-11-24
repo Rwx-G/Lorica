@@ -28,7 +28,7 @@ use lorica_core::listeners::{
     AcceptPermit, AcceptVerdict, ConnectionFilter, ProxyHeaderOutcome, ProxyProtocolMode,
     ProxyProtocolPolicy, ServerAddress,
 };
-use lorica_core::protocols::proxy_protocol::V2_SIGNATURE;
+use lorica_core::protocols::proxy_protocol::{HEADER_READ_TIMEOUT, V2_SIGNATURE};
 use lorica_core::protocols::Stream;
 use lorica_core::server::ShutdownWatch;
 use lorica_core::services::listening::Service;
@@ -472,6 +472,30 @@ async fn a_post_from_a_direct_client_is_not_taken_for_a_signature() {
 
     let report = Report::parse(&response).expect("a direct client is served");
     assert_eq!(report.get("request"), "POST /form");
+    assert!(policy.outcomes().is_empty());
+}
+
+#[tokio::test]
+async fn a_signature_completed_after_the_read_timeout_reaches_the_parser_as_bytes() {
+    let elsewhere: IpAddr = "192.0.2.1".parse().unwrap();
+    let policy = TestPolicy::new(ProxyProtocolMode::Required, &[elsewhere]);
+    let server = start(Some(policy.clone()), TestFilter::denying(&[]), None).await;
+
+    let mut client = TcpStream::connect(&server.addr).await.expect("connect");
+    let wire = with_request(v1_header("192.0.2.10:51000", "198.51.100.1:80"));
+    // `PROXY` without its space: the sniff cannot decide on it.
+    client.write_all(&wire[..5]).await.expect("write");
+    tokio::time::sleep(HEADER_READ_TIMEOUT + Duration::from_millis(500)).await;
+    client.write_all(&wire[5..]).await.expect("write");
+    let response = read_to_close(&mut client).await;
+
+    let report = Report::parse(&response).expect("served as a direct client");
+    assert_eq!(
+        report.get("request"),
+        "invalid: PROXY TCP4 192.0.2.10 198.51.100.1 51000 80"
+    );
+    assert!(report.get("peer").starts_with("127.0.0.1:"));
+    assert_eq!(report.get("proxied"), "");
     assert!(policy.outcomes().is_empty());
 }
 

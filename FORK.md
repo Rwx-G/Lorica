@@ -537,7 +537,12 @@ lives in.
   new socket digest, and only then runs the filter, with its per-IP
   permit, on the carried client address. Any other peer is filtered at
   accept as upstream does, and its first bytes are sniffed: a PROXY
-  signature closes the connection. Sites, each marked `Lorica:`:
+  signature closes the connection. The sniff is bounded by
+  `HEADER_READ_TIMEOUT` from accept too (audit finding C19): a peer
+  whose first bytes have not told it apart by then goes on to the
+  handshake as a direct client, its bytes rewound, so a silent plaintext
+  client is handed to the HTTP read as upstream hands it, instead of
+  waiting out the 60 s handshake timeout. Sites, each marked `Lorica:`:
   `listeners/proxy_protocol.rs` (new, additive: the policy trait, the
   mode, the outcome enum, the header read and the sniff),
   `listeners/l4.rs` (`ListenerEndpoint::accept_staged` beside an

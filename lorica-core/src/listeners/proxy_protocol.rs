@@ -31,7 +31,11 @@
 //!   carried client address;
 //! - any other peer is filtered at accept as today and served as a direct
 //!   client, unless its first bytes are a PROXY signature, which closes
-//!   the connection.
+//!   the connection. The sniff is bounded by [`HEADER_READ_TIMEOUT`] from
+//!   accept too: a peer whose first bytes have not told it apart by then
+//!   is served as a direct client, its bytes rewound, and a signature it
+//!   completes later reaches the HTTP parser or the TLS handshake as
+//!   bytes, never as a header.
 //!
 //! Both reads happen in the connection task, before the read buffer is
 //! set, so a slow peer never stalls the accept loop and no client byte
@@ -181,7 +185,7 @@ enum Stage {
         accepted_at: Instant,
     },
     /// Any other peer, filtered at accept on its socket address.
-    Direct,
+    Direct { accepted_at: Instant },
 }
 
 /// What the header read found, before the connection filter runs.
@@ -226,9 +230,10 @@ impl PendingProxyHeader {
     pub(crate) fn direct(
         policy: Arc<dyn ProxyProtocolPolicy>,
         filter: Arc<dyn ConnectionFilter>,
+        accepted_at: Instant,
     ) -> PendingProxyHeader {
         PendingProxyHeader {
-            stage: Stage::Direct,
+            stage: Stage::Direct { accepted_at },
             policy,
             filter,
         }
@@ -239,7 +244,9 @@ impl PendingProxyHeader {
     /// the handshake, every byte read past a header rewound onto it.
     pub(crate) async fn resolve(self, stream: &mut Stream) -> Result<()> {
         match self.stage {
-            Stage::Direct => refuse_signature(&*self.policy, stream).await,
+            Stage::Direct { accepted_at } => {
+                refuse_signature(&*self.policy, stream, accepted_at).await
+            }
             Stage::AwaitingHeader { peer, accepted_at } => {
                 self.read_header(stream, peer, accepted_at).await
             }
@@ -444,25 +451,34 @@ async fn read_until_parsed(
 
 /// Reads the first bytes of a direct client until they tell a PROXY
 /// signature apart, closes the connection on one, and rewinds them
-/// otherwise. No timer of its own: the handshake timeout bounds it.
-async fn refuse_signature(policy: &dyn ProxyProtocolPolicy, stream: &mut Stream) -> Result<()> {
+/// otherwise.
+///
+/// Bounded by [`HEADER_READ_TIMEOUT`] from `accepted_at`, as the trusted
+/// read is. Without that bound a client that sends nothing would wait
+/// out the 60 s handshake timeout and end in an unthrottled error line,
+/// where a plaintext listener without PROXY hands it to the HTTP read at
+/// once. On expiry the bytes read so far are rewound and the connection
+/// goes on as a direct client: whatever it sends later is the HTTP
+/// parser's or the TLS handshake's to judge, and is never read as a
+/// header.
+async fn refuse_signature(
+    policy: &dyn ProxyProtocolPolicy,
+    stream: &mut Stream,
+    accepted_at: Instant,
+) -> Result<()> {
     let mut prefix = [0u8; V2_SIGNATURE.len()];
     let mut filled = 0;
-    let verdict = loop {
-        let verdict = classify_prefix(&prefix[..filled]);
-        if verdict != Prefix::NeedMore {
-            break verdict;
+    let sniff = tokio::time::timeout_at(
+        accepted_at + HEADER_READ_TIMEOUT,
+        read_prefix(stream, &mut prefix, &mut filled),
+    )
+    .await;
+    let verdict = match sniff {
+        Ok(verdict) => verdict?,
+        Err(_) => {
+            debug!("No PROXY signature decided within the read timeout: served as a direct client");
+            Prefix::NotProxy
         }
-        let n = stream
-            .read(&mut prefix[filled..])
-            .await
-            .or_err(ErrorType::ReadError, "while reading the first bytes")?;
-        if n == 0 {
-            // Closed mid-prefix: what was sent goes on, and the handshake
-            // sees the end of stream as it would have.
-            break Prefix::NotProxy;
-        }
-        filled += n;
     };
     match verdict {
         Prefix::V1 | Prefix::V2 => {
@@ -483,9 +499,99 @@ async fn refuse_signature(policy: &dyn ProxyProtocolPolicy, stream: &mut Stream)
     }
 }
 
+/// Reads into `prefix` until [`classify_prefix`] decides, `filled` kept
+/// current so a caller that stops waiting still holds every byte read.
+async fn read_prefix(stream: &mut Stream, prefix: &mut [u8], filled: &mut usize) -> Result<Prefix> {
+    loop {
+        let verdict = classify_prefix(&prefix[..*filled]);
+        if verdict != Prefix::NeedMore {
+            return Ok(verdict);
+        }
+        let n = stream
+            .read(&mut prefix[*filled..])
+            .await
+            .or_err(ErrorType::ReadError, "while reading the first bytes")?;
+        if n == 0 {
+            // Closed mid-prefix: what was sent goes on, and the handshake
+            // sees the end of stream as it would have.
+            return Ok(Prefix::NotProxy);
+        }
+        *filled += n;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use crate::listeners::AcceptAllFilter;
+
+    /// A policy in `required` mode that trusts nobody and keeps every
+    /// outcome it is told.
+    #[derive(Debug, Default)]
+    struct Recorder(Mutex<Vec<ProxyHeaderOutcome>>);
+
+    impl ProxyProtocolPolicy for Recorder {
+        fn mode(&self) -> ProxyProtocolMode {
+            ProxyProtocolMode::Required
+        }
+
+        fn is_trusted(&self, _peer: &SocketAddr) -> bool {
+            false
+        }
+
+        fn record(
+            &self,
+            outcome: ProxyHeaderOutcome,
+            _peer: Option<&SocketAddr>,
+            _detail: Option<&'static str>,
+        ) {
+            self.0.lock().expect("records lock").push(outcome);
+        }
+    }
+
+    /// The server side of a loopback connection, with the socket digest
+    /// the listener gives it, and its client.
+    async fn accepted() -> (Stream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let client = tokio::net::TcpStream::connect(listener.local_addr().expect("address"))
+            .await
+            .expect("connect");
+        let (server, _) = listener.accept().await.expect("accept");
+        let mut server = Stream::from(server);
+        let digest = SocketDigest::from_raw_fd(server.as_raw_fd());
+        server.set_socket_digest(digest);
+        (server, client)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_direct_client_is_served_once_the_read_timeout_passes() {
+        let policy = Arc::new(Recorder::default());
+        let (mut server, _client) = accepted().await;
+        let accepted_at = Instant::now();
+        let pending =
+            PendingProxyHeader::direct(policy.clone(), Arc::new(AcceptAllFilter), accepted_at);
+
+        // The 60 s handshake timeout of `services::listening`.
+        let resolved =
+            tokio::time::timeout(Duration::from_secs(60), pending.resolve(&mut server)).await;
+
+        assert!(
+            matches!(resolved, Ok(Ok(()))),
+            "the sniff gives up at the read timeout and serves the client: {resolved:?}"
+        );
+        let waited = accepted_at.elapsed();
+        assert!(waited >= HEADER_READ_TIMEOUT, "{waited:?}");
+        assert!(
+            waited < HEADER_READ_TIMEOUT + Duration::from_secs(1),
+            "{waited:?}"
+        );
+        assert!(policy.0.lock().expect("records lock").is_empty());
+    }
 
     #[test]
     fn labels_are_unique_and_split_accepted_from_refused() {

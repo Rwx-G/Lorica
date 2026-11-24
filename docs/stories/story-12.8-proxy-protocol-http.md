@@ -255,6 +255,21 @@ attempt is the one refusal an operator most needs to see. **Cost:** a
 read and a rewind per direct connection on a listener with PROXY on,
 none on a listener with it off.
 
+*Note (2026-11-24, audit lot E, finding C19):* "no new timer applies to
+them" did not hold for plaintext listeners. Without a PROXY policy a
+plaintext `handshake` returns at once and the HTTP read owns the wait;
+with one, a client that sent nothing sat in the sniff until the 60 s
+handshake timeout and ended in one `error!` line per connection,
+outside the rate-limited refusal log. The sniff is now bounded by
+`HEADER_READ_TIMEOUT` from accept, as the trusted read is. On expiry the
+bytes read so far are rewound and the connection goes on as a direct
+client: a signature completed later reaches the HTTP parser (a 400) or
+the TLS handshake as bytes, never as a header, and is not counted
+`untrusted_peer`. A TLS listener keeps the 60 s handshake timeout it
+always had for the handshake itself. Pinned by
+`a_silent_direct_client_is_served_once_the_read_timeout_passes` and
+`a_signature_completed_after_the_read_timeout_reaches_the_parser_as_bytes`.
+
 ### D-d. Configuration: two listener modes and one node-local trust list
 
 Three `GlobalSettings` fields, key/value rows like the rest (no
@@ -1304,3 +1319,4 @@ machine. NFR1 (mode off costs nothing measurable) is measured by Story
 | 2026-11-15 | 0.9 | Lot D: PROXY accept wired on the HTTP and HTTPS listeners through a live gate on the connection filter, one `X-Forwarded-For` trust rule, the two per-worker counters and the rate-limited refusal log. Status InProgress. | Romain G. |
 | 2026-11-18 | 0.10 | Lot F, all but `README.md` and `CHANGELOG.md`: the PROXY header section of `docs/security.md`, PROXY-header spoofing and loopback trust in the threat model, the node-local family in `docs/cluster.md`. | Romain G. |
 | 2026-11-18 | 0.11 | Lot F, the CHANGELOG part: Added and Security entries for PROXY accept on the HTTP listeners; with the other documentation pass's boxes, every box of the Lot is ticked. Status InProgress. | Romain G. |
+| 2026-11-24 | 0.12 | Phase 1 audit lot E, finding C19: a direct client's signature sniff is bounded by `HEADER_READ_TIMEOUT` and serves the client on expiry (dated note under D-c). | Romain G. |

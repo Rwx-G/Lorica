@@ -492,7 +492,11 @@ impl ListenerEndpoint {
             }
             self.apply_stream_settings(&mut stream)?;
             let pending = (mode != ProxyProtocolMode::Off).then(|| {
-                PendingProxyHeader::direct(Arc::clone(policy), Arc::clone(&self.connection_filter))
+                PendingProxyHeader::direct(
+                    Arc::clone(policy),
+                    Arc::clone(&self.connection_filter),
+                    accepted_at,
+                )
             });
             return Ok((stream, pending));
         }
