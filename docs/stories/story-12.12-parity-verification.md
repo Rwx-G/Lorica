@@ -921,7 +921,14 @@ the numbers after O.
 - [ ] CI per D-m; a branch run proves `e2e-perf` failing or timing out
       does not fail the workflow (Completion Notes say how it was
       forced).
+      *2026-11-24: the jobs are written and lint clean (Lot N
+      Completion Notes); the branch run happens on the release PR, the
+      first push that runs this workflow, forced as the notes say.*
 - [ ] Documentation and changelog.
+      *2026-11-24: written except the 1.11.0 numbers, which Lot O adds
+      as a dated results table at the end of `docs/benchmarks.md`'s
+      "Layer-4 parity harness" and of `docs/streams.md`'s "Parity
+      verification".*
 
 ### Lot O: the release run - IV1
 
@@ -2059,6 +2066,90 @@ pulled images.
     one round trip per connection that nginx does not make.
   - **Not done.** The small-layout dry run (see the task).
 
+- **Lot N, 2026-11-24, CI and the documentation that needs no Lot O
+  number**, on `fa89e23c`. No cargo, no image build.
+  - **The jobs** (`.github/workflows/ci.yml`), all on the workflow's
+    triggers (pull requests to `main`, pushes of `main` and `v*` tags),
+    all `needs: lint`:
+
+    | Job | Command, from `tests-e2e-docker/` | Timeout | Release |
+    |---|---|---|---|
+    | `e2e-docker`, E2E (Docker) | `./run.sh --build --skip-l4 --skip-perf` | 90 min | gates, as before |
+    | `e2e-l4`, E2E (L4) | `./run.sh --build --only-l4` | 90 min | gates |
+    | `e2e-report`, E2E scenario report (every row) | `report.py --strict` over the two jobs' logs | 10 min | gates |
+    | `e2e-perf`, E2E (performance) | `./run.sh --build --only-perf --perf-advisory` | 120 min | waits for it, `continue-on-error: true` |
+
+    `verify-tag` needs `e2e-docker`, `e2e-l4`, `e2e-report` and
+    `e2e-perf` beside its previous jobs; `release` still needs
+    `verify-tag` alone. Every e2e job appends its Markdown to
+    `$GITHUB_STEP_SUMMARY` under `if: always()` (`l4-summary.md`, or
+    `perf-summary.md`, or a line saying the run wrote none) and uploads
+    `results/` as an artifact (`e2e-docker-results`, `e2e-l4-results`,
+    `e2e-perf-results`, 30 days). The timeouts are D-m's: the measured
+    runs fit them with room (the L4 Lots' lane runs add up to about 20
+    minutes on the development machine, D-o estimates the stream
+    sections at about 12 on top of the 43-minute job, the perf phase took
+    76.5 minutes on the larger layout before the p99 change), but every
+    figure was measured on 24 CPUs, and a hosted runner has 4 and builds the images in the job.
+    The first CI run gives the real ones.
+  - **Strict mode across the jobs, and a deviation: a fourth job.** The
+    report judges a non-strict run per profile that ran, so it reads a
+    profile that never announced itself as `NOT-RUN` and passes. Split
+    over two jobs, neither run is strict, and a pre-existing phase that
+    silently stopped announcing its profile, or an L4 profile the driver
+    skipped, would pass both jobs, where the release run's `--strict`
+    fails it. Shown on synthetic logs built from the registry (every
+    row's profiles, one verdict per row and profile): each job's log
+    alone passes per profile that ran; the two together pass `--strict`
+    (52 PASS, 6 PARTIAL, 3 NOT-E2E); with the `mcp` block removed from
+    the first log, that log alone still passes and the union fails
+    `--strict` with 12.7 IV2 and 12.10 IV1 `MISSING`. So `e2e-report`
+    concatenates the two logs and runs `report.py --strict` on the
+    runner's Python against the registry and the PRD in the checkout,
+    the same inputs the `l4-report` service mounts. The two jobs'
+    profiles are disjoint (`streams` and `streams-single` in one, every
+    other registry profile in the other, `suite` included, since
+    `--skip-l4 --skip-perf` skips no pre-existing phase), so the union
+    is exactly the release run's set; with no `pending` row left in the
+    registry, the per-profile and strict judgements differ only by
+    profiles that did not run, which the union check catches. D-m named
+    three jobs; this fourth one only reads the other two's artifacts and
+    adds about a minute.
+  - **Validation.** `yaml.safe_load` parses the workflow and gives the
+    expected `needs`, timeouts and `continue-on-error`. actionlint
+    1.7.12 from the official image pinned by digest
+    (`rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667`,
+    run with `--network none`, its bundled shellcheck included): no
+    finding on the new workflow, none on `fa89e23c`'s either. No CI run
+    yet.
+  - **How the open task's branch run will be forced**, on the release
+    PR, with throwaway commits reverted before the merge: (1) failure:
+    `PERF_REPS: 4` in the `e2e-perf` step's `env`, which `run-perf.sh`
+    refuses with exit 2, a harness error `--perf-advisory` does not
+    swallow; (2) timeout: `timeout-minutes: 2` on `e2e-perf`; (3) in the
+    same commits, a temporary job `needs: e2e-perf` that prints
+    `needs.e2e-perf.result`, standing in for `verify-tag`, which only a
+    tag reaches. The task is ticked when both runs end with the
+    workflow green and the stand-in job run. If a timed-out job reads as
+    `cancelled` rather than `failure` and the stand-in is skipped, D-m's
+    "fairly sure" was wrong, and `verify-tag`'s condition has to say
+    `!cancelled()` and test the other needs' results explicitly.
+  - **Documentation.** `docs/benchmarks.md` gains "Layer-4 parity
+    harness" (what runs against what, layouts and the environment guard,
+    the measurements, the spread rule and the pooled p99 with its
+    bootstrap interval, verdicts and output, running it locally with the
+    machine alone, what CI runs) and a pointer to it in its
+    introduction. `docs/streams.md` gains "Parity verification": the
+    matrix is not transcribed; the section links the PRD's coverage
+    matrix and the registry's `matrix` column, and says how the report
+    derives the P1 rows and where it prints the table. Constants are
+    named, not quoted (`CHECKS`, `MIN_REPS`, `MAX_SPREAD`, `P99_RUNS`,
+    `BOOTSTRAP_*`, `DEFAULT_SEED`, `ONE_WORKER_SHARE`,
+    `IPERF_STREAMS_PER_WORKER`). Both sections end where Lot O appends
+    its dated results table. `CHANGELOG.md` `[Unreleased]`: Added, the L4
+    phase and the performance phase; Changed, the release waits for the
+    L4 phase.
+
 ## File List
 
 Lot A:
@@ -2240,6 +2331,16 @@ Lot M:
 - `tests-e2e-docker/perf/test_analyse.py` (new, 2026-11-24, the p99
   method of D-k's amendment)
 
+Lot N:
+
+- `.github/workflows/ci.yml` (the `e2e-docker` run line, its summary and
+  artifact steps; the `e2e-l4`, `e2e-report` and `e2e-perf` jobs;
+  `verify-tag`'s `needs`)
+- `docs/benchmarks.md` ("Layer-4 parity harness", the pointer in the
+  introduction)
+- `docs/streams.md` ("Parity verification")
+- `CHANGELOG.md` (`[Unreleased]`: Added, Changed)
+
 ## Change Log
 
 | Date | Version | Description | Author |
@@ -2266,3 +2367,4 @@ Lot M:
 | 2026-11-21 | 0.20 | Phase 1 audit item N1: a Lot O check added, the breaker RPC load under a UDP flood measured after C9, and the maintainer's decision that a worker-local breaker cache is built only if HTTP p99 then moves past NFR1. | Romain G. |
 | 2026-11-22 | 0.21 | Lot M implemented: the performance phase (`docker-compose.perf.yml`, `perf/run-perf.sh`, `perf/analyse.py`, the connect-latency and UDP-peer tools), `run.sh --only-perf`, `--skip-perf`, `--perf-advisory`; iperf3 at 8 streams per worker with single-worker runs excluded (D-j deviation, the accept spread); the larger-layout dry run recorded as the pre-fix baseline: TCP download throughput FAIL at 0.881, NFR1 HTTP p99 INCONCLUSIVE after four attempts, everything else PASS. Small-layout dry run deferred. | Romain G. |
 | 2026-11-24 | 0.22 | Phase 1 audit fixes: p99 checks judged on pooled samples with a seeded bootstrap interval on whole runs, 10 runs per p99 series (D-k amended, D-j 2 and D-l noted, Lot M note); shared e2e helpers moved to `l4/lib.sh` with a check that each scenario file runs on its own (C32); `report.py` covered by `test_report.py` (C15). | Romain G. |
+| 2026-11-24 | 0.23 | Lot N, all but the Lot O numbers and the forced branch run: the e2e suite split into E2E (Docker), E2E (L4) and E2E (performance, advisory, `continue-on-error`), plus an E2E scenario report job that holds the two gating jobs' logs together to `--strict` (deviation from D-m's three jobs: neither job alone is strict); `verify-tag` waits for all four; actionlint clean. `docs/benchmarks.md` "Layer-4 parity harness", `docs/streams.md` "Parity verification", changelog entries. | Romain G. |

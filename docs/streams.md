@@ -1812,3 +1812,85 @@ access-log row is lost.
 
 A connection already draining keeps the reason of the first drain that
 reached it.
+
+---
+
+## Parity verification
+
+"On a par with nginx `stream` and HAProxy `mode tcp`" is checked two
+ways before 1.11.0 ships (Story 12.12 of the [PRD](prd/epic-12-v1.11.0.md)):
+every Phase 1 row of the PRD's coverage matrix is proved by a named test,
+and the performance of streams is measured against nginx on the same
+machine.
+
+### The matrix and its scenarios
+
+The rows are the PRD's own: every Feature of the [coverage
+matrix](prd/epic-12-v1.11.0.md#coverage-matrix-and-loricas-commitment)
+whose Lorica column says P1. What proves each row is written in one
+place, the `matrix` column of the scenario registry,
+`tests-e2e-docker/l4/scenarios.tsv`, and nowhere else: the report
+(`tests-e2e-docker/test-runner/l4/report.py`) reads the P1 rows from the
+PRD itself at every run and fails the run when a P1 row has no scenario
+proving it, or when a registry row names a row the matrix does not have.
+When a matrix row is added, renamed or dropped in the PRD, the next run
+names the row that no scenario proves, or the registry entry that no
+longer matches a row.
+
+Each registry row is one scenario:
+
+- **Its name** is `<story>-<kind>-<slug>`: the kind is `iv<n>` for an
+  Integration Verification of the PRD, `ac<n>` for an acceptance
+  criterion a story's e2e plan checked, `matrix` for a matrix row no
+  Integration Verification covers, and `x` for another named check a
+  story planned.
+- **Its profiles** are where it runs. Most run in the L4 phase's own
+  profiles, `streams` (worker mode) and `streams-single` (single
+  process); the rest run as sections appended to the e2e profiles that
+  already build the topology they need, such as the three-node fleet,
+  the ACME server, the hot upgrade or the MCP endpoint. The backends are
+  real servers where the proof needs one (PostgreSQL, CoreDNS, Redis,
+  OpenSSH) and standard-library test servers where a scenario must see
+  what the proxy sent, such as the raw ClientHello.
+- **Its level**: `full` must pass as written; `partial` may pass with a
+  `PARTIAL` line naming the part no test automates (a browser click, the
+  real systemd unit), which the release run's notes list; `not-e2e` is a
+  matrix row proved by the unit or integration test the row cites
+  instead.
+
+Every scenario prints one line, `L4-SCENARIO <name> <PASS|FAIL|PARTIAL>
+<detail>`, and the report holds the run to the registry: a scenario that
+did not print exactly one line for each of its profiles that ran fails
+the run, as does a `FAIL` or a `PARTIAL` from a `full` row. A scenario
+that silently did not run is a failure, not a pass. On the release run
+every row must report, whatever ran.
+
+Each run writes the scenario table and the parity matrix, every P1 row
+with the scenarios that prove it and their results, to
+`tests-e2e-docker/results/l4-summary.md`. To produce it locally, with
+the machine to itself as the e2e suite requires:
+
+```bash
+cd tests-e2e-docker
+./run.sh --only-l4 --build   # the L4 phase alone
+./run.sh --build             # the release run: every phase, every row
+```
+
+In CI, the E2E (L4) job and the pre-existing profiles' job each publish
+the rows they ran in their job summary, and the E2E scenario report job
+publishes the whole matrix from both jobs' logs together.
+
+### Performance against nginx
+
+The performance phase runs Lorica and nginx `stream` in one compose,
+alternately, on the same backends and the same cores, and gates on
+ratios only: TCP throughput and proxy CPU per GiB each way, the p99 from
+accept to backend connect, and a UDP hold at 80 % of Lorica's session
+ceiling with no loss and no eviction, with Lorica's memory per 1,000
+sessions reported beside nginx's. The same phase holds HTTP throughput
+and p99 against the released 1.10.7 (NFR1), with and without a stream
+configured. The thresholds are Story 12.12's acceptance criteria. The
+method, the statistics that decide a verdict and how to run it are in
+[Layer-4 parity harness](benchmarks.md#layer-4-parity-harness); in CI
+the phase is advisory, and the local release run on the release machine
+is the gate.
