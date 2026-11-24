@@ -101,3 +101,18 @@ pub use tls::TlsParts;
 pub use tracker::{ConnectionTracker, TrackedConnection, UpgradeDrainCounts};
 pub use transport::{ControlTransport, InProcessPeer};
 pub use udp::{UdpEngine, UdpEngineParts};
+
+/// `address` without its IPv4-mapped form: a dual-stack `[::]` socket
+/// reports an IPv4 client as `::ffff:192.0.2.10`, which the engines'
+/// keys, records and source controls read as `192.0.2.10`.
+pub(crate) fn canonical(address: std::net::SocketAddr) -> std::net::SocketAddr {
+    std::net::SocketAddr::new(address.ip().to_canonical(), address.port())
+}
+
+/// Wait until `deadline`, or forever without one.
+pub(crate) async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending().await,
+    }
+}

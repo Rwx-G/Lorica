@@ -82,7 +82,7 @@ use tracing::debug;
 
 use super::connect::{Connected, Request, Rotation, Shared, UpstreamAttempt};
 use super::forward::{close, Forwarder};
-use super::proxy_header::{canonical, read_trusted, send_header, HeaderRead, TrustedPeers};
+use super::proxy_header::{read_trusted, send_header, HeaderRead, TrustedPeers};
 use crate::admission::{AdmissionControl, Admitted};
 use crate::counters::{
     ClientHelloOutcome, HandshakeOutcome, ProxyHeaderOutcome, StreamCounters, StreamStats,
@@ -101,6 +101,7 @@ use crate::tls::client_hello::{
 use crate::tls::rewind::Rewind;
 use crate::tls::{client_auth, matcher, server, TlsContext, TlsParts};
 use crate::tracker::TrackedConnection;
+use crate::{canonical, sleep_until_opt};
 
 // What a trusted peer's PROXY read leaves past its header always fits in
 // the ClientHello buffer it is copied into.
@@ -202,14 +203,6 @@ impl StreamHandler for TcpEngine {
         self.inner.admission.table_changed(table);
         self.inner.tls.table_changed(table);
         self.inner.trusted_peers_changed(table);
-    }
-}
-
-/// Wait until `deadline`, or forever without one.
-async fn sleep_until_opt(deadline: Option<Instant>) {
-    match deadline {
-        Some(d) => tokio::time::sleep_until(d).await,
-        None => std::future::pending().await,
     }
 }
 
@@ -831,15 +824,9 @@ impl Inner {
         } = match connected {
             Err(reason) => return reason,
             Ok(Err(reason)) => {
-                if matches!(
-                    reason,
-                    StreamEndReason::ConnectFailed | StreamEndReason::NoHealthyBackend
-                ) {
-                    self.observer.connect_outcome(
-                        &snapshot.id,
-                        StreamProtocol::Tcp,
-                        ConnectOutcome::NotConnected,
-                    );
+                if let Some(outcome) = ConnectOutcome::for_unconnected(reason) {
+                    self.observer
+                        .connect_outcome(&snapshot.id, StreamProtocol::Tcp, outcome);
                 }
                 return reason;
             }

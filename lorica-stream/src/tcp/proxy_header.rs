@@ -33,6 +33,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::time::Instant;
 
+use crate::canonical;
 use crate::counters::ProxyHeaderOutcome;
 
 /// A stream's `proxy_protocol_trusted_cidrs`, parsed once: the engine
@@ -158,11 +159,6 @@ pub async fn read_trusted(client: &mut TcpStream, deadline: Instant) -> HeaderRe
             Ok(Ok(n)) => filled += n,
         }
     }
-}
-
-/// `addr` with an IPv4-mapped IP read as the IPv4 address it carries.
-pub fn canonical(addr: SocketAddr) -> SocketAddr {
-    SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
 /// The header a stream sends its backend for a connection from `client`

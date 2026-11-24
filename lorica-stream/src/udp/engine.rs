@@ -89,6 +89,7 @@ use crate::selection::{
 };
 use crate::table::StreamTable;
 use crate::tracker::TrackedConnection;
+use crate::{canonical, sleep_until_opt};
 
 /// What the UDP engine is built from: the process's selector, breaker
 /// gate, resolver cache and counters, the same ones the TCP engine holds
@@ -176,19 +177,6 @@ impl DatagramHandler for UdpEngine {
         inner.exclusions.retain(table);
         inner.admission.table_changed(table);
         inner.rotation.retain(table);
-    }
-}
-
-/// An address without its IPv4-mapped form.
-fn canonical(address: SocketAddr) -> SocketAddr {
-    SocketAddr::new(address.ip().to_canonical(), address.port())
-}
-
-/// Wait until `deadline`, or forever without one.
-async fn sleep_until_opt(deadline: Option<Instant>) {
-    match deadline {
-        Some(d) => tokio::time::sleep_until(d).await,
-        None => std::future::pending().await,
     }
 }
 
@@ -477,17 +465,9 @@ impl Inner {
         };
         let natural = match opening {
             Err(reason) => {
-                // Only the selection can end it so; a drain or the total
-                // timeout says nothing about the backends.
-                if matches!(
-                    reason,
-                    StreamEndReason::ConnectFailed | StreamEndReason::NoHealthyBackend
-                ) {
-                    self.observer.connect_outcome(
-                        &snapshot.id,
-                        StreamProtocol::Udp,
-                        ConnectOutcome::NotConnected,
-                    );
+                if let Some(outcome) = ConnectOutcome::for_unconnected(reason) {
+                    self.observer
+                        .connect_outcome(&snapshot.id, StreamProtocol::Udp, outcome);
                 }
                 reason
             }

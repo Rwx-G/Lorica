@@ -377,6 +377,21 @@ pub enum ConnectOutcome {
     NoResponse,
 }
 
+impl ConnectOutcome {
+    /// The outcome of a connect phase that ended `reason` without a
+    /// backend: [`ConnectOutcome::NotConnected`] when the selection ended
+    /// it (`connect_failed`, `no_healthy_backend`), `None` for any other
+    /// end. Only the selection says something about the backends; a
+    /// drain, the total timeout or a refusal does not.
+    pub fn for_unconnected(reason: StreamEndReason) -> Option<ConnectOutcome> {
+        matches!(
+            reason,
+            StreamEndReason::ConnectFailed | StreamEndReason::NoHealthyBackend
+        )
+        .then_some(ConnectOutcome::NotConnected)
+    }
+}
+
 /// Where an engine hands each [`ConnectionRecord`], each admitted
 /// [`RefusalRecord`], each [`SuppressedRecord`] and each
 /// [`ConnectOutcome`]. The default `observe` logs at debug; the engine
