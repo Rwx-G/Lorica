@@ -290,17 +290,15 @@ impl Inner {
         // only for the refusal the log writes.
         let refuse = |refusal: StreamRefusal| {
             stats.refused(refusal);
-            self.admission
-                .report_with(snapshot, refusal, || RefusalRecord {
-                    stream_id: snapshot.id.clone(),
-                    stream_name: snapshot.name.clone(),
-                    protocol: StreamProtocol::Udp,
-                    listen_port: key.local.port(),
-                    client: key.client,
-                    proxied_from: None,
+            self.admission.report_with(snapshot, refusal, || {
+                RefusalRecord::new(
+                    snapshot,
+                    StreamProtocol::Udp,
+                    key.local.port(),
+                    key.client,
                     refusal,
-                    at: Utc::now(),
-                });
+                )
+            });
         };
         let Some(caps) = d.caps.get(&snapshot.id) else {
             // The supervisor sends `caps` before a stream's first `attach`
@@ -432,29 +430,14 @@ impl Inner {
         let total = snapshot
             .total_timeout_s
             .map(|s| accepted_at + Duration::from_secs(u64::from(s)));
-        let mut record = ConnectionRecord {
-            stream_id: snapshot.id.clone(),
-            stream_name: snapshot.name.clone(),
-            protocol: StreamProtocol::Udp,
-            bind_gen: session.key.bind_gen,
-            client: session.key.client,
-            peer: session.key.client,
-            proxied_from: None,
-            local: session.key.local,
-            backend_id: None,
-            backend_address: None,
-            attempts: 0,
-            bytes_upload: 0,
-            bytes_download: 0,
-            datagrams_upload: None,
-            datagrams_download: None,
-            accepted_at: accepted_wall,
-            connected_at: None,
-            ended_at: accepted_wall,
-            end_reason: StreamEndReason::IdleTimeout,
-            tls: None,
-            detected_protocol: None,
-        };
+        let mut record = ConnectionRecord::accepted(
+            &snapshot,
+            StreamProtocol::Udp,
+            session.key.bind_gen,
+            session.key.client,
+            session.key.local,
+            accepted_wall,
+        );
 
         let backend_caps = permit.region().worker(permit.slot());
         let opening = tokio::select! {
@@ -522,8 +505,7 @@ impl Inner {
             record.bytes_download = forwarded.bytes_download;
             record.datagrams_upload = Some(forwarded.datagrams_upload);
             record.datagrams_download = Some(forwarded.datagrams_download);
-            record.ended_at = Utc::now();
-            record.end_reason = reason;
+            record.end(reason);
             // A refused session is a row through the refusal log, not a
             // record (Story 12.6 D-j).
             self.admission.ended(record);

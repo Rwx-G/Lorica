@@ -1263,8 +1263,8 @@ pub async fn clear_stream_logs(
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    //! The one place each `lorica-stream` record is spelled out, so a
-    //! field the record gains changes these constructors and no test.
+    //! The fixture records, built from `lorica-stream`'s own constructors
+    //! where it has one, so a field a record gains changes no test.
 
     use lorica_stream::StreamLogKey;
 
@@ -1278,31 +1278,38 @@ pub(crate) mod test_support {
             + chrono::Duration::milliseconds(millis)
     }
 
+    /// The stream every fixture record belongs to, of `protocol`.
+    fn stream(protocol: StreamProtocol) -> lorica_config::models::Stream {
+        lorica_config::models::Stream::new(
+            "stream-1".into(),
+            "postgres".into(),
+            protocol,
+            "192.0.2.1".parse().expect("fixture address"),
+            5432,
+            5432,
+            at(0),
+        )
+    }
+
     /// A TCP connection to `backend` that ended with `end_reason`.
     pub(crate) fn tcp_connection(end_reason: StreamEndReason) -> ConnectionRecord {
-        ConnectionRecord {
-            stream_id: "stream-1".into(),
-            stream_name: "postgres".into(),
-            protocol: StreamProtocol::Tcp,
-            bind_gen: 1,
-            client: "192.0.2.10:40000".parse().expect("fixture address"),
-            peer: "192.0.2.10:40000".parse().expect("fixture address"),
-            proxied_from: None,
-            local: "192.0.2.1:5432".parse().expect("fixture address"),
-            backend_id: Some("backend-1".into()),
-            backend_address: Some("10.0.0.10:5432".parse().expect("fixture address")),
-            attempts: 1,
-            bytes_upload: 100,
-            bytes_download: 2_000,
-            datagrams_upload: None,
-            datagrams_download: None,
-            accepted_at: at(0),
-            connected_at: Some(at(7)),
-            ended_at: at(1_500),
-            end_reason,
-            tls: None,
-            detected_protocol: None,
-        }
+        let mut record = ConnectionRecord::accepted(
+            &stream(StreamProtocol::Tcp),
+            StreamProtocol::Tcp,
+            1,
+            "192.0.2.10:40000".parse().expect("fixture address"),
+            "192.0.2.1:5432".parse().expect("fixture address"),
+            at(0),
+        );
+        record.backend_id = Some("backend-1".into());
+        record.backend_address = Some("10.0.0.10:5432".parse().expect("fixture address"));
+        record.attempts = 1;
+        record.bytes_upload = 100;
+        record.bytes_download = 2_000;
+        record.connected_at = Some(at(7));
+        record.ended_at = at(1_500);
+        record.end_reason = end_reason;
+        record
     }
 
     /// A UDP session: datagram counts set.
@@ -1316,16 +1323,15 @@ pub(crate) mod test_support {
 
     /// A refusal of `refusal` on a stream of `protocol`.
     pub(crate) fn refusal(protocol: StreamProtocol, refusal: StreamRefusal) -> RefusalRecord {
-        RefusalRecord {
-            stream_id: "stream-1".into(),
-            stream_name: "postgres".into(),
+        let mut record = RefusalRecord::new(
+            &stream(protocol),
             protocol,
-            listen_port: 5432,
-            client: "198.51.100.7:51000".parse().expect("fixture address"),
-            proxied_from: None,
+            5432,
+            "198.51.100.7:51000".parse().expect("fixture address"),
             refusal,
-            at: at(0),
-        }
+        );
+        record.at = at(0);
+        record
     }
 
     /// `suppressed` rows of `key` held back by one window.

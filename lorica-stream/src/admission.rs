@@ -493,16 +493,7 @@ impl RefusalLog {
     fn ended(self: &Arc<Self>, record: ConnectionRecord) {
         match StreamLogKey::of(record.end_reason) {
             None => self.observer.observe(record),
-            Some(StreamLogKey::Refused(refusal)) => self.report(RefusalRecord {
-                listen_port: record.local.port(),
-                at: record.ended_at,
-                refusal,
-                stream_id: record.stream_id,
-                stream_name: record.stream_name,
-                protocol: record.protocol,
-                client: record.client,
-                proxied_from: record.proxied_from,
-            }),
+            Some(StreamLogKey::Refused(refusal)) => self.report(record.into_refusal(refusal)),
             Some(key) => {
                 let subject = Subject {
                     stream_id: &record.stream_id,
@@ -960,16 +951,13 @@ mod tests {
     }
 
     fn refusal(stream: &Stream, refusal: StreamRefusal) -> RefusalRecord {
-        RefusalRecord {
-            stream_id: stream.id.clone(),
-            stream_name: stream.name.clone(),
-            protocol: stream.protocol,
-            listen_port: stream.port_first,
-            client: SocketAddr::new(ip(PEER), 40_000),
-            proxied_from: None,
+        RefusalRecord::new(
+            stream,
+            stream.protocol,
+            stream.port_first,
+            SocketAddr::new(ip(PEER), 40_000),
             refusal,
-            at: Utc::now(),
-        }
+        )
     }
 
     #[tokio::test(start_paused = true)]

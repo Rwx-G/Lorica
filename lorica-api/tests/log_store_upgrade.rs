@@ -33,7 +33,7 @@ use lorica_api::audit::{AuditQuery, NewAuditEntry, GENESIS_HASH};
 use lorica_api::log_store::LogStore;
 use lorica_api::logs::{LogEntry, LogsQuery};
 use lorica_api::stream_logs::{StreamLogEntry, StreamLogFilter};
-use lorica_config::models::{StreamProtocol, StreamRefusal};
+use lorica_config::models::{Stream, StreamProtocol, StreamRefusal};
 use rusqlite::{params, Connection};
 
 /// `access_logs` as v1.0.0 to v1.2.0 created it.
@@ -592,18 +592,27 @@ fn assert_upgrades(release: &Released) {
 
 /// A refused connection's row, the one stream row these tests write.
 fn stream_row() -> StreamLogEntry {
-    StreamLogEntry::from_refusal(&lorica_stream::RefusalRecord {
-        stream_id: "stream-1".into(),
-        stream_name: "postgres".into(),
-        protocol: StreamProtocol::Tcp,
-        listen_port: 5432,
-        client: "192.0.2.10:40000".parse().expect("fixture address"),
-        proxied_from: None,
-        refusal: StreamRefusal::NoMatch,
-        at: chrono::DateTime::parse_from_rfc3339("2026-11-16T10:00:00Z")
-            .expect("fixture time")
-            .with_timezone(&chrono::Utc),
-    })
+    let at = chrono::DateTime::parse_from_rfc3339("2026-11-16T10:00:00Z")
+        .expect("fixture time")
+        .with_timezone(&chrono::Utc);
+    let stream = Stream::new(
+        "stream-1".into(),
+        "postgres".into(),
+        StreamProtocol::Tcp,
+        "192.0.2.1".parse().expect("fixture address"),
+        5432,
+        5432,
+        at,
+    );
+    let mut refusal = lorica_stream::RefusalRecord::new(
+        &stream,
+        StreamProtocol::Tcp,
+        5432,
+        "192.0.2.10:40000".parse().expect("fixture address"),
+        StreamRefusal::NoMatch,
+    );
+    refusal.at = at;
+    StreamLogEntry::from_refusal(&refusal)
 }
 
 fn stream_rows(store: &LogStore) -> Vec<StreamLogEntry> {

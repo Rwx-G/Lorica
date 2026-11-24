@@ -336,16 +336,13 @@ impl Inner {
                 conn.tracked
                     .finish(StreamEndReason::Refused(refusal), |reason| {
                         stats.ended(reason.kind());
-                        self.admission.report(RefusalRecord {
-                            stream_id: snapshot.id.clone(),
-                            stream_name: snapshot.name.clone(),
-                            protocol: StreamProtocol::Tcp,
-                            listen_port: local.port(),
-                            client: peer,
-                            proxied_from: None,
+                        self.admission.report(RefusalRecord::new(
+                            &snapshot,
+                            StreamProtocol::Tcp,
+                            local.port(),
+                            peer,
                             refusal,
-                            at: Utc::now(),
-                        });
+                        ));
                     });
                 return;
             }
@@ -358,7 +355,15 @@ impl Inner {
             debug!(stream_id = %snapshot.id, error = %e,
                    "TCP_NODELAY not set on a stream client socket");
         }
-        let tls = (snapshot.tls_mode != StreamTlsMode::None || snapshot.upstream_tls.is_some())
+        let mut record = ConnectionRecord::accepted(
+            &snapshot,
+            StreamProtocol::Tcp,
+            conn.bind_gen,
+            peer,
+            local,
+            Utc::now(),
+        );
+        record.tls = (snapshot.tls_mode != StreamTlsMode::None || snapshot.upstream_tls.is_some())
             .then(|| TlsRecord {
                 mode: snapshot.tls_mode,
                 server_name: None,
@@ -379,29 +384,7 @@ impl Inner {
                 total: snapshot
                     .total_timeout_s
                     .map(|s| accepted_at + Duration::from_secs(u64::from(s))),
-                record: ConnectionRecord {
-                    stream_id: snapshot.id.clone(),
-                    stream_name: snapshot.name.clone(),
-                    protocol: StreamProtocol::Tcp,
-                    bind_gen: conn.bind_gen,
-                    client: peer,
-                    peer,
-                    proxied_from: None,
-                    local,
-                    backend_id: None,
-                    backend_address: None,
-                    attempts: 0,
-                    bytes_upload: 0,
-                    bytes_download: 0,
-                    datagrams_upload: None,
-                    datagrams_download: None,
-                    accepted_at: Utc::now(),
-                    connected_at: None,
-                    ended_at: Utc::now(),
-                    end_reason: StreamEndReason::ClientClose,
-                    tls,
-                    detected_protocol: None,
-                },
+                record,
                 admitted,
             },
         };
@@ -420,8 +403,7 @@ impl Inner {
         // never stops with a row still in flight.
         tracked.finish(natural, |reason| {
             stats.ended(reason.kind());
-            record.ended_at = Utc::now();
-            record.end_reason = reason;
+            record.end(reason);
             // A refused connection is a row through the refusal log, not
             // a record (D-j), and one that ended before forwarding passes
             // the same log (Story 12.9 D-c): whoever connects chooses how

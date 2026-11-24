@@ -205,6 +205,69 @@ pub struct ConnectionRecord {
     pub detected_protocol: Option<String>,
 }
 
+impl ConnectionRecord {
+    /// The record of a connection or session of `stream` the moment it is
+    /// accepted from `peer` on `local`, both canonical: the peer is the
+    /// client, no PROXY header replaced it, nothing is connected or
+    /// forwarded, and no TLS or detection is recorded. `protocol` is the
+    /// engine's. The end is [`ConnectionRecord::end`]'s to set; until
+    /// then the record reads `client_close` at `accepted_at`.
+    pub fn accepted(
+        stream: &Stream,
+        protocol: StreamProtocol,
+        bind_gen: u64,
+        peer: SocketAddr,
+        local: SocketAddr,
+        accepted_at: DateTime<Utc>,
+    ) -> ConnectionRecord {
+        ConnectionRecord {
+            stream_id: stream.id.clone(),
+            stream_name: stream.name.clone(),
+            protocol,
+            bind_gen,
+            client: peer,
+            peer,
+            proxied_from: None,
+            local,
+            backend_id: None,
+            backend_address: None,
+            attempts: 0,
+            bytes_upload: 0,
+            bytes_download: 0,
+            datagrams_upload: None,
+            datagrams_download: None,
+            accepted_at,
+            connected_at: None,
+            ended_at: accepted_at,
+            end_reason: StreamEndReason::ClientClose,
+            tls: None,
+            detected_protocol: None,
+        }
+    }
+
+    /// End the record with `reason`, now.
+    pub fn end(&mut self, reason: StreamEndReason) {
+        self.ended_at = Utc::now();
+        self.end_reason = reason;
+    }
+
+    /// The row of a connection that ended refused `refusal`, which the
+    /// refusal log writes instead of the record (Story 12.6 D-j): judged
+    /// on the record's client, refused when the record ended.
+    pub fn into_refusal(self, refusal: StreamRefusal) -> RefusalRecord {
+        RefusalRecord {
+            listen_port: self.local.port(),
+            at: self.ended_at,
+            refusal,
+            stream_id: self.stream_id,
+            stream_name: self.stream_name,
+            protocol: self.protocol,
+            client: self.client,
+            proxied_from: self.proxied_from,
+        }
+    }
+}
+
 /// The TLS side of a [`ConnectionRecord`] (Story 12.4 D-m). Story 12.9
 /// decides which of it the access log writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,6 +333,30 @@ pub struct RefusalRecord {
     pub refusal: StreamRefusal,
     /// When it was refused.
     pub at: DateTime<Utc>,
+}
+
+impl RefusalRecord {
+    /// A refusal, now, of `client` (canonical) on `listen_port` of
+    /// `stream`, judged on its socket address: no PROXY header carried
+    /// it. `protocol` is the engine's.
+    pub fn new(
+        stream: &Stream,
+        protocol: StreamProtocol,
+        listen_port: u16,
+        client: SocketAddr,
+        refusal: StreamRefusal,
+    ) -> RefusalRecord {
+        RefusalRecord {
+            stream_id: stream.id.clone(),
+            stream_name: stream.name.clone(),
+            protocol,
+            listen_port,
+            client,
+            proxied_from: None,
+            refusal,
+            at: Utc::now(),
+        }
+    }
 }
 
 /// What the refusal log limits per stream (Story 12.9 D-c): the ends
