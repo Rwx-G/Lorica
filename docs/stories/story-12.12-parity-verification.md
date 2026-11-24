@@ -888,7 +888,7 @@ budget view.
 - [x] Topology, cpusets and environment guard per D-i.
 - [x] Measurements 1 to 3 per D-j, NFR1 per D-l.
 - [x] Statistics, re-runs, verdicts and output per D-k.
-- [ ] A dry run on the development machine with both layouts (force the
+- [x] A dry run on the development machine with both layouts (force the
       small one with an override variable) recorded in the Completion
       Notes, including whether any series reaches 5 % spread at all
       and how long the phase took.
@@ -904,6 +904,11 @@ budget view.
       `perf/test_analyse.py` (stdlib `unittest`, no Docker). The phase
       has not run with it yet: the larger-layout baseline above is the
       old method's, and both layouts' dry runs are owed.*
+      *Done 2026-11-24 on `67573484`: both layouts ran with the amended
+      method (Lot M Completion Notes, the post-audit run). Larger layout
+      64.9 min, small layout 57.9 min; throughput, CPU per GiB and
+      req/s series reach 5 % spread in both (0.4 to 3.4 %), the p99
+      series are judged on their intervals.*
 
 ### Lot N: CI and documentation - no cargo
 
@@ -2066,6 +2071,107 @@ pulled images.
     one round trip per connection that nginx does not make.
   - **Not done.** The small-layout dry run (see the task).
 
+- **Lot M, 2026-11-24, the post-audit run.** Both layouts on
+  `67573484` (the 1.10.10 merge and every Phase 1 audit fix lot), with
+  D-k's amended p99 method; images `lorica-e2e-l4/{lorica,perf-tools}:perf2`
+  built from that tree by `l4/build-images.sh` (`lorica --version`
+  1.10.10 before the bump; the baseline `lorica 1.10.7`), the tree clean,
+  no container outside the project. `L4_IMAGE_TAG=perf2 ./run.sh
+  --only-perf`, then the same with `PERF_LAYOUT=small`; bootstrap seed
+  12012, 2,000 resamples, 10 runs per p99 arm. No code changed.
+  - **Larger layout** (`results/perf-20261124T014806Z.*`), proxy `2-3`,
+    load `4-5`, backends `6-7`, N = 2: **64.9 min** (3,891 s; 76.5 min
+    pre-fix): `tcp-up` 412 s and `tcp-down` 410 s (two attempts each,
+    one nginx run per first attempt excluded on the one-worker guard),
+    `connect` 463 s, `udp` 526 s, `nfr1-http-rps` 295 s, `nfr1-http-p99`
+    729 s, HTTPS 294 + 731 s; every check settled or completed on its
+    first eligible attempt.
+
+    | Check | Lorica / L arm | nginx / B arm | Ratio, spread or 95 % interval | Verdict | Pre-fix |
+    |---|---|---|---|---|---|
+    | TCP upload throughput | 50.96 Gbit/s (0.7 %) | 52.32 (0.9 %) | 0.974 | PASS (attempt 2) | 0.904 PASS |
+    | TCP upload CPU per GiB | 0.3363 s (0.8 %) | 0.3265 (0.9 %) | 1.03 | PASS (attempt 2) | 1.11 PASS |
+    | TCP download throughput | 50.07 Gbit/s (1.6 %) | 50.62 (2.9 %) | 0.989 | PASS (attempt 2; attempt 1 also 0.989) | 0.881 FAIL |
+    | TCP download CPU per GiB | 0.3422 s (1.6 %) | 0.3373 (3.0 %) | 1.01 | PASS (attempt 2) | 1.14 PASS |
+    | Connect p99, pooled | 461.4 us | 320.6 | 1.44 [1.285, 1.642] | **INCONCLUSIVE** | 1.22 PASS (spread rule, attempt 3) |
+    | UDP hold, 21,766 sessions (80 % of 27,208, `source_ports`) | 5 of 5 held | 5 of 5 | - | PASS | PASS |
+    | PSS per 1,000 sessions, first fill | 3,533 KiB | 10,070 KiB | - | reported | 3,541 |
+    | NFR1 HTTP req/s, L0 / B | 16,230 (1.9 %) | 16,010 (1.4 %) | 1.01 | PASS | 1.00 PASS |
+    | NFR1 HTTP req/s, L1 / B | 16,220 (0.9 %) | 16,010 (1.4 %) | 1.01 | PASS | 1.01 PASS |
+    | NFR1 HTTP p99 at 8,003 req/s, L0 / B | 1.873 ms | 1.827 | 1.02 [0.940, 1.151] | **INCONCLUSIVE** | 0.872 INCONCLUSIVE |
+    | NFR1 HTTP p99, L1 / B | 1.750 ms | 1.827 | 0.958 [0.894, 1.049] | PASS | 1.04 INCONCLUSIVE |
+    | NFR1 HTTPS req/s, L0 and L1 / B | 15,570 and 15,810 | 15,950 | 0.977, 0.992 | reported | 1.02, 1.02 |
+    | NFR1 HTTPS p99 at 7,973 req/s, L0 and L1 / B | 7.186 and 2.024 ms | 17.10 | 0.42 [0.049, 4.858], 0.118 [0.042, 1.131] | reported | 0.954, 1.96 |
+
+  - **Small layout** (`PERF_LAYOUT=small`, `results/perf-20261124T025312Z.*`),
+    proxy `1`, load `2`, backends `3`, N = 1: **57.9 min** (3,472 s):
+    `tcp-up` 210 s and `tcp-down` 209 s (one attempt each), `connect`
+    464 s, `udp` 528 s, `nfr1-http-rps` 294 s, `nfr1-http-p99` 719 s,
+    HTTPS 295 + 723 s. Every gated check passes, every one on attempt 1;
+    the one-worker counts read 5 of 5 by construction at N = 1 and
+    exclude nothing (the guard is for multi-worker runs).
+
+    | Check | Lorica / L arm | nginx / B arm | Ratio, spread or 95 % interval | Verdict |
+    |---|---|---|---|---|
+    | TCP upload throughput | 24.79 Gbit/s (2.1 %) | 24.50 (1.1 %) | 1.01 | PASS |
+    | TCP upload CPU per GiB | 0.3456 s (2.2 %) | 0.3482 (1.1 %) | 0.992 | PASS |
+    | TCP download throughput | 25.19 Gbit/s (0.9 %) | 25.13 (1.8 %) | 1.00 | PASS |
+    | TCP download CPU per GiB | 0.3403 s (0.9 %) | 0.3400 (1.9 %) | 1.00 | PASS |
+    | Connect p99, pooled | 383.5 us | 344.5 | 1.11 [0.997, 1.285] | PASS |
+    | UDP hold, 21,766 sessions | 5 of 5 held | 5 of 5 | - | PASS |
+    | PSS per 1,000 sessions, first fill | 3,568 KiB | 10,070 KiB | - | reported |
+    | NFR1 HTTP req/s, L0 / B | 9,528 (0.6 %) | 9,714 (0.7 %) | 0.981 | PASS |
+    | NFR1 HTTP req/s, L1 / B | 9,502 (1.0 %) | 9,714 (0.7 %) | 0.978 | PASS |
+    | NFR1 HTTP p99 at 4,857 req/s, L0 / B | 1.443 ms | 1.469 | 0.982 [0.939, 1.016] | PASS |
+    | NFR1 HTTP p99, L1 / B | 1.458 ms | 1.469 | 0.993 [0.948, 1.030] | PASS |
+    | NFR1 HTTPS req/s, L0 and L1 / B | 9,295 and 9,225 | 9,361 | 0.993, 0.986 | reported |
+    | NFR1 HTTPS p99 at 4,680 req/s, L0 and L1 / B | 1.599 and 1.508 ms | 1.527 | 1.05 [1.010, 1.085], 0.988 [0.962, 1.013] | reported |
+
+  - **TCP download, the pre-fix FAIL, now passes** at 0.989 (CPU per
+    GiB 1.01), and upload moved from 0.904 to 0.974 (1.11 to 1.03). The
+    audit's forwarding-loop fixes are the likely cause, not measured
+    separately: `548dc94a` (one timer and one close wait per forwarding
+    call instead of one per read and per write) and `e028960f` (a quiet
+    direction polled once per turn instead of once per chunk). No
+    profile was taken: nothing failed, and the splice decision handed by
+    Story 12.3 now has no throughput gap to close on this machine.
+  - **Connect p99, larger layout, INCONCLUSIVE**: the pooled ratio 1.44
+    is under 1.5 but the interval's upper bound, 1.642, is not. The old
+    method would not have rescued it: the median of the per-run p99s
+    gives 441.9 against 302.2 us, 1.46. Against the pre-fix run, Lorica's
+    tail is about the same (461 against 486 us) and nginx's is faster
+    (321 against 397 us). Two things widen the interval: a constant gap
+    at the median (Lorica's p50 168.6 to 181.7 us in every run, nginx's
+    93.9 to 104.8, as before the fixes), and a drift both arms share
+    (runs 1 to 5 higher than runs 6 to 10 in each arm, by about 90 us
+    on average),
+    which resampling whole runs keeps by design. On the small layout
+    the gap is smaller (p50 138.5 to 155.9 against 87.1 to 109.2 us) and
+    the check passes at 1.11. Suspected causes, from the code, not
+    measured: the breaker admission RPC to the supervisor before each
+    backend dial (as in the pre-fix notes), and with two workers the
+    supervisor sharing the two proxy cores with them.
+  - **NFR1 HTTP p99 L0, larger layout, INCONCLUSIVE**: ratio 1.02,
+    interval [0.940, 1.151]. One L0 run of ten had a p99 of 3.451 ms,
+    the other nine 1.579 to 2.294 ms, and B's ten 1.514 to 2.102 ms; the
+    same binary with a stream bound (L1) passes at 0.958 [0.894, 1.049],
+    and the small layout passes both at 0.982 and 0.993 with intervals
+    under 1.03. The HTTPS series show the same class of single-run stall
+    at larger size (one B run at 76.5 ms, L0 runs at 12.0 and 14.8 ms),
+    which is why their intervals span a factor of 100. Read: no evidence
+    of an NFR1 regression, one run's stall wide enough to keep the
+    interval open. Per D-k's amendment the attempt was complete and is
+    not re-run.
+  - **Gate status of this dry run**: larger layout NOT PASSED, two
+    gated INCONCLUSIVE (connect p99, NFR1 HTTP p99 L0), no FAIL; small
+    layout PASSED. On the release run either INCONCLUSIVE blocks pending
+    an owner decision (AC #3); Lot O records it on its own numbers.
+  - **Which series reach 5 % spread.** Throughput, CPU per GiB and
+    saturation req/s in both layouts, at 0.4 to 3.4 %. The PSS refill
+    figure never does (139 % and 347 %, refills of 0 to 155 KiB per
+    1,000 sessions);
+    it is reported only.
+
 - **Lot N, 2026-11-24, CI and the documentation that needs no Lot O
   number**, on `fa89e23c`. No cargo, no image build.
   - **The jobs** (`.github/workflows/ci.yml`), all on the workflow's
@@ -2368,3 +2474,4 @@ Lot N:
 | 2026-11-22 | 0.21 | Lot M implemented: the performance phase (`docker-compose.perf.yml`, `perf/run-perf.sh`, `perf/analyse.py`, the connect-latency and UDP-peer tools), `run.sh --only-perf`, `--skip-perf`, `--perf-advisory`; iperf3 at 8 streams per worker with single-worker runs excluded (D-j deviation, the accept spread); the larger-layout dry run recorded as the pre-fix baseline: TCP download throughput FAIL at 0.881, NFR1 HTTP p99 INCONCLUSIVE after four attempts, everything else PASS. Small-layout dry run deferred. | Romain G. |
 | 2026-11-24 | 0.22 | Phase 1 audit fixes: p99 checks judged on pooled samples with a seeded bootstrap interval on whole runs, 10 runs per p99 series (D-k amended, D-j 2 and D-l noted, Lot M note); shared e2e helpers moved to `l4/lib.sh` with a check that each scenario file runs on its own (C32); `report.py` covered by `test_report.py` (C15). | Romain G. |
 | 2026-11-24 | 0.23 | Lot N, all but the Lot O numbers and the forced branch run: the e2e suite split into E2E (Docker), E2E (L4) and E2E (performance, advisory, `continue-on-error`), plus an E2E scenario report job that holds the two gating jobs' logs together to `--strict` (deviation from D-m's three jobs: neither job alone is strict); `verify-tag` waits for all four; actionlint clean. `docs/benchmarks.md` "Layer-4 parity harness", `docs/streams.md` "Parity verification", changelog entries. | Romain G. |
+| 2026-11-24 | 0.24 | Lot M's post-audit run on `67573484`, both layouts with D-k's amended method: TCP download 0.989 (the pre-fix FAIL at 0.881 cleared) and every other TCP series passing; larger layout with connect p99 1.44 [1.285, 1.642] and NFR1 HTTP p99 L0 1.02 [0.940, 1.151] inconclusive, small layout passing every gated check; the dry-run task ticked. | Romain G. |
