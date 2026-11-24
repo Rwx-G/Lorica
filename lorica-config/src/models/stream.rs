@@ -23,7 +23,7 @@ use super::route::{validate_node_selector_names, GeoIpConfig, MtlsConfig};
 use super::ProxyProtocolMode;
 use crate::connection_filter::{parse_cidr, validate_proxy_protocol};
 use crate::host_shape::names_an_address;
-use crate::local_address::is_local_host;
+use crate::local_address::needs_local_backend_flag;
 use crate::route_selection::{
     canonical_hostname, validate_hostname_syntax, ROUTE_REDIRECT_HOSTNAME_SHAPE,
     STREAM_SERVER_NAME_SHAPE,
@@ -2341,9 +2341,10 @@ pub enum AttachmentRule {
     /// A portless backend has active checks on: there is no port to
     /// probe.
     PortlessWithActiveChecks,
-    /// A backend whose address is local
-    /// (`crate::local_address::is_local_host`) is linked to a stream
-    /// that does not set `allow_local_backend` (Story 12.3, D-m rule A).
+    /// A backend whose address is local or a cloud instance metadata
+    /// literal (`crate::local_address::needs_local_backend_flag`) is
+    /// linked to a stream that does not set `allow_local_backend` (Story
+    /// 12.3, D-m rule A).
     LocalBackend,
     /// Every backend linked to the stream is a backup, so none would
     /// ever be selected first (Story 12.3, D-f).
@@ -2435,8 +2436,8 @@ impl std::fmt::Display for AttachmentConflict {
             ),
             AttachmentRule::LocalBackend => write!(
                 f,
-                "backend {backend} is a local address and cannot serve {on_stream} unless the \
-                 stream sets allow_local_backend"
+                "backend {backend} is a local or cloud instance metadata address and cannot \
+                 serve {on_stream} unless the stream sets allow_local_backend"
             ),
             AttachmentRule::NoPrimaryBackend => write!(
                 f,
@@ -2613,7 +2614,7 @@ pub fn check_backend_attachments(
         }
 
         let host = backend_address_host(&backend.address);
-        let local = is_local_host(host);
+        let local = needs_local_backend_flag(host);
         let literal_family = host
             .parse::<IpAddr>()
             .ok()
@@ -4815,6 +4816,11 @@ pub(crate) mod tests {
             "0.0.0.0:5432",
             "localhost:5432",
             "db.localhost:5432",
+            // Cloud instance metadata outside link-local (audit C5).
+            "[fd00:ec2::254]:80",
+            "[fd20:ce::254]:80",
+            "100.100.100.200:80",
+            "[::ffff:100.100.100.200]:80",
         ];
         for address in local {
             let tcp = stream("t", "pg", StreamProtocol::Tcp, 5432);
@@ -4840,6 +4846,8 @@ pub(crate) mod tests {
             "192.0.2.10:5432",
             "pg.example.com:5432",
             "[2001:db8::1]:5432",
+            "100.64.0.10:5432",
+            "[fd00:ec2::10]:5432",
         ] {
             let tcp = stream("t", "pg", StreamProtocol::Tcp, 5432);
             assert!(

@@ -22,14 +22,16 @@
 //! destination is refused when its port is one of the node's reserved
 //! ports or a listen port this process binds for any stream (rule B,
 //! flag or not), and otherwise unless the stream sets
-//! `allow_local_backend` (rule A).
+//! `allow_local_backend` (rule A). A cloud instance metadata address
+//! ([`is_instance_metadata_ip`]) is not this node, so rule B leaves it
+//! alone, but rule A refuses it as it refuses a local destination.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use lorica_config::listen_ports::ReservedPorts;
-use lorica_config::local_address::is_local_ip;
+use lorica_config::local_address::{is_instance_metadata_ip, is_local_ip};
 
 /// The listen ports of every binding attached in this process, TCP and
 /// UDP alike. The runtime keeps it current on attach and detach; an
@@ -76,8 +78,8 @@ impl BoundPorts {
 /// Why a local destination is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalRefusal {
-    /// Rule A: a local destination on a stream without
-    /// `allow_local_backend`.
+    /// Rule A: a local or cloud instance metadata destination on a
+    /// stream without `allow_local_backend`.
     NeedsFlag,
     /// Rule B: a local destination on a reserved port of the node or a
     /// listen port this process binds, refused whatever the flag. This
@@ -120,12 +122,13 @@ impl NodeLocality<'_> {
     ///
     /// The rule that refuses it.
     pub fn check(&self, destination: SocketAddr, allow_local: bool) -> Result<(), LocalRefusal> {
-        if !self.is_local(destination.ip()) {
+        if self.is_local(destination.ip()) {
+            let port = destination.port();
+            if self.reserved.is_some_and(|r| r.clash(port).is_some()) || self.bound.contains(port) {
+                return Err(LocalRefusal::NodePort);
+            }
+        } else if !is_instance_metadata_ip(destination.ip()) {
             return Ok(());
-        }
-        let port = destination.port();
-        if self.reserved.is_some_and(|r| r.clash(port).is_some()) || self.bound.contains(port) {
-            return Err(LocalRefusal::NodePort);
         }
         if allow_local {
             Ok(())
@@ -192,6 +195,39 @@ mod tests {
         assert_eq!(node.check(sa("192.0.2.10:9443"), false), Ok(()));
         bound.remove(5432);
         assert_eq!(node.check(sa("127.0.0.1:5432"), true), Ok(()));
+    }
+
+    #[test]
+    fn an_instance_metadata_address_needs_the_flag_and_is_no_node_port() {
+        let interfaces: HashSet<IpAddr> = HashSet::new();
+        let bound = BoundPorts::new();
+        bound.add(80);
+        let reserved = reserved();
+        let node = NodeLocality {
+            interfaces: &interfaces,
+            reserved: Some(&reserved),
+            bound: &bound,
+        };
+        for &(ip, service) in lorica_config::local_address::INSTANCE_METADATA_ADDRESSES {
+            for port in [80, 9443] {
+                let destination = SocketAddr::new(ip, port);
+                assert_eq!(
+                    node.check(destination, false),
+                    Err(LocalRefusal::NeedsFlag),
+                    "{service} on {port} without the flag"
+                );
+                assert_eq!(
+                    node.check(destination, true),
+                    Ok(()),
+                    "{service} on {port} with the flag: not this node's port"
+                );
+            }
+        }
+        assert_eq!(
+            node.check(sa("[::ffff:100.100.100.200]:80"), false),
+            Err(LocalRefusal::NeedsFlag)
+        );
+        assert_eq!(node.check(sa("100.100.100.201:80"), false), Ok(()));
     }
 
     #[test]

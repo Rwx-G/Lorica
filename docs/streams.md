@@ -765,7 +765,15 @@ Two rules hold, at validation and again at every connect:
 
 - **Rule A:** a local backend needs `allow_local_backend` on the stream
   (`422` otherwise). The flag carries a permanent "local backend" badge
-  and no automation or MCP surface can set it.
+  and no automation or MCP surface can set it. The same flag is needed
+  for a cloud instance metadata address that link-local does not cover
+  (`INSTANCE_METADATA_ADDRESSES` in `lorica-config/src/local_address.rs`:
+  AWS's and Google Cloud's IPv6 services and Alibaba Cloud's
+  `100.100.100.200`), at validation for a literal and at connect for a
+  resolved name. These are exact addresses: the carrier-grade NAT and
+  ULA ranges around them stay ordinary backends. The IPv4 service most
+  clouds answer on, `169.254.169.254`, is link-local and so local
+  already.
 - **Rule B:** a local backend may never reach a reserved port of a node
   that binds the stream (management, HTTP, HTTPS, cluster, enrollment,
   automation) or a listen port of any stream that node binds, this one
