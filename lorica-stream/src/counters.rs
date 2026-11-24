@@ -59,166 +59,157 @@ use crate::table::StreamTable;
 pub const CONNECT_LATENCY_BUCKETS_S: &[f64] =
     &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0];
 
-/// The outcome of a PROXY header on a stream (D-k).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ProxyHeaderOutcome {
-    /// A v1 header carrying TCP addresses, accepted from a trusted peer.
-    AcceptedV1,
-    /// A v2 header carrying TCP addresses, accepted from a trusted peer.
-    AcceptedV2,
-    /// A header without usable addresses (`LOCAL`, `UNKNOWN`,
-    /// `AF_UNSPEC`, `AF_UNIX`), accepted: the socket addresses stay.
-    AcceptedLocal,
-    /// A trusted peer's header broke the grammar, or the peer closed
-    /// before completing it.
-    RefusedMalformed,
-    /// A trusted peer's header was longer than the bound.
-    RefusedOversized,
-    /// A trusted peer's header used something a TCP stream does not
-    /// accept (`DGRAM` among others).
-    RefusedUnsupported,
-    /// A trusted peer sent no complete header in time.
-    RefusedTimeout,
-    /// A peer outside the trusted list opened with a PROXY signature.
-    RefusedUntrustedPeer,
+/// Declares an enum counted here from one list of `Variant => "word"`
+/// lines. Its `ALL` and its `as_str` come from that list, so a variant
+/// cannot be missing from either (Phase 1 audit C13), and two variants
+/// sharing a word do not compile.
+macro_rules! counted_enum {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident => $word:literal,
+            )+
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum $name {
+            $(
+                $(#[$variant_meta])*
+                $variant,
+            )+
+        }
+
+        impl $name {
+            /// Every value, in declaration order.
+            pub const ALL: [$name; [$($word),+].len()] = [$(Self::$variant),+];
+
+            /// The snake_case word of the value.
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    $(Self::$variant => $word,)+
+                }
+            }
+        }
+
+        const _: () = assert!(
+            words_are_distinct(&[$($word),+]),
+            concat!("two ", stringify!($name), " values share a word")
+        );
+    };
 }
 
-impl ProxyHeaderOutcome {
-    /// Every outcome, in declaration order.
-    pub const ALL: [ProxyHeaderOutcome; 8] = [
-        Self::AcceptedV1,
-        Self::AcceptedV2,
-        Self::AcceptedLocal,
-        Self::RefusedMalformed,
-        Self::RefusedOversized,
-        Self::RefusedUnsupported,
-        Self::RefusedTimeout,
-        Self::RefusedUntrustedPeer,
-    ];
-
-    /// The snake_case word of the outcome.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::AcceptedV1 => "accepted_v1",
-            Self::AcceptedV2 => "accepted_v2",
-            Self::AcceptedLocal => "accepted_local",
-            Self::RefusedMalformed => "refused_malformed",
-            Self::RefusedOversized => "refused_oversized",
-            Self::RefusedUnsupported => "refused_unsupported",
-            Self::RefusedTimeout => "refused_timeout",
-            Self::RefusedUntrustedPeer => "refused_untrusted_peer",
+const fn words_are_distinct(words: &[&str]) -> bool {
+    let mut i = 0;
+    while i < words.len() {
+        let mut j = i + 1;
+        while j < words.len() {
+            if same_bytes(words[i].as_bytes(), words[j].as_bytes()) {
+                return false;
+            }
+            j += 1;
         }
+        i += 1;
+    }
+    true
+}
+
+const fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+counted_enum! {
+    /// The outcome of a PROXY header on a stream (D-k).
+    pub enum ProxyHeaderOutcome {
+        /// A v1 header carrying TCP addresses, accepted from a trusted peer.
+        AcceptedV1 => "accepted_v1",
+        /// A v2 header carrying TCP addresses, accepted from a trusted peer.
+        AcceptedV2 => "accepted_v2",
+        /// A header without usable addresses (`LOCAL`, `UNKNOWN`,
+        /// `AF_UNSPEC`, `AF_UNIX`), accepted: the socket addresses stay.
+        AcceptedLocal => "accepted_local",
+        /// A trusted peer's header broke the grammar, or the peer closed
+        /// before completing it.
+        RefusedMalformed => "refused_malformed",
+        /// A trusted peer's header was longer than the bound.
+        RefusedOversized => "refused_oversized",
+        /// A trusted peer's header used something a TCP stream does not
+        /// accept (`DGRAM` among others).
+        RefusedUnsupported => "refused_unsupported",
+        /// A trusted peer sent no complete header in time.
+        RefusedTimeout => "refused_timeout",
+        /// A peer outside the trusted list opened with a PROXY signature.
+        RefusedUntrustedPeer => "refused_untrusted_peer",
     }
 }
 
-/// Why a connect attempt failed, as the breaker counts it (D-g). On a
-/// UDP session (Story 12.5 D-i) `refused` and `unreachable` come from an
-/// ICMP error on the session socket, and `no_response` is a session that
-/// expected answers and reached its idle timeout without any.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ConnectFailureKind {
-    /// The backend answered with a reset to the SYN, or with an ICMP port
-    /// unreachable to a datagram.
-    Refused,
-    /// No answer within the connect timeout.
-    Timeout,
-    /// No route, host or network unreachable, and any other error.
-    Unreachable,
-    /// The connection was reset while being established.
-    Reset,
-    /// A UDP session owed responses reached its idle timeout without
-    /// receiving one.
-    NoResponse,
-}
-
-impl ConnectFailureKind {
-    /// Every kind, in declaration order.
-    pub const ALL: [ConnectFailureKind; 5] = [
-        Self::Refused,
-        Self::Timeout,
-        Self::Unreachable,
-        Self::Reset,
-        Self::NoResponse,
-    ];
-
-    /// The snake_case word of the kind.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Refused => "refused",
-            Self::Timeout => "timeout",
-            Self::Unreachable => "unreachable",
-            Self::Reset => "reset",
-            Self::NoResponse => "no_response",
-        }
+counted_enum! {
+    /// Why a connect attempt failed, as the breaker counts it (D-g). On a
+    /// UDP session (Story 12.5 D-i) `refused` and `unreachable` come from
+    /// an ICMP error on the session socket, and `no_response` is a session
+    /// that expected answers and reached its idle timeout without any.
+    pub enum ConnectFailureKind {
+        /// The backend answered with a reset to the SYN, or with an ICMP
+        /// port unreachable to a datagram.
+        Refused => "refused",
+        /// No answer within the connect timeout.
+        Timeout => "timeout",
+        /// No route, host or network unreachable, and any other error.
+        Unreachable => "unreachable",
+        /// The connection was reset while being established.
+        Reset => "reset",
+        /// A UDP session owed responses reached its idle timeout without
+        /// receiving one.
+        NoResponse => "no_response",
     }
 }
 
-/// How a TLS stream's ClientHello read ended (Story 12.4 D-n).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ClientHelloOutcome {
-    /// A complete ClientHello was read.
-    Parsed,
-    /// None was complete by the deadline: the connection ended
-    /// `clienthello_timeout`.
-    Timeout,
-    /// The bytes are no ClientHello the stream accepts.
-    Invalid,
-    /// The hello was larger, or spread over more records, than the
-    /// reader accepts.
-    Oversized,
-}
-
-impl ClientHelloOutcome {
-    /// Every outcome, in declaration order.
-    pub const ALL: [ClientHelloOutcome; 4] =
-        [Self::Parsed, Self::Timeout, Self::Invalid, Self::Oversized];
-
-    /// The snake_case word of the outcome.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Parsed => "parsed",
-            Self::Timeout => "timeout",
-            Self::Invalid => "invalid",
-            Self::Oversized => "oversized",
-        }
+counted_enum! {
+    /// How a TLS stream's ClientHello read ended (Story 12.4 D-n).
+    pub enum ClientHelloOutcome {
+        /// A complete ClientHello was read.
+        Parsed => "parsed",
+        /// None was complete by the deadline: the connection ended
+        /// `clienthello_timeout`.
+        Timeout => "timeout",
+        /// The bytes are no ClientHello the stream accepts.
+        Invalid => "invalid",
+        /// The hello was larger, or spread over more records, than the
+        /// reader accepts.
+        Oversized => "oversized",
     }
 }
 
-/// How a terminating stream's handshake ended (Story 12.4 D-n). Every
-/// outcome but `ok` refuses the connection with the
-/// [`StreamRefusal`] of the same word.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HandshakeOutcome {
-    /// The handshake completed.
-    Ok,
-    /// No certificate of the node serves the name or the local address.
-    NoCertificate,
-    /// The client's certificate, its absence or its organization was
-    /// refused.
-    ClientCertificate,
-    /// Any other failure, the deadline included.
-    TlsHandshake,
+counted_enum! {
+    /// How a terminating stream's handshake ended (Story 12.4 D-n). Every
+    /// outcome but `ok` refuses the connection with the
+    /// [`StreamRefusal`] of the same word.
+    pub enum HandshakeOutcome {
+        /// The handshake completed.
+        Ok => "ok",
+        /// No certificate of the node serves the name or the local address.
+        NoCertificate => "no_certificate",
+        /// The client's certificate, its absence or its organization was
+        /// refused.
+        ClientCertificate => "client_certificate",
+        /// Any other failure, the deadline included.
+        TlsHandshake => "tls_handshake",
+    }
 }
 
 impl HandshakeOutcome {
-    /// Every outcome, in declaration order.
-    pub const ALL: [HandshakeOutcome; 4] = [
-        Self::Ok,
-        Self::NoCertificate,
-        Self::ClientCertificate,
-        Self::TlsHandshake,
-    ];
-
-    /// The snake_case word of the outcome.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::NoCertificate => "no_certificate",
-            Self::ClientCertificate => "client_certificate",
-            Self::TlsHandshake => "tls_handshake",
-        }
-    }
-
     /// The refusal a failed handshake ends the connection with; `None`
     /// for [`HandshakeOutcome::Ok`].
     pub fn refusal(&self) -> Option<StreamRefusal> {
@@ -231,39 +222,27 @@ impl HandshakeOutcome {
     }
 }
 
-/// Why an attempt's upstream TLS failed (Story 12.4 D-i, D-n). Only
-/// `handshake` and `timeout` count against the backend in the breaker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum UpstreamTlsFailure {
-    /// The backend reset the connection or sent an alert during the
-    /// handshake: it does not serve TLS correctly.
-    Handshake,
-    /// The backend's certificate did not verify against the stream's
-    /// trust: the configuration and the backend disagree.
-    Verify,
-    /// The handshake did not complete within the connect timeout.
-    Timeout,
-    /// The stream's upstream TLS cannot be configured on this node: the
-    /// public roots did not load, its CA bundle does not load, or its
-    /// client identity's key is not held here. No connection is opened.
-    NoTrust,
+counted_enum! {
+    /// Why an attempt's upstream TLS failed (Story 12.4 D-i, D-n). Only
+    /// `handshake` and `timeout` count against the backend in the breaker.
+    pub enum UpstreamTlsFailure {
+        /// The backend reset the connection or sent an alert during the
+        /// handshake: it does not serve TLS correctly.
+        Handshake => "handshake",
+        /// The backend's certificate did not verify against the stream's
+        /// trust: the configuration and the backend disagree.
+        Verify => "verify",
+        /// The handshake did not complete within the connect timeout.
+        Timeout => "timeout",
+        /// The stream's upstream TLS cannot be configured on this node:
+        /// the public roots did not load, its CA bundle does not load, or
+        /// its client identity's key is not held here. No connection is
+        /// opened.
+        NoTrust => "no_trust",
+    }
 }
 
 impl UpstreamTlsFailure {
-    /// Every kind, in declaration order.
-    pub const ALL: [UpstreamTlsFailure; 4] =
-        [Self::Handshake, Self::Verify, Self::Timeout, Self::NoTrust];
-
-    /// The snake_case word of the kind.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Handshake => "handshake",
-            Self::Verify => "verify",
-            Self::Timeout => "timeout",
-            Self::NoTrust => "no_trust",
-        }
-    }
-
     /// Whether the breaker counts it as a failure of the backend.
     pub fn is_backend_failure(&self) -> bool {
         matches!(self, Self::Handshake | Self::Timeout)
@@ -998,19 +977,10 @@ mod tests {
     }
 
     #[test]
-    fn outcome_and_kind_words_are_distinct() {
-        let words: std::collections::HashSet<&str> =
-            ProxyHeaderOutcome::ALL.iter().map(|o| o.as_str()).collect();
-        assert_eq!(words.len(), ProxyHeaderOutcome::ALL.len());
-        let words: std::collections::HashSet<&str> =
-            ConnectFailureKind::ALL.iter().map(|k| k.as_str()).collect();
-        assert_eq!(words.len(), ConnectFailureKind::ALL.len());
-        let words: std::collections::HashSet<&str> =
-            ClientHelloOutcome::ALL.iter().map(|o| o.as_str()).collect();
-        assert_eq!(words.len(), ClientHelloOutcome::ALL.len());
-        let words: std::collections::HashSet<&str> =
-            UpstreamTlsFailure::ALL.iter().map(|k| k.as_str()).collect();
-        assert_eq!(words.len(), UpstreamTlsFailure::ALL.len());
+    fn the_word_check_tells_a_shared_word() {
+        assert!(words_are_distinct(&["timeout", "time", "timeouts"]));
+        assert!(!words_are_distinct(&["refused", "timeout", "refused"]));
+        assert!(words_are_distinct(&[]));
     }
 
     /// A failed handshake's word is its refusal's, so the counter and the
