@@ -573,6 +573,19 @@ stream's algorithm among themselves.
   cell, so past half its capacity a newly opened circuit may find its
   window full and keeps its round trip (logged); and the region grows
   by the table (`BREAKER_SLOTS` cells of 32 bytes).
+  *Measured (2026-11-24), the larger layout's connect series alone*
+  (`PERF_LAYOUT=large PERF_MEASUREMENTS=connect ./run.sh --only-perf
+  --perf-advisory`, 10 runs per arm, bootstrap seed 12012, nothing else
+  running), the two arms back to back on images built for the purpose:
+  before, `34ee649d` (the tree of Lot M's post-audit run plus
+  documentation), pooled p99 438.0 against nginx's 308.7 us, ratio 1.42
+  [1.247, 1.610], INCONCLUSIVE, Lorica's per-run p50 172.1 to 187.0 us
+  (median 176.2) against nginx's 90.5 to 104.1 (median 95.8), which
+  reproduces Lot M's 1.44 [1.285, 1.642]; after, this change, pooled
+  p99 284.1 against 300.5 us, ratio 0.945 [0.821, 1.065], PASS on
+  attempt 1, Lorica's per-run p50 98.1 to 110.6 us (median 106.1)
+  against nginx's 91.3 to 106.1 (median 96.4). The median gap to nginx
+  falls from about 80 us to about 10 us.
 
 ### D-h. Retry semantics
 
