@@ -74,7 +74,7 @@ use lorica_config::route_selection::canonical_hostname;
 use lorica_core::protocols::proxy_protocol::{
     classify_prefix, Prefix, HEADER_READ_TIMEOUT, MAX_HEADER_LEN,
 };
-use lorica_tls::ClientConfig;
+use lorica_tls::{ClientConfig, ServerTlsStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Instant;
@@ -99,6 +99,7 @@ use crate::tls::client_hello::{
     parse, ClientHelloError, InvalidClientHello, Parsed, CLIENTHELLO_BUFFER,
 };
 use crate::tls::rewind::Rewind;
+use crate::tls::server::TerminateConfigs;
 use crate::tls::{client_auth, matcher, server, TlsContext, TlsParts};
 use crate::tracker::TrackedConnection;
 use crate::{canonical, sleep_until_opt};
@@ -250,11 +251,16 @@ impl Conn {
     }
 }
 
-/// A complete ClientHello and the buffer it was read into: the hello,
-/// then whatever the client sent after it.
+/// A complete ClientHello, carrying what phase 2 decided with it.
 struct Hello {
+    /// The buffer it was read into: the hello, then whatever the client
+    /// sent after it.
     buf: Vec<u8>,
     parsed: Parsed,
+    /// The name of the rule it matched.
+    rule: String,
+    /// The instant phase 2 ends by, a terminating handshake included.
+    deadline: Instant,
 }
 
 /// What phases 3 and 4 need from phase 2.
@@ -417,107 +423,35 @@ impl Inner {
     async fn pipeline(&self, live: &mut Live, trusted: bool) -> StreamEndReason {
         let snapshot = Arc::clone(live.conn.tracked.snapshot());
         let stats = self.shared.counters.stream(&snapshot.id);
-        let accepted_at = live.conn.accepted_at;
         let hello_deadline = snapshot.tls_mode.reads_client_hello().then(|| {
-            accepted_at
+            live.conn.accepted_at
                 + Duration::from_millis(u64::from(snapshot.effective_clienthello_timeout_ms()))
         });
 
-        // Phase 2: a trusted peer's PROXY header. On a TLS stream it is
-        // bounded by the ClientHello deadline too: phase 2 as a whole
-        // ends by that instant.
-        let mut destination = live.conn.record.local;
-        let mut preamble = Vec::new();
-        if trusted {
-            let header_deadline = accepted_at + HEADER_READ_TIMEOUT;
-            let deadline = hello_deadline.map_or(header_deadline, |d| d.min(header_deadline));
-            let read = guarded(
-                &mut live.conn.tracked,
-                live.conn.total,
-                read_trusted(&mut live.client, deadline),
-            )
-            .await;
-            match read {
+        // Phase 2: a trusted peer's PROXY header, then on a TLS stream the
+        // ClientHello and the rule it matches.
+        let (destination, preamble) = if trusted {
+            match self
+                .read_proxy_header(live, &snapshot, &stats, hello_deadline)
+                .await
+            {
+                Ok(read) => read,
                 Err(reason) => return reason,
-                Ok(HeaderRead::Refused(ProxyHeaderOutcome::RefusedTimeout))
-                    if hello_deadline.is_some_and(|d| d <= header_deadline) =>
-                {
-                    stats.clienthello(ClientHelloOutcome::Timeout);
-                    return StreamEndReason::ClienthelloTimeout;
-                }
-                Ok(HeaderRead::Refused(outcome)) => {
-                    stats.proxy_header(outcome);
-                    debug!(stream_id = %snapshot.id, peer = %live.conn.record.peer,
-                           outcome = outcome.as_str(), "PROXY header refused");
-                    return StreamEndReason::ProxyHeaderInvalid;
-                }
-                Ok(HeaderRead::Accepted {
-                    outcome,
-                    carried,
-                    preamble: rest,
-                }) => {
-                    stats.proxy_header(outcome);
-                    if let Some((source, carried_destination)) = carried {
-                        live.conn.record.proxied_from = Some(live.conn.record.peer);
-                        live.conn.record.client = source;
-                        destination = carried_destination;
-                    }
-                    preamble = rest;
-                    // The source checks the peer skipped, on the client
-                    // the header carried (D-b), before any byte moves.
-                    if let Err(refusal) = self.admission.admit_carried(
-                        &mut live.conn.admitted,
-                        &snapshot,
-                        &stats,
-                        live.conn.record.client.ip(),
-                    ) {
-                        stats.refused(refusal);
-                        return StreamEndReason::Refused(refusal);
-                    }
-                }
             }
-        }
+        } else {
+            (live.conn.record.local, Vec::new())
+        };
         let classify = snapshot.proxy_protocol_accept && !trusted;
-
-        // Phase 2 on a TLS stream: the ClientHello and the rule it
-        // matches.
-        let hello = match hello_deadline {
-            None => None,
+        let (hello, preamble) = match hello_deadline {
+            None => (None, preamble),
             Some(deadline) => {
                 match self
-                    .read_client_hello(live, std::mem::take(&mut preamble), deadline, classify)
+                    .read_hello(live, &snapshot, &stats, preamble, deadline, classify)
                     .await
                 {
-                    Ok(hello) => Some(hello),
+                    Ok(hello) => (Some(hello), Vec::new()),
                     Err(reason) => return reason,
                 }
-            }
-        };
-        let rule: Option<String> = match &hello {
-            None => None,
-            Some(hello) => {
-                let parsed = &hello.parsed;
-                let Some(rule) = matcher::select(
-                    &snapshot.match_rules,
-                    parsed.server_name.as_deref(),
-                    &parsed.alpn,
-                ) else {
-                    stats.refused(StreamRefusal::NoMatch);
-                    debug!(stream_id = %snapshot.id, peer = %live.conn.record.peer,
-                           server_name = ?parsed.server_name, "ClientHello matches no rule");
-                    return StreamEndReason::Refused(StreamRefusal::NoMatch);
-                };
-                if parsed.server_name.is_none() {
-                    stats.no_sni_matched();
-                }
-                self.shared
-                    .counters
-                    .rule(&snapshot.id, &rule.name)
-                    .matched();
-                if let Some(tls) = live.conn.tls_record() {
-                    tls.rule = Some(rule.name.clone());
-                }
-                Some(rule.name.clone())
             }
         };
 
@@ -534,95 +468,28 @@ impl Inner {
             .as_ref()
             .and_then(|hello| hello.parsed.server_name.clone());
 
+        // Phases 3 and 4, on the TLS stream Lorica terminated or on the
+        // client socket.
         match (snapshot.tls_mode, hello) {
             (StreamTlsMode::Terminate, Some(hello)) => {
-                let Some(Ok(terminate)) = configs.as_ref().and_then(|c| c.terminate.as_ref())
-                else {
-                    return handshake_refused(&stats, &snapshot, HandshakeOutcome::TlsHandshake);
-                };
-                let local_ip = live.conn.record.local.ip();
-                let resolver = &self.tls.parts.resolver;
-                let no_certificate = match &hello.parsed.server_name {
-                    Some(name) => !resolver.serves_server_name(name),
-                    None => !resolver.serves_local_ip(local_ip),
-                };
-                // A rule and the deadline exist on every stream that read
-                // a hello, and the configs were built from this snapshot's
-                // rules: the refusal below is never reached in practice.
-                let Some(((rule, deadline), config)) = rule
-                    .as_deref()
-                    .zip(hello_deadline)
-                    .and_then(|(rule, deadline)| {
-                        terminate
-                            .config(rule, local_ip)
-                            .map(|config| ((rule, deadline), config))
-                    })
-                else {
-                    return handshake_refused(&stats, &snapshot, HandshakeOutcome::TlsHandshake);
-                };
-                let Hello { buf, parsed } = hello;
-                let accepted = guarded(
-                    &mut live.conn.tracked,
-                    live.conn.total,
-                    tokio::time::timeout_at(
-                        deadline,
-                        server::accept(config, Rewind::new(buf, &mut live.client)),
-                    ),
-                )
-                .await;
-                let mut tls = match accepted {
+                let rule = hello.rule.clone();
+                let terminate = configs.as_ref().and_then(|c| c.terminate.as_ref());
+                let terminated = self
+                    .terminate(
+                        &mut live.client,
+                        &mut live.conn,
+                        &snapshot,
+                        &stats,
+                        terminate,
+                        hello,
+                    )
+                    .await;
+                let mut tls = match terminated {
+                    Ok(tls) => tls,
                     Err(reason) => return reason,
-                    Ok(handshake) => match handshake.unwrap_or(Err(HandshakeOutcome::TlsHandshake))
-                    {
-                        Ok(tls) => tls,
-                        Err(_) if no_certificate => {
-                            return handshake_refused(
-                                &stats,
-                                &snapshot,
-                                HandshakeOutcome::NoCertificate,
-                            )
-                        }
-                        Err(outcome) => return handshake_refused(&stats, &snapshot, outcome),
-                    },
                 };
-                stats.handshake(HandshakeOutcome::Ok);
-                let (_, connection) = tls.get_ref();
-                let read_by_rustls = connection
-                    .server_name()
-                    .map(|name| canonical_hostname(name).into_owned());
-                if read_by_rustls != parsed.server_name {
-                    stats.sni_mismatch();
-                    stats.refused(StreamRefusal::InvalidClientHello);
-                    debug!(stream_id = %snapshot.id, parsed = ?parsed.server_name,
-                           rustls = ?read_by_rustls,
-                           "the two ClientHello readers disagree on the server name");
-                    return StreamEndReason::Refused(StreamRefusal::InvalidClientHello);
-                }
-                let client_auth = snapshot
-                    .tls_terminate
-                    .as_ref()
-                    .and_then(|terminate| terminate.client_auth.as_ref());
-                let negotiated = connection.alpn_protocol().map(<[u8]>::to_vec);
-                // `None` on a stream that does not verify: its row says
-                // null there, not `absent` (Story 12.9 D-a).
-                let certificate = match client_auth {
-                    None => None,
-                    Some(auth) => match client_auth::admit(auth, connection.peer_certificates()) {
-                        Some(outcome) => Some(outcome),
-                        None => {
-                            stats.refused(StreamRefusal::ClientCertificate);
-                            debug!(stream_id = %snapshot.id, peer = %live.conn.record.peer,
-                                   "client certificate organization not admitted");
-                            return StreamEndReason::Refused(StreamRefusal::ClientCertificate);
-                        }
-                    },
-                };
-                if let Some(record) = live.conn.tls_record() {
-                    record.negotiated_alpn = negotiated;
-                    record.client_certificate = certificate;
-                }
                 let route = Route {
-                    rule: Some(rule),
+                    rule: Some(&rule),
                     destination,
                     preamble: Vec::new(),
                     classify: false,
@@ -636,7 +503,10 @@ impl Inner {
                 // Passthrough replays the ClientHello and whatever
                 // followed it; a stream without TLS replays what the
                 // PROXY read left.
-                let replayed = hello.map_or(preamble, |hello| hello.buf);
+                let (rule, replayed) = match hello {
+                    Some(Hello { buf, rule, .. }) => (Some(rule), buf),
+                    None => (None, preamble),
+                };
                 let route = Route {
                     rule: rule.as_deref(),
                     destination,
@@ -651,6 +521,227 @@ impl Inner {
         }
     }
 
+    /// Phase 2's PROXY read: the header a trusted peer must send, within
+    /// [`HEADER_READ_TIMEOUT`] of accept and, on a TLS stream, by the
+    /// ClientHello deadline too, since phase 2 as a whole ends by that
+    /// instant. Returns the destination the header sent to the backend
+    /// names and the client bytes read past the header. A header that
+    /// carries a client makes it the record's client, admitted by the
+    /// source checks the peer skipped (D-b) before any byte moves.
+    async fn read_proxy_header(
+        &self,
+        live: &mut Live,
+        snapshot: &Stream,
+        stats: &StreamStats,
+        hello_deadline: Option<Instant>,
+    ) -> Result<(SocketAddr, Vec<u8>), StreamEndReason> {
+        let header_deadline = live.conn.accepted_at + HEADER_READ_TIMEOUT;
+        let deadline = hello_deadline.map_or(header_deadline, |d| d.min(header_deadline));
+        let read = guarded(
+            &mut live.conn.tracked,
+            live.conn.total,
+            read_trusted(&mut live.client, deadline),
+        )
+        .await;
+        match read {
+            Err(reason) => Err(reason),
+            Ok(HeaderRead::Refused(ProxyHeaderOutcome::RefusedTimeout))
+                if hello_deadline.is_some_and(|d| d <= header_deadline) =>
+            {
+                stats.clienthello(ClientHelloOutcome::Timeout);
+                Err(StreamEndReason::ClienthelloTimeout)
+            }
+            Ok(HeaderRead::Refused(outcome)) => {
+                stats.proxy_header(outcome);
+                debug!(stream_id = %snapshot.id, peer = %live.conn.record.peer,
+                       outcome = outcome.as_str(), "PROXY header refused");
+                Err(StreamEndReason::ProxyHeaderInvalid)
+            }
+            Ok(HeaderRead::Accepted {
+                outcome,
+                carried,
+                preamble,
+            }) => {
+                stats.proxy_header(outcome);
+                let mut destination = live.conn.record.local;
+                if let Some((source, carried_destination)) = carried {
+                    live.conn.record.proxied_from = Some(live.conn.record.peer);
+                    live.conn.record.client = source;
+                    destination = carried_destination;
+                }
+                if let Err(refusal) = self.admission.admit_carried(
+                    &mut live.conn.admitted,
+                    snapshot,
+                    stats,
+                    live.conn.record.client.ip(),
+                ) {
+                    stats.refused(refusal);
+                    return Err(StreamEndReason::Refused(refusal));
+                }
+                Ok((destination, preamble))
+            }
+        }
+    }
+
+    /// The rest of phase 2 on a TLS stream: the ClientHello, `leftover`
+    /// first and complete by `deadline`, and the rule it matches.
+    async fn read_hello(
+        &self,
+        live: &mut Live,
+        snapshot: &Stream,
+        stats: &StreamStats,
+        leftover: Vec<u8>,
+        deadline: Instant,
+        classify: bool,
+    ) -> Result<Hello, StreamEndReason> {
+        let (buf, parsed) = self
+            .read_client_hello(live, leftover, deadline, classify)
+            .await?;
+        let rule = self.select_rule(&mut live.conn, snapshot, stats, &parsed)?;
+        Ok(Hello {
+            buf,
+            parsed,
+            rule,
+            deadline,
+        })
+    }
+
+    /// The name of the first rule of `snapshot` that `parsed` matches,
+    /// counted and written to the record. A hello no rule matches ends
+    /// `refused(no_match)` before any byte is forwarded or any handshake
+    /// starts.
+    fn select_rule(
+        &self,
+        conn: &mut Conn,
+        snapshot: &Stream,
+        stats: &StreamStats,
+        parsed: &Parsed,
+    ) -> Result<String, StreamEndReason> {
+        let Some(rule) = matcher::select(
+            &snapshot.match_rules,
+            parsed.server_name.as_deref(),
+            &parsed.alpn,
+        ) else {
+            stats.refused(StreamRefusal::NoMatch);
+            debug!(stream_id = %snapshot.id, peer = %conn.record.peer,
+                   server_name = ?parsed.server_name, "ClientHello matches no rule");
+            return Err(StreamEndReason::Refused(StreamRefusal::NoMatch));
+        };
+        if parsed.server_name.is_none() {
+            stats.no_sni_matched();
+        }
+        self.shared
+            .counters
+            .rule(&snapshot.id, &rule.name)
+            .matched();
+        if let Some(tls) = conn.tls_record() {
+            tls.rule = Some(rule.name.clone());
+        }
+        Ok(rule.name.clone())
+    }
+
+    /// The terminating handshake on `client` (Story 12.4 D-f): the
+    /// hello's buffer replayed to rustls on its rule's config, complete
+    /// by its deadline; then the server name rustls read must be the one
+    /// the rule was chosen by, and a stream that verifies client
+    /// certificates must admit the client's. Any failure ends the
+    /// connection refused.
+    async fn terminate<'c>(
+        &self,
+        client: &'c mut TcpStream,
+        conn: &mut Conn,
+        snapshot: &Stream,
+        stats: &StreamStats,
+        configs: Option<&Result<TerminateConfigs, String>>,
+        hello: Hello,
+    ) -> Result<ServerTlsStream<Rewind<&'c mut TcpStream>>, StreamEndReason> {
+        let Some(Ok(configs)) = configs else {
+            return Err(handshake_refused(
+                stats,
+                snapshot,
+                HandshakeOutcome::TlsHandshake,
+            ));
+        };
+        let local_ip = conn.record.local.ip();
+        let resolver = &self.tls.parts.resolver;
+        let no_certificate = match &hello.parsed.server_name {
+            Some(name) => !resolver.serves_server_name(name),
+            None => !resolver.serves_local_ip(local_ip),
+        };
+        // The configs were built from this snapshot's rules, the matched
+        // one among them.
+        let Some(config) = configs.config(&hello.rule, local_ip) else {
+            return Err(handshake_refused(
+                stats,
+                snapshot,
+                HandshakeOutcome::TlsHandshake,
+            ));
+        };
+        let Hello {
+            buf,
+            parsed,
+            deadline,
+            ..
+        } = hello;
+        let accepted = guarded(
+            &mut conn.tracked,
+            conn.total,
+            tokio::time::timeout_at(deadline, server::accept(config, Rewind::new(buf, client))),
+        )
+        .await;
+        let tls = match accepted {
+            Err(reason) => return Err(reason),
+            Ok(handshake) => match handshake.unwrap_or(Err(HandshakeOutcome::TlsHandshake)) {
+                Ok(tls) => tls,
+                Err(_) if no_certificate => {
+                    return Err(handshake_refused(
+                        stats,
+                        snapshot,
+                        HandshakeOutcome::NoCertificate,
+                    ))
+                }
+                Err(outcome) => return Err(handshake_refused(stats, snapshot, outcome)),
+            },
+        };
+        stats.handshake(HandshakeOutcome::Ok);
+        let (_, connection) = tls.get_ref();
+        let read_by_rustls = connection
+            .server_name()
+            .map(|name| canonical_hostname(name).into_owned());
+        if read_by_rustls != parsed.server_name {
+            stats.sni_mismatch();
+            stats.refused(StreamRefusal::InvalidClientHello);
+            debug!(stream_id = %snapshot.id, parsed = ?parsed.server_name,
+                   rustls = ?read_by_rustls,
+                   "the two ClientHello readers disagree on the server name");
+            return Err(StreamEndReason::Refused(StreamRefusal::InvalidClientHello));
+        }
+        let client_auth = snapshot
+            .tls_terminate
+            .as_ref()
+            .and_then(|terminate| terminate.client_auth.as_ref());
+        let negotiated = connection.alpn_protocol().map(<[u8]>::to_vec);
+        // `None` on a stream that does not verify: its row says null
+        // there, not `absent` (Story 12.9 D-a).
+        let certificate = match client_auth {
+            None => None,
+            Some(auth) => match client_auth::admit(auth, connection.peer_certificates()) {
+                Some(outcome) => Some(outcome),
+                None => {
+                    stats.refused(StreamRefusal::ClientCertificate);
+                    debug!(stream_id = %snapshot.id, peer = %conn.record.peer,
+                           "client certificate organization not admitted");
+                    return Err(StreamEndReason::Refused(StreamRefusal::ClientCertificate));
+                }
+            },
+        };
+        if let Some(record) = conn.tls_record() {
+            record.negotiated_alpn = negotiated;
+            record.client_certificate = certificate;
+        }
+        Ok(tls)
+    }
+
     /// Read the ClientHello into the [`CLIENTHELLO_BUFFER`], `leftover`
     /// (the PROXY read's) first, complete by `deadline`.
     async fn read_client_hello(
@@ -659,7 +750,7 @@ impl Inner {
         leftover: Vec<u8>,
         deadline: Instant,
         classify: bool,
-    ) -> Result<Hello, StreamEndReason> {
+    ) -> Result<(Vec<u8>, Parsed), StreamEndReason> {
         let snapshot = Arc::clone(live.conn.tracked.snapshot());
         let stats = self.shared.counters.stream(&snapshot.id);
         let mut buf = vec![0u8; CLIENTHELLO_BUFFER];
@@ -678,7 +769,7 @@ impl Inner {
                         tls.ech_offered = parsed.ech_offered;
                     }
                     buf.truncate(filled);
-                    return Ok(Hello { buf, parsed });
+                    return Ok((buf, parsed));
                 }
                 Err(ClientHelloError::NeedMore) => {}
                 Err(ClientHelloError::Invalid(kind)) => {
