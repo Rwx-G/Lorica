@@ -13,12 +13,14 @@
 // limitations under the License.
 
 //! Test suite for the pure ACME core: config, DNS-01 challenge config
-//! validation, challenger construction, and the Cloudflare / OVH challenger
-//! HTTP paths exercised against a `wiremock` mock server.
+//! validation, challenger construction, and the Cloudflare / OVH / Aliyun
+//! challenger HTTP paths exercised against a `wiremock` mock server.
 
 use crate::config::AcmeConfig;
 use crate::dns_challengers::{
-    build_dns_challenger, CloudflareDnsChallenger, DnsChallengeConfig, OvhDnsChallenger,
+    aliyun::{canonical_query, percent_encode, sign},
+    build_dns_challenger, AliyunDnsChallenger, CloudflareDnsChallenger, DnsChallengeConfig,
+    OvhDnsChallenger,
 };
 
 #[test]
@@ -513,5 +515,581 @@ async fn ovh_delete_without_tracked_record_is_err() {
     assert!(
         err.contains("no tracked"),
         "error should name the missing-id condition: {err}"
+    );
+}
+
+// --- Aliyun (Alidns) challenger ---
+
+#[test]
+fn test_dns_config_valid_aliyun() {
+    let config = DnsChallengeConfig {
+        provider: "aliyun".into(),
+        zone_id: String::new(),
+        api_token: "LTAI5tExampleKeyId".into(),
+        api_secret: Some("ExampleKeySecret".into()),
+        ovh_endpoint: None,
+        ovh_consumer_key: None,
+    };
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn test_dns_config_aliyun_missing_token() {
+    let config = DnsChallengeConfig {
+        provider: "aliyun".into(),
+        zone_id: String::new(),
+        api_token: String::new(),
+        api_secret: Some("ExampleKeySecret".into()),
+        ovh_endpoint: None,
+        ovh_consumer_key: None,
+    };
+    let err = config.validate().unwrap_err();
+    assert!(err.contains("api_token"));
+}
+
+#[test]
+fn test_dns_config_aliyun_missing_secret() {
+    let config = DnsChallengeConfig {
+        provider: "aliyun".into(),
+        zone_id: String::new(),
+        api_token: "LTAI5tExampleKeyId".into(),
+        api_secret: None,
+        ovh_endpoint: None,
+        ovh_consumer_key: None,
+    };
+    let err = config.validate().unwrap_err();
+    assert!(err.contains("api_secret"));
+}
+
+#[tokio::test]
+async fn test_build_dns_challenger_aliyun() {
+    let config = DnsChallengeConfig {
+        provider: "aliyun".into(),
+        zone_id: String::new(),
+        api_token: "LTAI5tExampleKeyId".into(),
+        api_secret: Some("ExampleKeySecret".into()),
+        ovh_endpoint: None,
+        ovh_consumer_key: None,
+    };
+    assert!(build_dns_challenger(&config).await.is_ok());
+}
+
+#[test]
+fn test_aliyun_challenge_rr() {
+    for (zone, name, expected) in [
+        ("example.com", "example.com", "_acme-challenge"),
+        ("example.com", "app.example.com", "_acme-challenge.app"),
+        ("example.com", "a.b.example.com", "_acme-challenge.a.b"),
+        ("b.example.com", "a.b.example.com", "_acme-challenge.a"),
+    ] {
+        assert_eq!(
+            AliyunDnsChallenger::challenge_rr(zone, name),
+            expected,
+            "zone {zone}, name {name}"
+        );
+    }
+}
+
+#[test]
+fn test_aliyun_percent_encode() {
+    // The unreserved set survives verbatim; everything else is
+    // upper-case-hex escaped. A space is `%20`, never `+`.
+    assert_eq!(percent_encode("abcXYZ019-_.~"), "abcXYZ019-_.~");
+    assert_eq!(percent_encode("a b+c*d"), "a%20b%2Bc%2Ad");
+    assert_eq!(
+        percent_encode("2026-11-24T10:00:00Z"),
+        "2026-11-24T10%3A00%3A00Z"
+    );
+    assert_eq!(percent_encode("/"), "%2F");
+    assert_eq!(percent_encode("éxample"), "%C3%A9xample");
+}
+
+#[test]
+fn test_aliyun_canonical_query_sorts_and_encodes() {
+    let mut params = vec![
+        ("Version".to_string(), "2015-01-09".to_string()),
+        ("Action".to_string(), "AddDomainRecord".to_string()),
+        ("RR".to_string(), "_acme-challenge.app".to_string()),
+    ];
+    assert_eq!(
+        canonical_query(&mut params),
+        "Action=AddDomainRecord&RR=_acme-challenge.app&Version=2015-01-09"
+    );
+}
+
+/// Pinned signature vector: the canonicalised query and its HMAC-SHA1
+/// signature were computed independently from the algorithm the Alidns
+/// docs describe, so a regression in ordering, encoding or keying
+/// fails here rather than against the live API.
+#[test]
+fn test_aliyun_sign_pinned_vector() {
+    let mut params = vec![
+        ("AccessKeyId".to_string(), "testid".to_string()),
+        ("Action".to_string(), "DescribeDomainRecords".to_string()),
+        ("DomainName".to_string(), "example.com".to_string()),
+        ("Format".to_string(), "JSON".to_string()),
+        ("PageNumber".to_string(), "1".to_string()),
+        ("PageSize".to_string(), "1".to_string()),
+        ("SignatureMethod".to_string(), "HMAC-SHA1".to_string()),
+        (
+            "SignatureNonce".to_string(),
+            "f59cb6d92202fdd8e2a3c84e0d6c3d1f".to_string(),
+        ),
+        ("SignatureVersion".to_string(), "1.0".to_string()),
+        ("Timestamp".to_string(), "2026-11-24T10:00:00Z".to_string()),
+        ("Version".to_string(), "2015-01-09".to_string()),
+    ];
+    let canonicalized = canonical_query(&mut params);
+    assert_eq!(
+        sign("testsecret", &canonicalized),
+        "JbLIsf2WY9xFYU9mlnPonumTk7Y="
+    );
+}
+
+/// The zone walk skips suffixes the account does not host and creates
+/// the record under the first hosted one.
+#[tokio::test]
+async fn aliyun_create_txt_walks_to_hosted_zone() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(query_param("Action", "DescribeDomainRecords"))
+        .and(query_param("DomainName", "app.example.com"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "Code": "InvalidDomainName.NoExist",
+            "Message": "The specified domain name does not exist.",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(query_param("Action", "DescribeDomainRecords"))
+        .and(query_param("DomainName", "example.com"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "TotalCount": 1,
+            "PageNumber": 1,
+            "PageSize": 1,
+            "DomainRecords": {"Record": []},
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(query_param("Action", "AddDomainRecord"))
+        .and(query_param("DomainName", "example.com"))
+        .and(query_param("RR", "_acme-challenge.app"))
+        .and(query_param("Type", "TXT"))
+        .and(query_param("Value", "challenge-value"))
+        .and(query_param("TTL", "600"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "RequestId": "536E9CAD-DB30-4647-AC87-AA5CC38C5382",
+            "RecordId": "1001",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let challenger =
+        AliyunDnsChallenger::with_base_url("key-id".into(), "key-secret".into(), server.uri())
+            .expect("test setup: challenger");
+    challenger
+        .create_txt_record("app.example.com", "challenge-value")
+        .await
+        .expect("create should succeed once the hosted zone is found");
+
+    // Every request must carry the common RPC parameters. The signature
+    // algorithm itself is pinned by `test_aliyun_sign_pinned_vector`.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("test setup: recorded requests");
+    let add = requests
+        .iter()
+        .find(|r| {
+            r.url
+                .query_pairs()
+                .any(|(k, v)| k == "Action" && v == "AddDomainRecord")
+        })
+        .expect("test setup: AddDomainRecord request");
+    let sent_params: Vec<(String, String)> = add
+        .url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    for required in [
+        "Format",
+        "Version",
+        "AccessKeyId",
+        "SignatureMethod",
+        "SignatureVersion",
+        "SignatureNonce",
+        "Timestamp",
+        "Signature",
+    ] {
+        assert!(
+            sent_params.iter().any(|(k, _)| k == required),
+            "signed request is missing {required}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn aliyun_create_txt_no_hosted_zone_is_err() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(query_param("Action", "DescribeDomainRecords"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "Code": "InvalidDomainName.NoExist",
+            "Message": "The specified domain name does not exist.",
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let challenger =
+        AliyunDnsChallenger::with_base_url("key-id".into(), "key-secret".into(), server.uri())
+            .expect("test setup: challenger");
+    let err = challenger
+        .create_txt_record("app.example.com", "val")
+        .await
+        .expect_err("no hosted zone must map to Err");
+    assert!(
+        err.contains("no hosted Alidns zone"),
+        "error should name the missing zone: {err}"
+    );
+}
+
+#[tokio::test]
+async fn aliyun_create_txt_surfaces_api_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(query_param("Action", "DescribeDomainRecords"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "TotalCount": 1,
+            "PageNumber": 1,
+            "PageSize": 1,
+            "DomainRecords": {"Record": []},
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(query_param("Action", "AddDomainRecord"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "Code": "InvalidAccessKeyId.NotFound",
+            "Message": "Specified access key is not found.",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let challenger =
+        AliyunDnsChallenger::with_base_url("bad-key-id".into(), "bad-secret".into(), server.uri())
+            .expect("test setup: challenger");
+    let err = challenger
+        .create_txt_record("example.com", "val")
+        .await
+        .expect_err("400 must map to Err");
+    assert!(err.contains("400"), "error must carry the status: {err}");
+    assert!(
+        err.contains("InvalidAccessKeyId.NotFound"),
+        "error must carry the API code: {err}"
+    );
+    assert!(
+        err.contains("Specified access key is not found"),
+        "error must carry the API message: {err}"
+    );
+}
+
+/// One order carrying a name and its wildcard tracks two record ids
+/// under the same TXT name. Cleanup retracts the successful id, keeps
+/// the failed one, and retries only that id on the next call.
+#[tokio::test]
+async fn aliyun_delete_txt_retracts_and_retries_tracked_records() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(query_param("Action", "DescribeDomainRecords"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "TotalCount": 1,
+            "PageNumber": 1,
+            "PageSize": 1,
+            "DomainRecords": {"Record": []},
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    for (record_id, value) in [("1001", "value-apex"), ("1002", "value-wildcard")] {
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .and(query_param("Action", "AddDomainRecord"))
+            .and(query_param("Value", value))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "RecordId": record_id,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(query_param("Action", "DeleteDomainRecord"))
+        .and(query_param("RecordId", "1001"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "RecordId": "1001",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(query_param("Action", "DeleteDomainRecord"))
+        .and(query_param("RecordId", "1002"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "Code": "Throttling",
+            "Message": "Request was denied due to request throttling.",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let challenger =
+        AliyunDnsChallenger::with_base_url("key-id".into(), "key-secret".into(), server.uri())
+            .expect("test setup: challenger");
+    challenger
+        .create_txt_record("example.com", "value-apex")
+        .await
+        .expect("test setup: first create");
+    challenger
+        .create_txt_record("example.com", "value-wildcard")
+        .await
+        .expect("test setup: second create");
+    let err = challenger
+        .delete_txt_record("example.com")
+        .await
+        .expect_err("the failed deletion must be reported");
+    assert!(
+        err.contains("Throttling"),
+        "error must carry the API code: {err}"
+    );
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(query_param("Action", "DeleteDomainRecord"))
+        .and(query_param("RecordId", "1001"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(query_param("Action", "DeleteDomainRecord"))
+        .and(query_param("RecordId", "1002"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "RecordId": "1002",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    challenger
+        .delete_txt_record("example.com")
+        .await
+        .expect("retry must delete only the id left by the failed call");
+
+    let err = challenger
+        .delete_txt_record("example.com")
+        .await
+        .expect_err("a later cleanup has nothing tracked");
+    assert!(
+        err.contains("no tracked"),
+        "error should name the missing-id condition: {err}"
+    );
+}
+
+/// A 200 response with a business `Code` must not be accepted as a
+/// hosted zone or a successful record change.
+#[tokio::test]
+async fn aliyun_create_txt_rejects_business_error_in_200_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(query_param("Action", "DescribeDomainRecords"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Code": "InvalidAccessKeyId.NotFound",
+            "Message": "Specified access key is not found.",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(query_param("Action", "AddDomainRecord"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "RecordId": "1001",
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let challenger =
+        AliyunDnsChallenger::with_base_url("bad-key".into(), "bad-secret".into(), server.uri())
+            .expect("test setup: challenger");
+    let err = challenger
+        .create_txt_record("example.com", "val")
+        .await
+        .expect_err("a 200 response with a Code must map to Err");
+    assert!(
+        err.contains("InvalidAccessKeyId.NotFound"),
+        "error must carry the API code: {err}"
+    );
+}
+
+/// A credential or throttling error during zone probing must surface
+/// as itself, not be swallowed as "domain is not hosted".
+#[tokio::test]
+async fn aliyun_create_txt_surfaces_auth_error_during_zone_probe() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(query_param("Action", "DescribeDomainRecords"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "Code": "Forbidden.RAM",
+            "Message": "The RAM user is not authorized.",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let challenger =
+        AliyunDnsChallenger::with_base_url("key-id".into(), "key-secret".into(), server.uri())
+            .expect("test setup: challenger");
+    let err = challenger
+        .create_txt_record("app.example.com", "val")
+        .await
+        .expect_err("a RAM error must map to Err");
+    assert!(
+        err.contains("Forbidden.RAM"),
+        "error must carry the original code: {err}"
+    );
+    assert!(
+        !err.contains("no hosted"),
+        "a RAM error must not be disguised as a missing zone: {err}"
+    );
+}
+
+/// The client must not follow a redirect: doing so would send the
+/// signed query, including the AccessKey id and signature, to a host
+/// the configuration never named.
+#[tokio::test]
+async fn aliyun_client_follows_no_redirect() {
+    let target = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/stolen"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&target)
+        .await;
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/stolen", target.uri())),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let challenger =
+        AliyunDnsChallenger::with_base_url("key-id".into(), "key-secret".into(), server.uri())
+            .expect("test setup: challenger");
+    let err = challenger
+        .create_txt_record("example.com", "val")
+        .await
+        .expect_err("a 302 is a failed RPC call, not a redirect to follow");
+    assert!(err.contains("302"), "error must carry the status: {err}");
+    assert!(
+        !err.contains("Signature"),
+        "error must not carry the signed query: {err}"
+    );
+}
+
+/// `reqwest` renders the full request URL in transport errors. An
+/// unreachable endpoint must not turn that URL, with its AccessKey id
+/// and signature, into an ACME log line.
+#[tokio::test]
+async fn aliyun_transport_error_has_no_signed_url() {
+    let challenger = AliyunDnsChallenger::with_base_url(
+        "sensitive-key-id".into(),
+        "sensitive-secret".into(),
+        "http://127.0.0.1:1".into(),
+    )
+    .expect("test setup: challenger");
+    let err = challenger
+        .create_txt_record("example.com", "val")
+        .await
+        .expect_err("an unreachable endpoint must fail");
+    assert!(
+        err.contains("request failed"),
+        "error must name the failed call: {err}"
+    );
+    for secret in ["sensitive-key-id", "AccessKeyId", "Signature", "Timestamp"] {
+        assert!(
+            !err.contains(secret),
+            "transport error must not carry the signed URL ({secret}): {err}"
+        );
+    }
+}
+
+/// An API error body that echoes the signed URL in either `Code` or
+/// `Message` must be scrubbed end to end.
+#[tokio::test]
+async fn aliyun_api_error_body_is_scrubbed() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(query_param("Action", "DescribeDomainRecords"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "Code": "GatewayError: Signature=code-secret&AccessKeyId=code-id",
+            "Message": "GET /?AccessKeyId=sensitive-id&Signature=a%2Bb%3D&SignatureNonce=abc&Timestamp=2026-11-24T10%3A00%3A00Z",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let challenger =
+        AliyunDnsChallenger::with_base_url("key-id".into(), "key-secret".into(), server.uri())
+            .expect("test setup: challenger");
+    let err = challenger
+        .create_txt_record("example.com", "val")
+        .await
+        .expect_err("a 400 error body must map to Err");
+    for secret in [
+        "code-secret",
+        "code-id",
+        "sensitive-id",
+        "a%2Bb%3D",
+        "SignatureNonce=abc",
+        "2026-11-24T10%3A00%3A00Z",
+    ] {
+        assert!(
+            !err.contains(secret),
+            "error body leaked a signed query value ({secret}): {err}"
+        );
+    }
+    assert!(
+        err.contains("[REDACTED]"),
+        "scrubbed values are marked: {err}"
     );
 }

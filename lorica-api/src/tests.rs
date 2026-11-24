@@ -3277,6 +3277,75 @@ async fn test_dns_provider_credentials_never_returned() {
 }
 
 #[tokio::test]
+async fn test_dns_provider_aliyun_config_accepted() {
+    // The aliyun provider maps its two-part AccessKey credential onto
+    // the generic dns01 config; both the create validation and the
+    // challenger-build behind /test must accept it.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let create_body = serde_json::json!({
+        "name": "aliyun-zone",
+        "provider_type": "aliyun",
+        "config": {
+            "aliyun_access_key_id": "LTAI5tExampleKeyId",
+            "aliyun_access_key_secret": "ExampleKeySecret"
+        }
+    });
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/dns-providers")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(create_body.to_string()))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    let provider_id = json["data"]["id"].as_str().expect("test setup");
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/dns-providers/{provider_id}/test"))
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // A missing AccessKey secret is refused at create time.
+    let create_body = serde_json::json!({
+        "name": "aliyun-incomplete",
+        "provider_type": "aliyun",
+        "config": { "aliyun_access_key_id": "LTAI5tExampleKeyId" }
+    });
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/dns-providers")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(create_body.to_string()))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    let message = json["error"]["message"].as_str().expect("test setup");
+    assert!(
+        message.contains("aliyun_access_key_secret"),
+        "error must name the missing field: {message}"
+    );
+}
+
+#[tokio::test]
 async fn test_update_settings_invalid_log_level() {
     let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;

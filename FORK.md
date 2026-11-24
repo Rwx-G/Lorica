@@ -76,7 +76,7 @@ These crates do not exist in upstream Pingora:
 | `lorica-bench` | SLA monitoring, load testing engine |
 | `lorica-worker` | fork+exec worker isolation, socket passing |
 | `lorica-command` | Protobuf supervisor-worker command channel |
-| `lorica-acme` | Pure ACME core: HTTP-01 / DNS-01 issuance driver, DNS challengers (Cloudflare / Route53 / OVH) |
+| `lorica-acme` | Pure ACME core: HTTP-01 / DNS-01 issuance driver, DNS challengers (Cloudflare / Route53 / OVH / Alibaba Cloud DNS) |
 | `lorica-metrics` | Shared Prometheus registry + cross-worker counter aggregation |
 | `lorica-challenge` | Bot-protection challenge engine (PoW / captcha / cookie) |
 | `lorica-geoip` | GeoIP / ASN country and network lookups |

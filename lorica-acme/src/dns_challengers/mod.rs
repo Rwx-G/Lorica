@@ -16,11 +16,13 @@
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod aliyun;
 mod cloudflare;
 mod ovh;
 #[cfg(feature = "route53")]
 mod route53;
 
+pub use aliyun::AliyunDnsChallenger;
 pub use cloudflare::CloudflareDnsChallenger;
 pub use ovh::OvhDnsChallenger;
 #[cfg(feature = "route53")]
@@ -29,17 +31,18 @@ pub use route53::Route53DnsChallenger;
 /// Configuration for DNS-01 ACME challenges.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DnsChallengeConfig {
-    /// DNS provider: `"cloudflare"`, `"route53"`, or `"ovh"`.
+    /// DNS provider: `"cloudflare"`, `"route53"`, `"ovh"`, or `"aliyun"`.
     pub provider: String,
     /// Zone identifier (Cloudflare zone ID or Route53 hosted zone ID).
-    /// Not used for OVH (zone is extracted from domain).
+    /// Not used for OVH and Aliyun (zone is resolved from the domain).
     #[serde(default)]
     pub zone_id: String,
     /// API token (Cloudflare API token or AWS access key ID).
-    /// For OVH: the application_key.
+    /// For OVH: the application_key. For Aliyun: the AccessKey ID.
     #[serde(default)]
     pub api_token: String,
-    /// Optional secret (AWS secret access key, OVH application_secret).
+    /// Optional secret (AWS secret access key, OVH application_secret,
+    /// Aliyun AccessKey secret).
     pub api_secret: Option<String>,
     /// OVH endpoint (default: "eu.api.ovh.com"). Only used for OVH.
     #[serde(default)]
@@ -83,9 +86,19 @@ impl DnsChallengeConfig {
                     return Err("ovh_consumer_key is required for OVH".into());
                 }
             }
+            "aliyun" => {
+                if self.api_token.is_empty() {
+                    return Err("api_token (AccessKey ID) is required for Alibaba Cloud DNS".into());
+                }
+                if self.api_secret.as_ref().is_none_or(|s| s.is_empty()) {
+                    return Err(
+                        "api_secret (AccessKey secret) is required for Alibaba Cloud DNS".into(),
+                    );
+                }
+            }
             other => {
                 return Err(format!(
-                    "unsupported DNS provider '{}': expected 'cloudflare', 'route53', or 'ovh'",
+                    "unsupported DNS provider '{}': expected 'cloudflare', 'route53', 'ovh', or 'aliyun'",
                     other
                 ));
             }
@@ -127,6 +140,13 @@ pub async fn build_dns_challenger(
         )),
         #[cfg(not(feature = "route53"))]
         "route53" => Err("route53 provider requires the 'route53' feature flag".into()),
+        "aliyun" => Ok(Box::new(AliyunDnsChallenger::new(
+            config.api_token.clone(),
+            config
+                .api_secret
+                .clone()
+                .expect("validate() ensures api_secret is Some for aliyun"),
+        )?)),
         "ovh" => Ok(Box::new(OvhDnsChallenger::new(
             config
                 .ovh_endpoint

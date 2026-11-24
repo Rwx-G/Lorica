@@ -37,6 +37,9 @@
   let dpR53AccessKey = $state('');
   let dpR53SecretKey = $state('');
   let dpR53HostedZoneId = $state('');
+  // Aliyun fields
+  let dpAliAccessKeyId = $state('');
+  let dpAliAccessKeySecret = $state('');
   let dnsProviderError = $state('');
   let dnsProviderSaving = $state(false);
   let deletingDnsProvider: DnsProviderResponse | null = $state(null);
@@ -55,6 +58,8 @@
     dpR53AccessKey = '';
     dpR53SecretKey = '';
     dpR53HostedZoneId = '';
+    dpAliAccessKeyId = '';
+    dpAliAccessKeySecret = '';
     dnsProviderError = '';
     showDnsProviderForm = true;
   }
@@ -73,6 +78,8 @@
     dpR53AccessKey = '';
     dpR53SecretKey = '';
     dpR53HostedZoneId = '';
+    dpAliAccessKeyId = '';
+    dpAliAccessKeySecret = '';
     dnsProviderError = '';
     showDnsProviderForm = true;
   }
@@ -100,6 +107,9 @@
       config.aws_access_key_id = dpR53AccessKey;
       config.aws_secret_access_key = dpR53SecretKey;
       config.hosted_zone_id = dpR53HostedZoneId;
+    } else if (dnsProviderType === 'aliyun') {
+      config.aliyun_access_key_id = dpAliAccessKeyId;
+      config.aliyun_access_key_secret = dpAliAccessKeySecret;
     }
 
     const body = { name: dnsProviderName.trim(), provider_type: dnsProviderType, config };
@@ -208,6 +218,7 @@
           <option value="ovh">OVH</option>
           <option value="cloudflare">Cloudflare</option>
           <option value="route53">AWS Route53</option>
+          <option value="aliyun">Alibaba Cloud DNS</option>
         </select>
       </div>
 
@@ -253,6 +264,15 @@
         <div class="settings-form-row">
           <label for="dp-r53-zone">Hosted Zone ID <span class="settings-required">*</span></label>
           <input id="dp-r53-zone" type="text" bind:value={dpR53HostedZoneId} placeholder="Hosted zone ID" />
+        </div>
+      {:else if dnsProviderType === 'aliyun'}
+        <div class="settings-form-row">
+          <label for="dp-ali-key-id">AccessKey ID <span class="settings-required">*</span></label>
+          <input id="dp-ali-key-id" type="text" bind:value={dpAliAccessKeyId} placeholder="Alibaba Cloud DNS AccessKey ID" />
+        </div>
+        <div class="settings-form-row">
+          <label for="dp-ali-key-secret">AccessKey Secret <span class="settings-required">*</span></label>
+          <input id="dp-ali-key-secret" type="password" bind:value={dpAliAccessKeySecret} placeholder="Alibaba Cloud DNS AccessKey secret" />
         </div>
       {/if}
 

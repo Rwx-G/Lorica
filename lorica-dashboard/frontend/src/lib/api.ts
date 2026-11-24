@@ -1268,6 +1268,9 @@ export interface DnsProviderConfig {
   aws_secret_access_key?: string;
   aws_region?: string;
   hosted_zone_id?: string;
+  // Aliyun
+  aliyun_access_key_id?: string;
+  aliyun_access_key_secret?: string;
 }
 
 export interface CreateDnsProviderRequest {

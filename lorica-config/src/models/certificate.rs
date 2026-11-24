@@ -41,7 +41,8 @@ pub struct Certificate {
     /// Insert timestamp.
     pub created_at: DateTime<Utc>,
     /// ACME provisioning method: "http01", "dns01-ovh", "dns01-cloudflare",
-    /// "dns01-route53", "dns01-manual". None for non-ACME certificates.
+    /// "dns01-route53", "dns01-aliyun", "dns01-manual". None for non-ACME
+    /// certificates.
     #[serde(default)]
     pub acme_method: Option<String>,
     /// Reference to a global DNS provider (dns_providers.id).
@@ -240,7 +241,7 @@ pub struct DnsProvider {
     pub id: String,
     /// User-friendly name (e.g. "OVH rwx-g.fr").
     pub name: String,
-    /// Provider type: "ovh", "cloudflare", "route53".
+    /// Provider type: "ovh", "cloudflare", "route53", "aliyun".
     pub provider_type: String,
     /// Encrypted JSON with provider credentials.
     pub config: String,

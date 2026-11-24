@@ -106,6 +106,12 @@
             acmeSubmitting = false;
             return;
           }
+        } else if (acmeDnsProvider === 'aliyun') {
+          if (!acmeDnsApiToken.trim() || !acmeDnsApiSecret.trim()) {
+            acmeError = 'AccessKey ID and AccessKey Secret are required for Alibaba Cloud DNS';
+            acmeSubmitting = false;
+            return;
+          }
         } else {
           if (!acmeDnsZoneId.trim() || !acmeDnsApiToken.trim()) {
             acmeError = 'Zone ID and API token are required for DNS-01';
@@ -277,7 +283,7 @@
           </label>
           <label class="radio-item">
             <input type="radio" bind:group={acmeMode} value="dns01" />
-            DNS-01 Automatic (Cloudflare, Route53, OVH)
+            DNS-01 Automatic (Cloudflare, Route53, OVH, Alibaba Cloud DNS)
           </label>
           <label class="radio-item">
             <input type="radio" bind:group={acmeMode} value="dns01-manual" />
@@ -308,6 +314,7 @@
               <option value="cloudflare">Cloudflare</option>
               <option value="route53">AWS Route53</option>
               <option value="ovh">OVH</option>
+              <option value="aliyun">Alibaba Cloud DNS</option>
             </select>
           </div>
           {#if acmeDnsProvider === 'ovh'}
@@ -331,6 +338,15 @@
                 <option value="api.us.ovhcloud.com">US (api.us.ovhcloud.com)</option>
               </select>
             </div>
+          {:else if acmeDnsProvider === 'aliyun'}
+            <div class="form-group">
+              <label for="acme-aliyun-key-id">AccessKey ID <span class="required">*</span></label>
+              <input id="acme-aliyun-key-id" type="text" bind:value={acmeDnsApiToken} placeholder="Alibaba Cloud DNS AccessKey ID" />
+            </div>
+            <div class="form-group">
+              <label for="acme-aliyun-key-secret">AccessKey Secret <span class="required">*</span></label>
+              <input id="acme-aliyun-key-secret" type="password" bind:value={acmeDnsApiSecret} placeholder="Alibaba Cloud DNS AccessKey secret" />
+            </div>
           {:else}
             <div class="form-group">
               <label for="acme-dns-zone-id">Zone ID <span class="required">*</span></label>
@@ -348,7 +364,7 @@
             {/if}
           {/if}
         {/if}
-        <span class="hint">Automated DNS-01 via Cloudflare, AWS Route53 or OVH API.</span>
+        <span class="hint">Automated DNS-01 via Cloudflare, AWS Route53, OVH or Alibaba Cloud DNS API.</span>
       {/if}
 
       {#if acmeMode === 'dns01-manual'}
