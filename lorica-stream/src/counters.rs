@@ -22,8 +22,9 @@
 //! the workers and writes the logs; nothing here is a metric name.
 //!
 //! Keyed families (end kinds, refusals, header outcomes, connect failure
-//! kinds, datagram drops) are maps filled on first use, so a snapshot
-//! carries only what happened; the word lists come from the enums
+//! kinds, datagram drops) count each key in a slot of its own, lock-free,
+//! and a snapshot carries only the keys that happened; the word lists
+//! come from the enums
 //! ([`StreamEndKind`], [`StreamRefusal`], [`ProxyHeaderOutcome::ALL`],
 //! [`ConnectFailureKind::ALL`], [`DatagramDropReason`],
 //! [`ClientHelloOutcome::ALL`], [`HandshakeOutcome::ALL`],
@@ -46,7 +47,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use lorica_config::models::{DatagramDropReason, StreamEndKind, StreamRefusal};
@@ -58,6 +59,25 @@ use crate::table::StreamTable;
 /// shape with an implicit `+Inf`.
 pub const CONNECT_LATENCY_BUCKETS_S: &[f64] =
     &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0];
+
+/// A fieldless enum counted by [`Keyed`], at the slot of its
+/// discriminant.
+trait Counted: Copy + Eq + Hash {
+    fn slot(self) -> usize;
+}
+
+/// The `lorica-config` enums counted here; their word lists are theirs.
+macro_rules! counted_by_discriminant {
+    ($($counted:ty),+) => {
+        $(impl Counted for $counted {
+            fn slot(self) -> usize {
+                self as usize
+            }
+        })+
+    };
+}
+
+counted_by_discriminant!(StreamEndKind, StreamRefusal, DatagramDropReason);
 
 /// Declares an enum counted here from one list of `Variant => "word"`
 /// lines. Its `ALL` and its `as_str` come from that list, so a variant
@@ -91,6 +111,12 @@ macro_rules! counted_enum {
                 match self {
                     $(Self::$variant => $word,)+
                 }
+            }
+        }
+
+        impl Counted for $name {
+            fn slot(self) -> usize {
+                self as usize
             }
         }
 
@@ -253,31 +279,70 @@ impl UpstreamTlsFailure {
 /// edge re-arms, in percent (Story 12.5 D-n).
 pub const CEILING_REARM_PERCENT: u64 = 90;
 
-/// A map of counts keyed by an enum, filled on first use.
+/// The slots of a [`Keyed`] family.
+const KEYED_SLOTS: usize = 32;
+
+/// Counts keyed by an enum, filled on first use. A key is counted at the
+/// slot of its discriminant, which takes no lock and allocates nothing
+/// (Phase 1 audit C24): a flood of refusals or dropped datagrams pays one
+/// atomic add each. A key past the slots is counted under the overflow
+/// lock, so an enum that outgrows them loses nothing.
 #[derive(Debug)]
-struct Keyed<K>(Mutex<HashMap<K, u64>>);
+struct Keyed<K> {
+    slots: [Slot<K>; KEYED_SLOTS],
+    overflow: Mutex<HashMap<K, u64>>,
+}
+
+#[derive(Debug)]
+struct Slot<K> {
+    /// Set by the slot's first count, so the snapshot can name it.
+    key: OnceLock<K>,
+    count: AtomicU64,
+}
 
 impl<K> Default for Keyed<K> {
     fn default() -> Self {
-        Keyed(Mutex::new(HashMap::new()))
+        Keyed {
+            slots: std::array::from_fn(|_| Slot {
+                key: OnceLock::new(),
+                count: AtomicU64::new(0),
+            }),
+            overflow: Mutex::new(HashMap::new()),
+        }
     }
 }
 
-impl<K: Copy + Eq + Hash> Keyed<K> {
+impl<K: Counted> Keyed<K> {
     fn add(&self, key: K) {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(key)
-            .or_default() += 1;
+        match self.slots.get(key.slot()) {
+            Some(slot) => {
+                slot.key.get_or_init(|| key);
+                bump(&slot.count);
+            }
+            None => {
+                *self
+                    .overflow
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entry(key)
+                    .or_default() += 1;
+            }
+        }
     }
 
     fn snapshot(&self) -> HashMap<K, u64> {
-        self.0
+        let mut counts = self
+            .overflow
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .clone();
+        counts.extend(self.slots.iter().filter_map(|slot| {
+            let count = get(&slot.count);
+            // A count seen before its key waits for the next snapshot.
+            let key = slot.key.get().filter(|_| count > 0)?;
+            Some((*key, count))
+        }));
+        counts
     }
 }
 
@@ -974,6 +1039,30 @@ mod tests {
         assert_eq!((snap.datagrams_upload, snap.bytes_upload), (1, 40));
         assert_eq!((snap.datagrams_download, snap.bytes_download), (2, 500));
         assert_eq!(snap.dropped[&DatagramDropReason::ResponseCountBound], 1);
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    enum Spread {
+        First,
+        PastTheSlots = KEYED_SLOTS as isize,
+    }
+
+    impl Counted for Spread {
+        fn slot(self) -> usize {
+            self as usize
+        }
+    }
+
+    #[test]
+    fn a_key_past_the_slots_is_still_counted() {
+        let keyed = Keyed::default();
+        keyed.add(Spread::First);
+        keyed.add(Spread::PastTheSlots);
+        keyed.add(Spread::PastTheSlots);
+        assert_eq!(
+            keyed.snapshot(),
+            HashMap::from([(Spread::First, 1), (Spread::PastTheSlots, 2)])
+        );
     }
 
     #[test]
