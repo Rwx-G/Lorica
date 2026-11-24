@@ -27,13 +27,15 @@
 //!       32    _pad0              [u8; 32]                 32
 //!       64    rate_counters      AtomicHashTable<N>   N * 64
 //!      ...    waf_auto_ban       AtomicHashTable<N>   N * 64
+//!      ...    stream_breakers    BreakerStates        B * 32
 //! ```
 //!
 //! The padding to offset 64 is enforced by `#[repr(C, align(64))]` on
-//! both this struct and `AtomicHashTable`. N is fixed at compile time
-//! to [`WAF_SLOTS`]; any change to N, to the struct layout, or to the
-//! ABI of `Slot` must bump [`LAYOUT_VERSION`] and be documented in
-//! `docs/BUMP-CHECKLIST.md`.
+//! this struct, `AtomicHashTable` and `BreakerStates`. N is fixed at
+//! compile time to [`WAF_SLOTS`] and B to
+//! [`BREAKER_SLOTS`](crate::BREAKER_SLOTS); any change to either, to the
+//! struct layout, or to the ABI of `Slot` or `BreakerCell` must bump
+//! [`LAYOUT_VERSION`] and be documented in `docs/BUMP-CHECKLIST.md`.
 
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
@@ -41,6 +43,7 @@ use nix::errno::Errno;
 use nix::sys::mman::{mmap, MapFlags, ProtFlags};
 use std::num::NonZeroUsize;
 
+use crate::breaker::{BreakerKey, BreakerStates};
 use crate::hash::random_key;
 use crate::table::AtomicHashTable;
 
@@ -49,8 +52,9 @@ use crate::table::AtomicHashTable;
 pub const MAGIC: u64 = 0x4c4f_5249_4341_5348;
 
 /// Current layout version. Bumped on any change to the binary ABI of
-/// [`SharedRegion`] or its tables.
-pub const LAYOUT_VERSION: u32 = 1;
+/// [`SharedRegion`] or its tables. Version 2 (1.11.0) appended
+/// [`SharedRegion::stream_breakers`].
+pub const LAYOUT_VERSION: u32 = 2;
 
 /// Number of slots per WAF table, 64 bytes each. Must be a power of two.
 ///
@@ -96,6 +100,11 @@ pub struct SharedRegion {
     /// Each client's WAF violations, bumped by the workers, read and
     /// reset by the supervisor's auto-ban.
     pub waf_auto_ban: AtomicHashTable<WAF_SLOTS>,
+    /// The stream circuit states the supervisor's breaker registry
+    /// publishes and the workers' stream admissions read (Story 12.3
+    /// D-g): written by the supervisor alone, keyed through
+    /// [`SharedRegion::breaker_key`].
+    pub stream_breakers: BreakerStates,
 }
 
 // Sanity-check layout at compile time so accidental reordering is caught.
@@ -199,6 +208,12 @@ impl SharedRegion {
     pub fn tagged(&self, raw: u64) -> u64 {
         crate::table::tagged_hash(crate::hash::siphash13_u64(self.hash_key, raw))
     }
+
+    /// The [`stream_breakers`](Self::stream_breakers) key of the circuit
+    /// of `backend` under `route_id`, hashed with this region's key.
+    pub fn breaker_key(&self, route_id: &str, backend: &str) -> BreakerKey {
+        BreakerKey::new(self.hash_key, route_id, backend)
+    }
 }
 
 /// # Safety
@@ -298,11 +313,31 @@ mod tests {
     }
 
     #[test]
-    fn layout_is_exactly_16_mib_plus_header() {
-        // Two tables × 128 Ki slots × 64 B = 16 MiB. Plus the 64 B
-        // header cache line. Repr enforces; assert at runtime anyway.
-        let expected = 64 + 2 * WAF_SLOTS * 64;
+    fn layout_is_the_header_and_the_three_tables() {
+        // Two tables × 128 Ki slots × 64 B = 16 MiB, the breaker table's
+        // 32-byte cells, and the 64 B header cache line. Repr enforces;
+        // assert at runtime anyway.
+        let expected = 64 + 2 * WAF_SLOTS * 64 + crate::BREAKER_SLOTS * 32;
         assert_eq!(REGION_SIZE, expected);
+    }
+
+    #[test]
+    fn a_breaker_state_the_supervisor_publishes_reads_back_in_the_worker_mapping() {
+        use crate::BreakerState;
+        let (sup, fd) = SharedRegion::create_supervisor().expect("create");
+        let dup_fd = nix::unistd::dup(&fd).expect("dup").into_raw_fd();
+        let worker = unsafe { SharedRegion::open_worker(dup_fd) }.expect("worker open");
+        let key = worker.breaker_key("stream:s1", "192.0.2.10:5432");
+        assert_eq!(key, sup.breaker_key("stream:s1", "192.0.2.10:5432"));
+        assert_eq!(
+            worker.stream_breakers.lookup(key),
+            Some(BreakerState::Closed)
+        );
+        let open = BreakerState::Open {
+            until_ns: crate::now_ns() + 10_000_000_000,
+        };
+        assert!(sup.stream_breakers.publish(key, open));
+        assert_eq!(worker.stream_breakers.lookup(key), Some(open));
     }
 
     #[test]

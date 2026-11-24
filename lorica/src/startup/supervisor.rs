@@ -638,8 +638,9 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // admitted and report back the outcome; the supervisor owns
         // the Closed/Open/HalfOpen state machine so probe admission
         // never races across workers. See design § 7 WPAR-3.
-        let breaker_registry: Arc<SupervisorBreakerRegistry> =
-            Arc::new(SupervisorBreakerRegistry::new(5, Duration::from_secs(10)));
+        let breaker_registry: Arc<SupervisorBreakerRegistry> = Arc::new(
+            SupervisorBreakerRegistry::new(5, Duration::from_secs(10)).publishing_to(shmem_region),
+        );
 
         // Shared shutdown flag. Set by the SIGTERM handler before
         // `manager.shutdown_all()` so the worker monitor short-circuits
@@ -2562,6 +2563,11 @@ struct SupervisorBreakerRegistry {
     /// set once the alert channel and the stream plane exist, after the
     /// first RPC handlers already hold the registry.
     stream_alerts: std::sync::OnceLock<Arc<lorica::stream_alerts::StreamAlerts>>,
+    /// Where the state of every stream circuit is published for the
+    /// workers' admissions (Story 12.3 D-g, amended 2026-11-24): the
+    /// shared region they map. `None` publishes nothing, and every
+    /// admission keeps asking.
+    published: Option<&'static lorica_shmem::SharedRegion>,
 }
 
 impl SupervisorBreakerRegistry {
@@ -2571,6 +2577,50 @@ impl SupervisorBreakerRegistry {
             failure_threshold,
             cooldown,
             stream_alerts: std::sync::OnceLock::new(),
+            published: None,
+        }
+    }
+
+    /// Publish every state change of a stream circuit into `region`'s
+    /// [`lorica_shmem::BreakerStates`], so a worker admits on a closed
+    /// circuit and refuses on an open one inside its cooldown without a
+    /// round trip.
+    fn publishing_to(mut self, region: &'static lorica_shmem::SharedRegion) -> Self {
+        self.published = Some(region);
+        self
+    }
+
+    /// Write `state`, the new state of a stream circuit, where the
+    /// workers read it. Called under the entry's lock, before the answer
+    /// to the query or report that changed it leaves: a worker's awaited
+    /// failure report returns only once its effect is readable.
+    fn publish(&self, route_id: &str, backend: &str, state: SupervisorBreakerState) {
+        let Some(region) = self.published else {
+            return;
+        };
+        if !route_id.starts_with(lorica::stream_engine::STREAM_BREAKER_PREFIX) {
+            return;
+        }
+        let published = match state {
+            SupervisorBreakerState::Closed => lorica_shmem::BreakerState::Closed,
+            SupervisorBreakerState::Open { opened_at } => {
+                // The time left is taken before the clock is read, so the
+                // published end is never earlier than this registry's.
+                let left = self.cooldown.saturating_sub(opened_at.elapsed());
+                lorica_shmem::BreakerState::Open {
+                    until_ns: lorica_shmem::now_ns()
+                        .saturating_add(u64::try_from(left.as_nanos()).unwrap_or(u64::MAX)),
+                }
+            }
+            SupervisorBreakerState::HalfOpen { .. } => lorica_shmem::BreakerState::HalfOpen,
+        };
+        let key = region.breaker_key(route_id, backend);
+        if !region.stream_breakers.publish(key, published) {
+            tracing::warn!(
+                route_id,
+                backend,
+                "stream breaker state not published: its table window is full;                  admissions of this circuit keep asking the supervisor"
+            );
         }
     }
 
@@ -2619,7 +2669,8 @@ impl SupervisorBreakerRegistry {
             })
         });
         let mut guard = entry.value().lock();
-        match guard.state {
+        let before = guard.state;
+        let decision = match guard.state {
             SupervisorBreakerState::Closed => lorica_command::BreakerDecision::Allow,
             SupervisorBreakerState::Open { opened_at } => {
                 if opened_at.elapsed() >= self.cooldown {
@@ -2662,7 +2713,11 @@ impl SupervisorBreakerRegistry {
                     Some(_) => lorica_command::BreakerDecision::Deny,
                 }
             }
+        };
+        if guard.state != before {
+            self.publish(route_id, backend, guard.state);
         }
+        decision
     }
 
     /// Update breaker state after a worker reports the outcome. Returns
@@ -2677,6 +2732,7 @@ impl SupervisorBreakerRegistry {
             })
         });
         let mut guard = entry.value().lock();
+        let before = guard.state;
         let was_closed = matches!(guard.state, SupervisorBreakerState::Closed);
         if success {
             guard.consecutive_failures = 0;
@@ -2700,6 +2756,9 @@ impl SupervisorBreakerRegistry {
                     opened_at: Instant::now(),
                 };
             }
+        }
+        if guard.state != before {
+            self.publish(route_id, backend, guard.state);
         }
         was_closed && matches!(guard.state, SupervisorBreakerState::Open { .. })
     }
@@ -3510,6 +3569,15 @@ mod supervisor_tests {
     /// serves breaker traffic from `registry`, as the supervisor's RPC
     /// loop does.
     fn breaker_rpc_worker(registry: Arc<SupervisorBreakerRegistry>) -> lorica_command::RpcEndpoint {
+        counted_breaker_rpc_worker(registry, Arc::default())
+    }
+
+    /// [`breaker_rpc_worker`], counting in `queries` every breaker query
+    /// that reaches the supervisor end.
+    fn counted_breaker_rpc_worker(
+        registry: Arc<SupervisorBreakerRegistry>,
+        queries: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> lorica_command::RpcEndpoint {
         let (supervisor_end, worker_end) =
             tokio::net::UnixStream::pair().expect("test setup: UnixStream::pair");
         let (supervisor_ep, mut supervisor_incoming) =
@@ -3520,6 +3588,7 @@ mod supervisor_tests {
             while let Some(inc) = supervisor_incoming.recv().await {
                 match inc.command_type() {
                     lorica_command::CommandType::BreakerQuery => {
+                        queries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         handle_breaker_query(inc, &registry).await
                     }
                     lorica_command::CommandType::BreakerReport => {
@@ -3542,27 +3611,7 @@ mod supervisor_tests {
         const STREAM_ID: &str = "6f1c1a52-5b0e-4f7e-9a51-1a7c5a1b2c3d";
         const ROUTE_ID: &str = "0b7e3c2a-1d4f-4e5a-8b6c-7d8e9f0a1b2c";
         let registry = Arc::new(SupervisorBreakerRegistry::new(5, Duration::from_secs(10)));
-        let backend = lorica_config::models::Backend {
-            id: "b1".into(),
-            address: "192.0.2.10:5432".into(),
-            name: "b1".into(),
-            group_name: String::new(),
-            weight: 1,
-            health_status: lorica_config::models::HealthStatus::Healthy,
-            health_check_enabled: false,
-            health_check_interval_s: 10,
-            health_check_path: None,
-            health_check: lorica_config::models::HealthCheck::TcpConnect,
-            lifecycle_state: lorica_config::models::LifecycleState::Normal,
-            active_connections: 0,
-            tls_upstream: false,
-            tls_skip_verify: false,
-            tls_sni: None,
-            h2_upstream: false,
-            managed_by: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
+        let backend = stream_backend();
 
         let workers: Vec<(StreamBreakerGate, lorica::proxy_wiring::BreakerEngine)> = (0..2)
             .map(|_| {
@@ -3618,6 +3667,220 @@ mod supervisor_tests {
             registry.query(ROUTE_ID, &backend.address),
             lorica_command::BreakerDecision::Allow
         );
+    }
+
+    /// The one backend of the stream breaker tests.
+    fn stream_backend() -> lorica_config::models::Backend {
+        lorica_config::models::Backend {
+            id: "b1".into(),
+            address: "192.0.2.10:5432".into(),
+            name: "b1".into(),
+            group_name: String::new(),
+            weight: 1,
+            health_status: lorica_config::models::HealthStatus::Healthy,
+            health_check_enabled: false,
+            health_check_interval_s: 10,
+            health_check_path: None,
+            health_check: lorica_config::models::HealthCheck::TcpConnect,
+            lifecycle_state: lorica_config::models::LifecycleState::Normal,
+            active_connections: 0,
+            tls_upstream: false,
+            tls_skip_verify: false,
+            tls_sni: None,
+            h2_upstream: false,
+            managed_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    const PUBLISHED_STREAM_ID: &str = "3a9d1c7e-2b4f-4c8a-9e1d-5f6a7b8c9d0e";
+
+    /// Two workers' stream gates over one registry that publishes into a
+    /// fresh shared region, as the supervisor's does: each gate reads the
+    /// region through a mapping of its own, as a forked worker does, and
+    /// asks over an RPC endpoint of its own. Every breaker query that
+    /// reaches the registry is counted in `queries`.
+    struct PublishedWorkers {
+        registry: Arc<SupervisorBreakerRegistry>,
+        region: &'static lorica_shmem::SharedRegion,
+        gates: Vec<lorica::stream_engine::StreamBreakerGate>,
+        queries: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PublishedWorkers {
+        fn new(threshold: u32, cooldown: Duration) -> Self {
+            use std::os::fd::IntoRawFd;
+            let (region, fd) =
+                lorica_shmem::SharedRegion::create_supervisor().expect("test setup: region");
+            let registry =
+                Arc::new(SupervisorBreakerRegistry::new(threshold, cooldown).publishing_to(region));
+            let queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let gates = (0..2)
+                .map(|_| {
+                    let worker_fd = fd.try_clone().expect("test setup: dup").into_raw_fd();
+                    // SAFETY: a fresh duplicate of the region's own memfd,
+                    // owned by nothing else.
+                    let mapping = unsafe { lorica_shmem::SharedRegion::open_worker(worker_fd) }
+                        .expect("test setup: worker mapping");
+                    let gate =
+                        lorica::stream_engine::StreamBreakerGate::new().reading_published(mapping);
+                    gate.install(lorica::proxy_wiring::BreakerEngine::rpc(
+                        counted_breaker_rpc_worker(Arc::clone(&registry), Arc::clone(&queries)),
+                        Duration::from_millis(500),
+                    ));
+                    gate
+                })
+                .collect();
+            PublishedWorkers {
+                registry,
+                region,
+                gates,
+                queries,
+            }
+        }
+
+        fn queries(&self) -> usize {
+            self.queries.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn admit(&self, worker: usize) -> lorica_stream::Admission {
+            use lorica_stream::BreakerGate;
+            self.gates[worker]
+                .admit(PUBLISHED_STREAM_ID, &stream_backend())
+                .await
+        }
+
+        async fn record(&self, worker: usize, success: bool, was_probe: bool) {
+            use lorica_stream::BreakerGate;
+            self.gates[worker]
+                .record(PUBLISHED_STREAM_ID, &stream_backend(), success, was_probe)
+                .await
+        }
+
+        /// Admit from `worker` until it answers `expected`, for at most
+        /// `within`.
+        async fn admits_within(
+            &self,
+            worker: usize,
+            expected: lorica_stream::Admission,
+            within: Duration,
+        ) -> bool {
+            let deadline = tokio::time::Instant::now() + within;
+            loop {
+                if self.admit(worker).await == expected {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closed_stream_circuit_admits_in_every_worker_without_a_round_trip() {
+        use lorica_stream::Admission;
+        let w = PublishedWorkers::new(5, Duration::from_secs(10));
+        // Failures below the threshold leave the circuit closed.
+        w.record(0, false, false).await;
+        w.record(1, false, false).await;
+        for _ in 0..50 {
+            for worker in 0..2 {
+                assert_eq!(w.admit(worker).await, Admission::Allow);
+            }
+        }
+        assert_eq!(w.queries(), 0, "a closed circuit is admitted locally");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_stream_circuit_refuses_in_every_worker_without_a_round_trip() {
+        use lorica_stream::Admission;
+        const ROUTE_ID: &str = "0b7e3c2a-1d4f-4e5a-8b6c-7d8e9f0a1b2c";
+        let w = PublishedWorkers::new(5, Duration::from_secs(10));
+        for _ in 0..3 {
+            w.record(0, false, false).await;
+        }
+        for _ in 0..2 {
+            w.record(1, false, false).await;
+        }
+        for _ in 0..50 {
+            for worker in 0..2 {
+                assert_eq!(w.admit(worker).await, Admission::Deny);
+            }
+        }
+        assert_eq!(
+            w.queries(),
+            0,
+            "an open circuit inside its cooldown is refused locally"
+        );
+        // HTTP keeps asking: a route's circuit is never published.
+        for _ in 0..5 {
+            w.registry
+                .report_outcome(ROUTE_ID, &stream_backend().address, false, false);
+        }
+        assert_eq!(
+            w.registry.query(ROUTE_ID, &stream_backend().address),
+            lorica_command::BreakerDecision::Deny
+        );
+        let route_key = w.region.breaker_key(ROUTE_ID, &stream_backend().address);
+        assert_eq!(
+            w.region.stream_breakers.lookup(route_key),
+            Some(lorica_shmem::BreakerState::Closed)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_circuit_one_worker_opens_is_refused_by_the_other_at_its_next_admission() {
+        use lorica_stream::Admission;
+        let w = PublishedWorkers::new(1, Duration::from_secs(10));
+        assert_eq!(w.admit(1).await, Admission::Allow);
+        // The failure report is awaited, and the supervisor publishes
+        // before it answers: no window is left for the other worker.
+        w.record(0, false, false).await;
+        assert_eq!(w.admit(1).await, Admission::Deny);
+        assert_eq!(w.queries(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_half_open_probe_stays_single_across_two_workers_and_its_success_closes_for_both() {
+        use lorica_stream::Admission;
+        let cooldown = Duration::from_millis(50);
+        let w = PublishedWorkers::new(1, cooldown);
+        w.record(0, false, false).await;
+        assert_eq!(w.admit(1).await, Admission::Deny);
+        assert_eq!(w.queries(), 0);
+
+        // Past the cooldown both workers ask, and the supervisor grants
+        // one probe.
+        tokio::time::sleep(cooldown + Duration::from_millis(20)).await;
+        let (first, second) = tokio::join!(w.admit(0), w.admit(1));
+        let mut answers = [first, second];
+        answers.sort_by_key(|a| *a == Admission::AllowProbe);
+        assert_eq!(answers, [Admission::Deny, Admission::AllowProbe]);
+        assert_eq!(w.queries(), 2, "past the cooldown the supervisor decides");
+        let prober = if first == Admission::AllowProbe { 0 } else { 1 };
+        // While the probe is out the circuit is half-open: still asked,
+        // still refused.
+        assert_eq!(w.admit(1 - prober).await, Admission::Deny);
+        assert_eq!(w.queries(), 3);
+
+        // The probe's success report is not awaited (C9); once it lands,
+        // both workers admit locally again.
+        w.record(prober, true, true).await;
+        for worker in 0..2 {
+            assert!(
+                w.admits_within(worker, Admission::Allow, Duration::from_secs(2))
+                    .await,
+                "worker {worker} never saw the circuit close"
+            );
+        }
+        let settled = w.queries();
+        for worker in 0..2 {
+            assert_eq!(w.admit(worker).await, Admission::Allow);
+        }
+        assert_eq!(w.queries(), settled, "closed again, admitted locally");
     }
 
     /// A worker on the far end of a real RPC socketpair that answers

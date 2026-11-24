@@ -238,7 +238,13 @@ pub(crate) fn run_worker(
             "started without --reserved-ports; stream connects refuse only the stream listen ports"
         );
     }
-    let stream_breaker = Arc::new(lorica::stream_engine::StreamBreakerGate::new());
+    // Admissions read the circuit states the supervisor publishes in the
+    // shared region, and ask it only to arbitrate a probe (Story 12.3
+    // D-g, amended 2026-11-24).
+    let stream_breaker = Arc::new(match shmem_region {
+        Some(region) => lorica::stream_engine::StreamBreakerGate::new().reading_published(region),
+        None => lorica::stream_engine::StreamBreakerGate::new(),
+    });
     // Open a LogStore so the worker can persist access logs, WAF events
     // and stream rows directly (with route_hostname and action stamped).
     // SQLite WAL mode allows concurrent writes from multiple worker

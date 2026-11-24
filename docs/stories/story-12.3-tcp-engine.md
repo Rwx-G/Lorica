@@ -456,6 +456,11 @@ breaker is open, round robin's state advances past a denied backend,
 so the distribution over the others is very slightly uneven during the
 cooldown.
 
+*Note (2026-11-24):* since D-g's amendment of the same date, a
+connection makes no RPC in the common case: the admission reads the
+state the supervisor publishes and asks only when a probe is to be
+arbitrated.
+
 **Candidates** for an attempt: backends linked to the stream, primary
 or backup per D-f, with `health_status != Down`, `lifecycle_state ==
 Normal`, a known resolved address (D-n), not refused as local (D-m),
@@ -521,6 +526,53 @@ stream's algorithm among themselves.
   can leave that admission to see the circuit as it was a moment
   before. The local breaker of single-process mode records inline, as
   before.
+- **Admissions read published states** (amended 2026-11-24, Story
+  12.12 Lot M's post-audit performance run; supersedes Phase 1 audit
+  triage decision 9, "no worker-local breaker cache unless a
+  measurement requires it", pending the maintainer's review). The run
+  left connect p99 against nginx at 1.44 with a 95 % interval of
+  [1.285, 1.642] against the 1.5 threshold, inconclusive, and Lorica's
+  connect median at about 173 us against nginx's 97 us, unmoved by the
+  audit fixes: the admission was the one supervisor round trip left in
+  front of every connect. Decision: the supervisor's registry publishes
+  the state of every `stream:` circuit, after each change of state and
+  before it answers the query or report that changed it, in a third
+  table of the shared region every worker already maps
+  (`SharedRegion::stream_breakers`, `lorica-shmem/src/breaker.rs`;
+  the region's `LAYOUT_VERSION` moves to 2). In worker mode, while the
+  gate's engine is the supervisor's, an admission reads that state
+  first: closed, or never published, admits; open before its cooldown
+  end refuses with the same `Deny`, so the same refusal reason and
+  counters; open past its cooldown end, half-open, or a key the table
+  cannot hold asks the supervisor as before, which still arbitrates the
+  single probe. Failure reports stay awaited (C9). The registry stays
+  the only state machine and the only writer; the worker keeps no copy
+  and no TTL.
+  *Staleness bound:* a worker can still admit a circuit the supervisor
+  has opened only between the registry's state change and its publish
+  store, both under the entry's lock with no await between them, so
+  sub-microsecond; the reporting worker's own next admission always
+  sees it (its failure report is awaited, and the publish precedes the
+  answer), and the other workers see it from their next admission. A
+  probe's success is seen once its unawaited report lands; until then
+  the circuit reads half-open and admissions ask.
+  *Why shared memory and not pushed transitions:* a push over each
+  worker's channel would need a new command, a per-worker cache, and an
+  ordering argument between the push and the failure report's answer;
+  its staleness would be a channel's latency under load, not a lock's
+  width. The shared region is mapped by every worker from its first
+  instruction, and its one writer needs no protocol.
+  *Why the WAF region and not the stream-caps region or a new one:*
+  the caps regions are per stream and regenerated with a cap edit, so
+  the supervisor would have to re-publish into every new generation;
+  the WAF region is node-wide, lives exactly as long as the registry,
+  and already reaches every worker, so no new descriptor travels.
+  *What it gives up:* HTTP is not changed and keeps one query per
+  request (a separate decision); the table holds the circuits that
+  opened at least once since the supervisor started and never frees a
+  cell, so past half its capacity a newly opened circuit may find its
+  window full and keeps its round trip (logged); and the region grows
+  by the table (`BREAKER_SLOTS` cells of 32 bytes).
 
 ### D-h. Retry semantics
 
@@ -2022,3 +2074,4 @@ Lot B:
 | 2026-11-24 | 0.15 | Phase 1 audit lot C, finding C9: D-g amended, a breaker success report is no longer awaited in worker mode. | Romain G. |
 | 2026-11-24 | 0.16 | Phase 1 audit, model and token boundary lot: C4 landed, a token's address change on a backend any stream links is a 403, flag or not (dated note under D-m); C5, the cloud instance metadata addresses outside link-local need `allow_local_backend` under rule A, at validation and at connect, while rule B leaves them alone (dated note under D-m). | Romain G. |
 | 2026-11-24 | 0.17 | Phase 1 audit, shared PROXY accept vectors: a trusted peer that sends no header counts `refused_missing`, aligned with the HTTP listeners' `missing` (dated note under D-k). | Romain G. |
+| 2026-11-24 | 0.18 | D-g amended after Story 12.12 Lot M's post-audit run: in worker mode a stream admission reads the circuit state the supervisor publishes in the shared region, and asks only to have a probe arbitrated (supersedes triage decision 9 pending the maintainer's review). | Romain G. |

@@ -256,6 +256,7 @@ pub struct SharedRegion {
 
     pub rate_counters: AtomicHashTable<128 * 1024>,  // 8 MiB, § 6 (c)
     pub waf_auto_ban:  AtomicHashTable<128 * 1024>,  // 8 MiB, § 6 (a)
+    pub stream_breakers: BreakerStates,              // BREAKER_SLOTS x 32 B, § 7 WPAR-3
 }
 
 #[repr(C, align(64))]
@@ -280,7 +281,8 @@ pub struct Slot {
 
 Three atomics = 24 B of data, padded to a 64 B cache line per slot
 (`align(64)` on `Slot`). Total: 64 B * 128K slots * 2 tables =
-16 MiB. Still trivial.
+16 MiB, plus the stream breaker table's `BREAKER_SLOTS` cells of 32 B
+(added in v1.11.0, § 7 WPAR-3). Still trivial.
 
 Note: earlier drafts carried a `version` seqlock field so readers
 could observe (`value`, `last_update_ns`) atomically. The seqlock
@@ -576,6 +578,62 @@ state machine; on success after `ALLOW_PROBE`, the breaker closes.
 Supervisor reuses the existing scoped breaker logic, just relocated
 behind the RPC boundary.
 
+**Stream admissions read published states (v1.11.0, Story 12.3 D-g,
+amended 2026-11-24).** HTTP still asks on every request. For the stream
+plane, one query per connection put a supervisor round trip in front of
+every connect, which Story 12.12's connect p99 against nginx could not
+absorb. The supervisor therefore publishes the state of every stream
+circuit (`stream:<id>` keys only) in `SharedRegion::stream_breakers`
+(`lorica-shmem/src/breaker.rs`), and a worker's stream admission reads
+it before asking:
+
+| Published state | Worker's answer | Round trip |
+|---|---|---|
+| `Closed`, or the key never published | admit | none |
+| `Open`, now before its cooldown end | refuse (the same `Deny`, so the same refusal and counters) | none |
+| `Open` past its cooldown end, or `HalfOpen` | ask, as before: the supervisor grants the one probe | one |
+| not in the table (its probe window full of other keys) | ask, as before | one |
+
+*Writer and cells.* The registry is the only writer. It publishes under
+the lock of the entry it changed, after every change of state (a closed
+circuit that stays closed publishes nothing), and before it answers the
+query or report that caused the change. A cell holds the key's tagged
+hash, a second independent hash a lookup also compares (so a circuit of
+one stream never answers for another's), and one state word packing the
+state with the end of an open circuit's cooldown, so a reader cannot see
+the one without the other and no seqlock is needed. A key gets a cell
+the first time its circuit leaves `Closed` and keeps it for the
+supervisor's life; nothing frees a cell, which is what lets a lookup
+stop at the first free cell of its window and read the key as never
+opened. The table's `BREAKER_SLOTS` cells hold every (stream, backend)
+circuit that opened at least once since the supervisor started; past
+half load a new key's
+window may be full, which costs that circuit its round trip, never a
+wrong answer, and logs a warning.
+
+*Staleness bound.* A worker reads the supervisor's state as of the
+moment it loads the cell. The only window in which a worker can still
+admit a circuit the supervisor has opened is between the registry's
+state change and its publish store: both happen under the entry's lock
+with no await between them, so it lasts the duration of a hash and a
+few stores, sub-microsecond, and it is the same race a query reaching
+the registry an instant before the failing report had before. There is
+no cache TTL and no poll. The worker that reported the failure awaits
+its report (C9), so its own next admission always sees the open
+circuit. In the other direction a closed circuit is seen once the
+probe's success report lands, which C9 leaves unawaited; until then the
+circuit reads half-open and admissions ask, as they did. The cooldown
+end is computed from the registry's own instant, read before the shared
+clock, so a local refusal never outlasts the registry's cooldown by more
+than the gap between two clock reads.
+
+*Before the region, and without a supervisor.* A worker with no region
+(none received) or no RPC engine (it fell back to its local breaker)
+asks its engine as before. If the supervisor dies, a worker keeps
+reading the last published states: closed circuits admit, open ones
+refuse until their cooldown ends and then ask, which fails open as any
+breaker RPC does.
+
 ### WPAR-7 (metrics pull)
 
 `/metrics` handler issues a `MetricsRequest` to every worker via
@@ -788,7 +846,7 @@ Stated explicitly so reviewers can sanity-check.
 
 | Failure | Behaviour |
 |---|---|
-| Supervisor crashes, worker keeps running | Worker RPCs time out (500 ms). Worker falls back to local-only cached state for verdict/breaker/rate-limit. Shmem reads still succeed (region persists). Supervisor restart re-forks workers. |
+| Supervisor crashes, worker keeps running | Worker RPCs time out (500 ms). Worker falls back to local-only cached state for verdict/breaker/rate-limit. Shmem reads still succeed (region persists), stream breaker states included: the last published state answers, and an open circuit past its cooldown asks and fails open (§ 7 WPAR-3). Supervisor restart re-forks workers. |
 | Worker crashes, supervisor keeps running | Supervisor restarts the worker (existing crash backoff). Worker restarts with empty local caches. Shmem state survives. Authoritative state on supervisor unaffected. |
 | Channel goes silent (UDS broken) but processes alive | RPC requests time out. Worker logs warn + falls back. Supervisor's worker monitor will eventually kill + respawn the worker. |
 | Shmem layout mismatch (binary upgrade with new layout) | Supervisor refuses to mmap a region with a different `magic` / `layout_version`, logs error, exits. systemd restarts; new layout fresh. |

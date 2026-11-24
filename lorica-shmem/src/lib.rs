@@ -19,7 +19,10 @@
 //! memfd region shared between the supervisor and all worker processes,
 //! containing two fixed-layout atomic hashtables: the per-client WAF
 //! auto-ban counts, and the windowed counts ([`WindowedCount`]) behind
-//! the rate-limit auto-ban and the flood defence's proxy-wide rate.
+//! the rate-limit auto-ban and the flood defence's proxy-wide rate. A
+//! third table, [`BreakerStates`], carries the stream circuit states the
+//! supervisor's breaker registry publishes, so a worker's stream
+//! admission asks the supervisor only when a probe is to be arbitrated.
 //!
 //! The entry point is [`SharedRegion`]:
 //!
@@ -55,6 +58,7 @@
 #![warn(clippy::all)]
 #![cfg(target_os = "linux")]
 
+pub mod breaker;
 pub mod eviction;
 pub mod hash;
 pub mod region;
@@ -62,6 +66,7 @@ pub mod stream_caps;
 pub mod table;
 pub mod window;
 
+pub use breaker::{BreakerKey, BreakerState, BreakerStates, BREAKER_SLOTS};
 pub use eviction::{evict_once, EvictionStats, DEFAULT_SCAN_INTERVAL, DEFAULT_STALE_AFTER};
 pub use hash::{random_key, siphash13_u64};
 pub use region::{SharedRegion, SharedRegionError, LAYOUT_VERSION, MAGIC, REGION_SIZE, WAF_SLOTS};

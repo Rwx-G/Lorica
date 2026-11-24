@@ -26,7 +26,9 @@
 //! - [`StreamBreakerGate`]: the process's [`BreakerEngine`], HTTP's
 //!   registry, keyed `stream:<id>` (D-g). The slot is late-bound
 //!   because a worker creates its RPC endpoint after its stream runtime;
-//!   an empty slot admits, the fail-open policy of an RPC failure.
+//!   an empty slot admits, the fail-open policy of an RPC failure. In
+//!   worker mode an admission reads the supervisor's published circuit
+//!   state first and asks only to have a probe arbitrated.
 //! - [`HickoryResolve`]: `hickory-resolver` from the system
 //!   configuration with the hosts file, which returns the record TTLs a
 //!   TTL-bounded schedule needs (D-n).
@@ -56,6 +58,7 @@ use lorica_config::listen_ports::ReservedPorts;
 use lorica_config::models::StreamRefusal;
 use lorica_config::models::{Backend, Certificate, LoadBalancing, Stream};
 use lorica_geoip::GeoIpResolver;
+use lorica_shmem::BreakerState;
 use lorica_stream::seams::SeamFuture;
 use lorica_stream::{
     Admission, BackendSelector, BreakerGate, Candidate, ClientIdentity, ConnectionObserver,
@@ -271,13 +274,18 @@ impl BackendSelector for StreamSelector {
 /// With [`StreamBreakerGate::with_alerts`] (single-process mode, whose
 /// breaker is this process's own) a circuit a stream's failure opens
 /// raises `stream_backend_down` (Story 12.9 D-h). In worker mode the
-/// registry, and so the alert, is the supervisor's: an admission and a
-/// failure report wait for their answer (D-g), a success report is sent
-/// from a task of its own and waits for nothing.
+/// registry, and so the alert, is the supervisor's: a failure report
+/// waits for its answer (D-g), a success report is sent from a task of
+/// its own and waits for nothing. An admission reads the state the
+/// supervisor publishes in the shared region
+/// ([`StreamBreakerGate::reading_published`]) and asks the supervisor
+/// only when that state leaves the answer to it: an open circuit past
+/// its cooldown, a half-open one, or a circuit the table cannot hold.
 #[derive(Default)]
 pub struct StreamBreakerGate {
     engine: ArcSwapOption<BreakerEngine>,
     alerts: Option<Arc<StreamAlerts>>,
+    published: Option<&'static lorica_shmem::SharedRegion>,
 }
 
 impl std::fmt::Debug for StreamBreakerGate {
@@ -313,6 +321,17 @@ impl StreamBreakerGate {
         self.alerts = Some(alerts);
         self
     }
+
+    /// Admit from the circuit states the supervisor publishes in
+    /// `region` while the engine is the supervisor's
+    /// ([`BreakerEngine::Rpc`]): a closed circuit admits and an open one
+    /// inside its cooldown refuses with no round trip. The local engine
+    /// a worker falls back to without an RPC channel is its own
+    /// authority, and is always asked.
+    pub fn reading_published(mut self, region: &'static lorica_shmem::SharedRegion) -> Self {
+        self.published = Some(region);
+        self
+    }
 }
 
 impl BreakerGate for StreamBreakerGate {
@@ -321,10 +340,22 @@ impl BreakerGate for StreamBreakerGate {
             let Some(engine) = self.engine.load_full() else {
                 return Admission::Allow;
             };
-            match engine
-                .admit(&stream_breaker_key(stream_id), &backend.address)
-                .await
-            {
+            let key = stream_breaker_key(stream_id);
+            if let (BreakerEngine::Rpc { .. }, Some(region)) = (&*engine, self.published) {
+                let published = region
+                    .stream_breakers
+                    .lookup(region.breaker_key(&key, &backend.address));
+                match published {
+                    Some(BreakerState::Closed) => return Admission::Allow,
+                    Some(BreakerState::Open { until_ns }) if lorica_shmem::now_ns() < until_ns => {
+                        return Admission::Deny
+                    }
+                    // Past the cooldown, half-open, or not in the table:
+                    // the supervisor decides, and arbitrates the probe.
+                    _ => {}
+                }
+            }
+            match engine.admit(&key, &backend.address).await {
                 BreakerAdmission::Allow => Admission::Allow,
                 BreakerAdmission::Probe => Admission::AllowProbe,
                 BreakerAdmission::Deny => Admission::Deny,

@@ -66,9 +66,11 @@ When bumping the version, update ALL of these files:
 every process that maps that region. Neither follows the product version,
 and neither moves because the other did:
 
-- `LAYOUT_VERSION` (`lorica-shmem/src/region.rs`): the WAF region. Bumped
-  on any change to `WAF_SLOTS`, to the layout of `SharedRegion` or of its
-  tables, or to the ABI of `Slot`.
+- `LAYOUT_VERSION` (`lorica-shmem/src/region.rs`): the WAF region, which
+  since v1.11.0 also carries the published stream breaker states. Bumped
+  on any change to `WAF_SLOTS` or `BREAKER_SLOTS`, to the layout of
+  `SharedRegion` or of its tables, or to the ABI of `Slot` or
+  `BreakerCell`.
 - `STREAM_CAPS_LAYOUT_VERSION` (`lorica-shmem/src/stream_caps.rs`, since
   v1.11.0): the stream-caps region. Bumped on any change to its header,
   its parts, their order or the ABI of its cells.

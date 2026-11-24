@@ -629,6 +629,26 @@ Active health checks feed the same backend state as for routes
 ([health checks](health-checks.md)); a confirmed health change reaches every
 worker's table at once.
 
+**No supervisor round trip on a connect, except to arbitrate a probe.**
+With workers, the breaker's state machine lives in the supervisor, and
+it publishes the state of every stream circuit in the shared memory
+the workers map. A worker reads it at each connect attempt: a closed
+circuit admits and an open one inside its cooldown refuses, the same
+refusal as before, without asking the supervisor. Only an open circuit
+past its cooldown, or a half-open one, is asked about, so the supervisor
+still grants exactly one probe whichever worker asks first. A circuit
+the supervisor opens is refused by every worker from the next attempt
+on: the supervisor publishes before it answers the failing worker, and
+the only window in which a worker can still admit is between the
+supervisor's state change and its publish, both under one lock,
+sub-microsecond. There is no cache to expire. A circuit a probe closes
+is admitted locally again once that probe's success report reaches the
+supervisor; success reports are sent without waiting for an answer, so
+for that instant the circuit reads half-open and connects ask, as they
+did. HTTP routes still ask the supervisor on every request. A single
+process has its breaker in-process and has nothing to publish
+([worker shared state](architecture/worker-shared-state.md), § 7 WPAR-3).
+
 **On a range stream, one breaker covers every port of a backend.** The
 breaker is keyed by the stream and the backend as configured, and a
 range stream's backends carry no port, so the failures of all its ports
