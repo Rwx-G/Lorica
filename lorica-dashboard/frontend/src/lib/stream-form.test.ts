@@ -69,6 +69,7 @@ const REFUSED: Record<string, StreamField[]> = {
     'max_connect_attempts',
     'backend_keepalive',
     'backend_keepalive_idle_s',
+    'close_on_backend_down',
     'upload_rate_bps',
     'download_rate_bps',
     'source_max_connections',

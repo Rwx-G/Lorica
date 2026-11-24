@@ -102,12 +102,14 @@ const ALWAYS: readonly StreamField[] = [
   'open_rate',
 ];
 
-/** The settings of Story 12.3 a UDP stream gives a meaning to (Story 12.5 D-l); the others must hold their default there. */
+/**
+ * The settings of Story 12.3 a UDP stream gives a meaning to (Story 12.5 D-l); the others must hold their default there.
+ * `close_on_backend_down` waits for UDP active checks (Story 12.14): until then nothing marks a UDP backend down.
+ */
 const LIFTED_ON_UDP: readonly StreamField[] = [
   'load_balancing',
   'idle_timeout_s',
   'total_timeout_s',
-  'close_on_backend_down',
   'allow_local_backend',
   'proxy_protocol_send',
   'source_addresses',
