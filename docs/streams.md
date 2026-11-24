@@ -357,7 +357,7 @@ worker process counts on its own.
 | `total_timeout_s` | both | per connection or session | off; `TOTAL_TIMEOUT_S_RANGE` |
 | `max_connect_attempts` | TCP | per connection | `DEFAULT_MAX_CONNECT_ATTEMPTS`, `MAX_CONNECT_ATTEMPTS_RANGE` |
 | `backend_keepalive`, `backend_keepalive_idle_s` | TCP | per backend socket | on; `DEFAULT_BACKEND_KEEPALIVE_IDLE_S`, `BACKEND_KEEPALIVE_IDLE_S_RANGE` |
-| `close_on_backend_down` | both | | off |
+| `close_on_backend_down` | TCP (UDP from Story 12.14) | | off |
 | `proxy_protocol_send` | both (`v1` TCP only) | | `off` |
 | `proxy_protocol_accept`, `proxy_protocol_trusted_cidrs` | TCP only, for good | | off; at most `PROXY_PROTOCOL_TRUSTED_CIDRS_MAX` entries |
 | `source_addresses` | both | per attempt (TCP), per session (UDP) | empty; at most `SOURCE_ADDRESSES_MAX` |
@@ -676,6 +676,12 @@ established ones are left alone, unless the stream sets
 `close_on_backend_down` (HAProxy's `on-marked-down shutdown-sessions`):
 then the connections it serves end at once with `backend_down`. The
 setting is read from the snapshot each connection was accepted with.
+"Goes down" means marked down by an active health check, so the
+setting acts only on backends that have one: on a range stream, whose
+backends carry no port and so no active check, it is accepted and never
+fires. A UDP stream refuses it (`422`) until UDP backends get active
+checks in Story 12.14, since nothing marks a UDP backend down before
+then.
 
 ### Forwarding, buffers and half-close
 
@@ -1059,8 +1065,11 @@ with no access-log row.
 
 The algorithms are those of TCP except `peak_ewma` (a session has no
 connect latency); `least_conn` counts sessions. Backups, the circuit
-breaker, `close_on_backend_down`, `total_timeout_s`, `source_addresses`
-and `allow_local_backend` apply per session, with the same meaning.
+breaker, `total_timeout_s`, `source_addresses` and
+`allow_local_backend` apply per session, with the same meaning.
+`close_on_backend_down` is refused on UDP until Story 12.14 gives UDP
+backends active checks: a UDP stream's backends carry none, so nothing
+would ever mark one down.
 **The breaker judges a UDP backend by ICMP errors only** (port, host or
 network unreachable before any response). A session that receives
 nothing before its idle timeout, while it was owed a response, counts as

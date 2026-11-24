@@ -8422,7 +8422,11 @@ components:
             Close established connections to a backend that goes down,
             with the end reason `backend_down` (HAProxy's
             `on-marked-down shutdown-sessions`). Off, a backend going
-            down only stops receiving new connections.
+            down only stops receiving new connections. A backend goes
+            down by its active health check, so on a range stream, whose
+            backends carry no port and no check, it never acts. Refused
+            on a UDP stream (422) until UDP backends get active checks
+            (Story 12.14).
         proxy_protocol_send:
           allOf:
             - $ref: "#/components/schemas/StreamProxyProtocol"

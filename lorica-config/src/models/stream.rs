@@ -1068,7 +1068,13 @@ pub const TCP_ENGINE_FIELDS: &[TcpEngineField] = &[
     TcpEngineField {
         name: "close_on_backend_down",
         at_default: |s| !s.close_on_backend_down,
-        on_udp: OnUdp::Applies,
+        // Audit finding C20: what closes a session is a backend marked
+        // down, only an active check marks one, and a UDP stream's
+        // backends carry none (`AttachmentRule::UdpWithActiveChecks`).
+        // Story 12.14 brings UDP checks and lifts this.
+        on_udp: OnUdp::KeepsDefault(
+            "a UDP backend has no active health check until Story 12.14, so nothing marks it down",
+        ),
     },
     TcpEngineField {
         name: "proxy_protocol_send",
@@ -4068,12 +4074,26 @@ pub(crate) mod tests {
                 "load_balancing",
                 "idle_timeout_s",
                 "total_timeout_s",
-                "close_on_backend_down",
                 "proxy_protocol_send",
                 "source_addresses",
                 "allow_local_backend",
             ]
         );
+    }
+
+    #[test]
+    fn close_on_backend_down_is_refused_on_udp_until_udp_backends_have_checks() {
+        // Audit finding C20: a UDP stream's backends carry no active
+        // check, so nothing ever marks one down and the setting would be
+        // accepted and never act.
+        let mut udp = stream("u", "dns", StreamProtocol::Udp, 53);
+        udp.close_on_backend_down = true;
+        let err = udp.validate().expect_err("refused on UDP");
+        assert!(err.contains("close_on_backend_down"), "{err}");
+        assert!(err.contains("Story 12.14"), "{err}");
+        let mut tcp = stream("t", "pg", StreamProtocol::Tcp, 5432);
+        tcp.close_on_backend_down = true;
+        assert!(tcp.validate().is_ok(), "{:?}", tcp.validate());
     }
 
     #[test]
