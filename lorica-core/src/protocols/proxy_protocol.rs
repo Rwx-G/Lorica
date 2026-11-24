@@ -43,6 +43,9 @@
 //! [`encode_v2_unspec`]. No TLV is written. Every header it encodes parses
 //! back through [`parse`] to the same addresses, canonicalised.
 //!
+//! [`accept_vectors`] is the vector set the HTTP listeners and the stream
+//! plane both replay through their accept paths.
+//!
 //! Specification: <https://www.haproxy.org/download/3.0/doc/proxy-protocol.txt>
 
 use std::fmt;
@@ -686,6 +689,339 @@ fn v2_with_block(family: u8, block: &[u8]) -> Vec<u8> {
     wire.extend_from_slice(&declared.to_be_bytes());
     wire.extend_from_slice(block);
     wire
+}
+
+pub mod accept_vectors {
+    //! Lorica: the accept vectors both PROXY accept paths replay.
+    //!
+    //! The parser of the parent module is shared, the I/O around it is
+    //! not. The HTTP listeners read a trusted peer's header, and sniff a
+    //! direct client's first bytes, before the handshake
+    //! (`listeners::proxy_protocol` of this crate, under
+    //! `connection_filter`); the stream plane reads the header before it
+    //! picks a backend and checks a direct client's first bytes in flight,
+    //! in its forwarding loop (`lorica-stream`, `tcp::proxy_header` and
+    //! `tcp::forward`). Each vector is the client side of one connection
+    //! and the outcome both paths must reach. Each plane replays every
+    //! vector through its own accept path and compares what it observed
+    //! with [`AcceptVector::expected`] and [`AcceptVector::delivered`]:
+    //! the `listeners::proxy_protocol` unit tests here, and
+    //! `lorica-stream/tests/proxy_vectors.rs`.
+    //!
+    //! The outcome vocabulary is the one both planes tell apart. The HTTP
+    //! listeners name a trusted peer that sent no PROXY signature at all
+    //! `missing`, which the stream plane counts `malformed`; both refuse
+    //! it, and the HTTP replay reads `missing` as [`Refusal::Malformed`].
+    //!
+    //! Behaviour that differs by design stays out of the set and is tested
+    //! on its plane: the `optional` mode exists on the HTTP listeners
+    //! only, and a direct client's signature completed after
+    //! [`HEADER_READ_TIMEOUT`] is refused by the stream plane, whose check
+    //! holds nothing once the connection is forwarded, while an HTTP
+    //! listener has handed that connection to its parser by then.
+
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use super::{
+        encode_v1, encode_v1_unknown, encode_v2, encode_v2_dgram, Version, HEADER_READ_TIMEOUT,
+        MAX_HEADER_LEN, V2_FIXED_LEN, V2_SIGNATURE, V2_VERSION_PROXY,
+    };
+
+    /// Whether the connection's socket peer is in the trust list.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Peer {
+        /// Inside the list: it must send a header.
+        Trusted,
+        /// Outside the list: a direct client, which must not send one.
+        Untrusted,
+    }
+
+    /// One write of the client, made `pause` after the previous one (or
+    /// after connect, for the first).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Write {
+        /// How long the client waits before writing.
+        pub pause: Duration,
+        /// What it writes.
+        pub bytes: Vec<u8>,
+    }
+
+    /// What the client does once its writes are out.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Then {
+        /// Shuts its write side down.
+        Close,
+        /// Keeps the connection open and sends nothing more, until the
+        /// other end closes it.
+        Hold,
+    }
+
+    /// Why an accept path refused a connection.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum_macros::EnumIter)]
+    pub enum Refusal {
+        /// A trusted peer sent bytes that are not a header of the version
+        /// they claim, or no header, or closed inside one.
+        Malformed,
+        /// A trusted peer's header is longer than [`MAX_HEADER_LEN`].
+        Oversized,
+        /// A trusted peer's header is well formed but not accepted on a
+        /// TCP connection.
+        Unsupported,
+        /// A trusted peer sent no complete header within
+        /// [`HEADER_READ_TIMEOUT`] of accept.
+        Timeout,
+        /// A direct client opened with a PROXY signature.
+        UntrustedPeer,
+    }
+
+    /// What an accept path makes of a connection.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Outcome {
+        /// A header carried the client: the connection goes on as
+        /// `source` connecting to `destination`.
+        Carried {
+            /// The header's version.
+            version: Version,
+            /// The client the header named, canonical.
+            source: SocketAddr,
+            /// The destination the header named, canonical.
+            destination: SocketAddr,
+        },
+        /// A header without a usable address: the socket's own addresses
+        /// stay.
+        NoAddress,
+        /// A direct client served on its socket addresses.
+        Direct,
+        /// The connection is closed before any byte reaches the
+        /// application or the backend.
+        Refused(Refusal),
+    }
+
+    /// The client side of one connection and what both accept paths must
+    /// make of it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct AcceptVector {
+        /// What the vector checks, for assertion messages.
+        pub name: &'static str,
+        /// Whether the socket peer is trusted.
+        pub peer: Peer,
+        /// What the client writes.
+        pub writes: Vec<Write>,
+        /// What the client does after its writes.
+        pub then: Then,
+        /// The outcome both paths must reach.
+        pub expected: Outcome,
+        /// The bytes the application or the backend must receive,
+        /// unchanged and in order: everything the client wrote past the
+        /// header. Empty for a refusal.
+        pub delivered: Vec<u8>,
+    }
+
+    /// The client bytes past the header: an HTTP request, so an HTTP
+    /// listener serves it and a stream forwards it, opening with `P` so a
+    /// direct client's sniff must read past its first byte.
+    pub const REQUEST: &[u8] =
+        b"POST /probe HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
+
+    /// How long a split write waits between its parts: long enough that
+    /// the parts arrive as separate reads on loopback.
+    const SPLIT_PAUSE: Duration = Duration::from_millis(100);
+
+    fn sock(text: &str) -> SocketAddr {
+        text.parse()
+            .unwrap_or_else(|_| unreachable!("a socket address literal of this module"))
+    }
+
+    fn now(bytes: &[u8]) -> Write {
+        Write {
+            pause: Duration::ZERO,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn after(pause: Duration, bytes: &[u8]) -> Write {
+        Write {
+            pause,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn then_request(header: &[u8]) -> Vec<u8> {
+        let mut wire = header.to_vec();
+        wire.extend_from_slice(REQUEST);
+        wire
+    }
+
+    fn served(
+        name: &'static str,
+        peer: Peer,
+        writes: Vec<Write>,
+        expected: Outcome,
+    ) -> AcceptVector {
+        AcceptVector {
+            name,
+            peer,
+            writes,
+            then: Then::Close,
+            expected,
+            delivered: REQUEST.to_vec(),
+        }
+    }
+
+    fn refused(
+        name: &'static str,
+        peer: Peer,
+        writes: Vec<Write>,
+        then: Then,
+        refusal: Refusal,
+    ) -> AcceptVector {
+        AcceptVector {
+            name,
+            peer,
+            writes,
+            then,
+            expected: Outcome::Refused(refusal),
+            delivered: Vec::new(),
+        }
+    }
+
+    /// Every vector, built from the parent module's encoder and bounds.
+    pub fn vectors() -> Vec<AcceptVector> {
+        let source = sock("192.0.2.10:51000");
+        let destination = sock("198.51.100.1:443");
+        let source6 = sock("[2001:db8::10]:51000");
+        let destination6 = sock("[2001:db8::1]:443");
+        let v1 = encode_v1(source, destination);
+        let v2 = encode_v2(source, destination);
+        let mut v2_local = V2_SIGNATURE.to_vec();
+        v2_local.extend_from_slice(&[V2_VERSION_PROXY & 0xF0, 0, 0, 0]);
+        let mut oversized = V2_SIGNATURE.to_vec();
+        oversized.extend_from_slice(&[V2_VERSION_PROXY, 0x11]);
+        let declared = u16::try_from(MAX_HEADER_LEN + 1 - V2_FIXED_LEN)
+            .unwrap_or_else(|_| unreachable!("the header bound fits a v2 length"));
+        oversized.extend_from_slice(&declared.to_be_bytes());
+
+        vec![
+            served(
+                "a trusted v1 header carries the client",
+                Peer::Trusted,
+                vec![now(&then_request(&v1))],
+                Outcome::Carried {
+                    version: Version::V1,
+                    source,
+                    destination,
+                },
+            ),
+            served(
+                "a trusted v2 header carries an IPv6 client",
+                Peer::Trusted,
+                vec![now(&then_request(&encode_v2(source6, destination6)))],
+                Outcome::Carried {
+                    version: Version::V2,
+                    source: source6,
+                    destination: destination6,
+                },
+            ),
+            served(
+                "a trusted v2 header split inside its signature and its addresses is read whole",
+                Peer::Trusted,
+                vec![
+                    now(&v2[..7]),
+                    after(SPLIT_PAUSE, &v2[7..20]),
+                    after(SPLIT_PAUSE, &then_request(&v2[20..])),
+                ],
+                Outcome::Carried {
+                    version: Version::V2,
+                    source,
+                    destination,
+                },
+            ),
+            served(
+                "a trusted v1 UNKNOWN header keeps the socket addresses",
+                Peer::Trusted,
+                vec![now(&then_request(&encode_v1_unknown()))],
+                Outcome::NoAddress,
+            ),
+            served(
+                "a trusted v2 LOCAL header keeps the socket addresses",
+                Peer::Trusted,
+                vec![now(&then_request(&v2_local))],
+                Outcome::NoAddress,
+            ),
+            refused(
+                "a trusted v2 header declaring one byte past the bound is oversized",
+                Peer::Trusted,
+                vec![now(&oversized)],
+                Then::Hold,
+                Refusal::Oversized,
+            ),
+            refused(
+                "a trusted v2 DGRAM header is unsupported on TCP",
+                Peer::Trusted,
+                vec![now(&then_request(&encode_v2_dgram(source, destination)))],
+                Then::Hold,
+                Refusal::Unsupported,
+            ),
+            refused(
+                "a trusted v1 line that breaks the grammar is malformed",
+                Peer::Trusted,
+                vec![now(b"PROXY TCP4 nonsense\r\n")],
+                Then::Hold,
+                Refusal::Malformed,
+            ),
+            refused(
+                "a trusted peer that sends no header is refused",
+                Peer::Trusted,
+                vec![now(REQUEST)],
+                Then::Hold,
+                Refusal::Malformed,
+            ),
+            refused(
+                "a trusted peer that closes inside its header is malformed",
+                Peer::Trusted,
+                vec![now(&v1[..20])],
+                Then::Close,
+                Refusal::Malformed,
+            ),
+            refused(
+                "a trusted header unfinished at the read timeout is refused",
+                Peer::Trusted,
+                vec![now(&v1[..20])],
+                Then::Hold,
+                Refusal::Timeout,
+            ),
+            refused(
+                "an untrusted peer's v1 header is refused",
+                Peer::Untrusted,
+                vec![now(&then_request(&v1))],
+                Then::Hold,
+                Refusal::UntrustedPeer,
+            ),
+            refused(
+                "an untrusted peer's v2 signature split across writes is refused",
+                Peer::Untrusted,
+                vec![now(&v2[..5]), after(SPLIT_PAUSE, &then_request(&v2[5..]))],
+                Then::Hold,
+                Refusal::UntrustedPeer,
+            ),
+            served(
+                "a direct client whose first byte is P is served",
+                Peer::Untrusted,
+                vec![now(&REQUEST[..1]), after(SPLIT_PAUSE, &REQUEST[1..])],
+                Outcome::Direct,
+            ),
+            served(
+                "a direct client silent past the read timeout is served",
+                Peer::Untrusted,
+                vec![after(
+                    HEADER_READ_TIMEOUT + Duration::from_millis(500),
+                    REQUEST,
+                )],
+                Outcome::Direct,
+            ),
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -1335,6 +1671,78 @@ mod tests {
                 assert_eq!(header.addresses, expected);
             }
         }
+    }
+
+    // ---- The accept vectors (audit finding C22) ----
+
+    /// Each vector agrees with the parser: a served trusted vector's
+    /// bytes parse to its outcome with exactly `delivered` behind the
+    /// header, a direct client's bytes are `delivered` unchanged, and a
+    /// refused one delivers nothing.
+    #[test]
+    fn every_accept_vector_agrees_with_the_parser() {
+        use accept_vectors::{vectors, Outcome, Peer};
+        for vector in vectors() {
+            let wire: Vec<u8> = vector
+                .writes
+                .iter()
+                .flat_map(|write| write.bytes.iter().copied())
+                .collect();
+            match (vector.peer, vector.expected) {
+                (
+                    Peer::Trusted,
+                    Outcome::Carried {
+                        version,
+                        source,
+                        destination,
+                    },
+                ) => {
+                    let (header, consumed) = complete(&wire);
+                    assert_eq!(header.version, version, "{}", vector.name);
+                    assert_eq!(
+                        header.addresses,
+                        Addresses::Tcp {
+                            source,
+                            destination
+                        },
+                        "{}",
+                        vector.name
+                    );
+                    assert_eq!(wire[consumed..], vector.delivered[..], "{}", vector.name);
+                }
+                (Peer::Trusted, Outcome::NoAddress) => {
+                    let (header, consumed) = complete(&wire);
+                    assert_eq!(header.addresses, Addresses::Unspecified, "{}", vector.name);
+                    assert_eq!(wire[consumed..], vector.delivered[..], "{}", vector.name);
+                }
+                (Peer::Untrusted, Outcome::Direct) => {
+                    assert_eq!(classify_prefix(&wire), Prefix::NotProxy, "{}", vector.name);
+                    assert_eq!(wire, vector.delivered, "{}", vector.name);
+                }
+                (_, Outcome::Refused(_)) => {
+                    assert!(vector.delivered.is_empty(), "{}", vector.name);
+                }
+                (peer, expected) => panic!("{}: {peer:?} cannot be {expected:?}", vector.name),
+            }
+        }
+    }
+
+    #[test]
+    fn the_accept_vectors_cover_every_refusal_and_have_unique_names() {
+        use accept_vectors::{vectors, Outcome, Refusal};
+        use strum::IntoEnumIterator;
+        let vectors = vectors();
+        for refusal in Refusal::iter() {
+            assert!(
+                vectors
+                    .iter()
+                    .any(|vector| vector.expected == Outcome::Refused(refusal)),
+                "no vector for {refusal:?}"
+            );
+        }
+        let names: std::collections::HashSet<&str> =
+            vectors.iter().map(|vector| vector.name).collect();
+        assert_eq!(names.len(), vectors.len());
     }
 
     #[test]

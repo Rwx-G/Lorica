@@ -517,8 +517,12 @@ lives in.
   apply (`MAX_HEADER_LEN`, `HEADER_READ_TIMEOUT`), and, since Story
   12.3, the encoder the stream engine sends to backends with
   (`encode_v1`, `encode_v2`, `encode_v2_dgram`, `encode_v1_unknown`,
-  `encode_v2_unspec`; no TLV). It does no I/O, is std only and sits
-  behind no feature, so `lorica-stream` reaches it without
+  `encode_v2_unspec`; no TLV), and, since the v1.11.0 audit (finding
+  C22), `accept_vectors`: the connections and outcomes both accept
+  paths are held to, replayed by the unit tests of this crate's
+  `listeners/proxy_protocol.rs` and by
+  `lorica-stream/tests/proxy_vectors.rs`. It does no I/O, is std only
+  and sits behind no feature, so `lorica-stream` reaches it without
   `connection_filter`. An upstream sync leaves the file alone and keeps
   the `pub mod` line. Its fuzz target is
   `fuzz/fuzz_targets/fuzz_proxy_protocol.rs`, which also round-trips
@@ -563,8 +567,9 @@ lives in.
   Upstream `5104a3e0` (accept limits per endpoint, deferred in the
   1.10.5 row and ruled out for these listeners by Story 12.2) lands on
   this same accept path, so any later upstream commit building on it
-  conflicts here first. Tests: `lorica-core/tests/proxy_protocol.rs`,
-  run by the rustls line of CI.
+  conflicts here first. Tests: `lorica-core/tests/proxy_protocol.rs` and
+  the unit tests of `listeners/proxy_protocol.rs`, which replay
+  `accept_vectors`, both run by the rustls line of CI.
 - **`lorica-timeout`, a timer stub subscribes before it checks
   (v1.11.0), a port of upstream PR #983 ahead of its merge.** Site:
   `TimerStub::poll` and `poll_impl` in `lorica-timeout/src/timer.rs`,

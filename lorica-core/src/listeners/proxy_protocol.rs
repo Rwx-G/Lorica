@@ -526,10 +526,16 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use crate::listeners::AcceptAllFilter;
+    use tokio::io::AsyncWriteExt;
 
-    /// A policy in `required` mode that trusts nobody and keeps every
-    /// outcome it is told.
+    use crate::listeners::AcceptAllFilter;
+    use crate::protocols::proxy_protocol::accept_vectors::{
+        vectors, AcceptVector, Outcome, Peer, Refusal, Then,
+    };
+
+    /// A policy in `required` mode that keeps every outcome it is told.
+    /// It trusts nobody: the tests pick each connection's stage
+    /// themselves, as the accept loop would from the trust list.
     #[derive(Debug, Default)]
     struct Recorder(Mutex<Vec<ProxyHeaderOutcome>>);
 
@@ -591,6 +597,116 @@ mod tests {
             "{waited:?}"
         );
         assert!(policy.0.lock().expect("records lock").is_empty());
+    }
+
+    /// The shared vocabulary's name for a refused outcome of this path.
+    /// `missing` (no signature from a trusted peer) is one of the cases
+    /// the stream plane counts `malformed`.
+    fn refusal_of(outcome: ProxyHeaderOutcome) -> Refusal {
+        match outcome {
+            ProxyHeaderOutcome::Malformed | ProxyHeaderOutcome::Missing => Refusal::Malformed,
+            ProxyHeaderOutcome::Oversized => Refusal::Oversized,
+            ProxyHeaderOutcome::Unsupported => Refusal::Unsupported,
+            ProxyHeaderOutcome::Timeout => Refusal::Timeout,
+            ProxyHeaderOutcome::UntrustedPeer => Refusal::UntrustedPeer,
+            accepted @ (ProxyHeaderOutcome::V1
+            | ProxyHeaderOutcome::V2
+            | ProxyHeaderOutcome::Local
+            | ProxyHeaderOutcome::Absent) => panic!("{accepted:?} is not a refusal"),
+        }
+    }
+
+    /// Runs `vector` through this path, from the stage the accept loop
+    /// hands on to the end of `resolve`, and answers the outcome, read
+    /// from the policy's records and the socket digest, with the bytes
+    /// the handshake would go on with.
+    async fn replay(vector: &AcceptVector) -> (Outcome, Vec<u8>) {
+        let policy = Arc::new(Recorder::default());
+        let (mut server, mut client) = accepted().await;
+        let accepted_at = Instant::now();
+        let filter: Arc<dyn ConnectionFilter> = Arc::new(AcceptAllFilter);
+        let pending = match vector.peer {
+            Peer::Trusted => {
+                let peer = client.local_addr().expect("address");
+                PendingProxyHeader::awaiting_header(policy.clone(), filter, peer, accepted_at)
+            }
+            Peer::Untrusted => PendingProxyHeader::direct(policy.clone(), filter, accepted_at),
+        };
+        let (writes, then) = (vector.writes.clone(), vector.then);
+        let writer = tokio::spawn(async move {
+            for write in writes {
+                tokio::time::sleep(write.pause).await;
+                if client.write_all(&write.bytes).await.is_err() {
+                    return client;
+                }
+            }
+            if then == Then::Close {
+                let _ = client.shutdown().await;
+            }
+            client
+        });
+
+        // The 60 s handshake timeout of `services::listening`.
+        let resolved = tokio::time::timeout(Duration::from_secs(60), pending.resolve(&mut server))
+            .await
+            .unwrap_or_else(|_| panic!("{}: undecided at the handshake timeout", vector.name));
+        let recorded = policy.0.lock().expect("records lock").clone();
+        let outcome = match (resolved, &recorded[..]) {
+            (Err(error), [refused]) if is_refusal(&error) => Outcome::Refused(refusal_of(*refused)),
+            (Ok(()), []) => Outcome::Direct,
+            (Ok(()), [ProxyHeaderOutcome::Local]) => Outcome::NoAddress,
+            (Ok(()), [carried @ (ProxyHeaderOutcome::V1 | ProxyHeaderOutcome::V2)]) => {
+                let digest = server.get_socket_digest().expect("a digest");
+                Outcome::Carried {
+                    version: if *carried == ProxyHeaderOutcome::V1 {
+                        Version::V1
+                    } else {
+                        Version::V2
+                    },
+                    source: *digest
+                        .peer_addr()
+                        .and_then(|a| a.as_inet())
+                        .expect("the carried source"),
+                    destination: *digest
+                        .local_addr()
+                        .and_then(|a| a.as_inet())
+                        .expect("the carried destination"),
+                }
+            }
+            (resolved, recorded) => panic!("{}: {resolved:?} with {recorded:?}", vector.name),
+        };
+        let mut delivered = Vec::new();
+        if !matches!(outcome, Outcome::Refused(_)) {
+            tokio::time::timeout(Duration::from_secs(60), server.read_to_end(&mut delivered))
+                .await
+                .unwrap_or_else(|_| panic!("{}: no end of stream", vector.name))
+                .expect("read");
+        }
+        writer.abort();
+        (outcome, delivered)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_accept_vector_reaches_its_outcome_on_the_http_path() {
+        let replays: Vec<_> = vectors()
+            .into_iter()
+            .map(|vector| {
+                tokio::spawn(async move {
+                    let observed = replay(&vector).await;
+                    (vector, observed)
+                })
+            })
+            .collect();
+        for replay in replays {
+            let (vector, (outcome, delivered)) = replay.await.expect("replay task");
+            assert_eq!(outcome, vector.expected, "{}", vector.name);
+            assert_eq!(
+                String::from_utf8_lossy(&delivered),
+                String::from_utf8_lossy(&vector.delivered),
+                "{}",
+                vector.name
+            );
+        }
     }
 
     #[test]
