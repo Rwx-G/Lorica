@@ -782,6 +782,29 @@ What it gives up: token-driven moves of stream backends, which no
 released version had. The change ships with the audit's code lot for
 C4; until it lands, the paragraph above is what the code does.
 
+*Note (2026-11-24, audit lot D, C4 landed):* `write.rs` refuses a
+token's address change on any backend a stream links
+(`ensure_not_moved_under_a_stream`, formerly
+`ensure_not_moved_under_a_local_stream`), on REST, both MCP transports,
+apply and preview; the refusal lists every such stream through
+`streams_as_seen_by`. A management session still moves the backend,
+and once no stream links it the address is the token's again. Pinned by
+`a_token_cannot_move_a_backend_any_stream_links`.
+
+*Note (2026-11-24, audit lot D, finding C5):* "local" leaves out two
+instance metadata services that link-local does not cover, AWS's
+`fd00:ec2::254` and Alibaba Cloud's `100.100.100.200`, both of which
+hand out instance credentials; Google Cloud's `fd20:ce::254` is the
+same case. They are not folded into `is_local_ip`, because rule B would
+then refuse them on reserved ports, which are this node's ports and not
+theirs. A sibling list, `INSTANCE_METADATA_ADDRESSES`, with
+`is_instance_metadata_ip`, is read by rule A only: at validation through
+`needs_local_backend_flag` (`AttachmentRule::LocalBackend`), at connect
+through `NodeLocality::check` (`NeedsFlag`, counted
+`local_destination_refused`). Exact addresses only: `100.64.0.0/10` is
+carrier-grade NAT and Tailscale space, and the ULA prefixes hold real
+backends. Streams are unreleased, so no released version is affected.
+
 ### D-n. DNS re-resolution
 
 - **Per process**, inside the engine: one `ResolverCache` per worker
@@ -1985,3 +2008,4 @@ Lot B:
 | 2026-11-21 | 0.13 | Phase 1 audit: finding C4's maintainer decision recorded under D-m (a token's address change on a backend any stream links is refused, 403; the code ships with the audit's code lot); the "one thread per process" pitfall corrected to two threads (A-I1). | Romain G. |
 | 2026-11-22 | 0.14 | Phase 1 audit, TCP data path lot: dated notes under D-d (one timer per forwarding call for the idle and total timeouts, idle fires at its value; findings C10, C11) and D-o (bucket capacity covers two timer ticks of the rate; finding C8). The client socket now gets the `TCP_NODELAY` D-c always promised (C2). | Romain G. |
 | 2026-11-24 | 0.15 | Phase 1 audit lot C, finding C9: D-g amended, a breaker success report is no longer awaited in worker mode. | Romain G. |
+| 2026-11-24 | 0.15 | Phase 1 audit, model and token boundary lot: C4 landed, a token's address change on a backend any stream links is a 403, flag or not (dated note under D-m); C5, the cloud instance metadata addresses outside link-local need `allow_local_backend` under rule A, at validation and at connect, while rule B leaves them alone (dated note under D-m). | Romain G. |

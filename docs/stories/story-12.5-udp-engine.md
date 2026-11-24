@@ -746,6 +746,20 @@ default and range above), `total_timeout_s`, `close_on_backend_down`,
 Story 12.6), `proxy_protocol_trusted_cidrs`; and `proxy_protocol_accept`
 stays refused on UDP for good (12.3 D-k).
 
+*Note (2026-11-24, Phase 1 audit, finding C20):* `close_on_backend_down`
+is taken back off the lifted list. What closes a session is its backend
+marked down, only an active check marks one, and a UDP stream's
+backends carry none (`AttachmentRule::UdpWithActiveChecks`), so the
+setting was accepted and could never act. It now keeps its default on
+UDP (`OnUdp::KeepsDefault` in `TCP_ENGINE_FIELDS`, a `422` naming the
+field), the dashboard's stream form stops offering it there
+(`LIFTED_ON_UDP`), and Story 12.14 lifts it with UDP checks. The same
+holds on a TCP range stream, whose portless backends carry no check:
+there it stays accepted and is documented as inert. Streams are
+unreleased, so no stored configuration of a released version can carry
+the refused combination, and neither the canonical format nor a
+migration moves.
+
 **The flag on every surface (AC #4).** The management API returns
 `udp.unbounded_responses`; `openapi.yaml` documents it. The automation
 `streams:read` resource, the MCP read tools and the dashboard badge are
@@ -2170,3 +2184,4 @@ Lot A:
 | 2026-11-21 | 0.15 | Phase 1 audit, finding C1: D-i amended by maintainer decision, the UDP breaker counts only ICMP errors and never a missing response, which stays on the link counter and in the SLA; the code ships with the audit's code lot. | Romain G. |
 | 2026-11-22 | 0.16 | Phase 1 audit, C1 landed: the UDP engine reports a missing response to the link counter and the SLA only; an unanswered half-open probe is answered as a success (dated note under D-i). | Romain G. |
 | 2026-11-22 | 0.17 | Phase 1 audit, C14: E9 said rotation and the family rule are 12.3's, unchanged, but the engine carried a copy of TCP's selection. The candidate filter, the backup rule, the selector call, the local check with its exclusion transition and the rotation now live in one `lorica-stream/src/selection.rs` both engines call; a UDP twin of TCP's local-destination test pins the shared path. | Romain G. |
+| 2026-11-24 | 0.18 | Phase 1 audit, C20: `close_on_backend_down` keeps its default on UDP until Story 12.14 gives UDP backends active checks, and the dashboard stops offering it there (dated note under D-l). | Romain G. |

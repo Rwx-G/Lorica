@@ -432,6 +432,16 @@ access control, and switching checks off is already a token's right.
 | Management API, dashboard | allowed (Operator, the backend write floor) | handler tests |
 | Replica apply, TOML import | allowed: the source is the management plane of the control plane or an operator's file; validated by D-6 | replica and import tests |
 
+*Note (2026-11-24, Phase 1 audit, finding C18):* "exactly as it is"
+did not cover the address the bytes go to. A token could keep the
+stored payload untouched and move the backend to a host of its own
+inside its grant, sending the operator's bytes there. A stored custom
+check is now kept only on the address it was written for: an address
+change while it rides the patch is a `403` naming `health_check`,
+preview included, and the same move with the check turned into a
+template in the same write is allowed. `HEALTH_CHECK_PAYLOAD.rule` says
+so. Pinned by `a_token_never_moves_a_custom_payload_to_another_address`.
+
 The `403` names the field and the rule's words, never the payload.
 The MCP tool's schema renders the `template` property's `enum` from
 `TCP_CHECK_TEMPLATES` at schema build, and the backend tools' summaries
@@ -1318,3 +1328,4 @@ None open.
 | 2026-11-15 | 0.9 | Lot 3: rendered template module and documentation section with their fixture test, dashboard template and send/expect editors with client-side limits. Status InProgress. | Romain G. |
 | 2026-11-16 | 1.0 | Lot 4: `docs/health-checks.md` around the rendered section, the D-7 rule and the masked `send` in `docs/automation.md` and `docs/mcp.md`, the rollback consequence in `docs/hot-upgrade.md`, threat model T11, the new files in the source tree, CHANGELOG Added and Security. Every Lot done. Status Review. | Romain G. |
 | 2026-11-21 | 1.1 | IV1 against a real Redis frozen with `docker pause` and the SMTP banner template, delivered by Story 12.12 Lot G, pass; backend-side noise observed and documented. Status Review. | Romain G. |
+| 2026-11-24 | 1.2 | Phase 1 audit, C18: a stored custom check is kept only on the address it was written for; a token's address change while it rides the patch is a 403 (dated note under D-7). | Romain G. |
