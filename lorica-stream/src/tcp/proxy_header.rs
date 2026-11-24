@@ -26,7 +26,8 @@ use std::net::{IpAddr, SocketAddr};
 use lorica_config::connection_filter::{parse_cidr, ConnectionFilterPolicy};
 use lorica_config::models::StreamProxyProtocol;
 use lorica_core::protocols::proxy_protocol::{
-    encode_v1, encode_v2, parse, Addresses, Command, ParseError, Parsed, Version, MAX_HEADER_LEN,
+    classify_prefix, encode_v1, encode_v2, parse, Addresses, Command, ParseError, Parsed, Prefix,
+    Version, MAX_HEADER_LEN,
 };
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -103,6 +104,12 @@ pub async fn read_trusted(client: &mut TcpStream, deadline: Instant) -> HeaderRe
     let mut buf = vec![0u8; MAX_HEADER_LEN];
     let mut filled = 0;
     loop {
+        // Bytes that cannot open a header are no header at all, which the
+        // HTTP listeners count `missing` too; the parser would call them
+        // malformed.
+        if classify_prefix(&buf[..filled]) == Prefix::NotProxy {
+            return HeaderRead::Refused(ProxyHeaderOutcome::RefusedMissing);
+        }
         match parse(&buf[..filled]) {
             Err(e) => return refused(e),
             Ok(Parsed::Complete { header, consumed }) => {
@@ -142,6 +149,9 @@ pub async fn read_trusted(client: &mut TcpStream, deadline: Instant) -> HeaderRe
         }
         match tokio::time::timeout_at(deadline, client.read(&mut buf[filled..])).await {
             Err(_) => return HeaderRead::Refused(ProxyHeaderOutcome::RefusedTimeout),
+            Ok(Ok(0)) if filled == 0 => {
+                return HeaderRead::Refused(ProxyHeaderOutcome::RefusedMissing)
+            }
             Ok(Ok(0)) | Ok(Err(_)) => {
                 return HeaderRead::Refused(ProxyHeaderOutcome::RefusedMalformed)
             }

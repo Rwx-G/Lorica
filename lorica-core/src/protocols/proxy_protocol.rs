@@ -708,10 +708,10 @@ pub mod accept_vectors {
     //! the `listeners::proxy_protocol` unit tests here, and
     //! `lorica-stream/tests/proxy_vectors.rs`.
     //!
-    //! The outcome vocabulary is the one both planes tell apart. The HTTP
-    //! listeners name a trusted peer that sent no PROXY signature at all
-    //! `missing`, which the stream plane counts `malformed`; both refuse
-    //! it, and the HTTP replay reads `missing` as [`Refusal::Malformed`].
+    //! The outcome vocabulary is the one both planes tell apart, each
+    //! naming it with its own counter words: a trusted peer that sends no
+    //! header is [`Refusal::Missing`] on both, `missing` on the HTTP
+    //! listeners and `refused_missing` on a stream.
     //!
     //! Behaviour that differs by design stays out of the set and is tested
     //! on its plane: the `optional` mode exists on the HTTP listeners
@@ -760,8 +760,11 @@ pub mod accept_vectors {
     /// Why an accept path refused a connection.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum_macros::EnumIter)]
     pub enum Refusal {
+        /// A trusted peer sent no header: its first bytes open with no
+        /// PROXY signature, or it closed before sending any byte.
+        Missing,
         /// A trusted peer sent bytes that are not a header of the version
-        /// they claim, or no header, or closed inside one.
+        /// they claim, or closed inside one.
         Malformed,
         /// A trusted peer's header is longer than [`MAX_HEADER_LEN`].
         Oversized,
@@ -971,11 +974,18 @@ pub mod accept_vectors {
                 Refusal::Malformed,
             ),
             refused(
-                "a trusted peer that sends no header is refused",
+                "a trusted peer that sends no header is missing",
                 Peer::Trusted,
                 vec![now(REQUEST)],
                 Then::Hold,
-                Refusal::Malformed,
+                Refusal::Missing,
+            ),
+            refused(
+                "a trusted peer that closes before sending any byte is missing",
+                Peer::Trusted,
+                Vec::new(),
+                Then::Close,
+                Refusal::Missing,
             ),
             refused(
                 "a trusted peer that closes inside its header is malformed",

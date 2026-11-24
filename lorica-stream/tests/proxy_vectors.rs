@@ -274,6 +274,7 @@ async fn sink() -> (SocketAddr, mpsc::UnboundedReceiver<Vec<u8>>) {
 /// plane.
 fn refusal_of(outcome: ProxyHeaderOutcome) -> Refusal {
     match outcome {
+        ProxyHeaderOutcome::RefusedMissing => Refusal::Missing,
         ProxyHeaderOutcome::RefusedMalformed => Refusal::Malformed,
         ProxyHeaderOutcome::RefusedOversized => Refusal::Oversized,
         ProxyHeaderOutcome::RefusedUnsupported => Refusal::Unsupported,

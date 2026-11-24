@@ -166,8 +166,12 @@ counted_enum! {
         /// A header without usable addresses (`LOCAL`, `UNKNOWN`,
         /// `AF_UNSPEC`, `AF_UNIX`), accepted: the socket addresses stay.
         AcceptedLocal => "accepted_local",
+        /// A trusted peer sent no header: its first bytes open with no
+        /// PROXY signature, or it closed before sending any byte. The
+        /// HTTP listeners' `missing` (Story 12.8 D-j).
+        RefusedMissing => "refused_missing",
         /// A trusted peer's header broke the grammar, or the peer closed
-        /// before completing it.
+        /// inside it.
         RefusedMalformed => "refused_malformed",
         /// A trusted peer's header was longer than the bound.
         RefusedOversized => "refused_oversized",

@@ -654,6 +654,16 @@ stream's algorithm among themselves.
 - Refusal counters per stream and outcome (D-r). The per-source pending
   cap of Story 12.6 AC #5 applies to phase 2 from that story on.
 
+*Note (2026-11-24, Phase 1 audit, shared PROXY accept vectors):* a
+trusted peer that sends no header, whether its first bytes open with no
+PROXY signature or it closes before sending any, counts
+`refused_missing`, the stream word for Story 12.8 D-j's `missing`; it
+counted `refused_malformed` before, which the HTTP listeners keep for a
+header that breaks its grammar or a close inside one. The end reason
+stays `proxy_header_invalid`. The `accept_vectors` of `lorica-core` now
+name the refusal `Missing` on both planes, so a drift on either side
+fails its replay.
+
 ### D-l. Chosen source addresses (`proxy_bind`)
 
 - **Field** `source_addresses: Vec<IpAddr>`, default empty (the kernel
@@ -1639,9 +1649,11 @@ performance phase.
   second; 64 KiB at 16 KiB/s still measures 3.0 s.
 - Untrusted sniff: a client that sends FIN inside an unfinished
   signature gets its held bytes forwarded, then the FIN (it sent no
-  header). A trusted peer that closes before a complete header counts
-  `refused_malformed`; an accepted header without addresses (`LOCAL`,
-  `UNKNOWN`, `AF_UNSPEC`, `AF_UNIX`) counts `accepted_local`.
+  header). A trusted peer that closes inside its header counts
+  `refused_malformed`, one that closes before any byte
+  `refused_missing` (dated note under D-k); an accepted header without
+  addresses (`LOCAL`, `UNKNOWN`, `AF_UNSPEC`, `AF_UNIX`) counts
+  `accepted_local`.
 - The quiesce point: `Forwarder::run` is cancel-safe at every await, so
   it can be dropped and resumed with nothing lost; `upload()` and
   `download()` expose `DirectionState::held_bytes()`,
@@ -2009,3 +2021,4 @@ Lot B:
 | 2026-11-22 | 0.14 | Phase 1 audit, TCP data path lot: dated notes under D-d (one timer per forwarding call for the idle and total timeouts, idle fires at its value; findings C10, C11) and D-o (bucket capacity covers two timer ticks of the rate; finding C8). The client socket now gets the `TCP_NODELAY` D-c always promised (C2). | Romain G. |
 | 2026-11-24 | 0.15 | Phase 1 audit lot C, finding C9: D-g amended, a breaker success report is no longer awaited in worker mode. | Romain G. |
 | 2026-11-24 | 0.16 | Phase 1 audit, model and token boundary lot: C4 landed, a token's address change on a backend any stream links is a 403, flag or not (dated note under D-m); C5, the cloud instance metadata addresses outside link-local need `allow_local_backend` under rule A, at validation and at connect, while rule B leaves them alone (dated note under D-m). | Romain G. |
+| 2026-11-24 | 0.17 | Phase 1 audit, shared PROXY accept vectors: a trusted peer that sends no header counts `refused_missing`, aligned with the HTTP listeners' `missing` (dated note under D-k). | Romain G. |

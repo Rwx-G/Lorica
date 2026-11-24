@@ -600,11 +600,10 @@ mod tests {
     }
 
     /// The shared vocabulary's name for a refused outcome of this path.
-    /// `missing` (no signature from a trusted peer) is one of the cases
-    /// the stream plane counts `malformed`.
     fn refusal_of(outcome: ProxyHeaderOutcome) -> Refusal {
         match outcome {
-            ProxyHeaderOutcome::Malformed | ProxyHeaderOutcome::Missing => Refusal::Malformed,
+            ProxyHeaderOutcome::Missing => Refusal::Missing,
+            ProxyHeaderOutcome::Malformed => Refusal::Malformed,
             ProxyHeaderOutcome::Oversized => Refusal::Oversized,
             ProxyHeaderOutcome::Unsupported => Refusal::Unsupported,
             ProxyHeaderOutcome::Timeout => Refusal::Timeout,
