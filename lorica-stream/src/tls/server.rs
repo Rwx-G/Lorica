@@ -38,7 +38,7 @@ use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use lorica_config::models::Stream;
+use lorica_config::models::{MtlsConfig, StreamMatchRule};
 use lorica_tls::cert_resolver::{LocalIpConfigs, ResolvesServerCertByLocalIp};
 use lorica_tls::http_client::crypto_provider;
 use lorica_tls::{version, RusTlsError, ServerConfig, ServerTlsStream, TlsAcceptor};
@@ -55,15 +55,15 @@ struct RuleConfig {
 }
 
 /// The server configs of one terminating stream, built when the engine
-/// sees the stream in its table and kept until the stream changes, never
-/// per connection.
+/// sees the stream in its table and kept until what they are built from
+/// changes, never per connection.
 pub struct TerminateConfigs {
     rules: HashMap<String, RuleConfig>,
 }
 
 impl TerminateConfigs {
-    /// The configs of `stream`'s rules over `resolver`, sharing the
-    /// stream's one client verifier, if it authenticates clients.
+    /// The configs of a stream's match `rules` over `resolver`, sharing
+    /// the stream's one client verifier when `client_auth` is set.
     ///
     /// # Errors
     ///
@@ -71,17 +71,13 @@ impl TerminateConfigs {
     /// handshakes are then refused, never run without the verification
     /// the operator asked for.
     pub fn build(
-        stream: &Stream,
+        rules: &[StreamMatchRule],
+        client_auth: Option<&MtlsConfig>,
         resolver: &Arc<dyn ResolvesServerCertByLocalIp>,
     ) -> Result<TerminateConfigs, String> {
-        let verifier = stream
-            .tls_terminate
-            .as_ref()
-            .and_then(|terminate| terminate.client_auth.as_ref())
-            .map(client_auth::verifier)
-            .transpose()?;
-        let mut rules = HashMap::new();
-        for rule in &stream.match_rules {
+        let verifier = client_auth.map(client_auth::verifier).transpose()?;
+        let mut configs = HashMap::new();
+        for rule in rules {
             let builder = ServerConfig::builder_with_provider(crypto_provider())
                 .with_protocol_versions(&[&version::TLS12, &version::TLS13])
                 .map_err(|e| format!("the TLS versions are refused: {e}"))?;
@@ -99,7 +95,7 @@ impl TerminateConfigs {
                 .collect();
             config.max_early_data_size = 0;
             let base = Arc::new(config);
-            rules.insert(
+            configs.insert(
                 rule.name.clone(),
                 RuleConfig {
                     base: Arc::clone(&base),
@@ -107,7 +103,7 @@ impl TerminateConfigs {
                 },
             );
         }
-        Ok(TerminateConfigs { rules })
+        Ok(TerminateConfigs { rules: configs })
     }
 
     /// The config a connection matched to `rule` and accepted on

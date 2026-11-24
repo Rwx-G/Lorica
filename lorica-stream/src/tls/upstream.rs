@@ -38,12 +38,13 @@ use lorica_tls::{
 use tokio::net::TcpStream;
 
 use crate::counters::UpstreamTlsFailure;
-use crate::table::StreamTable;
+use crate::table::ClientIdentity;
 use crate::tcp::FORWARD_BUFFER_SIZE;
 
 /// The client config of a stream's upstream TLS `settings`.
 /// `public_roots` is the process's store, `None` when it did not load;
-/// `table` holds the client identities.
+/// `identity` is the one the table holds for
+/// `settings.client_certificate_id`, `None` when it holds none.
 ///
 /// # Errors
 ///
@@ -55,7 +56,7 @@ use crate::tcp::FORWARD_BUFFER_SIZE;
 pub fn client_config(
     settings: &StreamUpstreamTls,
     public_roots: Option<&Arc<RootCertStore>>,
-    table: &StreamTable,
+    identity: Option<&ClientIdentity>,
 ) -> Result<Arc<ClientConfig>, String> {
     if settings.skip_verify && settings.client_certificate_id.is_some() {
         return Err("skip_verify is refused beside a client certificate".into());
@@ -80,8 +81,7 @@ pub fn client_config(
     };
     let mut config = match &settings.client_certificate_id {
         Some(id) => {
-            let identity = table
-                .client_identity(id)
+            let identity = identity
                 .ok_or_else(|| format!("client certificate `{id}` is not held on this node"))?;
             builder
                 .with_client_auth_cert(identity.chain().to_vec(), identity.key())
@@ -248,13 +248,12 @@ mod tests {
 
     #[test]
     fn skip_verify_beside_a_credential_or_a_bundle_is_refused() {
-        let table = StreamTable::default();
         let with_identity = StreamUpstreamTls {
             skip_verify: true,
             client_certificate_id: Some("c".into()),
             ..StreamUpstreamTls::default()
         };
-        assert!(client_config(&with_identity, None, &table)
+        assert!(client_config(&with_identity, None, None)
             .unwrap_err()
             .contains("client certificate"));
         let with_bundle = StreamUpstreamTls {
@@ -262,30 +261,29 @@ mod tests {
             ca_cert_pem: Some("x".into()),
             ..StreamUpstreamTls::default()
         };
-        assert!(client_config(&with_bundle, None, &table).is_err());
+        assert!(client_config(&with_bundle, None, None).is_err());
         let bare = StreamUpstreamTls {
             skip_verify: true,
             alpn: vec!["postgresql".into()],
             ..StreamUpstreamTls::default()
         };
-        let config = client_config(&bare, None, &table).unwrap();
+        let config = client_config(&bare, None, None).unwrap();
         assert_eq!(config.alpn_protocols, vec![b"postgresql".to_vec()]);
     }
 
     #[test]
     fn missing_trust_or_identity_leaves_the_stream_unconfigured() {
-        let table = StreamTable::default();
         let public = StreamUpstreamTls::default();
-        assert!(client_config(&public, None, &table)
+        assert!(client_config(&public, None, None)
             .unwrap_err()
             .contains("public roots"));
-        assert!(client_config(&public, Some(&Arc::new(RootCertStore::empty())), &table).is_ok());
+        assert!(client_config(&public, Some(&Arc::new(RootCertStore::empty())), None).is_ok());
         let identity = StreamUpstreamTls {
             client_certificate_id: Some("absent".into()),
             ..StreamUpstreamTls::default()
         };
         assert!(
-            client_config(&identity, Some(&Arc::new(RootCertStore::empty())), &table)
+            client_config(&identity, Some(&Arc::new(RootCertStore::empty())), None)
                 .unwrap_err()
                 .contains("not held")
         );

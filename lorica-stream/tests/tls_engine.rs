@@ -59,6 +59,7 @@ use lorica_tls::{
 };
 use lorica_worker::stream_ctl::StreamCtlMsg;
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+use rustls::HandshakeKind;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -1273,6 +1274,69 @@ async fn a_resolver_reload_reaches_new_handshakes_and_spares_open_connections() 
     round_trip(&mut open, b"after").await.unwrap();
 }
 
+/// A table load that changes nothing a terminating stream is built from
+/// keeps its server configs, and with them the session cache: a client
+/// resumes across the refresh. A certificate renewed in the resolver
+/// still reaches the next full handshake through those kept configs
+/// (Phase 1 audit C16).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_keeps_resumption_and_a_renewal_still_reaches_new_handshakes() {
+    let h = Harness::new(None);
+    let ca = Ca::new("Server CA");
+    let first = ca.issue(&["app.example.com"], None);
+    let renewed = ca.issue(&["app.example.com"], None);
+    h.resolver
+        .reload(vec![first.cert_data(&["app.example.com"])])
+        .unwrap();
+    let app = echo().await;
+    let load = || {
+        table(
+            vec![terminating(
+                "s",
+                vec![rule("app", &["app.example.com"], &[])],
+                None,
+            )],
+            vec![("s", backend("app", app), Some("app"))],
+        )
+    };
+    h.set(load());
+    let listen = h.listen("s").await;
+    let returning = client_config(ca.roots(), None, &[]);
+    let mut full = tls_connect(listen, "app.example.com", Arc::clone(&returning))
+        .await
+        .unwrap();
+    // The round trip also reads the session ticket the server sends.
+    round_trip(&mut full, b"full").await.unwrap();
+    assert_eq!(full.get_ref().1.handshake_kind(), Some(HandshakeKind::Full));
+
+    h.set(load());
+    let mut resumed = tls_connect(listen, "app.example.com", returning)
+        .await
+        .unwrap();
+    round_trip(&mut resumed, b"resumed").await.unwrap();
+    assert_eq!(
+        resumed.get_ref().1.handshake_kind(),
+        Some(HandshakeKind::Resumed)
+    );
+
+    h.resolver
+        .reload(vec![renewed.cert_data(&["app.example.com"])])
+        .unwrap();
+    h.set(load());
+    let mut fresh = tls_connect(
+        listen,
+        "app.example.com",
+        client_config(ca.roots(), None, &[]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fresh.get_ref().1.peer_certificates().unwrap()[0],
+        renewed.der
+    );
+    round_trip(&mut fresh, b"fresh").await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_drain_in_the_middle_of_a_handshake_ends_with_the_drain_reason() {
     let mut h = Harness::new(None);
@@ -1323,8 +1387,8 @@ async fn a_rule_config_refuses_a_client_offering_none_of_its_protocols() {
         .reload(vec![server.cert_data(&["app.example.com"])])
         .unwrap();
     let resolver: Arc<dyn ResolvesServerCertByLocalIp> = resolver;
-    let s = terminating("s", vec![rule("app", &["app.example.com"], &["h2"])], None);
-    let configs = TerminateConfigs::build(&s, &resolver).unwrap();
+    let rules = [rule("app", &["app.example.com"], &["h2"])];
+    let configs = TerminateConfigs::build(&rules, None, &resolver).unwrap();
     let config = configs.config("app", LOOPBACK).unwrap();
     assert_eq!(config.max_early_data_size, 0);
 
