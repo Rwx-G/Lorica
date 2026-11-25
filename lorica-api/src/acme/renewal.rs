@@ -838,8 +838,9 @@ enum RenewalPlan {
 /// is gone).
 ///
 /// - `"http01"` or `None` -> HTTP-01 (original behavior)
-/// - `"dns01-cloudflare"` / `"dns01-route53"` / `"dns01-ovh"` -> the
-///   provider's configuration, checked against the method
+/// - `"dns01-cloudflare"` / `"dns01-route53"` / `"dns01-ovh"` /
+///   `"dns01-aliyun"` -> the provider's configuration, checked against
+///   the method
 /// - `"dns01-manual"` -> error (requires manual renewal)
 ///
 /// # Errors

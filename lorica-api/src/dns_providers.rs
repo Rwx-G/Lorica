@@ -1,5 +1,5 @@
 //! CRUD endpoints for stored DNS provider credentials used by ACME DNS-01
-//! challenges (Cloudflare, Route53, OVH).
+//! challenges (Cloudflare, Route53, OVH, Aliyun).
 
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
@@ -18,7 +18,7 @@ pub struct DnsProviderResponse {
     pub id: String,
     /// Human-readable label.
     pub name: String,
-    /// Provider kind (`"ovh"` / `"cloudflare"` / `"route53"`).
+    /// Provider kind (`"ovh"` / `"cloudflare"` / `"route53"` / `"aliyun"`).
     pub provider_type: String,
     /// RFC 3339 insert timestamp.
     pub created_at: String,
@@ -47,7 +47,7 @@ pub async fn list_dns_providers(
 pub struct CreateDnsProviderRequest {
     /// Human-readable label.
     pub name: String,
-    /// Provider kind (`"ovh"` / `"cloudflare"` / `"route53"`).
+    /// Provider kind (`"ovh"` / `"cloudflare"` / `"route53"` / `"aliyun"`).
     pub provider_type: String,
     /// Provider-specific credentials.
     pub config: DnsProviderConfig,
@@ -79,6 +79,11 @@ pub struct DnsProviderConfig {
     pub aws_region: Option<String>,
     /// Route53 hosted zone id.
     pub hosted_zone_id: Option<String>,
+    // Aliyun
+    /// Aliyun AccessKey ID of the RAM user that owns the zone.
+    pub aliyun_access_key_id: Option<String>,
+    /// Aliyun AccessKey secret of the same RAM user.
+    pub aliyun_access_key_secret: Option<String>,
 }
 
 impl DnsProviderConfig {
@@ -133,9 +138,24 @@ impl DnsProviderConfig {
                     "zone_id": zone
                 })
             }
+            "aliyun" => {
+                let key_id = self.aliyun_access_key_id.as_deref().unwrap_or("");
+                let secret = self.aliyun_access_key_secret.as_deref().unwrap_or("");
+                if key_id.is_empty() || secret.is_empty() {
+                    return Err(ApiError::BadRequest(
+                        "Alibaba Cloud DNS requires aliyun_access_key_id and aliyun_access_key_secret".into(),
+                    ));
+                }
+                serde_json::json!({
+                    "provider": "aliyun",
+                    "api_token": key_id,
+                    "api_secret": secret,
+                    "zone_id": ""
+                })
+            }
             other => {
                 return Err(ApiError::BadRequest(format!(
-                    "unsupported provider_type '{other}': expected 'ovh', 'cloudflare', or 'route53'"
+                    "unsupported provider_type '{other}': expected 'ovh', 'cloudflare', 'route53', or 'aliyun'"
                 )));
             }
         };

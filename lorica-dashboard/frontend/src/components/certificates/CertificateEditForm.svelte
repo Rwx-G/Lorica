@@ -143,6 +143,7 @@
           <option value="dns01-ovh">DNS-01 (OVH)</option>
           <option value="dns01-cloudflare">DNS-01 (Cloudflare)</option>
           <option value="dns01-route53">DNS-01 (Route53)</option>
+          <option value="dns01-aliyun">DNS-01 (Alibaba Cloud DNS)</option>
           <option value="dns01-manual">DNS-01 (Manual)</option>
         </select>
       </div>

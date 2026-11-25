@@ -11,6 +11,8 @@ Author: Rwx-G
 
 ### Added
 
+- **ACME DNS-01 via Alibaba Cloud DNS (Alidns).** A fourth automated DNS provider, `aliyun`, alongside Cloudflare, Route53 and OVH. The challenger signs the Alidns RPC API (`2015-01-09`) itself with the RAM user's AccessKey pair (HMAC-SHA1), walks the domain's suffixes to find the hosted zone, creates the `_acme-challenge` TXT record with the smallest TTL every Alidns edition accepts (600 s), and on cleanup deletes exactly the record ids it created, so an order covering a name and its wildcard retracts both records and never touches a pre-existing one. The RPC client does not follow redirects or log signed URLs, scrubs echoed signed query values from error bodies, treats a business `Code` in a 200 response as a failure, and keeps record ids that failed deletion for retry. No schema migration; a provider is added in Settings with its AccessKey ID and secret, and renewal reuses the stored provider like the other DNS-01 methods.
+
 ### Changed
 
 ### Fixed

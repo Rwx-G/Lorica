@@ -4222,8 +4222,8 @@ paths:
       tags: [DnsProviders]
       summary: Create a DNS provider credential entry
       description: |
-        Adds a Cloudflare / OVH / Route53 credential set used by
-        the ACME DNS-01 flow. Credentials are encrypted at rest
+        Adds a Cloudflare / OVH / Route53 / Alibaba Cloud DNS credential set used
+        by the ACME DNS-01 flow. Credentials are encrypted at rest
         with the global encryption key.
       security:
         - sessionCookie: []
@@ -7148,7 +7148,7 @@ components:
           type: boolean
         acme_method:
           type: string
-          description: "ACME provisioning method: http01, dns01-cloudflare, dns01-route53, dns01-ovh, dns01-manual"
+          description: "ACME provisioning method: http01, dns01-cloudflare, dns01-route53, dns01-ovh, dns01-aliyun, dns01-manual"
           nullable: true
         created_at:
           type: string

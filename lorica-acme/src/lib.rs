@@ -31,7 +31,7 @@
 //!   manual DNS-01 flow.
 //!
 //! DNS providers implement [`DnsChallenger`]; built-ins cover Cloudflare,
-//! OVH, and (behind the `route53` feature) AWS Route53.
+//! OVH, Aliyun (Alidns), and (behind the `route53` feature) AWS Route53.
 
 pub mod config;
 pub mod dns_challengers;
@@ -45,8 +45,8 @@ pub use config::AcmeConfig;
 #[cfg(feature = "route53")]
 pub use dns_challengers::Route53DnsChallenger;
 pub use dns_challengers::{
-    build_dns_challenger, CloudflareDnsChallenger, DnsChallengeConfig, DnsChallenger,
-    OvhDnsChallenger,
+    build_dns_challenger, AliyunDnsChallenger, CloudflareDnsChallenger, DnsChallengeConfig,
+    DnsChallenger, OvhDnsChallenger,
 };
 pub use driver::{
     acme_dns_base_domain, begin_manual_dns01, finalize_manual_dns01, issue_dns01, issue_http01,

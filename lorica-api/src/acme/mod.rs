@@ -17,7 +17,7 @@
 //! Supports three challenge modes:
 //! - **HTTP-01**: Requires port 80 reachable from the Internet.
 //! - **DNS-01 (automated)**: Creates a `_acme-challenge.{domain}` TXT record via DNS
-//!   provider API. Supports Cloudflare and AWS Route53.
+//!   provider API. Supports Cloudflare, OVH, Aliyun (Alidns) and AWS Route53.
 //! - **DNS-01 (manual)**: Returns the TXT record info for the user to create manually,
 //!   then confirms the challenge in a second step.
 //!

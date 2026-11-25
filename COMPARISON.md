@@ -189,7 +189,7 @@
 
 ### Lorica Strengths
 
-- **ACME DNS-01 with 3 providers** (Cloudflare, Route53, OVH) + manual mode. Traefik ships many more DNS providers built in, and Caddy offers many as caddy-dns plugins (none in the standard build); Lorica's spread covers the common European-centric set. Route 53 is an opt-in Cargo feature (not in the default `.deb` / `.rpm` build) to keep the AWS SDK dep graph out of the default binary.
+- **ACME DNS-01 with 4 providers** (Cloudflare, Route53, OVH, Alibaba Cloud DNS) + manual mode. Traefik ships many more DNS providers built in, and Caddy offers many as caddy-dns plugins (none in the standard build); Lorica's spread covers the common European-centric set plus Alibaba Cloud DNS for domains hosted there. Route 53 is an opt-in Cargo feature (not in the default `.deb` / `.rpm` build) to keep the AWS SDK dep graph out of the default binary.
 - **Internal certificates from Active Directory Certificate Services** (v1.10.0, first packaged in v1.10.1) - Lorica enrolls, renews and adopts certificates from an AD CS authority through its Certificate Enrollment Web Service, with Kerberos and a TLS channel binding, so an internal PKI is served the way Let's Encrypt is. The others serve public names through ACME and leave an AD CS estate to a separate enrollment tool or a manual CSR workflow.
 - **SNI hot-swap** via arc-swap - zero-downtime cert rotation.
 - **Per-route mTLS policy** - chain verification at the TLS listener plus per-route enforcement knobs (`required`, org allowlist) that hot-reload without restart. Nginx, Caddy, Traefik and HAProxy also scope client-certificate verification per host name, and Nginx and HAProxy can express an organization allowlist in configuration; Lorica's difference is a turnkey per-route field.
